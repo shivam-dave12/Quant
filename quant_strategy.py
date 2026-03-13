@@ -555,7 +555,9 @@ class ATREngine:
             return self._atr
 
         if not self._seeded:
-            # Full seed pass
+            # Full seed pass — compute rolling ATR across ALL historical candles
+            # and fill _atr_hist with the last ATR_PCTILE_WINDOW values so the
+            # percentile filter has a proper baseline from the first tick.
             trs = [
                 max(float(candles[i]['h']) - float(candles[i]['l']),
                     abs(float(candles[i]['h']) - float(candles[i - 1]['c'])),
@@ -565,19 +567,26 @@ class ATREngine:
             if len(trs) < period:
                 return self._atr
             atr = sum(trs[:period]) / period
+            # Collect all rolling ATR values from the seed candles
+            rolling_atrs: List[float] = [atr]
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
+                rolling_atrs.append(atr)
             self._atr    = atr
             self._seeded = True
+            # Populate history with the last maxlen values so percentile
+            # is immediately meaningful rather than starting from 1 entry.
+            for val in rolling_atrs[-(self._atr_hist.maxlen or 100):]:
+                self._atr_hist.append(val)
         else:
             # FIX-09: incremental update for the newest candle only
             hi  = float(candles[-1]['h']); lo = float(candles[-1]['l'])
             prc = float(candles[-2]['c'])
             tr  = max(hi - lo, abs(hi - prc), abs(lo - prc))
             self._atr = (self._atr * (period - 1) + tr) / period
+            # FIX-10: append after increment (hist[-1]=current, hist[:-1]=prior)
+            self._atr_hist.append(self._atr)
 
-        # FIX-10: snapshot BEFORE append so percentile excludes self
-        self._atr_hist.append(self._atr)
         self._last_ts = last_ts
         return self._atr
 
@@ -956,7 +965,12 @@ class QuantStrategy:
             return None
 
         if not self._atr_5m.is_regime_valid():       # FIX-10: unbiased percentile
-            logger.debug(f"Regime gated — pctile={self._atr_5m.get_percentile():.0%}")
+            pct = self._atr_5m.get_percentile()
+            logger.info(
+                f"⏸ Regime gated — ATR(5m) pctile={pct:.0%} "
+                f"[valid: {QCfg.ATR_MIN_PCTILE():.0%}–{QCfg.ATR_MAX_PCTILE():.0%}] "
+                f"hist_len={len(list(self._atr_5m._atr_hist))}"
+            )
             return None
 
         price = data_manager.get_last_price()

@@ -43,16 +43,16 @@ REMAINDER_MIN_QTY        = 0.001
 # ─────────────────────────────────────────────
 RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 400
-MAX_DAILY_LOSS_PCT      = 5.0
-MAX_DRAWDOWN_PCT        = 15.0
+MAX_DAILY_LOSS_PCT      = 10.0
+MAX_DRAWDOWN_PCT        = 30.0
 MAX_CONSECUTIVE_LOSSES  = 3
-MAX_DAILY_TRADES        = 8
+MAX_DAILY_TRADES        = 30
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 10
 TRADE_COOLDOWN_SECONDS  = 600
 MIN_RISK_REWARD_RATIO   = 1.5
-TARGET_RISK_REWARD_RATIO= 2.5
-MAX_RR_RATIO            = 12.0
+TARGET_RISK_REWARD_RATIO= 3.0
+MAX_RR_RATIO            = 50.0
 
 # ─────────────────────────────────────────────
 # 5. ORDER EXECUTION
