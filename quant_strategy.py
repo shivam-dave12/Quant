@@ -557,14 +557,21 @@ class ATREngine:
             return self._atr
 
         if not self._seeded:
-            # Full seed pass — compute rolling ATR across ALL historical candles
-            # and fill _atr_hist with the last ATR_PCTILE_WINDOW values so the
-            # percentile filter has a proper baseline from the first tick.
+            # Full seed pass — compute rolling ATR across ALL CLOSED candles only.
+            #
+            # CRITICAL: candles[-1] is always the current FORMING (not-yet-closed)
+            # candle. Its hi/lo/close are partial data. Exclude it by seeding only
+            # on candles[:-1]. last_ts is still set to candles[-1]['t'] below, so
+            # FIX-11 correctly skips all subsequent ticks in the same period.
+            closed = candles[:-1]
+            if len(closed) < period + 1:
+                return self._atr
+
             trs = [
-                max(float(candles[i]['h']) - float(candles[i]['l']),
-                    abs(float(candles[i]['h']) - float(candles[i - 1]['c'])),
-                    abs(float(candles[i]['l']) - float(candles[i - 1]['c'])))
-                for i in range(1, len(candles))
+                max(float(closed[i]['h']) - float(closed[i]['l']),
+                    abs(float(closed[i]['h']) - float(closed[i - 1]['c'])),
+                    abs(float(closed[i]['l']) - float(closed[i - 1]['c'])))
+                for i in range(1, len(closed))
             ]
             if len(trs) < period:
                 return self._atr
@@ -581,9 +588,21 @@ class ATREngine:
             for val in rolling_atrs[-(self._atr_hist.maxlen or 100):]:
                 self._atr_hist.append(val)
         else:
-            # FIX-09: incremental update for the newest candle only
-            hi  = float(candles[-1]['h']); lo = float(candles[-1]['l'])
-            prc = float(candles[-2]['c'])
+            # FIX-09 (CORRECTED): use the JUST-CLOSED candle, not the forming candle.
+            #
+            # Root cause of 0% regime after first entry:
+            # Original used candles[-1] (the NEW forming candle, ~1 tick old,
+            # hi=lo=open=close). True Range ≈ 0. Fed into Wilder every 5 min,
+            # ATR deflated from $132 → $89 in 10 candles while history held $120+.
+            # Result: percentile → 0%, regime permanently gated.
+            #
+            # candles[-1] = FORMING (skip)
+            # candles[-2] = just-CLOSED  ← use hi/lo from here
+            # candles[-3] = prior closed  ← use prev_close from here
+            # (len >= period+1 = 15 candles guaranteed above, so [-3] is safe)
+            hi  = float(candles[-2]['h'])
+            lo  = float(candles[-2]['l'])
+            prc = float(candles[-3]['c'])
             tr  = max(hi - lo, abs(hi - prc), abs(lo - prc))
             self._atr = (self._atr * (period - 1) + tr) / period
             # FIX-10: append after increment (hist[-1]=current, hist[:-1]=prior)
