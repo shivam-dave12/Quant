@@ -182,7 +182,7 @@ class QCfg:
     @staticmethod
     def ATR_PCTILE_WINDOW()-> int:  return int(_cfg("QUANT_ATR_PCTILE_WINDOW", 100))
     @staticmethod
-    def ATR_MIN_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE",  0.08))
+    def ATR_MIN_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE",  0.15))
     @staticmethod
     def ATR_MAX_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MAX_PCTILE",  0.90))
 
@@ -292,22 +292,11 @@ class VWAPEngine:
         self._std      = 0.0
         self._slope    = 0.0
         self._history: deque[float] = deque(maxlen=QCfg.VWAP_SLOPE_BARS() * 3)
-        self._last_bars_used = 0  # tracks actual window used (for logging)
-
-    # Minimum viable bars for a meaningful VWAP — below this, signal = 0.0
-    _MIN_BARS = 50
 
     def update(self, candles: List[Dict], atr: float) -> None:
-        # FIX: Graceful degradation — use whatever bars are available down to
-        # _MIN_BARS. The old hard-gate `if len < window: return` caused VWAP
-        # to silently return 0.000 for the entire warmup period when VWAP_WINDOW
-        # (200) exceeded the 1m warmup fetch (99 candles), breaking composite
-        # weighting and disabling direction bias for the first ~100 minutes.
-        available = len(candles)
-        if available < self._MIN_BARS:
+        window = QCfg.VWAP_WINDOW()
+        if len(candles) < window:
             return
-        window = min(QCfg.VWAP_WINDOW(), available)
-        self._last_bars_used = window
 
         recent = candles[-window:]
 
@@ -348,10 +337,6 @@ class VWAPEngine:
     def vwap(self) -> float: return self._vwap
     @property
     def vwap_std(self) -> float: return self._std
-    @property
-    def is_degraded(self) -> bool:
-        """True if running on fewer bars than the configured window."""
-        return 0 < self._last_bars_used < QCfg.VWAP_WINDOW()
 
 
 class MomentumEngine:
@@ -502,9 +487,7 @@ class VolumeFlowEngine:
     """
 
     def __init__(self):
-        # maxlen = window × 20 so there is always ample baseline history
-        # for the z-score; recomputed on each update() so config changes take effect.
-        self._ratios: deque[float] = deque(maxlen=QCfg.VOL_FLOW_WINDOW() * 20)
+        self._ratios: deque[float] = deque(maxlen=200)
 
     def update(self, candles: List[Dict]) -> None:
         self._ratios.clear()
@@ -572,57 +555,29 @@ class ATREngine:
             return self._atr
 
         if not self._seeded:
-            # Full seed pass — compute rolling ATR across ALL CLOSED candles only.
-            #
-            # CRITICAL: candles[-1] is always the current FORMING (not-yet-closed)
-            # candle. Its hi/lo/close are partial data. Exclude it by seeding only
-            # on candles[:-1]. last_ts is still set to candles[-1]['t'] below, so
-            # FIX-11 correctly skips all subsequent ticks in the same period.
-            closed = candles[:-1]
-            if len(closed) < period + 1:
-                return self._atr
-
+            # Full seed pass
             trs = [
-                max(float(closed[i]['h']) - float(closed[i]['l']),
-                    abs(float(closed[i]['h']) - float(closed[i - 1]['c'])),
-                    abs(float(closed[i]['l']) - float(closed[i - 1]['c'])))
-                for i in range(1, len(closed))
+                max(float(candles[i]['h']) - float(candles[i]['l']),
+                    abs(float(candles[i]['h']) - float(candles[i - 1]['c'])),
+                    abs(float(candles[i]['l']) - float(candles[i - 1]['c'])))
+                for i in range(1, len(candles))
             ]
             if len(trs) < period:
                 return self._atr
             atr = sum(trs[:period]) / period
-            # Collect all rolling ATR values from the seed candles
-            rolling_atrs: List[float] = [atr]
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
-                rolling_atrs.append(atr)
             self._atr    = atr
             self._seeded = True
-            # Populate history with the last maxlen values so percentile
-            # is immediately meaningful rather than starting from 1 entry.
-            for val in rolling_atrs[-(self._atr_hist.maxlen or 100):]:
-                self._atr_hist.append(val)
         else:
-            # FIX-09 (CORRECTED): use the JUST-CLOSED candle, not the forming candle.
-            #
-            # Root cause of 0% regime after first entry:
-            # Original used candles[-1] (the NEW forming candle, ~1 tick old,
-            # hi=lo=open=close). True Range ≈ 0. Fed into Wilder every 5 min,
-            # ATR deflated from $132 → $89 in 10 candles while history held $120+.
-            # Result: percentile → 0%, regime permanently gated.
-            #
-            # candles[-1] = FORMING (skip)
-            # candles[-2] = just-CLOSED  ← use hi/lo from here
-            # candles[-3] = prior closed  ← use prev_close from here
-            # (len >= period+1 = 15 candles guaranteed above, so [-3] is safe)
-            hi  = float(candles[-2]['h'])
-            lo  = float(candles[-2]['l'])
-            prc = float(candles[-3]['c'])
+            # FIX-09: incremental update for the newest candle only
+            hi  = float(candles[-1]['h']); lo = float(candles[-1]['l'])
+            prc = float(candles[-2]['c'])
             tr  = max(hi - lo, abs(hi - prc), abs(lo - prc))
             self._atr = (self._atr * (period - 1) + tr) / period
-            # FIX-10: append after increment (hist[-1]=current, hist[:-1]=prior)
-            self._atr_hist.append(self._atr)
 
+        # FIX-10: snapshot BEFORE append so percentile excludes self
+        self._atr_hist.append(self._atr)
         self._last_ts = last_ts
         return self._atr
 
@@ -639,103 +594,9 @@ class ATREngine:
         prev = hist[:-1]   # FIX-10: exclude current from ranking
         return sum(1 for h in prev if h <= ref) / len(prev)
 
-    def get_atr_zscore(self) -> float:
-        """
-        Z-score of current ATR vs history. +3 = 3σ above mean (very high vol).
-        Paired with percentile to detect how extreme the current regime is.
-        """
-        hist = list(self._atr_hist)
-        if len(hist) < 10:
-            return 0.0
-        mu  = sum(hist) / len(hist)
-        var = sum((x - mu) ** 2 for x in hist) / max(len(hist) - 1, 1)
-        std = math.sqrt(var)
-        return (self._atr - mu) / (std + 1e-12)
-
-    def classify_regime(self, vwap_signal: float = 0.0) -> "RegimeResult":
-        """
-        Map current ATR state to a fully parameterised RegimeResult.
-
-        Core principle: HIGH vol ≠ no-trade.  It means TRADE DIFFERENTLY.
-          - EXTREME regime: VWAP deviation drives direction (mean-reversion)
-          - Size and SL width scale with regime severity
-          - Confirmation ticks increase with chaos level
-
-        Args:
-            vwap_signal: VWAPEngine.get_signal() in [-1, +1].
-                         Positive = price above VWAP (overbought).
-        """
-        p  = self.get_percentile()
-        z  = self.get_atr_zscore()
-        lo = QCfg.ATR_MIN_PCTILE()   # default 0.15
-
-        # ── COMPRESSED: below configured floor (low vol, coiling) ─────────
-        if p < lo:
-            return RegimeResult(
-                mode=RegimeMode.COMPRESSED, pctile=p, atr_zscore=z,
-                size_scalar=0.60, sl_atr_mult=0.90, entry_threshold=0.68,
-                extra_confirms=1, direction_bias="any",
-                note=f"COMPRESSED ({p:.0%}) — breakout/squeeze only",
-            )
-
-        # ── TRENDING: normal operating band 15th–70th ─────────────────────
-        if p <= 0.70:
-            return RegimeResult(
-                mode=RegimeMode.TRENDING, pctile=p, atr_zscore=z,
-                size_scalar=1.00, sl_atr_mult=1.00,
-                entry_threshold=QCfg.LONG_THRESHOLD(),
-                extra_confirms=0, direction_bias="any",
-                note=f"TRENDING ({p:.0%}) — full signal suite, full size",
-            )
-
-        # ── ELEVATED: 70th–90th percentile ────────────────────────────────
-        if p <= 0.90:
-            return RegimeResult(
-                mode=RegimeMode.ELEVATED, pctile=p, atr_zscore=z,
-                size_scalar=0.80, sl_atr_mult=1.20,
-                entry_threshold=max(QCfg.LONG_THRESHOLD(), 0.60),
-                extra_confirms=0, direction_bias="any",
-                note=f"ELEVATED ({p:.0%}) — 80% size, wider SL",
-            )
-
-        # ── EXTREME: above 90th percentile — was a binary kill-switch ──────
-        # The WRONG fix was blocking all entries here. In extreme vol, VWAP
-        # deviation is the strongest edge: price far from VWAP = mean-revert.
-        #   vwap_signal > +0.25 → overbought → SHORT mean-reversion bias
-        #   vwap_signal < -0.25 → oversold  → LONG  mean-reversion bias
-        #   |vwap| ≤ 0.25       → near VWAP → no directional constraint
-        #
-        # Threshold is split by trade type:
-        #   mean-reversion (bias ≠ any): 0.45 — MOM is only partially recovered
-        #     in a bounce/fade; max achievable composite ≈ 0.49. Momentum breakout
-        #     signals (MOM 0.9+, SQZ 1.0) are absent.
-        #   momentum (bias = any):       0.65 — near-VWAP breakout, all signals
-        #     can align explosively → higher bar appropriate.
-        BIAS = 0.25
-        if vwap_signal > BIAS:
-            bias      = "short_only"
-            bias_note = f"VWAP+{vwap_signal:+.2f} → fade extension SHORT"
-        elif vwap_signal < -BIAS:
-            bias      = "long_only"
-            bias_note = f"VWAP{vwap_signal:+.2f} → mean-revert LONG"
-        else:
-            bias      = "any"
-            bias_note = f"VWAP≈0 ({vwap_signal:+.2f}) — momentum valid"
-
-        # Mean-reversion ceiling ≈ 0.49; momentum ceiling > 0.80
-        thr = 0.45 if bias != "any" else 0.65
-
-        return RegimeResult(
-            mode=RegimeMode.EXTREME, pctile=p, atr_zscore=z,
-            size_scalar=0.50, sl_atr_mult=1.50,
-            entry_threshold=thr,
-            extra_confirms=1, direction_bias=bias,
-            note=f"EXTREME ({p:.0%} z={z:+.1f}) — {bias_note}",
-        )
-
     def is_regime_valid(self) -> bool:
-        """Backward-compat: True for any tradeable regime (not COMPRESSED)."""
-        return self.classify_regime().mode != RegimeMode.COMPRESSED
+        p = self.get_percentile()
+        return QCfg.ATR_MIN_PCTILE() <= p <= QCfg.ATR_MAX_PCTILE()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -753,15 +614,14 @@ class SignalBreakdown:
     atr:       float = 0.0
     atr_pct:   float = 0.0
     regime_ok: bool  = False
-    regime:    Optional["RegimeResult"] = None   # full regime snapshot
 
     def __str__(self) -> str:
-        reg_str = str(self.regime) if self.regime else f"ATR${self.atr:.1f}({self.atr_pct:.0%})"
         return (
             f"CVD={self.cvd:+.3f} VWAP={self.vwap:+.3f} "
             f"MOM={self.mom:+.3f} SQZ={self.squeeze:+.3f} "
             f"VFL={self.vol:+.3f} → Σ={self.composite:+.4f} "
-            f"{reg_str}"
+            f"ATR=${self.atr:.1f}({self.atr_pct:.0%}) "
+            f"{'✅' if self.regime_ok else '🚫GATED'}"
         )
 
 
@@ -771,8 +631,7 @@ class SignalAggregator:
     @staticmethod
     def compute(cvd: float, vwap: float, mom: float,
                 squeeze: float, vol: float,
-                atr_engine: ATREngine,
-                vwap_signal_for_regime: float = 0.0) -> SignalBreakdown:
+                atr_engine: ATREngine) -> SignalBreakdown:
 
         w = {
             'cvd': QCfg.W_CVD(), 'vwap': QCfg.W_VWAP(), 'mom': QCfg.W_MOM(),
@@ -783,33 +642,11 @@ class SignalAggregator:
             logger.warning(f"Weight sum={total_w:.4f} ≠ 1.0 — normalising. Fix QUANT_W_* in config.")
             w = {k: v / total_w for k, v in w.items()}
 
-        # ── Classify regime FIRST so composite can be regime-aware ───────────
-        regime = atr_engine.classify_regime(vwap_signal=vwap_signal_for_regime)
-
-        # ── Mean-reversion VWAP sign flip ─────────────────────────────────────
-        # In EXTREME mean-reversion mode (direction_bias != "any"), the VWAP
-        # signal is semantically inverted relative to the trade direction:
-        #
-        #   long_only bias  → price BELOW VWAP (vwap_signal < 0, oversold)
-        #                     VWAP normally means "bearish" in composite, but
-        #                     here "below VWAP" is the BUY signal → flip to +
-        #
-        #   short_only bias → price ABOVE VWAP (vwap_signal > 0, overbought)
-        #                     VWAP normally means "bullish" in composite, but
-        #                     here "above VWAP" is the SELL signal → flip to -
-        #
-        # Without this flip, VWAP drags the composite in the WRONG direction
-        # while simultaneously setting the correct direction bias.  Result was
-        # composite stuck at +0.29 (CVD+0.77, MOM+0.50) never reaching +0.65.
-        vwap_for_composite = vwap
-        if regime.direction_bias != "any":
-            vwap_for_composite = -vwap  # oversold/overbought → trade-aligned signal
-
         composite = max(-1.0, min(1.0,
-            w['cvd']     * cvd               +
-            w['vwap']    * vwap_for_composite +
-            w['mom']     * mom                +
-            w['squeeze'] * squeeze            +
+            w['cvd']     * cvd     +
+            w['vwap']    * vwap    +
+            w['mom']     * mom     +
+            w['squeeze'] * squeeze +
             w['vol']     * vol
         ))
 
@@ -818,8 +655,7 @@ class SignalAggregator:
             composite=composite,
             atr=atr_engine.atr,
             atr_pct=atr_engine.get_percentile(),
-            regime_ok=regime.mode not in (RegimeMode.COMPRESSED,),
-            regime=regime,
+            regime_ok=atr_engine.is_regime_valid(),
         )
 
 
@@ -832,64 +668,6 @@ class PositionPhase(Enum):
     ENTERING = auto()
     ACTIVE   = auto()
     EXITING  = auto()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# VOLATILITY REGIME CLASSIFICATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RegimeMode(Enum):
-    """
-    Four-state volatility regime derived from ATR percentile rank.
-
-    COMPRESSED  (<15th pctile) : Price coiling in tight range.
-                                 Only squeeze-breakout signals valid.
-                                 Wait for clear directional expansion.
-
-    TRENDING    (15th–70th)    : Normal operating environment.
-                                 All 5 signal engines active, full size.
-
-    ELEVATED    (70th–90th)    : Above-average volatility.
-                                 All signals valid, 80% size, wider SL.
-                                 Slightly higher confirmation threshold.
-
-    EXTREME     (>90th pctile) : Explosive move in progress.
-                                 VWAP-deviation drives direction bias:
-                                   price far above VWAP → SHORT mean-revert
-                                   price far below VWAP → LONG  mean-revert
-                                 50% size, 1.5× ATR SL buffer, +1 confirm tick.
-    """
-    COMPRESSED = "COMPRESSED"
-    TRENDING   = "TRENDING"
-    ELEVATED   = "ELEVATED"
-    EXTREME    = "EXTREME"
-
-
-@dataclass
-class RegimeResult:
-    """
-    All regime-driven trading parameters in one immutable snapshot.
-    Created once per evaluate_entry() call and passed through to _enter_trade().
-    """
-    mode:            RegimeMode
-    pctile:          float       # 0.0–1.0   raw ATR percentile rank
-    atr_zscore:      float       # z-score of current ATR vs history (signed)
-    size_scalar:     float       # multiply raw position size by this (0–1]
-    sl_atr_mult:     float       # override SL ATR multiplier for this regime
-    entry_threshold: float       # composite signal must exceed this (both dirs)
-    extra_confirms:  int         # additional confirm ticks beyond QCfg.CONFIRM_TICKS()
-    direction_bias:  str         # "any" | "long_only" | "short_only"
-    note:            str         # human-readable reason string
-
-    def __str__(self) -> str:
-        return (
-            f"Regime={self.mode.value}({self.pctile:.0%}) "
-            f"z={self.atr_zscore:+.2f} "
-            f"size={self.size_scalar:.0%} "
-            f"SLmult={self.sl_atr_mult:.1f}× "
-            f"thr={self.entry_threshold:.2f} "
-            f"bias={self.direction_bias}"
-        )
 
 
 @dataclass
@@ -1046,10 +824,6 @@ class QuantStrategy:
         self._last_think_log  = 0.0
         self._think_interval  = 30.0   # seconds between thinking prints
 
-        # Regime gate log — rate-limited so it doesn't spam every 5s tick
-        self._last_regime_log      = 0.0
-        self._regime_log_interval  = 60.0   # at most once per minute
-        self._last_regime_pct      = -1.0   # detect pctile changes worth logging
         # Reconciliation — rate-gate for the exchange API call
         # _reconcile_pending: a background thread is running a reconcile query
         # _reconcile_data:    result dict from the most recent completed query
@@ -1057,11 +831,6 @@ class QuantStrategy:
         self._RECONCILE_SEC       = 30.0
         self._reconcile_pending   = False          # guard: only one thread in flight
         self._reconcile_data: Optional[Dict] = None   # filled by bg thread, read on-tick
-
-        # Memo of the last successfully placed entry — used to recover full position
-        # state when the exchange returns entry_price=0 or missing order IDs on adopt.
-        # Cleared on finalise_exit so it can't be applied to a different position.
-        self._last_entry_memo: Optional[Dict] = None
 
         # Statistics
         self._total_trades   = 0
@@ -1135,29 +904,26 @@ class QuantStrategy:
                     and not self._reconcile_pending):
                 self._last_reconcile_time = now
                 self._reconcile_pending   = True
-                # Snapshot the phase at fire-time. _reconcile_apply will discard
-                # the result if the phase has changed during the I/O wait — this
-                # prevents stale "exchange flat" results from falsely closing a
-                # position that was entered while the thread was in flight.
-                fired_phase = self._pos.phase
                 t = threading.Thread(
                     target=self._reconcile_query_thread,
-                    args=(order_manager, fired_phase),
+                    args=(order_manager,),
                     daemon=True,
                 )
                 t.start()
 
-            # Position sync — the background reconcile fires every _RECONCILE_SEC
-            # and already handles both ACTIVE→FLAT (TP/SL fired) and FLAT→ACTIVE
-            # (adopted position).  Running _sync_position on the main tick thread
-            # IN ADDITION doubles the rate-limited API call budget and adds
-            # synchronous latency to every tick.  Removed: let reconcile own all
-            # exchange-state transitions.
-            #
-            # EXITING: stay gated (return below) until reconcile confirms flat.
-            # Maximum additional wait = _RECONCILE_SEC (30 s) + API latency.
-            if phase == PositionPhase.EXITING:
-                return  # block new entries; reconcile will call _finalise_exit
+            # Position sync gating (existing ACTIVE/EXITING path)
+            if phase == PositionPhase.ACTIVE:
+                if now - self._last_pos_sync > QCfg.POS_SYNC_SEC():
+                    self._sync_position(order_manager)
+                    self._last_pos_sync = now
+                    if self._pos.is_flat():
+                        return
+
+            elif phase == PositionPhase.EXITING:
+                if now - self._last_exit_sync > QCfg.POS_SYNC_SEC():
+                    self._sync_position(order_manager)
+                    self._last_exit_sync = now
+                return
 
             # Route
             if phase == PositionPhase.FLAT:
@@ -1172,11 +938,9 @@ class QuantStrategy:
     # SIGNAL COMPUTATION
     # ───────────────────────────────────────────────────────────────────
 
-    def _compute_signals(self, data_manager,
-                         bypass_regime: bool = False) -> Optional[SignalBreakdown]:
+    def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
-        _5m_seed_limit = QCfg.ATR_PCTILE_WINDOW() + QCfg.ATR_PERIOD() + 3
-        candles_5m = data_manager.get_candles("5m", limit=_5m_seed_limit)
+        candles_5m = data_manager.get_candles("5m", limit=100)
 
         if len(candles_1m) < QCfg.MIN_1M_BARS():
             logger.debug(f"1m bars: {len(candles_1m)}/{QCfg.MIN_1M_BARS()}")
@@ -1185,63 +949,36 @@ class QuantStrategy:
             logger.debug(f"5m bars: {len(candles_5m)}/{QCfg.MIN_5M_BARS()}")
             return None
 
-        atr_1m = self._atr_1m.compute(candles_1m)
-        atr_5m = self._atr_5m.compute(candles_5m)
+        atr_1m = self._atr_1m.compute(candles_1m)   # FIX-09/11
+        atr_5m = self._atr_5m.compute(candles_5m)   # FIX-09/11
 
         if atr_5m < 1e-10:
+            return None
+
+        if not self._atr_5m.is_regime_valid():       # FIX-10: unbiased percentile
+            logger.debug(f"Regime gated — pctile={self._atr_5m.get_percentile():.0%}")
             return None
 
         price = data_manager.get_last_price()
         if price < 1.0:
             return None
 
-        # ── ALWAYS compute all engines — regime is a MODULATOR not a kill-switch ──
-        # FIX: Previous code returned None here when regime was "invalid", meaning
-        # CVD/VWAP/MOM/SQUEEZE/VOL were NEVER updated in high-vol environments.
-        # The bot was completely blind in the most obvious trending markets.
-        # Now all indicators run on every tick; _evaluate_entry() decides whether
-        # to act based on the regime result embedded in the SignalBreakdown.
-        self._cvd.update(candles_1m)
-        self._vwap.update(candles_1m, atr_1m)
-        self._mom.update(candles_1m, candles_5m, atr_1m, atr_5m)
-        self._squeeze.update(candles_1m, atr_1m)
-        self._volflow.update(candles_1m)
+        self._cvd.update(candles_1m)                       # FIX-02/03
+        self._vwap.update(candles_1m, atr_1m)              # FIX-04/05
+        self._mom.update(candles_1m, candles_5m,           # FIX-01/25
+                         atr_1m, atr_5m)
+        self._squeeze.update(candles_1m, atr_1m)           # FIX-06/07/27
+        self._volflow.update(candles_1m)                    # FIX-08/28
 
-        vwap_sig = self._vwap.get_signal(price)
-
-        sig = SignalAggregator.compute(
+        sig = SignalAggregator.compute(                     # FIX-23
             self._cvd.get_signal(),
-            vwap_sig,
+            self._vwap.get_signal(price),
             self._mom.get_signal(),
             self._squeeze.get_signal(),
             self._volflow.get_signal(),
             self._atr_5m,
-            vwap_signal_for_regime=vwap_sig,   # regime direction bias from VWAP
         )
         self._last_sig = sig
-
-        # Regime-aware logging (replaces the old binary "regime gated" spam)
-        regime = sig.regime
-        if regime and not bypass_regime:
-            now_t = time.time()
-            pct_rounded = round(regime.pctile, 2)
-            if (now_t - self._last_regime_log >= self._regime_log_interval
-                    or abs(pct_rounded - self._last_regime_pct) >= 0.05):
-                self._last_regime_log = now_t
-                self._last_regime_pct = pct_rounded
-                # Only log COMPRESSED as "gated" — all others are valid trading modes
-                if regime.mode == RegimeMode.COMPRESSED:
-                    logger.info(
-                        f"⏸ Regime COMPRESSED — ATR(5m) pctile={regime.pctile:.0%} "
-                        f"z={regime.atr_zscore:+.2f} — waiting for vol expansion"
-                    )
-                else:
-                    logger.debug(
-                        f"📊 Regime={regime.mode.value} pctile={regime.pctile:.0%} "
-                        f"z={regime.atr_zscore:+.2f} bias={regime.direction_bias} "
-                        f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}"
-                    )
-
         logger.debug(f"Signal: {sig}")
         return sig
 
@@ -1274,49 +1011,24 @@ class QuantStrategy:
             arrow = "▲" if v > 0.05 else ("▼" if v < -0.05 else "─")
             return f"  {label:<6} {bar(v)} {arrow} {v:+.3f}"
 
-        regime = sig.regime
+        lt = QCfg.LONG_THRESHOLD()
+        st = QCfg.SHORT_THRESHOLD()
+        c  = sig.composite
 
-        # ── Use regime-adjusted thresholds (not raw config) ─────────────────
-        # In EXTREME regime the threshold is 0.65, in COMPRESSED 0.68, etc.
-        # Using the base 0.55 here makes "Lean" and "Next move" misleading.
-        if regime and not (self._pos.phase == PositionPhase.ACTIVE):
-            lt = regime.entry_threshold
-            st = regime.entry_threshold
-            long_allowed_think  = regime.direction_bias in ("any", "long_only")
-            short_allowed_think = regime.direction_bias in ("any", "short_only")
-            need = QCfg.CONFIRM_TICKS() + regime.extra_confirms
+        # Determine overall lean
+        if c >= lt:
+            lean = f"BULLISH  ✅  ({c:+.3f} ≥ +{lt})"
+        elif c <= -st:
+            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{st})"
+        elif c >= lt * 0.7:
+            lean = f"weakly bullish  ({c:+.3f}, need ≥{lt:.2f})"
+        elif c <= -st * 0.7:
+            lean = f"weakly bearish  ({c:+.3f}, need ≤{-st:.2f})"
         else:
-            lt = QCfg.LONG_THRESHOLD()
-            st = QCfg.SHORT_THRESHOLD()
-            long_allowed_think  = True
-            short_allowed_think = True
-            need = QCfg.CONFIRM_TICKS()
+            lean = f"NEUTRAL  🔇  ({c:+.3f})"
 
-        c = sig.composite
-
-        # Determine overall lean (vs regime-adjusted threshold)
-        if c >= lt and long_allowed_think:
-            lean = f"BULLISH  ✅  ({c:+.3f} ≥ +{lt:.2f})"
-        elif c <= -st and short_allowed_think:
-            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{st:.2f})"
-        elif not long_allowed_think and c >= lt:
-            lean = f"BULLISH but BLOCKED — bias={regime.direction_bias}"
-        elif not short_allowed_think and c <= -st:
-            lean = f"BEARISH but BLOCKED — bias={regime.direction_bias}"
-        elif c >= lt * 0.75:
-            lean = f"approaching LONG  ({c:+.3f}, need ≥{lt:.2f})"
-        elif c <= -st * 0.75:
-            lean = f"approaching SHORT ({c:+.3f}, need ≤{-st:.2f})"
-        else:
-            # Show distance to nearest valid threshold
-            if long_allowed_think and not short_allowed_think:
-                gap = lt - c
-                lean = f"LONG only — gap {gap:.3f} to trigger (+{lt:.2f})"
-            elif short_allowed_think and not long_allowed_think:
-                gap = c - (-st)
-                lean = f"SHORT only — gap {abs(gap):.3f} to trigger (-{st:.2f})"
-            else:
-                lean = f"NEUTRAL  🔇  ({c:+.3f})"
+        # Confirmation progress
+        need = QCfg.CONFIRM_TICKS()
         if self._confirm_long > 0:
             conf_str = f"LONG confirms: {self._confirm_long}/{need}"
         elif self._confirm_short > 0:
@@ -1324,52 +1036,29 @@ class QuantStrategy:
         else:
             conf_str = "No confirmation building"
 
-        # Next action — regime-aware: use adjusted thresholds and direction bias
-        if c >= lt and long_allowed_think and self._confirm_long >= need - 1:
+        # Next action
+        if c >= lt and self._confirm_long >= need - 1:
             next_move = "⚡ ENTRY LONG — next tick fires if signal holds"
-        elif c <= -st and short_allowed_think and self._confirm_short >= need - 1:
+        elif c <= -st and self._confirm_short >= need - 1:
             next_move = "⚡ ENTRY SHORT — next tick fires if signal holds"
-        elif (c >= lt and long_allowed_think) or (c <= -st and short_allowed_think):
+        elif c >= lt or c <= -st:
             remaining = need - max(self._confirm_long, self._confirm_short)
             next_move = f"🕐 Building confirmation — {remaining} tick(s) remaining"
-        elif regime and regime.direction_bias != "any":
-            if long_allowed_think:
-                next_move = f"🔍 Awaiting LONG setup — composite needs +{lt - c:.3f} more"
-            else:
-                next_move = f"🔍 Awaiting SHORT setup — composite needs {c - (-st):.3f} lower"
         else:
             next_move = "👀 Watching — signal below entry threshold"
 
-        # Regime display (regime variable already set above for threshold calc)
-        in_trade = self._pos.phase == PositionPhase.ACTIVE
-        if regime:
-            emoji_map = {"COMPRESSED":"🟡","TRENDING":"🟢","ELEVATED":"🟠","EXTREME":"🔴"}
-            em = emoji_map.get(regime.mode.value, "⚪")
-            if in_trade:
-                regime_str = f"{em} {regime.mode.value} ({regime.pctile:.0%}) — bypassed (in position)"
-            else:
-                regime_str = (
-                    f"{em} {regime.mode.value} ({regime.pctile:.0%} pctile "
-                    f"z={regime.atr_zscore:+.2f}) "
-                    f"thr={regime.entry_threshold:.2f} size={regime.size_scalar:.0%} "
-                    f"SLx={regime.sl_atr_mult:.1f}× bias={regime.direction_bias}"
-                )
-        else:
-            regime_str = "unknown"
+        # Regime
+        regime_str = (f"VALID ({sig.atr_pct:.0%} pctile)" if sig.regime_ok
+                      else f"GATED ({sig.atr_pct:.0%} pctile — outside [{QCfg.ATR_MIN_PCTILE():.0%},{QCfg.ATR_MAX_PCTILE():.0%}])")
 
         # Cooldown
         cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
         cd_str = f"{cooldown_rem:.0f}s" if cooldown_rem > 0 else "ready"
 
-        vwap_warn = (f"  ⚠ VWAP degraded ({self._vwap._last_bars_used}/"
-                     f"{QCfg.VWAP_WINDOW()}b)"
-                     if self._vwap.is_degraded else "")
-        # Show VWAP↔ label when sign is flipped (mean-reversion mode)
-        vwap_label = "VWAP↔" if (regime and regime.direction_bias != "any") else "VWAP "
         lines = [
-            f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f}{vwap_warn} ─────────────────",
-            fmt("CVD",       sig.cvd),
-            fmt(vwap_label, sig.vwap),
+            f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f} ─────────────────",
+            fmt("CVD",  sig.cvd),
+            fmt("VWAP", sig.vwap),
             fmt("MOM",  sig.mom),
             fmt("SQZ",  sig.squeeze),
             fmt("VFL",  sig.vol),
@@ -1392,17 +1081,12 @@ class QuantStrategy:
     # RECONCILIATION — authoritative exchange state sync
     # ───────────────────────────────────────────────────────────────────
 
-    def _reconcile_query_thread(self, order_manager, fired_phase: PositionPhase) -> None:
+    def _reconcile_query_thread(self, order_manager) -> None:
         """
         Daemon thread: query the exchange for position + open orders.
         Runs OUTSIDE the strategy lock so network latency never blocks on_tick.
         Stores raw results in self._reconcile_data; the next on_tick tick picks
         them up and calls _reconcile_apply() under the lock.
-
-        fired_phase: the PositionPhase at the moment this thread was launched.
-        _reconcile_apply compares this to the current phase and discards stale
-        results if the phase changed while the query was in flight — preventing
-        a pre-entry FLAT query from falsely closing an in-flight entry.
 
         Never crashes the thread — all exceptions are caught and logged.
         Always clears _reconcile_pending on exit (even on failure).
@@ -1434,7 +1118,6 @@ class QuantStrategy:
                 self._reconcile_data = {
                     "ex_pos":      ex_pos,
                     "open_orders": open_orders,
-                    "fired_phase": fired_phase,   # phase when thread was launched
                 }
 
         except Exception as e:
@@ -1454,39 +1137,13 @@ class QuantStrategy:
              → TP or SL fired — record exit and finalise.
           C) ACTIVE internal + exchange matches
              → Backfill missing SL/TP order IDs.
-
-        Phase-mismatch guard: if the bot's phase changed WHILE the query was
-        in flight (e.g. entry fired between thread-launch and thread-result),
-        the result is stale and must be discarded. Example race:
-          Thread fires at T=0 (phase=FLAT), entry executes at T=3 (ACTIVE),
-          thread result arrives at T=5 and sees exchange flat at T=0 → without
-          the guard this would falsely record an exit on the fresh entry.
         """
         ex_pos      = data["ex_pos"]
         open_orders = data.get("open_orders")   # may be None if query failed
-        fired_phase = data.get("fired_phase")   # phase at thread-launch time
 
         ex_size = float(ex_pos.get("size", 0.0))
         ex_side = str(ex_pos.get("side") or "").upper()   # "LONG" | "SHORT" | ""
         phase   = self._pos.phase
-
-        # ── Phase-mismatch guard ───────────────────────────────────────────
-        # Only outcome B (ACTIVE + exchange flat → record exit) is dangerous
-        # if fired during a phase transition. Outcomes A and C are safe:
-        #   A: fired FLAT, still FLAT, exchange has position → adopt (correct)
-        #   C: fired ACTIVE, still ACTIVE, exchange matches → backfill (correct)
-        # Outcome B: fired FLAT, now ACTIVE, exchange flat → stale pre-entry
-        # result. Discard. The next reconcile cycle will get a fresh result.
-        if (fired_phase is not None
-                and fired_phase != phase
-                and phase == PositionPhase.ACTIVE
-                and ex_size < QCfg.MIN_QTY()):
-            logger.info(
-                f"📡 Reconcile: discarding stale result "
-                f"(fired_phase={fired_phase.name} → current={phase.name}, "
-                f"exchange shows flat but we just entered) — will re-check next cycle"
-            )
-            return
 
         # ── OUTCOME A: we think FLAT but exchange has a live position ──────
         if phase == PositionPhase.FLAT and ex_size >= QCfg.MIN_QTY():
@@ -1506,59 +1163,21 @@ class QuantStrategy:
                         tp_order_id = o["order_id"]
                         tp_price    = float(o.get("trigger_price") or 0)
 
-            # ── Memo fallback ──────────────────────────────────────────────
-            # CoinSwitch returns entry_price=0 for freshly filled positions
-            # and the /open_orders endpoint is 404, so sl_order_id/tp_order_id
-            # are always None on this exchange. If we have a recent entry memo
-            # from _enter_trade (written after SL/TP were confirmed placed),
-            # use it to fill any gaps before building the PositionState.
-            m = self._last_entry_memo
-            # Evaluate memo match unconditionally so variables are always defined
-            memo_side_ok = False
-            memo_qty_ok  = False
-            if m is not None:
-                internal_side_memo = "long" if ex_side == "LONG" else "short"
-                memo_side_ok = (m.get("side", "") == internal_side_memo)
-                memo_qty_ok  = (abs(m.get("quantity", 0) - ex_size) < 1e-6)
-
-            memo_valid = m is not None and memo_side_ok and memo_qty_ok
-
-            if memo_valid:
-                if ex_entry <= 0:
-                    ex_entry = m["entry_price"]
-                    logger.info(
-                        f"📡 Reconcile adopt: exchange entry_price=0 — "
-                        f"restored from memo: ${ex_entry:,.2f}"
-                    )
-                if sl_order_id is None and m.get("sl_order_id"):
-                    sl_order_id = m["sl_order_id"]
-                    logger.info(f"📡 Reconcile adopt: restored SL order ID from memo")
-                if tp_order_id is None and m.get("tp_order_id"):
-                    tp_order_id = m["tp_order_id"]
-                    logger.info(f"📡 Reconcile adopt: restored TP order ID from memo")
-                if sl_price <= 0 and m.get("sl_price", 0) > 0:
-                    sl_price = m["sl_price"]
-                if tp_price <= 0 and m.get("tp_price", 0) > 0:
-                    tp_price = m["tp_price"]
-
             internal_side = "long" if ex_side == "LONG" else "short"
-
-            sl_dist = abs(ex_entry - sl_price) if (ex_entry > 0 and sl_price > 0) else 0.0
-            initial_risk = sl_dist * ex_size
 
             self._pos = PositionState(
                 phase          = PositionPhase.ACTIVE,
                 side           = internal_side,
                 quantity       = ex_size,
-                entry_price    = ex_entry,
+                entry_price    = ex_entry if ex_entry > 0 else 0.0,
                 sl_price       = sl_price,
                 tp_price       = tp_price,
                 sl_order_id    = sl_order_id,
                 tp_order_id    = tp_order_id,
-                entry_time     = m["entry_time"] if memo_valid else time.time(),
-                initial_risk   = initial_risk,
-                initial_sl_dist= sl_dist,
-                entry_atr      = (m["entry_atr"] if memo_valid else self._atr_5m.atr),
+                entry_time     = time.time(),
+                initial_risk   = 0.0,
+                initial_sl_dist= abs(ex_entry - sl_price) if sl_price > 0 else 0.0,
+                entry_atr      = self._atr_5m.atr,
                 peak_profit    = 0.0,
             )
             self.current_sl_price = sl_price
@@ -1585,7 +1204,7 @@ class QuantStrategy:
         # ── OUTCOME B: we think ACTIVE but exchange is flat ────────────────
         if phase == PositionPhase.ACTIVE and ex_size < QCfg.MIN_QTY():
             logger.info("📡 Reconcile: exchange FLAT while ACTIVE → TP/SL fired")
-            self._record_exchange_exit(order_manager, ex_pos)
+            self._record_exchange_exit(ex_pos)
             return
 
         # ── OUTCOME C: ACTIVE + exchange matches — backfill missing order IDs ──
@@ -1614,84 +1233,28 @@ class QuantStrategy:
             self._confirm_long = self._confirm_short = 0
             return
 
-        price  = data_manager.get_last_price()
-        regime = sig.regime
+        price = data_manager.get_last_price()
         self._log_thinking(sig, price, now)
 
-        # ── COMPRESSED regime: only enter on strong squeeze-breakout signal ──
-        # All other regimes proceed to normal entry evaluation below.
-        if regime and regime.mode == RegimeMode.COMPRESSED:
-            if self._squeeze.get_signal() == 0.0:
-                # No active squeeze breakout — stand aside
-                self._confirm_long = self._confirm_short = 0
-                return
-            # Fall through: squeeze is firing, allow entry with regime's tighter params
-
-        # ── Determine per-regime thresholds and direction constraints ─────────
-        if regime:
-            thr_long      = regime.entry_threshold
-            thr_short     = regime.entry_threshold
-            long_allowed  = regime.direction_bias in ("any", "long_only")
-            short_allowed = regime.direction_bias in ("any", "short_only")
-            total_confirms = QCfg.CONFIRM_TICKS() + regime.extra_confirms
-        else:
-            thr_long = thr_short  = QCfg.LONG_THRESHOLD()
-            long_allowed = short_allowed = True
-            total_confirms = QCfg.CONFIRM_TICKS()
-
-        # Log regime state at most once per _regime_log_interval (shared gate)
-        # Prevents the "⚡ Regime EXTREME" line from spamming every 5-second tick.
-        if regime and regime.mode in (RegimeMode.ELEVATED, RegimeMode.EXTREME):
-            now_log = time.time()
-            pct_r   = round(regime.pctile, 2)
-            if (now_log - self._last_regime_log >= self._regime_log_interval
-                    or abs(pct_r - self._last_regime_pct) >= 0.05):
-                self._last_regime_log = now_log
-                self._last_regime_pct = pct_r
-                em = {"ELEVATED": "🟠", "EXTREME": "🔴"}.get(regime.mode.value, "")
-                logger.info(
-                    f"{em} Regime {regime.mode.value} — {regime.note} | "
-                    f"thr={thr_long:.2f} confirms={total_confirms} "
-                    f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}×"
-                )
-
         c = sig.composite
-
-        if c >= thr_long and long_allowed:
+        if c >= QCfg.LONG_THRESHOLD():
             self._confirm_long  += 1;  self._confirm_short  = 0
-        elif c <= -thr_short and short_allowed:
+        elif c <= -QCfg.SHORT_THRESHOLD():
             self._confirm_short += 1;  self._confirm_long   = 0
-        elif c >= thr_long and not long_allowed:
-            # Signal says LONG but regime says short_only: log and reset
-            logger.info(
-                f"⛔ LONG signal ({c:+.3f}) blocked by regime bias "
-                f"({regime.direction_bias if regime else '?'}) — ignoring"
-            )
-            self._confirm_long = self._confirm_short = 0
-            return
-        elif c <= -thr_short and not short_allowed:
-            logger.info(
-                f"⛔ SHORT signal ({c:+.3f}) blocked by regime bias "
-                f"({regime.direction_bias if regime else '?'}) — ignoring"
-            )
-            self._confirm_long = self._confirm_short = 0
-            return
         else:
             self._confirm_long = self._confirm_short = 0
             return
 
-        if self._confirm_long >= total_confirms:
+        thresh = QCfg.CONFIRM_TICKS()
+        if self._confirm_long >= thresh:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager,
-                              "long", sig, regime)
-        elif self._confirm_short >= total_confirms:
+            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig)
+        elif self._confirm_short >= thresh:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager,
-                              "short", sig, regime)
+            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
 
     def _enter_trade(self, data_manager, order_manager,
-                     risk_manager, side: str, sig: SignalBreakdown,
-                     regime: Optional["RegimeResult"] = None) -> None:
+                     risk_manager, side: str, sig: SignalBreakdown) -> None:
         price = data_manager.get_last_price()
         if price < 1.0:
             logger.warning("Entry aborted: no valid price")
@@ -1701,16 +1264,6 @@ class QuantStrategy:
         if atr < 1e-10:
             logger.warning("Entry aborted: ATR not computed")
             return
-
-        # ── Regime-adjusted ATR for SL/TP computation ─────────────────────
-        # In ELEVATED/EXTREME regimes the SL needs more room to breathe.
-        # We scale the ATR seen by _compute_sl_tp(), NOT the price levels directly,
-        # so the full SL/TP pipeline (min%, max%, RR checks) still applies correctly.
-        sl_atr_mult = regime.sl_atr_mult if regime else 1.0
-        atr_for_sltp = atr * sl_atr_mult
-
-        # ── Regime-adjusted position size scalar ──────────────────────────
-        size_scalar = regime.size_scalar if regime else 1.0
 
         # FIX-19: risk gate check before any API calls
         bal_info = risk_manager.get_available_balance()
@@ -1725,19 +1278,11 @@ class QuantStrategy:
             logger.info(f"Entry blocked by risk gate: {reason}")
             return
 
-        qty_base = self._compute_quantity(risk_manager, price)   # FIX-18
-        if qty_base is None or qty_base < QCfg.MIN_QTY():
+        qty = self._compute_quantity(risk_manager, price)   # FIX-18
+        if qty is None or qty < QCfg.MIN_QTY():
             return
 
-        # Apply regime size scalar (floor at MIN_QTY so we never send 0)
-        qty = max(QCfg.MIN_QTY(),
-                  math.floor(qty_base * size_scalar / QCfg.LOT_STEP()) * QCfg.LOT_STEP())
-        qty = round(qty, 8)
-        if qty < QCfg.MIN_QTY():
-            logger.info(f"Entry aborted: regime-scaled qty {qty} < MIN_QTY")
-            return
-
-        sl_price, tp_price = self._compute_sl_tp(price, side, atr_for_sltp)   # FIX-20/21
+        sl_price, tp_price = self._compute_sl_tp(price, side, atr)   # FIX-20/21
         if sl_price is None or tp_price is None:
             return
 
@@ -1751,10 +1296,9 @@ class QuantStrategy:
             logger.info(f"Entry blocked: R:R={rr:.4f} < min={QCfg.MIN_RR_RATIO()}")
             return
 
-        regime_tag = f" [{regime.mode.value} {regime.size_scalar:.0%} sz]" if regime else ""
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f}{regime_tag} | {sig}"
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | {sig}"
         )
 
         # Market order
@@ -1777,7 +1321,7 @@ class QuantStrategy:
         slip = abs(fill_price - price) / price
         if slip > QCfg.SLIPPAGE_TOL():
             logger.info(f"Slippage {slip:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} — recalc SL/TP")
-            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr_for_sltp)  # use regime-adj ATR
+            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr)
             if new_sl is None or new_tp is None:
                 # FIX-12: guard None return — close naked position immediately
                 logger.error("❌ SL/TP recompute after fill returned None — closing position")
@@ -1858,22 +1402,6 @@ class QuantStrategy:
         self.current_tp_price = tp_price
         self._total_trades   += 1
 
-        # Memo: preserve complete entry state so reconcile can recover it
-        # if the exchange later returns entry_price=0 or missing order IDs.
-        self._last_entry_memo = {
-            "side":         side,
-            "quantity":     qty,
-            "entry_price":  fill_price,
-            "sl_price":     sl_price,
-            "tp_price":     tp_price,
-            "sl_order_id":  sl_data["order_id"],
-            "tp_order_id":  tp_data["order_id"],
-            "entry_time":   time.time(),
-            "initial_risk": initial_risk,
-            "initial_sl_dist": sl_dist_filled,
-            "entry_atr":    self._atr_5m.atr,
-        }
-
         send_telegram_message(
             f"{'📈' if side == 'long' else '📉'} <b>QUANT ENTRY — {side.upper()}</b>\n\n"
             f"Symbol:   {QCfg.SYMBOL()}\n"
@@ -1886,9 +1414,7 @@ class QuantStrategy:
             f"Qty:      {qty} BTC\n"
             f"Margin:   ${initial_risk/QCfg.LEVERAGE():.2f} USDT\n"
             f"Risk:     ${initial_risk:.2f} USDT\n"
-            f"Leverage: {QCfg.LEVERAGE()}x\n"
-            f"Regime:   {regime.mode.value if regime else 'N/A'} "
-            f"({regime.pctile:.0%} pctile, {regime.size_scalar:.0%} sz)\n\n"
+            f"Leverage: {QCfg.LEVERAGE()}x\n\n"
             f"<i>{sig}</i>"
         )
         logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | "
@@ -1907,7 +1433,7 @@ class QuantStrategy:
             return
 
         # 1. Signal reversal
-        sig = self._compute_signals(data_manager, bypass_regime=True)
+        sig = self._compute_signals(data_manager)
         if sig is not None:
             self._log_thinking(sig, price, now)   # ← show thinking while in trade
             c = sig.composite; flip = QCfg.EXIT_FLIP_THRESH()
@@ -2102,7 +1628,7 @@ class QuantStrategy:
 
         if result is None:
             logger.warning("🚨 SL already fired (replace returned None) — finalising")
-            self._record_exchange_exit(order_manager, None)
+            self._record_exchange_exit(None)
             return True
 
         if isinstance(result, dict) and "error" in result:
@@ -2156,138 +1682,30 @@ class QuantStrategy:
         )
         self._finalise_exit()
 
-    def _record_exchange_exit(self, order_manager, ex_pos: Optional[Dict]) -> None:
+    def _record_exchange_exit(self, ex_pos: Optional[Dict]) -> None:
         """
-        FIX-17 (ENHANCED): Recover actual exit PnL via a 3-strategy cascade.
-
-        Strategy 1 — Order fill query
-            Query get_fill_details() for both tp_order_id and sl_order_id.
-            The first FILLED order that returns a fill_price > 0 is used to
-            compute PnL via _estimate_pnl(), same formula as manual exits.
-
-        Strategy 2 — Transactions endpoint
-            If fill query returns no price, call api.get_transactions() to
-            find the most recent "P&L" entry timestamped after position entry.
-            This returns the exchange-computed realised PnL directly.
-
-        Strategy 3 — SL/TP price estimate
-            If both network queries fail or return 0, fall back to the known
-            tp_price / sl_price stored on the position state.
-            We pick TP first (positions tend to be exited at TP in trending markets)
-            but also check which direction price last moved toward.
-
-        None of these strategies require the /open_orders endpoint.
-        The caller provides order_manager so we can make API calls without a
-        circular reference from inside the strategy engine.
+        FIX-17: When TP/SL fires on exchange, attempt to record PnL.
+        exchange unrealized_pnl at close moment is our best approximation.
         """
         pos = self._pos
         pnl = 0.0
-        exit_price = 0.0
-        exit_source = ""
-
-        # ── Strategy 1: query order fill prices ──────────────────────────
-        if order_manager is not None:
-            # Check TP first (most common successful exit), then SL
-            for oid, label in [
-                (pos.tp_order_id, "TP"),
-                (pos.sl_order_id, "SL"),
-            ]:
-                if not oid:
-                    continue
-                try:
-                    details = order_manager.get_fill_details(oid)
-                    if details is None:
-                        continue
-                    status = str(details.get("status", "")).upper()
-                    if status not in ("EXECUTED", "FILLED", "COMPLETELY_FILLED"):
-                        continue
-                    fp = details.get("fill_price")
-                    if fp is not None:
-                        fp_f = float(fp)
-                        if fp_f > 0:
-                            exit_price = fp_f
-                            exit_source = f"{label} fill @ ${exit_price:,.2f}"
-                            logger.info(f"📡 Exchange exit: {exit_source} [{status}]")
-                            break
-                except Exception as e:
-                    logger.debug(f"Exchange exit: fill query for {label} order {oid}: {e}")
-
-        # ── Strategy 2: transactions endpoint ────────────────────────────
-        if abs(exit_price) < 1e-10 and order_manager is not None:
-            try:
-                txns = order_manager.api.get_transactions(
-                    exchange=config.EXCHANGE,
-                    symbol=config.SYMBOL,
-                )
-                if isinstance(txns, dict) and not txns.get("error"):
-                    txn_list = txns.get("data", [])
-                    if isinstance(txn_list, list) and txn_list:
-                        # Find the most recent P&L entry after position entry time
-                        entry_ts_s = pos.entry_time  # epoch seconds
-                        best_txn = None
-                        best_ts  = 0.0
-                        for txn in txn_list:
-                            t_type = str(txn.get("transaction_type", txn.get("type", ""))).lower()
-                            if "p&l" not in t_type and "pnl" not in t_type and "realize" not in t_type:
-                                continue
-                            # Parse timestamp (exchange may use ms or s)
-                            raw_ts = txn.get("timestamp", txn.get("created_at", 0))
-                            try:
-                                ts_f = float(raw_ts)
-                                ts_s = ts_f / 1000.0 if ts_f > 1e12 else ts_f
-                            except (TypeError, ValueError):
-                                ts_s = 0.0
-                            if ts_s >= entry_ts_s and ts_s > best_ts:
-                                best_ts  = ts_s
-                                best_txn = txn
-                        if best_txn is not None:
-                            raw_pnl = float(best_txn.get("amount", best_txn.get("pnl", 0.0)))
-                            if abs(raw_pnl) > 1e-10:
-                                pnl        = raw_pnl
-                                exit_source = f"transactions endpoint (${pnl:+.2f})"
-                                logger.info(f"📡 Exchange exit PnL from {exit_source}")
-            except Exception as e:
-                logger.debug(f"Exchange exit: transactions query error: {e}")
-
-        # ── Compute PnL from fill price (Strategy 1 result) ──────────────
-        if exit_price > 0 and pos.entry_price > 0 and abs(pnl) < 1e-10:
-            pnl = self._estimate_pnl(pos, exit_price)
-
-        # ── Strategy 3: estimate from known SL/TP prices ─────────────────
-        if abs(pnl) < 1e-10 and abs(exit_price) < 1e-10:
-            # Heuristic: if unrealised PnL was positive at last heartbeat,
-            # assume TP fired; otherwise assume SL fired.
-            if pos.tp_price > 0:
-                exit_price  = pos.tp_price
-                exit_source = f"TP estimate @ ${pos.tp_price:,.2f}"
-            elif pos.sl_price > 0:
-                exit_price  = pos.sl_price
-                exit_source = f"SL estimate @ ${pos.sl_price:,.2f}"
-
-            if exit_price > 0 and pos.entry_price > 0:
-                pnl = self._estimate_pnl(pos, exit_price)
-                logger.info(
-                    f"📡 Exchange exit: fill & transaction queries returned nothing — "
-                    f"using {exit_source}.  PnL estimate: ${pnl:+.2f}  "
-                    f"(verify in exchange history)"
-                )
+        if ex_pos is not None:
+            pnl = float(ex_pos.get("unrealized_pnl", 0.0))
+            if abs(pnl) < 1e-10 and ex_pos.get("entry_price") and pos.entry_price > 0:
+                # Try computing from entry price vs exchange entry (may differ if partial fill)
+                ex_entry = float(ex_pos.get("entry_price", pos.entry_price))
+                logger.info(f"Exchange exit: entry ${pos.entry_price:.2f} vs "
+                            f"exchange_entry ${ex_entry:.2f}")
 
         if abs(pnl) < 1e-10:
-            logger.warning(
-                "📡 Exchange exit: PnL could not be determined via fill query, "
-                "transactions endpoint, or SL/TP estimate — recorded as $0.  "
-                "Check exchange history manually."
-            )
+            logger.warning("Exchange exit: PnL=0 recorded — verify in exchange history")
 
-        hold_min = max(0.0, (time.time() - pos.entry_time) / 60.0)
         self._record_pnl(pnl)
         send_telegram_message(
             f"📡 <b>EXCHANGE EXIT — {pos.side.upper()}</b>\n\n"
             f"TP/SL fired between sync ticks\n"
-            f"Entry:   ${pos.entry_price:,.2f}\n"
-            f"PnL:     ${pnl:+.2f} USDT"
-            + (f"\nSource:  {exit_source}" if exit_source else "") +
-            f"\nHold:    {hold_min:.1f} min\n\n"
+            f"Entry: ${pos.entry_price:,.2f}\n"
+            f"PnL:   ${pnl:+.2f} USDT\n\n"
             f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%}</i>"
         )
         self._finalise_exit()
@@ -2303,7 +1721,6 @@ class QuantStrategy:
         self._last_exit_time  = time.time()
         self.current_sl_price = 0.0
         self.current_tp_price = 0.0
-        self._last_entry_memo = None   # stale — cannot apply to a future position
         logger.info("Position closed — FLAT")
 
     # ───────────────────────────────────────────────────────────────────
@@ -2331,7 +1748,7 @@ class QuantStrategy:
         if self._pos.phase == PositionPhase.ACTIVE:
             if ex_size < QCfg.MIN_QTY():
                 logger.info("📡 Sync: exchange FLAT while ACTIVE → TP/SL fired")
-                self._record_exchange_exit(order_manager, ex_pos)   # FIX-17 enhanced
+                self._record_exchange_exit(ex_pos)   # FIX-17
 
             else:
                 ex_side = str(ex_pos.get("side") or "").upper()
@@ -2450,7 +1867,6 @@ class QuantStrategy:
         return self._winning_trades / self._total_trades if self._total_trades else 0.0
 
     def get_stats(self) -> Dict:
-        regime = self._last_sig.regime if self._last_sig else None
         return {
             "total_trades":    self._total_trades,
             "winning_trades":  self._winning_trades,
@@ -2463,30 +1879,20 @@ class QuantStrategy:
             "atr_5m":          round(self._atr_5m.atr, 2),
             "atr_1m":          round(self._atr_1m.atr, 2),
             "atr_pctile":      f"{self._atr_5m.get_percentile():.0%}",
-            "atr_zscore":      f"{self._atr_5m.get_atr_zscore():+.2f}",
             "regime_ok":       self._atr_5m.is_regime_valid(),
-            "regime_mode":     regime.mode.value if regime else "UNKNOWN",
-            "regime_bias":     regime.direction_bias if regime else "any",
-            "regime_size":     f"{regime.size_scalar:.0%}" if regime else "100%",
         }
 
     def format_status_report(self) -> str:
         """FIX-22: Removed dead pnl_live computation. Shows live position timing."""
         stats = self.get_stats()
         pos   = self._pos
-        regime_emoji = {
-            "COMPRESSED": "🟡", "TRENDING": "🟢",
-            "ELEVATED": "🟠", "EXTREME": "🔴", "UNKNOWN": "⚪",
-        }
-        rm = stats.get("regime_mode", "UNKNOWN")
         lines = [
             "📊 <b>QUANT STRATEGY STATUS</b>",
             "",
             f"Phase:       {stats['current_phase']}",
-            f"Regime:      {regime_emoji.get(rm,'⚪')} {rm} "
-            f"({stats['atr_pctile']} pctile  z={stats['atr_zscore']})",
-            f"Bias:        {stats['regime_bias']}  |  Size: {stats['regime_size']}",
-            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}",
+            f"Regime:      {'✅ Valid' if stats['regime_ok'] else '🚫 Gated'}",
+            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}  "
+            f"({stats['atr_pctile']} pctile)",
             f"Signal:      {stats['last_signal']}",
             "",
             f"Session:     {stats['total_trades']} trades | WR {stats['win_rate']}",

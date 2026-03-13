@@ -43,16 +43,16 @@ REMAINDER_MIN_QTY        = 0.001
 # ─────────────────────────────────────────────
 RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 400
-MAX_DAILY_LOSS_PCT      = 10.0
-MAX_DRAWDOWN_PCT        = 30.0
+MAX_DAILY_LOSS_PCT      = 5.0
+MAX_DRAWDOWN_PCT        = 15.0
 MAX_CONSECUTIVE_LOSSES  = 3
-MAX_DAILY_TRADES        = 30
+MAX_DAILY_TRADES        = 8
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 10
 TRADE_COOLDOWN_SECONDS  = 600
 MIN_RISK_REWARD_RATIO   = 1.5
-TARGET_RISK_REWARD_RATIO= 3.0
-MAX_RR_RATIO            = 50.0
+TARGET_RISK_REWARD_RATIO= 2.5
+MAX_RR_RATIO            = 12.0
 
 # ─────────────────────────────────────────────
 # 5. ORDER EXECUTION
@@ -70,7 +70,6 @@ SNIPER_MAX_DISTANCE_ATR  = 1.0
 # ─────────────────────────────────────────────
 READY_TIMEOUT_SEC    = 120.0
 MIN_CANDLES_1M       = 100
-WARMUP_1M_CANDLES    = 250   # FIX: seeds full VWAP_WINDOW=200 at boot (was hardcoded 100 in data_manager)
 MIN_CANDLES_5M       = 100
 MIN_CANDLES_15M      = 100
 MIN_CANDLES_1H       = 20
@@ -92,7 +91,7 @@ HEALTH_CHECK_INTERVAL_SEC          = 12.0
 PRICE_STALE_SECONDS                = 90.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
-ENTRY_EVALUATION_INTERVAL_SECONDS  = 1
+ENTRY_EVALUATION_INTERVAL_SECONDS  = 5
 ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS
 
 # ─────────────────────────────────────────────
@@ -156,9 +155,7 @@ QUANT_TRAIL_ATR_MULT        = 1.0
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
 QUANT_CVD_HIST_MULT         = 15
-QUANT_VWAP_WINDOW           = 200   # FIX: was 50 (50 min on 1m) — too narrow; captures
-                                    # the entire crash/pump in EXTREME regimes, inflating
-                                    # std and diluting z-score. 200 bars ≈ 3.3h anchor.
+QUANT_VWAP_WINDOW           = 50
 QUANT_VWAP_SLOPE_BARS       = 8
 QUANT_EMA_FAST              = 8
 QUANT_EMA_SLOW              = 21
@@ -172,9 +169,9 @@ QUANT_VOL_FLOW_WINDOW       = 10
 # 10f. Minimum Data (MIN_CANDLES_1M / 5M shared above, >= required values)
 
 # 10g. Regime Filter
-QUANT_ATR_PCTILE_WINDOW     = 230
-QUANT_ATR_MIN_PCTILE        = 0.05
-QUANT_ATR_MAX_PCTILE        = 0.95   # FIX: was 1.10 (unreachable — pctile range is 0–1)
+QUANT_ATR_PCTILE_WINDOW     = 100
+QUANT_ATR_MIN_PCTILE        = 0.15
+QUANT_ATR_MAX_PCTILE        = 0.90
 
 # 10h. Timing
 QUANT_MAX_HOLD_SEC          = 1800
@@ -185,9 +182,9 @@ QUANT_POS_SYNC_SEC          = 30
 
 # 10j. Signal Weights — must sum to 1.0
 QUANT_W_CVD                 = 0.30
-QUANT_W_VWAP                = 0.25  # restored: VWAP was broken (returned 0.000) — weight reduced for wrong reason
-QUANT_W_MOM                 = 0.25  # restored from 0.35: was inflated to compensate for broken VWAP
-QUANT_W_SQUEEZE             = 0.10  # restored: needed for COMPRESSED squeeze detection
+QUANT_W_VWAP                = 0.25
+QUANT_W_MOM                 = 0.25
+QUANT_W_SQUEEZE             = 0.10
 QUANT_W_VOL                 = 0.10
 # Sum = 1.00
 
