@@ -825,8 +825,12 @@ class QuantStrategy:
         self._think_interval  = 30.0   # seconds between thinking prints
 
         # Reconciliation — rate-gate for the exchange API call
+        # _reconcile_pending: a background thread is running a reconcile query
+        # _reconcile_data:    result dict from the most recent completed query
         self._last_reconcile_time = 0.0
         self._RECONCILE_SEC       = 30.0
+        self._reconcile_pending   = False          # guard: only one thread in flight
+        self._reconcile_data: Optional[Dict] = None   # filled by bg thread, read on-tick
 
         # Statistics
         self._total_trades   = 0
@@ -880,13 +884,32 @@ class QuantStrategy:
             phase = self._pos.phase
 
             # ── Exchange reconciliation ───────────────────────────────────────
-            # Rate-gated regardless of phase. When FLAT this is the primary
-            # protection against entering while a position exists on exchange.
-            # When ACTIVE it cross-checks that our internal state matches reality.
-            if now - self._last_reconcile_time >= self._RECONCILE_SEC:
+            # The query is I/O-bound and can hang for seconds on a slow exchange.
+            # We fire it in a daemon thread (outside the lock) so the strategy
+            # loop is NEVER blocked waiting for a network response.
+            #
+            # Pattern: fire → thread queries → stores raw data → next on_tick
+            #          call picks up the result and applies it under the lock.
+            #
+            # 1. Apply any completed reconcile result from the previous thread.
+            if self._reconcile_data is not None:
+                data = self._reconcile_data
+                self._reconcile_data = None
+                self._reconcile_apply(order_manager, data)
+                phase = self._pos.phase   # may have changed
+
+            # 2. Fire a new background query if the interval has elapsed and
+            #    no query is currently in flight.
+            if (now - self._last_reconcile_time >= self._RECONCILE_SEC
+                    and not self._reconcile_pending):
                 self._last_reconcile_time = now
-                self._reconcile(order_manager)
-                phase = self._pos.phase   # may have changed after reconcile
+                self._reconcile_pending   = True
+                t = threading.Thread(
+                    target=self._reconcile_query_thread,
+                    args=(order_manager,),
+                    daemon=True,
+                )
+                t.start()
 
             # Position sync gating (existing ACTIVE/EXITING path)
             if phase == PositionPhase.ACTIVE:
@@ -1058,35 +1081,65 @@ class QuantStrategy:
     # RECONCILIATION — authoritative exchange state sync
     # ───────────────────────────────────────────────────────────────────
 
-    def _reconcile(self, order_manager) -> None:
+    def _reconcile_query_thread(self, order_manager) -> None:
         """
-        Single source of truth: query the exchange for position + open orders,
-        then bring internal state into alignment.
+        Daemon thread: query the exchange for position + open orders.
+        Runs OUTSIDE the strategy lock so network latency never blocks on_tick.
+        Stores raw results in self._reconcile_data; the next on_tick tick picks
+        them up and calls _reconcile_apply() under the lock.
 
-        Three outcomes:
-          A) FLAT internal + exchange position found
-             → Adopt the position. Classify existing SL/TP orders by type.
-             → Transition to ACTIVE. Bot will manage it, not enter again.
-
-          B) ACTIVE internal + exchange is flat
-             → TP or SL fired while we weren't looking.
-             → Record exchange exit and finalise (same as _sync_position does).
-
-          C) ACTIVE internal + exchange position matches
-             → Update SL/TP order IDs if we don't have them (e.g. manually placed).
-             → No phase change needed.
-
-        Silently no-ops on any API failure — never assumes flat on timeout.
+        Never crashes the thread — all exceptions are caught and logged.
+        Always clears _reconcile_pending on exit (even on failure).
         """
         try:
-            ex_pos = order_manager.get_open_position()
-        except Exception as e:
-            logger.debug(f"Reconcile: get_open_position error: {e}")
-            return
+            try:
+                ex_pos = order_manager.get_open_position()
+            except Exception as e:
+                logger.debug(f"Reconcile query: get_open_position error: {e}")
+                return
 
-        if ex_pos is None:
-            # API failed — do NOT change state, wait for next cycle
-            return
+            if ex_pos is None:
+                return   # API failure — don't store anything, next cycle will retry
+
+            ex_size = float(ex_pos.get("size", 0.0))
+
+            # Only query open orders when they might be needed (position exists, or we
+            # think ACTIVE and exchange is flat — orders will be empty anyway in that case)
+            open_orders = None
+            if ex_size >= float(getattr(config, "MIN_POSITION_SIZE", 0.001)):
+                try:
+                    open_orders = order_manager.get_open_orders()
+                except Exception as e:
+                    logger.debug(f"Reconcile query: get_open_orders error: {e}")
+                    # open_orders stays None — _reconcile_apply handles it gracefully
+
+            # Publish result for the main thread to pick up
+            with self._lock:
+                self._reconcile_data = {
+                    "ex_pos":      ex_pos,
+                    "open_orders": open_orders,
+                }
+
+        except Exception as e:
+            logger.warning(f"Reconcile thread unexpected error: {e}")
+        finally:
+            self._reconcile_pending = False   # always allow next query to fire
+
+    def _reconcile_apply(self, order_manager, data: Dict) -> None:
+        """
+        Apply a reconcile result captured by the background query thread.
+        Called from on_tick while holding self._lock.
+
+        Three outcomes (same logic as before, now lock-safe):
+          A) FLAT internal + exchange position found
+             → Adopt the position, transition to ACTIVE.
+          B) ACTIVE internal + exchange is flat
+             → TP or SL fired — record exit and finalise.
+          C) ACTIVE internal + exchange matches
+             → Backfill missing SL/TP order IDs.
+        """
+        ex_pos      = data["ex_pos"]
+        open_orders = data.get("open_orders")   # may be None if query failed
 
         ex_size = float(ex_pos.get("size", 0.0))
         ex_side = str(ex_pos.get("side") or "").upper()   # "LONG" | "SHORT" | ""
@@ -1097,34 +1150,20 @@ class QuantStrategy:
             ex_entry = float(ex_pos.get("entry_price", 0.0))
             ex_upnl  = float(ex_pos.get("unrealized_pnl", 0.0))
 
-            # Classify open orders into SL / TP order IDs
+            # Classify open orders into SL / TP
             sl_order_id, tp_order_id = None, None
-            try:
-                open_orders = order_manager.get_open_orders()
-                if open_orders is not None:
-                    for o in open_orders:
-                        otype = o.get("type", "").upper()
-                        if otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET"):
-                            sl_order_id = o["order_id"]
-                        elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
-                            tp_order_id = o["order_id"]
-            except Exception as e:
-                logger.debug(f"Reconcile: open orders query error: {e}")
-
-            internal_side = "long" if ex_side == "LONG" else "short"
-
-            # Best-effort SL/TP prices from the order objects
-            sl_price, tp_price = 0.0, 0.0
-            try:
-                open_orders = open_orders or []   # reuse if already fetched
+            sl_price,    tp_price    = 0.0,  0.0
+            if open_orders is not None:
                 for o in open_orders:
                     otype = o.get("type", "").upper()
                     if otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET"):
-                        sl_price = float(o.get("trigger_price") or 0)
+                        sl_order_id = o["order_id"]
+                        sl_price    = float(o.get("trigger_price") or 0)
                     elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
-                        tp_price = float(o.get("trigger_price") or 0)
-            except Exception:
-                pass
+                        tp_order_id = o["order_id"]
+                        tp_price    = float(o.get("trigger_price") or 0)
+
+            internal_side = "long" if ex_side == "LONG" else "short"
 
             self._pos = PositionState(
                 phase          = PositionPhase.ACTIVE,
@@ -1135,10 +1174,10 @@ class QuantStrategy:
                 tp_price       = tp_price,
                 sl_order_id    = sl_order_id,
                 tp_order_id    = tp_order_id,
-                entry_time     = time.time(),   # unknown — use now
+                entry_time     = time.time(),
                 initial_risk   = 0.0,
                 initial_sl_dist= abs(ex_entry - sl_price) if sl_price > 0 else 0.0,
-                entry_atr      = self._atr_5m.atr,   # best available at adoption time
+                entry_atr      = self._atr_5m.atr,
                 peak_profit    = 0.0,
             )
             self.current_sl_price = sl_price
@@ -1168,24 +1207,20 @@ class QuantStrategy:
             self._record_exchange_exit(ex_pos)
             return
 
-        # ── OUTCOME C: ACTIVE + exchange matches — update order IDs if missing ──
+        # ── OUTCOME C: ACTIVE + exchange matches — backfill missing order IDs ──
         if phase == PositionPhase.ACTIVE and ex_size >= QCfg.MIN_QTY():
-            if not self._pos.sl_order_id or not self._pos.tp_order_id:
-                try:
-                    open_orders = order_manager.get_open_orders()
-                    if open_orders is not None:
-                        for o in open_orders:
-                            otype = o.get("type", "").upper()
-                            if (not self._pos.sl_order_id and
-                                    otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET")):
-                                self._pos.sl_order_id = o["order_id"]
-                                logger.info(f"📡 Reconcile: adopted SL order id {o['order_id'][:8]}…")
-                            elif (not self._pos.tp_order_id and
-                                    otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")):
-                                self._pos.tp_order_id = o["order_id"]
-                                logger.info(f"📡 Reconcile: adopted TP order id {o['order_id'][:8]}…")
-                except Exception as e:
-                    logger.debug(f"Reconcile outcome C order query error: {e}")
+            if (not self._pos.sl_order_id or not self._pos.tp_order_id) \
+                    and open_orders is not None:
+                for o in open_orders:
+                    otype = o.get("type", "").upper()
+                    if (not self._pos.sl_order_id and
+                            otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET")):
+                        self._pos.sl_order_id = o["order_id"]
+                        logger.info(f"📡 Reconcile: adopted SL order id {o['order_id'][:8]}…")
+                    elif (not self._pos.tp_order_id and
+                            otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")):
+                        self._pos.tp_order_id = o["order_id"]
+                        logger.info(f"📡 Reconcile: adopted TP order id {o['order_id'][:8]}…")
 
     # ───────────────────────────────────────────────────────────────────
     # ENTRY EVALUATION
