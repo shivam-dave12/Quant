@@ -845,6 +845,11 @@ class QuantStrategy:
         self._reconcile_pending   = False          # guard: only one thread in flight
         self._reconcile_data: Optional[Dict] = None   # filled by bg thread, read on-tick
 
+        # Memo of the last successfully placed entry — used to recover full position
+        # state when the exchange returns entry_price=0 or missing order IDs on adopt.
+        # Cleared on finalise_exit so it can't be applied to a different position.
+        self._last_entry_memo: Optional[Dict] = None
+
         # Statistics
         self._total_trades   = 0
         self._winning_trades = 0
@@ -917,9 +922,14 @@ class QuantStrategy:
                     and not self._reconcile_pending):
                 self._last_reconcile_time = now
                 self._reconcile_pending   = True
+                # Snapshot the phase at fire-time. _reconcile_apply will discard
+                # the result if the phase has changed during the I/O wait — this
+                # prevents stale "exchange flat" results from falsely closing a
+                # position that was entered while the thread was in flight.
+                fired_phase = self._pos.phase
                 t = threading.Thread(
                     target=self._reconcile_query_thread,
-                    args=(order_manager,),
+                    args=(order_manager, fired_phase),
                     daemon=True,
                 )
                 t.start()
@@ -1105,12 +1115,17 @@ class QuantStrategy:
     # RECONCILIATION — authoritative exchange state sync
     # ───────────────────────────────────────────────────────────────────
 
-    def _reconcile_query_thread(self, order_manager) -> None:
+    def _reconcile_query_thread(self, order_manager, fired_phase: PositionPhase) -> None:
         """
         Daemon thread: query the exchange for position + open orders.
         Runs OUTSIDE the strategy lock so network latency never blocks on_tick.
         Stores raw results in self._reconcile_data; the next on_tick tick picks
         them up and calls _reconcile_apply() under the lock.
+
+        fired_phase: the PositionPhase at the moment this thread was launched.
+        _reconcile_apply compares this to the current phase and discards stale
+        results if the phase changed while the query was in flight — preventing
+        a pre-entry FLAT query from falsely closing an in-flight entry.
 
         Never crashes the thread — all exceptions are caught and logged.
         Always clears _reconcile_pending on exit (even on failure).
@@ -1142,6 +1157,7 @@ class QuantStrategy:
                 self._reconcile_data = {
                     "ex_pos":      ex_pos,
                     "open_orders": open_orders,
+                    "fired_phase": fired_phase,   # phase when thread was launched
                 }
 
         except Exception as e:
@@ -1161,13 +1177,39 @@ class QuantStrategy:
              → TP or SL fired — record exit and finalise.
           C) ACTIVE internal + exchange matches
              → Backfill missing SL/TP order IDs.
+
+        Phase-mismatch guard: if the bot's phase changed WHILE the query was
+        in flight (e.g. entry fired between thread-launch and thread-result),
+        the result is stale and must be discarded. Example race:
+          Thread fires at T=0 (phase=FLAT), entry executes at T=3 (ACTIVE),
+          thread result arrives at T=5 and sees exchange flat at T=0 → without
+          the guard this would falsely record an exit on the fresh entry.
         """
         ex_pos      = data["ex_pos"]
         open_orders = data.get("open_orders")   # may be None if query failed
+        fired_phase = data.get("fired_phase")   # phase at thread-launch time
 
         ex_size = float(ex_pos.get("size", 0.0))
         ex_side = str(ex_pos.get("side") or "").upper()   # "LONG" | "SHORT" | ""
         phase   = self._pos.phase
+
+        # ── Phase-mismatch guard ───────────────────────────────────────────
+        # Only outcome B (ACTIVE + exchange flat → record exit) is dangerous
+        # if fired during a phase transition. Outcomes A and C are safe:
+        #   A: fired FLAT, still FLAT, exchange has position → adopt (correct)
+        #   C: fired ACTIVE, still ACTIVE, exchange matches → backfill (correct)
+        # Outcome B: fired FLAT, now ACTIVE, exchange flat → stale pre-entry
+        # result. Discard. The next reconcile cycle will get a fresh result.
+        if (fired_phase is not None
+                and fired_phase != phase
+                and phase == PositionPhase.ACTIVE
+                and ex_size < QCfg.MIN_QTY()):
+            logger.info(
+                f"📡 Reconcile: discarding stale result "
+                f"(fired_phase={fired_phase.name} → current={phase.name}, "
+                f"exchange shows flat but we just entered) — will re-check next cycle"
+            )
+            return
 
         # ── OUTCOME A: we think FLAT but exchange has a live position ──────
         if phase == PositionPhase.FLAT and ex_size >= QCfg.MIN_QTY():
@@ -1187,21 +1229,54 @@ class QuantStrategy:
                         tp_order_id = o["order_id"]
                         tp_price    = float(o.get("trigger_price") or 0)
 
+            # ── Memo fallback ──────────────────────────────────────────────
+            # CoinSwitch returns entry_price=0 for freshly filled positions
+            # and the /open_orders endpoint is 404, so sl_order_id/tp_order_id
+            # are always None on this exchange. If we have a recent entry memo
+            # from _enter_trade (written after SL/TP were confirmed placed),
+            # use it to fill any gaps before building the PositionState.
+            m = self._last_entry_memo
+            if m is not None:
+                internal_side_memo = "long" if ex_side == "LONG" else "short"
+                side_matches = (m.get("side", "") == internal_side_memo)
+                qty_matches  = (abs(m.get("quantity", 0) - ex_size) < 1e-6)
+                if side_matches and qty_matches:
+                    if ex_entry <= 0:
+                        ex_entry = m["entry_price"]
+                        logger.info(
+                            f"📡 Reconcile adopt: exchange entry_price=0 — "
+                            f"restored from memo: ${ex_entry:,.2f}"
+                        )
+                    if sl_order_id is None and m.get("sl_order_id"):
+                        sl_order_id = m["sl_order_id"]
+                        logger.info(f"📡 Reconcile adopt: restored SL order ID from memo")
+                    if tp_order_id is None and m.get("tp_order_id"):
+                        tp_order_id = m["tp_order_id"]
+                        logger.info(f"📡 Reconcile adopt: restored TP order ID from memo")
+                    if sl_price <= 0 and m.get("sl_price", 0) > 0:
+                        sl_price = m["sl_price"]
+                    if tp_price <= 0 and m.get("tp_price", 0) > 0:
+                        tp_price = m["tp_price"]
+
             internal_side = "long" if ex_side == "LONG" else "short"
+
+            sl_dist = abs(ex_entry - sl_price) if (ex_entry > 0 and sl_price > 0) else 0.0
+            initial_risk = sl_dist * ex_size
 
             self._pos = PositionState(
                 phase          = PositionPhase.ACTIVE,
                 side           = internal_side,
                 quantity       = ex_size,
-                entry_price    = ex_entry if ex_entry > 0 else 0.0,
+                entry_price    = ex_entry,
                 sl_price       = sl_price,
                 tp_price       = tp_price,
                 sl_order_id    = sl_order_id,
                 tp_order_id    = tp_order_id,
-                entry_time     = time.time(),
-                initial_risk   = 0.0,
-                initial_sl_dist= abs(ex_entry - sl_price) if sl_price > 0 else 0.0,
-                entry_atr      = self._atr_5m.atr,
+                entry_time     = m["entry_time"] if (m and qty_matches and side_matches) else time.time(),
+                initial_risk   = initial_risk,
+                initial_sl_dist= sl_dist,
+                entry_atr      = (m["entry_atr"] if (m and qty_matches and side_matches)
+                                  else self._atr_5m.atr),
                 peak_profit    = 0.0,
             )
             self.current_sl_price = sl_price
@@ -1425,6 +1500,22 @@ class QuantStrategy:
         self.current_sl_price = sl_price
         self.current_tp_price = tp_price
         self._total_trades   += 1
+
+        # Memo: preserve complete entry state so reconcile can recover it
+        # if the exchange later returns entry_price=0 or missing order IDs.
+        self._last_entry_memo = {
+            "side":         side,
+            "quantity":     qty,
+            "entry_price":  fill_price,
+            "sl_price":     sl_price,
+            "tp_price":     tp_price,
+            "sl_order_id":  sl_data["order_id"],
+            "tp_order_id":  tp_data["order_id"],
+            "entry_time":   time.time(),
+            "initial_risk": initial_risk,
+            "initial_sl_dist": sl_dist_filled,
+            "entry_atr":    self._atr_5m.atr,
+        }
 
         send_telegram_message(
             f"{'📈' if side == 'long' else '📉'} <b>QUANT ENTRY — {side.upper()}</b>\n\n"
@@ -1745,6 +1836,7 @@ class QuantStrategy:
         self._last_exit_time  = time.time()
         self.current_sl_price = 0.0
         self.current_tp_price = 0.0
+        self._last_entry_memo = None   # stale — cannot apply to a future position
         logger.info("Position closed — FLAT")
 
     # ───────────────────────────────────────────────────────────────────
