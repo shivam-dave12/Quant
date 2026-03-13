@@ -169,7 +169,7 @@ QUANT_VOL_FLOW_WINDOW       = 10
 # 10f. Minimum Data (MIN_CANDLES_1M / 5M shared above, >= required values)
 
 # 10g. Regime Filter
-QUANT_ATR_PCTILE_WINDOW     = 480
+QUANT_ATR_PCTILE_WINDOW     = 230
 QUANT_ATR_MIN_PCTILE        = 0.15
 QUANT_ATR_MAX_PCTILE        = 0.90
 

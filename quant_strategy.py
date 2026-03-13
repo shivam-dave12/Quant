@@ -983,7 +983,20 @@ class QuantStrategy:
     def _compute_signals(self, data_manager,
                          bypass_regime: bool = False) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
-        candles_5m = data_manager.get_candles("5m", limit=100)
+
+        # ATREngine seed requires ATR_PCTILE_WINDOW + ATR_PERIOD + 3 candles to
+        # fully populate _atr_hist on cold start.  After seeding, the incremental
+        # update only reads candles[-2] (just-closed) and candles[-3] (prev close),
+        # so limit=3 is sufficient — no point copying hundreds of dicts every tick.
+        #
+        # CoinSwitch 5m kline hard cap = 251 bars  →  QUANT_ATR_PCTILE_WINDOW=230
+        # guarantees the seed request (230+14+3=247) returns enough bars to fill
+        # _atr_hist completely on the first tick after restart.
+        _5m_seed_limit = QCfg.ATR_PCTILE_WINDOW() + QCfg.ATR_PERIOD() + 3
+        candles_5m = data_manager.get_candles(
+            "5m",
+            limit=3 if self._atr_5m._seeded else _5m_seed_limit
+        )
 
         if len(candles_1m) < QCfg.MIN_1M_BARS():
             logger.debug(f"1m bars: {len(candles_1m)}/{QCfg.MIN_1M_BARS()}")
