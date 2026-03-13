@@ -711,7 +711,11 @@ class ICTDataManager:
                 candle_deque.append(candle)
             # Clear forming tracker — this period is done
             self._forming_ts.pop(tf_key, None)
-            logger.info(f"✅ {tf_label} CLOSED @ ${candle.close:.2f} ({len(candle_deque)})")
+            # Only surface 5m+ closures at INFO — 1m fires every minute and is noise
+            if tf_label.endswith("1m"):
+                logger.debug(f"✅ {tf_label} CLOSED @ ${candle.close:.2f} ({len(candle_deque)})")
+            else:
+                logger.info(f"✅ {tf_label} CLOSED @ ${candle.close:.2f} ({len(candle_deque)})")
         else:
             if forming_ts == start_ts and candle_deque:
                 # Same period update — overwrite in place

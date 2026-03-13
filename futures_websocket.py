@@ -171,12 +171,13 @@ class FuturesWebSocket:
                 if not isinstance(data, dict) or 'o' not in data or 't' not in data:
                     return
 
-                # Log first candle
+                # Log first candle at debug (raw JSON is noise at INFO level)
                 if not hasattr(self, '_first_candle_logged'):
-                    logger.info("="*80)
-                    logger.info(f"✅ First candle: {data}")
-                    logger.info("="*80)
+                    logger.debug("="*80)
+                    logger.debug(f"✅ First candle: {data}")
+                    logger.debug("="*80)
                     self._first_candle_logged = True
+                    logger.info(f"✅ WS candle feed live (interval={data.get('i','?')})")
 
                 # ✅ FIX: Route by interval field 'i'
                 interval_key = str(data.get('i', ''))

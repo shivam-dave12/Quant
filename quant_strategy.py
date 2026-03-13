@@ -817,6 +817,10 @@ class QuantStrategy:
         self._last_pos_sync   = 0.0
         self._last_exit_sync  = 0.0   # FIX-24: separate gate for EXITING phase
 
+        # Thinking log — emit a rich "what the bot sees" block every N seconds
+        self._last_think_log  = 0.0
+        self._think_interval  = 30.0   # seconds between thinking prints
+
         # Statistics
         self._total_trades   = 0
         self._winning_trades = 0
@@ -941,6 +945,97 @@ class QuantStrategy:
         return sig
 
     # ───────────────────────────────────────────────────────────────────
+    # THINKING LOG — periodic rich status to terminal
+    # ───────────────────────────────────────────────────────────────────
+
+    def _log_thinking(self, sig: SignalBreakdown, price: float, now: float) -> None:
+        """
+        Emit a human-readable 'what is the bot thinking' block every
+        self._think_interval seconds.  Shows every indicator score,
+        a mini ASCII bar, the composite vs thresholds, confirmation
+        progress, and the most likely next action.
+        """
+        if now - self._last_think_log < self._think_interval:
+            return
+        self._last_think_log = now
+
+        def bar(v: float, width: int = 12) -> str:
+            """Compact bipolar bar centred at 0."""
+            half = width // 2
+            filled = int(abs(v) * half + 0.5)
+            filled = min(filled, half)
+            if v >= 0:
+                return " " * half + "█" * filled + "░" * (half - filled)
+            else:
+                return "░" * (half - filled) + "█" * filled + " " * half
+
+        def fmt(label: str, v: float) -> str:
+            arrow = "▲" if v > 0.05 else ("▼" if v < -0.05 else "─")
+            return f"  {label:<6} {bar(v)} {arrow} {v:+.3f}"
+
+        lt = QCfg.LONG_THRESHOLD()
+        st = QCfg.SHORT_THRESHOLD()
+        c  = sig.composite
+
+        # Determine overall lean
+        if c >= lt:
+            lean = f"BULLISH  ✅  ({c:+.3f} ≥ +{lt})"
+        elif c <= -st:
+            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{st})"
+        elif c >= lt * 0.7:
+            lean = f"weakly bullish  ({c:+.3f}, need ≥{lt:.2f})"
+        elif c <= -st * 0.7:
+            lean = f"weakly bearish  ({c:+.3f}, need ≤{-st:.2f})"
+        else:
+            lean = f"NEUTRAL  🔇  ({c:+.3f})"
+
+        # Confirmation progress
+        need = QCfg.CONFIRM_TICKS()
+        if self._confirm_long > 0:
+            conf_str = f"LONG confirms: {self._confirm_long}/{need}"
+        elif self._confirm_short > 0:
+            conf_str = f"SHORT confirms: {self._confirm_short}/{need}"
+        else:
+            conf_str = "No confirmation building"
+
+        # Next action
+        if c >= lt and self._confirm_long >= need - 1:
+            next_move = "⚡ ENTRY LONG — next tick fires if signal holds"
+        elif c <= -st and self._confirm_short >= need - 1:
+            next_move = "⚡ ENTRY SHORT — next tick fires if signal holds"
+        elif c >= lt or c <= -st:
+            remaining = need - max(self._confirm_long, self._confirm_short)
+            next_move = f"🕐 Building confirmation — {remaining} tick(s) remaining"
+        else:
+            next_move = "👀 Watching — signal below entry threshold"
+
+        # Regime
+        regime_str = (f"VALID ({sig.atr_pct:.0%} pctile)" if sig.regime_ok
+                      else f"GATED ({sig.atr_pct:.0%} pctile — outside [{QCfg.ATR_MIN_PCTILE():.0%},{QCfg.ATR_MAX_PCTILE():.0%}])")
+
+        # Cooldown
+        cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
+        cd_str = f"{cooldown_rem:.0f}s" if cooldown_rem > 0 else "ready"
+
+        lines = [
+            f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f} ─────────────────",
+            fmt("CVD",  sig.cvd),
+            fmt("VWAP", sig.vwap),
+            fmt("MOM",  sig.mom),
+            fmt("SQZ",  sig.squeeze),
+            fmt("VFL",  sig.vol),
+            f"  {'─'*38}",
+            f"  Σ composite  [{bar(c)}] {c:+.4f}",
+            f"  Regime:      {regime_str}",
+            f"  Lean:        {lean}",
+            f"  {conf_str}",
+            f"  Cooldown:    {cd_str}",
+            f"  Next move:   {next_move}",
+            f"└{'─'*66}",
+        ]
+        logger.info("\n" + "\n".join(lines))
+
+    # ───────────────────────────────────────────────────────────────────
     # ENTRY
     # ───────────────────────────────────────────────────────────────────
 
@@ -950,6 +1045,9 @@ class QuantStrategy:
         if sig is None:
             self._confirm_long = self._confirm_short = 0
             return
+
+        price = data_manager.get_last_price()
+        self._log_thinking(sig, price, now)   # ← periodic "what is the bot thinking"
 
         c = sig.composite
         if c >= QCfg.LONG_THRESHOLD():
@@ -1130,6 +1228,7 @@ class QuantStrategy:
         # 2. Signal reversal
         sig = self._compute_signals(data_manager)
         if sig is not None:
+            self._log_thinking(sig, price, now)   # ← show thinking while in trade
             c = sig.composite; flip = QCfg.EXIT_FLIP_THRESH()
             if pos.side == "long"  and c <= -flip:
                 logger.info(f"🔄 Alpha flip SHORT ({c:+.3f} ≤ -{flip}) → exit LONG")

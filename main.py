@@ -84,6 +84,7 @@ class QuantBot:
 
         self.trading_enabled      = True
         self.trading_pause_reason = ""
+        self.last_heartbeat_sec   = 0.0
 
     # =================================================================
     # INITIALIZE
@@ -177,6 +178,40 @@ class QuantBot:
             return False
 
     # =================================================================
+    # HEARTBEAT — compact 60s pulse showing price + bot state
+    # =================================================================
+
+    def maybe_log_heartbeat(self) -> None:
+        """Emit a one-line status pulse every 60 s so the terminal feels alive."""
+        now = time.time()
+        if now - self.last_heartbeat_sec < 60.0:
+            return
+        self.last_heartbeat_sec = now
+
+        price = self.data_manager.get_last_price() if self.data_manager else 0.0
+        pos   = self.strategy.get_position()        if self.strategy   else None
+
+        if pos:
+            side  = pos.get("side", "?").upper()
+            entry = pos.get("entry_price", 0.0)
+            sl    = pos.get("sl_price", 0.0)
+            tp    = pos.get("tp_price", 0.0)
+            pnl_pts = (price - entry) if side == "LONG" else (entry - price)
+            logger.info(
+                f"💓 ${price:,.2f} | IN {side} @ ${entry:,.2f} | "
+                f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl_pts:+.2f} pts"
+            )
+        else:
+            stats = self.strategy.get_stats() if self.strategy else {}
+            phase = stats.get("current_phase", "FLAT")
+            trades = stats.get("daily_trades", 0)
+            pnl   = stats.get("total_pnl", 0.0)
+            logger.info(
+                f"💓 ${price:,.2f} | {phase} | "
+                f"trades today: {trades} | session PnL: ${pnl:+.2f}"
+            )
+
+    # =================================================================
     # STREAM SUPERVISOR  (unchanged from ICT bot)
     # =================================================================
 
@@ -254,6 +289,7 @@ class QuantBot:
                 time.sleep(0.25)
                 self.maybe_supervise_streams()
                 self.maybe_send_report()
+                self.maybe_log_heartbeat()
 
                 pos = self.strategy.get_position() if self.strategy else None
                 if not self.trading_enabled and pos is None:
