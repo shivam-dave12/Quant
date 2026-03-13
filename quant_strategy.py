@@ -704,6 +704,13 @@ class ATREngine:
         #   vwap_signal > +0.25 → overbought → SHORT mean-reversion bias
         #   vwap_signal < -0.25 → oversold  → LONG  mean-reversion bias
         #   |vwap| ≤ 0.25       → near VWAP → no directional constraint
+        #
+        # Threshold is split by trade type:
+        #   mean-reversion (bias ≠ any): 0.45 — MOM is only partially recovered
+        #     in a bounce/fade; max achievable composite ≈ 0.49. Momentum breakout
+        #     signals (MOM 0.9+, SQZ 1.0) are absent.
+        #   momentum (bias = any):       0.65 — near-VWAP breakout, all signals
+        #     can align explosively → higher bar appropriate.
         BIAS = 0.25
         if vwap_signal > BIAS:
             bias      = "short_only"
@@ -715,10 +722,13 @@ class ATREngine:
             bias      = "any"
             bias_note = f"VWAP≈0 ({vwap_signal:+.2f}) — momentum valid"
 
+        # Mean-reversion ceiling ≈ 0.49; momentum ceiling > 0.80
+        thr = 0.45 if bias != "any" else 0.65
+
         return RegimeResult(
             mode=RegimeMode.EXTREME, pctile=p, atr_zscore=z,
             size_scalar=0.50, sl_atr_mult=1.50,
-            entry_threshold=0.65,
+            entry_threshold=thr,
             extra_confirms=1, direction_bias=bias,
             note=f"EXTREME ({p:.0%} z={z:+.1f}) — {bias_note}",
         )
@@ -773,15 +783,35 @@ class SignalAggregator:
             logger.warning(f"Weight sum={total_w:.4f} ≠ 1.0 — normalising. Fix QUANT_W_* in config.")
             w = {k: v / total_w for k, v in w.items()}
 
+        # ── Classify regime FIRST so composite can be regime-aware ───────────
+        regime = atr_engine.classify_regime(vwap_signal=vwap_signal_for_regime)
+
+        # ── Mean-reversion VWAP sign flip ─────────────────────────────────────
+        # In EXTREME mean-reversion mode (direction_bias != "any"), the VWAP
+        # signal is semantically inverted relative to the trade direction:
+        #
+        #   long_only bias  → price BELOW VWAP (vwap_signal < 0, oversold)
+        #                     VWAP normally means "bearish" in composite, but
+        #                     here "below VWAP" is the BUY signal → flip to +
+        #
+        #   short_only bias → price ABOVE VWAP (vwap_signal > 0, overbought)
+        #                     VWAP normally means "bullish" in composite, but
+        #                     here "above VWAP" is the SELL signal → flip to -
+        #
+        # Without this flip, VWAP drags the composite in the WRONG direction
+        # while simultaneously setting the correct direction bias.  Result was
+        # composite stuck at +0.29 (CVD+0.77, MOM+0.50) never reaching +0.65.
+        vwap_for_composite = vwap
+        if regime.direction_bias != "any":
+            vwap_for_composite = -vwap  # oversold/overbought → trade-aligned signal
+
         composite = max(-1.0, min(1.0,
-            w['cvd']     * cvd     +
-            w['vwap']    * vwap    +
-            w['mom']     * mom     +
-            w['squeeze'] * squeeze +
+            w['cvd']     * cvd               +
+            w['vwap']    * vwap_for_composite +
+            w['mom']     * mom                +
+            w['squeeze'] * squeeze            +
             w['vol']     * vol
         ))
-
-        regime = atr_engine.classify_regime(vwap_signal=vwap_signal_for_regime)
 
         return SignalBreakdown(
             cvd=cvd, vwap=vwap, mom=mom, squeeze=squeeze, vol=vol,
@@ -1334,10 +1364,12 @@ class QuantStrategy:
         vwap_warn = (f"  ⚠ VWAP degraded ({self._vwap._last_bars_used}/"
                      f"{QCfg.VWAP_WINDOW()}b)"
                      if self._vwap.is_degraded else "")
+        # Show VWAP↔ label when sign is flipped (mean-reversion mode)
+        vwap_label = "VWAP↔" if (regime and regime.direction_bias != "any") else "VWAP "
         lines = [
             f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f}{vwap_warn} ─────────────────",
-            fmt("CVD",  sig.cvd),
-            fmt("VWAP", sig.vwap),
+            fmt("CVD",       sig.cvd),
+            fmt(vwap_label, sig.vwap),
             fmt("MOM",  sig.mom),
             fmt("SQZ",  sig.squeeze),
             fmt("VFL",  sig.vol),
