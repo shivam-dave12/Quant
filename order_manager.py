@@ -1065,3 +1065,135 @@ class OrderManager:
     def get_recent_order_history(self, limit: int = 20) -> list:
         with self._orders_lock:
             return list(self.order_history[-limit:])
+
+    # ========================================================================
+    # OPEN ORDERS QUERY — wraps futures_api.get_open_orders with rate limiting
+    # ========================================================================
+
+    def get_open_orders(self, symbol: str = None) -> Optional[list]:
+        """
+        Return all open orders for the symbol as a normalised list.
+
+        Each item: {order_id, type, side, quantity, trigger_price, price, status}
+
+        Returns:
+            list  — zero or more orders (empty list = confirmed no orders)
+            None  — API failure; caller must NOT assume no orders exist
+        """
+        try:
+            GlobalRateLimiter.wait()
+            resp = self.api.get_open_orders(
+                exchange=config.EXCHANGE,
+                symbol=symbol or config.SYMBOL,
+            )
+
+            if not isinstance(resp, dict):
+                logger.error(f"get_open_orders: non-dict response: {resp}")
+                return None
+
+            if "error" in resp:
+                logger.error(f"get_open_orders API error: {resp['error']}")
+                return None
+
+            raw_orders = resp.get("data", [])
+            if not isinstance(raw_orders, list):
+                # Some exchanges wrap in a dict
+                raw_orders = [raw_orders] if isinstance(raw_orders, dict) else []
+
+            result = []
+            for o in raw_orders:
+                if not isinstance(o, dict):
+                    continue
+                oid   = str(o.get("order_id") or o.get("id") or "")
+                otype = str(o.get("order_type") or o.get("type") or "").upper()
+                side  = str(o.get("side") or "").upper()
+                try:
+                    qty = float(o.get("quantity") or o.get("orig_qty") or 0)
+                except (ValueError, TypeError):
+                    qty = 0.0
+                try:
+                    trig = float(o.get("trigger_price") or o.get("stop_price") or 0)
+                except (ValueError, TypeError):
+                    trig = 0.0
+                try:
+                    px = float(o.get("price") or 0)
+                except (ValueError, TypeError):
+                    px = 0.0
+                status = str(o.get("status") or "").upper()
+                if oid:
+                    result.append({
+                        "order_id":      oid,
+                        "type":          otype,
+                        "side":          side,
+                        "quantity":      qty,
+                        "trigger_price": trig,
+                        "price":         px,
+                        "status":        status,
+                        "raw":           o,
+                    })
+
+            return result
+
+        except Exception as e:
+            logger.error(f"get_open_orders error: {e}", exc_info=True)
+            return None
+
+    # ========================================================================
+    # CONDITIONAL ORDER SWEEP
+    # ========================================================================
+
+    def cancel_symbol_conditionals(self, symbol: str = None) -> Dict[str, CancelResult]:
+        """
+        Cancel ALL open STOP_MARKET and TAKE_PROFIT_MARKET orders for the symbol.
+
+        This is the correct pre-entry sweep: before placing a new SL/TP pair,
+        call this to guarantee no 'order already exists' rejection. Exchange
+        allows only one STOP_MARKET per position — we must own it.
+
+        Returns:
+            {order_id: CancelResult} for every order found and acted on.
+            Empty dict if no conditional orders exist (clean state confirmed).
+            None is never returned — API failures are logged per order.
+
+        Design:
+            - Queries open orders fresh every call (no cache)
+            - Cancels STOP_MARKET + TAKE_PROFIT_MARKET types only
+            - Rate-limited via GlobalRateLimiter inside cancel_order()
+            - Does NOT cancel LIMIT or MARKET orders
+        """
+        sym    = symbol or config.SYMBOL
+        orders = self.get_open_orders(symbol=sym)
+
+        if orders is None:
+            logger.error("cancel_symbol_conditionals: open orders query failed — "
+                         "cannot confirm clean state, aborting sweep")
+            return {}
+
+        CONDITIONAL_TYPES = {"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
+                             "TAKE_PROFIT", "STOP_LOSS_MARKET"}
+
+        targets = [o for o in orders if o["type"] in CONDITIONAL_TYPES]
+
+        if not targets:
+            logger.debug(f"cancel_symbol_conditionals: no conditional orders found for {sym}")
+            return {}
+
+        logger.info(f"⚠️  Sweeping {len(targets)} conditional order(s) for {sym} "
+                    f"before placing new SL/TP: "
+                    f"{[o['order_id'][:8] + '...' for o in targets]}")
+
+        results: Dict[str, CancelResult] = {}
+        for o in targets:
+            oid = o["order_id"]
+            res = self.cancel_order(oid)
+            results[oid] = res
+            if res in (CancelResult.SUCCESS, CancelResult.NOT_FOUND):
+                logger.info(f"  ✅ Swept {o['type']} order {oid[:8]}… ({res.value})")
+            elif res in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
+                logger.warning(f"  ⚡ {o['type']} order {oid[:8]}… filled during sweep "
+                               f"({res.value}) — position may have closed")
+            else:
+                logger.error(f"  ❌ Failed to sweep {o['type']} order {oid[:8]}… "
+                             f"({res.value})")
+
+        return results

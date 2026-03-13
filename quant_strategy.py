@@ -60,6 +60,7 @@ from typing import Dict, List, Optional, Tuple
 
 import config
 from telegram_notifier import send_telegram_message
+from order_manager import CancelResult
 
 logger = logging.getLogger(__name__)
 
@@ -821,6 +822,10 @@ class QuantStrategy:
         self._last_think_log  = 0.0
         self._think_interval  = 30.0   # seconds between thinking prints
 
+        # Reconciliation — rate-gate for the exchange API call
+        self._last_reconcile_time = 0.0
+        self._RECONCILE_SEC       = 30.0
+
         # Statistics
         self._total_trades   = 0
         self._winning_trades = 0
@@ -872,7 +877,16 @@ class QuantStrategy:
 
             phase = self._pos.phase
 
-            # Position sync gating
+            # ── Exchange reconciliation ───────────────────────────────────────
+            # Rate-gated regardless of phase. When FLAT this is the primary
+            # protection against entering while a position exists on exchange.
+            # When ACTIVE it cross-checks that our internal state matches reality.
+            if now - self._last_reconcile_time >= self._RECONCILE_SEC:
+                self._last_reconcile_time = now
+                self._reconcile(order_manager)
+                phase = self._pos.phase   # may have changed after reconcile
+
+            # Position sync gating (existing ACTIVE/EXITING path)
             if phase == PositionPhase.ACTIVE:
                 if now - self._last_pos_sync > QCfg.POS_SYNC_SEC():
                     self._sync_position(order_manager)
@@ -881,11 +895,10 @@ class QuantStrategy:
                         return
 
             elif phase == PositionPhase.EXITING:
-                # FIX-24: EXITING uses its own independent time gate
                 if now - self._last_exit_sync > QCfg.POS_SYNC_SEC():
                     self._sync_position(order_manager)
                     self._last_exit_sync = now
-                return   # never evaluate entries while exiting
+                return
 
             # Route
             if phase == PositionPhase.FLAT:
@@ -1039,6 +1052,141 @@ class QuantStrategy:
     # ENTRY
     # ───────────────────────────────────────────────────────────────────
 
+    # ───────────────────────────────────────────────────────────────────
+    # RECONCILIATION — authoritative exchange state sync
+    # ───────────────────────────────────────────────────────────────────
+
+    def _reconcile(self, order_manager) -> None:
+        """
+        Single source of truth: query the exchange for position + open orders,
+        then bring internal state into alignment.
+
+        Three outcomes:
+          A) FLAT internal + exchange position found
+             → Adopt the position. Classify existing SL/TP orders by type.
+             → Transition to ACTIVE. Bot will manage it, not enter again.
+
+          B) ACTIVE internal + exchange is flat
+             → TP or SL fired while we weren't looking.
+             → Record exchange exit and finalise (same as _sync_position does).
+
+          C) ACTIVE internal + exchange position matches
+             → Update SL/TP order IDs if we don't have them (e.g. manually placed).
+             → No phase change needed.
+
+        Silently no-ops on any API failure — never assumes flat on timeout.
+        """
+        try:
+            ex_pos = order_manager.get_open_position()
+        except Exception as e:
+            logger.debug(f"Reconcile: get_open_position error: {e}")
+            return
+
+        if ex_pos is None:
+            # API failed — do NOT change state, wait for next cycle
+            return
+
+        ex_size = float(ex_pos.get("size", 0.0))
+        ex_side = str(ex_pos.get("side") or "").upper()   # "LONG" | "SHORT" | ""
+        phase   = self._pos.phase
+
+        # ── OUTCOME A: we think FLAT but exchange has a live position ──────
+        if phase == PositionPhase.FLAT and ex_size >= QCfg.MIN_QTY():
+            ex_entry = float(ex_pos.get("entry_price", 0.0))
+            ex_upnl  = float(ex_pos.get("unrealized_pnl", 0.0))
+
+            # Classify open orders into SL / TP order IDs
+            sl_order_id, tp_order_id = None, None
+            try:
+                open_orders = order_manager.get_open_orders()
+                if open_orders is not None:
+                    for o in open_orders:
+                        otype = o.get("type", "").upper()
+                        if otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET"):
+                            sl_order_id = o["order_id"]
+                        elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                            tp_order_id = o["order_id"]
+            except Exception as e:
+                logger.debug(f"Reconcile: open orders query error: {e}")
+
+            internal_side = "long" if ex_side == "LONG" else "short"
+
+            # Best-effort SL/TP prices from the order objects
+            sl_price, tp_price = 0.0, 0.0
+            try:
+                open_orders = open_orders or []   # reuse if already fetched
+                for o in open_orders:
+                    otype = o.get("type", "").upper()
+                    if otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET"):
+                        sl_price = float(o.get("trigger_price") or 0)
+                    elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                        tp_price = float(o.get("trigger_price") or 0)
+            except Exception:
+                pass
+
+            self._pos = PositionState(
+                phase          = PositionPhase.ACTIVE,
+                side           = internal_side,
+                quantity       = ex_size,
+                entry_price    = ex_entry if ex_entry > 0 else 0.0,
+                sl_price       = sl_price,
+                tp_price       = tp_price,
+                sl_order_id    = sl_order_id,
+                tp_order_id    = tp_order_id,
+                entry_time     = time.time(),   # unknown — use now
+                initial_risk   = 0.0,
+                initial_sl_dist= abs(ex_entry - sl_price) if sl_price > 0 else 0.0,
+            )
+            self.current_sl_price = sl_price
+            self.current_tp_price = tp_price
+            self._confirm_long = self._confirm_short = 0
+
+            logger.warning(
+                f"⚡ RECONCILE: adopted {ex_side} position from exchange — "
+                f"size={ex_size} @ ${ex_entry:,.2f}  uPnL=${ex_upnl:+.2f} | "
+                f"SL_id={sl_order_id}  TP_id={tp_order_id}"
+            )
+            send_telegram_message(
+                f"⚡ <b>POSITION ADOPTED FROM EXCHANGE</b>\n\n"
+                f"Side:    {ex_side}\n"
+                f"Size:    {ex_size} BTC\n"
+                f"Entry:   ${ex_entry:,.2f}\n"
+                f"uPnL:    ${ex_upnl:+.2f}\n"
+                f"SL ord:  {sl_order_id or 'none found'}\n"
+                f"TP ord:  {tp_order_id or 'none found'}\n\n"
+                f"<i>Bot is now monitoring this position.</i>"
+            )
+            return
+
+        # ── OUTCOME B: we think ACTIVE but exchange is flat ────────────────
+        if phase == PositionPhase.ACTIVE and ex_size < QCfg.MIN_QTY():
+            logger.info("📡 Reconcile: exchange FLAT while ACTIVE → TP/SL fired")
+            self._record_exchange_exit(ex_pos)
+            return
+
+        # ── OUTCOME C: ACTIVE + exchange matches — update order IDs if missing ──
+        if phase == PositionPhase.ACTIVE and ex_size >= QCfg.MIN_QTY():
+            if not self._pos.sl_order_id or not self._pos.tp_order_id:
+                try:
+                    open_orders = order_manager.get_open_orders()
+                    if open_orders is not None:
+                        for o in open_orders:
+                            otype = o.get("type", "").upper()
+                            if (not self._pos.sl_order_id and
+                                    otype in ("STOP_MARKET", "STOP", "STOP_LOSS_MARKET")):
+                                self._pos.sl_order_id = o["order_id"]
+                                logger.info(f"📡 Reconcile: adopted SL order id {o['order_id'][:8]}…")
+                            elif (not self._pos.tp_order_id and
+                                    otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")):
+                                self._pos.tp_order_id = o["order_id"]
+                                logger.info(f"📡 Reconcile: adopted TP order id {o['order_id'][:8]}…")
+                except Exception as e:
+                    logger.debug(f"Reconcile outcome C order query error: {e}")
+
+    # ───────────────────────────────────────────────────────────────────
+    # ENTRY EVALUATION
+    # ───────────────────────────────────────────────────────────────────
+
     def _evaluate_entry(self, data_manager, order_manager,
                         risk_manager, now: float) -> None:
         sig = self._compute_signals(data_manager)
@@ -1047,7 +1195,7 @@ class QuantStrategy:
             return
 
         price = data_manager.get_last_price()
-        self._log_thinking(sig, price, now)   # ← periodic "what is the bot thinking"
+        self._log_thinking(sig, price, now)
 
         c = sig.composite
         if c >= QCfg.LONG_THRESHOLD():
@@ -1099,14 +1247,14 @@ class QuantStrategy:
         if sl_price is None or tp_price is None:
             return
 
-        # FIX-13: minimum R:R enforcement
+        # FIX-13: minimum R:R enforcement  (+epsilon to avoid float precision rejections)
         sl_dist = abs(price - sl_price)
         tp_dist = abs(price - tp_price)
         if sl_dist < 1e-10:
             return
         rr = tp_dist / sl_dist
-        if rr < QCfg.MIN_RR_RATIO():
-            logger.info(f"Entry blocked: R:R={rr:.2f} < min={QCfg.MIN_RR_RATIO()}")
+        if rr < QCfg.MIN_RR_RATIO() - 1e-9:
+            logger.info(f"Entry blocked: R:R={rr:.4f} < min={QCfg.MIN_RR_RATIO()}")
             return
 
         logger.info(
@@ -1140,23 +1288,45 @@ class QuantStrategy:
                 logger.error("❌ SL/TP recompute after fill returned None — closing position")
                 exit_s = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
+                self._last_exit_time = time.time()   # enforce cooldown before next attempt
+                self._last_reconcile_time = 0.0        # force exchange check on next eval
                 return
             new_rr = abs(fill_price - new_tp) / abs(fill_price - new_sl)
-            if new_rr < QCfg.MIN_RR_RATIO():
-                logger.warning(f"R:R={new_rr:.2f} below min after slippage — closing position")
+            if new_rr < QCfg.MIN_RR_RATIO() - 1e-9:
+                logger.warning(f"R:R={new_rr:.4f} below min after slippage — closing position")
                 exit_s = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
+                self._last_exit_time = time.time()   # enforce cooldown before next attempt
+                self._last_reconcile_time = 0.0        # force exchange check on next eval
                 return
             sl_price, tp_price = new_sl, new_tp
             rr = new_rr
 
         exit_side = "sell" if side == "long" else "buy"
 
+        # ── Sweep any pre-existing conditional orders ──────────────────────
+        # CoinSwitch allows ONE STOP_MARKET per position. Orphaned stops from
+        # prior sessions or manual orders cause 400 "already exists". Sweeping
+        # first guarantees a clean slate regardless of prior state.
+        sweep = order_manager.cancel_symbol_conditionals()
+        if sweep:
+            filled = [oid for oid, r in sweep.items()
+                      if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)]
+            if filled:
+                logger.warning(
+                    f"⚠️ Conditional(s) filled during pre-entry sweep: {filled} "
+                    f"— position may have changed. Aborting entry, forcing reconcile."
+                )
+                self._last_reconcile_time = 0.0
+                return
+
         sl_data = order_manager.place_stop_loss(side=exit_side, quantity=qty,
                                                 trigger_price=sl_price)
         if not sl_data:
             logger.error("❌ SL placement failed — closing naked position")
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+            self._last_exit_time = time.time()   # enforce cooldown before next attempt
+            self._last_reconcile_time = 0.0        # force exchange check on next eval
             return
 
         tp_data = order_manager.place_take_profit(side=exit_side, quantity=qty,
@@ -1165,6 +1335,8 @@ class QuantStrategy:
             logger.error("❌ TP placement failed — cancelling SL, closing position")
             order_manager.cancel_order(sl_data["order_id"])
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+            self._last_exit_time = time.time()   # enforce cooldown before next attempt
+            self._last_reconcile_time = 0.0        # force exchange check on next eval
             return
 
         sl_dist_filled  = abs(fill_price - sl_price)
