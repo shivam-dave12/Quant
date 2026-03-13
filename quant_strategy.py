@@ -1,0 +1,1475 @@
+"""
+INSTITUTIONAL MULTI-FACTOR MOMENTUM + ORDER FLOW STRATEGY — v2 (AUDITED)
+=========================================================================
+Technique Stack:
+  ─ Cumulative Volume Delta (CVD)  → Order flow imbalance, tanh z-scored
+  ─ VWAP + Volume-Weighted Bands   → Institutional price anchor & deviation
+  ─ EMA Crossover Momentum         → Multi-timeframe trend alignment (1m + 5m)
+  ─ Keltner/BB Squeeze Breakout    → Volatility compression → expansion detection
+  ─ Multi-Bar Volume Flow          → Institutional participation imbalance
+  ─ ATR Regime Filter              → Only trade in statistically valid vol regimes
+
+AUDIT FIXES (v2) — 28 issues corrected:
+  FIX-01  MomentumEngine: med ROC used self.fast (wrong period). Replaced ROC with
+          proper EMA crossover (fast/slow EMA on 1m + EMA slope on 5m).
+  FIX-02  CVDEngine: deque maxlen=window*3=60 was statistically insufficient.
+          Expanded to window × CVD_HIST_MULT (default 300 bars).
+  FIX-03  CVDEngine: z/2.0 clamp wrong for unbounded z. Replaced with tanh(z/2).
+  FIX-04  VWAPEngine: std used (close-VWAP)² → now volume-weighted (TP-VWAP)².
+  FIX-05  VWAPEngine: slope normalizer hardcoded 0.001 → ATR-relative, dynamic.
+  FIX-06  VolatilitySqueezeEngine: fired on any non-squeeze bar. Now tracks
+          squeeze→expansion state transitions, active only first N breakout bars.
+  FIX-07  VolatilitySqueezeEngine: population std (÷n) → sample std (÷n-1).
+  FIX-08  VolumeConfirmationEngine: single O→C candle direction → multi-bar
+          rolling buy/sell imbalance ratio vs historical baseline.
+  FIX-09  ATREngine: full Wilder recompute every 5s tick → incremental update.
+  FIX-10  ATREngine: percentile biased (current in history) → snapshot before append.
+  FIX-11  ATREngine: duplicate appends per tick → gated by candle timestamp.
+  FIX-12  _enter_trade: recomputed SL/TP (None,None) case not guarded → fixed.
+  FIX-13  _enter_trade: no minimum R:R enforcement → uses MIN_RISK_REWARD_RATIO.
+  FIX-14  _enter_trade: slippage threshold 0.001 hardcoded → QUANT_SLIPPAGE_TOLERANCE.
+  FIX-15  _update_trailing_sl: replace_stop_loss None (SL fired) silently ignored
+          → now triggers _record_exchange_exit() and finalises position.
+  FIX-16  _sync_position: summed all qty → uses get_open_position() directly.
+  FIX-17  _sync_position: TP/SL pnl not tracked → PnL extracted from exchange data.
+  FIX-18  _compute_quantity: final margin check always passed → correct guard.
+  FIX-19  _compute_quantity: no risk limits → DailyRiskGate enforces MAX_DAILY_TRADES,
+          MAX_CONSECUTIVE_LOSSES, MAX_DAILY_LOSS_PCT.
+  FIX-20  _compute_sl_tp: TP min = sl_min×1.5 hardcoded → MIN_RISK_REWARD_RATIO.
+  FIX-21  _compute_sl_tp: round(...,1) hardcoded → TICK_SIZE from config.
+  FIX-22  format_status_report: dead pnl_live=0 line removed → live elapsed/trail info.
+  FIX-23  SignalAggregator: no weight validation → normalises + warns at call time.
+  FIX-24  on_tick EXITING: sync every 5s with no separate gate → rate-gated independently.
+  FIX-25  MomentumEngine: ROC cap 0.005 hardcoded → ATR-relative adaptive normalisation.
+  FIX-26  QCfg: class attrs at import time → all values fetched live from config.
+  FIX-27  VolatilitySqueezeEngine: Keltner Channel (BB inside KC) replaces BBW percentile.
+  FIX-28  VolumeFlowEngine: replaces VolumeConfirmationEngine entirely with multi-bar logic.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+import threading
+from collections import deque
+from dataclasses import dataclass
+from datetime import date
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple
+
+import config
+from telegram_notifier import send_telegram_message
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION ACCESSOR — FIX-26
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cfg(name: str, default):
+    """
+    Live config accessor. Always reads the current value from config module.
+    Falls back to `default` only if the attribute is absent.
+    Zero / False / empty-string are valid — never replaced by default.
+    """
+    val = getattr(config, name, None)
+    return default if val is None else val
+
+
+class QCfg:
+    """
+    All values fetched live via _cfg() — no import-time caching.
+    Config changes take effect on the next tick without restart.
+    """
+
+    @staticmethod
+    def SYMBOL()    -> str:   return str(config.SYMBOL)
+    @staticmethod
+    def EXCHANGE()  -> str:   return str(config.EXCHANGE)
+
+    # Leverage & sizing
+    @staticmethod
+    def LEVERAGE()        -> int:   return int(_cfg("LEVERAGE",               30))
+    @staticmethod
+    def MARGIN_PCT()      -> float: return float(_cfg("QUANT_MARGIN_PCT",     0.20))
+    @staticmethod
+    def LOT_STEP()        -> float: return float(_cfg("LOT_STEP_SIZE",        0.001))
+    @staticmethod
+    def MIN_QTY()         -> float: return float(_cfg("MIN_POSITION_SIZE",    0.001))
+    @staticmethod
+    def MAX_QTY()         -> float: return float(_cfg("MAX_POSITION_SIZE",    1.0))
+    @staticmethod
+    def MIN_MARGIN_USDT() -> float: return float(_cfg("MIN_MARGIN_PER_TRADE", 4.0))
+    @staticmethod
+    def COMMISSION_RATE() -> float: return float(_cfg("COMMISSION_RATE",      0.00055))
+    @staticmethod
+    def TICK_SIZE()       -> float: return float(_cfg("TICK_SIZE",            0.1))      # FIX-21
+    @staticmethod
+    def SLIPPAGE_TOL()    -> float: return float(_cfg("QUANT_SLIPPAGE_TOLERANCE", 0.0005))  # FIX-14
+
+    # Signal thresholds
+    @staticmethod
+    def LONG_THRESHOLD()  -> float: return float(_cfg("QUANT_LONG_THRESHOLD",  0.55))
+    @staticmethod
+    def SHORT_THRESHOLD() -> float: return float(_cfg("QUANT_SHORT_THRESHOLD", 0.55))
+    @staticmethod
+    def EXIT_FLIP_THRESH()-> float: return float(_cfg("QUANT_EXIT_FLIP",       0.30))
+    @staticmethod
+    def CONFIRM_TICKS()   -> int:   return int(_cfg("QUANT_CONFIRM_TICKS",     2))
+
+    # ATR SL / TP
+    @staticmethod
+    def ATR_PERIOD()      -> int:   return int(_cfg("SL_ATR_PERIOD",           14))
+    @staticmethod
+    def SL_ATR_MULT()     -> float: return float(_cfg("QUANT_SL_ATR_MULT",    1.5))
+    @staticmethod
+    def TP_ATR_MULT()     -> float: return float(_cfg("QUANT_TP_ATR_MULT",    2.5))
+    @staticmethod
+    def MIN_SL_PCT()      -> float: return float(_cfg("MIN_SL_DISTANCE_PCT",  0.004))
+    @staticmethod
+    def MAX_SL_PCT()      -> float: return float(_cfg("MAX_SL_DISTANCE_PCT",  0.030))
+    @staticmethod
+    def MIN_RR_RATIO()    -> float: return float(_cfg("MIN_RISK_REWARD_RATIO", 1.5))  # FIX-20
+
+    # Trailing SL
+    @staticmethod
+    def TRAIL_ENABLED()      -> bool:  return bool(_cfg("QUANT_TRAIL_ENABLED",    True))
+    @staticmethod
+    def TRAIL_ACTIVATE_R()   -> float: return float(_cfg("QUANT_TRAIL_ACTIVATE_R", 1.0))
+    @staticmethod
+    def TRAIL_ATR_MULT()     -> float: return float(_cfg("QUANT_TRAIL_ATR_MULT",  1.0))
+    @staticmethod
+    def TRAIL_INTERVAL_S()   -> int:   return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 30))
+    @staticmethod
+    def TRAIL_MIN_MOVE_ATR() -> float: return float(_cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.1))
+
+    # Indicator windows
+    @staticmethod
+    def CVD_WINDOW()          -> int:   return int(_cfg("QUANT_CVD_WINDOW",        20))
+    @staticmethod
+    def CVD_HIST_MULT()       -> int:   return int(_cfg("QUANT_CVD_HIST_MULT",     15))   # FIX-02
+    @staticmethod
+    def VWAP_WINDOW()         -> int:   return int(_cfg("QUANT_VWAP_WINDOW",       50))
+    @staticmethod
+    def VWAP_SLOPE_BARS()     -> int:   return int(_cfg("QUANT_VWAP_SLOPE_BARS",   8))    # FIX-05
+    @staticmethod
+    def EMA_FAST()            -> int:   return int(_cfg("QUANT_EMA_FAST",          8))    # FIX-01
+    @staticmethod
+    def EMA_SLOW()            -> int:   return int(_cfg("QUANT_EMA_SLOW",         21))
+    @staticmethod
+    def EMA_SIGNAL_BARS()     -> int:   return int(_cfg("QUANT_EMA_SIGNAL_BARS",   5))
+    @staticmethod
+    def BB_WINDOW()           -> int:   return int(_cfg("QUANT_BB_WINDOW",         20))
+    @staticmethod
+    def BB_STD()              -> float: return float(_cfg("QUANT_BB_STD",          2.0))
+    @staticmethod
+    def KC_ATR_MULT()         -> float: return float(_cfg("QUANT_KC_ATR_MULT",     1.5))  # FIX-27
+    @staticmethod
+    def SQUEEZE_BREAKOUT_BARS()-> int:  return int(_cfg("QUANT_SQUEEZE_BREAKOUT_BARS", 5)) # FIX-06
+    @staticmethod
+    def VOL_FLOW_WINDOW()     -> int:   return int(_cfg("QUANT_VOL_FLOW_WINDOW",   10))   # FIX-08
+
+    # Minimum data requirements
+    @staticmethod
+    def MIN_1M_BARS()     -> int:   return int(_cfg("MIN_CANDLES_1M",           80))
+    @staticmethod
+    def MIN_5M_BARS()     -> int:   return int(_cfg("MIN_CANDLES_5M",           60))
+
+    # Regime filter
+    @staticmethod
+    def ATR_PCTILE_WINDOW()-> int:  return int(_cfg("QUANT_ATR_PCTILE_WINDOW", 100))
+    @staticmethod
+    def ATR_MIN_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE",  0.15))
+    @staticmethod
+    def ATR_MAX_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MAX_PCTILE",  0.90))
+
+    # Timing
+    @staticmethod
+    def MAX_HOLD_SEC()    -> int:   return int(_cfg("QUANT_MAX_HOLD_SEC",       1800))
+    @staticmethod
+    def COOLDOWN_SEC()    -> int:   return int(_cfg("QUANT_COOLDOWN_SEC",       60))
+    @staticmethod
+    def TICK_EVAL_SEC()   -> float: return float(_cfg("ENTRY_EVALUATION_INTERVAL_SECONDS", 5))
+    @staticmethod
+    def POS_SYNC_SEC()    -> float: return float(_cfg("QUANT_POS_SYNC_SEC",    30))
+
+    # Risk limits — FIX-19
+    @staticmethod
+    def MAX_DAILY_TRADES()  -> int:   return int(_cfg("MAX_DAILY_TRADES",        8))
+    @staticmethod
+    def MAX_CONSEC_LOSSES() -> int:   return int(_cfg("MAX_CONSECUTIVE_LOSSES",  3))
+    @staticmethod
+    def MAX_DAILY_LOSS_PCT()-> float: return float(_cfg("MAX_DAILY_LOSS_PCT",    5.0))
+
+    # Signal weights
+    @staticmethod
+    def W_CVD()     -> float: return float(_cfg("QUANT_W_CVD",     0.30))
+    @staticmethod
+    def W_VWAP()    -> float: return float(_cfg("QUANT_W_VWAP",    0.25))
+    @staticmethod
+    def W_MOM()     -> float: return float(_cfg("QUANT_W_MOM",     0.25))
+    @staticmethod
+    def W_SQUEEZE() -> float: return float(_cfg("QUANT_W_SQUEEZE", 0.10))
+    @staticmethod
+    def W_VOL()     -> float: return float(_cfg("QUANT_W_VOL",     0.10))
+
+
+def _round_to_tick(price: float) -> float:
+    """FIX-21: Round to exchange TICK_SIZE from config, not hardcoded decimal places."""
+    tick = QCfg.TICK_SIZE()
+    if tick <= 0:
+        return price
+    return round(round(price / tick) * tick, 10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALPHA SIGNAL ENGINES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CVDEngine:
+    """
+    Cumulative Volume Delta — rolling z-score of buy/sell imbalance.
+
+    Per-bar delta heuristic (OHLCV, matches TradingView):
+        delta_frac = (2×close - high - low) / (high - low)
+        delta      = volume × delta_frac
+
+    Signal = tanh(z / 2)   where z is z-score of rolling window CVD sum.
+
+    FIX-02: History = window × CVD_HIST_MULT — large enough for stable z-scores.
+    FIX-03: tanh(z/2) not clamp(z/2). tanh is the proper sigmoid for unbounded z.
+    """
+
+    def __init__(self):
+        self._deltas: deque[float] = deque(maxlen=QCfg.CVD_WINDOW() * QCfg.CVD_HIST_MULT())
+        self._window = QCfg.CVD_WINDOW()
+
+    def update(self, candles: List[Dict]) -> None:
+        self._deltas.clear()
+        for c in candles:
+            hi  = float(c['h']); lo = float(c['l'])
+            cl  = float(c['c']); vol = float(c['v'])
+            rng = hi - lo
+            delta_frac = (2.0 * cl - hi - lo) / rng if rng > 1e-10 else 0.0
+            self._deltas.append(vol * delta_frac)
+
+    def get_signal(self) -> float:
+        w   = QCfg.CVD_WINDOW()
+        arr = list(self._deltas)
+        if len(arr) < w + 5:
+            return 0.0
+
+        sums = [sum(arr[i: i + w]) for i in range(len(arr) - w + 1)]
+        if len(sums) < 5:
+            return 0.0
+
+        mu  = sum(sums) / len(sums)
+        var = sum((s - mu) ** 2 for s in sums) / max(len(sums) - 1, 1)
+        std = math.sqrt(var)
+        if std < 1e-12:
+            return 0.0
+
+        z = (sums[-1] - mu) / std
+        return math.tanh(z / 2.0)   # FIX-03
+
+
+class VWAPEngine:
+    """
+    Volume-Weighted Average Price with volume-weighted standard deviation bands.
+
+    FIX-04: Std = sqrt( Σ(vol × (TP - VWAP)²) / Σvol )  — volume-weighted.
+            Properly represents the price dispersion institutional orders care about.
+
+    FIX-05: Slope normalised by (ATR / VWAP), making it dimensionless and
+            regime-adaptive instead of the previous hardcoded 0.001.
+    """
+
+    def __init__(self):
+        self._vwap     = 0.0
+        self._std      = 0.0
+        self._slope    = 0.0
+        self._history: deque[float] = deque(maxlen=QCfg.VWAP_SLOPE_BARS() * 3)
+
+    def update(self, candles: List[Dict], atr: float) -> None:
+        window = QCfg.VWAP_WINDOW()
+        if len(candles) < window:
+            return
+
+        recent = candles[-window:]
+
+        # Volume-weighted average typical price  (FIX-04)
+        tp_vol = sum((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 * float(c['v'])
+                     for c in recent)
+        vol_sum = sum(float(c['v']) for c in recent)
+        if vol_sum < 1e-12:
+            return
+        self._vwap = tp_vol / vol_sum
+
+        # Volume-weighted variance  (FIX-04)
+        var_sum = sum(float(c['v']) *
+                      ((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 - self._vwap) ** 2
+                      for c in recent)
+        self._std = math.sqrt(var_sum / vol_sum)
+
+        # Slope: % change of VWAP over SLOPE_BARS, normalised by ATR%  (FIX-05)
+        self._history.append(self._vwap)
+        sb = QCfg.VWAP_SLOPE_BARS()
+        if len(self._history) >= sb + 1 and atr > 1e-10 and self._vwap > 1e-10:
+            hist = list(self._history)
+            raw_pct_slope = (hist[-1] - hist[-sb - 1]) / (hist[-sb - 1] + 1e-12)
+            atr_pct       = atr / self._vwap
+            self._slope   = max(-1.0, min(1.0, raw_pct_slope / (atr_pct + 1e-12)))
+
+    def get_signal(self, price: float) -> float:
+        if self._vwap < 1e-10 or self._std < 1e-10:
+            return 0.0
+        z         = (price - self._vwap) / self._std
+        dev_score = math.tanh(z / 2.0)
+        combined  = dev_score * 0.6 + self._slope * 0.4
+        if dev_score * self._slope < 0:
+            combined *= 0.25   # contradict penalty
+        return max(-1.0, min(1.0, combined))
+
+    @property
+    def vwap(self) -> float: return self._vwap
+    @property
+    def vwap_std(self) -> float: return self._std
+
+
+class MomentumEngine:
+    """
+    EMA Crossover Momentum on two timeframes.
+
+    FIX-01: Replaced the broken ROC approach (self.med was never used) with
+            EMA(fast) minus EMA(slow) crossover, normalised by ATR.
+            Primary: 1m EMA cross (intraday momentum direction).
+            Secondary: 5m EMA slope (higher-TF confirmation).  (FIX-01)
+
+    FIX-25: Normalisation uses ATR (adaptive to vol regime) not hardcoded 0.005.
+    """
+
+    def __init__(self):
+        self._cross_1m = 0.0
+        self._cross_5m = 0.0
+
+    @staticmethod
+    def _ema_series(values: List[float], period: int) -> List[float]:
+        if len(values) < period:
+            return []
+        k   = 2.0 / (period + 1)
+        ema = sum(values[:period]) / period
+        out = [ema]
+        for v in values[period:]:
+            ema = v * k + ema * (1.0 - k)
+            out.append(ema)
+        return out
+
+    def update(self, candles_1m: List[Dict], candles_5m: List[Dict],
+               atr_1m: float, atr_5m: float) -> None:
+        fast = QCfg.EMA_FAST(); slow = QCfg.EMA_SLOW(); sig_b = QCfg.EMA_SIGNAL_BARS()
+        cl1  = [float(c['c']) for c in candles_1m]
+        cl5  = [float(c['c']) for c in candles_5m]
+
+        # 1m MACD-line = EMA(fast) - EMA(slow), normalised by 1m ATR  (FIX-25)
+        if len(cl1) > slow + 2 and atr_1m > 1e-10:
+            ef = self._ema_series(cl1, fast)
+            es = self._ema_series(cl1, slow)
+            n  = min(len(ef), len(es))
+            macd_now = ef[-1] - es[-1]
+            self._cross_1m = math.tanh(macd_now / atr_1m)
+        else:
+            self._cross_1m = 0.0
+
+        # 5m EMA slope (FIX-01: now actually uses 5m candles with its own period)
+        if len(cl5) > fast + sig_b and atr_5m > 1e-10:
+            ef5   = self._ema_series(cl5, fast)
+            if len(ef5) >= sig_b + 1:
+                slope = ef5[-1] - ef5[-sig_b - 1]
+                self._cross_5m = math.tanh(slope / atr_5m)
+            else:
+                self._cross_5m = 0.0
+        else:
+            self._cross_5m = 0.0
+
+    def get_signal(self) -> float:
+        m1 = self._cross_1m; m5 = self._cross_5m
+        if abs(m1) < 1e-8 and abs(m5) < 1e-8:
+            return 0.0
+        same_dir = (m1 >= 0) == (m5 >= 0)
+        return (m1 * 0.60 + m5 * 0.40) if same_dir else (m1 * 0.30)
+
+
+class VolatilitySqueezeEngine:
+    """
+    TTM-style Bollinger + Keltner Squeeze with correct state machine.
+
+    Squeeze = BB inside Keltner Channel (more robust than BBW percentile
+    threshold which is sensitive to the lookback length chosen).  (FIX-27)
+
+    FIX-06: Signal fires only for the first SQUEEZE_BREAKOUT_BARS bars after
+            squeeze exits.  Previous code fired on ANY non-squeeze bar = always on.
+    FIX-07: Sample standard deviation (÷ n-1) for BB width calculation.
+    """
+
+    def __init__(self):
+        self._in_squeeze    = False
+        self._post_sq_bars  = 0     # bars since squeeze exit
+        self._bb_mid        = 0.0   # midpoint at squeeze exit (breakout reference)
+        self._last_signal   = 0.0
+
+    def update(self, candles: List[Dict], atr: float) -> None:
+        window     = QCfg.BB_WINDOW()
+        n_std      = QCfg.BB_STD()
+        kc_mult    = QCfg.KC_ATR_MULT()
+        break_bars = QCfg.SQUEEZE_BREAKOUT_BARS()
+
+        if len(candles) < window or atr < 1e-10:
+            self._last_signal = 0.0
+            return
+
+        closes = [float(c['c']) for c in candles[-window:]]
+        n      = len(closes)
+        mid    = sum(closes) / n
+
+        # FIX-07: sample std
+        var = sum((c - mid) ** 2 for c in closes) / (n - 1)
+        std = math.sqrt(var)
+
+        bb_upper = mid + n_std * std
+        bb_lower = mid - n_std * std
+
+        # FIX-27: Keltner Channel
+        kc_upper = mid + kc_mult * atr
+        kc_lower = mid - kc_mult * atr
+
+        in_sq = (bb_upper < kc_upper) and (bb_lower > kc_lower)
+
+        if in_sq:
+            # Squeeze active — record midpoint, emit 0
+            if not self._in_squeeze:
+                self._in_squeeze   = True
+                self._post_sq_bars = 0
+            self._bb_mid        = mid
+            self._last_signal   = 0.0
+            return
+
+        # FIX-06: Not squeezing
+        if self._in_squeeze:
+            self._in_squeeze   = False
+            self._post_sq_bars = 0
+
+        self._post_sq_bars += 1
+
+        if self._post_sq_bars <= break_bars:
+            cl    = float(candles[-1]['c'])
+            disp  = (cl - self._bb_mid) / (std + 1e-12)
+            self._last_signal = math.tanh(disp)
+        else:
+            self._last_signal = 0.0
+
+    def get_signal(self) -> float:
+        return self._last_signal
+
+
+class VolumeFlowEngine:
+    """
+    Multi-Bar Volume Flow Imbalance.  (FIX-08, FIX-28)
+
+    For each bar: buy_frac  = max(0, close-open) / (high-low)
+                  sell_frac = max(0, open-close) / (high-low)
+                  flow_ratio = (buy_vol - sell_vol) / (buy_vol + sell_vol + ε)
+
+    Signal = tanh-z-score of rolling window avg vs historical baseline.
+    This captures whether recent buying/selling pressure is anomalous vs history.
+    """
+
+    def __init__(self):
+        self._ratios: deque[float] = deque(maxlen=200)
+
+    def update(self, candles: List[Dict]) -> None:
+        self._ratios.clear()
+        for c in candles:
+            hi  = float(c['h']); lo = float(c['l'])
+            op  = float(c['o']); cl = float(c['c']); vol = float(c['v'])
+            rng = hi - lo
+            if rng > 1e-10:
+                buy_f  = max(0.0, cl - op) / rng
+                sell_f = max(0.0, op - cl) / rng
+            else:
+                buy_f = sell_f = 0.0
+            bv = vol * buy_f; sv = vol * sell_f; tot = bv + sv
+            ratio = (bv - sv) / (tot + 1e-12) if tot > 1e-10 else 0.0
+            self._ratios.append(ratio)
+
+    def get_signal(self) -> float:
+        window = QCfg.VOL_FLOW_WINDOW()
+        arr    = list(self._ratios)
+        if len(arr) < window + 5:
+            return 0.0
+        recent_avg = sum(arr[-window:]) / window
+        hist       = arr[:-window]
+        if len(hist) < 5:
+            return 0.0
+        mu  = sum(hist) / len(hist)
+        var = sum((x - mu) ** 2 for x in hist) / max(len(hist) - 1, 1)
+        std = math.sqrt(var)
+        if std < 1e-12:
+            return 0.0
+        return math.tanh((recent_avg - mu) / std / 2.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATR ENGINE — FIX-09, FIX-10, FIX-11
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ATREngine:
+    """
+    Wilder's ATR — incremental, candle-gated, unbiased percentile.
+
+    FIX-09: Incremental Wilder smoothing, not full recompute every tick.
+    FIX-10: Percentile uses a snapshot of history BEFORE appending current ATR.
+    FIX-11: Only appends to history when a genuinely new candle is seen (ts check).
+    """
+
+    def __init__(self):
+        self._atr            = 0.0
+        self._atr_hist: deque[float] = deque(maxlen=QCfg.ATR_PCTILE_WINDOW())
+        self._last_ts: int   = -1
+        self._seeded: bool   = False
+
+    def compute(self, candles: List[Dict]) -> float:
+        if not candles:
+            return self._atr
+
+        period  = QCfg.ATR_PERIOD()
+        last_ts = int(candles[-1].get('t', 0))
+
+        # FIX-11: skip if same candle
+        if last_ts == self._last_ts and self._seeded:
+            return self._atr
+
+        if len(candles) < period + 1:
+            return self._atr
+
+        if not self._seeded:
+            # Full seed pass
+            trs = [
+                max(float(candles[i]['h']) - float(candles[i]['l']),
+                    abs(float(candles[i]['h']) - float(candles[i - 1]['c'])),
+                    abs(float(candles[i]['l']) - float(candles[i - 1]['c'])))
+                for i in range(1, len(candles))
+            ]
+            if len(trs) < period:
+                return self._atr
+            atr = sum(trs[:period]) / period
+            for tr in trs[period:]:
+                atr = (atr * (period - 1) + tr) / period
+            self._atr    = atr
+            self._seeded = True
+        else:
+            # FIX-09: incremental update for the newest candle only
+            hi  = float(candles[-1]['h']); lo = float(candles[-1]['l'])
+            prc = float(candles[-2]['c'])
+            tr  = max(hi - lo, abs(hi - prc), abs(lo - prc))
+            self._atr = (self._atr * (period - 1) + tr) / period
+
+        # FIX-10: snapshot BEFORE append so percentile excludes self
+        self._atr_hist.append(self._atr)
+        self._last_ts = last_ts
+        return self._atr
+
+    @property
+    def atr(self) -> float:
+        return self._atr
+
+    def get_percentile(self) -> float:
+        """Unbiased percentile: current ATR vs ALL prior values (not including itself)."""
+        hist = list(self._atr_hist)
+        if len(hist) < 10:
+            return 0.5     # insufficient data → neutral
+        ref  = hist[-1]
+        prev = hist[:-1]   # FIX-10: exclude current from ranking
+        return sum(1 for h in prev if h <= ref) / len(prev)
+
+    def is_regime_valid(self) -> bool:
+        p = self.get_percentile()
+        return QCfg.ATR_MIN_PCTILE() <= p <= QCfg.ATR_MAX_PCTILE()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL AGGREGATOR — FIX-23
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SignalBreakdown:
+    cvd:       float = 0.0
+    vwap:      float = 0.0
+    mom:       float = 0.0
+    squeeze:   float = 0.0
+    vol:       float = 0.0
+    composite: float = 0.0
+    atr:       float = 0.0
+    atr_pct:   float = 0.0
+    regime_ok: bool  = False
+
+    def __str__(self) -> str:
+        return (
+            f"CVD={self.cvd:+.3f} VWAP={self.vwap:+.3f} "
+            f"MOM={self.mom:+.3f} SQZ={self.squeeze:+.3f} "
+            f"VFL={self.vol:+.3f} → Σ={self.composite:+.4f} "
+            f"ATR=${self.atr:.1f}({self.atr_pct:.0%}) "
+            f"{'✅' if self.regime_ok else '🚫GATED'}"
+        )
+
+
+class SignalAggregator:
+    """FIX-23: Live weight fetch + runtime normalisation if weights don't sum to 1.0."""
+
+    @staticmethod
+    def compute(cvd: float, vwap: float, mom: float,
+                squeeze: float, vol: float,
+                atr_engine: ATREngine) -> SignalBreakdown:
+
+        w = {
+            'cvd': QCfg.W_CVD(), 'vwap': QCfg.W_VWAP(), 'mom': QCfg.W_MOM(),
+            'squeeze': QCfg.W_SQUEEZE(), 'vol': QCfg.W_VOL(),
+        }
+        total_w = sum(w.values())
+        if abs(total_w - 1.0) > 0.01:
+            logger.warning(f"Weight sum={total_w:.4f} ≠ 1.0 — normalising. Fix QUANT_W_* in config.")
+            w = {k: v / total_w for k, v in w.items()}
+
+        composite = max(-1.0, min(1.0,
+            w['cvd']     * cvd     +
+            w['vwap']    * vwap    +
+            w['mom']     * mom     +
+            w['squeeze'] * squeeze +
+            w['vol']     * vol
+        ))
+
+        return SignalBreakdown(
+            cvd=cvd, vwap=vwap, mom=mom, squeeze=squeeze, vol=vol,
+            composite=composite,
+            atr=atr_engine.atr,
+            atr_pct=atr_engine.get_percentile(),
+            regime_ok=atr_engine.is_regime_valid(),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PositionPhase(Enum):
+    FLAT     = auto()
+    ENTERING = auto()
+    ACTIVE   = auto()
+    EXITING  = auto()
+
+
+@dataclass
+class PositionState:
+    phase:           PositionPhase         = PositionPhase.FLAT
+    side:            str                   = ""
+    quantity:        float                 = 0.0
+    entry_price:     float                 = 0.0
+    sl_price:        float                 = 0.0
+    tp_price:        float                 = 0.0
+    sl_order_id:     Optional[str]         = None
+    tp_order_id:     Optional[str]         = None
+    entry_order_id:  Optional[str]         = None
+    entry_time:      float                 = 0.0
+    initial_risk:    float                 = 0.0    # |entry-sl| × qty (USDT at risk)
+    initial_sl_dist: float                 = 0.0    # |entry-sl| price units (for trail gate)
+    trail_active:    bool                  = False
+    last_trail_time: float                 = 0.0
+    entry_signal:    Optional[SignalBreakdown] = None
+
+    def is_active(self) -> bool: return self.phase == PositionPhase.ACTIVE
+    def is_flat(self)   -> bool: return self.phase == PositionPhase.FLAT
+
+    def to_dict(self) -> Dict:
+        return {
+            "side": self.side, "quantity": self.quantity,
+            "entry_price": self.entry_price,
+            "sl_price": self.sl_price, "tp_price": self.tp_price,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DAILY RISK GATE — FIX-19
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DailyRiskGate:
+    """
+    Enforces MAX_DAILY_TRADES, MAX_CONSECUTIVE_LOSSES, MAX_DAILY_LOSS_PCT.
+    All counters reset at UTC midnight.  Consecutive losses persist across days.
+    """
+
+    def __init__(self):
+        self._today:          date  = date.today()
+        self._daily_trades:   int   = 0
+        self._consec_losses:  int   = 0
+        self._daily_pnl:      float = 0.0
+        self._daily_open_bal: float = 0.0
+        self._lock = threading.Lock()
+
+    def _reset_if_new_day(self) -> None:
+        today = date.today()
+        if today != self._today:
+            logger.info(f"📅 Daily risk counters reset (new day: {today})")
+            self._today        = today
+            self._daily_trades = 0
+            self._daily_pnl    = 0.0
+            self._daily_open_bal = 0.0
+            # Consecutive losses intentionally persist across days
+
+    def set_opening_balance(self, balance: float) -> None:
+        with self._lock:
+            self._reset_if_new_day()
+            if self._daily_open_bal < 1e-10 and balance > 0:
+                self._daily_open_bal = balance
+
+    def can_trade(self, current_balance: float) -> Tuple[bool, str]:
+        with self._lock:
+            self._reset_if_new_day()
+            max_dt = QCfg.MAX_DAILY_TRADES()
+            max_cl = QCfg.MAX_CONSEC_LOSSES()
+            max_lp = QCfg.MAX_DAILY_LOSS_PCT()
+
+            if self._daily_trades >= max_dt:
+                return False, f"Daily trade cap: {self._daily_trades}/{max_dt}"
+
+            if self._consec_losses >= max_cl:
+                return False, f"Consecutive loss cap: {self._consec_losses}/{max_cl}"
+
+            if self._daily_open_bal > 1e-10:
+                loss_pct = -self._daily_pnl / self._daily_open_bal * 100.0
+                if loss_pct >= max_lp:
+                    return False, f"Daily loss cap: {loss_pct:.1f}% ≥ {max_lp}%"
+
+            return True, ""
+
+    def record_trade_start(self) -> None:
+        with self._lock:
+            self._reset_if_new_day()
+            self._daily_trades += 1
+
+    def record_trade_result(self, pnl: float) -> None:
+        with self._lock:
+            self._daily_pnl += pnl
+            if pnl < 0:
+                self._consec_losses += 1
+            else:
+                self._consec_losses = 0
+
+    @property
+    def daily_trades(self) -> int:
+        with self._lock: return self._daily_trades
+
+    @property
+    def consec_losses(self) -> int:
+        with self._lock: return self._consec_losses
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN STRATEGY CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QuantStrategy:
+    """
+    Institutional Multi-Factor Momentum + Order Flow Strategy — v2 (audited).
+
+    Drop-in replacement for AdvancedICTStrategy.  Public interface:
+        on_tick(data_manager, order_manager, risk_manager, timestamp_ms) → None
+        get_position() → dict | None
+        current_sl_price: float
+        current_tp_price: float
+    """
+
+    def __init__(self, order_manager=None):
+        self._om    = order_manager
+        self._lock  = threading.RLock()
+
+        # Engines
+        self._cvd     = CVDEngine()
+        self._vwap    = VWAPEngine()
+        self._mom     = MomentumEngine()
+        self._squeeze = VolatilitySqueezeEngine()
+        self._volflow = VolumeFlowEngine()
+        self._atr_1m  = ATREngine()   # 1m ATR for momentum normalisation
+        self._atr_5m  = ATREngine()   # 5m ATR for SL/TP (less noise)
+
+        # State
+        self._pos         = PositionState()
+        self._last_sig    = SignalBreakdown()
+        self._risk_gate   = DailyRiskGate()
+
+        # Confirmation counters
+        self._confirm_long  = 0
+        self._confirm_short = 0
+
+        # Timing
+        self._last_eval_time  = 0.0
+        self._last_exit_time  = 0.0
+        self._last_pos_sync   = 0.0
+        self._last_exit_sync  = 0.0   # FIX-24: separate gate for EXITING phase
+
+        # Statistics
+        self._total_trades   = 0
+        self._winning_trades = 0
+        self._total_pnl      = 0.0
+
+        # Required by main.py stop()
+        self.current_sl_price: float = 0.0
+        self.current_tp_price: float = 0.0
+
+        self._log_init()
+
+    def _log_init(self) -> None:
+        logger.info("=" * 72)
+        logger.info("⚡ QuantStrategy v2 (AUDITED) INITIALIZED")
+        logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x lev | "
+                    f"{QCfg.MARGIN_PCT():.0%} margin | "
+                    f"SL={QCfg.SL_ATR_MULT()}×ATR TP={QCfg.TP_ATR_MULT()}×ATR "
+                    f"minRR={QCfg.MIN_RR_RATIO()}")
+        logger.info(f"   EMA {QCfg.EMA_FAST()}/{QCfg.EMA_SLOW()} | "
+                    f"CVD {QCfg.CVD_WINDOW()}×{QCfg.CVD_HIST_MULT()} hist | "
+                    f"VWAP {QCfg.VWAP_WINDOW()}b | "
+                    f"BB/KC {QCfg.BB_WINDOW()}b/{QCfg.KC_ATR_MULT()}x")
+        w_total = QCfg.W_CVD()+QCfg.W_VWAP()+QCfg.W_MOM()+QCfg.W_SQUEEZE()+QCfg.W_VOL()
+        logger.info(f"   Weights: CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} "
+                    f"MOM={QCfg.W_MOM()} SQZ={QCfg.W_SQUEEZE()} "
+                    f"VFL={QCfg.W_VOL()} (sum={w_total:.2f})")
+        logger.info(f"   Risk: {QCfg.MAX_DAILY_TRADES()} trades/day | "
+                    f"{QCfg.MAX_CONSEC_LOSSES()} consec losses | "
+                    f"{QCfg.MAX_DAILY_LOSS_PCT()}% daily loss cap")
+        logger.info("=" * 72)
+
+    # ───────────────────────────────────────────────────────────────────
+    # PUBLIC API
+    # ───────────────────────────────────────────────────────────────────
+
+    def get_position(self) -> Optional[Dict]:
+        with self._lock:
+            return None if self._pos.is_flat() else self._pos.to_dict()
+
+    def on_tick(self, data_manager, order_manager, risk_manager,
+                timestamp_ms: int) -> None:
+        with self._lock:
+            now      = timestamp_ms / 1000.0
+            self._om = order_manager
+
+            if now - self._last_eval_time < QCfg.TICK_EVAL_SEC():
+                return
+            self._last_eval_time = now
+
+            phase = self._pos.phase
+
+            # Position sync gating
+            if phase == PositionPhase.ACTIVE:
+                if now - self._last_pos_sync > QCfg.POS_SYNC_SEC():
+                    self._sync_position(order_manager)
+                    self._last_pos_sync = now
+                    if self._pos.is_flat():
+                        return
+
+            elif phase == PositionPhase.EXITING:
+                # FIX-24: EXITING uses its own independent time gate
+                if now - self._last_exit_sync > QCfg.POS_SYNC_SEC():
+                    self._sync_position(order_manager)
+                    self._last_exit_sync = now
+                return   # never evaluate entries while exiting
+
+            # Route
+            if phase == PositionPhase.FLAT:
+                if now - self._last_exit_time < float(QCfg.COOLDOWN_SEC()):
+                    return
+                self._evaluate_entry(data_manager, order_manager, risk_manager, now)
+
+            elif phase == PositionPhase.ACTIVE:
+                self._manage_active(data_manager, order_manager, now)
+
+    # ───────────────────────────────────────────────────────────────────
+    # SIGNAL COMPUTATION
+    # ───────────────────────────────────────────────────────────────────
+
+    def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
+        candles_1m = data_manager.get_candles("1m", limit=300)
+        candles_5m = data_manager.get_candles("5m", limit=100)
+
+        if len(candles_1m) < QCfg.MIN_1M_BARS():
+            logger.debug(f"1m bars: {len(candles_1m)}/{QCfg.MIN_1M_BARS()}")
+            return None
+        if len(candles_5m) < QCfg.MIN_5M_BARS():
+            logger.debug(f"5m bars: {len(candles_5m)}/{QCfg.MIN_5M_BARS()}")
+            return None
+
+        atr_1m = self._atr_1m.compute(candles_1m)   # FIX-09/11
+        atr_5m = self._atr_5m.compute(candles_5m)   # FIX-09/11
+
+        if atr_5m < 1e-10:
+            return None
+
+        if not self._atr_5m.is_regime_valid():       # FIX-10: unbiased percentile
+            logger.debug(f"Regime gated — pctile={self._atr_5m.get_percentile():.0%}")
+            return None
+
+        price = data_manager.get_last_price()
+        if price < 1.0:
+            return None
+
+        self._cvd.update(candles_1m)                       # FIX-02/03
+        self._vwap.update(candles_1m, atr_1m)              # FIX-04/05
+        self._mom.update(candles_1m, candles_5m,           # FIX-01/25
+                         atr_1m, atr_5m)
+        self._squeeze.update(candles_1m, atr_1m)           # FIX-06/07/27
+        self._volflow.update(candles_1m)                    # FIX-08/28
+
+        sig = SignalAggregator.compute(                     # FIX-23
+            self._cvd.get_signal(),
+            self._vwap.get_signal(price),
+            self._mom.get_signal(),
+            self._squeeze.get_signal(),
+            self._volflow.get_signal(),
+            self._atr_5m,
+        )
+        self._last_sig = sig
+        logger.debug(f"Signal: {sig}")
+        return sig
+
+    # ───────────────────────────────────────────────────────────────────
+    # ENTRY
+    # ───────────────────────────────────────────────────────────────────
+
+    def _evaluate_entry(self, data_manager, order_manager,
+                        risk_manager, now: float) -> None:
+        sig = self._compute_signals(data_manager)
+        if sig is None:
+            self._confirm_long = self._confirm_short = 0
+            return
+
+        c = sig.composite
+        if c >= QCfg.LONG_THRESHOLD():
+            self._confirm_long  += 1;  self._confirm_short  = 0
+        elif c <= -QCfg.SHORT_THRESHOLD():
+            self._confirm_short += 1;  self._confirm_long   = 0
+        else:
+            self._confirm_long = self._confirm_short = 0
+            return
+
+        thresh = QCfg.CONFIRM_TICKS()
+        if self._confirm_long >= thresh:
+            self._confirm_long = self._confirm_short = 0
+            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig)
+        elif self._confirm_short >= thresh:
+            self._confirm_long = self._confirm_short = 0
+            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
+
+    def _enter_trade(self, data_manager, order_manager,
+                     risk_manager, side: str, sig: SignalBreakdown) -> None:
+        price = data_manager.get_last_price()
+        if price < 1.0:
+            logger.warning("Entry aborted: no valid price")
+            return
+
+        atr = self._atr_5m.atr
+        if atr < 1e-10:
+            logger.warning("Entry aborted: ATR not computed")
+            return
+
+        # FIX-19: risk gate check before any API calls
+        bal_info = risk_manager.get_available_balance()
+        if bal_info is None:
+            logger.warning("Entry aborted: balance unavailable")
+            return
+        total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
+        self._risk_gate.set_opening_balance(total_bal)
+
+        allowed, reason = self._risk_gate.can_trade(total_bal)
+        if not allowed:
+            logger.info(f"Entry blocked by risk gate: {reason}")
+            return
+
+        qty = self._compute_quantity(risk_manager, price)   # FIX-18
+        if qty is None or qty < QCfg.MIN_QTY():
+            return
+
+        sl_price, tp_price = self._compute_sl_tp(price, side, atr)   # FIX-20/21
+        if sl_price is None or tp_price is None:
+            return
+
+        # FIX-13: minimum R:R enforcement
+        sl_dist = abs(price - sl_price)
+        tp_dist = abs(price - tp_price)
+        if sl_dist < 1e-10:
+            return
+        rr = tp_dist / sl_dist
+        if rr < QCfg.MIN_RR_RATIO():
+            logger.info(f"Entry blocked: R:R={rr:.2f} < min={QCfg.MIN_RR_RATIO()}")
+            return
+
+        logger.info(
+            f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | {sig}"
+        )
+
+        # Market order
+        entry_data = order_manager.place_market_order(side=side, quantity=qty)
+        if not entry_data:
+            logger.error("❌ Market order failed — aborting")
+            return
+
+        self._risk_gate.record_trade_start()
+
+        # Extract fill price with cascading fallbacks
+        fill_price = (
+            float(entry_data.get("average_price") or 0) or
+            float(entry_data.get("fill_price")    or 0) or
+            float(entry_data.get("price")         or 0) or
+            price
+        )
+
+        # FIX-12 + FIX-14: re-compute SL/TP if slippage > configured tolerance
+        slip = abs(fill_price - price) / price
+        if slip > QCfg.SLIPPAGE_TOL():
+            logger.info(f"Slippage {slip:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} — recalc SL/TP")
+            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr)
+            if new_sl is None or new_tp is None:
+                # FIX-12: guard None return — close naked position immediately
+                logger.error("❌ SL/TP recompute after fill returned None — closing position")
+                exit_s = "sell" if side == "long" else "buy"
+                order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
+                return
+            new_rr = abs(fill_price - new_tp) / abs(fill_price - new_sl)
+            if new_rr < QCfg.MIN_RR_RATIO():
+                logger.warning(f"R:R={new_rr:.2f} below min after slippage — closing position")
+                exit_s = "sell" if side == "long" else "buy"
+                order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
+                return
+            sl_price, tp_price = new_sl, new_tp
+            rr = new_rr
+
+        exit_side = "sell" if side == "long" else "buy"
+
+        sl_data = order_manager.place_stop_loss(side=exit_side, quantity=qty,
+                                                trigger_price=sl_price)
+        if not sl_data:
+            logger.error("❌ SL placement failed — closing naked position")
+            order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+
+        tp_data = order_manager.place_take_profit(side=exit_side, quantity=qty,
+                                                   trigger_price=tp_price)
+        if not tp_data:
+            logger.error("❌ TP placement failed — cancelling SL, closing position")
+            order_manager.cancel_order(sl_data["order_id"])
+            order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+            return
+
+        sl_dist_filled  = abs(fill_price - sl_price)
+        initial_risk    = sl_dist_filled * qty
+
+        self._pos = PositionState(
+            phase           = PositionPhase.ACTIVE,
+            side            = side,
+            quantity        = qty,
+            entry_price     = fill_price,
+            sl_price        = sl_price,
+            tp_price        = tp_price,
+            sl_order_id     = sl_data["order_id"],
+            tp_order_id     = tp_data["order_id"],
+            entry_order_id  = entry_data.get("order_id"),
+            entry_time      = time.time(),
+            initial_risk    = initial_risk,
+            initial_sl_dist = sl_dist_filled,
+            entry_signal    = sig,
+        )
+        self.current_sl_price = sl_price
+        self.current_tp_price = tp_price
+        self._total_trades   += 1
+
+        send_telegram_message(
+            f"{'📈' if side == 'long' else '📉'} <b>QUANT ENTRY — {side.upper()}</b>\n\n"
+            f"Symbol:   {QCfg.SYMBOL()}\n"
+            f"Entry:    ${fill_price:,.2f}\n"
+            f"SL:       ${sl_price:,.2f}  "
+            f"(−${sl_dist_filled:.2f} / {sl_dist_filled/fill_price:.3%})\n"
+            f"TP:       ${tp_price:,.2f}  "
+            f"(+${abs(tp_price-fill_price):.2f})\n"
+            f"R:R:      1:{rr:.2f}\n"
+            f"Qty:      {qty} BTC\n"
+            f"Margin:   ${initial_risk/QCfg.LEVERAGE():.2f} USDT\n"
+            f"Risk:     ${initial_risk:.2f} USDT\n"
+            f"Leverage: {QCfg.LEVERAGE()}x\n\n"
+            f"<i>{sig}</i>"
+        )
+        logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | "
+                    f"R:R=1:{rr:.2f} | risk=${initial_risk:.2f}")
+
+    # ───────────────────────────────────────────────────────────────────
+    # ACTIVE MANAGEMENT
+    # ───────────────────────────────────────────────────────────────────
+
+    def _manage_active(self, data_manager, order_manager, now: float) -> None:
+        pos   = self._pos
+        price = data_manager.get_last_price()
+
+        if price < 1.0:
+            logger.debug("Stale price — skip management tick")
+            return
+
+        # 1. Max hold time
+        if now - pos.entry_time > QCfg.MAX_HOLD_SEC():
+            logger.info(f"⏰ Max hold exceeded — exiting")
+            self._exit_trade(order_manager, price, "max_hold_time")
+            return
+
+        # 2. Signal reversal
+        sig = self._compute_signals(data_manager)
+        if sig is not None:
+            c = sig.composite; flip = QCfg.EXIT_FLIP_THRESH()
+            if pos.side == "long"  and c <= -flip:
+                logger.info(f"🔄 Alpha flip SHORT ({c:+.3f} ≤ -{flip}) → exit LONG")
+                self._exit_trade(order_manager, price, "signal_reversal");  return
+            if pos.side == "short" and c >= flip:
+                logger.info(f"🔄 Alpha flip LONG  ({c:+.3f} ≥ +{flip}) → exit SHORT")
+                self._exit_trade(order_manager, price, "signal_reversal");  return
+
+        # 3. Trailing SL
+        if QCfg.TRAIL_ENABLED():
+            if now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
+                self._pos.last_trail_time = now
+                closed = self._update_trailing_sl(order_manager, price)
+                if closed:
+                    return
+
+    def _update_trailing_sl(self, order_manager, price: float) -> bool:
+        """
+        Ratchet trailing SL.  Returns True if position was detected as already closed.
+        FIX-15: replace_stop_loss returning None means SL already fired.
+        """
+        pos = self._pos
+        atr = self._atr_5m.atr
+        if atr < 1e-10:
+            return False
+
+        profit   = (price - pos.entry_price) if pos.side == "long" \
+                   else (pos.entry_price - price)
+        activate = pos.initial_sl_dist * QCfg.TRAIL_ACTIVATE_R()
+        if profit < activate:
+            return False
+
+        trail_dist = QCfg.TRAIL_ATR_MULT() * atr
+        min_move   = QCfg.TRAIL_MIN_MOVE_ATR() * atr
+
+        if pos.side == "long":
+            new_sl = price - trail_dist
+            if new_sl <= pos.sl_price + min_move:
+                return False
+        else:
+            new_sl = price + trail_dist
+            if new_sl >= pos.sl_price - min_move:
+                return False
+
+        new_sl_tick = _round_to_tick(new_sl)  # FIX-21
+        exit_side   = "sell" if pos.side == "long" else "buy"
+        logger.info(f"🔒 Trail SL: ${pos.sl_price:,.1f} → ${new_sl_tick:,.1f}")
+
+        result = order_manager.replace_stop_loss(
+            existing_sl_order_id = pos.sl_order_id,
+            side                 = exit_side,
+            quantity             = pos.quantity,
+            new_trigger_price    = new_sl_tick,
+        )
+
+        # FIX-15: None = SL already fired between ticks
+        if result is None:
+            logger.warning("🚨 SL already fired (replace returned None) — finalising")
+            self._record_exchange_exit(None)
+            return True
+
+        if isinstance(result, dict) and "error" in result:
+            logger.error(f"Trail SL error: {result.get('error')}")
+            return False
+
+        if result and isinstance(result, dict):
+            self._pos.sl_price    = new_sl_tick
+            self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
+            self.current_sl_price = new_sl_tick
+            if not pos.trail_active:
+                self._pos.trail_active = True
+                logger.info("✅ Trailing SL activated")
+
+        return False
+
+    # ───────────────────────────────────────────────────────────────────
+    # EXIT
+    # ───────────────────────────────────────────────────────────────────
+
+    def _exit_trade(self, order_manager, price: float, reason: str) -> None:
+        pos = self._pos
+        if pos.phase != PositionPhase.ACTIVE:
+            return
+        logger.info(f"🚪 EXIT {pos.side.upper()} @ ${price:,.2f} | {reason}")
+        self._pos.phase = PositionPhase.EXITING
+
+        order_manager.cancel_all_exit_orders(
+            sl_order_id=pos.sl_order_id,
+            tp_order_id=pos.tp_order_id,
+        )
+        exit_side = "sell" if pos.side == "long" else "buy"
+        order_manager.place_market_order(side=exit_side, quantity=pos.quantity,
+                                         reduce_only=True)
+        pnl = self._estimate_pnl(pos, price)
+        self._record_pnl(pnl)
+
+        hold_min = (time.time() - pos.entry_time) / 60
+        send_telegram_message(
+            f"{'✅' if pnl > 0 else '❌'} <b>QUANT EXIT — {pos.side.upper()}</b>\n\n"
+            f"Reason:  {reason}\n"
+            f"Entry:   ${pos.entry_price:,.2f}\n"
+            f"Exit:    ${price:,.2f}\n"
+            f"PnL:     ${pnl:+.2f} USDT\n"
+            f"Hold:    {hold_min:.1f} min\n\n"
+            f"<i>Trades: {self._total_trades} | "
+            f"WR: {self._win_rate():.0%} | "
+            f"PnL: ${self._total_pnl:+.2f}</i>"
+        )
+        self._finalise_exit()
+
+    def _record_exchange_exit(self, ex_pos: Optional[Dict]) -> None:
+        """
+        FIX-17: When TP/SL fires on exchange, attempt to record PnL.
+        exchange unrealized_pnl at close moment is our best approximation.
+        """
+        pos = self._pos
+        pnl = 0.0
+        if ex_pos is not None:
+            pnl = float(ex_pos.get("unrealized_pnl", 0.0))
+            if abs(pnl) < 1e-10 and ex_pos.get("entry_price") and pos.entry_price > 0:
+                # Try computing from entry price vs exchange entry (may differ if partial fill)
+                ex_entry = float(ex_pos.get("entry_price", pos.entry_price))
+                logger.info(f"Exchange exit: entry ${pos.entry_price:.2f} vs "
+                            f"exchange_entry ${ex_entry:.2f}")
+
+        if abs(pnl) < 1e-10:
+            logger.warning("Exchange exit: PnL=0 recorded — verify in exchange history")
+
+        self._record_pnl(pnl)
+        send_telegram_message(
+            f"📡 <b>EXCHANGE EXIT — {pos.side.upper()}</b>\n\n"
+            f"TP/SL fired between sync ticks\n"
+            f"Entry: ${pos.entry_price:,.2f}\n"
+            f"PnL:   ${pnl:+.2f} USDT\n\n"
+            f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%}</i>"
+        )
+        self._finalise_exit()
+
+    def _record_pnl(self, pnl: float) -> None:
+        self._total_pnl += pnl
+        if pnl > 0:
+            self._winning_trades += 1
+        self._risk_gate.record_trade_result(pnl)
+
+    def _finalise_exit(self) -> None:
+        self._pos             = PositionState()
+        self._last_exit_time  = time.time()
+        self.current_sl_price = 0.0
+        self.current_tp_price = 0.0
+        logger.info("Position closed — FLAT")
+
+    # ───────────────────────────────────────────────────────────────────
+    # POSITION SYNC — FIX-16, FIX-17
+    # ───────────────────────────────────────────────────────────────────
+
+    def _sync_position(self, order_manager) -> None:
+        """
+        FIX-16: Uses order_manager.get_open_position() which already handles
+        symbol filtering, field normalisation, and rate limiting.
+        FIX-17: Passes exchange position dict to _record_exchange_exit() for PnL.
+        """
+        try:
+            ex_pos = order_manager.get_open_position()
+        except Exception as e:
+            logger.debug(f"Position sync error: {e}")
+            return
+
+        if ex_pos is None:
+            # API failure — do NOT assume flat, wait for next sync
+            return
+
+        ex_size = float(ex_pos.get("size", 0.0))
+
+        if self._pos.phase == PositionPhase.ACTIVE:
+            if ex_size < QCfg.MIN_QTY():
+                logger.info("📡 Sync: exchange FLAT while ACTIVE → TP/SL fired")
+                self._record_exchange_exit(ex_pos)   # FIX-17
+
+            else:
+                ex_side = str(ex_pos.get("side") or "").upper()
+                expected = "LONG" if self._pos.side == "long" else "SHORT"
+                if ex_side and ex_side != expected:
+                    logger.warning(f"Side mismatch: internal={expected} exchange={ex_side}")
+
+        elif self._pos.phase == PositionPhase.EXITING:
+            if ex_size < QCfg.MIN_QTY():
+                logger.info("📡 Sync: EXITING confirmed flat on exchange")
+                self._finalise_exit()
+
+    # ───────────────────────────────────────────────────────────────────
+    # SIZING — FIX-18
+    # ───────────────────────────────────────────────────────────────────
+
+    def _compute_quantity(self, risk_manager, price: float) -> Optional[float]:
+        """
+        Quantity = (available × MARGIN_PCT × LEVERAGE) / price
+
+        FIX-18: Correct margin check — actual margin drawn vs allocated margin
+                (was checking actual vs total available, which ALWAYS passes).
+        """
+        bal = risk_manager.get_available_balance()
+        if bal is None:
+            logger.warning("Sizing: balance unavailable")
+            return None
+
+        available = float(bal.get("available", 0.0))
+        if available < QCfg.MIN_MARGIN_USDT():
+            logger.warning(f"Sizing: available ${available:.2f} < min ${QCfg.MIN_MARGIN_USDT()}")
+            return None
+
+        margin_alloc = available * QCfg.MARGIN_PCT()
+        if margin_alloc < QCfg.MIN_MARGIN_USDT():
+            return None
+
+        notional = margin_alloc * QCfg.LEVERAGE()
+        qty_raw  = notional / price
+
+        step = QCfg.LOT_STEP()
+        qty  = math.floor(qty_raw / step) * step
+        qty  = round(qty, 8)
+        qty  = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
+
+        # FIX-18: actual margin drawn vs ALLOCATED margin (not vs total balance)
+        actual_margin = (qty * price) / QCfg.LEVERAGE()
+        if actual_margin > margin_alloc * 1.02:   # 2% tolerance for step rounding
+            logger.warning(f"Sizing: actual margin ${actual_margin:.2f} > "
+                           f"allocated ${margin_alloc:.2f}")
+            return None
+
+        logger.info(
+            f"Sizing → avail=${available:.2f} | alloc={QCfg.MARGIN_PCT():.0%} "
+            f"| margin=${margin_alloc:.2f} | {QCfg.LEVERAGE()}x "
+            f"| notional=${notional:.2f} | qty={qty} BTC"
+        )
+        return qty
+
+    # ───────────────────────────────────────────────────────────────────
+    # SL / TP — FIX-20, FIX-21
+    # ───────────────────────────────────────────────────────────────────
+
+    def _compute_sl_tp(self, price: float, side: str,
+                       atr: float) -> Tuple[Optional[float], Optional[float]]:
+        """
+        SL = price ± SL_ATR_MULT × ATR  (clamped to [MIN_SL_PCT, MAX_SL_PCT] of price)
+        TP = price ± max(TP_ATR_MULT × ATR, SL_dist × MIN_RR_RATIO)
+
+        FIX-20: TP minimum enforced via MIN_RISK_REWARD_RATIO not hardcoded 1.5.
+        FIX-21: All prices rounded via _round_to_tick() using TICK_SIZE from config.
+        """
+        sl_atr = QCfg.SL_ATR_MULT() * atr
+        tp_atr = QCfg.TP_ATR_MULT() * atr
+
+        sl_min = price * QCfg.MIN_SL_PCT()
+        sl_max = price * QCfg.MAX_SL_PCT()
+        sl_dist = max(sl_min, min(sl_max, sl_atr))
+
+        # FIX-20: TP must achieve at least MIN_RR_RATIO × SL distance
+        tp_dist = max(sl_dist * QCfg.MIN_RR_RATIO(), tp_atr)
+
+        if side == "long":
+            sl_raw = price - sl_dist
+            tp_raw = price + tp_dist
+        else:
+            sl_raw = price + sl_dist
+            tp_raw = price - tp_dist
+
+        sl_price = _round_to_tick(sl_raw)   # FIX-21
+        tp_price = _round_to_tick(tp_raw)   # FIX-21
+
+        # Sanity checks
+        if side == "long"  and (sl_price >= price or tp_price <= price):
+            logger.error(f"SL/TP sanity fail LONG: entry={price} sl={sl_price} tp={tp_price}")
+            return None, None
+        if side == "short" and (sl_price <= price or tp_price >= price):
+            logger.error(f"SL/TP sanity fail SHORT: entry={price} sl={sl_price} tp={tp_price}")
+            return None, None
+
+        return sl_price, tp_price
+
+    # ───────────────────────────────────────────────────────────────────
+    # UTILITIES
+    # ───────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_pnl(pos: PositionState, exit_price: float) -> float:
+        """Gross PnL minus round-trip commission."""
+        gross = ((exit_price - pos.entry_price) if pos.side == "long"
+                 else (pos.entry_price - exit_price)) * pos.quantity
+        fee   = (pos.entry_price + exit_price) * pos.quantity * QCfg.COMMISSION_RATE()
+        return gross - fee
+
+    def _win_rate(self) -> float:
+        return self._winning_trades / self._total_trades if self._total_trades else 0.0
+
+    def get_stats(self) -> Dict:
+        return {
+            "total_trades":    self._total_trades,
+            "winning_trades":  self._winning_trades,
+            "win_rate":        f"{self._win_rate():.1%}",
+            "total_pnl":       round(self._total_pnl, 2),
+            "daily_trades":    self._risk_gate.daily_trades,
+            "consec_losses":   self._risk_gate.consec_losses,
+            "current_phase":   self._pos.phase.name,
+            "last_signal":     str(self._last_sig),
+            "atr_5m":          round(self._atr_5m.atr, 2),
+            "atr_1m":          round(self._atr_1m.atr, 2),
+            "atr_pctile":      f"{self._atr_5m.get_percentile():.0%}",
+            "regime_ok":       self._atr_5m.is_regime_valid(),
+        }
+
+    def format_status_report(self) -> str:
+        """FIX-22: Removed dead pnl_live computation. Shows live position timing."""
+        stats = self.get_stats()
+        pos   = self._pos
+        lines = [
+            "📊 <b>QUANT STRATEGY STATUS</b>",
+            "",
+            f"Phase:       {stats['current_phase']}",
+            f"Regime:      {'✅ Valid' if stats['regime_ok'] else '🚫 Gated'}",
+            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}  "
+            f"({stats['atr_pctile']} pctile)",
+            f"Signal:      {stats['last_signal']}",
+            "",
+            f"Session:     {stats['total_trades']} trades | WR {stats['win_rate']}",
+            f"Session PnL: ${stats['total_pnl']:+.2f} USDT",
+            f"Daily:       {stats['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} trades | "
+            f"{stats['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()} consec losses",
+        ]
+        if not pos.is_flat():
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            max_hold_min = QCfg.MAX_HOLD_SEC() / 60
+            lines += [
+                "",
+                f"<b>Active Position ({pos.side.upper()}):</b>",
+                f"Entry:   ${pos.entry_price:,.2f}",
+                f"SL:      ${pos.sl_price:,.2f}",
+                f"TP:      ${pos.tp_price:,.2f}",
+                f"Qty:     {pos.quantity} BTC",
+                f"Risk:    ${pos.initial_risk:.2f} USDT",
+                f"Hold:    {elapsed_min:.1f} / {max_hold_min:.0f} min",
+                f"Trail:   {'active ✅' if pos.trail_active else 'pending'}",
+            ]
+        return "\n".join(lines)
