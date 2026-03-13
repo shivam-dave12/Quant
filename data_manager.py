@@ -346,8 +346,23 @@ class ICTDataManager:
         except Exception as e:
             logger.error(f"Error in 1m warmup: {e}", exc_info=True)
 
-    def _warmup_from_klines_5m(self, limit: int = 100) -> None:
-        """Warm up 5m candles from REST"""
+    def _warmup_from_klines_5m(self, limit: int | None = None) -> None:
+        """Warm up 5m candles from REST.
+
+        limit is derived from ATR config so the ATREngine percentile history
+        is fully populated on the very first tick after restart:
+
+            needed = ATR_PCTILE_WINDOW + ATR_PERIOD + 2
+              (+ 2: one forming candle excluded by seed, one safety margin)
+
+        Capped at 500 — the safe maximum for most exchanges including
+        CoinSwitch.  If ATR_PCTILE_WINDOW > 480, raise it only after
+        confirming the klines endpoint accepts >500 in a single request.
+        """
+        if limit is None:
+            _window = int(getattr(config, "QUANT_ATR_PCTILE_WINDOW", 100))
+            _period = int(getattr(config, "SL_ATR_PERIOD", 14))
+            limit   = min(_window + _period + 2, 500)
         try:
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - limit * 5 * 60 * 1000
