@@ -191,6 +191,11 @@ class OrderManager:
         # order_manager.CancelResult.PARTIAL_FILL
         self.CancelResult = CancelResult
 
+        # Set to True on the first 404 from get_open_orders — the endpoint
+        # simply doesn't exist on this exchange. Subsequent calls are skipped
+        # silently rather than spamming ERROR logs every 30 seconds.
+        self._open_orders_404 = False
+
         logger.info("✅ OrderManager v3 initialized")
 
     # ========================================================================
@@ -1079,7 +1084,16 @@ class OrderManager:
         Returns:
             list  — zero or more orders (empty list = confirmed no orders)
             None  — API failure; caller must NOT assume no orders exist
+
+        Note: if the exchange returns 404 the first time, _open_orders_404 is
+        set and subsequent calls return None immediately at DEBUG level — no
+        further ERROR spam for a permanently unsupported endpoint.
         """
+        # Fast-path: endpoint known unsupported on this exchange
+        if self._open_orders_404:
+            logger.debug("get_open_orders: endpoint unsupported (404) — skipping")
+            return None
+
         try:
             GlobalRateLimiter.wait()
             resp = self.api.get_open_orders(
@@ -1092,7 +1106,17 @@ class OrderManager:
                 return None
 
             if "error" in resp:
-                logger.error(f"get_open_orders API error: {resp['error']}")
+                err_str = str(resp["error"])
+                if "404" in err_str:
+                    self._open_orders_404 = True
+                    logger.warning(
+                        "get_open_orders: endpoint returned 404 — "
+                        "CoinSwitch does not expose /open_orders. "
+                        "Pre-entry sweep and reconcile order classification "
+                        "will be skipped. Subsequent calls suppressed."
+                    )
+                else:
+                    logger.error(f"get_open_orders API error: {resp['error']}")
                 return None
 
             raw_orders = resp.get("data", [])
@@ -1165,8 +1189,19 @@ class OrderManager:
         orders = self.get_open_orders(symbol=sym)
 
         if orders is None:
-            logger.error("cancel_symbol_conditionals: open orders query failed — "
-                         "cannot confirm clean state, aborting sweep")
+            if self._open_orders_404:
+                # Endpoint doesn't exist on this exchange — we cannot enumerate
+                # conditional orders, so we cannot sweep them. Proceed without
+                # sweeping. The exchange itself enforces "one stop per position"
+                # so any orphaned order will surface as a 400 on placement;
+                # that path is already handled in _enter_trade.
+                logger.debug(
+                    "cancel_symbol_conditionals: open_orders endpoint unsupported "
+                    "— sweep skipped, proceeding with entry"
+                )
+                return {}
+            logger.warning("cancel_symbol_conditionals: open orders query failed — "
+                           "cannot confirm clean state, aborting sweep")
             return {}
 
         CONDITIONAL_TYPES = {"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
