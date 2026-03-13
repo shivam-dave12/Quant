@@ -624,9 +624,93 @@ class ATREngine:
         prev = hist[:-1]   # FIX-10: exclude current from ranking
         return sum(1 for h in prev if h <= ref) / len(prev)
 
+    def get_atr_zscore(self) -> float:
+        """
+        Z-score of current ATR vs history. +3 = 3σ above mean (very high vol).
+        Paired with percentile to detect how extreme the current regime is.
+        """
+        hist = list(self._atr_hist)
+        if len(hist) < 10:
+            return 0.0
+        mu  = sum(hist) / len(hist)
+        var = sum((x - mu) ** 2 for x in hist) / max(len(hist) - 1, 1)
+        std = math.sqrt(var)
+        return (self._atr - mu) / (std + 1e-12)
+
+    def classify_regime(self, vwap_signal: float = 0.0) -> "RegimeResult":
+        """
+        Map current ATR state to a fully parameterised RegimeResult.
+
+        Core principle: HIGH vol ≠ no-trade.  It means TRADE DIFFERENTLY.
+          - EXTREME regime: VWAP deviation drives direction (mean-reversion)
+          - Size and SL width scale with regime severity
+          - Confirmation ticks increase with chaos level
+
+        Args:
+            vwap_signal: VWAPEngine.get_signal() in [-1, +1].
+                         Positive = price above VWAP (overbought).
+        """
+        p  = self.get_percentile()
+        z  = self.get_atr_zscore()
+        lo = QCfg.ATR_MIN_PCTILE()   # default 0.15
+
+        # ── COMPRESSED: below configured floor (low vol, coiling) ─────────
+        if p < lo:
+            return RegimeResult(
+                mode=RegimeMode.COMPRESSED, pctile=p, atr_zscore=z,
+                size_scalar=0.60, sl_atr_mult=0.90, entry_threshold=0.68,
+                extra_confirms=1, direction_bias="any",
+                note=f"COMPRESSED ({p:.0%}) — breakout/squeeze only",
+            )
+
+        # ── TRENDING: normal operating band 15th–70th ─────────────────────
+        if p <= 0.70:
+            return RegimeResult(
+                mode=RegimeMode.TRENDING, pctile=p, atr_zscore=z,
+                size_scalar=1.00, sl_atr_mult=1.00,
+                entry_threshold=QCfg.LONG_THRESHOLD(),
+                extra_confirms=0, direction_bias="any",
+                note=f"TRENDING ({p:.0%}) — full signal suite, full size",
+            )
+
+        # ── ELEVATED: 70th–90th percentile ────────────────────────────────
+        if p <= 0.90:
+            return RegimeResult(
+                mode=RegimeMode.ELEVATED, pctile=p, atr_zscore=z,
+                size_scalar=0.80, sl_atr_mult=1.20,
+                entry_threshold=max(QCfg.LONG_THRESHOLD(), 0.60),
+                extra_confirms=0, direction_bias="any",
+                note=f"ELEVATED ({p:.0%}) — 80% size, wider SL",
+            )
+
+        # ── EXTREME: above 90th percentile — was a binary kill-switch ──────
+        # The WRONG fix was blocking all entries here. In extreme vol, VWAP
+        # deviation is the strongest edge: price far from VWAP = mean-revert.
+        #   vwap_signal > +0.25 → overbought → SHORT mean-reversion bias
+        #   vwap_signal < -0.25 → oversold  → LONG  mean-reversion bias
+        #   |vwap| ≤ 0.25       → near VWAP → no directional constraint
+        BIAS = 0.25
+        if vwap_signal > BIAS:
+            bias      = "short_only"
+            bias_note = f"VWAP+{vwap_signal:+.2f} → fade extension SHORT"
+        elif vwap_signal < -BIAS:
+            bias      = "long_only"
+            bias_note = f"VWAP{vwap_signal:+.2f} → mean-revert LONG"
+        else:
+            bias      = "any"
+            bias_note = f"VWAP≈0 ({vwap_signal:+.2f}) — momentum valid"
+
+        return RegimeResult(
+            mode=RegimeMode.EXTREME, pctile=p, atr_zscore=z,
+            size_scalar=0.50, sl_atr_mult=1.50,
+            entry_threshold=0.65,
+            extra_confirms=1, direction_bias=bias,
+            note=f"EXTREME ({p:.0%} z={z:+.1f}) — {bias_note}",
+        )
+
     def is_regime_valid(self) -> bool:
-        p = self.get_percentile()
-        return QCfg.ATR_MIN_PCTILE() <= p <= QCfg.ATR_MAX_PCTILE()
+        """Backward-compat: True for any tradeable regime (not COMPRESSED)."""
+        return self.classify_regime().mode != RegimeMode.COMPRESSED
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -644,14 +728,15 @@ class SignalBreakdown:
     atr:       float = 0.0
     atr_pct:   float = 0.0
     regime_ok: bool  = False
+    regime:    Optional["RegimeResult"] = None   # full regime snapshot
 
     def __str__(self) -> str:
+        reg_str = str(self.regime) if self.regime else f"ATR${self.atr:.1f}({self.atr_pct:.0%})"
         return (
             f"CVD={self.cvd:+.3f} VWAP={self.vwap:+.3f} "
             f"MOM={self.mom:+.3f} SQZ={self.squeeze:+.3f} "
             f"VFL={self.vol:+.3f} → Σ={self.composite:+.4f} "
-            f"ATR=${self.atr:.1f}({self.atr_pct:.0%}) "
-            f"{'✅' if self.regime_ok else '🚫GATED'}"
+            f"{reg_str}"
         )
 
 
@@ -661,7 +746,8 @@ class SignalAggregator:
     @staticmethod
     def compute(cvd: float, vwap: float, mom: float,
                 squeeze: float, vol: float,
-                atr_engine: ATREngine) -> SignalBreakdown:
+                atr_engine: ATREngine,
+                vwap_signal_for_regime: float = 0.0) -> SignalBreakdown:
 
         w = {
             'cvd': QCfg.W_CVD(), 'vwap': QCfg.W_VWAP(), 'mom': QCfg.W_MOM(),
@@ -680,12 +766,15 @@ class SignalAggregator:
             w['vol']     * vol
         ))
 
+        regime = atr_engine.classify_regime(vwap_signal=vwap_signal_for_regime)
+
         return SignalBreakdown(
             cvd=cvd, vwap=vwap, mom=mom, squeeze=squeeze, vol=vol,
             composite=composite,
             atr=atr_engine.atr,
             atr_pct=atr_engine.get_percentile(),
-            regime_ok=atr_engine.is_regime_valid(),
+            regime_ok=regime.mode not in (RegimeMode.COMPRESSED,),
+            regime=regime,
         )
 
 
@@ -698,6 +787,64 @@ class PositionPhase(Enum):
     ENTERING = auto()
     ACTIVE   = auto()
     EXITING  = auto()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VOLATILITY REGIME CLASSIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RegimeMode(Enum):
+    """
+    Four-state volatility regime derived from ATR percentile rank.
+
+    COMPRESSED  (<15th pctile) : Price coiling in tight range.
+                                 Only squeeze-breakout signals valid.
+                                 Wait for clear directional expansion.
+
+    TRENDING    (15th–70th)    : Normal operating environment.
+                                 All 5 signal engines active, full size.
+
+    ELEVATED    (70th–90th)    : Above-average volatility.
+                                 All signals valid, 80% size, wider SL.
+                                 Slightly higher confirmation threshold.
+
+    EXTREME     (>90th pctile) : Explosive move in progress.
+                                 VWAP-deviation drives direction bias:
+                                   price far above VWAP → SHORT mean-revert
+                                   price far below VWAP → LONG  mean-revert
+                                 50% size, 1.5× ATR SL buffer, +1 confirm tick.
+    """
+    COMPRESSED = "COMPRESSED"
+    TRENDING   = "TRENDING"
+    ELEVATED   = "ELEVATED"
+    EXTREME    = "EXTREME"
+
+
+@dataclass
+class RegimeResult:
+    """
+    All regime-driven trading parameters in one immutable snapshot.
+    Created once per evaluate_entry() call and passed through to _enter_trade().
+    """
+    mode:            RegimeMode
+    pctile:          float       # 0.0–1.0   raw ATR percentile rank
+    atr_zscore:      float       # z-score of current ATR vs history (signed)
+    size_scalar:     float       # multiply raw position size by this (0–1]
+    sl_atr_mult:     float       # override SL ATR multiplier for this regime
+    entry_threshold: float       # composite signal must exceed this (both dirs)
+    extra_confirms:  int         # additional confirm ticks beyond QCfg.CONFIRM_TICKS()
+    direction_bias:  str         # "any" | "long_only" | "short_only"
+    note:            str         # human-readable reason string
+
+    def __str__(self) -> str:
+        return (
+            f"Regime={self.mode.value}({self.pctile:.0%}) "
+            f"z={self.atr_zscore:+.2f} "
+            f"size={self.size_scalar:.0%} "
+            f"SLmult={self.sl_atr_mult:.1f}× "
+            f"thr={self.entry_threshold:.2f} "
+            f"bias={self.direction_bias}"
+        )
 
 
 @dataclass
@@ -983,16 +1130,6 @@ class QuantStrategy:
     def _compute_signals(self, data_manager,
                          bypass_regime: bool = False) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
-
-        # Always fetch enough 5m candles to satisfy MIN_5M_BARS (60) AND seed the
-        # ATR history (ATR_PCTILE_WINDOW + ATR_PERIOD + 3 = 247).  The ATREngine
-        # self-gates on candle timestamp (FIX-11), so it will skip recomputing the
-        # ATR on ticks where no new candle has closed — there is no performance
-        # penalty from fetching the full window every tick.
-        #
-        # BUG (was): limit=3 after seeding satisfied the ATR engine but always
-        # failed the MIN_5M_BARS guard (3 < 60), causing _compute_signals() to
-        # return None on every tick after the first, silently halting all entries.
         _5m_seed_limit = QCfg.ATR_PCTILE_WINDOW() + QCfg.ATR_PERIOD() + 3
         candles_5m = data_manager.get_candles("5m", limit=_5m_seed_limit)
 
@@ -1009,41 +1146,57 @@ class QuantStrategy:
         if atr_5m < 1e-10:
             return None
 
-        if not bypass_regime and not self._atr_5m.is_regime_valid():
-            pct = self._atr_5m.get_percentile()
-            now_t = time.time()
-            pct_rounded = round(pct, 2)
-            if (now_t - self._last_regime_log >= self._regime_log_interval
-                    or abs(pct_rounded - self._last_regime_pct) >= 0.05):
-                self._last_regime_log = now_t
-                self._last_regime_pct = pct_rounded
-                logger.info(
-                    f"⏸ Regime gated — ATR(5m) pctile={pct:.0%} "
-                    f"[valid: {QCfg.ATR_MIN_PCTILE():.0%}–{QCfg.ATR_MAX_PCTILE():.0%}] "
-                    f"hist_len={len(list(self._atr_5m._atr_hist))}"
-                )
-            return None
-
         price = data_manager.get_last_price()
         if price < 1.0:
             return None
 
-        self._cvd.update(candles_1m)                       # FIX-02/03
-        self._vwap.update(candles_1m, atr_1m)              # FIX-04/05
-        self._mom.update(candles_1m, candles_5m,           # FIX-01/25
-                         atr_1m, atr_5m)
-        self._squeeze.update(candles_1m, atr_1m)           # FIX-06/07/27
-        self._volflow.update(candles_1m)                    # FIX-08/28
+        # ── ALWAYS compute all engines — regime is a MODULATOR not a kill-switch ──
+        # FIX: Previous code returned None here when regime was "invalid", meaning
+        # CVD/VWAP/MOM/SQUEEZE/VOL were NEVER updated in high-vol environments.
+        # The bot was completely blind in the most obvious trending markets.
+        # Now all indicators run on every tick; _evaluate_entry() decides whether
+        # to act based on the regime result embedded in the SignalBreakdown.
+        self._cvd.update(candles_1m)
+        self._vwap.update(candles_1m, atr_1m)
+        self._mom.update(candles_1m, candles_5m, atr_1m, atr_5m)
+        self._squeeze.update(candles_1m, atr_1m)
+        self._volflow.update(candles_1m)
 
-        sig = SignalAggregator.compute(                     # FIX-23
+        vwap_sig = self._vwap.get_signal(price)
+
+        sig = SignalAggregator.compute(
             self._cvd.get_signal(),
-            self._vwap.get_signal(price),
+            vwap_sig,
             self._mom.get_signal(),
             self._squeeze.get_signal(),
             self._volflow.get_signal(),
             self._atr_5m,
+            vwap_signal_for_regime=vwap_sig,   # regime direction bias from VWAP
         )
         self._last_sig = sig
+
+        # Regime-aware logging (replaces the old binary "regime gated" spam)
+        regime = sig.regime
+        if regime and not bypass_regime:
+            now_t = time.time()
+            pct_rounded = round(regime.pctile, 2)
+            if (now_t - self._last_regime_log >= self._regime_log_interval
+                    or abs(pct_rounded - self._last_regime_pct) >= 0.05):
+                self._last_regime_log = now_t
+                self._last_regime_pct = pct_rounded
+                # Only log COMPRESSED as "gated" — all others are valid trading modes
+                if regime.mode == RegimeMode.COMPRESSED:
+                    logger.info(
+                        f"⏸ Regime COMPRESSED — ATR(5m) pctile={regime.pctile:.0%} "
+                        f"z={regime.atr_zscore:+.2f} — waiting for vol expansion"
+                    )
+                else:
+                    logger.debug(
+                        f"📊 Regime={regime.mode.value} pctile={regime.pctile:.0%} "
+                        f"z={regime.atr_zscore:+.2f} bias={regime.direction_bias} "
+                        f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}"
+                    )
+
         logger.debug(f"Signal: {sig}")
         return sig
 
@@ -1113,13 +1266,22 @@ class QuantStrategy:
             next_move = "👀 Watching — signal below entry threshold"
 
         # Regime
+        regime   = sig.regime
         in_trade = self._pos.phase == PositionPhase.ACTIVE
-        if sig.regime_ok:
-            regime_str = f"VALID ({sig.atr_pct:.0%} pctile)"
-        elif in_trade:
-            regime_str = f"BYPASSED ({sig.atr_pct:.0%} pctile — entry gated, management active)"
+        if regime:
+            emoji_map = {"COMPRESSED":"🟡","TRENDING":"🟢","ELEVATED":"🟠","EXTREME":"🔴"}
+            em = emoji_map.get(regime.mode.value, "⚪")
+            if in_trade:
+                regime_str = f"{em} {regime.mode.value} ({regime.pctile:.0%}) — bypassed (in position)"
+            else:
+                regime_str = (
+                    f"{em} {regime.mode.value} ({regime.pctile:.0%} pctile "
+                    f"z={regime.atr_zscore:+.2f}) "
+                    f"thr={regime.entry_threshold:.2f} size={regime.size_scalar:.0%} "
+                    f"SLx={regime.sl_atr_mult:.1f}× bias={regime.direction_bias}"
+                )
         else:
-            regime_str = f"GATED ({sig.atr_pct:.0%} pctile — outside [{QCfg.ATR_MIN_PCTILE():.0%},{QCfg.ATR_MAX_PCTILE():.0%}])"
+            regime_str = "unknown"
 
         # Cooldown
         cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
@@ -1373,28 +1535,76 @@ class QuantStrategy:
             self._confirm_long = self._confirm_short = 0
             return
 
-        price = data_manager.get_last_price()
+        price  = data_manager.get_last_price()
+        regime = sig.regime
         self._log_thinking(sig, price, now)
 
+        # ── COMPRESSED regime: only enter on strong squeeze-breakout signal ──
+        # All other regimes proceed to normal entry evaluation below.
+        if regime and regime.mode == RegimeMode.COMPRESSED:
+            if self._squeeze.get_signal() == 0.0:
+                # No active squeeze breakout — stand aside
+                self._confirm_long = self._confirm_short = 0
+                return
+            # Fall through: squeeze is firing, allow entry with regime's tighter params
+
+        # ── Determine per-regime thresholds and direction constraints ─────────
+        if regime:
+            thr_long      = regime.entry_threshold
+            thr_short     = regime.entry_threshold
+            long_allowed  = regime.direction_bias in ("any", "long_only")
+            short_allowed = regime.direction_bias in ("any", "short_only")
+            total_confirms = QCfg.CONFIRM_TICKS() + regime.extra_confirms
+        else:
+            thr_long = thr_short  = QCfg.LONG_THRESHOLD()
+            long_allowed = short_allowed = True
+            total_confirms = QCfg.CONFIRM_TICKS()
+
+        # Log regime when direction is constrained (EXTREME bias active)
+        if regime and regime.mode == RegimeMode.EXTREME:
+            logger.info(
+                f"⚡ Regime {regime.mode.value} — {regime.note} | "
+                f"thr={thr_long:.2f} confirms={total_confirms} "
+                f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}×"
+            )
+
         c = sig.composite
-        if c >= QCfg.LONG_THRESHOLD():
+
+        if c >= thr_long and long_allowed:
             self._confirm_long  += 1;  self._confirm_short  = 0
-        elif c <= -QCfg.SHORT_THRESHOLD():
+        elif c <= -thr_short and short_allowed:
             self._confirm_short += 1;  self._confirm_long   = 0
+        elif c >= thr_long and not long_allowed:
+            # Signal says LONG but regime says short_only: log and reset
+            logger.info(
+                f"⛔ LONG signal ({c:+.3f}) blocked by regime bias "
+                f"({regime.direction_bias if regime else '?'}) — ignoring"
+            )
+            self._confirm_long = self._confirm_short = 0
+            return
+        elif c <= -thr_short and not short_allowed:
+            logger.info(
+                f"⛔ SHORT signal ({c:+.3f}) blocked by regime bias "
+                f"({regime.direction_bias if regime else '?'}) — ignoring"
+            )
+            self._confirm_long = self._confirm_short = 0
+            return
         else:
             self._confirm_long = self._confirm_short = 0
             return
 
-        thresh = QCfg.CONFIRM_TICKS()
-        if self._confirm_long >= thresh:
+        if self._confirm_long >= total_confirms:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig)
-        elif self._confirm_short >= thresh:
+            self._enter_trade(data_manager, order_manager, risk_manager,
+                              "long", sig, regime)
+        elif self._confirm_short >= total_confirms:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
+            self._enter_trade(data_manager, order_manager, risk_manager,
+                              "short", sig, regime)
 
     def _enter_trade(self, data_manager, order_manager,
-                     risk_manager, side: str, sig: SignalBreakdown) -> None:
+                     risk_manager, side: str, sig: SignalBreakdown,
+                     regime: Optional["RegimeResult"] = None) -> None:
         price = data_manager.get_last_price()
         if price < 1.0:
             logger.warning("Entry aborted: no valid price")
@@ -1404,6 +1614,16 @@ class QuantStrategy:
         if atr < 1e-10:
             logger.warning("Entry aborted: ATR not computed")
             return
+
+        # ── Regime-adjusted ATR for SL/TP computation ─────────────────────
+        # In ELEVATED/EXTREME regimes the SL needs more room to breathe.
+        # We scale the ATR seen by _compute_sl_tp(), NOT the price levels directly,
+        # so the full SL/TP pipeline (min%, max%, RR checks) still applies correctly.
+        sl_atr_mult = regime.sl_atr_mult if regime else 1.0
+        atr_for_sltp = atr * sl_atr_mult
+
+        # ── Regime-adjusted position size scalar ──────────────────────────
+        size_scalar = regime.size_scalar if regime else 1.0
 
         # FIX-19: risk gate check before any API calls
         bal_info = risk_manager.get_available_balance()
@@ -1418,11 +1638,19 @@ class QuantStrategy:
             logger.info(f"Entry blocked by risk gate: {reason}")
             return
 
-        qty = self._compute_quantity(risk_manager, price)   # FIX-18
-        if qty is None or qty < QCfg.MIN_QTY():
+        qty_base = self._compute_quantity(risk_manager, price)   # FIX-18
+        if qty_base is None or qty_base < QCfg.MIN_QTY():
             return
 
-        sl_price, tp_price = self._compute_sl_tp(price, side, atr)   # FIX-20/21
+        # Apply regime size scalar (floor at MIN_QTY so we never send 0)
+        qty = max(QCfg.MIN_QTY(),
+                  math.floor(qty_base * size_scalar / QCfg.LOT_STEP()) * QCfg.LOT_STEP())
+        qty = round(qty, 8)
+        if qty < QCfg.MIN_QTY():
+            logger.info(f"Entry aborted: regime-scaled qty {qty} < MIN_QTY")
+            return
+
+        sl_price, tp_price = self._compute_sl_tp(price, side, atr_for_sltp)   # FIX-20/21
         if sl_price is None or tp_price is None:
             return
 
@@ -1436,9 +1664,10 @@ class QuantStrategy:
             logger.info(f"Entry blocked: R:R={rr:.4f} < min={QCfg.MIN_RR_RATIO()}")
             return
 
+        regime_tag = f" [{regime.mode.value} {regime.size_scalar:.0%} sz]" if regime else ""
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | {sig}"
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f}{regime_tag} | {sig}"
         )
 
         # Market order
@@ -1461,7 +1690,7 @@ class QuantStrategy:
         slip = abs(fill_price - price) / price
         if slip > QCfg.SLIPPAGE_TOL():
             logger.info(f"Slippage {slip:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} — recalc SL/TP")
-            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr)
+            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr_for_sltp)  # use regime-adj ATR
             if new_sl is None or new_tp is None:
                 # FIX-12: guard None return — close naked position immediately
                 logger.error("❌ SL/TP recompute after fill returned None — closing position")
@@ -1570,7 +1799,9 @@ class QuantStrategy:
             f"Qty:      {qty} BTC\n"
             f"Margin:   ${initial_risk/QCfg.LEVERAGE():.2f} USDT\n"
             f"Risk:     ${initial_risk:.2f} USDT\n"
-            f"Leverage: {QCfg.LEVERAGE()}x\n\n"
+            f"Leverage: {QCfg.LEVERAGE()}x\n"
+            f"Regime:   {regime.mode.value if regime else 'N/A'} "
+            f"({regime.pctile:.0%} pctile, {regime.size_scalar:.0%} sz)\n\n"
             f"<i>{sig}</i>"
         )
         logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | "
@@ -2132,6 +2363,7 @@ class QuantStrategy:
         return self._winning_trades / self._total_trades if self._total_trades else 0.0
 
     def get_stats(self) -> Dict:
+        regime = self._last_sig.regime if self._last_sig else None
         return {
             "total_trades":    self._total_trades,
             "winning_trades":  self._winning_trades,
@@ -2144,20 +2376,30 @@ class QuantStrategy:
             "atr_5m":          round(self._atr_5m.atr, 2),
             "atr_1m":          round(self._atr_1m.atr, 2),
             "atr_pctile":      f"{self._atr_5m.get_percentile():.0%}",
+            "atr_zscore":      f"{self._atr_5m.get_atr_zscore():+.2f}",
             "regime_ok":       self._atr_5m.is_regime_valid(),
+            "regime_mode":     regime.mode.value if regime else "UNKNOWN",
+            "regime_bias":     regime.direction_bias if regime else "any",
+            "regime_size":     f"{regime.size_scalar:.0%}" if regime else "100%",
         }
 
     def format_status_report(self) -> str:
         """FIX-22: Removed dead pnl_live computation. Shows live position timing."""
         stats = self.get_stats()
         pos   = self._pos
+        regime_emoji = {
+            "COMPRESSED": "🟡", "TRENDING": "🟢",
+            "ELEVATED": "🟠", "EXTREME": "🔴", "UNKNOWN": "⚪",
+        }
+        rm = stats.get("regime_mode", "UNKNOWN")
         lines = [
             "📊 <b>QUANT STRATEGY STATUS</b>",
             "",
             f"Phase:       {stats['current_phase']}",
-            f"Regime:      {'✅ Valid' if stats['regime_ok'] else '🚫 Gated'}",
-            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}  "
-            f"({stats['atr_pctile']} pctile)",
+            f"Regime:      {regime_emoji.get(rm,'⚪')} {rm} "
+            f"({stats['atr_pctile']} pctile  z={stats['atr_zscore']})",
+            f"Bias:        {stats['regime_bias']}  |  Size: {stats['regime_size']}",
+            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}",
             f"Signal:      {stats['last_signal']}",
             "",
             f"Session:     {stats['total_trades']} trades | WR {stats['win_rate']}",

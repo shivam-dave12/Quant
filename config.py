@@ -171,7 +171,7 @@ QUANT_VOL_FLOW_WINDOW       = 10
 # 10g. Regime Filter
 QUANT_ATR_PCTILE_WINDOW     = 230
 QUANT_ATR_MIN_PCTILE        = 0.15
-QUANT_ATR_MAX_PCTILE        = 0.9
+QUANT_ATR_MAX_PCTILE        = 0.90   # FIX: was 1.10 (unreachable — pctile range is 0–1)
 
 # 10h. Timing
 QUANT_MAX_HOLD_SEC          = 1800
