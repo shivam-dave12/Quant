@@ -46,6 +46,7 @@ ORDER HEALTH:
 import time
 import logging
 import threading
+from collections import deque
 from typing import Dict, Optional, Tuple
 from datetime import datetime
 from enum import Enum
@@ -182,7 +183,9 @@ class OrderManager:
 
         self._orders_lock        = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
-        self.order_history: list            = []
+        # Bounded deque — prevents unbounded memory growth in long-running sessions.
+        # 1000 entries covers weeks of trading at the configured daily trade cap.
+        self.order_history: deque = deque(maxlen=1000)
 
         self._rate_window_start = time.time()
         self._rate_window_count = 0
@@ -1069,7 +1072,9 @@ class OrderManager:
 
     def get_recent_order_history(self, limit: int = 20) -> list:
         with self._orders_lock:
-            return list(self.order_history[-limit:])
+            # deque slicing returns a deque; convert to plain list for callers
+            history = list(self.order_history)
+            return history[-limit:]
 
     # ========================================================================
     # OPEN ORDERS QUERY — wraps futures_api.get_open_orders with rate limiting

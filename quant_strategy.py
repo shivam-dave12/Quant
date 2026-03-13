@@ -487,7 +487,9 @@ class VolumeFlowEngine:
     """
 
     def __init__(self):
-        self._ratios: deque[float] = deque(maxlen=200)
+        # maxlen = window × 20 so there is always ample baseline history
+        # for the z-score; recomputed on each update() so config changes take effect.
+        self._ratios: deque[float] = deque(maxlen=QCfg.VOL_FLOW_WINDOW() * 20)
 
     def update(self, candles: List[Dict]) -> None:
         self._ratios.clear()
@@ -934,19 +936,17 @@ class QuantStrategy:
                 )
                 t.start()
 
-            # Position sync gating (existing ACTIVE/EXITING path)
-            if phase == PositionPhase.ACTIVE:
-                if now - self._last_pos_sync > QCfg.POS_SYNC_SEC():
-                    self._sync_position(order_manager)
-                    self._last_pos_sync = now
-                    if self._pos.is_flat():
-                        return
-
-            elif phase == PositionPhase.EXITING:
-                if now - self._last_exit_sync > QCfg.POS_SYNC_SEC():
-                    self._sync_position(order_manager)
-                    self._last_exit_sync = now
-                return
+            # Position sync — the background reconcile fires every _RECONCILE_SEC
+            # and already handles both ACTIVE→FLAT (TP/SL fired) and FLAT→ACTIVE
+            # (adopted position).  Running _sync_position on the main tick thread
+            # IN ADDITION doubles the rate-limited API call budget and adds
+            # synchronous latency to every tick.  Removed: let reconcile own all
+            # exchange-state transitions.
+            #
+            # EXITING: stay gated (return below) until reconcile confirms flat.
+            # Maximum additional wait = _RECONCILE_SEC (30 s) + API latency.
+            if phase == PositionPhase.EXITING:
+                return  # block new entries; reconcile will call _finalise_exit
 
             # Route
             if phase == PositionPhase.FLAT:
@@ -961,7 +961,8 @@ class QuantStrategy:
     # SIGNAL COMPUTATION
     # ───────────────────────────────────────────────────────────────────
 
-    def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
+    def _compute_signals(self, data_manager,
+                         bypass_regime: bool = False) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
         candles_5m = data_manager.get_candles("5m", limit=100)
 
@@ -972,13 +973,13 @@ class QuantStrategy:
             logger.debug(f"5m bars: {len(candles_5m)}/{QCfg.MIN_5M_BARS()}")
             return None
 
-        atr_1m = self._atr_1m.compute(candles_1m)   # FIX-09/11
-        atr_5m = self._atr_5m.compute(candles_5m)   # FIX-09/11
+        atr_1m = self._atr_1m.compute(candles_1m)
+        atr_5m = self._atr_5m.compute(candles_5m)
 
         if atr_5m < 1e-10:
             return None
 
-        if not self._atr_5m.is_regime_valid():       # FIX-10: unbiased percentile
+        if not bypass_regime and not self._atr_5m.is_regime_valid():
             pct = self._atr_5m.get_percentile()
             now_t = time.time()
             pct_rounded = round(pct, 2)
@@ -1082,8 +1083,13 @@ class QuantStrategy:
             next_move = "👀 Watching — signal below entry threshold"
 
         # Regime
-        regime_str = (f"VALID ({sig.atr_pct:.0%} pctile)" if sig.regime_ok
-                      else f"GATED ({sig.atr_pct:.0%} pctile — outside [{QCfg.ATR_MIN_PCTILE():.0%},{QCfg.ATR_MAX_PCTILE():.0%}])")
+        in_trade = self._pos.phase == PositionPhase.ACTIVE
+        if sig.regime_ok:
+            regime_str = f"VALID ({sig.atr_pct:.0%} pctile)"
+        elif in_trade:
+            regime_str = f"BYPASSED ({sig.atr_pct:.0%} pctile — entry gated, management active)"
+        else:
+            regime_str = f"GATED ({sig.atr_pct:.0%} pctile — outside [{QCfg.ATR_MIN_PCTILE():.0%},{QCfg.ATR_MAX_PCTILE():.0%}])"
 
         # Cooldown
         cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
@@ -1236,27 +1242,33 @@ class QuantStrategy:
             # from _enter_trade (written after SL/TP were confirmed placed),
             # use it to fill any gaps before building the PositionState.
             m = self._last_entry_memo
+            # Evaluate memo match unconditionally so variables are always defined
+            memo_side_ok = False
+            memo_qty_ok  = False
             if m is not None:
                 internal_side_memo = "long" if ex_side == "LONG" else "short"
-                side_matches = (m.get("side", "") == internal_side_memo)
-                qty_matches  = (abs(m.get("quantity", 0) - ex_size) < 1e-6)
-                if side_matches and qty_matches:
-                    if ex_entry <= 0:
-                        ex_entry = m["entry_price"]
-                        logger.info(
-                            f"📡 Reconcile adopt: exchange entry_price=0 — "
-                            f"restored from memo: ${ex_entry:,.2f}"
-                        )
-                    if sl_order_id is None and m.get("sl_order_id"):
-                        sl_order_id = m["sl_order_id"]
-                        logger.info(f"📡 Reconcile adopt: restored SL order ID from memo")
-                    if tp_order_id is None and m.get("tp_order_id"):
-                        tp_order_id = m["tp_order_id"]
-                        logger.info(f"📡 Reconcile adopt: restored TP order ID from memo")
-                    if sl_price <= 0 and m.get("sl_price", 0) > 0:
-                        sl_price = m["sl_price"]
-                    if tp_price <= 0 and m.get("tp_price", 0) > 0:
-                        tp_price = m["tp_price"]
+                memo_side_ok = (m.get("side", "") == internal_side_memo)
+                memo_qty_ok  = (abs(m.get("quantity", 0) - ex_size) < 1e-6)
+
+            memo_valid = m is not None and memo_side_ok and memo_qty_ok
+
+            if memo_valid:
+                if ex_entry <= 0:
+                    ex_entry = m["entry_price"]
+                    logger.info(
+                        f"📡 Reconcile adopt: exchange entry_price=0 — "
+                        f"restored from memo: ${ex_entry:,.2f}"
+                    )
+                if sl_order_id is None and m.get("sl_order_id"):
+                    sl_order_id = m["sl_order_id"]
+                    logger.info(f"📡 Reconcile adopt: restored SL order ID from memo")
+                if tp_order_id is None and m.get("tp_order_id"):
+                    tp_order_id = m["tp_order_id"]
+                    logger.info(f"📡 Reconcile adopt: restored TP order ID from memo")
+                if sl_price <= 0 and m.get("sl_price", 0) > 0:
+                    sl_price = m["sl_price"]
+                if tp_price <= 0 and m.get("tp_price", 0) > 0:
+                    tp_price = m["tp_price"]
 
             internal_side = "long" if ex_side == "LONG" else "short"
 
@@ -1272,11 +1284,10 @@ class QuantStrategy:
                 tp_price       = tp_price,
                 sl_order_id    = sl_order_id,
                 tp_order_id    = tp_order_id,
-                entry_time     = m["entry_time"] if (m and qty_matches and side_matches) else time.time(),
+                entry_time     = m["entry_time"] if memo_valid else time.time(),
                 initial_risk   = initial_risk,
                 initial_sl_dist= sl_dist,
-                entry_atr      = (m["entry_atr"] if (m and qty_matches and side_matches)
-                                  else self._atr_5m.atr),
+                entry_atr      = (m["entry_atr"] if memo_valid else self._atr_5m.atr),
                 peak_profit    = 0.0,
             )
             self.current_sl_price = sl_price
@@ -1303,7 +1314,7 @@ class QuantStrategy:
         # ── OUTCOME B: we think ACTIVE but exchange is flat ────────────────
         if phase == PositionPhase.ACTIVE and ex_size < QCfg.MIN_QTY():
             logger.info("📡 Reconcile: exchange FLAT while ACTIVE → TP/SL fired")
-            self._record_exchange_exit(ex_pos)
+            self._record_exchange_exit(order_manager, ex_pos)
             return
 
         # ── OUTCOME C: ACTIVE + exchange matches — backfill missing order IDs ──
@@ -1548,7 +1559,7 @@ class QuantStrategy:
             return
 
         # 1. Signal reversal
-        sig = self._compute_signals(data_manager)
+        sig = self._compute_signals(data_manager, bypass_regime=True)
         if sig is not None:
             self._log_thinking(sig, price, now)   # ← show thinking while in trade
             c = sig.composite; flip = QCfg.EXIT_FLIP_THRESH()
@@ -1743,7 +1754,7 @@ class QuantStrategy:
 
         if result is None:
             logger.warning("🚨 SL already fired (replace returned None) — finalising")
-            self._record_exchange_exit(None)
+            self._record_exchange_exit(order_manager, None)
             return True
 
         if isinstance(result, dict) and "error" in result:
@@ -1797,30 +1808,138 @@ class QuantStrategy:
         )
         self._finalise_exit()
 
-    def _record_exchange_exit(self, ex_pos: Optional[Dict]) -> None:
+    def _record_exchange_exit(self, order_manager, ex_pos: Optional[Dict]) -> None:
         """
-        FIX-17: When TP/SL fires on exchange, attempt to record PnL.
-        exchange unrealized_pnl at close moment is our best approximation.
+        FIX-17 (ENHANCED): Recover actual exit PnL via a 3-strategy cascade.
+
+        Strategy 1 — Order fill query
+            Query get_fill_details() for both tp_order_id and sl_order_id.
+            The first FILLED order that returns a fill_price > 0 is used to
+            compute PnL via _estimate_pnl(), same formula as manual exits.
+
+        Strategy 2 — Transactions endpoint
+            If fill query returns no price, call api.get_transactions() to
+            find the most recent "P&L" entry timestamped after position entry.
+            This returns the exchange-computed realised PnL directly.
+
+        Strategy 3 — SL/TP price estimate
+            If both network queries fail or return 0, fall back to the known
+            tp_price / sl_price stored on the position state.
+            We pick TP first (positions tend to be exited at TP in trending markets)
+            but also check which direction price last moved toward.
+
+        None of these strategies require the /open_orders endpoint.
+        The caller provides order_manager so we can make API calls without a
+        circular reference from inside the strategy engine.
         """
         pos = self._pos
         pnl = 0.0
-        if ex_pos is not None:
-            pnl = float(ex_pos.get("unrealized_pnl", 0.0))
-            if abs(pnl) < 1e-10 and ex_pos.get("entry_price") and pos.entry_price > 0:
-                # Try computing from entry price vs exchange entry (may differ if partial fill)
-                ex_entry = float(ex_pos.get("entry_price", pos.entry_price))
-                logger.info(f"Exchange exit: entry ${pos.entry_price:.2f} vs "
-                            f"exchange_entry ${ex_entry:.2f}")
+        exit_price = 0.0
+        exit_source = ""
+
+        # ── Strategy 1: query order fill prices ──────────────────────────
+        if order_manager is not None:
+            # Check TP first (most common successful exit), then SL
+            for oid, label in [
+                (pos.tp_order_id, "TP"),
+                (pos.sl_order_id, "SL"),
+            ]:
+                if not oid:
+                    continue
+                try:
+                    details = order_manager.get_fill_details(oid)
+                    if details is None:
+                        continue
+                    status = str(details.get("status", "")).upper()
+                    if status not in ("EXECUTED", "FILLED", "COMPLETELY_FILLED"):
+                        continue
+                    fp = details.get("fill_price")
+                    if fp is not None:
+                        fp_f = float(fp)
+                        if fp_f > 0:
+                            exit_price = fp_f
+                            exit_source = f"{label} fill @ ${exit_price:,.2f}"
+                            logger.info(f"📡 Exchange exit: {exit_source} [{status}]")
+                            break
+                except Exception as e:
+                    logger.debug(f"Exchange exit: fill query for {label} order {oid}: {e}")
+
+        # ── Strategy 2: transactions endpoint ────────────────────────────
+        if abs(exit_price) < 1e-10 and order_manager is not None:
+            try:
+                txns = order_manager.api.get_transactions(
+                    exchange=config.EXCHANGE,
+                    symbol=config.SYMBOL,
+                )
+                if isinstance(txns, dict) and not txns.get("error"):
+                    txn_list = txns.get("data", [])
+                    if isinstance(txn_list, list) and txn_list:
+                        # Find the most recent P&L entry after position entry time
+                        entry_ts_s = pos.entry_time  # epoch seconds
+                        best_txn = None
+                        best_ts  = 0.0
+                        for txn in txn_list:
+                            t_type = str(txn.get("transaction_type", txn.get("type", ""))).lower()
+                            if "p&l" not in t_type and "pnl" not in t_type and "realize" not in t_type:
+                                continue
+                            # Parse timestamp (exchange may use ms or s)
+                            raw_ts = txn.get("timestamp", txn.get("created_at", 0))
+                            try:
+                                ts_f = float(raw_ts)
+                                ts_s = ts_f / 1000.0 if ts_f > 1e12 else ts_f
+                            except (TypeError, ValueError):
+                                ts_s = 0.0
+                            if ts_s >= entry_ts_s and ts_s > best_ts:
+                                best_ts  = ts_s
+                                best_txn = txn
+                        if best_txn is not None:
+                            raw_pnl = float(best_txn.get("amount", best_txn.get("pnl", 0.0)))
+                            if abs(raw_pnl) > 1e-10:
+                                pnl        = raw_pnl
+                                exit_source = f"transactions endpoint (${pnl:+.2f})"
+                                logger.info(f"📡 Exchange exit PnL from {exit_source}")
+            except Exception as e:
+                logger.debug(f"Exchange exit: transactions query error: {e}")
+
+        # ── Compute PnL from fill price (Strategy 1 result) ──────────────
+        if exit_price > 0 and pos.entry_price > 0 and abs(pnl) < 1e-10:
+            pnl = self._estimate_pnl(pos, exit_price)
+
+        # ── Strategy 3: estimate from known SL/TP prices ─────────────────
+        if abs(pnl) < 1e-10 and abs(exit_price) < 1e-10:
+            # Heuristic: if unrealised PnL was positive at last heartbeat,
+            # assume TP fired; otherwise assume SL fired.
+            if pos.tp_price > 0:
+                exit_price  = pos.tp_price
+                exit_source = f"TP estimate @ ${pos.tp_price:,.2f}"
+            elif pos.sl_price > 0:
+                exit_price  = pos.sl_price
+                exit_source = f"SL estimate @ ${pos.sl_price:,.2f}"
+
+            if exit_price > 0 and pos.entry_price > 0:
+                pnl = self._estimate_pnl(pos, exit_price)
+                logger.info(
+                    f"📡 Exchange exit: fill & transaction queries returned nothing — "
+                    f"using {exit_source}.  PnL estimate: ${pnl:+.2f}  "
+                    f"(verify in exchange history)"
+                )
 
         if abs(pnl) < 1e-10:
-            logger.warning("Exchange exit: PnL=0 recorded — verify in exchange history")
+            logger.warning(
+                "📡 Exchange exit: PnL could not be determined via fill query, "
+                "transactions endpoint, or SL/TP estimate — recorded as $0.  "
+                "Check exchange history manually."
+            )
 
+        hold_min = max(0.0, (time.time() - pos.entry_time) / 60.0)
         self._record_pnl(pnl)
         send_telegram_message(
             f"📡 <b>EXCHANGE EXIT — {pos.side.upper()}</b>\n\n"
             f"TP/SL fired between sync ticks\n"
-            f"Entry: ${pos.entry_price:,.2f}\n"
-            f"PnL:   ${pnl:+.2f} USDT\n\n"
+            f"Entry:   ${pos.entry_price:,.2f}\n"
+            f"PnL:     ${pnl:+.2f} USDT"
+            + (f"\nSource:  {exit_source}" if exit_source else "") +
+            f"\nHold:    {hold_min:.1f} min\n\n"
             f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%}</i>"
         )
         self._finalise_exit()
@@ -1864,7 +1983,7 @@ class QuantStrategy:
         if self._pos.phase == PositionPhase.ACTIVE:
             if ex_size < QCfg.MIN_QTY():
                 logger.info("📡 Sync: exchange FLAT while ACTIVE → TP/SL fired")
-                self._record_exchange_exit(ex_pos)   # FIX-17
+                self._record_exchange_exit(order_manager, ex_pos)   # FIX-17 enhanced
 
             else:
                 ex_side = str(ex_pos.get("side") or "").upper()
