@@ -687,6 +687,8 @@ class PositionState:
     trail_active:    bool                  = False
     last_trail_time: float                 = 0.0
     entry_signal:    Optional[SignalBreakdown] = None
+    peak_profit:     float                 = 0.0   # max favourable excursion (price pts)
+    entry_atr:       float                 = 0.0   # 5m ATR at the moment of entry
 
     def is_active(self) -> bool: return self.phase == PositionPhase.ACTIVE
     def is_flat(self)   -> bool: return self.phase == PositionPhase.FLAT
@@ -1136,6 +1138,8 @@ class QuantStrategy:
                 entry_time     = time.time(),   # unknown — use now
                 initial_risk   = 0.0,
                 initial_sl_dist= abs(ex_entry - sl_price) if sl_price > 0 else 0.0,
+                entry_atr      = self._atr_5m.atr,   # best available at adoption time
+                peak_profit    = 0.0,
             )
             self.current_sl_price = sl_price
             self.current_tp_price = tp_price
@@ -1356,6 +1360,8 @@ class QuantStrategy:
             initial_risk    = initial_risk,
             initial_sl_dist = sl_dist_filled,
             entry_signal    = sig,
+            entry_atr       = self._atr_5m.atr,   # snapshot ATR for vol-ratio trail
+            peak_profit     = 0.0,
         )
         self.current_sl_price = sl_price
         self.current_tp_price = tp_price
@@ -1391,13 +1397,7 @@ class QuantStrategy:
             logger.debug("Stale price — skip management tick")
             return
 
-        # 1. Max hold time
-        if now - pos.entry_time > QCfg.MAX_HOLD_SEC():
-            logger.info(f"⏰ Max hold exceeded — exiting")
-            self._exit_trade(order_manager, price, "max_hold_time")
-            return
-
-        # 2. Signal reversal
+        # 1. Signal reversal
         sig = self._compute_signals(data_manager)
         if sig is not None:
             self._log_thinking(sig, price, now)   # ← show thinking while in trade
@@ -1409,46 +1409,181 @@ class QuantStrategy:
                 logger.info(f"🔄 Alpha flip LONG  ({c:+.3f} ≥ +{flip}) → exit SHORT")
                 self._exit_trade(order_manager, price, "signal_reversal");  return
 
-        # 3. Trailing SL
+        # 2. Institutional trailing SL (no hard timer — time-decay tightening instead)
         if QCfg.TRAIL_ENABLED():
             if now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
                 self._pos.last_trail_time = now
-                closed = self._update_trailing_sl(order_manager, price)
+                closed = self._update_trailing_sl(
+                    order_manager, data_manager, price, sig, now
+                )
                 if closed:
                     return
 
-    def _update_trailing_sl(self, order_manager, price: float) -> bool:
+    def _find_swing_sl(self, data_manager, side: str, atr: float) -> Optional[float]:
         """
-        Ratchet trailing SL.  Returns True if position was detected as already closed.
-        FIX-15: replace_stop_loss returning None means SL already fired.
+        Return a structural SL level from the last N closed 5m candles.
+          SHORT → SL just above the highest recent high  (+0.25×ATR buffer)
+          LONG  → SL just below the lowest recent low   (−0.25×ATR buffer)
+
+        Returns None if not enough data.
+        """
+        try:
+            candles = data_manager.get_candles("5m", limit=9)
+        except Exception:
+            return None
+        if not candles or len(candles) < 4:
+            return None
+        # Exclude the still-forming candle at the end; use last 6 closed bars
+        closed = candles[:-1][-6:]
+        buffer = 0.25 * atr
+        if side == "short":
+            return max(float(c['h']) for c in closed) + buffer
+        else:
+            return min(float(c['l']) for c in closed) - buffer
+
+    def _update_trailing_sl(
+        self,
+        order_manager,
+        data_manager,
+        price:  float,
+        sig:    Optional[SignalBreakdown],
+        now:    float,
+    ) -> bool:
+        """
+        Institutional multi-layer trailing SL.  No hard time-based exit.
+
+        Layer 1 — Peak profit (MFE) tracking
+          Continuously records the maximum favourable excursion so tier
+          transitions are based on best-reached profit, not current.
+
+        Layer 2 — Profit-tier gating  (keyed on profit / initial_sl_dist)
+          < 0.5R  → below activation threshold — hold original SL
+          0.5–1R  → Tier 1: move SL to breakeven (no loss possible)
+          1–1.5R  → Tier 2: lock in a small profit cushion (0.35×ATR)
+          ≥ 1.5R  → Tier 3: full ATR trail + swing structure — tightest wins
+
+        Layer 3 — Signal-conviction scaling
+          The composite score for the position's direction maps to a
+          trail-distance multiplier: full conviction → 1.0×, fading → 0.55×.
+          Weakening alpha automatically tightens the leash.
+
+        Layer 4 — ATR volatility ratio
+          Current ATR / entry ATR.  If vol has contracted since entry the
+          trail tightens; if vol has expanded it gets a bit more room (capped 1.3×).
+
+        Layer 5 — Time-decay tightening
+          Instead of a hard kill at MAX_HOLD_SEC, the trail distance shrinks
+          linearly from 1.0× → 0.55× over the configured hold horizon.
+          A trending trade continuously pushes MFE → the ratcheted SL stays
+          safely behind it.  A stalling trade gets caught as the leash shortens.
+
+        Layer 6 — Swing structure reference
+          The tightest of (ATR trail, recent swing high/low + buffer) is chosen
+          so the SL always respects market structure.
+
+        Returns True if the position was detected as already closed.
         """
         pos = self._pos
         atr = self._atr_5m.atr
         if atr < 1e-10:
             return False
 
-        profit   = (price - pos.entry_price) if pos.side == "long" \
-                   else (pos.entry_price - price)
-        activate = pos.initial_sl_dist * QCfg.TRAIL_ACTIVATE_R()
-        if profit < activate:
+        # ── Layer 1: track MFE ───────────────────────────────────────────
+        profit = (pos.entry_price - price) if pos.side == "short" \
+                 else (price - pos.entry_price)
+        if profit > pos.peak_profit:
+            pos.peak_profit = profit
+
+        # ── Layer 2: profit tier (use peak_profit so tier never retreats) ─
+        init_dist = pos.initial_sl_dist
+        tier = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+
+        if tier < 0.5:
+            # Haven't earned management yet — hold original SL
             return False
 
-        trail_dist = QCfg.TRAIL_ATR_MULT() * atr
-        min_move   = QCfg.TRAIL_MIN_MOVE_ATR() * atr
+        # ── Layer 3: signal conviction multiplier ────────────────────────
+        # Maps [0, full_conviction] onto [0.55, 1.0]
+        if sig is not None:
+            raw = sig.composite
+            if pos.side == "short":
+                strength = min(abs(min(raw, 0.0)) / 0.65, 1.0)
+            else:
+                strength = min(abs(max(raw, 0.0)) / 0.65, 1.0)
+        else:
+            strength = 0.5                          # no data → neutral
+        signal_mult = 0.55 + 0.45 * strength        # [0.55, 1.0]
 
-        if pos.side == "long":
-            new_sl = price - trail_dist
-            if new_sl <= pos.sl_price + min_move:
+        # ── Layer 4: ATR volatility ratio ────────────────────────────────
+        entry_atr = pos.entry_atr if pos.entry_atr > 1e-10 else atr
+        atr_ratio = max(0.60, min(atr / entry_atr, 1.30))   # [0.60, 1.30]
+
+        # ── Layer 5: time-decay tightening ───────────────────────────────
+        hold_ratio = min((now - pos.entry_time) / QCfg.MAX_HOLD_SEC(), 1.0)
+        time_mult  = 1.0 - 0.45 * hold_ratio        # 1.0 → 0.55
+
+        # ── Combined ATR trail distance ───────────────────────────────────
+        base_mult  = QCfg.TRAIL_ATR_MULT()           # config default 1.0×
+        trail_dist = base_mult * atr * signal_mult * atr_ratio * time_mult
+
+        # ── Layer 6: swing structure ─────────────────────────────────────
+        swing_sl = self._find_swing_sl(data_manager, pos.side, atr)
+
+        # ── Determine candidate SL by tier ───────────────────────────────
+        if pos.side == "short":
+            if tier < 1.0:
+                # Tier 1: breakeven — SL fractionally above entry
+                new_sl = pos.entry_price + 0.10 * atr
+            elif tier < 1.5:
+                # Tier 2: lock partial profit — SL below entry
+                new_sl = pos.entry_price - 0.35 * atr
+            else:
+                # Tier 3: ATR trail + swing — tighter of the two wins
+                atr_trail_sl = price + trail_dist
+                new_sl = atr_trail_sl
+                if swing_sl is not None:
+                    new_sl = min(new_sl, swing_sl)  # lower = tighter for short
+
+        else:  # long
+            if tier < 1.0:
+                new_sl = pos.entry_price - 0.10 * atr
+            elif tier < 1.5:
+                new_sl = pos.entry_price + 0.35 * atr
+            else:
+                atr_trail_sl = price - trail_dist
+                new_sl = atr_trail_sl
+                if swing_sl is not None:
+                    new_sl = max(new_sl, swing_sl)  # higher = tighter for long
+
+        # ── Ratchet: SL may only improve (never widen) ───────────────────
+        new_sl_tick = _round_to_tick(new_sl)
+        min_move    = QCfg.TRAIL_MIN_MOVE_ATR() * atr
+
+        if pos.side == "short":
+            # Improvement = SL moves DOWN (away from price, toward tighter)
+            if new_sl_tick >= pos.sl_price - min_move:
                 return False
         else:
-            new_sl = price + trail_dist
-            if new_sl >= pos.sl_price - min_move:
+            # Improvement = SL moves UP
+            if new_sl_tick <= pos.sl_price + min_move:
                 return False
 
-        new_sl_tick = _round_to_tick(new_sl)  # FIX-21
-        exit_side   = "sell" if pos.side == "long" else "buy"
-        logger.info(f"🔒 Trail SL: ${pos.sl_price:,.1f} → ${new_sl_tick:,.1f}")
+        # ── Log with context ─────────────────────────────────────────────
+        tier_label = (
+            "🟡 BE"          if tier < 1.0  else
+            "🟠 Partial"     if tier < 1.5  else
+            "🟢 Full trail"
+        )
+        hold_min = (now - pos.entry_time) / 60.0
+        logger.info(
+            f"🔒 Trail [{tier_label}] "
+            f"${pos.sl_price:,.1f} → ${new_sl_tick:,.1f} "
+            f"| R={tier:.1f}  MFE={pos.peak_profit:.1f}pts  hold={hold_min:.0f}m "
+            f"| sig={signal_mult:.2f}× vol={atr_ratio:.2f}× time={time_mult:.2f}×"
+        )
 
+        # ── Replace SL on exchange ────────────────────────────────────────
+        exit_side = "sell" if pos.side == "long" else "buy"
         result = order_manager.replace_stop_loss(
             existing_sl_order_id = pos.sl_order_id,
             side                 = exit_side,
@@ -1456,7 +1591,6 @@ class QuantStrategy:
             new_trigger_price    = new_sl_tick,
         )
 
-        # FIX-15: None = SL already fired between ticks
         if result is None:
             logger.warning("🚨 SL already fired (replace returned None) — finalising")
             self._record_exchange_exit(None)
@@ -1472,7 +1606,9 @@ class QuantStrategy:
             self.current_sl_price = new_sl_tick
             if not pos.trail_active:
                 self._pos.trail_active = True
-                logger.info("✅ Trailing SL activated")
+                logger.info(
+                    "✅ Trailing SL active — time-decay tightening replaces hard timer"
+                )
 
         return False
 
