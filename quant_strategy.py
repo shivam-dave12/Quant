@@ -182,7 +182,7 @@ class QCfg:
     @staticmethod
     def ATR_PCTILE_WINDOW()-> int:  return int(_cfg("QUANT_ATR_PCTILE_WINDOW", 100))
     @staticmethod
-    def ATR_MIN_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE",  0.15))
+    def ATR_MIN_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE",  0.08))
     @staticmethod
     def ATR_MAX_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MAX_PCTILE",  0.90))
 
@@ -833,6 +833,10 @@ class QuantStrategy:
         self._last_think_log  = 0.0
         self._think_interval  = 30.0   # seconds between thinking prints
 
+        # Regime gate log — rate-limited so it doesn't spam every 5s tick
+        self._last_regime_log      = 0.0
+        self._regime_log_interval  = 60.0   # at most once per minute
+        self._last_regime_pct      = -1.0   # detect pctile changes worth logging
         # Reconciliation — rate-gate for the exchange API call
         # _reconcile_pending: a background thread is running a reconcile query
         # _reconcile_data:    result dict from the most recent completed query
@@ -966,11 +970,17 @@ class QuantStrategy:
 
         if not self._atr_5m.is_regime_valid():       # FIX-10: unbiased percentile
             pct = self._atr_5m.get_percentile()
-            logger.info(
-                f"⏸ Regime gated — ATR(5m) pctile={pct:.0%} "
-                f"[valid: {QCfg.ATR_MIN_PCTILE():.0%}–{QCfg.ATR_MAX_PCTILE():.0%}] "
-                f"hist_len={len(list(self._atr_5m._atr_hist))}"
-            )
+            now_t = time.time()
+            pct_rounded = round(pct, 2)
+            if (now_t - self._last_regime_log >= self._regime_log_interval
+                    or abs(pct_rounded - self._last_regime_pct) >= 0.05):
+                self._last_regime_log = now_t
+                self._last_regime_pct = pct_rounded
+                logger.info(
+                    f"⏸ Regime gated — ATR(5m) pctile={pct:.0%} "
+                    f"[valid: {QCfg.ATR_MIN_PCTILE():.0%}–{QCfg.ATR_MAX_PCTILE():.0%}] "
+                    f"hist_len={len(list(self._atr_5m._atr_hist))}"
+                )
             return None
 
         price = data_manager.get_last_price()
