@@ -292,11 +292,22 @@ class VWAPEngine:
         self._std      = 0.0
         self._slope    = 0.0
         self._history: deque[float] = deque(maxlen=QCfg.VWAP_SLOPE_BARS() * 3)
+        self._last_bars_used = 0  # tracks actual window used (for logging)
+
+    # Minimum viable bars for a meaningful VWAP — below this, signal = 0.0
+    _MIN_BARS = 50
 
     def update(self, candles: List[Dict], atr: float) -> None:
-        window = QCfg.VWAP_WINDOW()
-        if len(candles) < window:
+        # FIX: Graceful degradation — use whatever bars are available down to
+        # _MIN_BARS. The old hard-gate `if len < window: return` caused VWAP
+        # to silently return 0.000 for the entire warmup period when VWAP_WINDOW
+        # (200) exceeded the 1m warmup fetch (99 candles), breaking composite
+        # weighting and disabling direction bias for the first ~100 minutes.
+        available = len(candles)
+        if available < self._MIN_BARS:
             return
+        window = min(QCfg.VWAP_WINDOW(), available)
+        self._last_bars_used = window
 
         recent = candles[-window:]
 
@@ -337,6 +348,10 @@ class VWAPEngine:
     def vwap(self) -> float: return self._vwap
     @property
     def vwap_std(self) -> float: return self._std
+    @property
+    def is_degraded(self) -> bool:
+        """True if running on fewer bars than the configured window."""
+        return 0 < self._last_bars_used < QCfg.VWAP_WINDOW()
 
 
 class MomentumEngine:
@@ -1316,8 +1331,11 @@ class QuantStrategy:
         cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
         cd_str = f"{cooldown_rem:.0f}s" if cooldown_rem > 0 else "ready"
 
+        vwap_warn = (f"  ⚠ VWAP degraded ({self._vwap._last_bars_used}/"
+                     f"{QCfg.VWAP_WINDOW()}b)"
+                     if self._vwap.is_degraded else "")
         lines = [
-            f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f} ─────────────────",
+            f"┌─── 🧠 BOT THINKING  price=${price:,.2f}  ATR(5m)=${sig.atr:.2f}{vwap_warn} ─────────────────",
             fmt("CVD",  sig.cvd),
             fmt("VWAP", sig.vwap),
             fmt("MOM",  sig.mom),

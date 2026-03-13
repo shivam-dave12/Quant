@@ -220,7 +220,8 @@ class ICTDataManager:
             # This eliminates the race condition where WS candle arrives to an
             # empty deque and gets falsely logged as "CLOSED".
             logger.info("Warming up candles from REST API...")
-            self._warmup_from_klines_1m()
+            _warmup_1m_limit = int(getattr(config, "WARMUP_1M_CANDLES", 250))
+            self._warmup_from_klines_1m(limit=_warmup_1m_limit)
             time.sleep(3.5)   # respect CoinSwitch 3s hard limit
             self._warmup_from_klines_5m()
             time.sleep(3.5)
