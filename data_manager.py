@@ -932,6 +932,27 @@ class ICTDataManager:
             return True   # never received a price yet — don't restart prematurely
         return (time.time() - self._last_price_update_time) < max_stale_seconds
 
+    def get_orderbook(self) -> Dict:
+        """
+        Return the current orderbook snapshot for microstructure analysis.
+        Returns: {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}
+        Thread-safe copy.
+        """
+        with self._lock:
+            return {
+                "bids": list(self._orderbook.get("bids", [])),
+                "asks": list(self._orderbook.get("asks", [])),
+            }
+
+    def get_recent_trades_raw(self) -> List[Dict]:
+        """
+        Return recent trades for tick flow analysis.
+        Each trade: {"price": float, "quantity": float, "side": str, "timestamp": float}
+        Thread-safe copy of the last 200 trades.
+        """
+        with self._lock:
+            return list(self._recent_trades)[-200:]
+
     def get_recent_candles(self, timeframe: str = "1m", limit: int = 50) -> List[Candle]:
         with self._lock:
             if timeframe == "1m":

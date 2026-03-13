@@ -1,7 +1,7 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot — Institutional Multi-Factor Momentum + Order Flow
+Quant Bot v3 — Institutional Multi-Factor Momentum + Order Flow
 """
 
 import os
@@ -45,10 +45,10 @@ RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 400
 MAX_DAILY_LOSS_PCT      = 5.0
 MAX_DRAWDOWN_PCT        = 15.0
-MAX_CONSECUTIVE_LOSSES  = 3
-MAX_DAILY_TRADES        = 8
+MAX_CONSECUTIVE_LOSSES  = 4
+MAX_DAILY_TRADES        = 14
 ONE_POSITION_AT_A_TIME  = True
-MIN_TIME_BETWEEN_TRADES = 10
+MIN_TIME_BETWEEN_TRADES = 5
 TRADE_COOLDOWN_SECONDS  = 600
 MIN_RISK_REWARD_RATIO   = 1.5
 TARGET_RISK_REWARD_RATIO= 2.5
@@ -91,7 +91,7 @@ HEALTH_CHECK_INTERVAL_SEC          = 12.0
 PRICE_STALE_SECONDS                = 90.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
-ENTRY_EVALUATION_INTERVAL_SECONDS  = 5
+ENTRY_EVALUATION_INTERVAL_SECONDS  = 1
 ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS
 
 # ─────────────────────────────────────────────
@@ -117,19 +117,19 @@ REQUEST_TIMEOUT          = 30
 # SL INFRASTRUCTURE (shared with order_manager.py)
 # ─────────────────────────────────────────────
 SL_BUFFER_TICKS              = 5
-MIN_SL_DISTANCE_PCT          = 0.004
-MAX_SL_DISTANCE_PCT          = 0.03
+MIN_SL_DISTANCE_PCT          = 0.003
+MAX_SL_DISTANCE_PCT          = 0.035
 SL_MIN_IMPROVEMENT_PCT       = 0.001
 SL_RATCHET_ONLY              = True
 SL_ATR_PERIOD                = 14
 SL_ATR_BUFFER_MULT           = 0.75
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
-SL_MIN_IMPROVEMENT_ATR_MULT  = 0.1
-TRAILING_SL_CHECK_INTERVAL   = 30
+SL_MIN_IMPROVEMENT_ATR_MULT  = 0.08
+TRAILING_SL_CHECK_INTERVAL   = 15
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
 # ═══════════════════════════════════════════════════════════════════
-# 10. QUANT STRATEGY PARAMETERS
+# 10. QUANT STRATEGY PARAMETERS v3 — INSTITUTIONAL GRADE
 #     All read live by QCfg static methods — no restart needed.
 # ═══════════════════════════════════════════════════════════════════
 
@@ -137,20 +137,20 @@ TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 QUANT_MARGIN_PCT            = 0.20
 QUANT_SLIPPAGE_TOLERANCE    = 0.0005
 
-# 10b. Signal Thresholds
-QUANT_LONG_THRESHOLD        = 0.55
-QUANT_SHORT_THRESHOLD       = 0.55
-QUANT_EXIT_FLIP             = 0.30
-QUANT_CONFIRM_TICKS         = 2
+# 10b. Signal Thresholds — ADAPTIVE (base values, dynamic logic adjusts)
+QUANT_LONG_THRESHOLD        = 0.40
+QUANT_SHORT_THRESHOLD       = 0.40
+QUANT_EXIT_FLIP             = 0.22
+QUANT_CONFIRM_TICKS         = 1
 
 # 10c. ATR / SL / TP
-QUANT_SL_ATR_MULT           = 1.5
+QUANT_SL_ATR_MULT           = 1.4
 QUANT_TP_ATR_MULT           = 2.5
 
-# 10d. Trailing SL
+# 10d. Trailing SL — aggressive
 QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_ACTIVATE_R      = 1.0
-QUANT_TRAIL_ATR_MULT        = 1.0
+QUANT_TRAIL_ACTIVATE_R      = 0.5
+QUANT_TRAIL_ATR_MULT        = 0.9
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -163,36 +163,61 @@ QUANT_EMA_SIGNAL_BARS       = 5
 QUANT_BB_WINDOW             = 20
 QUANT_BB_STD                = 2.0
 QUANT_KC_ATR_MULT           = 1.5
-QUANT_SQUEEZE_BREAKOUT_BARS = 5
+QUANT_SQUEEZE_BREAKOUT_BARS = 8
 QUANT_VOL_FLOW_WINDOW       = 10
 
-# 10f. Minimum Data (MIN_CANDLES_1M / 5M shared above, >= required values)
-
-# 10g. Regime Filter
+# 10g. Regime Filter — WIDE GATE (let the signal quality decide)
 QUANT_ATR_PCTILE_WINDOW     = 100
-QUANT_ATR_MIN_PCTILE        = 0.15
-QUANT_ATR_MAX_PCTILE        = 0.90
+QUANT_ATR_MIN_PCTILE        = 0.05
+QUANT_ATR_MAX_PCTILE        = 0.97
 
-# 10h. Timing
-QUANT_MAX_HOLD_SEC          = 1800
-QUANT_COOLDOWN_SEC          = 60
+# 10h. Timing — FAST for quant-style execution
+QUANT_MAX_HOLD_SEC          = 2400
+QUANT_COOLDOWN_SEC          = 20
 QUANT_POS_SYNC_SEC          = 30
 
-# 10i. Risk Limits (MAX_DAILY_TRADES/LOSSES/LOSS_PCT shared above)
-
 # 10j. Signal Weights — must sum to 1.0
-QUANT_W_CVD                 = 0.30
-QUANT_W_VWAP                = 0.25
-QUANT_W_MOM                 = 0.25
-QUANT_W_SQUEEZE             = 0.10
-QUANT_W_VOL                 = 0.10
+#      When a signal returns 0.0 (inactive), its weight is
+#      dynamically redistributed to active signals.
+QUANT_W_CVD                 = 0.22
+QUANT_W_VWAP                = 0.18
+QUANT_W_MOM                 = 0.22
+QUANT_W_SQUEEZE             = 0.06
+QUANT_W_VOL                 = 0.06
+QUANT_W_ORDERBOOK           = 0.14
+QUANT_W_TICK_FLOW           = 0.12
 # Sum = 1.00
+
+# 10k. Multi-Timeframe Trend Filter
+QUANT_HTF_ENABLED           = True
+QUANT_HTF_VETO_STRENGTH     = 0.65
+QUANT_HTF_BOOST             = 0.12
+
+# 10l. Adaptive Threshold
+QUANT_AGREEMENT_DISCOUNT    = 0.07
+QUANT_MIN_AGREE_SIGNALS     = 3
+QUANT_STRONG_SIGNAL_LEVEL   = 0.35
+
+# 10m. Orderbook Imbalance
+QUANT_OB_DEPTH_LEVELS       = 5
+QUANT_OB_HIST_LEN           = 60
+
+# 10n. Tick Flow Aggregation
+QUANT_TICK_AGG_WINDOW_SEC   = 30.0
+QUANT_TICK_SURGE_MULT       = 2.5
+
+# 10o. Momentum Divergence
+QUANT_PRICE_MOM_LOOKBACK    = 12
+QUANT_DIVERGENCE_THRESHOLD  = 0.3
 
 # ─────────────────────────────────────────────────────────────────
 # TUNING GUIDE (all live — no restart needed):
-#   More selective entries  → QUANT_LONG_THRESHOLD  = 0.65
+#   More selective entries  → QUANT_LONG_THRESHOLD  = 0.55
 #   Tighter SL              → QUANT_SL_ATR_MULT     = 1.0
 #   Swing mode              → QUANT_MAX_HOLD_SEC     = 3600
-#   More order-flow weight  → QUANT_W_CVD            = 0.40
-#   Require confirmation    → QUANT_CONFIRM_TICKS    = 3
+#   More order-flow weight  → QUANT_W_CVD            = 0.35
+#   Require confirmation    → QUANT_CONFIRM_TICKS    = 2
+#   Wider regime gate       → QUANT_ATR_MIN_PCTILE   = 0.03
+#   Lower threshold when    → QUANT_AGREEMENT_DISCOUNT = 0.10
+#     multiple signals align
 # ─────────────────────────────────────────────────────────────────
