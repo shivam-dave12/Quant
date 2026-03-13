@@ -167,7 +167,8 @@ class QuantBot:
                 f"SL/TP:    {QCfg.SL_ATR_MULT()}×ATR / {QCfg.TP_ATR_MULT()}×ATR\n"
                 f"Min R:R:  {QCfg.MIN_RR_RATIO()}\n\n"
                 f"<i>Weights: CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} "
-                f"MOM={QCfg.W_MOM()} SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()}</i>"
+                f"MOM={QCfg.W_MOM()} SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()} "
+                f"OB={QCfg.W_ORDERBOOK()} TF={QCfg.W_TICK_FLOW()}</i>"
             )
 
             logger.info("🚀 QUANT BOT RUNNING")

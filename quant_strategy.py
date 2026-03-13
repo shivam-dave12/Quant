@@ -972,6 +972,11 @@ class SignalBreakdown:
     n_agreeing: int  = 0
     threshold_used: float = 0.0
 
+    @property
+    def regime_ok(self) -> bool:
+        """Backward compatibility with v2 consumers (telegram_bot_controller, etc.)."""
+        return self.regime_penalty >= 0.5
+
     def __str__(self) -> str:
         return (
             f"CVD={self.cvd:+.3f} VWAP={self.vwap:+.3f} "
@@ -1265,6 +1270,9 @@ class QuantStrategy:
         self._last_think_log = 0.0
         self._think_interval = 30.0
 
+        # Trade dedup guard — prevents re-feeding same trades every tick
+        self._last_fed_trade_ts = 0.0
+
         # Reconciliation
         self._last_reconcile_time = 0.0
         self._RECONCILE_SEC = 30.0
@@ -1375,7 +1383,7 @@ class QuantStrategy:
     def _feed_microstructure(self, data_manager) -> None:
         """Feed orderbook and tick data into microstructure engines."""
         try:
-            # Orderbook
+            # Orderbook — always update (snapshot, not incremental)
             ob = data_manager.get_orderbook()
             price = data_manager.get_last_price()
             if ob and price > 1.0:
@@ -1384,19 +1392,23 @@ class QuantStrategy:
             pass
 
         try:
-            # Tick flow — get recent trades and feed them
+            # Tick flow — only feed NEW trades (dedup guard)
             trades = data_manager.get_recent_trades_raw()
-            now = time.time()
+            cutoff_ts = self._last_fed_trade_ts
+            max_ts = cutoff_ts
             for t in trades:
                 ts = t.get("timestamp", 0.0)
-                # Only feed trades within the aggregation window
-                if now - ts <= QCfg.TICK_AGG_WINDOW_SEC() * 1.5:
+                if ts > cutoff_ts:
                     self._tick_eng.on_trade(
                         price=t.get("price", 0.0),
                         qty=t.get("quantity", 0.0),
                         is_buyer=(t.get("side") == "buy"),
                         ts=ts,
                     )
+                    if ts > max_ts:
+                        max_ts = ts
+            if max_ts > cutoff_ts:
+                self._last_fed_trade_ts = max_ts
             self._tick_eng.compute_signal()
         except Exception:
             pass

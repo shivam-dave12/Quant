@@ -287,7 +287,7 @@ class TelegramBotController:
             return f"Status error: {e}"
 
     def _cmd_signal(self) -> str:
-        """Live breakdown of all 5 alpha engines."""
+        """Live breakdown of all 7 alpha engines."""
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
@@ -305,15 +305,14 @@ class TelegramBotController:
                 return ("+" if v >= 0 else "-") + "█" * n + "░" * (15 - n)
 
             from quant_strategy import QCfg
-            lt = QCfg.LONG_THRESHOLD()
-            st = QCfg.SHORT_THRESHOLD()
+            thr = sig.threshold_used if sig.threshold_used > 0 else QCfg.LONG_THRESHOLD()
 
-            if sig.composite >= lt:
-                action = f"✅ LONG SIGNAL  ({sig.composite:+.4f} ≥ {lt})"
-            elif sig.composite <= -st:
-                action = f"✅ SHORT SIGNAL ({sig.composite:+.4f} ≤ -{st})"
+            if sig.composite >= thr:
+                action = f"✅ LONG SIGNAL  ({sig.composite:+.4f} ≥ {thr:.3f})"
+            elif sig.composite <= -thr:
+                action = f"✅ SHORT SIGNAL ({sig.composite:+.4f} ≤ -{thr:.3f})"
             else:
-                need = min(lt - sig.composite, st + sig.composite)
+                need = min(thr - sig.composite, thr + sig.composite)
                 action = f"⏸  NEUTRAL — need {need:.3f} more to fire"
 
             # Trailing status
@@ -324,7 +323,7 @@ class TelegramBotController:
                 pos_line = f"\n\nTrailing SL: {trail}"
 
             msg = (
-                f"<b>⚡ Signal Breakdown @ ${price:,.2f}</b>\n"
+                f"<b>⚡ v3 Signal @ ${price:,.2f}</b>\n"
                 f"{'─' * 32}\n"
                 f"CVD  (order flow)   W={QCfg.W_CVD():.0%}\n"
                 f"  {bar(sig.cvd)}  {sig.cvd:+.4f}\n\n"
@@ -335,13 +334,18 @@ class TelegramBotController:
                 f"SQZ  (KC squeeze)   W={QCfg.W_SQUEEZE():.0%}\n"
                 f"  {bar(sig.squeeze)}  {sig.squeeze:+.4f}\n\n"
                 f"VFL  (volume flow)  W={QCfg.W_VOL():.0%}\n"
-                f"  {bar(sig.vol)}  {sig.vol:+.4f}\n"
+                f"  {bar(sig.vol)}  {sig.vol:+.4f}\n\n"
+                f"OB   (orderbook)    W={QCfg.W_ORDERBOOK():.0%}\n"
+                f"  {bar(sig.orderbook)}  {sig.orderbook:+.4f}\n\n"
+                f"TICK (trade flow)   W={QCfg.W_TICK_FLOW():.0%}\n"
+                f"  {bar(sig.tick_flow)}  {sig.tick_flow:+.4f}\n"
                 f"{'─' * 32}\n"
                 f"COMPOSITE: {sig.composite:+.4f}\n"
                 f"  {bar(sig.composite)}\n\n"
                 f"{action}\n\n"
-                f"ATR 5m: ${sig.atr:.1f}  ({sig.atr_pct:.0%} pctile)\n"
-                f"Regime: {'✅ Valid' if sig.regime_ok else '🚫 Gated'}"
+                f"Agreeing: {sig.n_agreeing}/7 | Threshold: {thr:.3f}\n"
+                f"HTF: ×{sig.htf_mult:.2f} | Regime: ×{sig.regime_penalty:.2f}\n"
+                f"ATR 5m: ${sig.atr:.1f}  ({sig.atr_pct:.0%} pctile)"
                 f"{pos_line}"
             )
             return msg
@@ -505,7 +509,17 @@ class TelegramBotController:
                 "",
                 "<b>Signal Weights</b>",
                 f"CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} MOM={QCfg.W_MOM()} "
-                f"SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()}",
+                f"SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()}\n"
+                f"OB={QCfg.W_ORDERBOOK()} TICK={QCfg.W_TICK_FLOW()}",
+                "",
+                "<b>HTF Trend Filter</b>",
+                f"Enabled:       {QCfg.HTF_ENABLED()}",
+                f"Veto strength: {QCfg.HTF_VETO_STRENGTH()}",
+                f"Align boost:   {QCfg.HTF_BOOST()}",
+                "",
+                "<b>Adaptive Threshold</b>",
+                f"Agree discount: {QCfg.AGREEMENT_DISCOUNT()} per signal",
+                f"Min agreeing:   {QCfg.MIN_AGREE_SIGNALS()}",
                 "",
                 "<b>Timing</b>",
                 f"Max hold:      {QCfg.MAX_HOLD_SEC()//60} min",
@@ -586,7 +600,10 @@ class TelegramBotController:
                 "  max_daily_trades          (e.g. 6)\n"
                 "  max_consecutive_losses    (e.g. 2)\n"
                 "  max_daily_loss_pct        (e.g. 3.0)\n"
-                "  quant_w_cvd / _vwap / _mom / _squeeze / _vol"
+                "  quant_w_cvd / _vwap / _mom / _squeeze / _vol\n"
+                "  quant_w_orderbook / _tick_flow\n"
+                "  quant_htf_enabled / _veto_strength / _boost\n"
+                "  quant_agreement_discount / _min_agree_signals"
             )
 
         parts   = args.split(None, 1)
@@ -617,6 +634,13 @@ class TelegramBotController:
             "quant_w_mom":             ("QUANT_W_MOM",            float),
             "quant_w_squeeze":         ("QUANT_W_SQUEEZE",        float),
             "quant_w_vol":             ("QUANT_W_VOL",            float),
+            "quant_w_orderbook":       ("QUANT_W_ORDERBOOK",      float),
+            "quant_w_tick_flow":       ("QUANT_W_TICK_FLOW",      float),
+            "quant_htf_enabled":       ("QUANT_HTF_ENABLED",      bool),
+            "quant_htf_veto_strength": ("QUANT_HTF_VETO_STRENGTH",float),
+            "quant_htf_boost":         ("QUANT_HTF_BOOST",        float),
+            "quant_agreement_discount":("QUANT_AGREEMENT_DISCOUNT",float),
+            "quant_min_agree_signals": ("QUANT_MIN_AGREE_SIGNALS", int),
         }
 
         if key not in allowed:
@@ -636,8 +660,8 @@ class TelegramBotController:
         # Safety bounds
         bounds = {
             "QUANT_MARGIN_PCT":        (0.05, 0.50),
-            "QUANT_LONG_THRESHOLD":    (0.30, 0.90),
-            "QUANT_SHORT_THRESHOLD":   (0.30, 0.90),
+            "QUANT_LONG_THRESHOLD":    (0.15, 0.90),
+            "QUANT_SHORT_THRESHOLD":   (0.15, 0.90),
             "QUANT_EXIT_FLIP":         (0.10, 0.70),
             "QUANT_SL_ATR_MULT":       (0.50, 5.00),
             "QUANT_TP_ATR_MULT":       (0.50, 10.0),
@@ -651,7 +675,8 @@ class TelegramBotController:
 
         # Warn if signal weights will no longer sum to 1.0
         weight_attrs = {"QUANT_W_CVD","QUANT_W_VWAP","QUANT_W_MOM",
-                        "QUANT_W_SQUEEZE","QUANT_W_VOL"}
+                        "QUANT_W_SQUEEZE","QUANT_W_VOL",
+                        "QUANT_W_ORDERBOOK","QUANT_W_TICK_FLOW"}
         if attr_name in weight_attrs:
             cur = {a: getattr(cfg, a, 0) for a in weight_attrs}
             cur[attr_name] = new_val
@@ -661,7 +686,8 @@ class TelegramBotController:
                     f"⚠️ Weight sum would be {total:.3f} ≠ 1.0\n"
                     f"Adjust other weights so they sum to 1.0.\n"
                     f"Current: CVD={cfg.QUANT_W_CVD} VWAP={cfg.QUANT_W_VWAP} "
-                    f"MOM={cfg.QUANT_W_MOM} SQZ={cfg.QUANT_W_SQUEEZE} VFL={cfg.QUANT_W_VOL}"
+                    f"MOM={cfg.QUANT_W_MOM} SQZ={cfg.QUANT_W_SQUEEZE} VFL={cfg.QUANT_W_VOL}\n"
+                    f"OB={cfg.QUANT_W_ORDERBOOK} TICK={cfg.QUANT_W_TICK_FLOW}"
                 )
 
         old_val = getattr(cfg, attr_name, "?")
