@@ -155,7 +155,9 @@ QUANT_TRAIL_ATR_MULT        = 1.0
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
 QUANT_CVD_HIST_MULT         = 15
-QUANT_VWAP_WINDOW           = 50
+QUANT_VWAP_WINDOW           = 200   # FIX: was 50 (50 min on 1m) — too narrow; captures
+                                    # the entire crash/pump in EXTREME regimes, inflating
+                                    # std and diluting z-score. 200 bars ≈ 3.3h anchor.
 QUANT_VWAP_SLOPE_BARS       = 8
 QUANT_EMA_FAST              = 8
 QUANT_EMA_SLOW              = 21

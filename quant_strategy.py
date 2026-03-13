@@ -1229,24 +1229,49 @@ class QuantStrategy:
             arrow = "▲" if v > 0.05 else ("▼" if v < -0.05 else "─")
             return f"  {label:<6} {bar(v)} {arrow} {v:+.3f}"
 
-        lt = QCfg.LONG_THRESHOLD()
-        st = QCfg.SHORT_THRESHOLD()
-        c  = sig.composite
+        regime = sig.regime
 
-        # Determine overall lean
-        if c >= lt:
-            lean = f"BULLISH  ✅  ({c:+.3f} ≥ +{lt})"
-        elif c <= -st:
-            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{st})"
-        elif c >= lt * 0.7:
-            lean = f"weakly bullish  ({c:+.3f}, need ≥{lt:.2f})"
-        elif c <= -st * 0.7:
-            lean = f"weakly bearish  ({c:+.3f}, need ≤{-st:.2f})"
+        # ── Use regime-adjusted thresholds (not raw config) ─────────────────
+        # In EXTREME regime the threshold is 0.65, in COMPRESSED 0.68, etc.
+        # Using the base 0.55 here makes "Lean" and "Next move" misleading.
+        if regime and not (self._pos.phase == PositionPhase.ACTIVE):
+            lt = regime.entry_threshold
+            st = regime.entry_threshold
+            long_allowed_think  = regime.direction_bias in ("any", "long_only")
+            short_allowed_think = regime.direction_bias in ("any", "short_only")
+            need = QCfg.CONFIRM_TICKS() + regime.extra_confirms
         else:
-            lean = f"NEUTRAL  🔇  ({c:+.3f})"
+            lt = QCfg.LONG_THRESHOLD()
+            st = QCfg.SHORT_THRESHOLD()
+            long_allowed_think  = True
+            short_allowed_think = True
+            need = QCfg.CONFIRM_TICKS()
 
-        # Confirmation progress
-        need = QCfg.CONFIRM_TICKS()
+        c = sig.composite
+
+        # Determine overall lean (vs regime-adjusted threshold)
+        if c >= lt and long_allowed_think:
+            lean = f"BULLISH  ✅  ({c:+.3f} ≥ +{lt:.2f})"
+        elif c <= -st and short_allowed_think:
+            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{st:.2f})"
+        elif not long_allowed_think and c >= lt:
+            lean = f"BULLISH but BLOCKED — bias={regime.direction_bias}"
+        elif not short_allowed_think and c <= -st:
+            lean = f"BEARISH but BLOCKED — bias={regime.direction_bias}"
+        elif c >= lt * 0.75:
+            lean = f"approaching LONG  ({c:+.3f}, need ≥{lt:.2f})"
+        elif c <= -st * 0.75:
+            lean = f"approaching SHORT ({c:+.3f}, need ≤{-st:.2f})"
+        else:
+            # Show distance to nearest valid threshold
+            if long_allowed_think and not short_allowed_think:
+                gap = lt - c
+                lean = f"LONG only — gap {gap:.3f} to trigger (+{lt:.2f})"
+            elif short_allowed_think and not long_allowed_think:
+                gap = c - (-st)
+                lean = f"SHORT only — gap {abs(gap):.3f} to trigger (-{st:.2f})"
+            else:
+                lean = f"NEUTRAL  🔇  ({c:+.3f})"
         if self._confirm_long > 0:
             conf_str = f"LONG confirms: {self._confirm_long}/{need}"
         elif self._confirm_short > 0:
@@ -1254,19 +1279,23 @@ class QuantStrategy:
         else:
             conf_str = "No confirmation building"
 
-        # Next action
-        if c >= lt and self._confirm_long >= need - 1:
+        # Next action — regime-aware: use adjusted thresholds and direction bias
+        if c >= lt and long_allowed_think and self._confirm_long >= need - 1:
             next_move = "⚡ ENTRY LONG — next tick fires if signal holds"
-        elif c <= -st and self._confirm_short >= need - 1:
+        elif c <= -st and short_allowed_think and self._confirm_short >= need - 1:
             next_move = "⚡ ENTRY SHORT — next tick fires if signal holds"
-        elif c >= lt or c <= -st:
+        elif (c >= lt and long_allowed_think) or (c <= -st and short_allowed_think):
             remaining = need - max(self._confirm_long, self._confirm_short)
             next_move = f"🕐 Building confirmation — {remaining} tick(s) remaining"
+        elif regime and regime.direction_bias != "any":
+            if long_allowed_think:
+                next_move = f"🔍 Awaiting LONG setup — composite needs +{lt - c:.3f} more"
+            else:
+                next_move = f"🔍 Awaiting SHORT setup — composite needs {c - (-st):.3f} lower"
         else:
             next_move = "👀 Watching — signal below entry threshold"
 
-        # Regime
-        regime   = sig.regime
+        # Regime display (regime variable already set above for threshold calc)
         in_trade = self._pos.phase == PositionPhase.ACTIVE
         if regime:
             emoji_map = {"COMPRESSED":"🟡","TRENDING":"🟢","ELEVATED":"🟠","EXTREME":"🔴"}
@@ -1560,13 +1589,21 @@ class QuantStrategy:
             long_allowed = short_allowed = True
             total_confirms = QCfg.CONFIRM_TICKS()
 
-        # Log regime when direction is constrained (EXTREME bias active)
-        if regime and regime.mode == RegimeMode.EXTREME:
-            logger.info(
-                f"⚡ Regime {regime.mode.value} — {regime.note} | "
-                f"thr={thr_long:.2f} confirms={total_confirms} "
-                f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}×"
-            )
+        # Log regime state at most once per _regime_log_interval (shared gate)
+        # Prevents the "⚡ Regime EXTREME" line from spamming every 5-second tick.
+        if regime and regime.mode in (RegimeMode.ELEVATED, RegimeMode.EXTREME):
+            now_log = time.time()
+            pct_r   = round(regime.pctile, 2)
+            if (now_log - self._last_regime_log >= self._regime_log_interval
+                    or abs(pct_r - self._last_regime_pct) >= 0.05):
+                self._last_regime_log = now_log
+                self._last_regime_pct = pct_r
+                em = {"ELEVATED": "🟠", "EXTREME": "🔴"}.get(regime.mode.value, "")
+                logger.info(
+                    f"{em} Regime {regime.mode.value} — {regime.note} | "
+                    f"thr={thr_long:.2f} confirms={total_confirms} "
+                    f"size={regime.size_scalar:.0%} SLx={regime.sl_atr_mult:.1f}×"
+                )
 
         c = sig.composite
 
