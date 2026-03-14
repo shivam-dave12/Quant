@@ -881,14 +881,13 @@ class OrderManager:
         """
         Compute a 0..1 urgency score for use in MakerTakerDecision.decide().
 
-        Logic:
-          - If price is moving AWAY from the entry zone rapidly (deviation growing),
-            urgency is HIGH → take market (don't risk missing the setup)
-          - If price is stalling or slowly expanding, urgency is LOW → post maker
+        BUG 11 FIX (v4.3): Direction logic was inverted for mean-reversion.
 
-        Two components combined:
-          1. Momentum: (price change per tick) / ATR as a fraction
-          2. Extension: how far past the entry threshold are we?
+        For mean-reversion, we're fading an overextension from VWAP:
+          - Price moving TOWARD VWAP = window CLOSING = HIGH urgency (take market)
+          - Price moving AWAY from VWAP = opportunity GROWING = LOW urgency (post limit)
+
+        Old code had this backwards, causing taker entries on the best setups.
 
         Returns: float in [0.0, 1.0]
         """
@@ -899,23 +898,29 @@ class OrderManager:
         delta    = abs(price_now - price_prev)
         momentum = min(1.0, delta / (atr * 0.5))
 
-        # Direction: is price moving toward or away from VWAP?
+        # Direction: is price moving TOWARD or AWAY from VWAP?
+        # FIX: For LONG reversion (price below VWAP):
+        #   Rising price = reverting toward VWAP = URGENT (window closing)
+        #   Falling price = extending further = PATIENT (opportunity growing)
+        # For SHORT reversion (price above VWAP):
+        #   Falling price = reverting toward VWAP = URGENT
+        #   Rising price = extending further = PATIENT
         if side == "long":
-            direction_factor = 1.0 if price_now < price_prev else -0.3
-        else:
             direction_factor = 1.0 if price_now > price_prev else -0.3
+        else:
+            direction_factor = 1.0 if price_now < price_prev else -0.3
 
         momentum_urgency = max(0.0, min(1.0, momentum * direction_factor))
 
-        # Extension component: how far past threshold are we?
+        # Extension component: deeper past threshold = calmer (more room)
         dev_abs   = abs(vwap_dev_atr)
         threshold = entry_threshold_atr
         if dev_abs <= threshold:
-            extension_urgency = 0.8   # right at threshold — fragile
+            extension_urgency = 0.8   # right at threshold — fragile, act fast
         elif dev_abs <= threshold * 1.5:
             extension_urgency = 0.3   # good zone, be patient
         else:
-            extension_urgency = 0.45  # very overextended
+            extension_urgency = 0.15  # very overextended — very patient
 
         urgency = 0.65 * momentum_urgency + 0.35 * extension_urgency
         return round(min(1.0, max(0.0, urgency)), 3)

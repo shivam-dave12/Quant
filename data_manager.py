@@ -274,14 +274,30 @@ class ICTDataManager:
             logger.error(f"Error stopping ICTDataManager: {e}")
 
     def restart_streams(self) -> bool:
-        """Restart WebSocket with state preservation"""
+        """Restart WebSocket with state preservation.
+        
+        BUG 2 FIX (v4.3): After successful restart, notify strategy to reset
+        all engine timestamps (CVD, ATR, ADX). Without this, engines retain
+        stale _last_bar_ts values and silently skip all REST warmup candles,
+        leaving signals at zero/stale after reconnect.
+        """
         try:
             logger.warning("Restarting streams (will re-warmup)")
             self._warmup_complete = False
             self._forming_ts.clear()
             self.stop()
             time.sleep(2.0)
-            return self.start()
+            success = self.start()
+            
+            # FIX BUG 2: Reset strategy engine timestamps after warmup
+            if success and self._strategy_ref is not None:
+                try:
+                    self._strategy_ref.on_stream_restart()
+                    logger.info("✅ Strategy engines reset after stream restart")
+                except Exception as e:
+                    logger.warning(f"Strategy reset notification failed (non-fatal): {e}")
+            
+            return success
         except Exception as e:
             logger.error(f"Error restarting ICTDataManager: {e}", exc_info=True)
             return False

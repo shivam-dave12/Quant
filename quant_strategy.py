@@ -254,6 +254,11 @@ class CVDEngine:
         self._deltas: deque = deque(maxlen=QCfg.CVD_WINDOW() * QCfg.CVD_HIST_MULT())
         self._last_bar_ts: int = 0
 
+    def reset_state(self):
+        """Reset timestamps so warmup data is reprocessed after stream restart."""
+        self._last_bar_ts = 0
+        self._deltas.clear()
+
     def update(self, candles: List[Dict]) -> None:
         if not candles: return
         new_start = 0
@@ -392,7 +397,10 @@ class VolumeExhaustionEngine:
     def compute(self, candles: List[Dict]) -> float:
         if len(candles) < 20: return 0.0
         recent = candles[-10:]; earlier = candles[-20:-10]
-        pc = float(recent[-1]['c']) - float(earlier[0]['c'])
+        # v4.3 Bug 4 fix: use average close of each window instead of single endpoints
+        avg_recent = sum(float(c['c']) for c in recent) / len(recent)
+        avg_earlier = sum(float(c['c']) for c in earlier) / len(earlier)
+        pc = avg_recent - avg_earlier
         pd = 1.0 if pc > 0 else -1.0
         rv = sum(float(c['v']) for c in recent); ev = sum(float(c['v']) for c in earlier)
         if ev < 1e-10: return 0.0
@@ -430,6 +438,11 @@ class ADXEngine:
         self._smoothed_tr       = 0.0
         self._seeded            = False
         self._last_ts           = -1
+
+    def reset_state(self):
+        """Force full re-seed after stream restart."""
+        self._seeded = False
+        self._last_ts = -1
 
     def compute(self, candles: List[Dict]) -> float:
         if len(candles) < 2: return self._adx
@@ -1275,17 +1288,25 @@ class InstitutionalLevels:
                 if valid_highs:
                     candidates.append(min(valid_highs) + micro_buf)
 
-        # ── Phase-2 floor: structure-guided breakeven ─────────────────────────
+        # ── Phase-2 floor: fee-aware breakeven ────────────────────────────
+        # v4.3 TRAIL FIX: Old code moved SL to entry + 0.02×ATR which is
+        # BELOW the actual breakeven after fees. Result: every BE hit was a loss.
+        # Fix: compute actual fee-inclusive breakeven and use that as floor.
         if tier < QCfg.TRAIL_LOCK_R():
-            # Phase-2: only move SL to breakeven zone; block Phase-3 mechanisms
-            # Ensure at least one BE candidate is present
-            be = entry_price + (0.02 * atr if pos_side == "long" else -0.02 * atr)
-            candidates.append(be)
-            # Filter: must not exceed breakeven (no locking-in profit in Phase-2)
+            # Actual breakeven = entry + round-trip fees (per unit of price)
+            rt_fee_pct = QCfg.COMMISSION_RATE() * 2.0  # taker both legs (conservative)
+            fee_distance = entry_price * rt_fee_pct     # $ needed above/below entry to cover fees
+            fee_buffer = fee_distance + 0.10 * atr      # add small structural buffer on top
             if pos_side == "long":
-                candidates = [c for c in candidates if c <= be + atr * 0.5]
+                be = entry_price + fee_buffer
             else:
-                candidates = [c for c in candidates if c >= be - atr * 0.5]
+                be = entry_price - fee_buffer
+            candidates.append(be)
+            # Filter: don't lock in more than BE + reasonable margin in Phase-2
+            if pos_side == "long":
+                candidates = [c for c in candidates if c <= be + atr * 0.8]
+            else:
+                candidates = [c for c in candidates if c >= be - atr * 0.8]
 
         # ── Mechanism 3: HVN snap (Phase-3 only) ─────────────────────────────
         if tier >= QCfg.TRAIL_LOCK_R() and len(candles_1m) >= 30:
@@ -1361,6 +1382,13 @@ class ATREngine:
     def __init__(self):
         self._atr = 0.0; self._atr_hist: deque = deque(maxlen=QCfg.ATR_PCTILE_WINDOW())
         self._last_ts = -1; self._seeded = False
+
+    def reset_state(self):
+        """Force full re-seed from next candle batch after stream restart."""
+        self._seeded = False
+        self._last_ts = -1
+        self._atr_hist.clear()
+        self._atr = 0.0
 
     # These are read fresh on each use so config changes take effect immediately.
     # See config.py  ATR_SEED_RETAIN and ATR_PCTILE_RANK_WINDOW for tuning notes.
@@ -1501,6 +1529,8 @@ class PositionState:
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
     trade_mode: str = "reversion"  # "reversion" | "trend"
+    entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
+    trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -1608,6 +1638,56 @@ class QuantStrategy:
     def get_position(self) -> Optional[Dict]:
         with self._lock: return None if self._pos.is_flat() else self._pos.to_dict()
 
+    def on_stream_restart(self):
+        """v4.3 Bug 2 fix: Called by data_manager after restart_streams().
+        Resets all engine timestamps so they reprocess warmup data."""
+        with self._lock:
+            self._cvd.reset_state()
+            self._atr_1m.reset_state()
+            self._atr_5m.reset_state()
+            self._adx.reset_state()
+            logger.info("♻️ Strategy engines reset after stream restart")
+
+    def set_trail_override(self, enabled: Optional[bool]):
+        """v4.3: Telegram command to override trailing SL on/off, even mid-position.
+        None = use config default, True = force on, False = force off."""
+        with self._lock:
+            self._pos.trail_override = enabled
+            if enabled is None:
+                logger.info("Trail override cleared → using config default")
+            else:
+                logger.info(f"Trail override set → {'ENABLED' if enabled else 'DISABLED'}")
+
+    def get_trail_enabled(self) -> bool:
+        """Check if trailing is enabled considering override."""
+        override = self._pos.trail_override
+        if override is not None:
+            return override
+        return QCfg.TRAIL_ENABLED()
+
+    def _spread_atr_gate(self, data_manager) -> tuple:
+        """v4.3 Solution 5: Reject entries when spread cost is too large relative to ATR.
+        During low-liquidity hours, spread widens 3-5x making the cost-to-move ratio untenable."""
+        if self._fee_engine is None:
+            return True, 0.0
+        try:
+            spread_bps = self._fee_engine._spread.median_bps()
+            atr = self._atr_5m.atr
+            price = data_manager.get_last_price()
+            if atr < 1e-10 or price < 1.0:
+                return True, 0.0
+            spread_price = spread_bps / 10_000.0 * price
+            ratio = spread_price / atr
+            max_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO", 0.08))
+            if ratio > max_ratio:
+                logger.info(
+                    f"⛔ Spread/ATR gate: {ratio:.3f} > {max_ratio} "
+                    f"(spread={spread_bps:.1f}bps, ATR=${atr:.1f}) — too expensive")
+                return False, ratio
+            return True, ratio
+        except Exception:
+            return True, 0.0
+
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
         with self._lock:
             now = timestamp_ms / 1000.0; self._om = order_manager
@@ -1674,7 +1754,7 @@ class QuantStrategy:
         if atr_5m < 1e-10: return None
         price = data_manager.get_last_price()
         if price < 1.0: return None
-        self._vwap.update(candles_1m, atr_1m); self._cvd.update(candles_1m)
+        self._vwap.update(candles_1m, atr_5m); self._cvd.update(candles_1m)  # v4.3: was atr_1m — Bug 5 fix
         try:
             c15 = data_manager.get_candles("15m", limit=100); c4h = data_manager.get_candles("4h", limit=50)
             self._htf.update(c15, c4h, atr_5m)
@@ -1685,7 +1765,7 @@ class QuantStrategy:
         regime = self._regime.update(self._adx, self._atr_5m, self._htf)
 
         # ── Mean-reversion signals ────────────────────────────────────────────
-        vs = self._vwap.get_reversion_signal(price, atr_1m)
+        vs = self._vwap.get_reversion_signal(price, atr_5m)  # v4.3: was atr_1m — Bug 5 fix
         cs = self._cvd.get_divergence_signal(candles_1m)
         obs = self._ob_eng.get_signal(); ts = self._tick_eng.get_signal()
         ve = self._vol_exh.compute(candles_1m)
@@ -1707,7 +1787,7 @@ class QuantStrategy:
             composite=comp, atr=atr_5m, atr_pct=self._atr_5m.get_percentile(),
             regime_ok=self._atr_5m.regime_valid(), regime_penalty=self._atr_5m.regime_penalty(),
             htf_veto=self._htf.vetoes_trade(self._vwap.reversion_side(price)),
-            overextended=self._vwap.is_overextended(price, atr_1m),
+            overextended=self._vwap.is_overextended(price, atr_5m),  # v4.3: was atr_1m — Bug 5 fix
             vwap_price=self._vwap.vwap, deviation_atr=self._vwap.deviation_atr,
             reversion_side=self._vwap.reversion_side(price), n_confirming=nc,
             threshold_used=QCfg.COMPOSITE_ENTRY_MIN(),
@@ -1745,6 +1825,11 @@ class QuantStrategy:
         logger.info("\n"+"\n".join(lines))
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
+        # v4.3 Solution 5: Spread cost gate
+        spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
+        if not spread_ok:
+            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0
+            return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
         price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
@@ -2141,6 +2226,7 @@ class QuantStrategy:
             entry_atr       = self._atr_5m.atr,
             entry_vol       = entry_vol,
             trade_mode      = mode,
+            entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -2200,7 +2286,7 @@ class QuantStrategy:
                     logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT")
                     self._exit_trade(order_manager, price, "strong_reversal"); return
 
-        if QCfg.TRAIL_ENABLED() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
+        if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
             if self._update_trailing_sl(order_manager, data_manager, price, now): return
 
@@ -2295,7 +2381,8 @@ class QuantStrategy:
         order_manager.cancel_all_exit_orders(sl_order_id=pos.sl_order_id, tp_order_id=pos.tp_order_id)
         es = "sell" if pos.side=="long" else "buy"
         order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
-        pnl = self._estimate_pnl(pos, price)
+        fill_type = getattr(pos, 'entry_fill_type', 'taker')
+        pnl = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
         self._record_pnl(pnl)
         hm = (time.time()-pos.entry_time)/60
         send_telegram_message(
@@ -2306,35 +2393,36 @@ class QuantStrategy:
         self._last_exit_side = pos.side; self._finalise_exit()
 
     def _record_exchange_exit(self, ex_pos):
-        """PnL FIX: When exchange SL/TP fires, compute PnL from entry vs SL/TP price.
-        unrealized_pnl from API is often 0 because position is already closed."""
+        """v4.3: PnL fix with explicit TP hit detection for short side (Bug 7)
+        and correct fee rate based on entry fill type (Bug 12)."""
         pos = self._pos
         pnl = 0.0
-        # Try to get unrealized_pnl from exchange first
         if ex_pos is not None:
             pnl = float(ex_pos.get("unrealized_pnl", 0.0))
-        # If pnl is 0 (position already closed), calculate from known prices
         if abs(pnl) < 1e-10 and pos.entry_price > 0 and pos.quantity > 0:
-            # Determine likely exit price: if SL was trailed, use SL price as exit
-            # If TP was untouched, check if price was near TP
             exit_price = 0.0
             if self._last_known_price > 1.0:
-                # Check if TP was hit (price crossed TP level)
-                if pos.side == "long" and self._last_known_price >= pos.tp_price > 0:
-                    exit_price = pos.tp_price
-                elif pos.side == "short" and self._last_known_price <= pos.tp_price > 0:
-                    exit_price = pos.tp_price
-                # Check if SL was hit
-                elif pos.side == "long" and self._last_known_price <= pos.sl_price:
-                    exit_price = pos.sl_price
-                elif pos.side == "short" and self._last_known_price >= pos.sl_price:
-                    exit_price = pos.sl_price
-                else:
-                    exit_price = self._last_known_price
+                # v4.3 Bug 7 fix: explicit checks with entry price context
+                if pos.side == "long":
+                    if pos.tp_price > 0 and self._last_known_price >= pos.tp_price:
+                        exit_price = pos.tp_price
+                    elif pos.sl_price > 0 and self._last_known_price <= pos.sl_price:
+                        exit_price = pos.sl_price
+                    else:
+                        exit_price = self._last_known_price
+                else:  # short
+                    if pos.tp_price > 0 and self._last_known_price <= pos.tp_price:
+                        exit_price = pos.tp_price
+                    elif pos.sl_price > 0 and self._last_known_price >= pos.sl_price:
+                        exit_price = pos.sl_price
+                    else:
+                        exit_price = self._last_known_price
             elif pos.sl_price > 0:
-                exit_price = pos.sl_price  # best guess: SL was hit
+                exit_price = pos.sl_price
             if exit_price > 0:
-                pnl = self._estimate_pnl(pos, exit_price)
+                # v4.3 Bug 12 fix: use actual fill type for fee calculation
+                fill_type = getattr(pos, 'entry_fill_type', 'taker')
+                pnl = self._estimate_pnl(pos, exit_price, entry_fill_type=fill_type)
                 logger.info(f"📊 PnL calculated: entry=${pos.entry_price:,.2f} exit=${exit_price:,.2f} → ${pnl:+.2f}")
         self._record_pnl(pnl)
         pnl_icon = "✅" if pnl > 0 else ("❌" if pnl < 0 else "⚪")
@@ -2373,10 +2461,19 @@ class QuantStrategy:
         return qty
 
     @staticmethod
-    def _estimate_pnl(pos, exit_price):
+    def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
+        """v4.3 Bug 12 fix: uses correct fee rate based on actual entry fill type."""
         gross = ((exit_price-pos.entry_price) if pos.side=="long" else (pos.entry_price-exit_price))*pos.quantity
-        fee = (pos.entry_price+exit_price)*pos.quantity*QCfg.COMMISSION_RATE()
-        return gross - fee
+        # Entry fee: maker or taker based on how we actually entered
+        if entry_fill_type == "maker":
+            entry_rate = float(getattr(config, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+        else:
+            entry_rate = QCfg.COMMISSION_RATE()
+        # Exit fee: always taker (SL/TP are market orders)
+        exit_rate = QCfg.COMMISSION_RATE()
+        entry_fee = pos.entry_price * pos.quantity * entry_rate
+        exit_fee = exit_price * pos.quantity * exit_rate
+        return gross - entry_fee - exit_fee
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 

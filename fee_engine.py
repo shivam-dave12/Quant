@@ -208,8 +208,15 @@ class ProfitFloorModel:
             spread_penalty = 1.0
 
         # Signal confidence discount: conf_neutral = neutral, 1.0 = max conviction
+        # BUG 3 FIX: Old formula capped at 15% instead of configured 30%.
+        # Old: (conf - neutral) * disc  → max (1.0 - 0.5) * 0.3 = 0.15
+        # Fix: Normalize (conf - neutral) to [0, 1], then multiply by disc.
         conf_norm = max(0.0, min(1.0, signal_confidence))
-        confidence_discount = 1.0 - max(0.0, (conf_norm - conf_neutral) * conf_max_disc)
+        if conf_norm > conf_neutral and (1.0 - conf_neutral) > 1e-10:
+            conf_excess = (conf_norm - conf_neutral) / (1.0 - conf_neutral)
+            confidence_discount = 1.0 - conf_excess * conf_max_disc
+        else:
+            confidence_discount = 1.0  # no discount below neutral
 
         mult = base_mult * spread_penalty * confidence_discount
         return max(abs_min, mult)

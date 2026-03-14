@@ -1,6 +1,6 @@
 """
-Telegram Bot Controller — Quant Bot
-=====================================
+Telegram Bot Controller — Quant Bot v4.3
+==========================================
 Commands:
   /start      - Start quant bot
   /stop       - Stop quant bot
@@ -11,6 +11,7 @@ Commands:
   /balance    - Wallet balance
   /pause      - Pause new entries (keep managing open position)
   /resume     - Resume trading
+  /trail      - Toggle trailing SL: /trail on | /trail off | /trail auto
   /config     - Show current quant config values
   /set <k> <v>- Live-adjust a config key (no restart needed)
   /killswitch - Emergency: cancel all orders + close position
@@ -118,6 +119,7 @@ class TelegramBotController:
                 {"command": "balance",    "description": "Wallet balance"},
                 {"command": "pause",      "description": "Pause new entries"},
                 {"command": "resume",     "description": "Resume trading"},
+                {"command": "trail",      "description": "Trail SL: /trail on|off|auto"},
                 {"command": "config",     "description": "Show quant config values"},
                 {"command": "set",        "description": "Live-adjust config: /set key value"},
                 {"command": "killswitch", "description": "Emergency: close all"},
@@ -142,7 +144,7 @@ class TelegramBotController:
             cmd   = parts[0].lower()
             args  = parts[1] if len(parts) > 1 else ""
             known = ("start","stop","status","signal","position","trades",
-                     "balance","pause","resume","config","set","killswitch","help")
+                     "balance","pause","resume","trail","config","set","killswitch","help")
             if cmd in known:
                 return f"/{cmd}", args
             return t, ""
@@ -162,6 +164,7 @@ class TelegramBotController:
             elif cmd == "/balance":               return self._cmd_balance()
             elif cmd == "/pause":                 return self._cmd_pause()
             elif cmd == "/resume":                return self._cmd_resume()
+            elif cmd == "/trail":                 return self._cmd_trail(args)
             elif cmd == "/config":                return self._cmd_config()
             elif cmd == "/set":                   return self._cmd_set(args)
             elif cmd == "/killswitch":            return self._cmd_killswitch()
@@ -187,6 +190,7 @@ class TelegramBotController:
             "/balance    — Wallet balance\n"
             "/pause      — Pause new entries\n"
             "/resume     — Resume trading\n"
+            "/trail      — Trailing SL: /trail on | off | auto\n"
             "/config     — Show quant config values\n"
             "/set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
             "/killswitch — Emergency: cancel all + close position\n"
@@ -471,6 +475,87 @@ class TelegramBotController:
         bot_instance.trading_enabled      = True
         bot_instance.trading_pause_reason = ""
         return "Trading RESUMED."
+
+    def _cmd_trail(self, args: str) -> str:
+        """Toggle trailing SL on/off/auto — works even mid-position.
+        
+        /trail on    — Force trailing SL enabled (overrides config)
+        /trail off   — Force trailing SL disabled (overrides config)
+        /trail auto  — Use config.QUANT_TRAIL_ENABLED (default behaviour)
+        /trail       — Show current state
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        if not strat:
+            return "Strategy not ready."
+
+        args = args.strip().lower()
+
+        if args in ("on", "enable", "yes", "true", "1"):
+            strat.set_trail_override(True)
+            return "🔒 Trailing SL <b>FORCE ENABLED</b> — applies immediately to current position."
+
+        elif args in ("off", "disable", "no", "false", "0"):
+            strat.set_trail_override(False)
+            return (
+                "🔓 Trailing SL <b>FORCE DISABLED</b>.\n"
+                "SL stays where it is. TP/SL on exchange still active.\n"
+                "Use /trail on or /trail auto to re-enable."
+            )
+
+        elif args in ("auto", "default", "reset", "config"):
+            strat.set_trail_override(None)
+            from quant_strategy import QCfg
+            current = QCfg.TRAIL_ENABLED()
+            return (
+                f"🔄 Trail override cleared → using config default.\n"
+                f"Config QUANT_TRAIL_ENABLED = <b>{current}</b>\n"
+                f"Change with: /set quant_trail_enabled true/false"
+            )
+
+        else:
+            # Show current state
+            from quant_strategy import QCfg
+            override = strat._pos.trail_override if hasattr(strat._pos, 'trail_override') else None
+            config_val = QCfg.TRAIL_ENABLED()
+            effective = strat.get_trail_enabled()
+            pos = strat.get_position()
+
+            status_lines = [
+                "<b>🔒 Trailing SL Status</b>",
+                "",
+                f"Config default:  <b>{config_val}</b>",
+                f"Override:        <b>{override if override is not None else 'None (using config)'}</b>",
+                f"Effective:       <b>{'ENABLED ✅' if effective else 'DISABLED ❌'}</b>",
+                "",
+                f"Trail BE at:     {QCfg.TRAIL_BE_R()}R",
+                f"Trail Lock at:   {QCfg.TRAIL_LOCK_R()}R",
+                f"Chandelier:      {QCfg.TRAIL_CHANDELIER_N_START()} → {QCfg.TRAIL_CHANDELIER_N_END()} ATR",
+            ]
+
+            if pos:
+                trail_active = strat._pos.trail_active
+                status_lines += [
+                    "",
+                    f"<b>Current position:</b>",
+                    f"Trail active:    {'✅ yes' if trail_active else '⏳ not yet'}",
+                ]
+                if strat._pos.peak_profit > 0 and strat._pos.initial_sl_dist > 1e-10:
+                    tier = strat._pos.peak_profit / strat._pos.initial_sl_dist
+                    status_lines.append(f"Peak R:          {tier:.2f}R")
+            else:
+                status_lines.append("\nNo active position.")
+
+            status_lines += [
+                "",
+                "<b>Commands:</b>",
+                "/trail on   — Force enable",
+                "/trail off  — Force disable",
+                "/trail auto — Use config default",
+            ]
+            return "\n".join(status_lines)
 
     def _cmd_config(self) -> str:
         try:

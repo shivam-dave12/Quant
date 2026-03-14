@@ -1,7 +1,15 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot v3 — Institutional Multi-Factor Momentum + Order Flow
+Quant Bot v4.3 — Institutional Multi-Factor Momentum + Order Flow
+
+CHANGES from v4:
+  - ATR_SEED_RETAIN raised to 35 (Bug 13 fix: was < ATR_PCTILE_RANK_WINDOW)
+  - QUANT_TRAIL_BE_R raised to 1.0 (Trail fix: was 0.4 — too aggressive)
+  - QUANT_TRAIL_LOCK_R raised to 1.5 (Trail fix: was 0.8)
+  - QUANT_TRAIL_CHANDELIER_N_START raised to 3.0 (wider breathing room)
+  - Added QUANT_MAX_SPREAD_ATR_RATIO (Solution 5: time-of-day filter)
+  - Added QUANT_TP_VWAP_FRACTION bumped to 0.65 (wider TP for fee coverage)
 """
 
 import os
@@ -105,8 +113,6 @@ OUTLOOK_INTERVAL_SECONDS     = 900
 # 9. FEES
 # ─────────────────────────────────────────────
 COMMISSION_RATE       = 0.00055
-# Set COMMISSION_RATE_MAKER explicitly if your exchange has maker/taker tiers.
-# Default: 40% of taker rate (typical tiered exchange).
 COMMISSION_RATE_MAKER = COMMISSION_RATE * 0.40
 
 # ─────────────────────────────────────────────
@@ -132,8 +138,7 @@ TRAILING_SL_CHECK_INTERVAL   = 15
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
 # ═══════════════════════════════════════════════════════════════════
-# 10. QUANT STRATEGY PARAMETERS v4 — MEAN-REVERSION + ORDER FLOW
-#     All read live by QCfg static methods — no restart needed.
+# 10. QUANT STRATEGY PARAMETERS v4.3
 # ═══════════════════════════════════════════════════════════════════
 
 # 10a. Sizing
@@ -151,18 +156,21 @@ QUANT_CONFIRM_TICKS         = 2
 # 10c. SL/TP — INSTITUTIONAL LEVEL PLACEMENT
 QUANT_SL_SWING_LOOKBACK     = 12
 QUANT_SL_BUFFER_ATR_MULT    = 0.4
-QUANT_TP_VWAP_FRACTION      = 0.50
-QUANT_VP_BUCKET_COUNT       = 50      # Volume profile resolution (price buckets)
-QUANT_VP_HVN_THRESHOLD      = 0.70    # Top 30% volume = high-volume node
-QUANT_OB_WALL_DEPTH         = 20      # Orderbook levels to scan for walls
-QUANT_OB_WALL_MULT          = 2.5     # Qty > 2.5x avg = wall
-QUANT_TRAIL_SWING_BARS      = 5       # 1m candle lookback for micro-swing trail
-QUANT_TRAIL_VOL_DECAY_MULT  = 0.6     # Tighten trail when vol < 60% of entry vol
+QUANT_TP_VWAP_FRACTION      = 0.65     # v4.3: was 0.50 — wider TP for fee coverage
+QUANT_VP_BUCKET_COUNT       = 50
+QUANT_VP_HVN_THRESHOLD      = 0.70
+QUANT_OB_WALL_DEPTH         = 20
+QUANT_OB_WALL_MULT          = 2.5
+QUANT_TRAIL_SWING_BARS      = 5
+QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 
-# 10d. Trailing SL
+# 10d. Trailing SL — v4.3 OVERHAULED
+#      Old values (v4): BE_R=0.4, LOCK_R=0.8 — too aggressive, killed win rate.
+#      Fix: don't trail until trade has PROVEN itself at 1.0R+.
+#      Only lock profit at 1.5R. Let winners run.
 QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_BE_R            = 0.4
-QUANT_TRAIL_LOCK_R          = 0.8
+QUANT_TRAIL_BE_R            = 1.0      # v4.3: was 0.4 — START trailing only at 1.0R
+QUANT_TRAIL_LOCK_R          = 1.5      # v4.3: was 0.8 — LOCK profit only at 1.5R
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -199,76 +207,67 @@ QUANT_OB_DEPTH_LEVELS       = 5
 QUANT_OB_HIST_LEN           = 60
 QUANT_TICK_AGG_WINDOW_SEC   = 30.0
 
-# 10k. Institutional SL/TP/Trail — new in v4.1
-QUANT_TP_MAX_RR                = 3.5   # cap TP at 3.5:1 (don't chase impossible targets)
-QUANT_SL_SWING_DENSITY_WINDOW  = 0.30  # ATR fraction radius for swing cluster detection
-QUANT_TRAIL_CHANDELIER_N_START = 2.5   # chandelier: initial peak - N×ATR (wide, breathes)
-QUANT_TRAIL_CHANDELIER_N_END   = 1.5   # chandelier: final N after hold time decays (tighter)
-QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55  # HVN volume percentile to trigger lock-in snap
+# 10k. Institutional SL/TP/Trail — v4.3
+QUANT_TP_MAX_RR                = 3.5
+QUANT_SL_SWING_DENSITY_WINDOW  = 0.30
+QUANT_TRAIL_CHANDELIER_N_START = 3.0   # v4.3: was 2.5 — wider breathing room at start
+QUANT_TRAIL_CHANDELIER_N_END   = 1.8   # v4.3: was 1.5 — still tightens but not as aggressively
+QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55
 
 # 10l. Trend-following mode (v4.2)
-#      Activated when market regime is strongly directional.
-#      Reversion mode remains active in ranging/transitioning regimes.
-QUANT_ADX_PERIOD               = 14    # Wilder ADX period (5m candles)
-QUANT_ADX_TREND_THRESH         = 25.0  # ADX above this → trending
-QUANT_ADX_RANGE_THRESH         = 20.0  # ADX below this → ranging
-QUANT_ATR_EXPANSION_THRESH     = 1.30  # current_atr / mean(atr[-20]) above this → expanding
-QUANT_TREND_PULLBACK_ATR_MIN   = 0.10  # price must have pulled at least this much from EMA
-QUANT_TREND_PULLBACK_ATR_MAX   = 2.00  # price must not be deeper than this below/above EMA
-QUANT_TREND_CVD_MIN            = -0.20 # CVD trend bias floor (avoid buying into selling)
-QUANT_TREND_TP_ATR_MULT        = 2.5   # trend TP = entry ± N×ATR (ATR-channel target)
-QUANT_TREND_COMPOSITE_MIN      = 0.35  # min trend entry score
-QUANT_TREND_CONFIRM_TICKS      = 3     # confirmation ticks for trend entries
-QUANT_TREND_CHANDELIER_N       = 1.5   # trail in trend mode tighter (trend reversals are sharp)
+QUANT_ADX_PERIOD               = 14
+QUANT_ADX_TREND_THRESH         = 25.0
+QUANT_ADX_RANGE_THRESH         = 20.0
+QUANT_ATR_EXPANSION_THRESH     = 1.30
+QUANT_TREND_PULLBACK_ATR_MIN   = 0.10
+QUANT_TREND_PULLBACK_ATR_MAX   = 2.00
+QUANT_TREND_CVD_MIN            = -0.20
+QUANT_TREND_TP_ATR_MULT        = 2.5
+QUANT_TREND_COMPOSITE_MIN      = 0.35
+QUANT_TREND_CONFIRM_TICKS      = 3
+QUANT_TREND_CHANDELIER_N       = 1.5
+
+# 10m. Spread/ATR gate — v4.3 (Solution 5)
+QUANT_MAX_SPREAD_ATR_RATIO     = 0.08  # Skip entries when spread > 8% of ATR
 
 # ═══════════════════════════════════════════════════════════════════
-# 11. FEE ENGINE — ExecutionCostEngine, SpreadTracker, SlippageTracker,
-#                  ProfitFloorModel, MakerTakerDecision
-#     All values read live — change here, restart to apply.
+# 11. FEE ENGINE
 # ═══════════════════════════════════════════════════════════════════
 
 # 11a. SpreadTracker
-FEE_SPREAD_HIST_MAXLEN      = 500    # rolling sample window (~8 min at 1 obs/s)
-FEE_SPREAD_DEFAULT_BPS      = 2.0    # fallback spread when < 5 samples collected
+FEE_SPREAD_HIST_MAXLEN      = 500
+FEE_SPREAD_DEFAULT_BPS      = 2.0
 
 # 11b. SlippageTracker
-FEE_SLIP_ALPHA              = 0.25   # EWMA decay (α); ~4-trade half-life
-FEE_SLIP_DEFAULT_BPS        = 1.5    # warm-up slippage before first real fill
-FEE_SLIP_MIN_BPS            = 0.5    # floor on reported slippage (never report 0)
+FEE_SLIP_ALPHA              = 0.25
+FEE_SLIP_DEFAULT_BPS        = 1.5
+FEE_SLIP_MIN_BPS            = 0.5
 
 # 11c. ProfitFloorModel — sigmoid multiplier curve
-#      Multiplier determines how many × the round-trip cost the TP must cover.
-#      High = conservative (requires bigger move); Low = aggressive (smaller move OK).
-FEE_FLOOR_MULT_LOW          = 5.5    # mult at ATR pctile ≤ 0.10 (quiet market, fees dominate)
-FEE_FLOOR_MULT_HIGH         = 1.8    # mult at ATR pctile ≥ 0.85 (fat vol, fees are noise)
-FEE_FLOOR_INFLECT           = 0.45   # ATR percentile at sigmoid midpoint
-FEE_FLOOR_STEEPNESS         = 6.0    # sigmoid steepness (higher = sharper regime transition)
-FEE_FLOOR_ABS_MIN_MULT      = 1.4    # hard floor on multiplier regardless of signal strength
+FEE_FLOOR_MULT_LOW          = 5.5
+FEE_FLOOR_MULT_HIGH         = 1.8
+FEE_FLOOR_INFLECT           = 0.45
+FEE_FLOOR_STEEPNESS         = 6.0
+FEE_FLOOR_ABS_MIN_MULT      = 1.4
 
 # 11d. ProfitFloorModel — spread penalty
-#      Applied when spread/ATR ratio > threshold (expensive market relative to its moves)
-FEE_SPREAD_ATR_WARN         = 0.06   # spread/ATR fraction above which penalty applies (6%)
-FEE_SPREAD_PENALTY_K        = 4.0    # penalty growth rate per unit above threshold
+FEE_SPREAD_ATR_WARN         = 0.06
+FEE_SPREAD_PENALTY_K        = 4.0
 
 # 11e. ProfitFloorModel — signal confidence discount
-#      High-conviction signals earn a slightly lower TP floor (max FEE_CONF_MAX_DISCOUNT)
-FEE_CONF_NEUTRAL            = 0.5    # confidence below this = no discount
-FEE_CONF_MAX_DISCOUNT       = 0.30   # fraction of floor that full-confidence can save (30%)
+FEE_CONF_NEUTRAL            = 0.5
+FEE_CONF_MAX_DISCOUNT       = 0.30
 
 # 11f. MakerTakerDecision
-FEE_MAKER_MIN_SAVING_BPS    = 0.8    # min risk-adjusted saving (bps) to justify posting limit
-FEE_MAKER_URGENCY_CUTOFF    = 0.72   # urgency above this → always take market (time-sensitive)
-FEE_MAKER_DEPTH_LEVELS      = 5      # orderbook levels to aggregate for depth check
-FEE_MAKER_DEPTH_MAX_FRAC    = 0.25   # if order > this fraction of top-N depth → go market
-FEE_MAKER_DEPTH_FILL_FLOOR  = 0.2    # min fill-probability when book depth is unknown/thin
-FEE_MAKER_OPP_COST_WEIGHT   = 0.5    # weight on spread×(1-fill_p) as opportunity cost
+FEE_MAKER_MIN_SAVING_BPS    = 0.8
+FEE_MAKER_URGENCY_CUTOFF    = 0.72
+FEE_MAKER_DEPTH_LEVELS      = 5
+FEE_MAKER_DEPTH_MAX_FRAC    = 0.25
+FEE_MAKER_DEPTH_FILL_FLOOR  = 0.2
+FEE_MAKER_OPP_COST_WEIGHT   = 0.5
 
 # ═══════════════════════════════════════════════════════════════════
 # 12. ATR ENGINE REGIME TUNING
-#     Controls how the ATR percentile is computed and how quickly
-#     it recovers after high-volatility warmup windows.
 # ═══════════════════════════════════════════════════════════════════
-ATR_SEED_RETAIN             = 20     # warmup seed values to keep (rest trimmed to avoid
-                                     # stale high-vol values locking percentile at 0%)
-ATR_PCTILE_RANK_WINDOW      = 30     # bars used for percentile ranking (shorter = faster
-                                     # recovery after regime shift; ~2.5h at 5m cadence)
+ATR_SEED_RETAIN             = 35     # v4.3: was 20 — must be >= ATR_PCTILE_RANK_WINDOW
+ATR_PCTILE_RANK_WINDOW      = 30
