@@ -1406,6 +1406,15 @@ class QuantStrategy:
             entry_order_id=entry_data.get("order_id"), entry_time=time.time(),
             initial_risk=ir, initial_sl_dist=sdf, entry_signal=sig, entry_atr=self._atr_5m.atr,
             entry_vol=entry_vol)
+        # ── Reconcile safety: discard any in-flight reconcile data ────────────
+        # A reconcile thread that was dispatched before or during entry may have
+        # queried the exchange before the fill was visible (fill-latency window).
+        # That query returns size=0 ("FLAT"). If we let it apply, it calls
+        # _record_exchange_exit on a live position — the core of the race bug.
+        # Discarding stale data here and resetting the timer gives the position
+        # a full RECONCILE_SEC window to settle on the exchange before we query.
+        self._reconcile_data = None
+        self._last_reconcile_time = time.time()
         self.current_sl_price = sl_price; self.current_tp_price = tp_price; self._total_trades += 1
         rr_a = abs(fill_price-tp_price)/sdf if sdf > 0 else 0
         send_telegram_message(
@@ -1442,6 +1451,23 @@ class QuantStrategy:
         """Institutional trail: Chandelier + HVN-snap + micro-swing + vol-decay tightening."""
         pos = self._pos; atr = self._atr_5m.atr
         if atr < 1e-10: return False
+        # ── Guard: ghost position (adopted with entry_price=0) ────────────────
+        # If a position was adopted via reconcile before CoinSwitch settled the
+        # entry_price in its position feed, entry_price=0. Any tier or chandelier
+        # calculation on that data produces astronomically wrong values (tier≈800).
+        # Bail here; Fix 2 prevents re-adoption so this state resolves next cycle.
+        if pos.entry_price < 1.0:
+            logger.warning("Trail: entry_price invalid (%.2f) — skipping (ghost adoption)", pos.entry_price)
+            return False
+        # ── Guard: unknown SL order ID ────────────────────────────────────────
+        # When open_orders endpoint is 404 (CoinSwitch) the adopted position has
+        # sl_order_id=None. replace_stop_loss(None,...) skips the cancel and tries
+        # to place a fresh SL, which the exchange rejects with 400 "already exists".
+        # That None return was misread as "SL fired" → false position close loop.
+        # Without the existing order ID we cannot safely replace the SL — skip.
+        if pos.sl_order_id is None:
+            logger.debug("Trail: sl_order_id unknown (adopted without open_orders) — skipping")
+            return False
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
         if profit > pos.peak_profit: pos.peak_profit = profit
 
@@ -1640,6 +1666,18 @@ class QuantStrategy:
         phase = self._pos.phase
         if phase==PositionPhase.FLAT and ex_size>=QCfg.MIN_QTY():
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
+            # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
+            # has been filled but not yet fully settled in the position feed.
+            # Adopting it with entry_price=0 produces tier=~800 in the trail engine
+            # (profit = current_price − 0 = ~70k), fires the chandelier, and then
+            # tries to place a duplicate SL that the exchange rejects with 400.
+            # The resulting None from replace_stop_loss was misread as "SL fired" →
+            # false FLAT → re-adoption loop. Reject and wait for the next cycle.
+            if ex_entry < 1.0:
+                logger.warning(
+                    f"Reconcile: skipping adoption of {ex_side} size={ex_size} "
+                    f"— entry_price={ex_entry:.2f} not yet settled on exchange")
+                return
             sl_oid=tp_oid=None; sl_p=tp_p=0.0
             if open_orders:
                 for o in open_orders:

@@ -887,7 +887,18 @@ class OrderManager:
             if new_sl:
                 logger.info(f"✅ SL replaced → {new_sl['order_id']} "
                             f"@ ${new_trigger_price:,.2f}")
-            return new_sl
+                return new_sl
+
+            # place_stop_loss returned None — this is a PLACEMENT FAILURE, not an
+            # SL fill. Returning None here would be misread by the caller as
+            # "existing SL already fired → position closed", triggering a false
+            # _record_exchange_exit. Return an error dict instead so the caller
+            # takes the non-destructive path (return False / retry next cycle).
+            logger.error(
+                f"replace_stop_loss: failed to place new SL @ "
+                f"${new_trigger_price:,.2f} (existing_id={existing_sl_order_id})"
+            )
+            return {"error": "PLACE_FAILED"}
 
         except Exception as e:
             logger.error(f"replace_stop_loss error: {e}", exc_info=True)
@@ -938,7 +949,14 @@ class OrderManager:
             if new_tp:
                 logger.info(f"✅ TP replaced → {new_tp['order_id']} "
                             f"@ ${new_trigger_price:,.2f}")
-            return new_tp
+                return new_tp
+
+            # Same contract as replace_stop_loss: placement failure is not a fill.
+            logger.error(
+                f"replace_take_profit: failed to place new TP @ "
+                f"${new_trigger_price:,.2f} (existing_id={existing_tp_order_id})"
+            )
+            return {"error": "PLACE_FAILED"}
 
         except Exception as e:
             logger.error(f"replace_take_profit error: {e}", exc_info=True)
