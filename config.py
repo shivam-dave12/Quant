@@ -45,13 +45,13 @@ RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 400
 MAX_DAILY_LOSS_PCT      = 5.0
 MAX_DRAWDOWN_PCT        = 15.0
-MAX_CONSECUTIVE_LOSSES  = 4
-MAX_DAILY_TRADES        = 14
+MAX_CONSECUTIVE_LOSSES  = 3
+MAX_DAILY_TRADES        = 8
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 5
 TRADE_COOLDOWN_SECONDS  = 600
-MIN_RISK_REWARD_RATIO   = 1.5
-TARGET_RISK_REWARD_RATIO= 2.5
+MIN_RISK_REWARD_RATIO   = 0.8
+TARGET_RISK_REWARD_RATIO= 1.5
 MAX_RR_RATIO            = 12.0
 
 # ─────────────────────────────────────────────
@@ -129,7 +129,7 @@ TRAILING_SL_CHECK_INTERVAL   = 15
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
 # ═══════════════════════════════════════════════════════════════════
-# 10. QUANT STRATEGY PARAMETERS v3 — INSTITUTIONAL GRADE
+# 10. QUANT STRATEGY PARAMETERS v4 — MEAN-REVERSION + ORDER FLOW
 #     All read live by QCfg static methods — no restart needed.
 # ═══════════════════════════════════════════════════════════════════
 
@@ -137,87 +137,73 @@ TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 QUANT_MARGIN_PCT            = 0.20
 QUANT_SLIPPAGE_TOLERANCE    = 0.0005
 
-# 10b. Signal Thresholds — ADAPTIVE (base values, dynamic logic adjusts)
-QUANT_LONG_THRESHOLD        = 0.40
-QUANT_SHORT_THRESHOLD       = 0.40
-QUANT_EXIT_FLIP             = 0.22
-QUANT_CONFIRM_TICKS         = 1
+# 10b. Entry Thresholds — MEAN-REVERSION (hard confluence gates)
+QUANT_VWAP_ENTRY_ATR_MULT   = 1.2     # Price must be > 1.2 ATR from VWAP
+QUANT_CVD_DIVERGENCE_MIN    = 0.15    # Min CVD divergence strength
+QUANT_OB_CONFIRM_MIN        = 0.10    # Min orderbook confirmation
+QUANT_COMPOSITE_ENTRY_MIN   = 0.30    # Min composite score for entry
+QUANT_EXIT_REVERSAL_THRESH  = 0.40    # Strong reversal exit (was 0.22!)
+QUANT_CONFIRM_TICKS         = 2       # Require 2 consecutive confirms (was 1)
 
-# 10c. ATR / SL / TP
-QUANT_SL_ATR_MULT           = 1.4
-QUANT_TP_ATR_MULT           = 2.5
+# 10c. SL/TP — STRUCTURE-BASED (not arbitrary ATR)
+QUANT_SL_SWING_LOOKBACK     = 12      # Look back 12 5m candles for swing
+QUANT_SL_BUFFER_ATR_MULT    = 0.4     # Buffer beyond swing = 0.4 × ATR
+QUANT_TP_VWAP_FRACTION      = 0.50    # TP at 50% back to VWAP (tight!)
 
-# 10d. Trailing SL — aggressive
+# 10d. Trailing SL — aggressive breakeven
 QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_ACTIVATE_R      = 0.5
-QUANT_TRAIL_ATR_MULT        = 0.9
+QUANT_TRAIL_BE_R            = 0.4     # Move to BE at 0.4R (was 0.5R)
+QUANT_TRAIL_LOCK_R          = 0.8     # Start trailing at 0.8R
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
 QUANT_CVD_HIST_MULT         = 15
 QUANT_VWAP_WINDOW           = 50
-QUANT_VWAP_SLOPE_BARS       = 8
 QUANT_EMA_FAST              = 8
 QUANT_EMA_SLOW              = 21
-QUANT_EMA_SIGNAL_BARS       = 5
-QUANT_BB_WINDOW             = 20
-QUANT_BB_STD                = 2.0
-QUANT_KC_ATR_MULT           = 1.5
-QUANT_SQUEEZE_BREAKOUT_BARS = 8
 QUANT_VOL_FLOW_WINDOW       = 10
 
-# 10g. Regime Filter — WIDE GATE (let the signal quality decide)
+# 10f. Regime Filter — Binary (not gradient)
 QUANT_ATR_PCTILE_WINDOW     = 100
 QUANT_ATR_MIN_PCTILE        = 0.05
 QUANT_ATR_MAX_PCTILE        = 0.97
 
-# 10h. Timing — FAST for quant-style execution
+# 10g. Timing — PATIENT (not hyperactive)
 QUANT_MAX_HOLD_SEC          = 2400
-QUANT_COOLDOWN_SEC          = 20
+QUANT_COOLDOWN_SEC          = 180     # 3 minutes (was 20 seconds!)
+QUANT_LOSS_LOCKOUT_SEC      = 3600    # 1-hour lockout after 3 consec losses
 QUANT_POS_SYNC_SEC          = 30
 
-# 10j. Signal Weights — must sum to 1.0
-#      When a signal returns 0.0 (inactive), its weight is
-#      dynamically redistributed to active signals.
-QUANT_W_CVD                 = 0.22
-QUANT_W_VWAP                = 0.18
-QUANT_W_MOM                 = 0.22
-QUANT_W_SQUEEZE             = 0.06
-QUANT_W_VOL                 = 0.06
-QUANT_W_ORDERBOOK           = 0.14
-QUANT_W_TICK_FLOW           = 0.12
+# 10h. Signal Weights — REVERSION-FOCUSED (sum = 1.0)
+QUANT_W_VWAP_DEV            = 0.30    # VWAP deviation is PRIMARY signal
+QUANT_W_CVD_DIV             = 0.25    # CVD divergence (exhaustion)
+QUANT_W_OB                  = 0.20    # Orderbook imbalance
+QUANT_W_TICK_FLOW           = 0.15    # Real-time tick aggressor flow
+QUANT_W_VOL_EXHAUSTION      = 0.10    # Volume exhaustion detection
 # Sum = 1.00
 
-# 10k. Multi-Timeframe Trend Filter
+# 10i. Multi-Timeframe Trend Filter — VETO ONLY (no boost)
 QUANT_HTF_ENABLED           = True
-QUANT_HTF_VETO_STRENGTH     = 0.65
-QUANT_HTF_BOOST             = 0.12
+QUANT_HTF_VETO_STRENGTH     = 0.70    # Strong HTF trend vetoes reversion
 
-# 10l. Adaptive Threshold
-QUANT_AGREEMENT_DISCOUNT    = 0.07
-QUANT_MIN_AGREE_SIGNALS     = 3
-QUANT_STRONG_SIGNAL_LEVEL   = 0.35
-
-# 10m. Orderbook Imbalance
+# 10j. Orderbook Imbalance
 QUANT_OB_DEPTH_LEVELS       = 5
 QUANT_OB_HIST_LEN           = 60
 
-# 10n. Tick Flow Aggregation
+# 10k. Tick Flow
 QUANT_TICK_AGG_WINDOW_SEC   = 30.0
-QUANT_TICK_SURGE_MULT       = 2.5
-
-# 10o. Momentum Divergence
-QUANT_PRICE_MOM_LOOKBACK    = 12
-QUANT_DIVERGENCE_THRESHOLD  = 0.3
 
 # ─────────────────────────────────────────────────────────────────
-# TUNING GUIDE (all live — no restart needed):
-#   More selective entries  → QUANT_LONG_THRESHOLD  = 0.55
-#   Tighter SL              → QUANT_SL_ATR_MULT     = 1.0
-#   Swing mode              → QUANT_MAX_HOLD_SEC     = 3600
-#   More order-flow weight  → QUANT_W_CVD            = 0.35
-#   Require confirmation    → QUANT_CONFIRM_TICKS    = 2
-#   Wider regime gate       → QUANT_ATR_MIN_PCTILE   = 0.03
-#   Lower threshold when    → QUANT_AGREEMENT_DISCOUNT = 0.10
-#     multiple signals align
+# v4 TUNING GUIDE (all live — no restart needed):
+#
+# PHILOSOPHY: Wait for overextension, then fade it back to VWAP.
+# The tighter the TP, the higher the win rate.
+#
+#   More selective entries → QUANT_VWAP_ENTRY_ATR_MULT = 1.5
+#   Even higher win rate  → QUANT_TP_VWAP_FRACTION     = 0.35
+#   Wider SL (fewer stops)→ QUANT_SL_SWING_LOOKBACK    = 16
+#   Faster trail to BE    → QUANT_TRAIL_BE_R            = 0.3
+#   Longer cooldown       → QUANT_COOLDOWN_SEC          = 300
+#   Stricter confluence   → QUANT_COMPOSITE_ENTRY_MIN   = 0.40
+#   Lower risk/trade      → QUANT_MARGIN_PCT            = 0.15
 # ─────────────────────────────────────────────────────────────────

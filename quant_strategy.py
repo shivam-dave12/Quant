@@ -1,65 +1,40 @@
 """
-INSTITUTIONAL MULTI-FACTOR MOMENTUM + ORDER FLOW STRATEGY — v3
+QUANT STRATEGY v4 — MEAN-REVERSION + ORDER FLOW CONFLUENCE
 ==============================================================================
-COMPLETE REWRITE from v2. Every signal engine rebuilt for speed and accuracy.
+COMPLETE ARCHITECTURAL REDESIGN from v3.
 
-CORE PHILOSOPHY:
-  Real quant firms don't wait — they DETECT and ACT within milliseconds.
-  This v3 rewrite eliminates every source of delay, dead-weight, and
-  missed opportunity from v2.
+WHY v3 FAILED (see logs 2026-03-14 00:18–01:19):
+  1. Momentum chasing on 1m/5m = buying tops, selling bottoms
+  2. Regime penalty zeroed signals for 25 min while in profitable trade
+  3. EXIT_FLIP=0.22 caused 4 whipsaws in 1 hour
+  4. ATR-only SL/TP placed stops in noise zone ($10 on BTC)
+  5. 20-second cooldown = revenge trading
 
-ARCHITECTURE CHANGES vs v2:
-  ──────────────────────────────────────────────────────────────────────
-  PROBLEM                               FIX
-  ──────────────────────────────────────────────────────────────────────
-  Squeeze/VolFlow return 0 → 20% of     Dynamic weight redistribution:
-  composite weight is dead               inactive signals' weight flows
-                                         to active signals in real-time
+CORE PHILOSOPHY CHANGE:
+  v3: "Detect momentum and chase it" → LOW win rate by design
+  v4: "Wait for overextension, fade it back to equilibrium" → HIGH win rate
 
-  5-second eval interval misses moves    1-second eval interval
+  On 1m/5m timeframes, price reverts to VWAP ~70% of the time.
+  We enter ONLY when price is significantly overextended AND
+  order flow confirms exhaustion of the move.
 
-  2 confirmation ticks × 5s = 10s delay  1 tick or ZERO when signal is
-  before entry                           strong (≥0.6 composite)
+ENTRY CONDITIONS (ALL must be true — hard confluence gate):
+  1. VWAP DEVIATION: Price > 1.2× ATR from VWAP (overextended)
+  2. CVD DIVERGENCE:  Volume delta NOT confirming the move (exhaustion)
+  3. ORDERBOOK LEAN:  Book imbalance favors reversion direction
+  4. HTF ALIGNMENT:   Higher timeframe not strongly against us
+  5. REGIME VALID:    ATR in tradeable range (not dead flat)
 
-  No MTF alignment — trades against      4h/15m trend filter: boost
-  the dominant trend                     aligned, veto counter-trend
+SL/TP PHILOSOPHY:
+  - SL: Behind recent swing extreme + buffer (structure, not ATR)
+  - TP: Tight — 50% of distance back to VWAP (high win rate target)
+  - Trail: Breakeven at 0.4R, then ratchet to lock profit
 
-  Orderbook data subscribed but          OrderbookImbalanceEngine: bid/ask
-  never used for signals                 wall detection, depth imbalance
-
-  Trade stream subscribed but never      TickFlowEngine: real-time buy/sell
-  used for signals                       pressure from individual trades
-
-  CVD/VolFlow .clear() every tick        Incremental append-only updates
-  = O(N) full rebuild 200 times/sec      with dirty-flag recomputation
-
-  tanh(z/2) compresses extremes          Asymmetric sigmoid: preserves
-  into narrow ±0.5 band                  discrimination at extremes
-
-  Static threshold regardless of         Adaptive threshold: drops when
-  signal quality                         ≥3 signals agree in direction
-
-  Linear-only aggregation, no            Agreement bonus: extra composite
-  conditional logic                      boost when signals align
-
-  ATR regime gate too narrow             Widened gate + gradient penalty
-  (15%–90%) rejects valid setups         instead of binary reject
-  ──────────────────────────────────────────────────────────────────────
-
-SIGNAL ENGINES (7):
-  1. CVDEngine           — Cumulative Volume Delta z-score (order flow)
-  2. VWAPEngine          — VWAP deviation + slope (institutional anchor)
-  3. MomentumEngine      — EMA cross + multi-TF slope (trend direction)
-  4. SqueezeEngine       — BB/KC squeeze breakout (vol compression)
-  5. VolumeFlowEngine    — Multi-bar buy/sell imbalance (participation)
-  6. OrderbookEngine     — Bid/ask depth imbalance (microstructure)
-  7. TickFlowEngine      — Real-time trade aggressor flow (execution)
-
-META-LOGIC:
-  - SignalAggregator: dynamic weight redistribution + agreement detection
-  - HTFTrendFilter: 4h/15m alignment check (boost/veto)
-  - AdaptiveThreshold: lower entry bar when signals converge
-  - DailyRiskGate: max trades, consecutive losses, daily loss %
+ANTI-WHIPSAW:
+  - 180-second cooldown after exit (3 minutes, not 20 seconds)
+  - Directional bias: after exiting, don't immediately flip direction
+  - Max 8 trades/day (was 14)
+  - Max 3 consecutive losses pause (1-hour lockout)
 """
 
 from __future__ import annotations
@@ -118,43 +93,49 @@ class QCfg:
     @staticmethod
     def SLIPPAGE_TOL()    -> float: return float(_cfg("QUANT_SLIPPAGE_TOLERANCE", 0.0005))
 
-    # Signal thresholds
+    # ── v4 MEAN-REVERSION THRESHOLDS ──
     @staticmethod
-    def LONG_THRESHOLD()  -> float: return float(_cfg("QUANT_LONG_THRESHOLD", 0.40))
+    def VWAP_ENTRY_ATR_MULT() -> float: return float(_cfg("QUANT_VWAP_ENTRY_ATR_MULT", 1.2))
     @staticmethod
-    def SHORT_THRESHOLD() -> float: return float(_cfg("QUANT_SHORT_THRESHOLD", 0.40))
+    def CVD_DIVERGENCE_MIN()  -> float: return float(_cfg("QUANT_CVD_DIVERGENCE_MIN", 0.15))
     @staticmethod
-    def EXIT_FLIP_THRESH()-> float: return float(_cfg("QUANT_EXIT_FLIP", 0.22))
+    def OB_CONFIRM_MIN()      -> float: return float(_cfg("QUANT_OB_CONFIRM_MIN", 0.10))
     @staticmethod
-    def CONFIRM_TICKS()   -> int:   return int(_cfg("QUANT_CONFIRM_TICKS", 1))
+    def COMPOSITE_ENTRY_MIN() -> float: return float(_cfg("QUANT_COMPOSITE_ENTRY_MIN", 0.30))
+    @staticmethod
+    def EXIT_REVERSAL_THRESH()-> float: return float(_cfg("QUANT_EXIT_REVERSAL_THRESH", 0.40))
+    @staticmethod
+    def CONFIRM_TICKS()   -> int:   return int(_cfg("QUANT_CONFIRM_TICKS", 2))
 
-    # ATR SL / TP
+    # ── SL/TP v4: Structure-Based ──
     @staticmethod
-    def ATR_PERIOD()      -> int:   return int(_cfg("SL_ATR_PERIOD", 14))
+    def SL_SWING_LOOKBACK()  -> int:   return int(_cfg("QUANT_SL_SWING_LOOKBACK", 12))
     @staticmethod
-    def SL_ATR_MULT()     -> float: return float(_cfg("QUANT_SL_ATR_MULT", 1.4))
+    def SL_BUFFER_ATR_MULT() -> float: return float(_cfg("QUANT_SL_BUFFER_ATR_MULT", 0.4))
     @staticmethod
-    def TP_ATR_MULT()     -> float: return float(_cfg("QUANT_TP_ATR_MULT", 2.5))
+    def TP_VWAP_FRACTION()   -> float: return float(_cfg("QUANT_TP_VWAP_FRACTION", 0.50))
     @staticmethod
     def MIN_SL_PCT()      -> float: return float(_cfg("MIN_SL_DISTANCE_PCT", 0.003))
     @staticmethod
     def MAX_SL_PCT()      -> float: return float(_cfg("MAX_SL_DISTANCE_PCT", 0.035))
     @staticmethod
-    def MIN_RR_RATIO()    -> float: return float(_cfg("MIN_RISK_REWARD_RATIO", 1.5))
+    def MIN_RR_RATIO()    -> float: return float(_cfg("MIN_RISK_REWARD_RATIO", 0.8))
+    @staticmethod
+    def ATR_PERIOD()      -> int:   return int(_cfg("SL_ATR_PERIOD", 14))
 
-    # Trailing SL
+    # ── Trailing v4 ──
     @staticmethod
     def TRAIL_ENABLED()      -> bool:  return bool(_cfg("QUANT_TRAIL_ENABLED", True))
     @staticmethod
-    def TRAIL_ACTIVATE_R()   -> float: return float(_cfg("QUANT_TRAIL_ACTIVATE_R", 0.5))
+    def TRAIL_BE_R()         -> float: return float(_cfg("QUANT_TRAIL_BE_R", 0.4))
     @staticmethod
-    def TRAIL_ATR_MULT()     -> float: return float(_cfg("QUANT_TRAIL_ATR_MULT", 0.9))
+    def TRAIL_LOCK_R()       -> float: return float(_cfg("QUANT_TRAIL_LOCK_R", 0.8))
     @staticmethod
-    def TRAIL_INTERVAL_S()   -> int:   return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 15))
+    def TRAIL_INTERVAL_S()   -> int:   return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
     @staticmethod
     def TRAIL_MIN_MOVE_ATR() -> float: return float(_cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08))
 
-    # Indicator windows
+    # ── Indicator Windows ──
     @staticmethod
     def CVD_WINDOW()          -> int:   return int(_cfg("QUANT_CVD_WINDOW", 20))
     @staticmethod
@@ -162,31 +143,19 @@ class QCfg:
     @staticmethod
     def VWAP_WINDOW()         -> int:   return int(_cfg("QUANT_VWAP_WINDOW", 50))
     @staticmethod
-    def VWAP_SLOPE_BARS()     -> int:   return int(_cfg("QUANT_VWAP_SLOPE_BARS", 8))
-    @staticmethod
     def EMA_FAST()            -> int:   return int(_cfg("QUANT_EMA_FAST", 8))
     @staticmethod
     def EMA_SLOW()            -> int:   return int(_cfg("QUANT_EMA_SLOW", 21))
     @staticmethod
-    def EMA_SIGNAL_BARS()     -> int:   return int(_cfg("QUANT_EMA_SIGNAL_BARS", 5))
-    @staticmethod
-    def BB_WINDOW()           -> int:   return int(_cfg("QUANT_BB_WINDOW", 20))
-    @staticmethod
-    def BB_STD()              -> float: return float(_cfg("QUANT_BB_STD", 2.0))
-    @staticmethod
-    def KC_ATR_MULT()         -> float: return float(_cfg("QUANT_KC_ATR_MULT", 1.5))
-    @staticmethod
-    def SQUEEZE_BREAKOUT_BARS()-> int:  return int(_cfg("QUANT_SQUEEZE_BREAKOUT_BARS", 8))
-    @staticmethod
     def VOL_FLOW_WINDOW()     -> int:   return int(_cfg("QUANT_VOL_FLOW_WINDOW", 10))
 
-    # Minimum data
+    # ── Minimum Data ──
     @staticmethod
     def MIN_1M_BARS()     -> int:   return int(_cfg("MIN_CANDLES_1M", 80))
     @staticmethod
     def MIN_5M_BARS()     -> int:   return int(_cfg("MIN_CANDLES_5M", 60))
 
-    # Regime filter — wide gate
+    # ── Regime ──
     @staticmethod
     def ATR_PCTILE_WINDOW()-> int:  return int(_cfg("QUANT_ATR_PCTILE_WINDOW", 100))
     @staticmethod
@@ -194,67 +163,51 @@ class QCfg:
     @staticmethod
     def ATR_MAX_PCTILE()  -> float: return float(_cfg("QUANT_ATR_MAX_PCTILE", 0.97))
 
-    # Timing
+    # ── Timing v4 ──
     @staticmethod
     def MAX_HOLD_SEC()    -> int:   return int(_cfg("QUANT_MAX_HOLD_SEC", 2400))
     @staticmethod
-    def COOLDOWN_SEC()    -> int:   return int(_cfg("QUANT_COOLDOWN_SEC", 20))
+    def COOLDOWN_SEC()    -> int:   return int(_cfg("QUANT_COOLDOWN_SEC", 180))
+    @staticmethod
+    def LOSS_LOCKOUT_SEC()-> int:   return int(_cfg("QUANT_LOSS_LOCKOUT_SEC", 3600))
     @staticmethod
     def TICK_EVAL_SEC()   -> float: return float(_cfg("ENTRY_EVALUATION_INTERVAL_SECONDS", 1))
     @staticmethod
     def POS_SYNC_SEC()    -> float: return float(_cfg("QUANT_POS_SYNC_SEC", 30))
 
-    # Risk limits
+    # ── Risk ──
     @staticmethod
-    def MAX_DAILY_TRADES()  -> int:   return int(_cfg("MAX_DAILY_TRADES", 14))
+    def MAX_DAILY_TRADES()  -> int:   return int(_cfg("MAX_DAILY_TRADES", 8))
     @staticmethod
-    def MAX_CONSEC_LOSSES() -> int:   return int(_cfg("MAX_CONSECUTIVE_LOSSES", 4))
+    def MAX_CONSEC_LOSSES() -> int:   return int(_cfg("MAX_CONSECUTIVE_LOSSES", 3))
     @staticmethod
     def MAX_DAILY_LOSS_PCT()-> float: return float(_cfg("MAX_DAILY_LOSS_PCT", 5.0))
 
-    # Signal weights (7 engines)
+    # ── Signal Weights (v4: reversion-weighted) ──
     @staticmethod
-    def W_CVD()     -> float: return float(_cfg("QUANT_W_CVD", 0.22))
+    def W_VWAP_DEV()  -> float: return float(_cfg("QUANT_W_VWAP_DEV", 0.30))
     @staticmethod
-    def W_VWAP()    -> float: return float(_cfg("QUANT_W_VWAP", 0.18))
+    def W_CVD_DIV()   -> float: return float(_cfg("QUANT_W_CVD_DIV", 0.25))
     @staticmethod
-    def W_MOM()     -> float: return float(_cfg("QUANT_W_MOM", 0.22))
+    def W_OB()        -> float: return float(_cfg("QUANT_W_OB", 0.20))
     @staticmethod
-    def W_SQUEEZE() -> float: return float(_cfg("QUANT_W_SQUEEZE", 0.06))
+    def W_TICK_FLOW() -> float: return float(_cfg("QUANT_W_TICK_FLOW", 0.15))
     @staticmethod
-    def W_VOL()     -> float: return float(_cfg("QUANT_W_VOL", 0.06))
-    @staticmethod
-    def W_ORDERBOOK()-> float: return float(_cfg("QUANT_W_ORDERBOOK", 0.14))
-    @staticmethod
-    def W_TICK_FLOW()-> float: return float(_cfg("QUANT_W_TICK_FLOW", 0.12))
+    def W_VOL_EXHAUSTION() -> float: return float(_cfg("QUANT_W_VOL_EXHAUSTION", 0.10))
 
-    # MTF Trend Filter
+    # ── HTF Filter ──
     @staticmethod
     def HTF_ENABLED()       -> bool:  return bool(_cfg("QUANT_HTF_ENABLED", True))
     @staticmethod
-    def HTF_VETO_STRENGTH() -> float: return float(_cfg("QUANT_HTF_VETO_STRENGTH", 0.65))
-    @staticmethod
-    def HTF_BOOST()         -> float: return float(_cfg("QUANT_HTF_BOOST", 0.12))
+    def HTF_VETO_STRENGTH() -> float: return float(_cfg("QUANT_HTF_VETO_STRENGTH", 0.70))
 
-    # Adaptive threshold
-    @staticmethod
-    def AGREEMENT_DISCOUNT() -> float: return float(_cfg("QUANT_AGREEMENT_DISCOUNT", 0.07))
-    @staticmethod
-    def MIN_AGREE_SIGNALS()  -> int:   return int(_cfg("QUANT_MIN_AGREE_SIGNALS", 3))
-    @staticmethod
-    def STRONG_SIGNAL_LEVEL()-> float: return float(_cfg("QUANT_STRONG_SIGNAL_LEVEL", 0.35))
-
-    # Orderbook
+    # ── Orderbook / Tick ──
     @staticmethod
     def OB_DEPTH_LEVELS() -> int:   return int(_cfg("QUANT_OB_DEPTH_LEVELS", 5))
     @staticmethod
     def OB_HIST_LEN()     -> int:   return int(_cfg("QUANT_OB_HIST_LEN", 60))
-
-    # Tick flow
     @staticmethod
     def TICK_AGG_WINDOW_SEC() -> float: return float(_cfg("QUANT_TICK_AGG_WINDOW_SEC", 30.0))
-    @staticmethod
-    def TICK_SURGE_MULT()     -> float: return float(_cfg("QUANT_TICK_SURGE_MULT", 2.5))
 
 
 def _round_to_tick(price: float) -> float:
@@ -265,21 +218,109 @@ def _round_to_tick(price: float) -> float:
 
 
 def _sigmoid(z: float, steepness: float = 1.0) -> float:
-    """Asymmetric sigmoid that preserves extreme values better than tanh(z/2).
-    At |z|=2 this returns ±0.76 vs tanh's ±0.46 — much better discrimination."""
     return max(-1.0, min(1.0, z * steepness / (1.0 + abs(z * steepness) * 0.5)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 1: CVD — Cumulative Volume Delta
+# ENGINE 1: VWAP DEVIATION — Primary Mean-Reversion Signal
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VWAPEngine:
+    """
+    v4: VWAP deviation is the PRIMARY signal, not secondary.
+    We compute how far price has deviated from VWAP in ATR units.
+    Signal is INVERTED: price above VWAP → NEGATIVE (short opportunity)
+                       price below VWAP → POSITIVE (long opportunity)
+    This is MEAN-REVERSION: we fade the deviation.
+    """
+
+    def __init__(self):
+        self._vwap = 0.0
+        self._std = 0.0
+        self._deviation_atr = 0.0  # how many ATRs away from VWAP
+
+    def update(self, candles: List[Dict], atr: float) -> None:
+        window = QCfg.VWAP_WINDOW()
+        if len(candles) < window:
+            return
+
+        recent = candles[-window:]
+        tp_vol = sum((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 * float(c['v'])
+                     for c in recent)
+        vol_sum = sum(float(c['v']) for c in recent)
+        if vol_sum < 1e-12:
+            return
+        self._vwap = tp_vol / vol_sum
+
+        var_sum = sum(float(c['v']) *
+                      ((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 - self._vwap) ** 2
+                      for c in recent)
+        self._std = math.sqrt(var_sum / vol_sum)
+
+        if atr > 1e-10:
+            price = float(candles[-1]['c'])
+            self._deviation_atr = (price - self._vwap) / atr
+
+    def get_reversion_signal(self, price: float, atr: float) -> float:
+        """
+        Returns mean-reversion signal.
+        Positive = price below VWAP → long opportunity (fade down)
+        Negative = price above VWAP → short opportunity (fade up)
+        
+        Only fires when deviation > entry threshold ATR.
+        """
+        if self._vwap < 1e-10 or atr < 1e-10:
+            return 0.0
+
+        dev = (price - self._vwap) / atr
+        entry_thresh = QCfg.VWAP_ENTRY_ATR_MULT()
+
+        # Only signal when sufficiently overextended
+        if abs(dev) < entry_thresh * 0.6:
+            return 0.0
+
+        # INVERT: price above VWAP → negative signal (short/fade)
+        #         price below VWAP → positive signal (long/fade)
+        raw = -dev / (entry_thresh * 2.0)
+        return max(-1.0, min(1.0, _sigmoid(raw, 1.5)))
+
+    def is_overextended(self, price: float, atr: float) -> bool:
+        """Hard gate: price must be > VWAP_ENTRY_ATR_MULT × ATR from VWAP."""
+        if self._vwap < 1e-10 or atr < 1e-10:
+            return False
+        dev = abs(price - self._vwap) / atr
+        return dev >= QCfg.VWAP_ENTRY_ATR_MULT()
+
+    def reversion_side(self, price: float) -> str:
+        """Which side would a reversion trade be?"""
+        if price > self._vwap:
+            return "short"  # price above VWAP → fade by shorting
+        return "long"       # price below VWAP → fade by going long
+
+    def tp_target(self, price: float) -> float:
+        """TP target: fraction of distance back to VWAP."""
+        frac = QCfg.TP_VWAP_FRACTION()
+        return price + (self._vwap - price) * frac
+
+    @property
+    def vwap(self) -> float: return self._vwap
+    @property
+    def vwap_std(self) -> float: return self._std
+    @property
+    def deviation_atr(self) -> float: return self._deviation_atr
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENGINE 2: CVD DIVERGENCE — Exhaustion Detection
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CVDEngine:
     """
-    Per-bar delta heuristic:  delta = volume × (2×close - high - low) / (high - low)
-    Signal = sigmoid(z-score of rolling CVD sum).
-
-    v3 FIX: Incremental append — no .clear() rebuild.
+    v4: CVD is used for DIVERGENCE detection, not raw momentum.
+    
+    Divergence = price made a new extreme but CVD didn't confirm.
+    Example: Price pushed to new high, but CVD is flat/falling = 
+    buyers are exhausted → SHORT (fade the high).
     """
 
     def __init__(self):
@@ -287,10 +328,8 @@ class CVDEngine:
         self._last_bar_ts: int = 0
 
     def update(self, candles: List[Dict]) -> None:
-        """Append only new bars since last update."""
         if not candles:
             return
-        # Find where new data starts
         new_start = 0
         if self._last_bar_ts > 0:
             for i, c in enumerate(candles):
@@ -298,7 +337,6 @@ class CVDEngine:
                     new_start = i
                     break
             else:
-                # Update the last bar in-place (forming candle)
                 if candles:
                     c = candles[-1]
                     hi = float(c['h']); lo = float(c['l'])
@@ -317,335 +355,103 @@ class CVDEngine:
             self._deltas.append(vol * delta_frac)
             self._last_bar_ts = int(c['t'])
 
-    def get_signal(self) -> float:
+    def get_divergence_signal(self, candles: List[Dict]) -> float:
+        """
+        v4: Divergence-based signal.
+        
+        Compares price momentum direction with CVD momentum direction.
+        When they disagree → exhaustion → fade signal.
+        
+        Returns: positive = bullish divergence (price fell but CVD rising → long)
+                 negative = bearish divergence (price rose but CVD falling → short)
+        """
+        w = QCfg.CVD_WINDOW()
+        arr = list(self._deltas)
+        n = len(arr)
+        if n < w + 10 or len(candles) < w:
+            return 0.0
+
+        # CVD slope: sum of recent deltas vs earlier deltas
+        recent_cvd = sum(arr[-w//2:])
+        earlier_cvd = sum(arr[-w:-w//2])
+        cvd_slope = recent_cvd - earlier_cvd
+
+        # Price slope: recent closes vs earlier closes
+        closes = [float(c['c']) for c in candles[-w:]]
+        mid = w // 2
+        recent_price = sum(closes[mid:]) / max(len(closes[mid:]), 1)
+        earlier_price = sum(closes[:mid]) / max(len(closes[:mid]), 1)
+        price_slope = recent_price - earlier_price
+
+        if abs(price_slope) < 1e-10:
+            return 0.0
+
+        # Normalize CVD slope
+        all_sums = []
+        running = sum(arr[:w//2])
+        all_sums.append(running)
+        for i in range(w//2, n - w//2):
+            running += arr[i] - arr[i - w//2]
+            all_sums.append(running)
+        if len(all_sums) < 5:
+            return 0.0
+        mu = sum(all_sums) / len(all_sums)
+        var = sum((s - mu) ** 2 for s in all_sums) / max(len(all_sums) - 1, 1)
+        std = math.sqrt(var)
+        if std < 1e-12:
+            return 0.0
+
+        cvd_z = cvd_slope / std
+
+        # Divergence: price going UP but CVD going DOWN (or vice versa)
+        # This is a FADE signal
+        price_dir = 1.0 if price_slope > 0 else -1.0
+        cvd_dir = 1.0 if cvd_z > 0 else -1.0
+
+        if price_dir == cvd_dir:
+            # No divergence — CVD confirms the move → weak/no signal
+            return 0.0
+
+        # Divergence detected! Return signal in REVERSION direction
+        # price_dir > 0 (price rising) + cvd_dir < 0 (CVD falling) → bearish divergence → short
+        divergence_strength = min(abs(cvd_z), 3.0) / 3.0
+        return -price_dir * divergence_strength  # negative of price dir = fade dir
+
+    def get_raw_signal(self) -> float:
+        """Raw CVD z-score for logging."""
         w = QCfg.CVD_WINDOW()
         arr = list(self._deltas)
         n = len(arr)
         if n < w + 10:
             return 0.0
-
-        # Rolling sums via sliding window
         current_sum = sum(arr[-w:])
-        # Historical sums for z-score baseline
         sums = []
         running = sum(arr[:w])
         sums.append(running)
         for i in range(w, n - w):
             running += arr[i] - arr[i - w]
             sums.append(running)
-
         if len(sums) < 10:
             return 0.0
-
         mu = sum(sums) / len(sums)
         var = sum((s - mu) ** 2 for s in sums) / max(len(sums) - 1, 1)
         std = math.sqrt(var)
         if std < 1e-12:
             return 0.0
-
-        z = (current_sum - mu) / std
-        return _sigmoid(z, 0.6)
+        return _sigmoid((current_sum - mu) / std, 0.6)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 2: VWAP — Volume-Weighted Average Price
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class VWAPEngine:
-    """
-    VWAP deviation + VWAP slope, both ATR-normalized.
-    v3: Combined with momentum alignment for stronger directional signal.
-    """
-
-    def __init__(self):
-        self._vwap = 0.0
-        self._std = 0.0
-        self._slope = 0.0
-        self._history: deque = deque(maxlen=QCfg.VWAP_SLOPE_BARS() * 3)
-
-    def update(self, candles: List[Dict], atr: float) -> None:
-        window = QCfg.VWAP_WINDOW()
-        if len(candles) < window:
-            return
-
-        recent = candles[-window:]
-
-        tp_vol = sum((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 * float(c['v'])
-                     for c in recent)
-        vol_sum = sum(float(c['v']) for c in recent)
-        if vol_sum < 1e-12:
-            return
-        self._vwap = tp_vol / vol_sum
-
-        var_sum = sum(float(c['v']) *
-                      ((float(c['h']) + float(c['l']) + float(c['c'])) / 3.0 - self._vwap) ** 2
-                      for c in recent)
-        self._std = math.sqrt(var_sum / vol_sum)
-
-        self._history.append(self._vwap)
-        sb = QCfg.VWAP_SLOPE_BARS()
-        if len(self._history) >= sb + 1 and atr > 1e-10 and self._vwap > 1e-10:
-            hist = list(self._history)
-            raw_pct_slope = (hist[-1] - hist[-sb - 1]) / (hist[-sb - 1] + 1e-12)
-            atr_pct = atr / self._vwap
-            self._slope = max(-1.0, min(1.0, raw_pct_slope / (atr_pct + 1e-12)))
-
-    def get_signal(self, price: float) -> float:
-        if self._vwap < 1e-10 or self._std < 1e-10:
-            return 0.0
-        z = (price - self._vwap) / self._std
-        dev_score = _sigmoid(z, 0.5)
-        # Weighted combination: deviation 55%, slope 45% (slope more predictive)
-        combined = dev_score * 0.55 + self._slope * 0.45
-        # Penalize contradiction (price above VWAP but VWAP slope falling)
-        if dev_score * self._slope < 0:
-            combined *= 0.30
-        return max(-1.0, min(1.0, combined))
-
-    @property
-    def vwap(self) -> float: return self._vwap
-    @property
-    def vwap_std(self) -> float: return self._std
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 3: MOMENTUM — EMA Cross + Multi-TF
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class MomentumEngine:
-    """
-    v3: Three-layer momentum with acceleration detection.
-      Layer 1: 1m EMA(fast) vs EMA(slow) cross, normalized by ATR
-      Layer 2: 5m EMA slope (higher-TF momentum confirmation)
-      Layer 3: 1m acceleration (is momentum increasing or fading?)
-    """
-
-    def __init__(self):
-        self._cross_1m = 0.0
-        self._cross_5m = 0.0
-        self._accel_1m = 0.0
-
-    @staticmethod
-    def _ema_series(values: List[float], period: int) -> List[float]:
-        if len(values) < period:
-            return []
-        k = 2.0 / (period + 1)
-        ema = sum(values[:period]) / period
-        out = [ema]
-        for v in values[period:]:
-            ema = v * k + ema * (1.0 - k)
-            out.append(ema)
-        return out
-
-    def update(self, candles_1m: List[Dict], candles_5m: List[Dict],
-               atr_1m: float, atr_5m: float) -> None:
-        fast = QCfg.EMA_FAST(); slow = QCfg.EMA_SLOW(); sig_b = QCfg.EMA_SIGNAL_BARS()
-        cl1 = [float(c['c']) for c in candles_1m]
-        cl5 = [float(c['c']) for c in candles_5m]
-
-        # Layer 1: 1m MACD-line normalized by ATR
-        if len(cl1) > slow + 5 and atr_1m > 1e-10:
-            ef = self._ema_series(cl1, fast)
-            es = self._ema_series(cl1, slow)
-            n = min(len(ef), len(es))
-            if n >= 2:
-                macd_now = ef[-1] - es[-1]
-                macd_prev = ef[-2] - es[-2]
-                self._cross_1m = _sigmoid(macd_now / atr_1m, 1.2)
-                # Layer 3: Acceleration (is MACD growing or shrinking?)
-                self._accel_1m = _sigmoid((macd_now - macd_prev) / atr_1m, 2.0)
-            else:
-                self._cross_1m = 0.0
-                self._accel_1m = 0.0
-        else:
-            self._cross_1m = 0.0
-            self._accel_1m = 0.0
-
-        # Layer 2: 5m EMA slope
-        if len(cl5) > fast + sig_b and atr_5m > 1e-10:
-            ef5 = self._ema_series(cl5, fast)
-            if len(ef5) >= sig_b + 1:
-                slope = ef5[-1] - ef5[-sig_b - 1]
-                self._cross_5m = _sigmoid(slope / atr_5m, 1.0)
-            else:
-                self._cross_5m = 0.0
-        else:
-            self._cross_5m = 0.0
-
-    def get_signal(self) -> float:
-        m1 = self._cross_1m; m5 = self._cross_5m; acc = self._accel_1m
-        if abs(m1) < 1e-8 and abs(m5) < 1e-8:
-            return 0.0
-
-        same_dir = (m1 >= 0) == (m5 >= 0)
-        if same_dir:
-            # Both timeframes agree: full weight + acceleration bonus
-            base = m1 * 0.50 + m5 * 0.35
-            # Acceleration bonus: if momentum is increasing in trade direction
-            if (m1 > 0 and acc > 0) or (m1 < 0 and acc < 0):
-                base += acc * 0.15
-            return max(-1.0, min(1.0, base))
-        else:
-            # Disagreement: heavily penalize — only use 1m at 25% weight
-            return m1 * 0.25
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 4: SQUEEZE — BB/KC Volatility Compression Breakout
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SqueezeEngine:
-    """
-    TTM-style BB inside KC squeeze with improved breakout detection.
-    v3 FIX: Track squeeze duration for energy accumulation.
-    Longer squeeze → stronger breakout signal.
-    """
-
-    def __init__(self):
-        self._in_squeeze = False
-        self._squeeze_bars = 0     # how long squeeze has been active
-        self._post_sq_bars = 0
-        self._bb_mid = 0.0
-        self._last_signal = 0.0
-
-    def update(self, candles: List[Dict], atr: float) -> None:
-        window = QCfg.BB_WINDOW()
-        n_std = QCfg.BB_STD()
-        kc_mult = QCfg.KC_ATR_MULT()
-        break_bars = QCfg.SQUEEZE_BREAKOUT_BARS()
-
-        if len(candles) < window or atr < 1e-10:
-            self._last_signal = 0.0
-            return
-
-        closes = [float(c['c']) for c in candles[-window:]]
-        n = len(closes)
-        mid = sum(closes) / n
-        var = sum((c - mid) ** 2 for c in closes) / max(n - 1, 1)
-        std = math.sqrt(var)
-
-        bb_upper = mid + n_std * std
-        bb_lower = mid - n_std * std
-        kc_upper = mid + kc_mult * atr
-        kc_lower = mid - kc_mult * atr
-
-        in_sq = (bb_upper < kc_upper) and (bb_lower > kc_lower)
-
-        if in_sq:
-            if not self._in_squeeze:
-                self._in_squeeze = True
-                self._squeeze_bars = 0
-            self._squeeze_bars += 1
-            self._bb_mid = mid
-            self._last_signal = 0.0
-            return
-
-        # Squeeze just released or still in breakout window
-        if self._in_squeeze:
-            self._in_squeeze = False
-            self._post_sq_bars = 0
-
-        self._post_sq_bars += 1
-
-        if self._post_sq_bars <= break_bars and std > 1e-10:
-            cl = float(candles[-1]['c'])
-            disp = (cl - self._bb_mid) / (std + 1e-12)
-            # Energy multiplier: longer squeeze → stronger breakout (capped at 1.5x)
-            energy = min(1.5, 1.0 + self._squeeze_bars * 0.05)
-            raw = _sigmoid(disp, 0.8) * energy
-            self._last_signal = max(-1.0, min(1.0, raw))
-        else:
-            self._last_signal = 0.0
-
-    def get_signal(self) -> float:
-        return self._last_signal
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 5: VOLUME FLOW — Multi-Bar Participation Imbalance
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class VolumeFlowEngine:
-    """
-    Per-bar buy/sell volume estimation, z-scored against historical baseline.
-    v3 FIX: Incremental append, no .clear() rebuild.
-    """
-
-    def __init__(self):
-        self._ratios: deque = deque(maxlen=200)
-        self._last_bar_ts: int = 0
-
-    def update(self, candles: List[Dict]) -> None:
-        if not candles:
-            return
-        new_start = 0
-        if self._last_bar_ts > 0:
-            for i, c in enumerate(candles):
-                if int(c['t']) > self._last_bar_ts:
-                    new_start = i
-                    break
-            else:
-                # Update last forming bar
-                if candles and self._ratios:
-                    c = candles[-1]
-                    self._ratios[-1] = self._compute_ratio(c)
-                return
-
-        for c in candles[new_start:]:
-            self._ratios.append(self._compute_ratio(c))
-            self._last_bar_ts = int(c['t'])
-
-    @staticmethod
-    def _compute_ratio(c: Dict) -> float:
-        hi = float(c['h']); lo = float(c['l'])
-        op = float(c['o']); cl = float(c['c']); vol = float(c['v'])
-        rng = hi - lo
-        if rng > 1e-10:
-            buy_f = max(0.0, cl - op) / rng
-            sell_f = max(0.0, op - cl) / rng
-        else:
-            buy_f = sell_f = 0.0
-        bv = vol * buy_f; sv = vol * sell_f; tot = bv + sv
-        return (bv - sv) / (tot + 1e-12) if tot > 1e-10 else 0.0
-
-    def get_signal(self) -> float:
-        window = QCfg.VOL_FLOW_WINDOW()
-        arr = list(self._ratios)
-        if len(arr) < window + 10:
-            return 0.0
-        recent_avg = sum(arr[-window:]) / window
-        hist = arr[:-window]
-        if len(hist) < 10:
-            return 0.0
-        mu = sum(hist) / len(hist)
-        var = sum((x - mu) ** 2 for x in hist) / max(len(hist) - 1, 1)
-        std = math.sqrt(var)
-        if std < 1e-12:
-            return 0.0
-        return _sigmoid((recent_avg - mu) / std, 0.6)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 6: ORDERBOOK IMBALANCE — Microstructure (NEW in v3)
+# ENGINE 3: ORDERBOOK IMBALANCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class OrderbookEngine:
-    """
-    Bid/ask depth imbalance from live orderbook.
-
-    Metrics:
-      1. Depth Imbalance = (total_bid_depth - total_ask_depth) / total
-         across top N levels.
-      2. Imbalance z-score vs recent history → directional signal.
-      3. Spread-adjusted: tighter spread = higher confidence.
-
-    Fed by data_manager._on_orderbook_update() via get_orderbook().
-    """
+    """Same as v3 but signal interpretation inverted for mean-reversion."""
 
     def __init__(self):
         self._imbalance_hist: deque = deque(maxlen=QCfg.OB_HIST_LEN())
         self._last_imbalance = 0.0
-        self._spread_ratio = 0.0  # spread / midprice
+        self._spread_ratio = 0.0
 
     def update(self, orderbook: Dict, price: float) -> None:
         bids = orderbook.get("bids", [])
@@ -655,16 +461,15 @@ class OrderbookEngine:
         if not bids or not asks or price < 1.0:
             return
 
-        # Sum depth at top N levels
         bid_depth = 0.0
-        for i, level in enumerate(bids[:depth]):
+        for level in bids[:depth]:
             try:
                 bid_depth += float(level[1]) if isinstance(level, (list, tuple)) else 0.0
             except (IndexError, ValueError, TypeError):
                 pass
 
         ask_depth = 0.0
-        for i, level in enumerate(asks[:depth]):
+        for level in asks[:depth]:
             try:
                 ask_depth += float(level[1]) if isinstance(level, (list, tuple)) else 0.0
             except (IndexError, ValueError, TypeError):
@@ -678,7 +483,6 @@ class OrderbookEngine:
         self._last_imbalance = imbalance
         self._imbalance_hist.append(imbalance)
 
-        # Spread ratio
         try:
             best_bid = float(bids[0][0]) if isinstance(bids[0], (list, tuple)) else 0.0
             best_ask = float(asks[0][0]) if isinstance(asks[0], (list, tuple)) else 0.0
@@ -688,52 +492,41 @@ class OrderbookEngine:
             pass
 
     def get_signal(self) -> float:
+        """
+        Positive = more bids than asks = bullish support
+        Negative = more asks than bids = bearish pressure
+        """
         hist = list(self._imbalance_hist)
         if len(hist) < 15:
             return 0.0
 
         current = hist[-1]
-        # Rolling z-score of imbalance
         baseline = hist[:-1]
         mu = sum(baseline) / len(baseline)
         var = sum((x - mu) ** 2 for x in baseline) / max(len(baseline) - 1, 1)
         std = math.sqrt(var)
         if std < 1e-12:
-            # No variance — use raw imbalance
             return _sigmoid(current * 3.0, 0.8)
 
         z = (current - mu) / std
-
-        # Spread-adjusted confidence: tighter spread = higher signal
-        # Normal BTC spread ≈ 0.01-0.03%, penalize if wider
         spread_mult = max(0.5, min(1.0, 1.0 - (self._spread_ratio - 0.0002) * 100.0))
-
         return _sigmoid(z, 0.6) * spread_mult
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENGINE 7: TICK FLOW — Real-Time Trade Aggressor (NEW in v3)
+# ENGINE 4: TICK FLOW
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TickFlowEngine:
-    """
-    Real-time buy/sell aggressor analysis from the trade stream.
-
-    Every trade is classified as buyer-initiated or seller-initiated.
-    We compute a time-windowed dollar-weighted flow ratio and detect
-    surges (sudden spikes in one-sided flow vs baseline).
-
-    Fed by data_manager._on_trades_update() via get_recent_trades().
-    """
+    """Real-time buy/sell aggressor analysis from the trade stream."""
 
     def __init__(self):
-        self._buy_vol: deque = deque(maxlen=600)   # (timestamp, dollar_volume)
+        self._buy_vol: deque = deque(maxlen=600)
         self._sell_vol: deque = deque(maxlen=600)
         self._flow_hist: deque = deque(maxlen=120)
         self._last_signal = 0.0
 
     def on_trade(self, price: float, qty: float, is_buyer: bool, ts: float) -> None:
-        """Call this for every trade from the WebSocket stream."""
         dollar_vol = price * qty
         if is_buyer:
             self._buy_vol.append((ts, dollar_vol))
@@ -741,12 +534,10 @@ class TickFlowEngine:
             self._sell_vol.append((ts, dollar_vol))
 
     def compute_signal(self) -> float:
-        """Compute the tick flow signal from accumulated trade data."""
         now = time.time()
         window = QCfg.TICK_AGG_WINDOW_SEC()
         cutoff = now - window
 
-        # Sum buy/sell volume in the window
         buy_total = sum(dv for ts, dv in self._buy_vol if ts >= cutoff)
         sell_total = sum(dv for ts, dv in self._sell_vol if ts >= cutoff)
         total = buy_total + sell_total
@@ -761,7 +552,6 @@ class TickFlowEngine:
         if len(hist) < 10:
             return _sigmoid(flow_ratio * 2.0, 0.8)
 
-        # Z-score against recent history
         mu = sum(hist[:-1]) / len(hist[:-1])
         var = sum((x - mu) ** 2 for x in hist[:-1]) / max(len(hist[:-1]) - 1, 1)
         std = math.sqrt(var)
@@ -770,13 +560,6 @@ class TickFlowEngine:
             return _sigmoid(flow_ratio * 2.0, 0.8)
 
         z = (flow_ratio - mu) / std
-
-        # Surge detection: if current flow is TICK_SURGE_MULT × std above mean,
-        # amplify the signal (institutional order detected)
-        surge_mult = QCfg.TICK_SURGE_MULT()
-        if abs(z) > surge_mult:
-            z *= 1.3  # amplify extreme flows
-
         self._last_signal = _sigmoid(z, 0.5)
         return self._last_signal
 
@@ -785,7 +568,57 @@ class TickFlowEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ATR ENGINE — Wilder's ATR with incremental update
+# ENGINE 5: VOLUME EXHAUSTION — New in v4
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VolumeExhaustionEngine:
+    """
+    Detects when volume is declining during a price move.
+    Declining volume on a trend = exhaustion = reversion incoming.
+    
+    Returns signal in REVERSION direction.
+    """
+
+    def __init__(self):
+        self._last_signal = 0.0
+
+    def compute(self, candles: List[Dict]) -> float:
+        if len(candles) < 20:
+            return 0.0
+
+        recent = candles[-10:]
+        earlier = candles[-20:-10]
+
+        # Price direction
+        price_change = float(recent[-1]['c']) - float(earlier[0]['c'])
+        price_dir = 1.0 if price_change > 0 else -1.0
+
+        # Volume trend
+        recent_vol = sum(float(c['v']) for c in recent)
+        earlier_vol = sum(float(c['v']) for c in earlier)
+
+        if earlier_vol < 1e-10:
+            return 0.0
+
+        vol_ratio = recent_vol / earlier_vol
+
+        # Exhaustion: price moving but volume declining
+        if vol_ratio < 0.7:
+            # Strong volume decline — exhaustion signal
+            strength = min((0.7 - vol_ratio) / 0.4, 1.0)
+            self._last_signal = -price_dir * strength  # fade direction
+        elif vol_ratio < 0.9:
+            # Mild decline
+            strength = (0.9 - vol_ratio) / 0.4
+            self._last_signal = -price_dir * strength * 0.5
+        else:
+            self._last_signal = 0.0
+
+        return self._last_signal
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATR ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ATREngine:
@@ -833,8 +666,7 @@ class ATREngine:
         return self._atr
 
     @property
-    def atr(self) -> float:
-        return self._atr
+    def atr(self) -> float: return self._atr
 
     def get_percentile(self) -> float:
         hist = list(self._atr_hist)
@@ -844,51 +676,50 @@ class ATREngine:
         prev = hist[:-1]
         return sum(1 for h in prev if h <= ref) / len(prev)
 
-    def is_regime_valid(self) -> bool:
+    def regime_valid(self) -> bool:
+        """v4: Binary regime check (not gradient). Must be in tradeable range."""
         p = self.get_percentile()
         return QCfg.ATR_MIN_PCTILE() <= p <= QCfg.ATR_MAX_PCTILE()
 
     def regime_penalty(self) -> float:
-        """
-        v3: Gradient penalty instead of binary gate.
-        Returns 1.0 in ideal zone, decays toward edges.
-        Never returns 0 unless completely outside bounds.
-        """
-        p = self.get_percentile()
-        lo = QCfg.ATR_MIN_PCTILE()
-        hi = QCfg.ATR_MAX_PCTILE()
-        if lo <= p <= hi:
-            return 1.0
-        if p < lo:
-            # Below minimum: linear decay (e.g. 3% pctile when floor is 5%)
-            return max(0.0, p / (lo + 1e-12))
-        else:
-            # Above maximum: linear decay
-            return max(0.0, (1.0 - p) / (1.0 - hi + 1e-12))
+        """For backward compat with logging. 1.0 = valid, 0.0 = invalid."""
+        return 1.0 if self.regime_valid() else 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTF TREND FILTER — Multi-Timeframe Alignment (NEW in v3)
+# HTF TREND FILTER v4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class HTFTrendFilter:
     """
-    Uses 15m and 4h EMA slopes to determine dominant trend direction.
-    Returns a multiplier: >1 = aligned (boost), <1 = counter (penalize), 0 = strong veto.
+    v4: Used as VETO only, not boost. If HTF is strongly trending, we
+    don't take mean-reversion trades AGAINST it — the trend might just
+    continue and run our stops.
     """
 
     def __init__(self):
         self._trend_15m = 0.0
         self._trend_4h = 0.0
 
+    @staticmethod
+    def _ema_series(values: List[float], period: int) -> List[float]:
+        if len(values) < period:
+            return []
+        k = 2.0 / (period + 1)
+        ema = sum(values[:period]) / period
+        out = [ema]
+        for v in values[period:]:
+            ema = v * k + ema * (1.0 - k)
+            out.append(ema)
+        return out
+
     def update(self, candles_15m: List[Dict], candles_4h: List[Dict],
                atr_5m: float) -> None:
         fast = QCfg.EMA_FAST()
 
-        # 15m trend: EMA slope
         if len(candles_15m) > fast + 5 and atr_5m > 1e-10:
             cl15 = [float(c['c']) for c in candles_15m]
-            ema15 = MomentumEngine._ema_series(cl15, fast)
+            ema15 = self._ema_series(cl15, fast)
             if len(ema15) >= 4:
                 slope = ema15[-1] - ema15[-3]
                 self._trend_15m = _sigmoid(slope / atr_5m, 0.8)
@@ -897,52 +728,35 @@ class HTFTrendFilter:
         else:
             self._trend_15m = 0.0
 
-        # 4h trend: EMA slope (use longer lookback)
         slow = QCfg.EMA_SLOW()
         if len(candles_4h) > slow + 3 and atr_5m > 1e-10:
             cl4h = [float(c['c']) for c in candles_4h]
-            ema4h = MomentumEngine._ema_series(cl4h, slow)
+            ema4h = self._ema_series(cl4h, slow)
             if len(ema4h) >= 3:
                 slope = ema4h[-1] - ema4h[-2]
-                # 4h ATR is much larger, scale differently
                 self._trend_4h = _sigmoid(slope / (atr_5m * 4.0), 0.8)
             else:
                 self._trend_4h = 0.0
         else:
             self._trend_4h = 0.0
 
-    def get_alignment(self, signal_direction: float) -> float:
+    def vetoes_trade(self, side: str) -> bool:
         """
-        Returns multiplier for the composite signal.
-        signal_direction: +1 for long, -1 for short.
+        v4: VETO if HTF is strongly trending AGAINST our reversion trade.
+        Example: if 4h is strongly bullish and we want to SHORT (fade up),
+        HTF vetoes — the up move might just be trend continuation.
         """
         if not QCfg.HTF_ENABLED():
-            return 1.0
+            return False
 
-        # Combined HTF trend: 4h is dominant (60%), 15m secondary (40%)
+        veto_strength = QCfg.HTF_VETO_STRENGTH()
         htf_combined = self._trend_4h * 0.60 + self._trend_15m * 0.40
 
-        # Alignment check: does the HTF trend agree with our signal?
-        alignment = htf_combined * signal_direction  # positive = aligned
-
-        veto = QCfg.HTF_VETO_STRENGTH()
-        boost = QCfg.HTF_BOOST()
-
-        if alignment > 0.15:
-            # Aligned: boost proportional to alignment strength
-            return 1.0 + boost * min(alignment / 0.5, 1.0)
-        elif alignment < -0.15:
-            # Counter-trend: penalize
-            penalty = abs(alignment) / (veto + 1e-12)
-            if penalty > 1.0:
-                # Strong counter-trend: veto (return near-zero multiplier)
-                return max(0.05, 1.0 - penalty * 0.8)
-            else:
-                # Mild counter: moderate penalty
-                return max(0.3, 1.0 - penalty * 0.5)
-        else:
-            # Neutral: no adjustment
-            return 1.0
+        if side == "long" and htf_combined < -veto_strength:
+            return True  # HTF strongly bearish, don't go long
+        if side == "short" and htf_combined > veto_strength:
+            return True  # HTF strongly bullish, don't go short
+        return False
 
     @property
     def trend_15m(self) -> float: return self._trend_15m
@@ -951,159 +765,37 @@ class HTFTrendFilter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL AGGREGATOR — Dynamic Weight Redistribution + Agreement Detection
+# SIGNAL BREAKDOWN (for logging & telegram)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SignalBreakdown:
-    cvd:       float = 0.0
-    vwap:      float = 0.0
-    mom:       float = 0.0
-    squeeze:   float = 0.0
-    vol:       float = 0.0
-    orderbook: float = 0.0
-    tick_flow: float = 0.0
-    composite: float = 0.0
-    raw_composite: float = 0.0   # before HTF/regime adjustments
-    atr:       float = 0.0
-    atr_pct:   float = 0.0
-    regime_penalty: float = 1.0
-    htf_mult:  float = 1.0
-    n_agreeing: int  = 0
+    vwap_dev:     float = 0.0   # VWAP deviation signal (reversion)
+    cvd_div:      float = 0.0   # CVD divergence signal
+    orderbook:    float = 0.0   # Orderbook imbalance
+    tick_flow:    float = 0.0   # Tick aggressor flow
+    vol_exhaust:  float = 0.0   # Volume exhaustion
+    composite:    float = 0.0   # Weighted composite
+    atr:          float = 0.0
+    atr_pct:      float = 0.0
+    regime_ok:    bool  = False
+    htf_veto:     bool  = False
+    overextended: bool  = False
+    vwap_price:   float = 0.0
+    deviation_atr: float = 0.0
+    reversion_side: str = ""
+    n_confirming: int   = 0     # how many sub-signals confirm
     threshold_used: float = 0.0
-
-    @property
-    def regime_ok(self) -> bool:
-        """Backward compatibility with v2 consumers (telegram_bot_controller, etc.)."""
-        return self.regime_penalty >= 0.5
+    regime_penalty: float = 1.0  # backward compat
 
     def __str__(self) -> str:
         return (
-            f"CVD={self.cvd:+.3f} VWAP={self.vwap:+.3f} "
-            f"MOM={self.mom:+.3f} SQZ={self.squeeze:+.3f} "
-            f"VFL={self.vol:+.3f} OB={self.orderbook:+.3f} "
-            f"TF={self.tick_flow:+.3f} → Σ={self.composite:+.4f} "
-            f"(raw={self.raw_composite:+.3f} ×HTF={self.htf_mult:.2f} "
-            f"×REG={self.regime_penalty:.2f}) "
-            f"agree={self.n_agreeing} thr={self.threshold_used:.3f} "
+            f"VWAP={self.vwap_dev:+.3f} CVD={self.cvd_div:+.3f} "
+            f"OB={self.orderbook:+.3f} TF={self.tick_flow:+.3f} "
+            f"VEX={self.vol_exhaust:+.3f} → Σ={self.composite:+.4f} "
+            f"dev={self.deviation_atr:+.1f}ATR "
+            f"confirm={self.n_confirming}/5 "
             f"ATR=${self.atr:.1f}({self.atr_pct:.0%})"
-        )
-
-
-class SignalAggregator:
-    """
-    v3: Dynamic weight redistribution + agreement detection.
-
-    When a signal returns 0.0 (inactive, e.g. squeeze not firing),
-    its weight is redistributed proportionally to active signals.
-    This prevents dead-weight dilution that plagued v2.
-
-    Agreement detection: counts how many signals agree on direction.
-    When ≥ MIN_AGREE_SIGNALS agree, the entry threshold is lowered
-    by AGREEMENT_DISCOUNT (making entries easier when conviction is broad).
-    """
-
-    @staticmethod
-    def compute(signals: Dict[str, float],
-                atr_engine: ATREngine,
-                htf_filter: HTFTrendFilter) -> SignalBreakdown:
-
-        # Fetch base weights
-        base_weights = {
-            'cvd': QCfg.W_CVD(),
-            'vwap': QCfg.W_VWAP(),
-            'mom': QCfg.W_MOM(),
-            'squeeze': QCfg.W_SQUEEZE(),
-            'vol': QCfg.W_VOL(),
-            'orderbook': QCfg.W_ORDERBOOK(),
-            'tick_flow': QCfg.W_TICK_FLOW(),
-        }
-
-        # ── Dynamic weight redistribution ──────────────────────────────
-        # A signal is "inactive" if |value| < 0.01 (effectively zero)
-        INACTIVE_THRESHOLD = 0.01
-
-        active_weight_sum = 0.0
-        inactive_weight_sum = 0.0
-        for name, w in base_weights.items():
-            if abs(signals.get(name, 0.0)) >= INACTIVE_THRESHOLD:
-                active_weight_sum += w
-            else:
-                inactive_weight_sum += w
-
-        # Redistribute inactive weight to active signals proportionally
-        effective_weights = {}
-        if active_weight_sum > 1e-10:
-            redistribution_ratio = (active_weight_sum + inactive_weight_sum) / active_weight_sum
-            for name, w in base_weights.items():
-                if abs(signals.get(name, 0.0)) >= INACTIVE_THRESHOLD:
-                    effective_weights[name] = w * redistribution_ratio
-                else:
-                    effective_weights[name] = 0.0
-        else:
-            effective_weights = dict(base_weights)
-
-        # Normalize to sum = 1.0
-        total_ew = sum(effective_weights.values())
-        if total_ew > 1e-10:
-            effective_weights = {k: v / total_ew for k, v in effective_weights.items()}
-
-        # ── Weighted composite ──────────────────────────────────────────
-        raw_composite = sum(effective_weights.get(name, 0.0) * signals.get(name, 0.0)
-                           for name in base_weights)
-
-        # ── Agreement detection ─────────────────────────────────────────
-        direction = 1.0 if raw_composite >= 0 else -1.0
-        strong_level = QCfg.STRONG_SIGNAL_LEVEL()
-        n_agreeing = 0
-        for name in base_weights:
-            sig_val = signals.get(name, 0.0)
-            if abs(sig_val) >= INACTIVE_THRESHOLD:
-                # Signal agrees if it's pointing the same direction AND is strong enough
-                if sig_val * direction > 0 and abs(sig_val) >= strong_level * 0.5:
-                    n_agreeing += 1
-
-        # Agreement bonus: when many signals agree, add a small boost
-        if n_agreeing >= QCfg.MIN_AGREE_SIGNALS():
-            agreement_bonus = (n_agreeing - QCfg.MIN_AGREE_SIGNALS() + 1) * 0.02 * direction
-            raw_composite += agreement_bonus
-
-        raw_composite = max(-1.0, min(1.0, raw_composite))
-
-        # ── HTF trend adjustment ────────────────────────────────────────
-        htf_mult = htf_filter.get_alignment(direction)
-
-        # ── Regime penalty (gradient, not binary) ───────────────────────
-        regime_pen = atr_engine.regime_penalty()
-
-        # Final composite
-        composite = raw_composite * htf_mult * regime_pen
-        composite = max(-1.0, min(1.0, composite))
-
-        # ── Adaptive threshold ──────────────────────────────────────────
-        base_thresh = (QCfg.LONG_THRESHOLD() if composite >= 0
-                       else QCfg.SHORT_THRESHOLD())
-        discount = 0.0
-        if n_agreeing >= QCfg.MIN_AGREE_SIGNALS():
-            discount = QCfg.AGREEMENT_DISCOUNT() * (n_agreeing - QCfg.MIN_AGREE_SIGNALS() + 1)
-        threshold_used = max(0.20, base_thresh - discount)
-
-        return SignalBreakdown(
-            cvd=signals.get('cvd', 0.0),
-            vwap=signals.get('vwap', 0.0),
-            mom=signals.get('mom', 0.0),
-            squeeze=signals.get('squeeze', 0.0),
-            vol=signals.get('vol', 0.0),
-            orderbook=signals.get('orderbook', 0.0),
-            tick_flow=signals.get('tick_flow', 0.0),
-            composite=composite,
-            raw_composite=raw_composite,
-            atr=atr_engine.atr,
-            atr_pct=atr_engine.get_percentile(),
-            regime_penalty=regime_pen,
-            htf_mult=htf_mult,
-            n_agreeing=n_agreeing,
-            threshold_used=threshold_used,
         )
 
 
@@ -1150,7 +842,7 @@ class PositionState:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DAILY RISK GATE
+# DAILY RISK GATE v4 — with consecutive loss lockout
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DailyRiskGate:
@@ -1160,6 +852,7 @@ class DailyRiskGate:
         self._consec_losses: int = 0
         self._daily_pnl: float = 0.0
         self._daily_open_bal: float = 0.0
+        self._loss_lockout_until: float = 0.0  # v4: timestamp when lockout expires
         self._lock = threading.Lock()
 
     def _reset_if_new_day(self) -> None:
@@ -1170,6 +863,8 @@ class DailyRiskGate:
             self._daily_trades = 0
             self._daily_pnl = 0.0
             self._daily_open_bal = 0.0
+            self._consec_losses = 0
+            self._loss_lockout_until = 0.0
 
     def set_opening_balance(self, balance: float) -> None:
         with self._lock:
@@ -1180,6 +875,13 @@ class DailyRiskGate:
     def can_trade(self, current_balance: float) -> Tuple[bool, str]:
         with self._lock:
             self._reset_if_new_day()
+            now = time.time()
+
+            # v4: Lockout after consecutive losses
+            if now < self._loss_lockout_until:
+                remaining = int(self._loss_lockout_until - now)
+                return False, f"Loss lockout: {remaining}s remaining"
+
             max_dt = QCfg.MAX_DAILY_TRADES()
             max_cl = QCfg.MAX_CONSEC_LOSSES()
             max_lp = QCfg.MAX_DAILY_LOSS_PCT()
@@ -1187,7 +889,8 @@ class DailyRiskGate:
             if self._daily_trades >= max_dt:
                 return False, f"Daily trade cap: {self._daily_trades}/{max_dt}"
             if self._consec_losses >= max_cl:
-                return False, f"Consecutive loss cap: {self._consec_losses}/{max_cl}"
+                self._loss_lockout_until = now + QCfg.LOSS_LOCKOUT_SEC()
+                return False, f"Consec loss cap: {self._consec_losses}/{max_cl} → {QCfg.LOSS_LOCKOUT_SEC()}s lockout"
             if self._daily_open_bal > 1e-10:
                 loss_pct = -self._daily_pnl / self._daily_open_bal * 100.0
                 if loss_pct >= max_lp:
@@ -1217,12 +920,12 @@ class DailyRiskGate:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN STRATEGY CLASS — v3
+# MAIN STRATEGY CLASS — v4 MEAN-REVERSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class QuantStrategy:
     """
-    Institutional Multi-Factor Momentum + Order Flow Strategy — v3.
+    v4 Mean-Reversion + Order Flow Confluence Strategy.
 
     Public interface (unchanged for main.py compatibility):
         on_tick(data_manager, order_manager, risk_manager, timestamp_ms) → None
@@ -1235,20 +938,18 @@ class QuantStrategy:
         self._om = order_manager
         self._lock = threading.RLock()
 
-        # 7 Signal Engines
-        self._cvd     = CVDEngine()
+        # v4: 5 Signal Engines (reversion-focused)
         self._vwap    = VWAPEngine()
-        self._mom     = MomentumEngine()
-        self._squeeze = SqueezeEngine()
-        self._volflow = VolumeFlowEngine()
+        self._cvd     = CVDEngine()
         self._ob_eng  = OrderbookEngine()
         self._tick_eng = TickFlowEngine()
+        self._vol_exh = VolumeExhaustionEngine()
 
         # ATR on two timeframes
         self._atr_1m = ATREngine()
         self._atr_5m = ATREngine()
 
-        # HTF Trend Filter
+        # HTF Trend Filter (veto only)
         self._htf = HTFTrendFilter()
 
         # State
@@ -1265,12 +966,13 @@ class QuantStrategy:
         self._last_exit_time = 0.0
         self._last_pos_sync  = 0.0
         self._last_exit_sync = 0.0
+        self._last_exit_side = ""  # v4: anti-whipsaw directional memory
 
         # Thinking log
         self._last_think_log = 0.0
         self._think_interval = 30.0
 
-        # Trade dedup guard — prevents re-feeding same trades every tick
+        # Trade dedup
         self._last_fed_trade_ts = 0.0
 
         # Reconciliation
@@ -1292,24 +994,14 @@ class QuantStrategy:
 
     def _log_init(self) -> None:
         logger.info("=" * 72)
-        logger.info("⚡ QuantStrategy v3 — INSTITUTIONAL GRADE — 7 ENGINES")
+        logger.info("⚡ QuantStrategy v4 — MEAN-REVERSION + ORDER FLOW")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x lev | "
                     f"{QCfg.MARGIN_PCT():.0%} margin | "
-                    f"SL={QCfg.SL_ATR_MULT()}×ATR TP={QCfg.TP_ATR_MULT()}×ATR "
-                    f"minRR={QCfg.MIN_RR_RATIO()}")
-        logger.info(f"   Engines: CVD VWAP MOM SQZ VOL OB TICK")
-        logger.info(f"   Threshold: {QCfg.LONG_THRESHOLD()} (adaptive) | "
-                    f"Confirm: {QCfg.CONFIRM_TICKS()} | "
-                    f"Eval: {QCfg.TICK_EVAL_SEC()}s")
-        logger.info(f"   HTF Filter: {'ON' if QCfg.HTF_ENABLED() else 'OFF'} | "
-                    f"Regime: {QCfg.ATR_MIN_PCTILE():.0%}-{QCfg.ATR_MAX_PCTILE():.0%} (gradient)")
-        w_total = (QCfg.W_CVD() + QCfg.W_VWAP() + QCfg.W_MOM() +
-                   QCfg.W_SQUEEZE() + QCfg.W_VOL() +
-                   QCfg.W_ORDERBOOK() + QCfg.W_TICK_FLOW())
-        logger.info(f"   Weights: CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} "
-                    f"MOM={QCfg.W_MOM()} SQZ={QCfg.W_SQUEEZE()} "
-                    f"VFL={QCfg.W_VOL()} OB={QCfg.W_ORDERBOOK()} "
-                    f"TF={QCfg.W_TICK_FLOW()} (sum={w_total:.2f})")
+                    f"VWAP entry > {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR")
+        logger.info(f"   SL: swing structure + {QCfg.SL_BUFFER_ATR_MULT()}×ATR buffer")
+        logger.info(f"   TP: {QCfg.TP_VWAP_FRACTION():.0%} back to VWAP")
+        logger.info(f"   Cooldown: {QCfg.COOLDOWN_SEC()}s | Loss lockout: {QCfg.LOSS_LOCKOUT_SEC()}s")
+        logger.info(f"   Confirm: {QCfg.CONFIRM_TICKS()} ticks | Max trades: {QCfg.MAX_DAILY_TRADES()}/day")
         logger.info("=" * 72)
 
     # ───────────────────────────────────────────────────────────────────
@@ -1332,10 +1024,10 @@ class QuantStrategy:
 
             phase = self._pos.phase
 
-            # ── Feed microstructure engines from data_manager ──────────
+            # Feed microstructure engines
             self._feed_microstructure(data_manager)
 
-            # ── Reconciliation ────────────────────────────────────────
+            # Reconciliation
             if self._reconcile_data is not None:
                 data = self._reconcile_data
                 self._reconcile_data = None
@@ -1377,13 +1069,11 @@ class QuantStrategy:
                 self._manage_active(data_manager, order_manager, now)
 
     # ───────────────────────────────────────────────────────────────────
-    # MICROSTRUCTURE FEED — v3 NEW
+    # MICROSTRUCTURE FEED
     # ───────────────────────────────────────────────────────────────────
 
     def _feed_microstructure(self, data_manager) -> None:
-        """Feed orderbook and tick data into microstructure engines."""
         try:
-            # Orderbook — always update (snapshot, not incremental)
             ob = data_manager.get_orderbook()
             price = data_manager.get_last_price()
             if ob and price > 1.0:
@@ -1392,7 +1082,6 @@ class QuantStrategy:
             pass
 
         try:
-            # Tick flow — only feed NEW trades (dedup guard)
             trades = data_manager.get_recent_trades_raw()
             cutoff_ts = self._last_fed_trade_ts
             max_ts = cutoff_ts
@@ -1414,7 +1103,7 @@ class QuantStrategy:
             pass
 
     # ───────────────────────────────────────────────────────────────────
-    # SIGNAL COMPUTATION — v3 COMPLETE REWRITE
+    # SIGNAL COMPUTATION — v4 MEAN-REVERSION
     # ───────────────────────────────────────────────────────────────────
 
     def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
@@ -1436,14 +1125,11 @@ class QuantStrategy:
         if price < 1.0:
             return None
 
-        # Update all 5 candle-based engines
-        self._cvd.update(candles_1m)
+        # Update engines
         self._vwap.update(candles_1m, atr_1m)
-        self._mom.update(candles_1m, candles_5m, atr_1m, atr_5m)
-        self._squeeze.update(candles_1m, atr_1m)
-        self._volflow.update(candles_1m)
+        self._cvd.update(candles_1m)
 
-        # Update HTF trend filter
+        # Update HTF
         try:
             candles_15m = data_manager.get_candles("15m", limit=100)
             candles_4h = data_manager.get_candles("4h", limit=50)
@@ -1451,23 +1137,59 @@ class QuantStrategy:
         except Exception:
             pass
 
-        # Collect all 7 signals
-        signals = {
-            'cvd': self._cvd.get_signal(),
-            'vwap': self._vwap.get_signal(price),
-            'mom': self._mom.get_signal(),
-            'squeeze': self._squeeze.get_signal(),
-            'vol': self._volflow.get_signal(),
-            'orderbook': self._ob_eng.get_signal(),
-            'tick_flow': self._tick_eng.get_signal(),
-        }
+        # Collect signals
+        vwap_sig = self._vwap.get_reversion_signal(price, atr_1m)
+        cvd_sig = self._cvd.get_divergence_signal(candles_1m)
+        ob_sig = self._ob_eng.get_signal()
+        tick_sig = self._tick_eng.get_signal()
+        vol_exh = self._vol_exh.compute(candles_1m)
 
-        sig = SignalAggregator.compute(signals, self._atr_5m, self._htf)
+        # Weighted composite
+        composite = (
+            vwap_sig * QCfg.W_VWAP_DEV() +
+            cvd_sig * QCfg.W_CVD_DIV() +
+            ob_sig * QCfg.W_OB() +
+            tick_sig * QCfg.W_TICK_FLOW() +
+            vol_exh * QCfg.W_VOL_EXHAUSTION()
+        )
+        composite = max(-1.0, min(1.0, composite))
+
+        # Count confirming signals (same direction as composite)
+        direction = 1.0 if composite >= 0 else -1.0
+        n_confirm = 0
+        for s in [vwap_sig, cvd_sig, ob_sig, tick_sig, vol_exh]:
+            if s * direction > 0.05:
+                n_confirm += 1
+
+        overextended = self._vwap.is_overextended(price, atr_1m)
+        rev_side = self._vwap.reversion_side(price)
+        regime_ok = self._atr_5m.regime_valid()
+        htf_veto = self._htf.vetoes_trade(rev_side)
+
+        sig = SignalBreakdown(
+            vwap_dev=vwap_sig,
+            cvd_div=cvd_sig,
+            orderbook=ob_sig,
+            tick_flow=tick_sig,
+            vol_exhaust=vol_exh,
+            composite=composite,
+            atr=atr_5m,
+            atr_pct=self._atr_5m.get_percentile(),
+            regime_ok=regime_ok,
+            regime_penalty=1.0 if regime_ok else 0.0,
+            htf_veto=htf_veto,
+            overextended=overextended,
+            vwap_price=self._vwap.vwap,
+            deviation_atr=self._vwap.deviation_atr,
+            reversion_side=rev_side,
+            n_confirming=n_confirm,
+            threshold_used=QCfg.COMPOSITE_ENTRY_MIN(),
+        )
         self._last_sig = sig
         return sig
 
     # ───────────────────────────────────────────────────────────────────
-    # THINKING LOG
+    # THINKING LOG v4
     # ───────────────────────────────────────────────────────────────────
 
     def _log_thinking(self, sig: SignalBreakdown, price: float, now: float) -> None:
@@ -1489,65 +1211,46 @@ class QuantStrategy:
             return f"  {label:<6} {bar(v)} {arrow} {v:+.3f}"
 
         c = sig.composite
-        thr = sig.threshold_used
+        thr = QCfg.COMPOSITE_ENTRY_MIN()
 
-        if c >= thr:
-            lean = f"BULLISH  ✅  ({c:+.3f} ≥ {thr:.3f})"
-        elif c <= -thr:
-            lean = f"BEARISH  ✅  ({c:+.3f} ≤ -{thr:.3f})"
-        elif c >= thr * 0.7:
-            lean = f"weakly bullish  ({c:+.3f}, need ≥{thr:.3f})"
-        elif c <= -thr * 0.7:
-            lean = f"weakly bearish  ({c:+.3f}, need ≤-{thr:.3f})"
-        else:
-            lean = f"NEUTRAL  🔇  ({c:+.3f})"
+        # Entry gate status
+        gates = []
+        gates.append(f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR)")
+        gates.append(f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%} pctile)")
+        gates.append(f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})")
+        gates.append(f"{'✅' if sig.n_confirming >= 3 else '❌'} Confluence ({sig.n_confirming}/5 confirm)")
+        gates.append(f"{'✅' if abs(c) >= thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})")
 
-        need = QCfg.CONFIRM_TICKS()
-        if self._confirm_long > 0:
-            conf_str = f"LONG confirms: {self._confirm_long}/{need}"
-        elif self._confirm_short > 0:
-            conf_str = f"SHORT confirms: {self._confirm_short}/{need}"
-        else:
-            conf_str = "No confirmation building"
+        all_pass = (sig.overextended and sig.regime_ok and not sig.htf_veto
+                    and sig.n_confirming >= 3 and abs(c) >= thr)
 
-        if c >= thr and self._confirm_long >= need - 1:
-            next_move = "⚡ ENTRY LONG — next tick fires"
-        elif c <= -thr and self._confirm_short >= need - 1:
-            next_move = "⚡ ENTRY SHORT — next tick fires"
-        elif c >= thr or c <= -thr:
-            remaining = need - max(self._confirm_long, self._confirm_short)
-            next_move = f"🕐 Confirming — {remaining} tick(s) left"
-        else:
-            next_move = "👀 Watching — below threshold"
-
-        regime_str = (f"penalty={sig.regime_penalty:.2f} ({sig.atr_pct:.0%} pctile)")
-        cooldown_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
-        cd_str = f"{cooldown_rem:.0f}s" if cooldown_rem > 0 else "ready"
+        cd_rem = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
+        cd_str = f"{cd_rem:.0f}s" if cd_rem > 0 else "ready"
 
         lines = [
-            f"┌─── 🧠 v3 THINKING  ${price:,.2f}  ATR={sig.atr:.1f}  agree={sig.n_agreeing}/7 ────",
-            fmt("CVD",  sig.cvd),
-            fmt("VWAP", sig.vwap),
-            fmt("MOM",  sig.mom),
-            fmt("SQZ",  sig.squeeze),
-            fmt("VFL",  sig.vol),
-            fmt("OB",   sig.orderbook),
+            f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
+            fmt("VWAP", sig.vwap_dev),
+            fmt("CVD", sig.cvd_div),
+            fmt("OB", sig.orderbook),
             fmt("TICK", sig.tick_flow),
+            fmt("VEX", sig.vol_exhaust),
             f"  {'─'*42}",
-            f"  Σ raw={sig.raw_composite:+.4f} ×HTF={sig.htf_mult:.2f} ×REG={sig.regime_penalty:.2f} → [{bar(c)}] {c:+.4f}",
-            f"  HTF:  15m={self._htf.trend_15m:+.3f}  4h={self._htf.trend_4h:+.3f}",
-            f"  Regime:    {regime_str}",
-            f"  Threshold: {thr:.3f} (base={QCfg.LONG_THRESHOLD():.2f} - agree_disc)",
-            f"  Lean:      {lean}",
-            f"  {conf_str}",
-            f"  Cooldown:  {cd_str}",
-            f"  Next:      {next_move}",
-            f"└{'─'*66}",
+            f"  Σ composite: {c:+.4f}  |  Side: {sig.reversion_side.upper()}",
+            f"  ──── ENTRY GATES ────",
         ]
+        for g in gates:
+            lines.append(f"  {g}")
+        lines.append(f"  ────────────────────")
+        if all_pass:
+            lines.append(f"  🎯 ALL GATES PASS — confirming ({self._confirm_long + self._confirm_short}/{QCfg.CONFIRM_TICKS()})")
+        else:
+            lines.append(f"  👀 Watching — gates not met")
+        lines.append(f"  Cooldown: {cd_str}")
+        lines.append(f"└{'─'*66}")
         logger.info("\n" + "\n".join(lines))
 
     # ───────────────────────────────────────────────────────────────────
-    # ENTRY EVALUATION — v3: ADAPTIVE THRESHOLD + FAST CONFIRMATION
+    # ENTRY EVALUATION — v4: HARD CONFLUENCE GATE
     # ───────────────────────────────────────────────────────────────────
 
     def _evaluate_entry(self, data_manager, order_manager,
@@ -1561,31 +1264,136 @@ class QuantStrategy:
         self._log_thinking(sig, price, now)
 
         c = sig.composite
-        thr = sig.threshold_used  # ADAPTIVE threshold from aggregator
+        thr = QCfg.COMPOSITE_ENTRY_MIN()
+        side = sig.reversion_side
 
-        if c >= thr:
+        # ── v4: HARD CONFLUENCE GATES (ALL must pass) ──
+        if not sig.overextended:
+            self._confirm_long = self._confirm_short = 0
+            return
+        if not sig.regime_ok:
+            self._confirm_long = self._confirm_short = 0
+            return
+        if sig.htf_veto:
+            self._confirm_long = self._confirm_short = 0
+            return
+        if sig.n_confirming < 3:
+            self._confirm_long = self._confirm_short = 0
+            return
+
+        # v4: Anti-whipsaw — don't immediately flip direction
+        if self._last_exit_side and self._last_exit_side != side:
+            extra_cooldown = QCfg.COOLDOWN_SEC() * 0.5  # 50% extra for direction flip
+            if now - self._last_exit_time < QCfg.COOLDOWN_SEC() + extra_cooldown:
+                return
+
+        # Composite must exceed threshold in the reversion direction
+        if side == "long" and c >= thr:
             self._confirm_long += 1; self._confirm_short = 0
-        elif c <= -thr:
+        elif side == "short" and c <= -thr:
             self._confirm_short += 1; self._confirm_long = 0
         else:
             self._confirm_long = self._confirm_short = 0
             return
 
-        # v3: FAST ENTRY — skip confirmation for very strong signals
         confirm_needed = QCfg.CONFIRM_TICKS()
-        strong_composite = 0.60
-        if abs(c) >= strong_composite:
-            confirm_needed = 0  # instant entry on very strong signals
 
-        if self._confirm_long > confirm_needed:
+        if self._confirm_long >= confirm_needed:
             self._confirm_long = self._confirm_short = 0
             self._enter_trade(data_manager, order_manager, risk_manager, "long", sig)
-        elif self._confirm_short > confirm_needed:
+        elif self._confirm_short >= confirm_needed:
             self._confirm_long = self._confirm_short = 0
             self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
 
     # ───────────────────────────────────────────────────────────────────
-    # ENTER TRADE
+    # STRUCTURE-BASED SL/TP — v4
+    # ───────────────────────────────────────────────────────────────────
+
+    def _compute_sl_tp(self, data_manager, price: float, side: str,
+                       atr: float) -> Tuple[Optional[float], Optional[float]]:
+        """
+        v4: SL behind swing structure. TP toward VWAP.
+        
+        SL = recent swing extreme + buffer (in direction against us)
+        TP = fraction of distance back to VWAP (tight target for high WR)
+        """
+        # Get recent candles for swing detection
+        try:
+            candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK() + 2)
+        except Exception:
+            candles_5m = []
+
+        if len(candles_5m) < 5:
+            # Fallback: ATR-based
+            sl_dist = max(price * QCfg.MIN_SL_PCT(), min(price * QCfg.MAX_SL_PCT(), 2.0 * atr))
+            if side == "long":
+                sl_price = price - sl_dist
+            else:
+                sl_price = price + sl_dist
+        else:
+            closed = candles_5m[:-1][-QCfg.SL_SWING_LOOKBACK():]
+            buffer = QCfg.SL_BUFFER_ATR_MULT() * atr
+
+            if side == "long":
+                # SL below recent swing low
+                swing_low = min(float(c['l']) for c in closed)
+                sl_price = swing_low - buffer
+            else:
+                # SL above recent swing high
+                swing_high = max(float(c['h']) for c in closed)
+                sl_price = swing_high + buffer
+
+        # Enforce min/max SL distance
+        sl_dist = abs(price - sl_price)
+        min_sl = price * QCfg.MIN_SL_PCT()
+        max_sl = price * QCfg.MAX_SL_PCT()
+
+        if sl_dist < min_sl:
+            if side == "long":
+                sl_price = price - min_sl
+            else:
+                sl_price = price + min_sl
+            sl_dist = min_sl
+        elif sl_dist > max_sl:
+            if side == "long":
+                sl_price = price - max_sl
+            else:
+                sl_price = price + max_sl
+            sl_dist = max_sl
+
+        # TP: tight target toward VWAP (for high win rate)
+        tp_price = self._vwap.tp_target(price)
+
+        # Ensure TP is on correct side
+        if side == "long" and tp_price <= price:
+            tp_price = price + sl_dist * QCfg.MIN_RR_RATIO()
+        elif side == "short" and tp_price >= price:
+            tp_price = price - sl_dist * QCfg.MIN_RR_RATIO()
+
+        # Minimum R:R check
+        tp_dist = abs(price - tp_price)
+        if sl_dist > 1e-10:
+            rr = tp_dist / sl_dist
+            if rr < QCfg.MIN_RR_RATIO():
+                # Widen TP to meet minimum R:R
+                if side == "long":
+                    tp_price = price + sl_dist * QCfg.MIN_RR_RATIO()
+                else:
+                    tp_price = price - sl_dist * QCfg.MIN_RR_RATIO()
+
+        sl_price = _round_to_tick(sl_price)
+        tp_price = _round_to_tick(tp_price)
+
+        # Sanity check
+        if side == "long" and (sl_price >= price or tp_price <= price):
+            return None, None
+        if side == "short" and (sl_price <= price or tp_price >= price):
+            return None, None
+
+        return sl_price, tp_price
+
+    # ───────────────────────────────────────────────────────────────────
+    # ENTER TRADE — v4
     # ───────────────────────────────────────────────────────────────────
 
     def _enter_trade(self, data_manager, order_manager,
@@ -1613,7 +1421,7 @@ class QuantStrategy:
         if qty is None or qty < QCfg.MIN_QTY():
             return
 
-        sl_price, tp_price = self._compute_sl_tp(price, side, atr)
+        sl_price, tp_price = self._compute_sl_tp(data_manager, price, side, atr)
         if sl_price is None or tp_price is None:
             return
 
@@ -1622,13 +1430,11 @@ class QuantStrategy:
         if sl_dist < 1e-10:
             return
         rr = tp_dist / sl_dist
-        if rr < QCfg.MIN_RR_RATIO() - 1e-9:
-            logger.info(f"Entry blocked: R:R={rr:.4f} < min={QCfg.MIN_RR_RATIO()}")
-            return
 
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | {sig}"
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
+            f"VWAP=${sig.vwap_price:,.2f} dev={sig.deviation_atr:+.1f}ATR | {sig}"
         )
 
         entry_data = order_manager.place_market_order(side=side, quantity=qty)
@@ -1648,24 +1454,13 @@ class QuantStrategy:
         slip = abs(fill_price - price) / price
         if slip > QCfg.SLIPPAGE_TOL():
             logger.info(f"Slippage {slip:.4%} > tol — recalc SL/TP")
-            new_sl, new_tp = self._compute_sl_tp(fill_price, side, atr)
+            new_sl, new_tp = self._compute_sl_tp(data_manager, fill_price, side, atr)
             if new_sl is None or new_tp is None:
-                logger.error("❌ SL/TP recompute failed — closing")
                 exit_s = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
                 self._last_exit_time = time.time()
-                self._last_reconcile_time = 0.0
-                return
-            new_rr = abs(fill_price - new_tp) / abs(fill_price - new_sl)
-            if new_rr < QCfg.MIN_RR_RATIO() - 1e-9:
-                logger.warning(f"R:R={new_rr:.4f} below min after slippage — closing")
-                exit_s = "sell" if side == "long" else "buy"
-                order_manager.place_market_order(side=exit_s, quantity=qty, reduce_only=True)
-                self._last_exit_time = time.time()
-                self._last_reconcile_time = 0.0
                 return
             sl_price, tp_price = new_sl, new_tp
-            rr = new_rr
 
         exit_side = "sell" if side == "long" else "buy"
 
@@ -1684,7 +1479,6 @@ class QuantStrategy:
             logger.error("❌ SL placement failed — closing")
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
             self._last_exit_time = time.time()
-            self._last_reconcile_time = 0.0
             return
 
         tp_data = order_manager.place_take_profit(side=exit_side, quantity=qty,
@@ -1694,7 +1488,6 @@ class QuantStrategy:
             order_manager.cancel_order(sl_data["order_id"])
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
             self._last_exit_time = time.time()
-            self._last_reconcile_time = 0.0
             return
 
         sl_dist_filled = abs(fill_price - sl_price)
@@ -1721,26 +1514,23 @@ class QuantStrategy:
         self.current_tp_price = tp_price
         self._total_trades += 1
 
+        rr_actual = abs(fill_price - tp_price) / sl_dist_filled if sl_dist_filled > 0 else 0
+
         send_telegram_message(
-            f"{'📈' if side == 'long' else '📉'} <b>QUANT v3 ENTRY — {side.upper()}</b>\n\n"
+            f"{'📈' if side == 'long' else '📉'} <b>QUANT v4 REVERSION — {side.upper()}</b>\n\n"
             f"Symbol:   {QCfg.SYMBOL()}\n"
             f"Entry:    ${fill_price:,.2f}\n"
-            f"SL:       ${sl_price:,.2f}  "
-            f"(−${sl_dist_filled:.2f} / {sl_dist_filled/fill_price:.3%})\n"
-            f"TP:       ${tp_price:,.2f}  "
-            f"(+${abs(tp_price-fill_price):.2f})\n"
-            f"R:R:      1:{rr:.2f}\n"
+            f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f} ATR away)\n"
+            f"SL:       ${sl_price:,.2f} (swing structure)\n"
+            f"TP:       ${tp_price:,.2f} ({QCfg.TP_VWAP_FRACTION():.0%} to VWAP)\n"
+            f"R:R:      1:{rr_actual:.2f}\n"
             f"Qty:      {qty} BTC\n"
-            f"Margin:   ${initial_risk/QCfg.LEVERAGE():.2f} USDT\n"
-            f"Risk:     ${initial_risk:.2f} USDT\n"
-            f"Signals:  {sig.n_agreeing}/7 agree | thr={sig.threshold_used:.3f}\n"
-            f"HTF:      15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}\n\n"
-            f"<i>{sig}</i>"
+            f"Confirm:  {sig.n_confirming}/5 signals agree\n"
         )
-        logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | R:R=1:{rr:.2f}")
+        logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | R:R=1:{rr_actual:.2f}")
 
     # ───────────────────────────────────────────────────────────────────
-    # ACTIVE MANAGEMENT — v3: faster trailing + signal exit
+    # ACTIVE MANAGEMENT — v4: Trail + Max Hold + Signal Exit
     # ───────────────────────────────────────────────────────────────────
 
     def _manage_active(self, data_manager, order_manager, now: float) -> None:
@@ -1749,122 +1539,88 @@ class QuantStrategy:
         if price < 1.0:
             return
 
+        # Max hold time check
+        hold_sec = now - pos.entry_time
+        if hold_sec > QCfg.MAX_HOLD_SEC():
+            logger.info(f"⏰ Max hold time ({QCfg.MAX_HOLD_SEC()}s) → exiting")
+            self._exit_trade(order_manager, price, "max_hold_time")
+            return
+
+        # v4: Signal-based exit ONLY when position is significantly against us
+        # Don't exit just because signal flipped mildly
         sig = self._compute_signals(data_manager)
         if sig is not None:
             self._log_thinking(sig, price, now)
-            c = sig.composite; flip = QCfg.EXIT_FLIP_THRESH()
-            if pos.side == "long" and c <= -flip:
-                logger.info(f"🔄 Alpha flip ({c:+.3f} ≤ -{flip}) → exit LONG")
-                self._exit_trade(order_manager, price, "signal_reversal"); return
-            if pos.side == "short" and c >= flip:
-                logger.info(f"🔄 Alpha flip ({c:+.3f} ≥ +{flip}) → exit SHORT")
-                self._exit_trade(order_manager, price, "signal_reversal"); return
+            c = sig.composite
+            exit_thr = QCfg.EXIT_REVERSAL_THRESH()
 
+            # Only exit on STRONG reversal signal (not mild flip)
+            if pos.side == "long" and c <= -exit_thr:
+                logger.info(f"🔄 Strong reversal ({c:+.3f} ≤ -{exit_thr}) → exit LONG")
+                self._exit_trade(order_manager, price, "strong_reversal")
+                return
+            if pos.side == "short" and c >= exit_thr:
+                logger.info(f"🔄 Strong reversal ({c:+.3f} ≥ +{exit_thr}) → exit SHORT")
+                self._exit_trade(order_manager, price, "strong_reversal")
+                return
+
+        # Trailing SL
         if QCfg.TRAIL_ENABLED():
             if now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
                 self._pos.last_trail_time = now
-                closed = self._update_trailing_sl(order_manager, data_manager, price, sig, now)
+                closed = self._update_trailing_sl(order_manager, data_manager, price, now)
                 if closed:
                     return
 
-    def _find_swing_sl(self, data_manager, side: str, atr: float) -> Optional[float]:
-        try:
-            candles = data_manager.get_candles("5m", limit=9)
-        except Exception:
-            return None
-        if not candles or len(candles) < 4:
-            return None
-        closed = candles[:-1][-6:]
-        buffer = 0.25 * atr
-        if side == "short":
-            return max(float(c['h']) for c in closed) + buffer
-        else:
-            return min(float(c['l']) for c in closed) - buffer
-
     def _update_trailing_sl(self, order_manager, data_manager,
-                            price: float, sig: Optional[SignalBreakdown],
-                            now: float) -> bool:
+                            price: float, now: float) -> bool:
+        """v4: Simple, aggressive trailing. BE at 0.4R, lock at 0.8R, ratchet from there."""
         pos = self._pos
         atr = self._atr_5m.atr
         if atr < 1e-10:
             return False
 
-        # Track peak profit
-        profit = ((pos.entry_price - price) if pos.side == "short"
-                  else (price - pos.entry_price))
+        profit = ((price - pos.entry_price) if pos.side == "long"
+                  else (pos.entry_price - price))
         if profit > pos.peak_profit:
             pos.peak_profit = profit
 
         init_dist = pos.initial_sl_dist
         tier = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
 
-        if tier < QCfg.TRAIL_ACTIVATE_R():
-            return False
+        be_r = QCfg.TRAIL_BE_R()
+        lock_r = QCfg.TRAIL_LOCK_R()
 
-        # Signal conviction multiplier
-        if sig is not None:
-            raw = sig.composite
-            if pos.side == "short":
-                strength = min(abs(min(raw, 0.0)) / 0.65, 1.0)
+        if tier < be_r:
+            return False  # Not enough profit to trail
+
+        # Determine new SL
+        if tier < lock_r:
+            # Breakeven zone: move SL to entry ± small buffer
+            if pos.side == "long":
+                new_sl = pos.entry_price + 0.05 * atr
             else:
-                strength = min(abs(max(raw, 0.0)) / 0.65, 1.0)
+                new_sl = pos.entry_price - 0.05 * atr
         else:
-            strength = 0.5
-        signal_mult = 0.55 + 0.45 * strength
-
-        # ATR volatility ratio
-        entry_atr = pos.entry_atr if pos.entry_atr > 1e-10 else atr
-        atr_ratio = max(0.60, min(atr / entry_atr, 1.30))
-
-        # Time-decay tightening
-        hold_ratio = min((now - pos.entry_time) / QCfg.MAX_HOLD_SEC(), 1.0)
-        time_mult = 1.0 - 0.45 * hold_ratio
-
-        # Combined trail distance
-        base_mult = QCfg.TRAIL_ATR_MULT()
-        trail_dist = base_mult * atr * signal_mult * atr_ratio * time_mult
-
-        # Swing structure
-        swing_sl = self._find_swing_sl(data_manager, pos.side, atr)
-
-        # Determine candidate SL by tier
-        if pos.side == "short":
-            if tier < 1.0:
-                new_sl = pos.entry_price + 0.10 * atr
-            elif tier < 1.5:
-                new_sl = pos.entry_price - 0.35 * atr
+            # Lock zone: trail behind price
+            trail_dist = 0.8 * atr
+            if pos.side == "long":
+                new_sl = price - trail_dist
             else:
-                atr_trail_sl = price + trail_dist
-                new_sl = atr_trail_sl
-                if swing_sl is not None:
-                    new_sl = min(new_sl, swing_sl)
-        else:
-            if tier < 1.0:
-                new_sl = pos.entry_price - 0.10 * atr
-            elif tier < 1.5:
-                new_sl = pos.entry_price + 0.35 * atr
-            else:
-                atr_trail_sl = price - trail_dist
-                new_sl = atr_trail_sl
-                if swing_sl is not None:
-                    new_sl = max(new_sl, swing_sl)
+                new_sl = price + trail_dist
 
-        # Ratchet: SL may only improve
         new_sl_tick = _round_to_tick(new_sl)
         min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
 
-        if pos.side == "short":
-            if new_sl_tick >= pos.sl_price - min_move:
-                return False
-        else:
+        # Ratchet: SL may only improve
+        if pos.side == "long":
             if new_sl_tick <= pos.sl_price + min_move:
                 return False
+        else:
+            if new_sl_tick >= pos.sl_price - min_move:
+                return False
 
-        tier_label = (
-            "🟡 BE" if tier < 1.0 else
-            "🟠 Partial" if tier < 1.5 else
-            "🟢 Full trail"
-        )
+        tier_label = "🟡 BE" if tier < lock_r else "🟢 Lock"
         hold_min = (now - pos.entry_time) / 60.0
         logger.info(
             f"🔒 Trail [{tier_label}] "
@@ -1922,7 +1678,7 @@ class QuantStrategy:
 
         hold_min = (time.time() - pos.entry_time) / 60
         send_telegram_message(
-            f"{'✅' if pnl > 0 else '❌'} <b>QUANT v3 EXIT — {pos.side.upper()}</b>\n\n"
+            f"{'✅' if pnl > 0 else '❌'} <b>QUANT v4 EXIT — {pos.side.upper()}</b>\n\n"
             f"Reason:  {reason}\n"
             f"Entry:   ${pos.entry_price:,.2f}\n"
             f"Exit:    ${price:,.2f}\n"
@@ -1932,6 +1688,7 @@ class QuantStrategy:
             f"WR: {self._win_rate():.0%} | "
             f"PnL: ${self._total_pnl:+.2f}</i>"
         )
+        self._last_exit_side = pos.side
         self._finalise_exit()
 
     def _record_exchange_exit(self, ex_pos: Optional[Dict]) -> None:
@@ -1949,6 +1706,7 @@ class QuantStrategy:
             f"PnL:   ${pnl:+.2f} USDT\n\n"
             f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%}</i>"
         )
+        self._last_exit_side = pos.side
         self._finalise_exit()
 
     def _record_pnl(self, pnl: float) -> None:
@@ -1965,7 +1723,101 @@ class QuantStrategy:
         logger.info("Position closed — FLAT")
 
     # ───────────────────────────────────────────────────────────────────
-    # RECONCILIATION
+    # SIZING
+    # ───────────────────────────────────────────────────────────────────
+
+    def _compute_quantity(self, risk_manager, price: float) -> Optional[float]:
+        bal = risk_manager.get_available_balance()
+        if bal is None:
+            return None
+        available = float(bal.get("available", 0.0))
+        if available < QCfg.MIN_MARGIN_USDT():
+            return None
+
+        margin_alloc = available * QCfg.MARGIN_PCT()
+        if margin_alloc < QCfg.MIN_MARGIN_USDT():
+            return None
+
+        notional = margin_alloc * QCfg.LEVERAGE()
+        qty_raw = notional / price
+
+        step = QCfg.LOT_STEP()
+        qty = math.floor(qty_raw / step) * step
+        qty = round(qty, 8)
+        qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
+
+        actual_margin = (qty * price) / QCfg.LEVERAGE()
+        if actual_margin > margin_alloc * 1.02:
+            return None
+
+        logger.info(
+            f"Sizing → avail=${available:.2f} | alloc={QCfg.MARGIN_PCT():.0%} "
+            f"| margin=${margin_alloc:.2f} | {QCfg.LEVERAGE()}x "
+            f"| notional=${notional:.2f} | qty={qty}"
+        )
+        return qty
+
+    # ───────────────────────────────────────────────────────────────────
+    # UTILITIES
+    # ───────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_pnl(pos: PositionState, exit_price: float) -> float:
+        gross = ((exit_price - pos.entry_price) if pos.side == "long"
+                 else (pos.entry_price - exit_price)) * pos.quantity
+        fee = (pos.entry_price + exit_price) * pos.quantity * QCfg.COMMISSION_RATE()
+        return gross - fee
+
+    def _win_rate(self) -> float:
+        return self._winning_trades / self._total_trades if self._total_trades else 0.0
+
+    def get_stats(self) -> Dict:
+        return {
+            "total_trades": self._total_trades,
+            "winning_trades": self._winning_trades,
+            "win_rate": f"{self._win_rate():.1%}",
+            "total_pnl": round(self._total_pnl, 2),
+            "daily_trades": self._risk_gate.daily_trades,
+            "consec_losses": self._risk_gate.consec_losses,
+            "current_phase": self._pos.phase.name,
+            "last_signal": str(self._last_sig),
+            "atr_5m": round(self._atr_5m.atr, 2),
+            "atr_1m": round(self._atr_1m.atr, 2),
+            "atr_pctile": f"{self._atr_5m.get_percentile():.0%}",
+            "regime_ok": self._atr_5m.regime_valid(),
+        }
+
+    def format_status_report(self) -> str:
+        stats = self.get_stats()
+        pos = self._pos
+        lines = [
+            "📊 <b>QUANT v4 STATUS — MEAN-REVERSION</b>",
+            "",
+            f"Phase:       {stats['current_phase']}",
+            f"Regime:      {'✅' if stats['regime_ok'] else '❌'}",
+            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}  ({stats['atr_pctile']})",
+            f"HTF:         15m={self._htf.trend_15m:+.3f}  4h={self._htf.trend_4h:+.3f}",
+            f"VWAP:        ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f} ATR)",
+            "",
+            f"Session:     {stats['total_trades']} trades | WR {stats['win_rate']}",
+            f"Session PnL: ${stats['total_pnl']:+.2f} USDT",
+            f"Daily:       {stats['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} trades | "
+            f"{stats['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()} consec losses",
+        ]
+        if not pos.is_flat():
+            elapsed_min = (time.time() - pos.entry_time) / 60
+            max_hold_min = QCfg.MAX_HOLD_SEC() / 60
+            lines += [
+                "",
+                f"<b>Active ({pos.side.upper()}):</b>",
+                f"Entry: ${pos.entry_price:,.2f} | SL: ${pos.sl_price:,.2f} | TP: ${pos.tp_price:,.2f}",
+                f"Qty: {pos.quantity} | Risk: ${pos.initial_risk:.2f}",
+                f"Hold: {elapsed_min:.1f}/{max_hold_min:.0f}m | Trail: {'✅' if pos.trail_active else '⏳'}",
+            ]
+        return "\n".join(lines)
+
+    # ───────────────────────────────────────────────────────────────────
+    # RECONCILIATION (unchanged from v3 — same logic)
     # ───────────────────────────────────────────────────────────────────
 
     def _reconcile_query_thread(self, order_manager) -> None:
@@ -2079,130 +1931,3 @@ class QuantStrategy:
             if ex_size < QCfg.MIN_QTY():
                 logger.info("📡 Sync: EXITING confirmed flat")
                 self._finalise_exit()
-
-    # ───────────────────────────────────────────────────────────────────
-    # SIZING
-    # ───────────────────────────────────────────────────────────────────
-
-    def _compute_quantity(self, risk_manager, price: float) -> Optional[float]:
-        bal = risk_manager.get_available_balance()
-        if bal is None:
-            return None
-        available = float(bal.get("available", 0.0))
-        if available < QCfg.MIN_MARGIN_USDT():
-            return None
-
-        margin_alloc = available * QCfg.MARGIN_PCT()
-        if margin_alloc < QCfg.MIN_MARGIN_USDT():
-            return None
-
-        notional = margin_alloc * QCfg.LEVERAGE()
-        qty_raw = notional / price
-
-        step = QCfg.LOT_STEP()
-        qty = math.floor(qty_raw / step) * step
-        qty = round(qty, 8)
-        qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
-
-        actual_margin = (qty * price) / QCfg.LEVERAGE()
-        if actual_margin > margin_alloc * 1.02:
-            return None
-
-        logger.info(
-            f"Sizing → avail=${available:.2f} | alloc={QCfg.MARGIN_PCT():.0%} "
-            f"| margin=${margin_alloc:.2f} | {QCfg.LEVERAGE()}x "
-            f"| notional=${notional:.2f} | qty={qty}"
-        )
-        return qty
-
-    # ───────────────────────────────────────────────────────────────────
-    # SL / TP
-    # ───────────────────────────────────────────────────────────────────
-
-    def _compute_sl_tp(self, price: float, side: str,
-                       atr: float) -> Tuple[Optional[float], Optional[float]]:
-        sl_atr = QCfg.SL_ATR_MULT() * atr
-        tp_atr = QCfg.TP_ATR_MULT() * atr
-
-        sl_min = price * QCfg.MIN_SL_PCT()
-        sl_max = price * QCfg.MAX_SL_PCT()
-        sl_dist = max(sl_min, min(sl_max, sl_atr))
-
-        tp_dist = max(sl_dist * QCfg.MIN_RR_RATIO(), tp_atr)
-
-        if side == "long":
-            sl_raw = price - sl_dist
-            tp_raw = price + tp_dist
-        else:
-            sl_raw = price + sl_dist
-            tp_raw = price - tp_dist
-
-        sl_price = _round_to_tick(sl_raw)
-        tp_price = _round_to_tick(tp_raw)
-
-        if side == "long" and (sl_price >= price or tp_price <= price):
-            logger.error(f"SL/TP sanity fail LONG: entry={price} sl={sl_price} tp={tp_price}")
-            return None, None
-        if side == "short" and (sl_price <= price or tp_price >= price):
-            logger.error(f"SL/TP sanity fail SHORT: entry={price} sl={sl_price} tp={tp_price}")
-            return None, None
-
-        return sl_price, tp_price
-
-    # ───────────────────────────────────────────────────────────────────
-    # UTILITIES
-    # ───────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _estimate_pnl(pos: PositionState, exit_price: float) -> float:
-        gross = ((exit_price - pos.entry_price) if pos.side == "long"
-                 else (pos.entry_price - exit_price)) * pos.quantity
-        fee = (pos.entry_price + exit_price) * pos.quantity * QCfg.COMMISSION_RATE()
-        return gross - fee
-
-    def _win_rate(self) -> float:
-        return self._winning_trades / self._total_trades if self._total_trades else 0.0
-
-    def get_stats(self) -> Dict:
-        return {
-            "total_trades": self._total_trades,
-            "winning_trades": self._winning_trades,
-            "win_rate": f"{self._win_rate():.1%}",
-            "total_pnl": round(self._total_pnl, 2),
-            "daily_trades": self._risk_gate.daily_trades,
-            "consec_losses": self._risk_gate.consec_losses,
-            "current_phase": self._pos.phase.name,
-            "last_signal": str(self._last_sig),
-            "atr_5m": round(self._atr_5m.atr, 2),
-            "atr_1m": round(self._atr_1m.atr, 2),
-            "atr_pctile": f"{self._atr_5m.get_percentile():.0%}",
-            "regime_ok": self._atr_5m.is_regime_valid(),
-        }
-
-    def format_status_report(self) -> str:
-        stats = self.get_stats()
-        pos = self._pos
-        lines = [
-            "📊 <b>QUANT v3 STATUS</b>",
-            "",
-            f"Phase:       {stats['current_phase']}",
-            f"Regime:      pen={self._atr_5m.regime_penalty():.2f}",
-            f"ATR 5m/1m:   ${stats['atr_5m']} / ${stats['atr_1m']}  ({stats['atr_pctile']})",
-            f"HTF:         15m={self._htf.trend_15m:+.3f}  4h={self._htf.trend_4h:+.3f}",
-            "",
-            f"Session:     {stats['total_trades']} trades | WR {stats['win_rate']}",
-            f"Session PnL: ${stats['total_pnl']:+.2f} USDT",
-            f"Daily:       {stats['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} trades | "
-            f"{stats['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()} consec losses",
-        ]
-        if not pos.is_flat():
-            elapsed_min = (time.time() - pos.entry_time) / 60
-            max_hold_min = QCfg.MAX_HOLD_SEC() / 60
-            lines += [
-                "",
-                f"<b>Active ({pos.side.upper()}):</b>",
-                f"Entry: ${pos.entry_price:,.2f} | SL: ${pos.sl_price:,.2f} | TP: ${pos.tp_price:,.2f}",
-                f"Qty: {pos.quantity} | Risk: ${pos.initial_risk:.2f}",
-                f"Hold: {elapsed_min:.1f}/{max_hold_min:.0f}m | Trail: {'✅' if pos.trail_active else '⏳'}",
-            ]
-        return "\n".join(lines)
