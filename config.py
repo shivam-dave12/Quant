@@ -4,7 +4,7 @@ config.py — Single source of truth for all bot parameters.
 Quant Bot v4.3 — Institutional Multi-Factor Momentum + Order Flow
 
 CHANGES from v4:
-  - ATR_SEED_RETAIN raised to 35 (Bug 13 fix: was < ATR_PCTILE_RANK_WINDOW)
+  - ATR_SEED_RETAIN set to 1 (CRITICAL FIX: warmup data was poisoning percentile → 0% → blocked all trades)
   - QUANT_TRAIL_BE_R raised to 1.0 (Trail fix: was 0.4 — too aggressive)
   - QUANT_TRAIL_LOCK_R raised to 1.5 (Trail fix: was 0.8)
   - QUANT_TRAIL_CHANDELIER_N_START raised to 3.0 (wider breathing room)
@@ -269,5 +269,7 @@ FEE_MAKER_OPP_COST_WEIGHT   = 0.5
 # ═══════════════════════════════════════════════════════════════════
 # 12. ATR ENGINE REGIME TUNING
 # ═══════════════════════════════════════════════════════════════════
-ATR_SEED_RETAIN             = 35     # v4.3: was 20 — must be >= ATR_PCTILE_RANK_WINDOW
+ATR_SEED_RETAIN             = 1      # v4.3: Only keep final ATR from warmup.
+                                     # Old values (20, 35) poisoned percentile ranking
+                                     # with stale high-vol warmup data → 0% pctile → blocked all trades.
 ATR_PCTILE_RANK_WINDOW      = 30

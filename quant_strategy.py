@@ -1390,12 +1390,6 @@ class ATREngine:
         self._atr_hist.clear()
         self._atr = 0.0
 
-    # These are read fresh on each use so config changes take effect immediately.
-    # See config.py  ATR_SEED_RETAIN and ATR_PCTILE_RANK_WINDOW for tuning notes.
-    @staticmethod
-    def _seed_retain() -> int:
-        return int(_cfg("ATR_SEED_RETAIN", 20))
-
     @staticmethod
     def _pctile_rank_window() -> int:
         return int(_cfg("ATR_PCTILE_RANK_WINDOW", 30))
@@ -1411,19 +1405,20 @@ class ATREngine:
                        abs(float(candles[i]['l'])-float(candles[i-1]['c'])))
                    for i in range(1, len(candles))]
             if len(trs) < period: return self._atr
-            # Build the full Wilder-smoothed ATR sequence from warmup.
             atr = sum(trs[:period]) / period
-            self._atr_hist.append(atr)
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
-                self._atr_hist.append(atr)
-            # Trim seed history to ATR_SEED_RETAIN most-recent values so stale
-            # high-vol warmup candles don't lock the percentile at 0% for hours.
-            while len(self._atr_hist) > self._seed_retain():
-                self._atr_hist.popleft()
+            # v4.3 CRITICAL FIX: Only keep the FINAL ATR value from warmup.
+            # Old code kept 20-35 historical values that poisoned the percentile
+            # ranking — if warmup came from a different vol regime, the current
+            # ATR ranked at 0% against all of them, permanently blocking trades.
+            # Now: keep ONLY the latest value. Percentile returns 0.5 (neutral)
+            # until we accumulate enough LIVE bars to rank meaningfully.
+            self._atr_hist.clear()
+            self._atr_hist.append(atr)
             self._atr = atr; self._seeded = True
             self._last_ts = last_ts
-            return self._atr   # return early — history already populated
+            return self._atr
         else:
             hi=float(candles[-1]['h']); lo=float(candles[-1]['l']); prc=float(candles[-2]['c'])
             self._atr = (self._atr*(period-1)+max(hi-lo,abs(hi-prc),abs(lo-prc)))/period
@@ -1436,9 +1431,11 @@ class ATREngine:
     def get_percentile(self) -> float:
         hist = list(self._atr_hist)
         n = len(hist)
-        if n < 5: return 0.5
-        # Rank against only the last ATR_PCTILE_RANK_WINDOW values to keep
-        # percentile recovery lag short after a regime shift.
+        # v4.3 FIX: Need at least half a rank window of LIVE data before
+        # departing from neutral. This prevents warmup data from locking
+        # the percentile at extreme values during the first ~75 min.
+        min_samples = max(5, self._pctile_rank_window() // 2)
+        if n < min_samples: return 0.5
         window = hist[max(0, n - self._pctile_rank_window()):]
         if len(window) < 2: return 0.5
         cur = window[-1]
