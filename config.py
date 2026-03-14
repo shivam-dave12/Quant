@@ -50,7 +50,7 @@ MAX_DAILY_TRADES        = 8
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 5
 TRADE_COOLDOWN_SECONDS  = 600
-MIN_RISK_REWARD_RATIO   = 0.8
+MIN_RISK_REWARD_RATIO   = 1.5
 TARGET_RISK_REWARD_RATIO= 1.5
 MAX_RR_RATIO            = 12.0
 
@@ -195,3 +195,10 @@ QUANT_HTF_VETO_STRENGTH     = 0.70
 QUANT_OB_DEPTH_LEVELS       = 5
 QUANT_OB_HIST_LEN           = 60
 QUANT_TICK_AGG_WINDOW_SEC   = 30.0
+
+# 10k. Institutional SL/TP/Trail — new in v4.1
+QUANT_TP_MAX_RR                = 3.5   # cap TP at 3.5:1 (don't chase impossible targets)
+QUANT_SL_SWING_DENSITY_WINDOW  = 0.30  # ATR fraction radius for swing cluster detection
+QUANT_TRAIL_CHANDELIER_N_START = 2.5   # chandelier: initial peak - N×ATR (wide, breathes)
+QUANT_TRAIL_CHANDELIER_N_END   = 1.5   # chandelier: final N after hold time decays (tighter)
+QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55  # HVN volume percentile to trigger lock-in snap

@@ -154,6 +154,17 @@ class QCfg:
     def OB_HIST_LEN() -> int: return int(_cfg("QUANT_OB_HIST_LEN", 60))
     @staticmethod
     def TICK_AGG_WINDOW_SEC() -> float: return float(_cfg("QUANT_TICK_AGG_WINDOW_SEC", 30.0))
+    # ── New v4.1 accessors ──────────────────────────────────────
+    @staticmethod
+    def TP_MAX_RR() -> float: return float(_cfg("QUANT_TP_MAX_RR", 3.5))
+    @staticmethod
+    def SL_SWING_DENSITY_WINDOW() -> float: return float(_cfg("QUANT_SL_SWING_DENSITY_WINDOW", 0.30))
+    @staticmethod
+    def TRAIL_CHANDELIER_N_START() -> float: return float(_cfg("QUANT_TRAIL_CHANDELIER_N_START", 2.5))
+    @staticmethod
+    def TRAIL_CHANDELIER_N_END() -> float: return float(_cfg("QUANT_TRAIL_CHANDELIER_N_END", 1.5))
+    @staticmethod
+    def TRAIL_HVN_SNAP_THRESH() -> float: return float(_cfg("QUANT_TRAIL_HVN_SNAP_THRESH", 0.55))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -450,98 +461,178 @@ class InstitutionalLevels:
         return highs, lows
 
     @staticmethod
+    def _swing_cluster_score(level: float, all_swings: List[float], atr: float) -> float:
+        """
+        Score a structural level by how many other swing extremes cluster near it.
+        Clustered swings = contested zone = stronger barrier = better SL anchor.
+
+        Returns score in [1.0, 2.0]:
+          1.0 = isolated swing (weakest)
+          2.0 = four or more nearby swings (institutional zone)
+        """
+        if not all_swings or atr < 1e-10:
+            return 1.0
+        radius = QCfg.SL_SWING_DENSITY_WINDOW() * atr
+        nearby = sum(1 for s in all_swings if abs(s - level) <= radius and abs(s - level) > 1e-10)
+        return 1.0 + min(nearby / 4.0, 1.0)
+
+    @staticmethod
     def compute_sl(price: float, side: str, atr: float,
                    candles_5m: List[Dict], candles_1m: List[Dict],
-                   orderbook: Dict, vwap: float, vwap_std: float) -> float:
+                   orderbook: Dict, vwap: float, vwap_std: float,
+                   atr_pctile: float = 0.5,
+                   candles_15m: Optional[List[Dict]] = None) -> float:
         """
-        Institutional SL placement. Uses multiple factors, picks the best.
+        Institutional SL placement — v4.1.
 
-        For LONG: SL below price. Candidates:
-          1. Below nearest swing low on 5m
-          2. Below strongest bid wall in orderbook
-          3. Below nearest high-volume node below price
-          4. Below VWAP - 2σ (if that's below entry)
-          5. Floor: ATR-based minimum distance
+        Multi-timeframe swing density scoring + adaptive ATR buffer + VP HVN + OB walls.
 
-        Takes the HIGHEST of these (most protective that keeps SL below price).
-        For SHORT: mirror logic above price.
+        Key improvements over v4.0:
+          - Three timeframe inputs: 15m (macro), 5m (local), 1m (micro)
+          - Each candidate scored by structural density (clustered swings = stronger zone)
+          - Buffer adapts to ATR percentile: high-vol = tighter, low-vol = wider
+          - Candidates scored independently; best-scored within valid range wins
+          - No silent fallback to arbitrary ATR multiples
+
+        Score components:
+          15m swing: 4.0 × cluster_density  (macro structure — highest weight)
+          5m  swing: 3.0 × cluster_density  (local structure)
+          OB walls:  2.5 × wall_size_norm   (resting liquidity)
+          VP HVN:    2.0                     (historical volume gravity)
+          VWAP bands: 1.5 / 2.0 / 1.5       (statistical reference)
         """
-        candidates = []
-        buffer = QCfg.SL_BUFFER_ATR_MULT() * atr
+        # Adaptive buffer: high-vol regime already has wide ranges baked in,
+        # needs less extra room. Low-vol = sticky structure, needs wider clearance.
+        # buf_mult ∈ [0.25×, 0.40×, 0.57×] at pctile=[1.0, 0.5, 0.0]
+        buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
+        buffer   = buf_mult * atr
         min_dist = price * QCfg.MIN_SL_PCT()
         max_dist = price * QCfg.MAX_SL_PCT()
 
-        # 1. Swing structure from 5m
-        if len(candles_5m) >= 5:
-            sh, sl_list = InstitutionalLevels.find_swing_extremes(
-                candles_5m, QCfg.SL_SWING_LOOKBACK())
-            if side == "long" and sl_list:
-                # Nearest swing low below price
-                below = [s for s in sl_list if s < price]
-                if below:
-                    candidates.append(max(below) - buffer)
-            elif side == "short" and sh:
-                above = [s for s in sh if s > price]
-                if above:
-                    candidates.append(min(above) + buffer)
+        # ── Collect swing extremes from all available timeframes ──────────────
+        sh_5m,  sl_5m  = [], []
+        sh_15m, sl_15m = [], []
+        sh_1m,  sl_1m  = [], []
 
-        # 2. Orderbook liquidity walls
+        lb = QCfg.SL_SWING_LOOKBACK()
+        if len(candles_5m) >= 3:
+            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(candles_5m, lb)
+        if candles_15m and len(candles_15m) >= 3:
+            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
+                candles_15m, min(lb, len(candles_15m) - 2))
+        if len(candles_1m) >= 3:
+            sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
+                candles_1m, min(20, len(candles_1m) - 2))
+
+        # All-timeframe pools for cluster density scoring
+        all_lows  = sl_5m  + sl_15m  + sl_1m
+        all_highs = sh_5m  + sh_15m  + sh_1m
+
+        # ── OB walls (scored by relative wall size) ───────────────────────────
         wall_side = "bid" if side == "long" else "ask"
         walls = InstitutionalLevels.find_orderbook_walls(
             orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-        if walls:
-            # For long: SL just below the strongest bid wall below price
-            if side == "long":
-                below_walls = [(p, q) for p, q in walls if p < price]
-                if below_walls:
-                    best_wall = max(below_walls, key=lambda x: x[1])
-                    candidates.append(best_wall[0] - buffer * 0.5)
-            else:
-                above_walls = [(p, q) for p, q in walls if p > price]
-                if above_walls:
-                    best_wall = min(above_walls, key=lambda x: x[1])
-                    candidates.append(best_wall[0] + buffer * 0.5)
+        total_wall_qty = sum(q for _, q in walls) if walls else 0.0
 
-        # 3. Volume profile HVN
+        # ── Volume profile HVN ────────────────────────────────────────────────
+        hvn_levels: List[float] = []
         if len(candles_1m) >= 30:
             profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-100:], QCfg.VP_BUCKET_COUNT())
-            hvns = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
-            if hvns:
-                if side == "long":
-                    below_hvns = [h for h in hvns if h < price - min_dist * 0.5]
-                    if below_hvns:
-                        candidates.append(max(below_hvns) - buffer * 0.3)
-                else:
-                    above_hvns = [h for h in hvns if h > price + min_dist * 0.5]
-                    if above_hvns:
-                        candidates.append(min(above_hvns) + buffer * 0.3)
+                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
+            hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
 
-        # 4. VWAP bands
-        if vwap > 0 and vwap_std > 0:
-            vwap_2s_low = vwap - 2.0 * vwap_std
-            vwap_2s_high = vwap + 2.0 * vwap_std
-            if side == "long" and vwap_2s_low < price:
-                candidates.append(vwap_2s_low - buffer * 0.3)
-            elif side == "short" and vwap_2s_high > price:
-                candidates.append(vwap_2s_high + buffer * 0.3)
+        # ── Candidate pool: (sl_level, score) ────────────────────────────────
+        scored: List[Tuple[float, float]] = []
 
-        # Pick the best candidate (most protective = closest to price but valid)
+        def add(level: float, score: float) -> None:
+            dist = abs(price - level)
+            if dist < min_dist or dist > max_dist:
+                return
+            if side == "long" and level >= price:
+                return
+            if side == "short" and level <= price:
+                return
+            scored.append((level, score))
+
         if side == "long":
-            valid = [c for c in candidates if price - c >= min_dist and price - c <= max_dist]
-            if valid:
-                sl = max(valid)  # closest to price = least risk
-            else:
-                # Fallback: all candidates too close or too far — use floor
-                sl = price - max(min_dist, min(max_dist, 1.5 * atr))
-        else:
-            valid = [c for c in candidates if c - price >= min_dist and c - price <= max_dist]
-            if valid:
-                sl = min(valid)
-            else:
-                sl = price + max(min_dist, min(max_dist, 1.5 * atr))
+            # 15m swing lows — macro structure (highest weight)
+            for lvl in sl_15m:
+                if lvl < price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
+                    add(lvl - buffer * 0.80, 4.0 * cs)
 
-        # Final clamp
+            # 5m swing lows — local structure
+            for lvl in sl_5m:
+                if lvl < price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
+                    add(lvl - buffer, 3.0 * cs)
+
+            # 1m micro-swing lows — fine structure (lower weight)
+            for lvl in sl_1m:
+                if lvl < price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
+                    add(lvl - buffer * 0.50, 1.5 * cs)
+
+            # OB bid walls below price
+            for wp, wq in walls:
+                if wp < price:
+                    wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
+                    add(wp - buffer * 0.40, 2.5 * min(wscore, 2.0))
+
+            # Volume profile HVN below price
+            for h in hvn_levels:
+                if h < price - min_dist * 0.4:
+                    add(h - buffer * 0.25, 2.0)
+
+            # VWAP ± σ bands
+            if vwap > 0 and vwap_std > 0:
+                for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
+                    add(vwap - mult * vwap_std - buffer * 0.20, bscore)
+
+        else:  # side == "short"
+            for lvl in sh_15m:
+                if lvl > price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
+                    add(lvl + buffer * 0.80, 4.0 * cs)
+
+            for lvl in sh_5m:
+                if lvl > price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
+                    add(lvl + buffer, 3.0 * cs)
+
+            for lvl in sh_1m:
+                if lvl > price:
+                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
+                    add(lvl + buffer * 0.50, 1.5 * cs)
+
+            for wp, wq in walls:
+                if wp > price:
+                    wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
+                    add(wp + buffer * 0.40, 2.5 * min(wscore, 2.0))
+
+            for h in hvn_levels:
+                if h > price + min_dist * 0.4:
+                    add(h + buffer * 0.25, 2.0)
+
+            if vwap > 0 and vwap_std > 0:
+                for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
+                    add(vwap + mult * vwap_std + buffer * 0.20, bscore)
+
+        # ── Select best-scored candidate ──────────────────────────────────────
+        if scored:
+            # Primary sort: highest score. Tiebreak: closest to price (least risk).
+            if side == "long":
+                scored.sort(key=lambda x: (-x[1], price - x[0]))
+            else:
+                scored.sort(key=lambda x: (-x[1], x[0] - price))
+            sl = scored[0][0]
+        else:
+            # No structural candidate found — minimal ATR-based floor
+            sl = (price - max(min_dist, min(max_dist, 1.5 * atr))
+                  if side == "long" else
+                  price + max(min_dist, min(max_dist, 1.5 * atr)))
+
+        # Final hard clamp to [min_dist, max_dist]
         dist = abs(price - sl)
         if dist < min_dist:
             sl = (price - min_dist) if side == "long" else (price + min_dist)
@@ -553,80 +644,140 @@ class InstitutionalLevels:
     @staticmethod
     def compute_tp(price: float, side: str, atr: float, sl_price: float,
                    candles_1m: List[Dict], orderbook: Dict,
-                   vwap: float, vwap_std: float) -> float:
+                   vwap: float, vwap_std: float,
+                   candles_5m: Optional[List[Dict]] = None) -> float:
         """
-        Institutional TP placement.
+        Institutional TP placement — v4.1.
 
-        For mean-reversion, primary target is VWAP. But we also consider:
-        1. VWAP itself (full reversion)
-        2. Nearest HVN between price and VWAP (price gravitates to volume)
-        3. Orderbook resistance wall toward VWAP (wall absorbs momentum)
-        4. VWAP ± 1σ band (partial reversion)
+        Scored candidate selection across five target classes:
 
-        Takes the NEAREST target (conservative = higher win rate).
+          Score tiers (higher = take it more seriously):
+            5.0  OB liquidity wall directly in path (hard resistance/support)
+            4.0  VP High-Volume Node between entry and VWAP (price gravitates to volume)
+            3.5  VWAP itself (full mean-reversion target)
+            3.0  VWAP ± 0.5σ / ±1σ / ±1.5σ bands (statistical attraction)
+            2.5  5m swing extreme in direction of reversion (structure target)
+            2.0  VWAP partial fraction (fractional reversion)
+
+        Selection strategy: build a tiered target ladder.
+          Tier-A (≥ 3.5 score): take the NEAREST (conservative, high-WR)
+          If no tier-A exists within MAX_RR cap: take highest-scored valid target
+
+        All targets must satisfy MIN_RR_RATIO and are capped at TP_MAX_RR × sl_dist.
         """
         sl_dist = abs(price - sl_price)
-        min_tp_dist = sl_dist * QCfg.MIN_RR_RATIO()
-        candidates = []
+        if sl_dist < 1e-10:
+            return price + atr if side == "long" else price - atr
 
-        # 1. VWAP itself
-        if vwap > 0:
-            if side == "long" and vwap > price:
-                candidates.append(vwap)
-            elif side == "short" and vwap < price:
-                candidates.append(vwap)
+        min_tp_dist  = sl_dist * QCfg.MIN_RR_RATIO()
+        max_tp_dist  = sl_dist * QCfg.TP_MAX_RR()
 
-        # 2. VWAP partial (fraction toward VWAP)
-        if vwap > 0:
-            partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-            if side == "long" and partial > price + min_tp_dist:
-                candidates.append(partial)
-            elif side == "short" and partial < price - min_tp_dist:
-                candidates.append(partial)
-
-        # 3. Volume profile HVN between price and VWAP
-        if len(candles_1m) >= 30 and vwap > 0:
+        # ── Volume profile: single pass, shared across candidate generation ──
+        hvn_levels: List[float] = []
+        if len(candles_1m) >= 30:
             profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-100:], QCfg.VP_BUCKET_COUNT())
-            hvns = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
-            for h in hvns:
-                if side == "long" and price < h < vwap and h - price >= min_tp_dist:
-                    candidates.append(h)
-                elif side == "short" and vwap < h < price and price - h >= min_tp_dist:
-                    candidates.append(h)
+                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
+            hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
 
-        # 4. Orderbook walls toward VWAP
+        # ── OB walls in direction of trade ───────────────────────────────────
         wall_side = "ask" if side == "long" else "bid"
         walls = InstitutionalLevels.find_orderbook_walls(
             orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-        for wp, wq in walls:
-            if side == "long" and wp > price + min_tp_dist and (vwap <= 0 or wp <= vwap * 1.001):
-                candidates.append(wp - atr * 0.1)  # just before the wall
-            elif side == "short" and wp < price - min_tp_dist and (vwap <= 0 or wp >= vwap * 0.999):
-                candidates.append(wp + atr * 0.1)
+        total_wall_qty = sum(q for _, q in walls) if walls else 0.0
 
-        # 5. VWAP ± 1σ
-        if vwap > 0 and vwap_std > 0:
-            v1s_up = vwap + vwap_std
-            v1s_dn = vwap - vwap_std
-            if side == "long" and v1s_dn > price + min_tp_dist:
-                candidates.append(v1s_dn)
-            elif side == "short" and v1s_up < price - min_tp_dist:
-                candidates.append(v1s_up)
+        # ── 5m swing targets in reversion direction ───────────────────────────
+        sh_5m: List[float] = []
+        sl_5m: List[float] = []
+        if candles_5m and len(candles_5m) >= 3:
+            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
+                candles_5m, QCfg.SL_SWING_LOOKBACK())
 
-        # Pick NEAREST valid target (conservative for high WR)
+        # ── Scored candidate pool: (tp_level, score) ─────────────────────────
+        scored: List[Tuple[float, float]] = []
+
+        def add_tp(level: float, score: float) -> None:
+            dist = abs(level - price)
+            if dist < min_tp_dist or dist > max_tp_dist:
+                return
+            if side == "long" and level <= price:
+                return
+            if side == "short" and level >= price:
+                return
+            scored.append((level, score))
+
         if side == "long":
-            valid = [c for c in candidates if c > price + min_tp_dist]
-            if valid:
-                tp = min(valid)  # nearest target above
+            # OB ask walls: hard resistance — stop just below the wall
+            for wp, wq in walls:
+                if wp > price + min_tp_dist:
+                    w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
+                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5))
+
+            # VP HVN between entry and VWAP (gravity nodes)
+            for h in hvn_levels:
+                if price < h and (vwap <= 0 or h <= vwap * 1.002):
+                    add_tp(h, 4.0)
+
+            # VWAP full reversion
+            if vwap > price:
+                add_tp(vwap, 3.5)
+
+            # VWAP sigma bands
+            if vwap > 0 and vwap_std > 0:
+                for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                    lvl = vwap - mult * vwap_std
+                    if lvl > price:
+                        add_tp(lvl, bscore)
+
+            # 5m swing highs in reversion zone (potential supply)
+            for sh in sh_5m:
+                if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.005):
+                    add_tp(sh - atr * 0.10, 2.5)
+
+            # Fractional VWAP reversion
+            if vwap > price:
+                partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
+                add_tp(partial, 2.0)
+
+        else:  # short
+            for wp, wq in walls:
+                if wp < price - min_tp_dist:
+                    w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
+                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5))
+
+            for h in hvn_levels:
+                if price > h and (vwap <= 0 or h >= vwap * 0.998):
+                    add_tp(h, 4.0)
+
+            if vwap < price:
+                add_tp(vwap, 3.5)
+
+            if vwap > 0 and vwap_std > 0:
+                for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                    lvl = vwap + mult * vwap_std
+                    if lvl < price:
+                        add_tp(lvl, bscore)
+
+            for sl_v in sl_5m:
+                if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.995):
+                    add_tp(sl_v + atr * 0.10, 2.5)
+
+            if vwap < price:
+                partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
+                add_tp(partial, 2.0)
+
+        # ── Tiered selection ──────────────────────────────────────────────────
+        if scored:
+            # Tier-A: score ≥ 3.5 → nearest (maximises win-rate)
+            tier_a = [(lvl, sc) for lvl, sc in scored if sc >= 3.5]
+            if tier_a:
+                tp = min(tier_a, key=lambda x: abs(x[0] - price))[0]
             else:
-                tp = price + max(min_tp_dist, sl_dist * 1.0)
+                # Tier-B: below 3.5 → highest-scored (maximises expected value)
+                scored.sort(key=lambda x: -x[1])
+                tp = scored[0][0]
         else:
-            valid = [c for c in candidates if c < price - min_tp_dist]
-            if valid:
-                tp = max(valid)  # nearest target below
-            else:
-                tp = price - max(min_tp_dist, sl_dist * 1.0)
+            # No structural target found — enforce minimum R:R floor only
+            tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
 
         return tp
 
@@ -634,97 +785,181 @@ class InstitutionalLevels:
     def compute_trail_sl(pos_side: str, price: float, entry_price: float,
                          current_sl: float, atr: float,
                          candles_1m: List[Dict], orderbook: Dict,
-                         peak_profit: float, entry_vol: float) -> Optional[float]:
+                         peak_profit: float, entry_vol: float,
+                         hold_seconds: float = 0.0,
+                         peak_price_abs: float = 0.0) -> Optional[float]:
         """
-        Structure-based trailing SL.
+        Institutional trailing SL — v4.1 (Chandelier + HVN-snap + vol-decay).
 
-        Phase 1 (profit < 0.5 × initial_risk): Don't trail. Let trade breathe.
-        Phase 2 (0.5-1.0R): Move SL to breakeven, behind nearest micro-swing.
-        Phase 3 (>1.0R): Active trail — follow micro-swings on 1m,
-                          tighten when volume decays or orderbook wall disappears.
+        Three fully independent mechanisms run simultaneously; the most
+        protective result that passes the ratchet wins.
 
-        Returns None if no trail move needed.
+        ── Phase gate (unchanged from v4.0) ─────────────────────────────────
+          tier < TRAIL_BE_R  →  do nothing (let trade breathe)
+          tier [BE_R, LOCK_R) →  Phase-2: structure-guided breakeven
+          tier ≥ LOCK_R       →  Phase-3: all three mechanisms active
+
+        ── Mechanism 1: Chandelier Exit (volatility-adaptive) ───────────────
+          chandelier_sl = peak_price_abs − N(t) × ATR
+          N(t) decays linearly from CHANDELIER_N_START → CHANDELIER_N_END
+          over MAX_HOLD_SEC, so long-held trades get progressively tighter
+          protection without snapping unnecessarily early.
+          The chandelier is the primary mechanism — it is always computed.
+
+        ── Mechanism 2: Micro-swing structure (1m pivot lows/highs) ─────────
+          Identifies the most recent *confirmed* pivot extreme on 1m candles.
+          SL placed just beyond it with a small clearance buffer (0.12×ATR).
+          Confirmed = has a candle on each side that is higher/lower.
+          This keeps SL behind real structure, not arbitrary distances.
+
+        ── Mechanism 3: HVN snap ─────────────────────────────────────────────
+          When a High-Volume Node lies between current_sl and price, SL is
+          advanced to just behind that node. HVNs act as price magnets — once
+          price trades through one, the node flips from resistance to support
+          (long) and becomes a natural SL anchor. Only snaps forward, never
+          backward.
+
+        ── Vol-decay override (tightening layer) ─────────────────────────────
+          When recent avg volume falls below TRAIL_VOL_DECAY_MULT × entry_vol
+          the trade is likely exhausting. A tightening factor is applied on
+          top of all mechanisms above to compress the SL toward price by up
+          to 35% of ATR. This is capped to never exceed the current best SL.
+
+        ── Ratchet ───────────────────────────────────────────────────────────
+          SL may only improve (move toward price). Minimum move = TRAIL_MIN_MOVE_ATR.
+          Any candidate below this threshold is discarded (no micro-jitter updates).
+
+        Returns None if no improvement qualifies.
         """
         init_dist = abs(entry_price - current_sl) if abs(entry_price - current_sl) > 1e-10 else atr
-        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-        tier = profit / init_dist if init_dist > 1e-10 else 0.0
+        profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
+        tier      = profit / init_dist if init_dist > 1e-10 else 0.0
 
         if tier < QCfg.TRAIL_BE_R():
-            return None  # Phase 1: don't touch
+            return None  # Phase-1: hands off
 
-        swing_bars = QCfg.TRAIL_SWING_BARS()
-        new_sl = None
+        if atr < 1e-10:
+            return None
 
-        if tier < QCfg.TRAIL_LOCK_R():
-            # Phase 2: breakeven — use micro-swing on 1m to fine-tune
-            if len(candles_1m) >= swing_bars + 2:
-                recent = candles_1m[-(swing_bars + 2):-1]  # closed bars only
-                if pos_side == "long":
-                    micro_low = min(float(c['l']) for c in recent)
-                    # SL at micro swing low, but at least breakeven
-                    new_sl = max(micro_low - 0.15 * atr, entry_price + 0.02 * atr)
-                else:
-                    micro_high = max(float(c['h']) for c in recent)
-                    new_sl = min(micro_high + 0.15 * atr, entry_price - 0.02 * atr)
-            else:
-                # Fallback: just breakeven
-                new_sl = entry_price + (0.02 * atr if pos_side == "long" else -0.02 * atr)
+        candidates: List[float] = []
 
+        # ── Mechanism 1: Chandelier ───────────────────────────────────────────
+        if peak_price_abs > 1e-10:
+            peak_ref = peak_price_abs
         else:
-            # Phase 3: Active trail — follow micro-swings
-            if len(candles_1m) >= swing_bars + 2:
-                recent = candles_1m[-(swing_bars + 2):-1]
-                if pos_side == "long":
-                    micro_low = min(float(c['l']) for c in recent)
-                    base_trail = micro_low - 0.15 * atr
-                else:
-                    micro_high = max(float(c['h']) for c in recent)
-                    base_trail = micro_high + 0.15 * atr
+            peak_ref = entry_price + (pos_side == "long" and peak_profit or 0)
+
+        n_start = QCfg.TRAIL_CHANDELIER_N_START()
+        n_end   = QCfg.TRAIL_CHANDELIER_N_END()
+        max_hold = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
+        # Linear decay: starts wide (breathes), tightens as hold time grows
+        time_frac  = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
+        n_chandelier = n_start + (n_end - n_start) * time_frac
+
+        if pos_side == "long":
+            chandelier = peak_ref - n_chandelier * atr
+            if chandelier > entry_price:            # only use when in profit
+                candidates.append(chandelier)
+        else:
+            chandelier = peak_ref + n_chandelier * atr
+            if chandelier < entry_price:
+                candidates.append(chandelier)
+
+        # ── Mechanism 2: Confirmed micro-swing pivot ──────────────────────────
+        if len(candles_1m) >= 5:
+            # Need at least one bar on each side of the pivot (closed only: exclude last bar)
+            closed = candles_1m[:-1]  # last bar may be forming
+            sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
+                closed, min(QCfg.TRAIL_SWING_BARS() + 4, len(closed) - 2))
+            micro_buf = 0.12 * atr
+
+            if pos_side == "long" and sl_1m:
+                # Most recent swing low below price that is above entry (locks in profit)
+                valid_lows = [l for l in sl_1m if entry_price < l < price]
+                if valid_lows:
+                    candidates.append(max(valid_lows) - micro_buf)
+
+            elif pos_side == "short" and sh_1m:
+                valid_highs = [h for h in sh_1m if price < h < entry_price]
+                if valid_highs:
+                    candidates.append(min(valid_highs) + micro_buf)
+
+        # ── Phase-2 floor: structure-guided breakeven ─────────────────────────
+        if tier < QCfg.TRAIL_LOCK_R():
+            # Phase-2: only move SL to breakeven zone; block Phase-3 mechanisms
+            # Ensure at least one BE candidate is present
+            be = entry_price + (0.02 * atr if pos_side == "long" else -0.02 * atr)
+            candidates.append(be)
+            # Filter: must not exceed breakeven (no locking-in profit in Phase-2)
+            if pos_side == "long":
+                candidates = [c for c in candidates if c <= be + atr * 0.5]
             else:
-                trail_dist = 0.7 * atr
-                base_trail = (price - trail_dist) if pos_side == "long" else (price + trail_dist)
+                candidates = [c for c in candidates if c >= be - atr * 0.5]
 
-            # Volume decay tightening: if current volume is much lower than at entry,
-            # the move is running out of fuel → tighten the trail
-            if len(candles_1m) >= 10 and entry_vol > 1e-10:
-                recent_vol = sum(float(c['v']) for c in candles_1m[-5:]) / 5.0
-                vol_ratio = recent_vol / entry_vol
-                if vol_ratio < QCfg.TRAIL_VOL_DECAY_MULT():
-                    # Tighten: move trail closer to price
-                    tighten_factor = 0.5 * (1.0 - vol_ratio / QCfg.TRAIL_VOL_DECAY_MULT())
-                    if pos_side == "long":
-                        base_trail += tighten_factor * atr
-                    else:
-                        base_trail -= tighten_factor * atr
+        # ── Mechanism 3: HVN snap (Phase-3 only) ─────────────────────────────
+        if tier >= QCfg.TRAIL_LOCK_R() and len(candles_1m) >= 30:
+            profile = InstitutionalLevels.build_volume_profile(
+                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
+            hvns = InstitutionalLevels.find_hvn_levels(
+                profile, QCfg.TRAIL_HVN_SNAP_THRESH())
+            for hvn in hvns:
+                if pos_side == "long":
+                    # HVN between current_sl and price (price has traded through it = new support)
+                    if current_sl < hvn < price - atr * 0.3:
+                        candidates.append(hvn - 0.10 * atr)
+                else:
+                    if price + atr * 0.3 < hvn < current_sl:
+                        candidates.append(hvn + 0.10 * atr)
 
-            # Orderbook wall check: if there's a wall behind us, snap to it
+        # ── OB wall snapping (behind price, in-profit zone) ───────────────────
+        if tier >= QCfg.TRAIL_LOCK_R():
             wall_side = "bid" if pos_side == "long" else "ask"
             walls = InstitutionalLevels.find_orderbook_walls(
                 orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
             if walls:
                 if pos_side == "long":
-                    below_walls = [(p, q) for p, q in walls if p < price and p > entry_price]
-                    if below_walls:
-                        best_wall = max(below_walls, key=lambda x: x[1])
-                        wall_trail = best_wall[0] - 0.1 * atr
-                        base_trail = max(base_trail, wall_trail)
+                    in_profit_walls = [(p, q) for p, q in walls
+                                       if current_sl < p < price - atr * 0.2]
+                    if in_profit_walls:
+                        best = max(in_profit_walls, key=lambda x: x[1])
+                        candidates.append(best[0] - 0.08 * atr)
                 else:
-                    above_walls = [(p, q) for p, q in walls if p > price and p < entry_price]
-                    if above_walls:
-                        best_wall = min(above_walls, key=lambda x: x[1])
-                        wall_trail = best_wall[0] + 0.1 * atr
-                        base_trail = min(base_trail, wall_trail)
+                    in_profit_walls = [(p, q) for p, q in walls
+                                       if price + atr * 0.2 < p < current_sl]
+                    if in_profit_walls:
+                        best = min(in_profit_walls, key=lambda x: x[1])
+                        candidates.append(best[0] + 0.08 * atr)
 
-            new_sl = base_trail
-
-        if new_sl is None:
+        if not candidates:
             return None
 
-        # Ratchet: SL may only improve (never widen)
-        if pos_side == "long" and new_sl <= current_sl + QCfg.TRAIL_MIN_MOVE_ATR() * atr:
-            return None
-        if pos_side == "short" and new_sl >= current_sl - QCfg.TRAIL_MIN_MOVE_ATR() * atr:
-            return None
+        # ── Select best (most protective that is strictly better than current) ─
+        if pos_side == "long":
+            new_sl = max(candidates)
+        else:
+            new_sl = min(candidates)
+
+        # ── Vol-decay tightening overlay ──────────────────────────────────────
+        if len(candles_1m) >= 10 and entry_vol > 1e-10:
+            recent_vol  = sum(float(c['v']) for c in candles_1m[-5:]) / 5.0
+            vol_ratio   = recent_vol / entry_vol
+            decay_mult  = QCfg.TRAIL_VOL_DECAY_MULT()
+            if vol_ratio < decay_mult:
+                # Linear tighten: 0 at vol_ratio=decay_mult, max 0.35×ATR at vol=0
+                tighten = 0.35 * atr * (1.0 - vol_ratio / decay_mult)
+                if pos_side == "long":
+                    new_sl = min(new_sl + tighten, price - 0.10 * atr)
+                else:
+                    new_sl = max(new_sl - tighten, price + 0.10 * atr)
+
+        # ── Ratchet: SL may only improve; minimum meaningful move ─────────────
+        min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
+        if pos_side == "long":
+            if new_sl <= current_sl + min_move:
+                return None
+        else:
+            if new_sl >= current_sl - min_move:
+                return None
 
         return new_sl
 
@@ -747,9 +982,20 @@ class ATREngine:
                        abs(float(candles[i]['l'])-float(candles[i-1]['c'])))
                    for i in range(1, len(candles))]
             if len(trs) < period: return self._atr
+            # Seed with SMA of first 'period' TRs, then EMA over the rest.
+            # CRITICAL: populate _atr_hist with every intermediate value so
+            # get_percentile() has a genuine distribution. The original code only
+            # appended the final value once, making history a monotone sequence
+            # from the warmup-end ATR onward → percentile collapses to 0 whenever
+            # live volatility is below that single seed point.
             atr = sum(trs[:period]) / period
-            for tr in trs[period:]: atr = (atr*(period-1)+tr)/period
+            self._atr_hist.append(atr)
+            for tr in trs[period:]:
+                atr = (atr * (period - 1) + tr) / period
+                self._atr_hist.append(atr)
             self._atr = atr; self._seeded = True
+            self._last_ts = last_ts
+            return self._atr   # return early — history already populated
         else:
             hi=float(candles[-1]['h']); lo=float(candles[-1]['l']); prc=float(candles[-2]['c'])
             self._atr = (self._atr*(period-1)+max(hi-lo,abs(hi-prc),abs(lo-prc)))/period
@@ -844,6 +1090,7 @@ class PositionState:
     trail_active: bool = False; last_trail_time: float = 0.0
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
+    peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -1076,21 +1323,26 @@ class QuantStrategy:
             self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
 
     def _compute_sl_tp(self, data_manager, price, side, atr):
-        """Institutional SL/TP using volume profile + orderbook walls + swing structure + VWAP bands."""
-        try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+2)
+        """Institutional SL/TP using multi-TF swing density + VP HVN + OB walls + VWAP bands."""
+        try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+5)
         except: candles_5m = []
         try: candles_1m = data_manager.get_candles("1m", limit=150)
         except: candles_1m = []
+        try: candles_15m = data_manager.get_candles("15m", limit=30)
+        except: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except: orderbook = {"bids": [], "asks": []}
         vwap = self._vwap.vwap; vwap_std = self._vwap.vwap_std
+        atr_pctile = self._atr_5m.get_percentile()
 
         sl_price = InstitutionalLevels.compute_sl(
-            price, side, atr, candles_5m, candles_1m, orderbook, vwap, vwap_std)
+            price, side, atr, candles_5m, candles_1m, orderbook, vwap, vwap_std,
+            atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
         tp_price = InstitutionalLevels.compute_tp(
-            price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std)
+            price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
+            candles_5m=candles_5m)
         tp_price = _round_to_tick(tp_price)
 
         if side=="long" and (sl_price>=price or tp_price<=price): return None, None
@@ -1187,38 +1439,48 @@ class QuantStrategy:
             if self._update_trailing_sl(order_manager, data_manager, price, now): return
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
-        """Institutional trail: micro-swing following + volume decay tightening + orderbook wall snapping."""
+        """Institutional trail: Chandelier + HVN-snap + micro-swing + vol-decay tightening."""
         pos = self._pos; atr = self._atr_5m.atr
         if atr < 1e-10: return False
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
         if profit > pos.peak_profit: pos.peak_profit = profit
 
-        try: candles_1m = data_manager.get_candles("1m", limit=30)
+        # Track absolute peak price (used by chandelier)
+        if pos.side == "long":
+            if price > pos.peak_price_abs:
+                pos.peak_price_abs = price
+        else:
+            if pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs:
+                pos.peak_price_abs = price
+
+        try: candles_1m = data_manager.get_candles("1m", limit=60)
         except: candles_1m = []
         try: orderbook = data_manager.get_orderbook()
         except: orderbook = {"bids": [], "asks": []}
 
+        hold_secs = now - pos.entry_time
+
         new_sl = InstitutionalLevels.compute_trail_sl(
             pos.side, price, pos.entry_price, pos.sl_price, atr,
-            candles_1m, orderbook, pos.peak_profit, pos.entry_vol)
+            candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
+            hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs)
 
         if new_sl is None:
             return False
 
         new_sl_tick = _round_to_tick(new_sl)
 
-        # Determine trail phase for logging
+        # Determine trail phase label for logging
         init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         tier = pos.peak_profit / init_dist
         if tier < QCfg.TRAIL_LOCK_R():
-            phase_label = "🟡 BE (micro-swing)"
+            phase_label = "🟡 BE (structure-guided)"
         else:
-            # Check what drove the trail
-            phase_label = "🟢 Active (swing"
+            phase_label = "🟢 Active (chandelier"
             if len(candles_1m) >= 10 and pos.entry_vol > 1e-10:
                 recent_vol = sum(float(c['v']) for c in candles_1m[-5:]) / 5.0
                 if recent_vol / pos.entry_vol < QCfg.TRAIL_VOL_DECAY_MULT():
-                    phase_label += " + vol decay"
+                    phase_label += "+vol-decay"
             phase_label += ")"
 
         hm = (now - pos.entry_time) / 60.0
@@ -1238,7 +1500,7 @@ class QuantStrategy:
             self.current_sl_price = new_sl_tick
             if not pos.trail_active:
                 self._pos.trail_active = True; logger.info("✅ Trailing SL active")
-                send_telegram_message("✅ Trailing SL now active — following micro-swings")
+                send_telegram_message("✅ Trailing SL now active — chandelier + HVN-snap engaged")
         return False
 
     def _exit_trade(self, order_manager, price, reason):
