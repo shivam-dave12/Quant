@@ -743,6 +743,183 @@ class OrderManager:
             logger.error(f"place_limit_order error: {e}", exc_info=True)
             return None
 
+    def place_limit_entry(
+        self,
+        side: str,
+        quantity: float,
+        limit_price: float,
+        timeout_sec: float = 7.0,
+        fallback_to_market: bool = True,
+    ) -> Optional[Dict]:
+        """
+        Attempt a maker limit entry. Poll for fill. Fall back to market on timeout.
+
+        This is the ONLY method quant_strategy should call for position entry.
+        It abstracts the entire maker/taker decision lifecycle:
+          1. Post limit order at limit_price
+          2. Poll for fill every ~1.5s within timeout_sec
+          3. If filled → return with fill_type='maker'
+          4. If not filled → cancel + place market → return with fill_type='taker'
+          5. If market also fails → return None
+
+        The fill_type field lets the caller (strategy / fee_engine) record
+        the actual execution cost for slippage tracking.
+
+        Args:
+            side:               'long'/'buy' or 'short'/'sell'
+            quantity:           order size
+            limit_price:        price to post at (from MakerTakerDecision.decide())
+            timeout_sec:        how long to wait for fill before falling back
+            fallback_to_market: if True, fall back to market on timeout
+
+        Returns:
+            Order data dict on success (with fill_type and fill_price populated),
+            or None on total failure.
+        """
+        # ── Step 1: post the limit order ─────────────────────────────────────────
+        logger.info(f"🎯 Attempting maker entry: {side} {quantity} @ ${limit_price:.2f} "
+                    f"(timeout={timeout_sec:.0f}s)")
+
+        data = self.place_limit_order(
+            side=side, quantity=quantity, price=limit_price, reduce_only=False
+        )
+
+        if not data:
+            if fallback_to_market:
+                logger.info("Limit placement failed — falling back to market immediately")
+                mdata = self.place_market_order(side=side, quantity=quantity)
+                if mdata:
+                    mdata["fill_type"]  = "taker"
+                    mdata["fill_price"] = 0.0   # caller must read avg_execution_price
+                return mdata
+            return None
+
+        order_id = data.get("order_id", "")
+        if not order_id:
+            logger.error("Limit order returned no order_id")
+            return None
+
+        # ── Step 2: polling loop ─────────────────────────────────────────────────
+        deadline      = time.time() + timeout_sec
+        poll_interval = 1.5   # seconds between status checks
+
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            details = self.get_fill_details(order_id)
+
+            if details is None:
+                # API error — keep waiting; don't cancel yet
+                logger.debug(f"Fill query returned None for {order_id[:8]}… — retrying")
+                continue
+
+            status = str(details.get("status", "")).upper()
+
+            # ── Fully filled ──────────────────────────────────────────────────
+            if status in ("EXECUTED", "FILLED", "COMPLETELY_FILLED"):
+                fill_px = float(details.get("fill_price") or limit_price)
+                data["fill_type"]  = "maker"
+                data["fill_price"] = fill_px
+                logger.info(f"✅ Maker fill confirmed: {order_id[:8]}… @ ${fill_px:.2f}")
+                return data
+
+            # ── Already cancelled / rejected by exchange ──────────────────────
+            if status in ("CANCELLED", "REJECTED", "EXPIRED", "CANCEL"):
+                logger.info(f"Limit order {order_id[:8]}… rejected/cancelled by exchange "
+                            f"— falling back to market")
+                break
+
+            # ── Partially filled — adopt the partial and exit ─────────────────
+            if status in ("PARTIALLY_EXECUTED", "PARTIALLY_FILLED"):
+                filled_qty = float(details.get("filled_qty") or 0)
+                fill_px    = float(details.get("fill_price") or limit_price)
+                logger.info(f"⚠️  Partial fill: {filled_qty:.4f}/{quantity:.4f} "
+                            f"@ ${fill_px:.2f} — cancelling remainder")
+                self.cancel_order(order_id)
+                data["fill_type"]  = "maker"
+                data["fill_price"] = fill_px
+                data["quantity"]   = filled_qty   # actual filled quantity
+                return data
+
+            # Still OPEN / UNTRIGGERED — keep polling
+            logger.debug(f"Limit order {order_id[:8]}… status={status} — waiting")
+
+        # ── Step 3: timeout — cancel and fall back ────────────────────────────────
+        remaining = max(0, deadline - time.time())
+        logger.info(f"Limit entry timed out after {timeout_sec - remaining:.1f}s "
+                    f"— cancelling {order_id[:8]}…")
+        cancel_result = self.cancel_order(order_id)
+
+        if cancel_result == CancelResult.ALREADY_FILLED:
+            # Race condition: filled right as we timed out
+            logger.info(f"Race fill detected on cancel — adopting maker fill")
+            details = self.get_fill_details(order_id)
+            fill_px = float((details or {}).get("fill_price") or limit_price)
+            data["fill_type"]  = "maker"
+            data["fill_price"] = fill_px
+            return data
+
+        if fallback_to_market:
+            logger.info("Falling back to MARKET order after limit timeout")
+            mdata = self.place_market_order(side=side, quantity=quantity)
+            if mdata:
+                mdata["fill_type"]  = "taker"
+                mdata["fill_price"] = 0.0
+            return mdata
+
+        logger.warning("No fallback requested and limit timed out — entry aborted")
+        return None
+
+    @staticmethod
+    def compute_signal_urgency(
+        price_now: float,
+        price_prev: float,
+        atr: float,
+        side: str,
+        vwap_dev_atr: float,
+        entry_threshold_atr: float,
+    ) -> float:
+        """
+        Compute a 0..1 urgency score for use in MakerTakerDecision.decide().
+
+        Logic:
+          - If price is moving AWAY from the entry zone rapidly (deviation growing),
+            urgency is HIGH → take market (don't risk missing the setup)
+          - If price is stalling or slowly expanding, urgency is LOW → post maker
+
+        Two components combined:
+          1. Momentum: (price change per tick) / ATR as a fraction
+          2. Extension: how far past the entry threshold are we?
+
+        Returns: float in [0.0, 1.0]
+        """
+        if atr < 1e-10 or price_now < 1.0 or price_prev < 1.0:
+            return 0.5   # neutral default
+
+        # Momentum component: price change normalized by ATR
+        delta    = abs(price_now - price_prev)
+        momentum = min(1.0, delta / (atr * 0.5))
+
+        # Direction: is price moving toward or away from VWAP?
+        if side == "long":
+            direction_factor = 1.0 if price_now < price_prev else -0.3
+        else:
+            direction_factor = 1.0 if price_now > price_prev else -0.3
+
+        momentum_urgency = max(0.0, min(1.0, momentum * direction_factor))
+
+        # Extension component: how far past threshold are we?
+        dev_abs   = abs(vwap_dev_atr)
+        threshold = entry_threshold_atr
+        if dev_abs <= threshold:
+            extension_urgency = 0.8   # right at threshold — fragile
+        elif dev_abs <= threshold * 1.5:
+            extension_urgency = 0.3   # good zone, be patient
+        else:
+            extension_urgency = 0.45  # very overextended
+
+        urgency = 0.65 * momentum_urgency + 0.35 * extension_urgency
+        return round(min(1.0, max(0.0, urgency)), 3)
+
     def place_stop_loss(self, side: str, quantity: float,
                         trigger_price: float) -> Optional[Dict]:
         """

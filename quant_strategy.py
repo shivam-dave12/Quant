@@ -21,6 +21,10 @@ from typing import Dict, List, Optional, Tuple
 import config
 from telegram_notifier import send_telegram_message
 from order_manager import CancelResult
+try:
+    from fee_engine import ExecutionCostEngine
+except ImportError:
+    ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +169,29 @@ class QCfg:
     def TRAIL_CHANDELIER_N_END() -> float: return float(_cfg("QUANT_TRAIL_CHANDELIER_N_END", 1.5))
     @staticmethod
     def TRAIL_HVN_SNAP_THRESH() -> float: return float(_cfg("QUANT_TRAIL_HVN_SNAP_THRESH", 0.55))
+    # ── v4.2: Trend-following mode ──────────────────────────────
+    @staticmethod
+    def ADX_PERIOD() -> int: return int(_cfg("QUANT_ADX_PERIOD", 14))
+    @staticmethod
+    def ADX_TREND_THRESH() -> float: return float(_cfg("QUANT_ADX_TREND_THRESH", 25.0))
+    @staticmethod
+    def ADX_RANGE_THRESH() -> float: return float(_cfg("QUANT_ADX_RANGE_THRESH", 20.0))
+    @staticmethod
+    def ATR_EXPANSION_THRESH() -> float: return float(_cfg("QUANT_ATR_EXPANSION_THRESH", 1.30))
+    @staticmethod
+    def TREND_PULLBACK_ATR_MIN() -> float: return float(_cfg("QUANT_TREND_PULLBACK_ATR_MIN", 0.10))
+    @staticmethod
+    def TREND_PULLBACK_ATR_MAX() -> float: return float(_cfg("QUANT_TREND_PULLBACK_ATR_MAX", 2.00))
+    @staticmethod
+    def TREND_CVD_MIN() -> float: return float(_cfg("QUANT_TREND_CVD_MIN", -0.20))
+    @staticmethod
+    def TREND_TP_ATR_MULT() -> float: return float(_cfg("QUANT_TREND_TP_ATR_MULT", 2.5))
+    @staticmethod
+    def TREND_COMPOSITE_MIN() -> float: return float(_cfg("QUANT_TREND_COMPOSITE_MIN", 0.35))
+    @staticmethod
+    def TREND_CONFIRM_TICKS() -> int: return int(_cfg("QUANT_TREND_CONFIRM_TICKS", 3))
+    @staticmethod
+    def TREND_CHANDELIER_N() -> float: return float(_cfg("QUANT_TREND_CHANDELIER_N", 1.5))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -268,6 +295,32 @@ class CVDEngine:
         if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
         return -price_dir * min(abs(cvd_z), 3.0) / 3.0
 
+    def get_trend_signal(self) -> float:
+        """
+        Directional CVD bias for trend-following mode.
+
+        Unlike get_divergence_signal (which looks for CVD diverging from price),
+        this asks: is net order-flow consistently in one direction?
+
+        Returns +1.0 = sustained net buying, -1.0 = sustained net selling.
+        Used to confirm that trend trades are aligned with actual order flow.
+        """
+        arr = list(self._deltas); n = len(arr)
+        w = QCfg.CVD_WINDOW()
+        if n < w + 10: return 0.0
+        # Rolling sums over window 'w' to build a distribution
+        sums = []
+        for i in range(n - w * 2, n - w + 1):
+            if i >= 0:
+                sums.append(sum(arr[i:i + w]))
+        if len(sums) < 5: return 0.0
+        recent_sum = sum(arr[-w:])
+        mu  = sum(sums) / len(sums)
+        std = math.sqrt(sum((s - mu) ** 2 for s in sums) / max(len(sums) - 1, 1))
+        if std < 1e-12:
+            return _sigmoid(recent_sum / (abs(mu) + 1e-10), 0.5)
+        return _sigmoid((recent_sum - mu) / std, 0.7)
+
 # ═══════════════════════════════════════════════════════════════
 # ENGINE 3: ORDERBOOK IMBALANCE
 # ═══════════════════════════════════════════════════════════════
@@ -348,6 +401,252 @@ class VolumeExhaustionEngine:
         elif vr < 0.9: self._last_signal = -pd * (0.9 - vr) / 0.4 * 0.5
         else: self._last_signal = 0.0
         return self._last_signal
+
+# ═══════════════════════════════════════════════════════════════
+# ADX ENGINE — Wilder's Average Directional Index
+# ═══════════════════════════════════════════════════════════════
+class ADXEngine:
+    """
+    Proper Wilder ADX(14) with +DI/-DI.
+
+    Seeding: requires at least 2×period candles to bootstrap Wilder smoothing.
+    Incremental: each new candle updates the Wilder-smoothed TR, +DM, -DM, then
+    computes DX and Wilder-smooths it into ADX.
+
+    Interpretation:
+      ADX < 20  → no trend (ranging)
+      ADX 20-25 → transitional / weak trend
+      ADX > 25  → established trend
+      ADX > 40  → strong trend
+      +DI > -DI → bullish pressure dominant
+      -DI > +DI → bearish pressure dominant
+    """
+    def __init__(self):
+        self._adx               = 0.0
+        self._plus_di           = 0.0
+        self._minus_di          = 0.0
+        self._smoothed_plus_dm  = 0.0
+        self._smoothed_minus_dm = 0.0
+        self._smoothed_tr       = 0.0
+        self._seeded            = False
+        self._last_ts           = -1
+
+    def compute(self, candles: List[Dict]) -> float:
+        if len(candles) < 2: return self._adx
+        period  = QCfg.ADX_PERIOD()
+        last_ts = int(candles[-1].get('t', 0))
+        if last_ts == self._last_ts and self._seeded: return self._adx
+        if len(candles) < period * 2 + 1: return self._adx
+
+        if not self._seeded:
+            plus_dms: List[float] = []
+            minus_dms: List[float] = []
+            trs: List[float] = []
+            for i in range(1, len(candles)):
+                h  = float(candles[i]['h']);   l  = float(candles[i]['l'])
+                ph = float(candles[i-1]['h']); pl = float(candles[i-1]['l'])
+                pc = float(candles[i-1]['c'])
+                up = h - ph; dn = pl - l
+                plus_dms.append(up  if up  > dn and up  > 0 else 0.0)
+                minus_dms.append(dn if dn  > up and dn  > 0 else 0.0)
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+            # Bootstrap Wilder sum with straight sum of first 'period' bars
+            sp = sum(plus_dms[:period])
+            sm = sum(minus_dms[:period])
+            st = sum(trs[:period])
+
+            dxs: List[float] = []
+            for i in range(period, len(plus_dms)):
+                sp = sp - sp / period + plus_dms[i]
+                sm = sm - sm / period + minus_dms[i]
+                st = st - st / period + trs[i]
+                if st < 1e-10: continue
+                pdi = 100.0 * sp / st
+                mdi = 100.0 * sm / st
+                denom = pdi + mdi
+                dxs.append(100.0 * abs(pdi - mdi) / denom if denom > 1e-10 else 0.0)
+                self._plus_di = pdi; self._minus_di = mdi
+
+            self._smoothed_plus_dm  = sp
+            self._smoothed_minus_dm = sm
+            self._smoothed_tr       = st
+
+            if not dxs: return self._adx
+            n_seed = min(period, len(dxs))
+            adx    = sum(dxs[:n_seed]) / n_seed
+            for dx in dxs[n_seed:]:
+                adx = (adx * (period - 1) + dx) / period
+            self._adx     = adx
+            self._seeded  = True
+            self._last_ts = last_ts
+            return self._adx
+
+        # Incremental update — single new bar
+        h  = float(candles[-1]['h']); l  = float(candles[-1]['l'])
+        ph = float(candles[-2]['h']); pl = float(candles[-2]['l'])
+        pc = float(candles[-2]['c'])
+        up = h - ph; dn = pl - l
+        plus_dm  = up if up  > dn and up  > 0 else 0.0
+        minus_dm = dn if dn  > up and dn  > 0 else 0.0
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+
+        self._smoothed_plus_dm  = self._smoothed_plus_dm  - self._smoothed_plus_dm  / period + plus_dm
+        self._smoothed_minus_dm = self._smoothed_minus_dm - self._smoothed_minus_dm / period + minus_dm
+        self._smoothed_tr       = self._smoothed_tr       - self._smoothed_tr       / period + tr
+
+        if self._smoothed_tr > 1e-10:
+            self._plus_di  = 100.0 * self._smoothed_plus_dm  / self._smoothed_tr
+            self._minus_di = 100.0 * self._smoothed_minus_dm / self._smoothed_tr
+            denom = self._plus_di + self._minus_di
+            dx    = 100.0 * abs(self._plus_di - self._minus_di) / denom if denom > 1e-10 else 0.0
+            self._adx = (self._adx * (period - 1) + dx) / period
+
+        self._last_ts = last_ts
+        return self._adx
+
+    @property
+    def adx(self) -> float: return self._adx
+    @property
+    def plus_di(self) -> float: return self._plus_di
+    @property
+    def minus_di(self) -> float: return self._minus_di
+
+    def trend_direction(self) -> str:
+        """'up', 'down', or 'neutral' based on +DI vs -DI spread (>4 pt gap required)."""
+        diff = self._plus_di - self._minus_di
+        if abs(diff) < 4.0: return "neutral"
+        return "up" if diff > 0 else "down"
+
+    def is_trending(self) -> bool:
+        return self._seeded and self._adx >= QCfg.ADX_TREND_THRESH()
+
+    def is_ranging(self) -> bool:
+        return self._seeded and self._adx < QCfg.ADX_RANGE_THRESH()
+
+
+# ═══════════════════════════════════════════════════════════════
+# MARKET REGIME + CLASSIFIER
+# ═══════════════════════════════════════════════════════════════
+class MarketRegime(Enum):
+    RANGING       = "RANGING"       # consolidation — reversion mode is primary
+    TRANSITIONING = "TRANSITIONING" # unclear — reversion with tighter gates
+    TRENDING_UP   = "TRENDING_UP"   # directional up — trend entries only
+    TRENDING_DOWN = "TRENDING_DOWN" # directional down — trend entries only
+
+
+class RegimeClassifier:
+    """
+    Multi-factor regime detection.
+
+    Inputs and weights:
+      ADX(14) on 5m (50%):  Wilder's trend strength. > 25 = trending.
+      ATR expansion (30%):  current_atr / mean(atr[-20]). > 1.3 = directional vol.
+      HTF alignment (20%):  4h×0.6 + 15m×0.4 trend score magnitude. Macro confirms.
+
+    Regime thresholds:
+      TRENDING   ← confidence ≥ 0.55 AND ADX confirms AND +DI/-DI direction clear
+      RANGING    ← confidence < 0.30
+      TRANSITIONING ← otherwise
+
+    Direction requires ADX's +DI/-DI to broadly agree with the HTF composite.
+    This prevents regime flip on a single-candle spike.
+    """
+    def __init__(self):
+        self._regime     = MarketRegime.RANGING
+        self._confidence = 0.5
+        self._direction  = "neutral"
+
+    def update(self, adx: ADXEngine, atr: ATREngine, htf: HTFTrendFilter) -> MarketRegime:
+        adx_val    = adx.adx
+        trend_dir  = adx.trend_direction()
+        trend_thr  = QCfg.ADX_TREND_THRESH()
+        range_thr  = QCfg.ADX_RANGE_THRESH()
+
+        # ADX score
+        if adx_val >= trend_thr:
+            adx_score    = min((adx_val - trend_thr) / 20.0, 1.0)
+            adx_trending = True
+        elif adx_val < range_thr:
+            adx_score    = 0.0
+            adx_trending = False
+        else:
+            adx_score    = (adx_val - range_thr) / (trend_thr - range_thr) * 0.5
+            adx_trending = False
+
+        # ATR expansion score
+        # BUG FIX: original code used hist[-20:] which INCLUDES hist[-1] (current ATR)
+        # as part of the baseline mean.  Dividing current by a mean that already
+        # contains current understates expansion (self-reference bias).
+        # Fix: use hist[-21:-1] — the 20 bars BEFORE the current bar.
+        hist = list(atr._atr_hist)
+        expansion = 1.0
+        if len(hist) >= 21:
+            baseline = sum(hist[-21:-1]) / 20.0
+            if baseline > 1e-10:
+                expansion = hist[-1] / baseline
+        elif len(hist) >= 2:
+            # Not enough history for a full 20-bar baseline — use what we have,
+            # still excluding the current value.
+            prior = hist[:-1]
+            baseline = sum(prior) / len(prior)
+            if baseline > 1e-10:
+                expansion = hist[-1] / baseline
+        exp_thr         = QCfg.ATR_EXPANSION_THRESH()
+        expansion_score = min(max((expansion - 1.0) / (exp_thr - 1.0), 0.0), 1.0)
+
+        # HTF alignment score
+        htf_composite = htf.trend_4h * 0.60 + htf.trend_15m * 0.40
+        htf_score     = min(abs(htf_composite), 1.0)
+        htf_up        = htf_composite > 0
+
+        confidence = adx_score * 0.50 + expansion_score * 0.30 + htf_score * 0.20
+
+        if confidence >= 0.55 and adx_trending:
+            di_up = (trend_dir == "up")
+            if di_up and htf_up:
+                regime = MarketRegime.TRENDING_UP
+            elif not di_up and not htf_up:
+                regime = MarketRegime.TRENDING_DOWN
+            elif trend_dir == "up":
+                regime = MarketRegime.TRENDING_UP    # ADX clear; HTF still catching up
+            elif trend_dir == "down":
+                regime = MarketRegime.TRENDING_DOWN
+            else:
+                regime = MarketRegime.TRANSITIONING  # DI spread neutral
+        elif confidence < 0.30:
+            regime = MarketRegime.RANGING
+        else:
+            regime = MarketRegime.TRANSITIONING
+
+        self._regime     = regime
+        self._confidence = confidence
+        self._direction  = trend_dir
+        return regime
+
+    @property
+    def regime(self) -> MarketRegime: return self._regime
+    @property
+    def confidence(self) -> float:   return self._confidence
+    @property
+    def direction(self) -> str:      return self._direction
+
+    def is_trending(self) -> bool:
+        return self._regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN)
+
+    def trend_side(self) -> Optional[str]:
+        if self._regime == MarketRegime.TRENDING_UP:   return "long"
+        if self._regime == MarketRegime.TRENDING_DOWN: return "short"
+        return None
+
+    def allows_reversion(self, reversion_side: str) -> bool:
+        """
+        Hard-veto reversion trades that are counter to an established trend.
+        Fading a trend flush = stop-loss machine.
+        """
+        if self._regime == MarketRegime.TRENDING_UP   and reversion_side == "short": return False
+        if self._regime == MarketRegime.TRENDING_DOWN and reversion_side == "long":  return False
+        return True
 
 # ═══════════════════════════════════════════════════════════════
 # INSTITUTIONAL LEVEL ENGINE — Volume Profile + Orderbook Walls
@@ -782,12 +1081,98 @@ class InstitutionalLevels:
         return tp
 
     @staticmethod
+    def compute_tp_trend(price: float, side: str, atr: float, sl_price: float,
+                         candles_5m: List[Dict], orderbook: Dict,
+                         swing_lookback: int = 12) -> float:
+        """
+        Trend-following TP placement — v4.2.
+
+        In a trending market VWAP is behind price and is NOT the target.
+        Targets in order of preference:
+
+          1. Previous swing high/low (the one that started the current pullback)
+             — price broke that level → it becomes a continuation target
+          2. ATR channel extension: entry + TREND_TP_ATR_MULT × ATR
+             — the standard measured-move projection
+          3. Next orderbook resistance/support wall in trend direction
+             — where resting liquidity will absorb momentum
+
+        All candidates must satisfy MIN_RR_RATIO and are capped at TP_MAX_RR.
+        If no structural target is found, ATR channel is used as the hard floor.
+        """
+        sl_dist     = abs(price - sl_price)
+        if sl_dist < 1e-10:
+            return price + atr if side == "long" else price - atr
+
+        min_tp_dist = sl_dist * QCfg.MIN_RR_RATIO()
+        max_tp_dist = sl_dist * QCfg.TP_MAX_RR()
+
+        # ── ATR-channel baseline (always valid) ───────────────────────────────
+        atr_tp_dist  = atr * QCfg.TREND_TP_ATR_MULT()
+        atr_tp_dist  = max(atr_tp_dist, min_tp_dist)   # at least MIN_RR
+        atr_tp_dist  = min(atr_tp_dist, max_tp_dist)   # capped at MAX_RR
+        atr_tp       = (price + atr_tp_dist) if side == "long" else (price - atr_tp_dist)
+
+        # ── Swing target: recent pivot that started the pullback ──────────────
+        swing_tp: Optional[float] = None
+        if len(candles_5m) >= 3:
+            sh, sl_list = InstitutionalLevels.find_swing_extremes(candles_5m, swing_lookback)
+            if side == "long" and sh:
+                # Highs above price that are within max_tp_dist
+                valid = [h for h in sh if price + min_tp_dist < h <= price + max_tp_dist]
+                if valid:
+                    swing_tp = min(valid) - 0.05 * atr   # just below the level
+            elif side == "short" and sl_list:
+                valid = [l for l in sl_list if price - max_tp_dist <= l < price - min_tp_dist]
+                if valid:
+                    swing_tp = max(valid) + 0.05 * atr
+
+        # ── OB wall in trend direction ─────────────────────────────────────────
+        wall_side = "ask" if side == "long" else "bid"
+        walls     = InstitutionalLevels.find_orderbook_walls(
+            orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
+        wall_tp: Optional[float] = None
+        if walls:
+            if side == "long":
+                valid = [(p, q) for p, q in walls
+                         if price + min_tp_dist < p <= price + max_tp_dist]
+                if valid:
+                    best = min(valid, key=lambda x: x[0])   # nearest wall
+                    wall_tp = best[0] - 0.08 * atr
+            else:
+                valid = [(p, q) for p, q in walls
+                         if price - max_tp_dist <= p < price - min_tp_dist]
+                if valid:
+                    best = max(valid, key=lambda x: x[0])
+                    wall_tp = best[0] + 0.08 * atr
+
+        # ── Select: swing > ATR-channel > wall (prefer structural levels) ──────
+        # For trend trades we prefer the ATR channel over swing when the swing is
+        # very close (< 1.5× sl_dist) — that would be a weak R:R.
+        candidates: List[float] = []
+        if swing_tp is not None:
+            dist = abs(swing_tp - price)
+            if dist >= sl_dist * 1.5:   # at least 1.5:1 from structural target
+                candidates.append(swing_tp)
+        candidates.append(atr_tp)       # ATR channel always included
+        if wall_tp is not None:
+            candidates.append(wall_tp)
+
+        if side == "long":
+            valid_c = [c for c in candidates if price + min_tp_dist < c <= price + max_tp_dist]
+            return max(valid_c) if valid_c else atr_tp   # take farthest valid (trend continuation)
+        else:
+            valid_c = [c for c in candidates if price - max_tp_dist <= c < price - min_tp_dist]
+            return min(valid_c) if valid_c else atr_tp
+
+    @staticmethod
     def compute_trail_sl(pos_side: str, price: float, entry_price: float,
                          current_sl: float, atr: float,
                          candles_1m: List[Dict], orderbook: Dict,
                          peak_profit: float, entry_vol: float,
                          hold_seconds: float = 0.0,
-                         peak_price_abs: float = 0.0) -> Optional[float]:
+                         peak_price_abs: float = 0.0,
+                         trade_mode: str = "reversion") -> Optional[float]:
         """
         Institutional trailing SL — v4.1 (Chandelier + HVN-snap + vol-decay).
 
@@ -847,14 +1232,20 @@ class InstitutionalLevels:
         if peak_price_abs > 1e-10:
             peak_ref = peak_price_abs
         else:
-            peak_ref = entry_price + (pos_side == "long" and peak_profit or 0)
+            peak_ref = entry_price + (peak_profit if pos_side == "long" else 0)
 
-        n_start = QCfg.TRAIL_CHANDELIER_N_START()
-        n_end   = QCfg.TRAIL_CHANDELIER_N_END()
-        max_hold = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
-        # Linear decay: starts wide (breathes), tightens as hold time grows
-        time_frac  = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
-        n_chandelier = n_start + (n_end - n_start) * time_frac
+        if trade_mode == "trend":
+            # Trend chandelier: fixed tight multiplier — trend reversals are sharp.
+            # No time-decay widening: the whole point is to protect gains quickly
+            # when momentum flips.
+            n_chandelier = QCfg.TREND_CHANDELIER_N()
+        else:
+            # Reversion chandelier: starts wide (breathes), tightens with hold time.
+            n_start      = QCfg.TRAIL_CHANDELIER_N_START()
+            n_end        = QCfg.TRAIL_CHANDELIER_N_END()
+            max_hold     = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
+            time_frac    = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
+            n_chandelier = n_start + (n_end - n_start) * time_frac
 
         if pos_side == "long":
             chandelier = peak_ref - n_chandelier * atr
@@ -971,6 +1362,16 @@ class ATREngine:
         self._atr = 0.0; self._atr_hist: deque = deque(maxlen=QCfg.ATR_PCTILE_WINDOW())
         self._last_ts = -1; self._seeded = False
 
+    # These are read fresh on each use so config changes take effect immediately.
+    # See config.py  ATR_SEED_RETAIN and ATR_PCTILE_RANK_WINDOW for tuning notes.
+    @staticmethod
+    def _seed_retain() -> int:
+        return int(_cfg("ATR_SEED_RETAIN", 20))
+
+    @staticmethod
+    def _pctile_rank_window() -> int:
+        return int(_cfg("ATR_PCTILE_RANK_WINDOW", 30))
+
     def compute(self, candles: List[Dict]) -> float:
         if not candles: return self._atr
         period = QCfg.ATR_PERIOD(); last_ts = int(candles[-1].get('t', 0))
@@ -982,17 +1383,16 @@ class ATREngine:
                        abs(float(candles[i]['l'])-float(candles[i-1]['c'])))
                    for i in range(1, len(candles))]
             if len(trs) < period: return self._atr
-            # Seed with SMA of first 'period' TRs, then EMA over the rest.
-            # CRITICAL: populate _atr_hist with every intermediate value so
-            # get_percentile() has a genuine distribution. The original code only
-            # appended the final value once, making history a monotone sequence
-            # from the warmup-end ATR onward → percentile collapses to 0 whenever
-            # live volatility is below that single seed point.
+            # Build the full Wilder-smoothed ATR sequence from warmup.
             atr = sum(trs[:period]) / period
             self._atr_hist.append(atr)
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
                 self._atr_hist.append(atr)
+            # Trim seed history to ATR_SEED_RETAIN most-recent values so stale
+            # high-vol warmup candles don't lock the percentile at 0% for hours.
+            while len(self._atr_hist) > self._seed_retain():
+                self._atr_hist.popleft()
             self._atr = atr; self._seeded = True
             self._last_ts = last_ts
             return self._atr   # return early — history already populated
@@ -1007,8 +1407,14 @@ class ATREngine:
 
     def get_percentile(self) -> float:
         hist = list(self._atr_hist)
-        if len(hist) < 10: return 0.5
-        return sum(1 for h in hist[:-1] if h <= hist[-1]) / len(hist[:-1])
+        n = len(hist)
+        if n < 5: return 0.5
+        # Rank against only the last ATR_PCTILE_RANK_WINDOW values to keep
+        # percentile recovery lag short after a regime shift.
+        window = hist[max(0, n - self._pctile_rank_window()):]
+        if len(window) < 2: return 0.5
+        cur = window[-1]
+        return sum(1 for h in window[:-1] if h <= cur) / (len(window) - 1)
 
     def regime_valid(self) -> bool:
         p = self.get_percentile()
@@ -1066,6 +1472,9 @@ class SignalBreakdown:
     overextended: bool = False; vwap_price: float = 0.0
     deviation_atr: float = 0.0; reversion_side: str = ""
     n_confirming: int = 0; threshold_used: float = 0.0
+    market_regime: str = "RANGING"  # MarketRegime.value for display
+    adx: float = 0.0               # raw ADX value for display
+    trend_score: float = 0.0       # trend-following composite score
 
     def __str__(self):
         return (f"VWAP={self.vwap_dev:+.3f} CVD={self.cvd_div:+.3f} "
@@ -1091,6 +1500,7 @@ class PositionState:
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
+    trade_mode: str = "reversion"  # "reversion" | "trend"
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -1160,8 +1570,14 @@ class QuantStrategy:
         self._vwap = VWAPEngine(); self._cvd = CVDEngine()
         self._ob_eng = OrderbookEngine(); self._tick_eng = TickFlowEngine()
         self._vol_exh = VolumeExhaustionEngine()
+        # ── Execution cost engine (PATCH 2) ──────────────────────────────────────
+        self._fee_engine = ExecutionCostEngine() if ExecutionCostEngine is not None else None
+        self._prev_price_for_urgency: float = 0.0
         self._atr_1m = ATREngine(); self._atr_5m = ATREngine()
         self._htf = HTFTrendFilter()
+        self._adx = ADXEngine()
+        self._regime = RegimeClassifier()
+        self._confirm_trend_long = 0; self._confirm_trend_short = 0
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
@@ -1199,6 +1615,14 @@ class QuantStrategy:
             self._last_eval_time = now
             phase = self._pos.phase
             self._feed_microstructure(data_manager)
+            # ── Feed orderbook to fee engine (PATCH 3) ───────────────────────────
+            try:
+                ob = data_manager.get_orderbook()
+                price = data_manager.get_last_price()
+                if self._fee_engine is not None:
+                    self._fee_engine.update_orderbook(ob, price)
+            except Exception:
+                pass
             # Update last known price
             try:
                 p = data_manager.get_last_price()
@@ -1255,6 +1679,12 @@ class QuantStrategy:
             c15 = data_manager.get_candles("15m", limit=100); c4h = data_manager.get_candles("4h", limit=50)
             self._htf.update(c15, c4h, atr_5m)
         except: pass
+
+        # ── Regime classification ─────────────────────────────────────────────
+        self._adx.compute(candles_5m)
+        regime = self._regime.update(self._adx, self._atr_5m, self._htf)
+
+        # ── Mean-reversion signals ────────────────────────────────────────────
         vs = self._vwap.get_reversion_signal(price, atr_1m)
         cs = self._cvd.get_divergence_signal(candles_1m)
         obs = self._ob_eng.get_signal(); ts = self._tick_eng.get_signal()
@@ -1263,6 +1693,15 @@ class QuantStrategy:
         comp = max(-1.0, min(1.0, comp))
         direction = 1.0 if comp >= 0 else -1.0
         nc = sum(1 for s in [vs,cs,obs,ts,ve] if s*direction > 0.05)
+
+        # ── Trend-following score (used only in TRENDING regime) ──────────────
+        # Composite of: HTF alignment + CVD directional bias + OB imbalance direction
+        # Positive = long-biased, negative = short-biased
+        htf_comp     = self._htf.trend_4h * 0.60 + self._htf.trend_15m * 0.40
+        cvd_trend    = self._cvd.get_trend_signal()
+        trend_score  = htf_comp * 0.50 + cvd_trend * 0.30 + obs * 0.20
+        trend_score  = max(-1.0, min(1.0, trend_score))
+
         sig = SignalBreakdown(
             vwap_dev=vs, cvd_div=cs, orderbook=obs, tick_flow=ts, vol_exhaust=ve,
             composite=comp, atr=atr_5m, atr_pct=self._atr_5m.get_percentile(),
@@ -1271,7 +1710,8 @@ class QuantStrategy:
             overextended=self._vwap.is_overextended(price, atr_1m),
             vwap_price=self._vwap.vwap, deviation_atr=self._vwap.deviation_atr,
             reversion_side=self._vwap.reversion_side(price), n_confirming=nc,
-            threshold_used=QCfg.COMPOSITE_ENTRY_MIN())
+            threshold_used=QCfg.COMPOSITE_ENTRY_MIN(),
+            market_regime=regime.value, adx=self._adx.adx, trend_score=trend_score)
         self._last_sig = sig; return sig
 
     def _log_thinking(self, sig, price, now):
@@ -1284,12 +1724,14 @@ class QuantStrategy:
             a = "▲" if v>0.05 else ("▼" if v<-0.05 else "─")
             return f"  {l:<6} {bar(v)} {a} {v:+.3f}"
         c=sig.composite; thr=QCfg.COMPOSITE_ENTRY_MIN()
+        regime_lbl = sig.market_regime
         gates = [
             f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR)",
             f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})",
             f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
             f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/5)",
-            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})"]
+            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
+            f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
         ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr
         cd = max(0.0, QCfg.COOLDOWN_SEC()-(now-self._last_exit_time))
         lines = [f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
@@ -1304,9 +1746,29 @@ class QuantStrategy:
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         sig = self._compute_signals(data_manager)
-        if sig is None: self._confirm_long = self._confirm_short = 0; return
+        if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
         price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
+
+        # ── Route by regime ───────────────────────────────────────────────────
+        if self._regime.is_trending():
+            self._confirm_long = self._confirm_short = 0   # reset reversion counters
+            self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
+        else:
+            self._confirm_trend_long = self._confirm_trend_short = 0  # reset trend counters
+            self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
+
+    def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
+        """
+        Mean-reversion entry — active in RANGING and TRANSITIONING regimes.
+        Blocked in TRENDING regime for counter-trend direction.
+        In TRANSITIONING: all existing gates must pass + regime allows this side.
+        """
         c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
+
+        # Hard veto: if market is trending against this reversion trade, skip
+        if not self._regime.allows_reversion(side):
+            self._confirm_long = self._confirm_short = 0; return
+
         if not (sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming >= 3):
             self._confirm_long = self._confirm_short = 0; return
         if self._last_exit_side and self._last_exit_side != side:
@@ -1317,13 +1779,94 @@ class QuantStrategy:
         cn = QCfg.CONFIRM_TICKS()
         if self._confirm_long >= cn:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig)
+            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig, mode="reversion")
         elif self._confirm_short >= cn:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig)
+            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig, mode="reversion")
 
-    def _compute_sl_tp(self, data_manager, price, side, atr):
-        """Institutional SL/TP using multi-TF swing density + VP HVN + OB walls + VWAP bands."""
+    def _evaluate_trend_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
+        """
+        Trend-following pullback entry — active only in TRENDING_UP / TRENDING_DOWN.
+
+        Entry logic (institutional pullback-to-EMA):
+          1. Market must be in an established trend (RegimeClassifier confirms)
+          2. Price has pulled back into the EMA(8) zone (not chasing the breakout)
+          3. Pullback depth: TREND_PULLBACK_ATR_MIN ≤ dist(price, ema8) ≤ TREND_PULLBACK_ATR_MAX
+             — too shallow = not a real pullback; too deep = trend may be reversing
+          4. CVD trend bias not strongly opposed (prevents buying into distribution)
+          5. Tick flow in trend direction (live order flow confirming the move)
+          6. Composite trend score ≥ TREND_COMPOSITE_MIN
+          7. TREND_CONFIRM_TICKS consecutive confirming evaluations (slightly more
+             patient than reversion to avoid catching the start of a pullback)
+
+        TP: ATR-channel extension (not VWAP — VWAP is behind price in a trend).
+        SL: Behind the pullback swing low/high using existing multi-TF compute_sl.
+        Trail: Tight chandelier (TREND_CHANDELIER_N) — trends reverse sharply.
+        """
+        trend_side = self._regime.trend_side()
+        if trend_side is None: return
+
+        # CVD directional filter: don't buy if order flow is strongly opposed
+        cvd_bias = self._cvd.get_trend_signal()
+        if trend_side == "long"  and cvd_bias < QCfg.TREND_CVD_MIN(): return
+        if trend_side == "short" and cvd_bias > -QCfg.TREND_CVD_MIN(): return
+
+        # Tick flow must broadly agree with trend direction
+        tf = self._tick_eng.get_signal()
+        if trend_side == "long"  and tf < -0.30: return
+        if trend_side == "short" and tf >  0.30: return
+
+        # Composite trend score gate
+        if abs(sig.trend_score) < QCfg.TREND_COMPOSITE_MIN(): return
+        if trend_side == "long"  and sig.trend_score <= 0: return
+        if trend_side == "short" and sig.trend_score >= 0: return
+
+        # Pullback-to-EMA depth check
+        try: candles_5m = data_manager.get_candles("5m", limit=30)
+        except: return
+        if len(candles_5m) < 10: return
+        closes = [float(c['c']) for c in candles_5m]
+        period = QCfg.EMA_FAST()
+        k = 2.0 / (period + 1)
+        ema = sum(closes[:period]) / period
+        for v in closes[period:]: ema = v * k + ema * (1.0 - k)
+        atr = self._atr_5m.atr
+        ema_dist = (ema - price) if trend_side == "long" else (price - ema)
+        pb_min = QCfg.TREND_PULLBACK_ATR_MIN() * atr
+        pb_max = QCfg.TREND_PULLBACK_ATR_MAX() * atr
+        if not (pb_min <= ema_dist <= pb_max): return
+
+        # Confirmation counter
+        if trend_side == "long":
+            self._confirm_trend_long += 1; self._confirm_trend_short = 0
+        else:
+            self._confirm_trend_short += 1; self._confirm_trend_long = 0
+
+        cn = QCfg.TREND_CONFIRM_TICKS()
+        if trend_side == "long" and self._confirm_trend_long >= cn:
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig, mode="trend")
+        elif trend_side == "short" and self._confirm_trend_short >= cn:
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig, mode="trend")
+
+    def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
+                       signal_confidence=0.5, use_maker_entry=False):
+        """
+        Institutional SL/TP — mode-aware: reversion uses VWAP targets, trend uses ATR channel.
+
+        PATCH 4: Adds a fee-normalized TP floor gate before returning.
+          - Asks _fee_engine for the minimum gross TP distance that clears ALL execution
+            costs (spread + slippage + commission) with a regime-adaptive buffer.
+          - If computed TP is closer than that minimum, the setup is rejected
+            (returns None, None) before any order is placed.
+          - When _fee_engine is unavailable (fee_engine.py not yet deployed), the gate
+            is silently skipped and original behaviour is preserved.
+
+        Args:
+            signal_confidence: composite score mapped to [0, 1], passed from _enter_trade
+            use_maker_entry:   whether we intend to use a limit order for entry
+        """
         try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+5)
         except: candles_5m = []
         try: candles_1m = data_manager.get_candles("1m", limit=150)
@@ -1340,93 +1883,287 @@ class QuantStrategy:
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
-        tp_price = InstitutionalLevels.compute_tp(
-            price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
-            candles_5m=candles_5m)
+        if mode == "trend":
+            tp_price = InstitutionalLevels.compute_tp_trend(
+                price, side, atr, sl_price, candles_5m, orderbook,
+                swing_lookback=QCfg.SL_SWING_LOOKBACK())
+        else:
+            tp_price = InstitutionalLevels.compute_tp(
+                price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
+                candles_5m=candles_5m)
         tp_price = _round_to_tick(tp_price)
 
-        if side=="long" and (sl_price>=price or tp_price<=price): return None, None
-        if side=="short" and (sl_price<=price or tp_price>=price): return None, None
+        # ── Basic direction sanity (unchanged) ───────────────────────────────────
+        if side == "long"  and (sl_price >= price or tp_price <= price): return None, None
+        if side == "short" and (sl_price <= price or tp_price >= price): return None, None
+
+        # ── Fee-normalized TP floor gate (PATCH 4) ────────────────────────────────
+        # Only active when ExecutionCostEngine is available.
+        if self._fee_engine is not None:
+            tp_distance = abs(tp_price - price)
+            try:
+                min_tp = self._fee_engine.min_required_tp_move(
+                    price             = price,
+                    atr               = atr,
+                    atr_percentile    = atr_pctile,
+                    use_maker_entry   = use_maker_entry,
+                    signal_confidence = signal_confidence,
+                )
+                if tp_distance < min_tp:
+                    snap = self._fee_engine.diagnostic_snapshot()
+                    logger.info(
+                        f"⛔ TP gate: tp_dist=${tp_distance:.2f} < min_required=${min_tp:.2f} "
+                        f"[pctile={atr_pctile:.2f}, "
+                        f"spread={snap['spread_median_bps']:.1f}bps, "
+                        f"rt_cost_taker={snap['rt_cost_taker_bps']:.1f}bps] — setup rejected"
+                    )
+                    return None, None
+                logger.debug(
+                    f"✅ TP gate passed: tp_dist=${tp_distance:.2f} ≥ min=${min_tp:.2f} "
+                    f"(pctile={atr_pctile:.2f})"
+                )
+            except Exception as e:
+                # Never let fee engine errors block trading
+                logger.debug(f"Fee gate error (non-fatal): {e}")
+
         return sl_price, tp_price
 
-    def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig):
+    def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion"):
+        """
+        Position entry — PATCH 5.
+
+        Key changes vs original:
+          a) signal_confidence derived from composite score before any order
+          b) compute_signal_urgency() called to gauge how quickly price is moving
+          c) fee_engine.decide_entry_type() routes to maker (limit) or taker (market)
+          d) order_manager.place_limit_entry() used for maker path
+          e) _compute_sl_tp() receives use_maker_entry + signal_confidence for TP gate
+          f) fee_engine.record_fill() called for slippage tracking
+          g) execution cost snapshot logged on every entry
+          
+        When _fee_engine is None (fee_engine.py not deployed), falls back to the
+        original plain-market-order path so the bot continues to operate normally.
+        """
         price = data_manager.get_last_price()
         if price < 1.0: return
         atr = self._atr_5m.atr
         if atr < 1e-10: return
+
+        # ── Risk gate ─────────────────────────────────────────────────────────────
         bal_info = risk_manager.get_available_balance()
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
         allowed, reason = self._risk_gate.can_trade(total_bal)
-        if not allowed: logger.info(f"Entry blocked: {reason}"); return
+        if not allowed:
+            logger.info(f"Entry blocked: {reason}")
+            return
+
         qty = self._compute_quantity(risk_manager, price)
         if qty is None or qty < QCfg.MIN_QTY(): return
-        sl_price, tp_price = self._compute_sl_tp(data_manager, price, side, atr)
-        if sl_price is None: return
-        sd = abs(price-sl_price); td = abs(price-tp_price)
+
+        # ── Map composite score → signal_confidence [0, 1] (PATCH 5a) ───────────
+        raw_composite     = abs(sig.composite) if sig.composite is not None else 0.0
+        signal_confidence = min(1.0, raw_composite / 0.6)   # 0.6 composite = full confidence
+
+        # ── Maker vs taker decision (PATCH 5b/5c) ────────────────────────────────
+        use_maker  = False
+        limit_px   = price
+        mt_reason  = "fee_engine unavailable — market"
+
+        if self._fee_engine is not None:
+            try:
+                orderbook = data_manager.get_orderbook()
+            except Exception:
+                orderbook = {"bids": [], "asks": []}
+
+            urgency = order_manager.compute_signal_urgency(
+                price_now           = price,
+                price_prev          = self._prev_price_for_urgency,
+                atr                 = atr,
+                side                = side,
+                vwap_dev_atr        = self._vwap.deviation_atr,
+                entry_threshold_atr = QCfg.VWAP_ENTRY_ATR_MULT(),
+            )
+            self._prev_price_for_urgency = price
+
+            try:
+                use_maker, limit_px, mt_reason = self._fee_engine.decide_entry_type(
+                    side           = side,
+                    quantity       = qty,
+                    price          = price,
+                    orderbook      = orderbook,
+                    signal_urgency = urgency,
+                )
+            except Exception as e:
+                logger.debug(f"decide_entry_type error (non-fatal): {e}")
+                use_maker = False
+
+        logger.info(f"Entry routing: {'MAKER' if use_maker else 'TAKER'} | {mt_reason}")
+
+        # ── TP/SL viability check BEFORE placing the entry (PATCH 5d) ────────────
+        # Check fees against the planned TP before taking the position.
+        # If the setup doesn't clear the fee floor, skip entirely.
+        sl_price, tp_price = self._compute_sl_tp(
+            data_manager, price, side, atr, mode=mode,
+            signal_confidence=signal_confidence,
+            use_maker_entry=use_maker,
+        )
+        if sl_price is None: return   # TP floor rejected the setup
+
+        sd = abs(price - sl_price)
+        td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        logger.info(f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | VWAP=${sig.vwap_price:,.2f} | {sig}")
-        entry_data = order_manager.place_market_order(side=side, quantity=qty)
-        if not entry_data: logger.error("❌ Market order failed"); return
+        logger.info(
+            f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
+            f"{'maker' if use_maker else 'taker'} | VWAP=${sig.vwap_price:,.2f} | {sig}"
+        )
+
+        # ── Place entry order (PATCH 5e) ──────────────────────────────────────────
+        if use_maker:
+            entry_data = order_manager.place_limit_entry(
+                side=side, quantity=qty,
+                limit_price=limit_px,
+                timeout_sec=7.0,
+                fallback_to_market=True,
+            )
+        else:
+            entry_data = order_manager.place_market_order(side=side, quantity=qty)
+            if entry_data:
+                entry_data["fill_type"] = "taker"
+
+        if not entry_data:
+            logger.error("❌ Entry order failed")
+            return
+
         self._risk_gate.record_trade_start()
-        fill_price = float(entry_data.get("average_price") or 0) or float(entry_data.get("fill_price") or 0) or float(entry_data.get("price") or 0) or price
-        slip = abs(fill_price-price)/price
+
+        # ── Extract fill price ────────────────────────────────────────────────────
+        fill_price = (
+            float(entry_data.get("fill_price")          or 0)
+            or float(entry_data.get("average_price")    or 0)
+            or float(entry_data.get("avg_execution_price") or 0)
+            or float(entry_data.get("price")            or 0)
+            or price
+        )
+        actual_fill_type = entry_data.get("fill_type", "taker")
+
+        # ── Record slippage for fee engine (PATCH 5f) ─────────────────────────────
+        if self._fee_engine is not None:
+            try:
+                self._fee_engine.record_fill(price, fill_price)
+            except Exception as e:
+                logger.debug(f"record_fill error (non-fatal): {e}")
+
+        # ── Recompute SL/TP from actual fill if slippage was significant ──────────
+        slip = abs(fill_price - price) / price
         if slip > QCfg.SLIPPAGE_TOL():
-            new_sl, new_tp = self._compute_sl_tp(data_manager, fill_price, side, atr)
+            new_sl, new_tp = self._compute_sl_tp(
+                data_manager, fill_price, side, atr, mode=mode,
+                signal_confidence=signal_confidence,
+                use_maker_entry=(actual_fill_type == "maker"),
+            )
             if new_sl is None:
-                es = "sell" if side=="long" else "buy"
-                order_manager.place_market_order(side=es, quantity=qty, reduce_only=True)
-                self._last_exit_time = time.time(); return
+                # After slippage, trade no longer clears fee floor — abort
+                exit_side = "sell" if side == "long" else "buy"
+                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+                self._last_exit_time = time.time()
+                return
             sl_price, tp_price = new_sl, new_tp
-        exit_side = "sell" if side=="long" else "buy"
+
+        # ── Place SL/TP ───────────────────────────────────────────────────────────
+        exit_side = "sell" if side == "long" else "buy"
         sweep = order_manager.cancel_symbol_conditionals()
         if sweep:
-            filled = [oid for oid,r in sweep.items() if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)]
-            if filled: self._last_reconcile_time = 0.0; return
+            filled = [
+                oid for oid, r in sweep.items()
+                if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)
+            ]
+            if filled:
+                self._last_reconcile_time = 0.0
+                return
+
         sl_data = order_manager.place_stop_loss(side=exit_side, quantity=qty, trigger_price=sl_price)
         if not sl_data:
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-            self._last_exit_time = time.time(); return
+            self._last_exit_time = time.time()
+            return
+
         tp_data = order_manager.place_take_profit(side=exit_side, quantity=qty, trigger_price=tp_price)
         if not tp_data:
             order_manager.cancel_order(sl_data["order_id"])
             order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-            self._last_exit_time = time.time(); return
-        sdf = abs(fill_price-sl_price); ir = sdf*qty
-        # Compute entry volume for trail vol-decay detection
+            self._last_exit_time = time.time()
+            return
+
+        # ── Log execution cost snapshot (PATCH 5g) ────────────────────────────────
+        if self._fee_engine is not None:
+            try:
+                snap = self._fee_engine.diagnostic_snapshot()
+                sdf  = abs(fill_price - sl_price)
+                logger.info(
+                    f"📊 ExecCost | spread={snap['spread_median_bps']:.1f}bps "
+                    f"slip={snap['slippage_ewma_bps']:.1f}bps "
+                    f"rt_cost_{'maker' if actual_fill_type == 'maker' else 'taker'}"
+                    f"={snap['rt_cost_maker_bps' if actual_fill_type == 'maker' else 'rt_cost_taker_bps']:.1f}bps "
+                    f"fill_type={actual_fill_type}"
+                )
+            except Exception as e:
+                logger.debug(f"ExecCost snapshot error (non-fatal): {e}")
+
+        sdf = abs(fill_price - sl_price)
+        ir  = sdf * qty
+
+        # ── Build entry volume for trailing vol-decay detection ───────────────────
         try:
-            c1m = data_manager.get_candles("1m", limit=10)
+            c1m       = data_manager.get_candles("1m", limit=10)
             entry_vol = sum(float(c['v']) for c in c1m[-5:]) / 5.0 if len(c1m) >= 5 else 0.0
-        except: entry_vol = 0.0
-        self._pos = PositionState(phase=PositionPhase.ACTIVE, side=side, quantity=qty,
-            entry_price=fill_price, sl_price=sl_price, tp_price=tp_price,
-            sl_order_id=sl_data["order_id"], tp_order_id=tp_data["order_id"],
-            entry_order_id=entry_data.get("order_id"), entry_time=time.time(),
-            initial_risk=ir, initial_sl_dist=sdf, entry_signal=sig, entry_atr=self._atr_5m.atr,
-            entry_vol=entry_vol)
-        # ── Reconcile safety: discard any in-flight reconcile data ────────────
-        # A reconcile thread that was dispatched before or during entry may have
-        # queried the exchange before the fill was visible (fill-latency window).
-        # That query returns size=0 ("FLAT"). If we let it apply, it calls
-        # _record_exchange_exit on a live position — the core of the race bug.
-        # Discarding stale data here and resetting the timer gives the position
-        # a full RECONCILE_SEC window to settle on the exchange before we query.
-        self._reconcile_data = None
-        self._last_reconcile_time = time.time()
-        self.current_sl_price = sl_price; self.current_tp_price = tp_price; self._total_trades += 1
-        rr_a = abs(fill_price-tp_price)/sdf if sdf > 0 else 0
+        except Exception:
+            entry_vol = 0.0
+
+        # ── Update position state ─────────────────────────────────────────────────
+        self._pos = PositionState(
+            phase           = PositionPhase.ACTIVE,
+            side            = side,
+            quantity        = qty,
+            entry_price     = fill_price,
+            sl_price        = sl_price,
+            tp_price        = tp_price,
+            sl_order_id     = sl_data["order_id"],
+            tp_order_id     = tp_data["order_id"],
+            entry_order_id  = entry_data.get("order_id"),
+            entry_time      = time.time(),
+            initial_risk    = ir,
+            initial_sl_dist = sdf,
+            entry_signal    = sig,
+            entry_atr       = self._atr_5m.atr,
+            entry_vol       = entry_vol,
+            trade_mode      = mode,
+        )
+        # ── Reconcile safety: discard any in-flight reconcile data ────────────────
+        self._reconcile_data        = None
+        self._last_reconcile_time   = time.time()
+        self.current_sl_price       = sl_price
+        self.current_tp_price       = tp_price
+        self._total_trades         += 1
+        self._confirm_long          = self._confirm_short = 0
+
+        rr_a      = abs(fill_price - tp_price) / sdf if sdf > 0 else 0
+        mode_icon = "📈📈" if mode == "trend" else ("📈" if side == "long" else "📉")
         send_telegram_message(
-            f"{'📈' if side=='long' else '📉'} <b>QUANT v4 ENTRY — {side.upper()}</b>\n\n"
+            f"{mode_icon} <b>QUANT v4 ENTRY — {side.upper()} [{mode.upper()}]</b>\n\n"
             f"Entry:    ${fill_price:,.2f}\n"
+            f"Mode:     {mode.capitalize()} | Regime: {sig.market_regime} | ADX={sig.adx:.1f}\n"
             f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f} ATR away)\n"
-            f"SL:       ${sl_price:,.2f} (vol profile + OB wall + swing)\n"
-            f"TP:       ${tp_price:,.2f} (nearest HVN/wall toward VWAP)\n"
+            f"SL:       ${sl_price:,.2f}\n"
+            f"TP:       ${tp_price:,.2f}\n"
             f"R:R:      1:{rr_a:.2f}\n"
             f"Risk:     ${ir:.2f} ({sdf:.2f} pts × {qty} BTC)\n"
-            f"Confirm:  {sig.n_confirming}/5 agree")
-        logger.info(f"✅ ACTIVE {side.upper()} @ ${fill_price:,.2f} | R:R=1:{rr_a:.2f}")
+            f"Confirm:  {sig.n_confirming}/5 | TrendΣ={sig.trend_score:+.3f}"
+        )
+        logger.info(f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | R:R=1:{rr_a:.2f}")
 
     def _manage_active(self, data_manager, order_manager, now):
         pos = self._pos; price = data_manager.get_last_price()
@@ -1437,12 +2174,32 @@ class QuantStrategy:
         if sig is not None:
             self._log_thinking(sig, price, now)
             c = sig.composite; et = QCfg.EXIT_REVERSAL_THRESH()
-            if pos.side=="long" and c<=-et:
-                logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit LONG")
-                self._exit_trade(order_manager, price, "strong_reversal"); return
-            if pos.side=="short" and c>=et:
-                logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT")
-                self._exit_trade(order_manager, price, "strong_reversal"); return
+
+            if pos.trade_mode == "trend":
+                # Trend trade: exit on regime flip (market stops trending)
+                # or on strong counter-trend reversion composite
+                regime_flipped = not self._regime.is_trending() or (
+                    (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
+                    (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
+                if regime_flipped:
+                    logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
+                    self._exit_trade(order_manager, price, "regime_flip"); return
+                # Also exit on a very strong reversion signal (> 1.5× threshold)
+                if pos.side == "long" and c <= -(et * 1.5):
+                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit LONG [trend]")
+                    self._exit_trade(order_manager, price, "strong_reversal"); return
+                if pos.side == "short" and c >= (et * 1.5):
+                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT [trend]")
+                    self._exit_trade(order_manager, price, "strong_reversal"); return
+            else:
+                # Reversion trade: exit on standard composite reversal threshold
+                if pos.side == "long" and c <= -et:
+                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit LONG")
+                    self._exit_trade(order_manager, price, "strong_reversal"); return
+                if pos.side == "short" and c >= et:
+                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT")
+                    self._exit_trade(order_manager, price, "strong_reversal"); return
+
         if QCfg.TRAIL_ENABLED() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
             if self._update_trailing_sl(order_manager, data_manager, price, now): return
@@ -1489,7 +2246,8 @@ class QuantStrategy:
         new_sl = InstitutionalLevels.compute_trail_sl(
             pos.side, price, pos.entry_price, pos.sl_price, atr,
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
-            hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs)
+            hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
+            trade_mode=pos.trade_mode)
 
         if new_sl is None:
             return False
@@ -1631,20 +2389,46 @@ class QuantStrategy:
                 "atr_pctile":f"{self._atr_5m.get_percentile():.0%}","regime_ok":self._atr_5m.regime_valid()}
 
     def format_status_report(self):
-        s=self.get_stats(); p=self._pos
-        lines = ["📊 <b>QUANT v4 STATUS</b>","",
+        """
+        Telegram status report — PATCH 6.
+        Adds execution cost diagnostics block when _fee_engine is available.
+        """
+        s = self.get_stats()
+        p = self._pos
+        lines = [
+            "📊 <b>QUANT v4 STATUS</b>", "",
             f"Phase: {s['current_phase']}",
             f"Regime: {'✅' if s['regime_ok'] else '❌'}",
             f"ATR: ${s['atr_5m']}/{s['atr_1m']} ({s['atr_pctile']})",
             f"HTF: 15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}",
-            f"VWAP: ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f}ATR)","",
+            f"VWAP: ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f}ATR)", "",
             f"Trades: {s['total_trades']} | WR {s['win_rate']} | PnL ${s['total_pnl']:+.2f}",
-            f"Daily: {s['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} | Losses: {s['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()}"]
+            f"Daily: {s['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} | Losses: {s['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()}",
+        ]
+
+        # ── Execution cost diagnostics (only when fee engine is live) ─────────────
+        if self._fee_engine is not None:
+            try:
+                snap = self._fee_engine.diagnostic_snapshot()
+                lines += [
+                    "",
+                    "<b>Execution costs (live)</b>",
+                    f"Spread: {snap['spread_median_bps']:.1f}bps (p90: {snap['spread_p90_bps']:.1f})",
+                    f"Slippage EWMA: {snap['slippage_ewma_bps']:.1f}bps",
+                    f"RT cost taker: {snap['rt_cost_taker_bps']:.1f}bps | maker: {snap['rt_cost_maker_bps']:.1f}bps",
+                    f"Maker saving: {snap['maker_saving_bps']:.1f}bps/trade",
+                ]
+            except Exception as e:
+                logger.debug(f"Fee engine snapshot error in report (non-fatal): {e}")
+
         if not p.is_flat():
-            hm=(time.time()-p.entry_time)/60
-            lines += ["",f"<b>Active ({p.side.upper()})</b>",
+            hm = (time.time() - p.entry_time) / 60
+            lines += [
+                "",
+                f"<b>Active ({p.side.upper()})</b>",
                 f"Entry: ${p.entry_price:,.2f} | SL: ${p.sl_price:,.2f} | TP: ${p.tp_price:,.2f}",
-                f"Hold: {hm:.1f}m | Trail: {'✅' if p.trail_active else '⏳'}"]
+                f"Hold: {hm:.1f}m | Trail: {'✅' if p.trail_active else '⏳'}",
+            ]
         return "\n".join(lines)
 
     # ─── RECONCILIATION (unchanged logic, fixed PnL) ───
