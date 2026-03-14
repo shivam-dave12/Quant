@@ -93,8 +93,8 @@ class QuantBot:
     def initialize(self) -> bool:
         try:
             logger.info("=" * 80)
-            logger.info("⚡ QUANT BOT — MULTI-FACTOR MOMENTUM + ORDER FLOW ENGINE")
-            logger.info("   CVD | VWAP | EMA Cross | BB/KC Squeeze | Volume Flow")
+            logger.info("⚡ QUANT BOT v4 — MEAN-REVERSION + ORDER FLOW")
+            logger.info("   VWAP Deviation | CVD Divergence | Orderbook | Tick Flow | Vol Exhaustion")
             logger.info(f"   {config.SYMBOL} | {config.LEVERAGE}x leverage | "
                         f"{getattr(config, 'QUANT_MARGIN_PCT', 0.20):.0%} margin per trade")
             logger.info("=" * 80)
@@ -159,16 +159,18 @@ class QuantBot:
             # Log the strategy's initial config state
             from quant_strategy import QCfg
             send_telegram_message(
-                "⚡ <b>QUANT BOT STARTED</b>\n\n"
+                "⚡ <b>QUANT BOT v4 STARTED</b>\n\n"
                 f"Symbol:   {QCfg.SYMBOL()}\n"
                 f"Price:    ${price:,.2f}\n"
                 f"Leverage: {QCfg.LEVERAGE()}x\n"
                 f"Margin:   {QCfg.MARGIN_PCT():.0%} per trade\n"
-                f"SL/TP:    {QCfg.SL_ATR_MULT()}×ATR / {QCfg.TP_ATR_MULT()}×ATR\n"
-                f"Min R:R:  {QCfg.MIN_RR_RATIO()}\n\n"
-                f"<i>Weights: CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} "
-                f"MOM={QCfg.W_MOM()} SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()} "
-                f"OB={QCfg.W_ORDERBOOK()} TF={QCfg.W_TICK_FLOW()}</i>"
+                f"Entry:    VWAP dev > {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR\n"
+                f"SL:       Swing + {QCfg.SL_BUFFER_ATR_MULT()}×ATR buffer\n"
+                f"TP:       {QCfg.TP_VWAP_FRACTION():.0%} back to VWAP\n"
+                f"Min R:R:  {QCfg.MIN_RR_RATIO()}\n"
+                f"Cooldown: {QCfg.COOLDOWN_SEC()}s\n\n"
+                f"<i>Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} "
+                f"OB={QCfg.W_OB()} TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}</i>"
             )
 
             logger.info("🚀 QUANT BOT RUNNING")

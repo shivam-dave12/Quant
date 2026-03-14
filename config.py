@@ -137,23 +137,29 @@ TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 QUANT_MARGIN_PCT            = 0.20
 QUANT_SLIPPAGE_TOLERANCE    = 0.0005
 
-# 10b. Entry Thresholds — MEAN-REVERSION (hard confluence gates)
-QUANT_VWAP_ENTRY_ATR_MULT   = 1.2     # Price must be > 1.2 ATR from VWAP
-QUANT_CVD_DIVERGENCE_MIN    = 0.15    # Min CVD divergence strength
-QUANT_OB_CONFIRM_MIN        = 0.10    # Min orderbook confirmation
-QUANT_COMPOSITE_ENTRY_MIN   = 0.30    # Min composite score for entry
-QUANT_EXIT_REVERSAL_THRESH  = 0.40    # Strong reversal exit (was 0.22!)
-QUANT_CONFIRM_TICKS         = 2       # Require 2 consecutive confirms (was 1)
+# 10b. Entry — MEAN-REVERSION (hard confluence gates)
+QUANT_VWAP_ENTRY_ATR_MULT   = 1.2
+QUANT_CVD_DIVERGENCE_MIN    = 0.15
+QUANT_OB_CONFIRM_MIN        = 0.10
+QUANT_COMPOSITE_ENTRY_MIN   = 0.30
+QUANT_EXIT_REVERSAL_THRESH  = 0.40
+QUANT_CONFIRM_TICKS         = 2
 
-# 10c. SL/TP — STRUCTURE-BASED (not arbitrary ATR)
-QUANT_SL_SWING_LOOKBACK     = 12      # Look back 12 5m candles for swing
-QUANT_SL_BUFFER_ATR_MULT    = 0.4     # Buffer beyond swing = 0.4 × ATR
-QUANT_TP_VWAP_FRACTION      = 0.50    # TP at 50% back to VWAP (tight!)
+# 10c. SL/TP — INSTITUTIONAL LEVEL PLACEMENT
+QUANT_SL_SWING_LOOKBACK     = 12
+QUANT_SL_BUFFER_ATR_MULT    = 0.4
+QUANT_TP_VWAP_FRACTION      = 0.50
+QUANT_VP_BUCKET_COUNT       = 50      # Volume profile resolution (price buckets)
+QUANT_VP_HVN_THRESHOLD      = 0.70    # Top 30% volume = high-volume node
+QUANT_OB_WALL_DEPTH         = 20      # Orderbook levels to scan for walls
+QUANT_OB_WALL_MULT          = 2.5     # Qty > 2.5x avg = wall
+QUANT_TRAIL_SWING_BARS      = 5       # 1m candle lookback for micro-swing trail
+QUANT_TRAIL_VOL_DECAY_MULT  = 0.6     # Tighten trail when vol < 60% of entry vol
 
-# 10d. Trailing SL — aggressive breakeven
+# 10d. Trailing SL
 QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_BE_R            = 0.4     # Move to BE at 0.4R (was 0.5R)
-QUANT_TRAIL_LOCK_R          = 0.8     # Start trailing at 0.8R
+QUANT_TRAIL_BE_R            = 0.4
+QUANT_TRAIL_LOCK_R          = 0.8
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -163,47 +169,29 @@ QUANT_EMA_FAST              = 8
 QUANT_EMA_SLOW              = 21
 QUANT_VOL_FLOW_WINDOW       = 10
 
-# 10f. Regime Filter — Binary (not gradient)
+# 10f. Regime Filter
 QUANT_ATR_PCTILE_WINDOW     = 100
 QUANT_ATR_MIN_PCTILE        = 0.05
 QUANT_ATR_MAX_PCTILE        = 0.97
 
-# 10g. Timing — PATIENT (not hyperactive)
+# 10g. Timing — PATIENT
 QUANT_MAX_HOLD_SEC          = 2400
-QUANT_COOLDOWN_SEC          = 180     # 3 minutes (was 20 seconds!)
-QUANT_LOSS_LOCKOUT_SEC      = 3600    # 1-hour lockout after 3 consec losses
+QUANT_COOLDOWN_SEC          = 180
+QUANT_LOSS_LOCKOUT_SEC      = 3600
 QUANT_POS_SYNC_SEC          = 30
 
-# 10h. Signal Weights — REVERSION-FOCUSED (sum = 1.0)
-QUANT_W_VWAP_DEV            = 0.30    # VWAP deviation is PRIMARY signal
-QUANT_W_CVD_DIV             = 0.25    # CVD divergence (exhaustion)
-QUANT_W_OB                  = 0.20    # Orderbook imbalance
-QUANT_W_TICK_FLOW           = 0.15    # Real-time tick aggressor flow
-QUANT_W_VOL_EXHAUSTION      = 0.10    # Volume exhaustion detection
-# Sum = 1.00
+# 10h. Signal Weights (sum = 1.0)
+QUANT_W_VWAP_DEV            = 0.30
+QUANT_W_CVD_DIV             = 0.25
+QUANT_W_OB                  = 0.20
+QUANT_W_TICK_FLOW           = 0.15
+QUANT_W_VOL_EXHAUSTION      = 0.10
 
-# 10i. Multi-Timeframe Trend Filter — VETO ONLY (no boost)
+# 10i. HTF Filter — VETO ONLY
 QUANT_HTF_ENABLED           = True
-QUANT_HTF_VETO_STRENGTH     = 0.70    # Strong HTF trend vetoes reversion
+QUANT_HTF_VETO_STRENGTH     = 0.70
 
-# 10j. Orderbook Imbalance
+# 10j. Orderbook / Tick
 QUANT_OB_DEPTH_LEVELS       = 5
 QUANT_OB_HIST_LEN           = 60
-
-# 10k. Tick Flow
 QUANT_TICK_AGG_WINDOW_SEC   = 30.0
-
-# ─────────────────────────────────────────────────────────────────
-# v4 TUNING GUIDE (all live — no restart needed):
-#
-# PHILOSOPHY: Wait for overextension, then fade it back to VWAP.
-# The tighter the TP, the higher the win rate.
-#
-#   More selective entries → QUANT_VWAP_ENTRY_ATR_MULT = 1.5
-#   Even higher win rate  → QUANT_TP_VWAP_FRACTION     = 0.35
-#   Wider SL (fewer stops)→ QUANT_SL_SWING_LOOKBACK    = 16
-#   Faster trail to BE    → QUANT_TRAIL_BE_R            = 0.3
-#   Longer cooldown       → QUANT_COOLDOWN_SEC          = 300
-#   Stricter confluence   → QUANT_COMPOSITE_ENTRY_MIN   = 0.40
-#   Lower risk/trade      → QUANT_MARGIN_PCT            = 0.15
-# ─────────────────────────────────────────────────────────────────

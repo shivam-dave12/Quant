@@ -287,7 +287,7 @@ class TelegramBotController:
             return f"Status error: {e}"
 
     def _cmd_signal(self) -> str:
-        """Live breakdown of all 7 alpha engines."""
+        """Live breakdown of all 5 reversion engines."""
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
@@ -305,17 +305,15 @@ class TelegramBotController:
                 return ("+" if v >= 0 else "-") + "█" * n + "░" * (15 - n)
 
             from quant_strategy import QCfg
-            thr = sig.threshold_used if sig.threshold_used > 0 else QCfg.LONG_THRESHOLD()
+            thr = QCfg.COMPOSITE_ENTRY_MIN()
 
-            if sig.composite >= thr:
+            if sig.composite >= thr and sig.overextended:
                 action = f"✅ LONG SIGNAL  ({sig.composite:+.4f} ≥ {thr:.3f})"
-            elif sig.composite <= -thr:
+            elif sig.composite <= -thr and sig.overextended:
                 action = f"✅ SHORT SIGNAL ({sig.composite:+.4f} ≤ -{thr:.3f})"
             else:
-                need = min(thr - sig.composite, thr + sig.composite)
-                action = f"⏸  NEUTRAL — need {need:.3f} more to fire"
+                action = f"⏸  NEUTRAL — waiting for overextension + confluence"
 
-            # Trailing status
             pos = strat.get_position()
             pos_line = ""
             if pos:
@@ -323,28 +321,27 @@ class TelegramBotController:
                 pos_line = f"\n\nTrailing SL: {trail}"
 
             msg = (
-                f"<b>⚡ v3 Signal @ ${price:,.2f}</b>\n"
+                f"<b>⚡ v4 Reversion Signal @ ${price:,.2f}</b>\n"
+                f"VWAP: ${sig.vwap_price:,.2f} (dev={sig.deviation_atr:+.1f} ATR)\n"
                 f"{'─' * 32}\n"
-                f"CVD  (order flow)   W={QCfg.W_CVD():.0%}\n"
-                f"  {bar(sig.cvd)}  {sig.cvd:+.4f}\n\n"
-                f"VWAP (institutional) W={QCfg.W_VWAP():.0%}\n"
-                f"  {bar(sig.vwap)}  {sig.vwap:+.4f}\n\n"
-                f"MOM  (EMA cross)    W={QCfg.W_MOM():.0%}\n"
-                f"  {bar(sig.mom)}  {sig.mom:+.4f}\n\n"
-                f"SQZ  (KC squeeze)   W={QCfg.W_SQUEEZE():.0%}\n"
-                f"  {bar(sig.squeeze)}  {sig.squeeze:+.4f}\n\n"
-                f"VFL  (volume flow)  W={QCfg.W_VOL():.0%}\n"
-                f"  {bar(sig.vol)}  {sig.vol:+.4f}\n\n"
-                f"OB   (orderbook)    W={QCfg.W_ORDERBOOK():.0%}\n"
+                f"VWAP (reversion)   W={QCfg.W_VWAP_DEV():.0%}\n"
+                f"  {bar(sig.vwap_dev)}  {sig.vwap_dev:+.4f}\n\n"
+                f"CVD  (divergence)  W={QCfg.W_CVD_DIV():.0%}\n"
+                f"  {bar(sig.cvd_div)}  {sig.cvd_div:+.4f}\n\n"
+                f"OB   (orderbook)   W={QCfg.W_OB():.0%}\n"
                 f"  {bar(sig.orderbook)}  {sig.orderbook:+.4f}\n\n"
-                f"TICK (trade flow)   W={QCfg.W_TICK_FLOW():.0%}\n"
-                f"  {bar(sig.tick_flow)}  {sig.tick_flow:+.4f}\n"
+                f"TICK (trade flow)  W={QCfg.W_TICK_FLOW():.0%}\n"
+                f"  {bar(sig.tick_flow)}  {sig.tick_flow:+.4f}\n\n"
+                f"VEX  (exhaustion)  W={QCfg.W_VOL_EXHAUSTION():.0%}\n"
+                f"  {bar(sig.vol_exhaust)}  {sig.vol_exhaust:+.4f}\n"
                 f"{'─' * 32}\n"
                 f"COMPOSITE: {sig.composite:+.4f}\n"
                 f"  {bar(sig.composite)}\n\n"
                 f"{action}\n\n"
-                f"Agreeing: {sig.n_agreeing}/7 | Threshold: {thr:.3f}\n"
-                f"HTF: ×{sig.htf_mult:.2f} | Regime: ×{sig.regime_penalty:.2f}\n"
+                f"Confirming: {sig.n_confirming}/5 | Threshold: ±{thr:.3f}\n"
+                f"Overextended: {'✅' if sig.overextended else '❌'} | "
+                f"Regime: {'✅' if sig.regime_ok else '❌'} | "
+                f"HTF veto: {'🚫' if sig.htf_veto else '✅'}\n"
                 f"ATR 5m: ${sig.atr:.1f}  ({sig.atr_pct:.0%} pctile)"
                 f"{pos_line}"
             )
@@ -480,46 +477,42 @@ class TelegramBotController:
             import config as cfg
             from quant_strategy import QCfg
             lines = [
-                "<b>⚡ Quant Bot Config</b>\n",
+                "<b>⚡ Quant Bot v4 Config</b>\n",
                 f"Symbol:        {cfg.SYMBOL}",
                 f"Leverage:      {cfg.LEVERAGE}x",
                 f"Margin/trade:  {QCfg.MARGIN_PCT():.0%}",
                 f"Tick size:     ${QCfg.TICK_SIZE()}",
                 "",
-                "<b>Signal Thresholds</b>",
-                f"Entry:         ±{QCfg.LONG_THRESHOLD():.2f}",
-                f"Exit flip:     ±{QCfg.EXIT_FLIP_THRESH():.2f}",
+                "<b>Entry (Mean-Reversion)</b>",
+                f"VWAP dev:      > {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR",
+                f"Composite min: ±{QCfg.COMPOSITE_ENTRY_MIN():.2f}",
+                f"Exit reversal: ±{QCfg.EXIT_REVERSAL_THRESH():.2f}",
                 f"Confirm ticks: {QCfg.CONFIRM_TICKS()}",
                 "",
-                "<b>SL / TP</b>",
-                f"SL mult:       {QCfg.SL_ATR_MULT()}×ATR",
-                f"TP mult:       {QCfg.TP_ATR_MULT()}×ATR",
+                "<b>SL / TP (Structure-Based)</b>",
+                f"SL:            swing + {QCfg.SL_BUFFER_ATR_MULT()}×ATR buffer",
+                f"SL lookback:   {QCfg.SL_SWING_LOOKBACK()} bars (5m)",
+                f"TP:            {QCfg.TP_VWAP_FRACTION():.0%} back to VWAP",
                 f"Min R:R:       {QCfg.MIN_RR_RATIO()}",
                 f"SL range:      {QCfg.MIN_SL_PCT():.1%} – {QCfg.MAX_SL_PCT():.1%}",
                 "",
                 "<b>Trailing SL</b>",
                 f"Enabled:       {QCfg.TRAIL_ENABLED()}",
-                f"Activate at:   {QCfg.TRAIL_ACTIVATE_R()}R",
-                f"Trail by:      {QCfg.TRAIL_ATR_MULT()}×ATR",
+                f"BE at:         {QCfg.TRAIL_BE_R()}R",
+                f"Lock at:       {QCfg.TRAIL_LOCK_R()}R",
                 "",
                 "<b>Risk Limits</b>",
                 f"Max daily:     {QCfg.MAX_DAILY_TRADES()} trades",
-                f"Max consec L:  {QCfg.MAX_CONSEC_LOSSES()}",
+                f"Max consec L:  {QCfg.MAX_CONSEC_LOSSES()} (then {QCfg.LOSS_LOCKOUT_SEC()}s lockout)",
                 f"Daily loss:    {QCfg.MAX_DAILY_LOSS_PCT()}%",
                 "",
                 "<b>Signal Weights</b>",
-                f"CVD={QCfg.W_CVD()} VWAP={QCfg.W_VWAP()} MOM={QCfg.W_MOM()} "
-                f"SQZ={QCfg.W_SQUEEZE()} VFL={QCfg.W_VOL()}\n"
-                f"OB={QCfg.W_ORDERBOOK()} TICK={QCfg.W_TICK_FLOW()}",
+                f"VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
+                f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}",
                 "",
-                "<b>HTF Trend Filter</b>",
+                "<b>HTF Trend Filter (Veto Only)</b>",
                 f"Enabled:       {QCfg.HTF_ENABLED()}",
                 f"Veto strength: {QCfg.HTF_VETO_STRENGTH()}",
-                f"Align boost:   {QCfg.HTF_BOOST()}",
-                "",
-                "<b>Adaptive Threshold</b>",
-                f"Agree discount: {QCfg.AGREEMENT_DISCOUNT()} per signal",
-                f"Min agreeing:   {QCfg.MIN_AGREE_SIGNALS()}",
                 "",
                 "<b>Timing</b>",
                 f"Max hold:      {QCfg.MAX_HOLD_SEC()//60} min",
@@ -586,24 +579,24 @@ class TelegramBotController:
                 "<b>Adjustable keys:</b>\n"
                 "  leverage\n"
                 "  quant_margin_pct          (e.g. 0.20)\n"
-                "  quant_long_threshold      (e.g. 0.60)\n"
-                "  quant_short_threshold     (e.g. 0.60)\n"
-                "  quant_exit_flip           (e.g. 0.35)\n"
+                "  quant_vwap_entry_atr_mult (e.g. 1.5)\n"
+                "  quant_composite_entry_min (e.g. 0.40)\n"
+                "  quant_exit_reversal_thresh(e.g. 0.40)\n"
                 "  quant_confirm_ticks       (e.g. 3)\n"
-                "  quant_sl_atr_mult         (e.g. 1.2)\n"
-                "  quant_tp_atr_mult         (e.g. 3.0)\n"
-                "  min_risk_reward_ratio     (e.g. 2.0)\n"
+                "  quant_sl_swing_lookback   (e.g. 16)\n"
+                "  quant_sl_buffer_atr_mult  (e.g. 0.5)\n"
+                "  quant_tp_vwap_fraction    (e.g. 0.35)\n"
+                "  min_risk_reward_ratio     (e.g. 1.0)\n"
                 "  quant_max_hold_sec        (e.g. 3600)\n"
-                "  quant_cooldown_sec        (e.g. 120)\n"
+                "  quant_cooldown_sec        (e.g. 300)\n"
                 "  quant_trail_enabled       (e.g. True)\n"
-                "  quant_trail_activate_r    (e.g. 0.75)\n"
+                "  quant_trail_be_r          (e.g. 0.3)\n"
+                "  quant_trail_lock_r        (e.g. 0.6)\n"
                 "  max_daily_trades          (e.g. 6)\n"
                 "  max_consecutive_losses    (e.g. 2)\n"
                 "  max_daily_loss_pct        (e.g. 3.0)\n"
-                "  quant_w_cvd / _vwap / _mom / _squeeze / _vol\n"
-                "  quant_w_orderbook / _tick_flow\n"
-                "  quant_htf_enabled / _veto_strength / _boost\n"
-                "  quant_agreement_discount / _min_agree_signals"
+                "  quant_w_vwap_dev / _cvd_div / _ob / _tick_flow / _vol_exhaustion\n"
+                "  quant_htf_enabled / _veto_strength"
             )
 
         parts   = args.split(None, 1)
@@ -612,35 +605,31 @@ class TelegramBotController:
 
         # Map command-friendly names → (config attr, type)
         allowed = {
-            "leverage":                ("LEVERAGE",               int),
-            "quant_margin_pct":        ("QUANT_MARGIN_PCT",       float),
-            "quant_long_threshold":    ("QUANT_LONG_THRESHOLD",   float),
-            "quant_short_threshold":   ("QUANT_SHORT_THRESHOLD",  float),
-            "quant_exit_flip":         ("QUANT_EXIT_FLIP",        float),
-            "quant_confirm_ticks":     ("QUANT_CONFIRM_TICKS",    int),
-            "quant_sl_atr_mult":       ("QUANT_SL_ATR_MULT",      float),
-            "quant_tp_atr_mult":       ("QUANT_TP_ATR_MULT",      float),
-            "min_risk_reward_ratio":   ("MIN_RISK_REWARD_RATIO",  float),
-            "quant_max_hold_sec":      ("QUANT_MAX_HOLD_SEC",     int),
-            "quant_cooldown_sec":      ("QUANT_COOLDOWN_SEC",     int),
-            "quant_trail_enabled":     ("QUANT_TRAIL_ENABLED",    bool),
-            "quant_trail_activate_r":  ("QUANT_TRAIL_ACTIVATE_R", float),
-            "quant_trail_atr_mult":    ("QUANT_TRAIL_ATR_MULT",   float),
-            "max_daily_trades":        ("MAX_DAILY_TRADES",       int),
-            "max_consecutive_losses":  ("MAX_CONSECUTIVE_LOSSES", int),
-            "max_daily_loss_pct":      ("MAX_DAILY_LOSS_PCT",     float),
-            "quant_w_cvd":             ("QUANT_W_CVD",            float),
-            "quant_w_vwap":            ("QUANT_W_VWAP",           float),
-            "quant_w_mom":             ("QUANT_W_MOM",            float),
-            "quant_w_squeeze":         ("QUANT_W_SQUEEZE",        float),
-            "quant_w_vol":             ("QUANT_W_VOL",            float),
-            "quant_w_orderbook":       ("QUANT_W_ORDERBOOK",      float),
-            "quant_w_tick_flow":       ("QUANT_W_TICK_FLOW",      float),
-            "quant_htf_enabled":       ("QUANT_HTF_ENABLED",      bool),
-            "quant_htf_veto_strength": ("QUANT_HTF_VETO_STRENGTH",float),
-            "quant_htf_boost":         ("QUANT_HTF_BOOST",        float),
-            "quant_agreement_discount":("QUANT_AGREEMENT_DISCOUNT",float),
-            "quant_min_agree_signals": ("QUANT_MIN_AGREE_SIGNALS", int),
+            "leverage":                    ("LEVERAGE",                    int),
+            "quant_margin_pct":            ("QUANT_MARGIN_PCT",            float),
+            "quant_vwap_entry_atr_mult":   ("QUANT_VWAP_ENTRY_ATR_MULT",  float),
+            "quant_composite_entry_min":   ("QUANT_COMPOSITE_ENTRY_MIN",  float),
+            "quant_exit_reversal_thresh":  ("QUANT_EXIT_REVERSAL_THRESH", float),
+            "quant_confirm_ticks":         ("QUANT_CONFIRM_TICKS",        int),
+            "quant_sl_swing_lookback":     ("QUANT_SL_SWING_LOOKBACK",    int),
+            "quant_sl_buffer_atr_mult":    ("QUANT_SL_BUFFER_ATR_MULT",   float),
+            "quant_tp_vwap_fraction":      ("QUANT_TP_VWAP_FRACTION",     float),
+            "min_risk_reward_ratio":       ("MIN_RISK_REWARD_RATIO",      float),
+            "quant_max_hold_sec":          ("QUANT_MAX_HOLD_SEC",         int),
+            "quant_cooldown_sec":          ("QUANT_COOLDOWN_SEC",         int),
+            "quant_trail_enabled":         ("QUANT_TRAIL_ENABLED",        bool),
+            "quant_trail_be_r":            ("QUANT_TRAIL_BE_R",           float),
+            "quant_trail_lock_r":          ("QUANT_TRAIL_LOCK_R",         float),
+            "max_daily_trades":            ("MAX_DAILY_TRADES",           int),
+            "max_consecutive_losses":      ("MAX_CONSECUTIVE_LOSSES",     int),
+            "max_daily_loss_pct":          ("MAX_DAILY_LOSS_PCT",         float),
+            "quant_w_vwap_dev":            ("QUANT_W_VWAP_DEV",           float),
+            "quant_w_cvd_div":             ("QUANT_W_CVD_DIV",            float),
+            "quant_w_ob":                  ("QUANT_W_OB",                 float),
+            "quant_w_tick_flow":           ("QUANT_W_TICK_FLOW",          float),
+            "quant_w_vol_exhaustion":      ("QUANT_W_VOL_EXHAUSTION",     float),
+            "quant_htf_enabled":           ("QUANT_HTF_ENABLED",          bool),
+            "quant_htf_veto_strength":     ("QUANT_HTF_VETO_STRENGTH",    float),
         }
 
         if key not in allowed:
@@ -657,26 +646,23 @@ class TelegramBotController:
         except ValueError:
             return f"Invalid value <code>{val_str}</code> — expected {val_type.__name__}"
 
-        # Safety bounds
         bounds = {
-            "QUANT_MARGIN_PCT":        (0.05, 0.50),
-            "QUANT_LONG_THRESHOLD":    (0.15, 0.90),
-            "QUANT_SHORT_THRESHOLD":   (0.15, 0.90),
-            "QUANT_EXIT_FLIP":         (0.10, 0.70),
-            "QUANT_SL_ATR_MULT":       (0.50, 5.00),
-            "QUANT_TP_ATR_MULT":       (0.50, 10.0),
-            "MIN_RISK_REWARD_RATIO":   (0.50, 5.00),
-            "LEVERAGE":                (1,    50),
+            "QUANT_MARGIN_PCT":           (0.05, 0.50),
+            "QUANT_VWAP_ENTRY_ATR_MULT":  (0.50, 3.00),
+            "QUANT_COMPOSITE_ENTRY_MIN":  (0.15, 0.80),
+            "QUANT_EXIT_REVERSAL_THRESH": (0.20, 0.80),
+            "QUANT_SL_BUFFER_ATR_MULT":   (0.10, 2.00),
+            "QUANT_TP_VWAP_FRACTION":     (0.20, 0.90),
+            "MIN_RISK_REWARD_RATIO":      (0.30, 5.00),
+            "LEVERAGE":                   (1,    50),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]
             if not (lo <= new_val <= hi):
                 return f"Value out of safe range [{lo}, {hi}]: {new_val}"
 
-        # Warn if signal weights will no longer sum to 1.0
-        weight_attrs = {"QUANT_W_CVD","QUANT_W_VWAP","QUANT_W_MOM",
-                        "QUANT_W_SQUEEZE","QUANT_W_VOL",
-                        "QUANT_W_ORDERBOOK","QUANT_W_TICK_FLOW"}
+        weight_attrs = {"QUANT_W_VWAP_DEV","QUANT_W_CVD_DIV","QUANT_W_OB",
+                        "QUANT_W_TICK_FLOW","QUANT_W_VOL_EXHAUSTION"}
         if attr_name in weight_attrs:
             cur = {a: getattr(cfg, a, 0) for a in weight_attrs}
             cur[attr_name] = new_val
@@ -685,9 +671,8 @@ class TelegramBotController:
                 return (
                     f"⚠️ Weight sum would be {total:.3f} ≠ 1.0\n"
                     f"Adjust other weights so they sum to 1.0.\n"
-                    f"Current: CVD={cfg.QUANT_W_CVD} VWAP={cfg.QUANT_W_VWAP} "
-                    f"MOM={cfg.QUANT_W_MOM} SQZ={cfg.QUANT_W_SQUEEZE} VFL={cfg.QUANT_W_VOL}\n"
-                    f"OB={cfg.QUANT_W_ORDERBOOK} TICK={cfg.QUANT_W_TICK_FLOW}"
+                    f"Current: VWAP={cfg.QUANT_W_VWAP_DEV} CVD={cfg.QUANT_W_CVD_DIV} "
+                    f"OB={cfg.QUANT_W_OB} TF={cfg.QUANT_W_TICK_FLOW} VEX={cfg.QUANT_W_VOL_EXHAUSTION}"
                 )
 
         old_val = getattr(cfg, attr_name, "?")
