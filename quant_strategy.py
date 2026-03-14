@@ -2256,32 +2256,15 @@ class QuantStrategy:
         sig = self._compute_signals(data_manager)
         if sig is not None:
             self._log_thinking(sig, price, now)
-            c = sig.composite; et = QCfg.EXIT_REVERSAL_THRESH()
 
             if pos.trade_mode == "trend":
                 # Trend trade: exit on regime flip (market stops trending)
-                # or on strong counter-trend reversion composite
                 regime_flipped = not self._regime.is_trending() or (
                     (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
                     (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
                 if regime_flipped:
                     logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
                     self._exit_trade(order_manager, price, "regime_flip"); return
-                # Also exit on a very strong reversion signal (> 1.5× threshold)
-                if pos.side == "long" and c <= -(et * 1.5):
-                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit LONG [trend]")
-                    self._exit_trade(order_manager, price, "strong_reversal"); return
-                if pos.side == "short" and c >= (et * 1.5):
-                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT [trend]")
-                    self._exit_trade(order_manager, price, "strong_reversal"); return
-            else:
-                # Reversion trade: exit on standard composite reversal threshold
-                if pos.side == "long" and c <= -et:
-                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit LONG")
-                    self._exit_trade(order_manager, price, "strong_reversal"); return
-                if pos.side == "short" and c >= et:
-                    logger.info(f"🔄 Strong reversal ({c:+.3f}) → exit SHORT")
-                    self._exit_trade(order_manager, price, "strong_reversal"); return
 
         if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
