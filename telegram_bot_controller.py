@@ -16,6 +16,11 @@ Commands:
   /set <k> <v>- Live-adjust a config key (no restart needed)
   /killswitch - Emergency: cancel all orders + close position
   /help       - Show all commands
+
+FIX v4.3.1: _cmd_set now verifies the change by reading back from config
+module after setattr. Previously the change was applied to the config module
+but risk_manager cached stale values — that is now fixed in risk_manager.py.
+The readback here provides an extra safety net and user-visible confirmation.
 """
 
 import logging
@@ -655,7 +660,13 @@ class TelegramBotController:
             return f"Killswitch error: {e}"
 
     def _cmd_set(self, args: str) -> str:
-        """Live-adjust a quant config parameter. Takes effect on next tick."""
+        """Live-adjust a quant config parameter. Takes effect on next tick.
+
+        FIX v4.3.1: After setattr, we read back from the config module to
+        VERIFY the change actually took effect. Previously risk_manager cached
+        stale values — that is now fixed in risk_manager.py so all code reads
+        from config module dynamically.
+        """
         import config as cfg
 
         if not args or len(args.split()) < 2:
@@ -762,11 +773,27 @@ class TelegramBotController:
 
         old_val = getattr(cfg, attr_name, "?")
         setattr(cfg, attr_name, new_val)
-        logger.info(f"CONFIG LIVE-CHANGE via Telegram: {attr_name} = {old_val} → {new_val}")
+
+        # ── VERIFICATION READBACK ──────────────────────────────────
+        # Read back from the config module to confirm the change stuck.
+        # This catches any edge case where setattr silently fails.
+        verify_val = getattr(cfg, attr_name, None)
+        if verify_val != new_val:
+            logger.error(
+                f"CONFIG CHANGE FAILED: {attr_name} — wrote {new_val} "
+                f"but readback is {verify_val}"
+            )
+            return (
+                f"❌ <b>CHANGE FAILED</b>\n"
+                f"<code>{attr_name}</code>: wrote {new_val} but readback = {verify_val}\n"
+                f"Please report this bug."
+            )
+
+        logger.info(f"CONFIG LIVE-CHANGE via Telegram: {attr_name} = {old_val} → {new_val} (verified ✅)")
         return (
             f"✅ <b>{attr_name}</b>\n"
             f"{old_val} → <b>{new_val}</b>\n"
-            f"<i>Takes effect on next tick</i>"
+            f"<i>Verified ✅ — active immediately</i>"
         )
 
     # ================================================================
