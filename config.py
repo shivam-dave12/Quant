@@ -1,7 +1,15 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot v4.3 — Institutional Multi-Factor Momentum + Order Flow
+Quant Bot v4.4 — Institutional Multi-Factor Momentum + Order Flow
+
+CHANGES from v4.3:
+  - QUANT_TRAIL_BE_R lowered to 0.5 (was 1.0 — trades peaked at 0.6R with zero protection)
+  - QUANT_TRAIL_LOCK_R lowered to 1.0 (was 1.5 — lock profit earlier)
+  - Added QUANT_REVERSION_MIN_RR=1.5 / QUANT_REVERSION_MAX_RR=3.0 (mode-aware R:R)
+  - Added QUANT_TREND_MIN_RR=3.0 / QUANT_TREND_MAX_RR=5.0 (trend keeps high R:R)
+  - Added QUANT_TIME_BE_SECONDS=300 / QUANT_TIME_TRAIL_SECONDS=600 (time-based profit protection)
+  - Added QUANT_SMART_MAX_HOLD=True (tighten SL instead of market-dumping profitable trades)
 
 CHANGES from v4:
   - ATR_SEED_RETAIN set to 1 (CRITICAL FIX: warmup data was poisoning percentile → 0% → blocked all trades)
@@ -169,8 +177,8 @@ QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 #      Fix: don't trail until trade has PROVEN itself at 1.0R+.
 #      Only lock profit at 1.5R. Let winners run.
 QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_BE_R            = 1.0      # v4.3: was 0.4 — START trailing only at 1.0R
-QUANT_TRAIL_LOCK_R          = 1.5      # v4.3: was 0.8 — LOCK profit only at 1.5R
+QUANT_TRAIL_BE_R            = 0.5      # v4.4: was 1.0 — START trailing at 0.5R (earlier protection)
+QUANT_TRAIL_LOCK_R          = 1.0      # v4.4: was 1.5 — LOCK profit at 1.0R (was 1.5 — too late)
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -229,6 +237,32 @@ QUANT_TREND_CHANDELIER_N       = 1.5
 
 # 10m. Spread/ATR gate — v4.3 (Solution 5)
 QUANT_MAX_SPREAD_ATR_RATIO     = 0.08  # Skip entries when spread > 8% of ATR
+
+# 10n. Mode-aware R:R — v4.4 FIX
+#      v4.3 used MIN_RISK_REWARD_RATIO=3.0 for ALL trades. For mean-reversion
+#      this pushed TP to 3x SL distance — far beyond the natural VWAP target.
+#      Result: TP was unreachable, trade timed out, profit evaporated.
+#      Fix: separate R:R bounds per mode. Reversion edge = win rate (60-70%),
+#      not R:R. Trend edge = letting winners run, so higher R:R.
+QUANT_REVERSION_MIN_RR         = 1.5   # Reversion: closer TP, win-rate driven
+QUANT_REVERSION_MAX_RR         = 3.0   # Cap reversion TP distance
+QUANT_TREND_MIN_RR             = 3.0   # Trend: let winners run
+QUANT_TREND_MAX_RR             = 5.0   # Cap trend TP distance
+
+# 10o. Time-based profit protection — v4.4 FIX
+#      v4.3 trail required 1.0R profit before activating. On a 3:1 R:R trade
+#      that means 33% of TP distance. Many trades peak at 0.5-0.8R and reverse
+#      before trail ever kicks in. Fix: after TIME_BE_SECONDS of continuous
+#      profit, force SL to breakeven regardless of R tier.
+QUANT_TIME_BE_SECONDS          = 300   # After 5 min in profit → force BE
+QUANT_TIME_TRAIL_SECONDS       = 600   # After 10 min in profit → tighten to entry+0.5ATR
+
+# 10p. Smart max-hold exit — v4.4 FIX
+#      v4.3 max-hold dumped positions via market order regardless of profit.
+#      This turned a +$174 winner into a +$2 scratch. Fix: if in profit at
+#      max hold, tighten SL to protect gains instead of market-exiting.
+QUANT_SMART_MAX_HOLD           = True  # True = tighten SL; False = old behavior (market exit)
+QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.3   # When smart-exiting in profit: SL = price - 0.3*ATR
 
 # ═══════════════════════════════════════════════════════════════════
 # 11. FEE ENGINE

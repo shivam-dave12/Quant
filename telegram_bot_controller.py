@@ -726,6 +726,15 @@ class TelegramBotController:
             "quant_w_vol_exhaustion":      ("QUANT_W_VOL_EXHAUSTION",     float),
             "quant_htf_enabled":           ("QUANT_HTF_ENABLED",          bool),
             "quant_htf_veto_strength":     ("QUANT_HTF_VETO_STRENGTH",    float),
+            # v4.4 additions
+            "quant_reversion_min_rr":      ("QUANT_REVERSION_MIN_RR",     float),
+            "quant_reversion_max_rr":      ("QUANT_REVERSION_MAX_RR",     float),
+            "quant_trend_min_rr":          ("QUANT_TREND_MIN_RR",         float),
+            "quant_trend_max_rr":          ("QUANT_TREND_MAX_RR",         float),
+            "quant_time_be_seconds":       ("QUANT_TIME_BE_SECONDS",      int),
+            "quant_time_trail_seconds":    ("QUANT_TIME_TRAIL_SECONDS",   int),
+            "quant_smart_max_hold":        ("QUANT_SMART_MAX_HOLD",       bool),
+            "quant_max_hold_profit_sl_atr":("QUANT_MAX_HOLD_PROFIT_SL_ATR", float),
         }
 
         if key not in allowed:
@@ -751,6 +760,12 @@ class TelegramBotController:
             "QUANT_TP_VWAP_FRACTION":     (0.20, 0.90),
             "MIN_RISK_REWARD_RATIO":      (0.30, 5.00),
             "LEVERAGE":                   (1,    50),
+            # v4.4 bounds
+            "QUANT_REVERSION_MIN_RR":     (0.50, 3.00),
+            "QUANT_REVERSION_MAX_RR":     (1.00, 5.00),
+            "QUANT_TREND_MIN_RR":         (1.00, 6.00),
+            "QUANT_TREND_MAX_RR":         (2.00, 10.0),
+            "QUANT_MAX_HOLD_PROFIT_SL_ATR": (0.10, 1.50),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]
