@@ -33,7 +33,7 @@ if not COINSWITCH_API_KEY or not COINSWITCH_SECRET_KEY:
 # ─────────────────────────────────────────────
 SYMBOL   = "BTCUSDT"
 EXCHANGE = "EXCHANGE_2"
-LEVERAGE = 30
+LEVERAGE = 40
 
 # ─────────────────────────────────────────────
 # 3. POSITION SIZING
@@ -58,9 +58,9 @@ MAX_DAILY_TRADES        = 8
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 5
 TRADE_COOLDOWN_SECONDS  = 600
-MIN_RISK_REWARD_RATIO   = 1.5
-TARGET_RISK_REWARD_RATIO= 1.5
-MAX_RR_RATIO            = 12.0
+MIN_RISK_REWARD_RATIO   = 3.0
+TARGET_RISK_REWARD_RATIO= 4.0
+MAX_RR_RATIO            = 20.0
 
 # ─────────────────────────────────────────────
 # 5. ORDER EXECUTION
