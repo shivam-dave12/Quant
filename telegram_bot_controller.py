@@ -776,6 +776,17 @@ class TelegramBotController:
             "QUANT_TRAIL_MIN_DIST_ATR_P2": (0.30, 2.00),
             "QUANT_TRAIL_MIN_DIST_ATR_P3": (0.20, 1.50),
             "QUANT_TRAIL_REV_MIN_SIGNALS": (1, 6),
+            # v4.6 bounds
+            "QUANT_TP_MIN_ATR_MULT":      (0.20, 2.00),
+            "QUANT_TP_MAX_ATR_MULT":      (2.00, 12.0),
+            "QUANT_REVERSION_REJECT_RR":  (0.05, 0.50),
+            "QUANT_SL_MAX_ATR_MULT":      (2.00, 8.00),
+            "QUANT_MAX_SPREAD_ATR_RATIO": (0.05, 0.50),
+            "QUANT_LOSS_LOCKOUT_SEC":     (60, 7200),
+            "MAX_CONSECUTIVE_LOSSES":     (1, 10),
+            "QUANT_MAX_HOLD_EXTENSIONS":  (0, 10),
+            "QUANT_HOLD_EXTENSION_SEC":   (300, 3600),
+            "QUANT_THESIS_MAX_DRAWDOWN_PCT": (0.30, 0.95),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]

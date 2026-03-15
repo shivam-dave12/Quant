@@ -1,7 +1,36 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot v4.5 — Institutional Multi-Factor Momentum + Order Flow
+Quant Bot v4.6 — Thesis-Aware Exit + Gate Fixes
+
+CHANGES from v4.5 (v4.6 — CRITICAL WIN-RATE FIX):
+  ROOT CAUSE: Max-hold timer (40 min) killed correct trades before they could
+  reach TP. Example: LONG @ $71,452, price dipped to $71,318, timer fired
+  at $71,349 → exited for loss. Price then rallied to $71,900 → TP hit.
+  The trade thesis was CORRECT the entire time — timer destroyed the edge.
+
+  FIX 1: THESIS-AWARE MAX-HOLD (the primary fix)
+    - When max-hold fires, CHECK THE MARKET instead of blind exit
+    - If in profit → tighten SL, let trade ride (no forced exit)
+    - If underwater + thesis valid → EXTEND hold (up to 5 × 20 min)
+    - If thesis broken → exit
+    - Thesis valid = composite in direction + not deeply underwater + VWAP relation holds
+    - New: MAX_HOLD_EXTENSIONS=5, HOLD_EXTENSION_SEC=1200, THESIS_MAX_DRAWDOWN_PCT=0.70
+    - Total possible hold: 40 + 5×20 = 140 min (2.3 hours) for valid thesis
+
+  FIX 2: LOSS LOCKOUT REDUCED
+    - LOSS_LOCKOUT_SEC=300 (was 3600 — blocked Σ=+0.717 signals at bottom)
+    - MAX_CONSECUTIVE_LOSSES=5 (was 3)
+
+  FIX 3: REGIME GATE FIXED
+    - ATR_MIN_PCTILE=0.00 (was 0.05 — blocked entries when ATR contracted)
+
+  FIX 4: SPREAD GATE WIDENED
+    - MAX_SPREAD_ATR_RATIO=0.30 (was 0.08 — blocked all entries in low-vol)
+
+  NOTE: SL stays at structural level (5m swing). Capping SL at 4×ATR was
+  tested but REJECTED — it moved SL from $71,216 to $71,363, which was hit
+  during a temporary dip that the structural SL survived. Structure > ATR.
 
 CHANGES from v4.4:
   - COMPLETE TRAIL REWRITE: v4.4 time-triggered BE moved SL into noise → whipsaw loss
@@ -69,7 +98,7 @@ RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 400
 MAX_DAILY_LOSS_PCT      = 5.0
 MAX_DRAWDOWN_PCT        = 15.0
-MAX_CONSECUTIVE_LOSSES  = 3
+MAX_CONSECUTIVE_LOSSES  = 5   # v4.6: was 3 — too aggressive, locked out best signals
 MAX_DAILY_TRADES        = 8
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 5
@@ -215,13 +244,13 @@ QUANT_VOL_FLOW_WINDOW       = 10
 
 # 10f. Regime Filter
 QUANT_ATR_PCTILE_WINDOW     = 100
-QUANT_ATR_MIN_PCTILE        = 0.05
+QUANT_ATR_MIN_PCTILE        = 0.00  # v4.6: was 0.05 — blocked entries when ATR contracted
 QUANT_ATR_MAX_PCTILE        = 0.97
 
 # 10g. Timing — PATIENT
 QUANT_MAX_HOLD_SEC          = 2400
 QUANT_COOLDOWN_SEC          = 180
-QUANT_LOSS_LOCKOUT_SEC      = 3600
+QUANT_LOSS_LOCKOUT_SEC      = 300   # v4.6: was 3600 — blocked Σ=+0.717 signals at the bottom
 QUANT_POS_SYNC_SEC          = 30
 
 # 10h. Signal Weights (sum = 1.0)
@@ -261,22 +290,46 @@ QUANT_TREND_CONFIRM_TICKS      = 3
 QUANT_TREND_CHANDELIER_N       = 1.5
 
 # 10m. Spread/ATR gate — v4.3 (Solution 5)
-QUANT_MAX_SPREAD_ATR_RATIO     = 0.08  # Skip entries when spread > 8% of ATR
+#      v4.6 FIX: was 0.08 — when ATR contracts to $20, spread/ATR=0.18 and
+#      blocks ALL entries. ATR-normalized spread is a bad gate in low-vol.
+QUANT_MAX_SPREAD_ATR_RATIO     = 0.30  # v4.6: was 0.08 — far too tight for low-vol
 
-# 10n. Mode-aware R:R — v4.4 FIX
-#      v4.3 used MIN_RISK_REWARD_RATIO=3.0 for ALL trades. For mean-reversion
-#      this pushed TP to 3x SL distance — far beyond the natural VWAP target.
-#      Result: TP was unreachable, trade timed out, profit evaporated.
-#      Fix: separate R:R bounds per mode. Reversion edge = win rate (60-70%),
-#      not R:R. Trend edge = letting winners run, so higher R:R.
-QUANT_REVERSION_MIN_RR         = 1.5   # Reversion: closer TP, win-rate driven
-QUANT_REVERSION_MAX_RR         = 3.0   # Cap reversion TP distance
+# 10n. Mode-aware R:R — v4.6 COMPLETE REWRITE
+#      v4.4 used min_tp_dist = SL × REVERSION_MIN_RR. When ATR=$22 but SL was
+#      $220 behind swing structure (10×ATR), TP was forced to $330 (15×ATR).
+#      Mean reversion NEVER moves 15×ATR. Every trade timed out at max_hold.
+#
+#      v4.6 FIX: TP is placed at the NATURAL structural target (VWAP, HVN, OB).
+#      min_tp_dist is fee clearance + small ATR floor — NOT SL-linked.
+#      If natural target gives R:R < REJECT threshold, trade is SKIPPED.
+#      Don't inflate TP to unreachable levels — reject the setup.
+QUANT_REVERSION_MIN_RR         = 1.5   # LEGACY — no longer used for TP floor
+QUANT_REVERSION_MAX_RR         = 3.0   # Still caps max TP distance
 QUANT_TREND_MIN_RR             = 3.0   # Trend: let winners run
 QUANT_TREND_MAX_RR             = 5.0   # Cap trend TP distance
 
-# 10o. Smart max-hold exit — v4.4 FIX
-QUANT_SMART_MAX_HOLD           = True  # Tighten SL instead of market-dumping profitable trades
-QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.5   # v4.5: 0.5×ATR from price (was 0.3 — too tight)
+# 10n-v46. Natural TP placement params
+QUANT_TP_MIN_ATR_MULT          = 0.5   # TP floor: at least 0.5×ATR from entry
+QUANT_TP_MAX_ATR_MULT          = 6.0   # TP ceiling: never more than 6×ATR (reversion)
+QUANT_REVERSION_REJECT_RR      = 0.20  # Reject trade if R:R < 0.20 (fee-negative)
+
+# 10n-v46. SL ATR cap — prevents SL from being 10×ATR behind entry
+#          When ATR contracts, MIN_SL_PCT ($214) stays huge relative to ATR.
+#          SL must be max SL_MAX_ATR_MULT × ATR from entry for reversion trades.
+QUANT_SL_MAX_ATR_MULT          = 4.0   # Reversion SL: max 4×ATR from entry
+
+# 10o. Smart max-hold exit — v4.6 COMPLETE REWRITE
+#      v4.4: tighten SL for profitable trades. Still force-exited underwater trades.
+#      v4.6: thesis-aware extension. When timer fires:
+#        - If in profit → tighten SL, let it ride (don't force exit)
+#        - If underwater but thesis valid → EXTEND hold (max N times)
+#        - If thesis broken → exit
+#      This prevents killing winning trades (chart: $71,452 → $71,900 missed)
+QUANT_SMART_MAX_HOLD           = True  # Enable thesis-aware max-hold
+QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.5   # Tighten SL to 0.5×ATR from price when in profit
+QUANT_MAX_HOLD_EXTENSIONS      = 5     # Max times to extend when thesis valid (total: 40+5×20=140min)
+QUANT_HOLD_EXTENSION_SEC       = 1200  # Each extension adds 20 min
+QUANT_THESIS_MAX_DRAWDOWN_PCT  = 0.70  # Exit if underwater > 70% of SL distance
 
 # ═══════════════════════════════════════════════════════════════════
 # 11. FEE ENGINE

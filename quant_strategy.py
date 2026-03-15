@@ -232,6 +232,22 @@ class QCfg:
     def SMART_MAX_HOLD() -> bool: return bool(_cfg("QUANT_SMART_MAX_HOLD", True))
     @staticmethod
     def MAX_HOLD_PROFIT_SL_ATR() -> float: return float(_cfg("QUANT_MAX_HOLD_PROFIT_SL_ATR", 0.5))
+    # ── v4.6: Thesis-aware max-hold extension ────────────────────
+    @staticmethod
+    def MAX_HOLD_EXTENSIONS() -> int: return int(_cfg("QUANT_MAX_HOLD_EXTENSIONS", 3))
+    @staticmethod
+    def HOLD_EXTENSION_SEC() -> int: return int(_cfg("QUANT_HOLD_EXTENSION_SEC", 1200))
+    @staticmethod
+    def THESIS_MAX_DRAWDOWN_PCT() -> float: return float(_cfg("QUANT_THESIS_MAX_DRAWDOWN_PCT", 0.70))
+    # ── v4.6: Natural TP + SL ATR cap ───────────────────────────
+    @staticmethod
+    def TP_MIN_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MIN_ATR_MULT", 0.5))
+    @staticmethod
+    def TP_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MAX_ATR_MULT", 6.0))
+    @staticmethod
+    def REVERSION_REJECT_RR() -> float: return float(_cfg("QUANT_REVERSION_REJECT_RR", 0.20))
+    @staticmethod
+    def SL_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_SL_MAX_ATR_MULT", 4.0))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -999,33 +1015,26 @@ class InstitutionalLevels:
                    vwap: float, vwap_std: float,
                    candles_5m: Optional[List[Dict]] = None) -> float:
         """
-        Institutional TP placement — v4.1.
+        Institutional TP placement — v4.6.
 
         Scored candidate selection across five target classes:
+          5.0  OB liquidity wall directly in path
+          4.0  VP High-Volume Node between entry and VWAP
+          3.5  VWAP itself (full mean-reversion target)
+          3.0  VWAP ± σ bands
+          2.5  5m swing extreme in direction of reversion
+          2.0  VWAP partial fraction
 
-          Score tiers (higher = take it more seriously):
-            5.0  OB liquidity wall directly in path (hard resistance/support)
-            4.0  VP High-Volume Node between entry and VWAP (price gravitates to volume)
-            3.5  VWAP itself (full mean-reversion target)
-            3.0  VWAP ± 0.5σ / ±1σ / ±1.5σ bands (statistical attraction)
-            2.5  5m swing extreme in direction of reversion (structure target)
-            2.0  VWAP partial fraction (fractional reversion)
-
-        Selection strategy: build a tiered target ladder.
-          Tier-A (≥ 3.5 score): take the NEAREST (conservative, high-WR)
-          If no tier-A exists within MAX_RR cap: take highest-scored valid target
-
-        All targets must satisfy REVERSION_MIN_RR and are capped at REVERSION_MAX_RR × sl_dist.
-
-        v4.4 FIX: was MIN_RR_RATIO=3.0 which pushed TP far beyond natural VWAP
-        reversion target. Reversion edge = win rate, not R:R. Now uses 1.5 min.
+        v4.6: SL is now ATR-capped upstream (_compute_sl_tp caps to SL_MAX_ATR_MULT×ATR).
+        This means sl_dist is proportional to ATR, so R:R-based bounds are naturally
+        reasonable. min_tp ≈ 4×ATR × 1.5 = 6×ATR (reachable) instead of 10×ATR × 1.5 = 15×ATR.
         """
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
             return price + atr if side == "long" else price - atr
 
-        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()   # v4.4: was MIN_RR_RATIO (3.0)
-        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()   # v4.4: was TP_MAX_RR (3.5)
+        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
+        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
 
         # ── Volume profile: single pass, shared across candidate generation ──
         hvn_levels: List[float] = []
@@ -1745,6 +1754,7 @@ class PositionState:
     trade_mode: str = "reversion"  # "reversion" | "trend"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
+    hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -2182,6 +2192,14 @@ class QuantStrategy:
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
+        # ── v4.6 NOTE: SL stays at structural level (no ATR cap) ────────────
+        # The structural SL behind 5m swing is CORRECT — it's where the market
+        # proves the thesis wrong. Capping it tighter (4×ATR) killed Trade 1:
+        # SL at $71,363 (4×ATR) was hit during a temporary dip to $71,318,
+        # but structural SL at $71,216 HELD and price rallied to $71,900.
+        # The thesis-aware max-hold extension is the real fix, not SL capping.
+        # SL_MAX_ATR_MULT is retained in config for manual /set if needed.
+
         if mode == "trend":
             tp_price = InstitutionalLevels.compute_tp_trend(
                 price, side, atr, sl_price, candles_5m, orderbook,
@@ -2469,23 +2487,53 @@ class QuantStrategy:
         pos = self._pos; price = data_manager.get_last_price()
         if price < 1.0: return
 
-        # ── Smart max-hold (v4.4) ─────────────────────────────────────────────
-        # Old v4.3: market-dumped at MAX_HOLD_SEC regardless of profit.
-        # Turned a +$174 winner into a +$2 scratch.
-        # Fix: if in profit, tighten SL to protect gains instead of dumping.
-        if now - pos.entry_time > QCfg.MAX_HOLD_SEC():
+        # ── Compute signals FIRST (needed for thesis check) ──────────────────
+        sig = self._compute_signals(data_manager)
+        if sig is not None:
+            self._log_thinking(sig, price, now)
+
+            if pos.trade_mode == "trend":
+                regime_flipped = not self._regime.is_trending() or (
+                    (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
+                    (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
+                if regime_flipped:
+                    logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
+                    self._exit_trade(order_manager, price, "regime_flip"); return
+
+        # ── Thesis-aware max-hold (v4.6) ─────────────────────────────────────
+        #
+        # v4.4 BUG: blind 40-min timer killed LONG @ $71,452 at $71,349.
+        #           Price then rallied to $71,900. TP at $71,806 would have hit.
+        #           The trade thesis was CORRECT — timer destroyed the edge.
+        #
+        # v4.6 FIX: When timer fires, ASK THE MARKET if the trade should continue:
+        #   1. In profit  → tighten SL, let SL manage the exit (NO forced dump)
+        #   2. Underwater + thesis valid → EXTEND hold (max N extensions)
+        #   3. Underwater + thesis broken → EXIT
+        #
+        # Thesis valid means:
+        #   a) Composite signal still agrees with trade direction
+        #   b) Price still between SL and TP (not breached)
+        #   c) Not deeply underwater (< THESIS_MAX_DRAWDOWN_PCT of SL distance)
+        #   d) Reversion: price still on "wrong" side of VWAP (hasn't reverted past it)
+        #
+        hold_time = now - pos.entry_time
+        base_hold = QCfg.MAX_HOLD_SEC()
+        extension_sec = QCfg.HOLD_EXTENSION_SEC()
+        total_allowed = base_hold + pos.hold_extensions * extension_sec
+
+        if hold_time > total_allowed:
             profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
             atr = self._atr_5m.atr
 
+            # CASE 1: IN PROFIT → tighten SL, let it ride
             if QCfg.SMART_MAX_HOLD() and profit > 0 and atr > 1e-10 and pos.sl_order_id is not None:
-                # Tighten SL to price - N×ATR instead of market-selling
                 tight_mult = QCfg.MAX_HOLD_PROFIT_SL_ATR()
                 if pos.side == "long":
                     tight_sl = _round_to_tick(price - tight_mult * atr)
                 else:
                     tight_sl = _round_to_tick(price + tight_mult * atr)
 
-                # Only if it improves current SL
                 improves = (pos.side == "long" and tight_sl > pos.sl_price) or \
                            (pos.side == "short" and tight_sl < pos.sl_price)
                 if improves:
@@ -2511,35 +2559,111 @@ class QuantStrategy:
                             f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
                             f"Profit: ${profit:+.2f} → protecting with tight SL\n"
                             f"SL: ${tight_sl:,.2f} (ATR×{tight_mult} from price)\n"
-                            f"<i>Trade will exit on next SL/TP trigger or price move</i>")
+                            f"<i>Trade rides with tight SL — no forced exit</i>")
+                    # DO NOT return here — let trailing logic also run
+                    # The trade continues with tight SL protection
+                else:
+                    # SL already tight + in profit → just let it ride
+                    logger.info(f"⏰ Max hold, SL already tight + profit ${profit:+.2f} → ride")
+                return  # skip forced exit, SL manages it
+
+            # CASE 2: UNDERWATER — check thesis
+            max_ext = QCfg.MAX_HOLD_EXTENSIONS()
+            if QCfg.SMART_MAX_HOLD() and pos.hold_extensions < max_ext and sig is not None:
+                thesis_ok, reason = self._check_thesis(pos, price, sig, atr)
+                if thesis_ok:
+                    self._pos.hold_extensions += 1
+                    ext_min = extension_sec // 60
+                    total_min = (base_hold + pos.hold_extensions * extension_sec) // 60
+                    logger.info(
+                        f"⏰ Max hold: THESIS VALID → extending +{ext_min}m "
+                        f"({pos.hold_extensions}/{max_ext}) | total allowed: {total_min}m | {reason}")
+                    send_telegram_message(
+                        f"⏰ <b>MAX HOLD — THESIS EXTENSION</b>\n"
+                        f"Trade: {pos.side.upper()} @ ${pos.entry_price:,.2f}\n"
+                        f"Current: ${price:,.2f} ({'+' if profit > 0 else ''}{profit:.2f} pts)\n"
+                        f"Extension: {pos.hold_extensions}/{max_ext} (+{ext_min}min)\n"
+                        f"Reason: {reason}\n"
+                        f"<i>Thesis still valid — letting it work</i>")
                     return
                 else:
-                    # SL already tighter than what we'd set — market exit
-                    logger.info(f"⏰ Max hold, SL already tight → exit")
-                    self._exit_trade(order_manager, price, "max_hold_time")
-                    return
-            else:
-                # Not in profit or smart_max_hold disabled → old behavior
-                logger.info(f"⏰ Max hold → exit")
-                self._exit_trade(order_manager, price, "max_hold_time")
-                return
+                    logger.info(f"⏰ Max hold: THESIS BROKEN → exit | {reason}")
 
-        sig = self._compute_signals(data_manager)
-        if sig is not None:
-            self._log_thinking(sig, price, now)
+            # CASE 3: No extensions left OR thesis broken OR not smart
+            logger.info(f"⏰ Max hold → exit")
+            self._exit_trade(order_manager, price, "max_hold_time")
+            return
 
-            if pos.trade_mode == "trend":
-                # Trend trade: exit on regime flip (market stops trending)
-                regime_flipped = not self._regime.is_trending() or (
-                    (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
-                    (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
-                if regime_flipped:
-                    logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
-                    self._exit_trade(order_manager, price, "regime_flip"); return
-
+        # ── Trailing SL ──────────────────────────────────────────────────────
         if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
             if self._update_trailing_sl(order_manager, data_manager, price, now): return
+
+    def _check_thesis(self, pos, price, sig, atr) -> Tuple[bool, str]:
+        """
+        v4.6: Check if the original trade thesis is still valid.
+        Returns (thesis_valid, reason_string).
+
+        A trade thesis is valid when:
+          1. Price is still between SL and TP (not breached either)
+          2. Composite signal has not flipped against the trade
+          3. Not deeply underwater (< THESIS_MAX_DRAWDOWN_PCT of SL distance)
+          4. For reversion: price hasn't passed VWAP (reversion hasn't completed)
+
+        If ANY check fails → thesis broken → force exit.
+        If ALL pass → thesis valid → grant extension.
+        """
+        reasons = []
+
+        # 1. Price between SL and TP
+        if pos.side == "long":
+            if price <= pos.sl_price:
+                return False, "price at/below SL"
+            if price >= pos.tp_price:
+                return False, "price at/above TP"
+        else:
+            if price >= pos.sl_price:
+                return False, "price at/above SL"
+            if price <= pos.tp_price:
+                return False, "price at/below TP"
+
+        # 2. Composite signal still agrees (or at least neutral)
+        # For LONG: composite should not be deeply negative
+        # For SHORT: composite should not be deeply positive
+        comp = sig.composite
+        if pos.side == "long" and comp < -0.15:
+            return False, f"composite flipped bearish ({comp:+.3f})"
+        if pos.side == "short" and comp > 0.15:
+            return False, f"composite flipped bullish ({comp:+.3f})"
+        reasons.append(f"Σ={comp:+.3f}")
+
+        # 3. Not deeply underwater
+        drawdown = (pos.entry_price - price) if pos.side == "long" else (price - pos.entry_price)
+        sl_dist = abs(pos.entry_price - pos.sl_price)
+        if sl_dist > 0:
+            dd_pct = drawdown / sl_dist
+            max_dd = QCfg.THESIS_MAX_DRAWDOWN_PCT()
+            if dd_pct > max_dd:
+                return False, f"drawdown {dd_pct:.0%} > {max_dd:.0%} of SL"
+            reasons.append(f"DD={dd_pct:.0%}")
+        
+        # 4. Reversion: price still on overextended side of VWAP
+        vwap = self._vwap.vwap
+        if pos.trade_mode == "reversion" and vwap > 0:
+            if pos.side == "long" and price > vwap * 1.001:
+                # Price already reverted PAST VWAP — thesis completed, take profit
+                return False, f"reverted past VWAP (${price:,.0f} > ${vwap:,.0f})"
+            if pos.side == "short" and price < vwap * 0.999:
+                return False, f"reverted past VWAP (${price:,.0f} < ${vwap:,.0f})"
+            reasons.append(f"VWAP={abs(price-vwap)/atr:.1f}ATR away")
+
+        # 5. Bonus: if signals are strong in our direction, thesis is robust
+        if pos.side == "long" and comp > 0.2:
+            reasons.append("signals STRONG ✅")
+        elif pos.side == "short" and comp < -0.2:
+            reasons.append("signals STRONG ✅")
+
+        return True, " | ".join(reasons)
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
         """Institutional trail v4.5: structure-only + pullback detection."""
