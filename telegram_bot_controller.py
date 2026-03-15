@@ -726,15 +726,19 @@ class TelegramBotController:
             "quant_w_vol_exhaustion":      ("QUANT_W_VOL_EXHAUSTION",     float),
             "quant_htf_enabled":           ("QUANT_HTF_ENABLED",          bool),
             "quant_htf_veto_strength":     ("QUANT_HTF_VETO_STRENGTH",    float),
-            # v4.4 additions
+            # v4.5 trail + R:R additions
             "quant_reversion_min_rr":      ("QUANT_REVERSION_MIN_RR",     float),
             "quant_reversion_max_rr":      ("QUANT_REVERSION_MAX_RR",     float),
             "quant_trend_min_rr":          ("QUANT_TREND_MIN_RR",         float),
             "quant_trend_max_rr":          ("QUANT_TREND_MAX_RR",         float),
-            "quant_time_be_seconds":       ("QUANT_TIME_BE_SECONDS",      int),
-            "quant_time_trail_seconds":    ("QUANT_TIME_TRAIL_SECONDS",   int),
             "quant_smart_max_hold":        ("QUANT_SMART_MAX_HOLD",       bool),
             "quant_max_hold_profit_sl_atr":("QUANT_MAX_HOLD_PROFIT_SL_ATR", float),
+            "quant_trail_aggressive_r":    ("QUANT_TRAIL_AGGRESSIVE_R",   float),
+            "quant_trail_min_dist_atr_p1": ("QUANT_TRAIL_MIN_DIST_ATR_P1",float),
+            "quant_trail_min_dist_atr_p2": ("QUANT_TRAIL_MIN_DIST_ATR_P2",float),
+            "quant_trail_min_dist_atr_p3": ("QUANT_TRAIL_MIN_DIST_ATR_P3",float),
+            "quant_trail_pullback_freeze": ("QUANT_TRAIL_PULLBACK_FREEZE",bool),
+            "quant_trail_rev_min_signals": ("QUANT_TRAIL_REV_MIN_SIGNALS",int),
         }
 
         if key not in allowed:
@@ -765,7 +769,13 @@ class TelegramBotController:
             "QUANT_REVERSION_MAX_RR":     (1.00, 5.00),
             "QUANT_TREND_MIN_RR":         (1.00, 6.00),
             "QUANT_TREND_MAX_RR":         (2.00, 10.0),
-            "QUANT_MAX_HOLD_PROFIT_SL_ATR": (0.10, 1.50),
+            "QUANT_MAX_HOLD_PROFIT_SL_ATR": (0.10, 2.00),
+            # v4.5 trail bounds
+            "QUANT_TRAIL_AGGRESSIVE_R":   (1.50, 5.00),
+            "QUANT_TRAIL_MIN_DIST_ATR_P1": (0.50, 3.00),
+            "QUANT_TRAIL_MIN_DIST_ATR_P2": (0.30, 2.00),
+            "QUANT_TRAIL_MIN_DIST_ATR_P3": (0.20, 1.50),
+            "QUANT_TRAIL_REV_MIN_SIGNALS": (1, 6),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]

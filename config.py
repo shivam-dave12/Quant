@@ -1,14 +1,22 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot v4.4 — Institutional Multi-Factor Momentum + Order Flow
+Quant Bot v4.5 — Institutional Multi-Factor Momentum + Order Flow
+
+CHANGES from v4.4:
+  - COMPLETE TRAIL REWRITE: v4.4 time-triggered BE moved SL into noise → whipsaw loss
+  - Removed TIME_BE_SECONDS / TIME_TRAIL_SECONDS (time-based BE is a retail concept)
+  - Removed "breakeven" concept entirely (entry price is irrelevant to market)
+  - TRAIL_BE_R raised to 1.0R (trade must PROVE itself before ANY SL movement)
+  - TRAIL_LOCK_R raised to 2.0R, added TRAIL_AGGRESSIVE_R=3.0R
+  - Added per-phase minimum distance: 1.5/1.0/0.7 × ATR (kills whipsaw)
+  - Added 6-factor pullback-vs-reversal classifier (freezes SL during pullbacks)
+  - SL only moves behind CONFIRMED 5m swing structure, not arbitrary prices
+  - Smart max-hold ATR widened to 0.5 (was 0.3)
 
 CHANGES from v4.3:
-  - QUANT_TRAIL_BE_R lowered to 0.5 (was 1.0 — trades peaked at 0.6R with zero protection)
-  - QUANT_TRAIL_LOCK_R lowered to 1.0 (was 1.5 — lock profit earlier)
   - Added QUANT_REVERSION_MIN_RR=1.5 / QUANT_REVERSION_MAX_RR=3.0 (mode-aware R:R)
   - Added QUANT_TREND_MIN_RR=3.0 / QUANT_TREND_MAX_RR=5.0 (trend keeps high R:R)
-  - Added QUANT_TIME_BE_SECONDS=300 / QUANT_TIME_TRAIL_SECONDS=600 (time-based profit protection)
   - Added QUANT_SMART_MAX_HOLD=True (tighten SL instead of market-dumping profitable trades)
 
 CHANGES from v4:
@@ -172,13 +180,30 @@ QUANT_OB_WALL_MULT          = 2.5
 QUANT_TRAIL_SWING_BARS      = 5
 QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 
-# 10d. Trailing SL — v4.3 OVERHAULED
-#      Old values (v4): BE_R=0.4, LOCK_R=0.8 — too aggressive, killed win rate.
-#      Fix: don't trail until trade has PROVEN itself at 1.0R+.
-#      Only lock profit at 1.5R. Let winners run.
-QUANT_TRAIL_ENABLED         = True
-QUANT_TRAIL_BE_R            = 0.5      # v4.4: was 1.0 — START trailing at 0.5R (earlier protection)
-QUANT_TRAIL_LOCK_R          = 1.0      # v4.4: was 1.5 — LOCK profit at 1.0R (was 1.5 — too late)
+# 10d. Trailing SL — v4.5 INSTITUTIONAL REWRITE
+#
+#      v4.4 FAILURE: time-triggered BE moved SL to $71,723 (0.43×ATR from price).
+#      Normal $34 pullback clipped stop → turned $77 winner into -$0.58 loss.
+#      "Breakeven" concept is flawed: your entry price is irrelevant to the market.
+#      SL must live behind STRUCTURE, not anchored to entry.
+#
+#      INSTITUTIONAL PRINCIPLES:
+#        1. No movement until trade PROVES itself (1.0R minimum).
+#        2. SL only behind confirmed 5m swing structure.
+#        3. Pullback classifier prevents tightening during healthy retracements.
+#        4. Minimum distance = 1.5×ATR (Phase 1) → noise can never clip you.
+#
+QUANT_TRAIL_ENABLED            = True
+QUANT_TRAIL_BE_R               = 1.0   # Phase 0→1 at 1.0R (trade must PROVE itself)
+QUANT_TRAIL_LOCK_R             = 2.0   # Phase 1→2 at 2.0R (chandelier engages)
+QUANT_TRAIL_AGGRESSIVE_R       = 3.0   # Phase 2→3 at 3.0R (full mechanisms)
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.5   # Phase 1: min SL distance = 1.5×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.0   # Phase 2: 1.0×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.7   # Phase 3: 0.7×ATR
+QUANT_TRAIL_PULLBACK_FREEZE    = True  # Freeze SL during healthy pullbacks
+QUANT_TRAIL_PB_VOL_RATIO       = 0.60  # Pullback vol < 60% of impulse → healthy
+QUANT_TRAIL_PB_DEPTH_ATR       = 0.80  # Pullback < 0.8×ATR → healthy
+QUANT_TRAIL_REV_MIN_SIGNALS    = 3     # Need ≥3 of 6 reversal signals to tighten
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -249,20 +274,9 @@ QUANT_REVERSION_MAX_RR         = 3.0   # Cap reversion TP distance
 QUANT_TREND_MIN_RR             = 3.0   # Trend: let winners run
 QUANT_TREND_MAX_RR             = 5.0   # Cap trend TP distance
 
-# 10o. Time-based profit protection — v4.4 FIX
-#      v4.3 trail required 1.0R profit before activating. On a 3:1 R:R trade
-#      that means 33% of TP distance. Many trades peak at 0.5-0.8R and reverse
-#      before trail ever kicks in. Fix: after TIME_BE_SECONDS of continuous
-#      profit, force SL to breakeven regardless of R tier.
-QUANT_TIME_BE_SECONDS          = 300   # After 5 min in profit → force BE
-QUANT_TIME_TRAIL_SECONDS       = 600   # After 10 min in profit → tighten to entry+0.5ATR
-
-# 10p. Smart max-hold exit — v4.4 FIX
-#      v4.3 max-hold dumped positions via market order regardless of profit.
-#      This turned a +$174 winner into a +$2 scratch. Fix: if in profit at
-#      max hold, tighten SL to protect gains instead of market-exiting.
-QUANT_SMART_MAX_HOLD           = True  # True = tighten SL; False = old behavior (market exit)
-QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.3   # When smart-exiting in profit: SL = price - 0.3*ATR
+# 10o. Smart max-hold exit — v4.4 FIX
+QUANT_SMART_MAX_HOLD           = True  # Tighten SL instead of market-dumping profitable trades
+QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.5   # v4.5: 0.5×ATR from price (was 0.3 — too tight)
 
 # ═══════════════════════════════════════════════════════════════════
 # 11. FEE ENGINE
