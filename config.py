@@ -305,8 +305,9 @@ QUANT_MAX_SPREAD_ATR_RATIO     = 0.30  # v4.6: was 0.08 — far too tight for lo
 #      Don't inflate TP to unreachable levels — reject the setup.
 QUANT_REVERSION_MIN_RR         = 1.5   # LEGACY — no longer used for TP floor
 QUANT_REVERSION_MAX_RR         = 3.0   # Still caps max TP distance
-QUANT_TREND_MIN_RR             = 3.0   # Trend: let winners run
-QUANT_TREND_MAX_RR             = 5.0   # Cap trend TP distance
+QUANT_TREND_MIN_RR             = 2.0   # v4.7: was 3.0 → unreachable with ATR SL
+QUANT_TREND_MAX_RR             = 3.0   # v4.7: was 5.0 → cap at 3:1 for 5m scalps
+QUANT_TREND_SL_ATR_MULT        = 2.0   # v4.7: trend/momentum SL max 2×ATR from entry
 
 # 10n-v46. Natural TP placement params
 QUANT_TP_MIN_ATR_MULT          = 0.5   # TP floor: at least 0.5×ATR from entry

@@ -2570,13 +2570,46 @@ class QuantStrategy:
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
-        # ── v4.6 NOTE: SL stays at structural level (no ATR cap) ────────────
-        # The structural SL behind 5m swing is CORRECT — it's where the market
-        # proves the thesis wrong. Capping it tighter (4×ATR) killed Trade 1:
-        # SL at $71,363 (4×ATR) was hit during a temporary dip to $71,318,
-        # but structural SL at $71,216 HELD and price rallied to $71,900.
-        # The thesis-aware max-hold extension is the real fix, not SL capping.
-        # SL_MAX_ATR_MULT is retained in config for manual /set if needed.
+        # ── v4.7: Mode-aware SL sizing ────────────────────────────────────
+        #
+        # REVERSION: Keep structural swing SL. These trades enter near range
+        # boundaries where the swing defines the thesis. A dip that doesn't
+        # break the swing is expected — ATR-capping killed winners before.
+        #
+        # TREND/MOMENTUM: Use ATR-based SL, capped at 2×ATR from entry.
+        # These trades enter mid-move. The structural swing is hours old
+        # and irrelevant. With 40x leverage, a 6×ATR SL = 80% of margin
+        # at risk, and the TP (3× SL distance) becomes unreachable.
+        #
+        # The math: margin=$47, qty=0.025, 2×ATR=$470 → risk=$11.75 (25% of margin)
+        # That's a proper risk-managed scalp, not a liquidation waiting to happen.
+        #
+        if mode in ("trend", "momentum"):
+            max_sl_atr = float(_cfg("QUANT_TREND_SL_ATR_MULT", 2.0))
+            max_sl_dist = max_sl_atr * atr
+            current_dist = abs(price - sl_price)
+            if current_dist > max_sl_dist:
+                if side == "long":
+                    sl_price = _round_to_tick(price - max_sl_dist)
+                else:
+                    sl_price = _round_to_tick(price + max_sl_dist)
+                logger.info(
+                    f"📏 Trend SL capped: {current_dist:.0f} → {max_sl_dist:.0f} "
+                    f"({max_sl_atr:.1f}×ATR) | SL=${sl_price:,.2f}")
+
+            # Also enforce liquidation safety: SL must be at least 0.5×ATR
+            # ABOVE liquidation price (which is ~entry ± entry/leverage)
+            liq_buffer = 0.5 * atr
+            if side == "long":
+                liq_price = price - (price / QCfg.LEVERAGE()) * 0.95  # ~95% of margin
+                if sl_price < liq_price + liq_buffer:
+                    sl_price = _round_to_tick(liq_price + liq_buffer)
+                    logger.info(f"⚠️ SL raised above liquidation: SL=${sl_price:,.2f} liq≈${liq_price:,.2f}")
+            else:
+                liq_price = price + (price / QCfg.LEVERAGE()) * 0.95
+                if sl_price > liq_price - liq_buffer:
+                    sl_price = _round_to_tick(liq_price - liq_buffer)
+                    logger.info(f"⚠️ SL lowered below liquidation: SL=${sl_price:,.2f} liq≈${liq_price:,.2f}")
 
         if mode in ("trend", "momentum"):
             tp_price = InstitutionalLevels.compute_tp_trend(

@@ -791,6 +791,9 @@ class TelegramBotController:
             "QUANT_BO_MIN_SCORE":          (3, 6),
             "QUANT_BO_BLOCK_SEC":          (300, 1800),
             "QUANT_BO_RETEST_TIMEOUT":     (300, 1800),
+            "QUANT_TREND_SL_ATR_MULT":     (1.0, 4.0),
+            "QUANT_TREND_MIN_RR":          (1.5, 4.0),
+            "QUANT_TREND_MAX_RR":          (2.0, 6.0),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]
