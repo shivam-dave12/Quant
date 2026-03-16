@@ -15,6 +15,8 @@ from urllib.parse import urlparse, urlencode
 from dotenv import load_dotenv
 import logging
 
+import config
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
