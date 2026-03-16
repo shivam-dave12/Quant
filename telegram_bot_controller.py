@@ -1,19 +1,27 @@
 """
-Telegram Bot Controller v11 — Comprehensive Bot Control
-=========================================================
+Telegram Bot Controller v12 — Rewritten for QuantStrategy v4.8
+================================================================
+All command handlers rebuilt against the actual API:
+  - QuantStrategy   (quant_strategy.py)
+  - RiskManager     (risk_manager.py)
+  - ICTEngine       (ict_engine.py)
+  - Config          (config.py)
+
 Commands:
   /start          - Start trading bot
   /stop           - Stop trading bot
-  /status         - Full bot status + market overview
-  /structures     - Deep ICT structure analysis
+  /status         - Full bot status + ICT structures
+  /thinking       - Live signal breakdown + what is blocking entry
+  /structures     - Full ICT structure map with prices
   /position       - Current position details
   /trades         - Recent trade history
   /config         - Show current config values
   /pause          - Pause trading (keep monitoring)
   /resume         - Resume trading
   /balance        - Wallet balance
+  /trail          - Toggle trailing SL on/off/auto
   /killswitch     - Emergency: close all positions + cancel orders
-  /set <key> <val>- Live-adjust config (e.g. /set leverage 20)
+  /set <key> <val>- Live-adjust config (e.g. /set cooldown 120)
   /help           - Show commands
 """
 
@@ -24,45 +32,41 @@ import requests
 from typing import Optional
 from datetime import datetime, timezone
 import sys
-import traceback
 
 import telegram_config
 
 logger = logging.getLogger(__name__)
 
 bot_instance = None
-bot_thread = None
-bot_running = False
+bot_thread   = None
+bot_running  = False
 
 
 class TelegramBotController:
     def __init__(self):
-        self.bot_token = telegram_config.TELEGRAM_BOT_TOKEN
-        self.chat_id = str(telegram_config.TELEGRAM_CHAT_ID)
+        self.bot_token      = telegram_config.TELEGRAM_BOT_TOKEN
+        self.chat_id        = str(telegram_config.TELEGRAM_CHAT_ID)
         self.last_update_id = 0
-        self.running = False
+        self.running        = False
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
-        logger.info("TelegramBotController v11 initialized")
+        logger.info("TelegramBotController v12 initialized")
 
     # ================================================================
     # MESSAGING
     # ================================================================
 
     def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
-        """Send message with auto-truncation and error handling."""
+        """Send message with auto-chunking (Telegram 4096 char limit)."""
         try:
-            # Telegram message limit is 4096 chars
             if len(message) > 4000:
-                # Split into chunks
                 chunks = []
                 while message:
                     if len(message) <= 4000:
                         chunks.append(message)
                         break
-                    # Find a good split point
                     split_at = message.rfind('\n', 0, 4000)
                     if split_at == -1:
                         split_at = 4000
@@ -72,11 +76,9 @@ class TelegramBotController:
                     self._send_raw(chunk, parse_mode)
                     time.sleep(0.5)
                 return True
-
             return self._send_raw(message, parse_mode)
         except Exception as e:
             logger.error(f"Send error: {e}")
-            # Fallback: try without parse_mode
             try:
                 return self._send_raw(message, parse_mode=None)
             except Exception:
@@ -85,8 +87,8 @@ class TelegramBotController:
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
-            "chat_id": self.chat_id,
-            "text": text,
+            "chat_id":                  self.chat_id,
+            "text":                     text,
             "disable_web_page_preview": True,
         }
         if parse_mode:
@@ -100,8 +102,8 @@ class TelegramBotController:
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
             params = {
-                "offset": self.last_update_id + 1,
-                "timeout": timeout,
+                "offset":          self.last_update_id + 1,
+                "timeout":         timeout,
                 "allowed_updates": ["message"],
             }
             resp = requests.get(url, params=params, timeout=timeout + 5)
@@ -124,37 +126,33 @@ class TelegramBotController:
     def set_my_commands(self):
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
-
             commands = [
-                {"command": "start", "description": "Start trading bot"},
-                {"command": "stop", "description": "Stop trading bot"},
-                {"command": "status", "description": "Full status + market overview"},
-                {"command": "thinking", "description": "Deep analysis: what bot plans next"},
-                {"command": "structures", "description": "ICT structure analysis"},
-                {"command": "position", "description": "Current position details"},
-                {"command": "trades", "description": "Recent trade history"},
-                {"command": "balance", "description": "Wallet balance"},
-                {"command": "pause", "description": "Pause trading"},
-                {"command": "resume", "description": "Resume trading"},
-                {"command": "config", "description": "Show config values"},
+                {"command": "start",      "description": "Start trading bot"},
+                {"command": "stop",       "description": "Stop trading bot"},
+                {"command": "status",     "description": "Full status + ICT overview"},
+                {"command": "thinking",   "description": "Live signal breakdown"},
+                {"command": "structures", "description": "ICT structure map with prices"},
+                {"command": "position",   "description": "Current position details"},
+                {"command": "trades",     "description": "Recent trade history"},
+                {"command": "balance",    "description": "Wallet balance"},
+                {"command": "pause",      "description": "Pause trading"},
+                {"command": "resume",     "description": "Resume trading"},
+                {"command": "trail",      "description": "Toggle trailing SL on/off/auto"},
+                {"command": "config",     "description": "Show config values"},
                 {"command": "killswitch", "description": "Emergency close all"},
-                {"command": "set", "description": "Set config value"},
-                {"command": "help", "description": "Show commands"},
+                {"command": "set",        "description": "Set config value live"},
+                {"command": "help",       "description": "Show commands"},
             ]
-
             payload = {
-                "commands": commands,
-                "scope": {"type": "all_private_chats"},
-                "language_code": "en"
+                "commands":     commands,
+                "scope":        {"type": "all_private_chats"},
+                "language_code": "en",
             }
-
             resp = requests.post(url, json=payload, timeout=10)
-
             if resp.status_code != 200:
-                logger.error(f"Telegram command registration failed: {resp.text}")
+                logger.error(f"Command registration failed: {resp.text}")
             else:
-                logger.info("Telegram commands registered successfully")
-
+                logger.info("Telegram commands registered")
         except Exception as e:
             logger.error(f"Error setting commands: {e}")
 
@@ -163,27 +161,25 @@ class TelegramBotController:
     # ================================================================
 
     def _normalize_command(self, text: str) -> tuple:
-        """Parse command and arguments. Returns (command, args_string)."""
         t = (text or "").strip()
+        bare_cmds = {
+            "start", "stop", "status", "thinking", "structures", "position",
+            "trades", "config", "pause", "resume", "balance", "trail",
+            "killswitch", "set", "help",
+        }
         if not t.startswith("/"):
-            # Accept bare commands
             parts = t.split(None, 1)
-            cmd = parts[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
-            if cmd in ("start", "stop", "status", "thinking", "structures", "position",
-                        "trades", "config", "pause", "resume", "balance",
-                        "killswitch", "set", "help"):
+            cmd   = parts[0].lower()
+            args  = parts[1] if len(parts) > 1 else ""
+            if cmd in bare_cmds:
                 return f"/{cmd}", args
             return t, ""
         parts = t.split(None, 1)
         return parts[0].lower(), parts[1] if len(parts) > 1 else ""
 
     def handle_command(self, raw_text: str) -> Optional[str]:
-        """Route command to handler. Returns response text or None (if sent directly)."""
         global bot_instance, bot_thread, bot_running
-
         cmd, args = self._normalize_command(raw_text)
-
         try:
             if cmd in ("/help", "/commands"):
                 return self._cmd_help()
@@ -207,6 +203,8 @@ class TelegramBotController:
                 return self._cmd_pause()
             elif cmd == "/resume":
                 return self._cmd_resume()
+            elif cmd == "/trail":
+                return self._cmd_trail(args)
             elif cmd == "/config":
                 return self._cmd_config()
             elif cmd == "/killswitch":
@@ -217,7 +215,7 @@ class TelegramBotController:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
             logger.error(f"Command error [{cmd}]: {e}", exc_info=True)
-            return f"Error: {e}"
+            return f"❌ Error in {cmd}: {e}"
 
     # ================================================================
     # COMMAND IMPLEMENTATIONS
@@ -226,19 +224,20 @@ class TelegramBotController:
     def _cmd_help(self) -> str:
         return (
             "<b>Quant Bot v4.8 Commands</b>\n\n"
-            "/start — Start trading bot\n"
-            "/stop — Stop trading bot\n"
-            "/status — Full status + market\n"
-            "/thinking — Deep analysis: what bot plans next\n"
-            "/structures — ICT structure map\n"
-            "/position — Current position\n"
+            "/status — Full status + ICT overview\n"
+            "/thinking — Live signal breakdown + entry gates\n"
+            "/structures — ICT structure map with prices\n"
+            "/position — Current position details\n"
             "/trades — Recent trade history\n"
             "/balance — Wallet balance\n"
-            "/pause — Pause trading\n"
+            "/pause — Pause trading (keep monitoring)\n"
             "/resume — Resume trading\n"
-            "/config — Show config\n"
-            "/set &lt;key&gt; &lt;val&gt; — Adjust config\n"
-            "/killswitch — Emergency close all\n"
+            "/trail [on|off|auto] — Toggle trailing SL\n"
+            "/config — Show config values\n"
+            "/set &lt;key&gt; &lt;value&gt; — Adjust config live\n"
+            "/killswitch — Emergency: close position + cancel orders\n"
+            "/start — Start bot\n"
+            "/stop — Stop bot\n"
             "/help — This list"
         )
 
@@ -251,8 +250,8 @@ class TelegramBotController:
         bot_thread.start()
         time.sleep(2.0)
         if bot_thread.is_alive():
-            return "Starting bot... Check /status in 30s."
-        return "Start failed. Check logs."
+            return "⏳ Starting bot... Check /status in 30s."
+        return "❌ Start failed. Check logs."
 
     def _cmd_stop(self) -> str:
         global bot_instance, bot_running
@@ -262,90 +261,28 @@ class TelegramBotController:
         bot_running = False
         if bot_instance:
             bot_instance.stop()
-        return "Bot stopped."
+        return "🛑 Bot stopped."
 
     def _cmd_status(self) -> str:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running. Use /start"
-
         try:
-            bot = bot_instance
-            strat = bot.strategy
-            dm = bot.data_manager
-            rm = bot.risk_manager
-
-            if not strat or not dm or not rm:
-                return "Bot components not ready yet."
-
-            price = dm.get_last_price()
-            bal = rm.get_available_balance()
-            bal_val = float(bal.get("available", 0)) if bal else 0.0
-            stats = strat.get_strategy_stats()
-
-            pos = strat.get_position()
-            pos_line = ""
-            if pos:
-                side = pos.get("side", "?").upper()
-                entry = strat.initial_entry_price or 0
-                sl = strat.current_sl_price or 0
-                tp = strat.current_tp_price or 0
-                upnl = pos.get("unrealized_pnl", 0)
-                pos_line = (
-                    f"\n<b>POSITION</b>\n"
-                    f"  {side} Entry: ${entry:,.2f}\n"
-                    f"  SL: ${sl:,.2f} | TP: ${tp:,.2f}\n"
-                    f"  uPnL: ${upnl:+,.2f}\n"
-                    f"  BE: {'YES' if strat.breakeven_moved else 'NO'}"
-                )
-
-            # Regime info
-            rs = strat.regime_engine.state
-            regime_line = f"Regime: {rs.regime} (ADX {rs.adx:.1f})"
-
-            # Session info
-            session_line = (
-                f"Session: {strat.current_session}"
-                f"{' | KZ' if strat.in_killzone else ''}"
-                f" | AMD: {strat.amd_phase}"
-            )
-
-            msg = (
-                f"<b>Quant Bot v4.8 Status</b>\n"
-                f"{'=' * 30}\n"
-                f"Price: <b>${price:,.2f}</b>\n"
-                f"Balance: <b>${bal_val:,.2f}</b> USDT\n"
-                f"State: <b>{strat.state}</b>\n\n"
-                f"HTF: <b>{strat.htf_bias}</b> ({strat.htf_bias_strength:.0%})\n"
-                f"Daily: {strat.daily_bias}\n"
-                f"{regime_line}\n"
-                f"{session_line}\n\n"
-                f"<b>Performance</b>\n"
-                f"  Trades: {stats.get('total_exits', 0)}\n"
-                f"  Win Rate: {stats.get('win_rate_pct', 0):.1f}%\n"
-                f"  Daily P&L: ${stats.get('daily_pnl', 0):+,.2f}\n"
-                f"  Total P&L: ${stats.get('total_pnl', 0):+,.2f}\n"
-                f"  Consec Losses: {stats.get('consecutive_losses', 0)}\n\n"
-                f"<b>Structures</b>\n"
-                f"  OBs: {stats.get('bull_obs', 0)}B / {stats.get('bear_obs', 0)}S\n"
-                f"  FVGs: {stats.get('bull_fvgs', 0)}B / {stats.get('bear_fvgs', 0)}S\n"
-                f"  Liquidity: {stats.get('liq_pools', 0)} pools\n"
-                f"  Swings: {stats.get('swing_highs', 0)}H / {stats.get('swing_lows', 0)}L\n"
-                f"  MSS: {stats.get('ms_count', 0)}"
-                f"{pos_line}"
-            )
-
-            self.send_message(msg)
+            strat = bot_instance.strategy
+            if not strat:
+                return "Strategy not ready."
+            # format_status_report() includes regime, ICT, PnL, active position
+            report = strat.format_status_report()
+            self.send_message(report)
             return None
-
         except Exception as e:
             logger.error(f"Status error: {e}", exc_info=True)
-            return f"Status error: {e}"
+            return f"❌ Status error: {e}"
 
     def _cmd_thinking(self) -> str:
         """
-        Deep analysis: what the bot sees, what it plans, and what's blocking it.
-        Runs a full dry-run of the entry evaluation for both sides.
+        Live signal breakdown — shows exactly what the bot sees and what
+        is blocking or allowing entry. Uses QuantStrategy's actual internals.
         """
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
@@ -353,181 +290,190 @@ class TelegramBotController:
 
         try:
             import config as cfg
-            bot = bot_instance
-            strat = bot.strategy
-            dm = bot.data_manager
-            rm = bot.risk_manager
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
+            rm    = bot_instance.risk_manager
 
             if not strat or not dm or not rm:
-                return "Bot components not ready yet."
+                return "Components not ready."
 
             price = dm.get_last_price()
-            now_ms = int(time.time() * 1000)
+            now   = time.time()
+            sig   = strat._last_sig   # SignalBreakdown — always populated after first tick
 
-            lines = [f"<b>🧠 BOT THINKING @ ${price:,.1f}</b>\n"]
+            # ── Header ────────────────────────────────────────────────────────
+            lines = [f"<b>🧠 THINKING @ ${price:,.2f}</b>\n"]
 
-            # ── 1. Market context ────────────────────────────────
-            rs = strat.regime_engine.state
-            lines.append(f"<b>Context</b>")
-            lines.append(f"  HTF: <b>{strat.htf_bias}</b> ({strat.htf_bias_strength:.0%})")
-            lines.append(f"  Daily: {strat.daily_bias}")
-            lines.append(f"  Regime: {rs.regime} (ADX {rs.adx:.1f}, ATR×{rs.atr_ratio:.2f})")
-            lines.append(f"  Session: {strat.current_session}"
-                         f"{' | KZ' if strat.in_killzone else ''}"
-                         f" | AMD: {strat.amd_phase}")
-            lines.append(f"  State: <b>{strat.state}</b>")
+            # ── Market context ────────────────────────────────────────────────
+            regime_val = getattr(strat._regime, '_regime', None)
+            regime_str = regime_val.value if regime_val else "UNKNOWN"
+            conf       = getattr(strat._regime, '_confidence', 0.0)
+            adx_val    = strat._adx.adx
+            pdi        = strat._adx.plus_di
+            mdi        = strat._adx.minus_di
+            trend_dir  = strat._adx.trend_direction()
+            atr        = strat._atr_5m.atr
+            atr_pct    = strat._atr_5m.get_percentile()
+            vwap       = strat._vwap.vwap
+            dev_atr    = strat._vwap.deviation_atr
+            htf_15m    = strat._htf.trend_15m
+            htf_4h     = strat._htf.trend_4h
+            htf_str    = ("BULLISH" if htf_4h >  0.3
+                          else ("BEARISH" if htf_4h < -0.3 else "NEUTRAL"))
 
-            # ── Dealing ranges ──────────────────────────────────
-            ndr = strat._ndr
-            if ndr.daily:
-                d = ndr.daily
-                zone = d.zone_pct(price)
-                zone_label = "PREMIUM" if d.is_premium(price) else ("DISCOUNT" if d.is_discount(price) else "EQ")
-                lines.append(f"  DR Daily: ${d.low:,.0f}–${d.high:,.0f} ({zone_label} {zone*100:.0f}%)")
-            if ndr.intraday:
-                i = ndr.intraday
-                lines.append(f"  DR Intra: ${i.low:,.0f}–${i.high:,.0f}")
+            ict    = strat._ict
+            sess   = ict._session  if ict else "N/A"
+            kz     = ict._killzone if ict else ""
+            kz_str = f" [{kz}]" if kz else ""
 
-            # ── Range-bound mode ────────────────────────────────
-            rb_active = strat._is_range_bound_mode()
-            if rb_active:
-                rb_dr = strat._get_range_bound_dr()
-                if rb_dr:
-                    z = rb_dr.zone_pct(price)
-                    lines.append(f"\n📊 <b>RANGE-BOUND MODE ACTIVE</b>")
-                    lines.append(f"  DR: ${rb_dr.low:,.0f}–${rb_dr.high:,.0f} (zone {z*100:.0f}%)")
-                    lines.append(f"  Long zone: below {cfg.RANGE_BOUND_DISCOUNT_ENTRY*100:.0f}% ({'✅ YES' if z <= cfg.RANGE_BOUND_DISCOUNT_ENTRY else '❌ NO'})")
-                    lines.append(f"  Short zone: above {cfg.RANGE_BOUND_PREMIUM_ENTRY*100:.0f}% ({'✅ YES' if z >= cfg.RANGE_BOUND_PREMIUM_ENTRY else '❌ NO'})")
-                    lines.append(f"  Trades today: {strat._range_bound_daily_trades}/{cfg.RANGE_BOUND_MAX_DAILY_TRADES}")
-            elif strat.htf_bias == "NEUTRAL":
-                lines.append(f"\n📊 Range-bound: INACTIVE")
-                if rs.adx > cfg.RANGE_BOUND_MAX_ADX:
-                    lines.append(f"  ❌ ADX {rs.adx:.1f} > {cfg.RANGE_BOUND_MAX_ADX} (too directional)")
-                rb_dr = strat._get_range_bound_dr()
-                if rb_dr is None:
-                    lines.append(f"  ❌ No valid DR within size bounds")
+            lines.append("<b>Market Context</b>")
+            lines.append(f"  Price: ${price:,.2f}  VWAP: ${vwap:,.2f}  Dev: {dev_atr:+.2f}ATR")
+            lines.append(f"  ATR(5m): ${atr:.1f}  ({atr_pct:.0%} pctile)")
+            lines.append(f"  Regime: <b>{regime_str}</b>  (conf={conf:.0%})")
+            lines.append(f"  ADX: {adx_val:.1f}  +DI: {pdi:.1f}  -DI: {mdi:.1f}  dir={trend_dir}")
+            lines.append(f"  HTF: {htf_str}  (4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
+            lines.append(f"  Session: {sess}{kz_str}")
 
-            # ── 2. Risk manager gate ────────────────────────────
-            can_trade, risk_reason = rm.can_trade()
-            if can_trade:
-                lines.append(f"\n✅ Risk gate: CLEAR")
+            # ── Risk gate ─────────────────────────────────────────────────────
+            lines.append("")
+            can_ok, risk_reason = rm.can_trade()
+            daily_trades = len(getattr(rm, 'daily_trades', []))
+            max_trades   = getattr(rm, 'max_daily_trades',
+                                   getattr(cfg, 'MAX_DAILY_TRADES', 8))
+            consec_loss  = getattr(rm, 'consecutive_losses', 0)
+            daily_pnl    = getattr(rm, 'daily_pnl', 0.0)
+
+            if can_ok:
+                lines.append(
+                    f"✅ Risk gate: CLEAR  "
+                    f"({daily_trades}/{max_trades} trades  "
+                    f"consec_loss={consec_loss}  today=${daily_pnl:+.2f})")
             else:
-                lines.append(f"\n🚫 Risk gate: <b>BLOCKED</b>")
-                lines.append(f"  {risk_reason}")
+                lines.append(f"🚫 Risk gate: <b>BLOCKED</b>  → {risk_reason}")
 
-            # ── 3. Trade plans (dry-run both sides) ──────────────
-            plans = {}  # store for "What needs to change?" section below
-            for side in ["long", "short"]:
-                plan = strat._build_trade_plan(side, price, dm, now_ms)
-                plans[side] = plan
-                status = plan.get("status", "?")
-                label = side.upper()
-                rb_tag = " [RANGE]" if plan.get("range_bound") else ""
+            # ── Cooldown ──────────────────────────────────────────────────────
+            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
+            cd_remaining = max(0.0, cooldown_sec - (now - strat._last_exit_time))
+            if cd_remaining > 0:
+                lines.append(f"⏳ Trade cooldown: {cd_remaining:.0f}s remaining")
+            else:
+                lines.append(f"✅ Cooldown: ready")
 
-                lines.append(f"\n{'─' * 25}")
-                if status == "READY":
-                    lines.append(f"🎯 <b>{label}{rb_tag}: READY</b>")
-                    lines.append(f"  Entry: ${plan.get('entry', 0):,.1f}")
-                    lines.append(f"  SL: ${plan.get('sl', 0):,.1f} ({plan.get('sl_reason', '?')})")
-                    lines.append(f"  TP: ${plan.get('tp', 0):,.1f} ({plan.get('tp_reason', '?')})")
-                    lines.append(f"  RR: {plan.get('rr', 0):.1f}x")
-                    lines.append(f"  Score: {plan.get('score', 0):.0f}/{plan.get('threshold', 0):.0f}")
-                    if plan.get("reasons"):
-                        top = plan["reasons"][:5]
-                        lines.append(f"  Reasons: {', '.join(top)}")
-                else:
-                    icon = "⛔"
-                    lines.append(f"{icon} <b>{label}{rb_tag}: {status}</b>")
-                    gate = plan.get("gate_failed", "unknown")
-                    lines.append(f"  Reason: {gate}")
+            # ── Breakout state ────────────────────────────────────────────────
+            bo = strat._breakout
+            if bo.is_active:
+                retest = "RETEST READY ✅" if bo.retest_ready else "waiting for pullback retest"
+                lines.append(f"🚀 Breakout {bo.direction.upper()} active — {retest}")
 
-                    # Show what's missing
-                    if plan.get("missing"):
-                        lines.append(f"  Need: {plan['missing']}")
+            # ── Signal bars ───────────────────────────────────────────────────
+            lines.append("")
+            lines.append("<b>Signals (last eval)</b>")
 
-                    # Show partial score if we got that far
-                    if plan.get("score"):
-                        threshold = plan.get("threshold", 0)
-                        score = plan.get("score", 0)
-                        lines.append(f"  Score: {score:.0f}"
-                                     + (f"/{threshold:.0f}" if threshold else ""))
-                        if plan.get("reasons"):
-                            top = plan["reasons"][:4]
-                            lines.append(f"  {', '.join(top)}")
+            def bar(v, w=10):
+                h = w // 2
+                f = min(int(abs(v) * h + 0.5), h)
+                return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
+                    else ("░" * (h - f) + "█" * f + "·" * h)
 
-            # ── 4. What needs to change ──────────────────────────
-            lines.append(f"\n{'─' * 25}")
-            lines.append(f"<b>What needs to change?</b>")
+            def sig_line(label, val):
+                arrow = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
+                return f"  {label:<7} {bar(val)} {arrow} {val:+.3f}"
 
-            added = False
+            lines.append(sig_line("VWAP",  sig.vwap_dev))
+            lines.append(sig_line("CVD",   sig.cvd_div))
+            lines.append(sig_line("OB",    sig.orderbook))
+            lines.append(sig_line("TICK",  sig.tick_flow))
+            lines.append(sig_line("VEX",   sig.vol_exhaust))
+            if sig.ict_total > 0.01:
+                lines.append(sig_line("ICT",   sig.ict_total))
 
-            # State-level blockers
-            if strat.state == "POSITION_ACTIVE":
-                lines.append("• Position already active — managing SL/TP")
-                added = True
-            elif strat.state == "ENTRY_PENDING":
-                lines.append("• Entry order pending fill")
-                added = True
+            lines.append(f"  {'─' * 32}")
+            thr      = getattr(cfg, 'QUANT_COMPOSITE_ENTRY_MIN', 0.30)
+            c        = sig.composite
+            side_lbl = (sig.reversion_side.upper()
+                        if sig.reversion_side else "?")
+            lines.append(f"  Σ = {c:+.4f}  (threshold ±{thr:.3f})  side={side_lbl}")
+            lines.append(f"  Confirming: {sig.n_confirming}/{'6' if ict else '5'} signals")
 
-            # Risk gate
-            if not can_trade:
-                lines.append(f"• Risk gate blocked: {risk_reason}")
-                added = True
+            # ── Entry gates ───────────────────────────────────────────────────
+            lines.append("")
+            lines.append("<b>Entry Gates</b>")
+            g_ext  = sig.overextended
+            g_reg  = sig.regime_ok
+            g_htf  = not sig.htf_veto
+            g_conf = sig.n_confirming >= 3
+            g_comp = abs(c) >= thr
+            all_pass = g_ext and g_reg and g_htf and g_conf and g_comp
 
-            # Bias/regime context
-            if strat.htf_bias == "NEUTRAL":
-                if rb_active:
-                    lines.append("• Price must reach DR extremes (discount for long, premium for short)")
-                else:
-                    lines.append("• HTF bias must turn directional (BULLISH or BEARISH)")
-                    lines.append(f"  OR ADX must drop below {getattr(cfg, 'RANGE_BOUND_MAX_ADX', 22)} for range-bound mode")
-                added = True
+            entry_mult = getattr(cfg, 'QUANT_VWAP_ENTRY_ATR_MULT', 1.2)
+            lines.append(
+                f"  {'✅' if g_ext  else '❌'} Overextended   "
+                f"({dev_atr:+.2f} ATR from VWAP  need ≥{entry_mult:.1f})")
+            lines.append(
+                f"  {'✅' if g_reg  else '❌'} ATR regime     "
+                f"({atr_pct:.0%} pctile)")
+            lines.append(
+                f"  {'✅' if g_htf  else '❌'} HTF veto       "
+                f"(4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
+            lines.append(
+                f"  {'✅' if g_conf else '❌'} Confluence     "
+                f"({sig.n_confirming}/{'6' if ict else '5'} signals agree)")
+            lines.append(
+                f"  {'✅' if g_comp else '❌'} Composite      "
+                f"({c:+.3f}  threshold ±{thr:.3f})")
 
-            # Per-side plan blockers — the most useful part
-            for s, plan in plans.items():
-                status = plan.get("status", "")
-                if status == "READY":
-                    continue  # nothing to report for ready side
-                label = s.upper()
-                gate = plan.get("gate_failed") or ""
-                missing = plan.get("missing") or ""
-                score = plan.get("score", 0)
-                threshold = plan.get("threshold", 0)
+            # ICT detail line
+            if ict and ict._initialized:
+                lines.append(
+                    f"  🏛️ ICT Σ={sig.ict_total:.2f}  "
+                    f"OB={sig.ict_ob:.2f}  FVG={sig.ict_fvg:.2f}  "
+                    f"Sweep={sig.ict_sweep:.2f}  KZ={sig.ict_session:.2f}")
+                if sig.ict_details:
+                    lines.append(f"     → {sig.ict_details}")
+            elif ict:
+                nb = len(list(ict.order_blocks_bull))
+                ns = len(list(ict.order_blocks_bear))
+                lines.append(f"  🏛️ ICT: warming up ({nb}🟢 {ns}🔴 OBs so far)")
 
-                if gate or missing:
-                    lines.append(f"\n{label} needs:")
-                    if gate:
-                        lines.append(f"  • {gate}")
-                    if missing:
-                        lines.append(f"  • {missing}")
-                    if score and threshold and score < threshold:
-                        lines.append(f"  • Score {score:.0f}/{threshold:.0f} — needs {threshold - score:.0f} more pts")
-                    added = True
+            # ── Verdict ───────────────────────────────────────────────────────
+            lines.append("")
+            if all_pass and can_ok and cd_remaining == 0:
+                cn_long  = getattr(strat, '_confirm_long', 0)
+                cn_short = getattr(strat, '_confirm_short', 0)
+                cn_need  = getattr(cfg, 'QUANT_CONFIRM_TICKS', 2)
+                lines.append(
+                    f"🎯 <b>ALL PASS — confirming entry</b>  "
+                    f"({max(cn_long, cn_short)}/{cn_need} ticks)")
+            else:
+                missing = []
+                if not g_ext:
+                    missing.append(
+                        f"VWAP dev {abs(dev_atr):.2f}ATR < {entry_mult:.1f}ATR required")
+                if not g_reg:
+                    missing.append(f"ATR regime gate ({atr_pct:.0%} pctile)")
+                if not g_htf:
+                    veto_dir = "LONG" if htf_4h < 0 else "SHORT"
+                    missing.append(f"HTF vetoing {veto_dir}")
+                if not g_conf:
+                    missing.append(
+                        f"Only {sig.n_confirming}/{'6' if ict else '5'} signals agree (need 3)")
+                if not g_comp:
+                    missing.append(f"Composite {c:+.3f} < ±{thr:.3f}")
+                if not can_ok:
+                    missing.append(f"Risk gate: {risk_reason}")
+                if cd_remaining > 0:
+                    missing.append(f"Cooldown {cd_remaining:.0f}s")
 
-            # Nearest structure zones
-            se = getattr(strat, 'structure_engine', None)
-            if se:
-                zone_lines = []
-                for s in ["long", "short"]:
-                    zone = se.get_best_entry_zone(s, price, now_ms)
-                    if zone:
-                        z_lo, z_hi, z_type = zone
-                        dist = abs(price - (z_lo + z_hi) / 2) / price * 100
-                        zone_lines.append(f"• Nearest {s.upper()} zone: {z_type} ${z_lo:,.0f}–${z_hi:,.0f} ({dist:.2f}% away)")
-                if zone_lines:
-                    lines.append("")
-                    lines.extend(zone_lines)
-                    added = True
-
-            if not added:
-                lines.append("• No specific blockers identified — waiting for structure")
+                lines.append("👀 <b>Watching</b>")
+                for m in missing:
+                    lines.append(f"   • {m}")
 
             self.send_message("\n".join(lines))
             return None
 
         except Exception as e:
             logger.error(f"Thinking error: {e}", exc_info=True)
-            return f"Error: {e}"
+            return f"❌ Thinking error: {e}"
 
     def _cmd_structures(self) -> str:
         global bot_instance, bot_running
@@ -535,16 +481,14 @@ class TelegramBotController:
             return "Bot not running."
 
         try:
-            bot  = bot_instance
-            strat = bot.strategy
-            dm    = bot.data_manager
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
             if not strat or not dm:
                 return "Components not ready."
 
             price  = dm.get_last_price()
             now_ms = int(time.time() * 1000)
 
-            # ICT engine lives at strat._ict (ICTEngine instance)
             ict = getattr(strat, '_ict', None)
             if ict is None:
                 return "❌ ICT engine not available (ict_engine.py not loaded)."
@@ -553,44 +497,42 @@ class TelegramBotController:
                 ns = len(list(ict.order_blocks_bear))
                 return (f"⏳ ICT engine warming up...\n"
                         f"Detected so far: {nb}🟢 {ns}🔴 OBs\n"
-                        f"Need ≥10 candles and 5s update cycle to complete.")
+                        f"Need ≥10 candles + 5s update cycle.")
 
-            atr   = getattr(strat, '_atr_5m', None)
-            atr_v = atr.atr if atr else 0.0
-            if atr_v < 1e-10:
-                atr_v = price * 0.002   # rough 0.2% fallback for display only
+            atr_eng = getattr(strat, '_atr_5m', None)
+            atr_v   = atr_eng.atr if atr_eng and atr_eng.atr > 1e-10 else price * 0.002
 
-            st    = ict.get_full_status(price, atr_v, now_ms)
-            c     = st["counts"]
-            sess  = st.get("session", "UNKNOWN")
-            kz    = st.get("killzone", "")
-            kz_str = f" [{kz}]" if kz else ""
+            st   = ict.get_full_status(price, atr_v, now_ms)
+            c    = st["counts"]
+            sess = st.get("session", "UNKNOWN")
+            kz   = st.get("killzone", "")
+            kz_s = f" [{kz}]" if kz else ""
 
             lines = [
                 f"🏛️ <b>ICT Structures @ ${price:,.1f}</b>",
-                f"Session: {sess}{kz_str}  |  ATR(5m): ${atr_v:.1f}",
-                f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
-                f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
-                f"Liq: {c['liq_active']} active / {c['liq_swept']} swept",
-                ""
+                f"Session: {sess}{kz_s}  |  ATR(5m): ${atr_v:.1f}",
+                (f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
+                 f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
+                 f"Liq: {c['liq_active']} active / {c['liq_swept']} swept"),
+                "",
             ]
 
-            # ── BULLISH ORDER BLOCKS ──────────────────────────────────────
+            # ── Bullish OBs ──────────────────────────────────────────────
             if st["bull_obs"]:
                 lines.append("<b>🟢 Bullish Order Blocks</b>")
-                for ob in st["bull_obs"][:6]:
-                    ote_zone_lo = ob["high"] - 0.79 * (ob["high"] - ob["low"])
-                    ote_zone_hi = ob["high"] - 0.50 * (ob["high"] - ob["low"])
-                    tags = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
-                    in_tag = " ◄ PRICE IN OB" if ob["in_ob"] else (" ← OTE ZONE" if ob["in_ote"] else "")
-                    bos = " BOS✓" if ob["bos"] else ""
+                for ob in st["bull_obs"][:5]:
+                    ote_lo = ob["high"] - 0.79 * (ob["high"] - ob["low"])
+                    ote_hi = ob["high"] - 0.50 * (ob["high"] - ob["low"])
+                    tags   = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
+                    in_tag = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+                    bos    = " BOS✓" if ob["bos"] else ""
                     lines.append(
-                        f"  ${ob['low']:,.1f} ─ ${ob['high']:,.1f}  "
+                        f"  ${ob['low']:,.1f} – ${ob['high']:,.1f}  "
                         f"mid=${ob['midpoint']:,.1f}  "
-                        f"dist={ob['dist_pts']:+.1f}pts ({ob['dist_atr']:.2f}ATR)\n"
-                        f"    str={ob['strength']:.0f}  visits={ob['visit_count']}  "
+                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.2f}ATR\n"
+                        f"    str={ob['strength']:.0f}  v={ob['visit_count']}  "
                         f"age={ob['age_min']:.0f}m  "
-                        f"OTE: ${ote_zone_lo:,.1f}─${ote_zone_hi:,.1f}"
+                        f"OTE:${ote_lo:,.0f}–${ote_hi:,.0f}"
                         f"{bos} {tags}{in_tag}"
                     )
             else:
@@ -598,22 +540,22 @@ class TelegramBotController:
 
             lines.append("")
 
-            # ── BEARISH ORDER BLOCKS ──────────────────────────────────────
+            # ── Bearish OBs ──────────────────────────────────────────────
             if st["bear_obs"]:
                 lines.append("<b>🔴 Bearish Order Blocks</b>")
-                for ob in st["bear_obs"][:6]:
-                    ote_zone_lo = ob["low"] + 0.50 * (ob["high"] - ob["low"])
-                    ote_zone_hi = ob["low"] + 0.79 * (ob["high"] - ob["low"])
-                    tags = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
-                    in_tag = " ◄ PRICE IN OB" if ob["in_ob"] else (" ← OTE ZONE" if ob["in_ote"] else "")
-                    bos = " BOS✓" if ob["bos"] else ""
+                for ob in st["bear_obs"][:5]:
+                    ote_lo = ob["low"] + 0.50 * (ob["high"] - ob["low"])
+                    ote_hi = ob["low"] + 0.79 * (ob["high"] - ob["low"])
+                    tags   = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
+                    in_tag = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+                    bos    = " BOS✓" if ob["bos"] else ""
                     lines.append(
-                        f"  ${ob['low']:,.1f} ─ ${ob['high']:,.1f}  "
+                        f"  ${ob['low']:,.1f} – ${ob['high']:,.1f}  "
                         f"mid=${ob['midpoint']:,.1f}  "
-                        f"dist={ob['dist_pts']:+.1f}pts ({ob['dist_atr']:.2f}ATR)\n"
-                        f"    str={ob['strength']:.0f}  visits={ob['visit_count']}  "
+                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.2f}ATR\n"
+                        f"    str={ob['strength']:.0f}  v={ob['visit_count']}  "
                         f"age={ob['age_min']:.0f}m  "
-                        f"OTE: ${ote_zone_lo:,.1f}─${ote_zone_hi:,.1f}"
+                        f"OTE:${ote_lo:,.0f}–${ote_hi:,.0f}"
                         f"{bos} {tags}{in_tag}"
                     )
             else:
@@ -621,164 +563,209 @@ class TelegramBotController:
 
             lines.append("")
 
-            # ── FAIR VALUE GAPS ───────────────────────────────────────────
+            # ── FVGs ─────────────────────────────────────────────────────
             all_fvgs = st["bull_fvgs"][:3] + st["bear_fvgs"][:3]
             if all_fvgs:
                 lines.append("<b>Fair Value Gaps</b>")
                 for fvg in sorted(all_fvgs, key=lambda x: abs(x["dist_pts"])):
-                    icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
-                    in_tag = " ◄ PRICE IN GAP" if fvg["in_gap"] else ""
+                    icon   = "🟦" if fvg["direction"] == "bullish" else "🟥"
+                    in_tag = " ◄ IN GAP" if fvg["in_gap"] else ""
                     lines.append(
-                        f"  {icon} ${fvg['bottom']:,.1f} ─ ${fvg['top']:,.1f}  "
+                        f"  {icon} ${fvg['bottom']:,.1f}–${fvg['top']:,.1f}  "
                         f"size=${fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
-                        f"dist={fvg['dist_pts']:+.1f}pts ({fvg['dist_atr']:.2f}ATR)  "
+                        f"{fvg['dist_pts']:+.0f}pts/{fvg['dist_atr']:.2f}ATR  "
                         f"age={fvg['age_min']:.0f}m{in_tag}"
                     )
             else:
-                lines.append("No active FVGs near price")
+                lines.append("No active FVGs")
 
             lines.append("")
 
-            # ── LIQUIDITY POOLS ───────────────────────────────────────────
-            # Show all within 5×ATR
+            # ── Liquidity ────────────────────────────────────────────────
             nearby = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 5.0 * atr_v]
             if nearby:
                 lines.append("<b>💧 Liquidity Pools</b>")
-                eqh = sorted([l for l in nearby if l["pool_type"] == "EQH"], key=lambda x: x["price"], reverse=True)
-                eql = sorted([l for l in nearby if l["pool_type"] == "EQL"], key=lambda x: x["price"], reverse=True)
+                eqh = sorted(
+                    [l for l in nearby if l["pool_type"] == "EQH"],
+                    key=lambda x: x["price"], reverse=True)
+                eql = sorted(
+                    [l for l in nearby if l["pool_type"] == "EQL"],
+                    key=lambda x: x["price"], reverse=True)
                 for l in eqh[:4]:
-                    dist_atr = abs(l["dist_pts"]) / atr_v
                     lines.append(
-                        f"  EQH ▲ ${l['price']:,.1f}  "
-                        f"x{l['touch_count']}  dist={l['dist_pts']:+.1f}pts ({dist_atr:.2f}ATR)")
+                        f"  EQH ▲ ${l['price']:,.1f}  x{l['touch_count']}  "
+                        f"{l['dist_pts']:+.0f}pts/{abs(l['dist_pts'])/atr_v:.2f}ATR")
                 for l in eql[:4]:
-                    dist_atr = abs(l["dist_pts"]) / atr_v
                     lines.append(
-                        f"  EQL ▼ ${l['price']:,.1f}  "
-                        f"x{l['touch_count']}  dist={l['dist_pts']:+.1f}pts ({dist_atr:.2f}ATR)")
+                        f"  EQL ▼ ${l['price']:,.1f}  x{l['touch_count']}  "
+                        f"{l['dist_pts']:+.0f}pts/{abs(l['dist_pts'])/atr_v:.2f}ATR")
 
-            # Recent sweeps
             if st["liq_swept"]:
                 lines.append("<b>🌊 Recent Sweeps</b>")
-                for l in st["liq_swept"][:4]:
+                for l in st["liq_swept"][:3]:
                     disp = "DISP✓" if l["displacement"] else "weak"
-                    wick = "WR✓" if l["wick_rejection"] else ""
-                    age  = f"{l['sweep_age_min']:.0f}m ago" if l["sweep_age_min"] is not None else ""
+                    wick = " WR✓" if l["wick_rejection"] else ""
+                    age  = (f"{l['sweep_age_min']:.0f}m ago"
+                            if l["sweep_age_min"] is not None else "")
                     lines.append(
-                        f"  {l['pool_type']} ${l['price']:,.1f}  [{disp} {wick}]  {age}")
+                        f"  {l['pool_type']} ${l['price']:,.1f}  [{disp}{wick}]  {age}")
 
             lines.append("")
 
-            # ── SWING LEVELS ──────────────────────────────────────────────
-            sh_above = st["swing_highs"][:5]
-            sl_below = st["swing_lows"][:5]
-            if sh_above or sl_below:
+            # ── Swing levels ─────────────────────────────────────────────
+            sh = st["swing_highs"][:4]
+            sl = st["swing_lows"][:4]
+            if sh or sl:
                 lines.append("<b>📌 Swing Levels</b>")
-                if sh_above:
-                    sh_str = "  ".join(
-                        f"${h:,.1f}(+{h-price:.0f})" for h in sh_above)
+                if sh:
+                    sh_str = "  ".join(f"${h:,.0f}(+{h-price:.0f})" for h in sh)
                     lines.append(f"  Highs ▲: {sh_str}")
-                if sl_below:
-                    sl_str = "  ".join(
-                        f"${l:,.1f}({l-price:.0f})" for l in sl_below)
+                if sl:
+                    sl_str = "  ".join(f"${l:,.0f}({l-price:.0f})" for l in sl)
                     lines.append(f"  Lows  ▼: {sl_str}")
 
-            # ── ICT CONFLUENCE SCORE ──────────────────────────────────────
             lines.append("")
-            # Score for both sides
-            long_conf  = ict.get_confluence("long",  price, now_ms)
-            short_conf = ict.get_confluence("short", price, now_ms)
+
+            # ── Confluence scores both sides ──────────────────────────────
+            long_c  = ict.get_confluence("long",  price, now_ms)
+            short_c = ict.get_confluence("short", price, now_ms)
             lines.append("<b>Confluence Scores</b>")
             lines.append(
-                f"  LONG  Σ={long_conf.total:.2f}  "
-                f"OB={long_conf.ob_score:.2f}  FVG={long_conf.fvg_score:.2f}  "
-                f"Sweep={long_conf.sweep_score:.2f}  KZ={long_conf.session_score:.2f}")
-            if long_conf.details:
-                lines.append(f"    → {long_conf.details}")
+                f"  LONG  Σ={long_c.total:.2f}  "
+                f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
+                f"Sweep={long_c.sweep_score:.2f}  KZ={long_c.session_score:.2f}")
+            if long_c.details:
+                lines.append(f"    → {long_c.details}")
             lines.append(
-                f"  SHORT Σ={short_conf.total:.2f}  "
-                f"OB={short_conf.ob_score:.2f}  FVG={short_conf.fvg_score:.2f}  "
-                f"Sweep={short_conf.sweep_score:.2f}  KZ={short_conf.session_score:.2f}")
-            if short_conf.details:
-                lines.append(f"    → {short_conf.details}")
+                f"  SHORT Σ={short_c.total:.2f}  "
+                f"OB={short_c.ob_score:.2f}  FVG={short_c.fvg_score:.2f}  "
+                f"Sweep={short_c.sweep_score:.2f}  KZ={short_c.session_score:.2f}")
+            if short_c.details:
+                lines.append(f"    → {short_c.details}")
 
             self.send_message("\n".join(lines))
             return None
 
         except Exception as e:
             logger.error(f"Structures error: {e}", exc_info=True)
-            return f"❌ Error: {e}"
+            return f"❌ Structures error: {e}"
 
     def _cmd_position(self) -> str:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+
         strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
         if not strat:
             return "Strategy not ready."
 
         pos = strat.get_position()
         if not pos:
-            return "No active position."
+            return "📭 No active position."
 
-        side = pos.get("side", "?").upper()
-        entry = strat.initial_entry_price or 0
-        sl = strat.current_sl_price or 0
-        tp = strat.current_tp_price or 0
-        qty = strat.entry_quantity
-        upnl = pos.get("unrealized_pnl", 0)
-        price = bot_instance.data_manager.get_last_price() if bot_instance.data_manager else 0
+        # Access PositionState directly — these fields are guaranteed
+        p     = strat._pos
+        price = dm.get_last_price() if dm else 0.0
+        atr   = strat._atr_5m.atr
 
-        risk = abs(entry - sl) if entry and sl else 0
-        if risk > 0 and entry:
-            current_r = (price - entry) / risk if side == "LONG" else (entry - price) / risk
+        side    = p.side.upper()
+        entry   = p.entry_price
+        sl      = p.sl_price
+        tp      = p.tp_price
+        qty     = p.quantity
+        mode    = p.trade_mode
+        phase   = p.phase.name
+
+        sl_dist = abs(entry - sl) if sl > 0 else 0.0
+
+        if sl_dist > 1e-10:
+            current_r = ((price - entry) / sl_dist if side == "LONG"
+                         else (entry - price) / sl_dist)
         else:
-            current_r = 0
+            current_r = 0.0
 
-        msg = (
-            f"<b>Active Position</b>\n"
-            f"Side: <b>{side}</b>\n"
-            f"Entry: ${entry:,.2f}\n"
-            f"Current: ${price:,.2f}\n"
-            f"Qty: {qty:.4f} BTC\n\n"
-            f"SL: ${sl:,.2f}\n"
+        upnl = ((price - entry) * qty if side == "LONG"
+                else (entry - price) * qty)
+
+        hold_min     = (time.time() - p.entry_time) / 60.0 if p.entry_time > 0 else 0.0
+        trail_state  = "✅ active" if p.trail_active else "⏳ waiting"
+        peak_profit  = getattr(p, 'peak_profit', 0.0)
+        init_sl_dist = getattr(p, 'initial_sl_dist', sl_dist)
+        mfe_r        = peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        be_moved     = ((side == "LONG"  and sl >= entry) or
+                        (side == "SHORT" and sl <= entry and sl > 0))
+
+        # Entry signal context
+        sig_lines = []
+        if p.entry_signal:
+            es = p.entry_signal
+            sig_lines.append(
+                f"\n<b>Entry signal:</b>  Σ={es.composite:+.3f}  "
+                f"regime={es.market_regime}  ADX={es.adx:.1f}")
+            if es.ict_total > 0.01:
+                sig_lines.append(
+                    f"ICT: {es.ict_total:.2f} [{es.ict_details}]")
+
+        return (
+            f"<b>Active Position — {side}</b>\n"
+            f"Mode: {mode.upper()}  |  Phase: {phase}\n\n"
+            f"Entry:   ${entry:,.2f}\n"
+            f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
+            f"uPnL:    ${upnl:+,.2f}\n"
+            f"Qty:     {qty:.4f} BTC\n\n"
+            f"SL: ${sl:,.2f}  (${sl_dist:.0f} / {sl_dist/max(atr,1):.2f}ATR)\n"
             f"TP: ${tp:,.2f}\n"
-            f"Current R: {current_r:+.2f}R\n"
-            f"uPnL: ${upnl:+,.2f}\n\n"
-            f"BE Moved: {'Yes' if strat.breakeven_moved else 'No'}\n"
-            f"MFE: {strat.max_favorable_excursion:.2f}R\n"
-            f"MAE: {strat.max_adverse_excursion:.2f}R\n"
-            f"Score: {strat.entry_score:.0f}"
+            f"MFE: {mfe_r:.2f}R\n\n"
+            f"Hold:  {hold_min:.1f}m\n"
+            f"Trail: {trail_state}\n"
+            f"BE:    {'Yes ✅' if be_moved else 'No'}"
+            + "".join(sig_lines)
         )
-        return msg
 
     def _cmd_trades(self) -> str:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
-        rm = bot_instance.risk_manager
-        if not rm:
-            return "Risk manager not ready."
 
-        history = getattr(rm, 'trade_history', [])
-        if not history:
-            return "No trades recorded yet."
+        strat = bot_instance.strategy
+        rm    = bot_instance.risk_manager
+        if not strat or not rm:
+            return "Components not ready."
 
-        lines = ["<b>Recent Trades</b>\n"]
-        # deque doesn't support slicing — convert to list first
-        recent = list(history)[-5:]
-        for trade in recent:
-            # TradeRecord is a dataclass, use getattr not .get()
-            side   = getattr(trade, "side", "?").upper()
-            pnl    = getattr(trade, "pnl", 0)
-            reason = getattr(trade, "reason", "?")
-            icon   = "✅" if pnl >= 0 else "❌"
-            lines.append(f"  {icon} {side} P&L: ${pnl:+,.2f} [{reason}]")
+        lines   = ["<b>Trade History</b>\n"]
+        history = list(getattr(rm, 'trade_history', []))
 
-        stats = bot_instance.strategy.get_strategy_stats() if bot_instance.strategy else {}
-        lines.append(f"\nTotal: {stats.get('total_exits', 0)} trades")
-        lines.append(f"Win Rate: {stats.get('win_rate_pct', 0):.1f}%")
-        lines.append(f"Total P&L: ${stats.get('total_pnl', 0):+,.2f}")
+        if history:
+            for t in history[-8:]:
+                side   = getattr(t, 'side',        '?').upper()
+                pnl    = getattr(t, 'pnl',          0.0)
+                reason = getattr(t, 'reason',       '?')
+                ep     = getattr(t, 'entry_price',  0.0)
+                xp     = getattr(t, 'exit_price',   0.0)
+                icon   = "✅" if pnl >= 0 else "❌"
+                lines.append(
+                    f"  {icon} {side}  ${ep:,.0f}→${xp:,.0f}  "
+                    f"PnL=${pnl:+,.2f}  [{reason}]")
+        else:
+            lines.append("  No trades recorded yet.")
+
+        # Summary stats
+        total_t   = len(history)
+        wins      = sum(1 for t in history if getattr(t, 'is_win', False))
+        wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = sum(getattr(t, 'pnl', 0.0) for t in history)
+        daily_pnl = getattr(rm, 'daily_pnl', 0.0)
+        consec    = getattr(rm, 'consecutive_losses', 0)
+        daily_cnt = len(getattr(rm, 'daily_trades', []))
+        max_d     = getattr(rm, 'max_daily_trades',
+                            getattr(__import__('config'), 'MAX_DAILY_TRADES', 8))
+
+        lines.append("")
+        lines.append(f"Total: {total_t}  WR: {wr:.0f}%  PnL: ${total_pnl:+,.2f}")
+        lines.append(
+            f"Today: {daily_cnt}/{max_d} trades  ${daily_pnl:+,.2f}  "
+            f"consec_loss={consec}")
         return "\n".join(lines)
 
     def _cmd_balance(self) -> str:
@@ -788,19 +775,22 @@ class TelegramBotController:
         rm = bot_instance.risk_manager
         if not rm:
             return "Risk manager not ready."
-
         try:
             bal = rm.get_available_balance()
             if not bal:
                 return "Could not fetch balance."
-            avail = float(bal.get("available", 0))
-            total = float(bal.get("total", avail))
-            locked = total - avail
+            avail    = float(bal.get("available", 0))
+            total    = float(bal.get("total", avail))
+            locked   = total - avail
+            dpnl     = getattr(rm, 'daily_pnl', 0.0)
+            init_bal = getattr(rm, 'initial_balance', 0.0)
+            dpct     = (dpnl / init_bal * 100.0 if init_bal > 1e-10 else 0.0)
             return (
                 f"<b>Wallet Balance</b>\n"
                 f"Available: <b>${avail:,.2f}</b> USDT\n"
-                f"Locked: ${locked:,.2f} USDT\n"
-                f"Total: ${total:,.2f} USDT"
+                f"Locked:    ${locked:,.2f} USDT\n"
+                f"Total:     ${total:,.2f} USDT\n\n"
+                f"Today's PnL: ${dpnl:+,.2f} ({dpct:+.2f}%)"
             )
         except Exception as e:
             return f"Balance error: {e}"
@@ -809,36 +799,72 @@ class TelegramBotController:
         global bot_instance
         if not bot_instance:
             return "Bot not running."
-        bot_instance.trading_enabled = False
+        bot_instance.trading_enabled      = False
         bot_instance.trading_pause_reason = "Paused via Telegram"
-        return "Trading PAUSED. Monitoring continues. Use /resume to re-enable."
+        return "⏸️ Trading PAUSED. Monitoring continues. Use /resume to re-enable."
 
     def _cmd_resume(self) -> str:
         global bot_instance
         if not bot_instance:
             return "Bot not running."
-        bot_instance.trading_enabled = True
+        bot_instance.trading_enabled      = True
         bot_instance.trading_pause_reason = ""
-        return "Trading RESUMED."
+        return "▶️ Trading RESUMED."
+
+    def _cmd_trail(self, args: str) -> str:
+        global bot_instance
+        if not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        if not strat:
+            return "Strategy not ready."
+        arg = (args or "").strip().lower()
+        if arg in ("on", "enable", "1", "true", "yes"):
+            strat.set_trail_override(True)
+            return "🔒 Trailing SL: FORCED ON"
+        elif arg in ("off", "disable", "0", "false", "no"):
+            strat.set_trail_override(False)
+            return "🔓 Trailing SL: FORCED OFF"
+        else:
+            strat.set_trail_override(None)
+            enabled = strat.get_trail_enabled()
+            return (f"🔄 Trailing SL: AUTO  "
+                    f"(config default = {'ON' if enabled else 'OFF'})")
 
     def _cmd_config(self) -> str:
         import config as cfg
         lines = [
             "<b>Bot Configuration</b>\n",
-            f"Symbol: {cfg.SYMBOL}",
-            f"Leverage: {cfg.LEVERAGE}x",
-            f"Risk/Trade: {cfg.RISK_PER_TRADE}%",
-            f"Max Daily Loss: ${cfg.MAX_DAILY_LOSS}",
-            f"Max Consec Losses: {cfg.MAX_CONSECUTIVE_LOSSES}",
-            f"Max Daily Trades: {cfg.MAX_DAILY_TRADES}",
-            f"Min RR: {cfg.MIN_RISK_REWARD_RATIO}x",
-            f"Entry Threshold (KZ): {cfg.ENTRY_THRESHOLD_KILLZONE}",
-            f"Entry Threshold (Reg): {cfg.ENTRY_THRESHOLD_REGULAR}",
-            f"Min SL Dist: {cfg.MIN_SL_DISTANCE_PCT*100:.1f}%",
-            f"Max SL Dist: {cfg.MAX_SL_DISTANCE_PCT*100:.1f}%",
-            f"SL ATR Buffer: {cfg.SL_ATR_BUFFER_MULT}x",
-            f"Cooldown: {cfg.TRADE_COOLDOWN_SECONDS}s",
-            f"Balance Usage: {cfg.BALANCE_USAGE_PERCENTAGE}%",
+            f"Symbol:     {cfg.SYMBOL}",
+            f"Exchange:   {cfg.EXCHANGE}",
+            f"Leverage:   {cfg.LEVERAGE}x",
+            "",
+            "<b>Position Sizing</b>",
+            f"  Margin/trade: {getattr(cfg,'QUANT_MARGIN_PCT',0.20):.0%} of available balance",
+            f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',4.0):.2f} USDT",
+            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',1.0)} BTC",
+            "",
+            "<b>Entry</b>",
+            f"  VWAP ATR mult:    {getattr(cfg,'QUANT_VWAP_ENTRY_ATR_MULT',1.2)}×ATR",
+            f"  Composite min:    ±{getattr(cfg,'QUANT_COMPOSITE_ENTRY_MIN',0.30)}",
+            f"  Confirm ticks:    {getattr(cfg,'QUANT_CONFIRM_TICKS',2)}",
+            f"  Cooldown:         {getattr(cfg,'QUANT_COOLDOWN_SEC',180)}s",
+            f"  Max hold:         {getattr(cfg,'QUANT_MAX_HOLD_SEC',2400)}s",
+            "",
+            "<b>Risk</b>",
+            f"  Min SL dist:      {getattr(cfg,'MIN_SL_DISTANCE_PCT',0.003)*100:.2f}%",
+            f"  Max SL dist:      {getattr(cfg,'MAX_SL_DISTANCE_PCT',0.035)*100:.2f}%",
+            f"  SL ATR buffer:    {getattr(cfg,'QUANT_SL_BUFFER_ATR_MULT',0.4)}×ATR",
+            f"  Min R:R:          {getattr(cfg,'MIN_RISK_REWARD_RATIO',0.8)}",
+            f"  Max daily trades: {getattr(cfg,'MAX_DAILY_TRADES',8)}",
+            f"  Max daily loss:   {getattr(cfg,'MAX_DAILY_LOSS_PCT',5.0):.1f}%",
+            f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',3)}",
+            "",
+            "<b>Trail</b>",
+            f"  Enabled:    {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
+            f"  BE (0→1):   {getattr(cfg,'QUANT_TRAIL_BE_R',0.3)}R",
+            f"  Lock (1→2): {getattr(cfg,'QUANT_TRAIL_LOCK_R',0.8)}R",
+            f"  Aggr (2→3): {getattr(cfg,'QUANT_TRAIL_AGGRESSIVE_R',1.5)}R",
         ]
         return "\n".join(lines)
 
@@ -846,52 +872,72 @@ class TelegramBotController:
         global bot_instance
         if not bot_instance:
             return "Bot not running."
-
         try:
             import config
-            # Pause trading first
             bot_instance.trading_enabled = False
+            om      = bot_instance.order_manager
+            results = []
 
-            om = bot_instance.order_manager
             if not om:
-                return "Order manager not available."
+                return "❌ Order manager not available."
 
-            # Cancel all open orders
+            # 1. Cancel all open orders
             try:
-                om.api.cancel_all_orders(symbol=config.SYMBOL)
-                logger.warning("KILLSWITCH: Cancelled all orders")
+                resp = om.api.cancel_all_orders(
+                    exchange=config.EXCHANGE, symbol=config.SYMBOL)
+                if isinstance(resp, dict) and resp.get("error"):
+                    results.append(f"⚠️ Cancel: {resp['error']}")
+                else:
+                    results.append("✅ All orders cancelled")
             except Exception as e:
-                logger.error(f"Killswitch cancel error: {e}")
+                results.append(f"⚠️ Cancel error: {e}")
 
-            # Close any open position
+            # 2. Close open position
             try:
                 pos = om.get_open_position()
-                if pos and pos.get("size", 0) > 0:
-                    side = "SELL" if pos["side"].upper() == "LONG" else "BUY"
-                    om.api.place_order(
+                if pos and float(pos.get("size", 0)) > 0:
+                    pos_side   = str(pos.get("side", "")).upper()
+                    close_side = "SELL" if pos_side == "LONG" else "BUY"
+                    qty        = float(pos["size"])
+                    resp       = om.api.place_order(
                         symbol=config.SYMBOL,
-                        side=side,
+                        side=close_side,
                         order_type="MARKET",
-                        quantity=pos["size"],
-                        reduce_only=True
+                        quantity=qty,
+                        exchange=config.EXCHANGE,
+                        reduce_only=True,
                     )
-                    logger.warning(f"KILLSWITCH: Closed {pos['side']} position, size={pos['size']}")
+                    if isinstance(resp, dict) and resp.get("error"):
+                        results.append(f"⚠️ Close: {resp['error']}")
+                    else:
+                        results.append(f"✅ Closed {pos_side} ({qty} BTC)")
+                else:
+                    results.append("ℹ️ No open position on exchange")
             except Exception as e:
-                logger.error(f"Killswitch close error: {e}")
+                results.append(f"⚠️ Close error: {e}")
 
-            # Reset strategy state
-            if bot_instance.strategy:
-                bot_instance.strategy._reset_position_state()
+            # 3. Reset strategy state to FLAT
+            strat = bot_instance.strategy
+            if strat:
+                try:
+                    from quant_strategy import PositionState
+                    with strat._lock:
+                        strat._pos = PositionState()
+                        strat._confirm_long = strat._confirm_short = 0
+                        strat._confirm_trend_long = strat._confirm_trend_short = 0
+                    results.append("✅ Strategy reset to FLAT")
+                except Exception as e:
+                    results.append(f"⚠️ State reset: {e}")
 
+            result_str = "\n".join(f"  {r}" for r in results)
             return (
-                "KILLSWITCH ACTIVATED\n"
-                "- All orders cancelled\n"
-                "- Position closed (if any)\n"
-                "- Trading PAUSED\n\n"
-                "Use /resume to re-enable trading."
+                f"🚨 <b>KILLSWITCH ACTIVATED</b>\n\n"
+                f"{result_str}\n\n"
+                f"Trading is PAUSED. Use /resume to re-enable."
             )
         except Exception as e:
-            return f"Killswitch error: {e}"
+            logger.error(f"Killswitch error: {e}", exc_info=True)
+            return f"❌ Killswitch error: {e}"
 
     def _cmd_set(self, args: str) -> str:
         """Live-adjust a config parameter."""
@@ -900,42 +946,55 @@ class TelegramBotController:
         if not args or len(args.split()) < 2:
             return (
                 "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
-                "Adjustable keys:\n"
-                "  leverage, risk_per_trade, max_daily_loss,\n"
-                "  entry_threshold_killzone, entry_threshold_regular,\n"
-                "  min_rr, cooldown_seconds, max_daily_trades"
+                "<b>Adjustable:</b>\n"
+                "  leverage          int   (e.g. 20)\n"
+                "  margin            float (e.g. 0.15)\n"
+                "  cooldown          int   seconds\n"
+                "  max_daily_trades  int\n"
+                "  max_daily_loss    float %\n"
+                "  max_consec_loss   int\n"
+                "  min_rr            float\n"
+                "  composite_min     float (e.g. 0.30)\n"
+                "  trail_enabled     bool  (true/false)\n"
+                "  max_hold          int   seconds\n"
+                "  vwap_mult         float (e.g. 1.2)\n"
+                "  sl_buffer         float (e.g. 0.4)\n"
             )
 
-        parts = args.split(None, 1)
-        key = parts[0].lower()
+        parts   = args.split(None, 1)
+        key     = parts[0].lower().strip()
         val_str = parts[1].strip()
 
-        # Allowed keys with their config attribute names and types
         allowed = {
-            "leverage":                   ("LEVERAGE", int),
-            "risk_per_trade":             ("RISK_PER_TRADE", float),
-            "max_daily_loss":             ("MAX_DAILY_LOSS", float),
-            "entry_threshold_killzone":   ("ENTRY_THRESHOLD_KILLZONE", int),
-            "entry_threshold_regular":    ("ENTRY_THRESHOLD_REGULAR", int),
-            "min_rr":                     ("MIN_RISK_REWARD_RATIO", float),
-            "cooldown_seconds":           ("TRADE_COOLDOWN_SECONDS", int),
-            "max_daily_trades":           ("MAX_DAILY_TRADES", int),
+            "leverage":         ("LEVERAGE",                  int),
+            "margin":           ("QUANT_MARGIN_PCT",          float),
+            "cooldown":         ("QUANT_COOLDOWN_SEC",        int),
+            "max_daily_trades": ("MAX_DAILY_TRADES",          int),
+            "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",        float),
+            "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES",    int),
+            "min_rr":           ("MIN_RISK_REWARD_RATIO",     float),
+            "composite_min":    ("QUANT_COMPOSITE_ENTRY_MIN", float),
+            "trail_enabled":    ("QUANT_TRAIL_ENABLED",       bool),
+            "max_hold":         ("QUANT_MAX_HOLD_SEC",        int),
+            "vwap_mult":        ("QUANT_VWAP_ENTRY_ATR_MULT", float),
+            "sl_buffer":        ("QUANT_SL_BUFFER_ATR_MULT",  float),
         }
 
         if key not in allowed:
-            return f"Unknown key: {key}\nAllowed: {', '.join(allowed.keys())}"
+            return (f"Unknown key: <code>{key}</code>\n"
+                    f"Allowed: {', '.join(sorted(allowed.keys()))}")
 
         attr_name, val_type = allowed[key]
         try:
-            new_val = val_type(val_str)
+            new_val = (val_str.lower() in ("true", "1", "yes", "on")
+                       if val_type == bool else val_type(val_str))
         except ValueError:
-            return f"Invalid value: {val_str} (expected {val_type.__name__})"
+            return f"Invalid value: <code>{val_str}</code> (expected {val_type.__name__})"
 
         old_val = getattr(cfg, attr_name, "?")
         setattr(cfg, attr_name, new_val)
-
-        logger.info(f"CONFIG CHANGED via Telegram: {attr_name} = {old_val} -> {new_val}")
-        return f"Set <b>{attr_name}</b>: {old_val} -> <b>{new_val}</b>"
+        logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+        return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
 
     # ================================================================
     # BOT THREAD
@@ -944,25 +1003,21 @@ class TelegramBotController:
     def _run_bot_thread(self):
         global bot_instance, bot_running
         try:
-            bot_running = True
+            bot_running  = True
             from main import QuantBot
-
             bot_instance = QuantBot()
             if not bot_instance.initialize():
-                self.send_message("Bot init failed.")
+                self.send_message("❌ Bot init failed. Check logs.")
                 bot_running = False
                 return
-
             if not bot_instance.start():
-                self.send_message("Bot start failed.")
+                self.send_message("❌ Bot start failed. Check logs.")
                 bot_running = False
                 return
-
             bot_instance.run()
-
         except Exception as e:
             logger.error(f"Bot crashed: {e}", exc_info=True)
-            self.send_message(f"Bot crashed: {e}")
+            self.send_message(f"❌ Bot crashed: {e}")
         finally:
             bot_running = False
             logger.info("Bot thread finished")
@@ -975,8 +1030,8 @@ class TelegramBotController:
         self.running = True
         self.clear_old_messages()
         self.set_my_commands()
-        self.send_message("Quant Bot v4.8 Controller Ready.\n\n" + self._cmd_help())
-
+        self.send_message(
+            "⚡ <b>Quant Bot v4.8 Controller Ready</b>\n\n" + self._cmd_help())
         logger.info("Telegram controller started")
 
         while self.running:
@@ -984,18 +1039,15 @@ class TelegramBotController:
                 updates = self.get_updates(timeout=30)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)
-                    msg = upd.get("message") or {}
+                    msg     = upd.get("message") or {}
                     chat_id = str((msg.get("chat") or {}).get("id", ""))
-                    text = (msg.get("text") or "").strip()
-
+                    text    = (msg.get("text") or "").strip()
                     if chat_id != self.chat_id or not text:
                         continue
-
                     logger.info(f"Received: {text}")
                     response = self.handle_command(text)
                     if response:
                         self.send_message(response)
-
             except KeyboardInterrupt:
                 break
             except Exception as e:
@@ -1021,7 +1073,7 @@ def main():
         ],
     )
     try:
-        import config  # ensure config is importable
+        import config
         controller = TelegramBotController()
         controller.start()
     except KeyboardInterrupt:

@@ -2584,7 +2584,10 @@ class QuantStrategy:
             return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
-        price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
+        price = data_manager.get_last_price()
+        # NOTE: _log_thinking is called AFTER the ICT block below so that sig.ict_*
+        # fields are populated before logging. Calling it here would always show
+        # ICT Σ=0.00 because the fields haven't been set yet on this tick.
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
         # Update ICT structures (OB, FVG, liquidity, session) every 5s
@@ -2642,6 +2645,9 @@ class QuantStrategy:
 
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
+
+        # ICT fields are now populated — log_thinking can see the real scores
+        self._log_thinking(sig, price, now)
 
         # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
         # This is the single most important defense against bleeding in trends.
