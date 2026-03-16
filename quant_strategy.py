@@ -717,9 +717,177 @@ class RegimeClassifier:
         if self._regime == MarketRegime.TRENDING_DOWN and reversion_side == "long":  return False
         return True
 
+
 # ═══════════════════════════════════════════════════════════════
-# INSTITUTIONAL LEVEL ENGINE — Volume Profile + Orderbook Walls
+# BREAKOUT DETECTOR — FAST directional momentum filter (v4.6)
 # ═══════════════════════════════════════════════════════════════
+class BreakoutDetector:
+    """
+    Fast breakout detection that fires BEFORE ADX catches up.
+
+    Problem: ADX takes 14+ bars (70+ min on 5m) to reach 25 during a breakout.
+    Meanwhile the mean-reversion bot keeps fading the move → repeated SL hits.
+
+    Solution: Detect directional momentum using FAST indicators:
+      1. Consecutive directional candles (3+ closes in same direction)
+      2. ATR expansion (current ATR > 1.5× baseline)
+      3. Volume surge (recent volume > 2× average)
+      4. Price displacement (price moved > 2×ATR from N-bar-ago close)
+
+    When breakout is detected:
+      - BLOCK all reversion entries for BREAKOUT_BLOCK_SEC
+      - Allow trend/momentum entries in breakout direction
+      - Log the detection for monitoring
+
+    This is a VETO system, not an entry system. It prevents the most
+    destructive trade the bot can make: fading a breakout.
+    """
+    def __init__(self):
+        self._breakout_active = False
+        self._breakout_dir = ""          # "up" or "down"
+        self._breakout_until = 0.0       # timestamp when block expires
+        self._last_check = 0.0
+        self._CHECK_INTERVAL = 5.0       # check every 5s (not every tick)
+
+    def reset_state(self):
+        self._breakout_active = False
+        self._breakout_dir = ""
+        self._breakout_until = 0.0
+
+    def update(self, candles_5m: List[Dict], atr_engine: 'ATREngine',
+               price: float, now: float) -> None:
+        """Check for breakout conditions. Called from _evaluate_entry."""
+        if now - self._last_check < self._CHECK_INTERVAL:
+            return
+        self._last_check = now
+
+        # If block expired, clear it
+        if self._breakout_active and now > self._breakout_until:
+            self._breakout_active = False
+            self._breakout_dir = ""
+            logger.info("🔓 Breakout block expired — reversion entries re-enabled")
+
+        if len(candles_5m) < 10:
+            return
+
+        atr = atr_engine.atr
+        if atr < 1e-10:
+            return
+
+        score_up = 0
+        score_down = 0
+
+        # ── Factor 1: Consecutive directional closes ──────────────────────
+        # 3+ candles closing in same direction = momentum
+        recent = candles_5m[-6:]
+        consec_up = 0
+        consec_down = 0
+        for c in recent:
+            if float(c['c']) > float(c['o']):
+                consec_up += 1
+                consec_down = 0
+            elif float(c['c']) < float(c['o']):
+                consec_down += 1
+                consec_up = 0
+            else:
+                consec_up = 0
+                consec_down = 0
+
+        thresh_consec = int(_cfg("QUANT_BO_CONSEC_CANDLES", 3))
+        if consec_up >= thresh_consec:
+            score_up += 1
+        if consec_down >= thresh_consec:
+            score_down += 1
+
+        # ── Factor 2: ATR expansion ───────────────────────────────────────
+        # Current ATR significantly higher than baseline = vol expansion
+        hist = list(atr_engine._atr_hist)
+        if len(hist) >= 10:
+            baseline = sum(hist[-10:-1]) / 9.0 if len(hist) >= 10 else hist[-1]
+            if baseline > 1e-10:
+                expansion = hist[-1] / baseline
+                thresh_exp = float(_cfg("QUANT_BO_ATR_EXPANSION", 1.5))
+                if expansion >= thresh_exp:
+                    # Expansion alone doesn't tell direction — add to both,
+                    # direction comes from other factors
+                    score_up += 1
+                    score_down += 1
+
+        # ── Factor 3: Volume surge ────────────────────────────────────────
+        vols = [float(c.get('v', 0)) for c in candles_5m[-10:]]
+        if len(vols) >= 6 and sum(vols[:5]) > 0:
+            avg_vol = sum(vols[:5]) / 5.0
+            recent_vol = sum(vols[-3:]) / 3.0
+            vol_ratio = recent_vol / avg_vol if avg_vol > 1e-10 else 1.0
+            thresh_vol = float(_cfg("QUANT_BO_VOL_SURGE", 1.8))
+            if vol_ratio >= thresh_vol:
+                score_up += 1
+                score_down += 1
+
+        # ── Factor 4: Price displacement ──────────────────────────────────
+        # Price moved > N×ATR from where it was M candles ago
+        lookback = int(_cfg("QUANT_BO_DISP_LOOKBACK", 6))
+        if len(candles_5m) > lookback:
+            ref_close = float(candles_5m[-lookback - 1]['c'])
+            displacement = price - ref_close
+            disp_atr = abs(displacement) / atr
+            thresh_disp = float(_cfg("QUANT_BO_DISP_ATR", 2.0))
+            if disp_atr >= thresh_disp:
+                if displacement > 0:
+                    score_up += 2   # strong signal, double weight
+                else:
+                    score_down += 2
+
+        # ── Evaluate ─────────────────────────────────────────────────────
+        min_score = int(_cfg("QUANT_BO_MIN_SCORE", 3))
+        block_sec = float(_cfg("QUANT_BO_BLOCK_SEC", 600))
+
+        if score_up >= min_score and score_up > score_down and not self._breakout_active:
+            self._breakout_active = True
+            self._breakout_dir = "up"
+            self._breakout_until = now + block_sec
+            logger.info(
+                f"🚀 BREAKOUT UP detected (score={score_up}) | "
+                f"consec={consec_up} | disp={displacement/atr:.1f}ATR | "
+                f"Reversion BLOCKED for {block_sec/60:.0f}min")
+
+        elif score_down >= min_score and score_down > score_up and not self._breakout_active:
+            self._breakout_active = True
+            self._breakout_dir = "down"
+            self._breakout_until = now + block_sec
+            logger.info(
+                f"🚀 BREAKOUT DOWN detected (score={score_down}) | "
+                f"consec={consec_down} | disp={displacement/atr:.1f}ATR | "
+                f"Reversion BLOCKED for {block_sec/60:.0f}min")
+
+    @property
+    def is_active(self) -> bool:
+        return self._breakout_active
+
+    @property
+    def direction(self) -> str:
+        return self._breakout_dir
+
+    def blocks_reversion(self, side: str) -> bool:
+        """Returns True if this reversion entry should be BLOCKED."""
+        if not self._breakout_active:
+            return False
+        # Block reversion trades that FADE the breakout
+        if self._breakout_dir == "up" and side == "short":
+            return True
+        if self._breakout_dir == "down" and side == "long":
+            return True
+        return False
+
+    def allows_momentum_entry(self, side: str) -> bool:
+        """Returns True if a momentum entry WITH the breakout is OK."""
+        if not self._breakout_active:
+            return False
+        if self._breakout_dir == "up" and side == "long":
+            return True
+        if self._breakout_dir == "down" and side == "short":
+            return True
+        return False
 class InstitutionalLevels:
     """
     Computes SL/TP/Trail levels using:
@@ -1831,6 +1999,7 @@ class QuantStrategy:
         self._htf = HTFTrendFilter()
         self._adx = ADXEngine()
         self._regime = RegimeClassifier()
+        self._breakout = BreakoutDetector()  # v4.6: fast breakout detection
         self._confirm_trend_long = 0; self._confirm_trend_short = 0
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
@@ -1870,6 +2039,7 @@ class QuantStrategy:
             self._atr_1m.reset_state()
             self._atr_5m.reset_state()
             self._adx.reset_state()
+            self._breakout.reset_state()  # v4.6
             logger.info("♻️ Strategy engines reset after stream restart")
 
     def set_trail_override(self, enabled: Optional[bool]):
@@ -2058,12 +2228,27 @@ class QuantStrategy:
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
         price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
 
-        # ── Route by regime ───────────────────────────────────────────────────
+        # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
+        # This is the single most important defense against bleeding in trends.
+        # ADX takes 70+ min to reach 25 during a breakout. By then, 3 reversion
+        # trades have been stopped out. The breakout detector fires in <5 candles.
+        try:
+            candles_5m = data_manager.get_candles("5m", limit=20)
+        except:
+            candles_5m = []
+        self._breakout.update(candles_5m, self._atr_5m, price, now)
+
+        # ── Route by regime + breakout ─────────────────────────────────────
         if self._regime.is_trending():
-            self._confirm_long = self._confirm_short = 0   # reset reversion counters
+            self._confirm_long = self._confirm_short = 0
             self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
+        elif self._breakout.is_active:
+            # Breakout detected but ADX hasn't caught up yet.
+            # Block reversion. Try momentum entry in breakout direction.
+            self._confirm_long = self._confirm_short = 0
+            self._evaluate_momentum_entry(data_manager, order_manager, risk_manager, sig, price, now)
         else:
-            self._confirm_trend_long = self._confirm_trend_short = 0  # reset trend counters
+            self._confirm_trend_long = self._confirm_trend_short = 0
             self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
 
     def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
@@ -2071,12 +2256,19 @@ class QuantStrategy:
         Mean-reversion entry — active in RANGING and TRANSITIONING regimes.
         Blocked in TRENDING regime for counter-trend direction.
         In TRANSITIONING: all existing gates must pass + regime allows this side.
+        v4.6: Also blocked when BreakoutDetector detects directional momentum.
         """
         c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
 
         # Hard veto: if market is trending against this reversion trade, skip
         if not self._regime.allows_reversion(side):
             self._confirm_long = self._confirm_short = 0; return
+
+        # v4.6: Breakout veto — NEVER fade a detected breakout
+        if self._breakout.blocks_reversion(side):
+            self._confirm_long = self._confirm_short = 0
+            logger.info(f"🚫 Breakout blocks {side.upper()} reversion (breakout {self._breakout.direction})")
+            return
 
         if not (sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming >= 3):
             self._confirm_long = self._confirm_short = 0; return
@@ -2158,6 +2350,67 @@ class QuantStrategy:
         elif trend_side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._enter_trade(data_manager, order_manager, risk_manager, "short", sig, mode="trend")
+
+    def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
+        """
+        v4.6: Momentum entry — trades WITH detected breakout.
+
+        Active only when BreakoutDetector fires and ADX hasn't classified TRENDING yet.
+        This fills the gap: ADX takes 70+ min to reach 25, breakout detector fires in 15-30 min.
+
+        Entry conditions (conservative — we're entering mid-move):
+          1. Breakout detector active + direction agrees
+          2. Tick flow in breakout direction (order flow confirms)
+          3. OB imbalance in breakout direction (book is tilted)
+          4. NOT deeply overextended from VWAP (>4×ATR = exhaustion risk)
+
+        Uses trend-mode SL/TP (ATR-based, not VWAP) since VWAP is behind price.
+        Confirm ticks: 2 (same as reversion — breakout is already confirmed by detector)
+        """
+        bo_dir = self._breakout.direction
+        if not bo_dir:
+            return
+
+        side = "long" if bo_dir == "up" else "short"
+
+        # Gate 1: Tick flow must agree with breakout
+        tf = self._tick_eng.get_signal()
+        if side == "long" and tf < -0.10:
+            return
+        if side == "short" and tf > 0.10:
+            return
+
+        # Gate 2: OB imbalance in breakout direction
+        obs = self._ob_eng.get_signal()
+        if side == "long" and obs < -0.20:
+            return
+        if side == "short" and obs > 0.20:
+            return
+
+        # Gate 3: Don't chase exhaustion — if already >4×ATR from VWAP, skip
+        atr = self._atr_5m.atr
+        if atr > 1e-10 and self._vwap.vwap > 0:
+            dev_atr = abs(price - self._vwap.vwap) / atr
+            if dev_atr > 4.0:
+                return  # too extended, likely exhaustion
+
+        # Confirmation counter (reuses trend counters)
+        if side == "long":
+            self._confirm_trend_long += 1
+            self._confirm_trend_short = 0
+        else:
+            self._confirm_trend_short += 1
+            self._confirm_trend_long = 0
+
+        cn = QCfg.CONFIRM_TICKS()  # 2 ticks — breakout already confirmed by detector
+        if side == "long" and self._confirm_trend_long >= cn:
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            logger.info(f"🚀 MOMENTUM ENTRY — {side.upper()} (breakout {bo_dir})")
+            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="trend")
+        elif side == "short" and self._confirm_trend_short >= cn:
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            logger.info(f"🚀 MOMENTUM ENTRY — {side.upper()} (breakout {bo_dir})")
+            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="trend")
 
     def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
                        signal_confidence=0.5, use_maker_entry=False):

@@ -318,6 +318,19 @@ QUANT_REVERSION_REJECT_RR      = 0.20  # Reject trade if R:R < 0.20 (fee-negativ
 #          SL must be max SL_MAX_ATR_MULT × ATR from entry for reversion trades.
 QUANT_SL_MAX_ATR_MULT          = 4.0   # Reversion SL: max 4×ATR from entry
 
+# ═══════════════════════════════════════════════════════════════════
+# 10p. BREAKOUT DETECTOR — v4.6
+# ═══════════════════════════════════════════════════════════════════
+# Fast directional momentum detection that fires BEFORE ADX catches up.
+# When triggered, blocks reversion entries and enables momentum entries.
+QUANT_BO_CONSEC_CANDLES        = 3     # Min consecutive directional 5m candles
+QUANT_BO_ATR_EXPANSION         = 1.5   # ATR must be 1.5× baseline for vol expansion
+QUANT_BO_VOL_SURGE             = 1.8   # Volume must be 1.8× recent average
+QUANT_BO_DISP_ATR              = 2.0   # Price must move 2×ATR from N bars ago
+QUANT_BO_DISP_LOOKBACK         = 6     # Lookback for displacement (6 × 5m = 30min)
+QUANT_BO_MIN_SCORE             = 3     # Min score to trigger breakout (out of ~6)
+QUANT_BO_BLOCK_SEC             = 600   # Block reversion for 10 min after breakout
+
 # 10o. Smart max-hold exit — v4.6 COMPLETE REWRITE
 #      v4.4: tighten SL for profitable trades. Still force-exited underwater trades.
 #      v4.6: thesis-aware extension. When timer fires:

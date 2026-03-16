@@ -787,6 +787,13 @@ class TelegramBotController:
             "QUANT_MAX_HOLD_EXTENSIONS":  (0, 10),
             "QUANT_HOLD_EXTENSION_SEC":   (300, 3600),
             "QUANT_THESIS_MAX_DRAWDOWN_PCT": (0.30, 0.95),
+            # v4.6 breakout bounds
+            "QUANT_BO_CONSEC_CANDLES":     (2, 6),
+            "QUANT_BO_ATR_EXPANSION":      (1.1, 3.0),
+            "QUANT_BO_VOL_SURGE":          (1.2, 4.0),
+            "QUANT_BO_DISP_ATR":           (1.0, 5.0),
+            "QUANT_BO_MIN_SCORE":          (2, 5),
+            "QUANT_BO_BLOCK_SEC":          (120, 1800),
         }
         if attr_name in bounds:
             lo, hi = bounds[attr_name]
