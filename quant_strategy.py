@@ -755,14 +755,19 @@ class BreakoutDetector:
         self._CHECK_INTERVAL = 5.0
 
         # Retest tracking state
-        self._bo_extreme = 0.0         # high of breakout candle (up) / low (down)
-        self._bo_midpoint = 0.0        # midpoint of breakout candle
-        self._retest_low = 0.0         # lowest price during pullback (for long)
-        self._retest_high = 0.0        # highest price during pullback (for short)
-        self._retest_started = False   # pullback has begun
-        self._retest_ready = False     # pullback complete, waiting for bounce
-        self._retest_timeout = 0.0     # when to give up waiting for retest
-        self._bo_atr = 0.0             # ATR at time of breakout
+        self._bo_extreme = 0.0
+        self._bo_midpoint = 0.0
+        self._retest_low = 0.0
+        self._retest_high = 0.0
+        self._retest_started = False
+        self._retest_ready = False
+        self._retest_invalidated = False   # v4.7: once pullback too deep, stays dead
+        self._retest_timeout = 0.0
+        self._bo_atr = 0.0
+
+        # v4.7 FLAW 4 FIX: Directional cooldown after expiry
+        self._last_expired_dir = ""        # direction of last expired breakout
+        self._last_expired_time = 0.0      # when it expired
 
     def reset_state(self):
         self._breakout_active = False
@@ -770,6 +775,9 @@ class BreakoutDetector:
         self._breakout_until = 0.0
         self._retest_started = False
         self._retest_ready = False
+        self._retest_invalidated = False
+        self._last_expired_dir = ""
+        self._last_expired_time = 0.0
 
     def update(self, candles_5m: List[Dict], atr_engine: 'ATREngine',
                price: float, now: float, vwap_price: float = 0.0) -> None:
@@ -778,12 +786,15 @@ class BreakoutDetector:
             return
         self._last_check = now
 
-        # If block expired, clear it
+        # If block expired, clear it and record direction for cooldown
         if self._breakout_active and now > self._breakout_until:
+            self._last_expired_dir = self._breakout_dir  # v4.7: remember direction
+            self._last_expired_time = now
             self._breakout_active = False
             self._breakout_dir = ""
             self._retest_started = False
             self._retest_ready = False
+            self._retest_invalidated = False
             logger.info("🔓 Breakout block expired — reversion entries re-enabled")
 
         if len(candles_5m) < 10:
@@ -797,6 +808,12 @@ class BreakoutDetector:
         if self._breakout_active:
             self._track_retest(price, atr, now)
             return  # don't re-detect while active
+
+        # v4.7 FLAW 4 FIX: Cooldown before detecting OPPOSITE direction
+        # After breakout UP expires and price pulls back, the correction candle
+        # looks like a breakout DOWN — but it's just mean reversion. Block opposite
+        # direction detection for 10 minutes after expiry.
+        opposite_cooldown = 600.0  # 10 minutes
 
         score_up = 0
         score_down = 0
@@ -886,6 +903,7 @@ class BreakoutDetector:
             self._retest_high = extreme if direction == "down" else 0.0
             self._retest_started = False
             self._retest_ready = False
+            self._retest_invalidated = False   # v4.7: fresh breakout
             self._retest_timeout = now + retest_timeout
             detail_str = " | ".join(f"{k}={v}" for k, v in details.items())
             logger.info(
@@ -893,65 +911,94 @@ class BreakoutDetector:
                 f"{detail_str} | Block {block_sec/60:.0f}min | "
                 f"Waiting for retest entry")
 
-        if score_up >= min_score and score_up > score_down:
+        # v4.7 FLAW 4: Apply directional cooldown
+        def _cooled_down(direction):
+            """Returns False if this direction is in cooldown from a recent expiry."""
+            if not self._last_expired_dir:
+                return True
+            # Opposite direction of recently expired breakout — apply cooldown
+            opposite = {"up": "down", "down": "up"}
+            if direction == opposite.get(self._last_expired_dir):
+                if now - self._last_expired_time < opposite_cooldown:
+                    return False
+            return True
+
+        if score_up >= min_score and score_up > score_down and _cooled_down("up"):
             extreme = float(last['h'])
             mid = (float(last['o']) + float(last['c'])) / 2.0
             _fire("up", score_up, extreme, mid)
 
-        elif score_down >= min_score and score_down > score_up:
+        elif score_down >= min_score and score_down > score_up and _cooled_down("down"):
             extreme = float(last['l'])
             mid = (float(last['o']) + float(last['c'])) / 2.0
             _fire("down", score_down, extreme, mid)
 
     def _track_retest(self, price: float, atr: float, now: float):
-        """Track pullback/retest state after breakout is detected."""
+        """Track pullback/retest state after breakout is detected.
+
+        v4.7 FIXES:
+          - FLAW 2: Only logs on state transitions, not every tick
+          - FLAW 3: Once retrace > pullback_max, permanently invalidated
+                    (was re-arming on next tick because retrace >= pullback_min)
+        """
         if now > self._retest_timeout:
-            if not self._retest_ready:
-                self._retest_ready = False  # timed out without completing retest
             return
 
-        pullback_min = 0.3 * self._bo_atr  # min retrace to qualify as pullback
-        pullback_max = 1.5 * self._bo_atr  # max retrace before breakout is invalid
+        # v4.7 FLAW 3: Once invalidated, stays dead. No re-arming.
+        if self._retest_invalidated:
+            return
+
+        pullback_min = 0.3 * self._bo_atr
+        pullback_max = 2.0 * self._bo_atr  # v4.7: raised from 1.5 to 2.0 (BTC moves big)
 
         if self._breakout_dir == "up":
-            # Track pullback low
             if price < self._retest_low:
                 self._retest_low = price
             retrace = self._bo_extreme - price
-            # Has pullback started? (price dropped from extreme)
+
+            # Invalidate if retrace too deep — BEFORE checking start/ready
+            if retrace > pullback_max:
+                if not self._retest_invalidated:
+                    self._retest_invalidated = True
+                    logger.info(f"❌ Retest invalidated: retrace {retrace:.0f} > max {pullback_max:.0f}")
+                return
+
+            # State transition: pullback started
             if retrace >= pullback_min and not self._retest_started:
                 self._retest_started = True
-                logger.info(f"📐 Retest pullback started: ${price:,.2f} "
-                           f"(retrace {retrace:.0f} from extreme ${self._bo_extreme:,.2f})")
-            # Is pullback complete? (price bouncing back above pullback low)
+                logger.info(f"📐 Retest pullback started: retrace {retrace:.0f} "
+                           f"from ${self._bo_extreme:,.2f}")
+
+            # State transition: pullback complete (bounce from low)
             if self._retest_started and not self._retest_ready:
-                bounce_from_low = price - self._retest_low
-                if bounce_from_low > 0.2 * self._bo_atr:
+                bounce = price - self._retest_low
+                if bounce > 0.2 * self._bo_atr:
                     self._retest_ready = True
-                    logger.info(f"✅ Retest ready: pullback low ${self._retest_low:,.2f} "
-                               f"→ bounce to ${price:,.2f}")
-            # Invalidate if retrace too deep
-            if retrace > pullback_max:
-                self._retest_started = False
-                self._retest_ready = False
+                    logger.info(f"✅ Retest ready: low ${self._retest_low:,.2f} "
+                               f"→ bounce ${price:,.2f} (+{bounce:.0f})")
 
         else:  # breakout down
             if price > self._retest_high:
                 self._retest_high = price
             retrace = price - self._bo_extreme
+
+            if retrace > pullback_max:
+                if not self._retest_invalidated:
+                    self._retest_invalidated = True
+                    logger.info(f"❌ Retest invalidated: retrace {retrace:.0f} > max {pullback_max:.0f}")
+                return
+
             if retrace >= pullback_min and not self._retest_started:
                 self._retest_started = True
-                logger.info(f"📐 Retest pullback started: ${price:,.2f} "
-                           f"(retrace {retrace:.0f} from extreme ${self._bo_extreme:,.2f})")
+                logger.info(f"📐 Retest pullback started: retrace {retrace:.0f} "
+                           f"from ${self._bo_extreme:,.2f}")
+
             if self._retest_started and not self._retest_ready:
-                bounce_from_high = self._retest_high - price
-                if bounce_from_high > 0.2 * self._bo_atr:
+                bounce = self._retest_high - price
+                if bounce > 0.2 * self._bo_atr:
                     self._retest_ready = True
-                    logger.info(f"✅ Retest ready: pullback high ${self._retest_high:,.2f} "
-                               f"→ bounce to ${price:,.2f}")
-            if retrace > pullback_max:
-                self._retest_started = False
-                self._retest_ready = False
+                    logger.info(f"✅ Retest ready: high ${self._retest_high:,.2f} "
+                               f"→ bounce ${price:,.2f} (+{bounce:.0f})")
 
     @property
     def is_active(self) -> bool:
@@ -2343,14 +2390,20 @@ class QuantStrategy:
                              vwap_price=self._vwap.vwap)
 
         # ── Route by regime + breakout ─────────────────────────────────────
-        if self._regime.is_trending():
-            self._confirm_long = self._confirm_short = 0
-            self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
-        elif self._breakout.is_active:
-            # Breakout detected but ADX hasn't caught up yet.
-            # Block reversion. Try momentum entry in breakout direction.
+        # v4.7 FIX: Old routing had breakout.is_active as exclusive elif
+        # which blocked ALL other entries (including with-direction reversion)
+        # when retest wasn't ready. Bot sat idle for 45 min in TRENDING_UP.
+        #
+        # New priority:
+        #   1. Breakout retest ready → momentum entry (highest priority)
+        #   2. TRENDING regime → trend pullback entry
+        #   3. Normal → reversion entry (blocks_reversion handles counter-dir veto)
+        if self._breakout.is_active and self._breakout.retest_ready:
             self._confirm_long = self._confirm_short = 0
             self._evaluate_momentum_entry(data_manager, order_manager, risk_manager, sig, price, now)
+        elif self._regime.is_trending():
+            self._confirm_long = self._confirm_short = 0
+            self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
         else:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
