@@ -225,7 +225,7 @@ class TelegramBotController:
 
     def _cmd_help(self) -> str:
         return (
-            "<b>ICT Bot v11 Commands</b>\n\n"
+            "<b>Quant Bot v4.8 Commands</b>\n\n"
             "/start — Start trading bot\n"
             "/stop — Stop trading bot\n"
             "/status — Full status + market\n"
@@ -311,7 +311,7 @@ class TelegramBotController:
             )
 
             msg = (
-                f"<b>ICT Bot v11 Status</b>\n"
+                f"<b>Quant Bot v4.8 Status</b>\n"
                 f"{'=' * 30}\n"
                 f"Price: <b>${price:,.2f}</b>\n"
                 f"Balance: <b>${bal_val:,.2f}</b> USDT\n"
@@ -863,9 +863,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         try:
             bot_running = True
-            from main import ICTBot
+            from main import QuantBot
 
-            bot_instance = ICTBot()
+            bot_instance = QuantBot()
             if not bot_instance.initialize():
                 self.send_message("Bot init failed.")
                 bot_running = False
@@ -893,7 +893,7 @@ class TelegramBotController:
         self.running = True
         self.clear_old_messages()
         self.set_my_commands()
-        self.send_message("ICT Bot v11 Controller Ready.\n\n" + self._cmd_help())
+        self.send_message("Quant Bot v4.8 Controller Ready.\n\n" + self._cmd_help())
 
         logger.info("Telegram controller started")
 
