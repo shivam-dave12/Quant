@@ -180,12 +180,20 @@ class ProfitFloorModel:
         atr:            current ATR in price units
         price:          current mid-price
         signal_confidence: composite signal strength mapped to 0..1
+
+        FEE_FLOOR_MULT calibration:
+          Original FEE_FLOOR_MULT_LOW=5.5 was physically impossible.
+          At pctile=0.12, ATR=$63: mult=5.05 × rt_cost($88) = $445 TP required.
+          That is 7×ATR. No structural target exists 7×ATR away on a 1×ATR SL setup.
+          The correct reasoning: fee cost needs 1.5-2× buffer, not 5×.
+          FEE_FLOOR_MULT_LOW=2.5 → at pctile=0.12: $88×2.3=$202 (taker) or $55×2.3=$127 (maker).
+          Still enforces the fee floor. Never demands physically unreachable TP.
         """
-        mult_low   = float(_cfg("FEE_FLOOR_MULT_LOW",    5.5))
-        mult_high  = float(_cfg("FEE_FLOOR_MULT_HIGH",   1.8))
+        mult_low   = float(_cfg("FEE_FLOOR_MULT_LOW",    2.5))   # was 5.5 — caused 7×ATR TP demands
+        mult_high  = float(_cfg("FEE_FLOOR_MULT_HIGH",   1.2))   # was 1.8 — still reasonable in high vol
         inflect    = float(_cfg("FEE_FLOOR_INFLECT",     0.45))
         steepness  = float(_cfg("FEE_FLOOR_STEEPNESS",   6.0))
-        abs_min    = float(_cfg("FEE_FLOOR_ABS_MIN_MULT", 1.4))
+        abs_min    = float(_cfg("FEE_FLOOR_ABS_MIN_MULT", 1.2))  # was 1.4
         spread_warn = float(_cfg("FEE_SPREAD_ATR_WARN",  0.06))
         penalty_k  = float(_cfg("FEE_SPREAD_PENALTY_K",  4.0))
         conf_neutral     = float(_cfg("FEE_CONF_NEUTRAL",      0.5))
@@ -207,16 +215,13 @@ class ProfitFloorModel:
         else:
             spread_penalty = 1.0
 
-        # Signal confidence discount: conf_neutral = neutral, 1.0 = max conviction
-        # BUG 3 FIX: Old formula capped at 15% instead of configured 30%.
-        # Old: (conf - neutral) * disc  → max (1.0 - 0.5) * 0.3 = 0.15
-        # Fix: Normalize (conf - neutral) to [0, 1], then multiply by disc.
+        # Signal confidence discount
         conf_norm = max(0.0, min(1.0, signal_confidence))
         if conf_norm > conf_neutral and (1.0 - conf_neutral) > 1e-10:
             conf_excess = (conf_norm - conf_neutral) / (1.0 - conf_neutral)
             confidence_discount = 1.0 - conf_excess * conf_max_disc
         else:
-            confidence_discount = 1.0  # no discount below neutral
+            confidence_discount = 1.0
 
         mult = base_mult * spread_penalty * confidence_discount
         return max(abs_min, mult)
@@ -234,8 +239,11 @@ class ProfitFloorModel:
         Returns the minimum gross price move (always positive) required
         for a trade to clear all execution costs with the regime-adaptive buffer.
 
-        This value is then compared to the computed TP distance in _compute_sl_tp.
-        If TP distance < min_gross_move → reject the setup.
+        ATR CAP: result is capped at FEE_FLOOR_MAX_ATR_MULT × ATR.
+        Without this cap, at very low ATR percentiles the mult can demand
+        4-7×ATR TP which is structurally impossible. The cap ensures the fee
+        floor never exceeds a physically reachable structural target.
+        Default cap: 2.0×ATR (a generous but achievable TP distance).
         """
         if price <= 0 or atr <= 0:
             return float("inf")
@@ -244,12 +252,19 @@ class ProfitFloorModel:
             atr_percentile, spread_bps, atr, price, signal_confidence
         )
         rt_cost_price = total_rt_cost_bps / 10_000.0 * price
-
         result = rt_cost_price * mult
+
+        # Hard cap: never require more than FEE_FLOOR_MAX_ATR_MULT×ATR
+        # This prevents the fee floor from demanding targets that don't exist
+        max_atr_mult = float(_cfg("FEE_FLOOR_MAX_ATR_MULT", 2.0))
+        atr_cap      = max_atr_mult * atr
+        result       = min(result, atr_cap)
+
         logger.debug(
             f"ProfitFloor: rt_cost={rt_cost_price:.2f} × mult={mult:.2f} "
             f"(pctile={atr_percentile:.2f}, spread={spread_bps:.1f}bps, "
-            f"conf={signal_confidence:.2f}) → min_move=${result:.2f}"
+            f"conf={signal_confidence:.2f}) → min_move=${result:.2f} "
+            f"(atr_cap=${atr_cap:.2f})"
         )
         return result
 

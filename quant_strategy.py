@@ -1395,170 +1395,135 @@ class InstitutionalLevels:
     def compute_tp(price: float, side: str, atr: float, sl_price: float,
                    candles_1m: List[Dict], orderbook: Dict,
                    vwap: float, vwap_std: float,
-                   candles_5m: Optional[List[Dict]] = None,
-                   ict_engine=None) -> float:
+                   candles_5m: Optional[List[Dict]] = None) -> float:
         """
-        Institutional TP placement — v4.9.
+        Institutional TP placement — v4.6.
 
-        Target hierarchy (score determines tier, tier determines selection):
+        Scored candidate selection across five target classes:
+          5.0  OB liquidity wall directly in path
+          4.0  VP High-Volume Node between entry and VWAP
+          3.5  VWAP itself (full mean-reversion target)
+          3.0  VWAP ± σ bands
+          2.5  5m swing extreme in direction of reversion
+          2.0  VWAP partial fraction
 
-          ICT Tier 1 (score 6.x):  Swept liquidity origin — THE highest-conviction
-            ICT target. When price sweeps a pool then reverses, smart money delivered
-            to the sweep level. Price seeks that origin on the way back.
-
-          ICT Tier 2 (score 5.x):  Open FVG in trade direction — imbalances fill.
-            Near edge = conservative, far edge = full fill. Freshness-weighted.
-
-          ICT Tier 3 (score 4.x):  Virgin OB in trade direction — unvisited
-            institutional footprint, strong magnet.
-
-          Quant Tier (score 3.5-5): VWAP (mean reversion anchor),
-            OB ask/bid walls, VP HVN gravity nodes.
-
-          Swing Tier (score 2.5-3): 5m swing extremes, VWAP partial fraction.
-
-        Selection logic:
-          1. Any ICT Tier-1 candidate (swept liq origin) ≥ REVERSION_MIN_RR → prefer nearest
-          2. Else highest-scored candidate overall ≥ REVERSION_MIN_RR
-          3. Fallback: REVERSION_MIN_RR floor only when NO structural target exists
-             (this means R:R is geometric, not structural — warn in caller)
-
-        The critical change from v4.6: the VWAP partial-fraction shortfall no
-        longer forces a synthetic R:R floor as TP. The floor is only used when
-        truly no structural level exists within the allowed window. If no
-        structural level exists within MAX_RR, the setup is geometrically poor
-        and the caller should log a warning — but still place the trade at floor.
+        v4.6: SL is now ATR-capped upstream (_compute_sl_tp caps to SL_MAX_ATR_MULT×ATR).
+        This means sl_dist is proportional to ATR, so R:R-based bounds are naturally
+        reasonable. min_tp ≈ 4×ATR × 1.5 = 6×ATR (reachable) instead of 10×ATR × 1.5 = 15×ATR.
         """
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
             return price + atr if side == "long" else price - atr
 
-        min_tp_dist = sl_dist * QCfg.REVERSION_MIN_RR()
-        max_tp_dist = sl_dist * QCfg.REVERSION_MAX_RR()
+        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
+        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
 
-        # ── Volume profile ────────────────────────────────────────────────
+        # ── Volume profile: single pass, shared across candidate generation ──
         hvn_levels: List[float] = []
         if len(candles_1m) >= 30:
             profile = InstitutionalLevels.build_volume_profile(
                 candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
             hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
 
-        # ── OB walls ─────────────────────────────────────────────────────
+        # ── OB walls in direction of trade ───────────────────────────────────
         wall_side = "ask" if side == "long" else "bid"
         walls = InstitutionalLevels.find_orderbook_walls(
             orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
         total_wall_qty = sum(q for _, q in walls) if walls else 0.0
 
-        # ── 5m swing targets ──────────────────────────────────────────────
+        # ── 5m swing targets in reversion direction ───────────────────────────
         sh_5m: List[float] = []
         sl_5m: List[float] = []
         if candles_5m and len(candles_5m) >= 3:
             sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
                 candles_5m, QCfg.SL_SWING_LOOKBACK())
 
-        # ── Scored candidate pool ─────────────────────────────────────────
-        scored: List[Tuple[float, float, str]] = []
+        # ── Scored candidate pool: (tp_level, score) ─────────────────────────
+        scored: List[Tuple[float, float]] = []
 
-        def add_tp(level: float, score: float, label: str = "") -> None:
+        def add_tp(level: float, score: float) -> None:
             dist = abs(level - price)
             if dist < min_tp_dist or dist > max_tp_dist:
                 return
-            if side == "long"  and level <= price: return
-            if side == "short" and level >= price: return
-            scored.append((level, score, label))
-
-        # ── ICT structural targets (highest priority) ─────────────────────
-        if ict_engine is not None and ict_engine._initialized:
-            try:
-                now_ms = int(time.time() * 1000)
-                ict_targets = ict_engine.get_structural_tp_targets(
-                    side, price, atr, now_ms, min_tp_dist, max_tp_dist)
-                for level, score, label in ict_targets:
-                    add_tp(level, score, f"ICT:{label}")
-            except Exception:
-                pass
+            if side == "long" and level <= price:
+                return
+            if side == "short" and level >= price:
+                return
+            scored.append((level, score))
 
         if side == "long":
-            # OB ask walls: hard resistance
+            # OB ask walls: hard resistance — stop just below the wall
             for wp, wq in walls:
                 if wp > price + min_tp_dist:
                     w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5), "OBwall")
+                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5))
 
-            # VP HVN between entry and VWAP
+            # VP HVN between entry and VWAP (gravity nodes)
             for h in hvn_levels:
                 if price < h and (vwap <= 0 or h <= vwap * 1.002):
-                    add_tp(h, 4.0, "HVN")
+                    add_tp(h, 4.0)
 
             # VWAP full reversion
             if vwap > price:
-                add_tp(vwap, 3.5, "VWAP")
+                add_tp(vwap, 3.5)
 
             # VWAP sigma bands
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
                     lvl = vwap - mult * vwap_std
                     if lvl > price:
-                        add_tp(lvl, bscore, f"VWAP-{mult}σ")
+                        add_tp(lvl, bscore)
 
-            # 5m swing highs in reversion zone
+            # 5m swing highs in reversion zone (potential supply)
             for sh in sh_5m:
                 if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.005):
-                    add_tp(sh - atr * 0.10, 2.5, "SwingH")
+                    add_tp(sh - atr * 0.10, 2.5)
 
-            # VWAP partial fraction (last resort — weakest)
+            # Fractional VWAP reversion
             if vwap > price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0, "VWAPpartial")
+                add_tp(partial, 2.0)
 
         else:  # short
             for wp, wq in walls:
                 if wp < price - min_tp_dist:
                     w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5), "OBwall")
+                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5))
 
             for h in hvn_levels:
                 if price > h and (vwap <= 0 or h >= vwap * 0.998):
-                    add_tp(h, 4.0, "HVN")
+                    add_tp(h, 4.0)
 
             if vwap < price:
-                add_tp(vwap, 3.5, "VWAP")
+                add_tp(vwap, 3.5)
 
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
                     lvl = vwap + mult * vwap_std
                     if lvl < price:
-                        add_tp(lvl, bscore, f"VWAP+{mult}σ")
+                        add_tp(lvl, bscore)
 
             for sl_v in sl_5m:
                 if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.995):
-                    add_tp(sl_v + atr * 0.10, 2.5, "SwingL")
+                    add_tp(sl_v + atr * 0.10, 2.5)
 
             if vwap < price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0, "VWAPpartial")
+                add_tp(partial, 2.0)
 
-        # ── Tiered selection ──────────────────────────────────────────────
+        # ── Tiered selection ──────────────────────────────────────────────────
         if scored:
-            # Tier A: ICT structural (score ≥ 4.0) — nearest maximises win-rate
-            tier_ict = [(lvl, sc, lb) for lvl, sc, lb in scored if sc >= 4.0]
-            if tier_ict:
-                tp = min(tier_ict, key=lambda x: abs(x[0] - price))[0]
-                best_label = min(tier_ict, key=lambda x: abs(x[0] - price))[2]
+            # Tier-A: score ≥ 3.5 → nearest (maximises win-rate)
+            tier_a = [(lvl, sc) for lvl, sc in scored if sc >= 3.5]
+            if tier_a:
+                tp = min(tier_a, key=lambda x: abs(x[0] - price))[0]
             else:
-                # Tier B: best-scored structural (VWAP / walls / swings)
+                # Tier-B: below 3.5 → highest-scored (maximises expected value)
                 scored.sort(key=lambda x: -x[1])
                 tp = scored[0][0]
-                best_label = scored[0][2]
-            logger.debug(f"TP selected: ${tp:,.2f} [{best_label}] from {len(scored)} candidates")
         else:
-            # No structural target — use minimum R:R floor (synthetic, log warning)
+            # No structural target found — enforce minimum R:R floor only
             tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
-            logger.info(
-                f"⚠️  No structural TP within [{QCfg.REVERSION_MIN_RR():.1f}–"
-                f"{QCfg.REVERSION_MAX_RR():.1f}]×SL_dist "
-                f"({min_tp_dist:.0f}–{max_tp_dist:.0f} pts). "
-                f"Using R:R floor ${tp:,.2f} — consider skipping entry.")
 
         return tp
 
@@ -2244,6 +2209,9 @@ class QuantStrategy:
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
+        self._last_momentum_attempt = 0.0   # cooldown after any retest attempt (pass or fail)
+        self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
+        self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
@@ -2667,6 +2635,15 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0
             return
 
+        # ── Retest attempt cooldown ───────────────────────────────────────
+        # Without this, after each _enter_trade call (whether it places an order
+        # OR is rejected by TP gate), the confirm counters reset to 0 and the
+        # momentum path re-fires every 2 seconds indefinitely.
+        # Allow a new attempt only after QUANT_RETEST_RETRY_SEC seconds.
+        retry_sec = float(_cfg("QUANT_RETEST_RETRY_SEC", 30.0))
+        if now - self._last_momentum_attempt < retry_sec:
+            return
+
         # ── Phase 2: Retest ready — apply entry gates ─────────────────────
 
         # Gate 1: Tick flow must agree with breakout direction
@@ -2701,6 +2678,7 @@ class QuantStrategy:
         cn = QCfg.CONFIRM_TICKS()
         if side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
+            self._last_momentum_attempt = now   # prevent re-fire for retry_sec
             retest_sl = self._breakout.retest_sl
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
@@ -2709,6 +2687,7 @@ class QuantStrategy:
             self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
         elif side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
+            self._last_momentum_attempt = now   # prevent re-fire for retry_sec
             retest_sl = self._breakout.retest_sl
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
@@ -2749,80 +2728,23 @@ class QuantStrategy:
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
-        # ── v4.8: ICT OB-aware SL — FVG/liquidity-pool immune ─────────────────
-        # get_ob_sl_level now runs FVG escape and liquidity-pool escape internally.
-        # Only upgrade (tighten) SL; never widen it.
+        # ── v4.8: ICT OB-aware SL enhancement ─────────────────────────────
+        # If an Order Block exists between current SL and price, use it as SL
+        # instead. OBs are institutional footprints — price is more likely to
+        # bounce off an OB than a random swing low. Only UPGRADE (tighter) SL.
         if self._ict is not None:
             try:
                 now_ms = int(time.time() * 1000)
-                ob_sl  = self._ict.get_ob_sl_level(side, price, atr, now_ms)
+                ob_sl = self._ict.get_ob_sl_level(side, price, atr, now_ms)
                 if ob_sl is not None:
                     if side == "long" and ob_sl > sl_price and ob_sl < price:
-                        logger.info(f"🏛️ ICT OB SL → ${sl_price:,.2f} → ${ob_sl:,.2f} (OB support, FVG/pool safe)")
+                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB support)")
                         sl_price = _round_to_tick(ob_sl)
                     elif side == "short" and ob_sl < sl_price and ob_sl > price:
-                        logger.info(f"🏛️ ICT OB SL → ${sl_price:,.2f} → ${ob_sl:,.2f} (OB resistance, FVG/pool safe)")
+                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB resistance)")
                         sl_price = _round_to_tick(ob_sl)
             except Exception as e:
                 logger.debug(f"ICT OB SL error: {e}")
-
-        # ── Structural SL: escape any FVG or liquidity pool it landed in ───────
-        # This is a defence-in-depth pass over the FINAL sl_price regardless of
-        # how it was computed. A SL inside a FVG will be filled. A SL within
-        # 0.3×ATR of a liquidity pool will be swept.
-        if self._ict is not None and self._ict._initialized:
-            try:
-                now_ms  = int(time.time() * 1000)
-                fvg_buf = 0.25 * atr
-                liq_buf = 0.35 * atr
-
-                if side == "short":
-                    # Short SL is above price — check bearish FVGs above price
-                    for fvg in list(self._ict.fvgs_bear):
-                        if fvg.filled or not fvg.is_active(now_ms):
-                            continue
-                        if fvg.bottom <= sl_price <= fvg.top:
-                            new_sl = _round_to_tick(fvg.top + fvg_buf)
-                            logger.info(
-                                f"⚠️  SL inside Bear FVG ${fvg.bottom:,.1f}–${fvg.top:,.1f} "
-                                f"→ escaping to ${new_sl:,.1f} (+{fvg_buf:.0f}pts above FVG)")
-                            sl_price = new_sl
-                            break
-                    # Check EQH pools above price
-                    for pool in list(self._ict.liquidity_pools):
-                        if pool.swept or pool.pool_type != "EQH":
-                            continue
-                        if pool.price > price and abs(sl_price - pool.price) < liq_buf and sl_price < pool.price:
-                            new_sl = _round_to_tick(pool.price + liq_buf)
-                            logger.info(
-                                f"⚠️  SL beneath EQH ${pool.price:,.1f} (x{pool.touch_count}) "
-                                f"→ escaping to ${new_sl:,.1f} (above pool)")
-                            sl_price = new_sl
-                else:
-                    # Long SL is below price — check bullish FVGs below price
-                    for fvg in list(self._ict.fvgs_bull):
-                        if fvg.filled or not fvg.is_active(now_ms):
-                            continue
-                        if fvg.bottom <= sl_price <= fvg.top:
-                            new_sl = _round_to_tick(fvg.bottom - fvg_buf)
-                            logger.info(
-                                f"⚠️  SL inside Bull FVG ${fvg.bottom:,.1f}–${fvg.top:,.1f} "
-                                f"→ escaping to ${new_sl:,.1f} (-{fvg_buf:.0f}pts below FVG)")
-                            sl_price = new_sl
-                            break
-                    for pool in list(self._ict.liquidity_pools):
-                        if pool.swept or pool.pool_type != "EQL":
-                            continue
-                        if pool.price < price and abs(sl_price - pool.price) < liq_buf and sl_price > pool.price:
-                            new_sl = _round_to_tick(pool.price - liq_buf)
-                            logger.info(
-                                f"⚠️  SL above EQL ${pool.price:,.1f} (x{pool.touch_count}) "
-                                f"→ escaping to ${new_sl:,.1f} (below pool)")
-                            sl_price = new_sl
-
-                sl_price = _round_to_tick(sl_price)
-            except Exception as e:
-                logger.debug(f"SL escape pass error: {e}")
 
         # ── v4.7: Mode-aware SL sizing ────────────────────────────────────
         #
@@ -2872,8 +2794,7 @@ class QuantStrategy:
         else:
             tp_price = InstitutionalLevels.compute_tp(
                 price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
-                candles_5m=candles_5m,
-                ict_engine=self._ict)   # v4.9: structural targets (swept liq, FVGs, OBs)
+                candles_5m=candles_5m)
         tp_price = _round_to_tick(tp_price)
 
         # ── Basic direction sanity (unchanged) ───────────────────────────────────
@@ -2884,6 +2805,7 @@ class QuantStrategy:
         # Only active when ExecutionCostEngine is available.
         if self._fee_engine is not None:
             tp_distance = abs(tp_price - price)
+            sl_distance = abs(sl_price - price)
             try:
                 min_tp = self._fee_engine.min_required_tp_move(
                     price             = price,
@@ -2894,19 +2816,21 @@ class QuantStrategy:
                 )
                 if tp_distance < min_tp:
                     snap = self._fee_engine.diagnostic_snapshot()
+                    actual_rr = tp_distance / sl_distance if sl_distance > 1e-10 else 0.0
+                    min_rr    = min_tp / sl_distance if sl_distance > 1e-10 else 0.0
                     logger.info(
-                        f"⛔ TP gate: tp_dist=${tp_distance:.2f} < min_required=${min_tp:.2f} "
-                        f"[pctile={atr_pctile:.2f}, "
-                        f"spread={snap['spread_median_bps']:.1f}bps, "
-                        f"rt_cost_taker={snap['rt_cost_taker_bps']:.1f}bps] — setup rejected"
+                        f"⛔ TP gate: tp=${tp_price:,.1f}({tp_distance:.0f}pts/{tp_distance/atr:.1f}ATR) "
+                        f"R:R={actual_rr:.2f} < required={min_rr:.2f} "
+                        f"[fee_floor=${min_tp:.0f} pctile={atr_pctile:.2f} "
+                        f"spread={snap['spread_median_bps']:.1f}bps "
+                        f"rt={snap['rt_cost_taker_bps']:.1f}bps]"
                     )
                     return None, None
                 logger.debug(
                     f"✅ TP gate passed: tp_dist=${tp_distance:.2f} ≥ min=${min_tp:.2f} "
-                    f"(pctile={atr_pctile:.2f})"
+                    f"R:R={tp_distance/sl_distance:.2f} (pctile={atr_pctile:.2f})"
                 )
             except Exception as e:
-                # Never let fee engine errors block trading
                 logger.debug(f"Fee gate error (non-fatal): {e}")
 
         return sl_price, tp_price
@@ -2998,50 +2922,10 @@ class QuantStrategy:
         td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-
-        # ── Structural TP viability gate ───────────────────────────────────────
-        # Reject entries where TP has no structural backing (just R:R arithmetic).
-        # Rule: if rr < REVERSION_MIN_RR by more than 5% AND ict is initialized
-        # AND no structural target exists within MAX_RR, the setup is invalid.
-        # We already log the "no structural TP" warning inside compute_tp —
-        # here we enforce the minimum R:R hard gate.
-        min_rr_required = QCfg.REVERSION_MIN_RR() if mode == "reversion" else QCfg.TREND_MIN_RR()
-        if rr < min_rr_required * 0.95:
-            logger.info(
-                f"⛔ R:R gate: {rr:.2f} < {min_rr_required:.1f} minimum "
-                f"(SL=${sl_price:,.2f} dist={sd:.0f}pts, TP=${tp_price:,.2f} dist={td:.0f}pts) — skipping")
-            return
-
-        # ── Compute SL/TP distances in ATR for the entry log ──────────────────
-        sl_atr = sd / atr
-        tp_atr = td / atr
-        vwap_dist = abs(price - self._vwap.vwap) / atr if self._vwap.vwap > 0 else 0.0
-
-        # ICT context for entry log
-        ict_context = ""
-        if self._ict is not None and self._ict._initialized:
-            try:
-                now_ms   = int(time.time() * 1000)
-                ict_c    = self._ict.get_confluence(side, price, now_ms)
-                sess     = self._ict._session
-                kz       = self._ict._killzone
-                kz_s     = f"/{kz}" if kz else ""
-                ict_context = (
-                    f" | ICT={ict_c.total:.2f}(OB={ict_c.ob_score:.1f} "
-                    f"FVG={ict_c.fvg_score:.1f} Sw={ict_c.sweep_score:.1f}) "
-                    f"{sess}{kz_s}")
-                if ict_c.details:
-                    ict_context += f" [{ict_c.details}]"
-            except Exception:
-                pass
-
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f}(-{sd:.0f}pts/{sl_atr:.2f}ATR) "
-            f"TP=${tp_price:,.2f}(-{td:.0f}pts/{tp_atr:.2f}ATR) "
-            f"R:R=1:{rr:.2f} | {'maker' if use_maker else 'taker'} | "
-            f"VWAP=${sig.vwap_price:,.2f}({vwap_dist:.1f}ATR) | "
-            f"{sig}{ict_context}"
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
+            f"{'maker' if use_maker else 'taker'} | VWAP=${sig.vwap_price:,.2f} | {sig}"
         )
 
         # ── Place entry order (PATCH 5e) ──────────────────────────────────────────
@@ -3087,21 +2971,52 @@ class QuantStrategy:
             except Exception as e:
                 logger.debug(f"record_fill error (non-fatal): {e}")
 
-        # ── Recompute SL/TP from actual fill if slippage was significant ──────────
-        slip = abs(fill_price - price) / price
-        if slip > QCfg.SLIPPAGE_TOL():
+        # ── Recompute SL/TP from actual fill only on ADVERSE slippage ────────────
+        # CRITICAL BUG FIX: The old code used abs(fill_price - price) which fired
+        # on FAVORABLE fills too. A SHORT limit at $73,629 filling at $73,683
+        # (market moved up, maker got better price) is NOT slippage — it's
+        # favorable execution. Recomputing in that case then hit pctile=0.00
+        # (ATR percentile drops in the seconds between decision and fill) and
+        # the fee floor rejected the now-open position, instantly closing it.
+        #
+        # Adverse slippage definition:
+        #   LONG:  fill_price > price (paid more than the market snapshot)
+        #   SHORT: fill_price < price (sold for less than the market snapshot)
+        #
+        # Favorable execution (market moved in our direction between decision
+        # and fill) should NOT trigger recompute — the SL/TP from the original
+        # decision are still valid or better.
+        is_adverse_slip = (
+            (side == "long"  and fill_price > price) or
+            (side == "short" and fill_price < price)
+        )
+        adverse_slip_pct = (abs(fill_price - price) / price) if is_adverse_slip else 0.0
+
+        if is_adverse_slip and adverse_slip_pct > QCfg.SLIPPAGE_TOL():
+            logger.info(
+                f"⚠️ Adverse slippage {adverse_slip_pct:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} "
+                f"— recomputing SL/TP from fill price ${fill_price:,.2f}")
             new_sl, new_tp = self._compute_sl_tp(
                 data_manager, fill_price, side, atr, mode=mode,
                 signal_confidence=signal_confidence,
                 use_maker_entry=(actual_fill_type == "maker"),
             )
             if new_sl is None:
-                # After slippage, trade no longer clears fee floor — abort
+                # After adverse slippage, trade no longer clears fee floor — abort
+                logger.warning(
+                    f"❌ Post-slippage TP gate rejected — aborting trade "
+                    f"(adverse slip={adverse_slip_pct:.4%})")
                 exit_side = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
                 self._last_exit_time = time.time()
                 return
             sl_price, tp_price = new_sl, new_tp
+        elif not is_adverse_slip and abs(fill_price - price) / price > QCfg.SLIPPAGE_TOL():
+            # Favorable fill: market moved our way. Log it but keep original SL/TP.
+            fav_pct = abs(fill_price - price) / price
+            logger.info(
+                f"✅ Favorable fill: ${fill_price:,.2f} vs snapshot ${price:,.2f} "
+                f"(+{fav_pct:.4%} in our direction) — keeping original SL/TP")
 
         # ── Place SL/TP ───────────────────────────────────────────────────────────
         exit_side = "sell" if side == "long" else "buy"

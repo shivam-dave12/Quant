@@ -329,6 +329,7 @@ QUANT_SL_MAX_ATR_MULT          = 4.0   # Reversion SL: max 4×ATR from entry
 QUANT_BO_MIN_SCORE             = 4     # Min score to trigger (out of ~10 possible)
 QUANT_BO_BLOCK_SEC             = 900   # Block reversion for 15 min after breakout
 QUANT_BO_RETEST_TIMEOUT        = 900   # Give up waiting for retest after 15 min
+QUANT_RETEST_RETRY_SEC         = 30    # Seconds between retest entry attempts after rejection (prevents 2s spam)
 
 # 10o. Smart max-hold exit — v4.6 COMPLETE REWRITE
 #      v4.4: tighten SL for profitable trades. Still force-exited underwater trades.
@@ -357,8 +358,9 @@ FEE_SLIP_DEFAULT_BPS        = 1.5
 FEE_SLIP_MIN_BPS            = 0.5
 
 # 11c. ProfitFloorModel — sigmoid multiplier curve
-FEE_FLOOR_MULT_LOW          = 5.5
-FEE_FLOOR_MULT_HIGH         = 1.8
+FEE_FLOOR_MULT_LOW          = 2.5   # was 5.5 — caused 7xATR TP demands at low pctile
+FEE_FLOOR_MULT_HIGH         = 1.2   # was 1.8
+FEE_FLOOR_MAX_ATR_MULT      = 2.0   # Hard ATR cap: fee floor can never exceed 2.0xATR (prevents physically impossible TP demands)
 FEE_FLOOR_INFLECT           = 0.45
 FEE_FLOOR_STEEPNESS         = 6.0
 FEE_FLOOR_ABS_MIN_MULT      = 1.4
@@ -409,7 +411,7 @@ ATR_PCTILE_RANK_WINDOW      = 30
 #
 
 # 13a. Order Blocks (ICT)
-OB_MIN_IMPULSE_PCT          = 0.15   # impulse candle body >= 0.15% of price (was 0.50 → required $420 body on BTC 5m — nothing qualified)
+OB_MIN_IMPULSE_PCT          = 0.50   # impulse candle must move >= 0.5%
 OB_MIN_BODY_RATIO           = 0.50   # impulse body >= 50% of range
 OB_IMPULSE_SIZE_MULTIPLIER  = 1.30   # impulse range >= 1.30x OB range
 OB_MAX_AGE_MINUTES          = 1440   # 24h — OBs remain valid for a full day
