@@ -2405,17 +2405,74 @@ class QuantStrategy:
         c=sig.composite; thr=QCfg.COMPOSITE_ENTRY_MIN()
         regime_lbl = sig.market_regime
         gates = [
-            f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR)",
-            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})",
-            f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
-            f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'})",
-            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
-            f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
-        if sig.ict_total > 0.01:
-            ict_lbl = f"🏛️ ICT: {sig.ict_total:.2f} (OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Sweep={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f})"
-            if sig.ict_details:
-                ict_lbl += f" [{sig.ict_details}]"
-            gates.append(ict_lbl)
+            f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR from VWAP ${sig.vwap_price:,.1f})",
+            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%} ATR pctile)",
+            f"{'✅' if not sig.htf_veto else '❌'} HTF veto (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
+            f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'} signals agree)",
+            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f} threshold)",
+            f"📊 Regime: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
+
+        # ICT structural context — show actual price levels not just a score
+        if self._ict is not None and self._ict._initialized:
+            atr_val = sig.atr
+            try:
+                st = self._ict.get_full_status(price, atr_val, int(now * 1000))
+                ict_lines = []
+                # Nearest bull OB below price
+                bull_below = [o for o in st["bull_obs"] if o["low"] < price][:1]
+                bear_above = [o for o in st["bear_obs"] if o["high"] > price][:1]
+                for ob in bull_below:
+                    tags = "+".join(ob["tags"]) if ob["tags"] else "plain"
+                    ict_lines.append(
+                        f"  🟢 Bull OB ${ob['low']:,.1f}-${ob['high']:,.1f} "
+                        f"({ob['dist_pts']:+.1f}pts / {ob['dist_atr']:.2f}ATR) "
+                        f"str={ob['strength']:.0f} [{tags}]")
+                for ob in bear_above:
+                    tags = "+".join(ob["tags"]) if ob["tags"] else "plain"
+                    ict_lines.append(
+                        f"  🔴 Bear OB ${ob['low']:,.1f}-${ob['high']:,.1f} "
+                        f"({ob['dist_pts']:+.1f}pts / {ob['dist_atr']:.2f}ATR) "
+                        f"str={ob['strength']:.0f} [{tags}]")
+                # Nearest FVGs
+                bull_fvg = [f for f in st["bull_fvgs"] if f["bottom"] < price][:1]
+                bear_fvg = [f for f in st["bear_fvgs"] if f["top"] > price][:1]
+                for fvg in bull_fvg:
+                    ict_lines.append(
+                        f"  🟦 Bull FVG ${fvg['bottom']:,.1f}-${fvg['top']:,.1f} "
+                        f"size={fvg['size']:.1f} fill={fvg['fill_pct']:.0%} "
+                        f"({fvg['dist_pts']:+.1f}pts)")
+                for fvg in bear_fvg:
+                    ict_lines.append(
+                        f"  🟥 Bear FVG ${fvg['bottom']:,.1f}-${fvg['top']:,.1f} "
+                        f"size={fvg['size']:.1f} fill={fvg['fill_pct']:.0%} "
+                        f"({fvg['dist_pts']:+.1f}pts)")
+                # Nearby liquidity
+                nearby_liq = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 3.0 * atr_val][:3]
+                for liq in nearby_liq:
+                    arrow = "▼" if liq["price"] < price else "▲"
+                    ict_lines.append(
+                        f"  💧 {liq['pool_type']} {arrow} ${liq['price']:,.1f} "
+                        f"x{liq['touch_count']} ({liq['dist_pts']:+.1f}pts)")
+                # Session + score
+                kz_str = f" [{st['killzone']}]" if st.get("killzone") else ""
+                ict_score_str = (f"🏛️ ICT Σ={sig.ict_total:.2f} "
+                                 f"OB={sig.ict_ob:.2f} FVG={sig.ict_fvg:.2f} "
+                                 f"Sweep={sig.ict_sweep:.2f} KZ={sig.ict_session:.2f} "
+                                 f"| {st['session']}{kz_str}")
+                if not ict_lines:
+                    ict_lines.append(f"  (no structures near price — {sig.ict_details})")
+                gates.append(ict_score_str)
+                gates.extend(ict_lines)
+            except Exception:
+                if sig.ict_total > 0.01:
+                    gates.append(
+                        f"🏛️ ICT: {sig.ict_total:.2f} "
+                        f"OB={sig.ict_ob:.2f} FVG={sig.ict_fvg:.2f} "
+                        f"[{sig.ict_details}]")
+        elif self._ict is not None and not self._ict._initialized:
+            gates.append(f"🏛️ ICT: warming up ({len(list(self._ict.order_blocks_bull))} bull / "
+                         f"{len(list(self._ict.order_blocks_bear))} bear OBs)")
+
         ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr
         cd = max(0.0, QCfg.COOLDOWN_SEC()-(now-self._last_exit_time))
         lines = [f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
@@ -2427,6 +2484,97 @@ class QuantStrategy:
         lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd>0 else 'ready'}")
         lines.append(f"└{'─'*66}")
         logger.info("\n"+"\n".join(lines))
+
+    def _log_ict_structures(self, st: Dict, ict_conf, ict_side: str,
+                            price: float, atr: float) -> None:
+        """
+        Throttled detailed ICT structure log — fires when OBs/FVGs exist near price.
+        Only emits when something meaningful is within 3×ATR.
+        Separate from _log_thinking so the 30s throttle on thinking doesn't suppress it.
+        """
+        if not hasattr(self, '_last_ict_struct_log'):
+            self._last_ict_struct_log = 0.0
+        now = time.time()
+        # Throttle to once per 60s — structure doesn't change that fast
+        if now - self._last_ict_struct_log < 60.0:
+            return
+        # Only log if we have something within 2×ATR
+        nearby_ob = any(abs(o["dist_pts"]) < 2.0 * atr
+                        for o in st["bull_obs"] + st["bear_obs"])
+        nearby_fvg = any(abs(f["dist_pts"]) < 2.0 * atr
+                         for f in st["bull_fvgs"] + st["bear_fvgs"])
+        if not nearby_ob and not nearby_fvg:
+            return
+        self._last_ict_struct_log = now
+
+        lines = [
+            f"┌─── 🏛️ ICT STRUCTURES  ${price:,.2f}  side={ict_side.upper()}  "
+            f"Σ={ict_conf.total:.2f} [{ict_conf.session_name}"
+            f"{(' '+ict_conf.killzone) if ict_conf.killzone else ''}] ────"
+        ]
+        c = st["counts"]
+        lines.append(
+            f"  OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
+            f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
+            f"Liq: {c['liq_active']} active {c['liq_swept']} swept"
+        )
+
+        # Bull OBs
+        for ob in st["bull_obs"][:4]:
+            in_tag = " ◄ IN" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+            tags = "+".join(ob["tags"]) if ob["tags"] else "-"
+            bos_char = "B" if ob["bos"] else " "
+            lines.append(
+                f"  🟢[{bos_char}] ${ob['low']:,.1f}─${ob['high']:,.1f} "
+                f"mid=${ob['midpoint']:,.1f}  dist={ob['dist_pts']:+.1f}pts/{ob['dist_atr']:.2f}ATR  "
+                f"str={ob['strength']:.0f} v={ob['visit_count']} [{tags}]{in_tag}"
+            )
+        # Bear OBs
+        for ob in st["bear_obs"][:4]:
+            in_tag = " ◄ IN" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+            tags = "+".join(ob["tags"]) if ob["tags"] else "-"
+            bos_char = "B" if ob["bos"] else " "
+            lines.append(
+                f"  🔴[{bos_char}] ${ob['low']:,.1f}─${ob['high']:,.1f} "
+                f"mid=${ob['midpoint']:,.1f}  dist={ob['dist_pts']:+.1f}pts/{ob['dist_atr']:.2f}ATR  "
+                f"str={ob['strength']:.0f} v={ob['visit_count']} [{tags}]{in_tag}"
+            )
+        # FVGs
+        for fvg in (st["bull_fvgs"] + st["bear_fvgs"])[:4]:
+            icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
+            in_tag = " ◄ IN" if fvg["in_gap"] else ""
+            lines.append(
+                f"  {icon} ${fvg['bottom']:,.1f}─${fvg['top']:,.1f}  "
+                f"size={fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
+                f"dist={fvg['dist_pts']:+.1f}pts/{fvg['dist_atr']:.2f}ATR  "
+                f"age={fvg['age_min']:.0f}m{in_tag}"
+            )
+        # Liquidity within 3×ATR
+        near_liq = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 3.0 * atr]
+        for liq in near_liq[:4]:
+            arrow = "▼" if liq["price"] < price else "▲"
+            lines.append(
+                f"  💧 {liq['pool_type']} {arrow} ${liq['price']:,.1f}  "
+                f"x{liq['touch_count']}  dist={liq['dist_pts']:+.1f}pts"
+            )
+        # Swept liquidity (last 2h)
+        for liq in st["liq_swept"][:2]:
+            disp = "DISP" if liq["displacement"] else "weak"
+            age = f"{liq['sweep_age_min']:.0f}m ago" if liq["sweep_age_min"] is not None else ""
+            lines.append(
+                f"  🌊 SWEPT {liq['pool_type']} ${liq['price']:,.1f}  "
+                f"[{disp}] {age}"
+            )
+        # Nearest swing levels
+        sh = st["swing_highs"][:3]
+        sl = st["swing_lows"][:3]
+        if sh:
+            lines.append(f"  📌 Swing highs: {' | '.join(f'${h:,.1f}' for h in sh)}")
+        if sl:
+            lines.append(f"  📌 Swing lows:  {' | '.join(f'${l:,.1f}' for l in sl)}")
+
+        lines.append(f"└{'─'*66}")
+        logger.info("\n" + "\n".join(lines))
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         # v4.3 Solution 5: Spread cost gate
@@ -2440,29 +2588,58 @@ class QuantStrategy:
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
         # Update ICT structures (OB, FVG, liquidity, session) every 5s
-        # Then score ICT confluence for the current reversion side
-        # ICT score is used to: (a) boost composite, (b) count as confirming signal
+        # Then score ICT confluence for the CORRECT trade direction:
+        #   - RANGING regime       → reversion_side (fade the extension)
+        #   - TRENDING regime      → trend direction (confirm the pullback)
+        #   - Breakout retest      → breakout direction
+        # BUG FIX: was always using reversion_side. In TRENDING_UP, reversion_side
+        # = "short", so bearish OBs got scored and boosted a LONG trend entry —
+        # the ICT signal was pointing exactly backwards.
         if self._ict is not None:
             try:
-                candles_5m = data_manager.get_candles("5m", limit=100)
+                candles_5m  = data_manager.get_candles("5m", limit=100)
                 candles_15m = data_manager.get_candles("15m", limit=50)
-                now_ms = int(now * 1000) if now < 1e12 else int(now)
+                now_ms = int(now * 1000)
                 self._ict.update(candles_5m, candles_15m, price, now_ms)
-                ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
+
+                # Determine correct ICT side for the current regime
+                if self._breakout.is_active and self._breakout.direction:
+                    ict_side = "long" if self._breakout.direction == "up" else "short"
+                elif self._regime.is_trending():
+                    trend_side = self._regime.trend_side()
+                    ict_side = trend_side if trend_side else sig.reversion_side
+                else:
+                    ict_side = sig.reversion_side if sig.reversion_side else (
+                        "long" if sig.composite > 0 else "short")
+
                 ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
-                sig.ict_ob = ict_conf.ob_score
-                sig.ict_fvg = ict_conf.fvg_score
-                sig.ict_sweep = ict_conf.sweep_score
+                sig.ict_ob      = ict_conf.ob_score
+                sig.ict_fvg     = ict_conf.fvg_score
+                sig.ict_sweep   = ict_conf.sweep_score
                 sig.ict_session = ict_conf.session_score
-                sig.ict_total = ict_conf.total
+                sig.ict_total   = ict_conf.total
                 sig.ict_details = ict_conf.details
+
                 # Boost composite: ICT structural alignment strengthens the signal
                 # max boost = 0.15 (ICT total=1.0 × 0.15 = strongest possible)
                 ict_boost = ict_conf.total * 0.15
-                sig.composite = max(-1.0, min(1.0, sig.composite + (ict_boost if sig.composite > 0 else -ict_boost)))
-                # ICT counts as a confirming signal if total > 0.3
+                if sig.composite > 0:
+                    sig.composite = min(1.0, sig.composite + ict_boost)
+                else:
+                    sig.composite = max(-1.0, sig.composite - ict_boost)
+
+                # ICT counts as a confirming signal if total >= 0.30
                 if ict_conf.total >= 0.30:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
+
+                # Detailed ICT log (throttled — only when near entry)
+                if ict_conf.total > 0.01:
+                    atr_val = self._atr_5m.atr
+                    st = self._ict.get_full_status(price, atr_val, now_ms)
+                    # Only log when we have actual structures to show
+                    if st["counts"]["ob_bull"] + st["counts"]["ob_bear"] > 0:
+                        self._log_ict_structures(st, ict_conf, ict_side, price, atr_val)
+
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
 
@@ -3488,23 +3665,74 @@ class QuantStrategy:
 
     def format_status_report(self):
         """
-        Telegram status report — PATCH 6.
-        Adds execution cost diagnostics block when _fee_engine is available.
+        Telegram status report — includes ICT structure counts + nearest levels.
         """
         s = self.get_stats()
         p = self._pos
         lines = [
             "📊 <b>QUANT v4 STATUS</b>", "",
             f"Phase: {s['current_phase']}",
-            f"Regime: {'✅' if s['regime_ok'] else '❌'}",
-            f"ATR: ${s['atr_5m']}/{s['atr_1m']} ({s['atr_pctile']})",
-            f"HTF: 15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}",
-            f"VWAP: ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f}ATR)", "",
+            f"Regime: {'✅' if s['regime_ok'] else '❌'} | ADX={self._adx.adx:.1f}",
+            f"ATR: ${s['atr_5m']} (5m) / ${s['atr_1m']} (1m)  [{s['atr_pctile']} pctile]",
+            f"HTF: 15m={self._htf.trend_15m:+.2f}  4h={self._htf.trend_4h:+.2f}",
+            f"VWAP: ${self._vwap.vwap:,.2f}  dev={self._vwap.deviation_atr:+.1f}ATR", "",
             f"Trades: {s['total_trades']} | WR {s['win_rate']} | PnL ${s['total_pnl']:+.2f}",
             f"Daily: {s['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} | Losses: {s['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()}",
         ]
 
-        # ── Execution cost diagnostics (only when fee engine is live) ─────────────
+        # ── ICT structure summary ─────────────────────────────────────────
+        if self._ict is not None and self._ict._initialized:
+            try:
+                price = self._last_known_price
+                atr   = self._atr_5m.atr
+                now_ms = int(time.time() * 1000)
+                st = self._ict.get_full_status(price, atr, now_ms)
+                c  = st["counts"]
+                kz = st.get("killzone", "")
+                sess = st.get("session", "")
+                lines += [
+                    "",
+                    f"<b>ICT Structure</b>  [{sess}{(' '+kz) if kz else ''}]",
+                    f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
+                    f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
+                    f"Liq: {c['liq_active']} active"
+                ]
+                # Nearest bull OB below
+                for ob in st["bull_obs"][:2]:
+                    tags = "+".join(ob["tags"]) if ob["tags"] else "-"
+                    in_t = " ◄IN" if ob["in_ob"] else ""
+                    lines.append(
+                        f"  🟢 ${ob['low']:,.0f}─${ob['high']:,.0f}  "
+                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.1f}ATR  "
+                        f"str={ob['strength']:.0f} [{tags}]{in_t}")
+                # Nearest bear OB above
+                for ob in st["bear_obs"][:2]:
+                    tags = "+".join(ob["tags"]) if ob["tags"] else "-"
+                    in_t = " ◄IN" if ob["in_ob"] else ""
+                    lines.append(
+                        f"  🔴 ${ob['low']:,.0f}─${ob['high']:,.0f}  "
+                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.1f}ATR  "
+                        f"str={ob['strength']:.0f} [{tags}]{in_t}")
+                # Nearest FVGs (1 each side)
+                for fvg in (st["bull_fvgs"][:1] + st["bear_fvgs"][:1]):
+                    icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
+                    in_t = " ◄IN" if fvg["in_gap"] else ""
+                    lines.append(
+                        f"  {icon} ${fvg['bottom']:,.0f}─${fvg['top']:,.0f}  "
+                        f"fill={fvg['fill_pct']:.0%}  {fvg['dist_pts']:+.0f}pts{in_t}")
+                # Recent sweeps
+                for liq in st["liq_swept"][:2]:
+                    disp = "DISP" if liq["displacement"] else "weak"
+                    age  = f"{liq['sweep_age_min']:.0f}m ago" if liq["sweep_age_min"] else ""
+                    lines.append(f"  🌊 SWEPT {liq['pool_type']} ${liq['price']:,.0f} [{disp}] {age}")
+            except Exception as e:
+                lines.append(f"  ICT: error ({e})")
+        elif self._ict is not None:
+            bull_n = len(list(self._ict.order_blocks_bull))
+            bear_n = len(list(self._ict.order_blocks_bear))
+            lines.append(f"\nICT: warming up  ({bull_n}🟢 {bear_n}🔴 OBs detected so far)")
+
+        # ── Execution cost diagnostics ────────────────────────────────────
         if self._fee_engine is not None:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()

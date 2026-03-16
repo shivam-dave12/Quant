@@ -190,8 +190,8 @@ class ICTEngine:
     """
 
     # ── Config defaults (overrideable via config module) ──────────────
-    OB_MIN_IMPULSE_PCT = 0.50
-    OB_MIN_BODY_RATIO = 0.50
+    OB_MIN_IMPULSE_PCT = 0.15   # 0.15% body — was 0.50 (required $420 on BTC 5m, nothing qualified)
+    OB_MIN_BODY_RATIO = 0.40   # body >= 40% of range (was 0.50 — too strict for wicky impulse candles)
     OB_IMPULSE_SIZE_MULT = 1.30
     OB_MAX_AGE_MS = 86_400_000
     FVG_MIN_SIZE_PCT = 0.020
@@ -287,25 +287,31 @@ class ICTEngine:
 
     def _detect_swing_points(self, candles_5m: List[Dict],
                               candles_15m: List[Dict]) -> None:
-        """Detect fractal swing highs/lows for OB reference and liquidity."""
+        """Detect fractal swing highs/lows for OB reference and liquidity.
+
+        BUG FIX: was using >= which lets flat-topped candles qualify as swing
+        highs, polluting the OB and liquidity pool detection. Strict > required.
+        lb_left reduced from 5→3, lb_right from 3→2: with 5-bar lookback on 5m
+        candles you need 25 minutes of price to clear both sides — almost no swings
+        were found, starving OB/liq detection of reference levels.
+        """
         self._swing_highs.clear()
         self._swing_lows.clear()
 
         for candles in [candles_5m, candles_15m]:
             if len(candles) < 7:
                 continue
-            lb_left = 5
-            lb_right = 3
+            lb_left = 3
+            lb_right = 2
             for i in range(lb_left, len(candles) - lb_right):
                 h = float(candles[i]['h'])
                 l = float(candles[i]['l'])
-                # Swing high
-                if all(h >= float(candles[j]['h']) for j in range(i - lb_left, i)) and \
-                   all(h >= float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
+                # STRICT > — flat tops must NOT qualify as swing highs
+                if all(h > float(candles[j]['h']) for j in range(i - lb_left, i)) and \
+                   all(h > float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_highs.append(h)
-                # Swing low
-                if all(l <= float(candles[j]['l']) for j in range(i - lb_left, i)) and \
-                   all(l <= float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
+                if all(l < float(candles[j]['l']) for j in range(i - lb_left, i)) and \
+                   all(l < float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_lows.append(l)
 
     # ══════════════════════════════════════════════════════════════════
@@ -314,47 +320,68 @@ class ICTEngine:
 
     def _detect_order_blocks(self, candles: List[Dict], price: float,
                               now_ms: int) -> None:
-        """OB = last opposite candle before a strong impulse move."""
-        if len(candles) < 5:
+        """OB = last opposite candle before a strong impulse move.
+
+        BUG FIX: was checking only candles[i+1] for the impulse. ICT OBs are
+        defined by the last opposing candle before a SEQUENCE of directional
+        candles. We now check if ANY of the next 1-3 candles form a qualifying
+        impulse, and aggregate their combined displacement.
+        """
+        if len(candles) < 6:
             return
 
-        tol = price * 0.001
+        tol = price * 0.0008   # dedup: OBs within 0.08% of each other ignored
         prior_highs = sorted(self._swing_highs, reverse=True)[:5]
-        prior_lows = sorted(self._swing_lows)[:5]
+        prior_lows  = sorted(self._swing_lows)[:5]
 
-        for i in range(2, len(candles) - 1):
+        for i in range(2, len(candles) - 3):
             cur = candles[i]
-            nxt = candles[i + 1]
-
             cur_o, cur_c = float(cur['o']), float(cur['c'])
             cur_h, cur_l = float(cur['h']), float(cur['l'])
-            nxt_o, nxt_c = float(nxt['o']), float(nxt['c'])
-            nxt_h, nxt_l = float(nxt['h']), float(nxt['l'])
             cur_ts = int(cur.get('t', now_ms))
 
-            nxt_range = nxt_h - nxt_l
-            nxt_body = abs(nxt_c - nxt_o)
+            # ── Measure the impulse over the next 1-3 candles ────────────────
+            # Aggregate: combined displacement, max body ratio, direction
+            imp_high = cur_h; imp_low = cur_l
+            max_body_ratio = 0.0; net_up = 0.0; net_dn = 0.0
+            for k in range(1, min(4, len(candles) - i)):
+                nc = candles[i + k]
+                nc_o, nc_c = float(nc['o']), float(nc['c'])
+                nc_h, nc_l = float(nc['h']), float(nc['l'])
+                nc_range = nc_h - nc_l
+                nc_body = abs(nc_c - nc_o)
+                br = nc_body / max(nc_range, 1e-9)
+                if nc_c > nc_o:
+                    net_up += nc_body; max_body_ratio = max(max_body_ratio, br)
+                else:
+                    net_dn += nc_body; max_body_ratio = max(max_body_ratio, br)
+                imp_high = max(imp_high, nc_h)
+                imp_low  = min(imp_low, nc_l)
 
-            impulse_up = (nxt_c > nxt_o and
-                         (nxt_c - nxt_o) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
-                         nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
-            impulse_down = (nxt_c < nxt_o and
-                           (nxt_o - nxt_c) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
-                           nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+            total_range = imp_high - imp_low
+            imp_move_up = (imp_high - cur_h) / max(cur_c, 1.0) * 100.0   # % move from OB high
+            imp_move_dn = (cur_l - imp_low) / max(cur_c, 1.0) * 100.0    # % move from OB low
+
+            impulse_up   = (net_up > net_dn and
+                            imp_move_up >= self.OB_MIN_IMPULSE_PCT and
+                            max_body_ratio >= self.OB_MIN_BODY_RATIO)
+            impulse_down = (net_dn > net_up and
+                            imp_move_dn >= self.OB_MIN_IMPULSE_PCT and
+                            max_body_ratio >= self.OB_MIN_BODY_RATIO)
 
             # Bullish OB: bearish candle before bullish impulse
             if impulse_up and cur_c < cur_o:
-                bos_ok = any(nxt_h > ph for ph in prior_highs[:3]) if prior_highs else False
-                has_disp = nxt_range > 0 and nxt_body / nxt_range >= self.SWEEP_DISP_MIN
+                bos_ok  = any(imp_high > ph for ph in prior_highs[:3]) if prior_highs else False
+                has_disp = total_range > 0 and net_up / total_range >= self.SWEEP_DISP_MIN
                 body_low = min(cur_o, cur_c)
                 wick = body_low - cur_l if body_low > cur_l else 0.0
                 wick_rej = (cur_h - cur_l) > 0 and wick / (cur_h - cur_l) >= 0.20
 
                 strength = 40.0
-                if bos_ok: strength += 20.0
-                if has_disp: strength += 15.0
-                if wick_rej: strength += 10.0
-                if nxt_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
+                if bos_ok:    strength += 20.0
+                if has_disp:  strength += 15.0
+                if wick_rej:  strength += 10.0
+                if total_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
                     strength += 15.0
                 strength = min(strength, 100.0)
 
@@ -365,20 +392,24 @@ class ICTEngine:
                         direction="bullish", strength=strength,
                         bos_confirmed=bos_ok, has_displacement=has_disp,
                         has_wick_rejection=wick_rej, max_age_ms=self.OB_MAX_AGE_MS))
+                    logger.debug(
+                        f"🟢 Bull OB @ ${cur_l:,.0f}-${cur_h:,.0f} "
+                        f"str={strength:.0f} BOS={bos_ok} disp={has_disp} wick={wick_rej}"
+                    )
 
             # Bearish OB: bullish candle before bearish impulse
             if impulse_down and cur_c > cur_o:
-                bos_ok = any(nxt_l < pl for pl in prior_lows[:3]) if prior_lows else False
-                has_disp = nxt_range > 0 and nxt_body / nxt_range >= self.SWEEP_DISP_MIN
+                bos_ok  = any(imp_low < pl for pl in prior_lows[:3]) if prior_lows else False
+                has_disp = total_range > 0 and net_dn / total_range >= self.SWEEP_DISP_MIN
                 body_top = max(cur_o, cur_c)
                 wick = cur_h - body_top if cur_h > body_top else 0.0
                 wick_rej = (cur_h - cur_l) > 0 and wick / (cur_h - cur_l) >= 0.20
 
                 strength = 40.0
-                if bos_ok: strength += 20.0
-                if has_disp: strength += 15.0
-                if wick_rej: strength += 10.0
-                if nxt_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
+                if bos_ok:    strength += 20.0
+                if has_disp:  strength += 15.0
+                if wick_rej:  strength += 10.0
+                if total_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
                     strength += 15.0
                 strength = min(strength, 100.0)
 
@@ -389,6 +420,10 @@ class ICTEngine:
                         direction="bearish", strength=strength,
                         bos_confirmed=bos_ok, has_displacement=has_disp,
                         has_wick_rejection=wick_rej, max_age_ms=self.OB_MAX_AGE_MS))
+                    logger.debug(
+                        f"🔴 Bear OB @ ${cur_l:,.0f}-${cur_h:,.0f} "
+                        f"str={strength:.0f} BOS={bos_ok} disp={has_disp} wick={wick_rej}"
+                    )
 
     # ══════════════════════════════════════════════════════════════════
     # FVG DETECTION
@@ -742,4 +777,120 @@ class ICTEngine:
             "sweeps_active": len([p for p in self.liquidity_pools if p.swept]),
             "session": self._session,
             "killzone": self._killzone or "none",
+        }
+
+    def get_full_status(self, price: float, atr: float, now_ms: int) -> Dict:
+        """
+        Return rich structure data with prices, distances, and ATR multiples.
+        Used by /structures command and enhanced terminal logging.
+
+        Returns a dict with:
+          - bull_obs, bear_obs: sorted by proximity to price
+          - bull_fvgs, bear_fvgs: sorted by proximity
+          - liq_active, liq_swept: liquidity pools
+          - swing_highs, swing_lows: raw swing levels
+          - session, killzone
+          - initialized: bool
+        """
+        atr_safe = atr if atr > 1e-10 else 1.0
+
+        def _ob_detail(ob: OrderBlock) -> Dict:
+            dist = price - ob.midpoint if ob.direction == "bullish" else ob.midpoint - price
+            dist_pct = (price - ob.midpoint) / price * 100.0
+            in_ob = ob.contains_price(price)
+            in_ote = ob.in_optimal_zone(price)
+            age_min = (now_ms - ob.timestamp) / 60_000.0
+            tags = []
+            if in_ote:  tags.append("OTE")
+            if in_ob and not in_ote: tags.append("BODY")
+            if ob.bos_confirmed: tags.append("BOS")
+            if ob.has_displacement: tags.append("DISP")
+            if ob.has_wick_rejection: tags.append("WR")
+            if ob.visit_count == 0: tags.append("VIRGIN")
+            return {
+                "low": ob.low, "high": ob.high,
+                "midpoint": ob.midpoint,
+                "direction": ob.direction,
+                "strength": ob.strength,
+                "visit_count": ob.visit_count,
+                "bos": ob.bos_confirmed,
+                "in_ob": in_ob, "in_ote": in_ote,
+                "dist_pts": dist,
+                "dist_pct": dist_pct,
+                "dist_atr": dist / atr_safe,
+                "age_min": age_min,
+                "tags": tags,
+                "is_active": ob.is_active(now_ms),
+            }
+
+        def _fvg_detail(fvg: FairValueGap) -> Dict:
+            dist_pts = price - fvg.midpoint if fvg.direction == "bullish" else fvg.midpoint - price
+            age_min = (now_ms - fvg.timestamp) / 60_000.0
+            return {
+                "bottom": fvg.bottom, "top": fvg.top,
+                "midpoint": fvg.midpoint,
+                "direction": fvg.direction,
+                "size": fvg.size,
+                "fill_pct": fvg.fill_percentage,
+                "filled": fvg.filled,
+                "in_gap": fvg.is_price_in_gap(price),
+                "dist_pts": dist_pts,
+                "dist_atr": dist_pts / atr_safe,
+                "age_min": age_min,
+            }
+
+        def _liq_detail(pool: LiquidityPool) -> Dict:
+            dist_pts = price - pool.price
+            age_sweep_min = (now_ms - pool.sweep_timestamp) / 60_000.0 if pool.swept else None
+            return {
+                "price": pool.price,
+                "pool_type": pool.pool_type,
+                "touch_count": pool.touch_count,
+                "swept": pool.swept,
+                "displacement": pool.displacement_confirmed,
+                "wick_rejection": pool.wick_rejection,
+                "dist_pts": dist_pts,
+                "dist_atr": dist_pts / atr_safe,
+                "sweep_age_min": age_sweep_min,
+            }
+
+        bull_obs  = sorted(
+            [_ob_detail(o) for o in self.order_blocks_bull if o.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+        bear_obs  = sorted(
+            [_ob_detail(o) for o in self.order_blocks_bear if o.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+        bull_fvgs = sorted(
+            [_fvg_detail(f) for f in self.fvgs_bull if not f.filled],
+            key=lambda x: abs(x["dist_pts"]))
+        bear_fvgs = sorted(
+            [_fvg_detail(f) for f in self.fvgs_bear if not f.filled],
+            key=lambda x: abs(x["dist_pts"]))
+        liq_active = sorted(
+            [_liq_detail(p) for p in self.liquidity_pools if not p.swept],
+            key=lambda x: abs(x["dist_pts"]))
+        liq_swept  = sorted(
+            [_liq_detail(p) for p in self.liquidity_pools if p.swept],
+            key=lambda x: abs(x.get("sweep_age_min", 9999)))
+
+        return {
+            "initialized": self._initialized,
+            "bull_obs": bull_obs,
+            "bear_obs": bear_obs,
+            "bull_fvgs": bull_fvgs,
+            "bear_fvgs": bear_fvgs,
+            "liq_active": liq_active,
+            "liq_swept": liq_swept,
+            "swing_highs": sorted([h for h in self._swing_highs if h > price]),
+            "swing_lows": sorted([l for l in self._swing_lows if l < price], reverse=True),
+            "session": self._session,
+            "killzone": self._killzone or "",
+            "counts": {
+                "ob_bull": len(bull_obs),
+                "ob_bear": len(bear_obs),
+                "fvg_bull": len(bull_fvgs),
+                "fvg_bear": len(bear_fvgs),
+                "liq_active": len(liq_active),
+                "liq_swept": len(liq_swept),
+            }
         }

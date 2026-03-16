@@ -535,97 +535,179 @@ class TelegramBotController:
             return "Bot not running."
 
         try:
-            bot = bot_instance
+            bot  = bot_instance
             strat = bot.strategy
-            dm = bot.data_manager
+            dm    = bot.data_manager
             if not strat or not dm:
                 return "Components not ready."
 
-            price = dm.get_last_price()
+            price  = dm.get_last_price()
             now_ms = int(time.time() * 1000)
 
-            # Get structures from the structure engine
-            se = getattr(strat, 'structure_engine', None)
-            if se is None:
-                # Fallback to strategy's own structures
-                bull_obs = list(getattr(strat, 'order_blocks_bull', []))
-                bear_obs = list(getattr(strat, 'order_blocks_bear', []))
-                bull_fvgs = list(getattr(strat, 'fvgs_bull', []))
-                bear_fvgs = list(getattr(strat, 'fvgs_bear', []))
-                liq_pools = list(getattr(strat, 'liquidity_pools', []))
-                mss_list = list(getattr(strat, 'market_structures', []))
-                s_highs = list(getattr(strat, 'swing_highs', []))
-                s_lows = list(getattr(strat, 'swing_lows', []))
+            # ICT engine lives at strat._ict (ICTEngine instance)
+            ict = getattr(strat, '_ict', None)
+            if ict is None:
+                return "❌ ICT engine not available (ict_engine.py not loaded)."
+            if not ict._initialized:
+                nb = len(list(ict.order_blocks_bull))
+                ns = len(list(ict.order_blocks_bear))
+                return (f"⏳ ICT engine warming up...\n"
+                        f"Detected so far: {nb}🟢 {ns}🔴 OBs\n"
+                        f"Need ≥10 candles and 5s update cycle to complete.")
+
+            atr   = getattr(strat, '_atr_5m', None)
+            atr_v = atr.atr if atr else 0.0
+            if atr_v < 1e-10:
+                atr_v = price * 0.002   # rough 0.2% fallback for display only
+
+            st    = ict.get_full_status(price, atr_v, now_ms)
+            c     = st["counts"]
+            sess  = st.get("session", "UNKNOWN")
+            kz    = st.get("killzone", "")
+            kz_str = f" [{kz}]" if kz else ""
+
+            lines = [
+                f"🏛️ <b>ICT Structures @ ${price:,.1f}</b>",
+                f"Session: {sess}{kz_str}  |  ATR(5m): ${atr_v:.1f}",
+                f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
+                f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
+                f"Liq: {c['liq_active']} active / {c['liq_swept']} swept",
+                ""
+            ]
+
+            # ── BULLISH ORDER BLOCKS ──────────────────────────────────────
+            if st["bull_obs"]:
+                lines.append("<b>🟢 Bullish Order Blocks</b>")
+                for ob in st["bull_obs"][:6]:
+                    ote_zone_lo = ob["high"] - 0.79 * (ob["high"] - ob["low"])
+                    ote_zone_hi = ob["high"] - 0.50 * (ob["high"] - ob["low"])
+                    tags = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
+                    in_tag = " ◄ PRICE IN OB" if ob["in_ob"] else (" ← OTE ZONE" if ob["in_ote"] else "")
+                    bos = " BOS✓" if ob["bos"] else ""
+                    lines.append(
+                        f"  ${ob['low']:,.1f} ─ ${ob['high']:,.1f}  "
+                        f"mid=${ob['midpoint']:,.1f}  "
+                        f"dist={ob['dist_pts']:+.1f}pts ({ob['dist_atr']:.2f}ATR)\n"
+                        f"    str={ob['strength']:.0f}  visits={ob['visit_count']}  "
+                        f"age={ob['age_min']:.0f}m  "
+                        f"OTE: ${ote_zone_lo:,.1f}─${ote_zone_hi:,.1f}"
+                        f"{bos} {tags}{in_tag}"
+                    )
             else:
-                bull_obs = list(se.order_blocks_bull)
-                bear_obs = list(se.order_blocks_bear)
-                bull_fvgs = list(se.fvgs_bull)
-                bear_fvgs = list(se.fvgs_bear)
-                liq_pools = list(se.liquidity_pools)
-                mss_list = list(se.market_structures)
-                s_highs = list(se.swing_highs)
-                s_lows = list(se.swing_lows)
+                lines.append("🟢 No active bullish OBs")
 
-            lines = [f"<b>ICT Structures @ ${price:,.1f}</b>\n"]
+            lines.append("")
 
-            # OBs
-            lines.append(f"<b>Order Blocks</b> ({len(bull_obs)}B / {len(bear_obs)}S)")
-            for ob in sorted(bull_obs, key=lambda o: abs(price - o.midpoint))[:4]:
-                dist = abs(price - ob.midpoint) / price * 100
-                tag = " IN" if ob.contains_price(price) else ""
-                lines.append(f"  🟢 ${ob.low:,.0f}-${ob.high:,.0f} str={ob.strength:.0f} v={ob.visit_count} {dist:.1f}%{tag}")
-            for ob in sorted(bear_obs, key=lambda o: abs(price - o.midpoint))[:4]:
-                dist = abs(price - ob.midpoint) / price * 100
-                tag = " IN" if ob.contains_price(price) else ""
-                lines.append(f"  🔴 ${ob.low:,.0f}-${ob.high:,.0f} str={ob.strength:.0f} v={ob.visit_count} {dist:.1f}%{tag}")
+            # ── BEARISH ORDER BLOCKS ──────────────────────────────────────
+            if st["bear_obs"]:
+                lines.append("<b>🔴 Bearish Order Blocks</b>")
+                for ob in st["bear_obs"][:6]:
+                    ote_zone_lo = ob["low"] + 0.50 * (ob["high"] - ob["low"])
+                    ote_zone_hi = ob["low"] + 0.79 * (ob["high"] - ob["low"])
+                    tags = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
+                    in_tag = " ◄ PRICE IN OB" if ob["in_ob"] else (" ← OTE ZONE" if ob["in_ote"] else "")
+                    bos = " BOS✓" if ob["bos"] else ""
+                    lines.append(
+                        f"  ${ob['low']:,.1f} ─ ${ob['high']:,.1f}  "
+                        f"mid=${ob['midpoint']:,.1f}  "
+                        f"dist={ob['dist_pts']:+.1f}pts ({ob['dist_atr']:.2f}ATR)\n"
+                        f"    str={ob['strength']:.0f}  visits={ob['visit_count']}  "
+                        f"age={ob['age_min']:.0f}m  "
+                        f"OTE: ${ote_zone_lo:,.1f}─${ote_zone_hi:,.1f}"
+                        f"{bos} {tags}{in_tag}"
+                    )
+            else:
+                lines.append("🔴 No active bearish OBs")
 
-            # FVGs
-            lines.append(f"\n<b>Fair Value Gaps</b> ({len(bull_fvgs)}B / {len(bear_fvgs)}S)")
-            for fvg in sorted(bull_fvgs, key=lambda f: abs(price - f.midpoint))[:3]:
-                tag = " IN" if fvg.is_price_in_gap(price) else ""
-                lines.append(f"  🟢 ${fvg.bottom:,.0f}-${fvg.top:,.0f} fill={fvg.fill_percentage*100:.0f}%{tag}")
-            for fvg in sorted(bear_fvgs, key=lambda f: abs(price - f.midpoint))[:3]:
-                tag = " IN" if fvg.is_price_in_gap(price) else ""
-                lines.append(f"  🔴 ${fvg.bottom:,.0f}-${fvg.top:,.0f} fill={fvg.fill_percentage*100:.0f}%{tag}")
+            lines.append("")
 
-            # Liquidity
-            active_pools = [p for p in liq_pools if not p.swept]
-            swept = [p for p in liq_pools if p.swept]
-            lines.append(f"\n<b>Liquidity</b> ({len(active_pools)} active, {len(swept)} swept)")
-            for p in sorted([pp for pp in active_pools if pp.pool_type == "EQH"], key=lambda x: x.price)[:3]:
-                lines.append(f"  EQH @ ${p.price:,.0f} x{p.touch_count}")
-            for p in sorted([pp for pp in active_pools if pp.pool_type == "EQL"], key=lambda x: -x.price)[:3]:
-                lines.append(f"  EQL @ ${p.price:,.0f} x{p.touch_count}")
-            for p in swept[-3:]:
-                d = "DISP" if p.displacement_confirmed else "weak"
-                lines.append(f"  SWEPT {p.pool_type} @ ${p.price:,.0f} ({d})")
+            # ── FAIR VALUE GAPS ───────────────────────────────────────────
+            all_fvgs = st["bull_fvgs"][:3] + st["bear_fvgs"][:3]
+            if all_fvgs:
+                lines.append("<b>Fair Value Gaps</b>")
+                for fvg in sorted(all_fvgs, key=lambda x: abs(x["dist_pts"])):
+                    icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
+                    in_tag = " ◄ PRICE IN GAP" if fvg["in_gap"] else ""
+                    lines.append(
+                        f"  {icon} ${fvg['bottom']:,.1f} ─ ${fvg['top']:,.1f}  "
+                        f"size=${fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
+                        f"dist={fvg['dist_pts']:+.1f}pts ({fvg['dist_atr']:.2f}ATR)  "
+                        f"age={fvg['age_min']:.0f}m{in_tag}"
+                    )
+            else:
+                lines.append("No active FVGs near price")
 
-            # MSS
-            lines.append(f"\n<b>Market Structure</b> (last 5)")
-            for ms in list(reversed(mss_list))[:5]:
-                age = (now_ms - ms.timestamp) / 60_000
-                icon = "📈" if ms.direction == "bullish" else "📉"
-                tf_str = getattr(ms, 'timeframe', '5m')
-                lines.append(f"  {icon} {ms.structure_type} {ms.direction} [{tf_str}] @ ${ms.price:,.0f} ({age:.0f}m)")
+            lines.append("")
 
-            # Key levels
-            highs_above = sorted([s for s in s_highs if s.price > price], key=lambda s: s.price)[:3]
-            lows_below = sorted([s for s in s_lows if s.price < price], key=lambda s: -s.price)[:3]
-            if highs_above or lows_below:
-                lines.append(f"\n<b>Key Levels</b>")
-                if highs_above:
-                    h_str = " | ".join(f"${s.price:,.0f}[{s.timeframe}]" for s in highs_above)
-                    lines.append(f"  Highs: {h_str}")
-                if lows_below:
-                    l_str = " | ".join(f"${s.price:,.0f}[{s.timeframe}]" for s in lows_below)
-                    lines.append(f"  Lows: {l_str}")
+            # ── LIQUIDITY POOLS ───────────────────────────────────────────
+            # Show all within 5×ATR
+            nearby = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 5.0 * atr_v]
+            if nearby:
+                lines.append("<b>💧 Liquidity Pools</b>")
+                eqh = sorted([l for l in nearby if l["pool_type"] == "EQH"], key=lambda x: x["price"], reverse=True)
+                eql = sorted([l for l in nearby if l["pool_type"] == "EQL"], key=lambda x: x["price"], reverse=True)
+                for l in eqh[:4]:
+                    dist_atr = abs(l["dist_pts"]) / atr_v
+                    lines.append(
+                        f"  EQH ▲ ${l['price']:,.1f}  "
+                        f"x{l['touch_count']}  dist={l['dist_pts']:+.1f}pts ({dist_atr:.2f}ATR)")
+                for l in eql[:4]:
+                    dist_atr = abs(l["dist_pts"]) / atr_v
+                    lines.append(
+                        f"  EQL ▼ ${l['price']:,.1f}  "
+                        f"x{l['touch_count']}  dist={l['dist_pts']:+.1f}pts ({dist_atr:.2f}ATR)")
+
+            # Recent sweeps
+            if st["liq_swept"]:
+                lines.append("<b>🌊 Recent Sweeps</b>")
+                for l in st["liq_swept"][:4]:
+                    disp = "DISP✓" if l["displacement"] else "weak"
+                    wick = "WR✓" if l["wick_rejection"] else ""
+                    age  = f"{l['sweep_age_min']:.0f}m ago" if l["sweep_age_min"] is not None else ""
+                    lines.append(
+                        f"  {l['pool_type']} ${l['price']:,.1f}  [{disp} {wick}]  {age}")
+
+            lines.append("")
+
+            # ── SWING LEVELS ──────────────────────────────────────────────
+            sh_above = st["swing_highs"][:5]
+            sl_below = st["swing_lows"][:5]
+            if sh_above or sl_below:
+                lines.append("<b>📌 Swing Levels</b>")
+                if sh_above:
+                    sh_str = "  ".join(
+                        f"${h:,.1f}(+{h-price:.0f})" for h in sh_above)
+                    lines.append(f"  Highs ▲: {sh_str}")
+                if sl_below:
+                    sl_str = "  ".join(
+                        f"${l:,.1f}({l-price:.0f})" for l in sl_below)
+                    lines.append(f"  Lows  ▼: {sl_str}")
+
+            # ── ICT CONFLUENCE SCORE ──────────────────────────────────────
+            lines.append("")
+            # Score for both sides
+            long_conf  = ict.get_confluence("long",  price, now_ms)
+            short_conf = ict.get_confluence("short", price, now_ms)
+            lines.append("<b>Confluence Scores</b>")
+            lines.append(
+                f"  LONG  Σ={long_conf.total:.2f}  "
+                f"OB={long_conf.ob_score:.2f}  FVG={long_conf.fvg_score:.2f}  "
+                f"Sweep={long_conf.sweep_score:.2f}  KZ={long_conf.session_score:.2f}")
+            if long_conf.details:
+                lines.append(f"    → {long_conf.details}")
+            lines.append(
+                f"  SHORT Σ={short_conf.total:.2f}  "
+                f"OB={short_conf.ob_score:.2f}  FVG={short_conf.fvg_score:.2f}  "
+                f"Sweep={short_conf.sweep_score:.2f}  KZ={short_conf.session_score:.2f}")
+            if short_conf.details:
+                lines.append(f"    → {short_conf.details}")
 
             self.send_message("\n".join(lines))
             return None
 
         except Exception as e:
             logger.error(f"Structures error: {e}", exc_info=True)
-            return f"Error: {e}"
+            return f"❌ Error: {e}"
 
     def _cmd_position(self) -> str:
         global bot_instance, bot_running
