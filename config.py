@@ -209,32 +209,62 @@ QUANT_OB_WALL_MULT          = 2.5
 QUANT_TRAIL_SWING_BARS      = 5
 QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 
-# 10d. Trailing SL — v4.8 INSTITUTIONAL REWRITE (7-bug fix)
+# 10d. Trailing SL — v5.0 INSTITUTIONAL HYBRID (ICT+Quant integration)
 #
-#      v4.7 FAILURE: Trail NEVER activated because TRAIL_BE_R=1.0 required
-#      +$470 profit with 2×ATR SL ($470 distance). BTC rarely moves that far.
-#      Every trade either hit TP or SL without trail ever touching the SL.
+#      v4.8 → v5.0 UPGRADE: User complaint "small pullback hits SL, then TP achieved"
 #
-#      v4.8 FIX: Recalibrated for 40x leverage scalping:
-#        - Trail starts at 0.3R (was 1.0R). With $200 SL, that's +$60.
-#        - Chandelier at 0.8R (was 2.0R). With $200 SL, that's +$160.
-#        - Full institutional at 1.5R (was 3.0R). With $200 SL, that's +$300.
-#        - Min distances reduced: 1.0/0.7/0.5 ATR (was 1.5/1.0/0.7).
-#          With ATR=$100, 1m candle range $15-30 → still 2-6x noise clearance.
-#        - Phase uses PEAK profit (ratchets up, never demotes during pullback).
-#        - init_dist uses ORIGINAL SL distance (not current, which shrinks).
+#      ROOT CAUSES FIXED:
+#        1. Min distance too tight (0.5×ATR = $11 at low vol → noise whipsaw)
+#        2. No ICT structure awareness (SL trails through virgin OBs/FVGs)
+#        3. No time context (30s whipsaw = 5min pullback)
+#        4. Fixed ATR mults (doesn't adapt to spread/liquidity)
+#        5. ICT+Quant separate (not truly hybrid)
+#
+#      v5.0 INSTITUTIONAL FIXES:
+#        - ICT-AWARE TRAILING: Never trail through virgin OB/FVG supporting trade
+#        - DYNAMIC MIN DISTANCE: Adapts to spread percentile + liquidity + volatility
+#        - TIME-AWARE PULLBACK: 9 signals (was 6), duration/chop/consolidation filters
+#        - MULTI-TF SL: Cross-reference 15m structure, use higher-TF swings when conflict
+#        - ICT CONFLUENCE TIERS: Premium (ICT≥0.50) lowers entry bar, weak (ICT<0.30) raises it
 #
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.3   # v4.8: was 1.0 → Phase 0→1 at +0.3R
-QUANT_TRAIL_LOCK_R             = 0.8   # v4.8: was 2.0 → Phase 1→2 at +0.8R
-QUANT_TRAIL_AGGRESSIVE_R       = 1.5   # v4.8: was 3.0 → Phase 2→3 at +1.5R
-QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.0   # v4.8: was 1.5 → Phase 1: min SL = 1.0×ATR
-QUANT_TRAIL_MIN_DIST_ATR_P2    = 0.7   # v4.8: was 1.0 → Phase 2: 0.7×ATR
-QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.5   # v4.8: was 0.7 → Phase 3: 0.5×ATR
+QUANT_TRAIL_BE_R               = 0.3   # v4.8: Phase 0→1 at +0.3R
+QUANT_TRAIL_LOCK_R             = 0.8   # v4.8: Phase 1→2 at +0.8R
+QUANT_TRAIL_AGGRESSIVE_R       = 1.5   # v4.8: Phase 2→3 at +1.5R
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.2   # v5.0: was 1.0 → wider (less whipsaw)
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 0.9   # v5.0: was 0.7 → wider
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.7   # v5.0: was 0.5 → wider (critical for Phase 3)
 QUANT_TRAIL_PULLBACK_FREEZE    = True  # Freeze SL during healthy pullbacks
 QUANT_TRAIL_PB_VOL_RATIO       = 0.60  # Pullback vol < 60% of impulse → healthy
 QUANT_TRAIL_PB_DEPTH_ATR       = 0.80  # Pullback < 0.8×ATR → healthy
-QUANT_TRAIL_REV_MIN_SIGNALS    = 3     # Need ≥3 of 6 reversal signals to tighten
+QUANT_TRAIL_REV_MIN_SIGNALS    = 4     # v5.0: was 3 → need 4/9 signals (tighter classifier)
+
+# 10d-v5.0: ICT-aware trailing
+QUANT_TRAIL_ICT_PROTECTION     = True  # Check for virgin OB/FVG before moving SL
+QUANT_TRAIL_ICT_OB_MAX_VISITS  = 1     # Only protect OBs with ≤N visits (0=virgin only, 1=virgin+once-touched)
+QUANT_TRAIL_ICT_FVG_MAX_FILL   = 0.30  # Only protect FVGs with ≤30% fill
+
+# 10d-v5.0: Dynamic minimum distance (microstructure-adaptive)
+QUANT_TRAIL_DYNAMIC_MIN_DIST      = True   # Enable adaptive min_dist
+QUANT_TRAIL_LIQUIDITY_MULT_MAX    = 1.5    # Max multiplier from low liquidity (1.0-1.5×)
+QUANT_TRAIL_VOLATILITY_MULT_MAX   = 1.3    # Max multiplier from vol spike (1.0-1.3×)
+QUANT_TRAIL_SPREAD_PCTILE_THRESH  = 0.70   # Spread > 70th pctile → wider min_dist
+
+# 10d-v5.0: Time-aware pullback classifier (3 new signals)
+QUANT_TRAIL_PB_MIN_DURATION_SEC   = 120    # Pullback < 2min → likely noise
+QUANT_TRAIL_PB_CHOP_REVERSALS     = 3      # ≥3 reversals in last 5 candles → choppy
+QUANT_TRAIL_PB_CONSOL_RANGE_ATR   = 0.3    # Price range < 0.3×ATR → consolidation
+
+# 10d-v5.0: Multi-timeframe SL (15m structure priority)
+QUANT_TRAIL_USE_15M_STRUCTURE     = True   # Cross-reference 15m swings/FVGs
+QUANT_TRAIL_15M_PRIORITY          = True   # If 5m/15m conflict, use 15m (more significant)
+
+# 10d-v5.0: ICT confluence entry tiers
+QUANT_ICT_TIER_PREMIUM_SCORE      = 0.50   # ICT ≥ 0.50 → premium setup (lower composite needed)
+QUANT_ICT_TIER_PREMIUM_COMPOSITE  = 0.25   # Premium tier min composite (vs normal 0.30)
+QUANT_ICT_TIER_WEAK_SCORE         = 0.30   # ICT < 0.30 → weak setup (higher composite needed)
+QUANT_ICT_TIER_WEAK_COMPOSITE     = 0.40   # Weak tier min composite (vs normal 0.30)
+
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20

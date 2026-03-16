@@ -1,9 +1,11 @@
 """
-Quant Bot — Institutional Multi-Factor Momentum + Order Flow
-=============================================================
+Quant Bot — Institutional Multi-Factor Momentum + Order Flow + ICT
+===================================================================
+v5.0 INSTITUTIONAL HYBRID — ICT + Quant + Microstructure Integration
+
 Drop-in replacement for ICT Bot v11.
 Uses QuantStrategy (EMA cross, CVD, VWAP, BB/KC squeeze, Volume Flow)
-instead of AdvancedICTStrategy (OB/FVG/ICT).
++ ICT structure (OB, FVG, Sweep, Killzone) in true hybrid mode.
 
 Same infrastructure:
   - ICTDataManager  (WebSocket + REST warmup)
@@ -11,11 +13,18 @@ Same infrastructure:
   - RiskManager     (balance, daily limits, trade history)
   - TelegramNotifier / TelegramBotController
 
-Changed:
-  - Strategy import: QuantStrategy
-  - Log file: quant_bot.log
-  - Startup/stop messages updated
-  - Feature probe at startup shows quant engine state
+v5.0 UPGRADES (user: "small pullback → SL hit → TP achieved"):
+  - ICT-AWARE TRAILING: Never trail through virgin OB/FVG supporting trade
+  - DYNAMIC MIN DISTANCE: Adapts to spread/liquidity/volatility (not fixed ATR)
+  - TIME-AWARE PULLBACK: 9 signals (was 6) with duration/chop/consolidation
+  - MULTI-TF SL: Cross-reference 15m structure, prioritize higher-TF swings
+  - ICT CONFLUENCE TIERS: Premium (ICT≥0.50) lowers entry bar, weak (ICT<0.30) raises it
+
+Changed from v4.8:
+  - Trailing SL: ICT structure protection + dynamic spacing + 9-signal pullback classifier
+  - Entry: ICT confluence gates entry threshold (3-tier system)
+  - Multi-timeframe: 15m structure added to SL candidates
+  - Microstructure: spread/liquidity/volatility adapt min_dist in real-time
 """
 
 import logging

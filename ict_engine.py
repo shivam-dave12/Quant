@@ -1057,3 +1057,70 @@ class ICTEngine:
             "swing_highs": swing_highs,
             "swing_lows": swing_lows,
         }
+    
+    # ══════════════════════════════════════════════════════════════════
+    # v5.0: ICT-AWARE TRAILING SL PROTECTION
+    # ══════════════════════════════════════════════════════════════════
+    
+    def check_sl_path_for_structure(self, pos_side: str, current_sl: float, 
+                                     new_sl: float, now_ms: int,
+                                     max_ob_visits: int = 1, 
+                                     max_fvg_fill: float = 0.30) -> Tuple[bool, str]:
+        """
+        v5.0 INSTITUTIONAL: Check if moving SL would cross virgin ICT structure.
+        
+        CRITICAL: Never trail SL through virgin OB/FVG that supports the trade.
+        
+        Args:
+            pos_side: "long" or "short"
+            current_sl: Current stop loss price
+            new_sl: Proposed new stop loss price
+            now_ms: Current timestamp
+            max_ob_visits: Only protect OBs with ≤N visits (0=virgin only, 1=virgin+once)
+            max_fvg_fill: Only protect FVGs with ≤N% fill
+            
+        Returns:
+            (blocked: bool, reason: str)
+            - blocked=True means SL should NOT move (structure protection)
+            - blocked=False means SL can move (no conflict)
+        """
+        if pos_side == "long":
+            # LONG: Check for bullish OBs/FVGs between current_sl and new_sl
+            # These support the trade — price bouncing here is GOOD
+            
+            # Check bullish OBs
+            for ob in self.order_blocks_bull:
+                if not ob.is_active(now_ms) or ob.visit_count > max_ob_visits:
+                    continue
+                # OB between current and new SL?
+                if current_sl < ob.low < new_sl or current_sl < ob.high < new_sl:
+                    return True, f"Virgin bullish OB @ ${ob.midpoint:.0f} (visits={ob.visit_count})"
+            
+            # Check bullish FVGs
+            for fvg in self.fvgs_bull:
+                if not fvg.is_active(now_ms) or fvg.fill_percentage > max_fvg_fill:
+                    continue
+                # FVG between current and new SL?
+                if current_sl < fvg.bottom < new_sl or current_sl < fvg.top < new_sl:
+                    return True, f"Fresh bullish FVG @ ${fvg.midpoint:.0f} (fill={fvg.fill_percentage:.0%})"
+        
+        else:  # SHORT
+            # SHORT: Check for bearish OBs/FVGs between new_sl and current_sl
+            
+            # Check bearish OBs
+            for ob in self.order_blocks_bear:
+                if not ob.is_active(now_ms) or ob.visit_count > max_ob_visits:
+                    continue
+                # OB between new and current SL?
+                if new_sl < ob.low < current_sl or new_sl < ob.high < current_sl:
+                    return True, f"Virgin bearish OB @ ${ob.midpoint:.0f} (visits={ob.visit_count})"
+            
+            # Check bearish FVGs
+            for fvg in self.fvgs_bear:
+                if not fvg.is_active(now_ms) or fvg.fill_percentage > max_fvg_fill:
+                    continue
+                # FVG between new and current SL?
+                if new_sl < fvg.bottom < current_sl or new_sl < fvg.top < current_sl:
+                    return True, f"Fresh bearish FVG @ ${fvg.midpoint:.0f} (fill={fvg.fill_percentage:.0%})"
+        
+        return False, ""  # No structure blocking the move

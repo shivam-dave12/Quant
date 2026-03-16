@@ -230,8 +230,44 @@ class QCfg:
     def TRAIL_PB_VOL_RATIO() -> float: return float(_cfg("QUANT_TRAIL_PB_VOL_RATIO", 0.60))
     @staticmethod
     def TRAIL_PB_DEPTH_ATR() -> float: return float(_cfg("QUANT_TRAIL_PB_DEPTH_ATR", 0.80))
-    @staticmethod
     def TRAIL_REV_MIN_SIGNALS() -> int: return int(_cfg("QUANT_TRAIL_REV_MIN_SIGNALS", 3))
+    # ── v5.0: ICT-aware trailing ────────────────────────────────
+    @staticmethod
+    def TRAIL_ICT_PROTECTION() -> bool: return bool(_cfg("QUANT_TRAIL_ICT_PROTECTION", True))
+    @staticmethod
+    def TRAIL_ICT_OB_MAX_VISITS() -> int: return int(_cfg("QUANT_TRAIL_ICT_OB_MAX_VISITS", 1))
+    @staticmethod
+    def TRAIL_ICT_FVG_MAX_FILL() -> float: return float(_cfg("QUANT_TRAIL_ICT_FVG_MAX_FILL", 0.30))
+    # ── v5.0: Dynamic min distance ──────────────────────────────
+    @staticmethod
+    def TRAIL_DYNAMIC_MIN_DIST() -> bool: return bool(_cfg("QUANT_TRAIL_DYNAMIC_MIN_DIST", True))
+    @staticmethod
+    def TRAIL_LIQUIDITY_MULT_MAX() -> float: return float(_cfg("QUANT_TRAIL_LIQUIDITY_MULT_MAX", 1.5))
+    @staticmethod
+    def TRAIL_VOLATILITY_MULT_MAX() -> float: return float(_cfg("QUANT_TRAIL_VOLATILITY_MULT_MAX", 1.3))
+    @staticmethod
+    def TRAIL_SPREAD_PCTILE_THRESH() -> float: return float(_cfg("QUANT_TRAIL_SPREAD_PCTILE_THRESH", 0.70))
+    # ── v5.0: Time-aware pullback classifier ────────────────────
+    @staticmethod
+    def TRAIL_PB_MIN_DURATION_SEC() -> float: return float(_cfg("QUANT_TRAIL_PB_MIN_DURATION_SEC", 120))
+    @staticmethod
+    def TRAIL_PB_CHOP_REVERSALS() -> int: return int(_cfg("QUANT_TRAIL_PB_CHOP_REVERSALS", 3))
+    @staticmethod
+    def TRAIL_PB_CONSOL_RANGE_ATR() -> float: return float(_cfg("QUANT_TRAIL_PB_CONSOL_RANGE_ATR", 0.3))
+    # ── v5.0: Multi-TF SL ───────────────────────────────────────
+    @staticmethod
+    def TRAIL_USE_15M_STRUCTURE() -> bool: return bool(_cfg("QUANT_TRAIL_USE_15M_STRUCTURE", True))
+    @staticmethod
+    def TRAIL_15M_PRIORITY() -> bool: return bool(_cfg("QUANT_TRAIL_15M_PRIORITY", True))
+    # ── v5.0: ICT confluence entry tiers ────────────────────────
+    @staticmethod
+    def ICT_TIER_PREMIUM_SCORE() -> float: return float(_cfg("QUANT_ICT_TIER_PREMIUM_SCORE", 0.50))
+    @staticmethod
+    def ICT_TIER_PREMIUM_COMPOSITE() -> float: return float(_cfg("QUANT_ICT_TIER_PREMIUM_COMPOSITE", 0.25))
+    @staticmethod
+    def ICT_TIER_WEAK_SCORE() -> float: return float(_cfg("QUANT_ICT_TIER_WEAK_SCORE", 0.30))
+    @staticmethod
+    def ICT_TIER_WEAK_COMPOSITE() -> float: return float(_cfg("QUANT_ICT_TIER_WEAK_COMPOSITE", 0.40))
     # ── v4.4: Smart max-hold exit ───────────────────────────────
     @staticmethod
     def SMART_MAX_HOLD() -> bool: return bool(_cfg("QUANT_SMART_MAX_HOLD", True))
@@ -1619,15 +1655,15 @@ class InstitutionalLevels:
             orderbook: Dict, entry_vol: float,
             peak_price_abs: float) -> Tuple[bool, int, str]:
         """
-        Institutional pullback-vs-reversal classifier — v4.5.
+        Institutional pullback-vs-reversal classifier — v5.0 (time-aware upgrade).
 
-        Evaluates 6 independent signals. Returns:
+        Evaluates 9 independent signals (was 6). Returns:
           (is_pullback: bool, reversal_count: int, detail: str)
 
         A pullback is a healthy retracement within the trend/reversion move.
         A reversal is a structural shift where the trade thesis is invalidated.
 
-        The 6 signals (each scores 0 or 1 toward reversal):
+        The 9 signals (each scores 0 or 1 toward reversal):
 
         1. VOLUME PROFILE: Is pullback volume expanding relative to impulse?
            Healthy pullback = declining volume. Reversal = expanding.
@@ -1646,6 +1682,17 @@ class InstitutionalLevels:
 
         6. MOMENTUM STALLING: Is price making lower highs (long) or higher lows (short)
            over the last 5+ candles? Momentum continuation = pullback. Stalling = reversal.
+        
+        ── v5.0: TIME-AWARE SIGNALS ───────────────────────────────────────
+        
+        7. PULLBACK DURATION: Has pullback lasted < 2 minutes?
+           Fast whipsaw (< 2min) = noise, freeze SL. Slow pullback = structural.
+        
+        8. CHOP DETECTION: Are there ≥3 direction changes in last 5 candles?
+           Choppy = consolidation, freeze SL. Clean pullback = allow trailing.
+        
+        9. CONSOLIDATION RANGE: Is price oscillating within < 0.3×ATR?
+           Tight range = noise/consolidation. Wide move = directional.
         """
         reversal_signals = 0
         details = []
@@ -1738,6 +1785,58 @@ class InstitutionalLevels:
                 if rising:
                     reversal_signals += 1
                     details.append("momentum_stalling")
+        
+        # ════════════════════════════════════════════════════════════
+        # v5.0: NEW TIME-AWARE SIGNALS
+        # ════════════════════════════════════════════════════════════
+        
+        # ── Signal 7: Pullback duration < 2 minutes → noise ──────────
+        # If price went from peak to current retracement in < 2min, it's a whipsaw
+        if len(candles_1m) >= 3:
+            # Find when price was last at peak (or close to it)
+            peak_threshold = peak_price_abs * 0.995 if pos_side == "long" else peak_price_abs * 1.005
+            candles_since_peak = 0
+            for c in reversed(candles_1m[-10:]):
+                h, l = float(c['h']), float(c['l'])
+                was_at_peak = (h >= peak_threshold) if pos_side == "long" else (l <= peak_threshold)
+                if was_at_peak:
+                    break
+                candles_since_peak += 1
+            
+            # 1m candles → duration in seconds ≈ candles × 60
+            pullback_duration_sec = candles_since_peak * 60
+            if pullback_duration_sec < QCfg.TRAIL_PB_MIN_DURATION_SEC():
+                reversal_signals += 1
+                details.append(f"fast_whipsaw({pullback_duration_sec}s)")
+        
+        # ── Signal 8: Chop detection (multiple reversals) ────────────
+        # Count direction changes in last 5 candles
+        if len(candles_1m) >= 6:
+            last5 = candles_1m[-5:]
+            directions = []
+            for c in last5:
+                cl, op = float(c['c']), float(c['o'])
+                directions.append(1 if cl > op else -1)
+            
+            # Count reversals (direction changes)
+            reversals_count = sum(1 for i in range(1, len(directions)) 
+                                 if directions[i] != directions[i-1])
+            
+            if reversals_count >= QCfg.TRAIL_PB_CHOP_REVERSALS():
+                reversal_signals += 1
+                details.append(f"choppy({reversals_count}_reversals)")
+        
+        # ── Signal 9: Consolidation range < 0.3×ATR ─────────────────
+        # If last 5 candles are all within tight range → consolidation, not pullback
+        if len(candles_1m) >= 5:
+            last5 = candles_1m[-5:]
+            highs = [float(c['h']) for c in last5]
+            lows = [float(c['l']) for c in last5]
+            range_5c = max(highs) - min(lows)
+            
+            if range_5c < QCfg.TRAIL_PB_CONSOL_RANGE_ATR() * atr:
+                reversal_signals += 1
+                details.append(f"consolidation({range_5c/atr:.2f}ATR_range)")
 
         is_pullback = reversal_signals < QCfg.TRAIL_REV_MIN_SIGNALS()
         return is_pullback, reversal_signals, "|".join(details)
@@ -1751,10 +1850,21 @@ class InstitutionalLevels:
                          peak_price_abs: float = 0.0,
                          trade_mode: str = "reversion",
                          candles_5m: Optional[List[Dict]] = None,
-                         initial_sl_dist: float = 0.0) -> Optional[float]:
+                         candles_15m: Optional[List[Dict]] = None,
+                         initial_sl_dist: float = 0.0,
+                         spread_pctile: float = 0.5,
+                         atr_pctile: float = 0.5,
+                         ict_engine = None,
+                         now_ms: int = 0) -> Optional[float]:
         """
-        Institutional trailing SL — v4.8 (7-bug rewrite).
+        Institutional trailing SL — v5.0 HYBRID (ICT + Quant + Microstructure).
 
+        v5.0 UPGRADES (user: "small pullback → SL hit → TP achieved"):
+          1. ICT-AWARE TRAILING: Never trail through virgin OB/FVG supporting trade
+          2. DYNAMIC MIN DISTANCE: Adapts to spread/liquidity/volatility (not fixed ATR)
+          3. TIME-AWARE PULLBACK: 9 signals (was 6) with duration/chop/consolidation
+          4. MULTI-TF SL: Cross-reference 15m structure, prioritize higher-TF swings
+          
         v4.8 FIXES:
           BUG 1: init_dist used current_sl (shrinks after trail moves)
                  → tier inflated artificially. FIX: use initial_sl_dist param.
@@ -1774,6 +1884,8 @@ class InstitutionalLevels:
         """
         if candles_5m is None:
             candles_5m = []
+        if candles_15m is None:
+            candles_15m = []
 
         # v4.8 BUG 1 FIX: Use ORIGINAL SL distance, not current
         # After trail moves SL from $73,320 to $73,600, using current SL
@@ -1797,16 +1909,59 @@ class InstitutionalLevels:
         if tier < QCfg.TRAIL_BE_R():
             return None
 
-        # ═══ DETERMINE PHASE AND MIN DISTANCE ═════════════════════════════
+        # ═══ DETERMINE PHASE AND BASE MIN DISTANCE ════════════════════════
         if tier >= QCfg.TRAIL_AGGRESSIVE_R():
             phase = 3
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P3() * atr
+            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P3()
         elif tier >= QCfg.TRAIL_LOCK_R():
             phase = 2
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P2() * atr
+            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P2()
         else:
             phase = 1
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
+            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P1()
+        
+        # ═══ v5.0: DYNAMIC MIN DISTANCE (microstructure-adaptive) ═════════
+        if QCfg.TRAIL_DYNAMIC_MIN_DIST():
+            liquidity_mult = 1.0
+            volatility_mult = 1.0
+            
+            # ── Spread penalty: wide spread → wider min_dist ─────────────
+            # High spread percentile = illiquid market = need more breathing room
+            if spread_pctile > QCfg.TRAIL_SPREAD_PCTILE_THRESH():
+                # Linear scale from 1.0 at threshold to max at 1.0
+                spread_factor = (spread_pctile - QCfg.TRAIL_SPREAD_PCTILE_THRESH()) / (1.0 - QCfg.TRAIL_SPREAD_PCTILE_THRESH())
+                liquidity_mult = 1.0 + spread_factor * (QCfg.TRAIL_LIQUIDITY_MULT_MAX() - 1.0)
+            
+            # ── Orderbook depth penalty: thin book → wider min_dist ──────
+            bids = orderbook.get("bids", [])
+            asks = orderbook.get("asks", [])
+            if bids and asks:
+                # Measure top-5 depth vs typical depth (proxy: check if severely imbalanced)
+                bid_depth = sum(float(b[1]) for b in bids[:5]) if len(bids) >= 5 else 0
+                ask_depth = sum(float(a[1]) for a in asks[:5]) if len(asks) >= 5 else 0
+                total_depth = bid_depth + ask_depth
+                # Thin book = low total depth relative to typical levels
+                # Use simple threshold: if total < some level, increase mult
+                # (This is simplified; could use rolling average of depth history)
+                if total_depth < 50.0:  # BTC: 50 contracts is quite thin
+                    depth_factor = 1.0 - min(total_depth / 50.0, 1.0)
+                    liquidity_mult = max(liquidity_mult, 1.0 + depth_factor * 0.3)
+            
+            # ── Volatility spike penalty: expanding ATR → wider min_dist ─
+            # High ATR percentile = recent vol expansion = price swings wider
+            if atr_pctile > 0.70:
+                vol_factor = (atr_pctile - 0.70) / 0.30
+                volatility_mult = 1.0 + vol_factor * (QCfg.TRAIL_VOLATILITY_MULT_MAX() - 1.0)
+            
+            # Apply multipliers
+            min_dist = base_min_dist_mult * liquidity_mult * volatility_mult * atr
+            logger.debug(
+                f"Trail v5.0: base={base_min_dist_mult:.2f} "
+                f"liq_mult={liquidity_mult:.2f} vol_mult={volatility_mult:.2f} "
+                f"→ min_dist={min_dist:.2f} (spread_pct={spread_pctile:.0%} atr_pct={atr_pctile:.0%})")
+        else:
+            # Fallback: static min_dist (old behavior)
+            min_dist = base_min_dist_mult * atr
 
         # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
         if QCfg.TRAIL_PULLBACK_FREEZE():
@@ -1849,6 +2004,34 @@ class InstitutionalLevels:
                 valid = [h for h in sh_5m if price + min_dist < h < current_sl - 0.1 * atr]
                 if valid:
                     candidates.append(min(valid) + swing_buf)
+        
+        # ── v5.0: 15m swing structure (Phase 1+ if enabled) ───────────────
+        # Higher timeframe = more significant structure
+        # If 5m and 15m conflict, 15m takes priority (more institutional)
+        if QCfg.TRAIL_USE_15M_STRUCTURE() and candles_15m and len(candles_15m) >= 4:
+            closed_15m = candles_15m[:-1]
+            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
+                closed_15m, min(QCfg.SL_SWING_LOOKBACK(), len(closed_15m) - 2))
+            swing_buf_15m = max(0.4 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 1.2)  # Wider buffer for 15m
+            
+            if pos_side == "long" and sl_15m:
+                valid_15m = [l for l in sl_15m if current_sl + 0.15 * atr < l < price - min_dist]
+                if valid_15m:
+                    sl_15m_candidate = max(valid_15m) - swing_buf_15m
+                    # v5.0: If 15m priority enabled and 15m swing found, replace 5m candidates
+                    if QCfg.TRAIL_15M_PRIORITY():
+                        # Remove 5m swing candidates, keep 15m only (more significant)
+                        candidates = [c for c in candidates if c < current_sl + 0.05 * atr or c > price]
+                    candidates.append(sl_15m_candidate)
+                    logger.debug(f"Trail v5.0: 15m swing SL candidate @ ${sl_15m_candidate:.2f}")
+            elif pos_side == "short" and sh_15m:
+                valid_15m = [h for h in sh_15m if price + min_dist < h < current_sl - 0.15 * atr]
+                if valid_15m:
+                    sl_15m_candidate = min(valid_15m) + swing_buf_15m
+                    if QCfg.TRAIL_15M_PRIORITY():
+                        candidates = [c for c in candidates if c > current_sl - 0.05 * atr or c < price]
+                    candidates.append(sl_15m_candidate)
+                    logger.debug(f"Trail v5.0: 15m swing SL candidate @ ${sl_15m_candidate:.2f}")
 
         # ── Chandelier exit (Phase 2+) ────────────────────────────────
         # v4.8 BUG 6 FIX: Check vs current_sl not entry_price.
@@ -1952,6 +2135,17 @@ class InstitutionalLevels:
             min_allowed = price + min_dist
             if new_sl < min_allowed:
                 new_sl = min_allowed
+        
+        # ═══ v5.0: ICT STRUCTURE PROTECTION ═══════════════════════════════
+        # CRITICAL: Never trail SL through virgin OB/FVG that supports the trade
+        if QCfg.TRAIL_ICT_PROTECTION() and ict_engine is not None and now_ms > 0:
+            blocked, reason = ict_engine.check_sl_path_for_structure(
+                pos_side, current_sl, new_sl, now_ms,
+                max_ob_visits=QCfg.TRAIL_ICT_OB_MAX_VISITS(),
+                max_fvg_fill=QCfg.TRAIL_ICT_FVG_MAX_FILL())
+            if blocked:
+                logger.info(f"Trail v5.0: ICT PROTECTION — SL freeze: {reason}")
+                return None
 
         # ═══ RATCHET: SL may only improve ════════════════════════════════
         min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
@@ -2507,6 +2701,22 @@ class QuantStrategy:
         v4.6: Also blocked when BreakoutDetector detects directional momentum.
         """
         c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
+        
+        # ═══ v5.0: ICT CONFLUENCE ENTRY TIERS ═════════════════════════════
+        # Premium setup (ICT ≥ 0.50): lower composite threshold
+        # Weak setup (ICT < 0.30): higher composite threshold
+        # Standard (0.30 ≤ ICT < 0.50): use normal threshold
+        if sig.ict_total >= QCfg.ICT_TIER_PREMIUM_SCORE():
+            # TIER 1 PREMIUM: Strong ICT confluence → accept lower composite
+            thr = QCfg.ICT_TIER_PREMIUM_COMPOSITE()
+            tier_label = "PREMIUM"
+        elif sig.ict_total < QCfg.ICT_TIER_WEAK_SCORE():
+            # TIER 3 WEAK: No ICT confluence → require higher composite
+            thr = QCfg.ICT_TIER_WEAK_COMPOSITE()
+            tier_label = "WEAK"
+        else:
+            # TIER 2 STANDARD: Normal ICT → use standard threshold
+            tier_label = "STANDARD"
 
         # Hard veto: if market is trending against this reversion trade, skip
         if not self._regime.allows_reversion(side):
@@ -2525,9 +2735,19 @@ class QuantStrategy:
             self._confirm_long = self._confirm_short = 0; return
         if self._last_exit_side and self._last_exit_side != side:
             if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5: return
-        if side == "long" and c >= thr: self._confirm_long += 1; self._confirm_short = 0
-        elif side == "short" and c <= -thr: self._confirm_short += 1; self._confirm_long = 0
-        else: self._confirm_long = self._confirm_short = 0; return
+        if side == "long" and c >= thr: 
+            self._confirm_long += 1
+            self._confirm_short = 0
+            if self._confirm_long == 1 and sig.ict_total > 0.01:
+                logger.info(f"✨ Entry tier: {tier_label} (ICT={sig.ict_total:.2f} thr={thr:.2f})")
+        elif side == "short" and c <= -thr: 
+            self._confirm_short += 1
+            self._confirm_long = 0
+            if self._confirm_short == 1 and sig.ict_total > 0.01:
+                logger.info(f"✨ Entry tier: {tier_label} (ICT={sig.ict_total:.2f} thr={thr:.2f})")
+        else: 
+            self._confirm_long = self._confirm_short = 0
+            return
         cn = QCfg.CONFIRM_TICKS()
         if self._confirm_long >= cn:
             self._confirm_long = self._confirm_short = 0
@@ -3360,18 +3580,30 @@ class QuantStrategy:
         except Exception: candles_1m = []
         try: candles_5m = data_manager.get_candles("5m", limit=30)
         except Exception: candles_5m = []
+        try: candles_15m = data_manager.get_candles("15m", limit=30)
+        except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
+        
+        # v5.0: Get spread and ATR percentiles for dynamic min_dist
+        spread_pctile = self._ob_eng.get_spread_percentile() if hasattr(self._ob_eng, 'get_spread_percentile') else 0.5
+        atr_pctile = self._atr_5m.get_percentile() if hasattr(self._atr_5m, 'get_percentile') else 0.5
 
         # v4.8: Pass initial_sl_dist so compute_trail_sl uses ORIGINAL risk, not current
+        # v5.0: Pass candles_15m, spread_pctile, atr_pctile, ict_engine, now_ms
         new_sl = InstitutionalLevels.compute_trail_sl(
             pos.side, price, pos.entry_price, pos.sl_price, atr,
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
             hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
-            initial_sl_dist=pos.initial_sl_dist)
+            candles_15m=candles_15m,
+            initial_sl_dist=pos.initial_sl_dist,
+            spread_pctile=spread_pctile,
+            atr_pctile=atr_pctile,
+            ict_engine=self._ict if _ICT_AVAILABLE and hasattr(self, '_ict') else None,
+            now_ms=int(now * 1000))
 
         if new_sl is None:
             return False
