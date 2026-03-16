@@ -940,7 +940,12 @@ class TelegramBotController:
             return f"❌ Killswitch error: {e}"
 
     def _cmd_set(self, args: str) -> str:
-        """Live-adjust a config parameter."""
+        """
+        Live-adjust a config parameter.
+        For LEVERAGE: also calls the exchange API to set it live and blocks
+        the change if a position is currently open (wrong leverage on open
+        position is dangerous).
+        """
         import config as cfg
 
         if not args or len(args.split()) < 2:
@@ -992,6 +997,66 @@ class TelegramBotController:
             return f"Invalid value: <code>{val_str}</code> (expected {val_type.__name__})"
 
         old_val = getattr(cfg, attr_name, "?")
+
+        # ── Leverage: exchange API call required ──────────────────────────────
+        if key == "leverage":
+            global bot_instance, bot_running
+
+            # Refuse if a position is open — changing leverage mid-trade is
+            # dangerous: the sizing already used the old leverage for qty calc.
+            if bot_running and bot_instance and bot_instance.strategy:
+                pos = bot_instance.strategy.get_position()
+                if pos:
+                    return (
+                        f"❌ Cannot change leverage while position is open.\n"
+                        f"Close position first, then /set leverage {new_val}."
+                    )
+
+            # Apply to config first so the bot uses it for the next sizing call
+            setattr(cfg, attr_name, new_val)
+            logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+
+            # Call the exchange API to set it live
+            if bot_running and bot_instance:
+                om = getattr(bot_instance, 'order_manager', None)
+                if om and hasattr(om, 'api'):
+                    try:
+                        resp = om.api.set_leverage(
+                            symbol   = cfg.SYMBOL,
+                            exchange = cfg.EXCHANGE,
+                            leverage = int(new_val),
+                        )
+                        if isinstance(resp, dict) and resp.get("error"):
+                            # Exchange rejected — revert config to avoid mismatch
+                            setattr(cfg, attr_name, old_val)
+                            return (
+                                f"❌ Exchange rejected leverage change: {resp['error']}\n"
+                                f"Config reverted to {old_val}x."
+                            )
+                        logger.info(f"Exchange leverage set to {new_val}x: {resp}")
+                        return (
+                            f"✅ <b>Leverage updated</b>: {old_val}x → <b>{new_val}x</b>\n"
+                            f"Config and exchange both updated."
+                        )
+                    except Exception as e:
+                        # Revert config so it stays in sync with exchange
+                        setattr(cfg, attr_name, old_val)
+                        logger.error(f"set_leverage API error: {e}")
+                        return (
+                            f"❌ Exchange API error: {e}\n"
+                            f"Config reverted to {old_val}x."
+                        )
+                else:
+                    return (
+                        f"⚠️ Config updated to {new_val}x but order manager "
+                        f"not available — exchange NOT updated.\n"
+                        f"Restart bot to apply leverage on exchange."
+                    )
+            else:
+                # Bot not running — config-only change is fine
+                return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (bot not running — exchange not updated)"
+
+        # ── All other keys: config-only ───────────────────────────────────────
         setattr(cfg, attr_name, new_val)
         logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
         return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
