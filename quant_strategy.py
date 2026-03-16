@@ -1395,135 +1395,170 @@ class InstitutionalLevels:
     def compute_tp(price: float, side: str, atr: float, sl_price: float,
                    candles_1m: List[Dict], orderbook: Dict,
                    vwap: float, vwap_std: float,
-                   candles_5m: Optional[List[Dict]] = None) -> float:
+                   candles_5m: Optional[List[Dict]] = None,
+                   ict_engine=None) -> float:
         """
-        Institutional TP placement — v4.6.
+        Institutional TP placement — v4.9.
 
-        Scored candidate selection across five target classes:
-          5.0  OB liquidity wall directly in path
-          4.0  VP High-Volume Node between entry and VWAP
-          3.5  VWAP itself (full mean-reversion target)
-          3.0  VWAP ± σ bands
-          2.5  5m swing extreme in direction of reversion
-          2.0  VWAP partial fraction
+        Target hierarchy (score determines tier, tier determines selection):
 
-        v4.6: SL is now ATR-capped upstream (_compute_sl_tp caps to SL_MAX_ATR_MULT×ATR).
-        This means sl_dist is proportional to ATR, so R:R-based bounds are naturally
-        reasonable. min_tp ≈ 4×ATR × 1.5 = 6×ATR (reachable) instead of 10×ATR × 1.5 = 15×ATR.
+          ICT Tier 1 (score 6.x):  Swept liquidity origin — THE highest-conviction
+            ICT target. When price sweeps a pool then reverses, smart money delivered
+            to the sweep level. Price seeks that origin on the way back.
+
+          ICT Tier 2 (score 5.x):  Open FVG in trade direction — imbalances fill.
+            Near edge = conservative, far edge = full fill. Freshness-weighted.
+
+          ICT Tier 3 (score 4.x):  Virgin OB in trade direction — unvisited
+            institutional footprint, strong magnet.
+
+          Quant Tier (score 3.5-5): VWAP (mean reversion anchor),
+            OB ask/bid walls, VP HVN gravity nodes.
+
+          Swing Tier (score 2.5-3): 5m swing extremes, VWAP partial fraction.
+
+        Selection logic:
+          1. Any ICT Tier-1 candidate (swept liq origin) ≥ REVERSION_MIN_RR → prefer nearest
+          2. Else highest-scored candidate overall ≥ REVERSION_MIN_RR
+          3. Fallback: REVERSION_MIN_RR floor only when NO structural target exists
+             (this means R:R is geometric, not structural — warn in caller)
+
+        The critical change from v4.6: the VWAP partial-fraction shortfall no
+        longer forces a synthetic R:R floor as TP. The floor is only used when
+        truly no structural level exists within the allowed window. If no
+        structural level exists within MAX_RR, the setup is geometrically poor
+        and the caller should log a warning — but still place the trade at floor.
         """
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
             return price + atr if side == "long" else price - atr
 
-        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
-        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
+        min_tp_dist = sl_dist * QCfg.REVERSION_MIN_RR()
+        max_tp_dist = sl_dist * QCfg.REVERSION_MAX_RR()
 
-        # ── Volume profile: single pass, shared across candidate generation ──
+        # ── Volume profile ────────────────────────────────────────────────
         hvn_levels: List[float] = []
         if len(candles_1m) >= 30:
             profile = InstitutionalLevels.build_volume_profile(
                 candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
             hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
 
-        # ── OB walls in direction of trade ───────────────────────────────────
+        # ── OB walls ─────────────────────────────────────────────────────
         wall_side = "ask" if side == "long" else "bid"
         walls = InstitutionalLevels.find_orderbook_walls(
             orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
         total_wall_qty = sum(q for _, q in walls) if walls else 0.0
 
-        # ── 5m swing targets in reversion direction ───────────────────────────
+        # ── 5m swing targets ──────────────────────────────────────────────
         sh_5m: List[float] = []
         sl_5m: List[float] = []
         if candles_5m and len(candles_5m) >= 3:
             sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
                 candles_5m, QCfg.SL_SWING_LOOKBACK())
 
-        # ── Scored candidate pool: (tp_level, score) ─────────────────────────
-        scored: List[Tuple[float, float]] = []
+        # ── Scored candidate pool ─────────────────────────────────────────
+        scored: List[Tuple[float, float, str]] = []
 
-        def add_tp(level: float, score: float) -> None:
+        def add_tp(level: float, score: float, label: str = "") -> None:
             dist = abs(level - price)
             if dist < min_tp_dist or dist > max_tp_dist:
                 return
-            if side == "long" and level <= price:
-                return
-            if side == "short" and level >= price:
-                return
-            scored.append((level, score))
+            if side == "long"  and level <= price: return
+            if side == "short" and level >= price: return
+            scored.append((level, score, label))
+
+        # ── ICT structural targets (highest priority) ─────────────────────
+        if ict_engine is not None and ict_engine._initialized:
+            try:
+                now_ms = int(time.time() * 1000)
+                ict_targets = ict_engine.get_structural_tp_targets(
+                    side, price, atr, now_ms, min_tp_dist, max_tp_dist)
+                for level, score, label in ict_targets:
+                    add_tp(level, score, f"ICT:{label}")
+            except Exception:
+                pass
 
         if side == "long":
-            # OB ask walls: hard resistance — stop just below the wall
+            # OB ask walls: hard resistance
             for wp, wq in walls:
                 if wp > price + min_tp_dist:
                     w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5))
+                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5), "OBwall")
 
-            # VP HVN between entry and VWAP (gravity nodes)
+            # VP HVN between entry and VWAP
             for h in hvn_levels:
                 if price < h and (vwap <= 0 or h <= vwap * 1.002):
-                    add_tp(h, 4.0)
+                    add_tp(h, 4.0, "HVN")
 
             # VWAP full reversion
             if vwap > price:
-                add_tp(vwap, 3.5)
+                add_tp(vwap, 3.5, "VWAP")
 
             # VWAP sigma bands
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
                     lvl = vwap - mult * vwap_std
                     if lvl > price:
-                        add_tp(lvl, bscore)
+                        add_tp(lvl, bscore, f"VWAP-{mult}σ")
 
-            # 5m swing highs in reversion zone (potential supply)
+            # 5m swing highs in reversion zone
             for sh in sh_5m:
                 if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.005):
-                    add_tp(sh - atr * 0.10, 2.5)
+                    add_tp(sh - atr * 0.10, 2.5, "SwingH")
 
-            # Fractional VWAP reversion
+            # VWAP partial fraction (last resort — weakest)
             if vwap > price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0)
+                add_tp(partial, 2.0, "VWAPpartial")
 
         else:  # short
             for wp, wq in walls:
                 if wp < price - min_tp_dist:
                     w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5))
+                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5), "OBwall")
 
             for h in hvn_levels:
                 if price > h and (vwap <= 0 or h >= vwap * 0.998):
-                    add_tp(h, 4.0)
+                    add_tp(h, 4.0, "HVN")
 
             if vwap < price:
-                add_tp(vwap, 3.5)
+                add_tp(vwap, 3.5, "VWAP")
 
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
                     lvl = vwap + mult * vwap_std
                     if lvl < price:
-                        add_tp(lvl, bscore)
+                        add_tp(lvl, bscore, f"VWAP+{mult}σ")
 
             for sl_v in sl_5m:
                 if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.995):
-                    add_tp(sl_v + atr * 0.10, 2.5)
+                    add_tp(sl_v + atr * 0.10, 2.5, "SwingL")
 
             if vwap < price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0)
+                add_tp(partial, 2.0, "VWAPpartial")
 
-        # ── Tiered selection ──────────────────────────────────────────────────
+        # ── Tiered selection ──────────────────────────────────────────────
         if scored:
-            # Tier-A: score ≥ 3.5 → nearest (maximises win-rate)
-            tier_a = [(lvl, sc) for lvl, sc in scored if sc >= 3.5]
-            if tier_a:
-                tp = min(tier_a, key=lambda x: abs(x[0] - price))[0]
+            # Tier A: ICT structural (score ≥ 4.0) — nearest maximises win-rate
+            tier_ict = [(lvl, sc, lb) for lvl, sc, lb in scored if sc >= 4.0]
+            if tier_ict:
+                tp = min(tier_ict, key=lambda x: abs(x[0] - price))[0]
+                best_label = min(tier_ict, key=lambda x: abs(x[0] - price))[2]
             else:
-                # Tier-B: below 3.5 → highest-scored (maximises expected value)
+                # Tier B: best-scored structural (VWAP / walls / swings)
                 scored.sort(key=lambda x: -x[1])
                 tp = scored[0][0]
+                best_label = scored[0][2]
+            logger.debug(f"TP selected: ${tp:,.2f} [{best_label}] from {len(scored)} candidates")
         else:
-            # No structural target found — enforce minimum R:R floor only
+            # No structural target — use minimum R:R floor (synthetic, log warning)
             tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
+            logger.info(
+                f"⚠️  No structural TP within [{QCfg.REVERSION_MIN_RR():.1f}–"
+                f"{QCfg.REVERSION_MAX_RR():.1f}]×SL_dist "
+                f"({min_tp_dist:.0f}–{max_tp_dist:.0f} pts). "
+                f"Using R:R floor ${tp:,.2f} — consider skipping entry.")
 
         return tp
 
@@ -2405,74 +2440,17 @@ class QuantStrategy:
         c=sig.composite; thr=QCfg.COMPOSITE_ENTRY_MIN()
         regime_lbl = sig.market_regime
         gates = [
-            f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR from VWAP ${sig.vwap_price:,.1f})",
-            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%} ATR pctile)",
-            f"{'✅' if not sig.htf_veto else '❌'} HTF veto (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
-            f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'} signals agree)",
-            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f} threshold)",
-            f"📊 Regime: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
-
-        # ICT structural context — show actual price levels not just a score
-        if self._ict is not None and self._ict._initialized:
-            atr_val = sig.atr
-            try:
-                st = self._ict.get_full_status(price, atr_val, int(now * 1000))
-                ict_lines = []
-                # Nearest bull OB below price
-                bull_below = [o for o in st["bull_obs"] if o["low"] < price][:1]
-                bear_above = [o for o in st["bear_obs"] if o["high"] > price][:1]
-                for ob in bull_below:
-                    tags = "+".join(ob["tags"]) if ob["tags"] else "plain"
-                    ict_lines.append(
-                        f"  🟢 Bull OB ${ob['low']:,.1f}-${ob['high']:,.1f} "
-                        f"({ob['dist_pts']:+.1f}pts / {ob['dist_atr']:.2f}ATR) "
-                        f"str={ob['strength']:.0f} [{tags}]")
-                for ob in bear_above:
-                    tags = "+".join(ob["tags"]) if ob["tags"] else "plain"
-                    ict_lines.append(
-                        f"  🔴 Bear OB ${ob['low']:,.1f}-${ob['high']:,.1f} "
-                        f"({ob['dist_pts']:+.1f}pts / {ob['dist_atr']:.2f}ATR) "
-                        f"str={ob['strength']:.0f} [{tags}]")
-                # Nearest FVGs
-                bull_fvg = [f for f in st["bull_fvgs"] if f["bottom"] < price][:1]
-                bear_fvg = [f for f in st["bear_fvgs"] if f["top"] > price][:1]
-                for fvg in bull_fvg:
-                    ict_lines.append(
-                        f"  🟦 Bull FVG ${fvg['bottom']:,.1f}-${fvg['top']:,.1f} "
-                        f"size={fvg['size']:.1f} fill={fvg['fill_pct']:.0%} "
-                        f"({fvg['dist_pts']:+.1f}pts)")
-                for fvg in bear_fvg:
-                    ict_lines.append(
-                        f"  🟥 Bear FVG ${fvg['bottom']:,.1f}-${fvg['top']:,.1f} "
-                        f"size={fvg['size']:.1f} fill={fvg['fill_pct']:.0%} "
-                        f"({fvg['dist_pts']:+.1f}pts)")
-                # Nearby liquidity
-                nearby_liq = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 3.0 * atr_val][:3]
-                for liq in nearby_liq:
-                    arrow = "▼" if liq["price"] < price else "▲"
-                    ict_lines.append(
-                        f"  💧 {liq['pool_type']} {arrow} ${liq['price']:,.1f} "
-                        f"x{liq['touch_count']} ({liq['dist_pts']:+.1f}pts)")
-                # Session + score
-                kz_str = f" [{st['killzone']}]" if st.get("killzone") else ""
-                ict_score_str = (f"🏛️ ICT Σ={sig.ict_total:.2f} "
-                                 f"OB={sig.ict_ob:.2f} FVG={sig.ict_fvg:.2f} "
-                                 f"Sweep={sig.ict_sweep:.2f} KZ={sig.ict_session:.2f} "
-                                 f"| {st['session']}{kz_str}")
-                if not ict_lines:
-                    ict_lines.append(f"  (no structures near price — {sig.ict_details})")
-                gates.append(ict_score_str)
-                gates.extend(ict_lines)
-            except Exception:
-                if sig.ict_total > 0.01:
-                    gates.append(
-                        f"🏛️ ICT: {sig.ict_total:.2f} "
-                        f"OB={sig.ict_ob:.2f} FVG={sig.ict_fvg:.2f} "
-                        f"[{sig.ict_details}]")
-        elif self._ict is not None and not self._ict._initialized:
-            gates.append(f"🏛️ ICT: warming up ({len(list(self._ict.order_blocks_bull))} bull / "
-                         f"{len(list(self._ict.order_blocks_bear))} bear OBs)")
-
+            f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR)",
+            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})",
+            f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
+            f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'})",
+            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
+            f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
+        if sig.ict_total > 0.01:
+            ict_lbl = f"🏛️ ICT: {sig.ict_total:.2f} (OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Sweep={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f})"
+            if sig.ict_details:
+                ict_lbl += f" [{sig.ict_details}]"
+            gates.append(ict_lbl)
         ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr
         cd = max(0.0, QCfg.COOLDOWN_SEC()-(now-self._last_exit_time))
         lines = [f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
@@ -2485,97 +2463,6 @@ class QuantStrategy:
         lines.append(f"└{'─'*66}")
         logger.info("\n"+"\n".join(lines))
 
-    def _log_ict_structures(self, st: Dict, ict_conf, ict_side: str,
-                            price: float, atr: float) -> None:
-        """
-        Throttled detailed ICT structure log — fires when OBs/FVGs exist near price.
-        Only emits when something meaningful is within 3×ATR.
-        Separate from _log_thinking so the 30s throttle on thinking doesn't suppress it.
-        """
-        if not hasattr(self, '_last_ict_struct_log'):
-            self._last_ict_struct_log = 0.0
-        now = time.time()
-        # Throttle to once per 60s — structure doesn't change that fast
-        if now - self._last_ict_struct_log < 60.0:
-            return
-        # Only log if we have something within 2×ATR
-        nearby_ob = any(abs(o["dist_pts"]) < 2.0 * atr
-                        for o in st["bull_obs"] + st["bear_obs"])
-        nearby_fvg = any(abs(f["dist_pts"]) < 2.0 * atr
-                         for f in st["bull_fvgs"] + st["bear_fvgs"])
-        if not nearby_ob and not nearby_fvg:
-            return
-        self._last_ict_struct_log = now
-
-        lines = [
-            f"┌─── 🏛️ ICT STRUCTURES  ${price:,.2f}  side={ict_side.upper()}  "
-            f"Σ={ict_conf.total:.2f} [{ict_conf.session_name}"
-            f"{(' '+ict_conf.killzone) if ict_conf.killzone else ''}] ────"
-        ]
-        c = st["counts"]
-        lines.append(
-            f"  OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
-            f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
-            f"Liq: {c['liq_active']} active {c['liq_swept']} swept"
-        )
-
-        # Bull OBs
-        for ob in st["bull_obs"][:4]:
-            in_tag = " ◄ IN" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
-            tags = "+".join(ob["tags"]) if ob["tags"] else "-"
-            bos_char = "B" if ob["bos"] else " "
-            lines.append(
-                f"  🟢[{bos_char}] ${ob['low']:,.1f}─${ob['high']:,.1f} "
-                f"mid=${ob['midpoint']:,.1f}  dist={ob['dist_pts']:+.1f}pts/{ob['dist_atr']:.2f}ATR  "
-                f"str={ob['strength']:.0f} v={ob['visit_count']} [{tags}]{in_tag}"
-            )
-        # Bear OBs
-        for ob in st["bear_obs"][:4]:
-            in_tag = " ◄ IN" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
-            tags = "+".join(ob["tags"]) if ob["tags"] else "-"
-            bos_char = "B" if ob["bos"] else " "
-            lines.append(
-                f"  🔴[{bos_char}] ${ob['low']:,.1f}─${ob['high']:,.1f} "
-                f"mid=${ob['midpoint']:,.1f}  dist={ob['dist_pts']:+.1f}pts/{ob['dist_atr']:.2f}ATR  "
-                f"str={ob['strength']:.0f} v={ob['visit_count']} [{tags}]{in_tag}"
-            )
-        # FVGs
-        for fvg in (st["bull_fvgs"] + st["bear_fvgs"])[:4]:
-            icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
-            in_tag = " ◄ IN" if fvg["in_gap"] else ""
-            lines.append(
-                f"  {icon} ${fvg['bottom']:,.1f}─${fvg['top']:,.1f}  "
-                f"size={fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
-                f"dist={fvg['dist_pts']:+.1f}pts/{fvg['dist_atr']:.2f}ATR  "
-                f"age={fvg['age_min']:.0f}m{in_tag}"
-            )
-        # Liquidity within 3×ATR
-        near_liq = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 3.0 * atr]
-        for liq in near_liq[:4]:
-            arrow = "▼" if liq["price"] < price else "▲"
-            lines.append(
-                f"  💧 {liq['pool_type']} {arrow} ${liq['price']:,.1f}  "
-                f"x{liq['touch_count']}  dist={liq['dist_pts']:+.1f}pts"
-            )
-        # Swept liquidity (last 2h)
-        for liq in st["liq_swept"][:2]:
-            disp = "DISP" if liq["displacement"] else "weak"
-            age = f"{liq['sweep_age_min']:.0f}m ago" if liq["sweep_age_min"] is not None else ""
-            lines.append(
-                f"  🌊 SWEPT {liq['pool_type']} ${liq['price']:,.1f}  "
-                f"[{disp}] {age}"
-            )
-        # Nearest swing levels
-        sh = st["swing_highs"][:3]
-        sl = st["swing_lows"][:3]
-        if sh:
-            lines.append(f"  📌 Swing highs: {' | '.join(f'${h:,.1f}' for h in sh)}")
-        if sl:
-            lines.append(f"  📌 Swing lows:  {' | '.join(f'${l:,.1f}' for l in sl)}")
-
-        lines.append(f"└{'─'*66}")
-        logger.info("\n" + "\n".join(lines))
-
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         # v4.3 Solution 5: Spread cost gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
@@ -2584,70 +2471,35 @@ class QuantStrategy:
             return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
-        price = data_manager.get_last_price()
-        # NOTE: _log_thinking is called AFTER the ICT block below so that sig.ict_*
-        # fields are populated before logging. Calling it here would always show
-        # ICT Σ=0.00 because the fields haven't been set yet on this tick.
+        price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
         # Update ICT structures (OB, FVG, liquidity, session) every 5s
-        # Then score ICT confluence for the CORRECT trade direction:
-        #   - RANGING regime       → reversion_side (fade the extension)
-        #   - TRENDING regime      → trend direction (confirm the pullback)
-        #   - Breakout retest      → breakout direction
-        # BUG FIX: was always using reversion_side. In TRENDING_UP, reversion_side
-        # = "short", so bearish OBs got scored and boosted a LONG trend entry —
-        # the ICT signal was pointing exactly backwards.
+        # Then score ICT confluence for the current reversion side
+        # ICT score is used to: (a) boost composite, (b) count as confirming signal
         if self._ict is not None:
             try:
-                candles_5m  = data_manager.get_candles("5m", limit=100)
+                candles_5m = data_manager.get_candles("5m", limit=100)
                 candles_15m = data_manager.get_candles("15m", limit=50)
-                now_ms = int(now * 1000)
+                now_ms = int(now * 1000) if now < 1e12 else int(now)
                 self._ict.update(candles_5m, candles_15m, price, now_ms)
-
-                # Determine correct ICT side for the current regime
-                if self._breakout.is_active and self._breakout.direction:
-                    ict_side = "long" if self._breakout.direction == "up" else "short"
-                elif self._regime.is_trending():
-                    trend_side = self._regime.trend_side()
-                    ict_side = trend_side if trend_side else sig.reversion_side
-                else:
-                    ict_side = sig.reversion_side if sig.reversion_side else (
-                        "long" if sig.composite > 0 else "short")
-
+                ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
                 ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
-                sig.ict_ob      = ict_conf.ob_score
-                sig.ict_fvg     = ict_conf.fvg_score
-                sig.ict_sweep   = ict_conf.sweep_score
+                sig.ict_ob = ict_conf.ob_score
+                sig.ict_fvg = ict_conf.fvg_score
+                sig.ict_sweep = ict_conf.sweep_score
                 sig.ict_session = ict_conf.session_score
-                sig.ict_total   = ict_conf.total
+                sig.ict_total = ict_conf.total
                 sig.ict_details = ict_conf.details
-
                 # Boost composite: ICT structural alignment strengthens the signal
                 # max boost = 0.15 (ICT total=1.0 × 0.15 = strongest possible)
                 ict_boost = ict_conf.total * 0.15
-                if sig.composite > 0:
-                    sig.composite = min(1.0, sig.composite + ict_boost)
-                else:
-                    sig.composite = max(-1.0, sig.composite - ict_boost)
-
-                # ICT counts as a confirming signal if total >= 0.30
+                sig.composite = max(-1.0, min(1.0, sig.composite + (ict_boost if sig.composite > 0 else -ict_boost)))
+                # ICT counts as a confirming signal if total > 0.3
                 if ict_conf.total >= 0.30:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
-
-                # Detailed ICT log (throttled — only when near entry)
-                if ict_conf.total > 0.01:
-                    atr_val = self._atr_5m.atr
-                    st = self._ict.get_full_status(price, atr_val, now_ms)
-                    # Only log when we have actual structures to show
-                    if st["counts"]["ob_bull"] + st["counts"]["ob_bear"] > 0:
-                        self._log_ict_structures(st, ict_conf, ict_side, price, atr_val)
-
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
-
-        # ICT fields are now populated — log_thinking can see the real scores
-        self._log_thinking(sig, price, now)
 
         # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
         # This is the single most important defense against bleeding in trends.
@@ -2897,23 +2749,80 @@ class QuantStrategy:
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
 
-        # ── v4.8: ICT OB-aware SL enhancement ─────────────────────────────
-        # If an Order Block exists between current SL and price, use it as SL
-        # instead. OBs are institutional footprints — price is more likely to
-        # bounce off an OB than a random swing low. Only UPGRADE (tighter) SL.
+        # ── v4.8: ICT OB-aware SL — FVG/liquidity-pool immune ─────────────────
+        # get_ob_sl_level now runs FVG escape and liquidity-pool escape internally.
+        # Only upgrade (tighten) SL; never widen it.
         if self._ict is not None:
             try:
                 now_ms = int(time.time() * 1000)
-                ob_sl = self._ict.get_ob_sl_level(side, price, atr, now_ms)
+                ob_sl  = self._ict.get_ob_sl_level(side, price, atr, now_ms)
                 if ob_sl is not None:
                     if side == "long" and ob_sl > sl_price and ob_sl < price:
-                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB support)")
+                        logger.info(f"🏛️ ICT OB SL → ${sl_price:,.2f} → ${ob_sl:,.2f} (OB support, FVG/pool safe)")
                         sl_price = _round_to_tick(ob_sl)
                     elif side == "short" and ob_sl < sl_price and ob_sl > price:
-                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB resistance)")
+                        logger.info(f"🏛️ ICT OB SL → ${sl_price:,.2f} → ${ob_sl:,.2f} (OB resistance, FVG/pool safe)")
                         sl_price = _round_to_tick(ob_sl)
             except Exception as e:
                 logger.debug(f"ICT OB SL error: {e}")
+
+        # ── Structural SL: escape any FVG or liquidity pool it landed in ───────
+        # This is a defence-in-depth pass over the FINAL sl_price regardless of
+        # how it was computed. A SL inside a FVG will be filled. A SL within
+        # 0.3×ATR of a liquidity pool will be swept.
+        if self._ict is not None and self._ict._initialized:
+            try:
+                now_ms  = int(time.time() * 1000)
+                fvg_buf = 0.25 * atr
+                liq_buf = 0.35 * atr
+
+                if side == "short":
+                    # Short SL is above price — check bearish FVGs above price
+                    for fvg in list(self._ict.fvgs_bear):
+                        if fvg.filled or not fvg.is_active(now_ms):
+                            continue
+                        if fvg.bottom <= sl_price <= fvg.top:
+                            new_sl = _round_to_tick(fvg.top + fvg_buf)
+                            logger.info(
+                                f"⚠️  SL inside Bear FVG ${fvg.bottom:,.1f}–${fvg.top:,.1f} "
+                                f"→ escaping to ${new_sl:,.1f} (+{fvg_buf:.0f}pts above FVG)")
+                            sl_price = new_sl
+                            break
+                    # Check EQH pools above price
+                    for pool in list(self._ict.liquidity_pools):
+                        if pool.swept or pool.pool_type != "EQH":
+                            continue
+                        if pool.price > price and abs(sl_price - pool.price) < liq_buf and sl_price < pool.price:
+                            new_sl = _round_to_tick(pool.price + liq_buf)
+                            logger.info(
+                                f"⚠️  SL beneath EQH ${pool.price:,.1f} (x{pool.touch_count}) "
+                                f"→ escaping to ${new_sl:,.1f} (above pool)")
+                            sl_price = new_sl
+                else:
+                    # Long SL is below price — check bullish FVGs below price
+                    for fvg in list(self._ict.fvgs_bull):
+                        if fvg.filled or not fvg.is_active(now_ms):
+                            continue
+                        if fvg.bottom <= sl_price <= fvg.top:
+                            new_sl = _round_to_tick(fvg.bottom - fvg_buf)
+                            logger.info(
+                                f"⚠️  SL inside Bull FVG ${fvg.bottom:,.1f}–${fvg.top:,.1f} "
+                                f"→ escaping to ${new_sl:,.1f} (-{fvg_buf:.0f}pts below FVG)")
+                            sl_price = new_sl
+                            break
+                    for pool in list(self._ict.liquidity_pools):
+                        if pool.swept or pool.pool_type != "EQL":
+                            continue
+                        if pool.price < price and abs(sl_price - pool.price) < liq_buf and sl_price > pool.price:
+                            new_sl = _round_to_tick(pool.price - liq_buf)
+                            logger.info(
+                                f"⚠️  SL above EQL ${pool.price:,.1f} (x{pool.touch_count}) "
+                                f"→ escaping to ${new_sl:,.1f} (below pool)")
+                            sl_price = new_sl
+
+                sl_price = _round_to_tick(sl_price)
+            except Exception as e:
+                logger.debug(f"SL escape pass error: {e}")
 
         # ── v4.7: Mode-aware SL sizing ────────────────────────────────────
         #
@@ -2963,7 +2872,8 @@ class QuantStrategy:
         else:
             tp_price = InstitutionalLevels.compute_tp(
                 price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
-                candles_5m=candles_5m)
+                candles_5m=candles_5m,
+                ict_engine=self._ict)   # v4.9: structural targets (swept liq, FVGs, OBs)
         tp_price = _round_to_tick(tp_price)
 
         # ── Basic direction sanity (unchanged) ───────────────────────────────────
@@ -3088,10 +2998,50 @@ class QuantStrategy:
         td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
+
+        # ── Structural TP viability gate ───────────────────────────────────────
+        # Reject entries where TP has no structural backing (just R:R arithmetic).
+        # Rule: if rr < REVERSION_MIN_RR by more than 5% AND ict is initialized
+        # AND no structural target exists within MAX_RR, the setup is invalid.
+        # We already log the "no structural TP" warning inside compute_tp —
+        # here we enforce the minimum R:R hard gate.
+        min_rr_required = QCfg.REVERSION_MIN_RR() if mode == "reversion" else QCfg.TREND_MIN_RR()
+        if rr < min_rr_required * 0.95:
+            logger.info(
+                f"⛔ R:R gate: {rr:.2f} < {min_rr_required:.1f} minimum "
+                f"(SL=${sl_price:,.2f} dist={sd:.0f}pts, TP=${tp_price:,.2f} dist={td:.0f}pts) — skipping")
+            return
+
+        # ── Compute SL/TP distances in ATR for the entry log ──────────────────
+        sl_atr = sd / atr
+        tp_atr = td / atr
+        vwap_dist = abs(price - self._vwap.vwap) / atr if self._vwap.vwap > 0 else 0.0
+
+        # ICT context for entry log
+        ict_context = ""
+        if self._ict is not None and self._ict._initialized:
+            try:
+                now_ms   = int(time.time() * 1000)
+                ict_c    = self._ict.get_confluence(side, price, now_ms)
+                sess     = self._ict._session
+                kz       = self._ict._killzone
+                kz_s     = f"/{kz}" if kz else ""
+                ict_context = (
+                    f" | ICT={ict_c.total:.2f}(OB={ict_c.ob_score:.1f} "
+                    f"FVG={ict_c.fvg_score:.1f} Sw={ict_c.sweep_score:.1f}) "
+                    f"{sess}{kz_s}")
+                if ict_c.details:
+                    ict_context += f" [{ict_c.details}]"
+            except Exception:
+                pass
+
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
-            f"{'maker' if use_maker else 'taker'} | VWAP=${sig.vwap_price:,.2f} | {sig}"
+            f"SL=${sl_price:,.2f}(-{sd:.0f}pts/{sl_atr:.2f}ATR) "
+            f"TP=${tp_price:,.2f}(-{td:.0f}pts/{tp_atr:.2f}ATR) "
+            f"R:R=1:{rr:.2f} | {'maker' if use_maker else 'taker'} | "
+            f"VWAP=${sig.vwap_price:,.2f}({vwap_dist:.1f}ATR) | "
+            f"{sig}{ict_context}"
         )
 
         # ── Place entry order (PATCH 5e) ──────────────────────────────────────────
@@ -3671,74 +3621,23 @@ class QuantStrategy:
 
     def format_status_report(self):
         """
-        Telegram status report — includes ICT structure counts + nearest levels.
+        Telegram status report — PATCH 6.
+        Adds execution cost diagnostics block when _fee_engine is available.
         """
         s = self.get_stats()
         p = self._pos
         lines = [
             "📊 <b>QUANT v4 STATUS</b>", "",
             f"Phase: {s['current_phase']}",
-            f"Regime: {'✅' if s['regime_ok'] else '❌'} | ADX={self._adx.adx:.1f}",
-            f"ATR: ${s['atr_5m']} (5m) / ${s['atr_1m']} (1m)  [{s['atr_pctile']} pctile]",
-            f"HTF: 15m={self._htf.trend_15m:+.2f}  4h={self._htf.trend_4h:+.2f}",
-            f"VWAP: ${self._vwap.vwap:,.2f}  dev={self._vwap.deviation_atr:+.1f}ATR", "",
+            f"Regime: {'✅' if s['regime_ok'] else '❌'}",
+            f"ATR: ${s['atr_5m']}/{s['atr_1m']} ({s['atr_pctile']})",
+            f"HTF: 15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}",
+            f"VWAP: ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f}ATR)", "",
             f"Trades: {s['total_trades']} | WR {s['win_rate']} | PnL ${s['total_pnl']:+.2f}",
             f"Daily: {s['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} | Losses: {s['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()}",
         ]
 
-        # ── ICT structure summary ─────────────────────────────────────────
-        if self._ict is not None and self._ict._initialized:
-            try:
-                price = self._last_known_price
-                atr   = self._atr_5m.atr
-                now_ms = int(time.time() * 1000)
-                st = self._ict.get_full_status(price, atr, now_ms)
-                c  = st["counts"]
-                kz = st.get("killzone", "")
-                sess = st.get("session", "")
-                lines += [
-                    "",
-                    f"<b>ICT Structure</b>  [{sess}{(' '+kz) if kz else ''}]",
-                    f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
-                    f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
-                    f"Liq: {c['liq_active']} active"
-                ]
-                # Nearest bull OB below
-                for ob in st["bull_obs"][:2]:
-                    tags = "+".join(ob["tags"]) if ob["tags"] else "-"
-                    in_t = " ◄IN" if ob["in_ob"] else ""
-                    lines.append(
-                        f"  🟢 ${ob['low']:,.0f}─${ob['high']:,.0f}  "
-                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.1f}ATR  "
-                        f"str={ob['strength']:.0f} [{tags}]{in_t}")
-                # Nearest bear OB above
-                for ob in st["bear_obs"][:2]:
-                    tags = "+".join(ob["tags"]) if ob["tags"] else "-"
-                    in_t = " ◄IN" if ob["in_ob"] else ""
-                    lines.append(
-                        f"  🔴 ${ob['low']:,.0f}─${ob['high']:,.0f}  "
-                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.1f}ATR  "
-                        f"str={ob['strength']:.0f} [{tags}]{in_t}")
-                # Nearest FVGs (1 each side)
-                for fvg in (st["bull_fvgs"][:1] + st["bear_fvgs"][:1]):
-                    icon = "🟦" if fvg["direction"] == "bullish" else "🟥"
-                    in_t = " ◄IN" if fvg["in_gap"] else ""
-                    lines.append(
-                        f"  {icon} ${fvg['bottom']:,.0f}─${fvg['top']:,.0f}  "
-                        f"fill={fvg['fill_pct']:.0%}  {fvg['dist_pts']:+.0f}pts{in_t}")
-                # Recent sweeps
-                for liq in st["liq_swept"][:2]:
-                    disp = "DISP" if liq["displacement"] else "weak"
-                    age  = f"{liq['sweep_age_min']:.0f}m ago" if liq["sweep_age_min"] else ""
-                    lines.append(f"  🌊 SWEPT {liq['pool_type']} ${liq['price']:,.0f} [{disp}] {age}")
-            except Exception as e:
-                lines.append(f"  ICT: error ({e})")
-        elif self._ict is not None:
-            bull_n = len(list(self._ict.order_blocks_bull))
-            bear_n = len(list(self._ict.order_blocks_bear))
-            lines.append(f"\nICT: warming up  ({bull_n}🟢 {bear_n}🔴 OBs detected so far)")
-
-        # ── Execution cost diagnostics ────────────────────────────────────
+        # ── Execution cost diagnostics (only when fee engine is live) ─────────────
         if self._fee_engine is not None:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()

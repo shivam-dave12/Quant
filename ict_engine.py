@@ -190,8 +190,8 @@ class ICTEngine:
     """
 
     # ── Config defaults (overrideable via config module) ──────────────
-    OB_MIN_IMPULSE_PCT = 0.15   # 0.15% body — was 0.50 (required $420 on BTC 5m, nothing qualified)
-    OB_MIN_BODY_RATIO = 0.40   # body >= 40% of range (was 0.50 — too strict for wicky impulse candles)
+    OB_MIN_IMPULSE_PCT = 0.50
+    OB_MIN_BODY_RATIO = 0.50
     OB_IMPULSE_SIZE_MULT = 1.30
     OB_MAX_AGE_MS = 86_400_000
     FVG_MIN_SIZE_PCT = 0.020
@@ -287,31 +287,25 @@ class ICTEngine:
 
     def _detect_swing_points(self, candles_5m: List[Dict],
                               candles_15m: List[Dict]) -> None:
-        """Detect fractal swing highs/lows for OB reference and liquidity.
-
-        BUG FIX: was using >= which lets flat-topped candles qualify as swing
-        highs, polluting the OB and liquidity pool detection. Strict > required.
-        lb_left reduced from 5→3, lb_right from 3→2: with 5-bar lookback on 5m
-        candles you need 25 minutes of price to clear both sides — almost no swings
-        were found, starving OB/liq detection of reference levels.
-        """
+        """Detect fractal swing highs/lows for OB reference and liquidity."""
         self._swing_highs.clear()
         self._swing_lows.clear()
 
         for candles in [candles_5m, candles_15m]:
             if len(candles) < 7:
                 continue
-            lb_left = 3
-            lb_right = 2
+            lb_left = 5
+            lb_right = 3
             for i in range(lb_left, len(candles) - lb_right):
                 h = float(candles[i]['h'])
                 l = float(candles[i]['l'])
-                # STRICT > — flat tops must NOT qualify as swing highs
-                if all(h > float(candles[j]['h']) for j in range(i - lb_left, i)) and \
-                   all(h > float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
+                # Swing high
+                if all(h >= float(candles[j]['h']) for j in range(i - lb_left, i)) and \
+                   all(h >= float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_highs.append(h)
-                if all(l < float(candles[j]['l']) for j in range(i - lb_left, i)) and \
-                   all(l < float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
+                # Swing low
+                if all(l <= float(candles[j]['l']) for j in range(i - lb_left, i)) and \
+                   all(l <= float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_lows.append(l)
 
     # ══════════════════════════════════════════════════════════════════
@@ -320,68 +314,47 @@ class ICTEngine:
 
     def _detect_order_blocks(self, candles: List[Dict], price: float,
                               now_ms: int) -> None:
-        """OB = last opposite candle before a strong impulse move.
-
-        BUG FIX: was checking only candles[i+1] for the impulse. ICT OBs are
-        defined by the last opposing candle before a SEQUENCE of directional
-        candles. We now check if ANY of the next 1-3 candles form a qualifying
-        impulse, and aggregate their combined displacement.
-        """
-        if len(candles) < 6:
+        """OB = last opposite candle before a strong impulse move."""
+        if len(candles) < 5:
             return
 
-        tol = price * 0.0008   # dedup: OBs within 0.08% of each other ignored
+        tol = price * 0.001
         prior_highs = sorted(self._swing_highs, reverse=True)[:5]
-        prior_lows  = sorted(self._swing_lows)[:5]
+        prior_lows = sorted(self._swing_lows)[:5]
 
-        for i in range(2, len(candles) - 3):
+        for i in range(2, len(candles) - 1):
             cur = candles[i]
+            nxt = candles[i + 1]
+
             cur_o, cur_c = float(cur['o']), float(cur['c'])
             cur_h, cur_l = float(cur['h']), float(cur['l'])
+            nxt_o, nxt_c = float(nxt['o']), float(nxt['c'])
+            nxt_h, nxt_l = float(nxt['h']), float(nxt['l'])
             cur_ts = int(cur.get('t', now_ms))
 
-            # ── Measure the impulse over the next 1-3 candles ────────────────
-            # Aggregate: combined displacement, max body ratio, direction
-            imp_high = cur_h; imp_low = cur_l
-            max_body_ratio = 0.0; net_up = 0.0; net_dn = 0.0
-            for k in range(1, min(4, len(candles) - i)):
-                nc = candles[i + k]
-                nc_o, nc_c = float(nc['o']), float(nc['c'])
-                nc_h, nc_l = float(nc['h']), float(nc['l'])
-                nc_range = nc_h - nc_l
-                nc_body = abs(nc_c - nc_o)
-                br = nc_body / max(nc_range, 1e-9)
-                if nc_c > nc_o:
-                    net_up += nc_body; max_body_ratio = max(max_body_ratio, br)
-                else:
-                    net_dn += nc_body; max_body_ratio = max(max_body_ratio, br)
-                imp_high = max(imp_high, nc_h)
-                imp_low  = min(imp_low, nc_l)
+            nxt_range = nxt_h - nxt_l
+            nxt_body = abs(nxt_c - nxt_o)
 
-            total_range = imp_high - imp_low
-            imp_move_up = (imp_high - cur_h) / max(cur_c, 1.0) * 100.0   # % move from OB high
-            imp_move_dn = (cur_l - imp_low) / max(cur_c, 1.0) * 100.0    # % move from OB low
-
-            impulse_up   = (net_up > net_dn and
-                            imp_move_up >= self.OB_MIN_IMPULSE_PCT and
-                            max_body_ratio >= self.OB_MIN_BODY_RATIO)
-            impulse_down = (net_dn > net_up and
-                            imp_move_dn >= self.OB_MIN_IMPULSE_PCT and
-                            max_body_ratio >= self.OB_MIN_BODY_RATIO)
+            impulse_up = (nxt_c > nxt_o and
+                         (nxt_c - nxt_o) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
+                         nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+            impulse_down = (nxt_c < nxt_o and
+                           (nxt_o - nxt_c) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
+                           nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
 
             # Bullish OB: bearish candle before bullish impulse
             if impulse_up and cur_c < cur_o:
-                bos_ok  = any(imp_high > ph for ph in prior_highs[:3]) if prior_highs else False
-                has_disp = total_range > 0 and net_up / total_range >= self.SWEEP_DISP_MIN
+                bos_ok = any(nxt_h > ph for ph in prior_highs[:3]) if prior_highs else False
+                has_disp = nxt_range > 0 and nxt_body / nxt_range >= self.SWEEP_DISP_MIN
                 body_low = min(cur_o, cur_c)
                 wick = body_low - cur_l if body_low > cur_l else 0.0
                 wick_rej = (cur_h - cur_l) > 0 and wick / (cur_h - cur_l) >= 0.20
 
                 strength = 40.0
-                if bos_ok:    strength += 20.0
-                if has_disp:  strength += 15.0
-                if wick_rej:  strength += 10.0
-                if total_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
+                if bos_ok: strength += 20.0
+                if has_disp: strength += 15.0
+                if wick_rej: strength += 10.0
+                if nxt_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
                     strength += 15.0
                 strength = min(strength, 100.0)
 
@@ -392,24 +365,20 @@ class ICTEngine:
                         direction="bullish", strength=strength,
                         bos_confirmed=bos_ok, has_displacement=has_disp,
                         has_wick_rejection=wick_rej, max_age_ms=self.OB_MAX_AGE_MS))
-                    logger.debug(
-                        f"🟢 Bull OB @ ${cur_l:,.0f}-${cur_h:,.0f} "
-                        f"str={strength:.0f} BOS={bos_ok} disp={has_disp} wick={wick_rej}"
-                    )
 
             # Bearish OB: bullish candle before bearish impulse
             if impulse_down and cur_c > cur_o:
-                bos_ok  = any(imp_low < pl for pl in prior_lows[:3]) if prior_lows else False
-                has_disp = total_range > 0 and net_dn / total_range >= self.SWEEP_DISP_MIN
+                bos_ok = any(nxt_l < pl for pl in prior_lows[:3]) if prior_lows else False
+                has_disp = nxt_range > 0 and nxt_body / nxt_range >= self.SWEEP_DISP_MIN
                 body_top = max(cur_o, cur_c)
                 wick = cur_h - body_top if cur_h > body_top else 0.0
                 wick_rej = (cur_h - cur_l) > 0 and wick / (cur_h - cur_l) >= 0.20
 
                 strength = 40.0
-                if bos_ok:    strength += 20.0
-                if has_disp:  strength += 15.0
-                if wick_rej:  strength += 10.0
-                if total_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
+                if bos_ok: strength += 20.0
+                if has_disp: strength += 15.0
+                if wick_rej: strength += 10.0
+                if nxt_range >= self.OB_IMPULSE_SIZE_MULT * (cur_h - cur_l):
                     strength += 15.0
                 strength = min(strength, 100.0)
 
@@ -420,10 +389,6 @@ class ICTEngine:
                         direction="bearish", strength=strength,
                         bos_confirmed=bos_ok, has_displacement=has_disp,
                         has_wick_rejection=wick_rej, max_age_ms=self.OB_MAX_AGE_MS))
-                    logger.debug(
-                        f"🔴 Bear OB @ ${cur_l:,.0f}-${cur_h:,.0f} "
-                        f"str={strength:.0f} BOS={bos_ok} disp={has_disp} wick={wick_rej}"
-                    )
 
     # ══════════════════════════════════════════════════════════════════
     # FVG DETECTION
@@ -725,42 +690,231 @@ class ICTEngine:
     def get_ob_sl_level(self, side: str, price: float, atr: float,
                          now_ms: int) -> Optional[float]:
         """
-        Find the best OB-based SL level for the given side.
+        OB-based SL placement — immune to FVG and liquidity-pool traps.
 
-        For LONG: SL goes below the nearest bullish OB low - buffer
-        For SHORT: SL goes above the nearest bearish OB high + buffer
+        For LONG:  SL = bullish OB low - buffer.
+        For SHORT: SL = bearish OB high + buffer.
 
-        Returns None if no suitable OB found.
+        Critical structural safety passes (in order):
+
+        1. FVG ESCAPE — if the computed SL falls inside an opposing FVG, the
+           FVG will be filled and the SL hunted. Push the SL to the far side
+           of the FVG plus a 0.2×ATR clearance.
+           Example: SHORT SL at $73,573 lands inside Bear FVG $73,492–$73,611.
+           Escape pushes SL to $73,611 + 0.2×ATR = $73,637 — above the trap.
+
+        2. LIQUIDITY POOL ESCAPE — if the computed SL is within 0.5×ATR of an
+           EQL (for longs) or EQH (for shorts), price will sweep that pool and
+           blow through the SL. Push SL past the pool + 0.3×ATR clearance.
+
+        3. DISTANCE GUARD — final candidate must be within [0.5, 4.0] × ATR
+           of entry. Reject if out of range (too tight = noise, too wide = bad
+           risk management).
         """
-        buffer = 0.3 * atr
+        buffer   = 0.3 * atr
+        fvg_buf  = 0.2 * atr
+        liq_buf  = 0.3 * atr
+        max_dist = 4.0 * atr
+        min_dist = 0.5 * atr
+
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []
 
         for ob in obs:
             if not ob.is_active(now_ms):
                 continue
+
             if side == "long" and ob.low < price:
                 sl_level = ob.low - buffer
-                dist = price - sl_level
-                if 0.5 * atr < dist < 3.0 * atr:
-                    candidates.append((sl_level, ob.strength))
             elif side == "short" and ob.high > price:
                 sl_level = ob.high + buffer
-                dist = sl_level - price
-                if 0.5 * atr < dist < 3.0 * atr:
-                    candidates.append((sl_level, ob.strength))
+            else:
+                continue
+
+            # ── Pass 1: Escape any opposing FVG the SL lands inside ──────────
+            # For SHORT, opposing FVGs are bullish (below price, SL above price).
+            # Actually the SL for SHORT is above price, so dangerous FVGs are
+            # BEARISH FVGs above price — if SL is inside one, price will fill
+            # the gap and stop us out on the way up.
+            if side == "short":
+                for fvg in self.fvgs_bear:
+                    if fvg.filled or not fvg.is_active(now_ms):
+                        continue
+                    if fvg.bottom <= sl_level <= fvg.top:
+                        # SL is inside a bearish FVG — push above the FVG
+                        sl_level = fvg.top + fvg_buf
+                        break
+            else:  # long
+                for fvg in self.fvgs_bull:
+                    if fvg.filled or not fvg.is_active(now_ms):
+                        continue
+                    if fvg.bottom <= sl_level <= fvg.top:
+                        # SL is inside a bullish FVG — push below the FVG
+                        sl_level = fvg.bottom - fvg_buf
+                        break
+
+            # ── Pass 2: Escape nearby liquidity pools ─────────────────────────
+            # For SHORT: SL is above price. Nearby EQH above price = stop-hunt
+            # magnet. If SL is within liq_buf of an EQH, push SL above the pool.
+            for pool in self.liquidity_pools:
+                if pool.swept:
+                    continue
+                if side == "short" and pool.pool_type == "EQH":
+                    if abs(sl_level - pool.price) < liq_buf and sl_level < pool.price:
+                        # SL is just below an EQH — price will sweep the EQH
+                        # and blow through SL. Push SL above pool + clearance.
+                        sl_level = pool.price + liq_buf
+                elif side == "long" and pool.pool_type == "EQL":
+                    if abs(sl_level - pool.price) < liq_buf and sl_level > pool.price:
+                        sl_level = pool.price - liq_buf
+
+            # ── Pass 3: Distance guard ────────────────────────────────────────
+            dist = abs(sl_level - price)
+            if not (min_dist <= dist <= max_dist):
+                continue
+
+            candidates.append((sl_level, ob.strength, dist))
 
         if not candidates:
             return None
 
-        # Pick the closest OB with highest strength
+        # Prefer: highest strength, then tightest (closest to price)
         if side == "long":
-            # Highest SL (closest to price) among strong OBs
-            candidates.sort(key=lambda x: (-x[1], -x[0]))
+            candidates.sort(key=lambda x: (-x[1], x[2]))   # highest SL closest to price
         else:
-            candidates.sort(key=lambda x: (-x[1], x[0]))
+            candidates.sort(key=lambda x: (-x[1], x[2]))   # lowest SL closest to price
 
-        return candidates[0][0]
+        sl_final = candidates[0][0]
+
+        # Final FVG/pool sweep check on selected candidate
+        # (secondary OBs after first loop may have shifted things)
+        if side == "short" and sl_final > price:
+            return sl_final
+        if side == "long" and sl_final < price:
+            return sl_final
+        return None
+
+    def get_structural_tp_targets(self, side: str, price: float, atr: float,
+                                   now_ms: int, min_dist: float,
+                                   max_dist: float) -> List[Tuple[float, float, str]]:
+        """
+        Return ICT structural TP candidates for the given trade direction.
+
+        Each candidate is (price_level, score, label) where score reflects
+        institutional significance:
+
+          6.0  Swept liquidity origin — the level price swept THROUGH before
+               reversing. After a sweep-and-reverse, price strongly targets
+               the sweep origin (smart money delivers to the raid origin).
+               This is the highest-conviction ICT target.
+
+          5.0  Unfilled FVG in trade direction — price fills open imbalances.
+               The FVG's near edge is the minimum target, far edge is full fill.
+               Score scales with gap size and freshness (low fill %).
+
+          4.0  Active OB in trade direction that price hasn't visited yet
+               (VIRGIN OB). These are institutional footprints and act as
+               strong price magnets and potential reversal/support zones.
+
+          3.0  Swing extreme in trade direction (from swing level detection).
+               Prior swing lows (for shorts) or highs (for longs) that were
+               significant enough to register as pivots.
+
+        All candidates are filtered to [min_dist, max_dist] from entry price.
+        Caller (compute_tp) adds these to its existing scored candidate pool.
+        """
+        candidates: List[Tuple[float, float, str]] = []
+
+        # ── 1. Swept liquidity origins ─────────────────────────────────────
+        for pool in self.liquidity_pools:
+            if not pool.swept:
+                continue
+            # After sweep, price targets the sweep origin
+            # For SHORT: swept EQH below price = price was pushed UP through it,
+            #            then reversed — target the origin (the EQH level)
+            # For LONG:  swept EQL above price = price was pushed DOWN through it,
+            #            then reversed — target the origin
+            sweep_age_ms = now_ms - pool.sweep_timestamp
+            if sweep_age_ms > self.SWEEP_MAX_AGE_MS:
+                continue
+
+            level = pool.price
+            dist  = price - level if side == "short" else level - price
+
+            if not (min_dist <= dist <= max_dist):
+                continue
+            if side == "short" and pool.pool_type == "EQH" and level < price:
+                freshness = max(0.0, 1.0 - sweep_age_ms / self.SWEEP_MAX_AGE_MS)
+                score = 6.0 * (0.7 + 0.3 * freshness)
+                if pool.displacement_confirmed:
+                    score += 0.5
+                candidates.append((level, score, f"SweepOrigin_EQH@${level:,.0f}"))
+            elif side == "long" and pool.pool_type == "EQL" and level > price:
+                freshness = max(0.0, 1.0 - sweep_age_ms / self.SWEEP_MAX_AGE_MS)
+                score = 6.0 * (0.7 + 0.3 * freshness)
+                if pool.displacement_confirmed:
+                    score += 0.5
+                candidates.append((level, score, f"SweepOrigin_EQL@${level:,.0f}"))
+
+        # ── 2. Open FVGs in trade direction ────────────────────────────────
+        # For SHORT: bullish FVGs BELOW price are TP targets (price fills them)
+        # For LONG:  bearish FVGs ABOVE price are TP targets
+        target_fvgs = self.fvgs_bull if side == "short" else self.fvgs_bear
+        for fvg in target_fvgs:
+            if fvg.filled or not fvg.is_active(now_ms):
+                continue
+            # Near edge of FVG (first touch = partial fill, conservative TP)
+            near_edge = fvg.top if side == "short" else fvg.bottom
+            far_edge  = fvg.bottom if side == "short" else fvg.top
+
+            dist_near = price - near_edge if side == "short" else near_edge - price
+            dist_far  = price - far_edge  if side == "short" else far_edge  - price
+
+            if not (min_dist <= dist_near <= max_dist):
+                continue
+
+            # Score: larger gap = more imbalance = higher conviction target
+            # Fresh FVG (low fill%) = higher score
+            freshness   = 1.0 - fvg.fill_percentage
+            size_factor = min(fvg.size / max(atr * 0.5, 1.0), 2.0)
+            score       = 5.0 * freshness * (0.6 + 0.4 * size_factor)
+            candidates.append((near_edge, score,
+                                f"FVG_near@${near_edge:,.0f}(fill={fvg.fill_percentage:.0%})"))
+
+            # Also offer the far edge as a second candidate (full fill)
+            if min_dist <= dist_far <= max_dist:
+                candidates.append((far_edge, score * 0.85,
+                                   f"FVG_far@${far_edge:,.0f}"))
+
+        # ── 3. Virgin OBs in trade direction ───────────────────────────────
+        # For SHORT: bullish OBs below price that haven't been visited
+        # For LONG:  bearish OBs above price
+        target_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
+        for ob in target_obs:
+            if not ob.is_active(now_ms) or ob.visit_count > 0:
+                continue
+            # Target the OB midpoint
+            level = ob.midpoint
+            dist  = price - level if side == "short" else level - price
+            if not (min_dist <= dist <= max_dist):
+                continue
+            score = 4.0 * ob.virgin_multiplier() * (ob.strength / 100.0)
+            if ob.bos_confirmed:
+                score += 0.5
+            candidates.append((level, score, f"VirginOB@${level:,.0f}_str={ob.strength:.0f}"))
+
+        # ── 4. Swing lows/highs in trade direction ─────────────────────────
+        # Already handled in quant_strategy.py's compute_tp, but provide our
+        # version filtered through ICT structural context
+        swing_levels = (self._swing_lows if side == "short" else self._swing_highs)
+        for level in sorted(swing_levels):
+            dist = price - level if side == "short" else level - price
+            if not (min_dist <= dist <= max_dist):
+                continue
+            # Lower score — swings without OB/FVG context are weaker
+            candidates.append((level, 3.0, f"Swing@${level:,.0f}"))
+
+        return candidates
 
     # ══════════════════════════════════════════════════════════════════
     # STATUS — for logging / telegram
@@ -777,120 +931,4 @@ class ICTEngine:
             "sweeps_active": len([p for p in self.liquidity_pools if p.swept]),
             "session": self._session,
             "killzone": self._killzone or "none",
-        }
-
-    def get_full_status(self, price: float, atr: float, now_ms: int) -> Dict:
-        """
-        Return rich structure data with prices, distances, and ATR multiples.
-        Used by /structures command and enhanced terminal logging.
-
-        Returns a dict with:
-          - bull_obs, bear_obs: sorted by proximity to price
-          - bull_fvgs, bear_fvgs: sorted by proximity
-          - liq_active, liq_swept: liquidity pools
-          - swing_highs, swing_lows: raw swing levels
-          - session, killzone
-          - initialized: bool
-        """
-        atr_safe = atr if atr > 1e-10 else 1.0
-
-        def _ob_detail(ob: OrderBlock) -> Dict:
-            dist = price - ob.midpoint if ob.direction == "bullish" else ob.midpoint - price
-            dist_pct = (price - ob.midpoint) / price * 100.0
-            in_ob = ob.contains_price(price)
-            in_ote = ob.in_optimal_zone(price)
-            age_min = (now_ms - ob.timestamp) / 60_000.0
-            tags = []
-            if in_ote:  tags.append("OTE")
-            if in_ob and not in_ote: tags.append("BODY")
-            if ob.bos_confirmed: tags.append("BOS")
-            if ob.has_displacement: tags.append("DISP")
-            if ob.has_wick_rejection: tags.append("WR")
-            if ob.visit_count == 0: tags.append("VIRGIN")
-            return {
-                "low": ob.low, "high": ob.high,
-                "midpoint": ob.midpoint,
-                "direction": ob.direction,
-                "strength": ob.strength,
-                "visit_count": ob.visit_count,
-                "bos": ob.bos_confirmed,
-                "in_ob": in_ob, "in_ote": in_ote,
-                "dist_pts": dist,
-                "dist_pct": dist_pct,
-                "dist_atr": dist / atr_safe,
-                "age_min": age_min,
-                "tags": tags,
-                "is_active": ob.is_active(now_ms),
-            }
-
-        def _fvg_detail(fvg: FairValueGap) -> Dict:
-            dist_pts = price - fvg.midpoint if fvg.direction == "bullish" else fvg.midpoint - price
-            age_min = (now_ms - fvg.timestamp) / 60_000.0
-            return {
-                "bottom": fvg.bottom, "top": fvg.top,
-                "midpoint": fvg.midpoint,
-                "direction": fvg.direction,
-                "size": fvg.size,
-                "fill_pct": fvg.fill_percentage,
-                "filled": fvg.filled,
-                "in_gap": fvg.is_price_in_gap(price),
-                "dist_pts": dist_pts,
-                "dist_atr": dist_pts / atr_safe,
-                "age_min": age_min,
-            }
-
-        def _liq_detail(pool: LiquidityPool) -> Dict:
-            dist_pts = price - pool.price
-            age_sweep_min = (now_ms - pool.sweep_timestamp) / 60_000.0 if pool.swept else None
-            return {
-                "price": pool.price,
-                "pool_type": pool.pool_type,
-                "touch_count": pool.touch_count,
-                "swept": pool.swept,
-                "displacement": pool.displacement_confirmed,
-                "wick_rejection": pool.wick_rejection,
-                "dist_pts": dist_pts,
-                "dist_atr": dist_pts / atr_safe,
-                "sweep_age_min": age_sweep_min,
-            }
-
-        bull_obs  = sorted(
-            [_ob_detail(o) for o in self.order_blocks_bull if o.is_active(now_ms)],
-            key=lambda x: abs(x["dist_pts"]))
-        bear_obs  = sorted(
-            [_ob_detail(o) for o in self.order_blocks_bear if o.is_active(now_ms)],
-            key=lambda x: abs(x["dist_pts"]))
-        bull_fvgs = sorted(
-            [_fvg_detail(f) for f in self.fvgs_bull if not f.filled],
-            key=lambda x: abs(x["dist_pts"]))
-        bear_fvgs = sorted(
-            [_fvg_detail(f) for f in self.fvgs_bear if not f.filled],
-            key=lambda x: abs(x["dist_pts"]))
-        liq_active = sorted(
-            [_liq_detail(p) for p in self.liquidity_pools if not p.swept],
-            key=lambda x: abs(x["dist_pts"]))
-        liq_swept  = sorted(
-            [_liq_detail(p) for p in self.liquidity_pools if p.swept],
-            key=lambda x: abs(x.get("sweep_age_min", 9999)))
-
-        return {
-            "initialized": self._initialized,
-            "bull_obs": bull_obs,
-            "bear_obs": bear_obs,
-            "bull_fvgs": bull_fvgs,
-            "bear_fvgs": bear_fvgs,
-            "liq_active": liq_active,
-            "liq_swept": liq_swept,
-            "swing_highs": sorted([h for h in self._swing_highs if h > price]),
-            "swing_lows": sorted([l for l in self._swing_lows if l < price], reverse=True),
-            "session": self._session,
-            "killzone": self._killzone or "",
-            "counts": {
-                "ob_bull": len(bull_obs),
-                "ob_bear": len(bear_obs),
-                "fvg_bull": len(bull_fvgs),
-                "fvg_bear": len(bear_fvgs),
-                "liq_active": len(liq_active),
-                "liq_swept": len(liq_swept),
-            }
         }
