@@ -2367,6 +2367,13 @@ class QuantStrategy:
         )
         actual_fill_type = entry_data.get("fill_type", "taker")
 
+        # v4.6 BUG FIX #8: Use actual filled quantity for partial fills
+        # order_manager.place_limit_entry returns adjusted quantity on partial fill
+        filled_qty = float(entry_data.get("quantity", 0)) if "quantity" in entry_data else 0
+        if filled_qty > 0 and filled_qty != qty:
+            logger.info(f"⚠️ Partial fill: {filled_qty:.4f} of {qty:.4f} — using filled qty")
+            qty = filled_qty
+
         # ── Record slippage for fee engine (PATCH 5f) ─────────────────────────────
         if self._fee_engine is not None:
             try:
@@ -2394,6 +2401,10 @@ class QuantStrategy:
         exit_side = "sell" if side == "long" else "buy"
         sweep = order_manager.cancel_symbol_conditionals()
         if sweep:
+            # v4.6 BUG FIX #3: Wait for exchange to process cancellations
+            # Without this, old SL/TP can fire against the new position instantly
+            # (Trade 3 in logs: entry + reconcile FLAT in same second)
+            time.sleep(1.5)
             filled = [
                 oid for oid, r in sweep.items()
                 if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)
@@ -2523,76 +2534,89 @@ class QuantStrategy:
         total_allowed = base_hold + pos.hold_extensions * extension_sec
 
         if hold_time > total_allowed:
-            profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
-            atr = self._atr_5m.atr
+            # v4.6 FIX: Throttle max-hold checks to every 30s
+            # (was every 1s tick → 900 log lines in 15 min)
+            if not hasattr(self, '_last_maxhold_check'):
+                self._last_maxhold_check = 0.0
+            if now - self._last_maxhold_check < 30.0:
+                pass  # skip — trailing SL handles it below
+            else:
+                self._last_maxhold_check = now
+                profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+                atr = self._atr_5m.atr
 
-            # CASE 1: IN PROFIT → tighten SL, let it ride
-            if QCfg.SMART_MAX_HOLD() and profit > 0 and atr > 1e-10 and pos.sl_order_id is not None:
-                tight_mult = QCfg.MAX_HOLD_PROFIT_SL_ATR()
-                if pos.side == "long":
-                    tight_sl = _round_to_tick(price - tight_mult * atr)
+                # CASE 1: IN PROFIT → tighten SL, let trailing manage exit
+                if QCfg.SMART_MAX_HOLD() and profit > 0 and atr > 1e-10 and pos.sl_order_id is not None:
+                    tight_mult = QCfg.MAX_HOLD_PROFIT_SL_ATR()
+                    if pos.side == "long":
+                        tight_sl = _round_to_tick(price - tight_mult * atr)
+                        # v4.6 BUG FIX: SL must be BELOW current price for LONG
+                        if tight_sl >= price:
+                            tight_sl = _round_to_tick(price - max(atr * 0.2, 1.0))
+                    else:
+                        tight_sl = _round_to_tick(price + tight_mult * atr)
+                        # v4.6 BUG FIX: SL must be ABOVE current price for SHORT
+                        if tight_sl <= price:
+                            tight_sl = _round_to_tick(price + max(atr * 0.2, 1.0))
+
+                    improves = (pos.side == "long" and tight_sl > pos.sl_price) or \
+                               (pos.side == "short" and tight_sl < pos.sl_price)
+                    sl_sane = (pos.side == "long" and tight_sl < price) or \
+                              (pos.side == "short" and tight_sl > price)
+
+                    if improves and sl_sane:
+                        logger.info(
+                            f"⏰ Max hold + ${profit:.2f} profit → tightening SL "
+                            f"${pos.sl_price:,.2f} → ${tight_sl:,.2f} (price - {tight_mult}×ATR)")
+                        es = "sell" if pos.side == "long" else "buy"
+                        result = order_manager.replace_stop_loss(
+                            existing_sl_order_id=pos.sl_order_id,
+                            side=es, quantity=pos.quantity,
+                            new_trigger_price=tight_sl)
+                        if result is None:
+                            logger.warning("🚨 SL fired during tighten")
+                            self._record_exchange_exit(None)
+                            return
+                        if result and isinstance(result, dict) and "error" not in result:
+                            self._pos.sl_price = tight_sl
+                            self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
+                            self.current_sl_price = tight_sl
+                            if not pos.trail_active:
+                                self._pos.trail_active = True
+                            send_telegram_message(
+                                f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
+                                f"Profit: ${profit:+.2f} → protecting with tight SL\n"
+                                f"SL: ${tight_sl:,.2f} (ATR×{tight_mult} from price)\n"
+                                f"<i>Trade rides with tight SL — no forced exit</i>")
+                    # Fall through to trailing SL — do NOT return
+
                 else:
-                    tight_sl = _round_to_tick(price + tight_mult * atr)
+                    # CASE 2: UNDERWATER — check thesis
+                    max_ext = QCfg.MAX_HOLD_EXTENSIONS()
+                    if QCfg.SMART_MAX_HOLD() and pos.hold_extensions < max_ext and sig is not None:
+                        thesis_ok, reason = self._check_thesis(pos, price, sig, atr)
+                        if thesis_ok:
+                            self._pos.hold_extensions += 1
+                            ext_min = extension_sec // 60
+                            total_min = (base_hold + pos.hold_extensions * extension_sec) // 60
+                            logger.info(
+                                f"⏰ Max hold: THESIS VALID → extending +{ext_min}m "
+                                f"({pos.hold_extensions}/{max_ext}) | total allowed: {total_min}m | {reason}")
+                            send_telegram_message(
+                                f"⏰ <b>MAX HOLD — THESIS EXTENSION</b>\n"
+                                f"Trade: {pos.side.upper()} @ ${pos.entry_price:,.2f}\n"
+                                f"Current: ${price:,.2f} ({'+' if profit > 0 else ''}{profit:.2f} pts)\n"
+                                f"Extension: {pos.hold_extensions}/{max_ext} (+{ext_min}min)\n"
+                                f"Reason: {reason}\n"
+                                f"<i>Thesis still valid — letting it work</i>")
+                            return
+                        else:
+                            logger.info(f"⏰ Max hold: THESIS BROKEN → exit | {reason}")
 
-                improves = (pos.side == "long" and tight_sl > pos.sl_price) or \
-                           (pos.side == "short" and tight_sl < pos.sl_price)
-                if improves:
-                    logger.info(
-                        f"⏰ Max hold + ${profit:.2f} profit → tightening SL "
-                        f"${pos.sl_price:,.2f} → ${tight_sl:,.2f} (price - {tight_mult}×ATR)")
-                    es = "sell" if pos.side == "long" else "buy"
-                    result = order_manager.replace_stop_loss(
-                        existing_sl_order_id=pos.sl_order_id,
-                        side=es, quantity=pos.quantity,
-                        new_trigger_price=tight_sl)
-                    if result is None:
-                        logger.warning("🚨 SL fired during tighten")
-                        self._record_exchange_exit(None)
-                        return
-                    if result and isinstance(result, dict) and "error" not in result:
-                        self._pos.sl_price = tight_sl
-                        self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
-                        self.current_sl_price = tight_sl
-                        if not pos.trail_active:
-                            self._pos.trail_active = True
-                        send_telegram_message(
-                            f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
-                            f"Profit: ${profit:+.2f} → protecting with tight SL\n"
-                            f"SL: ${tight_sl:,.2f} (ATR×{tight_mult} from price)\n"
-                            f"<i>Trade rides with tight SL — no forced exit</i>")
-                    # DO NOT return here — let trailing logic also run
-                    # The trade continues with tight SL protection
-                else:
-                    # SL already tight + in profit → just let it ride
-                    logger.info(f"⏰ Max hold, SL already tight + profit ${profit:+.2f} → ride")
-                return  # skip forced exit, SL manages it
-
-            # CASE 2: UNDERWATER — check thesis
-            max_ext = QCfg.MAX_HOLD_EXTENSIONS()
-            if QCfg.SMART_MAX_HOLD() and pos.hold_extensions < max_ext and sig is not None:
-                thesis_ok, reason = self._check_thesis(pos, price, sig, atr)
-                if thesis_ok:
-                    self._pos.hold_extensions += 1
-                    ext_min = extension_sec // 60
-                    total_min = (base_hold + pos.hold_extensions * extension_sec) // 60
-                    logger.info(
-                        f"⏰ Max hold: THESIS VALID → extending +{ext_min}m "
-                        f"({pos.hold_extensions}/{max_ext}) | total allowed: {total_min}m | {reason}")
-                    send_telegram_message(
-                        f"⏰ <b>MAX HOLD — THESIS EXTENSION</b>\n"
-                        f"Trade: {pos.side.upper()} @ ${pos.entry_price:,.2f}\n"
-                        f"Current: ${price:,.2f} ({'+' if profit > 0 else ''}{profit:.2f} pts)\n"
-                        f"Extension: {pos.hold_extensions}/{max_ext} (+{ext_min}min)\n"
-                        f"Reason: {reason}\n"
-                        f"<i>Thesis still valid — letting it work</i>")
+                    # CASE 3: No extensions left OR thesis broken
+                    logger.info(f"⏰ Max hold → exit")
+                    self._exit_trade(order_manager, price, "max_hold_time")
                     return
-                else:
-                    logger.info(f"⏰ Max hold: THESIS BROKEN → exit | {reason}")
-
-            # CASE 3: No extensions left OR thesis broken OR not smart
-            logger.info(f"⏰ Max hold → exit")
-            self._exit_trade(order_manager, price, "max_hold_time")
-            return
 
         # ── Trailing SL ──────────────────────────────────────────────────────
         if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
@@ -2639,7 +2663,9 @@ class QuantStrategy:
 
         # 3. Not deeply underwater
         drawdown = (pos.entry_price - price) if pos.side == "long" else (price - pos.entry_price)
-        sl_dist = abs(pos.entry_price - pos.sl_price)
+        # v4.6 BUG FIX #2: Use ORIGINAL SL distance, not current (may be tightened by trail)
+        # When trail moves SL from $71,200 to $72,900, using current SL makes DD look like 100%+
+        sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 0 else abs(pos.entry_price - pos.sl_price)
         if sl_dist > 0:
             dd_pct = drawdown / sl_dist
             max_dd = QCfg.THESIS_MAX_DRAWDOWN_PCT()
@@ -2647,15 +2673,24 @@ class QuantStrategy:
                 return False, f"drawdown {dd_pct:.0%} > {max_dd:.0%} of SL"
             reasons.append(f"DD={dd_pct:.0%}")
         
-        # 4. Reversion: price still on overextended side of VWAP
+        # 4. Reversion: check if price has blown through VWAP significantly
+        # v4.6 NOTE: Do NOT exit just because price crossed VWAP.
+        # TP is often BEYOND VWAP (e.g., VWAP + 1.5×SL_dist). Exiting at VWAP
+        # would kill winning trades that are on their way to TP.
+        # Only flag this for information, not for thesis break.
         vwap = self._vwap.vwap
-        if pos.trade_mode == "reversion" and vwap > 0:
-            if pos.side == "long" and price > vwap * 1.001:
-                # Price already reverted PAST VWAP — thesis completed, take profit
-                return False, f"reverted past VWAP (${price:,.0f} > ${vwap:,.0f})"
-            if pos.side == "short" and price < vwap * 0.999:
-                return False, f"reverted past VWAP (${price:,.0f} < ${vwap:,.0f})"
-            reasons.append(f"VWAP={abs(price-vwap)/atr:.1f}ATR away")
+        if pos.trade_mode == "reversion" and vwap > 0 and atr > 1e-10:
+            vwap_dist_atr = abs(price - vwap) / atr
+            if pos.side == "long":
+                if price > vwap:
+                    reasons.append(f"past VWAP ✅ (+{vwap_dist_atr:.1f}ATR)")
+                else:
+                    reasons.append(f"VWAP={vwap_dist_atr:.1f}ATR away")
+            else:
+                if price < vwap:
+                    reasons.append(f"past VWAP ✅ (+{vwap_dist_atr:.1f}ATR)")
+                else:
+                    reasons.append(f"VWAP={vwap_dist_atr:.1f}ATR away")
 
         # 5. Bonus: if signals are strong in our direction, thesis is robust
         if pos.side == "long" and comp > 0.2:
@@ -2773,6 +2808,11 @@ class QuantStrategy:
         """v4.3: PnL fix with explicit TP hit detection for short side (Bug 7)
         and correct fee rate based on entry fill type (Bug 12)."""
         pos = self._pos
+        # v4.6 BUG FIX #9: Guard against double PnL recording
+        # Both _sync_position and _reconcile can detect the same exit
+        if pos.phase == PositionPhase.FLAT:
+            logger.debug("_record_exchange_exit skipped — already FLAT")
+            return
         pnl = 0.0
         if ex_pos is not None:
             pnl = float(ex_pos.get("unrealized_pnl", 0.0))

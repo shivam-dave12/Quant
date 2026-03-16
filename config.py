@@ -158,7 +158,7 @@ OUTLOOK_INTERVAL_SECONDS     = 900
 # 9. FEES
 # ─────────────────────────────────────────────
 COMMISSION_RATE       = 0.00055
-COMMISSION_RATE_MAKER = COMMISSION_RATE * 0.40
+COMMISSION_RATE_MAKER = 0.00020  # v4.6: explicit CoinSwitch maker rate (was 40% of taker = 0.00022)
 
 # ─────────────────────────────────────────────
 # RATE LIMITING
