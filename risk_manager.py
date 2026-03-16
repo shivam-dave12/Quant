@@ -1,12 +1,6 @@
 """
 Risk Manager - Industry Grade
 Comprehensive risk management with position tracking
-
-FIX v4.3.1: Removed cached config values (daily_loss_limit, max_consecutive_losses,
-max_daily_trades, balance_cache_ttl). These were read ONCE at __init__ and never
-updated, so Telegram /set commands appeared to succeed but had zero runtime effect.
-All risk limits now read directly from the config module on every access, ensuring
-live changes via /set take effect immediately.
 """
 
 import logging
@@ -51,20 +45,17 @@ class RiskManager:
         self.daily_trades = []
         self.last_trade_time = 0.0
 
-        # ── Risk limits — NO LONGER CACHED ─────────────────────────
-        # Previously these were set once at init and never updated:
-        #   self.daily_loss_limit = config.MAX_DAILY_LOSS
-        #   self.max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
-        #   self.max_daily_trades = config.MAX_DAILY_TRADES
-        # Now read directly from config module in every method call.
-        # This allows Telegram /set to take effect immediately.
+        # Risk limits
+        self.daily_loss_limit = config.MAX_DAILY_LOSS
+        self.max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
+        self.max_daily_trades = config.MAX_DAILY_TRADES
 
         # Balance tracking
         self.initial_balance = 0.0
         self.current_balance   = 0.0   # total wallet equity (available + locked)
         self.available_balance = 0.0   # free margin only — used for position sizing
         self.balance_cache_time = 0.0
-        # balance_cache_ttl also read from config dynamically now
+        self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
 
         # Daily reset tracking — date-anchored, not trade-count dependent
         self._last_reset_date = datetime.now(timezone.utc).date()
@@ -87,8 +78,7 @@ class RiskManager:
             now = time.time()
             
             # Return cached balance if still valid
-            # READ balance_cache_ttl from config LIVE (not cached)
-            if now - self.balance_cache_time < config.BALANCE_CACHE_TTL_SEC:
+            if now - self.balance_cache_time < self.balance_cache_ttl:
                 return {
                     "available": self.available_balance,   # free margin (for sizing)
                     "total":     self.current_balance,     # total equity (for % calcs)
@@ -316,15 +306,11 @@ class RiskManager:
             self._reset_daily_if_needed()
 
             # ── Daily trade limit ─────────────────────────────────────────────
-            # READ FROM CONFIG LIVE — not from cached self.max_daily_trades
-            _max_daily_trades = config.MAX_DAILY_TRADES
-            if len(self.daily_trades) >= _max_daily_trades:
-                return False, f"Daily trade limit ({_max_daily_trades})"
+            if len(self.daily_trades) >= self.max_daily_trades:
+                return False, f"Daily trade limit ({self.max_daily_trades})"
 
             # ── Daily loss limit (USDT) ───────────────────────────────────────
-            # READ FROM CONFIG LIVE — not from cached self.daily_loss_limit
-            _daily_loss_limit = config.MAX_DAILY_LOSS
-            if self.daily_pnl <= -_daily_loss_limit:
+            if self.daily_pnl <= -self.daily_loss_limit:
                 return False, f"Daily loss limit hit (${abs(self.daily_pnl):.2f})"
 
             # ── Daily loss limit (% of balance) — new ────────────────────────
@@ -345,9 +331,7 @@ class RiskManager:
                                 f"({drawdown_pct:.1f}% >= {max_dd}%)")
 
             # ── Consecutive losses ────────────────────────────────────────────
-            # READ FROM CONFIG LIVE — not from cached self.max_consecutive_losses
-            _max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
-            if self.consecutive_losses >= _max_consecutive_losses:
+            if self.consecutive_losses >= self.max_consecutive_losses:
                 # Auto-reset after 4 hours: prevents infinite deadlock where
                 # losses block trading → can't trade → can't win → never resets.
                 # After 4h the market context has changed enough to try again.

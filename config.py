@@ -179,7 +179,7 @@ SL_ATR_PERIOD                = 14
 SL_ATR_BUFFER_MULT           = 0.75
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
 SL_MIN_IMPROVEMENT_ATR_MULT  = 0.08
-TRAILING_SL_CHECK_INTERVAL   = 15
+TRAILING_SL_CHECK_INTERVAL   = 10   # v4.8: was 15 → check trail every 10s
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
 # ═══════════════════════════════════════════════════════════════════
@@ -209,26 +209,28 @@ QUANT_OB_WALL_MULT          = 2.5
 QUANT_TRAIL_SWING_BARS      = 5
 QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 
-# 10d. Trailing SL — v4.5 INSTITUTIONAL REWRITE
+# 10d. Trailing SL — v4.8 INSTITUTIONAL REWRITE (7-bug fix)
 #
-#      v4.4 FAILURE: time-triggered BE moved SL to $71,723 (0.43×ATR from price).
-#      Normal $34 pullback clipped stop → turned $77 winner into -$0.58 loss.
-#      "Breakeven" concept is flawed: your entry price is irrelevant to the market.
-#      SL must live behind STRUCTURE, not anchored to entry.
+#      v4.7 FAILURE: Trail NEVER activated because TRAIL_BE_R=1.0 required
+#      +$470 profit with 2×ATR SL ($470 distance). BTC rarely moves that far.
+#      Every trade either hit TP or SL without trail ever touching the SL.
 #
-#      INSTITUTIONAL PRINCIPLES:
-#        1. No movement until trade PROVES itself (1.0R minimum).
-#        2. SL only behind confirmed 5m swing structure.
-#        3. Pullback classifier prevents tightening during healthy retracements.
-#        4. Minimum distance = 1.5×ATR (Phase 1) → noise can never clip you.
+#      v4.8 FIX: Recalibrated for 40x leverage scalping:
+#        - Trail starts at 0.3R (was 1.0R). With $200 SL, that's +$60.
+#        - Chandelier at 0.8R (was 2.0R). With $200 SL, that's +$160.
+#        - Full institutional at 1.5R (was 3.0R). With $200 SL, that's +$300.
+#        - Min distances reduced: 1.0/0.7/0.5 ATR (was 1.5/1.0/0.7).
+#          With ATR=$100, 1m candle range $15-30 → still 2-6x noise clearance.
+#        - Phase uses PEAK profit (ratchets up, never demotes during pullback).
+#        - init_dist uses ORIGINAL SL distance (not current, which shrinks).
 #
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 1.0   # Phase 0→1 at 1.0R (trade must PROVE itself)
-QUANT_TRAIL_LOCK_R             = 2.0   # Phase 1→2 at 2.0R (chandelier engages)
-QUANT_TRAIL_AGGRESSIVE_R       = 3.0   # Phase 2→3 at 3.0R (full mechanisms)
-QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.5   # Phase 1: min SL distance = 1.5×ATR
-QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.0   # Phase 2: 1.0×ATR
-QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.7   # Phase 3: 0.7×ATR
+QUANT_TRAIL_BE_R               = 0.3   # v4.8: was 1.0 → Phase 0→1 at +0.3R
+QUANT_TRAIL_LOCK_R             = 0.8   # v4.8: was 2.0 → Phase 1→2 at +0.8R
+QUANT_TRAIL_AGGRESSIVE_R       = 1.5   # v4.8: was 3.0 → Phase 2→3 at +1.5R
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.0   # v4.8: was 1.5 → Phase 1: min SL = 1.0×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 0.7   # v4.8: was 1.0 → Phase 2: 0.7×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.5   # v4.8: was 0.7 → Phase 3: 0.5×ATR
 QUANT_TRAIL_PULLBACK_FREEZE    = True  # Freeze SL during healthy pullbacks
 QUANT_TRAIL_PB_VOL_RATIO       = 0.60  # Pullback vol < 60% of impulse → healthy
 QUANT_TRAIL_PB_DEPTH_ATR       = 0.80  # Pullback < 0.8×ATR → healthy
@@ -272,8 +274,8 @@ QUANT_TICK_AGG_WINDOW_SEC   = 30.0
 # 10k. Institutional SL/TP/Trail — v4.3
 QUANT_TP_MAX_RR                = 3.5
 QUANT_SL_SWING_DENSITY_WINDOW  = 0.30
-QUANT_TRAIL_CHANDELIER_N_START = 3.0   # v4.3: was 2.5 — wider breathing room at start
-QUANT_TRAIL_CHANDELIER_N_END   = 1.8   # v4.3: was 1.5 — still tightens but not as aggressively
+QUANT_TRAIL_CHANDELIER_N_START = 2.5   # v4.8: was 3.0 → tighter chandelier start
+QUANT_TRAIL_CHANDELIER_N_END   = 1.2   # v4.8: was 1.8 → tighter chandelier end
 QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55
 
 # 10l. Trend-following mode (v4.2)
@@ -384,3 +386,46 @@ ATR_SEED_RETAIN             = 1      # v4.3: Only keep final ATR from warmup.
                                      # Old values (20, 35) poisoned percentile ranking
                                      # with stale high-vol warmup data → 0% pctile → blocked all trades.
 ATR_PCTILE_RANK_WINDOW      = 30
+
+# ═══════════════════════════════════════════════════════════════════
+# 13. ICT/SMC STRUCTURAL CONFLUENCE ENGINE (v4.8)
+# ═══════════════════════════════════════════════════════════════════
+#
+# The ICT engine detects price structure (Order Blocks, FVGs, Liquidity
+# Sweeps, Session/Killzones) and provides a 0-1 confluence score.
+# This score BOOSTS the quant composite — it cannot trigger entries alone.
+#
+# ARCHITECTURE:
+#   Quant composite (order flow) = primary signal (65% weight)
+#   ICT confluence (structure)   = secondary boost (35% weight)
+#   Entry requires: overextended + regime_ok + HTF_ok + confluence≥3 + composite≥threshold
+#   ICT adds to confluence count when total≥0.30, and boosts composite by up to 0.15
+#
+# RESULT:
+#   A reversion entry near a virgin OB in a killzone with a fresh sweep
+#   gets +0.15 composite boost and +1 confluence. This is the difference
+#   between "watching" and "all pass" on marginal setups that would otherwise
+#   fail the composite gate by 0.05.
+#
+
+# 13a. Order Blocks (ICT)
+OB_MIN_IMPULSE_PCT          = 0.50   # impulse candle must move >= 0.5%
+OB_MIN_BODY_RATIO           = 0.50   # impulse body >= 50% of range
+OB_IMPULSE_SIZE_MULTIPLIER  = 1.30   # impulse range >= 1.30x OB range
+OB_MAX_AGE_MINUTES          = 1440   # 24h — OBs remain valid for a full day
+
+# 13b. Fair Value Gaps (ICT)
+FVG_MIN_SIZE_PCT        = 0.020      # gap >= 0.02% of price
+FVG_MAX_AGE_MINUTES     = 1440       # 24h
+
+# 13c. Liquidity Pools (SMC)
+LIQ_TOUCH_TOLERANCE_PCT = 0.20       # 0.20% = ~$150 at $74K
+SWEEP_DISPLACEMENT_MIN  = 0.40       # displacement body ratio minimum
+SWEEP_MAX_AGE_MINUTES   = 120        # 2h
+
+# 13d. Kill Zones (New York local time, DST-aware)
+KZ_ASIA_NY_START    = 20   # 8:00 PM New York time
+KZ_LONDON_NY_START  = 2    # 2:00 AM New York time
+KZ_LONDON_NY_END    = 5    # 5:00 AM New York time
+KZ_NY_NY_START      = 7    # 7:00 AM New York time
+KZ_NY_NY_END        = 10   # 10:00 AM New York time
