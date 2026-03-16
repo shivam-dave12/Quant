@@ -1659,7 +1659,7 @@ class InstitutionalLevels:
 
         # ── Chandelier exit (Phase 2+) ────────────────────────────────
         if phase >= 2 and peak_price_abs > 1e-10:
-            if trade_mode == "trend":
+            if trade_mode in ("trend", "momentum"):
                 n_chandelier = QCfg.TREND_CHANDELIER_N()
             else:
                 n_start   = QCfg.TRAIL_CHANDELIER_N_START()
@@ -1919,7 +1919,7 @@ class PositionState:
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
-    trade_mode: str = "reversion"  # "reversion" | "trend"
+    trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
@@ -2406,11 +2406,11 @@ class QuantStrategy:
         if side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
             logger.info(f"🚀 MOMENTUM ENTRY — {side.upper()} (breakout {bo_dir})")
-            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="trend")
+            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
         elif side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
             logger.info(f"🚀 MOMENTUM ENTRY — {side.upper()} (breakout {bo_dir})")
-            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="trend")
+            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
 
     def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
                        signal_confidence=0.5, use_maker_entry=False):
@@ -2453,7 +2453,7 @@ class QuantStrategy:
         # The thesis-aware max-hold extension is the real fix, not SL capping.
         # SL_MAX_ATR_MULT is retained in config for manual /set if needed.
 
-        if mode == "trend":
+        if mode in ("trend", "momentum"):
             tp_price = InstitutionalLevels.compute_tp_trend(
                 price, side, atr, sl_price, candles_5m, orderbook,
                 swing_lookback=QCfg.SL_SWING_LOOKBACK())
@@ -2733,7 +2733,7 @@ class QuantStrategy:
         self._confirm_long          = self._confirm_short = 0
 
         rr_a      = abs(fill_price - tp_price) / sdf if sdf > 0 else 0
-        mode_icon = "📈📈" if mode == "trend" else ("📈" if side == "long" else "📉")
+        mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
         send_telegram_message(
             f"{mode_icon} <b>QUANT v4 ENTRY — {side.upper()} [{mode.upper()}]</b>\n\n"
             f"Entry:    ${fill_price:,.2f}\n"
@@ -2763,6 +2763,20 @@ class QuantStrategy:
                 if regime_flipped:
                     logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
                     self._exit_trade(order_manager, price, "regime_flip"); return
+
+            # v4.6: Momentum trades do NOT exit on regime flip.
+            # The whole point is they fire BEFORE regime catches up.
+            # They exit via: SL, TP, trailing SL, or max-hold only.
+            # But if breakout expires AND composite flips against us, exit.
+            if pos.trade_mode == "momentum":
+                if not self._breakout.is_active:
+                    # Breakout expired — check if composite still agrees
+                    if pos.side == "long" and sig.composite < -0.25:
+                        logger.info(f"🔄 Breakout expired + composite bearish → exit LONG [momentum]")
+                        self._exit_trade(order_manager, price, "breakout_expired"); return
+                    if pos.side == "short" and sig.composite > 0.25:
+                        logger.info(f"🔄 Breakout expired + composite bullish → exit SHORT [momentum]")
+                        self._exit_trade(order_manager, price, "breakout_expired"); return
 
         # ── Thesis-aware max-hold (v4.6) ─────────────────────────────────────
         #
