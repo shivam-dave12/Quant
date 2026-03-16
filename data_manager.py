@@ -256,12 +256,12 @@ class ICTDataManager:
     def register_strategy(self, strategy) -> None:
         """
         Register strategy instance so trade stream can feed
-        VolumeProfileAnalyzer and AdvancedLiquidityModel in real time.
+        real-time handlers in the strategy (e.g. tick flow engine).
         Must be called AFTER both data_manager.start() and strategy.__init__().
         """
         self._strategy_ref = strategy
         logger.info("✅ Strategy reference registered in DataManager "
-                    "(trade stream → VolumeProfileAnalyzer active)")
+                    "(trade stream → real-time feed active)")
 
     def stop(self) -> None:
         try:
@@ -305,338 +305,140 @@ class ICTDataManager:
     # -----------------------------------------------------------------
     # Warmup helpers
     # -----------------------------------------------------------------
-    def _warmup_from_klines_1m(self, limit: int = 100) -> None:
-        """Warm up 1m candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "1",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 1m: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                logger.warning(f"Warmup 1m: unexpected response type {type(resp)}")
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 1m: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_1m.append(candle)
-                        self._last_price = candle.close
-                        seeded += 1
-                except Exception:
+    # -----------------------------------------------------------------
+    # Warmup — generic method with retry (replaces 6 copy-pasted methods)
+    # -----------------------------------------------------------------
+
+    # Mapping: label → (interval_str, minutes_per_candle, default_limit, deque_attr)
+    _WARMUP_CONFIG = {
+        "1m":  ("1",    1,    100, "_candles_1m"),
+        "5m":  ("5",    5,    100, "_candles_5m"),
+        "15m": ("15",   15,   100, "_candles_15m"),
+        "1h":  ("60",   60,   100, "_candles_1h"),
+        "4h":  ("240",  240,   50, "_candles_4h"),
+        "1d":  ("1440", 1440,  30, "_candles_1d"),
+    }
+
+    def _warmup_klines(self, label: str, limit: int = 0, retries: int = 2) -> None:
+        """
+        Generic REST kline warmup for any timeframe.
+
+        Args:
+            label:   Timeframe label (e.g. "1m", "5m", "1h")
+            limit:   Number of candles to fetch (0 = use default)
+            retries: Number of retry attempts on failure
+        """
+        cfg = self._WARMUP_CONFIG.get(label)
+        if cfg is None:
+            logger.error(f"Unknown warmup label: {label}")
+            return
+
+        interval_str, minutes_per_candle, default_limit, deque_attr = cfg
+        if limit <= 0:
+            limit = default_limit
+        target_deque = getattr(self, deque_attr)
+
+        for attempt in range(1, retries + 2):  # retries + 1 total attempts
+            try:
+                end_ms = int(time.time() * 1000)
+                start_ms = end_ms - limit * minutes_per_candle * 60 * 1000
+
+                params = {
+                    "symbol": config.SYMBOL,
+                    "exchange": config.EXCHANGE,
+                    "interval": interval_str,
+                    "start_time": start_ms,
+                    "end_time": end_ms,
+                    "limit": limit,
+                }
+
+                logger.info(f"Warmup {label}: fetching {limit} candles"
+                            + (f" (attempt {attempt})" if attempt > 1 else ""))
+                resp = self.api._make_request(
+                    method="GET",
+                    endpoint="/trade/api/v2/futures/klines",
+                    params=params,
+                )
+
+                if not isinstance(resp, dict):
+                    logger.warning(f"Warmup {label}: unexpected response type {type(resp)}")
+                    if attempt <= retries:
+                        time.sleep(3.5)
+                        continue
+                    return
+
+                if resp.get("error"):
+                    logger.warning(f"Warmup {label}: API error: {resp.get('error')}")
+                    if attempt <= retries:
+                        time.sleep(3.5)
+                        continue
+                    return
+
+                data = resp.get("data", [])
+                if not data:
+                    logger.warning(f"Warmup {label}: no data returned")
+                    if attempt <= retries:
+                        time.sleep(3.5)
+                        continue
+                    return
+
+                seeded = 0
+                for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
+                    try:
+                        candle = Candle(
+                            timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                            open=float(k.get("o") or k.get("open") or 0),
+                            high=float(k.get("h") or k.get("high") or 0),
+                            low=float(k.get("l") or k.get("low") or 0),
+                            close=float(k.get("c") or k.get("close") or 0),
+                            volume=float(k.get("v") or k.get("volume") or 0),
+                        )
+                        if candle.close > 0:
+                            target_deque.append(candle)
+                            # Track last price from 1m (finest resolution available)
+                            if label == "1m":
+                                self._last_price = candle.close
+                            seeded += 1
+                    except Exception:
+                        continue
+
+                if seeded > 0:
+                    msg = f"Warmup {label} complete: {seeded} candles"
+                    if label == "1m":
+                        msg += f", last_price={self._last_price:.2f}"
+                    logger.info(msg)
+                    return  # Success
+                else:
+                    logger.warning(f"Warmup {label}: no valid candles parsed")
+                    if attempt <= retries:
+                        time.sleep(3.5)
+                        continue
+                    return
+
+            except Exception as e:
+                logger.error(f"Error in {label} warmup (attempt {attempt}): {e}", exc_info=True)
+                if attempt <= retries:
+                    time.sleep(3.5)
                     continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 1m complete: {seeded} candles, last_price={self._last_price:.2f}")
-            else:
-                logger.warning("Warmup 1m: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 1m warmup: {e}", exc_info=True)
+
+    # Legacy method names — delegate to generic for backward compat
+    def _warmup_from_klines_1m(self, limit: int = 100) -> None:
+        self._warmup_klines("1m", limit)
 
     def _warmup_from_klines_5m(self, limit: int = 100) -> None:
-        """Warm up 5m candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 5 * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "5",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 5m: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 5m: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_5m.append(candle)
-                        seeded += 1
-                except Exception:
-                    continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 5m complete: {seeded} candles")
-            else:
-                logger.warning("Warmup 5m: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 5m warmup: {e}", exc_info=True)
+        self._warmup_klines("5m", limit)
 
     def _warmup_from_klines_15m(self, limit: int = 100) -> None:
-        """Warm up 15m candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 15 * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "15",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 15m: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 15m: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_15m.append(candle)
-                        seeded += 1
-                except Exception:
-                    continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 15m complete: {seeded} candles")
-            else:
-                logger.warning("Warmup 15m: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 15m warmup: {e}", exc_info=True)
+        self._warmup_klines("15m", limit)
 
     def _warmup_from_klines_1h(self, limit: int = 100) -> None:
-        """Warm up 1h candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 60 * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "60",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 1h: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 1h: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_1h.append(candle)
-                        seeded += 1
-                except Exception:
-                    continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 1h complete: {seeded} candles")
-            else:
-                logger.warning("Warmup 1h: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 1h warmup: {e}", exc_info=True)
-
+        self._warmup_klines("1h", limit)
 
     def _warmup_from_klines_4h(self, limit: int = 50) -> None:
-        """Warm up 4h candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 240 * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "240",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 4h: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 4h: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_4h.append(candle)
-                        seeded += 1
-                except Exception:
-                    continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 4h complete: {seeded} candles")
-            else:
-                logger.warning("Warmup 4h: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 4h warmup: {e}", exc_info=True)
+        self._warmup_klines("4h", limit)
 
     def _warmup_from_klines_1d(self, limit: int = 30) -> None:
-        """Warm up 1d candles from REST"""
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - limit * 24 * 60 * 60 * 1000
-            
-            params = {
-                "symbol": config.SYMBOL,
-                "exchange": config.EXCHANGE,
-                "interval": "1440",
-                "start_time": start_ms,
-                "end_time": end_ms,
-                "limit": limit,
-            }
-            
-            logger.info(f"Warmup 1d: fetching {limit} candles")
-            resp = self.api._make_request(
-                method="GET",
-                endpoint="/trade/api/v2/futures/klines",
-                params=params,
-            )
-            
-            if not isinstance(resp, dict):
-                return
-            
-            data = resp.get("data", [])
-            if not data:
-                logger.warning("Warmup 1d: no data returned")
-                return
-            
-            seeded = 0
-            for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
-                try:
-                    candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
-                        open=float(k.get("o") or k.get("open") or 0),
-                        high=float(k.get("h") or k.get("high") or 0),
-                        low=float(k.get("l") or k.get("low") or 0),
-                        close=float(k.get("c") or k.get("close") or 0),
-                        volume=float(k.get("v") or k.get("volume") or 0),
-                    )
-                    if candle.close > 0:
-                        self._candles_1d.append(candle)
-                        seeded += 1
-                except Exception:
-                    continue
-            
-            if seeded > 0:
-                logger.info(f"Warmup 1d complete: {seeded} candles")
-            else:
-                logger.warning("Warmup 1d: no valid candles parsed")
-                
-        except Exception as e:
-            logger.error(f"Error in 1d warmup: {e}", exc_info=True)
+        self._warmup_klines("1d", limit)
 
     def _check_minimum_data(self) -> bool:
         """
@@ -781,16 +583,12 @@ class ICTDataManager:
                         "timestamp": time.time(),
                     })
 
-                    # ── Feed VolumeProfileAnalyzer ────────────────────────
+                    # ── Feed strategy-registered real-time handlers ───
                     if self._strategy_ref is not None:
                         try:
-                            va = getattr(self._strategy_ref, "volume_analyzer", None)
-                            if va is not None:
-                                va.on_candle({
-                                    'o': price, 'h': price, 'l': price, 'c': price,
-                                    'v': qty,
-                                    't': int(time.time() * 1000),
-                                })
+                            on_rt = getattr(self._strategy_ref, "_on_realtime_trade", None)
+                            if on_rt is not None:
+                                on_rt(price, qty, side)
                         except Exception:
                             pass
                     # ─────────────────────────────────────────────────────

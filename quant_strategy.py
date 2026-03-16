@@ -467,7 +467,7 @@ class OrderbookEngine:
         try:
             bb = float(bids[0][0]); ba = float(asks[0][0])
             if bb > 0 and ba > 0: self._spread_ratio = (ba - bb) / ((bb + ba) / 2.0)
-        except: pass
+        except Exception: pass
 
     def get_signal(self) -> float:
         hist = list(self._imbalance_hist)
@@ -2309,7 +2309,7 @@ class QuantStrategy:
             try:
                 p = data_manager.get_last_price()
                 if p > 1.0: self._last_known_price = p
-            except: pass
+            except Exception: pass
             # Reconciliation
             if self._reconcile_data is not None:
                 data = self._reconcile_data; self._reconcile_data = None
@@ -2335,7 +2335,7 @@ class QuantStrategy:
         try:
             ob = data_manager.get_orderbook(); price = data_manager.get_last_price()
             if ob and price > 1.0: self._ob_eng.update(ob, price)
-        except: pass
+        except Exception: pass
         try:
             trades = data_manager.get_recent_trades_raw()
             cutoff_ts = self._last_fed_trade_ts; max_ts = cutoff_ts
@@ -2346,7 +2346,7 @@ class QuantStrategy:
                     if ts > max_ts: max_ts = ts
             if max_ts > cutoff_ts: self._last_fed_trade_ts = max_ts
             self._tick_eng.compute_signal()
-        except: pass
+        except Exception: pass
 
     def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
@@ -2360,7 +2360,7 @@ class QuantStrategy:
         try:
             c15 = data_manager.get_candles("15m", limit=100); c4h = data_manager.get_candles("4h", limit=50)
             self._htf.update(c15, c4h, atr_5m)
-        except: pass
+        except Exception: pass
 
         # ── Regime classification ─────────────────────────────────────────────
         self._adx.compute(candles_5m)
@@ -2475,7 +2475,7 @@ class QuantStrategy:
         # trades have been stopped out. The breakout detector fires in <5 candles.
         try:
             candles_5m = data_manager.get_candles("5m", limit=20)
-        except:
+        except Exception:
             candles_5m = []
         self._breakout.update(candles_5m, self._atr_5m, price, now,
                              vwap_price=self._vwap.vwap)
@@ -2575,7 +2575,7 @@ class QuantStrategy:
 
         # Pullback-to-EMA depth check
         try: candles_5m = data_manager.get_candles("5m", limit=30)
-        except: return
+        except Exception: return
         if len(candles_5m) < 10: return
         closes = [float(c['c']) for c in candles_5m]
         period = QCfg.EMA_FAST()
@@ -2713,13 +2713,13 @@ class QuantStrategy:
             use_maker_entry:   whether we intend to use a limit order for entry
         """
         try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+5)
-        except: candles_5m = []
+        except Exception: candles_5m = []
         try: candles_1m = data_manager.get_candles("1m", limit=150)
-        except: candles_1m = []
+        except Exception: candles_1m = []
         try: candles_15m = data_manager.get_candles("15m", limit=30)
-        except: candles_15m = []
+        except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
-        except: orderbook = {"bids": [], "asks": []}
+        except Exception: orderbook = {"bids": [], "asks": []}
         vwap = self._vwap.vwap; vwap_std = self._vwap.vwap_std
         atr_pctile = self._atr_5m.get_percentile()
 
@@ -3357,11 +3357,11 @@ class QuantStrategy:
                 pos.peak_price_abs = price
 
         try: candles_1m = data_manager.get_candles("1m", limit=60)
-        except: candles_1m = []
+        except Exception: candles_1m = []
         try: candles_5m = data_manager.get_candles("5m", limit=30)
-        except: candles_5m = []
+        except Exception: candles_5m = []
         try: orderbook = data_manager.get_orderbook()
-        except: orderbook = {"bids": [], "asks": []}
+        except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
 
@@ -3585,7 +3585,7 @@ class QuantStrategy:
             ex_size = float(ex_pos.get("size",0.0)); open_orders = None
             if ex_size >= float(getattr(config,"MIN_POSITION_SIZE",0.001)):
                 try: open_orders = order_manager.get_open_orders()
-                except: pass
+                except Exception: pass
             with self._lock: self._reconcile_data = {"ex_pos":ex_pos,"open_orders":open_orders}
         except Exception as e: logger.warning(f"Reconcile error: {e}")
         finally: self._reconcile_pending = False
@@ -3636,7 +3636,7 @@ class QuantStrategy:
 
     def _sync_position(self, order_manager):
         try: ex_pos = order_manager.get_open_position()
-        except: return
+        except Exception: return
         if ex_pos is None: return
         ex_size = float(ex_pos.get("size",0.0))
         if self._pos.phase==PositionPhase.ACTIVE:

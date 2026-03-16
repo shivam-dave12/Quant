@@ -190,8 +190,8 @@ class ICTEngine:
     """
 
     # ── Config defaults (overrideable via config module) ──────────────
-    OB_MIN_IMPULSE_PCT = 0.50
-    OB_MIN_BODY_RATIO = 0.50
+    OB_MIN_IMPULSE_PCT = 0.15
+    OB_MIN_BODY_RATIO = 0.40
     OB_IMPULSE_SIZE_MULT = 1.30
     OB_MAX_AGE_MS = 86_400_000
     FVG_MIN_SIZE_PCT = 0.020
@@ -299,13 +299,13 @@ class ICTEngine:
             for i in range(lb_left, len(candles) - lb_right):
                 h = float(candles[i]['h'])
                 l = float(candles[i]['l'])
-                # Swing high
-                if all(h >= float(candles[j]['h']) for j in range(i - lb_left, i)) and \
-                   all(h >= float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
+                # Swing high: center candle must be strictly higher than all neighbors
+                if all(h > float(candles[j]['h']) for j in range(i - lb_left, i)) and \
+                   all(h > float(candles[j]['h']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_highs.append(h)
-                # Swing low
-                if all(l <= float(candles[j]['l']) for j in range(i - lb_left, i)) and \
-                   all(l <= float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
+                # Swing low: center candle must be strictly lower than all neighbors
+                if all(l < float(candles[j]['l']) for j in range(i - lb_left, i)) and \
+                   all(l < float(candles[j]['l']) for j in range(i + 1, i + lb_right + 1)):
                     self._swing_lows.append(l)
 
     # ══════════════════════════════════════════════════════════════════
@@ -931,4 +931,129 @@ class ICTEngine:
             "sweeps_active": len([p for p in self.liquidity_pools if p.swept]),
             "session": self._session,
             "killzone": self._killzone or "none",
+        }
+
+    def get_full_status(self, price: float, atr: float, now_ms: int) -> Dict:
+        """
+        Comprehensive status for Telegram /structures command.
+
+        Returns detailed information about all detected ICT structures
+        including order blocks, FVGs, liquidity pools, sweeps, and swings
+        with distance/ATR metrics relative to current price.
+        """
+        atr_safe = max(atr, 1e-9)
+
+        # ── Helper: build OB detail dict ─────────────────────────────────
+        def _ob_detail(ob: OrderBlock) -> Dict:
+            mid = ob.midpoint
+            dist = mid - price  # positive = above price
+            age_ms = now_ms - ob.timestamp
+            tags = []
+            if ob.has_displacement:
+                tags.append("DISP")
+            if ob.has_wick_rejection:
+                tags.append("WR")
+            if ob.visit_count == 0:
+                tags.append("VIRGIN")
+            return {
+                "low": ob.low,
+                "high": ob.high,
+                "midpoint": mid,
+                "strength": ob.strength,
+                "visit_count": ob.visit_count,
+                "bos": ob.bos_confirmed,
+                "in_ob": ob.contains_price(price),
+                "in_ote": ob.in_optimal_zone(price),
+                "dist_pts": dist,
+                "dist_atr": abs(dist) / atr_safe,
+                "age_min": age_ms / 60_000.0,
+                "tags": tags,
+            }
+
+        # ── Helper: build FVG detail dict ────────────────────────────────
+        def _fvg_detail(fvg) -> Dict:
+            mid = fvg.midpoint
+            dist = mid - price
+            age_ms = now_ms - fvg.timestamp
+            return {
+                "direction": fvg.direction,
+                "bottom": fvg.bottom,
+                "top": fvg.top,
+                "size": fvg.size,
+                "fill_pct": fvg.fill_percentage,
+                "in_gap": fvg.is_price_in_gap(price),
+                "dist_pts": dist,
+                "dist_atr": abs(dist) / atr_safe,
+                "age_min": age_ms / 60_000.0,
+            }
+
+        # ── Active OBs (sorted by distance to price) ────────────────────
+        bull_obs = sorted(
+            [_ob_detail(ob) for ob in self.order_blocks_bull
+             if ob.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+        bear_obs = sorted(
+            [_ob_detail(ob) for ob in self.order_blocks_bear
+             if ob.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+
+        # ── Active FVGs ──────────────────────────────────────────────────
+        bull_fvgs = sorted(
+            [_fvg_detail(f) for f in self.fvgs_bull
+             if f.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+        bear_fvgs = sorted(
+            [_fvg_detail(f) for f in self.fvgs_bear
+             if f.is_active(now_ms)],
+            key=lambda x: abs(x["dist_pts"]))
+
+        # ── Liquidity pools ──────────────────────────────────────────────
+        liq_active = []
+        liq_swept = []
+        for pool in self.liquidity_pools:
+            entry = {
+                "pool_type": pool.pool_type,
+                "price": pool.price,
+                "touch_count": pool.touch_count,
+                "dist_pts": pool.price - price,
+            }
+            if pool.swept:
+                entry["displacement"] = pool.sweep_displacement
+                entry["wick_rejection"] = pool.sweep_wick_rejection
+                sweep_age = (now_ms - pool.sweep_time) / 60_000.0 if pool.sweep_time else None
+                entry["sweep_age_min"] = sweep_age
+                liq_swept.append(entry)
+            else:
+                liq_active.append(entry)
+
+        liq_active.sort(key=lambda x: abs(x["dist_pts"]))
+        liq_swept.sort(key=lambda x: abs(x.get("sweep_age_min") or 9999))
+
+        # ── Swing levels (nearest to price) ──────────────────────────────
+        swing_highs = sorted(
+            [h for h in self._swing_highs if h > price],
+            key=lambda h: h - price)[:6]
+        swing_lows = sorted(
+            [l for l in self._swing_lows if l < price],
+            key=lambda l: price - l)[:6]
+
+        return {
+            "counts": {
+                "ob_bull": len(bull_obs),
+                "ob_bear": len(bear_obs),
+                "fvg_bull": len(bull_fvgs),
+                "fvg_bear": len(bear_fvgs),
+                "liq_active": len(liq_active),
+                "liq_swept": len(liq_swept),
+            },
+            "session": self._session,
+            "killzone": self._killzone or "",
+            "bull_obs": bull_obs,
+            "bear_obs": bear_obs,
+            "bull_fvgs": bull_fvgs,
+            "bear_fvgs": bear_fvgs,
+            "liq_active": liq_active,
+            "liq_swept": liq_swept,
+            "swing_highs": swing_highs,
+            "swing_lows": swing_lows,
         }

@@ -102,13 +102,16 @@ class FuturesAPI:
             'X-AUTH-APIKEY': self.api_key
         }
         
+        # Request timeout — prevents main loop from hanging forever on network issues
+        req_timeout = getattr(config, 'REQUEST_TIMEOUT', 30)
+
         try:
             # CRITICAL FIX: Don't send body for GET requests
             if method == "GET":
-                response = requests.request(method, url, headers=headers)
+                response = requests.request(method, url, headers=headers, timeout=req_timeout)
             else:
                 # For POST/DELETE, send payload as JSON body
-                response = requests.request(method, url, headers=headers, json=payload if payload else {})
+                response = requests.request(method, url, headers=headers, json=payload if payload else {}, timeout=req_timeout)
             
             response.raise_for_status()
             return response.json()
@@ -122,7 +125,7 @@ class FuturesAPI:
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_response['response'] = e.response.json()
-                except:
+                except Exception:
                     error_response['response'] = e.response.text
             
             logger.error(f"API request failed: {error_response}")

@@ -411,8 +411,8 @@ ATR_PCTILE_RANK_WINDOW      = 30
 #
 
 # 13a. Order Blocks (ICT)
-OB_MIN_IMPULSE_PCT          = 0.50   # impulse candle must move >= 0.5%
-OB_MIN_BODY_RATIO           = 0.50   # impulse body >= 50% of range
+OB_MIN_IMPULSE_PCT          = 0.15   # impulse candle must move >= 0.15% (was 0.50 — too high for BTC 5m candles)
+OB_MIN_BODY_RATIO           = 0.40   # impulse body >= 40% of range (was 0.50 — too strict)
 OB_IMPULSE_SIZE_MULTIPLIER  = 1.30   # impulse range >= 1.30x OB range
 OB_MAX_AGE_MINUTES          = 1440   # 24h — OBs remain valid for a full day
 
