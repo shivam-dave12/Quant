@@ -2523,6 +2523,18 @@ class QuantStrategy:
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         # Track last known price for PnL fallback
         self._last_known_price = 0.0
+        # Bug 6 fix: pre-declare all hasattr-guarded attrs so the very first
+        # evaluation tick behaves identically to every subsequent one.
+        self._last_data_warn       = 0.0
+        self._last_atr_warn        = 0.0
+        self._last_price_warn      = 0.0
+        self._last_bo_block_log    = 0.0
+        self._last_ict_gate_log    = 0.0
+        self._last_trail_block_log = 0.0
+        self._last_maxhold_check   = 0.0
+        # Bug 7: track first ICT-gate block timestamp for Telegram alert
+        self._ict_gate_start_time  = 0.0
+        self._ict_gate_alerted     = False
         self._log_init()
 
     def _log_init(self):
@@ -2610,13 +2622,20 @@ class QuantStrategy:
             return True, 0.0
 
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
+        # ── Bug 1 fix: locked section is non-blocking — only state reads/writes.
+        # All exchange API calls (_sync_position, _evaluate_entry, _manage_active,
+        # _finalise_exit) happen AFTER the lock is released so trailing-SL
+        # replace_stop_loss, bracket fill polls, and reconcile writes can never
+        # freeze each other or the health-check thread.
+        now = timestamp_ms / 1000.0
         with self._lock:
-            now = timestamp_ms / 1000.0; self._om = order_manager
-            if now - self._last_eval_time < QCfg.TICK_EVAL_SEC(): return
+            self._om = order_manager
+            if now - self._last_eval_time < QCfg.TICK_EVAL_SEC():
+                return
             self._last_eval_time = now
-            phase = self._pos.phase
+
+            # Local data feeds — all in-process reads, no I/O
             self._feed_microstructure(data_manager)
-            # ── Feed orderbook to fee engine (PATCH 3) ───────────────────────────
             try:
                 ob = data_manager.get_orderbook()
                 price = data_manager.get_last_price()
@@ -2624,41 +2643,62 @@ class QuantStrategy:
                     self._fee_engine.update_orderbook(ob, price)
             except Exception:
                 pass
-            # Update last known price
             try:
                 p = data_manager.get_last_price()
-                if p > 1.0: self._last_known_price = p
-            except Exception: pass
-            # Reconciliation
+                if p > 1.0:
+                    self._last_known_price = p
+            except Exception:
+                pass
+
+            # Apply any pending reconcile result (written by background thread)
             if self._reconcile_data is not None:
-                data = self._reconcile_data; self._reconcile_data = None
-                self._reconcile_apply(order_manager, data); phase = self._pos.phase
-            if now - self._last_reconcile_time >= self._RECONCILE_SEC and not self._reconcile_pending:
+                _rdata = self._reconcile_data; self._reconcile_data = None
+                self._reconcile_apply(order_manager, _rdata)
+
+            # Spawn reconcile background thread if due (non-blocking)
+            if not self._reconcile_pending and now - self._last_reconcile_time >= self._RECONCILE_SEC:
                 self._last_reconcile_time = now; self._reconcile_pending = True
-                threading.Thread(target=self._reconcile_query_thread, args=(order_manager,), daemon=True).start()
-            if phase == PositionPhase.ACTIVE:
-                if now - self._last_pos_sync > QCfg.POS_SYNC_SEC():
-                    self._sync_position(order_manager); self._last_pos_sync = now
-                    if self._pos.is_flat(): return
-            elif phase == PositionPhase.EXITING:
-                if now - self._last_exit_sync > QCfg.POS_SYNC_SEC():
-                    self._sync_position(order_manager); self._last_exit_sync = now
-                # Safety: if still EXITING after 120s the close order likely failed
-                # silently. Force-finalise so signals can resume, and alert user.
-                if self._pos.phase == PositionPhase.EXITING and (now - self._exiting_since) > 120.0:
-                    logger.warning("⚠️ EXITING stuck >120s — force-finalising to unblock signals")
-                    send_telegram_message(
-                        "⚠️ <b>EXITING TIMEOUT</b>\n"
-                        "Stuck in EXITING phase for >120s.\n"
-                        "Close order may have failed silently.\n"
-                        "<b>Check exchange for open position!</b>")
+                threading.Thread(
+                    target=self._reconcile_query_thread,
+                    args=(order_manager,), daemon=True,
+                ).start()
+
+            # Snapshot all decision-relevant state while locked
+            phase             = self._pos.phase
+            need_pos_sync     = (phase == PositionPhase.ACTIVE  and now - self._last_pos_sync  > QCfg.POS_SYNC_SEC())
+            need_exit_sync    = (phase == PositionPhase.EXITING and now - self._last_exit_sync > QCfg.POS_SYNC_SEC())
+            exiting_stuck     = (phase == PositionPhase.EXITING and (now - self._exiting_since) > 120.0)
+            cooldown_ok       = (now - self._last_exit_time >= float(QCfg.COOLDOWN_SEC()))
+
+        # ── All blocking exchange I/O below — lock is NOT held ───────────────────
+
+        if phase == PositionPhase.ACTIVE:
+            if need_pos_sync:
+                self._sync_position(order_manager)
+                with self._lock:
+                    self._last_pos_sync = now
+                    if self._pos.is_flat():
+                        return
+            self._manage_active(data_manager, order_manager, now)
+
+        elif phase == PositionPhase.EXITING:
+            if need_exit_sync:
+                self._sync_position(order_manager)
+                with self._lock:
+                    self._last_exit_sync = now
+            if exiting_stuck:
+                logger.warning("⚠️ EXITING stuck >120s — force-finalising to unblock signals")
+                send_telegram_message(
+                    "⚠️ <b>EXITING TIMEOUT</b>\n"
+                    "Stuck in EXITING phase for >120s.\n"
+                    "Close order may have failed silently.\n"
+                    "<b>Check exchange for open position!</b>")
+                with self._lock:
                     self._finalise_exit()
-                return
-            if phase == PositionPhase.FLAT:
-                if now - self._last_exit_time < float(QCfg.COOLDOWN_SEC()): return
+
+        elif phase == PositionPhase.FLAT:
+            if cooldown_ok:
                 self._evaluate_entry(data_manager, order_manager, risk_manager, now)
-            elif phase == PositionPhase.ACTIVE:
-                self._manage_active(data_manager, order_manager, now)
 
     def _feed_microstructure(self, data_manager):
         try:
@@ -2683,7 +2723,7 @@ class QuantStrategy:
         # Issue 1 fix: log WHY signals are blocked instead of silently returning None
         if len(candles_1m) < QCfg.MIN_1M_BARS():
             _now = time.time()
-            if not hasattr(self, '_last_data_warn') or _now - self._last_data_warn >= 30.0:
+            if _now - self._last_data_warn >= 30.0:
                 self._last_data_warn = _now
                 logger.info(
                     f"⏳ Signals blocked: 1m candles={len(candles_1m)}/{QCfg.MIN_1M_BARS()} "
@@ -2691,7 +2731,7 @@ class QuantStrategy:
             return None
         if len(candles_5m) < QCfg.MIN_5M_BARS():
             _now = time.time()
-            if not hasattr(self, '_last_data_warn') or _now - self._last_data_warn >= 30.0:
+            if _now - self._last_data_warn >= 30.0:
                 self._last_data_warn = _now
                 logger.info(
                     f"⏳ Signals blocked: 5m candles={len(candles_5m)}/{QCfg.MIN_5M_BARS()} "
@@ -2700,7 +2740,7 @@ class QuantStrategy:
         atr_1m = self._atr_1m.compute(candles_1m); atr_5m = self._atr_5m.compute(candles_5m)
         if atr_5m < 1e-10:
             _now = time.time()
-            if not hasattr(self, '_last_atr_warn') or _now - self._last_atr_warn >= 30.0:
+            if _now - self._last_atr_warn >= 30.0:
                 self._last_atr_warn = _now
                 logger.info(
                     "⏳ Signals blocked: ATR not seeded yet — stream reconnect recovery. "
@@ -2710,7 +2750,7 @@ class QuantStrategy:
         price = data_manager.get_last_price()
         if price < 1.0:
             _now = time.time()
-            if not hasattr(self, '_last_price_warn') or _now - self._last_price_warn >= 30.0:
+            if _now - self._last_price_warn >= 30.0:
                 self._last_price_warn = _now
                 logger.info("⏳ Signals blocked: no valid price from data manager")
             return None
@@ -2889,7 +2929,7 @@ class QuantStrategy:
         # v4.6: Breakout veto — NEVER fade a detected breakout
         if self._breakout.blocks_reversion(side):
             self._confirm_long = self._confirm_short = 0
-            if not hasattr(self, '_last_bo_block_log') or now - self._last_bo_block_log >= 60.0:
+            if now - self._last_bo_block_log >= 60.0:
                 self._last_bo_block_log = now
                 logger.info(f"🚫 Breakout blocks {side.upper()} reversion (breakout {self._breakout.direction})")
             return
@@ -2903,16 +2943,30 @@ class QuantStrategy:
         _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
-                # Throttle log to 30s — this fires every tick when no ICT structure
-                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                # Bug 7 fix: track how long the gate has been continuously blocking
+                if self._ict_gate_start_time == 0.0:
+                    self._ict_gate_start_time = now
+                # Throttle log to 30s
+                if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} REVERSION]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
                         f"— no structural confluence [{sig.ict_details}]")
+                # Bug 7 fix: Telegram alert after 15 min continuous block
+                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                    self._ict_gate_alerted = True
+                    send_telegram_message(
+                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                        f"No ICT structural confluence for ≥15 min.\n"
+                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"Details: {sig.ict_details}\n"
+                        f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_long = self._confirm_short = 0
                 return
         # ─────────────────────────────────────────────────────────────────────
+        # Bug 7 fix: gate just passed — reset block tracking
+        self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
 
         if not (sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming >= 3):
             self._confirm_long = self._confirm_short = 0; return
@@ -2970,15 +3024,26 @@ class QuantStrategy:
         _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
-                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                if self._ict_gate_start_time == 0.0:
+                    self._ict_gate_start_time = now
+                if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{trend_side.upper()} TREND]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
                         f"[{sig.ict_details}]")
+                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                    self._ict_gate_alerted = True
+                    send_telegram_message(
+                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                        f"No ICT structural confluence for ≥15 min.\n"
+                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"Details: {sig.ict_details}\n"
+                        f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
         # ─────────────────────────────────────────────────────────────────────
+        self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
 
         # Pullback-to-EMA depth check
         try: candles_5m = data_manager.get_candles("5m", limit=30)
@@ -3081,15 +3146,26 @@ class QuantStrategy:
         _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
-                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                if self._ict_gate_start_time == 0.0:
+                    self._ict_gate_start_time = now
+                if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
                         f"[{sig.ict_details}]")
+                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                    self._ict_gate_alerted = True
+                    send_telegram_message(
+                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                        f"No ICT structural confluence for ≥15 min.\n"
+                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"Details: {sig.ict_details}\n"
+                        f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
         # ─────────────────────────────────────────────────────────────────────
+        self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
 
         # ── Phase 3: Confirmation counter ─────────────────────────────────
         if side == "long":
@@ -3439,8 +3515,6 @@ class QuantStrategy:
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
             return
 
-        self._risk_gate.record_trade_start()
-
         # ── Extract fill price ────────────────────────────────────────────────────
         fill_price = (
             float(entry_data.get("fill_price")          or 0)
@@ -3621,6 +3695,13 @@ class QuantStrategy:
         # NOTE: _total_trades incremented at CLOSE (not here) so win-rate denominator
         # only counts completed trades, not abandoned/rejected ones.
         self._confirm_long          = self._confirm_short = 0
+        # Bug 5 fix: record_trade_start moved here — _pos is now ACTIVE so the
+        # daily trade counter only increments for trades that actually opened.
+        # Previously called right after entry_data was confirmed, meaning any
+        # abort path between placement and position-state assignment (adverse
+        # slippage exit, partial-fill abort, SL placement failure) would falsely
+        # consume a daily trade slot.
+        self._risk_gate.record_trade_start()
 
         # ── Build clean entry notification ───────────────────────────────────────
         # R:R = (TP distance) / (SL distance) — both measured from FILL price
@@ -3707,8 +3788,6 @@ class QuantStrategy:
         if hold_time > total_allowed:
             # v4.6 FIX: Throttle max-hold checks to every 30s
             # (was every 1s tick → 900 log lines in 15 min)
-            if not hasattr(self, '_last_maxhold_check'):
-                self._last_maxhold_check = 0.0
             if now - self._last_maxhold_check < 30.0:
                 pass  # skip — trailing SL handles it below
             else:
@@ -3878,7 +3957,7 @@ class QuantStrategy:
         if pos.entry_price < 1.0:
             logger.warning("Trail: entry_price invalid (%.2f) — skipping", pos.entry_price)
             return False
-        if pos.sl_order_id is None:
+        if not pos.sl_order_id:
             logger.debug("Trail: sl_order_id unknown — skipping")
             return False
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
@@ -3933,7 +4012,7 @@ class QuantStrategy:
         if new_sl is None:
             # Issue 2 fix: log WHY the trail was blocked (throttled to 30s)
             _trail_log_interval = 30.0
-            if not hasattr(self, '_last_trail_block_log') or now - self._last_trail_block_log >= _trail_log_interval:
+            if now - self._last_trail_block_log >= _trail_log_interval:
                 self._last_trail_block_log = now
                 init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
                 tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0

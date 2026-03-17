@@ -854,51 +854,90 @@ class OrderManager:
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
-                # Delta creates children asynchronously after fill — retry up to 5×.
+                # Delta creates children asynchronously after fill.
+                # Bug 4 fix: was a 6-attempt blocking loop (up to 24s of sleep
+                # while holding the strategy lock). Now: 2 fast attempts (3s
+                # total) return immediately to the caller. If children are still
+                # missing, a background thread polls for up to 90s and writes
+                # the IDs into _pending_bracket_children so the reconcile loop
+                # picks them up on the next pass.
                 sl_oid = tp_oid = ""
                 sl_trig = tp_trig = 0.0
                 _SL_TYPES = {
                     "STOP_MARKET", "STOP_MARKET_ORDER", "STOP",
                     "STOP_LOSS_MARKET", "STOP_LOSS_ORDER",
-                    # Delta bracket children often appear as plain stop_market_order
                 }
                 _TP_TYPES = {
                     "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET_ORDER",
                     "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
                 }
-                for _attempt in range(6):
-                    time.sleep(1.5 + _attempt * 1.0)  # 1.5 / 2.5 / 3.5 / 4.5 / 5.5 / 6.5s
-                    open_ords = self.get_open_orders()
-                    # Always log at INFO so we can see what Delta is returning
-                    raw_types = [(o.get("order_id","?")[:8], o.get("type","?")) for o in (open_ords or [])]
-                    logger.info(f"Bracket child query attempt {_attempt+1}/6 — open orders: {raw_types}")
-                    if not open_ords:
-                        continue
-                    for o in open_ords:
-                        # Check both normalised "type" key and raw order_type from Delta
+
+                def _parse_children(open_ords):
+                    """Return (sl_oid, sl_trig, tp_oid, tp_trig) from an open-orders list."""
+                    _sl_o = _tp_o = ""
+                    _sl_t = _tp_t = 0.0
+                    for o in (open_ords or []):
                         raw_type = str(
                             o.get("type") or
                             (o.get("raw") or {}).get("order_type") or
                             (o.get("raw") or {}).get("stop_order_type") or ""
                         )
-                        ot = raw_type.upper().replace(" ", "_").replace("-", "_")
+                        ot   = raw_type.upper().replace(" ", "_").replace("-", "_")
                         trig = float(o.get("trigger_price") or
                                      (o.get("raw") or {}).get("stop_price") or 0)
                         oid  = o.get("order_id", "")
-                        # Broad matching: anything with STOP/SL that isn't TP
-                        is_sl = (ot in _SL_TYPES or
-                                 ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
-                        is_tp = (ot in _TP_TYPES or
-                                 ("PROFIT" in ot or "TAKE_PROFIT" in ot))
-                        if is_sl and not sl_oid and oid:
-                            sl_oid  = oid
-                            sl_trig = trig
-                        elif is_tp and not tp_oid and oid:
-                            tp_oid  = oid
-                            tp_trig = trig
+                        is_sl = (ot in _SL_TYPES or ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
+                        is_tp = (ot in _TP_TYPES or ("PROFIT" in ot or "TAKE_PROFIT" in ot))
+                        if is_sl and not _sl_o and oid:
+                            _sl_o = oid; _sl_t = trig
+                        elif is_tp and not _tp_o and oid:
+                            _tp_o = oid; _tp_t = trig
+                    return _sl_o, _sl_t, _tp_o, _tp_t
+
+                # Fast path: 2 attempts x 1.5s = 3s max — covers >95% of cases
+                for _fast in range(2):
+                    time.sleep(1.5)
+                    open_ords = self.get_open_orders()
+                    raw_types = [(o.get("order_id","?")[:8], o.get("type","?")) for o in (open_ords or [])]
+                    logger.info(f"Bracket child query (fast {_fast+1}/2) — open orders: {raw_types}")
+                    sl_oid, sl_trig, tp_oid, tp_trig = _parse_children(open_ords)
                     if sl_oid and tp_oid:
-                        logger.info(f"Bracket children found on attempt {_attempt+1}")
+                        logger.info(f"Bracket children found on fast attempt {_fast+1}")
                         break
+
+                # Slow path: background thread resolves within 90s if still missing
+                if not (sl_oid and tp_oid):
+                    _captured_order_id = order_id
+                    _captured_om       = self
+
+                    def _bg_child_resolve():
+                        deadline = time.time() + 90.0
+                        attempt  = 0
+                        while time.time() < deadline:
+                            time.sleep(3.0 + min(attempt, 5) * 2.0)
+                            attempt += 1
+                            try:
+                                ords = _captured_om.get_open_orders()
+                                _s, _st, _t, _tt = _parse_children(ords)
+                                if _s and _t:
+                                    logger.info(
+                                        f"Bracket child bg-resolve: SL={_s[:8]}\u2026 TP={_t[:8]}\u2026 "
+                                        f"(attempt {attempt})")
+                                    if not hasattr(_captured_om, "_pending_bracket_children"):
+                                        _captured_om._pending_bracket_children = {}
+                                    _captured_om._pending_bracket_children[_captured_order_id] = {
+                                        "sl_order_id": _s, "sl_price": _st,
+                                        "tp_order_id": _t, "tp_price": _tt,
+                                    }
+                                    return
+                            except Exception as _e:
+                                logger.debug(f"Bracket child bg-resolve error: {_e}")
+                        logger.warning(
+                            f"Bracket child bg-resolve: children not found within 90s "
+                            f"for order {_captured_order_id[:8]}\u2026 — reconcile will recover SL/TP")
+
+                    import threading as _threading
+                    _threading.Thread(target=_bg_child_resolve, daemon=True).start()
 
                 data["bracket_sl_order_id"] = sl_oid
                 data["bracket_tp_order_id"] = tp_oid
