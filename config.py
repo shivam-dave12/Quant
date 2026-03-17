@@ -145,7 +145,7 @@ QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.50
+QUANT_TRAIL_BE_R               = 0.40   # was 0.50 — trail starts a little earlier
 QUANT_TRAIL_LOCK_R             = 1.00
 QUANT_TRAIL_AGGRESSIVE_R       = 2.00
 QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.50
@@ -154,7 +154,7 @@ QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.70
 QUANT_TRAIL_PULLBACK_FREEZE    = True
 QUANT_TRAIL_PB_VOL_RATIO       = 0.65
 QUANT_TRAIL_PB_DEPTH_ATR       = 1.20
-QUANT_TRAIL_REV_MIN_SIGNALS    = 4
+QUANT_TRAIL_REV_MIN_SIGNALS    = 2     # was 4 — 2 reversal signals sufficient to unfreeze trail
 QUANT_ICT_ZONE_FREEZE_ENABLED  = True
 QUANT_ICT_ZONE_FREEZE_ATR      = 0.40
 QUANT_ICT_OB_SL_ANCHOR         = True
@@ -262,6 +262,12 @@ KZ_LONDON_NY_START          = 2
 KZ_LONDON_NY_END            = 5
 KZ_NY_NY_START              = 7
 KZ_NY_NY_END                = 10
+
+# ── ICT Gate ──────────────────────────────────────────────────────────────────
+# Minimum ICT structural confluence score required before any trade entry.
+# Ensures the bot never enters purely on quant signals without ICT structure.
+# Set to 0.0 to disable (quant-only mode).
+ICT_MIN_SCORE_FOR_ENTRY     = 0.25
 
 # ── Legacy aliases (strategy code reads these) ────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE   # used by CoinSwitch order_manager path

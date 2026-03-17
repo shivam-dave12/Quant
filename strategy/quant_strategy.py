@@ -2184,6 +2184,24 @@ class ATREngine:
         self._atr_hist.clear()
         self._atr = 0.0
 
+    def soft_reset(self):
+        """
+        Issue 1 fix: Use this instead of reset_state() after stream restart.
+
+        Resets the seeding flag so the ATR will be fully recomputed from the
+        next candle batch, but PRESERVES the last computed ATR value and history.
+
+        Why: reset_state() sets self._atr = 0.0, which causes _compute_signals
+        to return None every tick for up to 75 minutes (the 5m re-seed time).
+        During this window all entry gates return None with zero logging, so the
+        bot appears dead. soft_reset() keeps the last valid ATR so signals
+        continue to work immediately after reconnect, while still triggering a
+        proper full re-seed from the fresh candle batch.
+        """
+        self._seeded = False
+        self._last_ts = -1
+        # _atr and _atr_hist intentionally preserved
+
     @staticmethod
     def _pctile_rank_window() -> int:
         return int(_cfg("ATR_PCTILE_RANK_WINDOW", 30))
@@ -2454,16 +2472,25 @@ class QuantStrategy:
         with self._lock: return None if self._pos.is_flat() else self._pos.to_dict()
 
     def on_stream_restart(self):
-        """v4.3 Bug 2 fix: Called by data_manager after restart_streams().
-        Resets all engine timestamps so they reprocess warmup data."""
+        """
+        Issue 1 fix: Called by data_manager after restart_streams().
+        Resets all engine timestamps so they reprocess warmup data.
+
+        ATR engines now use soft_reset() instead of reset_state().
+        reset_state() zeroed self._atr = 0.0 which caused _compute_signals
+        to return None for up to 75 minutes (5m re-seed window) with zero
+        log output — the bot appeared completely dead after every reconnect.
+        soft_reset() preserves the last valid ATR value so signals continue
+        working immediately while the engine re-seeds from fresh candles.
+        """
         with self._lock:
             self._cvd.reset_state()
-            self._atr_1m.reset_state()
-            self._atr_5m.reset_state()
+            self._atr_1m.soft_reset()   # preserves ATR value; re-seeds from next batch
+            self._atr_5m.soft_reset()   # same — avoids 75-min silence after reconnect
             self._adx.reset_state()
-            self._breakout.reset_state()  # v4.6
-            if self._ict: self._ict.reset_state()  # v4.8
-            logger.info("♻️ Strategy engines reset after stream restart")
+            self._breakout.reset_state()
+            if self._ict: self._ict.reset_state()
+            logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
         """v4.3: Telegram command to override trailing SL on/off, even mid-position.
@@ -2576,11 +2603,40 @@ class QuantStrategy:
     def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
         candles_5m = data_manager.get_candles("5m", limit=100)
-        if len(candles_1m) < QCfg.MIN_1M_BARS() or len(candles_5m) < QCfg.MIN_5M_BARS(): return None
+        # Issue 1 fix: log WHY signals are blocked instead of silently returning None
+        if len(candles_1m) < QCfg.MIN_1M_BARS():
+            _now = time.time()
+            if not hasattr(self, '_last_data_warn') or _now - self._last_data_warn >= 30.0:
+                self._last_data_warn = _now
+                logger.info(
+                    f"⏳ Signals blocked: 1m candles={len(candles_1m)}/{QCfg.MIN_1M_BARS()} "
+                    f"(waiting for warmup)")
+            return None
+        if len(candles_5m) < QCfg.MIN_5M_BARS():
+            _now = time.time()
+            if not hasattr(self, '_last_data_warn') or _now - self._last_data_warn >= 30.0:
+                self._last_data_warn = _now
+                logger.info(
+                    f"⏳ Signals blocked: 5m candles={len(candles_5m)}/{QCfg.MIN_5M_BARS()} "
+                    f"(waiting for warmup)")
+            return None
         atr_1m = self._atr_1m.compute(candles_1m); atr_5m = self._atr_5m.compute(candles_5m)
-        if atr_5m < 1e-10: return None
+        if atr_5m < 1e-10:
+            _now = time.time()
+            if not hasattr(self, '_last_atr_warn') or _now - self._last_atr_warn >= 30.0:
+                self._last_atr_warn = _now
+                logger.info(
+                    "⏳ Signals blocked: ATR not seeded yet — stream reconnect recovery. "
+                    f"1m_atr={atr_1m:.2f} 5m_atr={atr_5m:.2f} "
+                    f"(need {QCfg.ATR_PERIOD()} candles of live data)")
+            return None
         price = data_manager.get_last_price()
-        if price < 1.0: return None
+        if price < 1.0:
+            _now = time.time()
+            if not hasattr(self, '_last_price_warn') or _now - self._last_price_warn >= 30.0:
+                self._last_price_warn = _now
+                logger.info("⏳ Signals blocked: no valid price from data manager")
+            return None
         self._vwap.update(candles_1m, atr_5m); self._cvd.update(candles_1m)  # v4.3: was atr_1m — Bug 5 fix
         try:
             c15 = data_manager.get_candles("15m", limit=100); c4h = data_manager.get_candles("4h", limit=50)
@@ -2638,13 +2694,26 @@ class QuantStrategy:
             f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
             f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'})",
             f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
-            f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}"]
-        if sig.ict_total > 0.01:
-            ict_lbl = f"🏛️ ICT: {sig.ict_total:.2f} (OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Sweep={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f})"
-            if sig.ict_details:
-                ict_lbl += f" [{sig.ict_details}]"
-            gates.append(ict_lbl)
-        ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr
+        ]
+        # Issue 4 fix: ICT gate shown as an explicit required gate, not just a boost
+        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        if self._ict is not None:
+            if self._ict._initialized:
+                _ict_pass = sig.ict_total >= _ict_min
+                ict_gate_lbl = (
+                    f"{'✅' if _ict_pass else '❌'} ICT ({sig.ict_total:.2f} vs min={_ict_min:.2f}) "
+                    f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
+                )
+                if sig.ict_details:
+                    ict_gate_lbl += f" | {sig.ict_details}"
+                gates.append(ict_gate_lbl)
+            else:
+                gates.append("⏳ ICT (initializing...)")
+        gates.append(f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
+        # All-pass check now includes ICT gate
+        _ict_initialized = self._ict is not None and self._ict._initialized
+        _ict_ok = (not _ict_initialized) or (sig.ict_total >= _ict_min)
+        ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr and _ict_ok
         cd = max(0.0, QCfg.COOLDOWN_SEC()-(now-self._last_exit_time))
         lines = [f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
                  fmt("VWAP",sig.vwap_dev), fmt("CVD",sig.cvd_div), fmt("OB",sig.orderbook),
@@ -2730,6 +2799,7 @@ class QuantStrategy:
         Blocked in TRENDING regime for counter-trend direction.
         In TRANSITIONING: all existing gates must pass + regime allows this side.
         v4.6: Also blocked when BreakoutDetector detects directional momentum.
+        Issue 4 fix: ICT structural confluence now a hard gate (not just a boost).
         """
         c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
 
@@ -2740,11 +2810,30 @@ class QuantStrategy:
         # v4.6: Breakout veto — NEVER fade a detected breakout
         if self._breakout.blocks_reversion(side):
             self._confirm_long = self._confirm_short = 0
-            # v4.8: Throttle this log — was firing every 1s tick (600+ lines per breakout)
             if not hasattr(self, '_last_bo_block_log') or now - self._last_bo_block_log >= 60.0:
                 self._last_bo_block_log = now
                 logger.info(f"🚫 Breakout blocks {side.upper()} reversion (breakout {self._breakout.direction})")
             return
+
+        # ── Issue 4 fix: Hard ICT gate ───────────────────────────────────────
+        # ICT engine must confirm institutional structure alignment before entry.
+        # Quant signals tell us WHAT order flow is doing; ICT tells us WHERE smart
+        # money placed its orders. Both must agree. Without ICT gate, the bot was
+        # entering purely on order-flow divergence with zero structural context.
+        # Only enforced when ICT engine is initialized (has processed candles).
+        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        if _ict_min > 0 and self._ict is not None and self._ict._initialized:
+            if sig.ict_total < _ict_min:
+                # Throttle log to 30s — this fires every tick when no ICT structure
+                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                    self._last_ict_gate_log = now
+                    logger.info(
+                        f"⛔ ICT gate [{side.upper()} REVERSION]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
+                        f"— no structural confluence [{sig.ict_details}]")
+                self._confirm_long = self._confirm_short = 0
+                return
+        # ─────────────────────────────────────────────────────────────────────
 
         if not (sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming >= 3):
             self._confirm_long = self._confirm_short = 0; return
@@ -2797,6 +2886,20 @@ class QuantStrategy:
         if abs(sig.trend_score) < QCfg.TREND_COMPOSITE_MIN(): return
         if trend_side == "long"  and sig.trend_score <= 0: return
         if trend_side == "short" and sig.trend_score >= 0: return
+
+        # ── Issue 4 fix: Hard ICT gate for trend entries ─────────────────────
+        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        if _ict_min > 0 and self._ict is not None and self._ict._initialized:
+            if sig.ict_total < _ict_min:
+                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                    self._last_ict_gate_log = now
+                    logger.info(
+                        f"⛔ ICT gate [{trend_side.upper()} TREND]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
+                        f"[{sig.ict_details}]")
+                self._confirm_trend_long = self._confirm_trend_short = 0
+                return
+        # ─────────────────────────────────────────────────────────────────────
 
         # Pullback-to-EMA depth check
         try: candles_5m = data_manager.get_candles("5m", limit=30)
@@ -2892,6 +2995,23 @@ class QuantStrategy:
         if side == "short" and price > self._breakout._bo_midpoint:
             return
 
+        # ── Issue 4 fix: Gate 4 — ICT structural confluence ──────────────────
+        # Momentum entries need ICT OBs / FVGs in the retest zone to be valid.
+        # A retest without institutional structure is a noise bounce, not a
+        # real break-and-retest. The ICT gate prevents entering at random levels.
+        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        if _ict_min > 0 and self._ict is not None and self._ict._initialized:
+            if sig.ict_total < _ict_min:
+                if not hasattr(self, '_last_ict_gate_log') or now - self._last_ict_gate_log >= 30.0:
+                    self._last_ict_gate_log = now
+                    logger.info(
+                        f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
+                        f"[{sig.ict_details}]")
+                self._confirm_trend_long = self._confirm_trend_short = 0
+                return
+        # ─────────────────────────────────────────────────────────────────────
+
         # ── Phase 3: Confirmation counter ─────────────────────────────────
         if side == "long":
             self._confirm_trend_long += 1
@@ -2941,7 +3061,9 @@ class QuantStrategy:
         except Exception: candles_5m = []
         try: candles_1m = data_manager.get_candles("1m", limit=150)
         except Exception: candles_1m = []
-        try: candles_15m = data_manager.get_candles("15m", limit=30)
+        # Issue 3 fix: was limit=30 (7.5h) — increased to 60 (15h) so significant
+        # 15m swing levels from earlier sessions are captured for SL/TP anchoring.
+        try: candles_15m = data_manager.get_candles("15m", limit=60)
         except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except Exception: orderbook = {"bids": [], "asks": []}
@@ -2952,6 +3074,31 @@ class QuantStrategy:
             price, side, atr, candles_5m, candles_1m, orderbook, vwap, vwap_std,
             atr_pctile=atr_pctile, candles_15m=candles_15m)
         sl_price = _round_to_tick(sl_price)
+
+        # Issue 3 fix: log which 15m structure level was nearest and whether
+        # it influenced the final SL placement.
+        if candles_15m and len(candles_15m) >= 3:
+            try:
+                _lb_15m = min(12, len(candles_15m) - 2)
+                _sh_15m, _sl_15m = InstitutionalLevels.find_swing_extremes(candles_15m, _lb_15m)
+                if side == "long" and _sl_15m:
+                    _below = [l for l in _sl_15m if l < price]
+                    if _below:
+                        _near15 = max(_below)
+                        logger.info(
+                            f"📐 15m SL structure: nearest low=${_near15:,.2f} "
+                            f"({abs(price - _near15):.1f}pts / {abs(price - _near15)/atr:.2f}ATR) "
+                            f"→ final SL=${sl_price:,.2f}")
+                elif side == "short" and _sh_15m:
+                    _above = [h for h in _sh_15m if h > price]
+                    if _above:
+                        _near15 = min(_above)
+                        logger.info(
+                            f"📐 15m SL structure: nearest high=${_near15:,.2f} "
+                            f"({abs(price - _near15):.1f}pts / {abs(price - _near15)/atr:.2f}ATR) "
+                            f"→ final SL=${sl_price:,.2f}")
+            except Exception:
+                pass
 
         # ── v4.8: ICT OB-aware SL enhancement ─────────────────────────────
         # If an Order Block exists between current SL and price, use it as SL
@@ -3629,7 +3776,7 @@ class QuantStrategy:
         return True, " | ".join(reasons)
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
-        """Institutional trail v4.8: 7-bug rewrite."""
+        """Institutional trail v4.9 + Issue-2 fix: ICT refreshed from live candles."""
         pos = self._pos; atr = self._atr_5m.atr
         if atr < 1e-10: return False
         if pos.entry_price < 1.0:
@@ -3657,6 +3804,21 @@ class QuantStrategy:
         except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
+        now_ms = int(now * 1000)
+
+        # ── Issue 2 fix: Refresh ICT engine with live 1m/5m structure ────────
+        # ROOT CAUSE: ICT update() only ran in _evaluate_entry() (FLAT phase).
+        # During an active position, _manage_active() runs instead, so the ICT
+        # engine never saw new OBs, BOS events, or FVGs formed after entry.
+        # Zone-freeze was comparing price against entry-time OBs — some of which
+        # might permanently overlap the trail zone, freezing the trail forever.
+        # Fix: force ICT update here with live candles before every trail decision.
+        if self._ict is not None:
+            try:
+                candles_15m = data_manager.get_candles("15m", limit=30)
+                self._ict.update(candles_5m, candles_15m, price, now_ms)
+            except Exception as _ict_refresh_e:
+                logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
         # v4.9: Pass ict_engine + now_ms so trail can use ICT zone freeze,
         # OB anchor SL, and liquidity pool ceiling — the three new protections
@@ -3668,9 +3830,20 @@ class QuantStrategy:
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
             initial_sl_dist=pos.initial_sl_dist,
             ict_engine=self._ict,
-            now_ms=int(now * 1000))
+            now_ms=now_ms)
 
         if new_sl is None:
+            # Issue 2 fix: log WHY the trail was blocked (throttled to 30s)
+            _trail_log_interval = 30.0
+            if not hasattr(self, '_last_trail_block_log') or now - self._last_trail_block_log >= _trail_log_interval:
+                self._last_trail_block_log = now
+                init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+                tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
+                hm = (now - pos.entry_time) / 60.0
+                logger.info(
+                    f"🔒 Trail HOLD | tier={tier:.2f}R (need ≥{QCfg.TRAIL_BE_R():.1f}R to start) | "
+                    f"profit={profit:.1f}pts peak={pos.peak_profit:.1f}pts | "
+                    f"SL=${pos.sl_price:,.1f} | hold={hm:.0f}m")
             return False
 
         new_sl_tick = _round_to_tick(new_sl)

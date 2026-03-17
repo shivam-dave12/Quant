@@ -274,6 +274,10 @@ class ICTEngine:
         self._update_session(now_ms)
         self._detect_swing_points(candles_5m, candles_15m)
         self._detect_order_blocks(candles_5m, price, now_ms)
+        # Issue 3 fix: also detect OBs on 15m — they carry higher institutional weight
+        # and directly anchor the TP/SL levels the strategy computes.
+        if len(candles_15m) >= 5:
+            self._detect_order_blocks_htf(candles_15m, price, now_ms)
         self._detect_fvgs(candles_5m, price, now_ms)
         self._update_fvg_fills(candles_5m)
         self._detect_liquidity_pools(price, now_ms)
@@ -389,6 +393,72 @@ class ICTEngine:
                         direction="bearish", strength=strength,
                         bos_confirmed=bos_ok, has_displacement=has_disp,
                         has_wick_rejection=wick_rej, max_age_ms=self.OB_MAX_AGE_MS))
+
+    def _detect_order_blocks_htf(self, candles: List[Dict], price: float,
+                                  now_ms: int) -> None:
+        """
+        Detect Order Blocks from 15m (higher timeframe) candles.
+
+        Issue 3 fix: 15m OBs are far more significant than 5m OBs as institutional
+        SL/TP anchors. They carry higher base strength (75 vs 40), age slower
+        (2× max_age), and are always marked bos_confirmed + has_displacement to
+        ensure they rank above 5m candidates in scored selection.
+
+        Called every update() cycle alongside _detect_order_blocks(5m).
+        Deduplication check prevents double-counting OBs that appear on both TFs.
+        """
+        if len(candles) < 5:
+            return
+
+        tol = price * 0.001  # 0.1% tolerance for dedup check
+
+        for i in range(2, len(candles) - 1):
+            cur = candles[i]
+            nxt = candles[i + 1]
+
+            cur_o, cur_c = float(cur['o']), float(cur['c'])
+            cur_h, cur_l = float(cur['h']), float(cur['l'])
+            nxt_o, nxt_c = float(nxt['o']), float(nxt['c'])
+            nxt_h, nxt_l = float(nxt['h']), float(nxt['l'])
+            cur_ts = int(cur.get('t', now_ms))
+
+            nxt_range = nxt_h - nxt_l
+            nxt_body  = abs(nxt_c - nxt_o)
+
+            impulse_up = (nxt_c > nxt_o and
+                          (nxt_c - nxt_o) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
+                          nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+            impulse_down = (nxt_c < nxt_o and
+                            (nxt_o - nxt_c) / max(nxt_o, 1) * 100 >= self.OB_MIN_IMPULSE_PCT and
+                            nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+
+            # Bullish HTF OB: bearish candle before bullish 15m impulse
+            if impulse_up and cur_c < cur_o:
+                if not any(abs(ob.low - cur_l) <= tol and abs(ob.high - cur_h) <= tol
+                           for ob in self.order_blocks_bull):
+                    # HTF strength: 75 base (vs 40 for 5m). BOS + displacement
+                    # always marked True — a 15m impulse is structural by definition.
+                    htf_strength = min(75.0 + (15.0 if nxt_body / max(nxt_range, 1e-9) >= 0.60 else 0.0), 100.0)
+                    self.order_blocks_bull.append(OrderBlock(
+                        low=cur_l, high=cur_h, timestamp=cur_ts,
+                        direction="bullish", strength=htf_strength,
+                        bos_confirmed=True, has_displacement=True,
+                        has_wick_rejection=False,
+                        max_age_ms=self.OB_MAX_AGE_MS * 2))  # 15m OBs stay valid 2× longer
+                    logger.debug(f"📦 HTF OB BULL ${cur_l:.0f}–${cur_h:.0f} str={htf_strength:.0f}")
+
+            # Bearish HTF OB: bullish candle before bearish 15m impulse
+            if impulse_down and cur_c > cur_o:
+                if not any(abs(ob.low - cur_l) <= tol and abs(ob.high - cur_h) <= tol
+                           for ob in self.order_blocks_bear):
+                    htf_strength = min(75.0 + (15.0 if nxt_body / max(nxt_range, 1e-9) >= 0.60 else 0.0), 100.0)
+                    self.order_blocks_bear.append(OrderBlock(
+                        low=cur_l, high=cur_h, timestamp=cur_ts,
+                        direction="bearish", strength=htf_strength,
+                        bos_confirmed=True, has_displacement=True,
+                        has_wick_rejection=False,
+                        max_age_ms=self.OB_MAX_AGE_MS * 2))
+                    logger.debug(f"📦 HTF OB BEAR ${cur_l:.0f}–${cur_h:.0f} str={htf_strength:.0f}")
 
     # ══════════════════════════════════════════════════════════════════
     # FVG DETECTION
