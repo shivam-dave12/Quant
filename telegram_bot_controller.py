@@ -677,13 +677,19 @@ class TelegramBotController:
         mode    = p.trade_mode
         phase   = p.phase.name
 
-        sl_dist = abs(entry - sl) if sl > 0 else 0.0
+        # Issue 1 FIX: R:R must use INITIAL SL distance (not current, which shrinks
+        # as trail moves up). current_sl distance understates planned R:R.
+        init_sl_dist = getattr(p, 'initial_sl_dist', 0.0)
+        sl_dist = init_sl_dist if init_sl_dist > 1e-10 else (abs(entry - sl) if sl > 0 else 0.0)
+        current_sl_dist = abs(entry - sl) if sl > 0 else 0.0
 
         if sl_dist > 1e-10:
             current_r = ((price - entry) / sl_dist if side == "LONG"
                          else (entry - price) / sl_dist)
+            planned_rr = abs(tp - entry) / sl_dist if tp > 0 else 0.0
         else:
-            current_r = 0.0
+            current_r  = 0.0
+            planned_rr = 0.0
 
         upnl = ((price - entry) * qty if side == "LONG"
                 else (entry - price) * qty)
@@ -714,8 +720,11 @@ class TelegramBotController:
             f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
             f"uPnL:    ${upnl:+,.2f}\n"
             f"Qty:     {qty:.4f} BTC\n\n"
-            f"SL: ${sl:,.2f}  (${sl_dist:.0f} / {sl_dist/max(atr,1):.2f}ATR)\n"
-            f"TP: ${tp:,.2f}\n"
+            f"SL:      ${sl:,.2f}  "
+            f"(init dist: ${sl_dist:.0f} / {sl_dist/max(atr,1):.2f}ATR  "
+            f"current dist: ${current_sl_dist:.0f})\n"
+            f"TP:      ${tp:,.2f}\n"
+            f"Planned R:R: 1:{planned_rr:.2f}\n"
             f"MFE: {mfe_r:.2f}R\n\n"
             f"Hold:  {hold_min:.1f}m\n"
             f"Trail: {trail_state}\n"
@@ -733,39 +742,78 @@ class TelegramBotController:
         if not strat or not rm:
             return "Components not ready."
 
-        lines   = ["<b>Trade History</b>\n"]
-        history = list(getattr(rm, 'trade_history', []))
+        # ── Source: strategy._trade_history (ground truth, set at close) ──
+        history = getattr(strat, '_trade_history', [])
+
+        lines = ["<b>📋 Trade History</b>\n"]
 
         if history:
-            for t in history[-8:]:
-                side   = getattr(t, 'side',        '?').upper()
-                pnl    = getattr(t, 'pnl',          0.0)
-                reason = getattr(t, 'reason',       '?')
-                ep     = getattr(t, 'entry_price',  0.0)
-                xp     = getattr(t, 'exit_price',   0.0)
-                icon   = "✅" if pnl >= 0 else "❌"
+            # Show last 10 trades, newest first
+            for t in reversed(history[-10:]):
+                side    = t.get('side', '?').upper()
+                mode    = t.get('mode', '?').upper()
+                entry   = t.get('entry', 0.0)
+                exit_p  = t.get('exit',  0.0)
+                pnl     = t.get('pnl',   0.0)
+                reason  = t.get('reason', '?')
+                hold    = t.get('hold_min', 0.0)
+                mfe_r   = t.get('mfe_r', 0.0)
+                trailed = t.get('trailed', False)
+                is_win  = t.get('is_win', False)
+                init_sl = t.get('init_sl_dist', 0.0)
+                raw_pts = ((exit_p - entry) if side == "LONG" else (entry - exit_p))
+                ach_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
+
+                # Determine label
+                if reason == "tp_hit":
+                    label = "🎯 TP"
+                elif reason == "trail_sl_hit":
+                    label = "🔒 TRAIL"
+                elif reason == "sl_hit":
+                    label = "🛑 SL"
+                else:
+                    label = f"🚪 {reason[:8]}"
+
+                result = "✅" if is_win else "❌"
+                trail_tag = " [T]" if trailed else ""
                 lines.append(
-                    f"  {icon} {side}  ${ep:,.0f}→${xp:,.0f}  "
-                    f"PnL=${pnl:+,.2f}  [{reason}]")
+                    f"{result} {side} [{mode}]  "
+                    f"${entry:,.0f}→${exit_p:,.0f}  "
+                    f"PnL: <b>${pnl:+.2f}</b>  "
+                    f"R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
+                    f"    {label}{trail_tag}  hold: {hold:.0f}m"
+                )
         else:
-            lines.append("  No trades recorded yet.")
+            lines.append("  No trades recorded yet this session.")
 
-        # Summary stats
-        total_t   = len(history)
-        wins      = sum(1 for t in history if getattr(t, 'is_win', False))
-        wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
-        total_pnl = sum(getattr(t, 'pnl', 0.0) for t in history)
-        daily_pnl = getattr(rm, 'daily_pnl', 0.0)
-        consec    = getattr(rm, 'consecutive_losses', 0)
-        daily_cnt = len(getattr(rm, 'daily_trades', []))
-        max_d     = getattr(rm, 'max_daily_trades',
-                            getattr(__import__('config'), 'MAX_DAILY_TRADES', 8))
+        # ── Summary stats from strategy (ground truth) ──────────────────
+        total_t = getattr(strat, '_total_trades', 0)
+        wins    = getattr(strat, '_winning_trades', 0)
+        losses  = total_t - wins
+        wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = getattr(strat, '_total_pnl', 0.0)
 
-        lines.append("")
-        lines.append(f"Total: {total_t}  WR: {wr:.0f}%  PnL: ${total_pnl:+,.2f}")
-        lines.append(
-            f"Today: {daily_cnt}/{max_d} trades  ${daily_pnl:+,.2f}  "
-            f"consec_loss={consec}")
+        # Daily stats from risk gate (authoritative daily counters)
+        daily_cnt  = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
+        consec     = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
+        max_d      = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
+
+        # Avg win / avg loss from history
+        win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
+        loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+        avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+        avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
+
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Session:   {total_t} trades  W:{wins} L:{losses}  WR: <b>{wr:.0f}%</b>",
+            f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
+            f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
+            f"Expectancy: ${expectancy:+.2f}/trade",
+            f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
+        ]
         return "\n".join(lines)
 
     def _cmd_balance(self) -> str:

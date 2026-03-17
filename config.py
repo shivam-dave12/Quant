@@ -1,60 +1,34 @@
 """
 config.py — Single source of truth for all bot parameters.
 ============================================================
-Quant Bot v4.6 — Thesis-Aware Exit + Gate Fixes
+Quant Bot v4.9 — ICT-Anchored Trailing SL + Structural TP
 
-CHANGES from v4.5 (v4.6 — CRITICAL WIN-RATE FIX):
-  ROOT CAUSE: Max-hold timer (40 min) killed correct trades before they could
-  reach TP. Example: LONG @ $71,452, price dipped to $71,318, timer fired
-  at $71,349 → exited for loss. Price then rallied to $71,900 → TP hit.
-  The trade thesis was CORRECT the entire time — timer destroyed the edge.
+CHANGES from v4.8 (v4.9 — TRAIL AGGRESSION FIX):
 
-  FIX 1: THESIS-AWARE MAX-HOLD (the primary fix)
-    - When max-hold fires, CHECK THE MARKET instead of blind exit
-    - If in profit → tighten SL, let trade ride (no forced exit)
-    - If underwater + thesis valid → EXTEND hold (up to 5 × 20 min)
-    - If thesis broken → exit
-    - Thesis valid = composite in direction + not deeply underwater + VWAP relation holds
-    - New: MAX_HOLD_EXTENSIONS=5, HOLD_EXTENSION_SEC=1200, THESIS_MAX_DRAWDOWN_PCT=0.70
-    - Total possible hold: 40 + 5×20 = 140 min (2.3 hours) for valid thesis
+  ROOT CAUSE: Trail started at 0.3R with 1.0×ATR min-distance. A normal
+  BTC pullback of 1.2-1.8×ATR from the swing high hit the trailed SL.
+  Price then continued to TP. User reported: "small pullback → SL hit →
+  then TP achieves without us." This was structural, not parametric.
 
-  FIX 2: LOSS LOCKOUT REDUCED
-    - LOSS_LOCKOUT_SEC=300 (was 3600 — blocked Σ=+0.717 signals at bottom)
-    - MAX_CONSECUTIVE_LOSSES=5 (was 3)
+  FIX 1: ICT ZONE FREEZE (quant_strategy.py)
+    Trail is completely frozen when price tests an active OB or FVG.
+    Pullback into an OB = trade working as intended. TRAIL_BE_R 0.3→0.50.
 
-  FIX 3: REGIME GATE FIXED
-    - ATR_MIN_PCTILE=0.00 (was 0.05 — blocked entries when ATR contracted)
+  FIX 2: WIDER MIN DISTANCES
+    Phase 1: 1.0→1.5×ATR. Phase 2: 0.7→1.1×ATR. Phase 3: 0.5→0.7×ATR.
+    A 1.2×ATR pullback no longer hits the trail SL.
 
-  FIX 4: SPREAD GATE WIDENED
-    - MAX_SPREAD_ATR_RATIO=0.30 (was 0.08 — blocked all entries in low-vol)
+  FIX 3: PULLBACK TOLERANCE WIDENED
+    TRAIL_PB_DEPTH_ATR: 0.80→1.20 (healthy pullbacks up to 1.2×ATR).
+    TRAIL_REV_MIN_SIGNALS: 3→4 (need 4/6 reversal signals to freeze).
 
-  NOTE: SL stays at structural level (5m swing). Capping SL at 4×ATR was
-  tested but REJECTED — it moved SL from $71,216 to $71,363, which was hit
-  during a temporary dip that the structural SL survived. Structure > ATR.
+  FIX 4: ICT OB ANCHOR + LIQUIDITY CEILING (new config params)
+    OB anchor: SL placed below active OB for structural validity.
+    Liq ceiling: SL cannot cross unswept EQL/EQH pools.
 
-CHANGES from v4.4:
-  - COMPLETE TRAIL REWRITE: v4.4 time-triggered BE moved SL into noise → whipsaw loss
-  - Removed TIME_BE_SECONDS / TIME_TRAIL_SECONDS (time-based BE is a retail concept)
-  - Removed "breakeven" concept entirely (entry price is irrelevant to market)
-  - TRAIL_BE_R raised to 1.0R (trade must PROVE itself before ANY SL movement)
-  - TRAIL_LOCK_R raised to 2.0R, added TRAIL_AGGRESSIVE_R=3.0R
-  - Added per-phase minimum distance: 1.5/1.0/0.7 × ATR (kills whipsaw)
-  - Added 6-factor pullback-vs-reversal classifier (freezes SL during pullbacks)
-  - SL only moves behind CONFIRMED 5m swing structure, not arbitrary prices
-  - Smart max-hold ATR widened to 0.5 (was 0.3)
-
-CHANGES from v4.3:
-  - Added QUANT_REVERSION_MIN_RR=1.5 / QUANT_REVERSION_MAX_RR=3.0 (mode-aware R:R)
-  - Added QUANT_TREND_MIN_RR=3.0 / QUANT_TREND_MAX_RR=5.0 (trend keeps high R:R)
-  - Added QUANT_SMART_MAX_HOLD=True (tighten SL instead of market-dumping profitable trades)
-
-CHANGES from v4:
-  - ATR_SEED_RETAIN set to 1 (CRITICAL FIX: warmup data was poisoning percentile → 0% → blocked all trades)
-  - QUANT_TRAIL_BE_R raised to 1.0 (Trail fix: was 0.4 — too aggressive)
-  - QUANT_TRAIL_LOCK_R raised to 1.5 (Trail fix: was 0.8)
-  - QUANT_TRAIL_CHANDELIER_N_START raised to 3.0 (wider breathing room)
-  - Added QUANT_MAX_SPREAD_ATR_RATIO (Solution 5: time-of-day filter)
-  - Added QUANT_TP_VWAP_FRACTION bumped to 0.65 (wider TP for fee coverage)
+  FIX 5: ICT STRUCTURAL TP TARGETS (quant_strategy.py)
+    compute_tp now uses ICT engine's structural TP candidates:
+    swept liq origins (6+), unfilled FVGs (5+), virgin OBs (4+).
 """
 
 import os
@@ -117,6 +91,9 @@ MAX_ORDER_RETRIES        = 2
 MAX_CONSECUTIVE_TIMEOUTS = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC = 1800
 SNIPER_MAX_DISTANCE_ATR  = 1.0
+# Maker limit order fill timeout — raised from 7s (too short for 3s rate-limiter).
+# 25s allows 7-8 polls; gives real chance to fill before falling back to taker.
+LIMIT_ORDER_FILL_TIMEOUT_SEC = 25.0
 
 # ─────────────────────────────────────────────
 # 6. DATA / READINESS
@@ -209,62 +186,56 @@ QUANT_OB_WALL_MULT          = 2.5
 QUANT_TRAIL_SWING_BARS      = 5
 QUANT_TRAIL_VOL_DECAY_MULT  = 0.6
 
-# 10d. Trailing SL — v5.0 INSTITUTIONAL HYBRID (ICT+Quant integration)
+# 10d. Trailing SL — v4.9 INSTITUTIONAL REWRITE (ICT-anchored, zone-aware)
 #
-#      v4.8 → v5.0 UPGRADE: User complaint "small pullback hits SL, then TP achieved"
+#      v4.8 FAILURE: Trail activated at 0.3R (just +$60) with min_dist=1.0×ATR.
+#      A healthy BTC pullback of 1.2–1.8×ATR from the swing high hits that SL.
+#      Price then continues to TP. The pattern: "SL hit during pullback, then
+#      TP fires without us." This was the primary reported problem.
 #
-#      ROOT CAUSES FIXED:
-#        1. Min distance too tight (0.5×ATR = $11 at low vol → noise whipsaw)
-#        2. No ICT structure awareness (SL trails through virgin OBs/FVGs)
-#        3. No time context (30s whipsaw = 5min pullback)
-#        4. Fixed ATR mults (doesn't adapt to spread/liquidity)
-#        5. ICT+Quant separate (not truly hybrid)
+#      v4.9 FIX: 4-pronged institutional solution:
 #
-#      v5.0 INSTITUTIONAL FIXES:
-#        - ICT-AWARE TRAILING: Never trail through virgin OB/FVG supporting trade
-#        - DYNAMIC MIN DISTANCE: Adapts to spread percentile + liquidity + volatility
-#        - TIME-AWARE PULLBACK: 9 signals (was 6), duration/chop/consolidation filters
-#        - MULTI-TF SL: Cross-reference 15m structure, use higher-TF swings when conflict
-#        - ICT CONFLUENCE TIERS: Premium (ICT≥0.50) lowers entry bar, weak (ICT<0.30) raises it
+#      1. LATER TRAIL START: 0.50R (need half SL distance profit before trail).
+#         At a $200 SL that's +$100 — trade has PROVED it before SL moves.
+#
+#      2. WIDER MIN DISTANCES: 1.5/1.1/0.70 ATR (was 1.0/0.7/0.5).
+#         BTC average 5m ATR ≈ $100–200. 1.5×ATR = $150–300 breathing room.
+#         A 1.2×ATR pullback ($120–240) no longer hits the trailed SL.
+#
+#      3. ICT ZONE FREEZE: If price tests an active OB or sits inside an FVG,
+#         the trail is FROZEN entirely. These are institutional zones where
+#         smart money defends — a pullback into them is EXPECTED, not reversal.
+#         This is the most impactful change.
+#
+#      4. LIQUIDITY POOL CEILING: Trail cannot advance ABOVE (for long) or
+#         BELOW (for short) an unswept EQL/EQH. Smart money will sweep those
+#         stops before reversing — trailing SL right at the pool level ensures
+#         the sweep takes us out. Keep SL safely beyond liquidity.
+#
+#      5. ICT OB ANCHOR: When an active OB exists below price (for long),
+#         SL candidate = OB.low - buffer. This is the MOST VALID institutional
+#         SL level — that is literally where the orders are. Structure > chandelier.
 #
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.3   # v4.8: Phase 0→1 at +0.3R
-QUANT_TRAIL_LOCK_R             = 0.8   # v4.8: Phase 1→2 at +0.8R
-QUANT_TRAIL_AGGRESSIVE_R       = 1.5   # v4.8: Phase 2→3 at +1.5R
-QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.2   # v5.0: was 1.0 → wider (less whipsaw)
-QUANT_TRAIL_MIN_DIST_ATR_P2    = 0.9   # v5.0: was 0.7 → wider
-QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.7   # v5.0: was 0.5 → wider (critical for Phase 3)
+QUANT_TRAIL_BE_R               = 0.50  # v4.9: was 0.3 → Phase 0→1 at +0.50R
+QUANT_TRAIL_LOCK_R             = 1.00  # v4.9: was 0.8 → Phase 1→2 at +1.0R
+QUANT_TRAIL_AGGRESSIVE_R       = 2.00  # v4.9: was 1.5 → Phase 2→3 at +2.0R
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.50  # v4.9: was 1.0 → Phase 1: min SL = 1.5×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.10  # v4.9: was 0.7 → Phase 2: 1.1×ATR
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.70  # v4.9: was 0.5 → Phase 3: 0.7×ATR
 QUANT_TRAIL_PULLBACK_FREEZE    = True  # Freeze SL during healthy pullbacks
-QUANT_TRAIL_PB_VOL_RATIO       = 0.60  # Pullback vol < 60% of impulse → healthy
-QUANT_TRAIL_PB_DEPTH_ATR       = 0.80  # Pullback < 0.8×ATR → healthy
-QUANT_TRAIL_REV_MIN_SIGNALS    = 4     # v5.0: was 3 → need 4/9 signals (tighter classifier)
+QUANT_TRAIL_PB_VOL_RATIO       = 0.65  # v4.9: was 0.60 → pullback vol < 65% = healthy
+QUANT_TRAIL_PB_DEPTH_ATR       = 1.20  # v4.9: was 0.80 → pullback up to 1.2×ATR = healthy
+QUANT_TRAIL_REV_MIN_SIGNALS    = 4     # v4.9: was 3 → need 4/6 reversal signals to freeze
 
-# 10d-v5.0: ICT-aware trailing
-QUANT_TRAIL_ICT_PROTECTION     = True  # Check for virgin OB/FVG before moving SL
-QUANT_TRAIL_ICT_OB_MAX_VISITS  = 1     # Only protect OBs with ≤N visits (0=virgin only, 1=virgin+once-touched)
-QUANT_TRAIL_ICT_FVG_MAX_FILL   = 0.30  # Only protect FVGs with ≤30% fill
-
-# 10d-v5.0: Dynamic minimum distance (microstructure-adaptive)
-QUANT_TRAIL_DYNAMIC_MIN_DIST      = True   # Enable adaptive min_dist
-QUANT_TRAIL_LIQUIDITY_MULT_MAX    = 1.5    # Max multiplier from low liquidity (1.0-1.5×)
-QUANT_TRAIL_VOLATILITY_MULT_MAX   = 1.3    # Max multiplier from vol spike (1.0-1.3×)
-QUANT_TRAIL_SPREAD_PCTILE_THRESH  = 0.70   # Spread > 70th pctile → wider min_dist
-
-# 10d-v5.0: Time-aware pullback classifier (3 new signals)
-QUANT_TRAIL_PB_MIN_DURATION_SEC   = 120    # Pullback < 2min → likely noise
-QUANT_TRAIL_PB_CHOP_REVERSALS     = 3      # ≥3 reversals in last 5 candles → choppy
-QUANT_TRAIL_PB_CONSOL_RANGE_ATR   = 0.3    # Price range < 0.3×ATR → consolidation
-
-# 10d-v5.0: Multi-timeframe SL (15m structure priority)
-QUANT_TRAIL_USE_15M_STRUCTURE     = True   # Cross-reference 15m swings/FVGs
-QUANT_TRAIL_15M_PRIORITY          = True   # If 5m/15m conflict, use 15m (more significant)
-
-# 10d-v5.0: ICT confluence entry tiers
-QUANT_ICT_TIER_PREMIUM_SCORE      = 0.50   # ICT ≥ 0.50 → premium setup (lower composite needed)
-QUANT_ICT_TIER_PREMIUM_COMPOSITE  = 0.25   # Premium tier min composite (vs normal 0.30)
-QUANT_ICT_TIER_WEAK_SCORE         = 0.30   # ICT < 0.30 → weak setup (higher composite needed)
-QUANT_ICT_TIER_WEAK_COMPOSITE     = 0.40   # Weak tier min composite (vs normal 0.30)
-
+# v4.9: ICT Zone Freeze — trail is fully frozen when price tests institutional zones
+# These are the levels where smart money placed orders; a test is NOT a reversal.
+QUANT_ICT_ZONE_FREEZE_ENABLED  = True   # Freeze trail when price in/near OB or FVG
+QUANT_ICT_ZONE_FREEZE_ATR      = 0.40   # Freeze within 0.40×ATR of an active OB
+QUANT_ICT_OB_SL_ANCHOR         = True   # Use active OB as SL anchor candidate
+QUANT_ICT_OB_SL_BUFFER_ATR     = 0.35   # OB anchor SL = OB.low - 0.35×ATR (long)
+QUANT_ICT_LIQ_CEILING_ENABLED  = True   # Cap trail below/above unswept liquidity pools
+QUANT_ICT_LIQ_POOL_BUFFER_ATR  = 0.50   # Stay 0.5×ATR beyond any unswept pool
 
 # 10e. Indicator Windows
 QUANT_CVD_WINDOW            = 20
@@ -304,8 +275,8 @@ QUANT_TICK_AGG_WINDOW_SEC   = 30.0
 # 10k. Institutional SL/TP/Trail — v4.3
 QUANT_TP_MAX_RR                = 3.5
 QUANT_SL_SWING_DENSITY_WINDOW  = 0.30
-QUANT_TRAIL_CHANDELIER_N_START = 2.5   # v4.8: was 3.0 → tighter chandelier start
-QUANT_TRAIL_CHANDELIER_N_END   = 1.2   # v4.8: was 1.8 → tighter chandelier end
+QUANT_TRAIL_CHANDELIER_N_START = 3.00  # v4.9: was 2.5 → chandelier starts wider
+QUANT_TRAIL_CHANDELIER_N_END   = 1.50  # v4.9: was 1.2 → end slightly wider too
 QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55
 
 # 10l. Trend-following mode (v4.2)
@@ -404,11 +375,14 @@ FEE_CONF_NEUTRAL            = 0.5
 FEE_CONF_MAX_DISCOUNT       = 0.30
 
 # 11f. MakerTakerDecision
-FEE_MAKER_MIN_SAVING_BPS    = 0.8
-FEE_MAKER_URGENCY_CUTOFF    = 0.72
+# v4.9: urgency_cutoff raised 0.72→0.82 (was too conservative, fell back to taker too often)
+# v4.9: min_saving_bps lowered 0.8→0.5 (small saving still justifies limit post)
+# v4.9: depth_fill_floor raised 0.2→0.35 (thin books were killing fill probability)
+FEE_MAKER_MIN_SAVING_BPS    = 0.5
+FEE_MAKER_URGENCY_CUTOFF    = 0.82
 FEE_MAKER_DEPTH_LEVELS      = 5
 FEE_MAKER_DEPTH_MAX_FRAC    = 0.25
-FEE_MAKER_DEPTH_FILL_FLOOR  = 0.2
+FEE_MAKER_DEPTH_FILL_FLOOR  = 0.35
 FEE_MAKER_OPP_COST_WEIGHT   = 0.5
 
 # ═══════════════════════════════════════════════════════════════════

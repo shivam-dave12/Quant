@@ -748,7 +748,7 @@ class OrderManager:
         side: str,
         quantity: float,
         limit_price: float,
-        timeout_sec: float = 7.0,
+        timeout_sec: float = 25.0,
         fallback_to_market: bool = True,
     ) -> Optional[Dict]:
         """
@@ -757,10 +757,19 @@ class OrderManager:
         This is the ONLY method quant_strategy should call for position entry.
         It abstracts the entire maker/taker decision lifecycle:
           1. Post limit order at limit_price
-          2. Poll for fill every ~1.5s within timeout_sec
+          2. Poll for fill with adaptive interval within timeout_sec
           3. If filled → return with fill_type='maker'
           4. If not filled → cancel + place market → return with fill_type='taker'
           5. If market also fails → return None
+
+        TIMEOUT NOTE: Default raised from 7s → 25s.
+        With a 3.0s rate-limiter floor, 7s allowed only ~2 polls before
+        falling back to taker unconditionally. 25s allows 7-8 polls,
+        giving the limit order a real chance to fill on a mean-reversion
+        setup where price is moving toward the limit level.
+
+        Polling is adaptive: starts at 2s, widens to 4s after the first few
+        checks — faster early response without burning rate-limit budget.
 
         The fill_type field lets the caller (strategy / fee_engine) record
         the actual execution cost for slippage tracking.
@@ -799,12 +808,19 @@ class OrderManager:
             logger.error("Limit order returned no order_id")
             return None
 
-        # ── Step 2: polling loop ─────────────────────────────────────────────────
-        deadline      = time.time() + timeout_sec
-        poll_interval = 1.5   # seconds between status checks
+        # ── Step 2: adaptive polling loop ────────────────────────────────────────
+        # Adaptive intervals: fast early (2s), wider later (4s).
+        # Respects the 3s rate-limiter floor between API requests.
+        # With 25s timeout and ~3s floor: up to 7 polls possible.
+        deadline   = time.time() + timeout_sec
+        poll_count = 0
 
         while time.time() < deadline:
+            # Adaptive poll interval: first 2 polls at 2.5s, then 4s
+            poll_interval = 2.5 if poll_count < 2 else 4.0
             time.sleep(poll_interval)
+            poll_count += 1
+
             details = self.get_fill_details(order_id)
 
             if details is None:
@@ -819,7 +835,8 @@ class OrderManager:
                 fill_px = float(details.get("fill_price") or limit_price)
                 data["fill_type"]  = "maker"
                 data["fill_price"] = fill_px
-                logger.info(f"✅ Maker fill confirmed: {order_id[:8]}… @ ${fill_px:.2f}")
+                logger.info(f"✅ Maker fill confirmed: {order_id[:8]}… @ ${fill_px:.2f} "
+                            f"(poll #{poll_count}, {time.time()-deadline+timeout_sec:.1f}s elapsed)")
                 return data
 
             # ── Already cancelled / rejected by exchange ──────────────────────
@@ -841,12 +858,12 @@ class OrderManager:
                 return data
 
             # Still OPEN / UNTRIGGERED — keep polling
-            logger.debug(f"Limit order {order_id[:8]}… status={status} — waiting")
+            logger.debug(f"Limit order {order_id[:8]}… status={status} poll=#{poll_count} — waiting")
 
         # ── Step 3: timeout — cancel and fall back ────────────────────────────────
-        remaining = max(0, deadline - time.time())
-        logger.info(f"Limit entry timed out after {timeout_sec - remaining:.1f}s "
-                    f"— cancelling {order_id[:8]}…")
+        elapsed = timeout_sec - max(0, deadline - time.time())
+        logger.info(f"Limit entry timed out after {elapsed:.1f}s "
+                    f"({poll_count} polls) — cancelling {order_id[:8]}…")
         cancel_result = self.cancel_order(order_id)
 
         if cancel_result == CancelResult.ALREADY_FILLED:

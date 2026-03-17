@@ -1,22 +1,41 @@
 """
-QUANT STRATEGY v4.5 — MEAN-REVERSION + ORDER FLOW CONFLUENCE
+QUANT STRATEGY v4.9 — ICT-ANCHORED TRAILING SL + STRUCTURAL TP
 ==============================================================================
 Entry: Wait for overextension from VWAP + order flow divergence, then fade.
-SL: Behind swing structure. TP: mode-aware R:R. Trail: noise-adaptive.
+SL: Behind swing structure + ICT OB anchor. TP: ICT structural targets + VWAP.
+Trail: ICT zone-aware — frozen at OBs/FVGs. OB-anchored. Liq-ceiling capped.
 
-v4.4 FIXES:
-  - Mode-aware R:R: reversion uses 1.5-3.0 (was global 3.0 → unreachable TP)
-  - Noise-adaptive trailing SL: median 1m candle range × 2.0 = noise floor
-  - TRAIL REWRITE: structure-only trailing with pullback detection
-  - No trailing until 1.0R (trade must prove itself)
-  - 6-factor pullback-vs-reversal classifier
-  - Min SL distance: 1.5/1.0/0.7 × ATR per phase
-  - Smart max-hold: tighten SL when profitable instead of market-dumping
+v4.9 TRAIL REWRITE — solves "stopped during pullback, TP fires without us":
 
-PnL TRACKING FIX (v3 bug):
-  When exchange SL/TP fires, unrealized_pnl from API is 0 (position already
-  closed). v4 computes PnL from entry_price vs last known SL/TP price.
-  Trailed SL hit at profit correctly counts as WIN.
+  ROOT CAUSE: Trail started at 0.3R with 1.0×ATR min-distance. A healthy BTC
+  pullback of 1.2-1.8×ATR from the swing high hit the trailed SL. Price then
+  continued to TP. Classic retail stop-hunt pattern we were self-inflicting.
+
+  FIX 1 — ICT ZONE FREEZE:
+    If price tests an active Order Block or sits inside an FVG, trail is FROZEN.
+    These are institutional zones. A pullback INTO an OB is the trade working —
+    smart money is defending exactly there. Tightening SL during an OB test is
+    the primary source of the reported problem. Now completely prevented.
+
+  FIX 2 — LATER TRAIL START + WIDER DISTANCES:
+    TRAIL_BE_R: 0.3R → 0.50R. Trade must earn half the SL distance before trail.
+    Phase 1 min-dist: 1.0→1.5×ATR. Phase 2: 0.7→1.1×ATR. Phase 3: 0.5→0.7×ATR.
+    A healthy BTC pullback of 1.2×ATR no longer hits the trailed SL.
+
+  FIX 3 — ICT OB ANCHOR (additional SL candidate):
+    Trailing SL gets a candidate: OB.low - 0.35×ATR (for longs). This is WHERE
+    institutional orders sit. The SL is structurally valid here — price bounces
+    off OBs by design. Stronger signal than chandelier or arbitrary ATR levels.
+
+  FIX 4 — LIQUIDITY POOL CEILING:
+    Trail cannot advance past an unswept EQL/EQH pool. Smart money sweeps those
+    stops first. Staying 0.5×ATR beyond the pool keeps us in the trade.
+
+  FIX 5 — ICT STRUCTURAL TP TARGETS:
+    compute_tp now accepts ict_engine and queries get_structural_tp_targets().
+    Swept liquidity origins (score 6+), unfilled FVGs (score 5+), and virgin OBs
+    (score 4+) beat all quant-only candidates in the scored pool. TP is placed
+    at WHERE smart money is delivering price, not just VWAP fractions.
 """
 
 from __future__ import annotations
@@ -230,44 +249,8 @@ class QCfg:
     def TRAIL_PB_VOL_RATIO() -> float: return float(_cfg("QUANT_TRAIL_PB_VOL_RATIO", 0.60))
     @staticmethod
     def TRAIL_PB_DEPTH_ATR() -> float: return float(_cfg("QUANT_TRAIL_PB_DEPTH_ATR", 0.80))
+    @staticmethod
     def TRAIL_REV_MIN_SIGNALS() -> int: return int(_cfg("QUANT_TRAIL_REV_MIN_SIGNALS", 3))
-    # ── v5.0: ICT-aware trailing ────────────────────────────────
-    @staticmethod
-    def TRAIL_ICT_PROTECTION() -> bool: return bool(_cfg("QUANT_TRAIL_ICT_PROTECTION", True))
-    @staticmethod
-    def TRAIL_ICT_OB_MAX_VISITS() -> int: return int(_cfg("QUANT_TRAIL_ICT_OB_MAX_VISITS", 1))
-    @staticmethod
-    def TRAIL_ICT_FVG_MAX_FILL() -> float: return float(_cfg("QUANT_TRAIL_ICT_FVG_MAX_FILL", 0.30))
-    # ── v5.0: Dynamic min distance ──────────────────────────────
-    @staticmethod
-    def TRAIL_DYNAMIC_MIN_DIST() -> bool: return bool(_cfg("QUANT_TRAIL_DYNAMIC_MIN_DIST", True))
-    @staticmethod
-    def TRAIL_LIQUIDITY_MULT_MAX() -> float: return float(_cfg("QUANT_TRAIL_LIQUIDITY_MULT_MAX", 1.5))
-    @staticmethod
-    def TRAIL_VOLATILITY_MULT_MAX() -> float: return float(_cfg("QUANT_TRAIL_VOLATILITY_MULT_MAX", 1.3))
-    @staticmethod
-    def TRAIL_SPREAD_PCTILE_THRESH() -> float: return float(_cfg("QUANT_TRAIL_SPREAD_PCTILE_THRESH", 0.70))
-    # ── v5.0: Time-aware pullback classifier ────────────────────
-    @staticmethod
-    def TRAIL_PB_MIN_DURATION_SEC() -> float: return float(_cfg("QUANT_TRAIL_PB_MIN_DURATION_SEC", 120))
-    @staticmethod
-    def TRAIL_PB_CHOP_REVERSALS() -> int: return int(_cfg("QUANT_TRAIL_PB_CHOP_REVERSALS", 3))
-    @staticmethod
-    def TRAIL_PB_CONSOL_RANGE_ATR() -> float: return float(_cfg("QUANT_TRAIL_PB_CONSOL_RANGE_ATR", 0.3))
-    # ── v5.0: Multi-TF SL ───────────────────────────────────────
-    @staticmethod
-    def TRAIL_USE_15M_STRUCTURE() -> bool: return bool(_cfg("QUANT_TRAIL_USE_15M_STRUCTURE", True))
-    @staticmethod
-    def TRAIL_15M_PRIORITY() -> bool: return bool(_cfg("QUANT_TRAIL_15M_PRIORITY", True))
-    # ── v5.0: ICT confluence entry tiers ────────────────────────
-    @staticmethod
-    def ICT_TIER_PREMIUM_SCORE() -> float: return float(_cfg("QUANT_ICT_TIER_PREMIUM_SCORE", 0.50))
-    @staticmethod
-    def ICT_TIER_PREMIUM_COMPOSITE() -> float: return float(_cfg("QUANT_ICT_TIER_PREMIUM_COMPOSITE", 0.25))
-    @staticmethod
-    def ICT_TIER_WEAK_SCORE() -> float: return float(_cfg("QUANT_ICT_TIER_WEAK_SCORE", 0.30))
-    @staticmethod
-    def ICT_TIER_WEAK_COMPOSITE() -> float: return float(_cfg("QUANT_ICT_TIER_WEAK_COMPOSITE", 0.40))
     # ── v4.4: Smart max-hold exit ───────────────────────────────
     @staticmethod
     def SMART_MAX_HOLD() -> bool: return bool(_cfg("QUANT_SMART_MAX_HOLD", True))
@@ -289,6 +272,19 @@ class QCfg:
     def REVERSION_REJECT_RR() -> float: return float(_cfg("QUANT_REVERSION_REJECT_RR", 0.20))
     @staticmethod
     def SL_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_SL_MAX_ATR_MULT", 4.0))
+    # ── v4.9: ICT-anchored trailing SL ─────────────────────────────
+    @staticmethod
+    def ICT_ZONE_FREEZE_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_ZONE_FREEZE_ENABLED", True))
+    @staticmethod
+    def ICT_ZONE_FREEZE_ATR() -> float: return float(_cfg("QUANT_ICT_ZONE_FREEZE_ATR", 0.40))
+    @staticmethod
+    def ICT_OB_SL_ANCHOR() -> bool: return bool(_cfg("QUANT_ICT_OB_SL_ANCHOR", True))
+    @staticmethod
+    def ICT_OB_SL_BUFFER_ATR() -> float: return float(_cfg("QUANT_ICT_OB_SL_BUFFER_ATR", 0.35))
+    @staticmethod
+    def ICT_LIQ_CEILING_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_LIQ_CEILING_ENABLED", True))
+    @staticmethod
+    def ICT_LIQ_POOL_BUFFER_ATR() -> float: return float(_cfg("QUANT_ICT_LIQ_POOL_BUFFER_ATR", 0.50))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -1431,12 +1427,20 @@ class InstitutionalLevels:
     def compute_tp(price: float, side: str, atr: float, sl_price: float,
                    candles_1m: List[Dict], orderbook: Dict,
                    vwap: float, vwap_std: float,
-                   candles_5m: Optional[List[Dict]] = None) -> float:
+                   candles_5m: Optional[List[Dict]] = None,
+                   ict_engine=None,
+                   now_ms: int = 0) -> float:
         """
-        Institutional TP placement — v4.6.
+        Institutional TP placement — v4.9 (ICT structural targets added).
 
-        Scored candidate selection across five target classes:
-          5.0  OB liquidity wall directly in path
+        v4.9 ADDITION: ICT structural targets integrated as highest-conviction
+        candidates. In priority order:
+          6.0+ Swept liquidity origin — after sweep-and-reverse, price strongly
+               targets the sweep level. This is the primary ICT delivery target.
+          5.0+ Unfilled FVG in trade direction — imbalances attract price.
+               Near edge = conservative partial fill. Far edge = full fill.
+          4.0+ Virgin OB in trade direction — institutional order magnet.
+          5.0  OB liquidity wall (orderbook) directly in path
           4.0  VP High-Volume Node between entry and VWAP
           3.5  VWAP itself (full mean-reversion target)
           3.0  VWAP ± σ bands
@@ -1547,6 +1551,22 @@ class InstitutionalLevels:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
                 add_tp(partial, 2.0)
 
+        # ── v4.9: ICT Structural TP targets ──────────────────────────────────
+        # Swept liquidity origins, unfilled FVGs, and virgin OBs in trade direction.
+        # These carry the highest institutional conviction — they are WHERE smart
+        # money is delivering price to. Add them to the scored pool with priority
+        # scores that beat every quant-only candidate.
+        if ict_engine is not None:
+            try:
+                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+                _ict_targets = ict_engine.get_structural_tp_targets(
+                    side, price, atr, _ict_now_ms, min_tp_dist, max_tp_dist)
+                for _lvl, _sc, _lbl in _ict_targets:
+                    add_tp(_lvl, _sc)
+                    logger.debug(f"ICT TP candidate: ${_lvl:,.1f} score={_sc:.1f} [{_lbl}]")
+            except Exception as _ict_e:
+                logger.debug(f"ICT TP targets error (non-fatal): {_ict_e}")
+
         # ── Tiered selection ──────────────────────────────────────────────────
         if scored:
             # Tier-A: score ≥ 3.5 → nearest (maximises win-rate)
@@ -1655,15 +1675,15 @@ class InstitutionalLevels:
             orderbook: Dict, entry_vol: float,
             peak_price_abs: float) -> Tuple[bool, int, str]:
         """
-        Institutional pullback-vs-reversal classifier — v5.0 (time-aware upgrade).
+        Institutional pullback-vs-reversal classifier — v4.5.
 
-        Evaluates 9 independent signals (was 6). Returns:
+        Evaluates 6 independent signals. Returns:
           (is_pullback: bool, reversal_count: int, detail: str)
 
         A pullback is a healthy retracement within the trend/reversion move.
         A reversal is a structural shift where the trade thesis is invalidated.
 
-        The 9 signals (each scores 0 or 1 toward reversal):
+        The 6 signals (each scores 0 or 1 toward reversal):
 
         1. VOLUME PROFILE: Is pullback volume expanding relative to impulse?
            Healthy pullback = declining volume. Reversal = expanding.
@@ -1682,17 +1702,6 @@ class InstitutionalLevels:
 
         6. MOMENTUM STALLING: Is price making lower highs (long) or higher lows (short)
            over the last 5+ candles? Momentum continuation = pullback. Stalling = reversal.
-        
-        ── v5.0: TIME-AWARE SIGNALS ───────────────────────────────────────
-        
-        7. PULLBACK DURATION: Has pullback lasted < 2 minutes?
-           Fast whipsaw (< 2min) = noise, freeze SL. Slow pullback = structural.
-        
-        8. CHOP DETECTION: Are there ≥3 direction changes in last 5 candles?
-           Choppy = consolidation, freeze SL. Clean pullback = allow trailing.
-        
-        9. CONSOLIDATION RANGE: Is price oscillating within < 0.3×ATR?
-           Tight range = noise/consolidation. Wide move = directional.
         """
         reversal_signals = 0
         details = []
@@ -1785,58 +1794,6 @@ class InstitutionalLevels:
                 if rising:
                     reversal_signals += 1
                     details.append("momentum_stalling")
-        
-        # ════════════════════════════════════════════════════════════
-        # v5.0: NEW TIME-AWARE SIGNALS
-        # ════════════════════════════════════════════════════════════
-        
-        # ── Signal 7: Pullback duration < 2 minutes → noise ──────────
-        # If price went from peak to current retracement in < 2min, it's a whipsaw
-        if len(candles_1m) >= 3:
-            # Find when price was last at peak (or close to it)
-            peak_threshold = peak_price_abs * 0.995 if pos_side == "long" else peak_price_abs * 1.005
-            candles_since_peak = 0
-            for c in reversed(candles_1m[-10:]):
-                h, l = float(c['h']), float(c['l'])
-                was_at_peak = (h >= peak_threshold) if pos_side == "long" else (l <= peak_threshold)
-                if was_at_peak:
-                    break
-                candles_since_peak += 1
-            
-            # 1m candles → duration in seconds ≈ candles × 60
-            pullback_duration_sec = candles_since_peak * 60
-            if pullback_duration_sec < QCfg.TRAIL_PB_MIN_DURATION_SEC():
-                reversal_signals += 1
-                details.append(f"fast_whipsaw({pullback_duration_sec}s)")
-        
-        # ── Signal 8: Chop detection (multiple reversals) ────────────
-        # Count direction changes in last 5 candles
-        if len(candles_1m) >= 6:
-            last5 = candles_1m[-5:]
-            directions = []
-            for c in last5:
-                cl, op = float(c['c']), float(c['o'])
-                directions.append(1 if cl > op else -1)
-            
-            # Count reversals (direction changes)
-            reversals_count = sum(1 for i in range(1, len(directions)) 
-                                 if directions[i] != directions[i-1])
-            
-            if reversals_count >= QCfg.TRAIL_PB_CHOP_REVERSALS():
-                reversal_signals += 1
-                details.append(f"choppy({reversals_count}_reversals)")
-        
-        # ── Signal 9: Consolidation range < 0.3×ATR ─────────────────
-        # If last 5 candles are all within tight range → consolidation, not pullback
-        if len(candles_1m) >= 5:
-            last5 = candles_1m[-5:]
-            highs = [float(c['h']) for c in last5]
-            lows = [float(c['l']) for c in last5]
-            range_5c = max(highs) - min(lows)
-            
-            if range_5c < QCfg.TRAIL_PB_CONSOL_RANGE_ATR() * atr:
-                reversal_signals += 1
-                details.append(f"consolidation({range_5c/atr:.2f}ATR_range)")
 
         is_pullback = reversal_signals < QCfg.TRAIL_REV_MIN_SIGNALS()
         return is_pullback, reversal_signals, "|".join(details)
@@ -1850,42 +1807,39 @@ class InstitutionalLevels:
                          peak_price_abs: float = 0.0,
                          trade_mode: str = "reversion",
                          candles_5m: Optional[List[Dict]] = None,
-                         candles_15m: Optional[List[Dict]] = None,
                          initial_sl_dist: float = 0.0,
-                         spread_pctile: float = 0.5,
-                         atr_pctile: float = 0.5,
-                         ict_engine = None,
+                         ict_engine=None,
                          now_ms: int = 0) -> Optional[float]:
         """
-        Institutional trailing SL — v5.0 HYBRID (ICT + Quant + Microstructure).
+        Institutional trailing SL — v4.9 (ICT-anchored, zone-aware).
 
-        v5.0 UPGRADES (user: "small pullback → SL hit → TP achieved"):
-          1. ICT-AWARE TRAILING: Never trail through virgin OB/FVG supporting trade
-          2. DYNAMIC MIN DISTANCE: Adapts to spread/liquidity/volatility (not fixed ATR)
-          3. TIME-AWARE PULLBACK: 9 signals (was 6) with duration/chop/consolidation
-          4. MULTI-TF SL: Cross-reference 15m structure, prioritize higher-TF swings
-          
-        v4.8 FIXES:
-          BUG 1: init_dist used current_sl (shrinks after trail moves)
-                 → tier inflated artificially. FIX: use initial_sl_dist param.
-          BUG 2: tier used current profit (drops during pullback)
-                 → phase demoted when you need protection most. FIX: use peak_profit.
-          BUG 3: TRAIL_BE_R=1.0 unreachable with ATR-capped SL (needs +$470 profit).
-                 FIX: config lowered to 0.3R.
-          BUG 4: 5m swing filter used entry_price range → missed swings above current_sl.
-                 FIX: filter between current_sl and price.
-          BUG 5: 1m micro-swing same entry_price bug. FIX: use current_sl.
-          BUG 6: Chandelier checked vs entry_price not current_sl → downgrades possible.
-                 FIX: check vs current_sl.
-          BUG 7: Pullback classifier referenced entry_price for swing break detection
-                 → irrelevant after significant price movement. FIX: use peak context.
+        v4.9 ADDITIONS on top of v4.8's 7-bug rewrite:
 
-        Returns None if no improvement qualifies or if pullback freeze is active.
+        NEW 1: ICT ZONE FREEZE
+               If price is testing an active Order Block or sitting inside an FVG,
+               the trail is COMPLETELY FROZEN. These are institutional zones where
+               smart money placed orders. A test of an OB is not a reversal —
+               it is the setup completing. Freezing the trail here eliminates the
+               "SL hit during pullback, then TP fires without us" pattern.
+
+        NEW 2: ICT OB ANCHOR (additional SL candidate)
+               If an active OB exists between current_sl and price, compute SL =
+               OB.low - ICT_OB_SL_BUFFER_ATR × ATR (for long). This is the most
+               institutionally valid SL level — that is literally WHERE the orders
+               are sitting. The structure holds or it doesn't. OB anchor > chandelier.
+
+        NEW 3: LIQUIDITY POOL CEILING
+               After all candidates are built, cap the trail SL so it cannot advance
+               PAST an unswept liquidity pool (EQL for long, EQH for short) in the
+               direction of price. Smart money sweeps those pools — trailing SL right
+               at the pool means the sweep takes us out before the reversal.
+               Keep SL safely BEYOND the pool level by ICT_LIQ_POOL_BUFFER_ATR × ATR.
+
+        Returns None if no improvement qualifies, if in ICT zone freeze, or if
+        the pullback classifier says to hold.
         """
         if candles_5m is None:
             candles_5m = []
-        if candles_15m is None:
-            candles_15m = []
 
         # v4.8 BUG 1 FIX: Use ORIGINAL SL distance, not current
         # After trail moves SL from $73,320 to $73,600, using current SL
@@ -1909,59 +1863,61 @@ class InstitutionalLevels:
         if tier < QCfg.TRAIL_BE_R():
             return None
 
-        # ═══ DETERMINE PHASE AND BASE MIN DISTANCE ════════════════════════
+        # ═══ DETERMINE PHASE AND MIN DISTANCE ═════════════════════════════
         if tier >= QCfg.TRAIL_AGGRESSIVE_R():
             phase = 3
-            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P3()
+            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P3() * atr
         elif tier >= QCfg.TRAIL_LOCK_R():
             phase = 2
-            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P2()
+            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P2() * atr
         else:
             phase = 1
-            base_min_dist_mult = QCfg.TRAIL_MIN_DIST_ATR_P1()
-        
-        # ═══ v5.0: DYNAMIC MIN DISTANCE (microstructure-adaptive) ═════════
-        if QCfg.TRAIL_DYNAMIC_MIN_DIST():
-            liquidity_mult = 1.0
-            volatility_mult = 1.0
-            
-            # ── Spread penalty: wide spread → wider min_dist ─────────────
-            # High spread percentile = illiquid market = need more breathing room
-            if spread_pctile > QCfg.TRAIL_SPREAD_PCTILE_THRESH():
-                # Linear scale from 1.0 at threshold to max at 1.0
-                spread_factor = (spread_pctile - QCfg.TRAIL_SPREAD_PCTILE_THRESH()) / (1.0 - QCfg.TRAIL_SPREAD_PCTILE_THRESH())
-                liquidity_mult = 1.0 + spread_factor * (QCfg.TRAIL_LIQUIDITY_MULT_MAX() - 1.0)
-            
-            # ── Orderbook depth penalty: thin book → wider min_dist ──────
-            bids = orderbook.get("bids", [])
-            asks = orderbook.get("asks", [])
-            if bids and asks:
-                # Measure top-5 depth vs typical depth (proxy: check if severely imbalanced)
-                bid_depth = sum(float(b[1]) for b in bids[:5]) if len(bids) >= 5 else 0
-                ask_depth = sum(float(a[1]) for a in asks[:5]) if len(asks) >= 5 else 0
-                total_depth = bid_depth + ask_depth
-                # Thin book = low total depth relative to typical levels
-                # Use simple threshold: if total < some level, increase mult
-                # (This is simplified; could use rolling average of depth history)
-                if total_depth < 50.0:  # BTC: 50 contracts is quite thin
-                    depth_factor = 1.0 - min(total_depth / 50.0, 1.0)
-                    liquidity_mult = max(liquidity_mult, 1.0 + depth_factor * 0.3)
-            
-            # ── Volatility spike penalty: expanding ATR → wider min_dist ─
-            # High ATR percentile = recent vol expansion = price swings wider
-            if atr_pctile > 0.70:
-                vol_factor = (atr_pctile - 0.70) / 0.30
-                volatility_mult = 1.0 + vol_factor * (QCfg.TRAIL_VOLATILITY_MULT_MAX() - 1.0)
-            
-            # Apply multipliers
-            min_dist = base_min_dist_mult * liquidity_mult * volatility_mult * atr
-            logger.debug(
-                f"Trail v5.0: base={base_min_dist_mult:.2f} "
-                f"liq_mult={liquidity_mult:.2f} vol_mult={volatility_mult:.2f} "
-                f"→ min_dist={min_dist:.2f} (spread_pct={spread_pctile:.0%} atr_pct={atr_pctile:.0%})")
-        else:
-            # Fallback: static min_dist (old behavior)
-            min_dist = base_min_dist_mult * atr
+            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
+
+        # ═══ v4.9: ICT ZONE FREEZE ════════════════════════════════════════
+        # If price is testing an active OB or sitting inside an FVG, FREEZE.
+        # These are institutional accumulation/distribution zones. A pullback
+        # into an OB is the setup working as intended — not a reversal signal.
+        # Tightening the SL during an OB test causes the "stopped out, then TP
+        # fires without us" pattern that was the primary reported problem.
+        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None:
+            try:
+                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+                _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
+
+                # Check active Order Blocks in trade direction
+                _obs = (ict_engine.order_blocks_bull if pos_side == "long"
+                        else ict_engine.order_blocks_bear)
+                for _ob in _obs:
+                    if not _ob.is_active(_ict_now_ms):
+                        continue
+                    # Freeze zone: OB.low - freeze_atr to OB.high + freeze_atr
+                    _zone_lo = _ob.low  - _freeze_atr
+                    _zone_hi = _ob.high + _freeze_atr
+                    if _zone_lo <= price <= _zone_hi:
+                        logger.debug(
+                            f"Trail: ICT OB ZONE FREEZE — price ${price:,.1f} "
+                            f"in OB ${_ob.low:,.1f}–${_ob.high:,.1f} "
+                            f"(±{_freeze_atr:.0f} buffer). Trade thesis intact.")
+                        return None
+
+                # Check active FVGs in trade direction (price inside gap = fill in progress)
+                _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
+                         else ict_engine.fvgs_bear)
+                for _fvg in _fvgs:
+                    if not _fvg.is_active(_ict_now_ms):
+                        continue
+                    # FVG fill: price returned into the imbalance zone
+                    _fvg_lo = _fvg.bottom - _freeze_atr * 0.5
+                    _fvg_hi = _fvg.top    + _freeze_atr * 0.5
+                    if _fvg_lo <= price <= _fvg_hi:
+                        logger.debug(
+                            f"Trail: ICT FVG ZONE FREEZE — price ${price:,.1f} "
+                            f"in FVG ${_fvg.bottom:,.1f}–${_fvg.top:,.1f}. "
+                            f"FVG fill in progress — holding SL.")
+                        return None
+            except Exception as _ict_e:
+                logger.debug(f"Trail ICT zone check error (non-fatal): {_ict_e}")
 
         # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
         if QCfg.TRAIL_PULLBACK_FREEZE():
@@ -1975,135 +1931,151 @@ class InstitutionalLevels:
                 return None
 
         # ═══ BUILD CANDIDATE SL LEVELS ════════════════════════════════════
+        # v4.9 INSTITUTIONAL PRIORITY — structure first, chandelier last resort:
+        #   1. Profit floor      — fee-adjusted breakeven (all phases)
+        #   2. ICT OB anchor     — WHERE institutional orders are (all phases)
+        #   3. 5m swing low/high — market's confirmed structure (all phases)
+        #   4. 1m micro-swing    — tighter confirmed structure (Phase 2+)
+        #   5. Chandelier        — Phase 3 ONLY when no structure found
+        #   6. HVN               — volume-based support (Phase 3 only)
+        #   7. OB wall           — orderbook depth support (Phase 3 only)
+        #
+        # Chandelier was previously Phase 2+, causing stops on normal OB pullbacks.
+        # Structure must lead. Chandelier is the fallback for featureless markets.
         candidates: List[float] = []
 
-        # ── Guaranteed profit floor (all phases) ──────────────────────
-        rt_fee_per_btc = entry_price * QCfg.COMMISSION_RATE() * 2.0
+        # ── 1. Profit floor (all phases) ─────────────────────────────────
+        rt_fee_per_btc   = entry_price * QCfg.COMMISSION_RATE() * 2.0
         profit_floor_buf = rt_fee_per_btc + 0.3 * atr
-        if pos_side == "long":
-            profit_floor = entry_price + profit_floor_buf
-        else:
-            profit_floor = entry_price - profit_floor_buf
+        profit_floor = (entry_price + profit_floor_buf if pos_side == "long"
+                        else entry_price - profit_floor_buf)
         candidates.append(profit_floor)
 
-        # ── 5m swing structure (Phase 1+) ─────────────────────────────
-        # v4.8 BUG 4 FIX: Find swings between current_sl and price, not entry and price.
-        # After SL has trailed from $73,320 to $73,550, swings below $73,550
-        # are irrelevant — we only want swings ABOVE current SL as upgrade candidates.
+        # ── 2. ICT OB anchor (all phases) ────────────────────────────────
+        # Highest-conviction structural level: SL just below an active bullish OB
+        # (for long). That is literally WHERE smart money placed its buy orders.
+        # The market bounces off OBs by design; SL below it survives OB tests.
+        if QCfg.ICT_OB_SL_ANCHOR() and ict_engine is not None:
+            try:
+                _now_ms_ob = now_ms if now_ms > 0 else int(time.time() * 1000)
+                _ob_buf    = QCfg.ICT_OB_SL_BUFFER_ATR() * atr
+                _obs = (ict_engine.order_blocks_bull if pos_side == "long"
+                        else ict_engine.order_blocks_bear)
+                for _ob in sorted([o for o in _obs if o.is_active(_now_ms_ob)],
+                                   key=lambda x: abs(x.midpoint - price)):
+                    if pos_side == "long":
+                        if current_sl < _ob.low - _ob_buf < price - min_dist:
+                            candidates.append(_ob.low - _ob_buf)
+                            logger.debug(
+                                f"Trail: OB anchor ${_ob.low - _ob_buf:,.1f} "
+                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
+                            break
+                    else:
+                        if price + min_dist < _ob.high + _ob_buf < current_sl:
+                            candidates.append(_ob.high + _ob_buf)
+                            logger.debug(
+                                f"Trail: OB anchor ${_ob.high + _ob_buf:,.1f} "
+                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
+                            break
+            except Exception as _e:
+                logger.debug(f"Trail OB anchor error: {_e}")
+
+        # ── 3. 5m confirmed swing structure (all phases) ─────────────────
+        # PRIMARY structural trail. Only CLOSED candles (confirmed, not forming).
+        # A higher 5m swing low (long) = market proved a higher low → trail up.
         if candles_5m and len(candles_5m) >= 4:
-            closed_5m = candles_5m[:-1]
+            closed_5m    = candles_5m[:-1]
             sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
                 closed_5m, min(QCfg.SL_SWING_LOOKBACK(), len(closed_5m) - 2))
-            swing_buf = max(0.3 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr)
+            swing_buf = max(0.25 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr)
 
             if pos_side == "long" and sl_5m:
-                valid = [l for l in sl_5m if current_sl + 0.1 * atr < l < price - min_dist]
+                valid = [l for l in sl_5m
+                         if current_sl + 0.05 * atr < l < price - min_dist]
                 if valid:
-                    candidates.append(max(valid) - swing_buf)
+                    best_sw = max(valid)
+                    candidates.append(best_sw - swing_buf)
+                    logger.debug(
+                        f"Trail: 5m swing low ${best_sw:,.1f} → SL ${best_sw - swing_buf:,.1f}")
             elif pos_side == "short" and sh_5m:
-                valid = [h for h in sh_5m if price + min_dist < h < current_sl - 0.1 * atr]
+                valid = [h for h in sh_5m
+                         if price + min_dist < h < current_sl - 0.05 * atr]
                 if valid:
-                    candidates.append(min(valid) + swing_buf)
-        
-        # ── v5.0: 15m swing structure (Phase 1+ if enabled) ───────────────
-        # Higher timeframe = more significant structure
-        # If 5m and 15m conflict, 15m takes priority (more institutional)
-        if QCfg.TRAIL_USE_15M_STRUCTURE() and candles_15m and len(candles_15m) >= 4:
-            closed_15m = candles_15m[:-1]
-            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
-                closed_15m, min(QCfg.SL_SWING_LOOKBACK(), len(closed_15m) - 2))
-            swing_buf_15m = max(0.4 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 1.2)  # Wider buffer for 15m
-            
-            if pos_side == "long" and sl_15m:
-                valid_15m = [l for l in sl_15m if current_sl + 0.15 * atr < l < price - min_dist]
-                if valid_15m:
-                    sl_15m_candidate = max(valid_15m) - swing_buf_15m
-                    # v5.0: If 15m priority enabled and 15m swing found, replace 5m candidates
-                    if QCfg.TRAIL_15M_PRIORITY():
-                        # Remove 5m swing candidates, keep 15m only (more significant)
-                        candidates = [c for c in candidates if c < current_sl + 0.05 * atr or c > price]
-                    candidates.append(sl_15m_candidate)
-                    logger.debug(f"Trail v5.0: 15m swing SL candidate @ ${sl_15m_candidate:.2f}")
-            elif pos_side == "short" and sh_15m:
-                valid_15m = [h for h in sh_15m if price + min_dist < h < current_sl - 0.15 * atr]
-                if valid_15m:
-                    sl_15m_candidate = min(valid_15m) + swing_buf_15m
-                    if QCfg.TRAIL_15M_PRIORITY():
-                        candidates = [c for c in candidates if c > current_sl - 0.05 * atr or c < price]
-                    candidates.append(sl_15m_candidate)
-                    logger.debug(f"Trail v5.0: 15m swing SL candidate @ ${sl_15m_candidate:.2f}")
+                    best_sw = min(valid)
+                    candidates.append(best_sw + swing_buf)
+                    logger.debug(
+                        f"Trail: 5m swing high ${best_sw:,.1f} → SL ${best_sw + swing_buf:,.1f}")
 
-        # ── Chandelier exit (Phase 2+) ────────────────────────────────
-        # v4.8 BUG 6 FIX: Check vs current_sl not entry_price.
-        # Chandelier must IMPROVE on current SL, not just beat entry.
-        if phase >= 2 and peak_price_abs > 1e-10:
-            if trade_mode in ("trend", "momentum"):
-                n_chandelier = QCfg.TREND_CHANDELIER_N()
-            else:
-                n_start   = QCfg.TRAIL_CHANDELIER_N_START()
-                n_end     = QCfg.TRAIL_CHANDELIER_N_END()
-                max_hold  = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
-                time_frac = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
-                n_chandelier = n_start + (n_end - n_start) * time_frac
-
-            if pos_side == "long":
-                chandelier = peak_price_abs - n_chandelier * atr
-                if chandelier > current_sl:
-                    candidates.append(chandelier)
-            else:
-                chandelier = peak_price_abs + n_chandelier * atr
-                if chandelier < current_sl:
-                    candidates.append(chandelier)
-
-        # ── 1m micro-swing (Phase 2+) ────────────────────────────────
-        # v4.8 BUG 5 FIX: Filter between current_sl and price, not entry and price.
+        # ── 4. 1m micro-swing (Phase 2+) — tighter structural trail ─────
+        # After sufficient profit, also trail to confirmed 1m structure.
+        # Tighter buffer because 1m swings are smaller.
         if phase >= 2 and len(candles_1m) >= 8:
-            closed_1m = candles_1m[:-1]
+            closed_1m    = candles_1m[:-1]
             sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
                 closed_1m, min(QCfg.TRAIL_SWING_BARS() + 4, len(closed_1m) - 2))
-            micro_buf = max(0.20 * atr, min_dist * 0.3)
+            micro_buf = max(0.15 * atr, min_dist * 0.25)
 
             if pos_side == "long" and sl_1m:
                 valid = [l for l in sl_1m if current_sl < l < price - min_dist]
                 if valid:
-                    candidates.append(max(valid) - micro_buf)
+                    best_m = max(valid)
+                    candidates.append(best_m - micro_buf)
+                    logger.debug(
+                        f"Trail: 1m micro ${best_m:,.1f} → SL ${best_m - micro_buf:,.1f}")
             elif pos_side == "short" and sh_1m:
                 valid = [h for h in sh_1m if price + min_dist < h < current_sl]
                 if valid:
-                    candidates.append(min(valid) + micro_buf)
+                    best_m = min(valid)
+                    candidates.append(best_m + micro_buf)
 
-        # ── HVN snap (Phase 3 only) ──────────────────────────────────
+        # ── 5. Chandelier exit (Phase 3 ONLY — last resort) ──────────────
+        # Used ONLY when no structural candidate exists (featureless market, tight
+        # consolidation with no confirmed swings). NOT the primary driver.
+        # Previously was Phase 2+, which caused the main reported problem.
+        if phase >= 3 and peak_price_abs > 1e-10:
+            if trade_mode in ("trend", "momentum"):
+                n_chandelier = QCfg.TREND_CHANDELIER_N()
+            else:
+                n_start  = QCfg.TRAIL_CHANDELIER_N_START()
+                n_end    = QCfg.TRAIL_CHANDELIER_N_END()
+                max_hold = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
+                t_frac   = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
+                n_chandelier = n_start + (n_end - n_start) * t_frac
+
+            if pos_side == "long":
+                chand = peak_price_abs - n_chandelier * atr
+                if current_sl < chand < price - min_dist:
+                    candidates.append(chand)
+            else:
+                chand = peak_price_abs + n_chandelier * atr
+                if price + min_dist < chand < current_sl:
+                    candidates.append(chand)
+
+        # ── 6. HVN snap (Phase 3 only) ──────────────────────────────────
         if phase >= 3 and len(candles_1m) >= 30:
             profile = InstitutionalLevels.build_volume_profile(
                 candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
-            hvns = InstitutionalLevels.find_hvn_levels(
-                profile, QCfg.TRAIL_HVN_SNAP_THRESH())
-            for hvn in hvns:
-                if pos_side == "long":
-                    if current_sl < hvn < price - min_dist:
-                        candidates.append(hvn - 0.15 * atr)
-                else:
-                    if price + min_dist < hvn < current_sl:
-                        candidates.append(hvn + 0.15 * atr)
+            for hvn in InstitutionalLevels.find_hvn_levels(
+                    profile, QCfg.TRAIL_HVN_SNAP_THRESH()):
+                if pos_side == "long" and current_sl < hvn < price - min_dist:
+                    candidates.append(hvn - 0.15 * atr)
+                elif pos_side == "short" and price + min_dist < hvn < current_sl:
+                    candidates.append(hvn + 0.15 * atr)
 
-        # ── OB wall snap (Phase 3 only) ──────────────────────────────
+        # ── 7. OB wall snap (Phase 3 only) ──────────────────────────────
         if phase >= 3:
             wall_side = "bid" if pos_side == "long" else "ask"
             walls = InstitutionalLevels.find_orderbook_walls(
                 orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
             if walls:
                 if pos_side == "long":
-                    valid_walls = [(p, q) for p, q in walls
-                                   if current_sl < p < price - min_dist]
-                    if valid_walls:
-                        best = max(valid_walls, key=lambda x: x[1])
-                        candidates.append(best[0] - 0.10 * atr)
+                    vw = [(p, q) for p, q in walls if current_sl < p < price - min_dist]
+                    if vw:
+                        candidates.append(max(vw, key=lambda x: x[1])[0] - 0.10 * atr)
                 else:
-                    valid_walls = [(p, q) for p, q in walls
-                                   if price + min_dist < p < current_sl]
-                    if valid_walls:
-                        best = min(valid_walls, key=lambda x: x[1])
-                        candidates.append(best[0] + 0.10 * atr)
+                    vw = [(p, q) for p, q in walls if price + min_dist < p < current_sl]
+                    if vw:
+                        candidates.append(min(vw, key=lambda x: x[1])[0] + 0.10 * atr)
 
         if not candidates:
             return None
@@ -2126,6 +2098,39 @@ class InstitutionalLevels:
                 else:
                     new_sl = max(new_sl - tighten, price + min_dist)
 
+        # ── v4.9: LIQUIDITY POOL CEILING CAP ─────────────────────────
+        # Keep the trailing SL on the FAR SIDE of any unswept liquidity pool
+        # between current_sl and price. Smart money sweeps those pools — if our
+        # SL is right at or past the pool, the sweep hunts us before reversal.
+        # Cap the SL at: pool.price - ICT_LIQ_POOL_BUFFER (long) or pool.price + buffer (short).
+        if QCfg.ICT_LIQ_CEILING_ENABLED() and ict_engine is not None:
+            try:
+                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+                _liq_buf    = QCfg.ICT_LIQ_POOL_BUFFER_ATR() * atr
+                for _pool in ict_engine.liquidity_pools:
+                    if _pool.swept:
+                        continue
+                    if pos_side == "long" and _pool.pool_type == "EQL":
+                        # EQL below price: SL must stay BELOW the pool minus buffer
+                        # i.e., don't trail SL ABOVE the pool level
+                        _ceiling = _pool.price - _liq_buf
+                        if current_sl < _ceiling < new_sl:
+                            # SL candidate crossed above pool — cap it
+                            logger.debug(
+                                f"Trail: LIQ CEILING — capping SL at ${_ceiling:,.1f} "
+                                f"(EQL pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
+                            new_sl = _ceiling
+                    elif pos_side == "short" and _pool.pool_type == "EQH":
+                        # EQH above price: SL must stay ABOVE the pool plus buffer
+                        _floor = _pool.price + _liq_buf
+                        if current_sl > _floor > new_sl:
+                            logger.debug(
+                                f"Trail: LIQ FLOOR — capping SL at ${_floor:,.1f} "
+                                f"(EQH pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
+                            new_sl = _floor
+            except Exception as _liq_e:
+                logger.debug(f"Trail liq ceiling error (non-fatal): {_liq_e}")
+
         # ═══ MINIMUM DISTANCE ENFORCEMENT (absolute guard) ════════════════
         if pos_side == "long":
             max_allowed = price - min_dist
@@ -2135,17 +2140,6 @@ class InstitutionalLevels:
             min_allowed = price + min_dist
             if new_sl < min_allowed:
                 new_sl = min_allowed
-        
-        # ═══ v5.0: ICT STRUCTURE PROTECTION ═══════════════════════════════
-        # CRITICAL: Never trail SL through virgin OB/FVG that supports the trade
-        if QCfg.TRAIL_ICT_PROTECTION() and ict_engine is not None and now_ms > 0:
-            blocked, reason = ict_engine.check_sl_path_for_structure(
-                pos_side, current_sl, new_sl, now_ms,
-                max_ob_visits=QCfg.TRAIL_ICT_OB_MAX_VISITS(),
-                max_fvg_fill=QCfg.TRAIL_ICT_FVG_MAX_FILL())
-            if blocked:
-                logger.info(f"Trail v5.0: ICT PROTECTION — SL freeze: {reason}")
-                return None
 
         # ═══ RATCHET: SL may only improve ════════════════════════════════
         min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
@@ -2412,6 +2406,7 @@ class QuantStrategy:
         self._last_reconcile_time = 0.0; self._RECONCILE_SEC = 30.0
         self._reconcile_pending = False; self._reconcile_data = None
         self._total_trades = 0; self._winning_trades = 0; self._total_pnl = 0.0
+        self._trade_history: List[Dict] = []   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         # Track last known price for PnL fallback
         self._last_known_price = 0.0
@@ -2419,12 +2414,20 @@ class QuantStrategy:
 
     def _log_init(self):
         logger.info("=" * 72)
-        logger.info("⚡ QuantStrategy v4.8 — ORDER FLOW + ICT STRUCTURE")
+        logger.info("⚡ QuantStrategy v4.9 — ORDER FLOW + ICT STRUCTURE")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
         logger.info(f"   Entry: VWAP deviation > {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR | Confirm: {QCfg.CONFIRM_TICKS()} ticks")
-        logger.info(f"   SL: swing + {QCfg.SL_BUFFER_ATR_MULT()}×ATR buffer | TP: {QCfg.TP_VWAP_FRACTION():.0%} to VWAP")
+        logger.info(f"   SL: swing + {QCfg.SL_BUFFER_ATR_MULT()}×ATR buffer | TP: ICT structural + {QCfg.TP_VWAP_FRACTION():.0%} VWAP fraction")
         logger.info(f"   Trail: BE@{QCfg.TRAIL_BE_R()}R Lock@{QCfg.TRAIL_LOCK_R()}R Aggr@{QCfg.TRAIL_AGGRESSIVE_R()}R")
-        logger.info(f"   ICT: {'ENABLED (OB+FVG+Sweep+KZ)' if self._ict else 'DISABLED (ict_engine.py not found)'}")
+        logger.info(f"   Trail P1/P2/P3 min-dist: {QCfg.TRAIL_MIN_DIST_ATR_P1()}/{QCfg.TRAIL_MIN_DIST_ATR_P2()}/{QCfg.TRAIL_MIN_DIST_ATR_P3()}×ATR")
+        ict_status = "DISABLED (ict_engine.py not found)"
+        if self._ict:
+            ict_status = (
+                f"ENABLED | ZoneFreeze={QCfg.ICT_ZONE_FREEZE_ENABLED()} "
+                f"OBanchor={QCfg.ICT_OB_SL_ANCHOR()} "
+                f"LiqCeiling={QCfg.ICT_LIQ_CEILING_ENABLED()}"
+            )
+        logger.info(f"   ICT: {ict_status}")
         logger.info(f"   Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
                     f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}")
         logger.info("=" * 72)
@@ -2701,22 +2704,6 @@ class QuantStrategy:
         v4.6: Also blocked when BreakoutDetector detects directional momentum.
         """
         c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
-        
-        # ═══ v5.0: ICT CONFLUENCE ENTRY TIERS ═════════════════════════════
-        # Premium setup (ICT ≥ 0.50): lower composite threshold
-        # Weak setup (ICT < 0.30): higher composite threshold
-        # Standard (0.30 ≤ ICT < 0.50): use normal threshold
-        if sig.ict_total >= QCfg.ICT_TIER_PREMIUM_SCORE():
-            # TIER 1 PREMIUM: Strong ICT confluence → accept lower composite
-            thr = QCfg.ICT_TIER_PREMIUM_COMPOSITE()
-            tier_label = "PREMIUM"
-        elif sig.ict_total < QCfg.ICT_TIER_WEAK_SCORE():
-            # TIER 3 WEAK: No ICT confluence → require higher composite
-            thr = QCfg.ICT_TIER_WEAK_COMPOSITE()
-            tier_label = "WEAK"
-        else:
-            # TIER 2 STANDARD: Normal ICT → use standard threshold
-            tier_label = "STANDARD"
 
         # Hard veto: if market is trending against this reversion trade, skip
         if not self._regime.allows_reversion(side):
@@ -2735,19 +2722,9 @@ class QuantStrategy:
             self._confirm_long = self._confirm_short = 0; return
         if self._last_exit_side and self._last_exit_side != side:
             if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5: return
-        if side == "long" and c >= thr: 
-            self._confirm_long += 1
-            self._confirm_short = 0
-            if self._confirm_long == 1 and sig.ict_total > 0.01:
-                logger.info(f"✨ Entry tier: {tier_label} (ICT={sig.ict_total:.2f} thr={thr:.2f})")
-        elif side == "short" and c <= -thr: 
-            self._confirm_short += 1
-            self._confirm_long = 0
-            if self._confirm_short == 1 and sig.ict_total > 0.01:
-                logger.info(f"✨ Entry tier: {tier_label} (ICT={sig.ict_total:.2f} thr={thr:.2f})")
-        else: 
-            self._confirm_long = self._confirm_short = 0
-            return
+        if side == "long" and c >= thr: self._confirm_long += 1; self._confirm_short = 0
+        elif side == "short" and c <= -thr: self._confirm_short += 1; self._confirm_long = 0
+        else: self._confirm_long = self._confirm_short = 0; return
         cn = QCfg.CONFIRM_TICKS()
         if self._confirm_long >= cn:
             self._confirm_long = self._confirm_short = 0
@@ -3014,7 +2991,9 @@ class QuantStrategy:
         else:
             tp_price = InstitutionalLevels.compute_tp(
                 price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
-                candles_5m=candles_5m)
+                candles_5m=candles_5m,
+                ict_engine=self._ict,
+                now_ms=int(time.time() * 1000))
         tp_price = _round_to_tick(tp_price)
 
         # ── Basic direction sanity (unchanged) ───────────────────────────────────
@@ -3022,8 +3001,10 @@ class QuantStrategy:
         if side == "short" and (sl_price <= price or tp_price >= price): return None, None
 
         # ── Fee-normalized TP floor gate (PATCH 4) ────────────────────────────────
-        # Only active when ExecutionCostEngine is available.
-        if self._fee_engine is not None:
+        # Only active when ExecutionCostEngine is available AND warmed up.
+        # During warmup the engine returns hardcoded defaults which can be
+        # incorrectly tight or loose. Skip the gate for the first ~10s of operation.
+        if self._fee_engine is not None and self._fee_engine.is_warmed_up():
             tp_distance = abs(tp_price - price)
             sl_distance = abs(sl_price - price)
             try:
@@ -3052,6 +3033,8 @@ class QuantStrategy:
                 )
             except Exception as e:
                 logger.debug(f"Fee gate error (non-fatal): {e}")
+        elif self._fee_engine is not None and not self._fee_engine.is_warmed_up():
+            logger.debug("Fee gate skipped — engine not yet warmed up (< 5 spread samples)")
 
         return sl_price, tp_price
 
@@ -3115,13 +3098,21 @@ class QuantStrategy:
             self._prev_price_for_urgency = price
 
             try:
-                use_maker, limit_px, mt_reason = self._fee_engine.decide_entry_type(
-                    side           = side,
-                    quantity       = qty,
-                    price          = price,
-                    orderbook      = orderbook,
-                    signal_urgency = urgency,
-                )
+                # Only use maker/taker decision when engine is warmed up.
+                # During warmup, fee_engine uses default spread (2.0bps) which
+                # may over-estimate savings and post a limit at a bad price.
+                if self._fee_engine.is_warmed_up():
+                    use_maker, limit_px, mt_reason = self._fee_engine.decide_entry_type(
+                        side           = side,
+                        quantity       = qty,
+                        price          = price,
+                        orderbook      = orderbook,
+                        signal_urgency = urgency,
+                    )
+                else:
+                    use_maker  = False
+                    mt_reason  = "fee_engine_warming_up→taker"
+                    logger.debug("FeeEngine not warmed up — defaulting to taker entry")
             except Exception as e:
                 logger.debug(f"decide_entry_type error (non-fatal): {e}")
                 use_maker = False
@@ -3150,10 +3141,11 @@ class QuantStrategy:
 
         # ── Place entry order (PATCH 5e) ──────────────────────────────────────────
         if use_maker:
+            limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 25.0))
             entry_data = order_manager.place_limit_entry(
                 side=side, quantity=qty,
                 limit_price=limit_px,
-                timeout_sec=7.0,
+                timeout_sec=limit_timeout,
                 fallback_to_market=True,
             )
         else:
@@ -3317,23 +3309,38 @@ class QuantStrategy:
         self._last_reconcile_time   = time.time()
         self.current_sl_price       = sl_price
         self.current_tp_price       = tp_price
-        self._total_trades         += 1
+        # NOTE: _total_trades incremented at CLOSE (not here) so win-rate denominator
+        # only counts completed trades, not abandoned/rejected ones.
         self._confirm_long          = self._confirm_short = 0
 
-        rr_a      = abs(fill_price - tp_price) / sdf if sdf > 0 else 0
+        # ── Build clean entry notification ───────────────────────────────────────
+        # R:R = (TP distance) / (SL distance) — both measured from FILL price
+        sl_dist_pts = abs(fill_price - sl_price)
+        tp_dist_pts = abs(fill_price - tp_price)
+        rr_a        = tp_dist_pts / sl_dist_pts if sl_dist_pts > 1e-10 else 0.0
+        dollar_risk = sl_dist_pts * qty          # max loss in USDT (before fees)
+        # ICT context line
+        ict_line = ""
+        if sig.ict_total > 0.01:
+            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{sig.ict_details}]"
         mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
         send_telegram_message(
-            f"{mode_icon} <b>QUANT v4 ENTRY — {side.upper()} [{mode.upper()}]</b>\n\n"
-            f"Entry:    ${fill_price:,.2f}\n"
-            f"Mode:     {mode.capitalize()} | Regime: {sig.market_regime} | ADX={sig.adx:.1f}\n"
-            f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f} ATR away)\n"
-            f"SL:       ${sl_price:,.2f}\n"
-            f"TP:       ${tp_price:,.2f}\n"
-            f"R:R:      1:{rr_a:.2f}\n"
-            f"Risk:     ${ir:.2f} ({sdf:.2f} pts × {qty} BTC)\n"
-            f"Confirm:  {sig.n_confirming}/5 | TrendΣ={sig.trend_score:+.3f}"
+            f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Entry:    <b>${fill_price:,.2f}</b>\n"
+            f"SL:       ${sl_price:,.2f}  (−${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
+            f"TP:       ${tp_price:,.2f}  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
+            f"R:R:      1:{rr_a:.2f}  |  Risk: ${dollar_risk:.2f} USDT\n"
+            f"Qty:      {qty:.4f} BTC\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Regime:   {sig.market_regime} | ADX={sig.adx:.1f} | Mode: {mode.capitalize()}\n"
+            f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f}×ATR)\n"
+            f"Signals:  {sig.n_confirming}/5 agree | Σ={sig.composite:+.3f}{ict_line}"
         )
-        logger.info(f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | R:R=1:{rr_a:.2f}")
+        logger.info(
+            f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
+        )
 
     def _manage_active(self, data_manager, order_manager, now):
         pos = self._pos; price = data_manager.get_last_price()
@@ -3580,29 +3587,21 @@ class QuantStrategy:
         except Exception: candles_1m = []
         try: candles_5m = data_manager.get_candles("5m", limit=30)
         except Exception: candles_5m = []
-        try: candles_15m = data_manager.get_candles("15m", limit=30)
-        except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
-        
-        # v5.0: Get spread and ATR percentiles for dynamic min_dist
-        spread_pctile = self._ob_eng.get_spread_percentile() if hasattr(self._ob_eng, 'get_spread_percentile') else 0.5
-        atr_pctile = self._atr_5m.get_percentile() if hasattr(self._atr_5m, 'get_percentile') else 0.5
 
-        # v4.8: Pass initial_sl_dist so compute_trail_sl uses ORIGINAL risk, not current
-        # v5.0: Pass candles_15m, spread_pctile, atr_pctile, ict_engine, now_ms
+        # v4.9: Pass ict_engine + now_ms so trail can use ICT zone freeze,
+        # OB anchor SL, and liquidity pool ceiling — the three new protections
+        # that eliminate the "stopped during pullback, TP fires without us" pattern.
         new_sl = InstitutionalLevels.compute_trail_sl(
             pos.side, price, pos.entry_price, pos.sl_price, atr,
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
             hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
-            candles_15m=candles_15m,
             initial_sl_dist=pos.initial_sl_dist,
-            spread_pctile=spread_pctile,
-            atr_pctile=atr_pctile,
-            ict_engine=self._ict if _ICT_AVAILABLE and hasattr(self, '_ict') else None,
+            ict_engine=self._ict,
             now_ms=int(now * 1000))
 
         if new_sl is None:
@@ -3659,68 +3658,186 @@ class QuantStrategy:
         order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
         fill_type = getattr(pos, 'entry_fill_type', 'taker')
         pnl = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
-        self._record_pnl(pnl)
-        hm = (time.time()-pos.entry_time)/60
+        self._record_pnl(pnl, exit_reason=reason, exit_price=price)
+
+        hold_min     = (time.time() - pos.entry_time) / 60.0
+        init_sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else abs(pos.entry_price - pos.sl_price)
+        raw_pts      = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+        achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        tp_dist      = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
+        planned_rr   = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        result_icon  = "✅" if pnl > 0 else "❌"
+
         send_telegram_message(
-            f"{'✅' if pnl>0 else '❌'} <b>QUANT v4 EXIT — {pos.side.upper()}</b>\n\n"
-            f"Reason:  {reason}\nEntry:   ${pos.entry_price:,.2f}\nExit:    ${price:,.2f}\n"
-            f"PnL:     ${pnl:+.2f} USDT\nHold:    {hm:.1f} min\n\n"
-            f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%} | PnL: ${self._total_pnl:+.2f}</i>")
-        self._last_exit_side = pos.side; self._finalise_exit()
+            f"{result_icon} <b>{'WIN' if pnl>0 else 'LOSS'} — MANUAL EXIT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
+            f"Reason:   {reason}\n"
+            f"Entry:    ${pos.entry_price:,.2f}\n"
+            f"Exit:     <b>${price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
+            f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
+            f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
+            f"Hold:     {hold_min:.1f}m\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
+        )
+        self._last_exit_side = pos.side
+        self._finalise_exit()
 
     def _record_exchange_exit(self, ex_pos):
-        """v4.3: PnL fix with explicit TP hit detection for short side (Bug 7)
-        and correct fee rate based on entry fill type (Bug 12)."""
+        """
+        v4.9: Correct TP/SL detection, accurate PnL, reformatted notification.
+
+        BUG FIXES:
+        1. _last_known_price between SL and TP was used as exit_price — gave wrong PnL
+           when SL fired during a pullback recovery. Now uses sl_price/tp_price directly.
+        2. Win counted as pnl>0, but pnl could be positive due to wrong exit_price.
+           Fixed by using actual sl_price when SL fired.
+        3. _total_trades now incremented HERE (at close) not at entry — win-rate
+           denominator only counts completed trades.
+        4. Full trade record stored in _trade_history for /trades command.
+        """
         pos = self._pos
-        # v4.6 BUG FIX #9: Guard against double PnL recording
-        # Both _sync_position and _reconcile can detect the same exit
         if pos.phase == PositionPhase.FLAT:
             logger.debug("_record_exchange_exit skipped — already FLAT")
             return
-        pnl = 0.0
-        if ex_pos is not None:
-            pnl = float(ex_pos.get("unrealized_pnl", 0.0))
-        if abs(pnl) < 1e-10 and pos.entry_price > 0 and pos.quantity > 0:
-            exit_price = 0.0
-            if self._last_known_price > 1.0:
-                # v4.3 Bug 7 fix: explicit checks with entry price context
-                if pos.side == "long":
-                    if pos.tp_price > 0 and self._last_known_price >= pos.tp_price:
-                        exit_price = pos.tp_price
-                    elif pos.sl_price > 0 and self._last_known_price <= pos.sl_price:
-                        exit_price = pos.sl_price
-                    else:
-                        exit_price = self._last_known_price
-                else:  # short
-                    if pos.tp_price > 0 and self._last_known_price <= pos.tp_price:
-                        exit_price = pos.tp_price
-                    elif pos.sl_price > 0 and self._last_known_price >= pos.sl_price:
-                        exit_price = pos.sl_price
-                    else:
-                        exit_price = self._last_known_price
-            elif pos.sl_price > 0:
-                exit_price = pos.sl_price
-            if exit_price > 0:
-                # v4.3 Bug 12 fix: use actual fill type for fee calculation
-                fill_type = getattr(pos, 'entry_fill_type', 'taker')
-                pnl = self._estimate_pnl(pos, exit_price, entry_fill_type=fill_type)
-                logger.info(f"📊 PnL calculated: entry=${pos.entry_price:,.2f} exit=${exit_price:,.2f} → ${pnl:+.2f}")
-        self._record_pnl(pnl)
-        pnl_icon = "✅" if pnl > 0 else ("❌" if pnl < 0 else "⚪")
-        send_telegram_message(
-            f"📡 <b>{pnl_icon} EXCHANGE EXIT — {pos.side.upper()}</b>\n\n"
-            f"SL/TP fired on exchange\n"
-            f"Entry: ${pos.entry_price:,.2f}\n"
-            f"SL was: ${pos.sl_price:,.2f} | TP was: ${pos.tp_price:,.2f}\n"
-            f"PnL:   ${pnl:+.2f} USDT\n"
-            f"Trail was: {'active ✅' if pos.trail_active else 'not activated'}\n\n"
-            f"<i>Trades: {self._total_trades} | WR: {self._win_rate():.0%} | Total: ${self._total_pnl:+.2f}</i>")
-        self._last_exit_side = pos.side; self._finalise_exit()
 
-    def _record_pnl(self, pnl):
-        self._total_pnl += pnl
-        if pnl > 0: self._winning_trades += 1
+        # ─── Step 1: Determine exit type (SL or TP) and exit price ──────────────
+        # Priority: if last known price is at/past TP → TP hit.
+        #           if last known price is at/before SL → SL hit.
+        #           Otherwise default to SL (conservative — avoids false wins).
+        exit_reason = "exchange_exit"
+        exit_price  = 0.0
+        is_tp_hit   = False
+        is_sl_hit   = False
+
+        if pos.entry_price > 0 and pos.quantity > 0:
+            lkp = self._last_known_price if self._last_known_price > 1.0 else 0.0
+            sp  = pos.sl_price
+            tp  = pos.tp_price
+            trailed = pos.trail_active
+
+            if pos.side == "long":
+                if tp > 0 and lkp >= tp * 0.9995:   # price at or above TP (5 pip grace)
+                    exit_price  = tp
+                    exit_reason = "tp_hit"
+                    is_tp_hit   = True
+                elif sp > 0 and lkp <= sp * 1.0005:  # price at or below SL
+                    exit_price  = sp
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
+                else:
+                    # Ambiguous: price between SL and TP when we detected exit.
+                    # Default to SL price — conservative (avoids false win PnL).
+                    exit_price  = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
+            else:  # short
+                if tp > 0 and lkp <= tp * 1.0005:
+                    exit_price  = tp
+                    exit_reason = "tp_hit"
+                    is_tp_hit   = True
+                elif sp > 0 and lkp >= sp * 0.9995:
+                    exit_price  = sp
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
+                else:
+                    exit_price  = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
+
+        # ─── Step 2: Compute PnL ─────────────────────────────────────────────────
+        pnl = 0.0
+        if exit_price > 0:
+            fill_type = getattr(pos, 'entry_fill_type', 'taker')
+            pnl = self._estimate_pnl(pos, exit_price, entry_fill_type=fill_type)
+            logger.info(
+                f"📊 Exit price=${exit_price:,.2f} reason={exit_reason} "
+                f"entry=${pos.entry_price:,.2f} pnl=${pnl:+.2f}"
+            )
+
+        # ─── Step 3: Record PnL and trade history ────────────────────────────────
+        self._record_pnl(pnl, exit_reason=exit_reason, exit_price=exit_price)
+
+        # ─── Step 4: Build notification ──────────────────────────────────────────
+        hold_min = (time.time() - pos.entry_time) / 60.0 if pos.entry_time > 0 else 0.0
+        init_sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else abs(pos.entry_price - pos.sl_price)
+
+        # Determine actual R achieved
+        raw_pts = ((exit_price - pos.entry_price) if pos.side == "long"
+                   else (pos.entry_price - exit_price))
+        achieved_r = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+
+        if is_tp_hit:
+            result_icon  = "🎯"
+            result_label = "TP HIT"
+            result_color = "WIN ✅"
+        elif is_sl_hit and pnl > 0:
+            result_icon  = "🔒"
+            result_label = "TRAIL SL" if pos.trail_active else "SL HIT (profitable)"
+            result_color = "WIN ✅"
+        else:
+            result_icon  = "🛑"
+            result_label = "SL HIT"
+            result_color = "LOSS ❌"
+
+        mfe_r   = pos.peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        tp_dist = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
+        planned_rr = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+
+        send_telegram_message(
+            f"{result_icon} <b>{result_color} — {result_label}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
+            f"Entry:    ${pos.entry_price:,.2f}\n"
+            f"Exit:     <b>${exit_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
+            f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
+            f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
+            f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
+            f"Trail:    {'✅ was active' if pos.trail_active else '— not activated'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
+        )
+        self._last_exit_side = pos.side
+        self._finalise_exit()
+
+    def _record_pnl(self, pnl: float, exit_reason: str = "unknown",
+                    exit_price: float = 0.0):
+        """
+        Record a completed trade. _total_trades incremented HERE (at close),
+        not at entry — ensures win-rate denominator only counts closed trades.
+        """
+        pos = self._pos
+        self._total_trades += 1
+        self._total_pnl    += pnl
+        is_win = pnl > 0
+        if is_win:
+            self._winning_trades += 1
         self._risk_gate.record_trade_result(pnl)
+
+        # Full trade record for /trades command
+        init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
+        self._trade_history.append({
+            "ts":           time.time(),
+            "side":         getattr(pos, 'side', '?'),
+            "mode":         getattr(pos, 'trade_mode', '?'),
+            "entry":        getattr(pos, 'entry_price', 0.0),
+            "exit":         exit_price,
+            "qty":          getattr(pos, 'quantity', 0.0),
+            "sl":           getattr(pos, 'sl_price', 0.0),
+            "tp":           getattr(pos, 'tp_price', 0.0),
+            "init_sl_dist": init_sl_dist,
+            "pnl":          pnl,
+            "is_win":       is_win,
+            "reason":       exit_reason,
+            "hold_min":     (time.time() - pos.entry_time) / 60.0 if getattr(pos,'entry_time',0) > 0 else 0.0,
+            "trailed":      getattr(pos, 'trail_active', False),
+            "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
+                             if init_sl_dist > 1e-10 else 0.0),
+        })
+        # Keep last 200 trades in memory
+        if len(self._trade_history) > 200:
+            self._trade_history = self._trade_history[-200:]
 
     def _finalise_exit(self):
         self._pos = PositionState(); self._last_exit_time = time.time()
@@ -3759,53 +3876,98 @@ class QuantStrategy:
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 
     def get_stats(self):
-        return {"total_trades":self._total_trades,"winning_trades":self._winning_trades,
-                "win_rate":f"{self._win_rate():.1%}","total_pnl":round(self._total_pnl,2),
-                "daily_trades":self._risk_gate.daily_trades,"consec_losses":self._risk_gate.consec_losses,
-                "current_phase":self._pos.phase.name,"last_signal":str(self._last_sig),
-                "atr_5m":round(self._atr_5m.atr,2),"atr_1m":round(self._atr_1m.atr,2),
-                "atr_pctile":f"{self._atr_5m.get_percentile():.0%}","regime_ok":self._atr_5m.regime_valid()}
+        """Returns stats based on CLOSED trades only — correct win-rate denominator."""
+        return {
+            "total_trades":   self._total_trades,
+            "winning_trades": self._winning_trades,
+            "win_rate":       f"{self._win_rate():.1%}",
+            "total_pnl":      round(self._total_pnl, 2),
+            "daily_trades":   self._risk_gate.daily_trades,
+            "consec_losses":  self._risk_gate.consec_losses,
+            "current_phase":  self._pos.phase.name,
+            "last_signal":    str(self._last_sig),
+            "atr_5m":         round(self._atr_5m.atr, 2),
+            "atr_1m":         round(self._atr_1m.atr, 2),
+            "atr_pctile":     f"{self._atr_5m.get_percentile():.0%}",
+            "regime_ok":      self._atr_5m.regime_valid(),
+        }
 
     def format_status_report(self):
         """
-        Telegram status report — PATCH 6.
-        Adds execution cost diagnostics block when _fee_engine is available.
+        v4.9: Status report reads from _trade_history (ground truth).
+        Correct win-rate, expectancy, and live position R display.
         """
-        s = self.get_stats()
-        p = self._pos
+        p   = self._pos
+        atr = self._atr_5m.atr
+
+        # ── Session stats from _trade_history ────────────────────────────
+        hist     = self._trade_history
+        total_t  = self._total_trades
+        wins     = self._winning_trades
+        losses   = total_t - wins
+        wr       = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = self._total_pnl
+
+        win_pnls  = [t['pnl'] for t in hist if t.get('is_win')]
+        loss_pnls = [t['pnl'] for t in hist if not t.get('is_win')]
+        avg_w  = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+        avg_l  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        expect = (wr/100 * avg_w) + ((1 - wr/100) * avg_l) if total_t > 0 else 0.0
+
         lines = [
-            "📊 <b>QUANT v4 STATUS</b>", "",
-            f"Phase: {s['current_phase']}",
-            f"Regime: {'✅' if s['regime_ok'] else '❌'}",
-            f"ATR: ${s['atr_5m']}/{s['atr_1m']} ({s['atr_pctile']})",
-            f"HTF: 15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}",
-            f"VWAP: ${self._vwap.vwap:,.2f} (dev={self._vwap.deviation_atr:+.1f}ATR)", "",
-            f"Trades: {s['total_trades']} | WR {s['win_rate']} | PnL ${s['total_pnl']:+.2f}",
-            f"Daily: {s['daily_trades']}/{QCfg.MAX_DAILY_TRADES()} | Losses: {s['consec_losses']}/{QCfg.MAX_CONSEC_LOSSES()}",
+            "📊 <b>QUANT v4.9 STATUS</b>", "",
+            f"Regime: {self._regime.regime.value if self._regime else '?'} | "
+            f"ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%}pctile)",
+            f"HTF:  15m={self._htf.trend_15m:+.2f}  4h={self._htf.trend_4h:+.2f}",
+            f"VWAP: ${self._vwap.vwap:,.2f}  (dev={self._vwap.deviation_atr:+.1f}ATR)",
+            "",
+            "<b>Session P&L</b>",
+            f"  Trades: {total_t}  W:{wins} L:{losses}  WR: {wr:.0f}%",
+            f"  Total PnL: ${total_pnl:+.2f} USDT",
+            f"  Avg W: ${avg_w:+.2f}  Avg L: ${avg_l:+.2f}",
+            f"  Expectancy: ${expect:+.2f}/trade",
+            f"  Daily: {self._risk_gate.daily_trades}/{QCfg.MAX_DAILY_TRADES()} "
+            f"| ConsecL: {self._risk_gate.consec_losses}/{QCfg.MAX_CONSEC_LOSSES()}",
         ]
 
-        # ── Execution cost diagnostics (only when fee engine is live) ─────────────
+        # ── Execution cost diagnostics ──────────────────────────────────
         if self._fee_engine is not None:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()
+                warmed = snap.get('engine_warmed', False)
+                warmup_tag = "✅" if warmed else f"⏳ warming ({snap.get('spread_samples',0)} samples)"
                 lines += [
                     "",
-                    "<b>Execution costs (live)</b>",
-                    f"Spread: {snap['spread_median_bps']:.1f}bps (p90: {snap['spread_p90_bps']:.1f})",
-                    f"Slippage EWMA: {snap['slippage_ewma_bps']:.1f}bps",
-                    f"RT cost taker: {snap['rt_cost_taker_bps']:.1f}bps | maker: {snap['rt_cost_maker_bps']:.1f}bps",
-                    f"Maker saving: {snap['maker_saving_bps']:.1f}bps/trade",
+                    f"<b>Execution costs</b> [{warmup_tag}]",
+                    f"  Spread: {snap['spread_median_bps']:.1f}bps "
+                    f"(p90: {snap['spread_p90_bps']:.1f})",
+                    f"  Slip EWMA: {snap['slippage_ewma_bps']:.1f}bps",
+                    f"  RT taker: {snap['rt_cost_taker_bps']:.1f}bps "
+                    f"| maker: {snap['rt_cost_maker_bps']:.1f}bps "
+                    f"| saving: {snap['maker_saving_bps']:.1f}bps",
                 ]
-            except Exception as e:
-                logger.debug(f"Fee engine snapshot error in report (non-fatal): {e}")
+            except Exception:
+                pass
 
+        # ── Active position ──────────────────────────────────────────────
         if not p.is_flat():
-            hm = (time.time() - p.entry_time) / 60
+            price    = self._last_known_price
+            hm       = (time.time() - p.entry_time) / 60.0
+            init_sl  = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(p.entry_price - p.sl_price)
+            raw_pts  = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+            curr_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
+            mfe_r    = p.peak_profit / init_sl if init_sl > 1e-10 else 0.0
+            tp_dist  = abs(p.tp_price - p.entry_price) if p.tp_price > 0 else 0.0
+            planned  = tp_dist / init_sl if init_sl > 1e-10 else 0.0
+            upnl     = raw_pts * p.quantity
             lines += [
                 "",
-                f"<b>Active ({p.side.upper()})</b>",
-                f"Entry: ${p.entry_price:,.2f} | SL: ${p.sl_price:,.2f} | TP: ${p.tp_price:,.2f}",
-                f"Hold: {hm:.1f}m | Trail: {'✅' if p.trail_active else '⏳'}",
+                f"<b>🟢 Active {p.side.upper()} [{p.trade_mode.upper()}]</b>",
+                f"  Entry: ${p.entry_price:,.2f}  |  Now: ${price:,.2f}",
+                f"  SL: ${p.sl_price:,.2f}  |  TP: ${p.tp_price:,.2f}",
+                f"  uPnL: ${upnl:+.2f}  |  R: {curr_r:+.2f}R  |  MFE: {mfe_r:.2f}R",
+                f"  Planned R:R: 1:{planned:.2f}  |  Hold: {hm:.1f}m",
+                f"  Trail: {'✅ active' if p.trail_active else '⏳ waiting'}",
             ]
         return "\n".join(lines)
 

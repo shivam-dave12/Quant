@@ -71,9 +71,19 @@ class SpreadTracker:
             mid = (bid + ask) / 2.0
             bps = (ask - bid) / mid * 10_000.0
             with self._lock:
+                is_first = len(self._hist) == 0
                 self._hist.append(bps)
+                if is_first:
+                    logger.debug(f"SpreadTracker: first sample {bps:.2f}bps")
+                elif len(self._hist) == 5:
+                    logger.debug(f"SpreadTracker: 5 samples collected, median={self.median_bps():.2f}bps")
         except Exception:
             pass
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._hist)
 
     def median_bps(self) -> float:
         default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
@@ -318,12 +328,20 @@ class MakerTakerDecision:
             use_maker (bool): True → post limit, False → take market
             limit_price (float): the limit price to post at (0 if market)
             reason (str): human-readable explanation for logging
+
+        v4.9 FIXES:
+          - urgency_cutoff raised 0.72 → 0.82 (was falling back to taker too eagerly
+            on mean-reversion setups where urgency is moderate-high by design)
+          - depth_fill_floor raised 0.25 → 0.35 (thin books were getting fill_p=0.2,
+            making saving appear negative even with good urgency conditions)
+          - min_saving_bps lowered 0.8 → 0.5 (even a small saving justifies limit
+            given the 3s rate-limit overhead we're already paying)
         """
-        urgency_cutoff  = float(_cfg("FEE_MAKER_URGENCY_CUTOFF",   0.72))
-        min_saving_bps  = float(_cfg("FEE_MAKER_MIN_SAVING_BPS",   0.8))
+        urgency_cutoff  = float(_cfg("FEE_MAKER_URGENCY_CUTOFF",   0.82))  # was 0.72
+        min_saving_bps  = float(_cfg("FEE_MAKER_MIN_SAVING_BPS",   0.5))   # was 0.8
         depth_levels    = int(_cfg(  "FEE_MAKER_DEPTH_LEVELS",     5))
         depth_max_frac  = float(_cfg("FEE_MAKER_DEPTH_MAX_FRAC",   0.25))
-        depth_fill_floor= float(_cfg("FEE_MAKER_DEPTH_FILL_FLOOR", 0.2))
+        depth_fill_floor= float(_cfg("FEE_MAKER_DEPTH_FILL_FLOOR", 0.35))  # was 0.2
         opp_cost_weight = float(_cfg("FEE_MAKER_OPP_COST_WEIGHT",  0.5))
         tick            = self.TICK_SIZE
 
@@ -452,6 +470,18 @@ class ExecutionCostEngine:
         self._floor   = ProfitFloorModel()
         self._mtd     = MakerTakerDecision()
 
+    def is_warmed_up(self) -> bool:
+        """
+        True once the engine has enough samples for reliable cost estimates.
+
+        Before warmup: median_bps() returns hardcoded default (2.0bps).
+        That default can produce fee floors that reject valid setups
+        if the actual spread is tighter. Gate the TP floor check on warmup.
+
+        Warmup threshold: 5 spread samples (takes ~5 orderbook ticks, ~5-10s).
+        """
+        return self._spread.sample_count >= 5
+
     # ── Feed ──────────────────────────────────────────────────────────────────
 
     def update_orderbook(self, orderbook: Dict, price: float) -> None:
@@ -540,11 +570,16 @@ class ExecutionCostEngine:
         """Returns a dict of current engine state for logging/Telegram reports."""
         taker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=False)
         maker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=True)
+        spread_samples = self._spread.sample_count
+        slip_warmed    = self._slip._ewma is not None
         return {
             "spread_median_bps":    round(self._spread.median_bps(), 2),
             "spread_p90_bps":       round(self._spread.percentile_bps(0.90), 2),
+            "spread_samples":       spread_samples,
             "slippage_ewma_bps":    round(self._slip.expected_bps(), 2),
+            "slip_warmed":          slip_warmed,
             "rt_cost_taker_bps":    round(taker_cost, 2),
             "rt_cost_maker_bps":    round(maker_cost, 2),
             "maker_saving_bps":     round(taker_cost - maker_cost, 2),
+            "engine_warmed":        spread_samples >= 5 and slip_warmed,
         }
