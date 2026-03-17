@@ -1297,13 +1297,21 @@ class InstitutionalLevels:
           VP HVN:    2.0                     (historical volume gravity)
           VWAP bands: 1.5 / 2.0 / 1.5       (statistical reference)
         """
-        # Adaptive buffer: high-vol regime already has wide ranges baked in,
-        # needs less extra room. Low-vol = sticky structure, needs wider clearance.
-        # buf_mult ∈ [0.25×, 0.40×, 0.57×] at pctile=[1.0, 0.5, 0.0]
+        # Issue 3 fix: was `min_dist = price * QCfg.MIN_SL_PCT()` (0.3% = $224 at $74k).
+        # This filtered out every 15m/5m structural level closer than $224 — exactly
+        # the zones ICT analysis says are the most reliable SL anchors.
+        #
+        # New floor: max(price * MIN_SL_PCT, 0.3 × ATR)
+        #   At ATR=137, price=$74k: max(price*0.001=74.5, 0.3*137=41.2) = 74.5pts
+        #   A 15m swing 52pts away now passes (52 < 74.5 still fails at 0.001).
+        #   At ATR=137: 0.5×ATR = 68.7pts is the softest useful floor.
+        # Use 0.4×ATR as the ATR-based floor — below this is tick noise on BTC.
         buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
         buffer   = buf_mult * atr
-        min_dist = price * QCfg.MIN_SL_PCT()
-        max_dist = price * QCfg.MAX_SL_PCT()
+        atr_floor = 0.40 * atr   # ~55pts at ATR=137 — captures nearby 15m structure
+        pct_floor = price * QCfg.MIN_SL_PCT()  # config MIN_SL_DISTANCE_PCT (now 0.001)
+        min_dist  = max(pct_floor, atr_floor)   # whichever is larger — noise rejection
+        max_dist  = price * QCfg.MAX_SL_PCT()
 
         # ── Collect swing extremes from all available timeframes ──────────────
         sh_5m,  sl_5m  = [], []
@@ -1337,82 +1345,97 @@ class InstitutionalLevels:
                 candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
             hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
 
-        # ── Candidate pool: (sl_level, score) ────────────────────────────────
-        scored: List[Tuple[float, float]] = []
+        # ── Candidate pool: (sl_level, score, label) ─────────────────────────
+        # Each entry is (price_level, score, label_for_logging).
+        # 15m ICT candidates use bypass_min_dist=True — the structural swing
+        # itself is the validity criterion. min_dist is a noise guard for when
+        # NO structure exists and must NOT filter real 15m levels.
+        scored: List[Tuple[float, float, str]] = []
 
-        def add(level: float, score: float) -> None:
+        def add(level: float, score: float, label: str = "",
+                bypass_min_dist: bool = False) -> None:
             dist = abs(price - level)
-            if dist < min_dist or dist > max_dist:
+            if not bypass_min_dist and dist < min_dist:
+                return
+            if dist > max_dist:
                 return
             if side == "long" and level >= price:
                 return
             if side == "short" and level <= price:
                 return
-            scored.append((level, score))
+            scored.append((level, score, label))
 
         if side == "long":
-            # 15m swing lows — macro structure (highest weight)
+            # ── 15m swing lows — ICT PRIORITY (score 8.0, bypass min_dist) ──
+            # Root-cause fix: previously these were filtered by min_dist=0.3%
+            # ($224 on BTC), so a 15m low only 50-100 pts away was discarded and
+            # the SL fell to the min_dist floor with no ICT basis whatsoever.
             for lvl in sl_15m:
                 if lvl < price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer * 0.80, 4.0 * cs)
+                    add(lvl - buffer * 0.80, 8.0 * cs,
+                        f"15m_low@{lvl:.0f}", bypass_min_dist=True)
 
             # 5m swing lows — local structure
             for lvl in sl_5m:
                 if lvl < price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer, 3.0 * cs)
+                    add(lvl - buffer, 3.0 * cs, f"5m_low@{lvl:.0f}")
 
             # 1m micro-swing lows — fine structure (lower weight)
             for lvl in sl_1m:
                 if lvl < price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer * 0.50, 1.5 * cs)
+                    add(lvl - buffer * 0.50, 1.5 * cs, f"1m_low@{lvl:.0f}")
 
             # OB bid walls below price
             for wp, wq in walls:
                 if wp < price:
                     wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add(wp - buffer * 0.40, 2.5 * min(wscore, 2.0))
+                    add(wp - buffer * 0.40, 2.5 * min(wscore, 2.0), f"OBwall@{wp:.0f}")
 
             # Volume profile HVN below price
             for h in hvn_levels:
                 if h < price - min_dist * 0.4:
-                    add(h - buffer * 0.25, 2.0)
+                    add(h - buffer * 0.25, 2.0, f"HVN@{h:.0f}")
 
             # VWAP ± σ bands
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
-                    add(vwap - mult * vwap_std - buffer * 0.20, bscore)
+                    lvl = vwap - mult * vwap_std - buffer * 0.20
+                    add(lvl, bscore, f"VWAP-{mult}s@{lvl:.0f}")
 
         else:  # side == "short"
+            # ── 15m swing highs — ICT PRIORITY (score 8.0, bypass min_dist) ──
             for lvl in sh_15m:
                 if lvl > price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer * 0.80, 4.0 * cs)
+                    add(lvl + buffer * 0.80, 8.0 * cs,
+                        f"15m_high@{lvl:.0f}", bypass_min_dist=True)
 
             for lvl in sh_5m:
                 if lvl > price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer, 3.0 * cs)
+                    add(lvl + buffer, 3.0 * cs, f"5m_high@{lvl:.0f}")
 
             for lvl in sh_1m:
                 if lvl > price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer * 0.50, 1.5 * cs)
+                    add(lvl + buffer * 0.50, 1.5 * cs, f"1m_high@{lvl:.0f}")
 
             for wp, wq in walls:
                 if wp > price:
                     wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add(wp + buffer * 0.40, 2.5 * min(wscore, 2.0))
+                    add(wp + buffer * 0.40, 2.5 * min(wscore, 2.0), f"OBwall@{wp:.0f}")
 
             for h in hvn_levels:
                 if h > price + min_dist * 0.4:
-                    add(h + buffer * 0.25, 2.0)
+                    add(h + buffer * 0.25, 2.0, f"HVN@{h:.0f}")
 
             if vwap > 0 and vwap_std > 0:
                 for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
-                    add(vwap + mult * vwap_std + buffer * 0.20, bscore)
+                    lvl = vwap + mult * vwap_std + buffer * 0.20
+                    add(lvl, bscore, f"VWAP+{mult}s@{lvl:.0f}")
 
         # ── Select best-scored candidate ──────────────────────────────────────
         if scored:
@@ -1422,17 +1445,27 @@ class InstitutionalLevels:
             else:
                 scored.sort(key=lambda x: (-x[1], x[0] - price))
             sl = scored[0][0]
+            _w_label = scored[0][2]
+            _w_score = scored[0][1]
+            logger.info(
+                f"📌 SL winner: ${sl:,.2f} [{_w_label}] score={_w_score:.1f} "
+                f"dist={abs(price-sl):.1f}pts/{abs(price-sl)/max(atr,1e-10):.2f}ATR "
+                f"| {len(scored)} candidates (15m gets bypass+score 8.0)")
         else:
-            # No structural candidate found — minimal ATR-based floor
+            # No structural candidate found — use ATR-based floor
             sl = (price - max(min_dist, min(max_dist, 1.5 * atr))
                   if side == "long" else
                   price + max(min_dist, min(max_dist, 1.5 * atr)))
+            logger.info(
+                f"📌 SL fallback (no structure): ${sl:,.2f} "
+                f"dist={abs(price-sl):.1f}pts/{abs(price-sl)/max(atr,1e-10):.2f}ATR")
 
-        # Final hard clamp to [min_dist, max_dist]
+        # Final clamp: only enforce max_dist.
+        # min_dist clamp intentionally removed — 15m ICT levels are allowed to be
+        # closer than the percentage floor. The bypass_min_dist logic in add()
+        # already handles validity. Clamping back here would undo the ICT fix.
         dist = abs(price - sl)
-        if dist < min_dist:
-            sl = (price - min_dist) if side == "long" else (price + min_dist)
-        elif dist > max_dist:
+        if dist > max_dist:
             sl = (price - max_dist) if side == "long" else (price + max_dist)
 
         return sl
@@ -1496,8 +1529,24 @@ class InstitutionalLevels:
         scored: List[Tuple[float, float]] = []
 
         def add_tp(level: float, score: float) -> None:
+            """Standard quant TP filter — enforces REVERSION_MIN_RR floor."""
             dist = abs(level - price)
             if dist < min_tp_dist or dist > max_tp_dist:
+                return
+            if side == "long" and level <= price:
+                return
+            if side == "short" and level >= price:
+                return
+            scored.append((level, score))
+
+        def add_tp_ict(level: float, score: float, ict_min_dist: float) -> None:
+            """
+            ICT-primary TP filter — uses lower min_dist (1.0×SL instead of 1.5×SL).
+            Issue 3 fix: 15m FVGs and OBs at 1:1 R:R are structurally valid TP targets.
+            The lower floor only applies here — quant candidates still use min_tp_dist.
+            """
+            dist = abs(level - price)
+            if dist < ict_min_dist or dist > max_tp_dist:
                 return
             if side == "long" and level <= price:
                 return
@@ -1570,14 +1619,27 @@ class InstitutionalLevels:
         # These carry the highest institutional conviction — they are WHERE smart
         # money is delivering price to. Add them to the scored pool with priority
         # scores that beat every quant-only candidate.
+        #
+        # Issue 3 fix: ICT targets use a LOWER minimum distance floor (1.0×SL
+        # instead of 1.5×SL) so nearby 15m FVGs and OBs aren't filtered out.
+        # The quant pool still enforces min_tp_dist (1.5×SL), but ICT structure
+        # is authoritative enough to accept lower R:R — structure IS the reason
+        # to take the trade, not just a boost on top of quant signals.
         if ict_engine is not None:
             try:
                 _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+                # Issue 3: use sl_dist (1.0×) as ICT min distance, not min_tp_dist (1.5×)
+                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)   # at least 1:1 R:R or 0.5ATR
+                _ict_max_dist = max_tp_dist                       # same upper cap
                 _ict_targets = ict_engine.get_structural_tp_targets(
-                    side, price, atr, _ict_now_ms, min_tp_dist, max_tp_dist)
+                    side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist)
                 for _lvl, _sc, _lbl in _ict_targets:
-                    add_tp(_lvl, _sc)
+                    add_tp_ict(_lvl, _sc, _ict_min_dist)   # uses 1.0× floor, not 1.5×
                     logger.debug(f"ICT TP candidate: ${_lvl:,.1f} score={_sc:.1f} [{_lbl}]")
+                if _ict_targets:
+                    logger.info(
+                        f"📐 ICT TP pool: {len(_ict_targets)} candidates "
+                        f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
             except Exception as _ict_e:
                 logger.debug(f"ICT TP targets error (non-fatal): {_ict_e}")
 
@@ -1586,14 +1648,29 @@ class InstitutionalLevels:
             # Tier-A: score ≥ 3.5 → nearest (maximises win-rate)
             tier_a = [(lvl, sc) for lvl, sc in scored if sc >= 3.5]
             if tier_a:
-                tp = min(tier_a, key=lambda x: abs(x[0] - price))[0]
+                _winner = min(tier_a, key=lambda x: abs(x[0] - price))
+                tp = _winner[0]
+                logger.info(
+                    f"🎯 TP winner (Tier-A score≥3.5): ${tp:,.2f} "
+                    f"score={_winner[1]:.1f} "
+                    f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
+                    f"R:R=1:{abs(tp-price)/max(abs(price-sl_price),1e-10):.2f} "
+                    f"| {len(tier_a)} tier-A of {len(scored)} total")
             else:
                 # Tier-B: below 3.5 → highest-scored (maximises expected value)
                 scored.sort(key=lambda x: -x[1])
                 tp = scored[0][0]
+                logger.info(
+                    f"🎯 TP winner (Tier-B best): ${tp:,.2f} "
+                    f"score={scored[0][1]:.1f} "
+                    f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR")
         else:
             # No structural target found — enforce minimum R:R floor only
             tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
+            logger.info(
+                f"🎯 TP fallback (no structure in [{min_tp_dist:.0f}–{max_tp_dist:.0f}]pts range): "
+                f"${tp:,.2f} = 1:{QCfg.REVERSION_MIN_RR():.1f}R floor "
+                f"| SL dist={abs(price-sl_price):.0f}pts")
 
         return tp
 
@@ -2743,8 +2820,10 @@ class QuantStrategy:
             try:
                 candles_5m = data_manager.get_candles("5m", limit=100)
                 candles_15m = data_manager.get_candles("15m", limit=50)
+                candles_1m_ict = data_manager.get_candles("1m", limit=60)
                 now_ms = int(now * 1000) if now < 1e12 else int(now)
-                self._ict.update(candles_5m, candles_15m, price, now_ms)
+                self._ict.update(candles_5m, candles_15m, price, now_ms,
+                                 candles_1m=candles_1m_ict)
                 ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
                 ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
                 sig.ict_ob = ict_conf.ob_score
@@ -3100,21 +3179,38 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # ── v4.8: ICT OB-aware SL enhancement ─────────────────────────────
-        # If an Order Block exists between current SL and price, use it as SL
-        # instead. OBs are institutional footprints — price is more likely to
-        # bounce off an OB than a random swing low. Only UPGRADE (tighter) SL.
+        # ── ICT OB-primary SL ─────────────────────────────────────────────────
+        # Issue 3 fix: previous code only "upgraded" (moved SL closer to price)
+        # if the ICT OB was between the quant SL and price. This meant the quant
+        # SL dominated whenever it was closer to price than the OB — but the quant
+        # SL was chosen by the 0.3%-filtered pool, not by structure.
+        #
+        # New behaviour:
+        #   1. Query ICT for the best OB-based SL level
+        #   2. If valid (correct side, ≥ 0.5×ATR from entry), USE IT as the
+        #      primary SL — regardless of whether it's tighter or wider than quant
+        #   3. Log clearly which path won: ICT OB primary, ICT OB upgrade, or quant
         if self._ict is not None:
             try:
                 now_ms = int(time.time() * 1000)
                 ob_sl = self._ict.get_ob_sl_level(side, price, atr, now_ms)
                 if ob_sl is not None:
-                    if side == "long" and ob_sl > sl_price and ob_sl < price:
-                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB support)")
+                    ob_dist = abs(price - ob_sl)
+                    ob_valid_side = (side == "long" and ob_sl < price) or \
+                                    (side == "short" and ob_sl > price)
+                    ob_min_dist = 0.5 * atr   # must be at least 0.5×ATR from entry
+                    ob_max_dist = price * QCfg.MAX_SL_PCT()  # hard upper cap
+                    if ob_valid_side and ob_min_dist <= ob_dist <= ob_max_dist:
+                        # ICT OB primary — this is the institutional anchor
+                        logger.info(
+                            f"🏛️ ICT OB SL PRIMARY: ${sl_price:,.2f} → ${ob_sl:,.2f} "
+                            f"({ob_dist:.1f}pts / {ob_dist/atr:.2f}ATR from entry)")
                         sl_price = _round_to_tick(ob_sl)
-                    elif side == "short" and ob_sl < sl_price and ob_sl > price:
-                        logger.info(f"🏛️ ICT OB SL upgrade: ${sl_price:,.2f} → ${ob_sl:,.2f} (OB resistance)")
-                        sl_price = _round_to_tick(ob_sl)
+                    elif ob_valid_side and ob_dist < ob_min_dist:
+                        logger.info(
+                            f"⚠️ ICT OB SL too close ({ob_dist:.1f}pts < {ob_min_dist:.1f} min) "
+                            f"— keeping quant SL ${sl_price:,.2f}")
+                    # No else log — ob_sl out of range or wrong side
             except Exception as e:
                 logger.debug(f"ICT OB SL error: {e}")
 
@@ -3813,10 +3909,12 @@ class QuantStrategy:
         # Zone-freeze was comparing price against entry-time OBs — some of which
         # might permanently overlap the trail zone, freezing the trail forever.
         # Fix: force ICT update here with live candles before every trail decision.
+        # Now also passes candles_1m so fresh 1m OBs are detected for trail anchoring.
         if self._ict is not None:
             try:
                 candles_15m = data_manager.get_candles("15m", limit=30)
-                self._ict.update(candles_5m, candles_15m, price, now_ms)
+                self._ict.update(candles_5m, candles_15m, price, now_ms,
+                                 candles_1m=candles_1m)
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 

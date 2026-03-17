@@ -261,8 +261,15 @@ class ICTEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def update(self, candles_5m: List[Dict], candles_15m: List[Dict],
-               price: float, now_ms: int) -> None:
-        """Update all ICT structures. Throttled to every 5 seconds."""
+               price: float, now_ms: int,
+               candles_1m: Optional[List[Dict]] = None) -> None:
+        """
+        Update all ICT structures. Throttled to every 5 seconds.
+
+        candles_1m is optional — when supplied (e.g. during trail management)
+        it enables 1m OB detection which gives the trail engine fresh micro-structure
+        to anchor against. Called with 1m data from _update_trailing_sl().
+        """
         now_s = now_ms / 1000.0
         if now_s - self._last_update < self._UPDATE_INTERVAL:
             return
@@ -274,10 +281,13 @@ class ICTEngine:
         self._update_session(now_ms)
         self._detect_swing_points(candles_5m, candles_15m)
         self._detect_order_blocks(candles_5m, price, now_ms)
-        # Issue 3 fix: also detect OBs on 15m — they carry higher institutional weight
-        # and directly anchor the TP/SL levels the strategy computes.
+        # Issue 3 fix: 15m OBs carry higher institutional weight for SL/TP anchoring
         if len(candles_15m) >= 5:
             self._detect_order_blocks_htf(candles_15m, price, now_ms)
+        # 1m OBs for trail precision — detect fresh micro-OBs formed after entry
+        # so the trailing SL can anchor to the most recent institutional footprint
+        if candles_1m and len(candles_1m) >= 5:
+            self._detect_order_blocks_1m(candles_1m, price, now_ms)
         self._detect_fvgs(candles_5m, price, now_ms)
         self._update_fvg_fills(candles_5m)
         self._detect_liquidity_pools(price, now_ms)
@@ -459,6 +469,72 @@ class ICTEngine:
                         has_wick_rejection=False,
                         max_age_ms=self.OB_MAX_AGE_MS * 2))
                     logger.debug(f"📦 HTF OB BEAR ${cur_l:.0f}–${cur_h:.0f} str={htf_strength:.0f}")
+
+    def _detect_order_blocks_1m(self, candles: List[Dict], price: float,
+                                 now_ms: int) -> None:
+        """
+        Detect Order Blocks from 1m candles for trail SL precision.
+
+        These are the freshest institutional footprints — OBs that formed AFTER
+        the entry, representing where smart money re-entered to defend the position.
+        The trailing SL ICT OB anchor (get_ob_sl_level) will use these to keep the
+        SL behind the most recent 1m institutional level rather than a stale 5m OB.
+
+        1m OBs: base strength 50 (lower than 5m), max_age_ms = 30min.
+        Short-lived by design — 1m structure is micro, only relevant for the trail.
+        """
+        if len(candles) < 5:
+            return
+
+        # Only look at the last 30 candles (30 minutes of 1m data)
+        recent = candles[-30:]
+        tol = price * 0.0005  # tighter dedup tolerance for 1m
+
+        for i in range(2, len(recent) - 1):
+            cur = recent[i]
+            nxt = recent[i + 1]
+
+            cur_o, cur_c = float(cur['o']), float(cur['c'])
+            cur_h, cur_l = float(cur['h']), float(cur['l'])
+            nxt_o, nxt_c = float(nxt['o']), float(nxt['c'])
+            nxt_h, nxt_l = float(nxt['h']), float(nxt['l'])
+            cur_ts = int(cur.get('t', now_ms))
+
+            nxt_range = nxt_h - nxt_l
+            nxt_body  = abs(nxt_c - nxt_o)
+
+            # Use slightly relaxed thresholds for 1m (impulses are smaller)
+            min_impulse = self.OB_MIN_IMPULSE_PCT * 0.6  # 60% of 5m threshold
+            impulse_up = (nxt_c > nxt_o and
+                          (nxt_c - nxt_o) / max(nxt_o, 1) * 100 >= min_impulse and
+                          nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+            impulse_down = (nxt_c < nxt_o and
+                            (nxt_o - nxt_c) / max(nxt_o, 1) * 100 >= min_impulse and
+                            nxt_body / max(nxt_range, 1e-9) >= self.OB_MIN_BODY_RATIO)
+
+            # Bullish 1m OB: bearish candle before bullish 1m impulse
+            if impulse_up and cur_c < cur_o:
+                if not any(abs(ob.low - cur_l) <= tol and abs(ob.high - cur_h) <= tol
+                           for ob in self.order_blocks_bull):
+                    self.order_blocks_bull.append(OrderBlock(
+                        low=cur_l, high=cur_h, timestamp=cur_ts,
+                        direction="bullish", strength=50.0,
+                        bos_confirmed=False, has_displacement=False,
+                        has_wick_rejection=False,
+                        max_age_ms=1_800_000))   # 30 min — micro OBs expire fast
+                    logger.debug(f"📦 1m OB BULL ${cur_l:.0f}–${cur_h:.0f}")
+
+            # Bearish 1m OB: bullish candle before bearish 1m impulse
+            if impulse_down and cur_c > cur_o:
+                if not any(abs(ob.low - cur_l) <= tol and abs(ob.high - cur_h) <= tol
+                           for ob in self.order_blocks_bear):
+                    self.order_blocks_bear.append(OrderBlock(
+                        low=cur_l, high=cur_h, timestamp=cur_ts,
+                        direction="bearish", strength=50.0,
+                        bos_confirmed=False, has_displacement=False,
+                        has_wick_rejection=False,
+                        max_age_ms=1_800_000))
+                    logger.debug(f"📦 1m OB BEAR ${cur_l:.0f}–${cur_h:.0f}")
 
     # ══════════════════════════════════════════════════════════════════
     # FVG DETECTION
