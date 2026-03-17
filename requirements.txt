@@ -1,0 +1,17 @@
+# requirements.txt — Unified Dual-Exchange Quant Bot
+
+# HTTP + auth
+requests>=2.31.0
+cryptography>=41.0.0      # ED25519 for CoinSwitch signature
+python-dotenv>=1.0.0
+
+# WebSocket
+websocket-client>=1.7.0   # Delta Exchange (raw WS)
+python-socketio>=5.10.0   # CoinSwitch (Socket.IO)
+websockets>=12.0           # underlying async support
+
+# Telegram
+# (uses requests directly — no additional lib needed)
+
+# Utilities
+# All standard-library: threading, collections, dataclasses, enum, abc
