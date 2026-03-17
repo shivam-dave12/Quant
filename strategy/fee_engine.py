@@ -42,6 +42,19 @@ def _cfg(name: str, default):
     return default if val is None else val
 
 
+def _ob_px(lvl) -> float:
+    """Extract price from an orderbook level (list or Delta dict format)."""
+    if isinstance(lvl, (list, tuple)): return float(lvl[0])
+    if isinstance(lvl, dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
+    return 0.0
+
+def _ob_qty(lvl) -> float:
+    """Extract quantity from an orderbook level (list or Delta dict format)."""
+    if isinstance(lvl, (list, tuple)) and len(lvl) >= 2: return float(lvl[1])
+    if isinstance(lvl, dict): return float(lvl.get("size") or lvl.get("quantity") or lvl.get("depth") or 0)
+    return 0.0
+
+
 class SpreadTracker:
     """
     Maintains a rolling distribution of bid-ask spread in basis points.
@@ -65,8 +78,8 @@ class SpreadTracker:
         if not bids or not asks or price < 1.0:
             return
         try:
-            bid = float(bids[0][0])
-            ask = float(asks[0][0])
+            bid = _ob_px(bids[0])
+            ask = _ob_px(asks[0])
             if bid <= 0 or ask <= bid:
                 return
             mid = (bid + ask) / 2.0
@@ -106,8 +119,8 @@ class SpreadTracker:
 
     def current_bid_ask(self, orderbook: Dict) -> Tuple[float, float]:
         try:
-            bid = float(orderbook["bids"][0][0])
-            ask = float(orderbook["asks"][0][0])
+            bid = _ob_px(orderbook["bids"][0])
+            ask = _ob_px(orderbook["asks"][0])
             return bid, ask
         except Exception:
             return 0.0, 0.0
@@ -352,8 +365,8 @@ class MakerTakerDecision:
             if not bids or not asks:
                 return False, 0.0, "no_book_data"
 
-            bid = float(bids[0][0])
-            ask = float(asks[0][0])
+            bid = _ob_px(bids[0])
+            ask = _ob_px(asks[0])
             if bid <= 0 or ask <= bid:
                 return False, 0.0, "invalid_book"
 
@@ -369,12 +382,12 @@ class MakerTakerDecision:
 
             if side == "long":
                 relevant_depth = sum(
-                    float(b[1]) for b in bids[:depth_levels]
+                    _ob_qty(b) for b in bids[:depth_levels]
                     if isinstance(b, (list, tuple)) and len(b) >= 2
                 )
             else:
                 relevant_depth = sum(
-                    float(a[1]) for a in asks[:depth_levels]
+                    _ob_qty(a) for a in asks[:depth_levels]
                     if isinstance(a, (list, tuple)) and len(a) >= 2
                 )
 

@@ -491,14 +491,22 @@ class OrderbookEngine:
         bids = orderbook.get("bids",[]); asks = orderbook.get("asks",[])
         depth = QCfg.OB_DEPTH_LEVELS()
         if not bids or not asks or price < 1.0: return
-        bid_depth = sum(float(l[1]) for l in bids[:depth] if isinstance(l,(list,tuple)) and len(l)>1)
-        ask_depth = sum(float(l[1]) for l in asks[:depth] if isinstance(l,(list,tuple)) and len(l)>1)
+        def _qty(lvl):
+            if isinstance(lvl,(list,tuple)) and len(lvl)>=2: return float(lvl[1])
+            if isinstance(lvl,dict): return float(lvl.get("size") or lvl.get("quantity") or lvl.get("depth") or 0)
+            return 0.0
+        bid_depth = sum(_qty(l) for l in bids[:depth])
+        ask_depth = sum(_qty(l) for l in asks[:depth])
         total = bid_depth + ask_depth
         if total < 1e-12: return
         self._last_imbalance = (bid_depth - ask_depth) / total
         self._imbalance_hist.append(self._last_imbalance)
         try:
-            bb = float(bids[0][0]); ba = float(asks[0][0])
+            def _px(lvl):
+                if isinstance(lvl,(list,tuple)): return float(lvl[0])
+                if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                return 0.0
+            bb = _px(bids[0]); ba = _px(asks[0])
             if bb > 0 and ba > 0: self._spread_ratio = (ba - bb) / ((bb + ba) / 2.0)
         except Exception: pass
 
@@ -1213,6 +1221,11 @@ class InstitutionalLevels:
             try:
                 if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                     parsed.append((float(lvl[0]), float(lvl[1])))
+                elif isinstance(lvl, dict):
+                    _px = float(lvl.get("limit_price") or lvl.get("price") or 0)
+                    _qty = float(lvl.get("size") or lvl.get("quantity") or lvl.get("depth") or 0)
+                    if _px > 0:
+                        parsed.append((_px, _qty))
             except (ValueError, TypeError):
                 continue
         if not parsed:
@@ -1749,8 +1762,12 @@ class InstitutionalLevels:
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
         if bids and asks:
-            bid_depth = sum(float(b[1]) for b in bids[:5]) if len(bids) >= 5 else 0
-            ask_depth = sum(float(a[1]) for a in asks[:5]) if len(asks) >= 5 else 0
+            def _ob_qty(lvl):
+                if isinstance(lvl,(list,tuple)) and len(lvl)>=2: return float(lvl[1])
+                if isinstance(lvl,dict): return float(lvl.get("size") or lvl.get("quantity") or 0)
+                return 0.0
+            bid_depth = sum(_ob_qty(b) for b in bids[:5]) if len(bids) >= 5 else 0
+            ask_depth = sum(_ob_qty(a) for a in asks[:5]) if len(asks) >= 5 else 0
             total = bid_depth + ask_depth
             if total > 1e-10:
                 imbalance = (bid_depth - ask_depth) / total
@@ -3101,10 +3118,14 @@ class QuantStrategy:
             asks = (orderbook or {}).get("asks", [])
             if bids and asks:
                 if side == "long":
-                    limit_px  = round(float(bids[0][0]), 1)   # join best bid
+                    def _best_px(lvl):
+                        if isinstance(lvl,(list,tuple)): return float(lvl[0])
+                        if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                        return 0.0
+                    limit_px  = round(_best_px(bids[0]), 1)   # join best bid
                     mt_reason = f"limit_long@bid={limit_px:.1f}"
                 else:
-                    limit_px  = round(float(asks[0][0]), 1)   # join best ask
+                    limit_px  = round(_best_px(asks[0]), 1)   # join best ask
                     mt_reason = f"limit_short@ask={limit_px:.1f}"
             else:
                 raise ValueError("empty book")

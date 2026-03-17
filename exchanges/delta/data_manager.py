@@ -328,17 +328,43 @@ class DeltaDataManager:
 
     # ── WS callbacks ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalise_ob_side(raw: list) -> list:
+        """
+        Convert Delta orderbook levels to canonical [[price, qty], ...] format.
+        Delta WS delivers dicts: {'limit_price': '74041.0', 'size': 477, 'depth': '477'}
+        All consumers downstream expect [price, qty] lists.
+        """
+        result = []
+        for lvl in (raw or []):
+            try:
+                if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                    result.append([float(lvl[0]), float(lvl[1])])
+                elif isinstance(lvl, dict):
+                    px  = float(lvl.get("limit_price") or lvl.get("price") or 0)
+                    qty = float(lvl.get("size") or lvl.get("quantity") or
+                                lvl.get("depth") or 0)
+                    if px > 0:
+                        result.append([px, qty])
+            except Exception:
+                continue
+        return result
+
     def _on_orderbook(self, data: Dict) -> None:
         try:
             with self._lock:
+                # Delta WS uses "buy"/"sell" keys, NOT "bids"/"asks"
+                raw_bids = data.get("buy") or data.get("bids", [])
+                raw_asks = data.get("sell") or data.get("asks", [])
                 self._orderbook = {
-                    "bids": data.get("bids", []),
-                    "asks": data.get("asks", []),
+                    "bids": self._normalise_ob_side(raw_bids),
+                    "asks": self._normalise_ob_side(raw_asks),
                 }
                 bids, asks = self._orderbook["bids"], self._orderbook["asks"]
                 if bids and asks:
                     try:
-                        self._last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        self._last_price = (bids[0][0] + asks[0][0]) / 2.0
+                        self._last_price_update_time = time.time()
                     except Exception:
                         pass
                 self.stats.record_orderbook()

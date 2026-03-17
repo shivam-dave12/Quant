@@ -72,6 +72,30 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _norm_levels(raw_levels: list) -> list:
+    """
+    Normalise orderbook levels to [[price, qty], ...] format.
+
+    Handles both the canonical list format [[price, qty], ...]
+    and the Delta Exchange dict format [{'limit_price': p, 'size': q}, ...].
+    Returns an empty list for any level that cannot be parsed.
+    """
+    result = []
+    for lvl in (raw_levels or []):
+        try:
+            if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                result.append([float(lvl[0]), float(lvl[1])])
+            elif isinstance(lvl, dict):
+                px  = float(lvl.get("limit_price") or lvl.get("price") or 0)
+                qty = float(lvl.get("size") or lvl.get("quantity") or
+                            lvl.get("depth") or 0)
+                if px > 0:
+                    result.append([px, qty])
+        except Exception:
+            continue
+    return result
+
+
 class MarketAggregator:
     """
     Unified data manager facade consumed by QuantStrategy.
@@ -292,7 +316,12 @@ class MarketAggregator:
         p_ob = self._primary.get_orderbook()
 
         if self._secondary is None or not self._secondary_alive:
-            return p_ob
+            # Normalise even single-exchange OBs so consumers get [[p,q]] always
+            return {
+                "bids": _norm_levels(p_ob.get("bids", []) or p_ob.get("buy", [])),
+                "asks": _norm_levels(p_ob.get("asks", []) or p_ob.get("sell", [])),
+                "timestamp": p_ob.get("timestamp", time.time()),
+            }
 
         try:
             s_ob = self._secondary.get_orderbook()
@@ -303,10 +332,14 @@ class MarketAggregator:
 
         def merge_side(p_levels: list, s_levels: list, ascending: bool) -> list:
             combined: Dict[float, float] = {}
-            for lvl in (p_levels[:self._ob_depth] + s_levels[:self._ob_depth]):
+            all_levels = (
+                _norm_levels(p_levels)[:self._ob_depth] +
+                _norm_levels(s_levels)[:self._ob_depth]
+            )
+            for lvl in all_levels:
                 try:
-                    px  = round(float(lvl[0]), 2)
-                    qty = float(lvl[1])
+                    px  = round(lvl[0], 2)
+                    qty = lvl[1]
                     combined[px] = combined.get(px, 0.0) + qty
                 except Exception:
                     continue
@@ -315,9 +348,11 @@ class MarketAggregator:
                                    reverse=not ascending)
             return [[px, qty] for px, qty in sorted_levels[:self._ob_depth]]
 
-        merged_bids = merge_side(p_ob.get("bids", []), s_ob.get("bids", []),
+        merged_bids = merge_side(p_ob.get("bids", []) or p_ob.get("buy", []),
+                                 s_ob.get("bids", []) or s_ob.get("buy", []),
                                  ascending=False)
-        merged_asks = merge_side(p_ob.get("asks", []), s_ob.get("asks", []),
+        merged_asks = merge_side(p_ob.get("asks", []) or p_ob.get("sell", []),
+                                 s_ob.get("asks", []) or s_ob.get("sell", []),
                                  ascending=True)
 
         return {
