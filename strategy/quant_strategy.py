@@ -1904,7 +1904,8 @@ class InstitutionalLevels:
                          candles_5m: Optional[List[Dict]] = None,
                          initial_sl_dist: float = 0.0,
                          ict_engine=None,
-                         now_ms: int = 0) -> Optional[float]:
+                         now_ms: int = 0,
+                         hold_reason: Optional[List[str]] = None) -> Optional[float]:
         """
         Institutional trailing SL — v4.9 (ICT-anchored, zone-aware).
 
@@ -1952,10 +1953,14 @@ class InstitutionalLevels:
         tier = tier_profit / init_dist if init_dist > 1e-10 else 0.0
 
         if atr < 1e-10:
+            if hold_reason is not None:
+                hold_reason.append("ATR=0")
             return None
 
         # ═══ PHASE 0: HANDS OFF ═══════════════════════════════════════════
         if tier < QCfg.TRAIL_BE_R():
+            if hold_reason is not None:
+                hold_reason.append(f"PHASE0 tier={tier:.2f}R < BE_R={QCfg.TRAIL_BE_R():.1f}R")
             return None
 
         # ═══ DETERMINE PHASE AND MIN DISTANCE ═════════════════════════════
@@ -1994,6 +1999,8 @@ class InstitutionalLevels:
                             f"Trail: ICT OB ZONE FREEZE — price ${price:,.1f} "
                             f"in OB ${_ob.low:,.1f}–${_ob.high:,.1f} "
                             f"(±{_freeze_atr:.0f} buffer). Trade thesis intact.")
+                        if hold_reason is not None:
+                            hold_reason.append(f"ICT_OB_FREEZE OB=${_ob.low:.0f}-${_ob.high:.0f}")
                         return None
 
                 # Check active FVGs in trade direction (price inside gap = fill in progress)
@@ -2010,20 +2017,45 @@ class InstitutionalLevels:
                             f"Trail: ICT FVG ZONE FREEZE — price ${price:,.1f} "
                             f"in FVG ${_fvg.bottom:,.1f}–${_fvg.top:,.1f}. "
                             f"FVG fill in progress — holding SL.")
+                        if hold_reason is not None:
+                            hold_reason.append(f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
                         return None
             except Exception as _ict_e:
                 logger.debug(f"Trail ICT zone check error (non-fatal): {_ict_e}")
 
         # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
+        # Pullback freeze: hold SL when the move looks like a healthy pullback,
+        # not a true reversal. Prevents premature SL tightening mid-pullback.
+        #
+        # EXEMPTION — Break-even move is ALWAYS allowed regardless of pullback:
+        # If the current SL is still below entry (full original risk open) and
+        # there is a valid BE candidate, the pullback freeze must NOT block it.
+        # At 0.74R with SL still at original level, freezing the BE move means
+        # the position can retrace back to the original SL and take a full loss.
+        # The freeze is meaningful only AFTER break-even is already locked.
+        _be_price = (entry_price + 0.3 * atr if pos_side == "long"
+                     else entry_price - 0.3 * atr)
+        _be_is_unlocked = (
+            (pos_side == "long"  and current_sl >= _be_price) or
+            (pos_side == "short" and current_sl <= _be_price)
+        )
         if QCfg.TRAIL_PULLBACK_FREEZE():
             is_pb, rev_count, pb_detail = InstitutionalLevels._classify_pullback_vs_reversal(
                 pos_side, price, entry_price, atr,
                 candles_1m, candles_5m, orderbook, entry_vol, peak_price_abs)
-            if is_pb:
+            if is_pb and _be_is_unlocked:
+                # BE locked — full pullback freeze engaged
                 logger.debug(
                     f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} "
-                    f"reversal) — FROZEN [{pb_detail}]")
+                    f"reversal) BE locked — FROZEN [{pb_detail}]")
+                if hold_reason is not None:
+                    hold_reason.append(f"PULLBACK({rev_count}sig) [{pb_detail}]")
                 return None
+            elif is_pb and not _be_is_unlocked:
+                # BE not yet locked — allow BE move, but log the pullback status
+                logger.debug(
+                    f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} rev) "
+                    f"— BE not locked, allowing BE move [{pb_detail}]")
 
         # ═══ BUILD CANDIDATE SL LEVELS ════════════════════════════════════
         # v4.9 INSTITUTIONAL PRIORITY — structure first, chandelier last resort:
@@ -2173,6 +2205,8 @@ class InstitutionalLevels:
                         candidates.append(min(vw, key=lambda x: x[1])[0] + 0.10 * atr)
 
         if not candidates:
+            if hold_reason is not None:
+                hold_reason.append("NO_CANDIDATES")
             return None
 
         # ═══ SELECT BEST CANDIDATE ════════════════════════════════════════
@@ -2240,9 +2274,13 @@ class InstitutionalLevels:
         min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
         if pos_side == "long":
             if new_sl <= current_sl + min_move:
+                if hold_reason is not None:
+                    hold_reason.append(f"RATCHET new={new_sl:.1f} <= sl+min_move={current_sl+min_move:.1f}")
                 return None
         else:
             if new_sl >= current_sl - min_move:
+                if hold_reason is not None:
+                    hold_reason.append(f"RATCHET new={new_sl:.1f} >= sl-min_move={current_sl-min_move:.1f}")
                 return None
 
         return new_sl
@@ -2514,6 +2552,7 @@ class QuantStrategy:
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
+        self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
         # Concurrency guards: position sync runs in a background thread so the
         # main loop (trail, heartbeat, signals) is never blocked waiting for REST.
         self._pos_sync_in_progress  = False   # ACTIVE sync thread running
@@ -2726,9 +2765,70 @@ class QuantStrategy:
                 with self._lock:
                     self._finalise_exit()
 
+        elif phase == PositionPhase.ENTERING:
+            # Bracket fill is being polled by a background thread.
+            # This phase blocks re-entry on every tick until fill confirmed (→ACTIVE)
+            # or the entry aborts (→FLAT via finally in _launch_entry_async).
+            # Safety watchdog: force FLAT if background thread dies silently.
+            _entry_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
+            if (now - self._entering_since) > (_entry_timeout + 30.0):
+                with self._lock:
+                    if self._pos.phase == PositionPhase.ENTERING:
+                        logger.warning(
+                            "⚠️ ENTERING watchdog: >75s without fill confirmation "
+                            "— forcing FLAT (check exchange for orphaned position)")
+                        send_telegram_message(
+                            "⚠️ <b>ENTERING TIMEOUT</b>\n"
+                            "Bracket order fill not confirmed after 75s.\n"
+                            "State reset to FLAT.\n"
+                            "<b>Check exchange for open position!</b>")
+                        self._pos.phase = PositionPhase.FLAT
+                        self._last_exit_time = now
+
         elif phase == PositionPhase.FLAT:
             if cooldown_ok:
                 self._evaluate_entry(data_manager, order_manager, risk_manager, now)
+
+    def _launch_entry_async(self, data_manager, order_manager, risk_manager,
+                             side: str, sig, mode: str) -> None:
+        """
+        Non-blocking entry: sets ENTERING phase immediately, then runs
+        _enter_trade in a daemon thread so the main on_tick loop is never
+        blocked by the bracket fill-polling sleep loop (up to 45s).
+
+        Root cause fixed: place_bracket_limit_entry contains a time.sleep
+        polling loop that ran on the strategy thread, blocking every main-loop
+        tick for up to 45s and triggering the 15s watchdog alarm on every entry.
+
+        The try/finally guarantees any abort path inside _enter_trade
+        (TP gate rejection, SL failure, partial-fill abort, etc.) resets phase
+        to FLAT so entry evaluation resumes after cooldown.
+        """
+        with self._lock:
+            self._pos.phase      = PositionPhase.ENTERING
+            self._entering_since = time.time()
+
+        _dm, _om, _rm = data_manager, order_manager, risk_manager
+
+        def _bg():
+            try:
+                self._enter_trade(_dm, _om, _rm, side, sig, mode=mode)
+            except Exception as _e:
+                logger.error(
+                    f"_enter_trade background thread error ({mode}/{side}): {_e}",
+                    exc_info=True)
+            finally:
+                with self._lock:
+                    if self._pos.phase == PositionPhase.ENTERING:
+                        logger.warning(
+                            f"⚠️ Entry thread exited without activation "
+                            f"(mode={mode} side={side}) — resetting to FLAT")
+                        self._pos.phase      = PositionPhase.FLAT
+                        self._last_exit_time = time.time()
+
+        threading.Thread(
+            target=_bg, daemon=True, name=f"enter-{mode}-{side}"
+        ).start()
 
     def _feed_microstructure(self, data_manager):
         try:
@@ -2880,14 +2980,12 @@ class QuantStrategy:
             return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
-        price = data_manager.get_last_price()
+        price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
         # Update ICT structures (OB, FVG, liquidity, session) every 5s
         # Then score ICT confluence for the current reversion side
         # ICT score is used to: (a) boost composite, (b) count as confirming signal
-        # FIX: ICT update runs BEFORE _log_thinking so the display always shows the
-        # current tick's scores (previously the log showed stale prev-tick values).
         if self._ict is not None:
             try:
                 candles_5m = data_manager.get_candles("5m", limit=100)
@@ -2897,9 +2995,7 @@ class QuantStrategy:
                 self._ict.update(candles_5m, candles_15m, price, now_ms,
                                  candles_1m=candles_1m_ict)
                 ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
-                # FIX: pass atr so proximity scoring in get_confluence can compute
-                # ATR-normalised distances to nearby OBs/FVGs (root cause of 0.00)
-                ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
+                ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
                 sig.ict_ob = ict_conf.ob_score
                 sig.ict_fvg = ict_conf.fvg_score
                 sig.ict_sweep = ict_conf.sweep_score
@@ -2915,9 +3011,6 @@ class QuantStrategy:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
-
-        # Log AFTER ICT update — display now reflects current tick's scores
-        self._log_thinking(sig, price, now)
 
         # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
         # This is the single most important defense against bleeding in trends.
@@ -3015,10 +3108,10 @@ class QuantStrategy:
         cn = QCfg.CONFIRM_TICKS()
         if self._confirm_long >= cn:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig, mode="reversion")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="reversion")
         elif self._confirm_short >= cn:
             self._confirm_long = self._confirm_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig, mode="reversion")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="reversion")
 
     def _evaluate_trend_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -3106,10 +3199,10 @@ class QuantStrategy:
         cn = QCfg.TREND_CONFIRM_TICKS()
         if trend_side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "long", sig, mode="trend")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="trend")
         elif trend_side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._enter_trade(data_manager, order_manager, risk_manager, "short", sig, mode="trend")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend")
 
     def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -3177,36 +3270,27 @@ class QuantStrategy:
             return
 
         # ── Issue 4 fix: Gate 4 — ICT structural confluence ──────────────────
-        # FIX: sig.ict_total was scored for sig.reversion_side (the fade direction).
-        # For a breakout UP, reversion_side="short" but momentum side="long".
-        # Using the reversion score for a momentum entry checks the WRONG direction.
-        # Re-query get_confluence here for the actual momentum side.
+        # Momentum entries need ICT OBs / FVGs in the retest zone to be valid.
+        # A retest without institutional structure is a noise bounce, not a
+        # real break-and-retest. The ICT gate prevents entering at random levels.
         _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
-            now_ms_mo = int(now * 1000) if now < 1e12 else int(now)
-            try:
-                mo_conf = self._ict.get_confluence(side, price, now_ms_mo, atr=atr)
-                mo_ict_total = mo_conf.total
-                mo_ict_details = mo_conf.details
-            except Exception:
-                mo_ict_total = sig.ict_total
-                mo_ict_details = sig.ict_details
-            if mo_ict_total < _ict_min:
+            if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
                     self._ict_gate_start_time = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
-                        f"score={mo_ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{mo_ict_details}]")
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
+                        f"[{sig.ict_details}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
-                        f"Current score: {mo_ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {mo_ict_details}\n"
+                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"Details: {sig.ict_details}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
@@ -3224,22 +3308,22 @@ class QuantStrategy:
         cn = QCfg.CONFIRM_TICKS()
         if side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._last_momentum_attempt = now   # prevent re-fire for retry_sec
+            self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_low=${self._breakout._retest_low:,.2f} | "
                 f"SL=${retest_sl:,.2f}")
-            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
         elif side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._last_momentum_attempt = now   # prevent re-fire for retry_sec
+            self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_high=${self._breakout._retest_high:,.2f} | "
                 f"SL=${retest_sl:,.2f}")
-            self._enter_trade(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
 
     def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
                        signal_confidence=0.5, use_maker_entry=False):
@@ -4071,6 +4155,9 @@ class QuantStrategy:
         # v4.9: Pass ict_engine + now_ms so trail can use ICT zone freeze,
         # OB anchor SL, and liquidity pool ceiling — the three new protections
         # that eliminate the "stopped during pullback, TP fires without us" pattern.
+        # hold_reason: mutable list — compute_trail_sl appends the actual block reason
+        # so the Trail HOLD log can show WHY it was blocked (not always "Phase 0").
+        _hold_reason: List[str] = []
         new_sl = InstitutionalLevels.compute_trail_sl(
             pos.side, price, pos.entry_price, pos.sl_price, atr,
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
@@ -4078,18 +4165,20 @@ class QuantStrategy:
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
             initial_sl_dist=pos.initial_sl_dist,
             ict_engine=self._ict,
-            now_ms=now_ms)
+            now_ms=now_ms,
+            hold_reason=_hold_reason)
 
         if new_sl is None:
-            # Issue 2 fix: log WHY the trail was blocked (throttled to 30s)
             _trail_log_interval = 30.0
             if now - self._last_trail_block_log >= _trail_log_interval:
                 self._last_trail_block_log = now
                 init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
                 tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
                 hm = (now - pos.entry_time) / 60.0
+                # Show the ACTUAL reason trail was blocked — not always "need ≥0.4R"
+                _reason_str = " | ".join(_hold_reason) if _hold_reason else f"tier={tier:.2f}R < BE_R={QCfg.TRAIL_BE_R():.1f}R"
                 logger.info(
-                    f"🔒 Trail HOLD | tier={tier:.2f}R (need ≥{QCfg.TRAIL_BE_R():.1f}R to start) | "
+                    f"🔒 Trail HOLD | {_reason_str} | "
                     f"profit={profit:.1f}pts peak={pos.peak_profit:.1f}pts | "
                     f"SL=${pos.sl_price:,.1f} | hold={hm:.0f}m")
             return False
