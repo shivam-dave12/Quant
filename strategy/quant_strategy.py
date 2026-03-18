@@ -3422,12 +3422,31 @@ class QuantStrategy:
                        f"q={self._active_sweep_setup.quality_score():.2f}")
 
         else:
-            # Reversion path — original all-pass logic unchanged
+            # Reversion path
+            # E FIX: also detect ICT/VWAP direction mismatch so the display is
+            # explicit about the conflict instead of silently confusing.
+            _ict_dir_disp = sig.ict_direction   # +1=long, -1=short, 0=unset
+            _ict_rev_side = sig.reversion_side or "long"
+            _ict_vs_vwap_conflict = (
+                (_ict_dir_disp < 0 and _ict_rev_side == "long") or
+                (_ict_dir_disp > 0 and _ict_rev_side == "short")
+            )
+            if _ict_vs_vwap_conflict:
+                _conflict_lbl = (
+                    "▼SHORT" if _ict_dir_disp < 0 else "▲LONG")
+                gates.append(
+                    f"⚠️  ICT ({_conflict_lbl}) vs VWAP "
+                    f"({_ict_rev_side.upper()}) — opposite directions; "
+                    f"ICT scores re-computed for {_ict_rev_side.upper()}")
+
+            _ap_reason = ""
             if _ict_init and _ICT_TRADE_ENGINE_AVAILABLE:
                 try:
-                    _qh_ap = self._get_quant_helpers(sig, sig.reversion_side or "long")
-                    _ap_tier, _, _ = ICTEntryGate.evaluate(
-                        sig.reversion_side or "long", sig,
+                    _qh_ap = self._get_quant_helpers(sig, _ict_rev_side)
+                    # D FIX: capture reason so we can surface it in _status
+                    # instead of the generic "👀 Watching" that obscures ICT blocks.
+                    _ap_tier, _, _ap_reason = ICTEntryGate.evaluate(
+                        _ict_rev_side, sig,
                         self._active_sweep_setup, price, _qh_ap)
                     ap = _ap_tier in ("S", "A", "B")
                 except Exception:
@@ -3436,7 +3455,15 @@ class QuantStrategy:
                 _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
                 ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
                       sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
-            _status = "🎯 ENTRY READY" if ap else "👀 Watching"
+
+            # D FIX: surface the real block reason — "👀 Watching" implied
+            # passive state; when ICT hard-blocks the status must say so.
+            if ap:
+                _status = "🎯 ENTRY READY"
+            elif _ap_reason and _ap_reason not in ("no_ict", ""):
+                _status = f"⛔ ICT BLOCKED — {_ap_reason[:55]}"
+            else:
+                _status = "👀 Watching"
 
         cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
         _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
@@ -3697,6 +3724,54 @@ class QuantStrategy:
 
         # ── Build quant helper signals for ICTEntryGate ───────────────────
         quant_helpers = self._get_quant_helpers(sig, side)
+
+        # ── C FIX: Re-compute ICT confluence for the entry side when it was ──
+        # evaluated for the OPPOSITE direction in _evaluate_entry.
+        #
+        # _evaluate_entry computes ICT confluence for `ict_side` (driven by AMD
+        # bias or dominant OB structure).  When AMD is bearish and VWAP says LONG,
+        # ict_side="short" and sig.ict_total=0.53 is SHORT confluence strength.
+        # Passing that into ICTEntryGate.evaluate("long",...) is structurally wrong:
+        #   • SHORT strength 0.65 looks like strong LONG ICT support to the gate
+        #   • Gate can pass a LONG with zero real ICT backing
+        #   • Conversely, a high SHORT score blocks LONG for wrong reasons
+        #
+        # Fix: when ict_direction opposes side, re-run get_confluence(side) and
+        # update sig.ict_* fields so the gate uses correctly-directed scores.
+        #
+        # sig.composite is NOT touched — the signed boost was already applied
+        # in _evaluate_entry and correctly penalises confidence in this direction.
+        # sig.ict_boost_signed / sig.ict_direction are attribution fields — unchanged.
+        _ict_dir = sig.ict_direction   # +1.0=long, -1.0=short, 0.0=unset (B1 field)
+        _ict_opposes_side = (
+            (_ict_dir < 0 and side == "long") or
+            (_ict_dir > 0 and side == "short")
+        )
+        if (_ict_opposes_side and
+                self._ict is not None and self._ict._initialized):
+            try:
+                _now_ms_rg = int(now * 1000) if now < 1e12 else int(now)
+                _recomp    = self._ict.get_confluence(side, price, _now_ms_rg,
+                                                       atr=sig.atr)
+                sig.ict_ob      = _recomp.ob_score
+                sig.ict_fvg     = _recomp.fvg_score
+                sig.ict_sweep   = _recomp.sweep_score
+                sig.ict_session = _recomp.session_score
+                sig.ict_total   = _recomp.total
+                sig.ict_details = _recomp.details
+                # in_discount / in_premium / mtf_aligned come from AMD engine —
+                # independent of confluence side, leave unchanged.
+                _prev_dir_lbl = "SHORT" if _ict_dir < 0 else "LONG"
+                logger.debug(
+                    f"🔄 ICT re-computed for {side.upper()} "
+                    f"(was {_prev_dir_lbl}): "
+                    f"Σ={_recomp.total:.2f} "
+                    f"[OB={_recomp.ob_score:.2f} "
+                    f"FVG={_recomp.fvg_score:.2f}]")
+            except Exception as _rce:
+                logger.debug(f"ICT side-recompute error (non-fatal): {_rce}")
+                # Zero out so gate cannot mistake opposite-side scores as support
+                sig.ict_total = 0.0
 
         # ── ICT Tier-Based Gate ───────────────────────────────────────────
         _effective_cn = QCfg.CONFIRM_TICKS()   # default; overridden by tier
