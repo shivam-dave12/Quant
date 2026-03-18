@@ -3327,7 +3327,8 @@ class QuantStrategy:
                         (_ict_dir_vs_vwap > 0 and _disp_rev_side == "short")
                     )
 
-                    # Save originals for restore
+                    # Save originals for restore; also initialise display values to
+                    # originals so the no-recompute path falls through unchanged.
                     _orig_ict_ob    = sig.ict_ob
                     _orig_ict_fvg   = sig.ict_fvg
                     _orig_ict_sweep = sig.ict_sweep
@@ -3336,17 +3337,37 @@ class QuantStrategy:
                     _orig_ict_det   = sig.ict_details
                     _disp_note      = ""
 
+                    # H FIX: Track display scores separately so we can show the
+                    # re-computed values in the label AFTER restoring originals.
+                    # Without this, ict_gate_lbl used sig.ict_total (restored SHORT)
+                    # while the tier label came from LONG evaluation — displaying
+                    # "Σ=0.52 [disp re-comp for LONG]" where 0.52 was the SHORT score.
+                    _disp_ict_total = _orig_ict_total
+                    _disp_ict_ob    = _orig_ict_ob
+                    _disp_ict_fvg   = _orig_ict_fvg
+                    _disp_ict_sweep = _orig_ict_sweep
+                    _disp_ict_sess  = _orig_ict_sess
+
                     if _ict_opposes_disp:
                         try:
                             _now_ms_d = int(now * 1000) if now < 1e12 else int(now)
                             _rc = self._ict.get_confluence(
                                 _disp_rev_side, price, _now_ms_d, atr=sig.atr)
+                            # Patch sig so the ICTEntryGate evaluation reads
+                            # correctly-directed scores
                             sig.ict_ob      = _rc.ob_score
                             sig.ict_fvg     = _rc.fvg_score
                             sig.ict_sweep   = _rc.sweep_score
                             sig.ict_session = _rc.session_score
                             sig.ict_total   = _rc.total
                             sig.ict_details = _rc.details
+                            # H FIX: save re-computed values for display — these
+                            # will survive the restore below
+                            _disp_ict_total = _rc.total
+                            _disp_ict_ob    = _rc.ob_score
+                            _disp_ict_fvg   = _rc.fvg_score
+                            _disp_ict_sweep = _rc.sweep_score
+                            _disp_ict_sess  = _rc.session_score
                             _disp_note = f" [disp re-comp for {_disp_rev_side.upper()}]"
                         except Exception:
                             pass  # fall through: display original scores with a warning
@@ -3376,26 +3397,28 @@ class QuantStrategy:
                     _tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
                                    "BLOCKED": "⛔", "?": "❓"}
 
-                    # B1 FIX: show the signed ICT direction so the arrow and
-                    # boost value reflect the actual composite contribution.
+                    # B1 FIX: show the signed ICT direction (from _evaluate_entry)
+                    # so the arrow reflects the composite contribution direction.
                     _ict_dir_arrow = ("▲LONG"  if sig.ict_direction > 0
                                       else ("▼SHORT" if sig.ict_direction < 0
                                             else "─UNSET"))
                     _boost_str = f"{sig.ict_boost_signed:+.3f}" if sig.ict_direction != 0 else "n/a"
 
-                    # B6 FIX: OB raw accumulator can exceed 1.0.  Show normalised
-                    # and raw so OB=1.4raw / 0.70norm is unambiguous.
-                    # Use patched-then-restored originals for display (correct side
-                    # if recompute succeeded, original side if it failed).
-                    _ob_norm  = min(_orig_ict_ob  / 2.0, 1.0)
-                    _fvg_norm = min(_orig_ict_fvg / 1.5, 1.0)
+                    # B6 FIX + H FIX: use _disp_ict_* which holds either the
+                    # re-computed entry-side scores (when recompute succeeded) or
+                    # the original scores (when recompute was skipped / failed).
+                    # This ensures Σ and sub-scores always match the tier label
+                    # direction — previously the restored SHORT total was shown
+                    # next to a LONG tier label after re-computation.
+                    _ob_norm  = min(_disp_ict_ob  / 2.0, 1.0)
+                    _fvg_norm = min(_disp_ict_fvg / 1.5, 1.0)
 
                     ict_gate_lbl = (
                         f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}]{_disp_note} "
-                        f"Σ={sig.ict_total:.2f} ({_ict_dir_arrow} boost={_boost_str}) "
-                        f"[OB={_ob_norm:.2f}({_orig_ict_ob:.1f}raw) "
-                        f"FVG={_fvg_norm:.2f}({_orig_ict_fvg:.1f}raw) "
-                        f"Swp={_orig_ict_sweep:.1f} KZ={_orig_ict_sess:.1f}]"
+                        f"Σ={_disp_ict_total:.2f} ({_ict_dir_arrow} boost={_boost_str}) "
+                        f"[OB={_ob_norm:.2f}({_disp_ict_ob:.1f}raw) "
+                        f"FVG={_fvg_norm:.2f}({_disp_ict_fvg:.1f}raw) "
+                        f"Swp={_disp_ict_sweep:.1f} KZ={_disp_ict_sess:.1f}]"
                     )
                     if _tier_reason_d:
                         ict_gate_lbl += f"\n    {_tier_reason_d[:80]}"
