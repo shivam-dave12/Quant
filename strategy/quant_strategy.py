@@ -50,11 +50,6 @@ import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.
 import config
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
-import html as _html_mod
-
-def _esc_html(s) -> str:
-    """Escape <, >, & so dynamic strings are safe inside Telegram HTML messages."""
-    return _html_mod.escape(str(s) if s else "", quote=False)
 try:
     from strategy.ict_engine import ICTEngine, ICTConfluence
     _ICT_AVAILABLE = True
@@ -1634,8 +1629,13 @@ class InstitutionalLevels:
             try:
                 _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
                 # Issue 3: use sl_dist (1.0×) as ICT min distance, not min_tp_dist (1.5×)
-                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)   # at least 1:1 R:R or 0.5ATR
-                _ict_max_dist = max_tp_dist                       # same upper cap
+                # ICT targets must meet the same R:R floor as quant targets.
+                # Previously used sl_dist*1.0 (1:1), which allowed structurally valid
+                # but risk-inadequate TPs (e.g. nearby swept pool at 1.15R).
+                # ICT structure is authoritative — but only if the trade has positive EV
+                # after costs. REVERSION_MIN_RR (default 1.5) is the minimum viable EV floor.
+                _ict_min_dist = min_tp_dist   # same REVERSION_MIN_RR×sl_dist as quant
+                _ict_max_dist = max_tp_dist
                 _ict_targets = ict_engine.get_structural_tp_targets(
                     side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist)
                 for _lvl, _sc, _lbl in _ict_targets:
@@ -1907,6 +1907,7 @@ class InstitutionalLevels:
                          peak_price_abs: float = 0.0,
                          trade_mode: str = "reversion",
                          candles_5m: Optional[List[Dict]] = None,
+                         candles_15m: Optional[List[Dict]] = None,
                          initial_sl_dist: float = 0.0,
                          ict_engine=None,
                          now_ms: int = 0) -> Optional[float]:
@@ -2080,8 +2081,41 @@ class InstitutionalLevels:
             except Exception as _e:
                 logger.debug(f"Trail OB anchor error: {_e}")
 
-        # ── 3. 5m confirmed swing structure (all phases) ─────────────────
-        # PRIMARY structural trail. Only CLOSED candles (confirmed, not forming).
+        # ── 3a. 15m confirmed swing structure (all phases) — HIGHEST STRUCTURAL WEIGHT
+        # 15m swings represent institutional structure confirmation. A confirmed 15m
+        # swing low (for long) means large-timeframe participants defended that level.
+        # SL behind it is the most structurally sound position possible.
+        # Only use CLOSED candles so we trail to confirmed, not forming, structure.
+        if candles_15m and len(candles_15m) >= 4:
+            closed_15m     = candles_15m[:-1]
+            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
+                closed_15m, min(8, len(closed_15m) - 2))
+            swing_buf_15m  = max(0.35 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.9)
+
+            if pos_side == "long" and sl_15m:
+                # Trail to below the most recent 15m swing low that is:
+                #   - Above current SL (improvement)
+                #   - Below price - min_dist (enough room)
+                valid_15m = [l for l in sl_15m
+                             if current_sl + 0.05 * atr < l < price - min_dist]
+                if valid_15m:
+                    best_15m = max(valid_15m)
+                    candidates.append(best_15m - swing_buf_15m)
+                    logger.debug(
+                        f"Trail: 15m swing low ${best_15m:,.1f} → SL "
+                        f"${best_15m - swing_buf_15m:,.1f}")
+            elif pos_side == "short" and sh_15m:
+                valid_15m = [h for h in sh_15m
+                             if price + min_dist < h < current_sl - 0.05 * atr]
+                if valid_15m:
+                    best_15m = min(valid_15m)
+                    candidates.append(best_15m + swing_buf_15m)
+                    logger.debug(
+                        f"Trail: 15m swing high ${best_15m:,.1f} → SL "
+                        f"${best_15m + swing_buf_15m:,.1f}")
+
+        # ── 3b. 5m confirmed swing structure (all phases) ─────────────────
+        # Secondary structural trail. Only CLOSED candles (confirmed, not forming).
         # A higher 5m swing low (long) = market proved a higher low → trail up.
         if candles_5m and len(candles_5m) >= 4:
             closed_5m    = candles_5m[:-1]
@@ -2523,7 +2557,6 @@ class QuantStrategy:
         self._last_fed_trade_ts = 0.0
         self._last_reconcile_time = 0.0; self._RECONCILE_SEC = 30.0
         self._reconcile_pending = False; self._reconcile_data = None
-        self._reconcile_started_at = 0.0   # watchdog: detects stuck reconcile threads
         self._total_trades = 0; self._winning_trades = 0; self._total_pnl = 0.0
         self._trade_history: List[Dict] = []   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
@@ -2663,23 +2696,11 @@ class QuantStrategy:
 
             # Spawn reconcile background thread if due (non-blocking)
             if not self._reconcile_pending and now - self._last_reconcile_time >= self._RECONCILE_SEC:
-                self._last_reconcile_time = now
-                self._reconcile_pending = True
-                self._reconcile_started_at = now
+                self._last_reconcile_time = now; self._reconcile_pending = True
                 threading.Thread(
                     target=self._reconcile_query_thread,
                     args=(order_manager,), daemon=True,
                 ).start()
-            elif self._reconcile_pending and (now - self._reconcile_started_at) > 30.0:
-                # Watchdog: reconcile thread has been pending >30s — it either hung or
-                # raised before clearing the flag.  Force-clear so the next cycle
-                # can spawn a fresh thread and logging/signals are not stalled.
-                logger.warning(
-                    f"⚠️ Reconcile thread stuck for {now - self._reconcile_started_at:.0f}s "
-                    "— force-clearing pending flag"
-                )
-                self._reconcile_pending = False
-                self._reconcile_started_at = now
 
             # Snapshot all decision-relevant state while locked
             phase             = self._pos.phase
@@ -2970,7 +2991,7 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} REVERSION]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"— no structural confluence [{_esc_html(sig.ict_details)}]")
+                        f"— no structural confluence [{sig.ict_details}]")
                 # Bug 7 fix: Telegram alert after 15 min continuous block
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
@@ -2978,7 +2999,7 @@ class QuantStrategy:
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {_esc_html(sig.ict_details)}\n"
+                        f"Details: {sig.ict_details}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_long = self._confirm_short = 0
                 return
@@ -3049,14 +3070,14 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{trend_side.upper()} TREND]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{_esc_html(sig.ict_details)}]")
+                        f"[{sig.ict_details}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {_esc_html(sig.ict_details)}\n"
+                        f"Details: {sig.ict_details}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
@@ -3171,14 +3192,14 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{_esc_html(sig.ict_details)}]")
+                        f"[{sig.ict_details}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {_esc_html(sig.ict_details)}\n"
+                        f"Details: {sig.ict_details}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
@@ -3292,7 +3313,10 @@ class QuantStrategy:
                     ob_dist = abs(price - ob_sl)
                     ob_valid_side = (side == "long" and ob_sl < price) or \
                                     (side == "short" and ob_sl > price)
-                    ob_min_dist = 0.5 * atr   # must be at least 0.5×ATR from entry
+                    # 1.5×ATR floor: aligned with get_ob_sl_level's new minimum.
+                    # A SL at 0.5×ATR would be inside the noise band and stopped on
+                    # the first OB test — exactly the pullback the setup requires.
+                    ob_min_dist = 1.5 * atr
                     ob_max_dist = price * QCfg.MAX_SL_PCT()  # hard upper cap
                     if ob_valid_side and ob_min_dist <= ob_dist <= ob_max_dist:
                         # ICT OB primary — this is the institutional anchor
@@ -3730,7 +3754,7 @@ class QuantStrategy:
         # ICT context line
         ict_line = ""
         if sig.ict_total > 0.01:
-            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{_esc_html(sig.ict_details)}]"
+            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{sig.ict_details}]"
         mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
         send_telegram_message(
             f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]</b>\n"
@@ -3993,23 +4017,25 @@ class QuantStrategy:
         except Exception: candles_1m = []
         try: candles_5m = data_manager.get_candles("5m", limit=30)
         except Exception: candles_5m = []
+        # 15m candles: primary structural trail anchor (highest weight).
+        # Always fetched regardless of ICT engine state.
+        try: candles_15m = data_manager.get_candles("15m", limit=30)
+        except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
         now_ms = int(now * 1000)
 
-        # ── Issue 2 fix: Refresh ICT engine with live 1m/5m structure ────────
+        # ── Issue 2 fix: Refresh ICT engine with live 1m/5m/15m structure ─────
         # ROOT CAUSE: ICT update() only ran in _evaluate_entry() (FLAT phase).
         # During an active position, _manage_active() runs instead, so the ICT
         # engine never saw new OBs, BOS events, or FVGs formed after entry.
         # Zone-freeze was comparing price against entry-time OBs — some of which
         # might permanently overlap the trail zone, freezing the trail forever.
         # Fix: force ICT update here with live candles before every trail decision.
-        # Now also passes candles_1m so fresh 1m OBs are detected for trail anchoring.
         if self._ict is not None:
             try:
-                candles_15m = data_manager.get_candles("15m", limit=30)
                 self._ict.update(candles_5m, candles_15m, price, now_ms,
                                  candles_1m=candles_1m)
             except Exception as _ict_refresh_e:
@@ -4023,6 +4049,7 @@ class QuantStrategy:
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
             hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
+            candles_15m=candles_15m,
             initial_sl_dist=pos.initial_sl_dist,
             ict_engine=self._ict,
             now_ms=now_ms)

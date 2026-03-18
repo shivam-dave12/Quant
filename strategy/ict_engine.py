@@ -861,7 +861,12 @@ class ICTEngine:
         fvg_buf  = 0.2 * atr
         liq_buf  = 0.3 * atr
         max_dist = 4.0 * atr
-        min_dist = 0.5 * atr
+        # Minimum 1.5×ATR: the SL must survive a full OB test pullback.
+        # An OB-anchored SL at 0.5×ATR is inside the normal noise band and
+        # will be stopped out on the very pullback that validates the setup.
+        # 1.5×ATR keeps the SL on the structurally correct side of the OB
+        # while giving the position room to breathe through an OB test.
+        min_dist = 1.5 * atr
 
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []

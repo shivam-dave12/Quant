@@ -104,6 +104,9 @@ class QuantBot:
         self.last_health_check_sec = 0.0
         self.last_report_sec       = 0.0
         self.last_heartbeat_sec    = 0.0
+        # Stream supervisor state
+        self._last_stream_restart  = 0.0   # time of last restart attempt
+        self._restart_in_progress  = False  # prevents concurrent restarts
 
         self.data_manager:     Optional[MarketAggregator]  = None
         self.execution_router: Optional[ExecutionRouter]   = None
@@ -340,6 +343,33 @@ class QuantBot:
     # STREAM SUPERVISOR
     # =========================================================================
 
+    def _restart_streams_background(self, reason_str: str) -> None:
+        """
+        Run stream restart + wait_until_ready entirely in a background thread.
+
+        CRITICAL: This must NEVER run in the main loop thread.
+        restart_streams() takes ~5s (REST warmup). wait_until_ready() can block
+        up to READY_TIMEOUT_SEC=120s. Either call in the main thread freezes
+        on_tick, trail management, heartbeats, and signal generation completely.
+        """
+        try:
+            logger.warning("⚠️  Stream issue: %s — restarting in background...", reason_str)
+            send_telegram_message(
+                f"⚠️ STREAM ISSUE: {reason_str}\n🔄 Restarting streams (background)...")
+
+            ok = self.data_manager.restart_streams()
+            if not ok:
+                logger.error("❌ Stream restart failed")
+            else:
+                self.data_manager.wait_until_ready(
+                    timeout_sec=float(config.READY_TIMEOUT_SEC))
+                logger.info("✅ Stream restart complete")
+        except Exception as e:
+            logger.error(f"Stream restart thread error: {e}", exc_info=True)
+        finally:
+            self._restart_in_progress = False
+            self._last_stream_restart = time.time()
+
     def maybe_supervise_streams(self) -> None:
         if not self.data_manager:
             return
@@ -350,18 +380,41 @@ class QuantBot:
             return
         self.last_health_check_sec = now
 
+        # Don't trigger a new restart if one is already running or just finished.
+        # The WS has its own auto-reconnect (back in ~1s); give it 60s before
+        # deciding it truly needs a full restart.
+        _RESTART_COOLDOWN = 60.0
+        if self._restart_in_progress:
+            return
+        if now - self._last_stream_restart < _RESTART_COOLDOWN:
+            return
+
         ws = getattr(self.data_manager, "ws", None)
         if ws is None:
             return
 
-        stale_sec  = float(config.WS_STALE_SECONDS)
-        ws_healthy = ws.is_healthy(timeout_seconds=int(stale_sec))
-
+        # Only trigger restart when PRICE is genuinely stale, not just the WS.
+        # The WS auto-reconnects in ~1s; a brief disconnect does NOT warrant a
+        # full restart that blocks the main loop for up to 120s.
+        # Price stale = data is actually missing, not just a transient blip.
         price_stale_sec = getattr(config, "PRICE_STALE_SECONDS", 90.0)
         price_fresh     = self.data_manager.is_price_fresh(
             max_stale_seconds=price_stale_sec)
 
+        stale_sec  = float(config.WS_STALE_SECONDS)
+        ws_healthy = ws.is_healthy(timeout_seconds=int(stale_sec))
+
         if ws_healthy and price_fresh:
+            return
+
+        # Both must fail before restart — WS alone reconnects itself.
+        # Price stale AND WS unhealthy = genuinely dead feed.
+        if price_fresh and not ws_healthy:
+            # WS dropped but price is still fresh — auto-reconnect is working.
+            # Log at debug level only — this is normal and self-healing.
+            logger.debug(
+                f"WS silent >{stale_sec:.0f}s but price fresh — "
+                "auto-reconnect in progress, no restart needed")
             return
 
         reason = []
@@ -371,17 +424,14 @@ class QuantBot:
             reason.append(f"Price frozen >{price_stale_sec:.0f}s")
         reason_str = " | ".join(reason)
 
-        logger.warning("⚠️  Stream issue: %s — restarting...", reason_str)
-        send_telegram_message(
-            f"⚠️ STREAM ISSUE: {reason_str}\n🔄 Restarting streams...")
-
-        ok = self.data_manager.restart_streams()
-        if not ok:
-            logger.error("❌ Stream restart failed — entries gated")
-            return
-
-        self.data_manager.wait_until_ready(
-            timeout_sec=float(config.READY_TIMEOUT_SEC))
+        # Fire restart in a background thread — NEVER block the main loop.
+        self._restart_in_progress = True
+        threading.Thread(
+            target=self._restart_streams_background,
+            args=(reason_str,),
+            daemon=True,
+            name="stream-restart",
+        ).start()
 
     # =========================================================================
     # PERIODIC REPORT
