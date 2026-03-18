@@ -1,41 +1,27 @@
 """
-QUANT STRATEGY v4.9 — ICT-ANCHORED TRAILING SL + STRUCTURAL TP
-==============================================================================
-Entry: Wait for overextension from VWAP + order flow divergence, then fade.
-SL: Behind swing structure + ICT OB anchor. TP: ICT structural targets + VWAP.
-Trail: ICT zone-aware — frozen at OBs/FVGs. OB-anchored. Liq-ceiling capped.
+QUANT STRATEGY v5.0 — ICT-COMMANDER / QUANT-SCOUT ARCHITECTURE
+==============================================================
+Architecture:
+  ICT Engine  = Commander  — defines what to trade, where SL/TP go, when structure is valid
+  Quant Engine = Scout     — provides order-flow timing signals to execute within ICT setups
 
-v4.9 TRAIL REWRITE — solves "stopped during pullback, TP fires without us":
+Entry tiers (via ICTEntryGate):
+  Tier-S: ICT Sweep-and-Go in OTE zone (AMD sweep + displacement + 61.8%-78.6% retrace)
+    → SL at sweep wick extreme (0.5-0.8×ATR), TP at AMD delivery target (opposing pool)
+    → Confirm ticks: 1-2 | Expected edge: 58-66% WR, 1:2.5-4.0 R:R
+  Tier-A: ICT structural alignment (DISTRIBUTION/REACCUMULATION context)
+    → 2 confirm ticks | Expected edge: 52-58% WR, 1:2.0-3.5 R:R
+  Tier-B: Standard quant + ICT confluence
+    → 3 confirm ticks | Expected edge: 48-54% WR, 1:1.8-2.5 R:R
 
-  ROOT CAUSE: Trail started at 0.3R with 1.0×ATR min-distance. A healthy BTC
-  pullback of 1.2-1.8×ATR from the swing high hit the trailed SL. Price then
-  continued to TP. Classic retail stop-hunt pattern we were self-inflicting.
+Quant signals used as entry helpers (NOT primary gates):
+  VWAP deviation, CVD, tick flow, orderbook imbalance, volume exhaustion
+  → For Tier-S/A: soft veto only (tick flow not strongly opposing)
+  → For Tier-B:   hard requirements (overextended, n_confirming≥3, composite≥threshold)
 
-  FIX 1 — ICT ZONE FREEZE:
-    If price tests an active Order Block or sits inside an FVG, trail is FROZEN.
-    These are institutional zones. A pullback INTO an OB is the trade working —
-    smart money is defending exactly there. Tightening SL during an OB test is
-    the primary source of the reported problem. Now completely prevented.
-
-  FIX 2 — LATER TRAIL START + WIDER DISTANCES:
-    TRAIL_BE_R: 0.3R → 0.50R. Trade must earn half the SL distance before trail.
-    Phase 1 min-dist: 1.0→1.5×ATR. Phase 2: 0.7→1.1×ATR. Phase 3: 0.5→0.7×ATR.
-    A healthy BTC pullback of 1.2×ATR no longer hits the trailed SL.
-
-  FIX 3 — ICT OB ANCHOR (additional SL candidate):
-    Trailing SL gets a candidate: OB.low - 0.35×ATR (for longs). This is WHERE
-    institutional orders sit. The SL is structurally valid here — price bounces
-    off OBs by design. Stronger signal than chandelier or arbitrary ATR levels.
-
-  FIX 4 — LIQUIDITY POOL CEILING:
-    Trail cannot advance past an unswept EQL/EQH pool. Smart money sweeps those
-    stops first. Staying 0.5×ATR beyond the pool keeps us in the trade.
-
-  FIX 5 — ICT STRUCTURAL TP TARGETS:
-    compute_tp now accepts ict_engine and queries get_structural_tp_targets().
-    Swept liquidity origins (score 6+), unfilled FVGs (score 5+), and virgin OBs
-    (score 4+) beat all quant-only candidates in the scored pool. TP is placed
-    at WHERE smart money is delivering price, not just VWAP fractions.
+SL: ICTSLEngine 4-tier (sweep wick → disp OB → 15m ICT OB → 15m swing)
+TP: ICTTPEngine AMD delivery (opposing pool → structural → VWAP)
+Trail: ICTTrailEngine AMD-phase state machine (MANIP→freeze, DIST P1-P3, BOS trigger)
 """
 
 from __future__ import annotations
@@ -67,7 +53,8 @@ try:
         sys.path.insert(0, _ict_engine_dir)
     from ict_trade_engine import (
         ICTSweepSetup, ICTSweepDetector,
-        ICTSLEngine, ICTTPEngine, ICTTrailEngine, ICTEntryGate,
+        ICTSLEngine, ICTTPEngine, ICTTrailEngine,
+        ICTEntryGate, QuantHelperSignals,
         _find_swings, _round_tick as _ict_round_tick,
     )
     _ICT_TRADE_ENGINE_AVAILABLE = True
@@ -2592,6 +2579,33 @@ class QuantStrategy:
         except Exception:
             return True, 0.0
 
+    def _get_quant_helpers(self, sig, side: str) -> Optional['QuantHelperSignals']:
+        """
+        Build a QuantHelperSignals snapshot from the current SignalBreakdown.
+
+        This packages the quant signals that ICTEntryGate uses as SOFT HELPERS
+        (not hard gates) when evaluating ICT sweep entries. For standard Tier-B
+        entries, these signals become required gates within ICTEntryGate itself.
+
+        Returns None if _ICT_TRADE_ENGINE_AVAILABLE is False.
+        """
+        if not _ICT_TRADE_ENGINE_AVAILABLE:
+            return None
+        try:
+            return QuantHelperSignals(
+                tick_flow    = self._tick_eng.get_signal(),
+                cvd_trend    = self._cvd.get_trend_signal(),
+                vwap_dev     = sig.deviation_atr,
+                n_confirming = sig.n_confirming,
+                composite    = sig.composite,
+                regime_ok    = sig.regime_ok,
+                htf_veto     = sig.htf_veto,
+                adx          = sig.adx,
+                overextended = sig.overextended,
+            )
+        except Exception:
+            return None
+
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
         # ── Bug 1 fix: locked section is non-blocking — only state reads/writes.
         # All exchange API calls (_sync_position, _evaluate_entry, _manage_active,
@@ -2860,68 +2874,119 @@ class QuantStrategy:
         def fmt(l,v):
             a = "▲" if v>0.05 else ("▼" if v<-0.05 else "─")
             return f"  {l:<6} {bar(v)} {a} {v:+.3f}"
-        c=sig.composite; thr=QCfg.COMPOSITE_ENTRY_MIN()
+
+        c   = sig.composite
+        thr = QCfg.COMPOSITE_ENTRY_MIN()
         regime_lbl = sig.market_regime
+
+        # ── Sweep setup display ───────────────────────────────────────────
+        _sweep_line = ""
+        if self._active_sweep_setup is not None:
+            ss = self._active_sweep_setup
+            _sweep_line = (
+                f"🏛️ SWEEP {ss.side.upper()} [{ss.status}] "
+                f"OTE=[${ss.ote_entry_zone_low:.0f}–${ss.ote_entry_zone_high:.0f}] "
+                f"SL=${ss.sl_sweep_candle:.0f} "
+                f"AMD_conf={ss.amd_confidence:.2f} "
+                f"q={ss.quality_score():.2f}")
+
+        # ── Quant helper signals (display only — not gate logic here) ─────
         gates = [
-            f"{'✅' if sig.overextended else '❌'} Overextended ({sig.deviation_atr:+.1f} ATR)",
-            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})",
+            f"{'✅' if sig.overextended else '⚪'} Overextended ({sig.deviation_atr:+.1f} ATR)  [quant-scout: VWAP deviation]",
+            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})  [ATR percentile gate]",
             f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
-            f"{'✅' if sig.n_confirming>=3 else '❌'} Confluence ({sig.n_confirming}/{'6' if self._ict else '5'})",
-            f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
+            f"{'✅' if sig.n_confirming>=3 else '⚪'} Quant Confluence ({sig.n_confirming}/5) [scout: n_conf]",
+            f"{'✅' if abs(c)>=thr else '⚪'} Composite ({c:+.3f} vs ±{thr:.3f}) [scout: order-flow]",
         ]
-        # Issue 4 fix: ICT gate shown as an explicit required gate, not just a boost
-        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
-        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
-        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
+
+        # ── ICT tier gate display ─────────────────────────────────────────
         if self._ict is not None:
             if self._ict._initialized:
-                # During ACTIVE phase, ICT scores are 0 (not updated in _manage_active).
-                # Show as info-only (no pass/fail icon) to avoid confusing 0.00 display.
                 _ict_scores_valid = (sig.ict_ob + sig.ict_fvg + sig.ict_sweep + sig.ict_session) > 0.0
                 if _ict_scores_valid:
-                    _ict_pass = sig.ict_total >= _ict_min
+                    # Try to compute current tier for display
+                    _tier_display = "B"
+                    if _ICT_TRADE_ENGINE_AVAILABLE:
+                        try:
+                            _qh_d = self._get_quant_helpers(sig, sig.reversion_side or "long")
+                            _td, _, _tdr = ICTEntryGate.evaluate(
+                                sig.reversion_side or "long", sig,
+                                self._active_sweep_setup, price, _qh_d)
+                            _tier_display = _td
+                            _tier_reason_d = _tdr
+                        except Exception:
+                            _tier_display = "?"
+                            _tier_reason_d = ""
+                    else:
+                        _tier_reason_d = ""
+
+                    _tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
+                                   "BLOCKED": "⛔", "?": "❓"}
                     ict_gate_lbl = (
-                        f"{'✅' if _ict_pass else '❌'} ICT ({sig.ict_total:.2f} vs min={_ict_min:.2f}) "
-                        f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
+                        f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}] "
+                        f"Σ={sig.ict_total:.2f} "
+                        f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} "
+                        f"Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
                     )
-                    if sig.ict_details:
-                        ict_gate_lbl += f" | {sig.ict_details}"
+                    if _tier_reason_d:
+                        ict_gate_lbl += f"\n    {_tier_reason_d[:80]}"
                 else:
-                    # ICT not updated this tick (ACTIVE phase) — show neutral status
-                    ict_gate_lbl = "📋 ICT (not evaluated in active position)"
+                    ict_gate_lbl = "📋 ICT (ACTIVE position — not updated)"
                 gates.append(ict_gate_lbl)
             else:
                 gates.append("⏳ ICT (initializing...)")
-        # AMD phase + MTF structure display
+
+        # ── AMD phase + MTF ───────────────────────────────────────────────
         if self._ict is not None and self._ict._initialized:
             amd_icon = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
                         "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
                         "ACCUMULATION": "💤"}.get(sig.amd_phase, "❓")
-            bias_icon = "🟢" if sig.amd_bias == "bullish" else ("🔴" if sig.amd_bias == "bearish" else "⚪")
-            amd_line = (f"{amd_icon} AMD: {sig.amd_phase} {bias_icon}{sig.amd_bias} "
-                        f"conf={sig.amd_conf:.2f} | {sig.mtf_details}")
-            pd_icon = "💰DISC" if sig.in_discount else ("💎PREM" if sig.in_premium else "〰️EQ")
-            mtf_line = (f"🗺️ MTF: {'✅ALIGNED' if sig.mtf_aligned else '❌SPLIT'} {pd_icon} | "
-                        f"Structure: {sig.mtf_details}")
-            gates.append(amd_line)
-            gates.append(mtf_line)
-        gates.append(f"📊 Market: {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
-        # All-pass check now includes ICT gate
-        _ict_initialized = self._ict is not None and self._ict._initialized
-        _ict_ok = (not _ict_initialized) or (sig.ict_total >= _ict_min)
-        ap = sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming>=3 and abs(c)>=thr and _ict_ok
-        cd = max(0.0, QCfg.COOLDOWN_SEC()-(now-self._last_exit_time))
-        lines = [f"┌─── 🧠 v4 REVERSION  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────",
-                 fmt("VWAP",sig.vwap_dev), fmt("CVD",sig.cvd_div), fmt("OB",sig.orderbook),
-                 fmt("TICK",sig.tick_flow), fmt("VEX",sig.vol_exhaust), f"  {'─'*42}",
-                 f"  Σ={c:+.4f} | Side: {sig.reversion_side.upper()}", f"  ── GATES ──"]
-        for g in gates: lines.append(f"  {g}")
-        lines.append(f"  {'🎯 ALL PASS — confirming' if ap else '👀 Watching'}")
-        lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd>0 else 'ready'}")
+            bias_icon = "🟢" if sig.amd_bias == "bullish" else (
+                        "🔴" if sig.amd_bias == "bearish" else "⚪")
+            gates.append(
+                f"{amd_icon} AMD: {sig.amd_phase} {bias_icon}{sig.amd_bias} "
+                f"conf={sig.amd_conf:.2f} | {sig.mtf_details}")
+            pd_icon = "💰DISC" if sig.in_discount else (
+                      "💎PREM" if sig.in_premium  else "〰️EQ")
+            gates.append(
+                f"🗺️ MTF: {'✅ALIGNED' if sig.mtf_aligned else '❌SPLIT'} {pd_icon}")
+
+        gates.append(f"📊 {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
+
+        # ── All-pass (tier-aware): Tier-S/A bypass VWAP quant gates ─────
+        _ict_init = self._ict is not None and self._ict._initialized
+        if _ict_init and _ICT_TRADE_ENGINE_AVAILABLE:
+            try:
+                _qh_ap = self._get_quant_helpers(sig, sig.reversion_side or "long")
+                _ap_tier, _, _ = ICTEntryGate.evaluate(
+                    sig.reversion_side or "long", sig,
+                    self._active_sweep_setup, price, _qh_ap)
+                ap = _ap_tier in ("S", "A", "B")
+            except Exception:
+                ap = False
+        else:
+            _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
+            ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
+                  sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
+
+        cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
+        _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
+        lines = [
+            f"┌─── 🧠 v5 ICT+QUANT  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}"
+            f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────"]
+        if _sweep_line:
+            lines.append(f"  {_sweep_line}")
+        lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
+                  fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
+                  fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
+                  f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()}",
+                  f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
+        for g in gates:
+            lines.append(f"  {g}")
+        lines.append(f"  {'🎯 ENTRY READY' if ap else '👀 Watching'}")
+        lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
         lines.append(f"└{'─'*66}")
-        logger.info("\n"+"\n".join(lines))
+        logger.info("\n" + "\n".join(lines))
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         # v4.3 Solution 5: Spread cost gate
@@ -2950,8 +3015,25 @@ class QuantStrategy:
                                  candles_1h=candles_1h_ict,
                                  candles_4h=candles_4h_ict,
                                  candles_1d=candles_1d_ict)
-                ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
-                # Pass atr so proximity scoring can compute ATR-normalised distances
+
+                # ── ICT side: use AMD sweep bias or sweep setup when available ──
+                # NOT sig.reversion_side (VWAP) — ICT direction ≠ VWAP reversion side.
+                # AMD bias reflects where smart money is DELIVERING after a sweep.
+                # For a long sweep entry (SSL swept), AMD bias = "bullish" even if
+                # price is ABOVE VWAP (VWAP would say "short" for reversion).
+                amd_st = self._ict.get_amd_state()
+                if (self._active_sweep_setup is not None and
+                        self._active_sweep_setup.status in ("DETECTED", "OTE_READY")):
+                    # Sweep setup defines the direction
+                    ict_side = self._active_sweep_setup.side
+                elif amd_st.bias in ("bullish", "bearish"):
+                    # AMD engine has a clear directional bias
+                    ict_side = "long" if amd_st.bias == "bullish" else "short"
+                else:
+                    # Fallback: use VWAP reversion direction
+                    ict_side = (sig.reversion_side if sig.reversion_side
+                                else ("long" if sig.composite > 0 else "short"))
+
                 ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
                 sig.ict_ob      = ict_conf.ob_score
                 sig.ict_fvg     = ict_conf.fvg_score
@@ -2959,20 +3041,30 @@ class QuantStrategy:
                 sig.ict_session = ict_conf.session_score
                 sig.ict_total   = ict_conf.total
                 sig.ict_details = ict_conf.details
-                # v6.0: AMD + MTF context
-                sig.amd_phase  = ict_conf.amd_phase
-                sig.amd_bias   = ict_conf.amd_bias
-                sig.amd_conf   = self._ict.get_amd_state().confidence
+                # AMD + MTF context
+                sig.amd_phase   = ict_conf.amd_phase
+                sig.amd_bias    = ict_conf.amd_bias
+                sig.amd_conf    = amd_st.confidence
                 sig.mtf_aligned = ict_conf.mtf_aligned
                 sig.in_discount = ict_conf.in_discount
                 sig.in_premium  = ict_conf.in_premium
                 mb = self._ict.get_market_bias()
                 sig.mtf_details = mb.details
-                # ICT composite boost (structure confirmation adds signal weight)
-                ict_boost = ict_conf.total * 0.15
-                sig.composite = max(-1.0, min(1.0, sig.composite + (ict_boost if sig.composite > 0 else -ict_boost)))
+
+                # ── ICT composite boost: directional relative to ICT side ────
+                # Key fix: boost must align with ICT direction (AMD sweep bias),
+                # NOT with sig.composite direction (VWAP).
+                # Old: boost in direction composite is already going → self-reinforcing
+                # New: boost in ICT direction → may FLIP composite to align with ICT
+                ict_direction = 1.0 if ict_side == "long" else -1.0
+                ict_boost_signed = ict_conf.total * 0.15 * ict_direction
+                sig.composite = max(-1.0, min(1.0, sig.composite + ict_boost_signed))
+
+                # Only count ICT as a confirming signal when aligned with ICT direction
                 if ict_conf.total >= 0.30:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
+                # Store the resolved ICT side for downstream use
+                sig._ict_evaluated_side = ict_side  # type: ignore[attr-defined]
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
 
@@ -3050,40 +3142,55 @@ class QuantStrategy:
 
     def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
-        Mean-reversion entry — active in RANGING and TRANSITIONING regimes.
-        Blocked in TRENDING regime for counter-trend direction.
-        In TRANSITIONING: all existing gates must pass + regime allows this side.
-        v4.6: Also blocked when BreakoutDetector detects directional momentum.
-        Issue 4 fix: ICT structural confluence now a hard gate (not just a boost).
-        """
-        c = sig.composite; thr = QCfg.COMPOSITE_ENTRY_MIN(); side = sig.reversion_side
+        v5.0 — ICT-Commander / Quant-Scout Entry Evaluation.
 
-        # Hard veto: if market is trending against this reversion trade, skip
+        PATH SPLIT:
+          ICT SWEEP PATH (Tier-S/A): ICT structure defines the trade.
+            • Entry side = sweep_setup.side (NOT VWAP reversion side)
+            • VWAP overextension NOT required (price is at OTE, not VWAP extreme)
+            • n_confirming NOT required (ICT sweep is the signal)
+            • HTF veto bypassed when ICT is strong (sweep > HTF noise)
+            • Quant signals used as soft confirmation only:
+              - Tick flow not STRONGLY opposing
+              - ATR regime not extreme
+            • Confirm counter uses SWEEP SIDE, not VWAP side
+
+          STANDARD QUANT PATH (Tier-B): Quant and ICT both required.
+            • All legacy gates: overextended, regime_ok, htf_veto, n_confirming
+            • Composite threshold enforced
+            • P/D zone gate active
+            • Confirm counter uses VWAP reversion side
+        """
+        c    = sig.composite
+        thr  = QCfg.COMPOSITE_ENTRY_MIN()
+        side = sig.reversion_side   # VWAP-based default; overridden for sweep path
+
+        # ── Hard veto: trending against reversion trade ──────────────────
         if not self._regime.allows_reversion(side):
             self._confirm_long = self._confirm_short = 0; return
 
-        # v4.6: Breakout veto — NEVER fade a detected breakout
+        # ── Breakout veto: never fade a detected breakout ─────────────────
         if self._breakout.blocks_reversion(side):
             self._confirm_long = self._confirm_short = 0
             if now - self._last_bo_block_log >= 60.0:
                 self._last_bo_block_log = now
-                logger.info(f"🚫 Breakout blocks {side.upper()} reversion (breakout {self._breakout.direction})")
+                logger.info(f"🚫 Breakout blocks {side.upper()} reversion ({self._breakout.direction})")
             return
 
-        # ── v5.0: ICT Tier-Based Entry Gate ──────────────────────────────────
-        # Replaces hard threshold gate + AMD veto with structured tiered routing.
-        #
-        # Tier-S: Sweep-and-Go in OTE zone    → 1-2 confirm ticks
-        # Tier-A: Structural + order flow     → 2 confirm ticks
-        # Tier-B: Standard quant + confluence → 3 confirm ticks
-        # BLOCKED: AMD accumulation/opposing  → return immediately
-        #
-        # Legacy ICT gate applies when ict_trade_engine not available.
+        # ── Build quant helper signals for ICTEntryGate ───────────────────
+        quant_helpers = self._get_quant_helpers(sig, side)
+
+        # ── ICT Tier-Based Gate ───────────────────────────────────────────
+        _effective_cn = QCfg.CONFIRM_TICKS()   # default; overridden by tier
+        _tier         = "BLOCKED"
+        _tier_reason  = "no_ict"
+        _is_sweep_path = False
+
         if (self._ict is not None and self._ict._initialized and
                 _ICT_TRADE_ENGINE_AVAILABLE):
             try:
                 _tier, _cn_override, _tier_reason = ICTEntryGate.evaluate(
-                    side, sig, self._active_sweep_setup, price)
+                    side, sig, self._active_sweep_setup, price, quant_helpers)
 
                 if _tier == "BLOCKED":
                     if self._ict_gate_start_time == 0.0:
@@ -3097,115 +3204,149 @@ class QuantStrategy:
                         send_telegram_message(
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"No ICT confluence for ≥15 min.\n"
-                            f"Reason: {_tier_reason}\n"
-                            f"<i>Bot alive — waiting for institutional structure.</i>")
+                            f"Side: {side.upper()} | Reason: {_tier_reason}\n"
+                            f"<i>Bot alive — waiting for institutional setup.</i>")
                     self._confirm_long = self._confirm_short = 0
                     return
 
-                # Gate passed — reset block tracking + note tier
                 self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
-                _effective_cn = _cn_override  # tier determines confirm ticks
+                _effective_cn  = _cn_override
+                _is_sweep_path = (_tier in ("S", "A") and
+                                  self._active_sweep_setup is not None and
+                                  self._active_sweep_setup.status == "OTE_READY")
+
                 logger.debug(
-                    f"✅ ICTEntryGate TIER-{_tier} [{side.upper()}]: "
-                    f"{_tier_reason} | cn={_cn_override}")
+                    f"✅ Tier-{_tier} [{side.upper()}]: {_tier_reason} | "
+                    f"cn={_cn_override} sweep_path={_is_sweep_path}")
+
             except Exception as _ieg_e:
                 logger.debug(f"ICTEntryGate error (non-fatal): {_ieg_e}")
-                _effective_cn = QCfg.CONFIRM_TICKS()
-        else:
-            # ── Legacy ICT gate (no ict_trade_engine) ────────────────────────
+                # Fall through to legacy path below
+
+        elif self._ict is not None and self._ict._initialized:
+            # ── Legacy ICT gate (no ict_trade_engine) ────────────────────
             _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
             _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
             _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
-            if _ict_min > 0 and self._ict is not None and self._ict._initialized:
-                if sig.ict_total < _ict_min:
-                    if self._ict_gate_start_time == 0.0:
-                        self._ict_gate_start_time = now
-                    if now - self._last_ict_gate_log >= 30.0:
-                        self._last_ict_gate_log = now
-                        logger.info(
-                            f"⛔ ICT gate [{side.upper()} REVERSION]: "
-                            f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                            f"[{sig.ict_details}]")
-                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                        self._ict_gate_alerted = True
-                        send_telegram_message(
-                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                            f"No ICT structural confluence for ≥15 min.\n"
-                            f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                            f"Details: {sig.ict_details}\n"
-                            f"<i>Bot is alive — waiting for institutional structure.</i>")
-                    self._confirm_long = self._confirm_short = 0
-                    return
-            # ── Legacy AMD hard veto ─────────────────────────────────────────
-            if (self._ict is not None and self._ict._initialized and
-                    sig.amd_phase == "DISTRIBUTION" and sig.amd_conf >= 0.65):
-                amd_opposes = ((side == "long"  and sig.amd_bias == "bearish") or
-                               (side == "short" and sig.amd_bias == "bullish"))
-                if amd_opposes:
+            if sig.ict_total < _ict_min:
+                if self._ict_gate_start_time == 0.0:
+                    self._ict_gate_start_time = now
+                if now - self._last_ict_gate_log >= 30.0:
+                    self._last_ict_gate_log = now
+                    logger.info(
+                        f"⛔ ICT gate [{side.upper()} REVERSION]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} [{sig.ict_details}]")
+                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                    self._ict_gate_alerted = True
+                    send_telegram_message(
+                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"{sig.ict_details}")
+                self._confirm_long = self._confirm_short = 0
+                return
+            if (sig.amd_phase == "DISTRIBUTION" and sig.amd_conf >= 0.65):
+                if ((side == "long" and sig.amd_bias == "bearish") or
+                        (side == "short" and sig.amd_bias == "bullish")):
                     if now - self._last_amd_veto_log >= 30.0:
                         self._last_amd_veto_log = now
                         logger.info(
-                            f"⛔ AMD VETO [{side.upper()}]: DISTRIBUTION phase "
+                            f"⛔ AMD VETO [{side.upper()}]: DISTRIBUTION "
                             f"delivering {sig.amd_bias} (conf={sig.amd_conf:.2f})")
                     self._confirm_long = self._confirm_short = 0
                     return
             self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
-            _effective_cn = QCfg.CONFIRM_TICKS()
 
-        if not (sig.overextended and sig.regime_ok and not sig.htf_veto and sig.n_confirming >= 3):
-            self._confirm_long = self._confirm_short = 0; return
-        if self._last_exit_side and self._last_exit_side != side:
-            if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5: return
-        # ICT Premium/Discount zone filter:
-        # LONG entries valid in discount (4H PD < 0.55) — buying below equilibrium.
-        # SHORT entries valid in premium (4H PD > 0.45) — selling above equilibrium.
-        # These thresholds have 5% tolerance either side of EQ (0.50).
-        # Disabled if ICT not initialized (avoids blocking on warmup).
-        if self._ict is not None and self._ict._initialized:
-            if side == "long"  and sig.in_premium and not sig.in_discount:
-                # Price in 4H premium: statistically unfavorable long entry
-                if now - self._last_pd_gate_log.get("long", 0) >= 60.0:
-                    self._last_pd_gate_log["long"] = now
-                    logger.debug(
-                        f"📊 PD gate: LONG blocked — price in 4H premium zone "
-                        f"(pd={self._ict._tf['4h'].premium_discount:.2f})")
+        # ══════════════════════════════════════════════════════════════════
+        # PATH SPLIT: ICT SWEEP vs STANDARD QUANT
+        # ══════════════════════════════════════════════════════════════════
+
+        if _is_sweep_path:
+            # ── ICT SWEEP PATH (Tier-S / Tier-A) ─────────────────────────
+            # ICT structure is the commander.
+            # Quant helpers are already embedded in ICTEntryGate.evaluate().
+            # Entry side = SWEEP SETUP SIDE (not VWAP reversion side).
+            entry_side = self._active_sweep_setup.side
+
+            # ATR regime is the only hard quant gate here
+            # (already checked in ICTEntryGate, but double-check)
+            if not sig.regime_ok:
+                self._confirm_long = self._confirm_short = 0; return
+
+            # Confirm counter uses SWEEP SIDE
+            if entry_side == "long":
+                self._confirm_long += 1; self._confirm_short = 0
+                if self._confirm_long >= _effective_cn:
+                    self._confirm_long = self._confirm_short = 0
+                    logger.info(
+                        f"🏛️ ICT SWEEP LONG Tier-{_tier} confirmed "
+                        f"(cn={_effective_cn} AMD={sig.amd_phase} "
+                        f"OTE=[${self._active_sweep_setup.ote_entry_zone_low:.0f}–"
+                        f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
+                    self._launch_entry_async(
+                        data_manager, order_manager, risk_manager,
+                        "long", sig, mode="reversion")
+            else:
+                self._confirm_short += 1; self._confirm_long = 0
+                if self._confirm_short >= _effective_cn:
+                    self._confirm_long = self._confirm_short = 0
+                    logger.info(
+                        f"🏛️ ICT SWEEP SHORT Tier-{_tier} confirmed "
+                        f"(cn={_effective_cn} AMD={sig.amd_phase} "
+                        f"OTE=[${self._active_sweep_setup.ote_entry_zone_low:.0f}–"
+                        f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
+                    self._launch_entry_async(
+                        data_manager, order_manager, risk_manager,
+                        "short", sig, mode="reversion")
+
+        else:
+            # ── STANDARD QUANT PATH (Tier-B or no ICT) ───────────────────
+            # All legacy quant gates required.
+            # Entry side = VWAP reversion side.
+
+            # Full gate stack: overextended + regime + HTF + confluence
+            if not (sig.overextended and sig.regime_ok and
+                    not sig.htf_veto and sig.n_confirming >= 3):
+                self._confirm_long = self._confirm_short = 0; return
+
+            # Opposite-side cooldown after recent exit
+            if self._last_exit_side and self._last_exit_side != side:
+                if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5:
+                    return
+
+            # P/D zone gate (only for standard path — sweep path is already gated)
+            if self._ict is not None and self._ict._initialized:
+                _tf4h = self._ict._tf.get("4h")
+                _pd4h = _tf4h.premium_discount if _tf4h is not None else 0.5
+                if side == "long" and sig.in_premium and not sig.in_discount:
+                    if now - self._last_pd_gate_log.get("long", 0) >= 60.0:
+                        self._last_pd_gate_log["long"] = now
+                        logger.debug(f"📊 PD gate: LONG blocked — 4H premium (pd={_pd4h:.2f})")
+                    self._confirm_long = self._confirm_short = 0; return
+                if side == "short" and sig.in_discount and not sig.in_premium:
+                    if now - self._last_pd_gate_log.get("short", 0) >= 60.0:
+                        self._last_pd_gate_log["short"] = now
+                        logger.debug(f"📊 PD gate: SHORT blocked — 4H discount (pd={_pd4h:.2f})")
+                    self._confirm_long = self._confirm_short = 0; return
+
+            # Composite threshold gate (VWAP direction)
+            if side == "long" and c >= thr:
+                self._confirm_long += 1; self._confirm_short = 0
+            elif side == "short" and c <= -thr:
+                self._confirm_short += 1; self._confirm_long = 0
+            else:
+                self._confirm_long = self._confirm_short = 0; return
+
+            cn = _effective_cn
+            if self._confirm_long >= cn:
                 self._confirm_long = self._confirm_short = 0
-                return
-            if side == "short" and sig.in_discount and not sig.in_premium:
-                # Price in 4H discount: statistically unfavorable short entry
-                if now - self._last_pd_gate_log.get("short", 0) >= 60.0:
-                    self._last_pd_gate_log["short"] = now
-                    logger.debug(
-                        f"📊 PD gate: SHORT blocked — price in 4H discount zone "
-                        f"(pd={self._ict._tf['4h'].premium_discount:.2f})")
+                self._launch_entry_async(
+                    data_manager, order_manager, risk_manager,
+                    "long", sig, mode="reversion")
+            elif self._confirm_short >= cn:
                 self._confirm_long = self._confirm_short = 0
-                return
-
-        if side == "long" and c >= thr: self._confirm_long += 1; self._confirm_short = 0
-        elif side == "short" and c <= -thr: self._confirm_short += 1; self._confirm_long = 0
-        else: self._confirm_long = self._confirm_short = 0; return
-
-        # _effective_cn comes from ICTEntryGate (Tier-S=1, Tier-A=2, Tier-B=3)
-        # or falls back to config default when ict_trade_engine is unavailable.
-        cn = _effective_cn
-        if self._confirm_long >= cn:
-            self._confirm_long = self._confirm_short = 0
-            _entry_mode = "reversion"
-            if (self._active_sweep_setup is not None and
-                    getattr(self._active_sweep_setup, 'status', '') == "OTE_READY" and
-                    getattr(self._active_sweep_setup, 'side', '') == "long"):
-                _entry_mode = "reversion"   # sweep entries use reversion mode; PATH-A SL/TP
-                logger.info("🏛️ Sweep-and-Go LONG entry confirmed (Tier-S/A)")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode=_entry_mode)
-        elif self._confirm_short >= cn:
-            self._confirm_long = self._confirm_short = 0
-            _entry_mode = "reversion"
-            if (self._active_sweep_setup is not None and
-                    getattr(self._active_sweep_setup, 'status', '') == "OTE_READY" and
-                    getattr(self._active_sweep_setup, 'side', '') == "short"):
-                _entry_mode = "reversion"
-                logger.info("🏛️ Sweep-and-Go SHORT entry confirmed (Tier-S/A)")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode=_entry_mode)
+                self._launch_entry_async(
+                    data_manager, order_manager, risk_manager,
+                    "short", sig, mode="reversion")
 
     def _evaluate_trend_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -3244,34 +3385,49 @@ class QuantStrategy:
         if trend_side == "long"  and sig.trend_score <= 0: return
         if trend_side == "short" and sig.trend_score >= 0: return
 
-        # ── Issue 4 fix: Hard ICT gate for trend entries ─────────────────────
-        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
-        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
-        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
-        if _ict_min > 0 and self._ict is not None and self._ict._initialized:
+        # ── ICT gate for trend entries ───────────────────────────────────────
+        if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
+            try:
+                _qh = self._get_quant_helpers(sig, trend_side)
+                _t, _cn, _tr = ICTEntryGate.evaluate(trend_side, sig, None, price, _qh)
+                if _t == "BLOCKED":
+                    if self._ict_gate_start_time == 0.0:
+                        self._ict_gate_start_time = now
+                    if now - self._last_ict_gate_log >= 30.0:
+                        self._last_ict_gate_log = now
+                        logger.info(
+                            f"⛔ ICT gate [TREND {trend_side.upper()}]: {_tr}")
+                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                        self._ict_gate_alerted = True
+                        send_telegram_message(
+                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                            f"TREND {trend_side.upper()}: {_tr}\n"
+                            f"<i>Bot alive — waiting for structure.</i>")
+                    self._confirm_trend_long = self._confirm_trend_short = 0
+                    return
+                self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            except Exception as _tge:
+                logger.debug(f"Trend ICTEntryGate error (non-fatal): {_tge}")
+        elif self._ict is not None and self._ict._initialized:
+            # Legacy flat threshold gate
+            _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
                     self._ict_gate_start_time = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
-                        f"⛔ ICT gate [{trend_side.upper()} TREND]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{sig.ict_details}]")
+                        f"⛔ ICT gate [TREND {trend_side.upper()}]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                        f"No ICT structural confluence for ≥15 min.\n"
-                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
-                        f"<i>Bot is alive — waiting for institutional structure.</i>")
+                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"{sig.ict_details}")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
-        # ─────────────────────────────────────────────────────────────────────
-        self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
 
         # Pullback-to-EMA depth check
         try: candles_5m = data_manager.get_candles("5m", limit=30)
@@ -3367,37 +3523,49 @@ class QuantStrategy:
         if side == "short" and price > self._breakout._bo_midpoint:
             return
 
-        # ── Issue 4 fix: Gate 4 — ICT structural confluence ──────────────────
-        # Momentum entries need ICT OBs / FVGs in the retest zone to be valid.
-        # A retest without institutional structure is a noise bounce, not a
-        # real break-and-retest. The ICT gate prevents entering at random levels.
-        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
-        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
-        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
-        if _ict_min > 0 and self._ict is not None and self._ict._initialized:
+        # ── Gate 4: ICT structural confluence ───────────────────────────────
+        # Momentum retest requires institutional structure in the retest zone.
+        # A bounce without OBs/FVGs is noise — use ICTEntryGate for full check.
+        if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
+            try:
+                _qh_mo = self._get_quant_helpers(sig, side)
+                _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(side, sig, None, price, _qh_mo)
+                if _t_mo == "BLOCKED":
+                    if self._ict_gate_start_time == 0.0:
+                        self._ict_gate_start_time = now
+                    if now - self._last_ict_gate_log >= 30.0:
+                        self._last_ict_gate_log = now
+                        logger.info(
+                            f"⛔ ICT gate [MOMENTUM {side.upper()}]: {_tr_mo}")
+                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
+                        self._ict_gate_alerted = True
+                        send_telegram_message(
+                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
+                            f"MOMENTUM {side.upper()}: {_tr_mo}")
+                    self._confirm_trend_long = self._confirm_trend_short = 0
+                    return
+                self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            except Exception as _mge:
+                logger.debug(f"Momentum ICTEntryGate error (non-fatal): {_mge}")
+        elif self._ict is not None and self._ict._initialized:
+            _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
                     self._ict_gate_start_time = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
-                        f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{sig.ict_details}]")
+                        f"⛔ ICT gate [MOMENTUM {side.upper()}]: "
+                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                        f"No ICT structural confluence for ≥15 min.\n"
-                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
-                        f"<i>Bot is alive — waiting for institutional structure.</i>")
+                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"{sig.ict_details}")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
-        # ─────────────────────────────────────────────────────────────────────
-        self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
 
         # ── Phase 3: Confirmation counter ─────────────────────────────────
         if side == "long":

@@ -326,31 +326,35 @@ class ICTSweepDetector:
         """
         Identify sweep candle extreme + displacement candle geometry from 5m candles.
 
-        For long (SSL sweep):
-          - Scan back from current candle to find the candle that wicked below
-            the SSL pool price — that is the sweep candle.
-          - The NEXT candle (first candle that closes above the pool) is the
-            displacement candle.
+        Candle timestamps are OPEN times. Sweep timestamp is also the OPEN time of
+        the candle where the sweep occurred (from ict_engine._detect_sweeps).
+        Allow a 5-minute tolerance (one candle width) for timestamp matching.
         """
         if not candles_5m or len(candles_5m) < 5:
             return None, None, None, None
 
         pool_price = sweep_pool.price
         sweep_ts   = sweep_pool.sweep_timestamp
+        CANDLE_MS  = 5 * 60 * 1000   # 5 minutes in ms
 
-        # Find the sweep candle by timestamp proximity
-        # Candle timestamps are epoch ms of the candle open
+        # Find the sweep candle by timestamp proximity (allow ±1 candle)
         for i in range(len(candles_5m) - 1, 0, -1):
             c = candles_5m[i]
             c_ts = int(c.get('t', 0))
-            if c_ts > sweep_ts:
-                continue  # this candle is after the sweep time
+
+            # Skip candles clearly newer than the sweep (>1 candle after)
+            if c_ts > sweep_ts + CANDLE_MS:
+                continue
+
+            # Don't look more than 10 candles (50 min) before the sweep
+            if c_ts < sweep_ts - 10 * CANDLE_MS:
+                break
 
             if side == "long":
-                # Sweep candle: wicked below the SSL pool
-                if float(c['l']) <= pool_price * 1.001:
+                # Sweep candle: wicked below or to the SSL pool level
+                if float(c['l']) <= pool_price * 1.002:
                     sweep_extreme = float(c['l'])
-                    # Displacement: next candle(s) — find first close above pool
+                    # Displacement: next 1-3 candles — find first that closes above pool
                     for j in range(i + 1, min(i + 4, len(candles_5m))):
                         d = candles_5m[j]
                         if float(d['c']) > pool_price:
@@ -358,8 +362,8 @@ class ICTSweepDetector:
                                     float(d['h']), float(d['l']), float(d['c']))
                     break
             else:
-                # Sweep candle: wicked above the BSL pool
-                if float(c['h']) >= pool_price * 0.999:
+                # Sweep candle: wicked above or to the BSL pool level
+                if float(c['h']) >= pool_price * 0.998:
                     sweep_extreme = float(c['h'])
                     for j in range(i + 1, min(i + 4, len(candles_5m))):
                         d = candles_5m[j]
@@ -1012,28 +1016,70 @@ class ICTTrailEngine:
             except Exception:
                 pass
 
-        # 3. 5m swing structure (Phase 2+, primary driver)
-        if phase >= 2 and candles_5m and len(candles_5m) >= 6:
+        # 3. 5m swing structure (ALL phases — buffer scales with phase)
+        #    Phase 1: wide buffer (1.0×ATR) — conservative, protecting against pullbacks
+        #    Phase 2: medium buffer (0.25×ATR) — structural with breathing room
+        #    Phase 3: tight buffer (0.12×ATR) — aggressive locking to structure
+        if candles_5m and len(candles_5m) >= 6:
             closed_5m = candles_5m[:-1]
             highs_5m, lows_5m = _find_swings(
                 closed_5m, min(12, len(closed_5m) - 2))
-            sw_buf = max(0.12 * atr, 0.30 * atr)
+            # Phase-scaled buffer: wide in early phase, tight when deep in profit
+            if phase == 1:
+                sw_buf = 1.00 * atr    # wide — protect against healthy retracement
+            elif phase == 2:
+                sw_buf = 0.25 * atr    # structural — swing defines thesis boundary
+            else:
+                sw_buf = 0.12 * atr    # aggressive — lock tightly to confirmed swings
 
             if pos_side == "long" and lows_5m:
                 valid = [l for l in lows_5m
                          if current_sl + 0.05 * atr < l < price - min_dist]
                 if valid:
                     best = max(valid)
-                    candidates.append((best - sw_buf,
-                                       f"5m_SWING_LOW@${best:.0f}"))
+                    cand_sl = best - sw_buf
+                    # Phase 1: only add if it's an improvement (not just profit floor)
+                    if phase == 1 and cand_sl <= candidates[0][0] + 0.05 * atr:
+                        pass  # not an improvement over profit floor — skip
+                    else:
+                        candidates.append((cand_sl,
+                                           f"5m_SW_L@${best:.0f}(P{phase}buf={sw_buf:.0f})"))
 
             elif pos_side == "short" and highs_5m:
                 valid = [h for h in highs_5m
                          if price + min_dist < h < current_sl - 0.05 * atr]
                 if valid:
                     best = min(valid)
-                    candidates.append((best + sw_buf,
-                                       f"5m_SWING_HIGH@${best:.0f}"))
+                    cand_sl = best + sw_buf
+                    if phase == 1 and cand_sl >= candidates[0][0] - 0.05 * atr:
+                        pass
+                    else:
+                        candidates.append((cand_sl,
+                                           f"5m_SW_H@${best:.0f}(P{phase}buf={sw_buf:.0f})"))
+
+        # 3b. 5m BOS trigger: if 5m BOS confirmed in trade direction →
+        #     immediate advance to just behind the BOS swing
+        #     This is the most important ICT trail signal: BOS = continuation confirmed
+        if ict_engine is not None and phase >= 1:
+            try:
+                tf_st = ict_engine._tf.get("5m")
+                if tf_st is not None:
+                    if (pos_side == "long" and
+                            tf_st.bos_direction == "bullish" and
+                            tf_st.bos_level > current_sl and
+                            tf_st.bos_level < price - min_dist):
+                        bos_sl = tf_st.bos_level - 0.20 * atr
+                        candidates.append((bos_sl,
+                                           f"5m_BOS_BULL@${tf_st.bos_level:.0f}"))
+                    elif (pos_side == "short" and
+                            tf_st.bos_direction == "bearish" and
+                            tf_st.bos_level < current_sl and
+                            tf_st.bos_level > price + min_dist):
+                        bos_sl = tf_st.bos_level + 0.20 * atr
+                        candidates.append((bos_sl,
+                                           f"5m_BOS_BEAR@${tf_st.bos_level:.0f}"))
+            except Exception:
+                pass
 
         # 4. FVG fill trigger (immediate lock on 70%+ fill)
         if ict_engine is not None:
@@ -1062,7 +1108,7 @@ class ICTTrailEngine:
             closed_1m = candles_1m[:-1]
             sh_1m, sl_1m = _find_swings(
                 closed_1m, min(10, len(closed_1m) - 2))
-            micro_buf = max(0.08 * atr, 0.20 * atr)
+            micro_buf = 0.08 * atr   # tight — 1m swings are precise micro-structure
 
             if pos_side == "long" and sl_1m:
                 valid = [l for l in sl_1m
@@ -1261,124 +1307,265 @@ class ICTTrailEngine:
 # ICT ENTRY GATE
 # ═══════════════════════════════════════════════════════════════════════════
 
+@dataclass
+class QuantHelperSignals:
+    """
+    Quant engine signals used as HELPERS for ICT entry confirmation.
+
+    In v5.0, the quant engine is a scout — it provides order-flow context
+    that ICT structure uses to time execution within an institutional setup.
+
+    Unlike the primary ICT gates (AMD phase, sweep geometry, OTE zone), these
+    signals are soft filters — they can veto execution but not define the setup.
+
+    tick_flow:   [-1, +1]  Live order flow bias (tick imbalance last 30s)
+    cvd_trend:   [-1, +1]  Cumulative volume delta directional bias
+    vwap_dev:    float      Price deviation from VWAP in ATR units (+= above)
+    n_confirming: int       Number of quant signals agreeing with direction
+    composite:   float      Weighted quant composite [-1, +1]
+    regime_ok:   bool       ATR percentile in tradeable range (5%-97%)
+    htf_veto:    bool       HTF trend strongly opposing the trade side
+    adx:         float      Wilder ADX(14) value
+    overextended: bool      Price meaningfully deviated from VWAP
+    """
+    tick_flow:    float = 0.0
+    cvd_trend:    float = 0.0
+    vwap_dev:     float = 0.0
+    n_confirming: int   = 0
+    composite:    float = 0.0
+    regime_ok:    bool  = True
+    htf_veto:     bool  = False
+    adx:          float = 0.0
+    overextended: bool  = False
+
+    def flow_opposes(self, side: str) -> bool:
+        """True if live order flow is STRONGLY opposing the trade direction."""
+        if side == "long":
+            return self.tick_flow < -0.30
+        return self.tick_flow > 0.30
+
+    def cvd_opposes(self, side: str) -> bool:
+        """True if CVD trend is clearly opposing trade direction."""
+        if side == "long":
+            return self.cvd_trend < -0.35
+        return self.cvd_trend > 0.35
+
+    def quant_quality_score(self, side: str) -> float:
+        """
+        0–1 score: how strongly does quant confirm this ICT entry side?
+        Used for logging and partial weight in entry Telegram message.
+        Not used as an entry gate — ICT structure takes precedence.
+        """
+        direction = 1.0 if side == "long" else -1.0
+        s = 0.0
+        # Tick flow (most real-time)
+        s += max(0.0, self.tick_flow * direction) * 0.30
+        # CVD directional agreement
+        s += max(0.0, self.cvd_trend * direction) * 0.25
+        # Composite directional alignment
+        s += max(0.0, self.composite * direction) * 0.25
+        # Number of confirming signals
+        s += min(self.n_confirming / 5.0, 1.0) * 0.20
+        return min(s, 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ICT ENTRY GATE
+# ═══════════════════════════════════════════════════════════════════════════
+
 class ICTEntryGate:
     """
     Tier-based ICT entry quality classifier.
 
-    TIER-S: ICT Sweep-and-Go (highest conviction, best R:R)
-      All of:
-        • AMD phase MANIPULATION or DISTRIBUTION (sweep < 90min)
-        • AMD confidence ≥ 0.65
-        • Active sweep setup detected with OTE zone reached
-        • Price in OTE zone (61.8%-78.6% retrace)
-        • ICT confluence ≥ 0.60
-        • Price in discount (long) or premium (short)
-        • Kill zone preferred (2× weight for LN/NY)
-        → Confirm ticks: 1 (institutional — don't wait)
-        → Expected win rate: 60-68%
+    ARCHITECTURE: ICT is the COMMANDER, Quant is the SCOUT.
+    ─────────────────────────────────────────────────────────────────────
+    ICT structure DEFINES the trade:
+      • Which side (AMD sweep bias → distribution direction)
+      • Where SL/TP (sweep wick, OTE zone, delivery target)
+      • Whether market is set up (sweep + displacement + OTE)
 
-    TIER-A: ICT Structural + Order Flow
-      All of:
-        • AMD phase DISTRIBUTION or REACCUMULATION
-        • AMD confidence ≥ 0.52
-        • Displaced sweep in last 90min
+    Quant signals HELP time execution:
+      • Tick flow: is live order flow agreeing? (soft veto if strongly opposing)
+      • CVD: is cumulative buying/selling directional? (quality boost)
+      • Regime: is ATR in a tradeable range? (hard veto if extreme)
+      • HTF: is higher-timeframe trend blocking? (hard veto)
+
+    The quant composite, VWAP overextension, and n_confirming gates
+    ARE NOT REQUIRED for ICT sweep entries (Tier-S/A). They are required
+    only for standard quant entries (Tier-B) where ICT provides confluence
+    but not a primary structural setup.
+
+    TIER-S: ICT Sweep-and-Go in OTE zone
+      Requirements:
+        • AMD phase MANIPULATION or DISTRIBUTION, confidence ≥ 0.62
+        • Active sweep setup with status == OTE_READY
+        • Sweep side matches requested entry side
+        • ICT confluence ≥ 0.60 (structure + sweep + session)
+        • Price in correct P/D zone (long in discount, short in premium)
+        • Quant soft veto: tick flow not STRONGLY opposing (< −0.30 for long)
+        • Regime: ATR percentile in range (no extreme vol)
+      → Confirm ticks: 1 (kill zone) or 2 (off-session)
+      → Expected edge: 58–66% win rate, 1:2.5–4.0 R:R
+
+    TIER-A: ICT Structural Alignment (sweep context, not OTE)
+      Requirements:
+        • AMD phase DISTRIBUTION/REACCUMULATION/REDISTRIBUTION, conf ≥ 0.50
         • ICT confluence ≥ 0.55
-        • Price in discount/premium (threshold 0.45/0.55)
-        • Quant composite ≥ 0.30
-        • MTF aligned ≥ 2/4 TFs
-        → Confirm ticks: 2
-        → Expected win rate: 54-60%
+        • Quant composite in ICT direction ≥ 0.20 (light confirmation)
+        • Tick flow not strongly opposing
+        • No HTF veto
+        • Regime OK
+      → Confirm ticks: 2
+      → Expected edge: 52–58% win rate, 1:2.0–3.5 R:R
 
     TIER-B: Standard Quant + ICT Confluence
-      All of:
-        • ICT confluence ≥ 0.45 (existing gate)
-        • Quant composite ≥ 0.35
-        • AMD not opposing (AMD veto)
-        → Confirm ticks: 3 (existing)
-        → Expected win rate: 48-54%
+      Requirements:
+        • ICT confluence ≥ 0.40
+        • Quant composite ≥ 0.30 (meaningful signal)
+        • n_confirming ≥ 3 (most signals agree)
+        • VWAP overextended (meaningful deviation)
+        • No HTF veto, Regime OK
+        • AMD not opposing distribution
+      → Confirm ticks: 3 (config default)
+      → Expected edge: 48–54% win rate, 1:1.8–2.5 R:R
 
     BLOCKED:
-      • AMD ACCUMULATION with confidence ≥ 0.60 (no sweep, no delivery)
-      • AMD MANIPULATION without sweep setup (Judas swing still active)
-      • Price in neutral zone (0.48-0.52 P/D) with weak ICT ≤ 0.40
-      • HTF trend strongly opposing (ADX > 30, HTF against direction)
+      • AMD ACCUMULATION conf ≥ 0.55 (market consolidating, no delivery)
+      • AMD MANIPULATION without sweep setup (Judas swing active)
+      • AMD DISTRIBUTION strongly opposing (high conf, wrong direction)
+      • Regime invalid (ATR extreme)
+      • HTF veto present AND ICT weak (ICT < 0.40) — no structural cover
     """
 
     @staticmethod
     def evaluate(
             side: str,
-            sig,                       # SignalBreakdown
+            sig,                                    # SignalBreakdown
             sweep_setup: Optional['ICTSweepSetup'],
             price: float,
+            quant: Optional['QuantHelperSignals'] = None,
     ) -> Tuple[str, int, str]:
         """
         Returns (tier: "S"|"A"|"B"|"BLOCKED", confirm_ticks: int, reason: str).
+
+        quant: QuantHelperSignals — order-flow helpers. If None, soft-veto
+               checks based on quant are skipped (permissive fallback).
         """
         amd_phase = getattr(sig, 'amd_phase', 'ACCUMULATION')
-        amd_conf  = getattr(sig, 'amd_conf', 0.0)
-        amd_bias  = getattr(sig, 'amd_bias', 'neutral')
-        ict_total = getattr(sig, 'ict_total', 0.0)
+        amd_conf  = getattr(sig, 'amd_conf',  0.0)
+        amd_bias  = getattr(sig, 'amd_bias',  'neutral')
+        ict_total = getattr(sig, 'ict_total',  0.0)
         in_disc   = getattr(sig, 'in_discount', False)
-        in_prem   = getattr(sig, 'in_premium', False)
+        in_prem   = getattr(sig, 'in_premium',  False)
         mtf_align = getattr(sig, 'mtf_aligned', False)
 
-        # ── BLOCKED conditions ──────────────────────────────────────────
-        # No trade in ACCUMULATION with high confidence = no sweep = no reason
-        if amd_phase == "ACCUMULATION" and amd_conf >= 0.60:
-            return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_sweep"
+        # ── Quant helper signals (soft veto only) ─────────────────────────
+        tf_opposes  = quant.flow_opposes(side)  if quant is not None else False
+        cvd_opposes = quant.cvd_opposes(side)   if quant is not None else False
+        regime_ok   = quant.regime_ok           if quant is not None else True
+        htf_veto    = quant.htf_veto            if quant is not None else False
+        q_overext   = quant.overextended        if quant is not None else True
+        n_conf      = quant.n_confirming        if quant is not None else 0
+        q_composite = quant.composite           if quant is not None else 0.0
+        q_score     = quant.quant_quality_score(side) if quant is not None else 0.5
 
-        # AMD MANIPULATION without a confirmed sweep setup = Judas swing active
+        # ── HARD BLOCKED conditions (no trade regardless of tier) ─────────
+
+        # No trade when ATR percentile is extreme
+        if quant is not None and not regime_ok:
+            return "BLOCKED", 0, "REGIME_INVALID(ATR_extreme)"
+
+        # AMD Accumulation = no sweep = no delivery — waiting for setup
+        if amd_phase == "ACCUMULATION" and amd_conf >= 0.55:
+            return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_delivery"
+
+        # AMD Manipulation without a sweep setup = Judas swing still active
+        # Price is making the fake move, not the real move
         if amd_phase == "MANIPULATION" and sweep_setup is None:
-            return "BLOCKED", 0, "MANIP_no_sweep_setup"
+            return "BLOCKED", 0, "MANIP_no_confirmed_sweep"
 
-        # AMD delivering strongly AGAINST trade direction
-        if amd_phase == "DISTRIBUTION" and amd_conf >= 0.65:
-            amd_opposes = ((side == "long"  and amd_bias == "bearish") or
-                           (side == "short" and amd_bias == "bullish"))
-            if amd_opposes:
-                return "BLOCKED", 0, f"AMD_DIST_opposing_{amd_bias}(conf={amd_conf:.2f})"
+        # AMD Distribution delivering AGAINST our trade direction = wrong side
+        if (amd_phase == "DISTRIBUTION" and amd_conf >= 0.65 and
+                ((side == "long"  and amd_bias == "bearish") or
+                 (side == "short" and amd_bias == "bullish"))):
+            return "BLOCKED", 0, f"AMD_DIST_opposing_{amd_bias}(conf={amd_conf:.2f})"
 
-        # ── TIER-S: ICT Sweep-and-Go ────────────────────────────────────
-        if (sweep_setup is not None and
-                sweep_setup.status == "OTE_READY" and
-                sweep_setup.side == side and
-                amd_phase in ("MANIPULATION", "DISTRIBUTION") and
-                amd_conf >= 0.62 and
-                ict_total >= 0.60 and
-                (side == "long" and (in_disc or not in_prem) or
-                 side == "short" and (in_prem or not in_disc))):
+        # HTF veto with weak ICT = no structural cover for opposing HTF
+        if htf_veto and ict_total < 0.45:
+            return "BLOCKED", 0, f"HTF_VETO+weak_ICT({ict_total:.2f}<0.45)"
+
+        # ── TIER-S: ICT Sweep-and-Go in OTE zone ─────────────────────────
+        _tier_s_conditions = (
+            sweep_setup is not None and
+            sweep_setup.status == "OTE_READY" and
+            sweep_setup.side == side and
+            amd_phase in ("MANIPULATION", "DISTRIBUTION") and
+            amd_conf >= 0.62 and
+            ict_total >= 0.60 and
+            (side == "long" and (in_disc or not in_prem) or
+             side == "short" and (in_prem or not in_disc)) and
+            not tf_opposes  # tick flow soft veto
+        )
+        if _tier_s_conditions:
             quality = sweep_setup.quality_score()
-            cn = 1 if sweep_setup.kill_zone in ("london", "ny") else 2
+            # Kill zone = 1 tick, off-session = 2 ticks
+            cn = 1 if sweep_setup.kill_zone in ("london", "ny", "asia") else 2
             return ("S", cn,
-                    f"TIER-S sweep+OTE quality={quality:.2f} "
+                    f"TIER-S OTE quality={quality:.2f} q={q_score:.2f} "
                     f"AMD={amd_phase}(conf={amd_conf:.2f}) "
                     f"ICT={ict_total:.2f} KZ={sweep_setup.kill_zone or 'none'}")
 
-        # ── TIER-A: ICT Structural + Order Flow ──────────────────────────
-        # Has a swept pool in recent history (even if not in OTE)
-        has_recent_sweep = (amd_phase in ("DISTRIBUTION", "REACCUMULATION",
-                                           "REDISTRIBUTION") and
-                             amd_conf >= 0.50)
-        if (has_recent_sweep and
-                ict_total >= 0.55 and
-                sig.composite * (1 if side == "long" else -1) >= 0.30 and
-                (side == "long"  and not in_prem or
-                 side == "short" and not in_disc)):
+        # ── TIER-A: ICT Structural Alignment ─────────────────────────────
+        _has_delivery_context = amd_phase in (
+            "DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION") and amd_conf >= 0.50
+        _tier_a_conditions = (
+            _has_delivery_context and
+            ict_total >= 0.55 and
+            (side == "long"  and not in_prem or
+             side == "short" and not in_disc) and
+            not tf_opposes and
+            not htf_veto and
+            # Light quant confirmation: composite must lean in ICT direction
+            (q_composite * (1 if side == "long" else -1)) >= 0.20
+        )
+        if _tier_a_conditions:
             return ("A", 2,
                     f"TIER-A structural AMD={amd_phase}(conf={amd_conf:.2f}) "
-                    f"ICT={ict_total:.2f} mtf={'✓' if mtf_align else '✗'}")
+                    f"ICT={ict_total:.2f} q={q_score:.2f} "
+                    f"mtf={'✓' if mtf_align else '✗'}")
 
-        # ── TIER-B: Standard quant + ICT confluence ──────────────────────
-        ict_min  = 0.40  # slightly lower than previous 0.45 for TIER-B
-        comp_min = 0.30
-        if (ict_total >= ict_min and
-                abs(sig.composite) >= comp_min):
+        # ── TIER-B: Standard Quant + ICT Confluence ───────────────────────
+        # Quant gates are REQUIRED here — ICT just provides structural context
+        _tier_b_conditions = (
+            ict_total >= 0.40 and
+            abs(q_composite) >= 0.30 and
+            q_overext and          # VWAP overextension required for standard entries
+            n_conf >= 3 and        # majority of quant signals agree
+            not htf_veto and
+            not tf_opposes
+        )
+        if _tier_b_conditions:
             return ("B", 3,
-                    f"TIER-B standard ICT={ict_total:.2f} Σ={sig.composite:+.3f}")
+                    f"TIER-B std ICT={ict_total:.2f} "
+                    f"Σ={q_composite:+.3f} overext={q_overext} n={n_conf}/5")
 
-        return ("BLOCKED", 0,
-                f"BELOW_MIN ICT={ict_total:.2f}<{ict_min} "
-                f"Σ={sig.composite:+.3f}<{comp_min}")
+        # ── Specific BLOCKED reason for diagnostics ───────────────────────
+        block_reasons = []
+        if not _has_delivery_context and not _tier_s_conditions:
+            block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
+        if ict_total < 0.40:
+            block_reasons.append(f"ICT={ict_total:.2f}<0.40")
+        if tf_opposes:
+            block_reasons.append(f"TICK_OPPOSING({quant.tick_flow if quant else 0:.2f})")
+        if htf_veto:
+            block_reasons.append("HTF_VETO")
+        if not q_overext and ict_total < 0.55:
+            block_reasons.append("NOT_OVEREXTENDED+weak_ICT")
+        if abs(q_composite) < 0.30:
+            block_reasons.append(f"Σ={q_composite:+.3f}<0.30")
+
+        return ("BLOCKED", 0, "BELOW_MIN: " + " | ".join(block_reasons) if block_reasons
+                else f"BELOW_MIN ICT={ict_total:.2f} Σ={q_composite:+.3f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
