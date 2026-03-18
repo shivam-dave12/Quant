@@ -57,6 +57,10 @@ class RiskManager:
         self.available_balance = 0.0   # free margin only — used for position sizing
         self.balance_cache_time = 0.0
         self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
+        # Concurrency guard: prevents multiple threads piling into a REST balance fetch.
+        # Callers that arrive while a fetch is in progress return the cached value
+        # immediately instead of waiting — the main loop is never blocked.
+        self._balance_fetch_in_progress = False
 
         # Daily reset tracking — date-anchored, not trade-count dependent
         self._last_reset_date = datetime.now(timezone.utc).date()
@@ -71,70 +75,93 @@ class RiskManager:
         logger.info("✅ RiskManager initialized")
 
     def get_available_balance(self) -> Optional[Dict]:
-        """Get available balance with caching"""
+        """
+        Get available balance with caching.
+
+        Thread-safety model:
+          - Cache check and state update are lock-protected (fast, in-memory).
+          - The REST call is made OUTSIDE the lock so the main loop is never
+            blocked waiting for a network round-trip.
+          - A _balance_fetch_in_progress flag prevents concurrent fetches from
+            piling up: if a fetch is already running, callers return the cached
+            value immediately rather than waiting up to 30s for a HTTP timeout.
+
+        Critical: GlobalRateLimiter.wait() is intentionally NOT called here.
+          The global rate limiter governs ORDER placement (cancel, place, modify).
+          Balance reads are independent REST calls on a separate endpoint and
+          must never contend with the order rate limiter — doing so blocked the
+          main loop for up to 3 seconds every 35s (one full limiter interval).
+        """
         with self._lock:
             now = time.time()
-            
-            # Return cached balance if still valid
+
+            # Fast path: valid cache — return immediately without any I/O
             if now - self.balance_cache_time < self.balance_cache_ttl:
-                return {
-                    "available": self.available_balance,   # free margin (for sizing)
-                    "total":     self.current_balance,     # total equity (for % calcs)
-                    "cached": True
-                }
-
-            try:
-                from execution.order_manager import GlobalRateLimiter
-                GlobalRateLimiter.wait()
-
-                if self.api is None:
-                    return None
-                # Call get_balance() without currency arg — the adapter (CoinSwitch or Delta)
-                # already knows the correct settlement currency (USDT vs USD).
-                balance_data = self.api.get_balance() if hasattr(self.api, 'get_balance') else None
-                
-                if "error" in balance_data:
-                    logger.error(f"Balance fetch error: {balance_data['error']}")
-                    return {
-                        "available": self.available_balance,
-                        "total":     self.current_balance,
-                        "cached": True,
-                        "error": balance_data['error']
-                    }
-
-                # Two separate balance values:
-                #   available_balance = free margin (exchange: total_available_balance)
-                #   current_balance   = total wallet equity = available + locked
-                #
-                # CRITICAL: daily_loss_pct must divide by TOTAL equity, not free margin.
-                # When a position is open, margin is locked → available shrinks by $46+.
-                # Dividing by ~$31 instead of ~$77 inflates loss % by 2.5x, falsely
-                # blocking new entries while a live position is still open.
-                available = float(balance_data.get("available", 0.0))
-                locked    = float(balance_data.get("locked",    0.0))
-                self.available_balance = available              # free margin (for sizing)
-                self.current_balance   = available + locked     # total equity (for % calcs)
-                self.balance_cache_time = now
-
-                # Set initial balance on first fetch
-                if self.initial_balance == 0.0:
-                    self.initial_balance = self.current_balance
-                    logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
-
-                return {
-                    "available": self.available_balance,   # free margin
-                    "total":     self.current_balance,     # total equity
-                    "cached": False
-                }
-                
-            except Exception as e:
-                logger.error(f"Error fetching balance: {e}", exc_info=True)
                 return {
                     "available": self.available_balance,
                     "total":     self.current_balance,
-                    "cached": True,
-                    "error": str(e)
+                    "cached":    True,
                 }
+
+            # If another thread is already fetching, return cached value rather
+            # than blocking. The fresh data will be available on the next call.
+            if self._balance_fetch_in_progress:
+                return {
+                    "available": self.available_balance,
+                    "total":     self.current_balance,
+                    "cached":    True,
+                }
+
+            if self.api is None:
+                return None
+
+            self._balance_fetch_in_progress = True
+            # Snapshot cached values for fallback — used outside the lock
+            _fallback_avail = self.available_balance
+            _fallback_total = self.current_balance
+
+        # ── REST call — deliberately outside the lock ─────────────────────────
+        # The lock is not held during the HTTP request so on_tick, trail
+        # management, and all other threads continue running normally.
+        try:
+            balance_data = self.api.get_balance() if hasattr(self.api, "get_balance") else None
+
+            if balance_data is None:
+                with self._lock:
+                    self._balance_fetch_in_progress = False
+                return {"available": _fallback_avail, "total": _fallback_total,
+                        "cached": True, "error": "null response"}
+
+            if "error" in balance_data:
+                logger.error(f"Balance fetch error: {balance_data['error']}")
+                with self._lock:
+                    self._balance_fetch_in_progress = False
+                return {"available": _fallback_avail, "total": _fallback_total,
+                        "cached": True, "error": balance_data["error"]}
+
+            available = float(balance_data.get("available", 0.0))
+            locked    = float(balance_data.get("locked",    0.0))
+            total     = available + locked
+
+            # ── Re-acquire lock to update shared state ─────────────────────────
+            with self._lock:
+                self.available_balance = available
+                self.current_balance   = total
+                self.balance_cache_time = time.time()
+                self._balance_fetch_in_progress = False
+
+                if self.initial_balance == 0.0:
+                    self.initial_balance = total
+                    logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
+
+            return {"available": available, "total": total, "cached": False}
+
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}", exc_info=True)
+            with self._lock:
+                self._balance_fetch_in_progress = False
+            return {"available": _fallback_avail, "total": _fallback_total,
+                    "cached": True, "error": str(e)}
 
 
     def calculate_position_size(
