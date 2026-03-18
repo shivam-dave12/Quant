@@ -398,21 +398,29 @@ class _DeltaAdapter:
 
     def cancel_order(self, order_id: str) -> Dict:
         self.limiter.wait()
-        return self.api.cancel_order(order_id=order_id) or {}
+        # Pass product_id so api.cancel_order() can include it in the DELETE body.
+        # Delta requires product_id in the body; without it the request returns 404.
+        pid = self._get_product_id()
+        return self.api.cancel_order(order_id=order_id, product_id=pid) or {}
 
-    def edit_order(self, order_id: str, new_stop_price: float) -> Optional[Dict]:
+    def edit_order(self, order_id: str, new_stop_price: float,
+                   new_limit_price: Optional[float] = None) -> Optional[Dict]:
         """
-        Modify an existing stop order's trigger price via PUT /v2/orders/{id}.
+        Atomically modify a stop order's trigger price (and limit price for stop-limits).
 
-        Preferred over cancel+replace for trailing SL/TP updates because:
-          1. Atomic — no window where the position is unprotected
-          2. Works for bracket child orders (DELETE/POST cycle fails on these)
-          3. Returns 404 cleanly if the order is already gone (handled by caller)
+        PUT /v2/orders — id and product_id in body (confirmed from API doc).
+
+        For stop-limit trailing SLs, always pass new_limit_price alongside new_stop_price.
+        The API EditOrderRequest schema supports both fields — one round-trip, atomic.
 
         Returns a result dict on success, or {"_error": True, "_sc": sc} on failure.
         """
         self.limiter.wait()
-        resp = self.api.edit_order(order_id=order_id, stop_price=new_stop_price)
+        resp = self.api.edit_order(
+            order_id    = order_id,
+            stop_price  = new_stop_price,
+            limit_price = new_limit_price,   # None for stop-market, float for stop-limit
+        )
         if resp and resp.get("success"):
             result = resp.get("result", {}) or {}
             result["order_id"] = str(result.get("order_id", order_id))
@@ -982,25 +990,66 @@ class OrderManager:
         return None
 
     def place_stop_loss(self, side: str, quantity: float,
-                        trigger_price: float) -> Optional[Dict]:
+                        trigger_price: float,
+                        use_limit: bool = True) -> Optional[Dict]:
+        """
+        Place a standalone stop-loss order.
+
+        use_limit=True (default for trailing SLs): stop-limit order.
+          order_type=limit_order + stop_order_type=stop_loss_order + stop_price + limit_price
+          Advantages: atomic edit-in-place (PUT /v2/orders with stop_price+limit_price),
+          maker fee rebate (−0.02% vs +0.05% taker = 7bps saved per trail).
+          Limit offset configured via SL_LIMIT_OFFSET_TICKS (default 20 ticks = $2.00).
+
+        use_limit=False: stop-market order (used only for emergency/non-trailing SLs).
+          Guaranteed fill but taker fee and no edit-in-place for stop_price.
+
+        Bracket entry SL is always stop-market (placed by place_bracket_limit_entry).
+        Trailing SLs start as stop-limit on first cancel+replace of the bracket child.
+        """
         try:
             api_side = self._normalize_side(side)
-            logger.info(f"SL {side} qty={quantity} trigger=${trigger_price:,.2f}")
-            # API doc: standalone stop orders use order_type=market_order +
-            # stop_order_type=stop_loss_order, NOT stop_market_order.
-            # stop_market_order is a Delta internal type for bracket children only.
-            data = self._place_with_retry(
-                side=api_side, order_type="market_order",
-                quantity=quantity, trigger_price=trigger_price,
-                reduce_only=True, stop_order_type="stop_loss_order")
+            tick  = float(getattr(config, 'TICK_SIZE', 0.1))
+            offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
+            limit_offset = offset_ticks * tick
+
+            # Limit price: gives execution buffer past the stop trigger.
+            # SHORT SL (buy to close): limit = stop + offset (max price we'll pay)
+            # LONG  SL (sell to close): limit = stop - offset (min price we'll accept)
+            if use_limit:
+                if api_side == "BUY":
+                    limit_price = round(trigger_price + limit_offset, 1)
+                else:
+                    limit_price = round(trigger_price - limit_offset, 1)
+                logger.info(
+                    f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
+                    f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
+                data = self._place_with_retry(
+                    side=api_side, order_type="limit_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    price=limit_price,
+                    reduce_only=True, stop_order_type="stop_loss_order")
+            else:
+                # Stop-market: guaranteed fill, taker fee (for non-trailing / emergency)
+                logger.info(f"SL-MARKET {side} qty={quantity} trigger=${trigger_price:,.2f}")
+                data = self._place_with_retry(
+                    side=api_side, order_type="market_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    reduce_only=True, stop_order_type="stop_loss_order")
+
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id": data["order_id"], "side": side, "type": "STOP_LOSS",
+                    "order_id": data["order_id"], "side": side,
+                    "type": "STOP_LOSS_LIMIT" if use_limit else "STOP_LOSS",
                     "quantity": quantity, "trigger_price": trigger_price,
+                    "limit_price": limit_price if use_limit else None,
                     "status": data.get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 })
-                logger.info(f"✅ SL: {data['order_id']} @ ${trigger_price:,.2f}")
+                logger.info(
+                    f"✅ SL{'_LIMIT' if use_limit else ''}: {data['order_id']} "
+                    f"@ stop=${trigger_price:,.2f}"
+                    + (f" limit=${limit_price:,.2f}" if use_limit else ""))
             return data
         except Exception as e:
             logger.error(f"place_stop_loss error: {e}", exc_info=True)
@@ -1039,28 +1088,41 @@ class OrderManager:
         Update trailing SL to new_trigger_price.
 
         Strategy:
-          1. EDIT-IN-PLACE (Delta) — PUT /v2/orders/{id} with new stop_price.
-             Atomic: no unprotected window. Works on bracket child SL orders.
-             404 = order already gone → place fresh SL below.
-          2. CANCEL + REPLACE fallback — for CoinSwitch or non-404 edit failures.
+          1. EDIT-IN-PLACE (Delta) — PUT /v2/orders with id+product_id in body.
+             Sends both stop_price AND limit_price together (stop-limit).
+             Atomic: no cancel+replace cycle, zero unprotected window.
+             404 = order gone (SL fired) → return None, caller records exit.
+             bad_schema (with product_id fix) = should not occur — fall through.
 
-        Root cause of prior failure:
-          - DELETE returned 404 (bracket child stale) — benign, but
-          - POST returned bad_schema because post_only/time_in_force were
-            included in stop_market_order body (fixed in api.py).
-            edit_order avoids the POST entirely for Delta.
+          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit failures.
+             Places a stop-limit order (limit offset = SL_LIMIT_OFFSET_TICKS × TICK_SIZE).
+             NOT_FOUND on cancel → abort (old SL still live) to prevent orphan accumulation.
         """
+        tick  = float(getattr(config, 'TICK_SIZE', 0.1))
+        offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
+        limit_offset = offset_ticks * tick
+        api_side = self._normalize_side(side)
+
+        # Compute limit_price for the stop-limit (same logic as place_stop_loss)
+        if api_side == "BUY":
+            new_limit_price = round(new_trigger_price + limit_offset, 1)
+        else:
+            new_limit_price = round(new_trigger_price - limit_offset, 1)
+
         try:
             # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
+            # Sends stop_price + limit_price atomically — no cancel+replace needed.
+            # Confirmed from API doc: EditOrderRequest supports both fields.
             if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
                     order_id=existing_sl_order_id,
                     new_stop_price=new_trigger_price,
+                    new_limit_price=new_limit_price,
                 )
                 if edited and not edited.get("_error"):
                     logger.info(
                         f"✅ SL edited in-place {existing_sl_order_id[:10]}… "
-                        f"→ ${new_trigger_price:,.2f}"
+                        f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}"
                     )
                     edited["order_id"] = edited.get("order_id", existing_sl_order_id)
                     return edited
@@ -1068,10 +1130,12 @@ class OrderManager:
                 sc  = (edited or {}).get("_sc", 0)
                 err = (edited or {}).get("_err_msg", "")
                 if sc == 404 or "not_found" in str(err).lower():
+                    # SL order gone — it fired. Caller handles exit reconciliation.
                     logger.info(
                         f"SL {existing_sl_order_id[:10]}… gone (404) "
-                        f"— placing fresh SL @ ${new_trigger_price:,.2f}"
+                        f"— SL likely fired, letting reconcile detect exit"
                     )
+                    return None
                 else:
                     logger.warning(
                         f"SL edit failed sc={sc} err={err} "
@@ -1090,13 +1154,24 @@ class OrderManager:
                         return None
                     if result == CancelResult.FAILED:
                         return {"error": "CANCEL_FAILED"}
+                    # NOT_FOUND: old SL still live on exchange — do NOT place a new one.
+                    # Placing a new SL would accumulate orphaned stop orders (root cause
+                    # of the 5-SL bug seen in screenshot). Retry on next trail tick.
+                    if result == CancelResult.NOT_FOUND:
+                        logger.warning(
+                            f"⚠️ SL cancel returned NOT_FOUND for {existing_sl_order_id} — "
+                            f"aborting replace (old SL may still be live). Retry next tick.")
+                        return {"error": "CANCEL_NOT_FOUND"}
                     self._remove_active_order(existing_sl_order_id)
 
+            # Place stop-limit replacement (use_limit=True is default)
             new_sl = self.place_stop_loss(side=side, quantity=quantity,
-                                          trigger_price=new_trigger_price)
+                                          trigger_price=new_trigger_price,
+                                          use_limit=True)
             if new_sl:
-                logger.info(f"✅ SL replaced → {new_sl['order_id']} "
-                            f"@ ${new_trigger_price:,.2f}")
+                logger.info(
+                    f"✅ SL replaced (stop-limit) → {new_sl['order_id']} "
+                    f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}")
                 return new_sl
             return {"error": "PLACE_FAILED"}
         except Exception as e:

@@ -1226,14 +1226,30 @@ class DeltaAPI:
     def cancel_order(self, order_id: str, product_id: Optional[int] = None,
                      exchange: str = "") -> Dict:
         """
-        DELETE /v2/orders/{id} — cancel a single order.
+        DELETE /v2/orders — cancel a single order.
 
-        Compatible with existing bot interface.
+        API doc: id goes in the REQUEST BODY as "id", NOT in the URL path.
+        DELETE /v2/orders/{id} returns 404 Not Found — correct endpoint has no id suffix.
+        product_id is required in the body per the official API schema.
+
+        Body: {"id": <int>, "product_id": <int>}
         """
-        body: Dict[str, Any] = {}
-        if product_id:
-            body["product_id"] = product_id
-        return self._delete(f"/v2/orders/{order_id}", body=body if body else None)
+        # Resolve product_id from cache (populated at startup via ticker call)
+        _pid = product_id
+        if _pid is None:
+            for _sym in ("BTCUSD", "BTCUSDT", "ETHUSD"):
+                _pid = self._product_id_cache.get(_sym)
+                if _pid:
+                    break
+        if _pid is None:
+            _pid = self._symbol_to_product_id("BTCUSD")
+
+        body: Dict[str, Any] = {"id": int(order_id)}
+        if _pid:
+            body["product_id"] = int(_pid)
+
+        # Endpoint: DELETE /v2/orders (NO id suffix — id is in the body)
+        return self._delete("/v2/orders", body=body)
 
     def cancel_all_orders(
         self,
@@ -1265,23 +1281,42 @@ class DeltaAPI:
         product_id:  Optional[int]   = None,
     ) -> Dict:
         """
-        PUT /v2/orders — modify size or price of an existing open order.
+        PUT /v2/orders — atomically edit stop_price (and limit_price) of a stop order.
 
-        API doc confirms the endpoint is PUT /v2/orders (NOT /v2/orders/{id}).
-        The order identifier goes in the request BODY as the "id" field.
-        Sending the id in the URL path returns 404 Not Found.
+        API doc (EditOrderRequest schema):
+          {"id": <int>, "product_id": <int>, "stop_price": "56000",
+           "limit_price": "55000", "size": <int>, ...}
 
-        Used by order_manager.replace_stop_loss / replace_take_profit.
+        Key facts confirmed from API doc:
+          - Endpoint: PUT /v2/orders (NO id in URL — id goes in BODY)
+          - product_id REQUIRED in body (without it: bad_schema)
+          - stop_price editable for stop-market AND stop-limit orders
+          - limit_price editable for stop-limit orders (used together with stop_price)
+          - Atomic: no cancel+replace needed — no unprotected window
+
+        Used by order_manager.replace_stop_loss for trailing SL updates.
+        For stop-limit trailing SLs, both stop_price and limit_price are sent together
+        to keep the limit offset in sync with the new trigger level.
         """
+        # Resolve product_id from cache (populated at startup via ticker call)
+        _pid = product_id
+        if _pid is None:
+            for _sym in ("BTCUSD", "BTCUSDT", "ETHUSD"):
+                _pid = self._product_id_cache.get(_sym)
+                if _pid:
+                    break
+        if _pid is None:
+            _pid = self._symbol_to_product_id("BTCUSD")
+
         body: Dict[str, Any] = {"id": int(order_id)}   # id in BODY, not URL path
+        if _pid:
+            body["product_id"] = int(_pid)              # required — without it: bad_schema
         if size is not None:
             body["size"] = int(size)
         if limit_price is not None:
-            body["limit_price"] = str(limit_price)
+            body["limit_price"] = str(limit_price)      # for stop-limit: limit exec price
         if stop_price is not None:
-            body["stop_price"] = str(stop_price)
-        if product_id is not None:
-            body["product_id"] = product_id
+            body["stop_price"] = str(stop_price)        # trigger price
 
         resp = self._put("/v2/orders", body=body)       # endpoint has NO id suffix
         if resp["success"] and resp.get("result"):

@@ -108,6 +108,15 @@ DELTA_API_MIN_INTERVAL   = 0.25
 RATE_LIMIT_ORDERS        = 15
 
 # ── SL infrastructure ─────────────────────────────────────────────────────────
+# Trailing SL order type: stop-limit instead of stop-market.
+# Stop-limit = triggers at SL price, executes as limit order at limit_price.
+# Advantages: edit-in-place atomic (no cancel+replace cycle), maker fee rebate.
+# SL_LIMIT_OFFSET_TICKS: number of ticks of limit buffer past the stop trigger.
+#   SHORT SL (buy to close): limit_price = stop_price + offset (max buy price)
+#   LONG  SL (sell to close): limit_price = stop_price - offset (min sell price)
+# 20 ticks = $2.00 — covers normal BTC spread + slippage on structural breaks.
+# Bracket entry SL is always stop-market (guaranteed crash protection).
+SL_LIMIT_OFFSET_TICKS    = 20   # ticks of limit buffer on trailing stop-limit
 SL_BUFFER_TICKS              = 5
 MIN_SL_DISTANCE_PCT          = 0.001  # legacy pct floor; actual SL uses 1.0×ATR minimum
 MAX_SL_DISTANCE_PCT          = 0.035
