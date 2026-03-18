@@ -2880,12 +2880,14 @@ class QuantStrategy:
             return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
-        price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
+        price = data_manager.get_last_price()
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
         # Update ICT structures (OB, FVG, liquidity, session) every 5s
         # Then score ICT confluence for the current reversion side
         # ICT score is used to: (a) boost composite, (b) count as confirming signal
+        # FIX: ICT update runs BEFORE _log_thinking so the display always shows the
+        # current tick's scores (previously the log showed stale prev-tick values).
         if self._ict is not None:
             try:
                 candles_5m = data_manager.get_candles("5m", limit=100)
@@ -2895,7 +2897,9 @@ class QuantStrategy:
                 self._ict.update(candles_5m, candles_15m, price, now_ms,
                                  candles_1m=candles_1m_ict)
                 ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
-                ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
+                # FIX: pass atr so proximity scoring in get_confluence can compute
+                # ATR-normalised distances to nearby OBs/FVGs (root cause of 0.00)
+                ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
                 sig.ict_ob = ict_conf.ob_score
                 sig.ict_fvg = ict_conf.fvg_score
                 sig.ict_sweep = ict_conf.sweep_score
@@ -2911,6 +2915,9 @@ class QuantStrategy:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
+
+        # Log AFTER ICT update — display now reflects current tick's scores
+        self._log_thinking(sig, price, now)
 
         # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
         # This is the single most important defense against bleeding in trends.
@@ -3170,27 +3177,36 @@ class QuantStrategy:
             return
 
         # ── Issue 4 fix: Gate 4 — ICT structural confluence ──────────────────
-        # Momentum entries need ICT OBs / FVGs in the retest zone to be valid.
-        # A retest without institutional structure is a noise bounce, not a
-        # real break-and-retest. The ICT gate prevents entering at random levels.
+        # FIX: sig.ict_total was scored for sig.reversion_side (the fade direction).
+        # For a breakout UP, reversion_side="short" but momentum side="long".
+        # Using the reversion score for a momentum entry checks the WRONG direction.
+        # Re-query get_confluence here for the actual momentum side.
         _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
-            if sig.ict_total < _ict_min:
+            now_ms_mo = int(now * 1000) if now < 1e12 else int(now)
+            try:
+                mo_conf = self._ict.get_confluence(side, price, now_ms_mo, atr=atr)
+                mo_ict_total = mo_conf.total
+                mo_ict_details = mo_conf.details
+            except Exception:
+                mo_ict_total = sig.ict_total
+                mo_ict_details = sig.ict_details
+            if mo_ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
                     self._ict_gate_start_time = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{sig.ict_details}]")
+                        f"score={mo_ict_total:.2f} < min={_ict_min:.2f} "
+                        f"[{mo_ict_details}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
-                        f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
+                        f"Current score: {mo_ict_total:.2f} (min={_ict_min:.2f})\n"
+                        f"Details: {mo_ict_details}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return

@@ -220,6 +220,12 @@ class ICTEngine:
         self._killzone = ""
         self._initialized = False
 
+        # Proximity / bonus defaults (overridden by _load_config)
+        self.ICT_REQUIRE_OB_OR_FVG = False
+        self.OB_PROXIMITY_ATR      = 1.5   # max ATR dist for partial OB credit
+        self.FVG_PROXIMITY_ATR     = 0.8   # max ATR dist for partial FVG credit
+        self.SWEEP_DISP_BONUS      = 0.12  # confirmed-displacement sweep bonus
+
         # Try to load config overrides
         self._load_config()
 
@@ -241,8 +247,18 @@ class ICTEngine:
             self.KZ_LONDON_END = getattr(cfg, 'KZ_LONDON_NY_END', 5)
             self.KZ_NY_START = getattr(cfg, 'KZ_NY_NY_START', 7)
             self.KZ_NY_END = getattr(cfg, 'KZ_NY_NY_END', 10)
+            # Issue fix: load the config key that was previously dead (never read here)
+            self.ICT_REQUIRE_OB_OR_FVG = getattr(cfg, 'ICT_REQUIRE_OB_OR_FVG', False)
+            # Proximity scoring: max distance (in ATR) to give partial OB/FVG credit
+            self.OB_PROXIMITY_ATR = getattr(cfg, 'ICT_OB_PROXIMITY_ATR', 1.5)
+            self.FVG_PROXIMITY_ATR = getattr(cfg, 'ICT_FVG_PROXIMITY_ATR', 0.8)
+            # Sweep displacement bonus: confirmed sweep adds this to total
+            self.SWEEP_DISP_BONUS = getattr(cfg, 'ICT_SWEEP_DISP_BONUS', 0.12)
         except ImportError:
-            pass
+            self.ICT_REQUIRE_OB_OR_FVG = False
+            self.OB_PROXIMITY_ATR   = 1.5
+            self.FVG_PROXIMITY_ATR  = 0.8
+            self.SWEEP_DISP_BONUS   = 0.12
 
     def reset_state(self):
         """Clear all detected structures (called after stream restart)."""
@@ -723,7 +739,8 @@ class ICTEngine:
     # CONFLUENCE SCORING — called by quant strategy
     # ══════════════════════════════════════════════════════════════════
 
-    def get_confluence(self, side: str, price: float, now_ms: int) -> ICTConfluence:
+    def get_confluence(self, side: str, price: float, now_ms: int,
+                       atr: float = 0.0) -> ICTConfluence:
         """
         Score ICT structural confluence for a given trade direction.
 
@@ -731,10 +748,29 @@ class ICTEngine:
         The quant strategy uses total as a BOOST to its composite score.
 
         Scoring:
-          OB:      0.0-1.0 (in OB body=0.6, OTE=0.9, virgin+BOS=1.0)
-          FVG:     0.0-1.0 (in gap=0.5, fresh=0.8, OB+FVG overlap=1.0)
-          Sweep:   0.0-1.0 (recent sweep + displacement=1.0)
+          OB:      0.0-1.0 (in-zone: OTE=0.85, body=0.55; proximity: up to 0.40)
+          FVG:     0.0-1.0 (in-gap=0.5-0.8; proximity: up to 0.35)
+          Sweep:   0.0-1.0 (recent sweep + displacement=1.0; disp bonus adds 0.12)
           Session: 0.0-1.0 (killzone=0.8, liquid session=0.5, off-hours=0.0)
+
+        v5.0 FIX — Proximity scoring:
+          Previously OB/FVG only scored when price was physically INSIDE the zone.
+          During mean-reversion entries price has already bounced FROM the OB (just
+          above it) or hasn't yet reached a nearby OB. Both give 0 with in-zone
+          only scoring, making the 0.45 gate arithmetically unreachable.
+
+          Now: nearest OB/FVG within self.OB_PROXIMITY_ATR also scores (decaying
+          linearly with distance). At 0 ATR from OB edge → full proximity score
+          (0.40). At OB_PROXIMITY_ATR away → 0.0. This correctly models the
+          institutional concept that price near a demand/supply zone is significant
+          even before entering it.
+
+        v5.0 FIX — Sweep displacement bonus:
+          A displacement-confirmed + wick-rejection sweep is the canonical ICT entry
+          trigger ("liquidity sweep then entry"). Previously it maxed at 0.25 weight,
+          so sweep+session = 0.30 < min_score=0.45. Now confirmed sweeps add a 0.12
+          bonus to total AFTER weighting, enabling high-quality sweep setups to pass
+          without requiring an OB/FVG overlap.
         """
         if not self._initialized:
             return ICTConfluence(0, 0, 0, 0, 0, details="ICT not initialized")
@@ -746,43 +782,108 @@ class ICTEngine:
         session_score = 0.0
         active_ob = None
         active_fvg = None
+        _confirmed_sweep = False   # tracks displacement+wick sweep for bonus
 
         # ── 1. Order Block scoring ────────────────────────────────────
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
-        for ob in sorted([o for o in obs if o.is_active(now_ms)],
-                         key=lambda x: x.strength, reverse=True):
+        active_obs = sorted([o for o in obs if o.is_active(now_ms)],
+                            key=lambda x: x.strength, reverse=True)
+
+        for ob in active_obs:
             if ob.contains_price(price) or ob.in_optimal_zone(price):
                 in_ote = ob.in_optimal_zone(price)
-                # Base score: OTE (61.8-79% zone) > body touch
                 base = 0.85 if in_ote else 0.55
-                # Virgin multiplier: unvisited OB scores higher
                 vm = ob.virgin_multiplier()
-                # Visit penalty: each retest weakens the level
                 visit_penalty = max(0.5, 1.0 - ob.visit_count * 0.25)
-                # BOS/displacement bonus: confirmed structural break = institutional
                 bos_bonus = 0.15 if ob.bos_confirmed else 0.0
                 disp_bonus = 0.10 if ob.has_displacement else 0.0
                 ob_score = min(base * vm * visit_penalty + bos_bonus + disp_bonus, 1.0)
                 active_ob = ob
                 tag = "OTE" if in_ote else "BODY"
-                quality = "BOS+DISP" if (ob.bos_confirmed and ob.has_displacement) else                           ("BOS" if ob.bos_confirmed else ("DISP" if ob.has_displacement else "RAW"))
+                quality = "BOS+DISP" if (ob.bos_confirmed and ob.has_displacement) else \
+                          ("BOS" if ob.bos_confirmed else ("DISP" if ob.has_displacement else "RAW"))
                 details.append(f"OB_{tag}_{quality} ${ob.low:.0f}-${ob.high:.0f} s={ob.strength:.0f} v={ob.visit_count} score={ob_score:.2f}")
                 break
 
+        # ── 1b. Proximity OB scoring (price near but not inside OB) ──
+        # Root cause fix: mean-reversion entries fire AFTER price bounces from an OB
+        # (price is just ABOVE the OB high for longs, just BELOW the OB low for shorts).
+        # Give partial credit decaying linearly with distance up to OB_PROXIMITY_ATR.
+        if ob_score < 0.01 and atr > 1e-10:
+            prox_atr = self.OB_PROXIMITY_ATR
+            best_prox = (0.0, None)   # (score, ob)
+            for ob in active_obs:
+                if side == "long":
+                    # Bullish OB: price above OB high (just departed upward after bounce)
+                    if ob.high < price:
+                        dist_atr = (price - ob.high) / atr
+                        if dist_atr <= prox_atr:
+                            pf = 1.0 - dist_atr / prox_atr        # 1.0 at edge → 0 at limit
+                            vm = ob.virgin_multiplier()
+                            bos_b = 0.08 if ob.bos_confirmed else 0.0
+                            s = min(0.40 * pf * vm + bos_b, 0.45)
+                            if s > best_prox[0]:
+                                best_prox = (s, ob)
+                    # Also: price approaching OB from above (within proximity)
+                    elif ob.low <= price <= ob.high:
+                        pass   # handled by contains_price above
+                else:  # short
+                    # Bearish OB: price below OB low (just departed downward after test)
+                    if ob.low > price:
+                        dist_atr = (ob.low - price) / atr
+                        if dist_atr <= prox_atr:
+                            pf = 1.0 - dist_atr / prox_atr
+                            vm = ob.virgin_multiplier()
+                            bos_b = 0.08 if ob.bos_confirmed else 0.0
+                            s = min(0.40 * pf * vm + bos_b, 0.45)
+                            if s > best_prox[0]:
+                                best_prox = (s, ob)
+            if best_prox[0] > 0.01:
+                ob_score = best_prox[0]
+                active_ob = best_prox[1]
+                ob = best_prox[1]
+                dist_lbl = f"{(abs(price - ob.high) if side == 'long' else abs(ob.low - price)) / atr:.1f}ATR"
+                details.append(f"OB_PROX({dist_lbl}) ${ob.low:.0f}-${ob.high:.0f} v={ob.visit_count} score={ob_score:.2f}")
+
         # ── 2. FVG scoring ────────────────────────────────────────────
         fvgs = self.fvgs_bull if side == "long" else self.fvgs_bear
-        for fvg in [f for f in fvgs if f.is_active(now_ms)]:
+        active_fvgs = [f for f in fvgs if f.is_active(now_ms)]
+        for fvg in active_fvgs:
             if fvg.is_price_in_gap(price):
                 freshness = 1.0 - fvg.fill_percentage
                 fvg_score = 0.5 + 0.3 * freshness
                 active_fvg = fvg
-                # OB + FVG overlap bonus
                 if active_ob is not None:
                     fvg_score = min(fvg_score + 0.2, 1.0)
-                    details.append(f"FVG+OB overlap")
+                    details.append("FVG+OB overlap")
                 else:
                     details.append(f"FVG ${fvg.bottom:.0f}-${fvg.top:.0f} fill={fvg.fill_percentage:.0%}")
                 break
+
+        # ── 2b. Proximity FVG scoring (price near but not inside FVG) ─
+        if fvg_score < 0.01 and atr > 1e-10:
+            prox_atr_fvg = self.FVG_PROXIMITY_ATR
+            for fvg in active_fvgs:
+                if side == "long" and fvg.bottom > price:
+                    # Bullish FVG above price: price approaching it (reversion up)
+                    dist_atr = (fvg.bottom - price) / atr
+                    if dist_atr <= prox_atr_fvg:
+                        pf = 1.0 - dist_atr / prox_atr_fvg
+                        freshness = 1.0 - fvg.fill_percentage
+                        fvg_score = min(0.35 * pf * freshness, 0.35)
+                        active_fvg = fvg
+                        details.append(f"FVG_PROX {dist_atr:.1f}ATR ${fvg.bottom:.0f}-${fvg.top:.0f}")
+                        break
+                elif side == "short" and fvg.top < price:
+                    # Bearish FVG below price: price approaching it (reversion down)
+                    dist_atr = (price - fvg.top) / atr
+                    if dist_atr <= prox_atr_fvg:
+                        pf = 1.0 - dist_atr / prox_atr_fvg
+                        freshness = 1.0 - fvg.fill_percentage
+                        fvg_score = min(0.35 * pf * freshness, 0.35)
+                        active_fvg = fvg
+                        details.append(f"FVG_PROX {dist_atr:.1f}ATR ${fvg.bottom:.0f}-${fvg.top:.0f}")
+                        break
 
         # ── 3. Liquidity sweep scoring ────────────────────────────────
         for pool in reversed(list(self.liquidity_pools)):
@@ -798,6 +899,9 @@ class ICTEngine:
                 if pool.wick_rejection:
                     sweep_score += 0.2
                 sweep_score = min(sweep_score, 1.0)
+                # Track confirmed sweep for displacement bonus below
+                if pool.displacement_confirmed and pool.wick_rejection:
+                    _confirmed_sweep = True
                 details.append(f"Sweep {pool.pool_type} ${pool.price:.0f}")
                 break
 
@@ -822,22 +926,32 @@ class ICTEngine:
         #   FVG:     0.25 — imbalance that attracts price
         #   Sweep:   0.25 — liquidity raid confirming reversal intent
         #   Session: 0.05 — timing context only, not structure
-        #
-        # Design principle: session timing alone CANNOT pass the entry gate.
-        # Real ICT entries require actual structural confluence (OB or sweep),
-        # not just "it's the NY session." The old 0.15 session weight allowed
-        # FVG + session to nearly pass, and OB (body) + session to easily pass
-        # even when the OB had no displacement or BOS confirmation.
         total = (ob_score    * 0.45 +
                  fvg_score   * 0.25 +
                  sweep_score * 0.25 +
                  session_score * 0.05)
 
+        # ── Sweep displacement bonus ──────────────────────────────────
+        # A confirmed sweep (displacement + wick rejection) is the canonical ICT
+        # "liquidity sweep then entry" setup. Without this bonus, sweep+session
+        # maxes at 0.30, which is mathematically below ICT_MIN_SCORE_FOR_ENTRY=0.45.
+        # The bonus allows high-quality sweep setups to pass the gate even without
+        # a visible OB/FVG at current price.
+        if _confirmed_sweep:
+            total = min(total + self.SWEEP_DISP_BONUS, 1.0)
+            details.append(f"SWEEP_DISP_BONUS+{self.SWEEP_DISP_BONUS:.2f}")
+
         # Structural presence guard: if no OB AND no sweep, cap total at 0.30
         # so that FVG-only or FVG+session setups don't trigger the entry gate.
-        # An FVG without OB or sweep context is an imbalance, not a trade setup.
         if ob_score < 0.05 and sweep_score < 0.05:
             total = min(total, 0.30)
+
+        # ICT_REQUIRE_OB_OR_FVG enforcement: if enabled and neither OB nor FVG
+        # has scored (even via proximity), hard-cap at 0.20 to block entry.
+        if self.ICT_REQUIRE_OB_OR_FVG and ob_score < 0.05 and fvg_score < 0.05:
+            total = min(total, 0.20)
+            if "REQUIRE_OB_OR_FVG_CAP" not in " ".join(details):
+                details.append("REQUIRE_OB_OR_FVG_CAP")
 
         return ICTConfluence(
             ob_score=ob_score,

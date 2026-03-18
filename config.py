@@ -268,7 +268,19 @@ KZ_NY_NY_END                = 10
 # Ensures the bot never enters purely on quant signals without ICT structure.
 # Set to 0.0 to disable (quant-only mode).
 ICT_MIN_SCORE_FOR_ENTRY     = 0.45   # was 0.25 — session alone (0.15) trivially passed
-ICT_REQUIRE_OB_OR_FVG       = True   # entry only when price is inside an active OB or FVG
+ICT_REQUIRE_OB_OR_FVG       = False  # proximity scoring now handles this intent more
+                                      # gracefully — set True only to hard-require
+                                      # price physically inside an OB or FVG
+# v5.0: Proximity scoring — partial OB/FVG credit when price is near but not inside.
+# Root cause fix: mean-reversion entries fire after price bounces FROM an OB (just
+# above it), so contains_price() is always False → OB score permanently 0.
+# These control the decay window. Tighten to raise bar; widen for noisier markets.
+ICT_OB_PROXIMITY_ATR        = 1.5   # ATR distance within which an OB gets partial credit
+ICT_FVG_PROXIMITY_ATR       = 0.8   # ATR distance within which an FVG gets partial credit
+# v5.0: Confirmed displacement sweep bonus — added to weighted total post-scoring.
+# A displacement+wick_rejection sweep is the canonical ICT "stop hunt then entry"
+# setup. Without bonus: sweep+session = 0.30 < 0.45 gate. With bonus: can pass.
+ICT_SWEEP_DISP_BONUS        = 0.12
 
 # HTF veto — per-timeframe (reversion entries)
 # LONG veto:  15m < -0.35  OR  (15m < -0.20 AND 4h < -0.20)
