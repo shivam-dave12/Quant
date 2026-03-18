@@ -310,6 +310,9 @@ class QCfg:
     def ICT_TP_MIN_RR_REVERSION() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_REVERSION", 1.8))
     @staticmethod
     def ICT_TP_MIN_RR_TREND() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_TREND", 2.5))
+    # ── v5.1: CHoCH staleness expiry ─────────────────────────────────────────
+    @staticmethod
+    def CHOCH_EXPIRY_BARS() -> int: return int(_cfg("QUANT_CHOCH_EXPIRY_BARS", 10))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -2433,14 +2436,15 @@ class HTFTrendFilter:
         return out
 
     @staticmethod
-    def _ict_structure_score(tf_struct) -> float:
+    def _ict_structure_score(tf_struct, n_candles: int = 0) -> float:
         """
         Convert a TFStructure object into a [-1, +1] directional score.
 
         Component weights:
           Swing trend:  ±0.60  (dominant — multi-bar confirmation)
           BOS:          ±0.25  (structural break confirmation)
-          CHoCH:        ±0.15  (early character-change warning)
+          CHoCH:        ±0.15  (early character-change warning — expires after
+                                CHOCH_EXPIRY_BARS candles; stale CHoCH ignored)
 
         Ranging markets with no clear swing sequence return near-zero,
         which does NOT trigger a veto — correct behaviour since ranging
@@ -2460,11 +2464,20 @@ class HTFTrendFilter:
                 score += 0.25
             elif tf_struct.bos_direction == "bearish":
                 score -= 0.25
-        # CHoCH is an early reversal signal — weight lower than confirmed BOS
-        if tf_struct.choch_level > 0:
-            # CHoCH direction inferred: if bullish trend has CHoCH it means
-            # a lower-high formed (bearish signal). If bearish trend has CHoCH
-            # it means a higher-low formed (bullish signal).
+        # CHoCH is an early reversal signal — only apply when recent (within
+        # CHOCH_EXPIRY_BARS bars).  A CHoCH from 50+ candles ago indicates
+        # the trend long since resumed; applying it indefinitely softens an
+        # established HTF score with stale information.
+        if tf_struct.choch_level > 0 and tf_struct.choch_bar_index >= 0:
+            bars_ago = max(0, (n_candles - 1) - tf_struct.choch_bar_index)
+            if bars_ago <= QCfg.CHOCH_EXPIRY_BARS():
+                if trend == "bullish":
+                    score -= 0.15
+                elif trend == "bearish":
+                    score += 0.15
+        elif tf_struct.choch_level > 0 and tf_struct.choch_bar_index < 0:
+            # Legacy TFStructure with no bar index (e.g. loaded from old state):
+            # apply conservatively — assume recent.
             if trend == "bullish":
                 score -= 0.15
             elif trend == "bearish":
@@ -2485,8 +2498,8 @@ class HTFTrendFilter:
         if ict_engine is not None and getattr(ict_engine, '_initialized', False):
             tf_15m = ict_engine._tf.get("15m")
             tf_4h  = ict_engine._tf.get("4h")
-            self._trend_15m  = self._ict_structure_score(tf_15m)
-            self._trend_4h   = self._ict_structure_score(tf_4h)
+            self._trend_15m  = self._ict_structure_score(tf_15m, n_candles=len(candles_15m))
+            self._trend_4h   = self._ict_structure_score(tf_4h,  n_candles=len(candles_4h))
             self._ict_source = True
             return
 
@@ -2641,6 +2654,8 @@ class SignalBreakdown:
     ict_session: float = 0.0       # Session/KZ score
     ict_total: float = 0.0         # Total ICT confluence 0-1
     ict_details: str = ""          # Human-readable detail string
+    ict_boost_signed: float = 0.0  # Signed composite contribution (+/-); B1 fix
+    ict_direction: float = 0.0     # +1.0=long / -1.0=short resolved ICT side; B1 fix
     # v6.0: AMD phase + MTF context
     amd_phase: str = "ACCUMULATION"  # AMD cycle phase
     amd_bias: str = "neutral"         # AMD directional bias
@@ -3201,9 +3216,17 @@ class QuantStrategy:
         nc = sum(1 for s in [vs, cs, obs, ts, ve] if s * direction > 0.05)
 
         # ── Trend-following score (TRENDING regime) ───────────────────────────
+        # B4 FIX: The original formula used obs (Level-2 bid/ask z-score) at 20%
+        # weight.  obs updates every orderbook snapshot — a momentary bid spike adds
+        # +0.10 to trend_score, enough to flip a borderline TREND_COMPOSITE_MIN check
+        # and block a valid SHORT with no logged reason.
+        # Replacement: ADX +DI/-DI spread — structural and candle-frequency stable.
+        # Normalised to [-1, +1] by dividing by 50 (DI values rarely exceed 50).
+        _di_spread = (self._adx.plus_di - self._adx.minus_di) / 50.0
+        _di_spread = max(-1.0, min(1.0, _di_spread))
         htf_comp    = self._htf.trend_4h * 0.60 + self._htf.trend_15m * 0.40
         cvd_trend   = self._cvd.get_trend_signal()
-        trend_score = htf_comp * 0.50 + cvd_trend * 0.30 + obs * 0.20
+        trend_score = htf_comp * 0.50 + cvd_trend * 0.30 + _di_spread * 0.20
         trend_score = max(-1.0, min(1.0, trend_score))
 
         # ── Build signal breakdown with full attribution ───────────────────────
@@ -3239,6 +3262,26 @@ class QuantStrategy:
         thr = QCfg.COMPOSITE_ENTRY_MIN()
         regime_lbl = sig.market_regime
 
+        # ── Determine the active routing path (B2/B8 fix) ────────────────────
+        # _log_thinking previously computed only the reversion all-pass check,
+        # then displayed "👀 Watching" regardless of which path was actually
+        # active.  In TRENDING regime the bot routes to _evaluate_trend_entry —
+        # the reversion composite gate shown was never the actual blocker.
+        _has_sweep_entry = (
+            _ICT_TRADE_ENGINE_AVAILABLE and
+            QCfg.ICT_SWEEP_ENTRY_ENABLED() and
+            self._active_sweep_setup is not None and
+            self._active_sweep_setup.status == "OTE_READY"
+        )
+        if _has_sweep_entry:
+            _routing_path = "sweep"
+        elif self._breakout.is_active and self._breakout.retest_ready:
+            _routing_path = "momentum"
+        elif self._regime.is_trending():
+            _routing_path = "trend"
+        else:
+            _routing_path = "reversion"
+
         # ── Sweep setup display ───────────────────────────────────────────
         _sweep_line = ""
         if self._active_sweep_setup is not None:
@@ -3259,33 +3302,49 @@ class QuantStrategy:
             f"{'✅' if abs(c)>=thr else '⚪'} Composite ({c:+.3f} vs ±{thr:.3f}) [scout: order-flow]",
         ]
 
-        # ── ICT tier gate display ─────────────────────────────────────────
+        # ── ICT tier gate display (B1 + B6 fix) ──────────────────────────
         if self._ict is not None:
             if self._ict._initialized:
                 _ict_scores_valid = (sig.ict_ob + sig.ict_fvg + sig.ict_sweep + sig.ict_session) > 0.0
                 if _ict_scores_valid:
-                    # Try to compute current tier for display
                     _tier_display = "B"
+                    _tier_reason_d = ""
                     if _ICT_TRADE_ENGINE_AVAILABLE:
                         try:
                             _qh_d = self._get_quant_helpers(sig, sig.reversion_side or "long")
                             _td, _, _tdr = ICTEntryGate.evaluate(
                                 sig.reversion_side or "long", sig,
                                 self._active_sweep_setup, price, _qh_d)
-                            _tier_display = _td
+                            _tier_display  = _td
                             _tier_reason_d = _tdr
                         except Exception:
-                            _tier_display = "?"
+                            _tier_display  = "?"
                             _tier_reason_d = ""
-                    else:
-                        _tier_reason_d = ""
 
                     _tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
                                    "BLOCKED": "⛔", "?": "❓"}
+
+                    # B1 FIX: show the signed ICT direction so the arrow and
+                    # boost value reflect the actual composite contribution.
+                    # Previously Σ=0.33 with ▲ looked bullish even when the OB
+                    # was above price and the contribution was SHORT (negative).
+                    _ict_dir_arrow = ("▲LONG"  if sig.ict_direction > 0
+                                      else ("▼SHORT" if sig.ict_direction < 0
+                                            else "─UNSET"))
+                    _boost_str = f"{sig.ict_boost_signed:+.3f}" if sig.ict_direction != 0 else "n/a"
+
+                    # B6 FIX: OB raw accumulator can exceed 1.0 (sum of quality
+                    # multipliers across nearby OBs).  Show both the normalised
+                    # [0-1] value used in the total and the raw accumulator so
+                    # OB=1.4raw / 0.70norm is unambiguous.
+                    _ob_norm  = min(sig.ict_ob  / 2.0, 1.0)
+                    _fvg_norm = min(sig.ict_fvg / 1.5, 1.0)
+
                     ict_gate_lbl = (
                         f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}] "
-                        f"Σ={sig.ict_total:.2f} "
-                        f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} "
+                        f"Σ={sig.ict_total:.2f} ({_ict_dir_arrow} boost={_boost_str}) "
+                        f"[OB={_ob_norm:.2f}({sig.ict_ob:.1f}raw) "
+                        f"FVG={_fvg_norm:.2f}({sig.ict_fvg:.1f}raw) "
                         f"Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
                     )
                     if _tier_reason_d:
@@ -3313,21 +3372,71 @@ class QuantStrategy:
 
         gates.append(f"📊 {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
 
-        # ── All-pass (tier-aware): Tier-S/A bypass VWAP quant gates ─────
+        # ── B2/B8 FIX: routing-aware all-pass and status label ────────────
+        # Previously the all-pass check and "👀 Watching" label always showed
+        # reversion gates regardless of which path (_evaluate_trend_entry,
+        # _evaluate_momentum_entry, etc.) was actually active.  Now we surface
+        # the real blocker for the path currently being evaluated.
         _ict_init = self._ict is not None and self._ict._initialized
-        if _ict_init and _ICT_TRADE_ENGINE_AVAILABLE:
-            try:
-                _qh_ap = self._get_quant_helpers(sig, sig.reversion_side or "long")
-                _ap_tier, _, _ = ICTEntryGate.evaluate(
-                    sig.reversion_side or "long", sig,
-                    self._active_sweep_setup, price, _qh_ap)
-                ap = _ap_tier in ("S", "A", "B")
-            except Exception:
-                ap = False
+        ap       = False
+        _status  = "👀 Watching"
+
+        if _routing_path == "trend":
+            t_side   = self._regime.trend_side() or "?"
+            cvd_bias = self._cvd.get_trend_signal()
+            tf_sig   = self._tick_eng.get_signal()
+            _cvd_ok  = (cvd_bias >= QCfg.TREND_CVD_MIN()
+                        if t_side == "long"
+                        else cvd_bias <= -QCfg.TREND_CVD_MIN())
+            _tick_ok = (tf_sig > -0.30 if t_side == "long" else tf_sig < 0.30)
+            _ts_ok   = (abs(sig.trend_score) >= QCfg.TREND_COMPOSITE_MIN() and
+                        (sig.trend_score > 0 if t_side == "long"
+                         else sig.trend_score < 0))
+            _ict_ok_t = (not _ict_init) or (sig.ict_total >= 0.40)
+            gates.append(f"🔀 ACTIVE PATH: TREND [{t_side.upper()}]")
+            gates.append(
+                f"  {'✅' if _cvd_ok  else '❌'} CVD trend "
+                f"({cvd_bias:+.3f} vs ±{QCfg.TREND_CVD_MIN():.2f})")
+            gates.append(
+                f"  {'✅' if _tick_ok else '❌'} Tick flow "
+                f"({tf_sig:+.3f} vs ±0.30)")
+            gates.append(
+                f"  {'✅' if _ts_ok   else '❌'} Trend score "
+                f"({sig.trend_score:+.3f} vs ±{QCfg.TREND_COMPOSITE_MIN():.2f})")
+            ap = _cvd_ok and _tick_ok and _ts_ok and _ict_ok_t
+            _status = ("🎯 ENTRY READY" if ap
+                       else f"⏳ TREND WAIT [{t_side.upper()}] — EMA pullback")
+
+        elif _routing_path == "momentum":
+            gates.append(
+                f"🔀 ACTIVE PATH: MOMENTUM RETEST [{self._breakout.direction}]")
+            ap      = True   # momentum path manages its own confirm counter
+            _status = f"⏳ MOMENTUM RETEST ({self._breakout.direction})"
+
+        elif _routing_path == "sweep":
+            gates.append(
+                f"🔀 ACTIVE PATH: SWEEP OTE [{self._active_sweep_setup.side.upper()}]")
+            ap      = True
+            _status = (f"🏛️ SWEEP OTE "
+                       f"[{self._active_sweep_setup.side.upper()}] "
+                       f"q={self._active_sweep_setup.quality_score():.2f}")
+
         else:
-            _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
-            ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
-                  sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
+            # Reversion path — original all-pass logic unchanged
+            if _ict_init and _ICT_TRADE_ENGINE_AVAILABLE:
+                try:
+                    _qh_ap = self._get_quant_helpers(sig, sig.reversion_side or "long")
+                    _ap_tier, _, _ = ICTEntryGate.evaluate(
+                        sig.reversion_side or "long", sig,
+                        self._active_sweep_setup, price, _qh_ap)
+                    ap = _ap_tier in ("S", "A", "B")
+                except Exception:
+                    ap = False
+            else:
+                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
+                ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
+                      sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
+            _status = "🎯 ENTRY READY" if ap else "👀 Watching"
 
         cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
         _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
@@ -3343,10 +3452,46 @@ class QuantStrategy:
                   f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
         for g in gates:
             lines.append(f"  {g}")
-        lines.append(f"  {'🎯 ENTRY READY' if ap else '👀 Watching'}")
+        lines.append(f"  {_status}")
         lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
         lines.append(f"└{'─'*66}")
         logger.info("\n" + "\n".join(lines))
+
+
+    @staticmethod
+    def _resolve_ict_side_from_structure(ict_engine, fallback_side: str,
+                                          now_ms: int) -> str:
+        """
+        B3 FIX: Derive ICT direction from the dominant active OB structure when
+        AMD is neutral.  Previously this fell back to sig.reversion_side (VWAP),
+        causing the ICT boost to work against the OB score it was computed from.
+
+        Logic:
+          - Sum quality of active bull OBs  vs  active bear OBs.
+          - If one side dominates by > 0.1 quality points, use that side.
+          - Otherwise fall through to fallback_side (VWAP or composite sign).
+
+        The 0.1 threshold prevents noise from a single low-quality OB overriding
+        VWAP when structure is genuinely ambiguous.
+        """
+        try:
+            bull_quality = sum(
+                ob.strength / 100.0
+                for ob in ict_engine.order_blocks_bull
+                if ob.is_active(now_ms)
+            )
+            bear_quality = sum(
+                ob.strength / 100.0
+                for ob in ict_engine.order_blocks_bear
+                if ob.is_active(now_ms)
+            )
+            if bull_quality > bear_quality + 0.1:
+                return "long"
+            if bear_quality > bull_quality + 0.1:
+                return "short"
+        except Exception:
+            pass
+        return fallback_side
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         # v4.3 Solution 5: Spread cost gate
@@ -3390,9 +3535,18 @@ class QuantStrategy:
                     # AMD engine has a clear directional bias
                     ict_side = "long" if amd_st.bias == "bullish" else "short"
                 else:
-                    # Fallback: use VWAP reversion direction
-                    ict_side = (sig.reversion_side if sig.reversion_side
-                                else ("long" if sig.composite > 0 else "short"))
+                    # B3 FIX: When AMD is neutral, derive ICT side from the dominant
+                    # active OB structure rather than VWAP reversion direction.
+                    # VWAP direction and OB direction can oppose each other; using VWAP
+                    # here caused the ICT boost to work against the OB score it was
+                    # computed from (e.g. bullish OB below price getting a SHORT boost
+                    # because VWAP said short).
+                    ict_side = self._resolve_ict_side_from_structure(
+                        self._ict,
+                        fallback_side=(sig.reversion_side if sig.reversion_side
+                                       else ("long" if sig.composite > 0 else "short")),
+                        now_ms=int(now * 1000) if now < 1e12 else int(now),
+                    )
 
                 ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
                 sig.ict_ob      = ict_conf.ob_score
@@ -3416,9 +3570,13 @@ class QuantStrategy:
                 # NOT with sig.composite direction (VWAP).
                 # Old: boost in direction composite is already going → self-reinforcing
                 # New: boost in ICT direction → may FLIP composite to align with ICT
-                ict_direction = 1.0 if ict_side == "long" else -1.0
+                ict_direction    = 1.0 if ict_side == "long" else -1.0
                 ict_boost_signed = ict_conf.total * 0.15 * ict_direction
-                sig.composite = max(-1.0, min(1.0, sig.composite + ict_boost_signed))
+                sig.composite        = max(-1.0, min(1.0, sig.composite + ict_boost_signed))
+                # B1 FIX: store signed values so _log_thinking can display the actual
+                # contribution direction instead of the always-positive magnitude.
+                sig.ict_boost_signed = ict_boost_signed
+                sig.ict_direction    = ict_direction
 
                 # Only count ICT as a confirming signal when aligned with ICT direction
                 if ict_conf.total >= 0.30:
@@ -3674,7 +3832,12 @@ class QuantStrategy:
                     return
 
             # P/D zone gate (only for standard path — sweep path is already gated)
-            if self._ict is not None and self._ict._initialized:
+            # B7 FIX: skip entirely in a trending regime.  The PD zone logic is
+            # designed for mean-reversion (short from premium, long from discount).
+            # In TRENDING_DOWN, price IS in the lower half of the 4H range — that
+            # is the delivery zone, not a reason to block the SHORT.  Applying the
+            # gate unconditionally blocked the trade precisely where it should fire.
+            if self._ict is not None and self._ict._initialized and not self._regime.is_trending():
                 _tf4h = self._ict._tf.get("4h")
                 _pd4h = _tf4h.premium_discount if _tf4h is not None else 0.5
                 if side == "long" and sig.in_premium and not sig.in_discount:
@@ -3731,19 +3894,43 @@ class QuantStrategy:
         if trend_side is None: return
 
         # CVD directional filter: don't buy if order flow is strongly opposed
+        # B5 FIX: each early return now emits a debug log so the real gate
+        # blocker is visible instead of the display showing stale reversion info.
         cvd_bias = self._cvd.get_trend_signal()
-        if trend_side == "long"  and cvd_bias < QCfg.TREND_CVD_MIN(): return
-        if trend_side == "short" and cvd_bias > -QCfg.TREND_CVD_MIN(): return
+        if trend_side == "long" and cvd_bias < QCfg.TREND_CVD_MIN():
+            logger.debug(
+                f"⛔ TREND gate [CVD opposing]: {cvd_bias:+.3f} < {QCfg.TREND_CVD_MIN():.2f}")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
+        if trend_side == "short" and cvd_bias > -QCfg.TREND_CVD_MIN():
+            logger.debug(
+                f"⛔ TREND gate [CVD opposing]: {cvd_bias:+.3f} > {-QCfg.TREND_CVD_MIN():.2f}")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
 
         # Tick flow must broadly agree with trend direction
         tf = self._tick_eng.get_signal()
-        if trend_side == "long"  and tf < -0.30: return
-        if trend_side == "short" and tf >  0.30: return
+        if trend_side == "long" and tf < -0.30:
+            logger.debug(f"⛔ TREND gate [tick opposing]: {tf:+.3f} < -0.30")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
+        if trend_side == "short" and tf > 0.30:
+            logger.debug(f"⛔ TREND gate [tick opposing]: {tf:+.3f} > +0.30")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
 
         # Composite trend score gate
-        if abs(sig.trend_score) < QCfg.TREND_COMPOSITE_MIN(): return
-        if trend_side == "long"  and sig.trend_score <= 0: return
-        if trend_side == "short" and sig.trend_score >= 0: return
+        if abs(sig.trend_score) < QCfg.TREND_COMPOSITE_MIN():
+            logger.debug(
+                f"⛔ TREND gate [trend_score weak]: "
+                f"|{sig.trend_score:+.3f}| < {QCfg.TREND_COMPOSITE_MIN():.2f}")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
+        if trend_side == "long" and sig.trend_score <= 0:
+            logger.debug(
+                f"⛔ TREND gate [trend_score wrong sign]: "
+                f"LONG but score={sig.trend_score:+.3f}")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
+        if trend_side == "short" and sig.trend_score >= 0:
+            logger.debug(
+                f"⛔ TREND gate [trend_score wrong sign]: "
+                f"SHORT but score={sig.trend_score:+.3f}")
+            self._confirm_trend_long = self._confirm_trend_short = 0; return
 
         # ── ICT gate for trend entries ───────────────────────────────────────
         if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
@@ -3802,7 +3989,13 @@ class QuantStrategy:
         ema_dist = (ema - price) if trend_side == "long" else (price - ema)
         pb_min = QCfg.TREND_PULLBACK_ATR_MIN() * atr
         pb_max = QCfg.TREND_PULLBACK_ATR_MAX() * atr
-        if not (pb_min <= ema_dist <= pb_max): return
+        if not (pb_min <= ema_dist <= pb_max):
+            logger.debug(
+                f"⛔ TREND gate [EMA pullback out of window]: "
+                f"dist={ema_dist/atr:+.2f}ATR "
+                f"window=[{pb_min/atr:.2f}–{pb_max/atr:.2f}ATR] "
+                f"ema={ema:.2f} price={price:.2f}")
+            return
 
         # Confirmation counter
         if trend_side == "long":

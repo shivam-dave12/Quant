@@ -186,6 +186,7 @@ class TFStructure:
     bos_level:     float = 0.0
     bos_direction: str   = ""
     choch_level:   float = 0.0
+    choch_bar_index: int = -1    # candle index (within the lb-slice) where CHoCH was detected; -1 = none
     range_high:    float = 0.0
     range_low:     float = 0.0
     equilibrium:   float = 0.0
@@ -544,11 +545,15 @@ class ICTEngine:
             out.bos_direction = "bearish"
 
         # ── CHoCH (Change of Character) ───────────────────────────────
-        # First higher-low in a downtrend or lower-high in an uptrend
-        if trend == "bearish" and len(sl) >= 2 and sl[-1] > sl[-2]:
-            out.choch_level = sl[-1]
-        elif trend == "bullish" and len(sh) >= 2 and sh[-1] < sh[-2]:
-            out.choch_level = sh[-1]
+        # First higher-low in a downtrend or lower-high in an uptrend.
+        # choch_bar_index is the candle index inside `recent` (0-based from the
+        # start of the lb-slice) so HTFTrendFilter can compute staleness in bars.
+        if trend == "bearish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
+            out.choch_level     = lows[-1][1]
+            out.choch_bar_index = lows[-1][0]   # fractal index within recent[]
+        elif trend == "bullish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
+            out.choch_level     = highs[-1][1]
+            out.choch_bar_index = highs[-1][0]
 
         # ── Premium / Discount ────────────────────────────────────────
         h_max = max(float(c['h']) for c in recent)
