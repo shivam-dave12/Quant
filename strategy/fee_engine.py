@@ -90,7 +90,9 @@ class SpreadTracker:
                 if is_first:
                     logger.debug(f"SpreadTracker: first sample {bps:.2f}bps")
                 elif len(self._hist) == 5:
-                    logger.debug(f"SpreadTracker: 5 samples collected, median={self.median_bps():.2f}bps")
+                    # Use unlocked version — we already hold self._lock here.
+                    # Calling self.median_bps() would deadlock (non-reentrant Lock).
+                    logger.debug(f"SpreadTracker: 5 samples collected, median={self._median_bps_unlocked():.2f}bps")
         except Exception:
             pass
 
@@ -99,13 +101,18 @@ class SpreadTracker:
         with self._lock:
             return len(self._hist)
 
-    def median_bps(self) -> float:
+    def _median_bps_unlocked(self) -> float:
+        """Compute median WITHOUT acquiring the lock — for use within locked sections."""
         default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
+        if len(self._hist) < 5:
+            return default
+        arr = sorted(self._hist)
+        return arr[len(arr) // 2]
+
+    def median_bps(self) -> float:
+        """Thread-safe median — acquires lock. Do NOT call from within update()."""
         with self._lock:
-            if len(self._hist) < 5:
-                return default
-            arr = sorted(self._hist)
-            return arr[len(arr) // 2]
+            return self._median_bps_unlocked()
 
     def percentile_bps(self, pct: float) -> float:
         """pct in [0, 1]"""
