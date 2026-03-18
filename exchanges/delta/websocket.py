@@ -354,11 +354,13 @@ class DeltaWebSocket:
         """
         Resubscribe to all stored channels after reconnect.
 
-        Delta subscription format:
-          {"name": "l2_orderbook", "symbols": ["BTCUSDT"]}
-          {"name": "candlestick_1m", "symbols": ["BTCUSDT"]}
-
-        Channels are batched into a single subscribe message for efficiency.
+        Public channels are sent immediately. Private channels are NOT sent here
+        because auth hasn't been confirmed yet at call time (_on_open fires this,
+        then sends the auth frame). Private channels are subscribed exclusively in
+        _dispatch when the key-auth response arrives with success=True.
+        Sending privates before auth confirmation causes Delta to reject them
+        silently, requiring a second subscription anyway — causing a race condition
+        and duplicate subscriptions on every reconnect.
         """
         with self._subs_lock:
             subs = list(self._subs.values())
@@ -367,16 +369,11 @@ class DeltaWebSocket:
             logger.debug("No subscriptions to restore")
             return
 
-        public_channels  = [s.delta_channel_spec for s in subs if not s.is_private]
-        private_channels = [s.delta_channel_spec for s in subs if s.is_private]
+        public_channels = [s.delta_channel_spec for s in subs if not s.is_private]
 
         if public_channels:
             self._subscribe_channels(public_channels)
             logger.info(f"🔄 Resubscribed {len(public_channels)} public channels")
-
-        if private_channels and self._is_authenticated():
-            self._subscribe_channels(private_channels)
-            logger.info(f"🔄 Resubscribed {len(private_channels)} private channels")
 
     # =========================================================================
     # MESSAGE DISPATCH
@@ -410,7 +407,9 @@ class DeltaWebSocket:
                 logger.info("✅ DeltaWebSocket authenticated (private channels active)")
                 with self._subs_lock:
                     priv = [s.delta_channel_spec for s in self._subs.values() if s.is_private]
-                if priv: self._subscribe_channels(priv)
+                if priv:
+                    self._subscribe_channels(priv)
+                    logger.info(f"🔄 Resubscribed {len(priv)} private channels")
             else:
                 logger.error(f"❌ DeltaWebSocket auth failed: status={data.get('status','')} {data.get('message','')}")
             return

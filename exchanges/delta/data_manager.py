@@ -171,6 +171,17 @@ class DeltaDataManager:
             self._forming_ts.clear()
             self.stop()
             time.sleep(1.0)
+            # Clear candle deques before warmup — without this, warmup appends to
+            # existing data producing duplicate candles (same timestamps) that cause
+            # the ICT engine to create duplicate OBs and distort structure detection.
+            with self._lock:
+                self._candles_1m.clear()
+                self._candles_5m.clear()
+                self._candles_15m.clear()
+                self._candles_1h.clear()
+                self._candles_4h.clear()
+                self._candles_1d.clear()
+                self._recent_trades.clear()
             success = self.start()
             if success and self._strategy_ref is not None:
                 try:

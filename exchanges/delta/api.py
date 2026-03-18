@@ -918,14 +918,21 @@ class DeltaAPI:
         _otype = _otype_map.get(str(order_type).lower().replace(" ", "_"), order_type)
 
         body: Dict[str, Any] = {
-            "product_id":     _product_id,
-            "side":           _side,
-            "order_type":     _otype,
-            "size":           int(_size),       # Delta uses integer contract sizes
-            "reduce_only":    reduce_only,
-            "post_only":      post_only,
-            "time_in_force":  time_in_force,
+            "product_id":  _product_id,
+            "side":        _side,
+            "order_type":  _otype,
+            "size":        int(_size),       # Delta uses integer contract sizes
+            "reduce_only": reduce_only,
         }
+
+        # post_only and time_in_force are ONLY valid on limit-type orders.
+        # Delta returns bad_schema if either field is present on stop_market_order
+        # or take_profit_market_order — even with value False/"gtc".
+        # stop_limit_order and take_profit_limit_order still accept both fields.
+        _CONDITIONAL_MARKET_TYPES = {"stop_market_order", "take_profit_market_order"}
+        if _otype not in _CONDITIONAL_MARKET_TYPES:
+            body["post_only"]     = post_only
+            body["time_in_force"] = time_in_force
 
         if _price is not None:
             body["limit_price"] = str(_price)

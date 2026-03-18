@@ -398,6 +398,27 @@ class _DeltaAdapter:
         self.limiter.wait()
         return self.api.cancel_order(order_id=order_id) or {}
 
+    def edit_order(self, order_id: str, new_stop_price: float) -> Optional[Dict]:
+        """
+        Modify an existing stop order's trigger price via PUT /v2/orders/{id}.
+
+        Preferred over cancel+replace for trailing SL/TP updates because:
+          1. Atomic — no window where the position is unprotected
+          2. Works for bracket child orders (DELETE/POST cycle fails on these)
+          3. Returns 404 cleanly if the order is already gone (handled by caller)
+
+        Returns a result dict on success, or {"_error": True, "_sc": sc} on failure.
+        """
+        self.limiter.wait()
+        resp = self.api.edit_order(order_id=order_id, stop_price=new_stop_price)
+        if resp and resp.get("success"):
+            result = resp.get("result", {}) or {}
+            result["order_id"] = str(result.get("order_id", order_id))
+            return result
+        sc  = (resp or {}).get("status_code", 0)
+        err = (resp or {}).get("error", "")
+        return {"_error": True, "_sc": sc, "_err_msg": err}
+
     def get_order(self, order_id: str) -> Optional[Dict]:
         self.limiter.wait()
         resp = self.api.get_order(order_id=order_id)
@@ -1007,7 +1028,50 @@ class OrderManager:
     def replace_stop_loss(self, existing_sl_order_id: Optional[str],
                           side: str, quantity: float,
                           new_trigger_price: float) -> Optional[Dict]:
+        """
+        Update trailing SL to new_trigger_price.
+
+        Strategy:
+          1. EDIT-IN-PLACE (Delta) — PUT /v2/orders/{id} with new stop_price.
+             Atomic: no unprotected window. Works on bracket child SL orders.
+             404 = order already gone → place fresh SL below.
+          2. CANCEL + REPLACE fallback — for CoinSwitch or non-404 edit failures.
+
+        Root cause of prior failure:
+          - DELETE returned 404 (bracket child stale) — benign, but
+          - POST returned bad_schema because post_only/time_in_force were
+            included in stop_market_order body (fixed in api.py).
+            edit_order avoids the POST entirely for Delta.
+        """
         try:
+            # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
+            if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
+                edited = self._adapter.edit_order(
+                    order_id=existing_sl_order_id,
+                    new_stop_price=new_trigger_price,
+                )
+                if edited and not edited.get("_error"):
+                    logger.info(
+                        f"✅ SL edited in-place {existing_sl_order_id[:10]}… "
+                        f"→ ${new_trigger_price:,.2f}"
+                    )
+                    edited["order_id"] = edited.get("order_id", existing_sl_order_id)
+                    return edited
+
+                sc  = (edited or {}).get("_sc", 0)
+                err = (edited or {}).get("_err_msg", "")
+                if sc == 404 or "not_found" in str(err).lower():
+                    logger.info(
+                        f"SL {existing_sl_order_id[:10]}… gone (404) "
+                        f"— placing fresh SL @ ${new_trigger_price:,.2f}"
+                    )
+                else:
+                    logger.warning(
+                        f"SL edit failed sc={sc} err={err} "
+                        f"— falling back to cancel+replace"
+                    )
+
+            # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
             if existing_sl_order_id:
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
@@ -1035,7 +1099,31 @@ class OrderManager:
     def replace_take_profit(self, existing_tp_order_id: Optional[str],
                             side: str, quantity: float,
                             new_trigger_price: float) -> Optional[Dict]:
+        """Same edit-in-place → cancel+replace strategy as replace_stop_loss."""
         try:
+            # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
+            if existing_tp_order_id and hasattr(self._adapter, "edit_order"):
+                edited = self._adapter.edit_order(
+                    order_id=existing_tp_order_id,
+                    new_stop_price=new_trigger_price,
+                )
+                if edited and not edited.get("_error"):
+                    logger.info(
+                        f"✅ TP edited in-place {existing_tp_order_id[:10]}… "
+                        f"→ ${new_trigger_price:,.2f}"
+                    )
+                    edited["order_id"] = edited.get("order_id", existing_tp_order_id)
+                    return edited
+
+                sc  = (edited or {}).get("_sc", 0)
+                err = (edited or {}).get("_err_msg", "")
+                if sc != 404 and "not_found" not in str(err).lower():
+                    logger.warning(
+                        f"TP edit failed sc={sc} err={err} "
+                        f"— falling back to cancel+replace"
+                    )
+
+            # ── Path 2: Cancel + Replace fallback ────────────────────────────
             if existing_tp_order_id:
                 existing_status = self.get_order_status_safe(existing_tp_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
