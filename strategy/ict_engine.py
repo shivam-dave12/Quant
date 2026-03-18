@@ -996,13 +996,8 @@ class ICTEngine:
         """
         OB-based SL placement — immune to FVG and liquidity-pool traps.
 
-        htf_only=True (for initial entry SL): only consider 15m OBs (strength ≥ 70).
-          These are set from _detect_order_blocks_htf with base strength 75-90.
-          Using only 15m OBs ensures the entry SL is anchored to macro structure.
-
-        htf_only=False (for trail OB anchor): consider all active OBs.
-          The nearest OB to current price is used — this will often be a fresh
-          1m OB that formed after entry, giving the tightest valid anchor.
+        htf_only=True  (entry): only 15m OBs (strength ≥ 70).
+        htf_only=False (trail): all OBs — nearest is used for tight anchoring.
 
         For LONG:  SL = bullish OB low - buffer.
         For SHORT: SL = bearish OB high + buffer.
@@ -1031,16 +1026,15 @@ class ICTEngine:
 
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []
-
-        # HTF threshold: 15m OBs have base strength 75 (set in _detect_order_blocks_htf).
-        # 5m OBs = 40, 1m OBs = 50. Using 70 as the floor captures 15m cleanly.
+        # 15m OBs: base strength 75–90 (set in _detect_order_blocks_htf)
+        # 5m OBs:  base strength 40.  1m OBs: base strength 50.
         _htf_thresh = 70.0
 
         for ob in obs:
             if not ob.is_active(now_ms):
                 continue
             if htf_only and ob.strength < _htf_thresh:
-                continue   # skip non-HTF OBs for entry SL
+                continue  # entry SL: 15m OBs only
 
             if side == "long" and ob.low < price:
                 sl_level = ob.low - buffer
@@ -1119,19 +1113,15 @@ class ICTEngine:
         """
         Return ICT structural TP candidates for the given trade direction.
 
-        htf_only=True (for initial entry TP): only consider 15m OBs (strength ≥ 70).
-          FVGs and swept liquidity pools are not tagged by timeframe so they are
-          always included (they use 5m+15m candle data for detection).
-          OB candidates are filtered to strength ≥ 70 (15m-derived).
+        htf_only=True (entry TP): OB candidates filtered to strength ≥ 70 (15m OBs).
+          FVGs and swept pools are always included — they are not TF-tagged.
 
-        htf_only=False (default): all OBs included.
+        Scores:
+          6.0+  Swept liquidity origin — mandatory delivery target after sweep-reverse
+          5.0+  Unfilled FVG           — imbalance fill (always included)
+          4.0+  Virgin OB in path      — htf_only filters here
 
-        Candidates (price_level, score, label):
-          6.0  Swept liquidity origin — primary delivery target after sweep-reverse
-          5.0  Unfilled FVG — imbalance filling (not TF-filtered)
-          4.0  Virgin OB in path — institutional footprint (htf_only filters here)
-
-        All candidates are filtered to [min_dist, max_dist] from entry price.
+        All candidates filtered to [min_dist, max_dist] from entry.
         """
         _htf_thresh = 70.0
         candidates: List[Tuple[float, float, str]] = []
@@ -1198,15 +1188,13 @@ class ICTEngine:
                                    f"FVG_far@${far_edge:,.0f}"))
 
         # ── 3. Virgin OBs in trade direction ───────────────────────────────
-        # For SHORT: bullish OBs below price that haven't been visited
-        # For LONG:  bearish OBs above price
-        # htf_only=True: only 15m OBs (strength ≥ 70) for entry TP placement
+        # htf_only=True: only 15m OBs (strength ≥ 70) for entry TP
         target_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
         for ob in target_obs:
             if not ob.is_active(now_ms) or ob.visit_count > 0:
                 continue
             if htf_only and ob.strength < _htf_thresh:
-                continue   # skip non-HTF OBs for entry TP
+                continue  # entry TP: 15m OBs only
             # Target the OB midpoint
             level = ob.midpoint
             dist  = price - level if side == "short" else level - price
