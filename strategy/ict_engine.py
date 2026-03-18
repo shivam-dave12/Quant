@@ -996,8 +996,10 @@ class ICTEngine:
         """
         OB-based SL placement — immune to FVG and liquidity-pool traps.
 
-        htf_only=True  (entry): only 15m OBs (strength ≥ 70).
-        htf_only=False (trail): all OBs — nearest is used for tight anchoring.
+        htf_only=True  (entry SL): only 15m OBs (strength ≥ 70), v≤1 only.
+          v=2 OBs rejected: twice-visited zones are largely consumed — placing
+          SL at their low means the SL fires exactly when the zone breaks.
+        htf_only=False (trail anchor): all active OBs, sorted by proximity.
 
         For LONG:  SL = bullish OB low - buffer.
         For SHORT: SL = bearish OB high + buffer.
@@ -1026,15 +1028,21 @@ class ICTEngine:
 
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []
-        # 15m OBs: base strength 75–90 (set in _detect_order_blocks_htf)
-        # 5m OBs:  base strength 40.  1m OBs: base strength 50.
-        _htf_thresh = 70.0
+        _htf_thresh = 70.0  # 15m OBs have base strength 75-90
 
         for ob in obs:
             if not ob.is_active(now_ms):
                 continue
             if htf_only and ob.strength < _htf_thresh:
                 continue  # entry SL: 15m OBs only
+            if htf_only and ob.visit_count >= 2:
+                # Twice-visited OB is a consumed zone — not a reliable entry SL anchor.
+                # When an OB fails (which v=2 OBs commonly do), the SL fires AT the
+                # structural breakdown point. Only virgin or once-tested OBs qualify.
+                logger.debug(
+                    f"OB SL: skipping v={ob.visit_count} OB ${ob.low:.0f}–${ob.high:.0f}"
+                    f" (absorbed zone)")
+                continue
 
             if side == "long" and ob.low < price:
                 sl_level = ob.low - buffer
@@ -1113,13 +1121,13 @@ class ICTEngine:
         """
         Return ICT structural TP candidates for the given trade direction.
 
-        htf_only=True (entry TP): OB candidates filtered to strength ≥ 70 (15m OBs).
+        htf_only=True (entry TP): OB candidates limited to 15m OBs (strength ≥ 70).
           FVGs and swept pools are always included — they are not TF-tagged.
 
         Scores:
           6.0+  Swept liquidity origin — mandatory delivery target after sweep-reverse
-          5.0+  Unfilled FVG           — imbalance fill (always included)
-          4.0+  Virgin OB in path      — htf_only filters here
+          5.0+  Unfilled FVG           — imbalance fill
+          4.0+  Virgin OB in path      — htf_only filters to 15m OBs only
 
         All candidates filtered to [min_dist, max_dist] from entry.
         """
@@ -1188,11 +1196,13 @@ class ICTEngine:
                                    f"FVG_far@${far_edge:,.0f}"))
 
         # ── 3. Virgin OBs in trade direction ───────────────────────────────
-        # htf_only=True: only 15m OBs (strength ≥ 70) for entry TP
+        # For SHORT: bullish OBs below price that haven't been visited
+        # For LONG:  bearish OBs above price
+        # htf_only=True: entry TP uses only 15m OBs (strength ≥ 70)
         target_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
         for ob in target_obs:
             if not ob.is_active(now_ms) or ob.visit_count > 0:
-                continue
+                continue  # virgin OBs only — unvisited institutional footprint
             if htf_only and ob.strength < _htf_thresh:
                 continue  # entry TP: 15m OBs only
             # Target the OB midpoint

@@ -1832,89 +1832,56 @@ class InstitutionalLevels:
             phase = 1
             min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
 
-        # ═══ v4.9: ICT ZONE FREEZE ════════════════════════════════════════
-        # If price is testing an active OB or sitting inside an FVG, FREEZE.
-        # These are institutional accumulation/distribution zones. A pullback
-        # into an OB is the setup working as intended — not a reversal signal.
-        # Tightening the SL during an OB test causes the "stopped out, then TP
-        # fires without us" pattern that was the primary reported problem.
-        #
-        # EXEMPTION — Break-even move bypasses ICT zone freeze (same logic as
-        # pullback freeze). If SL is still below entry+0.3×ATR (full original risk
-        # open), the zone freeze is skipped so BE can be locked. A huge OB during
-        # warmup should never prevent the trade from reaching break-even.
-        #
-        # OVERSIZED OB GUARD — Skip OBs wider than 2.5×ATR in freeze decisions.
-        # Large OBs detected from warmup candles cover enormous price ranges and
-        # are not specific institutional levels. With freeze_atr buffer, a 5×ATR
-        # OB produces a 5.8×ATR freeze zone covering the entire trade range.
-        _max_ob_freeze_size = 2.5 * atr   # OBs wider than this are skipped
-
-        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
-            try:
-                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
-
-                # Check active Order Blocks in trade direction
-                _obs = (ict_engine.order_blocks_bull if pos_side == "long"
-                        else ict_engine.order_blocks_bear)
-                for _ob in _obs:
-                    if not _ob.is_active(_ict_now_ms):
-                        continue
-                    # Skip oversized OBs (warmup artifacts, not specific levels)
-                    if (_ob.high - _ob.low) > _max_ob_freeze_size:
-                        logger.debug(
-                            f"Trail: OB ${_ob.low:.0f}–${_ob.high:.0f} skipped in freeze "
-                            f"(size {_ob.high-_ob.low:.0f}pts > {_max_ob_freeze_size:.0f} max)")
-                        continue
-                    # Freeze zone: OB.low - freeze_atr to OB.high + freeze_atr
-                    _zone_lo = _ob.low  - _freeze_atr
-                    _zone_hi = _ob.high + _freeze_atr
-                    if _zone_lo <= price <= _zone_hi:
-                        logger.debug(
-                            f"Trail: ICT OB ZONE FREEZE — price ${price:,.1f} "
-                            f"in OB ${_ob.low:,.1f}–${_ob.high:,.1f} "
-                            f"(±{_freeze_atr:.0f} buffer). Trade thesis intact.")
-                        if hold_reason is not None:
-                            hold_reason.append(f"ICT_OB_FREEZE OB=${_ob.low:.0f}-${_ob.high:.0f}")
-                        return None
-
-                # Check active FVGs in trade direction (price inside gap = fill in progress)
-                _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
-                         else ict_engine.fvgs_bear)
-                for _fvg in _fvgs:
-                    if not _fvg.is_active(_ict_now_ms):
-                        continue
-                    # FVG fill: price returned into the imbalance zone
-                    _fvg_lo = _fvg.bottom - _freeze_atr * 0.5
-                    _fvg_hi = _fvg.top    + _freeze_atr * 0.5
-                    if _fvg_lo <= price <= _fvg_hi:
-                        logger.debug(
-                            f"Trail: ICT FVG ZONE FREEZE — price ${price:,.1f} "
-                            f"in FVG ${_fvg.bottom:,.1f}–${_fvg.top:,.1f}. "
-                            f"FVG fill in progress — holding SL.")
-                        if hold_reason is not None:
-                            hold_reason.append(f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
-                        return None
-            except Exception as _ict_e:
-                logger.debug(f"Trail ICT zone check error (non-fatal): {_ict_e}")
-
-        # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
-        # Pullback freeze: hold SL when the move looks like a healthy pullback,
-        # not a true reversal. Prevents premature SL tightening mid-pullback.
-        #
-        # EXEMPTION — Break-even move is ALWAYS allowed regardless of pullback:
-        # If the current SL is still below entry (full original risk open) and
-        # there is a valid BE candidate, the pullback freeze must NOT block it.
-        # At 0.74R with SL still at original level, freezing the BE move means
-        # the position can retrace back to the original SL and take a full loss.
-        # The freeze is meaningful only AFTER break-even is already locked.
+        # ═══ BREAK-EVEN UNLOCKED FLAG ════════════════════════════════════
+        # Defined here — before zone freeze — to fix the v4.9 forward-reference
+        # NameError that silently crashed every trail tick.
         _be_price = (entry_price + 0.3 * atr if pos_side == "long"
                      else entry_price - 0.3 * atr)
         _be_is_unlocked = (
             (pos_side == "long"  and current_sl >= _be_price) or
             (pos_side == "short" and current_sl <= _be_price)
         )
+
+        # ═══ v5.0: FVG ZONE FREEZE (time-limited + SL-proximity-gated) ════
+        # OB zone freeze removed — it permanently blocked trailing whenever
+        # overlapping OBs covered the entire trade range.
+        # FVG freeze kept with two hard guards:
+        #   GUARD 1 — TIME: release unconditionally after 10 minutes
+        #   GUARD 2 — SL PROXIMITY: only freeze when SL is within 1.5×ATR
+        #             of the FVG boundary (SL must have trailed to the zone)
+        _FVG_MAX_FREEZE_SEC = 600.0
+        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
+            if hold_seconds < _FVG_MAX_FREEZE_SEC:
+                try:
+                    _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+                    _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
+                    _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
+                             else ict_engine.fvgs_bear)
+                    for _fvg in _fvgs:
+                        if not _fvg.is_active(_ict_now_ms):
+                            continue
+                        _fvg_lo = _fvg.bottom - _freeze_atr * 0.5
+                        _fvg_hi = _fvg.top    + _freeze_atr * 0.5
+                        if not (_fvg_lo <= price <= _fvg_hi):
+                            continue
+                        if pos_side == "long":
+                            _sl_near_fvg = current_sl >= _fvg.bottom - 1.5 * atr
+                        else:
+                            _sl_near_fvg = current_sl <= _fvg.top + 1.5 * atr
+                        if not _sl_near_fvg:
+                            logger.debug(
+                                f"Trail: FVG freeze SKIPPED — SL ${current_sl:,.0f} "
+                                f"not near FVG ${_fvg.bottom:.0f}–${_fvg.top:.0f}")
+                            continue
+                        if hold_reason is not None:
+                            hold_reason.append(
+                                f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
+                        return None
+                except Exception as _ict_e:
+                    logger.debug(f"Trail ICT FVG zone check error (non-fatal): {_ict_e}")
+
+                # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
+        # NOTE: _be_price and _be_is_unlocked defined above in phase block.
         if QCfg.TRAIL_PULLBACK_FREEZE():
             is_pb, rev_count, pb_detail = InstitutionalLevels._classify_pullback_vs_reversal(
                 pos_side, price, entry_price, atr,
@@ -1983,40 +1950,39 @@ class InstitutionalLevels:
             except Exception as _e:
                 logger.debug(f"Trail OB anchor error: {_e}")
 
-        # ── 3. 5m confirmed swing structure (all phases) ─────────────────
-        # PRIMARY structural trail. Only CLOSED candles (confirmed, not forming).
-        # A higher 5m swing low (long) = market proved a higher low → trail up.
-        if candles_5m and len(candles_5m) >= 4:
-            closed_5m    = candles_5m[:-1]
-            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
-                closed_5m, min(QCfg.SL_SWING_LOOKBACK(), len(closed_5m) - 2))
-            swing_buf = max(0.25 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr)
+        # ── 3. 1m confirmed swing structure (all phases) — PRIMARY ─────────
+        # v5.0: 1m closed swing lows/highs are the primary trail driver.
+        # 15m ICT structure sets the SL/TP at entry. During the trade, 1m
+        # structure captures the freshest institutional footprints every minute.
+        if len(candles_1m) >= 6:
+            closed_1m_p = candles_1m[:-1]
+            sh_1m_p, sl_1m_p = InstitutionalLevels.find_swing_extremes(
+                closed_1m_p, min(10, len(closed_1m_p) - 2))
+            swing_buf_1m = max(0.10 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.40)
 
-            if pos_side == "long" and sl_5m:
-                valid = [l for l in sl_5m
+            if pos_side == "long" and sl_1m_p:
+                valid = [l for l in sl_1m_p
                          if current_sl + 0.05 * atr < l < price - min_dist]
                 if valid:
                     best_sw = max(valid)
-                    candidates.append(best_sw - swing_buf)
+                    candidates.append(best_sw - swing_buf_1m)
                     logger.debug(
-                        f"Trail: 5m swing low ${best_sw:,.1f} → SL ${best_sw - swing_buf:,.1f}")
-            elif pos_side == "short" and sh_5m:
-                valid = [h for h in sh_5m
+                        f"Trail: 1m swing low ${best_sw:,.1f} → SL ${best_sw-swing_buf_1m:,.1f}")
+            elif pos_side == "short" and sh_1m_p:
+                valid = [h for h in sh_1m_p
                          if price + min_dist < h < current_sl - 0.05 * atr]
                 if valid:
                     best_sw = min(valid)
-                    candidates.append(best_sw + swing_buf)
+                    candidates.append(best_sw + swing_buf_1m)
                     logger.debug(
-                        f"Trail: 5m swing high ${best_sw:,.1f} → SL ${best_sw + swing_buf:,.1f}")
+                        f"Trail: 1m swing high ${best_sw:,.1f} → SL ${best_sw+swing_buf_1m:,.1f}")
 
-        # ── 4. 1m micro-swing (Phase 2+) — tighter structural trail ─────
-        # After sufficient profit, also trail to confirmed 1m structure.
-        # Tighter buffer because 1m swings are smaller.
+        # ── 4. 1m tighter micro-swing (Phase 2+) ─────────────────────────
         if phase >= 2 and len(candles_1m) >= 8:
             closed_1m    = candles_1m[:-1]
             sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
-                closed_1m, min(QCfg.TRAIL_SWING_BARS() + 4, len(closed_1m) - 2))
-            micro_buf = max(0.15 * atr, min_dist * 0.25)
+                closed_1m, min(QCfg.TRAIL_SWING_BARS(), len(closed_1m) - 2))
+            micro_buf = max(0.08 * atr, swing_buf_1m * 0.60)
 
             if pos_side == "long" and sl_1m:
                 valid = [l for l in sl_1m if current_sl < l < price - min_dist]
@@ -2024,7 +1990,7 @@ class InstitutionalLevels:
                     best_m = max(valid)
                     candidates.append(best_m - micro_buf)
                     logger.debug(
-                        f"Trail: 1m micro ${best_m:,.1f} → SL ${best_m - micro_buf:,.1f}")
+                        f"Trail: 1m micro ${best_m:,.1f} → SL ${best_m-micro_buf:,.1f}")
             elif pos_side == "short" and sh_1m:
                 valid = [h for h in sh_1m if price + min_dist < h < current_sl]
                 if valid:
@@ -2039,11 +2005,8 @@ class InstitutionalLevels:
             if trade_mode in ("trend", "momentum"):
                 n_chandelier = QCfg.TREND_CHANDELIER_N()
             else:
-                n_start  = QCfg.TRAIL_CHANDELIER_N_START()
-                n_end    = QCfg.TRAIL_CHANDELIER_N_END()
-                max_hold = float(_cfg("QUANT_MAX_HOLD_SEC", 2400))
-                t_frac   = min(hold_seconds / max_hold, 1.0) if max_hold > 0 else 0.0
-                n_chandelier = n_start + (n_end - n_start) * t_frac
+                # v5.0: fixed N — no hold-time taper (max-hold timer removed)
+                n_chandelier = QCfg.TRAIL_CHANDELIER_N_START()
 
             if pos_side == "long":
                 chand = peak_price_abs - n_chandelier * atr
@@ -2277,10 +2240,38 @@ class HTFTrendFilter:
         else: self._trend_4h = 0.0
 
     def vetoes_trade(self, side: str) -> bool:
-        if not QCfg.HTF_ENABLED(): return False
-        htf = self._trend_4h * 0.60 + self._trend_15m * 0.40
-        if side == "long" and htf < -QCfg.HTF_VETO_STRENGTH(): return True
-        if side == "short" and htf > QCfg.HTF_VETO_STRENGTH(): return True
+        """
+        Per-timeframe HTF veto — matches config documentation exactly.
+
+        LONG  veto: 15m < -HTF_15M_VETO(0.35)
+                    OR (15m < -HTF_BOTH_VETO(0.20) AND 4h < -HTF_BOTH_VETO(0.20))
+
+        SHORT veto: 15m > +HTF_15M_VETO(0.35)
+                    OR (15m > +HTF_BOTH_VETO(0.20) AND 4h > +HTF_BOTH_VETO(0.20))
+
+        Previously used blended composite (4h*0.60 + 15m*0.40) which allowed a
+        bullish 4h to fully dilute a strongly bearish 15m. Example: 15m=-0.41,
+        4h=+0.10 → composite=-0.104, threshold=-0.35 → no veto. Wrong.
+
+        Per-TF logic: 15m=-0.41 < -0.35 is a hard LONG veto regardless of 4h.
+        """
+        if not QCfg.HTF_ENABLED():
+            return False
+        t15  = self._trend_15m
+        t4h  = self._trend_4h
+        veto_15m  = float(_cfg("QUANT_HTF_15M_VETO",  0.35))
+        veto_both = float(_cfg("QUANT_HTF_BOTH_VETO", 0.20))
+
+        if side == "long":
+            if t15 < -veto_15m:
+                return True
+            if t15 < -veto_both and t4h < -veto_both:
+                return True
+        elif side == "short":
+            if t15 > veto_15m:
+                return True
+            if t15 > veto_both and t4h > veto_both:
+                return True
         return False
 
     @property
@@ -2821,7 +2812,9 @@ class QuantStrategy:
         # Issue 4 fix: ICT gate shown as an explicit required gate, not just a boost
         _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
         _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
+        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
+        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
+        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
         if self._ict is not None:
             if self._ict._initialized:
                 # During ACTIVE phase, ICT scores are 0 (not updated in _manage_active).
@@ -2957,7 +2950,9 @@ class QuantStrategy:
         # Only enforced when ICT engine is initialized (has processed candles).
         _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
         _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
+        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
+        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
+        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 # Bug 7 fix: track how long the gate has been continuously blocking
@@ -3040,7 +3035,9 @@ class QuantStrategy:
         # ── Issue 4 fix: Hard ICT gate for trend entries ─────────────────────
         _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
         _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
+        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
+        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
+        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
@@ -3164,7 +3161,9 @@ class QuantStrategy:
         # real break-and-retest. The ICT gate prevents entering at random levels.
         _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
         _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
+        # Reduced gate only for high-quality OBs (virgin/once-visited: score ≥ 0.55)
+        # v=2 OB scores ~0.42 — below threshold, uses full base gate 0.45
+        _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
@@ -3824,116 +3823,11 @@ class QuantStrategy:
                         logger.info(f"🔄 Breakout expired + composite bullish → exit SHORT [momentum]")
                         self._exit_trade(order_manager, price, "breakout_expired"); return
 
-        # ── Thesis-aware max-hold (v4.6) ─────────────────────────────────────
-        #
-        # v4.4 BUG: blind 40-min timer killed LONG @ $71,452 at $71,349.
-        #           Price then rallied to $71,900. TP at $71,806 would have hit.
-        #           The trade thesis was CORRECT — timer destroyed the edge.
-        #
-        # v4.6 FIX: When timer fires, ASK THE MARKET if the trade should continue:
-        #   1. In profit  → tighten SL, let SL manage the exit (NO forced dump)
-        #   2. Underwater + thesis valid → EXTEND hold (max N extensions)
-        #   3. Underwater + thesis broken → EXIT
-        #
-        # Thesis valid means:
-        #   a) Composite signal still agrees with trade direction
-        #   b) Price still between SL and TP (not breached)
-        #   c) Not deeply underwater (< THESIS_MAX_DRAWDOWN_PCT of SL distance)
-        #   d) Reversion: price still on "wrong" side of VWAP (hasn't reverted past it)
-        #
-        hold_time = now - pos.entry_time
-        base_hold = QCfg.MAX_HOLD_SEC()
-        extension_sec = QCfg.HOLD_EXTENSION_SEC()
-        total_allowed = base_hold + pos.hold_extensions * extension_sec
+        # v5.0: max-hold time exit REMOVED.
+        # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
+        # A timer cannot know if the trade is working.
 
-        if hold_time > total_allowed:
-            # v4.6 FIX: Throttle max-hold checks to every 30s
-            # (was every 1s tick → 900 log lines in 15 min)
-            if now - self._last_maxhold_check < 30.0:
-                pass  # skip — trailing SL handles it below
-            else:
-                self._last_maxhold_check = now
-                profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
-                atr = self._atr_5m.atr
-
-                # CASE 1: IN PROFIT → tighten SL, let trailing manage exit
-                if QCfg.SMART_MAX_HOLD() and profit > 0 and atr > 1e-10 and pos.sl_order_id is not None:
-                    tight_mult = QCfg.MAX_HOLD_PROFIT_SL_ATR()
-                    if pos.side == "long":
-                        tight_sl = _round_to_tick(price - tight_mult * atr)
-                        # v4.6 BUG FIX: SL must be BELOW current price for LONG
-                        if tight_sl >= price:
-                            tight_sl = _round_to_tick(price - max(atr * 0.2, 1.0))
-                    else:
-                        tight_sl = _round_to_tick(price + tight_mult * atr)
-                        # v4.6 BUG FIX: SL must be ABOVE current price for SHORT
-                        if tight_sl <= price:
-                            tight_sl = _round_to_tick(price + max(atr * 0.2, 1.0))
-
-                    improves = (pos.side == "long" and tight_sl > pos.sl_price) or \
-                               (pos.side == "short" and tight_sl < pos.sl_price)
-                    sl_sane = (pos.side == "long" and tight_sl < price) or \
-                              (pos.side == "short" and tight_sl > price)
-
-                    if improves and sl_sane:
-                        logger.info(
-                            f"⏰ Max hold + ${profit:.2f} profit → tightening SL "
-                            f"${pos.sl_price:,.2f} → ${tight_sl:,.2f} (price - {tight_mult}×ATR)")
-                        # REST call in background — replace_stop_loss can block 30-60s
-                        _mh_es = "sell" if pos.side == "long" else "buy"
-                        _mh_oid = pos.sl_order_id; _mh_qty = pos.quantity
-                        _mh_tsl = tight_sl; _mh_mult = tight_mult; _mh_pnl = profit
-                        def _bg_mh_sl(om=order_manager):
-                            try:
-                                r = om.replace_stop_loss(
-                                    existing_sl_order_id=_mh_oid, side=_mh_es,
-                                    quantity=_mh_qty, new_trigger_price=_mh_tsl)
-                                if r is None:
-                                    logger.warning("🚨 SL fired during max-hold tighten")
-                                    return
-                                if r and isinstance(r, dict) and "error" not in r:
-                                    self._pos.sl_price = _mh_tsl
-                                    self._pos.sl_order_id = r.get("order_id", _mh_oid)
-                                    self.current_sl_price = _mh_tsl
-                                    self._pos.trail_active = True
-                                    send_telegram_message(
-                                        f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
-                                        f"Profit: ${_mh_pnl:+.2f} → tight SL\n"
-                                        f"SL: ${_mh_tsl:,.2f} (ATR×{_mh_mult} from price)")
-                            except Exception as _e:
-                                logger.error("Max-hold SL error: %s", _e, exc_info=True)
-                        threading.Thread(target=_bg_mh_sl, daemon=True, name="maxhold-sl").start()
-                    # Fall through to trailing SL — do NOT return
-
-                else:
-                    # CASE 2: UNDERWATER — check thesis
-                    max_ext = QCfg.MAX_HOLD_EXTENSIONS()
-                    if QCfg.SMART_MAX_HOLD() and pos.hold_extensions < max_ext and sig is not None:
-                        thesis_ok, reason = self._check_thesis(pos, price, sig, atr)
-                        if thesis_ok:
-                            self._pos.hold_extensions += 1
-                            ext_min = extension_sec // 60
-                            total_min = (base_hold + pos.hold_extensions * extension_sec) // 60
-                            logger.info(
-                                f"⏰ Max hold: THESIS VALID → extending +{ext_min}m "
-                                f"({pos.hold_extensions}/{max_ext}) | total allowed: {total_min}m | {reason}")
-                            send_telegram_message(
-                                f"⏰ <b>MAX HOLD — THESIS EXTENSION</b>\n"
-                                f"Trade: {pos.side.upper()} @ ${pos.entry_price:,.2f}\n"
-                                f"Current: ${price:,.2f} ({'+' if profit > 0 else ''}{profit:.2f} pts)\n"
-                                f"Extension: {pos.hold_extensions}/{max_ext} (+{ext_min}min)\n"
-                                f"Reason: {reason}\n"
-                                f"<i>Thesis still valid — letting it work</i>")
-                            return
-                        else:
-                            logger.info(f"⏰ Max hold: THESIS BROKEN → exit | {reason}")
-
-                    # CASE 3: No extensions left OR thesis broken
-                    logger.info(f"⏰ Max hold → exit")
-                    self._exit_trade(order_manager, price, "max_hold_time")
-                    return
-
-        # ── Trailing SL ──────────────────────────────────────────────────────
+                # ── Trailing SL ──────────────────────────────────────────────────────
         # _update_trailing_sl calls replace_stop_loss → REST (edit/cancel/place).
         # With 10s API timeout × retries this can block 30-60s in the main thread.
         # Dispatch to a background thread with a guard so:
