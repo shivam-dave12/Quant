@@ -991,9 +991,18 @@ class ICTEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def get_ob_sl_level(self, side: str, price: float, atr: float,
-                         now_ms: int) -> Optional[float]:
+                         now_ms: int,
+                         htf_only: bool = False) -> Optional[float]:
         """
         OB-based SL placement — immune to FVG and liquidity-pool traps.
+
+        htf_only=True (for initial entry SL): only consider 15m OBs (strength ≥ 70).
+          These are set from _detect_order_blocks_htf with base strength 75-90.
+          Using only 15m OBs ensures the entry SL is anchored to macro structure.
+
+        htf_only=False (for trail OB anchor): consider all active OBs.
+          The nearest OB to current price is used — this will often be a fresh
+          1m OB that formed after entry, giving the tightest valid anchor.
 
         For LONG:  SL = bullish OB low - buffer.
         For SHORT: SL = bearish OB high + buffer.
@@ -1023,9 +1032,15 @@ class ICTEngine:
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []
 
+        # HTF threshold: 15m OBs have base strength 75 (set in _detect_order_blocks_htf).
+        # 5m OBs = 40, 1m OBs = 50. Using 70 as the floor captures 15m cleanly.
+        _htf_thresh = 70.0
+
         for ob in obs:
             if not ob.is_active(now_ms):
                 continue
+            if htf_only and ob.strength < _htf_thresh:
+                continue   # skip non-HTF OBs for entry SL
 
             if side == "long" and ob.low < price:
                 sl_level = ob.low - buffer
@@ -1099,33 +1114,26 @@ class ICTEngine:
 
     def get_structural_tp_targets(self, side: str, price: float, atr: float,
                                    now_ms: int, min_dist: float,
-                                   max_dist: float) -> List[Tuple[float, float, str]]:
+                                   max_dist: float,
+                                   htf_only: bool = False) -> List[Tuple[float, float, str]]:
         """
         Return ICT structural TP candidates for the given trade direction.
 
-        Each candidate is (price_level, score, label) where score reflects
-        institutional significance:
+        htf_only=True (for initial entry TP): only consider 15m OBs (strength ≥ 70).
+          FVGs and swept liquidity pools are not tagged by timeframe so they are
+          always included (they use 5m+15m candle data for detection).
+          OB candidates are filtered to strength ≥ 70 (15m-derived).
 
-          6.0  Swept liquidity origin — the level price swept THROUGH before
-               reversing. After a sweep-and-reverse, price strongly targets
-               the sweep origin (smart money delivers to the raid origin).
-               This is the highest-conviction ICT target.
+        htf_only=False (default): all OBs included.
 
-          5.0  Unfilled FVG in trade direction — price fills open imbalances.
-               The FVG's near edge is the minimum target, far edge is full fill.
-               Score scales with gap size and freshness (low fill %).
-
-          4.0  Active OB in trade direction that price hasn't visited yet
-               (VIRGIN OB). These are institutional footprints and act as
-               strong price magnets and potential reversal/support zones.
-
-          3.0  Swing extreme in trade direction (from swing level detection).
-               Prior swing lows (for shorts) or highs (for longs) that were
-               significant enough to register as pivots.
+        Candidates (price_level, score, label):
+          6.0  Swept liquidity origin — primary delivery target after sweep-reverse
+          5.0  Unfilled FVG — imbalance filling (not TF-filtered)
+          4.0  Virgin OB in path — institutional footprint (htf_only filters here)
 
         All candidates are filtered to [min_dist, max_dist] from entry price.
-        Caller (compute_tp) adds these to its existing scored candidate pool.
         """
+        _htf_thresh = 70.0
         candidates: List[Tuple[float, float, str]] = []
 
         # ── 1. Swept liquidity origins ─────────────────────────────────────
@@ -1192,10 +1200,13 @@ class ICTEngine:
         # ── 3. Virgin OBs in trade direction ───────────────────────────────
         # For SHORT: bullish OBs below price that haven't been visited
         # For LONG:  bearish OBs above price
+        # htf_only=True: only 15m OBs (strength ≥ 70) for entry TP placement
         target_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
         for ob in target_obs:
             if not ob.is_active(now_ms) or ob.visit_count > 0:
                 continue
+            if htf_only and ob.strength < _htf_thresh:
+                continue   # skip non-HTF OBs for entry TP
             # Target the OB midpoint
             level = ob.midpoint
             dist  = price - level if side == "short" else level - price

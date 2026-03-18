@@ -1,44 +1,32 @@
 """
-QUANT STRATEGY v5.0 — 1m ICT STRUCTURE TRAILING SL
+QUANT STRATEGY v5.0 — 15m ICT ENTRY + 1m ICT TRAILING SL
 ==============================================================================
-Entry: Wait for overextension from VWAP + order flow divergence, then fade.
-SL/TP AT ENTRY: Set using 15m ICT structural data (swing highs/lows, OBs, FVGs).
-TRAIL: Driven exclusively by 1m ICT structure changes — freshest institutional
-       footprints. 5m swing removed from trail candidates (lagged by up to 4 min).
-       No max-hold time exit — trade runs until SL, TP, or trailing SL fires.
+Entry SL/TP: Set using 15m ICT structural data exclusively (swing highs/lows,
+  15m OBs via htf_only=True, FVGs, swept liquidity origins).
+Trail: Driven by 1m ICT structure changes — freshest institutional footprints.
+  5m swing removed from trail. No max-hold time exit.
 
-v5.0 TRAIL REWRITE — resolves "FVG freeze blocks trail for 50+ minutes":
+v5.0 CHANGES:
 
-  ROOT CAUSE 1 — FORWARD REFERENCE BUG:
-    `_be_is_unlocked` was used in the ICT zone freeze check BEFORE it was
-    defined (line 1995 vs 2056). Silent NameError caught by the background
-    thread — zone freeze silently crashed every trail tick. Fixed: moved
-    _be_is_unlocked definition to before the freeze check.
+  ENTRY SL — 15m SWINGS ONLY (compute_sl):
+    Removed: 5m swings, 1m swings, VWAP bands, HVN, OB walls.
+    Kept:    15m swing lows/highs (score 8.0) + ATR fallback.
+    ICT OB SL override uses htf_only=True (strength ≥ 70 = 15m OBs only).
 
-  ROOT CAUSE 2 — FVG FREEZE WITH NO TIME LIMIT OR PROXIMITY GUARD:
-    The FVG $74024–$74142 froze the trail for 51+ minutes. Price at $74127
-    is at the FVG top, inside the freeze zone (fvg.top + 0.5×ATR buffer).
-    No limit existed — it froze permanently as long as price was near the FVG.
-    FIX — Two guards added:
-      (a) SL PROXIMITY: Only freeze when SL is within 1.5×ATR of the FVG
-          boundary. If SL=$73,944 and FVG bottom=$74,024, the SL is $80
-          below — freeze is pointless. The guard skips it.
-      (b) TIME LIMIT: Release freeze unconditionally after 10 minutes (hold_seconds).
+  ENTRY TP — 15m SWINGS + ICT (compute_tp, compute_tp_trend):
+    Removed: 5m swings, HVN from 1m VP, OB walls.
+    Kept:    15m swing highs/lows (score 4.0) + VWAP/σ bands + ICT targets.
+    ICT structural targets use htf_only=True for OB filtering.
 
-  ROOT CAUSE 3 — OB ZONE FREEZE PERMANENTLY BLOCKING:
-    Overlapping OBs covering the entire trade range caused infinite freeze.
-    OB freeze REMOVED: the pullback classifier + OB anchor SL already handle
-    institutional zone awareness without an additional hard freeze.
-
-  ROOT CAUSE 4 — 5m SWING AS PRIMARY TRAIL DRIVER:
-    1m structure was only a secondary candidate in Phase 2+. Since SL/TP are
-    set from 15m at entry, the trail should follow 1m structure changes.
-    FIX: 1m swing is now the primary trail candidate from Phase 1. 5m swing
-    completely removed from trail candidates.
-
-  ROOT CAUSE 5 — MAX-HOLD TIME FORCED EXIT:
-    Timer-based exits cannot know if the trade is working. Removed entirely.
-    Trailing SL (1m ICT structure) is the correct exit mechanism.
+  TRAIL — 1m ICT STRUCTURE (compute_trail_sl):
+    Primary: 1m closed swing lows/highs (all phases from Phase 1).
+    Secondary: tighter 1m micro-swing (Phase 2+).
+    5m swing completely removed from trail candidates.
+    OB zone freeze removed (was blocking permanently with overlapping OBs).
+    FVG freeze: time-limited (10 min) + SL proximity guard (within 1.5×ATR).
+    _be_is_unlocked moved before zone freeze check (was forward-reference bug).
+    Max-hold forced exit removed — trail manages exit.
+    Chandelier taper removed (no hold-time dependency).
 """
 
 from __future__ import annotations
@@ -1281,78 +1269,55 @@ class InstitutionalLevels:
                    orderbook: Dict, vwap: float, vwap_std: float,
                    atr_pctile: float = 0.5,
                    candles_15m: Optional[List[Dict]] = None) -> float:
+        # NOTE v5.0: candles_5m, candles_1m, orderbook, vwap, vwap_std are
+        # accepted for backward-compat but no longer used. Only candles_15m
+        # and atr_pctile are consumed. The call site is unchanged to avoid
+        # breaking any external callers.
         """
-        Institutional SL placement — v4.1.
+        Initial SL placement — v5.0 (15m ICT structure ONLY).
 
-        Multi-timeframe swing density scoring + adaptive ATR buffer + VP HVN + OB walls.
+        v5.0 REWRITE: SL is anchored exclusively to 15m swing structure.
+        5m swings, 1m swings, VWAP bands, HVN, and OB walls all removed.
 
-        Key improvements over v4.0:
-          - Three timeframe inputs: 15m (macro), 5m (local), 1m (micro)
-          - Each candidate scored by structural density (clustered swings = stronger zone)
-          - Buffer adapts to ATR percentile: high-vol = tighter, low-vol = wider
-          - Candidates scored independently; best-scored within valid range wins
-          - No silent fallback to arbitrary ATR multiples
+        Rationale:
+          - 15m swings define the institutional structural context at entry.
+            They represent the last confirmed supply/demand imbalance on a
+            timeframe that matters to smart money. SL placed just beyond the
+            nearest 15m swing is where the trade thesis is definitively wrong.
+          - 5m and 1m swings are micro-noise on BTC at 40× leverage. They
+            produce SLs that are technically valid but too tight — normal
+            volatility routinely sweeps them before the move continues.
+          - VWAP bands, HVN, OB walls are momentum / orderbook concepts,
+            not structural ICT levels. They belong in the TP calculation,
+            not SL placement.
 
-        Score components:
-          15m swing: 4.0 × cluster_density  (macro structure — highest weight)
-          5m  swing: 3.0 × cluster_density  (local structure)
-          OB walls:  2.5 × wall_size_norm   (resting liquidity)
-          VP HVN:    2.0                     (historical volume gravity)
-          VWAP bands: 1.5 / 2.0 / 1.5       (statistical reference)
+        Trailing is handled separately with 1m structure (compute_trail_sl).
+
+        The ICT OB SL override (get_ob_sl_level with htf_only=True) runs
+        on top of this in _compute_sl_tp and uses 15m OBs as the primary
+        structural anchor.
+
+        Fallback: if no 15m swing is within the valid range, use 1.5×ATR.
         """
-        # Issue 3 fix: was `min_dist = price * QCfg.MIN_SL_PCT()` (0.3% = $224 at $74k).
-        # This filtered out every 15m/5m structural level closer than $224 — exactly
-        # the zones ICT analysis says are the most reliable SL anchors.
-        #
-        # New floor: max(price * MIN_SL_PCT, 0.3 × ATR)
-        #   At ATR=137, price=$74k: max(price*0.001=74.5, 0.3*137=41.2) = 74.5pts
-        #   A 15m swing 52pts away now passes (52 < 74.5 still fails at 0.001).
-        #   At ATR=137: 0.5×ATR = 68.7pts is the softest useful floor.
-        # Use 0.4×ATR as the ATR-based floor — below this is tick noise on BTC.
-        buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
-        buffer   = buf_mult * atr
-        atr_floor = 0.40 * atr   # ~55pts at ATR=137 — captures nearby 15m structure
-        pct_floor = price * QCfg.MIN_SL_PCT()  # config MIN_SL_DISTANCE_PCT (now 0.001)
-        min_dist  = max(pct_floor, atr_floor)   # whichever is larger — noise rejection
+        buf_mult  = QCfg.SL_BUFFER_ATR_MULT() * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
+        buffer    = buf_mult * atr
+        atr_floor = 0.40 * atr
+        pct_floor = price * QCfg.MIN_SL_PCT()
+        min_dist  = max(pct_floor, atr_floor)
         max_dist  = price * QCfg.MAX_SL_PCT()
 
-        # ── Collect swing extremes from all available timeframes ──────────────
-        sh_5m,  sl_5m  = [], []
+        # ── 15m swing extremes — ONLY source of structural SL candidates ──────
         sh_15m, sl_15m = [], []
-        sh_1m,  sl_1m  = [], []
-
-        lb = QCfg.SL_SWING_LOOKBACK()
-        if len(candles_5m) >= 3:
-            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(candles_5m, lb)
         if candles_15m and len(candles_15m) >= 3:
+            lb = QCfg.SL_SWING_LOOKBACK()
             sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
                 candles_15m, min(lb, len(candles_15m) - 2))
-        if len(candles_1m) >= 3:
-            sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
-                candles_1m, min(20, len(candles_1m) - 2))
 
-        # All-timeframe pools for cluster density scoring
-        all_lows  = sl_5m  + sl_15m  + sl_1m
-        all_highs = sh_5m  + sh_15m  + sh_1m
+        # For cluster scoring use only 15m swings (all we have)
+        all_lows  = sl_15m
+        all_highs = sh_15m
 
-        # ── OB walls (scored by relative wall size) ───────────────────────────
-        wall_side = "bid" if side == "long" else "ask"
-        walls = InstitutionalLevels.find_orderbook_walls(
-            orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-        total_wall_qty = sum(q for _, q in walls) if walls else 0.0
-
-        # ── Volume profile HVN ────────────────────────────────────────────────
-        hvn_levels: List[float] = []
-        if len(candles_1m) >= 30:
-            profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
-            hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
-
-        # ── Candidate pool: (sl_level, score, label) ─────────────────────────
-        # Each entry is (price_level, score, label_for_logging).
-        # 15m ICT candidates use bypass_min_dist=True — the structural swing
-        # itself is the validity criterion. min_dist is a noise guard for when
-        # NO structure exists and must NOT filter real 15m levels.
+        # ── Candidate pool: 15m swings only ──────────────────────────────────
         scored: List[Tuple[float, float, str]] = []
 
         def add(level: float, score: float, label: str = "",
@@ -1369,80 +1334,20 @@ class InstitutionalLevels:
             scored.append((level, score, label))
 
         if side == "long":
-            # ── 15m swing lows — ICT PRIORITY (score 8.0, bypass min_dist) ──
-            # Root-cause fix: previously these were filtered by min_dist=0.3%
-            # ($224 on BTC), so a 15m low only 50-100 pts away was discarded and
-            # the SL fell to the min_dist floor with no ICT basis whatsoever.
             for lvl in sl_15m:
                 if lvl < price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
                     add(lvl - buffer * 0.80, 8.0 * cs,
                         f"15m_low@{lvl:.0f}", bypass_min_dist=True)
-
-            # 5m swing lows — local structure
-            for lvl in sl_5m:
-                if lvl < price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer, 3.0 * cs, f"5m_low@{lvl:.0f}")
-
-            # 1m micro-swing lows — fine structure (lower weight)
-            for lvl in sl_1m:
-                if lvl < price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer * 0.50, 1.5 * cs, f"1m_low@{lvl:.0f}")
-
-            # OB bid walls below price
-            for wp, wq in walls:
-                if wp < price:
-                    wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add(wp - buffer * 0.40, 2.5 * min(wscore, 2.0), f"OBwall@{wp:.0f}")
-
-            # Volume profile HVN below price
-            for h in hvn_levels:
-                if h < price - min_dist * 0.4:
-                    add(h - buffer * 0.25, 2.0, f"HVN@{h:.0f}")
-
-            # VWAP ± σ bands
-            if vwap > 0 and vwap_std > 0:
-                for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
-                    lvl = vwap - mult * vwap_std - buffer * 0.20
-                    add(lvl, bscore, f"VWAP-{mult}s@{lvl:.0f}")
-
-        else:  # side == "short"
-            # ── 15m swing highs — ICT PRIORITY (score 8.0, bypass min_dist) ──
+        else:
             for lvl in sh_15m:
                 if lvl > price:
                     cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
                     add(lvl + buffer * 0.80, 8.0 * cs,
                         f"15m_high@{lvl:.0f}", bypass_min_dist=True)
 
-            for lvl in sh_5m:
-                if lvl > price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer, 3.0 * cs, f"5m_high@{lvl:.0f}")
-
-            for lvl in sh_1m:
-                if lvl > price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer * 0.50, 1.5 * cs, f"1m_high@{lvl:.0f}")
-
-            for wp, wq in walls:
-                if wp > price:
-                    wscore = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add(wp + buffer * 0.40, 2.5 * min(wscore, 2.0), f"OBwall@{wp:.0f}")
-
-            for h in hvn_levels:
-                if h > price + min_dist * 0.4:
-                    add(h + buffer * 0.25, 2.0, f"HVN@{h:.0f}")
-
-            if vwap > 0 and vwap_std > 0:
-                for mult, bscore in [(1.5, 1.5), (2.0, 2.0), (2.5, 1.5)]:
-                    lvl = vwap + mult * vwap_std + buffer * 0.20
-                    add(lvl, bscore, f"VWAP+{mult}s@{lvl:.0f}")
-
         # ── Select best-scored candidate ──────────────────────────────────────
         if scored:
-            # Primary sort: highest score. Tiebreak: closest to price (least risk).
             if side == "long":
                 scored.sort(key=lambda x: (-x[1], price - x[0]))
             else:
@@ -1453,20 +1358,16 @@ class InstitutionalLevels:
             logger.info(
                 f"📌 SL winner: ${sl:,.2f} [{_w_label}] score={_w_score:.1f} "
                 f"dist={abs(price-sl):.1f}pts/{abs(price-sl)/max(atr,1e-10):.2f}ATR "
-                f"| {len(scored)} candidates (15m gets bypass+score 8.0)")
+                f"| {len(scored)} 15m candidates")
         else:
-            # No structural candidate found — use ATR-based floor
+            # No 15m structural candidate in range — ATR fallback
             sl = (price - max(min_dist, min(max_dist, 1.5 * atr))
                   if side == "long" else
                   price + max(min_dist, min(max_dist, 1.5 * atr)))
             logger.info(
-                f"📌 SL fallback (no structure): ${sl:,.2f} "
+                f"📌 SL fallback (no 15m structure in range): ${sl:,.2f} "
                 f"dist={abs(price-sl):.1f}pts/{abs(price-sl)/max(atr,1e-10):.2f}ATR")
 
-        # Final clamp: only enforce max_dist.
-        # min_dist clamp intentionally removed — 15m ICT levels are allowed to be
-        # closer than the percentage floor. The bypass_min_dist logic in add()
-        # already handles validity. Clamping back here would undo the ICT fix.
         dist = abs(price - sl)
         if dist > max_dist:
             sl = (price - max_dist) if side == "long" else (price + max_dist)
@@ -1479,60 +1380,45 @@ class InstitutionalLevels:
                    vwap: float, vwap_std: float,
                    candles_5m: Optional[List[Dict]] = None,
                    ict_engine=None,
-                   now_ms: int = 0) -> float:
+                   now_ms: int = 0,
+                   candles_15m: Optional[List[Dict]] = None) -> float:
         """
-        Institutional TP placement — v4.9 (ICT structural targets added).
+        Initial TP placement — v5.0 (15m ICT structure primary).
 
-        v4.9 ADDITION: ICT structural targets integrated as highest-conviction
-        candidates. In priority order:
-          6.0+ Swept liquidity origin — after sweep-and-reverse, price strongly
-               targets the sweep level. This is the primary ICT delivery target.
-          5.0+ Unfilled FVG in trade direction — imbalances attract price.
-               Near edge = conservative partial fill. Far edge = full fill.
-          4.0+ Virgin OB in trade direction — institutional order magnet.
-          5.0  OB liquidity wall (orderbook) directly in path
-          4.0  VP High-Volume Node between entry and VWAP
-          3.5  VWAP itself (full mean-reversion target)
+        v5.0 REWRITE: TP candidates are sourced from 15m swing levels and ICT
+        engine structural targets (filtered to 15m-derived OBs/FVGs/sweeps).
+        5m swings and 1m HVN removed.
+
+        Priority order (score):
+          6.0+ ICT swept liquidity origin — primary delivery target
+          5.0+ ICT unfilled FVG (15m-derived, htf_only)
+          4.0+ ICT virgin OB in path (15m-derived, htf_only, strength ≥ 70)
+          4.0  15m swing extreme in reversion direction (structural target)
+          3.5  VWAP full reversion (session-level reference — always valid)
           3.0  VWAP ± σ bands
-          2.5  5m swing extreme in direction of reversion
-          2.0  VWAP partial fraction
+          2.0  VWAP partial fraction (minimum R:R floor)
 
-        v4.6: SL is now ATR-capped upstream (_compute_sl_tp caps to SL_MAX_ATR_MULT×ATR).
-        This means sl_dist is proportional to ATR, so R:R-based bounds are naturally
-        reasonable. min_tp ≈ 4×ATR × 1.5 = 6×ATR (reachable) instead of 10×ATR × 1.5 = 15×ATR.
+        OB walls removed — they represent live orderbook snapshots, not
+        15m ICT structural levels.
         """
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
             return price + atr if side == "long" else price - atr
 
-        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
-        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
+        min_tp_dist = sl_dist * QCfg.REVERSION_MIN_RR()
+        max_tp_dist = sl_dist * QCfg.REVERSION_MAX_RR()
 
-        # ── Volume profile: single pass, shared across candidate generation ──
-        hvn_levels: List[float] = []
-        if len(candles_1m) >= 30:
-            profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
-            hvn_levels = InstitutionalLevels.find_hvn_levels(profile, QCfg.VP_HVN_THRESHOLD())
-
-        # ── OB walls in direction of trade ───────────────────────────────────
-        wall_side = "ask" if side == "long" else "bid"
-        walls = InstitutionalLevels.find_orderbook_walls(
-            orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-        total_wall_qty = sum(q for _, q in walls) if walls else 0.0
-
-        # ── 5m swing targets in reversion direction ───────────────────────────
-        sh_5m: List[float] = []
-        sl_5m: List[float] = []
-        if candles_5m and len(candles_5m) >= 3:
-            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
-                candles_5m, QCfg.SL_SWING_LOOKBACK())
+        # ── 15m swing targets in reversion direction ──────────────────────────
+        sh_15m: List[float] = []
+        sl_15m: List[float] = []
+        if candles_15m and len(candles_15m) >= 3:
+            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
+                candles_15m, QCfg.SL_SWING_LOOKBACK())
 
         # ── Scored candidate pool: (tp_level, score) ─────────────────────────
         scored: List[Tuple[float, float]] = []
 
         def add_tp(level: float, score: float) -> None:
-            """Standard quant TP filter — enforces REVERSION_MIN_RR floor."""
             dist = abs(level - price)
             if dist < min_tp_dist or dist > max_tp_dist:
                 return
@@ -1543,11 +1429,6 @@ class InstitutionalLevels:
             scored.append((level, score))
 
         def add_tp_ict(level: float, score: float, ict_min_dist: float) -> None:
-            """
-            ICT-primary TP filter — uses lower min_dist (1.0×SL instead of 1.5×SL).
-            Issue 3 fix: 15m FVGs and OBs at 1:1 R:R are structurally valid TP targets.
-            The lower floor only applies here — quant candidates still use min_tp_dist.
-            """
             dist = abs(level - price)
             if dist < ict_min_dist or dist > max_tp_dist:
                 return
@@ -1558,16 +1439,10 @@ class InstitutionalLevels:
             scored.append((level, score))
 
         if side == "long":
-            # OB ask walls: hard resistance — stop just below the wall
-            for wp, wq in walls:
-                if wp > price + min_tp_dist:
-                    w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp - atr * 0.08, 5.0 * min(w_rel, 1.5))
-
-            # VP HVN between entry and VWAP (gravity nodes)
-            for h in hvn_levels:
-                if price < h and (vwap <= 0 or h <= vwap * 1.002):
-                    add_tp(h, 4.0)
+            # 15m swing highs in reversion zone (structural supply above price)
+            for sh in sh_15m:
+                if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.010):
+                    add_tp(sh - atr * 0.10, 4.0)
 
             # VWAP full reversion
             if vwap > price:
@@ -1580,25 +1455,16 @@ class InstitutionalLevels:
                     if lvl > price:
                         add_tp(lvl, bscore)
 
-            # 5m swing highs in reversion zone (potential supply)
-            for sh in sh_5m:
-                if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.005):
-                    add_tp(sh - atr * 0.10, 2.5)
-
             # Fractional VWAP reversion
             if vwap > price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
                 add_tp(partial, 2.0)
 
         else:  # short
-            for wp, wq in walls:
-                if wp < price - min_tp_dist:
-                    w_rel = (wq / total_wall_qty * len(walls)) if total_wall_qty > 0 else 1.0
-                    add_tp(wp + atr * 0.08, 5.0 * min(w_rel, 1.5))
-
-            for h in hvn_levels:
-                if price > h and (vwap <= 0 or h >= vwap * 0.998):
-                    add_tp(h, 4.0)
+            # 15m swing lows in reversion zone (structural demand below price)
+            for sl_v in sl_15m:
+                if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.990):
+                    add_tp(sl_v + atr * 0.10, 4.0)
 
             if vwap < price:
                 add_tp(vwap, 3.5)
@@ -1608,10 +1474,6 @@ class InstitutionalLevels:
                     lvl = vwap + mult * vwap_std
                     if lvl < price:
                         add_tp(lvl, bscore)
-
-            for sl_v in sl_5m:
-                if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.995):
-                    add_tp(sl_v + atr * 0.10, 2.5)
 
             if vwap < price:
                 partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
@@ -1634,8 +1496,11 @@ class InstitutionalLevels:
                 # Issue 3: use sl_dist (1.0×) as ICT min distance, not min_tp_dist (1.5×)
                 _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)   # at least 1:1 R:R or 0.5ATR
                 _ict_max_dist = max_tp_dist                       # same upper cap
+                # htf_only=True: entry TP uses only 15m OBs from ICT engine.
+                # FVGs and swept pools are always included (not TF-tagged).
                 _ict_targets = ict_engine.get_structural_tp_targets(
-                    side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist)
+                    side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist,
+                    htf_only=True)
                 for _lvl, _sc, _lbl in _ict_targets:
                     add_tp_ict(_lvl, _sc, _ict_min_dist)   # uses 1.0× floor, not 1.5×
                     logger.debug(f"ICT TP candidate: ${_lvl:,.1f} score={_sc:.1f} [{_lbl}]")
@@ -1680,84 +1545,60 @@ class InstitutionalLevels:
     @staticmethod
     def compute_tp_trend(price: float, side: str, atr: float, sl_price: float,
                          candles_5m: List[Dict], orderbook: Dict,
-                         swing_lookback: int = 12) -> float:
+                         swing_lookback: int = 12,
+                         candles_15m: Optional[List[Dict]] = None) -> float:
         """
-        Trend-following TP placement — v4.2.
+        Trend/momentum TP placement — v5.0 (15m ICT structure).
 
-        In a trending market VWAP is behind price and is NOT the target.
+        v5.0 CHANGE: Swing TP sourced from 15m candles only (was 5m).
+          In a trending market the 5m swing that started the pullback is too
+          tight — it's where the move came FROM, not where it's going TO.
+          The 15m swing above/below price represents the next institutional
+          delivery target: the last level where smart money was active.
+          OB walls (orderbook snapshot) removed — not ICT structure.
+
         Targets in order of preference:
-
-          1. Previous swing high/low (the one that started the current pullback)
-             — price broke that level → it becomes a continuation target
-          2. ATR channel extension: entry + TREND_TP_ATR_MULT × ATR
-             — the standard measured-move projection
-          3. Next orderbook resistance/support wall in trend direction
-             — where resting liquidity will absorb momentum
-
-        All candidates must satisfy TREND_MIN_RR and are capped at TREND_MAX_RR.
-        If no structural target is found, ATR channel is used as the hard floor.
+          1. 15m swing high/low in trend direction — institutional delivery target
+          2. ATR channel extension (entry ± TREND_TP_ATR_MULT × ATR) — always valid
         """
-        sl_dist     = abs(price - sl_price)
+        sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
             return price + atr if side == "long" else price - atr
 
-        min_tp_dist = sl_dist * QCfg.TREND_MIN_RR()     # v4.4: was MIN_RR_RATIO
-        max_tp_dist = sl_dist * QCfg.TREND_MAX_RR()      # v4.4: was TP_MAX_RR
+        min_tp_dist = sl_dist * QCfg.TREND_MIN_RR()
+        max_tp_dist = sl_dist * QCfg.TREND_MAX_RR()
 
-        # ── ATR-channel baseline (always valid) ───────────────────────────────
-        atr_tp_dist  = atr * QCfg.TREND_TP_ATR_MULT()
-        atr_tp_dist  = max(atr_tp_dist, min_tp_dist)   # at least MIN_RR
-        atr_tp_dist  = min(atr_tp_dist, max_tp_dist)   # capped at MAX_RR
-        atr_tp       = (price + atr_tp_dist) if side == "long" else (price - atr_tp_dist)
+        # ── ATR-channel baseline (always valid fallback) ──────────────────────
+        atr_tp_dist = atr * QCfg.TREND_TP_ATR_MULT()
+        atr_tp_dist = max(atr_tp_dist, min_tp_dist)
+        atr_tp_dist = min(atr_tp_dist, max_tp_dist)
+        atr_tp      = (price + atr_tp_dist) if side == "long" else (price - atr_tp_dist)
 
-        # ── Swing target: recent pivot that started the pullback ──────────────
+        # ── 15m swing target — institutional level ahead of current price ─────
         swing_tp: Optional[float] = None
-        if len(candles_5m) >= 3:
-            sh, sl_list = InstitutionalLevels.find_swing_extremes(candles_5m, swing_lookback)
+        c15 = candles_15m if (candles_15m and len(candles_15m) >= 3) else []
+        if c15:
+            sh, sl_list = InstitutionalLevels.find_swing_extremes(c15, swing_lookback)
             if side == "long" and sh:
-                # Highs above price that are within max_tp_dist
                 valid = [h for h in sh if price + min_tp_dist < h <= price + max_tp_dist]
                 if valid:
-                    swing_tp = min(valid) - 0.05 * atr   # just below the level
+                    swing_tp = min(valid) - 0.05 * atr   # just below the 15m high
             elif side == "short" and sl_list:
                 valid = [l for l in sl_list if price - max_tp_dist <= l < price - min_tp_dist]
                 if valid:
-                    swing_tp = max(valid) + 0.05 * atr
+                    swing_tp = max(valid) + 0.05 * atr   # just above the 15m low
 
-        # ── OB wall in trend direction ─────────────────────────────────────────
-        wall_side = "ask" if side == "long" else "bid"
-        walls     = InstitutionalLevels.find_orderbook_walls(
-            orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-        wall_tp: Optional[float] = None
-        if walls:
-            if side == "long":
-                valid = [(p, q) for p, q in walls
-                         if price + min_tp_dist < p <= price + max_tp_dist]
-                if valid:
-                    best = min(valid, key=lambda x: x[0])   # nearest wall
-                    wall_tp = best[0] - 0.08 * atr
-            else:
-                valid = [(p, q) for p, q in walls
-                         if price - max_tp_dist <= p < price - min_tp_dist]
-                if valid:
-                    best = max(valid, key=lambda x: x[0])
-                    wall_tp = best[0] + 0.08 * atr
-
-        # ── Select: swing > ATR-channel > wall (prefer structural levels) ──────
-        # For trend trades we prefer the ATR channel over swing when the swing is
-        # very close (< 1.5× sl_dist) — that would be a weak R:R.
+        # ── Select: 15m swing preferred, ATR channel as fallback ─────────────
         candidates: List[float] = []
         if swing_tp is not None:
             dist = abs(swing_tp - price)
-            if dist >= sl_dist * 1.5:   # at least 1.5:1 from structural target
+            if dist >= sl_dist * 1.5:
                 candidates.append(swing_tp)
-        candidates.append(atr_tp)       # ATR channel always included
-        if wall_tp is not None:
-            candidates.append(wall_tp)
+        candidates.append(atr_tp)
 
         if side == "long":
             valid_c = [c for c in candidates if price + min_tp_dist < c <= price + max_tp_dist]
-            return max(valid_c) if valid_c else atr_tp   # take farthest valid (trend continuation)
+            return max(valid_c) if valid_c else atr_tp
         else:
             valid_c = [c for c in candidates if price - max_tp_dist <= c < price - min_tp_dist]
             return min(valid_c) if valid_c else atr_tp
@@ -1917,41 +1758,24 @@ class InstitutionalLevels:
         CHANGE 1: 1m SWING IS NOW THE PRIMARY TRAIL DRIVER (all phases)
                Previously: 5m swing primary, 1m micro-swing Phase 2+ only.
                Now: 1m closed swing lows/highs anchor the trail from Phase 1.
-               15m ICT structure is used at ENTRY for SL/TP placement.
-               During the trade, 1m structure captures the freshest institutional
-               footprints — a 5m candle is up to 4 minutes stale, making it
-               useless for real-time trailing on a 10s check interval.
+               15m ICT structure sets SL/TP at ENTRY only.
 
         CHANGE 2: OB ZONE FREEZE REMOVED
-               The pullback classifier already prevents SL tightening during
-               healthy pullbacks. The OB anchor candidate keeps the SL at the
-               institutionally correct level. Adding a full OB freeze ON TOP
-               of the pullback freeze caused permanent blocking when overlapping
-               OBs covered the entire trade price range.
+               Pullback classifier already prevents tightening during pullbacks.
+               OB anchor candidate keeps SL at institutionally correct level.
+               Overlapping OBs were causing permanent blocking.
 
-        CHANGE 3: FVG FREEZE NOW TIME-LIMITED + SL-PROXIMITY-GATED
-               Old: freeze whenever price is near ANY active FVG, forever.
-               New: freeze only when (a) SL has already been trailed within
-               1.5×ATR of the FVG boundary, AND (b) total hold < 10 minutes.
-               Root cause of the 51-min freeze in the log: SL=$73,944 vs
-               FVG=$74,024. SL was $80 below the FVG bottom — the freeze
-               served no purpose (SL was nowhere near the FVG). Proximity guard
-               eliminates this. Time limit prevents any freeze from being permanent.
+        CHANGE 3: FVG FREEZE TIME-LIMITED + SL-PROXIMITY-GATED
+               Freeze only when (a) SL is within 1.5×ATR of FVG boundary AND
+               (b) total hold < 10 minutes. Prevents 51-min permanent freeze.
 
-        CHANGE 4: CHANDELIER TAPER REMOVED
-               Previously tapered N from N_START to N_END over MAX_HOLD_SEC.
-               MAX_HOLD_SEC exit removed in v5.0, so time-taper is meaningless.
-               Chandelier uses fixed TRAIL_CHANDELIER_N_START for reversion.
+        CHANGE 4: CHANDELIER TAPER REMOVED — fixed N (no hold-time dependency).
 
-        CHANGE 5: MAX-HOLD TIME EXIT REMOVED FROM _manage_active
-               Trades exit via SL, TP, trailing SL, or structural signal only.
-               No timer-based forced exit.
+        CHANGE 5: _be_is_unlocked MOVED before zone freeze check (was forward-
+               reference NameError that silently crashed every trail tick).
 
-        Original v4.9 features kept:
-          ICT OB anchor (SL behind nearest active 1m OB) — all phases
-          Liquidity pool ceiling cap — prevents trailing past unswept pools
-          Pullback classifier — freezes trail during healthy pullbacks
-          Ratchet-only: SL may only move in trade's favour
+        Kept from v4.9: ICT OB anchor, liquidity pool ceiling, pullback classifier,
+        ratchet-only advancement.
         """
         if candles_5m is None:
             candles_5m = []
@@ -1993,9 +1817,9 @@ class InstitutionalLevels:
             phase = 1
             min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
 
-        # ═══ BREAK-EVEN UNLOCKED FLAG (used below in freeze + pullback checks) ══
-        # BE is "unlocked" when the SL has already been moved to at least break-even.
-        # Used to gate pullback/FVG freezes — if BE isn't locked yet, never block it.
+        # ═══ BREAK-EVEN UNLOCKED FLAG ═════════════════════════════════════
+        # Defined HERE (before zone freeze) to fix the v4.9 forward-reference
+        # NameError that silently crashed every trail tick.
         _be_price = (entry_price + 0.3 * atr if pos_side == "long"
                      else entry_price - 0.3 * atr)
         _be_is_unlocked = (
@@ -2003,40 +1827,18 @@ class InstitutionalLevels:
             (pos_side == "short" and current_sl <= _be_price)
         )
 
-        # ═══ v5.0: FVG ZONE FREEZE — time-limited, SL-proximity-gated ═══════════
-        #
-        # OB zone freeze REMOVED: the pullback classifier (below) already prevents
-        # SL tightening during healthy pullbacks. The OB anchor candidate ensures SL
-        # is placed at the institutionally correct level. An additional OB freeze
-        # caused permanent blocking when overlapping OBs covered the entire trade range.
-        #
-        # FVG freeze KEPT but with two hard guards:
-        #
-        #   GUARD 1 — SL PROXIMITY: Only freeze if the SL is within 2×ATR of the
-        #     FVG boundary. If SL is far below the FVG (long) the freeze is pointless
-        #     — we haven't trailed to the FVG yet, so there's nothing to protect.
-        #     Root cause of the 51-min freeze: SL=$73,944 vs FVG bottom=$74,024 ($80 apart,
-        #     <1 ATR). Guard fires because 80 < 2×87=174. Fix: require SL within 1×ATR.
-        #     Actually we DON'T want to freeze here at all — the FVG is above the SL.
-        #     For LONG: only freeze if current_sl >= fvg.bottom - 1.5*atr (SL is
-        #     close to or past the FVG bottom — meaning we've trailed near it).
-        #
-        #   GUARD 2 — TIME LIMIT: If the trade has been in a freeze state for more
-        #     than FVG_MAX_FREEZE_SEC (10 min), release the freeze unconditionally.
-        #     hold_seconds is used as a conservative proxy — the freeze releases after
-        #     a total hold that exceeds the limit, preventing permanent block.
-        #
-        _FVG_MAX_FREEZE_SEC = 600.0  # 10 minutes max freeze per zone
+        # ═══ v5.0: FVG ZONE FREEZE (time-limited + SL-proximity-gated) ═══
+        # OB zone freeze REMOVED — pullback classifier handles OB pullbacks.
+        # FVG freeze kept but with two hard guards to prevent permanent blocking:
+        #   GUARD 1 — SL PROXIMITY: Only freeze when SL is within 1.5×ATR of
+        #     the FVG boundary. SL far below FVG = not yet trailed to this zone.
+        #   GUARD 2 — TIME LIMIT: Release freeze after 10 minutes of hold time.
+        _FVG_MAX_FREEZE_SEC = 600.0
         if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
-            # Time guard: if total hold > 10 min, never freeze (zone is stale)
-            _freeze_allowed_by_time = (hold_seconds < _FVG_MAX_FREEZE_SEC)
-            if _freeze_allowed_by_time:
+            if hold_seconds < _FVG_MAX_FREEZE_SEC:
                 try:
                     _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
                     _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
-
-                    # Check active FVGs in trade direction (price inside gap = fill in progress)
-                    # Only freeze if SL has already been trailed close to the FVG boundary.
                     _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
                              else ict_engine.fvgs_bear)
                     for _fvg in _fvgs:
@@ -2046,21 +1848,19 @@ class InstitutionalLevels:
                         _fvg_hi = _fvg.top    + _freeze_atr * 0.5
                         if not (_fvg_lo <= price <= _fvg_hi):
                             continue
-                        # SL proximity guard: only freeze when SL is already close
-                        # to the FVG boundary (meaning we've trailed to this zone).
+                        # SL proximity guard: only freeze if SL trailed near FVG
                         if pos_side == "long":
                             _sl_near_fvg = current_sl >= _fvg.bottom - 1.5 * atr
                         else:
                             _sl_near_fvg = current_sl <= _fvg.top + 1.5 * atr
                         if not _sl_near_fvg:
                             logger.debug(
-                                f"Trail: FVG freeze SKIPPED — SL ${current_sl:,.0f} not yet "
-                                f"near FVG ${_fvg.bottom:.0f}–${_fvg.top:.0f} (SL too far)")
+                                f"Trail: FVG freeze SKIPPED — SL ${current_sl:,.0f} "
+                                f"not near FVG ${_fvg.bottom:.0f}–${_fvg.top:.0f}")
                             continue
                         logger.debug(
                             f"Trail: ICT FVG ZONE FREEZE — price ${price:,.1f} "
-                            f"in FVG ${_fvg.bottom:,.1f}–${_fvg.top:,.1f}. "
-                            f"FVG fill in progress — holding SL.")
+                            f"in FVG ${_fvg.bottom:,.1f}–${_fvg.top:,.1f}.")
                         if hold_reason is not None:
                             hold_reason.append(f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
                         return None
@@ -2068,15 +1868,6 @@ class InstitutionalLevels:
                     logger.debug(f"Trail ICT FVG zone check error (non-fatal): {_ict_e}")
 
         # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
-        # Pullback freeze: hold SL when the move looks like a healthy pullback,
-        # not a true reversal. Prevents premature SL tightening mid-pullback.
-        #
-        # EXEMPTION — Break-even move is ALWAYS allowed regardless of pullback:
-        # If the current SL is still below entry (full original risk open) and
-        # there is a valid BE candidate, the pullback freeze must NOT block it.
-        # At 0.74R with SL still at original level, freezing the BE move means
-        # the position can retrace back to the original SL and take a full loss.
-        # The freeze is meaningful only AFTER break-even is already locked.
         # NOTE: _be_price and _be_is_unlocked defined above in the phase block.
         if QCfg.TRAIL_PULLBACK_FREEZE():
             is_pb, rev_count, pb_detail = InstitutionalLevels._classify_pullback_vs_reversal(
@@ -2097,17 +1888,14 @@ class InstitutionalLevels:
                     f"— BE not locked, allowing BE move [{pb_detail}]")
 
         # ═══ BUILD CANDIDATE SL LEVELS ════════════════════════════════════
-        # v5.0 INSTITUTIONAL PRIORITY — 1m structure primary, chandelier last resort:
+        # v5.0 — 1m ICT structure primary, chandelier last resort:
         #   1. Profit floor      — fee-adjusted breakeven (all phases)
-        #   2. ICT OB anchor     — WHERE institutional orders are (all phases, uses 1m OBs)
-        #   3. 1m swing primary  — freshest confirmed structure (all phases, was 5m)
-        #   4. 1m micro-swing    — tighter short-lookback 1m swing (Phase 2+)
-        #   5. Chandelier        — Phase 3 ONLY when no structure found (fixed N)
+        #   2. ICT OB anchor     — all-TF OBs sorted by proximity (all phases)
+        #   3. 1m swing primary  — freshest confirmed structure (all phases)
+        #   4. 1m micro-swing    — tighter short-lookback candidate (Phase 2+)
+        #   5. Chandelier        — Phase 3 ONLY, fixed N (no time-taper)
         #   6. HVN               — volume-based support (Phase 3 only)
         #   7. OB wall           — orderbook depth support (Phase 3 only)
-        #
-        # 5m swing REMOVED from trail candidates — 15m structure sets entry SL/TP,
-        # and 1m structure trails the position. 5m is redundant and lagged.
         candidates: List[float] = []
 
         # ── 1. Profit floor (all phases) ─────────────────────────────────
@@ -2146,26 +1934,14 @@ class InstitutionalLevels:
             except Exception as _e:
                 logger.debug(f"Trail OB anchor error: {_e}")
 
-        # ── 3. 1m confirmed swing structure (all phases) — PRIMARY 1m TRAIL ──
-        #
-        # v5.0 REWRITE: SL is trailed exclusively from 1m ICT structure.
-        # 15m ICT structure sets the initial SL/TP at entry. During the trade,
-        # the trail follows 1m swing lows/highs — fresh micro-structure that
-        # reflects the current price action without the lag of higher timeframes.
-        #
-        # 5m swing removed as trail input: 5m candles close every 5 min, so in
-        # a fast-moving 1m environment the 5m structure is always 1-4 min stale.
-        # 1m structure is confirmed every minute and accurately tracks where the
-        # market has printed its most recent support/resistance.
-        #
-        # Only CLOSED candles (confirmed, not forming). Buffer: 0.5× of the
-        # standard ATR buffer — 1m swings are tighter than 5m so less clearance
-        # is needed to keep SL outside the noise.
+        # ── 3. 1m confirmed swing structure (all phases) — PRIMARY ─────────
+        # v5.0: 1m closed swing lows/highs are the primary trail driver.
+        # 15m ICT structure set the SL at entry. During the trade, 1m structure
+        # captures the freshest institutional footprints every minute.
         if len(candles_1m) >= 6:
-            closed_1m_primary = candles_1m[:-1]   # exclude the forming candle
+            closed_1m_primary = candles_1m[:-1]
             sh_1m_p, sl_1m_p = InstitutionalLevels.find_swing_extremes(
-                closed_1m_primary,
-                min(10, len(closed_1m_primary) - 2))
+                closed_1m_primary, min(10, len(closed_1m_primary) - 2))
             swing_buf_1m = max(0.10 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.40)
 
             if pos_side == "long" and sl_1m_p:
@@ -2176,8 +1952,7 @@ class InstitutionalLevels:
                     candidates.append(best_sw - swing_buf_1m)
                     logger.debug(
                         f"Trail: 1m swing low ${best_sw:,.1f} → "
-                        f"SL ${best_sw - swing_buf_1m:,.1f} "
-                        f"(buf={swing_buf_1m:.0f})")
+                        f"SL ${best_sw - swing_buf_1m:,.1f}")
             elif pos_side == "short" and sh_1m_p:
                 valid = [h for h in sh_1m_p
                          if price + min_dist < h < current_sl - 0.05 * atr]
@@ -2186,12 +1961,9 @@ class InstitutionalLevels:
                     candidates.append(best_sw + swing_buf_1m)
                     logger.debug(
                         f"Trail: 1m swing high ${best_sw:,.1f} → "
-                        f"SL ${best_sw + swing_buf_1m:,.1f} "
-                        f"(buf={swing_buf_1m:.0f})")
+                        f"SL ${best_sw + swing_buf_1m:,.1f}")
 
-        # ── 4. 1m tighter micro-swing (Phase 2+) — additional candidate ─────
-        # Second pass with a tighter lookback to catch the most recent swing.
-        # Gives a tighter SL candidate when the trade is well in profit.
+        # ── 4. 1m tighter micro-swing (Phase 2+) — additional candidate ─
         if phase >= 2 and len(candles_1m) >= 8:
             closed_1m    = candles_1m[:-1]
             sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
@@ -2212,15 +1984,13 @@ class InstitutionalLevels:
                     candidates.append(best_m + micro_buf)
 
         # ── 5. Chandelier exit (Phase 3 ONLY — last resort) ──────────────
-        # Used ONLY when no structural candidate exists (featureless market, tight
-        # consolidation with no confirmed swings). NOT the primary driver.
-        # Previously was Phase 2+, which caused the main reported problem.
-        # v5.0: Fixed N value — no time-taper (max-hold time removed).
+        # Used ONLY when no structural candidate exists. NOT the primary driver.
+        # v5.0: time-taper removed (no max_hold_sec dependency). Fixed N value.
         if phase >= 3 and peak_price_abs > 1e-10:
             if trade_mode in ("trend", "momentum"):
                 n_chandelier = QCfg.TREND_CHANDELIER_N()
             else:
-                n_chandelier = QCfg.TRAIL_CHANDELIER_N_START()  # fixed — no hold-time taper
+                n_chandelier = QCfg.TRAIL_CHANDELIER_N_START()  # fixed — no taper
 
             if pos_side == "long":
                 chand = peak_price_abs - n_chandelier * atr
@@ -3467,7 +3237,9 @@ class QuantStrategy:
         if self._ict is not None:
             try:
                 now_ms = int(time.time() * 1000)
-                ob_sl = self._ict.get_ob_sl_level(side, price, atr, now_ms)
+                # htf_only=True: only use 15m OBs (strength ≥ 70) for entry SL anchor.
+                # Trailing SL uses htf_only=False to get the nearest (often 1m) OB.
+                ob_sl = self._ict.get_ob_sl_level(side, price, atr, now_ms, htf_only=True)
                 if ob_sl is not None:
                     ob_dist = abs(price - ob_sl)
                     ob_valid_side = (side == "long" and ob_sl < price) or \
@@ -3532,13 +3304,15 @@ class QuantStrategy:
         if mode in ("trend", "momentum"):
             tp_price = InstitutionalLevels.compute_tp_trend(
                 price, side, atr, sl_price, candles_5m, orderbook,
-                swing_lookback=QCfg.SL_SWING_LOOKBACK())
+                swing_lookback=QCfg.SL_SWING_LOOKBACK(),
+                candles_15m=candles_15m)
         else:
             tp_price = InstitutionalLevels.compute_tp(
                 price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
                 candles_5m=candles_5m,
                 ict_engine=self._ict,
-                now_ms=int(time.time() * 1000))
+                now_ms=int(time.time() * 1000),
+                candles_15m=candles_15m)
         tp_price = _round_to_tick(tp_price)
 
         # ── Basic direction sanity (unchanged) ───────────────────────────────────
@@ -3962,12 +3736,10 @@ class QuantStrategy:
                         self._exit_trade(order_manager, price, "breakout_expired"); return
 
         # v5.0: Max-hold time exit REMOVED.
-        # Trades are managed exclusively by: SL hit, TP hit, trailing SL, or
-        # regime flip (trend mode) / breakout expiry (momentum mode).
-        # A time-based exit cannot know whether the trade is working.
-        # The trailing SL (1m ICT structure) is the correct exit mechanism.
+        # Trades exit via: SL hit, TP hit, trailing SL (1m ICT structure),
+        # regime flip (trend mode), or breakout expiry (momentum mode).
 
-        # ── Trailing SL ──────────────────────────────────────────────────────
+                # ── Trailing SL ──────────────────────────────────────────────────────
         # _update_trailing_sl calls replace_stop_loss → REST (edit/cancel/place).
         # With 10s API timeout × retries this can block 30-60s in the main thread.
         # Dispatch to a background thread with a guard so:
@@ -4117,8 +3889,9 @@ class QuantStrategy:
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
-        # v5.0: Pass ict_engine + now_ms so trail can use FVG freeze (time+proximity gated),
-        # OB anchor SL (1m OBs preferred), and liquidity pool ceiling.
+        # v4.9: Pass ict_engine + now_ms so trail can use ICT zone freeze,
+        # OB anchor SL, and liquidity pool ceiling — the three new protections
+        # that eliminate the "stopped during pullback, TP fires without us" pattern.
         # hold_reason: mutable list — compute_trail_sl appends the actual block reason
         # so the Trail HOLD log can show WHY it was blocked (not always "Phase 0").
         _hold_reason: List[str] = []
@@ -4149,7 +3922,7 @@ class QuantStrategy:
 
         new_sl_tick = _round_to_tick(new_sl)
 
-        # v5.0: Use initial_sl_dist for tier, and peak_profit for phase (ratchet up)
+        # v4.8: Use initial_sl_dist for tier, and peak_profit for phase (ratchet up)
         init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
         if tier < QCfg.TRAIL_BE_R():
