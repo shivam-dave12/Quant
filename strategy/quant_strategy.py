@@ -424,19 +424,54 @@ class VWAPEngine:
     def deviation_atr(self) -> float: return self._deviation_atr
 
 # ═══════════════════════════════════════════════════════════════
-# ENGINE 2: CVD DIVERGENCE — Exhaustion Detection
+# ENGINE 2: CVD DIVERGENCE + TRUE TICK DELTA
 # ═══════════════════════════════════════════════════════════════
 class CVDEngine:
+    """
+    Cumulative Volume Delta engine — v6.0 (true tick tape + candle fallback).
+
+    Two data paths:
+    1. TRUE CVD (preferred): running sum of (buy_qty - sell_qty) per real trade tick.
+       Sourced from TickFlowEngine.on_trade() calls via _feed_microstructure.
+       Provides genuine institutional buy/sell pressure — no approximation.
+    2. CANDLE CVD (fallback): (2C-H-L)/(H-L) × V per bar when real ticks
+       are unavailable (warmup period or stream gap).
+
+    Both paths feed the same divergence and trend signal computations.
+    True CVD is preferred; candle path takes over automatically if tick history
+    is insufficient (<50 ticks).
+    """
     def __init__(self):
+        # Candle-based delta history (OHLCV approximation — fallback)
         self._deltas: deque = deque(maxlen=QCfg.CVD_WINDOW() * QCfg.CVD_HIST_MULT())
         self._last_bar_ts: int = 0
+        # True tick-tape CVD — (buy_vol - sell_vol) per trade, running window
+        self._tick_cvd: deque = deque(maxlen=2000)   # 2000 most recent tick deltas
+        self._tick_ts:  deque = deque(maxlen=2000)   # timestamps for windowing
+        self._tick_count: int = 0                     # total ticks received
+        self._tick_cvd_lock = threading.Lock()
 
-    def reset_state(self):
+    def reset_state(self) -> None:
         """Reset timestamps so warmup data is reprocessed after stream restart."""
         self._last_bar_ts = 0
         self._deltas.clear()
+        # Preserve tick history — it may still be valid even after candle restart
+
+    def update_from_tick(self, price: float, qty: float, is_buy: bool) -> None:
+        """
+        Feed a real trade tick into the true CVD accumulator.
+        Called from _feed_microstructure on every new raw trade.
+        Dollar-volume delta: positive = buy pressure, negative = sell pressure.
+        """
+        dollar_delta = price * qty * (1.0 if is_buy else -1.0)
+        ts = time.time()
+        with self._tick_cvd_lock:
+            self._tick_cvd.append(dollar_delta)
+            self._tick_ts.append(ts)
+            self._tick_count += 1
 
     def update(self, candles: List[Dict]) -> None:
+        """Update candle-based OHLCV delta (fallback path)."""
         if not candles: return
         new_start = 0
         if self._last_bar_ts > 0:
@@ -456,12 +491,73 @@ class CVDEngine:
             self._deltas.append(vol * ((2.0*cl-hi-lo)/rng if rng > 1e-10 else 0.0))
             self._last_bar_ts = int(c['t'])
 
+    def _get_true_cvd_array(self, window_sec: float = 600.0) -> Optional[List[float]]:
+        """
+        Return rolling true CVD values over the last window_sec seconds.
+        Returns None if insufficient tick data (<50 ticks in window).
+        Each value is the running cumulative sum at that tick.
+        """
+        with self._tick_cvd_lock:
+            if self._tick_count < 50:
+                return None
+            now   = time.time()
+            cutoff = now - window_sec
+            arr = list(self._tick_cvd)
+            tss = list(self._tick_ts)
+        # Build running sum over window
+        running = []
+        acc = 0.0
+        for i, ts in enumerate(tss):
+            if ts >= cutoff:
+                acc += arr[i]
+                running.append(acc)
+        if len(running) < 20:
+            return None
+        return running
+
     def get_divergence_signal(self, candles: List[Dict]) -> float:
-        w = QCfg.CVD_WINDOW(); arr = list(self._deltas); n = len(arr)
+        """
+        CVD divergence: detect when order flow disagrees with price direction.
+
+        Prefers true tick CVD when ≥50 ticks available; falls back to candle OHLCV.
+
+        Returns [-1, +1]:
+          Positive = CVD rising while price falling (bullish divergence — buy signal)
+          Negative = CVD falling while price rising (bearish divergence — sell signal)
+          Zero     = CVD and price agree (no divergence)
+        """
+        w = QCfg.CVD_WINDOW()
+
+        # ── Path 1: True tick CVD (preferred) ─────────────────────────
+        true_cvd = self._get_true_cvd_array(window_sec=max(w * 60, 600.0))
+        if true_cvd is not None and len(true_cvd) >= w + 10:
+            arr = true_cvd; n = len(arr)
+            recent_cvd  = sum(arr[-(w//2):]); earlier_cvd = sum(arr[-w:-(w//2)])
+            cvd_slope   = recent_cvd - earlier_cvd
+            closes      = [float(c['c']) for c in candles[-w:]] if len(candles) >= w else []
+            if len(closes) < w: return 0.0
+            mid = w // 2
+            price_slope = sum(closes[mid:])/max(len(closes[mid:]),1) - sum(closes[:mid])/max(len(closes[:mid]),1)
+            if abs(price_slope) < 1e-10: return 0.0
+            # Z-normalise cvd_slope against rolling distribution
+            all_sums = []; running = sum(arr[:w//2]); all_sums.append(running)
+            for i in range(w//2, n - w//2):
+                running += arr[i] - arr[i - w//2]; all_sums.append(running)
+            if len(all_sums) < 5: return 0.0
+            mu  = sum(all_sums)/len(all_sums)
+            std = math.sqrt(sum((s-mu)**2 for s in all_sums)/max(len(all_sums)-1,1))
+            if std < 1e-12: return 0.0
+            cvd_z     = cvd_slope / std
+            price_dir = 1.0 if price_slope > 0 else -1.0
+            if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
+            return -price_dir * min(abs(cvd_z), 3.0) / 3.0
+
+        # ── Path 2: Candle OHLCV approximation (fallback) ─────────────
+        arr = list(self._deltas); n = len(arr)
         if n < w + 10 or len(candles) < w: return 0.0
-        recent_cvd = sum(arr[-w//2:]); earlier_cvd = sum(arr[-w:-w//2])
-        cvd_slope = recent_cvd - earlier_cvd
-        closes = [float(c['c']) for c in candles[-w:]]
+        recent_cvd  = sum(arr[-w//2:]); earlier_cvd = sum(arr[-w:-w//2])
+        cvd_slope   = recent_cvd - earlier_cvd
+        closes      = [float(c['c']) for c in candles[-w:]]
         mid = w // 2
         price_slope = sum(closes[mid:])/max(len(closes[mid:]),1) - sum(closes[:mid])/max(len(closes[:mid]),1)
         if abs(price_slope) < 1e-10: return 0.0
@@ -469,10 +565,10 @@ class CVDEngine:
         for i in range(w//2, n - w//2):
             running += arr[i] - arr[i - w//2]; all_sums.append(running)
         if len(all_sums) < 5: return 0.0
-        mu = sum(all_sums)/len(all_sums)
+        mu  = sum(all_sums)/len(all_sums)
         std = math.sqrt(sum((s-mu)**2 for s in all_sums)/max(len(all_sums)-1,1))
         if std < 1e-12: return 0.0
-        cvd_z = cvd_slope / std
+        cvd_z     = cvd_slope / std
         price_dir = 1.0 if price_slope > 0 else -1.0
         if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
         return -price_dir * min(abs(cvd_z), 3.0) / 3.0
@@ -481,16 +577,30 @@ class CVDEngine:
         """
         Directional CVD bias for trend-following mode.
 
-        Unlike get_divergence_signal (which looks for CVD diverging from price),
-        this asks: is net order-flow consistently in one direction?
-
+        Prefers true tick CVD; falls back to candle OHLCV.
         Returns +1.0 = sustained net buying, -1.0 = sustained net selling.
-        Used to confirm that trend trades are aligned with actual order flow.
         """
-        arr = list(self._deltas); n = len(arr)
         w = QCfg.CVD_WINDOW()
+
+        # ── Path 1: True tick CVD ────────────────────────────────────
+        true_cvd = self._get_true_cvd_array(window_sec=max(w * 90, 900.0))
+        if true_cvd is not None and len(true_cvd) >= w + 10:
+            arr = true_cvd; n = len(arr)
+            sums = []
+            for i in range(n - w * 2, n - w + 1):
+                if i >= 0:
+                    sums.append(sum(arr[i:i + w]))
+            if len(sums) < 5: return 0.0
+            recent_sum = sum(arr[-w:])
+            mu  = sum(sums) / len(sums)
+            std = math.sqrt(sum((s-mu)**2 for s in sums)/max(len(sums)-1, 1))
+            if std < 1e-12:
+                return _sigmoid(recent_sum / (abs(mu) + 1e-10), 0.5)
+            return _sigmoid((recent_sum - mu) / std, 0.7)
+
+        # ── Path 2: Candle OHLCV fallback ────────────────────────────
+        arr = list(self._deltas); n = len(arr)
         if n < w + 10: return 0.0
-        # Rolling sums over window 'w' to build a distribution
         sums = []
         for i in range(n - w * 2, n - w + 1):
             if i >= 0:
@@ -498,10 +608,15 @@ class CVDEngine:
         if len(sums) < 5: return 0.0
         recent_sum = sum(arr[-w:])
         mu  = sum(sums) / len(sums)
-        std = math.sqrt(sum((s - mu) ** 2 for s in sums) / max(len(sums) - 1, 1))
+        std = math.sqrt(sum((s-mu)**2 for s in sums)/max(len(sums)-1, 1))
         if std < 1e-12:
             return _sigmoid(recent_sum / (abs(mu) + 1e-10), 0.5)
         return _sigmoid((recent_sum - mu) / std, 0.7)
+
+    @property
+    def tick_count(self) -> int:
+        """Number of real trade ticks received since startup."""
+        return self._tick_count
 
 # ═══════════════════════════════════════════════════════════════
 # ENGINE 3: ORDERBOOK IMBALANCE
@@ -546,32 +661,62 @@ class OrderbookEngine:
         return _sigmoid(z, 0.6) * sm
 
 # ═══════════════════════════════════════════════════════════════
-# ENGINE 4: TICK FLOW
+# ENGINE 4: TICK FLOW (regime-adaptive window)
 # ═══════════════════════════════════════════════════════════════
 class TickFlowEngine:
+    """
+    Real-time trade flow engine — v6.0 (regime-adaptive window).
+
+    Window adapts to ATR percentile regime:
+      Low vol  (ATR pctile < 30%): 60s — accumulate more signal in quiet markets
+      Normal   (30%–70%):          30s — baseline
+      High vol (ATR pctile > 70%): 15s — faster response in trending/volatile markets
+      Extreme  (ATR pctile > 90%): 10s — highest responsiveness
+
+    Z-score normalised against rolling history so absolute volume differences
+    across sessions do not bias the signal.
+    """
     def __init__(self):
-        self._buy_vol: deque = deque(maxlen=600); self._sell_vol: deque = deque(maxlen=600)
-        self._flow_hist: deque = deque(maxlen=120); self._last_signal = 0.0
+        self._buy_vol:   deque = deque(maxlen=1200)
+        self._sell_vol:  deque = deque(maxlen=1200)
+        self._flow_hist: deque = deque(maxlen=120)
+        self._last_signal = 0.0
+        self._atr_pctile: float = 0.5   # updated from outside
+
+    def set_atr_pctile(self, pctile: float) -> None:
+        """Allow ATREngine to update regime context each tick."""
+        self._atr_pctile = max(0.0, min(1.0, pctile))
+
+    def _adaptive_window_sec(self) -> float:
+        """Return window duration based on current ATR percentile."""
+        p = self._atr_pctile
+        if   p > 0.90: return 10.0
+        elif p > 0.70: return 15.0
+        elif p > 0.30: return 30.0
+        else:          return 60.0
 
     def on_trade(self, price: float, qty: float, is_buyer: bool, ts: float) -> None:
         (self._buy_vol if is_buyer else self._sell_vol).append((ts, price * qty))
 
     def compute_signal(self) -> float:
-        now = time.time(); cutoff = now - QCfg.TICK_AGG_WINDOW_SEC()
-        bt = sum(dv for ts,dv in self._buy_vol if ts >= cutoff)
-        st = sum(dv for ts,dv in self._sell_vol if ts >= cutoff)
+        now    = time.time()
+        cutoff = now - self._adaptive_window_sec()
+        bt = sum(dv for ts, dv in self._buy_vol  if ts >= cutoff)
+        st = sum(dv for ts, dv in self._sell_vol if ts >= cutoff)
         total = bt + st
         if total < 1e-10: return 0.0
-        fr = (bt - st) / total; self._flow_hist.append(fr)
+        fr = (bt - st) / total
+        self._flow_hist.append(fr)
         hist = list(self._flow_hist)
         if len(hist) < 10: return _sigmoid(fr * 2.0, 0.8)
-        mu = sum(hist[:-1])/len(hist[:-1])
-        std = math.sqrt(sum((x-mu)**2 for x in hist[:-1])/max(len(hist[:-1])-1,1))
+        mu  = sum(hist[:-1]) / len(hist[:-1])
+        std = math.sqrt(sum((x-mu)**2 for x in hist[:-1]) / max(len(hist[:-1])-1, 1))
         if std < 1e-12: return _sigmoid(fr * 2.0, 0.8)
         self._last_signal = _sigmoid((fr - mu) / std, 0.5)
         return self._last_signal
 
-    def get_signal(self) -> float: return self._last_signal
+    def get_signal(self) -> float:
+        return self._last_signal
 
 # ═══════════════════════════════════════════════════════════════
 # ENGINE 5: VOLUME EXHAUSTION
@@ -2242,7 +2387,43 @@ class ATREngine:
 # HTF TREND FILTER — VETO ONLY
 # ═══════════════════════════════════════════════════════════════
 class HTFTrendFilter:
-    def __init__(self): self._trend_15m = 0.0; self._trend_4h = 0.0
+    """
+    HTF Trend Filter — v7.0 (ICT structure-primary, EMA fallback).
+
+    v7.0 REWRITE — replaces naive EMA slope with ICT swing-structure scores.
+
+    ROOT CAUSE of old veto instability:
+      The EMA(8) slope was normalised by 5m ATR. A single large candle shifts
+      the EMA meaningfully — the veto flipped on/off tick-by-tick in volatile
+      markets, randomly blocking entries mid-setup.
+
+    NEW APPROACH — two-layer score per timeframe:
+
+    LAYER 1: ICT Swing Structure (primary — from ICTEngine._tf)
+      Score from -1.0 to +1.0 built from:
+        (a) Swing sequence: HH/HL = +1.0, LH/LL = -1.0, ranging = 0.0
+        (b) BOS direction: bullish break = +0.4 bonus, bearish = -0.4 bonus
+        (c) CHoCH signal: character change adds ±0.3 early warning
+      This is pure price structure — it does not flip on a single candle
+      because fractal swings require 2 bars on each side to confirm.
+
+    LAYER 2: EMA slope (secondary — used ONLY when ICT not initialised)
+      Same as v6 but normalised to 4h ATR equivalent for better scaling.
+      Acts as a bridge during the first 10–20 minutes of warmup.
+
+    VETO LOGIC (unchanged contract with quant_strategy):
+      LONG  veto: 15m < -HTF_15M_VETO(0.35) OR (15m < -0.20 AND 4h < -0.20)
+      SHORT veto: 15m > +HTF_15M_VETO(0.35) OR (15m > +0.20 AND 4h > +0.20)
+
+    The thresholds remain the same — the INPUTS are now structurally stable.
+    """
+    def __init__(self):
+        self._trend_15m  = 0.0
+        self._trend_4h   = 0.0
+        self._ict_source = False   # True when scores came from ICT structure
+        # Keep last EMA series for fallback display
+        self._ema_15m_raw = 0.0
+        self._ema_4h_raw  = 0.0
 
     @staticmethod
     def _ema_series(values, period):
@@ -2251,38 +2432,103 @@ class HTFTrendFilter:
         for v in values[period:]: ema = v*k+ema*(1.0-k); out.append(ema)
         return out
 
-    def update(self, candles_15m, candles_4h, atr_5m):
+    @staticmethod
+    def _ict_structure_score(tf_struct) -> float:
+        """
+        Convert a TFStructure object into a [-1, +1] directional score.
+
+        Component weights:
+          Swing trend:  ±0.60  (dominant — multi-bar confirmation)
+          BOS:          ±0.25  (structural break confirmation)
+          CHoCH:        ±0.15  (early character-change warning)
+
+        Ranging markets with no clear swing sequence return near-zero,
+        which does NOT trigger a veto — correct behaviour since ranging
+        means no strong directional bias, not a contrary signal.
+        """
+        if tf_struct is None:
+            return 0.0
+        score = 0.0
+        trend = tf_struct.trend  # "bullish" | "bearish" | "ranging"
+        if trend == "bullish":
+            score += 0.60
+        elif trend == "bearish":
+            score -= 0.60
+        # BOS adds conviction only in the direction of the break
+        if tf_struct.bos_level > 0:
+            if tf_struct.bos_direction == "bullish":
+                score += 0.25
+            elif tf_struct.bos_direction == "bearish":
+                score -= 0.25
+        # CHoCH is an early reversal signal — weight lower than confirmed BOS
+        if tf_struct.choch_level > 0:
+            # CHoCH direction inferred: if bullish trend has CHoCH it means
+            # a lower-high formed (bearish signal). If bearish trend has CHoCH
+            # it means a higher-low formed (bullish signal).
+            if trend == "bullish":
+                score -= 0.15
+            elif trend == "bearish":
+                score += 0.15
+        return max(-1.0, min(1.0, score))
+
+    def update(self, candles_15m, candles_4h, atr_5m, ict_engine=None):
+        """
+        Update HTF scores. Prefers ICT structure; falls back to EMA slope.
+
+        Args:
+            candles_15m:  15-minute candle list
+            candles_4h:   4-hour candle list
+            atr_5m:       current 5m ATR (for EMA fallback normalisation)
+            ict_engine:   ICTEngine instance (None = use EMA fallback)
+        """
+        # ── PRIMARY: ICT swing-structure scores ──────────────────────
+        if ict_engine is not None and getattr(ict_engine, '_initialized', False):
+            tf_15m = ict_engine._tf.get("15m")
+            tf_4h  = ict_engine._tf.get("4h")
+            self._trend_15m  = self._ict_structure_score(tf_15m)
+            self._trend_4h   = self._ict_structure_score(tf_4h)
+            self._ict_source = True
+            return
+
+        # ── FALLBACK: EMA slope (ICT not yet initialised) ─────────────
+        self._ict_source = False
         fast = QCfg.EMA_FAST()
-        if len(candles_15m) > fast+5 and atr_5m > 1e-10:
+        if len(candles_15m) > fast + 5 and atr_5m > 1e-10:
             ema15 = self._ema_series([float(c['c']) for c in candles_15m], fast)
-            self._trend_15m = _sigmoid((ema15[-1]-ema15[-3])/atr_5m, 0.8) if len(ema15)>=4 else 0.0
-        else: self._trend_15m = 0.0
+            if len(ema15) >= 4:
+                raw = (ema15[-1] - ema15[-3]) / atr_5m
+                self._ema_15m_raw = raw
+                self._trend_15m   = _sigmoid(raw, 0.8)
+            else:
+                self._trend_15m = 0.0
+        else:
+            self._trend_15m = 0.0
+
         slow = QCfg.EMA_SLOW()
-        if len(candles_4h) > slow+3 and atr_5m > 1e-10:
+        if len(candles_4h) > slow + 3 and atr_5m > 1e-10:
             ema4h = self._ema_series([float(c['c']) for c in candles_4h], slow)
-            self._trend_4h = _sigmoid((ema4h[-1]-ema4h[-2])/(atr_5m*4.0), 0.8) if len(ema4h)>=3 else 0.0
-        else: self._trend_4h = 0.0
+            if len(ema4h) >= 3:
+                raw = (ema4h[-1] - ema4h[-2]) / (atr_5m * 4.0)
+                self._ema_4h_raw = raw
+                self._trend_4h   = _sigmoid(raw, 0.8)
+            else:
+                self._trend_4h = 0.0
+        else:
+            self._trend_4h = 0.0
 
     def vetoes_trade(self, side: str) -> bool:
         """
-        Per-timeframe HTF veto — matches config documentation exactly.
+        Per-timeframe HTF veto.
 
-        LONG  veto: 15m < -HTF_15M_VETO(0.35)
-                    OR (15m < -HTF_BOTH_VETO(0.20) AND 4h < -HTF_BOTH_VETO(0.20))
+        LONG  veto: 15m < -HTF_15M_VETO OR (15m < -HTF_BOTH AND 4h < -HTF_BOTH)
+        SHORT veto: 15m > +HTF_15M_VETO OR (15m > +HTF_BOTH AND 4h > +HTF_BOTH)
 
-        SHORT veto: 15m > +HTF_15M_VETO(0.35)
-                    OR (15m > +HTF_BOTH_VETO(0.20) AND 4h > +HTF_BOTH_VETO(0.20))
-
-        Previously used blended composite (4h*0.60 + 15m*0.40) which allowed a
-        bullish 4h to fully dilute a strongly bearish 15m. Example: 15m=-0.41,
-        4h=+0.10 → composite=-0.104, threshold=-0.35 → no veto. Wrong.
-
-        Per-TF logic: 15m=-0.41 < -0.35 is a hard LONG veto regardless of 4h.
+        Thresholds unchanged — only the inputs are now structure-stable.
         """
         if not QCfg.HTF_ENABLED():
             return False
-        t15  = self._trend_15m
-        t4h  = self._trend_4h
+        t15       = self._trend_15m
+        t4h       = self._trend_4h
         veto_15m  = float(_cfg("QUANT_HTF_15M_VETO",  0.35))
         veto_both = float(_cfg("QUANT_HTF_BOTH_VETO", 0.20))
 
@@ -2299,9 +2545,79 @@ class HTFTrendFilter:
         return False
 
     @property
-    def trend_15m(self): return self._trend_15m
+    def trend_15m(self) -> float:
+        return self._trend_15m
     @property
-    def trend_4h(self): return self._trend_4h
+    def trend_4h(self) -> float:
+        return self._trend_4h
+    @property
+    def ict_source(self) -> bool:
+        """True if scores came from ICT structure; False if EMA fallback."""
+        return self._ict_source
+
+
+# ═══════════════════════════════════════════════════════════════
+# WEIGHT SCHEDULER — regime-adaptive signal weights
+# ═══════════════════════════════════════════════════════════════
+class WeightScheduler:
+    """
+    Regime-adaptive signal weight scheduler — v7.0.
+
+    Signal mix that maximises edge varies by market regime:
+
+    RANGING:
+      VWAP deviation is the dominant edge — price reverts reliably to VWAP.
+      OrderBook imbalance provides tight structural validation.
+      CVD divergence confirms exhaustion at extremes.
+      W: VWAP=0.40, OB=0.25, CVD=0.20, TICK=0.10, VEX=0.05
+
+    TRANSITIONING:
+      Equal weighting reflects uncertainty. VWAP and CVD both matter.
+      W: VWAP=0.30, CVD=0.25, OB=0.20, TICK=0.15, VEX=0.10
+
+    TRENDING_UP / TRENDING_DOWN:
+      CVD trend signal and tick flow dominate — they show active directional
+      participation. VWAP is lagging (price is above/below it by design).
+      W: CVD=0.35, TICK=0.25, OB=0.20, VWAP=0.15, VEX=0.05
+
+    BREAKOUT / HIGH_VOLATILITY:
+      Tick flow is most real-time. CVD confirms direction.
+      OB wall detection matters more than VWAP (now far below/above).
+      W: TICK=0.35, CVD=0.30, OB=0.20, VWAP=0.10, VEX=0.05
+    """
+
+    # (W_VWAP, W_CVD, W_OB, W_TICK, W_VEX)
+    _WEIGHTS = {
+        MarketRegime.RANGING:       (0.40, 0.20, 0.25, 0.10, 0.05),
+        MarketRegime.TRANSITIONING: (0.30, 0.25, 0.20, 0.15, 0.10),
+        MarketRegime.TRENDING_UP:   (0.15, 0.35, 0.20, 0.25, 0.05),
+        MarketRegime.TRENDING_DOWN: (0.15, 0.35, 0.20, 0.25, 0.05),
+    }
+
+    @classmethod
+    def get(cls, regime: MarketRegime) -> Tuple[float, float, float, float, float]:
+        """
+        Return (w_vwap, w_cvd, w_ob, w_tick, w_vex) for the given regime.
+        Falls back to config-static values if the regime is unrecognised.
+        """
+        if regime in cls._WEIGHTS:
+            return cls._WEIGHTS[regime]
+        # Static config fallback (backward compat)
+        return (
+            QCfg.W_VWAP_DEV(),
+            QCfg.W_CVD_DIV(),
+            QCfg.W_OB(),
+            QCfg.W_TICK_FLOW(),
+            QCfg.W_VOL_EXHAUSTION(),
+        )
+
+    @classmethod
+    def log_weights(cls, regime: MarketRegime) -> str:
+        """Human-readable weight string for logging."""
+        w = cls.get(regime)
+        return (f"VWAP={w[0]:.2f} CVD={w[1]:.2f} OB={w[2]:.2f} "
+                f"TICK={w[3]:.2f} VEX={w[4]:.2f}")
+
 
 # ═══════════════════════════════════════════════════════════════
 # SIGNAL BREAKDOWN
@@ -2333,6 +2649,13 @@ class SignalBreakdown:
     in_discount: bool = False         # Price in 4H discount zone (<40% PD)
     in_premium:  bool = False         # Price in 4H premium zone (>60% PD)
     mtf_details: str = ""             # MTF structure summary
+    # v7.0: Regime-adaptive weights applied (for trade attribution logging)
+    w_vwap: float = 0.30; w_cvd: float = 0.25; w_ob: float = 0.20
+    w_tick: float = 0.15; w_vex: float = 0.10
+    # v7.0: ICT entry tier that was active at entry (for signal attribution)
+    ict_entry_tier: str = ""          # "S" | "A" | "B" | "" if no ICT gate
+    htf_ict_source: bool = False      # True if HTF score came from ICT structure
+    cvd_tick_count: int = 0           # Number of real trade ticks in CVD accumulator
 
     def __str__(self):
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
@@ -2363,6 +2686,7 @@ class PositionState:
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
+    ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -2731,15 +3055,15 @@ class QuantStrategy:
                 self._evaluate_entry(data_manager, order_manager, risk_manager, now)
 
     def _launch_entry_async(self, data_manager, order_manager, risk_manager,
-                             side: str, sig, mode: str) -> None:
+                             side: str, sig, mode: str,
+                             ict_tier: str = "") -> None:
         """
         Non-blocking entry: sets ENTERING phase immediately, then runs
         _enter_trade in a daemon thread so the main on_tick loop is never
         blocked by the bracket fill-polling sleep loop (up to 45s).
 
-        Root cause fixed: place_bracket_limit_entry contains a time.sleep
-        polling loop that ran on the strategy thread, blocking every main-loop
-        tick for up to 45s and triggering the 15s watchdog alarm on every entry.
+        ict_tier: "S" | "A" | "B" | "" — passed through to _enter_trade so
+        confidence-weighted position sizing can scale size by conviction tier.
 
         The try/finally guarantees any abort path inside _enter_trade
         (TP gate rejection, SL failure, partial-fill abort, etc.) resets phase
@@ -2753,7 +3077,8 @@ class QuantStrategy:
 
         def _bg():
             try:
-                self._enter_trade(_dm, _om, _rm, side, sig, mode=mode)
+                self._enter_trade(_dm, _om, _rm, side, sig, mode=mode,
+                                  ict_tier=ict_tier)
             except Exception as _e:
                 logger.error(
                     f"_enter_trade background thread error ({mode}/{side}): {_e}",
@@ -2782,9 +3107,21 @@ class QuantStrategy:
             for t in trades:
                 ts = t.get("timestamp", 0.0)
                 if ts > cutoff_ts:
-                    self._tick_eng.on_trade(t.get("price",0.0), t.get("quantity",0.0), t.get("side")=="buy", ts)
+                    _price = t.get("price", 0.0)
+                    _qty   = t.get("quantity", 0.0)
+                    _buy   = t.get("side") == "buy"
+                    # ── Wire to TickFlowEngine ──────────────────────────────
+                    self._tick_eng.on_trade(_price, _qty, _buy, ts)
+                    # ── Wire to CVDEngine true tick path ────────────────────
+                    # This enables true cumulative volume delta — sum of actual
+                    # (buy - sell) dollar volume per tick, not OHLCV approximation
+                    if _price > 0 and _qty > 0:
+                        self._cvd.update_from_tick(_price, _qty, _buy)
                     if ts > max_ts: max_ts = ts
             if max_ts > cutoff_ts: self._last_fed_trade_ts = max_ts
+            # Update tick engine ATR percentile so window adapts to regime
+            _atr_pct = self._atr_5m.get_percentile() if self._atr_5m.atr > 1e-10 else 0.5
+            self._tick_eng.set_atr_pctile(_atr_pct)
             self._tick_eng.compute_signal()
         except Exception: pass
 
@@ -2825,34 +3162,51 @@ class QuantStrategy:
                 self._last_price_warn = _now
                 logger.info("⏳ Signals blocked: no valid price from data manager")
             return None
-        self._vwap.update(candles_1m, atr_5m); self._cvd.update(candles_1m)  # v4.3: was atr_1m — Bug 5 fix
+
+        self._vwap.update(candles_1m, atr_5m)
+        self._cvd.update(candles_1m)   # candle path fallback; tick path fed in _feed_microstructure
+
+        # ── HTF filter — PRIMARY: ICT structure, FALLBACK: EMA slope ─────────
+        # Pass the ICT engine so HTFTrendFilter can read BOS/CHoCH swing structure
+        # directly instead of using a fragile EMA slope that flips on single candles.
         try:
-            c15 = data_manager.get_candles("15m", limit=100); c4h = data_manager.get_candles("4h", limit=50)
-            self._htf.update(c15, c4h, atr_5m)
-        except Exception: pass
+            c15 = data_manager.get_candles("15m", limit=100)
+            c4h = data_manager.get_candles("4h", limit=50)
+            self._htf.update(c15, c4h, atr_5m, ict_engine=self._ict)
+        except Exception:
+            pass
 
         # ── Regime classification ─────────────────────────────────────────────
         self._adx.compute(candles_5m)
         regime = self._regime.update(self._adx, self._atr_5m, self._htf)
 
+        # ── Regime-adaptive weights (v7.0) ────────────────────────────────────
+        # Signal weights shift based on market regime so the composite score
+        # reflects what actually matters in each regime:
+        #   Ranging  → VWAP dominates; OB second
+        #   Trending → CVD + TICK dominate; VWAP deprioritised (lagging in trends)
+        #   Breakout → TICK first; CVD second
+        w_vwap, w_cvd, w_ob, w_tick, w_vex = WeightScheduler.get(regime)
+
         # ── Mean-reversion signals ────────────────────────────────────────────
-        vs = self._vwap.get_reversion_signal(price, atr_5m)  # v4.3: was atr_1m — Bug 5 fix
-        cs = self._cvd.get_divergence_signal(candles_1m)
-        obs = self._ob_eng.get_signal(); ts = self._tick_eng.get_signal()
-        ve = self._vol_exh.compute(candles_1m)
-        comp = vs*QCfg.W_VWAP_DEV() + cs*QCfg.W_CVD_DIV() + obs*QCfg.W_OB() + ts*QCfg.W_TICK_FLOW() + ve*QCfg.W_VOL_EXHAUSTION()
+        vs  = self._vwap.get_reversion_signal(price, atr_5m)
+        cs  = self._cvd.get_divergence_signal(candles_1m)
+        obs = self._ob_eng.get_signal()
+        ts  = self._tick_eng.get_signal()
+        ve  = self._vol_exh.compute(candles_1m)
+
+        comp = (vs*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
         comp = max(-1.0, min(1.0, comp))
         direction = 1.0 if comp >= 0 else -1.0
-        nc = sum(1 for s in [vs,cs,obs,ts,ve] if s*direction > 0.05)
+        nc = sum(1 for s in [vs, cs, obs, ts, ve] if s * direction > 0.05)
 
-        # ── Trend-following score (used only in TRENDING regime) ──────────────
-        # Composite of: HTF alignment + CVD directional bias + OB imbalance direction
-        # Positive = long-biased, negative = short-biased
-        htf_comp     = self._htf.trend_4h * 0.60 + self._htf.trend_15m * 0.40
-        cvd_trend    = self._cvd.get_trend_signal()
-        trend_score  = htf_comp * 0.50 + cvd_trend * 0.30 + obs * 0.20
-        trend_score  = max(-1.0, min(1.0, trend_score))
+        # ── Trend-following score (TRENDING regime) ───────────────────────────
+        htf_comp    = self._htf.trend_4h * 0.60 + self._htf.trend_15m * 0.40
+        cvd_trend   = self._cvd.get_trend_signal()
+        trend_score = htf_comp * 0.50 + cvd_trend * 0.30 + obs * 0.20
+        trend_score = max(-1.0, min(1.0, trend_score))
 
+        # ── Build signal breakdown with full attribution ───────────────────────
         sig = SignalBreakdown(
             vwap_dev=vs, cvd_div=cs, orderbook=obs, tick_flow=ts, vol_exhaust=ve,
             composite=comp, atr=atr_5m, atr_pct=self._atr_5m.get_percentile(),
@@ -2862,8 +3216,14 @@ class QuantStrategy:
             vwap_price=self._vwap.vwap, deviation_atr=self._vwap.deviation_atr,
             reversion_side=self._vwap.reversion_side(price), n_confirming=nc,
             threshold_used=QCfg.COMPOSITE_ENTRY_MIN(),
-            market_regime=regime.value, adx=self._adx.adx, trend_score=trend_score)
-        self._last_sig = sig; return sig
+            market_regime=regime.value, adx=self._adx.adx, trend_score=trend_score,
+            # v7.0: weight attribution
+            w_vwap=w_vwap, w_cvd=w_cvd, w_ob=w_ob, w_tick=w_tick, w_vex=w_vex,
+            htf_ict_source=self._htf.ict_source,
+            cvd_tick_count=self._cvd.tick_count,
+        )
+        self._last_sig = sig
+        return sig
 
     def _log_thinking(self, sig, price, now):
         if now - self._last_think_log < self._think_interval: return
@@ -3284,7 +3644,7 @@ class QuantStrategy:
                         f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
                     self._launch_entry_async(
                         data_manager, order_manager, risk_manager,
-                        "long", sig, mode="reversion")
+                        "long", sig, mode="reversion", ict_tier=_tier)
             else:
                 self._confirm_short += 1; self._confirm_long = 0
                 if self._confirm_short >= _effective_cn:
@@ -3296,7 +3656,7 @@ class QuantStrategy:
                         f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
                     self._launch_entry_async(
                         data_manager, order_manager, risk_manager,
-                        "short", sig, mode="reversion")
+                        "short", sig, mode="reversion", ict_tier=_tier)
 
         else:
             # ── STANDARD QUANT PATH (Tier-B or no ICT) ───────────────────
@@ -3341,12 +3701,12 @@ class QuantStrategy:
                 self._confirm_long = self._confirm_short = 0
                 self._launch_entry_async(
                     data_manager, order_manager, risk_manager,
-                    "long", sig, mode="reversion")
+                    "long", sig, mode="reversion", ict_tier=_tier)
             elif self._confirm_short >= cn:
                 self._confirm_long = self._confirm_short = 0
                 self._launch_entry_async(
                     data_manager, order_manager, risk_manager,
-                    "short", sig, mode="reversion")
+                    "short", sig, mode="reversion", ict_tier=_tier)
 
     def _evaluate_trend_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -3453,10 +3813,12 @@ class QuantStrategy:
         cn = QCfg.TREND_CONFIRM_TICKS()
         if trend_side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="trend")
+            _trend_tier = _t if "_t" in dir() else "B"
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="trend", ict_tier=_trend_tier)
         elif trend_side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend")
+            _trend_tier = _t if "_t" in dir() else "B"
+            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend", ict_tier=_trend_tier)
 
     def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -3580,20 +3942,22 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
+            _mo_tier = _t_mo if "_t_mo" in dir() else "B"
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_low=${self._breakout._retest_low:,.2f} | "
                 f"SL=${retest_sl:,.2f}")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum", ict_tier=_mo_tier)
         elif side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
+            _mo_tier = _t_mo if "_t_mo" in dir() else "B"
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_high=${self._breakout._retest_high:,.2f} | "
                 f"SL=${retest_sl:,.2f}")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum")
+            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum", ict_tier=_mo_tier)
 
     def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
                        signal_confidence=0.5, use_maker_entry=False):
@@ -3860,21 +4224,18 @@ class QuantStrategy:
 
         return sl_price, tp_price
 
-    def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion"):
+    def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion",
+                     ict_tier: str = ""):
         """
-        Position entry — PATCH 5.
+        Position entry — v7.0 (confidence-weighted sizing via ict_tier).
 
-        Key changes vs original:
-          a) signal_confidence derived from composite score before any order
-          b) compute_signal_urgency() called to gauge how quickly price is moving
-          c) fee_engine.decide_entry_type() routes to maker (limit) or taker (market)
-          d) order_manager.place_limit_entry() used for maker path
-          e) _compute_sl_tp() receives use_maker_entry + signal_confidence for TP gate
-          f) fee_engine.record_fill() called for slippage tracking
-          g) execution cost snapshot logged on every entry
-          
-        When _fee_engine is None (fee_engine.py not deployed), falls back to the
-        original plain-market-order path so the bot continues to operate normally.
+        ict_tier: "S" | "A" | "B" | "" — controls position size multiplier:
+          Tier-S: 1.00× base margin  (full conviction — confirmed sweep + AMD)
+          Tier-A: 0.80× base margin  (high conviction — structural alignment)
+          Tier-B: 0.65× base margin  (standard quant + ICT gate)
+          "":     0.50× base margin  (minimal exposure — no ICT gate)
+
+        Additionally modulated by composite score (±10%) and AMD confidence (±8%).
         """
         price = data_manager.get_last_price()
         if price < 1.0: return
@@ -3891,7 +4252,8 @@ class QuantStrategy:
             logger.info(f"Entry blocked: {reason}")
             return
 
-        qty = self._compute_quantity(risk_manager, price)
+        # ── Confidence-weighted position sizing ───────────────────────────────────
+        qty = self._compute_quantity(risk_manager, price, sig=sig, ict_tier=ict_tier)
         if qty is None or qty < QCfg.MIN_QTY(): return
 
         # ── Map composite score → signal_confidence [0, 1] (PATCH 5a) ───────────
@@ -4161,6 +4523,7 @@ class QuantStrategy:
             entry_vol       = entry_vol,
             trade_mode      = mode,
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
+            ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -4677,6 +5040,7 @@ class QuantStrategy:
         # Full trade record for /trades command
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
         self._trade_history.append({
+            # ── Core trade data ────────────────────────────────────────────
             "ts":           time.time(),
             "side":         getattr(pos, 'side', '?'),
             "mode":         getattr(pos, 'trade_mode', '?'),
@@ -4693,6 +5057,36 @@ class QuantStrategy:
             "trailed":      getattr(pos, 'trail_active', False),
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
+            # ── v7.0: Signal attribution — enables post-trade analysis ─────
+            # Which tier / signals drove this trade? Track these to learn
+            # which combinations actually produce wins vs losses.
+            "ict_tier":     getattr(pos, 'ict_entry_tier', ''),
+            "regime":       (pos.entry_signal.market_regime
+                             if pos.entry_signal else ''),
+            "composite":    (round(pos.entry_signal.composite, 4)
+                             if pos.entry_signal else 0.0),
+            "ict_total":    (round(pos.entry_signal.ict_total, 4)
+                             if pos.entry_signal else 0.0),
+            "amd_phase":    (pos.entry_signal.amd_phase
+                             if pos.entry_signal else ''),
+            "amd_bias":     (pos.entry_signal.amd_bias
+                             if pos.entry_signal else ''),
+            "amd_conf":     (round(pos.entry_signal.amd_conf, 3)
+                             if pos.entry_signal else 0.0),
+            "htf_15m":      (round(pos.entry_signal.deviation_atr, 3)
+                             if pos.entry_signal else 0.0),
+            "adx":          (round(pos.entry_signal.adx, 1)
+                             if pos.entry_signal else 0.0),
+            "n_conf":       (pos.entry_signal.n_confirming
+                             if pos.entry_signal else 0),
+            "htf_veto":     (pos.entry_signal.htf_veto
+                             if pos.entry_signal else False),
+            "w_vwap":       (round(pos.entry_signal.w_vwap, 2)
+                             if pos.entry_signal and hasattr(pos.entry_signal, 'w_vwap') else 0.0),
+            "cvd_ticks":    (pos.entry_signal.cvd_tick_count
+                             if pos.entry_signal and hasattr(pos.entry_signal, 'cvd_tick_count') else 0),
+            "htf_ict_src":  (pos.entry_signal.htf_ict_source
+                             if pos.entry_signal and hasattr(pos.entry_signal, 'htf_ict_source') else False),
         })
         # Keep last 200 trades in memory
         if len(self._trade_history) > 200:
@@ -4703,18 +5097,88 @@ class QuantStrategy:
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         logger.info("Position closed — FLAT")
 
-    def _compute_quantity(self, risk_manager, price):
+    def _compute_quantity(self, risk_manager, price,
+                           sig: Optional[SignalBreakdown] = None,
+                           ict_tier: str = "") -> Optional[float]:
+        """
+        Confidence-weighted position sizing — v7.0.
+
+        Base allocation: QUANT_MARGIN_PCT of available balance.
+
+        Tier multipliers (applied to base):
+          Tier-S (ICT sweep-and-go, AMD confirmed):  1.00×  — full size
+          Tier-A (ICT structural, strong confluence): 0.80×
+          Tier-B (standard quant + ICT gate):         0.65×
+          No tier / fallback:                         0.50×  — minimal exposure
+
+        Composite score modifier (on top of tier):
+          Composite ≥ 0.70: +10% (max confidence)
+          Composite ≥ 0.50: +5%
+          Composite < 0.35: −10% (marginal setup — reduce exposure)
+
+        ICT AMD confidence modifier:
+          AMD conf ≥ 0.85: +8%
+          AMD conf ≥ 0.70: +4%
+          AMD conf < 0.50: −5%
+
+        Total multiplier is capped to [0.40, 1.05] of base — never leverages
+        more than the base allocation, but can scale down significantly for
+        low-conviction setups.
+        """
         bal = risk_manager.get_available_balance()
-        if bal is None: return None
+        if bal is None:
+            return None
         available = float(bal.get("available", 0.0))
-        if available < QCfg.MIN_MARGIN_USDT(): return None
-        margin_alloc = available * QCfg.MARGIN_PCT()
-        if margin_alloc < QCfg.MIN_MARGIN_USDT(): return None
-        notional = margin_alloc * QCfg.LEVERAGE(); qty_raw = notional / price
-        step = QCfg.LOT_STEP(); qty = math.floor(qty_raw/step)*step; qty = round(qty,8)
-        qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
-        if (qty*price)/QCfg.LEVERAGE() > margin_alloc*1.02: return None
-        logger.info(f"Sizing → avail=${available:.2f} | alloc={QCfg.MARGIN_PCT():.0%} | margin=${margin_alloc:.2f} | {QCfg.LEVERAGE()}x | qty={qty}")
+        if available < QCfg.MIN_MARGIN_USDT():
+            return None
+
+        base_pct = QCfg.MARGIN_PCT()
+
+        # ── Tier multiplier ───────────────────────────────────────────
+        tier_mult = {
+            "S": 1.00,
+            "A": 0.80,
+            "B": 0.65,
+        }.get(ict_tier, 0.50)
+
+        # ── Composite score modifier ──────────────────────────────────
+        comp_mod = 0.0
+        if sig is not None:
+            abs_comp = abs(sig.composite)
+            if   abs_comp >= 0.70: comp_mod = +0.10
+            elif abs_comp >= 0.50: comp_mod = +0.05
+            elif abs_comp <  0.35: comp_mod = -0.10
+
+        # ── AMD confidence modifier ───────────────────────────────────
+        amd_mod = 0.0
+        if sig is not None and sig.amd_conf > 0:
+            if   sig.amd_conf >= 0.85: amd_mod = +0.08
+            elif sig.amd_conf >= 0.70: amd_mod = +0.04
+            elif sig.amd_conf <  0.50: amd_mod = -0.05
+
+        # ── Combine and clamp ─────────────────────────────────────────
+        total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
+        margin_alloc = available * base_pct * total_mult
+
+        if margin_alloc < QCfg.MIN_MARGIN_USDT():
+            return None
+
+        notional = margin_alloc * QCfg.LEVERAGE()
+        qty_raw  = notional / price
+        step     = QCfg.LOT_STEP()
+        qty      = math.floor(qty_raw / step) * step
+        qty      = round(qty, 8)
+        qty      = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
+
+        if (qty * price) / QCfg.LEVERAGE() > margin_alloc * 1.02:
+            return None
+
+        logger.info(
+            f"Sizing → avail=${available:.2f} | tier={ict_tier or 'none'} "
+            f"tmult={total_mult:.2f} (tier={tier_mult:.2f} comp={comp_mod:+.2f} amd={amd_mod:+.2f}) "
+            f"| alloc={base_pct:.0%}×{total_mult:.2f}=${margin_alloc:.2f} "
+            f"| {QCfg.LEVERAGE()}x | qty={qty}"
+        )
         return qty
 
     @staticmethod

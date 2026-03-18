@@ -1463,9 +1463,14 @@ class ICTEngine:
 
         def _ob(ob: OrderBlock) -> Dict:
             dist = ob.midpoint - price
+            _mid = ob.midpoint
+            _vc  = ob.visit_count
             return {
-                "low": ob.low, "high": ob.high, "mid": ob.midpoint,
-                "strength": ob.strength, "visits": ob.visit_count,
+                # Primary keys (new canonical names)
+                "low": ob.low, "high": ob.high,
+                "midpoint": _mid, "mid": _mid,          # both aliases — controller uses midpoint
+                "strength": ob.strength,
+                "visit_count": _vc, "visits": _vc,      # both aliases — controller uses visit_count
                 "tf": ob.timeframe, "bos": ob.bos_confirmed,
                 "in_ob": ob.contains_price(price), "in_ote": ob.in_optimal_zone(price),
                 "dist_pts": dist, "dist_atr": round(abs(dist)/a, 2),
@@ -1477,10 +1482,17 @@ class ICTEngine:
 
         def _fvg(fvg: FairValueGap) -> Dict:
             dist = fvg.midpoint - price
+            _bot  = fvg.bottom
+            _sz   = round(fvg.size, 1)
+            _fill = round(fvg.fill_percentage, 2)
             return {
-                "dir": fvg.direction, "tf": fvg.timeframe,
-                "bot": fvg.bottom, "top": fvg.top, "sz": round(fvg.size, 1),
-                "fill": round(fvg.fill_percentage, 2),
+                # Both old short names and full canonical names for controller compat
+                "direction": fvg.direction, "dir": fvg.direction,
+                "tf": fvg.timeframe,
+                "bottom": _bot, "bot": _bot,
+                "top": fvg.top,
+                "size": _sz, "sz": _sz,
+                "fill_pct": _fill, "fill": _fill,
                 "in_gap": fvg.is_price_in_gap(price),
                 "dist_pts": dist, "dist_atr": round(abs(dist)/a, 2),
                 "age_min": round((now_ms - fvg.timestamp)/60_000, 1),
@@ -1510,12 +1522,27 @@ class ICTEngine:
 
         liq_a, liq_s = [], []
         for p in self.liquidity_pools:
-            e = {"type": p.level_type, "price": p.price,
-                 "touches": p.touch_count, "dist": round(p.price - price, 1)}
+            _dist_val = round(p.price - price, 1)
+            # Include both old short names and canonical names for controller compat
+            e = {
+                "type":       p.level_type,
+                "pool_type":  p.pool_type,          # "EQH" / "EQL" — controller uses pool_type
+                "price":      p.price,
+                "touches":    p.touch_count,
+                "touch_count": p.touch_count,       # controller uses touch_count
+                "dist":       _dist_val,
+                "dist_pts":   _dist_val,             # controller uses dist_pts
+            }
             if p.swept:
-                e.update({"disp": p.displacement_confirmed, "wick": p.wick_rejection,
-                           "age_min": round((now_ms - p.sweep_timestamp)/60_000, 1)
-                           if p.sweep_timestamp else None})
+                _age = round((now_ms - p.sweep_timestamp)/60_000, 1) if p.sweep_timestamp else None
+                e.update({
+                    "disp":         p.displacement_confirmed,
+                    "displacement": p.displacement_confirmed,   # controller uses displacement
+                    "wick":         p.wick_rejection,
+                    "wick_rejection": p.wick_rejection,         # controller uses wick_rejection
+                    "age_min":      _age,
+                    "sweep_age_min": _age,                      # controller uses sweep_age_min
+                })
                 liq_s.append(e)
             else:
                 liq_a.append(e)

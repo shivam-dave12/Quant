@@ -150,6 +150,7 @@ class TelegramBotController:
                 {"command": "structures", "description": "ICT structure map with prices"},
                 {"command": "position",   "description": "Current position details"},
                 {"command": "trades",     "description": "Recent trade history"},
+                {"command": "stats",      "description": "Signal attribution analysis"},
                 {"command": "balance",    "description": "Wallet balance"},
                 {"command": "pause",      "description": "Pause trading"},
                 {"command": "resume",     "description": "Resume trading"},
@@ -180,7 +181,7 @@ class TelegramBotController:
         t = (text or "").strip()
         bare_cmds = {
             "start", "stop", "status", "thinking", "structures", "position",
-            "trades", "config", "pause", "resume", "balance", "trail",
+            "trades", "stats", "config", "pause", "resume", "balance", "trail",
             "killswitch", "set", "help",
         }
         if not t.startswith("/"):
@@ -213,6 +214,8 @@ class TelegramBotController:
                 return self._cmd_position()
             elif cmd == "/trades":
                 return self._cmd_trades()
+            elif cmd == "/stats":
+                return self._cmd_stats()
             elif cmd == "/balance":
                 return self._cmd_balance()
             elif cmd == "/pause":
@@ -247,6 +250,7 @@ class TelegramBotController:
             "/structures — ICT structure map with prices\n"
             "/position — Current position details\n"
             "/trades — Recent trade history\n"
+            "/stats — Signal attribution analysis (tier/regime WR breakdown)\n"
             "/balance — Wallet balance\n"
             "/pause — Pause trading (keep monitoring)\n"
             "/resume — Resume trading\n"
@@ -781,6 +785,14 @@ class TelegramBotController:
                 init_sl = t.get('init_sl_dist', 0.0)
                 raw_pts = ((exit_p - entry) if side == "LONG" else (entry - exit_p))
                 ach_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
+                # Attribution fields (v7.0)
+                ict_tier   = t.get('ict_tier', '')
+                regime     = t.get('regime', '')
+                composite  = t.get('composite', 0.0)
+                ict_total  = t.get('ict_total', 0.0)
+                amd_phase  = t.get('amd_phase', '')
+                adx_val    = t.get('adx', 0.0)
+                tier_badge = f" [T{ict_tier}]" if ict_tier else ""
 
                 # Determine label
                 if reason == "tp_hit":
@@ -795,11 +807,13 @@ class TelegramBotController:
                 result = "✅" if is_win else "❌"
                 trail_tag = " [T]" if trailed else ""
                 lines.append(
-                    f"{result} {side} [{mode}]  "
+                    f"{result} {side} [{mode}]{tier_badge}  "
                     f"${entry:,.0f}→${exit_p:,.0f}  "
                     f"PnL: <b>${pnl:+.2f}</b>  "
                     f"R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
                     f"    {label}{trail_tag}  hold: {hold:.0f}m"
+                    + (f"  Σ={composite:+.3f} ICT={ict_total:.2f}"
+                       f"  {_esc(amd_phase[:5])}  ADX={adx_val:.0f}" if composite else "")
                 )
         else:
             lines.append("  No trades recorded yet this session.")
@@ -832,6 +846,106 @@ class TelegramBotController:
             f"Expectancy: ${expectancy:+.2f}/trade",
             f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
         ]
+        return "\n".join(lines)
+
+    def _cmd_stats(self) -> str:
+        """
+        Signal attribution analysis — which signal combinations produce wins.
+        Shows win-rate breakdown by ICT tier, regime, AMD phase and composite score.
+        Requires ≥5 trades to produce meaningful stats.
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        if not strat:
+            return "Strategy not ready."
+
+        history = getattr(strat, '_trade_history', [])
+        if len(history) < 3:
+            return f"📊 Not enough trades yet ({len(history)} recorded — need ≥3)."
+
+        lines = ["<b>📊 Signal Attribution Analysis</b>\n"]
+
+        total  = len(history)
+        wins   = sum(1 for t in history if t.get('is_win'))
+        wr_all = wins / total * 100.0
+
+        lines.append(f"Total trades: {total}  WR: <b>{wr_all:.0f}%</b>\n")
+
+        # ── By ICT tier ──────────────────────────────────────────────────
+        lines.append("<b>By ICT Tier</b>")
+        tier_groups: dict = {}
+        for t in history:
+            k = t.get('ict_tier', '') or 'none'
+            tier_groups.setdefault(k, []).append(t)
+        for tier in ['S', 'A', 'B', 'none']:
+            grp = tier_groups.get(tier, [])
+            if not grp:
+                continue
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            avg_pnl = sum(t.get('pnl', 0) for t in grp) / len(grp)
+            label = f"Tier-{tier}" if tier != 'none' else "No tier"
+            lines.append(f"  {label}: {len(grp)} trades  WR={wr:.0f}%  avg=${avg_pnl:+.2f}")
+
+        # ── By regime ────────────────────────────────────────────────────
+        lines.append("\n<b>By Regime</b>")
+        reg_groups: dict = {}
+        for t in history:
+            k = t.get('regime', 'UNKNOWN')
+            reg_groups.setdefault(k, []).append(t)
+        for reg, grp in sorted(reg_groups.items()):
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            lines.append(f"  {_esc(reg)}: {len(grp)} trades  WR={wr:.0f}%")
+
+        # ── By AMD phase ─────────────────────────────────────────────────
+        lines.append("\n<b>By AMD Phase</b>")
+        amd_groups: dict = {}
+        for t in history:
+            k = t.get('amd_phase', 'UNKNOWN')
+            amd_groups.setdefault(k, []).append(t)
+        for phase, grp in sorted(amd_groups.items()):
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            lines.append(f"  {_esc(phase)}: {len(grp)} trades  WR={wr:.0f}%")
+
+        # ── By composite score bucket ─────────────────────────────────────
+        lines.append("\n<b>By Composite Score</b>")
+        buckets = [
+            ("≥0.70", lambda c: c >= 0.70),
+            ("0.50–0.70", lambda c: 0.50 <= c < 0.70),
+            ("0.35–0.50", lambda c: 0.35 <= c < 0.50),
+            ("<0.35", lambda c: abs(c) < 0.35),
+        ]
+        for label, fn in buckets:
+            grp = [t for t in history if fn(abs(t.get('composite', 0.0)))]
+            if not grp:
+                continue
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            lines.append(f"  {label}: {len(grp)} trades  WR={wr:.0f}%")
+
+        # ── Best and worst combos ─────────────────────────────────────────
+        if len(history) >= 10:
+            lines.append("\n<b>Top 3 win combos (tier+regime)</b>")
+            combo_groups: dict = {}
+            for t in history:
+                k = f"{t.get('ict_tier','?')}|{t.get('regime','?')[:8]}"
+                combo_groups.setdefault(k, []).append(t)
+            ranked = []
+            for combo, grp in combo_groups.items():
+                if len(grp) >= 2:
+                    w  = sum(1 for t in grp if t.get('is_win'))
+                    wr = w / len(grp) * 100.0
+                    ranked.append((wr, len(grp), combo))
+            ranked.sort(reverse=True)
+            for wr, cnt, combo in ranked[:3]:
+                tier_lbl, reg_lbl = combo.split('|')
+                lines.append(f"  Tier-{tier_lbl} + {_esc(reg_lbl)}: {cnt} trades  WR={wr:.0f}%")
+
         return "\n".join(lines)
 
     def _cmd_balance(self) -> str:
