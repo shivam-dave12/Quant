@@ -1265,11 +1265,15 @@ class DeltaAPI:
         product_id:  Optional[int]   = None,
     ) -> Dict:
         """
-        PUT /v2/orders/{id} — modify size or price of an existing open order.
+        PUT /v2/orders — modify size or price of an existing open order.
+
+        API doc confirms the endpoint is PUT /v2/orders (NOT /v2/orders/{id}).
+        The order identifier goes in the request BODY as the "id" field.
+        Sending the id in the URL path returns 404 Not Found.
 
         Used by order_manager.replace_stop_loss / replace_take_profit.
         """
-        body: Dict[str, Any] = {}
+        body: Dict[str, Any] = {"id": int(order_id)}   # id in BODY, not URL path
         if size is not None:
             body["size"] = int(size)
         if limit_price is not None:
@@ -1279,7 +1283,7 @@ class DeltaAPI:
         if product_id is not None:
             body["product_id"] = product_id
 
-        resp = self._put(f"/v2/orders/{order_id}", body=body)
+        resp = self._put("/v2/orders", body=body)       # endpoint has NO id suffix
         if resp["success"] and resp.get("result"):
             raw = resp["result"]
             resp["result"] = {

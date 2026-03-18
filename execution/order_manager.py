@@ -342,7 +342,8 @@ class _DeltaAdapter:
     def place_order(self, side: str, order_type: str, quantity: float,
                     price: Optional[float] = None,
                     trigger_price: Optional[float] = None,
-                    reduce_only: bool = False) -> Optional[Dict]:
+                    reduce_only: bool = False,
+                    stop_order_type: Optional[str] = None) -> Optional[Dict]:
         self.limiter.wait()
         # symbol is the primary key; Delta API resolves product_id internally
         # Convert BTC quantity → integer contracts
@@ -350,13 +351,14 @@ class _DeltaAdapter:
         _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
         resp = self.api.place_order(
-            symbol        = self.symbol,
-            side          = side.lower(),
-            order_type    = order_type,
-            size          = contracts,       # Delta: integer contracts
-            limit_price   = float(price) if price else None,
-            stop_price    = float(trigger_price) if trigger_price else None,
-            reduce_only   = reduce_only,
+            symbol          = self.symbol,
+            side            = side.lower(),
+            order_type      = order_type,
+            size            = contracts,       # Delta: integer contracts
+            limit_price     = float(price) if price else None,
+            stop_price      = float(trigger_price) if trigger_price else None,
+            reduce_only     = reduce_only,
+            stop_order_type = stop_order_type,  # "stop_loss_order" | "take_profit_order"
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -984,10 +986,13 @@ class OrderManager:
         try:
             api_side = self._normalize_side(side)
             logger.info(f"SL {side} qty={quantity} trigger=${trigger_price:,.2f}")
+            # API doc: standalone stop orders use order_type=market_order +
+            # stop_order_type=stop_loss_order, NOT stop_market_order.
+            # stop_market_order is a Delta internal type for bracket children only.
             data = self._place_with_retry(
-                side=api_side, order_type="STOP_MARKET",
+                side=api_side, order_type="market_order",
                 quantity=quantity, trigger_price=trigger_price,
-                reduce_only=True)
+                reduce_only=True, stop_order_type="stop_loss_order")
             if data:
                 self._record_order(data["order_id"], {
                     "order_id": data["order_id"], "side": side, "type": "STOP_LOSS",
@@ -1006,10 +1011,12 @@ class OrderManager:
         try:
             api_side = self._normalize_side(side)
             logger.info(f"TP {side} qty={quantity} trigger=${trigger_price:,.2f}")
+            # API doc: standalone TP orders use order_type=market_order +
+            # stop_order_type=take_profit_order.
             data = self._place_with_retry(
-                side=api_side, order_type="TAKE_PROFIT_MARKET",
+                side=api_side, order_type="market_order",
                 quantity=quantity, trigger_price=trigger_price,
-                reduce_only=True)
+                reduce_only=True, stop_order_type="take_profit_order")
             if data:
                 self._record_order(data["order_id"], {
                     "order_id": data["order_id"], "side": side, "type": "TAKE_PROFIT",
