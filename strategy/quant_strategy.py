@@ -1980,7 +1980,19 @@ class InstitutionalLevels:
         # into an OB is the setup working as intended — not a reversal signal.
         # Tightening the SL during an OB test causes the "stopped out, then TP
         # fires without us" pattern that was the primary reported problem.
-        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None:
+        #
+        # EXEMPTION — Break-even move bypasses ICT zone freeze (same logic as
+        # pullback freeze). If SL is still below entry+0.3×ATR (full original risk
+        # open), the zone freeze is skipped so BE can be locked. A huge OB during
+        # warmup should never prevent the trade from reaching break-even.
+        #
+        # OVERSIZED OB GUARD — Skip OBs wider than 2.5×ATR in freeze decisions.
+        # Large OBs detected from warmup candles cover enormous price ranges and
+        # are not specific institutional levels. With freeze_atr buffer, a 5×ATR
+        # OB produces a 5.8×ATR freeze zone covering the entire trade range.
+        _max_ob_freeze_size = 2.5 * atr   # OBs wider than this are skipped
+
+        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
             try:
                 _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
                 _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
@@ -1990,6 +2002,12 @@ class InstitutionalLevels:
                         else ict_engine.order_blocks_bear)
                 for _ob in _obs:
                     if not _ob.is_active(_ict_now_ms):
+                        continue
+                    # Skip oversized OBs (warmup artifacts, not specific levels)
+                    if (_ob.high - _ob.low) > _max_ob_freeze_size:
+                        logger.debug(
+                            f"Trail: OB ${_ob.low:.0f}–${_ob.high:.0f} skipped in freeze "
+                            f"(size {_ob.high-_ob.low:.0f}pts > {_max_ob_freeze_size:.0f} max)")
                         continue
                     # Freeze zone: OB.low - freeze_atr to OB.high + freeze_atr
                     _zone_lo = _ob.low  - _freeze_atr
@@ -2948,13 +2966,20 @@ class QuantStrategy:
         _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
         if self._ict is not None:
             if self._ict._initialized:
-                _ict_pass = sig.ict_total >= _ict_min
-                ict_gate_lbl = (
-                    f"{'✅' if _ict_pass else '❌'} ICT ({sig.ict_total:.2f} vs min={_ict_min:.2f}) "
-                    f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
-                )
-                if sig.ict_details:
-                    ict_gate_lbl += f" | {sig.ict_details}"
+                # During ACTIVE phase, ICT scores are 0 (not updated in _manage_active).
+                # Show as info-only (no pass/fail icon) to avoid confusing 0.00 display.
+                _ict_scores_valid = (sig.ict_ob + sig.ict_fvg + sig.ict_sweep + sig.ict_session) > 0.0
+                if _ict_scores_valid:
+                    _ict_pass = sig.ict_total >= _ict_min
+                    ict_gate_lbl = (
+                        f"{'✅' if _ict_pass else '❌'} ICT ({sig.ict_total:.2f} vs min={_ict_min:.2f}) "
+                        f"[OB={sig.ict_ob:.1f} FVG={sig.ict_fvg:.1f} Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
+                    )
+                    if sig.ict_details:
+                        ict_gate_lbl += f" | {sig.ict_details}"
+                else:
+                    # ICT not updated this tick (ACTIVE phase) — show neutral status
+                    ict_gate_lbl = "📋 ICT (not evaluated in active position)"
                 gates.append(ict_gate_lbl)
             else:
                 gates.append("⏳ ICT (initializing...)")
