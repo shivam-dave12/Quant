@@ -2943,7 +2943,9 @@ class QuantStrategy:
             f"{'✅' if abs(c)>=thr else '❌'} Composite ({c:+.3f} vs ±{thr:.3f})",
         ]
         # Issue 4 fix: ICT gate shown as an explicit required gate, not just a boost
-        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
+        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
+        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
         if self._ict is not None:
             if self._ict._initialized:
                 _ict_pass = sig.ict_total >= _ict_min
@@ -2980,12 +2982,11 @@ class QuantStrategy:
             return
         sig = self._compute_signals(data_manager)
         if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
-        price = data_manager.get_last_price(); self._log_thinking(sig, price, now)
+        price = data_manager.get_last_price()
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
-        # Update ICT structures (OB, FVG, liquidity, session) every 5s
-        # Then score ICT confluence for the current reversion side
-        # ICT score is used to: (a) boost composite, (b) count as confirming signal
+        # FIX: ICT update runs BEFORE _log_thinking so the thinking display
+        # always reflects the current tick's ICT scores (was stale prev-tick).
         if self._ict is not None:
             try:
                 candles_5m = data_manager.get_candles("5m", limit=100)
@@ -2995,22 +2996,23 @@ class QuantStrategy:
                 self._ict.update(candles_5m, candles_15m, price, now_ms,
                                  candles_1m=candles_1m_ict)
                 ict_side = sig.reversion_side if sig.reversion_side else ("long" if sig.composite > 0 else "short")
-                ict_conf = self._ict.get_confluence(ict_side, price, now_ms)
+                # Pass atr so proximity scoring can compute ATR-normalised distances
+                ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
                 sig.ict_ob = ict_conf.ob_score
                 sig.ict_fvg = ict_conf.fvg_score
                 sig.ict_sweep = ict_conf.sweep_score
                 sig.ict_session = ict_conf.session_score
                 sig.ict_total = ict_conf.total
                 sig.ict_details = ict_conf.details
-                # Boost composite: ICT structural alignment strengthens the signal
-                # max boost = 0.15 (ICT total=1.0 × 0.15 = strongest possible)
                 ict_boost = ict_conf.total * 0.15
                 sig.composite = max(-1.0, min(1.0, sig.composite + (ict_boost if sig.composite > 0 else -ict_boost)))
-                # ICT counts as a confirming signal if total > 0.3
                 if ict_conf.total >= 0.30:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
+
+        # Log AFTER ICT update — display now reflects current tick's ICT scores
+        self._log_thinking(sig, price, now)
 
         # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
         # This is the single most important defense against bleeding in trends.
@@ -3070,7 +3072,9 @@ class QuantStrategy:
         # money placed its orders. Both must agree. Without ICT gate, the bot was
         # entering purely on order-flow divergence with zero structural context.
         # Only enforced when ICT engine is initialized (has processed candles).
-        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
+        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
+        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 # Bug 7 fix: track how long the gate has been continuously blocking
@@ -3151,7 +3155,9 @@ class QuantStrategy:
         if trend_side == "short" and sig.trend_score >= 0: return
 
         # ── Issue 4 fix: Hard ICT gate for trend entries ─────────────────────
-        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
+        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
+        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:
@@ -3273,7 +3279,9 @@ class QuantStrategy:
         # Momentum entries need ICT OBs / FVGs in the retest zone to be valid.
         # A retest without institutional structure is a noise bounce, not a
         # real break-and-retest. The ICT gate prevents entering at random levels.
-        _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.25))
+        _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
+        _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
+        _ict_min = _ict_min_ob if sig.ict_ob > 0.10 else _ict_min_base
         if _ict_min > 0 and self._ict is not None and self._ict._initialized:
             if sig.ict_total < _ict_min:
                 if self._ict_gate_start_time == 0.0:

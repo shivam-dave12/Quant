@@ -679,12 +679,32 @@ class ICTEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def _update_ob_visits(self, price: float, now_ms: int) -> None:
-        visit_cooldown = 300_000  # 5 min between visits
+        """
+        Track how many times price has revisited each OB.
+
+        Visit cooldown is quality-adaptive:
+          BOS + displacement confirmed: 600s (10 min)
+            Rationale: a BOS+DISP OB is institutional accumulation/distribution.
+            Price consolidating IN it for 5-10 minutes is normal and healthy —
+            it doesn't degrade the OB. Using a 5-min cooldown causes a 10-min
+            consolidation to accumulate 2 visits, halving the scoring and making
+            the ICT gate unreachable for the highest-quality setups.
+          BOS only or DISP only: 450s (7.5 min)
+          RAW OB: 300s (5 min) — aggressive degradation for unconfirmed OBs
+        """
         for ob in list(self.order_blocks_bull) + list(self.order_blocks_bear):
-            if ob.is_active(now_ms) and ob.contains_price(price):
-                if now_ms - ob._last_visit_time >= visit_cooldown:
-                    ob.visit_count += 1
-                    ob._last_visit_time = now_ms
+            if not ob.is_active(now_ms) or not ob.contains_price(price):
+                continue
+            # Quality-adaptive cooldown
+            if ob.bos_confirmed and ob.has_displacement:
+                visit_cooldown = 600_000   # 10 min — institutional OB
+            elif ob.bos_confirmed or ob.has_displacement:
+                visit_cooldown = 450_000   # 7.5 min — partially confirmed
+            else:
+                visit_cooldown = 300_000   # 5 min — raw, degrade quickly
+            if now_ms - ob._last_visit_time >= visit_cooldown:
+                ob.visit_count += 1
+                ob._last_visit_time = now_ms
 
     # ══════════════════════════════════════════════════════════════════
     # SESSION / KILLZONE
