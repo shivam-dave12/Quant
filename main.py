@@ -64,6 +64,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Global exception hooks — no silent crash ever again ──────────────────────
+
+def _log_uncaught(exc_type, exc_value, exc_tb):
+    """Log any uncaught main-thread exception before the process dies."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical("💀 UNCAUGHT EXCEPTION — process is dying",
+                    exc_info=(exc_type, exc_value, exc_tb))
+    try:
+        from telegram.notifier import send_telegram_message as _stm
+        import traceback as _tb
+        _stm(f"💀 <b>BOT CRASH</b>\n"
+             f"<code>{''.join(_tb.format_exception(exc_type, exc_value, exc_tb))[-1500:]}</code>")
+    except Exception:
+        pass
+
+sys.excepthook = _log_uncaught
+
+
+def _log_thread_exception(args):
+    """Log any uncaught exception in a daemon/worker thread."""
+    if args.exc_type is SystemExit:
+        return
+    logger.error(
+        "💥 UNCAUGHT THREAD EXCEPTION in thread '%s'",
+        args.thread.name if args.thread else "unknown",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+threading.excepthook = _log_thread_exception
+
 # ── Deferred imports (after path is set up) ───────────────────────────────────
 from exchanges.coinswitch.api          import FuturesAPI  as CoinSwitchAPI
 from exchanges.coinswitch.data_manager import CoinSwitchDataManager
@@ -104,9 +136,6 @@ class QuantBot:
         self.last_health_check_sec = 0.0
         self.last_report_sec       = 0.0
         self.last_heartbeat_sec    = 0.0
-        # Stream supervisor state
-        self._last_stream_restart  = 0.0   # time of last restart attempt
-        self._restart_in_progress  = False  # prevents concurrent restarts
 
         self.data_manager:     Optional[MarketAggregator]  = None
         self.execution_router: Optional[ExecutionRouter]   = None
@@ -343,33 +372,6 @@ class QuantBot:
     # STREAM SUPERVISOR
     # =========================================================================
 
-    def _restart_streams_background(self, reason_str: str) -> None:
-        """
-        Run stream restart + wait_until_ready entirely in a background thread.
-
-        CRITICAL: This must NEVER run in the main loop thread.
-        restart_streams() takes ~5s (REST warmup). wait_until_ready() can block
-        up to READY_TIMEOUT_SEC=120s. Either call in the main thread freezes
-        on_tick, trail management, heartbeats, and signal generation completely.
-        """
-        try:
-            logger.warning("⚠️  Stream issue: %s — restarting in background...", reason_str)
-            send_telegram_message(
-                f"⚠️ STREAM ISSUE: {reason_str}\n🔄 Restarting streams (background)...")
-
-            ok = self.data_manager.restart_streams()
-            if not ok:
-                logger.error("❌ Stream restart failed")
-            else:
-                self.data_manager.wait_until_ready(
-                    timeout_sec=float(config.READY_TIMEOUT_SEC))
-                logger.info("✅ Stream restart complete")
-        except Exception as e:
-            logger.error(f"Stream restart thread error: {e}", exc_info=True)
-        finally:
-            self._restart_in_progress = False
-            self._last_stream_restart = time.time()
-
     def maybe_supervise_streams(self) -> None:
         if not self.data_manager:
             return
@@ -380,41 +382,18 @@ class QuantBot:
             return
         self.last_health_check_sec = now
 
-        # Don't trigger a new restart if one is already running or just finished.
-        # The WS has its own auto-reconnect (back in ~1s); give it 60s before
-        # deciding it truly needs a full restart.
-        _RESTART_COOLDOWN = 60.0
-        if self._restart_in_progress:
-            return
-        if now - self._last_stream_restart < _RESTART_COOLDOWN:
-            return
-
         ws = getattr(self.data_manager, "ws", None)
         if ws is None:
             return
 
-        # Only trigger restart when PRICE is genuinely stale, not just the WS.
-        # The WS auto-reconnects in ~1s; a brief disconnect does NOT warrant a
-        # full restart that blocks the main loop for up to 120s.
-        # Price stale = data is actually missing, not just a transient blip.
+        stale_sec  = float(config.WS_STALE_SECONDS)
+        ws_healthy = ws.is_healthy(timeout_seconds=int(stale_sec))
+
         price_stale_sec = getattr(config, "PRICE_STALE_SECONDS", 90.0)
         price_fresh     = self.data_manager.is_price_fresh(
             max_stale_seconds=price_stale_sec)
 
-        stale_sec  = float(config.WS_STALE_SECONDS)
-        ws_healthy = ws.is_healthy(timeout_seconds=int(stale_sec))
-
         if ws_healthy and price_fresh:
-            return
-
-        # Both must fail before restart — WS alone reconnects itself.
-        # Price stale AND WS unhealthy = genuinely dead feed.
-        if price_fresh and not ws_healthy:
-            # WS dropped but price is still fresh — auto-reconnect is working.
-            # Log at debug level only — this is normal and self-healing.
-            logger.debug(
-                f"WS silent >{stale_sec:.0f}s but price fresh — "
-                "auto-reconnect in progress, no restart needed")
             return
 
         reason = []
@@ -424,14 +403,17 @@ class QuantBot:
             reason.append(f"Price frozen >{price_stale_sec:.0f}s")
         reason_str = " | ".join(reason)
 
-        # Fire restart in a background thread — NEVER block the main loop.
-        self._restart_in_progress = True
-        threading.Thread(
-            target=self._restart_streams_background,
-            args=(reason_str,),
-            daemon=True,
-            name="stream-restart",
-        ).start()
+        logger.warning("⚠️  Stream issue: %s — restarting...", reason_str)
+        send_telegram_message(
+            f"⚠️ STREAM ISSUE: {reason_str}\n🔄 Restarting streams...")
+
+        ok = self.data_manager.restart_streams()
+        if not ok:
+            logger.error("❌ Stream restart failed — entries gated")
+            return
+
+        self.data_manager.wait_until_ready(
+            timeout_sec=float(config.READY_TIMEOUT_SEC))
 
     # =========================================================================
     # PERIODIC REPORT
@@ -457,6 +439,36 @@ class QuantBot:
     # MAIN LOOP
     # =========================================================================
 
+    # =========================================================================
+    # MAIN LOOP WATCHDOG — logs stuck threads before silently dying
+    # =========================================================================
+
+    def _watchdog_loop(self) -> None:
+        """
+        Runs in a daemon thread. Every 5 seconds checks whether the main loop
+        completed its last tick within WATCHDOG_THRESH seconds. If not, dumps
+        a full Python thread stack trace to the log so the freeze is diagnosable.
+        """
+        import traceback as _tb
+        WATCHDOG_THRESH = float(getattr(config, "WATCHDOG_THRESH_SEC", 15.0))
+        while self.running:
+            time.sleep(5.0)
+            if not self.running:
+                break
+            age = time.time() - self._last_tick_time
+            if age > WATCHDOG_THRESH:
+                logger.error(
+                    "🚨 WATCHDOG: main loop has not completed a tick in %.0fs "
+                    "(threshold=%.0fs). Dumping thread stacks:",
+                    age, WATCHDOG_THRESH,
+                )
+                frames = []
+                # Dump all thread stacks
+                for tid, frame in sys._current_frames().items():
+                    stack = "".join(_tb.format_stack(frame))
+                    frames.append(f"Thread id={tid}:\n{stack}")
+                logger.error("THREAD STACKS:\n%s", "\n---\n".join(frames))
+
     def run(self) -> None:
         if not all([self.strategy, self.data_manager,
                     self.execution_router, self.risk_manager]):
@@ -464,10 +476,17 @@ class QuantBot:
             return
 
         logger.info("📊 Main loop active (250ms tick)")
+        self._last_tick_time = time.time()
+
+        # Start watchdog — logs thread stacks if loop freezes >15s
+        _wd = threading.Thread(target=self._watchdog_loop, daemon=True, name="watchdog")
+        _wd.start()
 
         while self.running:
             try:
                 time.sleep(0.25)
+                self._last_tick_time = time.time()
+
                 self.maybe_supervise_streams()
                 self.maybe_send_report()
                 self.maybe_log_heartbeat()
@@ -476,12 +495,21 @@ class QuantBot:
                 if not self.trading_enabled and pos is None:
                     continue
 
+                _t0 = time.time()
                 self.strategy.on_tick(
                     self.data_manager,
                     self.execution_router,
                     self.risk_manager,
                     int(time.time() * 1000),
                 )
+                _tick_ms = (time.time() - _t0) * 1000
+                if _tick_ms > 5000:
+                    logger.warning(
+                        "⚠️ on_tick took %.0fms — possible REST call in main thread",
+                        _tick_ms,
+                    )
+
+                self._last_tick_time = time.time()
 
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt — shutting down")

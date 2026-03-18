@@ -110,7 +110,7 @@ class DeltaAPI:
     api_key    : str  — Delta API key (or env DELTA_API_KEY)
     secret_key : str  — Delta API secret (or env DELTA_SECRET_KEY)
     testnet    : bool — Use testnet endpoint (default False)
-    timeout    : int  — HTTP request timeout seconds (default 30)
+    timeout    : int  — HTTP request timeout seconds (default 10)
 
     All public methods return a plain dict:
       • success: {"success": True,  "result": <payload>, "error": None}
@@ -125,7 +125,7 @@ class DeltaAPI:
         api_key:    Optional[str] = None,
         secret_key: Optional[str] = None,
         testnet:    bool          = False,
-        timeout:    int           = 30,
+        timeout:    int           = 10,  # was 30s — 30s × retries = multi-min main-thread freeze
     ):
         self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
         self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")

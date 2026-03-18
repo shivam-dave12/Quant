@@ -1629,13 +1629,8 @@ class InstitutionalLevels:
             try:
                 _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
                 # Issue 3: use sl_dist (1.0×) as ICT min distance, not min_tp_dist (1.5×)
-                # ICT targets must meet the same R:R floor as quant targets.
-                # Previously used sl_dist*1.0 (1:1), which allowed structurally valid
-                # but risk-inadequate TPs (e.g. nearby swept pool at 1.15R).
-                # ICT structure is authoritative — but only if the trade has positive EV
-                # after costs. REVERSION_MIN_RR (default 1.5) is the minimum viable EV floor.
-                _ict_min_dist = min_tp_dist   # same REVERSION_MIN_RR×sl_dist as quant
-                _ict_max_dist = max_tp_dist
+                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)   # at least 1:1 R:R or 0.5ATR
+                _ict_max_dist = max_tp_dist                       # same upper cap
                 _ict_targets = ict_engine.get_structural_tp_targets(
                     side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist)
                 for _lvl, _sc, _lbl in _ict_targets:
@@ -1907,7 +1902,6 @@ class InstitutionalLevels:
                          peak_price_abs: float = 0.0,
                          trade_mode: str = "reversion",
                          candles_5m: Optional[List[Dict]] = None,
-                         candles_15m: Optional[List[Dict]] = None,
                          initial_sl_dist: float = 0.0,
                          ict_engine=None,
                          now_ms: int = 0) -> Optional[float]:
@@ -2081,41 +2075,8 @@ class InstitutionalLevels:
             except Exception as _e:
                 logger.debug(f"Trail OB anchor error: {_e}")
 
-        # ── 3a. 15m confirmed swing structure (all phases) — HIGHEST STRUCTURAL WEIGHT
-        # 15m swings represent institutional structure confirmation. A confirmed 15m
-        # swing low (for long) means large-timeframe participants defended that level.
-        # SL behind it is the most structurally sound position possible.
-        # Only use CLOSED candles so we trail to confirmed, not forming, structure.
-        if candles_15m and len(candles_15m) >= 4:
-            closed_15m     = candles_15m[:-1]
-            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(
-                closed_15m, min(8, len(closed_15m) - 2))
-            swing_buf_15m  = max(0.35 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.9)
-
-            if pos_side == "long" and sl_15m:
-                # Trail to below the most recent 15m swing low that is:
-                #   - Above current SL (improvement)
-                #   - Below price - min_dist (enough room)
-                valid_15m = [l for l in sl_15m
-                             if current_sl + 0.05 * atr < l < price - min_dist]
-                if valid_15m:
-                    best_15m = max(valid_15m)
-                    candidates.append(best_15m - swing_buf_15m)
-                    logger.debug(
-                        f"Trail: 15m swing low ${best_15m:,.1f} → SL "
-                        f"${best_15m - swing_buf_15m:,.1f}")
-            elif pos_side == "short" and sh_15m:
-                valid_15m = [h for h in sh_15m
-                             if price + min_dist < h < current_sl - 0.05 * atr]
-                if valid_15m:
-                    best_15m = min(valid_15m)
-                    candidates.append(best_15m + swing_buf_15m)
-                    logger.debug(
-                        f"Trail: 15m swing high ${best_15m:,.1f} → SL "
-                        f"${best_15m + swing_buf_15m:,.1f}")
-
-        # ── 3b. 5m confirmed swing structure (all phases) ─────────────────
-        # Secondary structural trail. Only CLOSED candles (confirmed, not forming).
+        # ── 3. 5m confirmed swing structure (all phases) ─────────────────
+        # PRIMARY structural trail. Only CLOSED candles (confirmed, not forming).
         # A higher 5m swing low (long) = market proved a higher low → trail up.
         if candles_5m and len(candles_5m) >= 4:
             closed_5m    = candles_5m[:-1]
@@ -2553,6 +2514,11 @@ class QuantStrategy:
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
+        # Concurrency guards: position sync runs in a background thread so the
+        # main loop (trail, heartbeat, signals) is never blocked waiting for REST.
+        self._pos_sync_in_progress  = False   # ACTIVE sync thread running
+        self._exit_sync_in_progress = False   # EXITING sync thread running
+        self._trail_in_progress     = False   # trail REST call running in background
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
         self._last_reconcile_time = 0.0; self._RECONCILE_SEC = 30.0
@@ -2712,19 +2678,44 @@ class QuantStrategy:
         # ── All blocking exchange I/O below — lock is NOT held ───────────────────
 
         if phase == PositionPhase.ACTIVE:
-            if need_pos_sync:
-                self._sync_position(order_manager)
+            if need_pos_sync and not self._pos_sync_in_progress:
+                # Dispatch position sync to a background thread.
+                # _sync_position calls get_open_position() → Delta REST with a 30s timeout.
+                # Running it in the main thread blocks on_tick, trail management, and the
+                # heartbeat for up to 30s every 30s (100% duty cycle = permanently frozen).
+                self._pos_sync_in_progress = True
                 with self._lock:
-                    self._last_pos_sync = now
-                    if self._pos.is_flat():
-                        return
+                    self._last_pos_sync = now   # stamp immediately so we don't re-trigger
+
+                def _bg_sync_active(om=order_manager):
+                    try:
+                        self._sync_position(om)
+                    except Exception as _e:
+                        logger.error("_sync_position (ACTIVE) error: %s", _e, exc_info=True)
+                    finally:
+                        self._pos_sync_in_progress = False
+
+                threading.Thread(target=_bg_sync_active, daemon=True,
+                                 name="pos-sync-active").start()
+
             self._manage_active(data_manager, order_manager, now)
 
         elif phase == PositionPhase.EXITING:
-            if need_exit_sync:
-                self._sync_position(order_manager)
+            if need_exit_sync and not self._exit_sync_in_progress:
+                self._exit_sync_in_progress = True
                 with self._lock:
                     self._last_exit_sync = now
+
+                def _bg_sync_exit(om=order_manager):
+                    try:
+                        self._sync_position(om)
+                    except Exception as _e:
+                        logger.error("_sync_position (EXITING) error: %s", _e, exc_info=True)
+                    finally:
+                        self._exit_sync_in_progress = False
+
+                threading.Thread(target=_bg_sync_exit, daemon=True,
+                                 name="pos-sync-exit").start()
             if exiting_stuck:
                 logger.warning("⚠️ EXITING stuck >120s — force-finalising to unblock signals")
                 send_telegram_message(
@@ -3313,10 +3304,7 @@ class QuantStrategy:
                     ob_dist = abs(price - ob_sl)
                     ob_valid_side = (side == "long" and ob_sl < price) or \
                                     (side == "short" and ob_sl > price)
-                    # 1.5×ATR floor: aligned with get_ob_sl_level's new minimum.
-                    # A SL at 0.5×ATR would be inside the noise band and stopped on
-                    # the first OB test — exactly the pullback the setup requires.
-                    ob_min_dist = 1.5 * atr
+                    ob_min_dist = 0.5 * atr   # must be at least 0.5×ATR from entry
                     ob_max_dist = price * QCfg.MAX_SL_PCT()  # hard upper cap
                     if ob_valid_side and ob_min_dist <= ob_dist <= ob_max_dist:
                         # ICT OB primary — this is the institutional anchor
@@ -3860,26 +3848,30 @@ class QuantStrategy:
                         logger.info(
                             f"⏰ Max hold + ${profit:.2f} profit → tightening SL "
                             f"${pos.sl_price:,.2f} → ${tight_sl:,.2f} (price - {tight_mult}×ATR)")
-                        es = "sell" if pos.side == "long" else "buy"
-                        result = order_manager.replace_stop_loss(
-                            existing_sl_order_id=pos.sl_order_id,
-                            side=es, quantity=pos.quantity,
-                            new_trigger_price=tight_sl)
-                        if result is None:
-                            logger.warning("🚨 SL fired during tighten")
-                            self._record_exchange_exit(None)
-                            return
-                        if result and isinstance(result, dict) and "error" not in result:
-                            self._pos.sl_price = tight_sl
-                            self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
-                            self.current_sl_price = tight_sl
-                            if not pos.trail_active:
-                                self._pos.trail_active = True
-                            send_telegram_message(
-                                f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
-                                f"Profit: ${profit:+.2f} → protecting with tight SL\n"
-                                f"SL: ${tight_sl:,.2f} (ATR×{tight_mult} from price)\n"
-                                f"<i>Trade rides with tight SL — no forced exit</i>")
+                        # REST call in background — replace_stop_loss can block 30-60s
+                        _mh_es = "sell" if pos.side == "long" else "buy"
+                        _mh_oid = pos.sl_order_id; _mh_qty = pos.quantity
+                        _mh_tsl = tight_sl; _mh_mult = tight_mult; _mh_pnl = profit
+                        def _bg_mh_sl(om=order_manager):
+                            try:
+                                r = om.replace_stop_loss(
+                                    existing_sl_order_id=_mh_oid, side=_mh_es,
+                                    quantity=_mh_qty, new_trigger_price=_mh_tsl)
+                                if r is None:
+                                    logger.warning("🚨 SL fired during max-hold tighten")
+                                    return
+                                if r and isinstance(r, dict) and "error" not in r:
+                                    self._pos.sl_price = _mh_tsl
+                                    self._pos.sl_order_id = r.get("order_id", _mh_oid)
+                                    self.current_sl_price = _mh_tsl
+                                    self._pos.trail_active = True
+                                    send_telegram_message(
+                                        f"⏰ <b>MAX HOLD — TIGHTENED SL</b>\n"
+                                        f"Profit: ${_mh_pnl:+.2f} → tight SL\n"
+                                        f"SL: ${_mh_tsl:,.2f} (ATR×{_mh_mult} from price)")
+                            except Exception as _e:
+                                logger.error("Max-hold SL error: %s", _e, exc_info=True)
+                        threading.Thread(target=_bg_mh_sl, daemon=True, name="maxhold-sl").start()
                     # Fall through to trailing SL — do NOT return
 
                 else:
@@ -3911,9 +3903,30 @@ class QuantStrategy:
                     return
 
         # ── Trailing SL ──────────────────────────────────────────────────────
+        # _update_trailing_sl calls replace_stop_loss → REST (edit/cancel/place).
+        # With 10s API timeout × retries this can block 30-60s in the main thread.
+        # Dispatch to a background thread with a guard so:
+        #   a) The main loop never blocks on trail REST calls.
+        #   b) Only one trail operation is in flight at a time (no duplicate SL edits).
         if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
-            if self._update_trailing_sl(order_manager, data_manager, price, now): return
+            if not self._trail_in_progress:
+                self._trail_in_progress = True
+                _snap_om  = order_manager   # capture for closure
+                _snap_dm  = data_manager
+                _snap_px  = price
+                _snap_now = now
+
+                def _bg_trail():
+                    try:
+                        self._update_trailing_sl(_snap_om, _snap_dm, _snap_px, _snap_now)
+                    except Exception as _te:
+                        logger.error("Trail background error: %s", _te, exc_info=True)
+                    finally:
+                        self._trail_in_progress = False
+
+                threading.Thread(target=_bg_trail, daemon=True,
+                                 name="trail-sl").start()
 
     def _check_thesis(self, pos, price, sig, atr) -> Tuple[bool, str]:
         """
@@ -4017,25 +4030,23 @@ class QuantStrategy:
         except Exception: candles_1m = []
         try: candles_5m = data_manager.get_candles("5m", limit=30)
         except Exception: candles_5m = []
-        # 15m candles: primary structural trail anchor (highest weight).
-        # Always fetched regardless of ICT engine state.
-        try: candles_15m = data_manager.get_candles("15m", limit=30)
-        except Exception: candles_15m = []
         try: orderbook = data_manager.get_orderbook()
         except Exception: orderbook = {"bids": [], "asks": []}
 
         hold_secs = now - pos.entry_time
         now_ms = int(now * 1000)
 
-        # ── Issue 2 fix: Refresh ICT engine with live 1m/5m/15m structure ─────
+        # ── Issue 2 fix: Refresh ICT engine with live 1m/5m structure ────────
         # ROOT CAUSE: ICT update() only ran in _evaluate_entry() (FLAT phase).
         # During an active position, _manage_active() runs instead, so the ICT
         # engine never saw new OBs, BOS events, or FVGs formed after entry.
         # Zone-freeze was comparing price against entry-time OBs — some of which
         # might permanently overlap the trail zone, freezing the trail forever.
         # Fix: force ICT update here with live candles before every trail decision.
+        # Now also passes candles_1m so fresh 1m OBs are detected for trail anchoring.
         if self._ict is not None:
             try:
+                candles_15m = data_manager.get_candles("15m", limit=30)
                 self._ict.update(candles_5m, candles_15m, price, now_ms,
                                  candles_1m=candles_1m)
             except Exception as _ict_refresh_e:
@@ -4049,7 +4060,6 @@ class QuantStrategy:
             candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
             hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
             trade_mode=pos.trade_mode, candles_5m=candles_5m,
-            candles_15m=candles_15m,
             initial_sl_dist=pos.initial_sl_dist,
             ict_engine=self._ict,
             now_ms=now_ms)

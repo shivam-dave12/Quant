@@ -431,27 +431,6 @@ class _DeltaAdapter:
         # Pass symbol — Delta API resolves product_id internally via _symbol_to_product_id
         return self.api.set_leverage(symbol=self.symbol, leverage=leverage)
 
-    def edit_order(self, order_id: str, new_trigger_price: float) -> Optional[Dict]:
-        """
-        Atomically amend an existing stop order's trigger price via
-        PUT /v2/orders/{id}.  Used by replace_stop_loss / replace_take_profit
-        for Delta bracket child SL/TP orders, which cannot be cancelled and
-        re-placed independently — only edited in-place.
-        """
-        self.limiter.wait()
-        resp = self.api.edit_order(
-            order_id=order_id,
-            stop_price=new_trigger_price,
-        )
-        if not isinstance(resp, dict) or not resp.get("success"):
-            return None
-        result = resp.get("result") or {}
-        return {
-            "order_id":  result.get("order_id", order_id),
-            "status":    result.get("status", ""),
-            "_raw":      result,
-        }
-
     def normalise_position(self, raw) -> Optional[Dict]:
         """Turn Delta position response into a canonical dict."""
         # raw may be a list (from get_positions result) or a single dict
@@ -511,10 +490,10 @@ class OrderManager:
     Inject a CoinSwitchAPI or DeltaAPI; this class handles the rest.
     """
 
-    _MAX_RETRIES       = 3
-    _RETRY_BASE_SLEEP  = 3.0
-    _MAX_401_RETRIES   = 3
-    _401_RETRY_DELAY   = 2.0
+    _MAX_RETRIES       = 2     # was 3 — 3 attempts × 30s timeout = 90s minimum block
+    _RETRY_BASE_SLEEP  = 1.0   # was 3.0 — base sleep for exponential backoff
+    _MAX_401_RETRIES   = 2     # was 3 — auth errors rarely fix themselves
+    _401_RETRY_DELAY   = 1.0   # was 2.0
 
     def __init__(self, api, exchange_name: str = "coinswitch") -> None:
         exch = exchange_name.lower()
@@ -635,11 +614,11 @@ class OrderManager:
                                 self._adapter.extract_status(data)
                     return data
                 if attempt < retry_count - 1:
-                    time.sleep(2.0 * (attempt + 1))
+                    time.sleep(1.0)   # was 2*(attempt+1) — reduced to limit blocking
             except Exception as e:
                 logger.error(f"get_order_status error attempt {attempt+1}: {e}")
                 if attempt < retry_count - 1:
-                    time.sleep(2.0)
+                    time.sleep(1.0)
         return None
 
     def get_order_status_safe(self, order_id: str) -> str:
@@ -1028,43 +1007,12 @@ class OrderManager:
     def replace_stop_loss(self, existing_sl_order_id: Optional[str],
                           side: str, quantity: float,
                           new_trigger_price: float) -> Optional[Dict]:
-        """
-        Move trailing SL to new_trigger_price.
-
-        Strategy:
-          1. For Delta bracket child SL orders: attempt atomic PUT /v2/orders/{id}
-             edit first.  Bracket children cannot be independently cancelled — only
-             amended in-place.  Cancel returns FAILED → trail never moves (old bug).
-          2. If adapter has no edit_order (CoinSwitch), or if edit fails, fall back
-             to cancel-then-place-new (standard path).
-        """
         try:
             if existing_sl_order_id:
-                # Guard: if already filled, SL fired — report to strategy
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
-                    logger.info(f"SL {existing_sl_order_id} already {existing_status} — position closed")
+                    logger.info(f"SL {existing_sl_order_id} already {existing_status}")
                     return None
-
-                # ── Path A: atomic edit (Delta only) ──────────────────────────
-                if hasattr(self._adapter, "edit_order"):
-                    result = self._adapter.edit_order(existing_sl_order_id, new_trigger_price)
-                    if result and not result.get("_error"):
-                        oid = result.get("order_id", existing_sl_order_id)
-                        logger.info(f"✅ SL edited (atomic) → {oid} @ ${new_trigger_price:,.2f}")
-                        self._record_order(oid, {
-                            "order_id": oid, "side": side, "type": "STOP_LOSS",
-                            "quantity": quantity, "trigger_price": new_trigger_price,
-                            "status": "PENDING",
-                            "timestamp": datetime.now().isoformat(),
-                        })
-                        return result
-                    logger.warning(
-                        f"SL atomic edit failed for {existing_sl_order_id} "
-                        f"— falling back to cancel+replace"
-                    )
-
-                # ── Path B: cancel + place new (CoinSwitch / edit fallback) ───
                 if existing_status == "PENDING":
                     result = self.cancel_order(existing_sl_order_id)
                     if result in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
@@ -1076,7 +1024,7 @@ class OrderManager:
             new_sl = self.place_stop_loss(side=side, quantity=quantity,
                                           trigger_price=new_trigger_price)
             if new_sl:
-                logger.info(f"✅ SL replaced (cancel+place) → {new_sl['order_id']} "
+                logger.info(f"✅ SL replaced → {new_sl['order_id']} "
                             f"@ ${new_trigger_price:,.2f}")
                 return new_sl
             return {"error": "PLACE_FAILED"}
@@ -1087,35 +1035,11 @@ class OrderManager:
     def replace_take_profit(self, existing_tp_order_id: Optional[str],
                             side: str, quantity: float,
                             new_trigger_price: float) -> Optional[Dict]:
-        """
-        Move TP to new_trigger_price using atomic edit where available.
-        Same pattern as replace_stop_loss — see that method for rationale.
-        """
         try:
             if existing_tp_order_id:
                 existing_status = self.get_order_status_safe(existing_tp_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
                     return None
-
-                # ── Path A: atomic edit (Delta only) ──────────────────────────
-                if hasattr(self._adapter, "edit_order"):
-                    result = self._adapter.edit_order(existing_tp_order_id, new_trigger_price)
-                    if result and not result.get("_error"):
-                        oid = result.get("order_id", existing_tp_order_id)
-                        logger.info(f"✅ TP edited (atomic) → {oid} @ ${new_trigger_price:,.2f}")
-                        self._record_order(oid, {
-                            "order_id": oid, "side": side, "type": "TAKE_PROFIT",
-                            "quantity": quantity, "trigger_price": new_trigger_price,
-                            "status": "PENDING",
-                            "timestamp": datetime.now().isoformat(),
-                        })
-                        return result
-                    logger.warning(
-                        f"TP atomic edit failed for {existing_tp_order_id} "
-                        f"— falling back to cancel+replace"
-                    )
-
-                # ── Path B: cancel + place new ─────────────────────────────────
                 if existing_status == "PENDING":
                     result = self.cancel_order(existing_tp_order_id)
                     if result in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
@@ -1127,7 +1051,7 @@ class OrderManager:
             new_tp = self.place_take_profit(side=side, quantity=quantity,
                                             trigger_price=new_trigger_price)
             if new_tp:
-                logger.info(f"✅ TP replaced (cancel+place) → {new_tp['order_id']} "
+                logger.info(f"✅ TP replaced → {new_tp['order_id']} "
                             f"@ ${new_trigger_price:,.2f}")
                 return new_tp
             return {"error": "PLACE_FAILED"}

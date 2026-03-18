@@ -753,13 +753,20 @@ class ICTEngine:
                          key=lambda x: x.strength, reverse=True):
             if ob.contains_price(price) or ob.in_optimal_zone(price):
                 in_ote = ob.in_optimal_zone(price)
-                base = 0.9 if in_ote else 0.6
+                # Base score: OTE (61.8-79% zone) > body touch
+                base = 0.85 if in_ote else 0.55
+                # Virgin multiplier: unvisited OB scores higher
                 vm = ob.virgin_multiplier()
-                bos_bonus = 0.1 if ob.bos_confirmed else 0.0
-                ob_score = min(base * vm + bos_bonus, 1.0)
+                # Visit penalty: each retest weakens the level
+                visit_penalty = max(0.5, 1.0 - ob.visit_count * 0.25)
+                # BOS/displacement bonus: confirmed structural break = institutional
+                bos_bonus = 0.15 if ob.bos_confirmed else 0.0
+                disp_bonus = 0.10 if ob.has_displacement else 0.0
+                ob_score = min(base * vm * visit_penalty + bos_bonus + disp_bonus, 1.0)
                 active_ob = ob
                 tag = "OTE" if in_ote else "BODY"
-                details.append(f"OB_{tag} ${ob.low:.0f}-${ob.high:.0f} s={ob.strength:.0f} v={ob.visit_count}")
+                quality = "BOS+DISP" if (ob.bos_confirmed and ob.has_displacement) else                           ("BOS" if ob.bos_confirmed else ("DISP" if ob.has_displacement else "RAW"))
+                details.append(f"OB_{tag}_{quality} ${ob.low:.0f}-${ob.high:.0f} s={ob.strength:.0f} v={ob.visit_count} score={ob_score:.2f}")
                 break
 
         # ── 2. FVG scoring ────────────────────────────────────────────
@@ -810,11 +817,27 @@ class ICTEngine:
             session_score = 0.1
 
         # ── Weighted total ────────────────────────────────────────────
-        # OB has highest weight because it's the most reliable ICT structure
-        total = (ob_score * 0.35 +
-                 fvg_score * 0.25 +
+        # Weights reflect institutional significance:
+        #   OB:      0.45 — highest conviction: where orders were placed
+        #   FVG:     0.25 — imbalance that attracts price
+        #   Sweep:   0.25 — liquidity raid confirming reversal intent
+        #   Session: 0.05 — timing context only, not structure
+        #
+        # Design principle: session timing alone CANNOT pass the entry gate.
+        # Real ICT entries require actual structural confluence (OB or sweep),
+        # not just "it's the NY session." The old 0.15 session weight allowed
+        # FVG + session to nearly pass, and OB (body) + session to easily pass
+        # even when the OB had no displacement or BOS confirmation.
+        total = (ob_score    * 0.45 +
+                 fvg_score   * 0.25 +
                  sweep_score * 0.25 +
-                 session_score * 0.15)
+                 session_score * 0.05)
+
+        # Structural presence guard: if no OB AND no sweep, cap total at 0.30
+        # so that FVG-only or FVG+session setups don't trigger the entry gate.
+        # An FVG without OB or sweep context is an imbalance, not a trade setup.
+        if ob_score < 0.05 and sweep_score < 0.05:
+            total = min(total, 0.30)
 
         return ICTConfluence(
             ob_score=ob_score,
@@ -861,12 +884,7 @@ class ICTEngine:
         fvg_buf  = 0.2 * atr
         liq_buf  = 0.3 * atr
         max_dist = 4.0 * atr
-        # Minimum 1.5×ATR: the SL must survive a full OB test pullback.
-        # An OB-anchored SL at 0.5×ATR is inside the normal noise band and
-        # will be stopped out on the very pullback that validates the setup.
-        # 1.5×ATR keeps the SL on the structurally correct side of the OB
-        # while giving the position room to breathe through an OB test.
-        min_dist = 1.5 * atr
+        min_dist = 0.5 * atr
 
         obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         candidates = []

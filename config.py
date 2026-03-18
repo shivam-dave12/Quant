@@ -109,7 +109,7 @@ RATE_LIMIT_ORDERS        = 15
 
 # ── SL infrastructure ─────────────────────────────────────────────────────────
 SL_BUFFER_TICKS              = 5
-MIN_SL_DISTANCE_PCT          = 0.003
+MIN_SL_DISTANCE_PCT          = 0.001  # legacy pct floor; actual SL uses 1.0×ATR minimum
 MAX_SL_DISTANCE_PCT          = 0.035
 SL_MIN_IMPROVEMENT_PCT       = 0.001
 SL_RATCHET_ONLY              = True
@@ -132,9 +132,9 @@ QUANT_SLIPPAGE_TOLERANCE       = 0.0005
 QUANT_VWAP_ENTRY_ATR_MULT      = 1.2
 QUANT_CVD_DIVERGENCE_MIN       = 0.15
 QUANT_OB_CONFIRM_MIN           = 0.10
-QUANT_COMPOSITE_ENTRY_MIN      = 0.30
+QUANT_COMPOSITE_ENTRY_MIN      = 0.35  # post-boost composite; pre-boost gate is QUANT_MIN_RAW_COMPOSITE
 QUANT_EXIT_REVERSAL_THRESH     = 0.40
-QUANT_CONFIRM_TICKS            = 2
+QUANT_CONFIRM_TICKS            = 3    # code enforces max(CONFIRM_TICKS,5) for reversion
 QUANT_SL_SWING_LOOKBACK        = 12
 QUANT_SL_BUFFER_ATR_MULT       = 0.4
 QUANT_TP_VWAP_FRACTION         = 0.65
@@ -180,7 +180,7 @@ QUANT_W_OB                     = 0.20
 QUANT_W_TICK_FLOW              = 0.15
 QUANT_W_VOL_EXHAUSTION         = 0.10
 QUANT_HTF_ENABLED              = True
-QUANT_HTF_VETO_STRENGTH        = 0.70
+QUANT_HTF_VETO_STRENGTH        = 0.35  # composite veto (trend entries); reversion uses per-TF
 QUANT_OB_DEPTH_LEVELS          = 5
 QUANT_OB_HIST_LEN              = 60
 QUANT_TICK_AGG_WINDOW_SEC      = 30.0
@@ -267,7 +267,18 @@ KZ_NY_NY_END                = 10
 # Minimum ICT structural confluence score required before any trade entry.
 # Ensures the bot never enters purely on quant signals without ICT structure.
 # Set to 0.0 to disable (quant-only mode).
-ICT_MIN_SCORE_FOR_ENTRY     = 0.25
+ICT_MIN_SCORE_FOR_ENTRY     = 0.45   # was 0.25 — session alone (0.15) trivially passed
+ICT_REQUIRE_OB_OR_FVG       = True   # entry only when price is inside an active OB or FVG
+
+# HTF veto — per-timeframe (reversion entries)
+# LONG veto:  15m < -0.35  OR  (15m < -0.20 AND 4h < -0.20)
+# SHORT veto: 15m > +0.35  OR  (15m > +0.20 AND 4h > +0.20)
+QUANT_HTF_15M_VETO           = 0.35  # 15m threshold for single-TF veto
+QUANT_HTF_BOTH_VETO          = 0.20  # threshold when both TFs align against trade
+
+# Quant signal quality gates (Gate C)
+QUANT_MIN_RAW_COMPOSITE      = 0.35  # pre-ICT-boost composite floor
+QUANT_MIN_CONFIRMING         = 4     # minimum confirming signals (of 5 quant + ICT)
 
 # ── Legacy aliases (strategy code reads these) ────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE   # used by CoinSwitch order_manager path
