@@ -3307,13 +3307,57 @@ class QuantStrategy:
             if self._ict._initialized:
                 _ict_scores_valid = (sig.ict_ob + sig.ict_fvg + sig.ict_sweep + sig.ict_session) > 0.0
                 if _ict_scores_valid:
+                    # G FIX: sig.ict_* may hold scores computed for the OPPOSITE
+                    # direction (e.g. AMD bearish → ict_side=SHORT, but we are
+                    # evaluating a LONG reversion).  If we pass those scores to
+                    # ICTEntryGate.evaluate("long", sig, ...) the gate reads SHORT
+                    # confluence as LONG support — potentially passing a tier check
+                    # that should fail, or showing a misleading BLOCKED reason.
+                    #
+                    # Fix: when ict_direction opposes reversion_side, re-compute
+                    # ICT confluence for reversion_side locally for this display call.
+                    # We patch sig.ict_* temporarily (single-threaded tick call),
+                    # evaluate the gate, then restore the originals.  sig.composite
+                    # and sig.ict_boost_signed are NOT touched — they reflect the
+                    # directional boost correctly applied in _evaluate_entry.
+                    _disp_rev_side = sig.reversion_side or "long"
+                    _ict_dir_vs_vwap = sig.ict_direction  # +1=long, -1=short, 0=unset
+                    _ict_opposes_disp = (
+                        (_ict_dir_vs_vwap < 0 and _disp_rev_side == "long") or
+                        (_ict_dir_vs_vwap > 0 and _disp_rev_side == "short")
+                    )
+
+                    # Save originals for restore
+                    _orig_ict_ob    = sig.ict_ob
+                    _orig_ict_fvg   = sig.ict_fvg
+                    _orig_ict_sweep = sig.ict_sweep
+                    _orig_ict_sess  = sig.ict_session
+                    _orig_ict_total = sig.ict_total
+                    _orig_ict_det   = sig.ict_details
+                    _disp_note      = ""
+
+                    if _ict_opposes_disp:
+                        try:
+                            _now_ms_d = int(now * 1000) if now < 1e12 else int(now)
+                            _rc = self._ict.get_confluence(
+                                _disp_rev_side, price, _now_ms_d, atr=sig.atr)
+                            sig.ict_ob      = _rc.ob_score
+                            sig.ict_fvg     = _rc.fvg_score
+                            sig.ict_sweep   = _rc.sweep_score
+                            sig.ict_session = _rc.session_score
+                            sig.ict_total   = _rc.total
+                            sig.ict_details = _rc.details
+                            _disp_note = f" [disp re-comp for {_disp_rev_side.upper()}]"
+                        except Exception:
+                            pass  # fall through: display original scores with a warning
+
                     _tier_display = "B"
                     _tier_reason_d = ""
                     if _ICT_TRADE_ENGINE_AVAILABLE:
                         try:
-                            _qh_d = self._get_quant_helpers(sig, sig.reversion_side or "long")
+                            _qh_d = self._get_quant_helpers(sig, _disp_rev_side)
                             _td, _, _tdr = ICTEntryGate.evaluate(
-                                sig.reversion_side or "long", sig,
+                                _disp_rev_side, sig,
                                 self._active_sweep_setup, price, _qh_d)
                             _tier_display  = _td
                             _tier_reason_d = _tdr
@@ -3321,31 +3365,37 @@ class QuantStrategy:
                             _tier_display  = "?"
                             _tier_reason_d = ""
 
+                    # Restore originals — must happen before any further sig use
+                    sig.ict_ob      = _orig_ict_ob
+                    sig.ict_fvg     = _orig_ict_fvg
+                    sig.ict_sweep   = _orig_ict_sweep
+                    sig.ict_session = _orig_ict_sess
+                    sig.ict_total   = _orig_ict_total
+                    sig.ict_details = _orig_ict_det
+
                     _tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
                                    "BLOCKED": "⛔", "?": "❓"}
 
                     # B1 FIX: show the signed ICT direction so the arrow and
                     # boost value reflect the actual composite contribution.
-                    # Previously Σ=0.33 with ▲ looked bullish even when the OB
-                    # was above price and the contribution was SHORT (negative).
                     _ict_dir_arrow = ("▲LONG"  if sig.ict_direction > 0
                                       else ("▼SHORT" if sig.ict_direction < 0
                                             else "─UNSET"))
                     _boost_str = f"{sig.ict_boost_signed:+.3f}" if sig.ict_direction != 0 else "n/a"
 
-                    # B6 FIX: OB raw accumulator can exceed 1.0 (sum of quality
-                    # multipliers across nearby OBs).  Show both the normalised
-                    # [0-1] value used in the total and the raw accumulator so
-                    # OB=1.4raw / 0.70norm is unambiguous.
-                    _ob_norm  = min(sig.ict_ob  / 2.0, 1.0)
-                    _fvg_norm = min(sig.ict_fvg / 1.5, 1.0)
+                    # B6 FIX: OB raw accumulator can exceed 1.0.  Show normalised
+                    # and raw so OB=1.4raw / 0.70norm is unambiguous.
+                    # Use patched-then-restored originals for display (correct side
+                    # if recompute succeeded, original side if it failed).
+                    _ob_norm  = min(_orig_ict_ob  / 2.0, 1.0)
+                    _fvg_norm = min(_orig_ict_fvg / 1.5, 1.0)
 
                     ict_gate_lbl = (
-                        f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}] "
+                        f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}]{_disp_note} "
                         f"Σ={sig.ict_total:.2f} ({_ict_dir_arrow} boost={_boost_str}) "
-                        f"[OB={_ob_norm:.2f}({sig.ict_ob:.1f}raw) "
-                        f"FVG={_fvg_norm:.2f}({sig.ict_fvg:.1f}raw) "
-                        f"Swp={sig.ict_sweep:.1f} KZ={sig.ict_session:.1f}]"
+                        f"[OB={_ob_norm:.2f}({_orig_ict_ob:.1f}raw) "
+                        f"FVG={_fvg_norm:.2f}({_orig_ict_fvg:.1f}raw) "
+                        f"Swp={_orig_ict_sweep:.1f} KZ={_orig_ict_sess:.1f}]"
                     )
                     if _tier_reason_d:
                         ict_gate_lbl += f"\n    {_tier_reason_d[:80]}"
@@ -3605,8 +3655,21 @@ class QuantStrategy:
                 sig.ict_boost_signed = ict_boost_signed
                 sig.ict_direction    = ict_direction
 
-                # Only count ICT as a confirming signal when aligned with ICT direction
-                if ict_conf.total >= 0.30:
+                # F FIX: Only count ICT as a confirming signal when its direction
+                # AGREES with the VWAP reversion side.
+                #
+                # Previously the check was `ict_conf.total >= 0.30` with no
+                # direction guard.  When ict_side="short" (AMD bearish MANIPULATION)
+                # and reversion_side="long" (VWAP says price is below), a SHORT
+                # confluence score of 0.52 was added to n_confirming — counted as
+                # a LONG signal confirmer.  The log showed "4/5 confluence" for a
+                # LONG where one of the 4 was actively bearish ICT structure.
+                #
+                # Correct rule: ICT counts as a confirming signal only when the
+                # ICT structural direction agrees with the direction being traded.
+                # For sweep entries (where ict_side drives the trade) this is
+                # already enforced by ICTEntryGate — n_confirming is irrelevant.
+                if ict_conf.total >= 0.30 and ict_side == sig.reversion_side:
                     sig.n_confirming = min(sig.n_confirming + 1, 6)
                 # Store the resolved ICT side for downstream use
                 sig._ict_evaluated_side = ict_side  # type: ignore[attr-defined]
