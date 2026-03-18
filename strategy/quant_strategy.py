@@ -50,6 +50,11 @@ import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.
 import config
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
+import html as _html_mod
+
+def _esc_html(s) -> str:
+    """Escape <, >, & so dynamic strings are safe inside Telegram HTML messages."""
+    return _html_mod.escape(str(s) if s else "", quote=False)
 try:
     from strategy.ict_engine import ICTEngine, ICTConfluence
     _ICT_AVAILABLE = True
@@ -2518,6 +2523,7 @@ class QuantStrategy:
         self._last_fed_trade_ts = 0.0
         self._last_reconcile_time = 0.0; self._RECONCILE_SEC = 30.0
         self._reconcile_pending = False; self._reconcile_data = None
+        self._reconcile_started_at = 0.0   # watchdog: detects stuck reconcile threads
         self._total_trades = 0; self._winning_trades = 0; self._total_pnl = 0.0
         self._trade_history: List[Dict] = []   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
@@ -2657,11 +2663,23 @@ class QuantStrategy:
 
             # Spawn reconcile background thread if due (non-blocking)
             if not self._reconcile_pending and now - self._last_reconcile_time >= self._RECONCILE_SEC:
-                self._last_reconcile_time = now; self._reconcile_pending = True
+                self._last_reconcile_time = now
+                self._reconcile_pending = True
+                self._reconcile_started_at = now
                 threading.Thread(
                     target=self._reconcile_query_thread,
                     args=(order_manager,), daemon=True,
                 ).start()
+            elif self._reconcile_pending and (now - self._reconcile_started_at) > 30.0:
+                # Watchdog: reconcile thread has been pending >30s — it either hung or
+                # raised before clearing the flag.  Force-clear so the next cycle
+                # can spawn a fresh thread and logging/signals are not stalled.
+                logger.warning(
+                    f"⚠️ Reconcile thread stuck for {now - self._reconcile_started_at:.0f}s "
+                    "— force-clearing pending flag"
+                )
+                self._reconcile_pending = False
+                self._reconcile_started_at = now
 
             # Snapshot all decision-relevant state while locked
             phase             = self._pos.phase
@@ -2952,7 +2970,7 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} REVERSION]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"— no structural confluence [{sig.ict_details}]")
+                        f"— no structural confluence [{_esc_html(sig.ict_details)}]")
                 # Bug 7 fix: Telegram alert after 15 min continuous block
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
@@ -2960,7 +2978,7 @@ class QuantStrategy:
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
+                        f"Details: {_esc_html(sig.ict_details)}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_long = self._confirm_short = 0
                 return
@@ -3031,14 +3049,14 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{trend_side.upper()} TREND]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{sig.ict_details}]")
+                        f"[{_esc_html(sig.ict_details)}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
+                        f"Details: {_esc_html(sig.ict_details)}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
@@ -3153,14 +3171,14 @@ class QuantStrategy:
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} MOMENTUM]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} "
-                        f"[{sig.ict_details}]")
+                        f"[{_esc_html(sig.ict_details)}]")
                 if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                     self._ict_gate_alerted = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"No ICT structural confluence for ≥15 min.\n"
                         f"Current score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"Details: {sig.ict_details}\n"
+                        f"Details: {_esc_html(sig.ict_details)}\n"
                         f"<i>Bot is alive — waiting for institutional structure.</i>")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
@@ -3712,7 +3730,7 @@ class QuantStrategy:
         # ICT context line
         ict_line = ""
         if sig.ict_total > 0.01:
-            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{sig.ict_details}]"
+            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{_esc_html(sig.ict_details)}]"
         mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
         send_telegram_message(
             f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]</b>\n"

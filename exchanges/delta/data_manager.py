@@ -374,9 +374,17 @@ class DeltaDataManager:
     def _on_trade(self, data: Dict) -> None:
         try:
             with self._lock:
-                price = float(data.get("p", 0) or 0)
-                qty   = float(data.get("q", 0) or 0)
-                side  = "sell" if bool(data.get("m")) else "buy"
+                # Delta public trades channel uses "price"/"size"/"side" fields.
+                # "p"/"q"/"m" is the aggregated ticker format — different channel.
+                # Support both formats defensively.
+                price = float(data.get("price") or data.get("p") or 0)
+                qty   = float(data.get("size")  or data.get("q") or 0)
+                side_raw = data.get("side", "")
+                if side_raw:
+                    side = "buy" if str(side_raw).lower() == "buy" else "sell"
+                else:
+                    # Fallback: "m" = True means buyer was maker = sell aggressor
+                    side = "sell" if bool(data.get("m")) else "buy"
                 if price > 0:
                     self._last_price = price
                     self._last_price_update_time = time.time()

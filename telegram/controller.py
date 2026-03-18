@@ -30,6 +30,7 @@ import logging
 import time
 import threading
 import requests
+import html as _html
 from typing import Optional
 from datetime import datetime, timezone
 import sys
@@ -37,8 +38,15 @@ import sys
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
 import config
+from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
+
+def _esc(s) -> str:
+    """Escape <, >, & in dynamic strings before embedding in Telegram HTML."""
+    if s is None:
+        return ""
+    return _html.escape(str(s), quote=False)
 
 bot_instance = None
 bot_thread   = None
@@ -88,6 +96,11 @@ class TelegramBotController:
                 return False
 
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
+        # Sanitize before every send so controller-built messages are treated
+        # identically to notifier-queue messages — strips unsupported tags and
+        # escapes bare < / > that would cause 400 "Unsupported start tag" errors.
+        if parse_mode == "HTML":
+            text = _sanitize_html(text)
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
             "chat_id":                  self.chat_id,
@@ -334,10 +347,10 @@ class TelegramBotController:
             lines.append("<b>Market Context</b>")
             lines.append(f"  Price: ${price:,.2f}  VWAP: ${vwap:,.2f}  Dev: {dev_atr:+.2f}ATR")
             lines.append(f"  ATR(5m): ${atr:.1f}  ({atr_pct:.0%} pctile)")
-            lines.append(f"  Regime: <b>{regime_str}</b>  (conf={conf:.0%})")
-            lines.append(f"  ADX: {adx_val:.1f}  +DI: {pdi:.1f}  -DI: {mdi:.1f}  dir={trend_dir}")
-            lines.append(f"  HTF: {htf_str}  (4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
-            lines.append(f"  Session: {sess}{kz_str}")
+            lines.append(f"  Regime: <b>{_esc(regime_str)}</b>  (conf={conf:.0%})")
+            lines.append(f"  ADX: {adx_val:.1f}  +DI: {pdi:.1f}  -DI: {mdi:.1f}  dir={_esc(trend_dir)}")
+            lines.append(f"  HTF: {_esc(htf_str)}  (4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
+            lines.append(f"  Session: {_esc(sess)}{_esc(kz_str)}")
 
             # ── Risk gate ─────────────────────────────────────────────────────
             lines.append("")
@@ -354,7 +367,7 @@ class TelegramBotController:
                     f"({daily_trades}/{max_trades} trades  "
                     f"consec_loss={consec_loss}  today=${daily_pnl:+.2f})")
             else:
-                lines.append(f"🚫 Risk gate: <b>BLOCKED</b>  → {risk_reason}")
+                lines.append(f"🚫 Risk gate: <b>BLOCKED</b>  → {_esc(risk_reason)}")
 
             # ── Cooldown ──────────────────────────────────────────────────────
             cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
@@ -434,7 +447,7 @@ class TelegramBotController:
                     f"OB={sig.ict_ob:.2f}  FVG={sig.ict_fvg:.2f}  "
                     f"Sweep={sig.ict_sweep:.2f}  KZ={sig.ict_session:.2f}")
                 if sig.ict_details:
-                    lines.append(f"     → {sig.ict_details}")
+                    lines.append(f"     → {_esc(sig.ict_details)}")
             elif ict:
                 nb = len(list(ict.order_blocks_bull))
                 ns = len(list(ict.order_blocks_bear))
@@ -453,7 +466,7 @@ class TelegramBotController:
                 missing = []
                 if not g_ext:
                     missing.append(
-                        f"VWAP dev {abs(dev_atr):.2f}ATR < {entry_mult:.1f}ATR required")
+                        f"VWAP dev {abs(dev_atr):.2f}ATR &lt; {entry_mult:.1f}ATR required")
                 if not g_reg:
                     missing.append(f"ATR regime gate ({atr_pct:.0%} pctile)")
                 if not g_htf:
@@ -463,9 +476,9 @@ class TelegramBotController:
                     missing.append(
                         f"Only {sig.n_confirming}/{'6' if ict else '5'} signals agree (need 3)")
                 if not g_comp:
-                    missing.append(f"Composite {c:+.3f} < ±{thr:.3f}")
+                    missing.append(f"Composite {c:+.3f} &lt; ±{thr:.3f}")
                 if not can_ok:
-                    missing.append(f"Risk gate: {risk_reason}")
+                    missing.append(f"Risk gate: {_esc(risk_reason)}")
                 if cd_remaining > 0:
                     missing.append(f"Cooldown {cd_remaining:.0f}s")
 
@@ -515,7 +528,7 @@ class TelegramBotController:
 
             lines = [
                 f"🏛️ <b>ICT Structures @ ${price:,.1f}</b>",
-                f"Session: {sess}{kz_s}  |  ATR(5m): ${atr_v:.1f}",
+                f"Session: {_esc(sess)}{_esc(kz_s)}  |  ATR(5m): ${atr_v:.1f}",
                 (f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
                  f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
                  f"Liq: {c['liq_active']} active / {c['liq_swept']} swept"),
@@ -640,13 +653,13 @@ class TelegramBotController:
                 f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
                 f"Sweep={long_c.sweep_score:.2f}  KZ={long_c.session_score:.2f}")
             if long_c.details:
-                lines.append(f"    → {long_c.details}")
+                lines.append(f"    → {_esc(long_c.details)}")
             lines.append(
                 f"  SHORT Σ={short_c.total:.2f}  "
                 f"OB={short_c.ob_score:.2f}  FVG={short_c.fvg_score:.2f}  "
                 f"Sweep={short_c.sweep_score:.2f}  KZ={short_c.session_score:.2f}")
             if short_c.details:
-                lines.append(f"    → {short_c.details}")
+                lines.append(f"    → {_esc(short_c.details)}")
 
             self.send_message("\n".join(lines))
             return None
@@ -716,7 +729,7 @@ class TelegramBotController:
                 f"regime={es.market_regime}  ADX={es.adx:.1f}")
             if es.ict_total > 0.01:
                 sig_lines.append(
-                    f"ICT: {es.ict_total:.2f} [{es.ict_details}]")
+                    f"ICT: {es.ict_total:.2f} [{_esc(es.ict_details)}]")
 
         return (
             f"<b>Active Position — {side}</b>\n"
