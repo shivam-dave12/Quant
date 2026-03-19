@@ -167,18 +167,52 @@ class ICTSweepDetector:
                   ict_engine.AMD_DISTRIB_WINDOW_MS):
                 self._active_setup = None
                 logger.debug("ICTSweepDetector: setup expired (>90min)")
+            else:
+                # FIX Bug-5: expire DETECTED setup when price has blown THROUGH
+                # the OTE zone without entering it — entry permanently missed.
+                # LONG: we need price to retrace DOWN into OTE; if price is now
+                #   BELOW ote_low (retraced too far), the zone is also missed.
+                # SHORT: symmetric — missed if price rallied above ote_high.
+                # Only applies to DETECTED (not yet OTE_READY). Once OTE_READY,
+                # the SL level handles invalidation via normal risk management.
+                _s = self._active_setup
+                if _s.status == "DETECTED":
+                    _ote_miss = False
+                    if _s.side == "long":
+                        # Missed: price went up through zone without retracing, OR
+                        # retraced too far below the zone
+                        if price > _s.ote_entry_zone_high + 0.5 * atr:
+                            _ote_miss = True   # price never pulled back to OTE
+                        elif price < _s.ote_entry_zone_low - 0.5 * atr:
+                            _ote_miss = True   # price blew through OTE downward
+                    else:  # short
+                        if price < _s.ote_entry_zone_low - 0.5 * atr:
+                            _ote_miss = True   # price never rallied to OTE
+                        elif price > _s.ote_entry_zone_high + 0.5 * atr:
+                            _ote_miss = True   # price blew through OTE upward
+                    if _ote_miss:
+                        logger.info(
+                            f"❌ ICTSweepDetector: {_s.side.upper()} OTE missed "
+                            f"(price=${price:,.0f} outside "
+                            f"[${_s.ote_entry_zone_low:.0f}–${_s.ote_entry_zone_high:.0f}]"
+                            f" ± {0.5*atr:.0f}) — setup expired")
+                        self._active_setup = None
 
         # Find the best new setup
         setup = self._find_best_setup(ict_engine, price, atr, now_ms,
                                        candles_5m or [], candles_15m or [])
         if setup is not None:
             self._active_setup = setup
+            # FIX Bug-4: f-string with conditional format spec crashes when
+            # delivery_target is None — format the value before embedding it.
+            _dt_str = (f"${setup.delivery_target:,.0f}"
+                       if setup.delivery_target is not None else "N/A")
             logger.info(
                 f"🎯 ICT SWEEP SETUP DETECTED: {setup.side.upper()} | "
                 f"sweep=${setup.sweep_price:.0f} | "
                 f"OTE=[${setup.ote_entry_zone_low:.0f}–${setup.ote_entry_zone_high:.0f}] | "
                 f"SL=${setup.sl_sweep_candle:.0f} | "
-                f"delivery=${setup.delivery_target:.0f if setup.delivery_target else 'N/A'} | "
+                f"delivery={_dt_str} | "
                 f"quality={setup.quality_score():.2f} | "
                 f"AMD={setup.amd_confidence:.2f}")
 
@@ -1575,8 +1609,13 @@ class ICTEntryGate:
             return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_delivery"
 
         # AMD Manipulation without a sweep setup = Judas swing still active
-        # Price is making the fake move, not the real move
-        if amd_phase == "MANIPULATION" and sweep_setup is None:
+        # Price is making the fake move, not the real move.
+        # FIX Bug-MANIP: also block when a sweep setup EXISTS but it is for the
+        # OPPOSITE direction — e.g. evaluating SHORT while a LONG sweep just fired.
+        # In MANIPULATION phase, smart money just swept SSL (bullish) or BSL
+        # (bearish); trading the counter-direction is trading the Judas swing.
+        if amd_phase == "MANIPULATION" and (
+                sweep_setup is None or sweep_setup.side != side):
             return "BLOCKED", 0, "MANIP_no_confirmed_sweep"
 
         # AMD Distribution delivering AGAINST our trade direction = wrong side

@@ -780,7 +780,21 @@ class ADXEngine:
     def compute(self, candles: List[Dict]) -> float:
         if len(candles) < 2: return self._adx
         period  = QCfg.ADX_PERIOD()
-        last_ts = int(candles[-1].get('t', 0))
+        # BUG-2 FIX: candles[-1].get('t', 0) silently returns 0 when candles
+        # are raw Candle dataclass objects (no __getitem__). After the first
+        # seed, self._last_ts = 0, and every subsequent call sees last_ts=0
+        # == self._last_ts=0, so the seeded early-return fires and ADX never
+        # updates again. Fix: read timestamp robustly from both Candle and dict.
+        def _ts(c) -> int:
+            try:
+                return int(c['t'])
+            except (KeyError, TypeError):
+                pass
+            try:
+                return int(getattr(c, 'timestamp', 0) * 1000)
+            except Exception:
+                return 0
+        last_ts = _ts(candles[-1])
         if last_ts == self._last_ts and self._seeded: return self._adx
         if len(candles) < period * 2 + 1: return self._adx
 
@@ -2334,7 +2348,20 @@ class ATREngine:
 
     def compute(self, candles: List[Dict]) -> float:
         if not candles: return self._atr
-        period = QCfg.ATR_PERIOD(); last_ts = int(candles[-1].get('t', 0))
+        period = QCfg.ATR_PERIOD()
+        # Same timestamp-read fix as ADXEngine: .get('t', 0) returns 0 for
+        # raw Candle dataclass objects, making _last_ts stick at 0 forever
+        # and the dedup early-return fire on every tick after the first seed.
+        def _ts(c) -> int:
+            try:
+                return int(c['t'])
+            except (KeyError, TypeError):
+                pass
+            try:
+                return int(getattr(c, 'timestamp', 0) * 1000)
+            except Exception:
+                return 0
+        last_ts = _ts(candles[-1])
         if last_ts == self._last_ts and self._seeded: return self._atr
         if len(candles) < period + 1: return self._atr
         if not self._seeded:
@@ -2941,6 +2968,13 @@ class QuantStrategy:
                 htf_veto     = sig.htf_veto,
                 adx          = sig.adx,
                 overextended = sig.overextended,
+                # FIX Bug-1: htf_15m and htf_4h were never passed — they
+                # defaulted to 0.0 in every QuantHelperSignals, which silently
+                # disabled the ICTEntryGate's 15m-extreme counter-HTF guard
+                # (|0.0| < 0.55 always passes). Now they carry live values from
+                # HTFTrendFilter so the gate reflects actual structure.
+                htf_15m      = self._htf.trend_15m,
+                htf_4h       = self._htf.trend_4h,
             )
         except Exception:
             return None
@@ -3522,12 +3556,24 @@ class QuantStrategy:
                         _ict_rev_side, sig,
                         self._active_sweep_setup, price, _qh_ap)
                     ap = _ap_tier in ("S", "A", "B")
+                    # FIX Bug-3: ICTEntryGate passed but breakout would block in
+                    # _evaluate_entry — display must reflect the same gate.
+                    # Without this, "🎯 ENTRY READY" appeared even when the next
+                    # line logged "🚫 Breakout blocks SHORT/LONG reversion".
+                    if ap and self._breakout.blocks_reversion(_ict_rev_side):
+                        ap = False
+                        _bo_dir = self._breakout.direction.upper()
+                        _ap_reason = f"BREAKOUT_BLOCK_{_bo_dir}"
                 except Exception:
                     ap = False
             else:
                 _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
                 ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
                       sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
+                # FIX Bug-3 (non-ICT path): same breakout gate
+                if ap and self._breakout.blocks_reversion(_ict_rev_side):
+                    ap = False
+                    _ap_reason = f"BREAKOUT_BLOCK_{self._breakout.direction.upper()}"
 
             # D FIX: surface the real block reason — "👀 Watching" implied
             # passive state; when ICT hard-blocks the status must say so.
@@ -3729,16 +3775,22 @@ class QuantStrategy:
             except Exception as _sd_e:
                 logger.debug(f"Sweep detector error (non-fatal): {_sd_e}")
 
-        # Log AFTER ICT update — display now reflects current tick's ICT scores
-        self._log_thinking(sig, price, now)
-
-        # ── v4.6: Fast breakout detection (runs BEFORE regime routing) ─────
+        # ── v4.6: Fast breakout detection — MUST run before _log_thinking ────
+        # BUG-B FIX: _breakout.update() was previously called AFTER _log_thinking,
+        # so whenever a breakout fired on this tick, the display showed "reversion"
+        # routing while _evaluate_entry would route to "momentum" — a one-tick
+        # display/routing mismatch that also caused ENTRY READY to appear when
+        # breakout would immediately veto it.  Moving it here means _log_thinking
+        # and _evaluate_entry both read the same up-to-date breakout state.
         try:
             candles_5m = data_manager.get_candles("5m", limit=20)
         except Exception:
             candles_5m = []
         self._breakout.update(candles_5m, self._atr_5m, price, now,
                              vwap_price=self._vwap.vwap)
+
+        # Log AFTER ICT update AND breakout update — display reflects current tick
+        self._log_thinking(sig, price, now)
 
         # ── v5.0 Route by regime + breakout + sweep setup ────────────────────
         #
@@ -3794,14 +3846,46 @@ class QuantStrategy:
         """
         c    = sig.composite
         thr  = QCfg.COMPOSITE_ENTRY_MIN()
-        side = sig.reversion_side   # VWAP-based default; overridden for sweep path
+
+        # ── BUG-A FIX: Override `side` to sweep_setup.side for sweep entries ─
+        # The docstring stated "overridden for sweep path" but this override was
+        # never implemented.  Consequence: every sweep OTE_READY entry used the
+        # VWAP reversion side (often the OPPOSITE of the sweep direction), causing
+        # three cascading failures:
+        #
+        #   1. allows_reversion() vetoed the sweep: a LONG sweep with price above
+        #      VWAP gives side="short"; TRENDING_UP then blocked it outright.
+        #
+        #   2. _ict_opposes_side triggered and zeroed sig.ict_total for the LONG
+        #      sweep's confluence scores, because ICT direction (+1 LONG) opposed
+        #      the VWAP side ("short").  Gate then saw ict_total=0.0.
+        #
+        #   3. ICTEntryGate.evaluate("short", ..., sweep_setup.side="long") failed
+        #      Tier-S (sweep_setup.side != side) and hit MANIP hard-block.
+        #
+        # Fix: detect OTE_READY sweep setup and switch `side` to sweep direction
+        # BEFORE any gate evaluation. Regime and breakout veto are skipped for
+        # sweep entries — they are DIRECTIONAL institutional setups, not fades.
+        _is_ote_sweep = (
+            _ICT_TRADE_ENGINE_AVAILABLE and
+            self._active_sweep_setup is not None and
+            self._active_sweep_setup.status == "OTE_READY"
+        )
+        if _is_ote_sweep:
+            side = self._active_sweep_setup.side  # "long" | "short"
+        else:
+            side = sig.reversion_side   # VWAP-based default for standard path
 
         # ── Hard veto: trending against reversion trade ──────────────────
-        if not self._regime.allows_reversion(side):
+        # Skipped for sweep entries — institutional sweep setups are valid IN
+        # any regime; the AMD phase + ICT gate is the structural filter here.
+        if not _is_ote_sweep and not self._regime.allows_reversion(side):
             self._confirm_long = self._confirm_short = 0; return
 
         # ── Breakout veto: never fade a detected breakout ─────────────────
-        if self._breakout.blocks_reversion(side):
+        # Skipped for sweep entries — a LONG sweep entry WITH the breakout
+        # direction is not a fade; blocks_reversion only protects counter-trend.
+        if not _is_ote_sweep and self._breakout.blocks_reversion(side):
             self._confirm_long = self._confirm_short = 0
             if now - self._last_bo_block_log >= 60.0:
                 self._last_bo_block_log = now
@@ -3822,8 +3906,10 @@ class QuantStrategy:
         #   • Gate can pass a LONG with zero real ICT backing
         #   • Conversely, a high SHORT score blocks LONG for wrong reasons
         #
-        # Fix: when ict_direction opposes side, re-run get_confluence(side) and
-        # update sig.ict_* fields so the gate uses correctly-directed scores.
+        # For sweep entries, `side` is now sweep_setup.side. If ict_direction
+        # (AMD bias) disagrees with the sweep side (shouldn't happen — sweep
+        # detector requires AMD bias to match sweep direction), still recompute
+        # so the gate always receives correctly-directed scores.
         #
         # sig.composite is NOT touched — the signed boost was already applied
         # in _evaluate_entry and correctly penalises confidence in this direction.
@@ -3880,14 +3966,18 @@ class QuantStrategy:
                             f"⛔ ICTEntryGate BLOCKED [{side.upper()}]: {_tier_reason}")
                     if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
                         self._ict_gate_alerted = True
+                        # BUG-C FIX: sig has no htf_15m/htf_4h fields (those live on
+                        # QuantHelperSignals / HTFTrendFilter).  getattr(sig,'htf_15m')
+                        # always returned 0.0, making the Telegram alert useless for
+                        # diagnosing HTF veto situations. Use self._htf directly.
                         send_telegram_message(
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"No ICT confluence for ≥15 min.\n"
                             f"Side: {side.upper()} | Reason: {_tier_reason}\n"
-                            f"HTF: 15m={getattr(sig,'htf_15m',0.0):+.2f}  "
-                            f"4H={getattr(sig,'htf_4h',0.0):+.2f}  "
-                            f"veto={'YES' if getattr(sig,'htf_veto',False) else 'no'}\n"
-                            f"AMD: {getattr(sig,'amd_phase','?')} conf={getattr(sig,'amd_conf',0.0):.2f}\n"
+                            f"HTF: 15m={self._htf.trend_15m:+.2f}  "
+                            f"4H={self._htf.trend_4h:+.2f}  "
+                            f"veto={'YES' if sig.htf_veto else 'no'}\n"
+                            f"AMD: {sig.amd_phase} conf={sig.amd_conf:.2f}\n"
                             f"<i>Bot alive — waiting for institutional setup.</i>")
                     self._confirm_long = self._confirm_short = 0
                     return
@@ -4921,10 +5011,11 @@ class QuantStrategy:
         # Counter-HTF flag — only shown when htf_veto was True at entry
         _counter_htf_line = ""
         if getattr(sig, 'htf_veto', False) and ict_tier in ("A",):
+            # BUG-C FIX (part 2): sig has no htf_15m/htf_4h fields — use self._htf
             _counter_htf_line = (
                 f"\n⚡ Counter-HTF entry  "
-                f"15m={getattr(sig,'htf_15m',0.0):+.2f}  "
-                f"4H={getattr(sig,'htf_4h',0.0):+.2f}")
+                f"15m={self._htf.trend_15m:+.2f}  "
+                f"4H={self._htf.trend_4h:+.2f}")
         # AMD context line
         _amd_line = ""
         if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
@@ -4942,10 +5033,11 @@ class QuantStrategy:
             # Try the sweep detector's last known setup before invalidation
             pass  # geometry already shown via _sweep_badge; detailed in SL/TP lines
         # HTF structure line — always shown
+        # BUG-C FIX (part 3): sig has no htf_15m/htf_4h — use self._htf
         _htf_line = (
-            f"\nHTF:      15m={getattr(sig,'htf_15m',0.0):+.2f}  "
-            f"4H={getattr(sig,'htf_4h',0.0):+.2f}  "
-            f"veto={'YES ⚠️' if getattr(sig,'htf_veto',False) else 'no ✅'}")
+            f"\nHTF:      15m={self._htf.trend_15m:+.2f}  "
+            f"4H={self._htf.trend_4h:+.2f}  "
+            f"veto={'YES ⚠️' if sig.htf_veto else 'no ✅'}")
 
         send_telegram_message(
             f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]{_sweep_badge}</b>\n"
