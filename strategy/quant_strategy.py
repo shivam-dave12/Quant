@@ -5218,6 +5218,14 @@ class QuantStrategy:
 
         new_sl_tick = _round_to_tick(new_sl)
 
+        # ── Guard: skip API call if tick-rounded value is identical to current SL ──
+        # ICTTrailEngine.compute() guarantees new_sl > current_sl (for SHORT: <) before
+        # rounding, but _round_to_tick() can snap it back to the same tick value as
+        # pos.sl_price. Without this guard, the trail fires ~10 REST calls/minute to the
+        # exchange setting the SL to the value it already is — burning rate limit budget.
+        if abs(new_sl_tick - pos.sl_price) < 1e-6:
+            return False
+
         # AMD-aware phase label for trail log
         init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0

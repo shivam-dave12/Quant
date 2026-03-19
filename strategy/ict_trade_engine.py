@@ -936,6 +936,20 @@ class ICTTrailEngine:
                         ob_near_sl = current_sl <= ob.high + 1.8 * atr
                     if not ob_near_sl:
                         continue
+                    # Guard: OB_ZONE_FREEZE is for PULLBACKS — price returning to test
+                    # a previously-left OB. It must NOT fire when price is currently
+                    # inside the OB during initial delivery (e.g. a live forming 4H
+                    # candle whose low tracks price down). A live candle makes price
+                    # always "inside" the OB by definition — permanent freeze.
+                    # For SHORT: OB is above, price has moved away downward. A pullback
+                    # test means price is moving back UP into the OB from below.
+                    # Guard: for SHORT, ob.low must be strictly ABOVE current price,
+                    # confirming price has cleanly exited the OB before we can call
+                    # a return to it a "pullback test."
+                    if pos_side == "short" and ob.low <= price:
+                        continue  # price still inside / below OB low — not a pullback
+                    if pos_side == "long" and ob.high >= price:
+                        continue  # price still inside / above OB high — not a pullback
                     # Check if price is testing the OB
                     if (ob.low - freeze_atr <= price <= ob.high + freeze_atr):
                         if hold_reason is not None:
