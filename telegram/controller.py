@@ -303,8 +303,9 @@ class TelegramBotController:
 
     def _cmd_thinking(self) -> str:
         """
-        Live signal breakdown — shows exactly what the bot sees and what
-        is blocking or allowing entry. Uses QuantStrategy's actual internals.
+        Live signal breakdown — shows the full decision stack:
+          Market context → HTF → AMD → Sweep → ICT tier → Quant gates → Verdict
+          Plus trail state when a position is active.
         """
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
@@ -319,176 +320,400 @@ class TelegramBotController:
             if not strat or not dm or not rm:
                 return "Components not ready."
 
-            price = dm.get_last_price()
-            now   = time.time()
-            sig   = strat._last_sig   # SignalBreakdown — always populated after first tick
+            price  = dm.get_last_price()
+            now    = time.time()
+            now_ms = int(now * 1000)
+            sig    = strat._last_sig
+            atr    = strat._atr_5m.atr
+            atr_pct = strat._atr_5m.get_percentile()
+            vwap   = strat._vwap.vwap
+            # dev_atr is SIGNED — use abs() for gate comparison, keep sign for display
+            dev_atr = strat._vwap.deviation_atr
+            htf_15m = strat._htf.trend_15m
+            htf_4h  = strat._htf.trend_4h
+            ict     = strat._ict
+            pos     = strat._pos
 
-            # ── Header ────────────────────────────────────────────────────────
-            lines = [f"<b>🧠 THINKING @ ${price:,.2f}</b>\n"]
+            lines = [f"<b>🧠 THINKING @ ${price:,.2f}</b>"]
 
-            # ── Market context ────────────────────────────────────────────────
+            # ══════════════════════════════════════════════════════════
+            # 1. MARKET CONTEXT
+            # ══════════════════════════════════════════════════════════
             regime_val = getattr(strat._regime, '_regime', None)
             regime_str = regime_val.value if regime_val else "UNKNOWN"
             conf       = getattr(strat._regime, '_confidence', 0.0)
             adx_val    = strat._adx.adx
             pdi        = strat._adx.plus_di
             mdi        = strat._adx.minus_di
-            trend_dir  = strat._adx.trend_direction()
-            atr        = strat._atr_5m.atr
-            atr_pct    = strat._atr_5m.get_percentile()
-            vwap       = strat._vwap.vwap
-            dev_atr    = strat._vwap.deviation_atr
-            htf_15m    = strat._htf.trend_15m
-            htf_4h     = strat._htf.trend_4h
-            htf_str    = ("BULLISH" if htf_4h >  0.3
-                          else ("BEARISH" if htf_4h < -0.3 else "NEUTRAL"))
 
-            ict    = strat._ict
-            sess   = ict._session  if ict else "N/A"
-            kz     = ict._killzone if ict else ""
-            kz_str = f" [{kz}]" if kz else ""
+            sess = ict._session  if ict else "N/A"
+            kz   = ict._killzone if ict else ""
+            kz_s = f" [{kz.upper()}]" if kz else " [off-session]"
 
-            lines.append("<b>Market Context</b>")
-            lines.append(f"  Price: ${price:,.2f}  VWAP: ${vwap:,.2f}  Dev: {dev_atr:+.2f}ATR")
+            lines.append("\n<b>━ Market Context</b>")
+            lines.append(f"  Price:  ${price:,.2f}  VWAP: ${vwap:,.2f}  Dev: {dev_atr:+.2f}ATR")
             lines.append(f"  ATR(5m): ${atr:.1f}  ({atr_pct:.0%} pctile)")
-            lines.append(f"  Regime: <b>{_esc(regime_str)}</b>  (conf={conf:.0%})")
-            lines.append(f"  ADX: {adx_val:.1f}  +DI: {pdi:.1f}  -DI: {mdi:.1f}  dir={_esc(trend_dir)}")
-            lines.append(f"  HTF: {_esc(htf_str)}  (4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
-            lines.append(f"  Session: {_esc(sess)}{_esc(kz_str)}")
+            lines.append(f"  Regime: <b>{_esc(regime_str)}</b>  conf={conf:.0%}"
+                         f"  ADX={adx_val:.1f}  +DI={pdi:.1f}  -DI={mdi:.1f}")
+            lines.append(f"  Session: {_esc(sess)}{_esc(kz_s)}")
 
-            # ── Risk gate ─────────────────────────────────────────────────────
-            lines.append("")
-            can_ok, risk_reason = rm.can_trade()
-            daily_trades = len(getattr(rm, 'daily_trades', []))
-            max_trades   = getattr(rm, 'max_daily_trades',
-                                   getattr(cfg, 'MAX_DAILY_TRADES', 8))
-            consec_loss  = getattr(rm, 'consecutive_losses', 0)
-            daily_pnl    = getattr(rm, 'daily_pnl', 0.0)
+            # ══════════════════════════════════════════════════════════
+            # 2. HTF STRUCTURE
+            # ══════════════════════════════════════════════════════════
+            # vetoes_trade fires when:
+            #   SHORT: t15m > +0.35 (15m bullish vetoes SHORT)
+            #   LONG:  t15m < -0.35 (15m bearish vetoes LONG)
+            # The direction being VETOED is determined by t15m sign, not t4h sign.
+            veto_15m  = float(getattr(cfg, 'QUANT_HTF_15M_VETO',  0.35))
+            veto_both = float(getattr(cfg, 'QUANT_HTF_BOTH_VETO', 0.20))
+            veto_short = (htf_15m > veto_15m or
+                          (htf_15m > veto_both and htf_4h > veto_both))
+            veto_long  = (htf_15m < -veto_15m or
+                          (htf_15m < -veto_both and htf_4h < -veto_both))
 
-            if can_ok:
+            if veto_short and not veto_long:
+                htf_verdict = f"❌ VETOING SHORT  (15m={htf_15m:+.2f} >{veto_15m:+.2f})"
+            elif veto_long and not veto_short:
+                htf_verdict = f"❌ VETOING LONG   (15m={htf_15m:+.2f} <{-veto_15m:+.2f})"
+            elif veto_short and veto_long:
+                htf_verdict = f"❌ VETOING BOTH   (15m={htf_15m:+.2f} 4h={htf_4h:+.2f})"
+            else:
+                htf_verdict = f"✅ No veto"
+
+            lines.append("\n<b>━ HTF Structure</b>")
+            lines.append(f"  4H:  {htf_4h:+.2f}  15m: {htf_15m:+.2f}")
+            lines.append(f"  {htf_verdict}")
+            lines.append(f"  Source: {'ICT swing structure' if strat._htf.ict_source else 'EMA fallback'}")
+
+            # ══════════════════════════════════════════════════════════
+            # 3. AMD PHASE  (full ICT layer — was missing entirely)
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ AMD Cycle</b>")
+            if ict and ict._initialized:
+                try:
+                    amd       = ict._amd
+                    amd_phase = amd.phase
+                    amd_conf  = amd.confidence
+                    amd_bias  = amd.bias
+                    amd_icons = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
+                                 "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
+                                 "ACCUMULATION": "💤"}
+                    amd_icon  = amd_icons.get(amd_phase, "❓")
+                    bias_icon = ("🔴" if amd_bias == "bearish"
+                                 else ("🟢" if amd_bias == "bullish" else "⚪"))
+                    lines.append(
+                        f"  {amd_icon} <b>{_esc(amd_phase)}</b>  {bias_icon}{_esc(amd_bias)}  "
+                        f"conf={amd_conf:.2f}")
+
+                    # MTF alignment
+                    mtf_aligned = getattr(sig, 'mtf_aligned', False)
+                    in_disc     = getattr(sig, 'in_discount', False)
+                    in_prem     = getattr(sig, 'in_premium',  False)
+                    zone_str    = ("💰DISCOUNT" if in_disc
+                                   else ("💸PREMIUM" if in_prem else "〰️EQUILIBRIUM"))
+                    mtf_str     = "✅ALIGNED" if mtf_aligned else "❌SPLIT"
+                    lines.append(f"  MTF: {mtf_str}  Price zone: {zone_str}")
+                    if sig.mtf_details:
+                        lines.append(f"  {_esc(sig.mtf_details)}")
+
+                    # AMD phase interpretation for entry
+                    if amd_phase == "ACCUMULATION" and amd_conf >= 0.55:
+                        lines.append("  ⛔ Hard block: accumulation — no delivery in progress")
+                    elif amd_phase == "MANIPULATION":
+                        lines.append("  ⚡ Judas swing active — need confirmed sweep for Tier-S")
+                    elif amd_phase in ("DISTRIBUTION", "REDISTRIBUTION"):
+                        lines.append(f"  🎯 Delivery phase — Tier-A/S entry eligible (ICT gate next)")
+                    elif amd_phase == "REACCUMULATION":
+                        lines.append(f"  🔄 Re-entry phase — with-HTF Tier-A eligible")
+                except Exception as _ae:
+                    lines.append(f"  AMD: error reading — {_ae}")
+            else:
+                lines.append("  ⏳ ICT engine not initialised")
+
+            # ══════════════════════════════════════════════════════════
+            # 4. SWEEP SETUP  (was missing entirely)
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ Sweep Setup</b>")
+            sweep = getattr(strat, '_active_sweep_setup', None)
+            if sweep is not None:
+                # Age
+                age_ms  = now_ms - sweep.setup_time_ms
+                age_min = age_ms / 60_000
+                atr_v   = max(atr, 1.0)
+                buf     = 0.5 * atr_v
+
+                # Distance to OTE and reachability.
+                # SHORT: BSL swept above, price displaced down. OTE is ABOVE current price.
+                #   Price must retrace UP into OTE.
+                #   Missed: price too far DOWN (below ote_low - buf) OR too far UP past zone.
+                # LONG:  SSL swept below, price displaced up. OTE is BELOW current price.
+                #   Price must retrace DOWN into OTE.
+                #   Missed ONLY: price blew too far DOWN through zone (below ote_low - buf).
+                #   Being above ote_high just means still approaching — always reachable.
+                in_ote = sweep.ote_entry_zone_low <= price <= sweep.ote_entry_zone_high
+                if sweep.side == "short":
+                    dist_to_ote   = sweep.ote_entry_zone_low - price   # + = price below OTE (approaching)
+                    ote_reachable = ((sweep.ote_entry_zone_low - buf)
+                                     <= price
+                                     <= (sweep.ote_entry_zone_high + buf))
+                else:
+                    dist_to_ote   = price - sweep.ote_entry_zone_high  # + = price above OTE (approaching)
+                    ote_reachable = price >= (sweep.ote_entry_zone_low - buf)
+
+                # Delivery target display — ternary outside format spec (f-string
+                # cannot contain conditional expressions in the format specifier)
+                delivery_str = (f"${sweep.delivery_target:,.0f}"
+                                if sweep.delivery_target else "N/A")
+
+                status_icon = "🟢" if sweep.status == "OTE_READY" else "🔵"
                 lines.append(
-                    f"✅ Risk gate: CLEAR  "
-                    f"({daily_trades}/{max_trades} trades  "
-                    f"consec_loss={consec_loss}  today=${daily_pnl:+.2f})")
+                    f"  {status_icon} <b>{sweep.side.upper()}</b>  status={_esc(sweep.status)}  "
+                    f"quality={sweep.quality_score():.2f}  age={age_min:.0f}m")
+                lines.append(
+                    f"  Sweep: ${sweep.sweep_price:,.0f}  "
+                    f"OTE: [${sweep.ote_entry_zone_low:,.0f}–${sweep.ote_entry_zone_high:,.0f}]")
+                if in_ote:
+                    lines.append(f"  ✅ Price IN OTE zone — entry eligible")
+                elif ote_reachable:
+                    lines.append(
+                        f"  ⏳ {abs(dist_to_ote):.0f}pts to OTE "
+                        f"({'up' if sweep.side == 'short' else 'down'})")
+                else:
+                    lines.append(f"  ❌ OTE missed — price {abs(dist_to_ote):.0f}pts beyond zone")
+                lines.append(
+                    f"  SL: ${sweep.sl_sweep_candle:,.0f}  "
+                    f"Delivery: {delivery_str}"
+                    f"  {'FVG✓' if sweep.has_fvg_in_ote else ''}"
+                    f"{'OB✓' if sweep.has_ob_in_ote else ''}")
             else:
-                lines.append(f"🚫 Risk gate: <b>BLOCKED</b>  → {_esc(risk_reason)}")
+                lines.append("  ─ No active sweep setup")
+                if ict and ict._initialized:
+                    swept_pools = [p for p in ict.liquidity_pools
+                                   if p.swept and p.displacement_confirmed]
+                    if swept_pools:
+                        latest = max(swept_pools, key=lambda p: p.sweep_timestamp)
+                        age_m  = (now_ms - latest.sweep_timestamp) / 60_000
+                        lines.append(
+                            f"  Last displaced sweep: ${latest.price:,.0f}  "
+                            f"{age_m:.0f}m ago  "
+                            f"({'SSL' if latest.level_type == 'SSL' else 'BSL'})")
 
-            # ── Cooldown ──────────────────────────────────────────────────────
-            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
-            cd_remaining = max(0.0, cooldown_sec - (now - strat._last_exit_time))
-            if cd_remaining > 0:
-                lines.append(f"⏳ Trade cooldown: {cd_remaining:.0f}s remaining")
+            # ══════════════════════════════════════════════════════════
+            # 5. ICT ENTRY TIER  (was missing entirely)
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ ICT Entry Gate</b>")
+            if ict and ict._initialized:
+                try:
+                    from strategy.ict_trade_engine import ICTEntryGate, QuantHelperSignals
+                    _side = sig.reversion_side or "long"
+                    _qh   = strat._get_quant_helpers(sig, _side)
+                    _tier, _cn, _reason = ICTEntryGate.evaluate(
+                        _side, sig, sweep, price, _qh)
+                    tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
+                                  "BLOCKED": "⛔"}
+                    lines.append(
+                        f"  {tier_icons.get(_tier,'❓')} <b>Tier-{_tier}</b>  "
+                        f"side={_side.upper()}  confirm_ticks={_cn}")
+                    lines.append(f"  {_esc(_reason)}")
+
+                    # Counter-HTF flag
+                    if _tier in ("A",) and getattr(sig, 'htf_veto', False):
+                        lines.append(
+                            f"  ⚡ Counter-HTF entry  "
+                            f"ICT={sig.ict_total:.2f}≥0.65  "
+                            f"AMD_conf={getattr(sig,'amd_conf',0):.2f}≥0.60")
+                except Exception as _te:
+                    lines.append(f"  ICT gate error: {_esc(str(_te))}")
+
+                # ICT scores — normalised (consistent with terminal display)
+                ob_norm  = min(sig.ict_ob  / 2.0, 1.0)
+                fvg_norm = min(sig.ict_fvg / 1.5, 1.0)
+                lines.append(
+                    f"  ICT Σ={sig.ict_total:.2f}  "
+                    f"OB={ob_norm:.2f}(raw={sig.ict_ob:.1f})  "
+                    f"FVG={fvg_norm:.2f}(raw={sig.ict_fvg:.1f})  "
+                    f"Sweep={sig.ict_sweep:.2f}  KZ={sig.ict_session:.2f}")
+                if sig.ict_details:
+                    lines.append(f"  {_esc(sig.ict_details)}")
             else:
-                lines.append(f"✅ Cooldown: ready")
+                lines.append("  ⏳ ICT engine initialising")
 
-            # ── Breakout state ────────────────────────────────────────────────
-            bo = strat._breakout
-            if bo.is_active:
-                retest = "RETEST READY ✅" if bo.retest_ready else "waiting for pullback retest"
-                lines.append(f"🚀 Breakout {bo.direction.upper()} active — {retest}")
-
-            # ── Signal bars ───────────────────────────────────────────────────
-            lines.append("")
-            lines.append("<b>Signals (last eval)</b>")
+            # ══════════════════════════════════════════════════════════
+            # 6. QUANT SIGNALS + GATES
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ Quant Signals</b>")
 
             def bar(v, w=10):
-                h = w // 2
-                f = min(int(abs(v) * h + 0.5), h)
-                return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
-                    else ("░" * (h - f) + "█" * f + "·" * h)
+                h = w // 2; f_ = min(int(abs(v) * h + 0.5), h)
+                return ("·" * h + "█" * f_ + "░" * (h - f_)) if v >= 0 \
+                    else ("░" * (h - f_) + "█" * f_ + "·" * h)
 
-            def sig_line(label, val):
+            def sline(label, val):
                 arrow = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
                 return f"  {label:<7} {bar(val)} {arrow} {val:+.3f}"
 
-            lines.append(sig_line("VWAP",  sig.vwap_dev))
-            lines.append(sig_line("CVD",   sig.cvd_div))
-            lines.append(sig_line("OB",    sig.orderbook))
-            lines.append(sig_line("TICK",  sig.tick_flow))
-            lines.append(sig_line("VEX",   sig.vol_exhaust))
-            if sig.ict_total > 0.01:
-                lines.append(sig_line("ICT",   sig.ict_total))
-
+            lines.append(sline("VWAP",  sig.vwap_dev))
+            lines.append(sline("CVD",   sig.cvd_div))
+            lines.append(sline("OB",    sig.orderbook))
+            lines.append(sline("TICK",  sig.tick_flow))
+            lines.append(sline("VEX",   sig.vol_exhaust))
             lines.append(f"  {'─' * 32}")
-            thr      = getattr(cfg, 'QUANT_COMPOSITE_ENTRY_MIN', 0.30)
-            c        = sig.composite
-            side_lbl = (sig.reversion_side.upper()
-                        if sig.reversion_side else "?")
-            lines.append(f"  Σ = {c:+.4f}  (threshold ±{thr:.3f})  side={side_lbl}")
-            lines.append(f"  Confirming: {sig.n_confirming}/{'6' if ict else '5'} signals")
 
-            # ── Entry gates ───────────────────────────────────────────────────
-            lines.append("")
-            lines.append("<b>Entry Gates</b>")
+            c   = sig.composite
+            thr = float(getattr(cfg, 'QUANT_COMPOSITE_ENTRY_MIN', 0.30))
+            # n_confirming counts QUANT signals only (max 5 — VWAP/CVD/OB/TICK/VEX)
+            # ICT has its own gate above; /6 denominator in old code was wrong
+            lines.append(f"  Σ = {c:+.4f}  (need ±{thr:.3f})")
+            lines.append(f"  Confirming: {sig.n_confirming}/5 quant signals")
+
+            lines.append("\n<b>━ Entry Gates</b>")
+            # Overextended: gate uses abs(deviation_atr)
+            entry_mult = float(getattr(cfg, 'QUANT_VWAP_ENTRY_ATR_MULT', 1.2))
             g_ext  = sig.overextended
             g_reg  = sig.regime_ok
             g_htf  = not sig.htf_veto
             g_conf = sig.n_confirming >= 3
             g_comp = abs(c) >= thr
-            all_pass = g_ext and g_reg and g_htf and g_conf and g_comp
 
-            entry_mult = getattr(cfg, 'QUANT_VWAP_ENTRY_ATR_MULT', 1.2)
             lines.append(
                 f"  {'✅' if g_ext  else '❌'} Overextended   "
-                f"({dev_atr:+.2f} ATR from VWAP  need ≥{entry_mult:.1f})")
+                f"(|{dev_atr:+.2f}|={abs(dev_atr):.2f}ATR  need ≥{entry_mult:.1f}ATR)")
             lines.append(
                 f"  {'✅' if g_reg  else '❌'} ATR regime     "
-                f"({atr_pct:.0%} pctile)")
+                f"({atr_pct:.0%} pctile  valid 5–97%)")
             lines.append(
                 f"  {'✅' if g_htf  else '❌'} HTF veto       "
                 f"(4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
             lines.append(
                 f"  {'✅' if g_conf else '❌'} Confluence     "
-                f"({sig.n_confirming}/{'6' if ict else '5'} signals agree)")
+                f"({sig.n_confirming}/5 quant  need ≥3)")
             lines.append(
                 f"  {'✅' if g_comp else '❌'} Composite      "
-                f"({c:+.3f}  threshold ±{thr:.3f})")
+                f"(Σ={c:+.3f}  need ±{thr:.3f})")
 
-            # ICT detail line
-            if ict and ict._initialized:
+            # ══════════════════════════════════════════════════════════
+            # 7. RISK GATE + COOLDOWN
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ Risk & Cooldown</b>")
+            can_ok, risk_reason = rm.can_trade()
+            daily_trades = strat._risk_gate.daily_trades
+            max_dt       = int(getattr(cfg, 'QUANT_MAX_DAILY_TRADES', 8))
+            consec       = strat._risk_gate.consec_losses
+            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
+            cd_rem       = max(0.0, cooldown_sec - (now - strat._last_exit_time))
+
+            lines.append(
+                f"  {'✅' if can_ok else '🚫'} Risk gate: "
+                f"{daily_trades}/{max_dt} trades  consec_loss={consec}"
+                + (f"  → {_esc(risk_reason)}" if not can_ok else ""))
+            lines.append(
+                f"  {'✅' if cd_rem == 0 else '⏳'} Cooldown: "
+                + (f"{cd_rem:.0f}s remaining" if cd_rem > 0 else "ready"))
+
+            bo = strat._breakout
+            if bo.is_active:
+                retest = "RETEST READY ✅" if bo.retest_ready else "awaiting pullback"
+                lines.append(f"  🚀 Breakout {_esc(bo.direction.upper())} — {retest}")
+
+            # ══════════════════════════════════════════════════════════
+            # 8. ACTIVE POSITION + TRAIL STATE  (was missing entirely)
+            # ══════════════════════════════════════════════════════════
+            from strategy.quant_strategy import PositionPhase
+            if pos.phase == PositionPhase.ACTIVE:
+                lines.append("\n<b>━ Active Position + Trail</b>")
+                profit_pts   = (pos.entry_price - price if pos.side == "short"
+                                else price - pos.entry_price)
+                sl_dist_now  = abs(price - pos.sl_price)
+                tp_dist_now  = abs(price - pos.tp_price)
+                init_dist    = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+                tier_r       = max(profit_pts, pos.peak_profit) / init_dist
+                rr_now       = tp_dist_now / max(sl_dist_now, 1e-9)
+                hold_m       = (now - pos.entry_time) / 60.0
+
+                # Trail phase
+                be_r   = float(getattr(cfg, 'QUANT_TRAIL_BE_R',        0.3))
+                lock_r = float(getattr(cfg, 'QUANT_TRAIL_LOCK_R',       0.8))
+                aggr_r = float(getattr(cfg, 'QUANT_TRAIL_AGGRESSIVE_R', 1.5))
+                if tier_r < be_r:
+                    phase_lbl = f"⬜ P0 — hands off (< {be_r:.1f}R)"
+                elif tier_r < lock_r:
+                    phase_lbl = f"🟡 P1 — structure trail (< {lock_r:.1f}R)"
+                elif tier_r < aggr_r:
+                    phase_lbl = f"🟠 P2 — locked trail (< {aggr_r:.1f}R)"
+                else:
+                    phase_lbl = f"🟢 P3 — aggressive trail"
+
                 lines.append(
-                    f"  🏛️ ICT Σ={sig.ict_total:.2f}  "
-                    f"OB={sig.ict_ob:.2f}  FVG={sig.ict_fvg:.2f}  "
-                    f"Sweep={sig.ict_sweep:.2f}  KZ={sig.ict_session:.2f}")
-                if sig.ict_details:
-                    lines.append(f"     → {_esc(sig.ict_details)}")
-            elif ict:
-                nb = len(list(ict.order_blocks_bull))
-                ns = len(list(ict.order_blocks_bear))
-                lines.append(f"  🏛️ ICT: warming up ({nb}🟢 {ns}🔴 OBs so far)")
+                    f"  {pos.side.upper()}  mode={_esc(pos.trade_mode)}  "
+                    f"tier={_esc(getattr(pos,'ict_entry_tier',''))}")
+                lines.append(
+                    f"  Entry:  ${pos.entry_price:,.2f}  "
+                    f"SL: ${pos.sl_price:,.2f}  TP: ${pos.tp_price:,.2f}")
+                lines.append(
+                    f"  P&L:    {profit_pts:+.1f}pts  "
+                    f"MFE: {pos.peak_profit:.1f}pts  "
+                    f"Hold: {hold_m:.0f}m")
+                lines.append(
+                    f"  R:      {tier_r:.2f}R  "
+                    f"Remaining R:R to TP: 1:{rr_now:.1f}")
+                lines.append(f"  Trail:  {phase_lbl}")
 
-            # ── Verdict ───────────────────────────────────────────────────────
-            lines.append("")
-            if all_pass and can_ok and cd_remaining == 0:
-                cn_long  = getattr(strat, '_confirm_long', 0)
+                # Break-even lock status
+                be_price = (pos.entry_price + 0.25 * atr if pos.side == "long"
+                            else pos.entry_price - 0.25 * atr)
+                be_locked = ((pos.side == "long"  and pos.sl_price >= be_price) or
+                             (pos.side == "short" and pos.sl_price <= be_price))
+                if be_locked:
+                    locked_profit = abs(pos.entry_price - pos.sl_price)
+                    lines.append(
+                        f"  🔒 Break-even locked  "
+                        f"({locked_profit:.0f}pts profit protected if SL hit)")
+                else:
+                    to_be = abs(profit_pts) / init_dist if init_dist > 1e-9 else 0
+                    lines.append(
+                        f"  ⬜ BE lock at {be_r:.1f}R — currently {to_be:.2f}R "
+                        f"({profit_pts:.0f}pts / {init_dist:.0f}pts SL)")
+
+            # ══════════════════════════════════════════════════════════
+            # 9. VERDICT
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━ Verdict</b>")
+            all_pass = g_ext and g_reg and g_htf and g_conf and g_comp
+
+            if pos.phase == PositionPhase.ACTIVE:
+                lines.append(f"  📍 Position ACTIVE — entry gate not evaluated")
+            elif all_pass and can_ok and cd_rem == 0:
+                cn_long  = getattr(strat, '_confirm_long',  0)
                 cn_short = getattr(strat, '_confirm_short', 0)
-                cn_need  = getattr(cfg, 'QUANT_CONFIRM_TICKS', 2)
+                cn_need  = int(getattr(cfg, 'QUANT_CONFIRM_TICKS', 2))
                 lines.append(
-                    f"🎯 <b>ALL PASS — confirming entry</b>  "
-                    f"({max(cn_long, cn_short)}/{cn_need} ticks)")
+                    f"  🎯 <b>ALL QUANT GATES PASS</b>  "
+                    f"({max(cn_long, cn_short)}/{cn_need} confirm ticks)  "
+                    f"— ICT gate is the binding decision above")
             else:
                 missing = []
                 if not g_ext:
                     missing.append(
-                        f"VWAP dev {abs(dev_atr):.2f}ATR &lt; {entry_mult:.1f}ATR required")
+                        f"VWAP: |{abs(dev_atr):.2f}|ATR &lt; {entry_mult:.1f}ATR")
                 if not g_reg:
-                    missing.append(f"ATR regime gate ({atr_pct:.0%} pctile)")
+                    missing.append(f"ATR regime ({atr_pct:.0%})")
                 if not g_htf:
-                    veto_dir = "LONG" if htf_4h < 0 else "SHORT"
-                    missing.append(f"HTF vetoing {veto_dir}")
+                    # Correct: what direction is actually being vetoed
+                    if veto_short:
+                        missing.append(f"HTF vetoing SHORT (15m={htf_15m:+.2f})")
+                    if veto_long:
+                        missing.append(f"HTF vetoing LONG (15m={htf_15m:+.2f})")
                 if not g_conf:
-                    missing.append(
-                        f"Only {sig.n_confirming}/{'6' if ict else '5'} signals agree (need 3)")
+                    missing.append(f"Confluence {sig.n_confirming}/5 &lt; 3")
                 if not g_comp:
-                    missing.append(f"Composite {c:+.3f} &lt; ±{thr:.3f}")
+                    missing.append(f"Composite Σ={c:+.3f} &lt; ±{thr:.3f}")
                 if not can_ok:
-                    missing.append(f"Risk gate: {_esc(risk_reason)}")
-                if cd_remaining > 0:
-                    missing.append(f"Cooldown {cd_remaining:.0f}s")
-
-                lines.append("👀 <b>Watching</b>")
+                    missing.append(f"Risk: {_esc(risk_reason)}")
+                if cd_rem > 0:
+                    missing.append(f"Cooldown {cd_rem:.0f}s")
+                lines.append("  👀 <b>Watching</b>  —  blocked by:")
                 for m in missing:
-                    lines.append(f"   • {m}")
+                    lines.append(f"    • {m}")
 
             self.send_message("\n".join(lines))
             return None
