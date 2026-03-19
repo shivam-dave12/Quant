@@ -1337,6 +1337,12 @@ class QuantHelperSignals:
     htf_veto:     bool  = False
     adx:          float = 0.0
     overextended: bool  = False
+    # v8.0: raw HTF structure scores — required for tier-aware veto in ICTEntryGate
+    # These are the underlying [-1, +1] ICT swing-structure scores that produce the
+    # htf_veto bool.  Exposing them here lets ICTEntryGate make tier-specific
+    # counter-HTF decisions rather than treating the veto as a binary hard-block.
+    htf_15m:      float = 0.0   # 15m ICT swing-structure score [-1 bearish → +1 bullish]
+    htf_4h:       float = 0.0   # 4H ICT swing-structure score  [-1 bearish → +1 bullish]
 
     def flow_opposes(self, side: str) -> bool:
         """True if live order flow is STRONGLY opposing the trade direction."""
@@ -1438,6 +1444,73 @@ class ICTEntryGate:
     """
 
     @staticmethod
+    def _htf_allows_tier_a(
+            htf_veto: bool,
+            ict_total: float,
+            amd_phase: str,
+            amd_conf: float,
+            htf_15m: float,
+            side: str,
+    ) -> bool:
+        """
+        Tier-A counter-HTF gate — v8.0.
+
+        Returns True = Tier-A entry is allowed.
+
+        Standard (with-HTF) path: htf_veto=False → allowed immediately.
+
+        Counter-HTF unlock:
+          In ICT, AMD DISTRIBUTION delivers price SHORT into bullish 15m structure.
+          Retail longs are trapped; institutions distribute into that buying pressure.
+          The bullish 15m structure IS the context that makes the distribution trade
+          high-probability — blocking it because of that structure is the anti-pattern.
+
+          Unlock conditions (ALL must be simultaneously true):
+            1. Phase: DISTRIBUTION or REDISTRIBUTION only.
+               REACCUMULATION is a with-trend continuation — not a counter-HTF
+               thesis and does not belong in this unlock window.
+            2. ICT confluence >= 0.65 (raised from Tier-A's normal 0.55).
+               The extra structural cover (OB+FVG+sweep geometry all confirmed)
+               compensates for the opposing HTF momentum.
+            3. AMD conviction >= 0.60 (raised from 0.50).
+               Model must be confident this is a delivery phase, not a marginal
+               or transitional reading.
+            4. 15m structure NOT at extreme (|htf_15m| < 0.55).
+               SHORT counter-HTF: 15m must be bullish-but-not-extreme (< 0.55).
+               If 15m has already reached full bullish extension (>= 0.55), price
+               has already moved — distribution entry window is closed.
+               LONG counter-HTF: same logic inverted (> -0.55).
+
+        Tier-B never reaches this function — its htf_veto block is unconditional.
+        Tier-S bypasses the veto entirely (runs before this check, no htf_veto gate).
+        """
+        if not htf_veto:
+            return True  # no opposition — standard Tier-A path
+
+        # DISTRIBUTION and REDISTRIBUTION only — reaccumulation is with-trend
+        if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
+            return False
+
+        # Raised ICT bar: structural cover required when opposing HTF momentum
+        if ict_total < 0.65:
+            return False
+
+        # Raised AMD bar: delivery phase must be confirmed, not marginal
+        if amd_conf < 0.60:
+            return False
+
+        # 15m must not be at extremes — extreme means the window has closed
+        # SHORT: distributing INTO bullish structure, but not if 15m is at max bullish
+        # LONG:  accumulating INTO bearish structure, but not if 15m is at max bearish
+        _HTF_EXTREME_THRESHOLD = 0.55
+        if side == "short" and htf_15m >= _HTF_EXTREME_THRESHOLD:
+            return False
+        if side == "long"  and htf_15m <= -_HTF_EXTREME_THRESHOLD:
+            return False
+
+        return True
+
+    @staticmethod
     def evaluate(
             side: str,
             sig,                                    # SignalBreakdown
@@ -1468,6 +1541,11 @@ class ICTEntryGate:
         n_conf      = quant.n_confirming        if quant is not None else 0
         q_composite = quant.composite           if quant is not None else 0.0
         q_score     = quant.quant_quality_score(side) if quant is not None else 0.5
+        # v8.0: raw HTF structure scores for tier-aware counter-HTF gate
+        # htf_4h is available on QuantHelperSignals but not consumed here —
+        # the 4H bias is already captured inside htf_veto (vetoes_trade fires
+        # when both 15m AND 4h oppose). Only the 15m extreme check is needed.
+        htf_15m     = quant.htf_15m             if quant is not None else 0.0
 
         # ── HARD BLOCKED conditions (no trade regardless of tier) ─────────
 
@@ -1518,20 +1596,36 @@ class ICTEntryGate:
         # ── TIER-A: ICT Structural Alignment ─────────────────────────────
         _has_delivery_context = amd_phase in (
             "DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION") and amd_conf >= 0.50
+        # v8.0: tier-aware HTF gate replaces the previous `not htf_veto` hard-block.
+        # With-HTF path (htf_veto=False): identical behaviour to prior versions.
+        # Counter-HTF path: narrow unlock — DISTRIBUTION/REDISTRIBUTION only,
+        # ICT>=0.65, AMD_conf>=0.60, 15m not at extremes (<0.55 absolute value).
+        # REACCUMULATION is a with-trend continuation — counter-HTF unlock is
+        # intentionally excluded; those setups need the HTF to agree.
+        _tier_a_htf_ok = ICTEntryGate._htf_allows_tier_a(
+            htf_veto=htf_veto,
+            ict_total=ict_total,
+            amd_phase=amd_phase,
+            amd_conf=amd_conf,
+            htf_15m=htf_15m,
+            side=side,
+        )
         _tier_a_conditions = (
             _has_delivery_context and
             ict_total >= 0.55 and
             (side == "long"  and not in_prem or
              side == "short" and not in_disc) and
             not tf_opposes and
-            not htf_veto and
+            _tier_a_htf_ok and
             # Light quant confirmation: composite must lean in ICT direction
             (q_composite * (1 if side == "long" else -1)) >= 0.20
         )
         if _tier_a_conditions:
+            _a_label = "⚡COUNTER-HTF" if htf_veto else "structural"
             return ("A", 2,
-                    f"TIER-A structural AMD={amd_phase}(conf={amd_conf:.2f}) "
+                    f"TIER-A {_a_label} AMD={amd_phase}(conf={amd_conf:.2f}) "
                     f"ICT={ict_total:.2f} q={q_score:.2f} "
+                    f"15m={htf_15m:+.2f} "
                     f"mtf={'✓' if mtf_align else '✗'}")
 
         # ── TIER-B: Standard Quant + ICT Confluence ───────────────────────
@@ -1557,8 +1651,26 @@ class ICTEntryGate:
             block_reasons.append(f"ICT={ict_total:.2f}<0.40")
         if tf_opposes:
             block_reasons.append(f"TICK_OPPOSING({quant.tick_flow if quant else 0:.2f})")
-        if htf_veto:
-            block_reasons.append("HTF_VETO")
+        if htf_veto and not _tier_a_htf_ok:
+            # Show exactly which gate failed so log analysis is unambiguous
+            if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
+                block_reasons.append(
+                    f"HTF_VETO+phase={amd_phase}(no_counter_htf_unlock)")
+            elif ict_total < 0.65:
+                block_reasons.append(
+                    f"HTF_VETO+ICT={ict_total:.2f}<0.65(counter_htf_bar)")
+            elif amd_conf < 0.60:
+                block_reasons.append(
+                    f"HTF_VETO+AMD_conf={amd_conf:.2f}<0.60(counter_htf_bar)")
+            else:
+                # 15m at extreme — distribution entry window is closed.
+                # SHORT: htf_15m >= +0.55 (15m fully bullish, rally exhausted)
+                # LONG:  htf_15m <= -0.55 (15m fully bearish, selloff exhausted)
+                _extreme_str = (f"{htf_15m:+.2f}≥+0.55"
+                                if side == "short"
+                                else f"{htf_15m:+.2f}≤-0.55")
+                block_reasons.append(
+                    f"HTF_VETO+15m_extreme({_extreme_str}_dist_window_closed)")
         if not q_overext and ict_total < 0.55:
             block_reasons.append("NOT_OVEREXTENDED+weak_ICT")
         if abs(q_composite) < 0.30:

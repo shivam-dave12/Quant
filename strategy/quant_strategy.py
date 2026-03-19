@@ -2671,6 +2671,13 @@ class SignalBreakdown:
     ict_entry_tier: str = ""          # "S" | "A" | "B" | "" if no ICT gate
     htf_ict_source: bool = False      # True if HTF score came from ICT structure
     cvd_tick_count: int = 0           # Number of real trade ticks in CVD accumulator
+    # v8.0: raw HTF structure scores stored on the signal for serialisation,
+    # post-trade attribution, and counter-HTF gate diagnostics.
+    # These mirror HTFTrendFilter.trend_15m / trend_4h at the moment of signal
+    # computation and are the authoritative source for the htf_15m key in the
+    # position snapshot dict.
+    htf_15m: float = 0.0             # 15m ICT swing-structure score [-1 bearish → +1 bullish]
+    htf_4h:  float = 0.0             # 4H ICT swing-structure score  [-1 bearish → +1 bullish]
 
     def __str__(self):
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
@@ -2941,6 +2948,11 @@ class QuantStrategy:
                 htf_veto     = sig.htf_veto,
                 adx          = sig.adx,
                 overextended = sig.overextended,
+                # v8.0: raw HTF scores — sourced from sig so ICTEntryGate sees the
+                # exact scores that were computed at signal time, not a live re-read
+                # of HTFTrendFilter (which could change between signal and gate eval)
+                htf_15m      = sig.htf_15m,
+                htf_4h       = sig.htf_4h,
             )
         except Exception:
             return None
@@ -3244,6 +3256,10 @@ class QuantStrategy:
             w_vwap=w_vwap, w_cvd=w_cvd, w_ob=w_ob, w_tick=w_tick, w_vex=w_vex,
             htf_ict_source=self._htf.ict_source,
             cvd_tick_count=self._cvd.tick_count,
+            # v8.0: raw HTF structure scores — stored on sig for serialisation and
+            # post-trade attribution; consumed by _get_quant_helpers → ICTEntryGate
+            htf_15m=self._htf.trend_15m,
+            htf_4h=self._htf.trend_4h,
         )
         self._last_sig = sig
         return sig
@@ -5427,8 +5443,10 @@ class QuantStrategy:
                              if pos.entry_signal else ''),
             "amd_conf":     (round(pos.entry_signal.amd_conf, 3)
                              if pos.entry_signal else 0.0),
-            "htf_15m":      (round(pos.entry_signal.deviation_atr, 3)
-                             if pos.entry_signal else 0.0),
+            "htf_15m":      (round(pos.entry_signal.htf_15m, 3)
+                             if pos.entry_signal and hasattr(pos.entry_signal, 'htf_15m') else 0.0),
+            "htf_4h":       (round(pos.entry_signal.htf_4h, 3)
+                             if pos.entry_signal and hasattr(pos.entry_signal, 'htf_4h') else 0.0),
             "adx":          (round(pos.entry_signal.adx, 1)
                              if pos.entry_signal else 0.0),
             "n_conf":       (pos.entry_signal.n_confirming
