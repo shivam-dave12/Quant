@@ -567,8 +567,17 @@ class TelegramBotController:
             lines.append(f"  Confirming: {sig.n_confirming}/5 quant signals")
 
             lines.append("\n<b>━ Entry Gates</b>")
-            # Overextended: gate uses abs(deviation_atr)
-            entry_mult = float(getattr(cfg, 'QUANT_VWAP_ENTRY_ATR_MULT', 1.2))
+            # Overextended: gate uses ADX-adaptive threshold (0.4/0.6/0.9 ATR)
+            # NOT the QUANT_VWAP_ENTRY_ATR_MULT config constant (which is unused in the gate)
+            if adx_val < 25.0:
+                actual_thresh = 0.4
+                thresh_regime = "ranging"
+            elif adx_val < 35.0:
+                actual_thresh = 0.6
+                thresh_regime = "transitioning"
+            else:
+                actual_thresh = 0.9
+                thresh_regime = "trending"
             g_ext  = sig.overextended
             g_reg  = sig.regime_ok
             g_htf  = not sig.htf_veto
@@ -577,7 +586,7 @@ class TelegramBotController:
 
             lines.append(
                 f"  {'✅' if g_ext  else '❌'} Overextended   "
-                f"(|{dev_atr:+.2f}|={abs(dev_atr):.2f}ATR  need ≥{entry_mult:.1f}ATR)")
+                f"(|dev|={abs(dev_atr):.2f}ATR  need ≥{actual_thresh:.1f}ATR [{thresh_regime}  ADX={adx_val:.1f}])")
             lines.append(
                 f"  {'✅' if g_reg  else '❌'} ATR regime     "
                 f"({atr_pct:.0%} pctile  valid 5–97%)")
@@ -694,7 +703,7 @@ class TelegramBotController:
                 missing = []
                 if not g_ext:
                     missing.append(
-                        f"VWAP: |{abs(dev_atr):.2f}|ATR &lt; {entry_mult:.1f}ATR")
+                        f"VWAP: |{abs(dev_atr):.2f}|ATR &lt; {actual_thresh:.1f}ATR ({thresh_regime})")
                 if not g_reg:
                     missing.append(f"ATR regime ({atr_pct:.0%})")
                 if not g_htf:

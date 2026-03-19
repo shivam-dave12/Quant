@@ -1245,13 +1245,16 @@ class ICTTrailEngine:
 
         retrace = abs(peak_price_abs - price) if peak_price_abs > 1e-10 else 0.0
 
-        # Signal 1: Volume expansion
+        # Signal 1: Volume expansion during pullback = more participants joining = reversal risk
+        # vr = recent_vol / prior_vol. True expansion requires vr > 1.20 (20%+ above prior).
+        # Old threshold was 0.60 — a 40% volume DECLINE — which fired almost always and
+        # produced false reversal signals, making the trail freeze instead of advance.
         if len(candles_1m) >= 10:
             rv = sum(float(c['v']) for c in candles_1m[-3:]) / 3.0
             iv = sum(float(c['v']) for c in candles_1m[-8:-3]) / 5.0
             if iv > 1e-10:
                 vr = rv / iv
-                if vr > 0.60:
+                if vr > 1.20:
                     rev_sigs += 1; details.append(f"vol_expand({vr:.2f})")
                 else:
                     details.append(f"vol_decline({vr:.2f})")

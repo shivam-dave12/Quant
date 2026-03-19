@@ -398,9 +398,9 @@ class VWAPEngine:
         In trending markets, it takes a larger deviation to be "overextended"
         because the trend creates sustained VWAP distance.
 
-          ADX < 25 (ranging):       0.5×ATR threshold
-          25 ≤ ADX < 35 (transit):  0.7×ATR threshold
-          ADX ≥ 35 (trending):      1.0×ATR threshold
+          ADX < 25 (ranging):       0.4×ATR threshold
+          25 ≤ ADX < 35 (transit):  0.6×ATR threshold
+          ADX ≥ 35 (trending):      0.9×ATR threshold
         """
         if self._vwap < 1e-10 or atr < 1e-10: return False
         dev_abs = abs(price - self._vwap) / atr
@@ -2830,7 +2830,7 @@ class QuantStrategy:
         logger.info("=" * 72)
         logger.info("⚡ QuantStrategy v5.0 — ORDER FLOW + ICT SWEEP ENGINE")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-        logger.info(f"   Entry: VWAP deviation > {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR | Confirm: {QCfg.CONFIRM_TICKS()} ticks")
+        logger.info(f"   Entry: VWAP dev ≥ 0.4–0.9×ATR (ADX-adaptive) | Confirm: {QCfg.CONFIRM_TICKS()} ticks")
         logger.info(f"   SL: ICT sweep-wick hierarchy | TP: AMD delivery targeting")
         logger.info(f"   Trail: AMD-phase-aware (MANIP→freeze DIST→OB/swing AGGR→1m)")
         sweep_status = (
