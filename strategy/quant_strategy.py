@@ -2671,13 +2671,6 @@ class SignalBreakdown:
     ict_entry_tier: str = ""          # "S" | "A" | "B" | "" if no ICT gate
     htf_ict_source: bool = False      # True if HTF score came from ICT structure
     cvd_tick_count: int = 0           # Number of real trade ticks in CVD accumulator
-    # v8.0: raw HTF structure scores stored on the signal for serialisation,
-    # post-trade attribution, and counter-HTF gate diagnostics.
-    # These mirror HTFTrendFilter.trend_15m / trend_4h at the moment of signal
-    # computation and are the authoritative source for the htf_15m key in the
-    # position snapshot dict.
-    htf_15m: float = 0.0             # 15m ICT swing-structure score [-1 bearish → +1 bullish]
-    htf_4h:  float = 0.0             # 4H ICT swing-structure score  [-1 bearish → +1 bullish]
 
     def __str__(self):
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
@@ -2948,11 +2941,6 @@ class QuantStrategy:
                 htf_veto     = sig.htf_veto,
                 adx          = sig.adx,
                 overextended = sig.overextended,
-                # v8.0: raw HTF scores — sourced from sig so ICTEntryGate sees the
-                # exact scores that were computed at signal time, not a live re-read
-                # of HTFTrendFilter (which could change between signal and gate eval)
-                htf_15m      = sig.htf_15m,
-                htf_4h       = sig.htf_4h,
             )
         except Exception:
             return None
@@ -3256,10 +3244,6 @@ class QuantStrategy:
             w_vwap=w_vwap, w_cvd=w_cvd, w_ob=w_ob, w_tick=w_tick, w_vex=w_vex,
             htf_ict_source=self._htf.ict_source,
             cvd_tick_count=self._cvd.tick_count,
-            # v8.0: raw HTF structure scores — stored on sig for serialisation and
-            # post-trade attribution; consumed by _get_quant_helpers → ICTEntryGate
-            htf_15m=self._htf.trend_15m,
-            htf_4h=self._htf.trend_4h,
         )
         self._last_sig = sig
         return sig
@@ -3437,7 +3421,7 @@ class QuantStrategy:
                         f"Swp={_disp_ict_sweep:.1f} KZ={_disp_ict_sess:.1f}]"
                     )
                     if _tier_reason_d:
-                        ict_gate_lbl += f"\n    {_tier_reason_d[:80]}"
+                        ict_gate_lbl += f"\n    {_tier_reason_d}"
                 else:
                     ict_gate_lbl = "📋 ICT (ACTIVE position — not updated)"
                 gates.append(ict_gate_lbl)
@@ -3550,7 +3534,7 @@ class QuantStrategy:
             if ap:
                 _status = "🎯 ENTRY READY"
             elif _ap_reason and _ap_reason not in ("no_ict", ""):
-                _status = f"⛔ ICT BLOCKED — {_ap_reason[:55]}"
+                _status = f"⛔ ICT BLOCKED — {_ap_reason}"
             else:
                 _status = "👀 Watching"
 
@@ -3900,6 +3884,10 @@ class QuantStrategy:
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"No ICT confluence for ≥15 min.\n"
                             f"Side: {side.upper()} | Reason: {_tier_reason}\n"
+                            f"HTF: 15m={getattr(sig,'htf_15m',0.0):+.2f}  "
+                            f"4H={getattr(sig,'htf_4h',0.0):+.2f}  "
+                            f"veto={'YES' if getattr(sig,'htf_veto',False) else 'no'}\n"
+                            f"AMD: {getattr(sig,'amd_phase','?')} conf={getattr(sig,'amd_conf',0.0):.2f}\n"
                             f"<i>Bot alive — waiting for institutional setup.</i>")
                     self._confirm_long = self._confirm_short = 0
                     return
@@ -4922,6 +4910,43 @@ class QuantStrategy:
         if _sweep_was_active:
             _sweep_badge = " 🏛️ SWEEP-AND-GO"
         mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
+
+        # ── v8.0: additive tier + counter-HTF + AMD + sweep context lines ────────
+        # Tier badge line
+        _tier_labels = {"S": "🥇 Tier-S — OTE Sweep-and-Go",
+                        "A": "🥈 Tier-A — ICT Structural",
+                        "B": "🥉 Tier-B — Quant+ICT Confluence",
+                        "":  "⚪ No ICT tier"}
+        _tier_badge  = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
+        # Counter-HTF flag — only shown when htf_veto was True at entry
+        _counter_htf_line = ""
+        if getattr(sig, 'htf_veto', False) and ict_tier in ("A",):
+            _counter_htf_line = (
+                f"\n⚡ Counter-HTF entry  "
+                f"15m={getattr(sig,'htf_15m',0.0):+.2f}  "
+                f"4H={getattr(sig,'htf_4h',0.0):+.2f}")
+        # AMD context line
+        _amd_line = ""
+        if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
+            _amd_icon = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
+                         "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
+                         "ACCUMULATION": "💤"}.get(sig.amd_phase, "❓")
+            _amd_line = (
+                f"\nAMD:      {_amd_icon} {sig.amd_phase}  "
+                f"conf={sig.amd_conf:.2f}  "
+                f"bias={getattr(sig,'amd_bias','?')}")
+        # Sweep geometry line — only when sweep was active
+        _sweep_geo_line = ""
+        if _sweep_was_active and self._active_sweep_setup is None:
+            # Setup was consumed — read geometry from sig (stored at entry time)
+            # Try the sweep detector's last known setup before invalidation
+            pass  # geometry already shown via _sweep_badge; detailed in SL/TP lines
+        # HTF structure line — always shown
+        _htf_line = (
+            f"\nHTF:      15m={getattr(sig,'htf_15m',0.0):+.2f}  "
+            f"4H={getattr(sig,'htf_4h',0.0):+.2f}  "
+            f"veto={'YES ⚠️' if getattr(sig,'htf_veto',False) else 'no ✅'}")
+
         send_telegram_message(
             f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]{_sweep_badge}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4933,7 +4958,9 @@ class QuantStrategy:
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Regime:   {sig.market_regime} | ADX={sig.adx:.1f} | Mode: {mode.capitalize()}\n"
             f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f}×ATR)\n"
-            f"Signals:  {sig.n_confirming}/5 agree | Σ={sig.composite:+.3f}{ict_line}"
+            f"Signals:  {sig.n_confirming}/5 agree | Σ={sig.composite:+.3f}{ict_line}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Gate:     {_tier_badge}{_counter_htf_line}{_amd_line}{_htf_line}"
         )
         logger.info(
             f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
@@ -5443,10 +5470,8 @@ class QuantStrategy:
                              if pos.entry_signal else ''),
             "amd_conf":     (round(pos.entry_signal.amd_conf, 3)
                              if pos.entry_signal else 0.0),
-            "htf_15m":      (round(pos.entry_signal.htf_15m, 3)
-                             if pos.entry_signal and hasattr(pos.entry_signal, 'htf_15m') else 0.0),
-            "htf_4h":       (round(pos.entry_signal.htf_4h, 3)
-                             if pos.entry_signal and hasattr(pos.entry_signal, 'htf_4h') else 0.0),
+            "htf_15m":      (round(pos.entry_signal.deviation_atr, 3)
+                             if pos.entry_signal else 0.0),
             "adx":          (round(pos.entry_signal.adx, 1)
                              if pos.entry_signal else 0.0),
             "n_conf":       (pos.entry_signal.n_confirming
