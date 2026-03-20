@@ -2056,36 +2056,70 @@ class ICTEngine:
                 active_fvg = fvg
                 break
 
-        # Proximity FVG — price is approaching but hasn't entered yet
-        # BUG-FVG-PROX-DIR FIX: the old code had the direction inverted.
-        #   LONG entry: look for bullish FVG BELOW current price (price is
-        #     above the FVG, approaching from above — the FVG acts as support
-        #     for the retracement entry).  Check: fvg.top < price.
-        #   SHORT entry: look for bearish FVG ABOVE current price (price is
-        #     below the FVG, approaching from below — FVG acts as resistance).
-        #     Check: fvg.bottom > price.
-        # The original code had these REVERSED, scoring confluence for FVGs
-        # that were on the WRONG side of price entirely.
+        # Proximity FVG — price is approaching but hasn't entered yet.
+        #
+        # Two approach directions must be checked:
+        #
+        # REVERSION approach (price has overextended, retreating back):
+        #   LONG:  price came down from above, bullish FVG is below.
+        #          Check: fvg.top < price  (FVG below, price approaching from above)
+        #   SHORT: price pushed up from below, bearish FVG is above.
+        #          Check: fvg.bottom > price  (FVG above, price approaching from below)
+        #
+        # DELIVERY approach (sweep entry — price rallies/falls INTO the delivery corridor):
+        #   LONG:  SSL swept, price now below FVG, approaching from below as it
+        #          delivers upward.  Bullish FVGs above price are the path.
+        #          Check: fvg.bottom > price  (FVG above, price approaching from below)
+        #   SHORT: BSL swept, price now above FVG, approaching from above as it
+        #          delivers downward.  Bearish FVGs below price are the path.
+        #          Check: fvg.top < price  (FVG below, price approaching from above)
+        #
+        # Both directions use the same FVG pool (fvgs_bull for LONG, fvgs_bear for SHORT).
+        # Take the closest qualifying FVG regardless of which direction it is from price.
         if active_fvg is None and atr > 1e-10:
+            _best_fvg   = None
+            _best_score = 0.0
             for fvg in act_fvgs:
-                if side == "long" and fvg.top < price:
-                    # FVG is below — price is above it, could retrace into it
-                    da = (price - fvg.top) / atr
-                    if da <= self.FVG_PROXIMITY_ATR:
-                        pf = 1.0 - da / self.FVG_PROXIMITY_ATR
-                        s  = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                        pd += s; active_fvg = fvg
-                        details.append(f"FVG_PROX({da:.1f}ATR) tf={fvg.timeframe}")
-                        break
-                elif side == "short" and fvg.bottom > price:
-                    # FVG is above — price is below it, could retrace into it
-                    da = (fvg.bottom - price) / atr
-                    if da <= self.FVG_PROXIMITY_ATR:
-                        pf = 1.0 - da / self.FVG_PROXIMITY_ATR
-                        s  = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                        pd += s; active_fvg = fvg
-                        details.append(f"FVG_PROX({da:.1f}ATR) tf={fvg.timeframe}")
-                        break
+                score = 0.0
+                if side == "long":
+                    # Reversion: FVG below price (price approaching from above)
+                    if fvg.top < price:
+                        da = (price - fvg.top) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
+                    # Delivery: FVG above price (price approaching from below)
+                    elif fvg.bottom > price:
+                        da = (fvg.bottom - price) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
+                else:  # short
+                    # Reversion: FVG above price (price approaching from below)
+                    if fvg.bottom > price:
+                        da = (fvg.bottom - price) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
+                    # Delivery: FVG below price (price approaching from above)
+                    elif fvg.top < price:
+                        da = (price - fvg.top) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
+                if score > _best_score:
+                    _best_score = score
+                    _best_fvg   = fvg
+            if _best_fvg is not None:
+                pd += _best_score
+                active_fvg = _best_fvg
+                _prox_dir  = ("below" if (
+                    (side == "long"  and _best_fvg.top   < price) or
+                    (side == "short" and _best_fvg.bottom > price)
+                ) else "above")
+                details.append(
+                    f"FVG_PROX({abs((price - _best_fvg.midpoint) / atr):.1f}ATR,"
+                    f"{_prox_dir}) tf={_best_fvg.timeframe}")
 
         out.pd_array_score = min(0.25, pd)
         out.active_ob  = active_ob
@@ -2238,17 +2272,9 @@ class ICTEngine:
         )
         out.mtf_ob_count = htf_ob_count
 
-        # MTF FVG stack — SYNC FIX: must match EXACTLY what the FVG score counts.
-        #
-        # Root cause of "FVG=0.67 but Stack:0FVG" contradiction:
-        #   Scoring counted proximity FVGs (fvg.top < price within FVG_PROXIMITY_ATR).
-        #   Stack counted only is_price_in_gap() — a DIFFERENT, tighter membership test.
-        #   When price moved slightly above the FVG gap (proximity zone), score stayed
-        #   at 0.67 but stack dropped to 0. These two must use identical criteria.
-        #
-        # Fix: count any FVG that EITHER contains price OR is within proximity window,
-        # matching the scoring logic exactly. Fill threshold corrected to 0.50
-        # (ICT mitigation = 50% fill, same as update_fill() marks filled=True).
+        # MTF FVG stack — count any active FVG within proximity in EITHER direction.
+        # Matches the scoring branch exactly (which now checks both reversion and
+        # delivery approach directions).
         _fvg_stack = 0
         fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
         for _f in fvgs_dir:
@@ -2257,12 +2283,19 @@ class ICTEngine:
             if _f.is_price_in_gap(price):
                 _fvg_stack += 1
             elif atr > 1e-10:
-                # Proximity check: matches the scoring branch exactly
-                if side == "long" and _f.top < price:
-                    if (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
+                if side == "long":
+                    # Reversion: FVG below price
+                    if _f.top < price and (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
                         _fvg_stack += 1
-                elif side == "short" and _f.bottom > price:
-                    if (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
+                    # Delivery: FVG above price
+                    elif _f.bottom > price and (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
+                        _fvg_stack += 1
+                else:
+                    # Reversion: FVG above price
+                    if _f.bottom > price and (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
+                        _fvg_stack += 1
+                    # Delivery: FVG below price
+                    elif _f.top < price and (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
                         _fvg_stack += 1
         out.fvg_stack_count = _fvg_stack
 
@@ -2270,24 +2303,24 @@ class ICTEngine:
         pdm = self.get_pd_matrix(price, now_ms)
         out.pd_matrix = pdm["matrix_str"]
 
-        # HTF reversal risk: if strong HTF OB opposes the trade within 2 ATR
+        # HTF reversal risk: score opposing OBs within 2 ATR, excluding those
+        # inside the active AMD delivery corridor (they are intended entry zones,
+        # not reversal obstacles).
         #
-        # Design-flaw fix: the original code scored ALL opposing OBs regardless
-        # of AMD context. After a BSL sweep (bearish AMD), the bullish OBs
-        # BETWEEN the current price and the sweep level are the INTENDED entry
-        # zones — smart money distributes into retail buying at those OBs.
-        # Scoring those same OBs as "reversal risk" produced RevRisk ≈ 1.0
-        # every tick (because 1d OBs have strength 97.0), permanently blocking
-        # the pre-gate for all SHORT entries in a 14-ATR delivery move.
-        #
-        # Fix: skip opposing OBs that sit between the current price and the AMD
-        # sweep origin — they are part of the delivery corridor, not blockers.
-        # Only OBs that are ABOVE the sweep origin (for shorts) / BELOW the
-        # sweep origin (for longs) represent genuine structural reversal risk.
-        _amd_sweep_origin = self._amd.sweep_origin   # None if no active sweep
-        _amd_phase        = self._amd.phase
-        _amd_bias         = self._amd.bias
-        _in_distribution  = _amd_phase in ("DISTRIBUTION", "MANIPULATION")
+        # Delivery corridor definitions:
+        #   SHORT (BSL swept, bearish): bull OBs between current price and sweep
+        #     origin are already in the delivery wake — exclude.
+        #   LONG  (SSL swept, bullish): bear OBs between sweep origin and AMD
+        #     delivery target are in the path being delivered INTO — price will
+        #     push through them, so they are not structural reversal risks.
+        #     Fix-3: the original LONG condition used `price` as upper bound,
+        #     which is always False when price < sweep_origin (before OTE entry).
+        #     Now use delivery_target as the corridor upper boundary.
+        _amd_sweep_origin    = self._amd.sweep_origin
+        _amd_phase           = self._amd.phase
+        _amd_bias            = self._amd.bias
+        _amd_delivery_target = self._amd.delivery_target
+        _in_distribution     = _amd_phase in ("DISTRIBUTION", "MANIPULATION")
         opp_obs = self.order_blocks_bear if side == "long" else self.order_blocks_bull
         rev_risk = 0.0
         for ob in opp_obs:
@@ -2295,17 +2328,18 @@ class ICTEngine:
                 continue
             dist = abs(ob.midpoint - price)
             if atr > 1e-9 and dist < 2.0 * atr:
-                # Delivery-corridor exclusion: skip OBs that are part of the
-                # active AMD delivery path so they aren't double-counted as risk.
-                if (_in_distribution and _amd_sweep_origin is not None):
+                if _in_distribution and _amd_sweep_origin is not None:
                     if (side == "short" and _amd_bias == "bearish" and
-                            ob.midpoint <= _amd_sweep_origin and ob.midpoint >= price):
-                        # Bull OB is between price and the BSL sweep → delivery corridor
-                        continue
-                    if (side == "long" and _amd_bias == "bullish" and
-                            ob.midpoint >= _amd_sweep_origin and ob.midpoint <= price):
-                        # Bear OB is between price and the SSL sweep → delivery corridor
-                        continue
+                            ob.midpoint <= _amd_sweep_origin and
+                            ob.midpoint >= price):
+                        continue   # bull OB between price and BSL sweep — delivery wake
+                    if side == "long" and _amd_bias == "bullish":
+                        _upper = (_amd_delivery_target
+                                  if _amd_delivery_target is not None
+                                  else (_amd_sweep_origin + 15.0 * max(atr, 1.0)))
+                        if (ob.midpoint >= _amd_sweep_origin and
+                                ob.midpoint <= _upper):
+                            continue   # bear OB inside LONG delivery corridor
                 rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)))
         out.htf_reversal_risk = min(1.0, rev_risk)
 
@@ -2852,16 +2886,21 @@ class ICTEngine:
                 if ob.strength < 70.0:  # HTF only
                     continue
 
-                # Delivery-corridor exclusion: skip OBs inside the active AMD
-                # delivery path — they are intended entry/support zones, not
-                # reversal risks.  Consistent with RevRisk calculation.
+                # Delivery-corridor exclusion: consistent with get_confluence RevRisk.
+                # Skip OBs that are inside the active AMD delivery path.
                 if _gz_in_delivery and _gz_amd_sweep is not None:
                     if (direction == "long" and _gz_amd_bias == "bearish" and
                             ob.midpoint <= _gz_amd_sweep and ob.midpoint >= price):
-                        continue   # bull OB between price and BSL sweep — delivery corridor
-                    if (direction == "short" and _gz_amd_bias == "bullish" and
-                            ob.midpoint >= _gz_amd_sweep and ob.midpoint <= price):
-                        continue   # bear OB between price and SSL sweep — delivery corridor
+                        continue   # bull OB between price and BSL sweep — delivery wake
+                    if direction == "short" and _gz_amd_bias == "bullish":
+                        # Fix-3: use delivery_target as corridor upper bound for LONG
+                        # (bear OBs from sweep origin up to delivery target are the
+                        # delivery path — not reversal zones)
+                        _gz_dt = self._amd.delivery_target
+                        _gz_upper = (_gz_dt if _gz_dt is not None
+                                     else (_gz_amd_sweep + 15.0 * max(atr, 1.0)))
+                        if (ob.midpoint >= _gz_amd_sweep and ob.midpoint <= _gz_upper):
+                            continue   # bear OB inside LONG delivery corridor
 
                 tf_st = self._tf.get(ob.timeframe, TFStructure(timeframe=ob.timeframe))
                 pd = tf_st.premium_discount

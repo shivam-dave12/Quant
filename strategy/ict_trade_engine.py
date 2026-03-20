@@ -1650,38 +1650,25 @@ class ICTEntryGate:
             amd_conf: float,
             htf_15m: float,
             side: str,
+            sweep_setup: Optional['ICTSweepSetup'] = None,
     ) -> bool:
         """
-        Tier-A counter-HTF gate — v8.0.
+        Tier-A counter-HTF gate.
 
         Returns True = Tier-A entry is allowed.
 
         Standard (with-HTF) path: htf_veto=False → allowed immediately.
 
-        Counter-HTF unlock:
-          In ICT, AMD DISTRIBUTION delivers price SHORT into bullish 15m structure.
-          Retail longs are trapped; institutions distribute into that buying pressure.
-          The bullish 15m structure IS the context that makes the distribution trade
-          high-probability — blocking it because of that structure is the anti-pattern.
-
-          Unlock conditions (ALL must be simultaneously true):
-            1. Phase: DISTRIBUTION or REDISTRIBUTION only.
-               REACCUMULATION is a with-trend continuation — not a counter-HTF
-               thesis and does not belong in this unlock window.
-            2. ICT confluence >= 0.65 (raised from Tier-A's normal 0.55).
-               The extra structural cover (OB+FVG+sweep geometry all confirmed)
-               compensates for the opposing HTF momentum.
-            3. AMD conviction >= 0.60 (raised from 0.50).
-               Model must be confident this is a delivery phase, not a marginal
-               or transitional reading.
-            4. 15m structure NOT at extreme (|htf_15m| < 0.55).
-               SHORT counter-HTF: 15m must be bullish-but-not-extreme (< 0.55).
-               If 15m has already reached full bullish extension (>= 0.55), price
-               has already moved — distribution entry window is closed.
-               LONG counter-HTF: same logic inverted (> -0.55).
-
-        Tier-B never reaches this function — its htf_veto block is unconditional.
-        Tier-S bypasses the veto entirely (runs before this check, no htf_veto gate).
+        Counter-HTF unlock (all conditions must hold):
+          1. Phase: DISTRIBUTION or REDISTRIBUTION only.
+          2. ICT confluence >= 0.65 (raised bar for structural cover).
+             EXCEPTION: when a confirmed matching sweep setup is present,
+             the sweep geometry itself IS the structural cover — bar drops
+             back to the normal Tier-A minimum of 0.55.  The sweep detected
+             the displacement, OTE zone, and SL level; that evidence is at
+             least as strong as requiring OB+FVG overlap in the ICT score.
+          3. AMD conviction >= 0.60.
+          4. 15m structure NOT at extreme (|htf_15m| < 0.55).
         """
         if not htf_veto:
             return True  # no opposition — standard Tier-A path
@@ -1690,17 +1677,23 @@ class ICTEntryGate:
         if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
             return False
 
-        # Raised ICT bar: structural cover required when opposing HTF momentum
-        if ict_total < 0.65:
+        # ICT bar: raised to 0.65 normally; drops to standard 0.55 when a
+        # confirmed matching sweep setup is present because the sweep provides
+        # the same structural cover the higher bar was requiring.
+        _has_sweep_cover = (
+            sweep_setup is not None and
+            sweep_setup.side == side and
+            sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
+        )
+        _ict_bar = 0.55 if _has_sweep_cover else 0.65
+        if ict_total < _ict_bar:
             return False
 
         # Raised AMD bar: delivery phase must be confirmed, not marginal
         if amd_conf < 0.60:
             return False
 
-        # 15m must not be at extremes — extreme means the window has closed
-        # SHORT: distributing INTO bullish structure, but not if 15m is at max bullish
-        # LONG:  accumulating INTO bearish structure, but not if 15m is at max bearish
+        # 15m must not be at extremes — the distribution/accumulation window is closed
         _HTF_EXTREME_THRESHOLD = 0.55
         if side == "short" and htf_15m >= _HTF_EXTREME_THRESHOLD:
             return False
@@ -1829,19 +1822,23 @@ class ICTEntryGate:
             amd_conf=amd_conf,
             htf_15m=htf_15m,
             side=side,
+            sweep_setup=sweep_setup,   # Fix 1: pass sweep for lower ICT bar
+        )
+        # Fix 2: counter-HTF entries use a softer tick flow threshold.
+        # Standard Tier-A (with-HTF): tf_opposes at −0.30 is appropriate.
+        # Counter-HTF Tier-A: the manipulation sweep naturally drives order flow
+        # AGAINST the trade direction — retail traders pile in while smart money
+        # distributes.  tick_flow < −0.30 is expected behaviour, not a veto signal.
+        # Use −0.60 so only extreme, sustained opposing flow blocks entry.
+        _tf_opposes_tier_a = (
+            quant is not None and (
+                (side == "long"  and quant.tick_flow < (-0.60 if htf_veto else -0.30)) or
+                (side == "short" and quant.tick_flow >  ( 0.60 if htf_veto else  0.30))
+            )
         )
         _tier_a_conditions = (
             _has_delivery_context and
             ict_total >= 0.55 and
-            # P/D zone gate — RELAXED for active AMD DISTRIBUTION with matching bias.
-            # Design-flaw fix: AMD DISTRIBUTION naturally delivers FROM premium TOWARD
-            # discount. Applying a strict P/D gate here meant that after a BSL sweep at
-            # the top of the range, the bot could never take the short delivery once
-            # price moved below the 4H equilibrium (≈40%), because "SHORT_IN_DISCOUNT"
-            # would block every Tier-A evaluation for the entire 14-ATR delivery.
-            # Tier-A already requires _has_delivery_context (AMD phase + conf ≥ 0.50),
-            # so the P/D gate is redundant — it was added for standard entries where
-            # there is no sweep context. Exempt AMD DISTRIBUTION with correct bias.
             (
                 (amd_phase == "DISTRIBUTION" and (
                     (side == "short" and amd_bias == "bearish") or
@@ -1852,9 +1849,8 @@ class ICTEntryGate:
                 or
                 (side == "short" and not in_disc)
             ) and
-            not tf_opposes and
+            not _tf_opposes_tier_a and    # Fix 2: softer threshold for counter-HTF
             _tier_a_htf_ok and
-            # Light quant confirmation: composite must lean in ICT direction
             (q_composite * (1 if side == "long" else -1)) >= 0.20
         )
         if _tier_a_conditions:
@@ -1899,8 +1895,10 @@ class ICTEntryGate:
                 block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
         if ict_total < 0.40:
             block_reasons.append(f"ICT={ict_total:.2f}<0.40")
-        if tf_opposes:
-            block_reasons.append(f"TICK_OPPOSING({quant.tick_flow if quant else 0:.2f})")
+        if _tf_opposes_tier_a:
+            _tf_val = quant.tick_flow if quant else 0.0
+            _tf_thr = 0.60 if htf_veto else 0.30
+            block_reasons.append(f"TICK_OPPOSING({_tf_val:.2f},thr={_tf_thr:.2f})")
         # P/D zone mismatch (only reported when not in AMD delivery — delivery is exempt)
         _in_amd_delivery = (
             amd_phase == "DISTRIBUTION" and (
@@ -1913,13 +1911,20 @@ class ICTEntryGate:
         if (side == "short" and in_disc  and not _in_amd_delivery):
             block_reasons.append("SHORT_IN_DISCOUNT")
         if htf_veto and not _tier_a_htf_ok:
-            # Show exactly which gate failed so log analysis is unambiguous
+            # Compute the effective ICT bar (matches _htf_allows_tier_a logic)
+            _has_sweep_cover = (
+                sweep_setup is not None and
+                sweep_setup.side == side and
+                sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
+            )
+            _eff_bar = 0.55 if _has_sweep_cover else 0.65
             if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
                 block_reasons.append(
                     f"HTF_VETO+phase={amd_phase}(no_counter_htf_unlock)")
-            elif ict_total < 0.65:
+            elif ict_total < _eff_bar:
                 block_reasons.append(
-                    f"HTF_VETO+ICT={ict_total:.2f}<0.65(counter_htf_bar)")
+                    f"HTF_VETO+ICT={ict_total:.2f}<{_eff_bar:.2f}(counter_htf_bar"
+                    f"{'_sweep_reduced' if _has_sweep_cover else ''})")
             elif amd_conf < 0.60:
                 block_reasons.append(
                     f"HTF_VETO+AMD_conf={amd_conf:.2f}<0.60(counter_htf_bar)")
@@ -1931,7 +1936,6 @@ class ICTEntryGate:
                     f"HTF_VETO+15m_extreme({_extreme_str}_dist_window_closed)")
         if not q_overext and ict_total < 0.55:
             block_reasons.append("NOT_OVEREXTENDED+weak_ICT")
-        # Bug-5: show real threshold value (TIER_B_COMPOSITE_MIN = 0.30)
         if abs(q_composite) < ICTEntryGate.TIER_B_COMPOSITE_MIN:
             block_reasons.append(
                 f"Σ={q_composite:+.3f}<{ICTEntryGate.TIER_B_COMPOSITE_MIN:.2f}(TierB_min)")
