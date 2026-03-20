@@ -130,6 +130,81 @@ class OrderBlock:
 
 
 @dataclass
+class BreakerBlock:
+    """
+    ICT Breaker Block — a MITIGATED Order Block that has flipped polarity.
+
+    When price closes THROUGH an OB's far extreme, the OB is mitigated and
+    becomes a Breaker Block.  The Breaker Block now acts as OPPOSING structure:
+      - A mitigated Bullish OB becomes a Bearish Breaker (resistance)
+      - A mitigated Bearish OB becomes a Bullish Breaker (support)
+
+    Price is expected to retrace back into the Breaker zone (the mitigated OB
+    range) and then continue in the new direction.  The Breaker is valid until
+    price closes back through it a second time (full invalidation).
+    """
+    low:       float
+    high:      float
+    timestamp: int
+    original_direction: str   # "bullish" | "bearish" — direction of the mitigated OB
+    direction: str            # FLIPPED: "bearish" | "bullish"
+    timeframe: str
+    strength:  float = 50.0
+    visit_count: int = 0
+    max_age_ms: int = 86_400_000 * 2   # Breakers live longer — structural flip
+
+    @property
+    def midpoint(self) -> float:
+        return (self.low + self.high) / 2.0
+
+    @property
+    def size(self) -> float:
+        return self.high - self.low
+
+    def contains_price(self, price: float) -> bool:
+        return self.low <= price <= self.high
+
+    def is_active(self, now_ms: int) -> bool:
+        return (now_ms - self.timestamp <= self.max_age_ms and
+                self.visit_count < 2)
+
+
+@dataclass
+class RejectionBlock:
+    """
+    ICT Rejection Block — an OB where price was REJECTED on the first visit.
+
+    Standard OB: price enters the zone → institutional orders fill → price continues.
+    Rejection Block: price wicks INTO the zone but CLOSES OUTSIDE it (wick rejection).
+    This signals a failed OB test — the zone is now a strong reversal level
+    because trapped traders who entered on the wick are stopped out on continuation.
+
+    A Rejection Block is created when:
+      - An OB is tested (price enters the zone)
+      - The CLOSE of the testing candle is OUTSIDE the OB range
+      - The wick was ≥ 50% of the candle range (significant rejection)
+    """
+    low:       float
+    high:      float
+    timestamp: int
+    direction: str    # "bullish" (support rejection) | "bearish" (resistance rejection)
+    timeframe: str
+    wick_size_pct: float = 0.0   # wick size as % of candle range
+    strength:      float = 50.0
+    max_age_ms:    int   = 86_400_000
+
+    @property
+    def midpoint(self) -> float:
+        return (self.low + self.high) / 2.0
+
+    def contains_price(self, price: float) -> bool:
+        return self.low <= price <= self.high
+
+    def is_active(self, now_ms: int) -> bool:
+        return now_ms - self.timestamp <= self.max_age_ms
+
+
+@dataclass
 class FairValueGap:
     """ICT FVG — 3-candle imbalance (candle[i-1].extremity vs candle[i+1].extremity)."""
     bottom:    float
@@ -203,7 +278,7 @@ class LiquidityLevel:
     sweep_timestamp:        int  = 0
     displacement_confirmed: bool = False
     wick_rejection:         bool = False
-    timeframe: str = "5m"
+    timeframe: str = "5m"   # source TF: "5m"|"15m"|"1h"|"4h"|"1d"
 
     @property
     def pool_type(self) -> str:
@@ -222,12 +297,107 @@ class TFStructure:
     prev_sl_:      float = 0.0
     bos_level:     float = 0.0
     bos_direction: str   = ""
+    bos_timestamp: int   = 0     # epoch ms of the CLOSED candle that confirmed the BOS
     choch_level:   float = 0.0
-    choch_bar_index: int = -1    # candle index (within the lb-slice) where CHoCH was detected; -1 = none
+    choch_timestamp: int = 0     # epoch ms of CHoCH confirmation candle
+    choch_bar_index: int = -1    # candle index within lb-slice; -1 = none
     range_high:    float = 0.0
     range_low:     float = 0.0
     equilibrium:   float = 0.0
     premium_discount: float = 0.5    # 0=deep discount, 1=deep premium
+    pd_grade:      str   = "EQ"      # "PREMIUM" | "EQ" | "DISCOUNT" (>65% / 35-65% / <35%)
+
+
+@dataclass
+class DealingRange:
+    """
+    ICT Dealing Range — the range between the last significant BSL and SSL.
+
+    This is the range smart money is 'dealing' within.  Institutional entries
+    occur at the extremes of the dealing range (discount SSL for longs,
+    premium BSL for shorts).  The equilibrium (50%) separates buy-side from
+    sell-side territory.
+
+    Quadrants (ICT standard):
+      0.00–0.25: Deep Discount       → highest conviction long zone
+      0.25–0.50: Discount            → valid long zone
+      0.50–0.75: Premium             → valid short zone
+      0.75–1.00: Deep Premium        → highest conviction short zone
+    """
+    low:          float   # SSL level (bottom of dealing range)
+    high:         float   # BSL level (top of dealing range)
+    equilibrium:  float   # 50% midpoint
+    current_pd:   float   # 0-1 position of price within range
+    quadrant:     str     # "DEEP_DISC"|"DISC"|"EQ"|"PREM"|"DEEP_PREM"
+    ssl_source_tf: str = "5m"
+    bsl_source_tf: str = "5m"
+    range_size:   float = 0.0
+
+    @property
+    def discount_boundary(self) -> float:
+        """Upper boundary of discount zone (25% level)."""
+        return self.low + 0.25 * self.range_size
+
+    @property
+    def premium_boundary(self) -> float:
+        """Lower boundary of premium zone (75% level)."""
+        return self.low + 0.75 * self.range_size
+
+
+@dataclass
+class PowerOf3State:
+    """
+    ICT Power of 3 (AMD time model) — session-based AMD thirds.
+
+    The session is divided into three time-based phases:
+      Accumulation (first third): range formation, stop accumulation
+      Manipulation (middle third): Judas swing — false breakout of the range
+      Distribution (final third): real move to the opposing liquidity
+
+    For NY session (13:30–21:00 UTC = 7.5 hours):
+      Accumulation: 13:30–16:00 (2.5h)
+      Manipulation: 16:00–18:30 (2.5h)
+      Distribution: 18:30–21:00 (2.5h)
+
+    For London session (07:00–15:00 UTC = 8 hours):
+      Accumulation: 07:00–09:40 (~2.7h)
+      Manipulation: 09:40–12:20 (~2.7h)
+      Distribution: 12:20–15:00 (~2.7h)
+    """
+    session: str          # "LONDON" | "NEW_YORK" | "ASIA" | "OFF_HOURS"
+    po3_phase: str        # "ACCUMULATION" | "MANIPULATION" | "DISTRIBUTION"
+    session_progress: float  # 0-1 through the session
+    phase_progress:   float  # 0-1 through the current Po3 phase
+    session_start_utc: float  # UTC hour when session started
+    session_end_utc:   float  # UTC hour when session ends
+    is_prime_entry_window: bool = False  # True during optimal entry windows
+
+
+@dataclass
+class IPDALevels:
+    """
+    IPDA (Interbank Price Delivery Algorithm) quarterly draw on liquidity.
+
+    ICT: institutions operate on 90-day (quarterly) cycles.  Key levels:
+      - Prior quarter high/low: strong draw targets for multi-week moves
+      - Current quarter open: institutional reference for quarterly bias
+      - 20/40/60-day highs and lows: medium-term draw levels
+
+    These are the levels where price is DELIVERED over weeks/months.
+    For intraday trading, they serve as the ultimate TP targets and bias filters.
+    """
+    prior_quarter_high: float = 0.0
+    prior_quarter_low:  float = 0.0
+    current_quarter_open: float = 0.0
+    current_quarter_high: float = 0.0
+    current_quarter_low:  float = 0.0
+    day_20_high: float = 0.0
+    day_20_low:  float = 0.0
+    day_40_high: float = 0.0
+    day_40_low:  float = 0.0
+    bias: str = "neutral"      # "bullish" (below PQH) | "bearish" (above PQL)
+    nearest_draw: float = 0.0  # nearest significant IPDA level
+    nearest_draw_label: str = ""
 
 
 @dataclass
@@ -290,6 +460,18 @@ class ICTConfluence:
     in_premium:  bool = False
     mtf_aligned: bool = False
 
+    # Advanced ICT delivery context
+    delivery_target:     Optional[float] = None   # AMD delivery target price
+    delivery_confidence: float = 0.0              # 0-1 confidence reaching target
+    pd_grade:            str   = "EQ"             # "PREMIUM"|"EQ"|"DISCOUNT" on 4H
+    htf_reversal_risk:   float = 0.0              # 0-1 probability of HTF opposing delivery
+    mtf_ob_count:        int   = 0                # TFs that have an OB supporting this trade
+    fvg_stack_count:     int   = 0                # TFs with unfilled FVG in trade zone
+    pd_matrix:           str   = ""               # e.g. "1D:DISC 4H:DISC 1H:EQ 15M:PREM"
+    judas_swing_active:  bool  = False            # price currently in Judas swing territory
+    nearest_ssl_dist_atr: float = 0.0             # for LONG: nearest SSL below (TP magnet)
+    nearest_bsl_dist_atr: float = 0.0             # for SHORT: nearest BSL above (TP magnet)
+
     details: str = ""
 
 
@@ -342,6 +524,10 @@ class ICTEngine:
         self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=60)
         self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=80)
         self._registered_sweeps: Deque[Tuple] = deque(maxlen=300)
+        # Advanced PD array types
+        self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=30)
+        self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=30)
+        self.rejection_blocks:    Deque[RejectionBlock] = deque(maxlen=30)
 
         # Per-TF structure snapshots
         self._tf: Dict[str, TFStructure] = {
@@ -351,9 +537,22 @@ class ICTEngine:
 
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
 
-        # Combined swing levels (for liquidity detection)
+        # ── Advanced structural state ──────────────────────────────────
+        # DealingRange: range between the most significant SSL and BSL
+        self._dealing_range: Optional[DealingRange]  = None
+        # Power of 3: session-time-based AMD phase estimate
+        self._po3:           Optional[PowerOf3State] = None
+        # IPDA quarterly draw levels (from 1D candles)
+        self._ipda:          Optional[IPDALevels]    = None
+        # Propulsion OBs — the specific OBs that caused the most recent BOS
+        # on 5m/15m/1h.  These are the highest-conviction structural levels.
+        self._propulsion_obs_bull: List[OrderBlock] = []
+        self._propulsion_obs_bear: List[OrderBlock] = []
         self._swing_highs: List[float] = []
         self._swing_lows:  List[float] = []
+        # Parallel metadata lists: (price, source_tf)
+        self._swing_highs_meta: List[Tuple[float, str]] = []
+        self._swing_lows_meta:  List[Tuple[float, str]] = []
 
         self._session  = ""
         self._killzone = ""
@@ -410,8 +609,18 @@ class ICTEngine:
         self.fvgs_bear.clear()
         self.liquidity_pools.clear()
         self._registered_sweeps.clear()
+        self.breaker_blocks_bull.clear()
+        self.breaker_blocks_bear.clear()
+        self.rejection_blocks.clear()
+        self._propulsion_obs_bull.clear()
+        self._propulsion_obs_bear.clear()
+        self._dealing_range = None
+        self._po3           = None
+        self._ipda          = None
         self._swing_highs.clear()
         self._swing_lows.clear()
+        self._swing_highs_meta.clear()
+        self._swing_lows_meta.clear()
         for tf in self._tf:
             self._tf[tf] = TFStructure(timeframe=tf)
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
@@ -458,7 +667,12 @@ class ICTEngine:
             self._tf["1m"] = self._analyze_structure(candles_1m, "1m", price)
 
         # ── Combined swing points (for liquidity clustering) ───────────
-        self._detect_swing_points(candles_5m, candles_15m)
+        # Pass HTF candles so equal highs/lows on 1H/4H/1D are tagged
+        # with their source timeframe for proper significance weighting.
+        self._detect_swing_points(candles_5m, candles_15m,
+                                   candles_1h=candles_1h,
+                                   candles_4h=candles_4h,
+                                   candles_1d=candles_1d)
 
         # ── Order Blocks — all timeframes ─────────────────────────────
         # 1m: micro-OBs for trail anchoring (short lookback, short life)
@@ -509,8 +723,28 @@ class ICTEngine:
         if candles_15m:
             self._update_ob_mitigation(candles_15m)
 
+        # ── Breaker + Rejection block detection ───────────────────────
+        self._detect_breaker_blocks(candles_5m, now_ms)
+        if len(candles_15m) >= 3:
+            self._detect_rejection_blocks(candles_15m, price, now_ms, "15m")
+        if candles_1h and len(candles_1h) >= 3:
+            self._detect_rejection_blocks(candles_1h, price, now_ms, "1h")
+
+        # ── Propulsion OB detection ───────────────────────────────────
+        self._detect_propulsion_obs(now_ms)
+
         # ── OB visit tracking ─────────────────────────────────────────
         self._update_ob_visits(price, now_ms)
+
+        # ── Dealing Range ─────────────────────────────────────────────
+        self._update_dealing_range(price)
+
+        # ── Power of 3 (session AMD thirds) ───────────────────────────
+        self._update_po3(now_ms)
+
+        # ── IPDA levels (1D candles needed) ───────────────────────────
+        if candles_1d and len(candles_1d) >= 20:
+            self._update_ipda(candles_1d, price)
 
         # ── AMD phase ─────────────────────────────────────────────────
         self._update_amd(price, now_ms)
@@ -584,23 +818,28 @@ class ICTEngine:
         # signals on every tick of the live candle whose close hasn't
         # been confirmed yet.
         last_close = float(recent[-2]['c'])
+        # bos_timestamp: the open-time of the candle whose CLOSE triggered BOS.
+        # This lets _update_amd compare "did this BOS happen AFTER the sweep?"
+        last_closed_ts = int(recent[-2].get('t', 0))
         if out.last_sh > 0 and last_close > out.last_sh:
             out.bos_level     = out.last_sh
             out.bos_direction = "bullish"
+            out.bos_timestamp = last_closed_ts
         elif out.last_sl_ > 0 and last_close < out.last_sl_:
             out.bos_level     = out.last_sl_
             out.bos_direction = "bearish"
+            out.bos_timestamp = last_closed_ts
 
         # ── CHoCH (Change of Character) ───────────────────────────────
         # First higher-low in a downtrend or lower-high in an uptrend.
-        # choch_bar_index is the candle index inside `recent` (0-based from the
-        # start of the lb-slice) so HTFTrendFilter can compute staleness in bars.
         if trend == "bearish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
             out.choch_level     = lows[-1][1]
-            out.choch_bar_index = lows[-1][0]   # fractal index within recent[]
+            out.choch_bar_index = lows[-1][0]
+            out.choch_timestamp = last_closed_ts
         elif trend == "bullish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
             out.choch_level     = highs[-1][1]
             out.choch_bar_index = highs[-1][0]
+            out.choch_timestamp = last_closed_ts
 
         # ── Premium / Discount ────────────────────────────────────────
         h_max = max(float(c['h']) for c in recent)
@@ -609,7 +848,9 @@ class ICTEngine:
         out.range_low    = l_min
         out.equilibrium  = (h_max + l_min) / 2.0
         rng = h_max - l_min
-        out.premium_discount = (price - l_min) / rng if rng > 1e-9 else 0.5
+        pd = (price - l_min) / rng if rng > 1e-9 else 0.5
+        out.premium_discount = pd
+        out.pd_grade = "PREMIUM" if pd > 0.65 else ("DISCOUNT" if pd < 0.35 else "EQ")
 
         return out
 
@@ -619,25 +860,37 @@ class ICTEngine:
 
     def _update_amd(self, price: float, now_ms: int) -> None:
         """
-        AMD phase from liquidity sweep recency + structure.
+        AMD cycle: Accumulation → Manipulation → Distribution → Re-accumulation
 
-        MANIPULATION  = sweep just happened (< 15 min)
-        DISTRIBUTION  = delivering after sweep, WITH 5m BOS confirmation
-        DISTRIBUTION* = 15-90 min but 5m BOS not yet printed → extended manip
-        REACCUM/REDIS = mid-trend pause (BOS on 15m but 5m ranging)
-        ACCUMULATION  = no recent sweep, price consolidating
+        PHASE TRANSITIONS (in order):
+          MANIPULATION  < 15 min after sweep (Judas swing active, no entry)
+          DISTRIBUTION  15-90 min, requires EITHER:
+                          (a) 5m BOS confirmed AFTER the sweep timestamp, OR
+                          (b) displacement ≥ 1.0 ATR from sweep level confirms
+                              delivery has started
+                          Note: (a) adds +0.05 confidence; (b) adds 0.0
+          PRE-DIST      15-30 min, no BOS yet → extended MANIP with reduced conf
+          REACCUM/REDIS > 90 min, 15m trending but 5m ranging (mid-trend pause)
+          ACCUMULATION  > 90 min, old sweep, confidence decays to neutral
 
-        BUG-AMD-DIST-NO-BOS FIX: previously DISTRIBUTION was declared purely
-        by elapsed time (15-90 min after sweep).  In ICT, the DISTRIBUTION
-        phase is confirmed when the execution timeframe (5m) prints a BOS in
-        the direction of the expected delivery.  Without that BOS, smart money
-        is still in the Judas-swing / manipulation phase and counter-direction
-        entries would be fighting the institutional move.
+        BOS TIMESTAMP GATE (regression fix):
+          The old code checked tf5m.bos_direction == delivery_dir without ANY
+          timestamp guard. During warmup, _analyze_structure processes historical
+          candles and may record a BOS from hours before the sweep. That BOS was
+          then used to block DISTRIBUTION indefinitely for 75+ minutes
+          (until the sweep aged past the 90-min window).
+          Fix: bos_in_delivery_dir requires bos_timestamp > sweep_timestamp.
 
-        BUG-AMD-DELIVERY-NEAREST FIX: delivery target now selects the most
-        SIGNIFICANT opposing pool (weighted by touch_count and proximity),
-        not simply the nearest one.  Higher touch_count = more clustered stops
-        = stronger institutional delivery magnet.
+        DISPLACEMENT FALLBACK (no BOS case):
+          For bearish AMD (BSL swept at X): if price < X − 1.0×ATR, the delivery
+          leg is clearly underway regardless of 5m BOS state.
+          For bullish AMD (SSL swept at X): if price > X + 1.0×ATR, same logic.
+          This ATR is approximated from the 5m range as a proxy since raw ATR is
+          not stored on ICTEngine state.
+
+        DELIVERY TARGET SCORING:
+          Most significant opposing pool (touch_count × weight / dist) wins.
+          Higher touch_count = more clustered stops = stronger delivery magnet.
         """
         swept = [p for p in self.liquidity_pools if p.swept]
         if not swept:
@@ -650,49 +903,85 @@ class ICTEngine:
         latest     = swept[0]
         age_ms     = now_ms - latest.sweep_timestamp
         sweep_type = latest.level_type
+        sweep_price = latest.price
 
         bias = "bullish" if sweep_type == "SSL" else "bearish"
 
-        # Confidence from sweep quality
+        # ── Confidence from sweep quality ────────────────────────────
         conf = 0.50
         if latest.displacement_confirmed: conf += 0.20
         if latest.wick_rejection:         conf += 0.10
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
 
-        # 5m BOS check: DISTRIBUTION requires a confirmed break of structure
-        # in the delivery direction on the execution timeframe.
+        # ── ATR proxy from 5m range ──────────────────────────────────
         tf5m = self._tf.get("5m", TFStructure(timeframe="5m"))
-        bos_in_delivery_dir = (
-            (bias == "bullish" and tf5m.bos_direction == "bullish") or
-            (bias == "bearish" and tf5m.bos_direction == "bearish")
+        rng5m = max(tf5m.range_high - tf5m.range_low, 1.0)
+        atr_proxy = rng5m * 0.025   # rough 1-ATR from recent 5m range
+
+        # ── BOS gate: must have occurred AFTER the sweep ─────────────
+        # bos_timestamp == 0 means BOS was never set (warmup artifact) — treat as no BOS
+        bos_after_sweep = (
+            tf5m.bos_timestamp > 0 and
+            tf5m.bos_timestamp > latest.sweep_timestamp and
+            ((bias == "bullish" and tf5m.bos_direction == "bullish") or
+             (bias == "bearish" and tf5m.bos_direction == "bearish"))
         )
 
-        # Phase determination
+        # ── Displacement fallback: delivery leg started, BOS pending ─
+        # After BSL swept at X (bearish), distribution = price below X − 1×ATR
+        # After SSL swept at X (bullish), distribution = price above X + 1×ATR
+        displacement_confirms = (
+            (bias == "bearish" and price < sweep_price - 1.0 * atr_proxy) or
+            (bias == "bullish" and price > sweep_price + 1.0 * atr_proxy)
+        )
+
+        # ── Phase determination ──────────────────────────────────────
+        EXTENDED_MANIP_MS = self.AMD_MANIP_WINDOW_MS + 900_000  # 15 + 15 = 30 min
+
         if age_ms < self.AMD_MANIP_WINDOW_MS:
+            # Acute manipulation — Judas swing still active, no entry
             phase   = "MANIPULATION"
-            details = f"Judas swing {sweep_type} @ ${latest.price:.0f} | {age_ms//1000:.0f}s ago"
+            details = (f"Judas swing {sweep_type} @ ${sweep_price:.0f} | "
+                       f"{age_ms//1000:.0f}s ago")
+
         elif age_ms < self.AMD_DISTRIB_WINDOW_MS:
-            if bos_in_delivery_dir:
+            if bos_after_sweep:
+                # Gold standard: post-sweep BOS confirms delivery has begun
                 phase   = "DISTRIBUTION"
-                details = (f"Delivering after {sweep_type} sweep @ ${latest.price:.0f} | "
-                           f"{age_ms//60000:.0f}m ago | 5m_BOS={tf5m.bos_direction}")
-            else:
-                # Sweep happened but 5m hasn't printed BOS yet — still in extended manip
+                conf    = min(conf + 0.05, 0.95)
+                details = (f"Delivering after {sweep_type} sweep @ ${sweep_price:.0f} | "
+                           f"{age_ms//60000:.0f}m ago | 5m_BOS confirmed")
+            elif displacement_confirms:
+                # Price has moved ≥1 ATR in delivery direction — distributing
+                phase   = "DISTRIBUTION"
+                details = (f"Delivering after {sweep_type} sweep @ ${sweep_price:.0f} | "
+                           f"{age_ms//60000:.0f}m ago | displacement confirmed")
+            elif age_ms < EXTENDED_MANIP_MS:
+                # Extended MANIP window (15-30 min): no BOS yet, stay cautious
                 phase   = "MANIPULATION"
-                conf    = max(conf - 0.10, 0.40)
-                details = (f"Post-sweep {sweep_type} @ ${latest.price:.0f} | "
-                           f"{age_ms//60000:.0f}m ago | awaiting 5m BOS")
+                conf    = max(conf - 0.08, 0.35)
+                details = (f"Post-sweep {sweep_type} @ ${sweep_price:.0f} | "
+                           f"{age_ms//60000:.0f}m — awaiting 5m BOS or displacement")
+            else:
+                # Past 30 min with no BOS and no displacement: force DISTRIBUTION
+                # with reduced confidence (structural evidence missing but time
+                # confirms this is no longer an acute Judas swing)
+                phase   = "DISTRIBUTION"
+                conf    = max(conf - 0.12, 0.35)
+                details = (f"Delivering (no BOS) {sweep_type} @ ${sweep_price:.0f} | "
+                           f"{age_ms//60000:.0f}m ago")
+
         else:
+            # > 90 min since sweep
             st = self._tf.get("15m", TFStructure(timeframe="15m"))
-            s5 = self._tf.get("5m",  TFStructure(timeframe="5m"))
+            s5 = tf5m
             if st.trend != "ranging" and s5.trend == "ranging":
                 phase   = "REACCUMULATION" if st.trend == "bullish" else "REDISTRIBUTION"
                 conf    = max(conf - 0.15, 0.30)
                 details = f"Mid-trend pause | 15m:{st.trend} 5m:ranging"
             else:
                 phase   = "ACCUMULATION"
-                # AMD-ACCUMULATION-DECAY FIX (from previous session)
                 excess_ms = age_ms - self.AMD_DISTRIB_WINDOW_MS
                 decay     = max(0.0, 1.0 - excess_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
                 conf      = max(conf * decay - 0.20, 0.20)
@@ -700,18 +989,15 @@ class ICTEngine:
                     bias = "neutral"
                 details = f"Old {sweep_type} sweep {age_ms//60000:.0f}m ago"
 
-        # Delivery target: most SIGNIFICANT opposing unswept pool.
-        # BUG-AMD-DELIVERY-NEAREST FIX: weight by touch_count and proximity.
-        # More clustered stops = stronger institutional magnet; nearer is also
-        # preferred but high touch_count can outweigh extra distance.
+        # ── Delivery target: most significant opposing unswept pool ──
         target = None
         unswept = [p for p in self.liquidity_pools if not p.swept]
-        safe_atr = max(self._tf.get("5m", TFStructure("5m")).range_high -
-                       self._tf.get("5m", TFStructure("5m")).range_low, 1.0) * 0.02
 
         def _pool_score(p: 'LiquidityLevel') -> float:
             dist = abs(p.price - price)
-            return float(p.touch_count) * 2.0 / (1.0 + dist / max(safe_atr, 1.0))
+            tf_w = {"1d": 5.0, "4h": 4.0, "1h": 3.0, "15m": 2.0, "5m": 1.0}.get(
+                getattr(p, 'timeframe', '5m'), 1.0)
+            return float(p.touch_count) * tf_w / (1.0 + dist / max(atr_proxy, 1.0))
 
         if bias == "bullish":
             bsl = [p for p in unswept if p.level_type == "BSL" and p.price > price]
@@ -724,7 +1010,7 @@ class ICTEngine:
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,
-            sweep_origin=latest.price, delivery_target=target,
+            sweep_origin=sweep_price, delivery_target=target,
             time_in_phase_ms=age_ms, sweep_type=sweep_type, details=details)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -898,20 +1184,24 @@ class ICTEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _detect_swing_points(self, candles_5m: List[Dict],
-                              candles_15m: List[Dict]) -> None:
+                              candles_15m: List[Dict],
+                              candles_1h:  Optional[List[Dict]] = None,
+                              candles_4h:  Optional[List[Dict]] = None,
+                              candles_1d:  Optional[List[Dict]] = None) -> None:
         """Fractal swings on 5m+15m for equal high/low liquidity clustering.
+        HTF swing points also detected for higher-significance pool tagging.
 
-        BUG-SWING-LOOKBACK FIX: the original used a 5-bar left / 3-bar right
-        asymmetric fractal.  A 5-bar left requirement is so restrictive that
-        nearly all real ICT swing highs/lows fail to qualify → _swing_highs
-        and _swing_lows stay nearly empty → _cluster_liq never finds 2+
-        touches → liquidity_pools stays empty → no sweeps → AMD stuck on
-        ACCUMULATION forever.  Fixed: symmetric 3/3, matching standard ICT
-        swing identification.
+        BUG-SWING-LOOKBACK FIX (prior session): symmetric 3/3 fractal.
+        New: 1H, 4H, 1D equal highs/lows detected separately so pools can be
+        tagged with their source timeframe and scored accordingly.
         """
         self._swing_highs.clear()
         self._swing_lows.clear()
-        for candles in (candles_5m, candles_15m):
+        self._swing_highs_meta.clear()
+        self._swing_lows_meta.clear()
+
+        # LTF swings (5m, 15m) — liquidity pool tag: 5m or 15m
+        for candles, tf_tag in ((candles_5m, "5m"), (candles_15m, "15m")):
             if len(candles) < 7:
                 continue
             for i in range(3, len(candles) - 3):
@@ -920,9 +1210,30 @@ class ICTEngine:
                 if (all(h > float(candles[j]['h']) for j in range(i-3, i)) and
                         all(h > float(candles[j]['h']) for j in range(i+1, i+4))):
                     self._swing_highs.append(h)
+                    self._swing_highs_meta.append((h, tf_tag))
                 if (all(l < float(candles[j]['l']) for j in range(i-3, i)) and
                         all(l < float(candles[j]['l']) for j in range(i+1, i+4))):
                     self._swing_lows.append(l)
+                    self._swing_lows_meta.append((l, tf_tag))
+
+        # HTF swings — tighter fractal (2/2) since HTF candles are already slow
+        for candles, tf_tag in (
+                (candles_1h  or [], "1h"),
+                (candles_4h  or [], "4h"),
+                (candles_1d  or [], "1d")):
+            if len(candles) < 5:
+                continue
+            for i in range(2, len(candles) - 2):
+                h = float(candles[i]['h'])
+                l = float(candles[i]['l'])
+                if (all(h > float(candles[j]['h']) for j in range(i-2, i)) and
+                        all(h > float(candles[j]['h']) for j in range(i+1, i+3))):
+                    self._swing_highs.append(h)
+                    self._swing_highs_meta.append((h, tf_tag))
+                if (all(l < float(candles[j]['l']) for j in range(i-2, i)) and
+                        all(l < float(candles[j]['l']) for j in range(i+1, i+3))):
+                    self._swing_lows.append(l)
+                    self._swing_lows_meta.append((l, tf_tag))
 
     # ─────────────────────────────────────────────────────────────────────
     # LIQUIDITY POOL DETECTION
@@ -931,40 +1242,44 @@ class ICTEngine:
     def _detect_liquidity_pools(self, price: float, now_ms: int) -> None:
         """Cluster equal highs (BSL) and equal lows (SSL).
 
-        BUG-LIQ-POOL-NO-EXPIRY FIX: the old code only appended to the deque
-        without ever removing stale entries.  Unswept pools from days ago
-        accumulated and distorted TP targeting and confluence scoring.
-
-        Rebuilt each cycle:
-          - Unswept pools: reconstructed from the CURRENT swing data (naturally
-            bounded to recent candle history).  Old swings that fell out of the
-            lookback window stop appearing in swing lists, so their pools are
-            naturally dropped.
-          - Swept pools: preserved for AMD delivery targeting, but expire after
-            3× the distribution window (~4.5 hours) from the sweep timestamp.
+        BUG-LIQ-POOL-NO-EXPIRY FIX: rebuilt each cycle from current swing data.
+        Swept pools preserved up to 3× distribution window (~4.5h).
+        HTF pools now tagged with their source timeframe so delivery scoring
+        can weight 4H/1D pools more heavily than 5m/15m pools.
         """
         tol = price * self.LIQ_TOUCH_TOL_PCT
 
-        # Preserve swept pools within age limit (AMD needs them)
+        # Preserve swept pools within age limit
         max_swept_age = self.AMD_DISTRIB_WINDOW_MS * 3
         swept_keep = [p for p in self.liquidity_pools
                       if p.swept and now_ms - p.sweep_timestamp <= max_swept_age]
-
-        # Rebuild from scratch
         self.liquidity_pools.clear()
         for p in swept_keep:
             self.liquidity_pools.append(p)
 
-        # Fresh unswept pools from current swing data
-        self._cluster_liq(self._swing_highs, "BSL", tol, price)
-        self._cluster_liq(self._swing_lows,  "SSL", tol, price)
+        # Cluster from current swing data — _cluster_liq handles TF tagging
+        # internally by reading the meta list for each cluster member.
+        self._cluster_liq(self._swing_highs, "BSL", tol, price,
+                          meta=self._swing_highs_meta)
+        self._cluster_liq(self._swing_lows,  "SSL", tol, price,
+                          meta=self._swing_lows_meta)
 
     def _cluster_liq(self, prices: List[float], kind: str,
-                     tol: float, ref: float) -> None:
+                     tol: float, ref: float,
+                     meta: Optional[List[Tuple[float, str]]] = None) -> None:
         if len(prices) < 2:
             return
+        TF_RANK = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
         sp   = sorted(prices)
         used = set()
+        # Build a price→tf lookup from meta if provided
+        price_tf: Dict[float, str] = {}
+        if meta:
+            for p, tf in meta:
+                key = round(p, 1)
+                if key not in price_tf or TF_RANK.get(tf, 1) > TF_RANK.get(price_tf[key], 1):
+                    price_tf[key] = tf
+
         for i, p1 in enumerate(sp):
             if i in used:
                 continue
@@ -975,10 +1290,17 @@ class ICTEngine:
                     used.add(j)
             if len(cluster) >= 2:
                 avg = sum(cluster) / len(cluster)
+                # Assign the highest-TF source found in the cluster
+                best_tf = "5m"
+                for cp in cluster:
+                    ct = price_tf.get(round(cp, 1), "5m")
+                    if TF_RANK.get(ct, 1) > TF_RANK.get(best_tf, 1):
+                        best_tf = ct
                 if not any(abs(lp.price - avg) <= tol and lp.level_type == kind
                            for lp in self.liquidity_pools):
                     self.liquidity_pools.append(LiquidityLevel(
-                        price=avg, level_type=kind, touch_count=len(cluster)))
+                        price=avg, level_type=kind,
+                        touch_count=len(cluster), timeframe=best_tf))
 
     # ─────────────────────────────────────────────────────────────────────
     # LIQUIDITY SWEEP DETECTION
@@ -1098,6 +1420,333 @@ class ICTEngine:
             if now_ms - ob._last_visit_time >= cd:
                 ob.visit_count       += 1
                 ob._last_visit_time   = now_ms
+
+    # ─────────────────────────────────────────────────────────────────────
+    # BREAKER BLOCK DETECTION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _detect_breaker_blocks(self, candles: List[Dict], now_ms: int) -> None:
+        """
+        Detect Breaker Blocks from recently mitigated OBs.
+
+        A Breaker Block forms when:
+          1. A Bullish OB is mitigated (close below ob.low) → becomes Bearish Breaker
+          2. A Bearish OB is mitigated (close above ob.high) → becomes Bullish Breaker
+
+        The Breaker zone IS the mitigated OB zone — price is expected to retrace
+        back into it and then continue in the new (flipped) direction.
+        """
+        if len(candles) < 2:
+            return
+        last_close = float(candles[-2]['c'])
+        last_ts    = int(candles[-2].get('t', now_ms))
+
+        for ob in self.order_blocks_bull:
+            if not ob.mitigated:
+                continue
+            # Bull OB mitigated → Bearish Breaker (resistance)
+            if not any(abs(b.low - ob.low) < 5.0 and abs(b.high - ob.high) < 5.0
+                       for b in self.breaker_blocks_bear):
+                self.breaker_blocks_bear.append(BreakerBlock(
+                    low=ob.low, high=ob.high, timestamp=last_ts,
+                    original_direction="bullish", direction="bearish",
+                    timeframe=ob.timeframe, strength=ob.strength,
+                    max_age_ms=self.HTF_OB_MAX_AGE_MS))
+                logger.debug(
+                    f"📦 BREAKER BEAR: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
+
+        for ob in self.order_blocks_bear:
+            if not ob.mitigated:
+                continue
+            # Bear OB mitigated → Bullish Breaker (support)
+            if not any(abs(b.low - ob.low) < 5.0 and abs(b.high - ob.high) < 5.0
+                       for b in self.breaker_blocks_bull):
+                self.breaker_blocks_bull.append(BreakerBlock(
+                    low=ob.low, high=ob.high, timestamp=last_ts,
+                    original_direction="bearish", direction="bullish",
+                    timeframe=ob.timeframe, strength=ob.strength,
+                    max_age_ms=self.HTF_OB_MAX_AGE_MS))
+                logger.debug(
+                    f"📦 BREAKER BULL: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # REJECTION BLOCK DETECTION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _detect_rejection_blocks(self, candles: List[Dict],
+                                  price: float, now_ms: int, tf: str) -> None:
+        """
+        Detect Rejection Blocks: OBs where price wicked in but closed outside.
+
+        A Rejection Block occurs when:
+          - Price enters a bull OB (wicks below ob.high into ob range)
+          - But CLOSES back ABOVE ob.high (rejected from inside)
+          - And the lower wick is ≥ 50% of the candle's total range
+
+        This creates a strong reversal signal — the OB held as support.
+        Symmetric logic for bear OBs (wick up into zone, close below).
+        """
+        if len(candles) < 3:
+            return
+        for c in candles[-10:]:
+            co, cc = float(c['o']), float(c['c'])
+            ch, cl = float(c['h']), float(c['l'])
+            cr = ch - cl
+            if cr < 1e-9:
+                continue
+            ts = int(c.get('t', now_ms))
+
+            # Bullish rejection: wick into bear OB from below, close outside (below)
+            for ob in self.order_blocks_bear:
+                if not ob.is_active(now_ms):
+                    continue
+                if cl <= ob.high and cl >= ob.low and cc < ob.low:
+                    wick_up = ch - max(co, cc)
+                    if wick_up / cr >= 0.50:
+                        if not any(abs(r.low - ob.low) < 5.0
+                                   for r in self.rejection_blocks):
+                            self.rejection_blocks.append(RejectionBlock(
+                                low=ob.low, high=ob.high, timestamp=ts,
+                                direction="bullish", timeframe=tf,
+                                wick_size_pct=round(wick_up / cr, 2),
+                                strength=ob.strength + 10.0))
+
+            # Bearish rejection: wick into bull OB from above, close outside (above)
+            for ob in self.order_blocks_bull:
+                if not ob.is_active(now_ms):
+                    continue
+                if ch >= ob.low and ch <= ob.high and cc > ob.high:
+                    wick_dn = min(co, cc) - cl
+                    if wick_dn / cr >= 0.50:
+                        if not any(abs(r.high - ob.high) < 5.0
+                                   for r in self.rejection_blocks):
+                            self.rejection_blocks.append(RejectionBlock(
+                                low=ob.low, high=ob.high, timestamp=ts,
+                                direction="bearish", timeframe=tf,
+                                wick_size_pct=round(wick_dn / cr, 2),
+                                strength=ob.strength + 10.0))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PROPULSION OB DETECTION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _detect_propulsion_obs(self, now_ms: int) -> None:
+        """
+        Identify Propulsion OBs — the specific OBs whose impulse caused a BOS.
+
+        In ICT, the OB immediately BEFORE a BOS impulse is the most significant
+        structural level — institutional orders at that price caused the market
+        to break structure.  These are 'Propulsion Blocks' — the highest-
+        conviction re-entry zones after price returns.
+
+        Detection: for each TF that has a confirmed BOS, find the last active OB
+        whose impulse candle closed beyond the BOS level.
+        """
+        self._propulsion_obs_bull.clear()
+        self._propulsion_obs_bear.clear()
+
+        for tf_name in ("5m", "15m", "1h", "4h"):
+            st = self._tf.get(tf_name)
+            if not st or st.bos_level < 1e-9:
+                continue
+            if st.bos_direction == "bullish":
+                # BOS bullish: find the last bull OB whose high is just below bos_level
+                cands = [ob for ob in self.order_blocks_bull
+                         if ob.is_active(now_ms) and ob.timeframe == tf_name
+                         and ob.high < st.bos_level and ob.bos_confirmed]
+                if cands:
+                    best = max(cands, key=lambda o: o.high)
+                    if not any(abs(p.midpoint - best.midpoint) < 5.0
+                               for p in self._propulsion_obs_bull):
+                        self._propulsion_obs_bull.append(best)
+            elif st.bos_direction == "bearish":
+                cands = [ob for ob in self.order_blocks_bear
+                         if ob.is_active(now_ms) and ob.timeframe == tf_name
+                         and ob.low > st.bos_level and ob.bos_confirmed]
+                if cands:
+                    best = min(cands, key=lambda o: o.low)
+                    if not any(abs(p.midpoint - best.midpoint) < 5.0
+                               for p in self._propulsion_obs_bear):
+                        self._propulsion_obs_bear.append(best)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # DEALING RANGE
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _update_dealing_range(self, price: float) -> None:
+        """
+        Compute the current Dealing Range: range between nearest significant SSL (below)
+        and BSL (above) that are UNSWEPT.
+
+        This is the range smart money is currently 'dealing' within.
+        The equilibrium of this range is the institutional reference level.
+        """
+        unswept = [p for p in self.liquidity_pools if not p.swept]
+        ssl_below = [p for p in unswept if p.level_type == "SSL" and p.price < price]
+        bsl_above = [p for p in unswept if p.level_type == "BSL" and p.price > price]
+
+        if not ssl_below or not bsl_above:
+            self._dealing_range = None
+            return
+
+        TF_WEIGHT = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
+        # Prefer significant pools (high touch_count + high TF)
+        def sig(p):
+            return p.touch_count * TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1)
+
+        best_ssl = max(ssl_below, key=sig)
+        best_bsl = max(bsl_above, key=sig)
+
+        low  = best_ssl.price
+        high = best_bsl.price
+        rng  = max(high - low, 1e-9)
+        eq   = (low + high) / 2.0
+        pd   = (price - low) / rng
+
+        if   pd < 0.25: q = "DEEP_DISC"
+        elif pd < 0.50: q = "DISC"
+        elif pd < 0.75: q = "PREM"
+        else:           q = "DEEP_PREM"
+
+        self._dealing_range = DealingRange(
+            low=low, high=high, equilibrium=eq, current_pd=pd,
+            quadrant=q,
+            ssl_source_tf=getattr(best_ssl, 'timeframe', '5m'),
+            bsl_source_tf=getattr(best_bsl, 'timeframe', '5m'),
+            range_size=rng)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # POWER OF 3
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _update_po3(self, now_ms: int) -> None:
+        """
+        Power of 3: session-time-based AMD phase estimation.
+
+        Divides each active session into three equal time periods:
+          Accumulation → Manipulation → Distribution
+        """
+        try:
+            dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+            uh  = dt.hour + dt.minute / 60.0
+            wd  = dt.weekday()
+
+            if wd >= 5:
+                self._po3 = PowerOf3State("WEEKEND", "ACCUMULATION", 0.0, 0.0, 0.0, 24.0)
+                return
+
+            # Session windows (UTC)
+            sessions = {
+                "NEW_YORK": (13.5, 21.0),
+                "LONDON":   (7.0,  15.0),
+                "ASIA":     (23.0, 31.0),   # 31 = 7am next day (wraps)
+            }
+
+            # Normalise for Asia wrap-around
+            uh_norm = uh + 24.0 if uh < 7.0 and self._session == "ASIA" else uh
+
+            sess_name = "OFF_HOURS"
+            sess_start = sess_end = 0.0
+            for s, (start, end) in sessions.items():
+                if start <= uh_norm < end:
+                    sess_name = s; sess_start = start; sess_end = end; break
+
+            if sess_name == "OFF_HOURS":
+                self._po3 = PowerOf3State("OFF_HOURS", "ACCUMULATION", 0.0, 0.0, 0.0, 0.0)
+                return
+
+            sess_dur  = sess_end - sess_start
+            sess_prog = max(0.0, min(1.0, (uh_norm - sess_start) / sess_dur))
+            third     = 1.0 / 3.0
+
+            if sess_prog < third:
+                po3_phase  = "ACCUMULATION"
+                phase_prog = sess_prog / third
+            elif sess_prog < 2 * third:
+                po3_phase  = "MANIPULATION"
+                phase_prog = (sess_prog - third) / third
+            else:
+                po3_phase  = "DISTRIBUTION"
+                phase_prog = (sess_prog - 2 * third) / third
+
+            # Prime entry windows: early DISTRIBUTION (0.0-0.25 through Dist phase)
+            # or late MANIPULATION (0.75-1.0 through Manip phase) = optimal OTE zone
+            is_prime = (
+                (po3_phase == "DISTRIBUTION" and phase_prog < 0.25) or
+                (po3_phase == "MANIPULATION" and phase_prog > 0.75)
+            )
+
+            self._po3 = PowerOf3State(
+                session=sess_name,
+                po3_phase=po3_phase,
+                session_progress=round(sess_prog, 3),
+                phase_progress=round(phase_prog, 3),
+                session_start_utc=sess_start,
+                session_end_utc=min(sess_end, 24.0),
+                is_prime_entry_window=is_prime)
+        except Exception:
+            self._po3 = None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # IPDA LEVELS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _update_ipda(self, candles_1d: List[Dict], price: float) -> None:
+        """
+        Compute IPDA quarterly draw levels from daily candles.
+
+        Uses the last 90 days of daily data to identify:
+          - Prior quarter high/low (previous 90-day range)
+          - Current quarter open (first close of current 90-day window)
+          - 20/40/60-day rolling highs and lows
+        """
+        if not candles_1d or len(candles_1d) < 20:
+            return
+
+        def _hi(cs): return max(float(c['h']) for c in cs)
+        def _lo(cs): return min(float(c['l']) for c in cs)
+
+        current  = candles_1d[-90:] if len(candles_1d) >= 90 else candles_1d
+        prior_90 = candles_1d[-180:-90] if len(candles_1d) >= 180 else candles_1d[:max(1, len(candles_1d)//2)]
+
+        pq_high = _hi(prior_90) if prior_90 else 0.0
+        pq_low  = _lo(prior_90) if prior_90 else 0.0
+        cq_open = float(current[0]['c']) if current else 0.0
+        cq_high = _hi(current)
+        cq_low  = _lo(current)
+        d20_h   = _hi(candles_1d[-20:]) if len(candles_1d) >= 20 else 0.0
+        d20_l   = _lo(candles_1d[-20:]) if len(candles_1d) >= 20 else 0.0
+        d40_h   = _hi(candles_1d[-40:]) if len(candles_1d) >= 40 else d20_h
+        d40_l   = _lo(candles_1d[-40:]) if len(candles_1d) >= 40 else d20_l
+
+        # Bias: below PQH → bullish draw (targeting the high)
+        #       above PQL → bearish draw (targeting the low)
+        if pq_high > 0 and price < pq_high:
+            bias = "bullish"
+        elif pq_low > 0 and price > pq_low:
+            bias = "bearish"
+        else:
+            bias = "neutral"
+
+        # Nearest significant draw level
+        levels = {
+            "PQH": pq_high, "PQL": pq_low, "CQH": cq_high, "CQL": cq_low,
+            "D20H": d20_h, "D20L": d20_l, "D40H": d40_h, "D40L": d40_l,
+        }
+        valid  = {k: v for k, v in levels.items() if v > 0}
+        if valid:
+            nearest_lbl = min(valid, key=lambda k: abs(valid[k] - price))
+            nearest_val = valid[nearest_lbl]
+        else:
+            nearest_lbl, nearest_val = "", 0.0
+
+        self._ipda = IPDALevels(
+            prior_quarter_high=pq_high, prior_quarter_low=pq_low,
+            current_quarter_open=cq_open, current_quarter_high=cq_high,
+            current_quarter_low=cq_low,
+            day_20_high=d20_h, day_20_low=d20_l,
+            day_40_high=d40_h, day_40_low=d40_l,
+            bias=bias, nearest_draw=nearest_val, nearest_draw_label=nearest_lbl)
 
     # ─────────────────────────────────────────────────────────────────────
     # SESSION / KILL ZONE
@@ -1411,17 +2060,55 @@ class ICTEngine:
         out.liquidity_score = min(0.15, liq)
         out.sweep_score = liq  # legacy
 
-        # ── 5. Session ────────────────────────────────────────────────
+        # ── 5. Session / Kill Zone × P/D multiplier ──────────────────
+        # ICT core principle: Kill Zone entries are ONLY high-probability
+        # when price is in the CORRECT P/D zone for the trade direction.
+        # A London KZ SHORT must be in PREMIUM. A NY KZ LONG must be in DISCOUNT.
+        # Flat KZ bonus regardless of P/D was giving equal weight to KZ
+        # entries at the wrong end of the dealing range — now multiplied.
+        t4h_pd = t4h.premium_discount
+        pd_aligned = ((side == "long"  and t4h_pd < 0.50) or
+                      (side == "short" and t4h_pd > 0.50))
+        pd_mult = 1.30 if pd_aligned else 0.60   # 30% bonus / 40% penalty
+
         if self._killzone:
-            out.session_score = 0.05
-            details.append(f"KZ={self._killzone}")
+            out.session_score = min(0.05, 0.05 * pd_mult)
+            details.append(
+                f"KZ={self._killzone} PD={'✓' if pd_aligned else '✗'}"
+                f"({pd_mult:.2f}x)")
         elif self._session in ("NEW_YORK", "LONDON"):
-            out.session_score = 0.03
+            out.session_score = min(0.03, 0.03 * pd_mult)
             details.append(f"Session={self._session}")
         elif self._session == "ASIA":
-            out.session_score = 0.01
+            out.session_score = 0.01  # Asia = accumulation, no P/D mult
         out.session_name = self._session
         out.killzone     = self._killzone
+
+        # ── 5b. Breaker Block bonus ───────────────────────────────────
+        # Price at a Breaker Block is ICT's highest-conviction reversal signal.
+        # A Bullish Breaker (previously mitigated Bear OB) at current price
+        # = strong support for long entries.
+        breakers = self.breaker_blocks_bull if side == "long" else self.breaker_blocks_bear
+        for bb in breakers:
+            if bb.is_active(now_ms) and bb.contains_price(price):
+                bb_score = min(0.06, (bb.strength / 100.0) * 0.08)
+                details.append(
+                    f"BREAKER_{bb.direction.upper()} ${bb.low:.0f}-${bb.high:.0f} "
+                    f"tf={bb.timeframe} +{bb_score:.2f}")
+                out.session_score = min(0.09, out.session_score + bb_score)
+                break
+
+        # ── 5c. Propulsion OB bonus ───────────────────────────────────
+        # Price at a Propulsion OB (the OB that caused the BOS) = highest
+        # structural re-entry conviction. Add a meaningful bonus.
+        prop_pool = self._propulsion_obs_bull if side == "long" else self._propulsion_obs_bear
+        for pob in prop_pool:
+            if pob.is_active(now_ms) and pob.contains_price(price):
+                details.append(
+                    f"PROPULSION_OB ${pob.low:.0f}-${pob.high:.0f} "
+                    f"tf={pob.timeframe}")
+                out.pd_array_score = min(0.25, out.pd_array_score + 0.05)
+                break
 
         # ── Total ─────────────────────────────────────────────────────
         # BUG-AMD-OPPOSING-PENALTY-NULLIFIED FIX: the old code used
@@ -1461,6 +2148,70 @@ class ICTEngine:
             1 if t1h.trend  == side else (0.5 if t1h.trend  == "ranging" else 0),
             1 if t15m.trend == side else (0.5 if t15m.trend == "ranging" else 0),
         ]) >= 2.5
+
+        # ── Advanced ICT fields ───────────────────────────────────────
+        # Delivery target + confidence
+        out.delivery_target     = amd.delivery_target
+        out.delivery_confidence = amd.confidence if amd.phase in (
+            "DISTRIBUTION", "REDISTRIBUTION", "MANIPULATION") else 0.0
+
+        # 4H premium/discount grade
+        out.pd_grade = t4h.pd_grade
+
+        # MTF OB stack: count TFs that have an active OB for this side
+        obs_dir = self.order_blocks_bull if side == "long" else self.order_blocks_bear
+        htf_ob_count = sum(
+            1 for ob in obs_dir
+            if ob.is_active(now_ms) and ob.strength >= 70.0 and ob.contains_price(price)
+        )
+        out.mtf_ob_count = htf_ob_count
+
+        # MTF FVG stack: count TFs with unfilled FVG containing current price
+        fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
+        out.fvg_stack_count = sum(
+            1 for f in fvgs_dir
+            if f.is_active(now_ms) and f.is_price_in_gap(price) and f.fill_percentage < 0.40
+        )
+
+        # PD matrix string
+        pdm = self.get_pd_matrix(price, now_ms)
+        out.pd_matrix = pdm["matrix_str"]
+
+        # HTF reversal risk: if strong HTF OB opposes the trade within 2 ATR
+        opp_obs = self.order_blocks_bear if side == "long" else self.order_blocks_bull
+        rev_risk = 0.0
+        for ob in opp_obs:
+            if not ob.is_active(now_ms) or ob.strength < 75.0:
+                continue
+            dist = abs(ob.midpoint - price)
+            if atr > 1e-9 and dist < 2.0 * atr:
+                rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)))
+        out.htf_reversal_risk = min(1.0, rev_risk)
+
+        # Judas swing active?
+        judas = self.get_judas_swing_context(price, atr, now_ms)
+        out.judas_swing_active = judas.get("price_in_judas", False)
+
+        # Nearest liquidity distances
+        lmap = self.get_mtf_liquidity_map(price, atr, now_ms)
+        if lmap["nearest_bsl"] and atr > 1e-9:
+            out.nearest_bsl_dist_atr = lmap["nearest_bsl"]["dist_atr"]
+        if lmap["nearest_ssl"] and atr > 1e-9:
+            out.nearest_ssl_dist_atr = lmap["nearest_ssl"]["dist_atr"]
+
+        # ── MTF stacking bonus to total ───────────────────────────────
+        # Each additional TF confirming an OB or FVG at this price = +0.03
+        mtf_stack_bonus = min(0.06, (htf_ob_count + out.fvg_stack_count) * 0.03)
+        if mtf_stack_bonus > 0:
+            out.total = min(1.0, out.total + mtf_stack_bonus)
+            if mtf_stack_bonus > 0:
+                details.append(f"MTF_STACK({htf_ob_count}OB+{out.fvg_stack_count}FVG)+{mtf_stack_bonus:.2f}")
+
+        # HTF reversal risk penalty
+        if out.htf_reversal_risk > 0.50:
+            penalty = out.htf_reversal_risk * 0.05
+            out.total = max(0.0, out.total - penalty)
+            details.append(f"HTF_REV_RISK({out.htf_reversal_risk:.2f})-{penalty:.2f}")
 
         out.details = " | ".join(details) if details else "no ICT structure"
         return out
@@ -1660,6 +2411,638 @@ class ICTEngine:
                 if new_sl < fvg.bottom < current_sl or new_sl < fvg.top < current_sl:
                     return True, f"Fresh bear FVG @ ${fvg.midpoint:.0f} tf={fvg.timeframe}"
         return False, ""
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: PREMIUM/DISCOUNT MATRIX
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_pd_matrix(self, price: float, now_ms: int) -> Dict:
+        """
+        Premium/Discount grade across all timeframes.
+
+        Returns:
+          grades: {tf: "PREMIUM"|"EQ"|"DISCOUNT"} for each active TF
+          aligned_long:  int — TFs agreeing on DISCOUNT (buy setup)
+          aligned_short: int — TFs agreeing on PREMIUM (sell setup)
+          verdict: "STRONG_DISC"|"DISC"|"EQ"|"PREM"|"STRONG_PREM"|"SPLIT"
+          matrix_str: human-readable e.g. "1D:DISC 4H:DISC 1H:EQ 15M:PREM"
+          long_score:  0-1 score favouring long (4H+1D weighted)
+          short_score: 0-1 score favouring short
+        """
+        TF_WEIGHT = {"1d": 0.35, "4h": 0.30, "1h": 0.20, "15m": 0.15}
+        grades = {}
+        long_score  = 0.0
+        short_score = 0.0
+        aligned_long = aligned_short = 0
+
+        for tf, w in TF_WEIGHT.items():
+            st = self._tf.get(tf)
+            if st is None or st.range_high < 1e-9:
+                continue
+            g = st.pd_grade
+            grades[tf] = g
+            if g == "DISCOUNT":
+                long_score  += w; aligned_long  += 1
+            elif g == "PREMIUM":
+                short_score += w; aligned_short += 1
+            else:
+                long_score  += w * 0.5
+                short_score += w * 0.5
+
+        if   aligned_long  >= 3: verdict = "STRONG_DISC"
+        elif aligned_long  >= 2: verdict = "DISC"
+        elif aligned_short >= 3: verdict = "STRONG_PREM"
+        elif aligned_short >= 2: verdict = "PREM"
+        elif abs(long_score - short_score) < 0.10: verdict = "EQ"
+        else: verdict = "SPLIT"
+
+        parts = [f"{tf.upper()}:{g}" for tf, g in sorted(grades.items(),
+                  key=lambda x: ["1d","4h","1h","15m"].index(x[0])
+                  if x[0] in ["1d","4h","1h","15m"] else 9)]
+
+        return {
+            "grades": grades,
+            "aligned_long": aligned_long,
+            "aligned_short": aligned_short,
+            "verdict": verdict,
+            "matrix_str": " ".join(parts),
+            "long_score":  round(long_score, 3),
+            "short_score": round(short_score, 3),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: MTF LIQUIDITY MAP
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_mtf_liquidity_map(self, price: float, atr: float,
+                               now_ms: int) -> Dict:
+        """
+        Complete multi-timeframe liquidity landscape.
+
+        Returns ordered lists of all detected liquidity pools:
+          above: BSL levels above price (buy-stop clusters = short targets/long invalidation)
+          below: SSL levels below price (sell-stop clusters = long targets/short invalidation)
+          swept_recent: recently swept pools (within SWEEP_MAX_AGE_MS)
+
+        Each pool entry:
+          price, type, tf, touch_count, dist_atr, significance, swept
+
+        significance = touch_count × tf_weight / (1 + dist_atr)
+        Sorting: by significance descending, so highest-conviction targets first.
+        """
+        TF_WEIGHT = {"1d": 5.0, "4h": 4.0, "1h": 3.0, "15m": 2.0, "5m": 1.0}
+        a = max(atr, 1e-9)
+
+        def _entry(p: LiquidityLevel) -> Dict:
+            dist_atr = abs(p.price - price) / a
+            tf_w     = TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1.0)
+            sig      = float(p.touch_count) * tf_w / (1.0 + dist_atr)
+            return {
+                "price":       round(p.price, 1),
+                "type":        p.level_type,
+                "tf":          getattr(p, 'timeframe', '5m'),
+                "touch_count": p.touch_count,
+                "dist_atr":    round(dist_atr, 2),
+                "significance": round(sig, 3),
+                "swept":       p.swept,
+            }
+
+        above   = sorted([_entry(p) for p in self.liquidity_pools
+                          if not p.swept and p.level_type == "BSL" and p.price > price],
+                         key=lambda x: -x["significance"])
+        below   = sorted([_entry(p) for p in self.liquidity_pools
+                          if not p.swept and p.level_type == "SSL" and p.price < price],
+                         key=lambda x: -x["significance"])
+        swept_r = sorted([_entry(p) for p in self.liquidity_pools
+                          if p.swept and now_ms - p.sweep_timestamp <= self.SWEEP_MAX_AGE_MS],
+                         key=lambda x: x["dist_atr"])
+
+        # AMD delivery target labelled explicitly
+        amd_target = self._amd.delivery_target
+        for lst in (above, below):
+            for e in lst:
+                if amd_target is not None and abs(e["price"] - amd_target) < 5.0:
+                    e["is_amd_target"] = True
+
+        return {
+            "above":        above[:8],
+            "below":        below[:8],
+            "swept_recent": swept_r[:4],
+            "nearest_bsl":  above[0] if above else None,
+            "nearest_ssl":  below[0] if below else None,
+            "amd_target":   amd_target,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: DELIVERY PROFILE
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_delivery_profile(self, side: str, price: float,
+                              atr: float, now_ms: int) -> Dict:
+        """
+        ICT institutional delivery projection for a given side.
+
+        Answers: "Where is smart money delivering price, what is in the
+        path, and how confident are we?"
+
+        Returns:
+          primary_target:   {price, label, score, dist_atr}
+          secondary_target: next level in path
+          delivery_zones:   FVGs + OBs in delivery path (ordered by distance)
+          invalidation:     HTF OB that would block delivery if reclaimed
+          expected_range_atr: distance to primary target in ATR
+          pd_favours:       True if P/D matrix aligns with this side
+          chain_score:      0-1 overall conviction score
+          fvg_chain:        unfilled FVGs stacked in delivery path
+          ob_chain:         virgin OBs stacked in delivery path
+        """
+        a = max(atr, 1e-9)
+        amd = self._amd
+
+        # ── Primary target: AMD delivery + scored pools ───────────────
+        candidates: List[Tuple[float, float, str]] = []
+
+        # AMD delivery target (highest priority)
+        if amd.delivery_target is not None:
+            dist = abs(amd.delivery_target - price)
+            in_right_dir = ((side == "long"  and amd.delivery_target > price) or
+                            (side == "short" and amd.delivery_target < price))
+            if in_right_dir:
+                score = 8.0 * amd.confidence
+                candidates.append((amd.delivery_target, score, "AMD_DELIVERY"))
+
+        # Opposing liquidity pools
+        liq_map = self.get_mtf_liquidity_map(price, atr, now_ms)
+        pool_list = liq_map["above"] if side == "long" else liq_map["below"]
+        for p in pool_list:
+            score = 5.0 + p["significance"] * 0.5
+            candidates.append((p["price"], score, f"{p['type']}_{p['tf']}"))
+
+        # ICT structural TPs
+        try:
+            ict_tps = self.get_structural_tp_targets(
+                side, price, atr, now_ms,
+                min_dist=atr * 0.5, max_dist=atr * 15.0)
+            for lvl, sc, lbl in ict_tps:
+                candidates.append((lvl, sc, lbl))
+        except Exception:
+            pass
+
+        candidates.sort(key=lambda x: -x[1])
+        primary   = ({"price": candidates[0][0],
+                      "label": candidates[0][2],
+                      "score": round(candidates[0][1], 2),
+                      "dist_atr": round(abs(candidates[0][0] - price) / a, 2)}
+                     if candidates else None)
+        secondary = ({"price": candidates[1][0],
+                      "label": candidates[1][2],
+                      "score": round(candidates[1][1], 2),
+                      "dist_atr": round(abs(candidates[1][0] - price) / a, 2)}
+                     if len(candidates) >= 2 else None)
+
+        # ── FVG chain in delivery path ────────────────────────────────
+        # LONG delivery: FVGs above price (price filling upward)
+        # SHORT delivery: FVGs below price (price filling downward)
+        fvg_pool = self.fvgs_bear if side == "long" else self.fvgs_bull
+        fvg_chain = []
+        for fvg in fvg_pool:
+            if not fvg.is_active(now_ms) or fvg.fill_percentage > 0.30:
+                continue
+            if side == "long" and fvg.bottom > price:
+                fvg_chain.append({"bottom": fvg.bottom, "top": fvg.top,
+                                   "fill": round(fvg.fill_percentage, 2),
+                                   "tf": fvg.timeframe,
+                                   "dist_atr": round((fvg.bottom - price) / a, 2)})
+            elif side == "short" and fvg.top < price:
+                fvg_chain.append({"bottom": fvg.bottom, "top": fvg.top,
+                                   "fill": round(fvg.fill_percentage, 2),
+                                   "tf": fvg.timeframe,
+                                   "dist_atr": round((price - fvg.top) / a, 2)})
+        fvg_chain.sort(key=lambda x: x["dist_atr"])
+
+        # ── OB chain in delivery path ─────────────────────────────────
+        # Virgin OBs between price and primary target
+        ob_pool = self.order_blocks_bear if side == "long" else self.order_blocks_bull
+        ob_chain = []
+        for ob in ob_pool:
+            if not ob.is_active(now_ms) or ob.visit_count > 0:
+                continue
+            if side == "long" and ob.low > price:
+                ob_chain.append({"low": ob.low, "high": ob.high, "tf": ob.timeframe,
+                                  "strength": ob.strength,
+                                  "dist_atr": round((ob.low - price) / a, 2)})
+            elif side == "short" and ob.high < price:
+                ob_chain.append({"low": ob.low, "high": ob.high, "tf": ob.timeframe,
+                                  "strength": ob.strength,
+                                  "dist_atr": round((price - ob.high) / a, 2)})
+        ob_chain.sort(key=lambda x: x["dist_atr"])
+
+        # ── Invalidation: nearest strong opposing OB ──────────────────
+        inv_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
+        invalidation = None
+        for ob in sorted([o for o in inv_obs if o.is_active(now_ms) and o.strength >= 70.0],
+                          key=lambda o: abs(o.midpoint - price)):
+            if side == "long" and ob.high < price:
+                invalidation = {"price": ob.low, "label": f"Bull_OB_{ob.timeframe}",
+                                "dist_atr": round((price - ob.high) / a, 2)}
+                break
+            elif side == "short" and ob.low > price:
+                invalidation = {"price": ob.high, "label": f"Bear_OB_{ob.timeframe}",
+                                "dist_atr": round((ob.low - price) / a, 2)}
+                break
+
+        # ── PD matrix alignment ───────────────────────────────────────
+        pdm = self.get_pd_matrix(price, now_ms)
+        pd_favours = ((side == "long"  and pdm["aligned_long"]  >= 2) or
+                      (side == "short" and pdm["aligned_short"] >= 2))
+
+        # ── Chain score ───────────────────────────────────────────────
+        chain_score = 0.0
+        if primary:         chain_score += 0.30
+        if fvg_chain:       chain_score += min(0.20, len(fvg_chain) * 0.07)
+        if ob_chain:        chain_score += min(0.15, len(ob_chain)  * 0.05)
+        if pd_favours:      chain_score += 0.15
+        if amd.phase in ("DISTRIBUTION", "REDISTRIBUTION"): chain_score += 0.20
+        chain_score = min(1.0, chain_score)
+
+        return {
+            "primary_target":     primary,
+            "secondary_target":   secondary,
+            "fvg_chain":          fvg_chain[:5],
+            "ob_chain":           ob_chain[:5],
+            "invalidation":       invalidation,
+            "expected_range_atr": round(abs(primary["price"] - price) / a, 2)
+                                   if primary else 0.0,
+            "pd_favours":         pd_favours,
+            "pd_matrix":          pdm["matrix_str"],
+            "chain_score":        round(chain_score, 3),
+            "amd_phase":          amd.phase,
+            "amd_conf":           round(amd.confidence, 2),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: HTF REVERSAL ZONES
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_htf_reversal_zones(self, price: float, atr: float,
+                                now_ms: int) -> List[Dict]:
+        """
+        Detect HTF zones where price is likely to reverse or stall.
+
+        ICT reversal = HTF OB (1H+) stacked with an unfilled HTF FVG,
+        located in a premium zone (for short) or discount zone (for long),
+        within a range where CHoCH has printed or is forming.
+
+        Returns a list of reversal zones ordered by conviction score:
+          price_low, price_high, direction, tf, type, score, details
+        """
+        a = max(atr, 1e-9)
+        zones = []
+
+        def _add_zone(low, high, direction, tf, zone_type, score, detail):
+            mid = (low + high) / 2.0
+            dist = abs(mid - price) / a
+            if dist > 8.0:
+                return  # too far to be relevant
+            zones.append({
+                "price_low":  round(low, 1),
+                "price_high": round(high, 1),
+                "midpoint":   round(mid, 1),
+                "direction":  direction,
+                "tf":         tf,
+                "type":       zone_type,
+                "score":      round(score, 3),
+                "dist_atr":   round(dist, 2),
+                "detail":     detail,
+            })
+
+        # HTF OBs as base reversal zones
+        for obs, direction in ((self.order_blocks_bull, "long"),
+                               (self.order_blocks_bear, "short")):
+            for ob in obs:
+                if not ob.is_active(now_ms):
+                    continue
+                if ob.strength < 70.0:  # HTF only
+                    continue
+                tf_st = self._tf.get(ob.timeframe, TFStructure(timeframe=ob.timeframe))
+                pd = tf_st.premium_discount
+
+                # Bullish OBs in discount = support / long reversal zones
+                # Bearish OBs in premium = resistance / short reversal zones
+                if direction == "long"  and pd > 0.45:
+                    continue  # bull OB should be in discount
+                if direction == "short" and pd < 0.55:
+                    continue  # bear OB should be in premium
+
+                score = ob.strength / 100.0 * 0.40
+
+                # Bonus: FVG overlap with this OB (PD array stacking)
+                fvg_pool = self.fvgs_bull if direction == "long" else self.fvgs_bear
+                fvg_overlap = any(
+                    f.is_active(now_ms) and f.fill_percentage < 0.40 and
+                    f.bottom <= ob.high and f.top >= ob.low
+                    for f in fvg_pool)
+                if fvg_overlap:
+                    score += 0.25
+                    detail = f"OB+FVG_{ob.timeframe}"
+                else:
+                    detail = f"OB_{ob.timeframe}"
+
+                # Bonus: CHoCH on this TF points in direction
+                if (direction == "long"  and tf_st.choch_level > ob.low):
+                    score += 0.10; detail += "+CHoCH"
+                if (direction == "short" and tf_st.choch_level > 0 and
+                        tf_st.choch_level < ob.high):
+                    score += 0.10; detail += "+CHoCH"
+
+                # Bonus: BOS confirmation from higher TF
+                if ob.bos_confirmed:
+                    score += 0.10; detail += "+BOS"
+
+                # Proximity bonus: close to current price = more relevant
+                dist = abs(ob.midpoint - price) / a
+                score += max(0.0, 0.15 * (1.0 - dist / 8.0))
+
+                _add_zone(ob.low, ob.high, direction, ob.timeframe,
+                          "OB_REVERSAL", score, detail)
+
+        # HTF FVGs without associated OB (standalone imbalance magnets)
+        for fvgs, direction in ((self.fvgs_bull, "long"),
+                                 (self.fvgs_bear, "short")):
+            for fvg in fvgs:
+                if not fvg.is_active(now_ms) or fvg.fill_percentage > 0.30:
+                    continue
+                if fvg.timeframe not in ("1h", "4h", "1d"):
+                    continue
+                tf_st = self._tf.get(fvg.timeframe, TFStructure(timeframe=fvg.timeframe))
+                pd = tf_st.premium_discount
+                if direction == "long"  and pd > 0.50: continue
+                if direction == "short" and pd < 0.50: continue
+
+                score = 0.30 * (1.0 - fvg.fill_percentage)
+                dist  = abs(fvg.midpoint - price) / a
+                score += max(0.0, 0.10 * (1.0 - dist / 8.0))
+                _add_zone(fvg.bottom, fvg.top, direction, fvg.timeframe,
+                          "FVG_MAGNET", score,
+                          f"FVG_{fvg.timeframe}(fill={fvg.fill_percentage:.0%})")
+
+        zones.sort(key=lambda z: -z["score"])
+        return zones[:8]
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: JUDAS SWING CONTEXT
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_judas_swing_context(self, price: float, atr: float,
+                                 now_ms: int) -> Dict:
+        """
+        When AMD=MANIPULATION, characterise the Judas swing.
+
+        ICT: smart money runs stops in one direction (the fake move) before
+        delivering price the opposite way. Knowing the Judas swing direction
+        and its likely extent helps filter out counter-sweep entries.
+
+        Returns:
+          active:              True if we are in MANIPULATION phase
+          judas_direction:     "up" (BSL being run) | "down" (SSL being run)
+          delivery_direction:  opposite of Judas swing
+          sweep_level:         price of the swept pool
+          judas_extent_price:  estimated maximum of fake move (sweep + 1.0 ATR)
+          ote_entry_zone:      {low, high} where the real entry should be
+          price_in_judas:      True if current price is still in Judas territory
+          age_sec:             seconds since the sweep
+          urgency:             "WAIT" | "APPROACHING" | "ENTERING_OTE"
+        """
+        amd = self._amd
+        if amd.phase != "MANIPULATION" or not amd.sweep_origin:
+            return {
+                "active": False,
+                "judas_direction": "",
+                "delivery_direction": "",
+                "sweep_level": 0.0,
+                "judas_extent_price": 0.0,
+                "ote_entry_zone": None,
+                "price_in_judas": False,
+                "age_sec": 0,
+                "urgency": "WAIT",
+            }
+
+        a = max(atr, 1e-9)
+        sweep_price   = amd.sweep_origin
+        sweep_type    = amd.sweep_type   # "BSL" or "SSL"
+        age_sec       = amd.time_in_phase_ms // 1000
+
+        # BSL swept = fake move UP (buy stops harvested) → delivery DOWN
+        judas_dir    = "up"   if sweep_type == "BSL" else "down"
+        deliv_dir    = "down" if judas_dir == "up"   else "up"
+
+        # Estimated Judas extent: pool price ± 1.0 ATR past the pool
+        judas_extent = (sweep_price + 1.0 * a if judas_dir == "up"
+                        else sweep_price - 1.0 * a)
+
+        # OTE entry zone: 61.8%-78.6% retracement of the Judas move
+        # We approximate using the displacement from the sweep pool
+        if judas_dir == "up":
+            # Displacement moved price UP from sweep low to some high
+            # OTE for SHORT = retrace back down to 61.8%-78.6% of that move
+            move_approx = abs(price - sweep_price)
+            ote_low  = price + move_approx * 0.618 * 0.30  # rough estimate
+            ote_high = price + move_approx * 0.786 * 0.30
+        else:
+            move_approx = abs(price - sweep_price)
+            ote_high = price - move_approx * 0.618 * 0.30
+            ote_low  = price - move_approx * 0.786 * 0.30
+
+        # Is price still in the Judas swing territory?
+        price_in_judas = (
+            (judas_dir == "up"   and price >= sweep_price) or
+            (judas_dir == "down" and price <= sweep_price)
+        )
+
+        # Urgency
+        if price_in_judas:
+            urgency = "WAIT"  # still in the fake move — no entry
+        else:
+            dist_to_ote = min(abs(price - ote_low), abs(price - ote_high)) / a
+            urgency = "ENTERING_OTE" if dist_to_ote < 0.30 else "APPROACHING"
+
+        return {
+            "active":             True,
+            "judas_direction":    judas_dir,
+            "delivery_direction": deliv_dir,
+            "sweep_level":        sweep_price,
+            "judas_extent_price": round(judas_extent, 1),
+            "ote_entry_zone":     {"low": round(ote_low, 1), "high": round(ote_high, 1)},
+            "price_in_judas":     price_in_judas,
+            "age_sec":            age_sec,
+            "urgency":            urgency,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: AMD SESSION CONTEXT
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_amd_session_context(self, now_ms: int) -> Dict:
+        """
+        Session-based AMD expectations using the ICT session model.
+
+        ICT session model:
+          Asia   (23:00-07:00 UTC): Accumulation — range formation, consolidation.
+                 Watch for equal highs/lows being formed (future liquidity pools).
+          London (07:00-15:00 UTC): Manipulation — Judas swing.
+                 Expect a false breakout of the Asia range; direction of the
+                 Judas swing reveals the London bias. Entry AGAINST the Judas
+                 swing in the OTE zone.
+          NY     (13:30-21:00 UTC): Distribution — real directional move.
+                 AMD delivery to the opposing liquidity pool. Highest-probability
+                 entries during the NY open kill zone (13:30-14:30 UTC).
+
+        Returns:
+          session:              "ASIA" | "LONDON" | "NEW_YORK" | "OFF_HOURS" | "WEEKEND"
+          expected_phase:       what AMD phase is typical for this session
+          entry_quality:        "HIGH" | "MEDIUM" | "LOW" | "AVOID"
+          asia_range:           {high, low, mid} if detectable from 1H TF
+          judas_direction:      expected Judas direction (London session)
+          delivery_target:      AMD delivery target (NY session)
+          session_bias_notes:   string describing current session expectations
+        """
+        dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+        uh  = dt.hour + dt.minute / 60.0
+        wd  = dt.weekday()
+
+        sess    = self._session
+        killz   = self._killzone
+        amd     = self._amd
+        t1h     = self._tf.get("1h", TFStructure(timeframe="1h"))
+
+        # Asia range estimate from 1H structure
+        asia_range = None
+        if t1h.range_high > 0 and t1h.range_low > 0:
+            asia_range = {
+                "high": round(t1h.range_high, 1),
+                "low":  round(t1h.range_low,  1),
+                "mid":  round(t1h.equilibrium, 1),
+            }
+
+        if wd >= 5:
+            return {"session": "WEEKEND", "expected_phase": "NONE",
+                    "entry_quality": "AVOID",
+                    "asia_range": asia_range, "judas_direction": "",
+                    "delivery_target": None,
+                    "session_bias_notes": "Weekend — no institutional activity"}
+
+        if sess == "ASIA" or (uh >= 23.0 or uh < 7.0):
+            eq = "LOW"
+            if killz == "ASIA_KZ": eq = "MEDIUM"
+            notes = ("Asia: accumulation phase. Watch for equal highs/lows being "
+                     "formed — these are tomorrow's liquidity pools. Avoid counter-trend "
+                     "entries. Best use: map the range for London Judas swing setup.")
+            return {"session": "ASIA", "expected_phase": "ACCUMULATION",
+                    "entry_quality": eq, "asia_range": asia_range,
+                    "judas_direction": "",
+                    "delivery_target": amd.delivery_target,
+                    "session_bias_notes": notes}
+
+        if sess == "LONDON" or (7.0 <= uh < 13.5):
+            eq = "HIGH" if killz == "LONDON_KZ" else "MEDIUM"
+            judas_dir = ""
+            notes = ("London: manipulation phase. Expect a Judas swing — a false "
+                     "breakout of the Asia range. Trade AGAINST the initial London "
+                     "spike in the OTE zone.")
+            if amd.phase == "MANIPULATION" and amd.sweep_origin:
+                judas_dir = ("up"   if amd.sweep_type == "BSL" else "down")
+                notes += (f" Active Judas swing {judas_dir.upper()} at ${amd.sweep_origin:.0f}. "
+                          f"Awaiting OTE retracement for {amd.bias} entry.")
+            return {"session": "LONDON", "expected_phase": "MANIPULATION",
+                    "entry_quality": eq, "asia_range": asia_range,
+                    "judas_direction": judas_dir,
+                    "delivery_target": amd.delivery_target,
+                    "session_bias_notes": notes}
+
+        # NY session
+        eq = "HIGH" if killz == "NY_KZ" else "MEDIUM"
+        notes = ("NY: distribution phase. Price delivering to the opposing "
+                 "liquidity pool identified by the AMD sweep. Highest-quality "
+                 "entries during NY open (13:30-14:30 UTC).")
+        if amd.phase in ("DISTRIBUTION", "REDISTRIBUTION") and amd.delivery_target:
+            notes += (f" AMD target: ${amd.delivery_target:.0f} ({amd.bias} bias, "
+                      f"conf={amd.confidence:.2f}).")
+        return {"session": "NEW_YORK", "expected_phase": "DISTRIBUTION",
+                "entry_quality": eq, "asia_range": asia_range,
+                "judas_direction": "",
+                "delivery_target": amd.delivery_target,
+                "session_bias_notes": notes}
+
+    def get_dealing_range(self) -> Optional[DealingRange]:
+        """Current dealing range between nearest significant SSL and BSL."""
+        return self._dealing_range
+
+    def get_po3_state(self) -> Optional[PowerOf3State]:
+        """Power of 3 session-time AMD phase estimate."""
+        return self._po3
+
+    def get_ipda_levels(self) -> Optional[IPDALevels]:
+        """IPDA quarterly draw levels from 1D candles."""
+        return self._ipda
+
+    def get_all_pd_arrays(self, price: float, atr: float, now_ms: int) -> Dict:
+        """
+        Complete PD array stack: OBs, Breakers, Rejection Blocks, FVGs, Propulsion OBs.
+
+        Returns a unified dict of all active PD arrays sorted by distance from price,
+        tagged with their type, direction, timeframe, and conviction score.
+
+        This gives the decision engine a single ranked view of all institutional
+        structural levels, rather than separate searches through each collection.
+        """
+        a = max(atr, 1e-9)
+        arrays = []
+
+        def _add(level_type, low, high, direction, tf, strength, extra=""):
+            mid  = (low + high) / 2.0
+            dist = abs(mid - price) / a
+            arrays.append({
+                "type":      level_type,
+                "low":       round(low,  1),
+                "high":      round(high, 1),
+                "mid":       round(mid,  1),
+                "direction": direction,
+                "tf":        tf,
+                "strength":  round(strength, 1),
+                "dist_atr":  round(dist, 2),
+                "extra":     extra,
+                "in_price":  low <= price <= high,
+            })
+
+        for ob in self.order_blocks_bull:
+            if ob.is_active(now_ms):
+                tag = "PROP_OB" if ob in self._propulsion_obs_bull else "OB"
+                _add(tag, ob.low, ob.high, "bullish", ob.timeframe, ob.strength)
+        for ob in self.order_blocks_bear:
+            if ob.is_active(now_ms):
+                tag = "PROP_OB" if ob in self._propulsion_obs_bear else "OB"
+                _add(tag, ob.low, ob.high, "bearish", ob.timeframe, ob.strength)
+
+        for bb in self.breaker_blocks_bull:
+            if bb.is_active(now_ms):
+                _add("BREAKER", bb.low, bb.high, "bullish", bb.timeframe, bb.strength)
+        for bb in self.breaker_blocks_bear:
+            if bb.is_active(now_ms):
+                _add("BREAKER", bb.low, bb.high, "bearish", bb.timeframe, bb.strength)
+
+        for rb in self.rejection_blocks:
+            if rb.is_active(now_ms):
+                _add("REJECTION", rb.low, rb.high, rb.direction, rb.timeframe,
+                     rb.strength, f"wick={rb.wick_size_pct:.0%}")
+
+        for fvg in list(self.fvgs_bull) + list(self.fvgs_bear):
+            if fvg.is_active(now_ms) and fvg.fill_percentage < 0.50:
+                strength = (1.0 - fvg.fill_percentage) * 60.0
+                _add("FVG", fvg.bottom, fvg.top, fvg.direction, fvg.timeframe,
+                     strength, f"fill={fvg.fill_percentage:.0%}")
+
+        arrays.sort(key=lambda x: x["dist_atr"])
+        return {"arrays": arrays[:20], "count": len(arrays)}
 
     # ─────────────────────────────────────────────────────────────────────
     # PUBLIC: STATUS

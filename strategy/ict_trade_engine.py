@@ -311,9 +311,22 @@ class ICTSweepDetector:
                 disp_close = latest_sweep.price - 1.5 * atr
 
         # Compute OTE zone (61.8%–78.6% retracement of displacement impulse)
+        #
+        # BUG-OTE-MOVE-TO FIX: the original code used disp_close as move_to
+        # for both long and short.  ICT OTE is measured from the sweep wick
+        # extreme to the TOP of the displacement candle (for a long setup),
+        # because the institutional impulse extended to that high — not just
+        # where it closed.  Using disp_close shrinks the Fibonacci range,
+        # placing the OTE zone too far from the sweep level and creating
+        # setups that look valid but are actually outside the real 61.8-78.6%
+        # of the full sweep-to-impulse-high move.
+        #
+        # Correct:
+        #   LONG:  move_from = sweep wick low, move_to = disp_high  (top of impulse)
+        #   SHORT: move_from = sweep wick high, move_to = disp_low   (bottom of impulse)
         if side == "long":
             move_from = sweep_candle_extreme   # absolute low of sweep wick
-            move_to   = disp_close             # close of displacement (impulse top)
+            move_to   = disp_high              # TOP of displacement candle (full impulse)
             move_size = move_to - move_from
             if move_size < 0.5 * atr:          # too small to be institutional
                 return None
@@ -323,7 +336,7 @@ class ICTSweepDetector:
             sl_ob    = disp_low - 0.15 * atr
         else:
             move_from = sweep_candle_extreme   # absolute high of sweep wick
-            move_to   = disp_close             # close of displacement (impulse bottom)
+            move_to   = disp_low               # BOTTOM of displacement candle (full impulse)
             move_size = move_from - move_to
             if move_size < 0.5 * atr:
                 return None
@@ -1736,14 +1749,19 @@ class ICTEntryGate:
                     f"mtf={'✓' if mtf_align else '✗'}")
 
         # ── TIER-B: Standard Quant + ICT Confluence ───────────────────────
-        # Quant gates are REQUIRED here — ICT just provides structural context
+        # Quant gates are REQUIRED here — ICT just provides structural context.
+        # P/D gate added: Tier-B entries require correct zone same as Tier-A.
+        # LONG must NOT be in premium (4H PD > 60%); SHORT must NOT be in discount.
         _tier_b_conditions = (
             ict_total >= 0.40 and
             abs(q_composite) >= 0.30 and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
             not htf_veto and
-            not tf_opposes
+            not tf_opposes and
+            # P/D zone gate: don't enter longs in premium or shorts in discount
+            (side == "long"  and not in_prem or
+             side == "short" and not in_disc)
         )
         if _tier_b_conditions:
             return ("B", 3,
@@ -1758,6 +1776,11 @@ class ICTEntryGate:
             block_reasons.append(f"ICT={ict_total:.2f}<0.40")
         if tf_opposes:
             block_reasons.append(f"TICK_OPPOSING({quant.tick_flow if quant else 0:.2f})")
+        # P/D zone mismatch
+        if (side == "long"  and in_prem):
+            block_reasons.append("LONG_IN_PREMIUM")
+        if (side == "short" and in_disc):
+            block_reasons.append("SHORT_IN_DISCOUNT")
         if htf_veto and not _tier_a_htf_ok:
             # Show exactly which gate failed so log analysis is unambiguous
             if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):

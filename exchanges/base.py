@@ -150,10 +150,15 @@ class BaseDataManager(ABC):
     @abstractmethod
     def get_candles(
         self, timeframe: str, limit: Optional[int] = None
-    ) -> List[Candle]:
+    ) -> List[Dict]:
         """
-        Returns a list of closed Candle objects, newest last.
+        Returns a list of closed candle dicts, newest last.
+        Each dict has keys: 't' (epoch ms int), 'o', 'h', 'l', 'c', 'v' (floats).
         timeframe: "1m" | "5m" | "15m" | "4h" | ...
+
+        Note: returns List[Dict] not List[Candle] — the ICT engine and strategy
+        consume raw dicts via ['h'],['l'],['c'] etc. for performance.
+        Use core.candle.wrap_candles() if you need CandleDict wrappers.
         """
         ...
 

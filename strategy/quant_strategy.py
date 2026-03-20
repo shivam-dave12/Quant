@@ -2718,6 +2718,20 @@ class SignalBreakdown:
     ict_entry_tier: str = ""          # "S" | "A" | "B" | "" if no ICT gate
     htf_ict_source: bool = False      # True if HTF score came from ICT structure
     cvd_tick_count: int = 0           # Number of real trade ticks in CVD accumulator
+    # v8.0: Advanced ICT delivery + structural context
+    ict_delivery_target:     float = 0.0   # AMD delivery target price (0 = none)
+    ict_delivery_conf:       float = 0.0   # 0-1 confidence reaching delivery target
+    ict_pd_grade:            str   = "EQ"  # "PREMIUM"|"EQ"|"DISCOUNT" on 4H
+    ict_pd_matrix:           str   = ""    # e.g. "1D:DISC 4H:DISC 1H:EQ 15M:PREM"
+    ict_htf_reversal_risk:   float = 0.0   # 0-1 risk of HTF zone opposing trade
+    ict_mtf_ob_count:        int   = 0     # TFs with active OB at current price
+    ict_fvg_stack_count:     int   = 0     # TFs with unfilled FVG at current price
+    ict_judas_active:        bool  = False # True if in Judas swing territory
+    ict_nearest_bsl_atr:     float = 0.0   # Nearest BSL above price in ATR
+    ict_nearest_ssl_atr:     float = 0.0   # Nearest SSL below price in ATR
+    ict_session_entry_q:     str   = ""    # "HIGH"|"MEDIUM"|"LOW"|"AVOID"
+    ict_chain_score:         float = 0.0   # delivery profile chain conviction 0-1
+    ict_htf_rev_zone_near:   bool  = False # True if within 1 ATR of HTF reversal zone
 
     def __str__(self):
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
@@ -3502,13 +3516,49 @@ class QuantStrategy:
                         "ACCUMULATION": "💤"}.get(sig.amd_phase, "❓")
             bias_icon = "🟢" if sig.amd_bias == "bullish" else (
                         "🔴" if sig.amd_bias == "bearish" else "⚪")
-            gates.append(
+            # AMD line — include delivery target and Judas flag if active
+            _amd_line = (
                 f"{amd_icon} AMD: {sig.amd_phase} {bias_icon}{sig.amd_bias} "
                 f"conf={sig.amd_conf:.2f} | {sig.mtf_details}")
+            if sig.ict_delivery_target > 0:
+                _dt_dist_atr = (abs(sig.ict_delivery_target - price) / sig.atr
+                                if sig.atr > 0 else 0.0)
+                _amd_line += (
+                    f" | 🎯TARGET=${sig.ict_delivery_target:,.0f}"
+                    f"({_dt_dist_atr:.1f}ATR,conf={sig.ict_delivery_conf:.2f})")
+            if sig.ict_judas_active:
+                _amd_line += " | ⚡JUDAS_ACTIVE"
+            gates.append(_amd_line)
+
+            # PD matrix — premium/discount across all TFs
             pd_icon = "💰DISC" if sig.in_discount else (
                       "💎PREM" if sig.in_premium  else "〰️EQ")
-            gates.append(
-                f"🗺️ MTF: {'✅ALIGNED' if sig.mtf_aligned else '❌SPLIT'} {pd_icon}")
+            _pd_line = f"🗺️ MTF: {'✅ALIGNED' if sig.mtf_aligned else '❌SPLIT'} {pd_icon}"
+            if sig.ict_pd_matrix:
+                _pd_line += f"  PD:[{sig.ict_pd_matrix}]"
+            gates.append(_pd_line)
+
+            # Advanced structural context line (session quality, chain, reversal risk)
+            _adv_parts = []
+            if sig.ict_session_entry_q:
+                _eq_icon = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🟠",
+                            "AVOID": "🔴"}.get(sig.ict_session_entry_q, "⚪")
+                _adv_parts.append(f"Session:{_eq_icon}{sig.ict_session_entry_q}")
+            if sig.ict_chain_score > 0:
+                _adv_parts.append(f"Chain={sig.ict_chain_score:.2f}")
+            if sig.ict_mtf_ob_count > 0 or sig.ict_fvg_stack_count > 0:
+                _adv_parts.append(
+                    f"Stack:{sig.ict_mtf_ob_count}OB+{sig.ict_fvg_stack_count}FVG")
+            if sig.ict_htf_reversal_risk > 0.40:
+                _adv_parts.append(f"⚠️RevRisk={sig.ict_htf_reversal_risk:.2f}")
+            if sig.ict_htf_rev_zone_near:
+                _adv_parts.append("🚧HTF_REV_ZONE<1ATR")
+            if sig.ict_nearest_ssl_atr > 0:
+                _adv_parts.append(f"SSL↓{sig.ict_nearest_ssl_atr:.1f}ATR")
+            if sig.ict_nearest_bsl_atr > 0:
+                _adv_parts.append(f"BSL↑{sig.ict_nearest_bsl_atr:.1f}ATR")
+            if _adv_parts:
+                gates.append(f"🔬 ICT: {' | '.join(_adv_parts)}")
 
         gates.append(f"📊 {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
 
@@ -3743,6 +3793,38 @@ class QuantStrategy:
                 sig.in_premium  = ict_conf.in_premium
                 mb = self._ict.get_market_bias()
                 sig.mtf_details = mb.details
+
+                # ── v8.0: Advanced ICT context (non-fatal, best-effort) ──────
+                try:
+                    # Delivery target and confidence from ICTConfluence
+                    if ict_conf.delivery_target:
+                        sig.ict_delivery_target = ict_conf.delivery_target
+                        sig.ict_delivery_conf   = ict_conf.delivery_confidence
+                    # PD matrix
+                    sig.ict_pd_grade  = ict_conf.pd_grade
+                    sig.ict_pd_matrix = ict_conf.pd_matrix
+                    # Risk + stack counts
+                    sig.ict_htf_reversal_risk = ict_conf.htf_reversal_risk
+                    sig.ict_mtf_ob_count      = ict_conf.mtf_ob_count
+                    sig.ict_fvg_stack_count   = ict_conf.fvg_stack_count
+                    sig.ict_judas_active      = ict_conf.judas_swing_active
+                    sig.ict_nearest_bsl_atr   = ict_conf.nearest_bsl_dist_atr
+                    sig.ict_nearest_ssl_atr   = ict_conf.nearest_ssl_dist_atr
+                    # Session entry quality
+                    sess_ctx = self._ict.get_amd_session_context(now_ms)
+                    sig.ict_session_entry_q = sess_ctx.get("entry_quality", "")
+                    # Delivery profile chain score
+                    dp = self._ict.get_delivery_profile(ict_side, price, sig.atr, now_ms)
+                    sig.ict_chain_score = dp.get("chain_score", 0.0)
+                    # HTF reversal zone proximity (within 1 ATR)
+                    if sig.atr > 0:
+                        rev_zones = self._ict.get_htf_reversal_zones(price, sig.atr, now_ms)
+                        sig.ict_htf_rev_zone_near = any(
+                            z["dist_atr"] < 1.0 and z["direction"] != ict_side
+                            for z in rev_zones
+                        )
+                except Exception as _adv_e:
+                    pass  # advanced fields are informational only
 
                 # ── ICT composite boost: directional relative to ICT side ────
                 # Key fix: boost must align with ICT direction (AMD sweep bias),
@@ -3983,6 +4065,22 @@ class QuantStrategy:
         _tier         = "BLOCKED"
         _tier_reason  = "no_ict"
         _is_sweep_path = False
+
+        # ── v8.0: Advanced ICT pre-gates (applied before ICTEntryGate) ───
+        # HTF reversal zone proximity: if a high-conviction opposing HTF OB+FVG
+        # zone is within 1 ATR, price is likely to stall or reverse there.
+        # Only block Tier-B entries — sweep setups (Tier-S/A) have their own
+        # structural invalidation via the OTE zone.
+        if (sig.ict_htf_rev_zone_near and
+                not _is_ote_sweep and
+                sig.ict_htf_reversal_risk > 0.55):
+            if now - self._last_ict_gate_log >= 30.0:
+                self._last_ict_gate_log = now
+                logger.info(
+                    f"⛔ HTF_REV_ZONE [{side.upper()}]: "
+                    f"opposing reversal zone <1ATR (risk={sig.ict_htf_reversal_risk:.2f})")
+            self._confirm_long = self._confirm_short = 0
+            return
 
         if (self._ict is not None and self._ict._initialized and
                 _ICT_TRADE_ENGINE_AVAILABLE):
