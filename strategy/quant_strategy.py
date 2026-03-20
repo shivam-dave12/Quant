@@ -3647,6 +3647,24 @@ class QuantStrategy:
                         ap = False
                         _bo_dir = self._breakout.direction.upper()
                         _ap_reason = f"BREAKOUT_BLOCK_{_bo_dir}"
+
+                    # DISPLAY-SYNC FIX: mirror the HTF_REV_ZONE pre-gate that fires
+                    # first in _evaluate_reversion_entry(). Without this, the status
+                    # box shows "MANIP_no_confirmed_sweep" while the actual first block
+                    # executed is HTF_REV_ZONE — misleading to read in the logs.
+                    # Note: _is_ote_sweep check matches the condition in _evaluate_entry.
+                    _disp_is_ote = (
+                        _ICT_TRADE_ENGINE_AVAILABLE and
+                        self._active_sweep_setup is not None and
+                        self._active_sweep_setup.status == "OTE_READY"
+                    )
+                    if (not ap and
+                            sig.ict_htf_rev_zone_near and
+                            not _disp_is_ote and
+                            sig.ict_htf_reversal_risk > 0.55):
+                        _ap_reason = (
+                            f"HTF_REV_ZONE(risk={sig.ict_htf_reversal_risk:.2f},"
+                            f"zone<1ATR)")
                 except Exception:
                     ap = False
             else:
