@@ -3429,6 +3429,23 @@ class QuantStrategy:
                     _disp_ict_sweep = _orig_ict_sweep
                     _disp_ict_sess  = _orig_ict_sess
 
+                    # STACK/RISK DISPLAY FIX: Stack and RevRisk display lines read
+                    # from sig.ict_mtf_ob_count / sig.ict_fvg_stack_count which were
+                    # set from the PRIMARY (ICT-side) confluence call. When ICT and
+                    # VWAP directions conflict and _rc is computed for the VWAP side,
+                    # the gate display shows re-computed FVG=0.67 while the Stack
+                    # still shows 0FVG from the original side — contradictory.
+                    # Fix: track display versions of all advanced fields and update
+                    # them from _rc when re-computing, without touching sig fields
+                    # that should remain from the authoritative primary computation.
+                    _disp_mtf_ob        = sig.ict_mtf_ob_count
+                    _disp_fvg_stack     = sig.ict_fvg_stack_count
+                    _disp_rev_risk      = sig.ict_htf_reversal_risk
+                    _disp_rev_zone_near = sig.ict_htf_rev_zone_near
+                    _disp_chain_score   = sig.ict_chain_score
+                    _disp_ssl_atr       = sig.ict_nearest_ssl_atr
+                    _disp_bsl_atr       = sig.ict_nearest_bsl_atr
+
                     if _ict_opposes_disp:
                         try:
                             _now_ms_d = int(now * 1000) if now < 1e12 else int(now)
@@ -3450,6 +3467,19 @@ class QuantStrategy:
                             _disp_ict_sweep = _rc.sweep_score
                             _disp_ict_sess  = _rc.session_score
                             _disp_note = f" [disp re-comp for {_disp_rev_side.upper()}]"
+                            # STACK/RISK DISPLAY: update display vars from _rc
+                            # so Stack, RevRisk, and RevZone reflect the same side
+                            # as the FVG/OB scores shown in the gate line
+                            _disp_mtf_ob        = _rc.mtf_ob_count
+                            _disp_fvg_stack     = _rc.fvg_stack_count
+                            _disp_rev_risk      = _rc.htf_reversal_risk
+                            _disp_rev_zone_near = (
+                                getattr(_rc, 'judas_swing_active', False) or
+                                _rc.htf_reversal_risk > 0.55
+                            )
+                            _disp_chain_score   = sig.ict_chain_score  # chain = AMD side, unchanged
+                            _disp_ssl_atr       = _rc.nearest_ssl_dist_atr
+                            _disp_bsl_atr       = _rc.nearest_bsl_dist_atr
                         except Exception:
                             pass  # fall through: display original scores with a warning
 
@@ -3544,19 +3574,28 @@ class QuantStrategy:
                 _eq_icon = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🟠",
                             "AVOID": "🔴"}.get(sig.ict_session_entry_q, "⚪")
                 _adv_parts.append(f"Session:{_eq_icon}{sig.ict_session_entry_q}")
-            if sig.ict_chain_score > 0:
-                _adv_parts.append(f"Chain={sig.ict_chain_score:.2f}")
-            if sig.ict_mtf_ob_count > 0 or sig.ict_fvg_stack_count > 0:
-                _adv_parts.append(
-                    f"Stack:{sig.ict_mtf_ob_count}OB+{sig.ict_fvg_stack_count}FVG")
-            if sig.ict_htf_reversal_risk > 0.40:
-                _adv_parts.append(f"⚠️RevRisk={sig.ict_htf_reversal_risk:.2f}")
-            if sig.ict_htf_rev_zone_near:
+            # Use _disp_* variables which reflect the re-computed side when applicable.
+            # This ensures Stack, RevRisk and SSL/BSL distances match the same side
+            # as the FVG/OB scores in the gate line (no more "FVG=0.67 but Stack:0FVG").
+            _d_chain   = _disp_chain_score   if '_disp_chain_score'   in dir() else sig.ict_chain_score
+            _d_ob      = _disp_mtf_ob        if '_disp_mtf_ob'        in dir() else sig.ict_mtf_ob_count
+            _d_fvg     = _disp_fvg_stack     if '_disp_fvg_stack'     in dir() else sig.ict_fvg_stack_count
+            _d_rr      = _disp_rev_risk      if '_disp_rev_risk'      in dir() else sig.ict_htf_reversal_risk
+            _d_rz      = _disp_rev_zone_near if '_disp_rev_zone_near' in dir() else sig.ict_htf_rev_zone_near
+            _d_ssl     = _disp_ssl_atr       if '_disp_ssl_atr'       in dir() else sig.ict_nearest_ssl_atr
+            _d_bsl     = _disp_bsl_atr       if '_disp_bsl_atr'       in dir() else sig.ict_nearest_bsl_atr
+            if _d_chain > 0:
+                _adv_parts.append(f"Chain={_d_chain:.2f}")
+            if _d_ob > 0 or _d_fvg > 0:
+                _adv_parts.append(f"Stack:{_d_ob}OB+{_d_fvg}FVG")
+            if _d_rr > 0.40:
+                _adv_parts.append(f"⚠️RevRisk={_d_rr:.2f}")
+            if _d_rz:
                 _adv_parts.append("🚧HTF_REV_ZONE<1ATR")
-            if sig.ict_nearest_ssl_atr > 0:
-                _adv_parts.append(f"SSL↓{sig.ict_nearest_ssl_atr:.1f}ATR")
-            if sig.ict_nearest_bsl_atr > 0:
-                _adv_parts.append(f"BSL↑{sig.ict_nearest_bsl_atr:.1f}ATR")
+            if _d_ssl > 0:
+                _adv_parts.append(f"SSL↓{_d_ssl:.1f}ATR")
+            if _d_bsl > 0:
+                _adv_parts.append(f"BSL↑{_d_bsl:.1f}ATR")
             if _adv_parts:
                 gates.append(f"🔬 ICT: {' | '.join(_adv_parts)}")
 
@@ -4064,8 +4103,31 @@ class QuantStrategy:
                 sig.ict_session = _recomp.session_score
                 sig.ict_total   = _recomp.total
                 sig.ict_details = _recomp.details
-                # in_discount / in_premium / mtf_aligned come from AMD engine —
-                # independent of confluence side, leave unchanged.
+                # ADVANCED FIELD PROPAGATION FIX: original code updated only the
+                # 6 basic scores. All 12 advanced fields remained from the primary
+                # (ICT-side) computation, so gate decisions used correct totals
+                # but display fields (Stack, RevRisk, RevZone) reflected the wrong
+                # side. Propagate the full recomputed result now.
+                sig.ict_mtf_ob_count      = _recomp.mtf_ob_count
+                sig.ict_fvg_stack_count   = _recomp.fvg_stack_count
+                sig.ict_htf_reversal_risk = _recomp.htf_reversal_risk
+                sig.ict_pd_grade          = _recomp.pd_grade
+                sig.ict_pd_matrix         = _recomp.pd_matrix
+                sig.ict_judas_active      = _recomp.judas_swing_active
+                sig.ict_nearest_bsl_atr   = _recomp.nearest_bsl_dist_atr
+                sig.ict_nearest_ssl_atr   = _recomp.nearest_ssl_dist_atr
+                if _recomp.delivery_target:
+                    sig.ict_delivery_target = _recomp.delivery_target
+                    sig.ict_delivery_conf   = _recomp.delivery_confidence
+                # HTF reversal zone: recompute for the new side
+                if sig.atr > 0:
+                    try:
+                        _rz = self._ict.get_htf_reversal_zones(price, sig.atr, _now_ms_rg)
+                        sig.ict_htf_rev_zone_near = any(
+                            z["dist_atr"] < 1.0 and z["direction"] != side
+                            for z in _rz)
+                    except Exception:
+                        pass
                 _prev_dir_lbl = "SHORT" if _ict_dir < 0 else "LONG"
                 logger.debug(
                     f"🔄 ICT re-computed for {side.upper()} "
