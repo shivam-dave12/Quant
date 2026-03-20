@@ -1634,6 +1634,14 @@ class ICTEntryGate:
       • HTF veto present AND ICT weak (ICT < 0.40) — no structural cover
     """
 
+    # Bug-5 fix: single source of truth for the Tier-B composite threshold.
+    # The display code in _log_thinking used QCfg.COMPOSITE_ENTRY_MIN() (0.350)
+    # while the actual gate check here used the hardcoded literal 0.30.
+    # Readers saw "Composite (-0.259 vs ±0.350)" in the log but the real block
+    # fired at 0.30 — the displayed threshold was wrong.  Now both places use
+    # this constant so the log always reflects the real gate value.
+    TIER_B_COMPOSITE_MIN: float = 0.30
+
     @staticmethod
     def _htf_allows_tier_a(
             htf_veto: bool,
@@ -1790,8 +1798,24 @@ class ICTEntryGate:
                     f"ICT={ict_total:.2f} KZ={sweep_setup.kill_zone or 'none'}")
 
         # ── TIER-A: ICT Structural Alignment ─────────────────────────────
-        _has_delivery_context = amd_phase in (
-            "DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION") and amd_conf >= 0.50
+        # Bug-1 fix: DISTRIBUTION that is actively opposing the entry side must
+        # NOT count as a delivery context.  Previously conf 0.50–0.65 opposing
+        # DISTRIBUTION would pass _has_delivery_context=True and could reach
+        # Tier-A even though AMD is delivering AGAINST the entry direction.
+        # The hard-block at line 1762 only fires at conf>=0.65; this gap let
+        # entries through at 0.50–0.65.  Now _has_delivery_context is False
+        # for any opposing DISTRIBUTION regardless of confidence.
+        _amd_opposes = (
+            amd_phase == "DISTRIBUTION" and (
+                (side == "long"  and amd_bias == "bearish") or
+                (side == "short" and amd_bias == "bullish")
+            )
+        )
+        _has_delivery_context = (
+            amd_phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION")
+            and amd_conf >= 0.50
+            and not _amd_opposes   # Bug-1: opposing DISTRIBUTION excluded
+        )
         # v8.0: tier-aware HTF gate replaces the previous `not htf_veto` hard-block.
         # With-HTF path (htf_veto=False): identical behaviour to prior versions.
         # Counter-HTF path: narrow unlock — DISTRIBUTION/REDISTRIBUTION only,
@@ -1830,7 +1854,7 @@ class ICTEntryGate:
         # LONG must NOT be in premium (4H PD > 60%); SHORT must NOT be in discount.
         _tier_b_conditions = (
             ict_total >= 0.40 and
-            abs(q_composite) >= 0.30 and
+            abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
             not htf_veto and
@@ -1847,7 +1871,15 @@ class ICTEntryGate:
         # ── Specific BLOCKED reason for diagnostics ───────────────────────
         block_reasons = []
         if not _has_delivery_context and not _tier_s_conditions:
-            block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
+            if _amd_opposes:
+                # Bug-1 / Bug-5: surface the specific opposing-DISTRIBUTION reason
+                # so logs clearly show WHY delivery context was denied, not just
+                # that the AMD phase/conf was insufficient.
+                block_reasons.append(
+                    f"AMD_DIST_opposing_{amd_bias}(conf={amd_conf:.2f})"
+                    "_no_delivery_context")
+            else:
+                block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
         if ict_total < 0.40:
             block_reasons.append(f"ICT={ict_total:.2f}<0.40")
         if tf_opposes:
@@ -1869,9 +1901,6 @@ class ICTEntryGate:
                 block_reasons.append(
                     f"HTF_VETO+AMD_conf={amd_conf:.2f}<0.60(counter_htf_bar)")
             else:
-                # 15m at extreme — distribution entry window is closed.
-                # SHORT: htf_15m >= +0.55 (15m fully bullish, rally exhausted)
-                # LONG:  htf_15m <= -0.55 (15m fully bearish, selloff exhausted)
                 _extreme_str = (f"{htf_15m:+.2f}≥+0.55"
                                 if side == "short"
                                 else f"{htf_15m:+.2f}≤-0.55")
@@ -1879,8 +1908,10 @@ class ICTEntryGate:
                     f"HTF_VETO+15m_extreme({_extreme_str}_dist_window_closed)")
         if not q_overext and ict_total < 0.55:
             block_reasons.append("NOT_OVEREXTENDED+weak_ICT")
-        if abs(q_composite) < 0.30:
-            block_reasons.append(f"Σ={q_composite:+.3f}<0.30")
+        # Bug-5: show real threshold value (TIER_B_COMPOSITE_MIN = 0.30)
+        if abs(q_composite) < ICTEntryGate.TIER_B_COMPOSITE_MIN:
+            block_reasons.append(
+                f"Σ={q_composite:+.3f}<{ICTEntryGate.TIER_B_COMPOSITE_MIN:.2f}(TierB_min)")
 
         return ("BLOCKED", 0, "BELOW_MIN: " + " | ".join(block_reasons) if block_reasons
                 else f"BELOW_MIN ICT={ict_total:.2f} Σ={q_composite:+.3f}")

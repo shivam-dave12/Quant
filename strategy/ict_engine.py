@@ -719,9 +719,15 @@ class ICTEngine:
                             candles_1h=candles_1h)
 
         # ── OB mitigation tracking ────────────────────────────────────
-        self._update_ob_mitigation(candles_5m)
-        if candles_15m:
-            self._update_ob_mitigation(candles_15m)
+        # Bug-23 fix: previously called twice (5m then 15m), iterating the
+        # full OB list each time and potentially using a different last-close
+        # for the same OB on consecutive passes. A single pass with the
+        # higher-conviction close (prefer 15m as it is already-closed) avoids
+        # redundant work and ensures each OB is evaluated once per update.
+        if candles_15m and len(candles_15m) >= 2:
+            self._update_ob_mitigation(candles_15m)  # 15m close is decisive
+        else:
+            self._update_ob_mitigation(candles_5m)   # fallback to 5m only
 
         # ── Breaker + Rejection block detection ───────────────────────
         self._detect_breaker_blocks(candles_5m, now_ms)
@@ -747,7 +753,7 @@ class ICTEngine:
             self._update_ipda(candles_1d, price)
 
         # ── AMD phase ─────────────────────────────────────────────────
-        self._update_amd(price, now_ms)
+        self._update_amd(price, now_ms, candles_5m)
 
         self._initialized = True
 
@@ -858,7 +864,42 @@ class ICTEngine:
     # AMD PHASE DETECTION
     # ─────────────────────────────────────────────────────────────────────
 
-    def _update_amd(self, price: float, now_ms: int) -> None:
+    def _select_best_sweep(self, swept: list, now_ms: int) -> 'LiquidityLevel':
+        """
+        Bug-15 fix: Select the most RELEVANT swept pool for AMD phase anchoring.
+
+        The original code always took `swept[0]` (most recent by timestamp).
+        A low-quality minor SSL swept 5 minutes ago would override a
+        high-conviction BSL swept 40 minutes ago that still has active delivery.
+
+        Selection criteria (within 1.5× distribution window):
+          freshness    × 0.40  — recent sweeps are more likely still in delivery
+          displacement × 0.35  — institutional confirmation of directional intent
+          wick_rejection × 0.15 — price rejected the swept level (conviction close)
+          touch_count  × 0.10  — more touches = deeper stop cluster = stronger magnet
+
+        Falls back to most-recent if all candidates are outside the window.
+        """
+        window_ms = self.AMD_DISTRIB_WINDOW_MS * 1.5
+        candidates = [p for p in swept
+                      if (now_ms - p.sweep_timestamp) < window_ms]
+        if not candidates:
+            # All sweeps are old — fall back to most recent
+            return max(swept, key=lambda p: p.sweep_timestamp)
+
+        def _sweep_quality(p: 'LiquidityLevel') -> float:
+            age_ms    = now_ms - p.sweep_timestamp
+            freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
+            q = freshness * 0.40
+            if p.displacement_confirmed: q += 0.35
+            if p.wick_rejection:         q += 0.15
+            q += min(0.10, getattr(p, 'touch_count', 1) * 0.03)
+            return q
+
+        return max(candidates, key=_sweep_quality)
+
+    def _update_amd(self, price: float, now_ms: int,
+                    candles_5m: Optional[List[Dict]] = None) -> None:
         """
         AMD cycle: Accumulation → Manipulation → Distribution → Re-accumulation
 
@@ -899,10 +940,12 @@ class ICTEngine:
                 details="No sweep detected")
             return
 
-        swept.sort(key=lambda p: p.sweep_timestamp, reverse=True)
-        latest     = swept[0]
-        age_ms     = now_ms - latest.sweep_timestamp
-        sweep_type = latest.level_type
+        # Bug-15 fix: use quality-weighted sweep selection instead of
+        # always taking the most recent — a minor low-conviction sweep should
+        # not override a high-conviction sweep that is still in active delivery.
+        latest      = self._select_best_sweep(swept, now_ms)
+        age_ms      = now_ms - latest.sweep_timestamp
+        sweep_type  = latest.level_type
         sweep_price = latest.price
 
         bias = "bullish" if sweep_type == "SSL" else "bearish"
@@ -914,10 +957,29 @@ class ICTEngine:
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
 
-        # ── ATR proxy from 5m range ──────────────────────────────────
+        # ── ATR proxy from 5m candles ────────────────────────────────
+        # Bug-14 fix: the original formula used total-range × 0.025 which
+        # produced values ~80% too small versus the real ATR (e.g. $30 vs
+        # $136 on BTC). This caused displacement_confirms to fire after a
+        # trivial move, prematurely advancing AMD to DISTRIBUTION.
+        # Now we compute a proper 14-period true-range average from the
+        # candles_5m argument (passed down from update()).
         tf5m = self._tf.get("5m", TFStructure(timeframe="5m"))
-        rng5m = max(tf5m.range_high - tf5m.range_low, 1.0)
-        atr_proxy = rng5m * 0.025   # rough 1-ATR from recent 5m range
+        if candles_5m and len(candles_5m) >= 2:
+            _lb   = min(14, len(candles_5m) - 1)
+            _trs  = []
+            for _i in range(len(candles_5m) - _lb, len(candles_5m)):
+                _hi = float(candles_5m[_i]['h'])
+                _lo = float(candles_5m[_i]['l'])
+                _pc = float(candles_5m[_i - 1]['c'])
+                _trs.append(max(_hi - _lo,
+                                abs(_hi - _pc),
+                                abs(_lo - _pc)))
+            atr_proxy = max(sum(_trs) / len(_trs), 1.0) if _trs else 1.0
+        else:
+            # Fallback only if candles unavailable (should not happen post-init)
+            rng5m     = max(tf5m.range_high - tf5m.range_low, 1.0)
+            atr_proxy = max(rng5m * 0.10, 1.0)  # 10% of range is more realistic
 
         # ── BOS gate: must have occurred AFTER the sweep ─────────────
         # bos_timestamp == 0 means BOS was never set (warmup artifact) — treat as no BOS
@@ -1971,6 +2033,13 @@ class ICTEngine:
                                 details.append(
                                     f"OB_PROX({da:.1f}ATR) ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
 
+        # Bug-13 fix: snapshot the OB-only contribution to pd BEFORE FVG
+        # scoring adds its own portion.  The legacy ob_score field must be
+        # normalised against the OB-cap (0.15), not against the combined
+        # pd_array_score.  When an FVG is also active the combined score can
+        # exceed 0.15, giving ob_score > 1.0 — an impossible display value.
+        _ob_pd_contrib = pd   # OB-only contribution, before FVG is added
+
         # FVG scoring
         fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
         act_fvgs = [f for f in fvgs_dir if f.is_active(now_ms)]
@@ -2021,8 +2090,11 @@ class ICTEngine:
         out.pd_array_score = min(0.25, pd)
         out.active_ob  = active_ob
         out.active_fvg = active_fvg
-        # Legacy compat
-        out.ob_score  = (out.pd_array_score / 0.15) if active_ob else 0.0
+        # Bug-13 fix: normalise ob_score against the OB-only cap (0.15) using
+        # the pre-FVG snapshot, so ob_score is always in [0, 1].  Previously
+        # dividing the combined pd_array_score by 0.15 produced values > 1.0
+        # when an active FVG added its own contribution alongside the OB.
+        out.ob_score  = min(1.0, _ob_pd_contrib / 0.15) if active_ob  else 0.0
         out.fvg_score = (1.0 - active_fvg.fill_percentage) if active_fvg else 0.0
 
         # ── 4. Liquidity ──────────────────────────────────────────────

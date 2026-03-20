@@ -115,19 +115,44 @@ class TelegramBotController:
         return resp.status_code == 200
 
     def get_updates(self, timeout: int = 30) -> list:
+        # Bug-21 fix: cap the effective long-poll read timeout at 15 s (down from
+        # timeout+5=35 s).  The old value meant stop() couldn't interrupt an
+        # in-flight poll for up to 35 seconds — dangerous when shutting down with
+        # an open position.  A 15-second read window still gives reliable delivery
+        # for all Telegram use cases; the poll repeats immediately on return.
+        _read_timeout = min(timeout, 15) + 2   # 2 s margin above poll interval
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
             params = {
                 "offset":          self.last_update_id + 1,
-                "timeout":         timeout,
+                "timeout":         min(timeout, 15),   # match read_timeout cap
                 "allowed_updates": ["message"],
             }
-            resp = requests.get(url, params=params, timeout=timeout + 5)
+            resp = requests.get(url, params=params,
+                                timeout=(5.0, _read_timeout))
+            # Bug-22 fix: log non-200 responses instead of silently returning [].
             if resp.status_code != 200:
+                logger.warning("Telegram API HTTP %d — getUpdates skipped",
+                               resp.status_code)
                 return []
             data = resp.json()
             return data.get("result", []) if data.get("ok") else []
-        except Exception:
+        except requests.exceptions.Timeout:
+            # Normal for a long-poll that expires with no messages — not an error.
+            return []
+        except requests.exceptions.ConnectionError as e:
+            # Bug-22 fix: network blip — warn so operator can see Telegram is down.
+            logger.warning("Telegram connection error (will retry): %s", e)
+            return []
+        except ValueError as e:
+            # Bug-22 fix: malformed JSON — log with context so it's diagnosable.
+            logger.error("Telegram JSON parse error in getUpdates: %s", e)
+            return []
+        except Exception as e:
+            # Bug-22 fix: catch-all still returns [] but now logs the failure so
+            # prolonged Telegram outages are visible in the bot log.
+            logger.error("Telegram getUpdates unexpected error: %s", e,
+                         exc_info=True)
             return []
 
     def clear_old_messages(self):
@@ -1563,7 +1588,12 @@ class TelegramBotController:
 
         while self.running:
             try:
-                updates = self.get_updates(timeout=30)
+                # Bug-21 fix: use timeout=10 so the poll returns within ~12 s
+                # of a stop() call rather than blocking for up to 35 s.  The
+                # shorter interval has no practical effect on message delivery —
+                # Telegram updates are pushed server-side regardless of the
+                # client poll timeout.
+                updates = self.get_updates(timeout=10)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)
                     msg     = upd.get("message") or {}

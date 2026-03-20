@@ -276,8 +276,18 @@ class ProfitFloorModel:
         floor never exceeds a physically reachable structural target.
         Default cap: 2.0×ATR (a generous but achievable TP distance).
         """
-        if price <= 0 or atr <= 0:
-            return float("inf")
+        if price <= 0:
+            return float("inf")     # genuine bad data — hard-block always correct
+        if atr <= 0:
+            # Bug-20 fix: returning inf here caused valid ICT entries to be
+            # silently rejected during ATR warmup (first ~14 candles after boot).
+            # The bot would confirm a signal through all structural gates, hit the
+            # fee floor check, get inf back, and silently drop the trade with no
+            # log entry. Strategy-level gates (min_qty, SL distance) still apply;
+            # bypassing the fee floor during warmup is safe — it re-activates the
+            # moment ATR > 0.
+            logger.debug("ProfitFloor: ATR=0 (engine warming up) — fee floor bypassed")
+            return 0.0
 
         mult = self.compute_multiplier(
             atr_percentile, spread_bps, atr, price, signal_confidence
@@ -493,13 +503,20 @@ class ExecutionCostEngine:
 
     def is_warmed_up(self) -> bool:
         """
-        True once the engine has enough samples for reliable cost estimates.
+        True once the engine has enough spread samples for reliable cost estimates.
 
-        Before warmup: median_bps() returns hardcoded default (2.0bps).
-        That default can produce fee floors that reject valid setups
-        if the actual spread is tighter. Gate the TP floor check on warmup.
+        Before warmup: median_bps() returns the hardcoded default (2.0 bps).
+        That default can produce fee floors that reject valid setups if the
+        actual spread is tighter.  Gate the TP floor check on warmup.
 
-        Warmup threshold: 5 spread samples (takes ~5 orderbook ticks, ~5-10s).
+        Warmup threshold: 5 spread samples (~5-10 seconds of live data).
+
+        Note: slippage EWMA is tracked separately in diagnostic_snapshot via
+        'slip_warmed'.  We do NOT require the slippage EWMA here because
+        expected_bps() has its own safe default (0.0 bps) when unwarmed,
+        which only underestimates round-trip cost — it never over-gates entries.
+        Requiring slip_warmed here would have blocked ALL entries for several
+        minutes after a stream restart until a fill was recorded.
         """
         return self._spread.sample_count >= 5
 
@@ -602,5 +619,12 @@ class ExecutionCostEngine:
             "rt_cost_taker_bps":    round(taker_cost, 2),
             "rt_cost_maker_bps":    round(maker_cost, 2),
             "maker_saving_bps":     round(taker_cost - maker_cost, 2),
-            "engine_warmed":        spread_samples >= 5 and slip_warmed,
+            # Bug-17 fix: engine_warmed now matches is_warmed_up() exactly (spread
+            # samples >= 5).  Previously this required slip_warmed=True as well,
+            # making the Telegram status report show "warming" for several minutes
+            # after a stream restart even though is_warmed_up() returned True and
+            # the fee gate was already active.  slip_warmed is kept as its own
+            # separate field for operator visibility — it just no longer gates
+            # the definition of "engine_warmed".
+            "engine_warmed":        spread_samples >= 5,
         }

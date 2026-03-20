@@ -485,7 +485,12 @@ class QuantBot:
         while self.running:
             try:
                 time.sleep(0.25)
-                self._last_tick_time = time.time()
+                # Bug-18 fix: do NOT update _last_tick_time here at the top of
+                # the loop.  The watchdog measures how long since the last tick
+                # COMPLETED.  Setting it here meant a 14.9-second hang inside
+                # on_tick() looked like a 0.25-second tick to the watchdog — it
+                # would never fire.  The update now sits only at the two
+                # explicit completion points below.
 
                 self.maybe_supervise_streams()
                 self.maybe_send_report()
@@ -493,6 +498,9 @@ class QuantBot:
 
                 pos = self.strategy.get_position() if self.strategy else None
                 if not self.trading_enabled and pos is None:
+                    # Paused path — no on_tick call but we still completed this
+                    # iteration; reset the watchdog so it doesn't false-trip.
+                    self._last_tick_time = time.time()
                     continue
 
                 _t0 = time.time()
@@ -509,6 +517,7 @@ class QuantBot:
                         _tick_ms,
                     )
 
+                # on_tick completed — now safe to reset watchdog timer
                 self._last_tick_time = time.time()
 
             except KeyboardInterrupt:

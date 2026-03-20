@@ -2895,9 +2895,18 @@ class QuantStrategy:
         self._last_ict_gate_log    = 0.0
         self._last_trail_block_log = 0.0
         self._last_maxhold_check   = 0.0
-        # Bug 7: track first ICT-gate block timestamp for Telegram alert
-        self._ict_gate_start_time  = 0.0
-        self._ict_gate_alerted     = False
+        # Bug-3 fix: path-specific ICT gate block timers.
+        # The original single shared pair (_ict_gate_start_time / _ict_gate_alerted)
+        # was used by reversion, momentum, and trend paths simultaneously.
+        # When the reversion path passed and reset the timer, the momentum path's
+        # accumulated block time was silently lost, preventing the 15-min Telegram
+        # alert from ever firing when the bot was stuck for hours.
+        self._ict_gate_start_time_rev   = 0.0   # reversion path
+        self._ict_gate_alerted_rev      = False
+        self._ict_gate_start_time_mom   = 0.0   # momentum retest path
+        self._ict_gate_alerted_mom      = False
+        self._ict_gate_start_time_trend = 0.0   # trend pullback path
+        self._ict_gate_alerted_trend    = False
         self._log_init()
 
     def _log_init(self):
@@ -3375,12 +3384,19 @@ class QuantStrategy:
                 f"q={ss.quality_score():.2f}")
 
         # ── Quant helper signals (display only — not gate logic here) ─────
+        # Bug-5/7 fix: the Composite gate line used QCfg.COMPOSITE_ENTRY_MIN()
+        # (0.350) as its displayed threshold, but the actual Tier-B gate in
+        # ICTEntryGate uses TIER_B_COMPOSITE_MIN (0.30). Logs showed entries
+        # "blocked at ±0.350" while the real block was at 0.30 — diagnostic
+        # confusion.  Use the real gate constant here for the display tick mark.
+        _tierb_thr = (ICTEntryGate.TIER_B_COMPOSITE_MIN
+                      if _ICT_TRADE_ENGINE_AVAILABLE else thr)
         gates = [
             f"{'✅' if sig.overextended else '⚪'} Overextended ({sig.deviation_atr:+.1f} ATR)  [quant-scout: VWAP deviation]",
             f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})  [ATR percentile gate]",
             f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
             f"{'✅' if sig.n_confirming>=3 else '⚪'} Quant Confluence ({sig.n_confirming}/5) [scout: n_conf]",
-            f"{'✅' if abs(c)>=thr else '⚪'} Composite ({c:+.3f} vs ±{thr:.3f}) [scout: order-flow]",
+            f"{'✅' if abs(c)>=_tierb_thr else '⚪'} Composite ({c:+.3f} vs ±{_tierb_thr:.3f}) [scout: order-flow]",
         ]
 
         # ── ICT tier gate display (B1 + B6 fix) ──────────────────────────
@@ -3577,13 +3593,19 @@ class QuantStrategy:
             # Use _disp_* variables which reflect the re-computed side when applicable.
             # This ensures Stack, RevRisk and SSL/BSL distances match the same side
             # as the FVG/OB scores in the gate line (no more "FVG=0.67 but Stack:0FVG").
-            _d_chain   = _disp_chain_score   if '_disp_chain_score'   in dir() else sig.ict_chain_score
-            _d_ob      = _disp_mtf_ob        if '_disp_mtf_ob'        in dir() else sig.ict_mtf_ob_count
-            _d_fvg     = _disp_fvg_stack     if '_disp_fvg_stack'     in dir() else sig.ict_fvg_stack_count
-            _d_rr      = _disp_rev_risk      if '_disp_rev_risk'      in dir() else sig.ict_htf_reversal_risk
-            _d_rz      = _disp_rev_zone_near if '_disp_rev_zone_near' in dir() else sig.ict_htf_rev_zone_near
-            _d_ssl     = _disp_ssl_atr       if '_disp_ssl_atr'       in dir() else sig.ict_nearest_ssl_atr
-            _d_bsl     = _disp_bsl_atr       if '_disp_bsl_atr'       in dir() else sig.ict_nearest_bsl_atr
+            # Bug-4 fix: use locals() instead of dir().  dir() includes class/instance
+            # attrs and has implementation-defined semantics for locals — locals() is
+            # the correct stdlib idiom to probe whether a name was assigned in the
+            # current frame.  The _disp_* vars are set unconditionally inside the
+            # _ict_scores_valid block above, so they are always present here when
+            # that block ran; the fallback path is only hit when ICT is uninitialized.
+            _d_chain   = locals().get('_disp_chain_score',   sig.ict_chain_score)
+            _d_ob      = locals().get('_disp_mtf_ob',        sig.ict_mtf_ob_count)
+            _d_fvg     = locals().get('_disp_fvg_stack',     sig.ict_fvg_stack_count)
+            _d_rr      = locals().get('_disp_rev_risk',      sig.ict_htf_reversal_risk)
+            _d_rz      = locals().get('_disp_rev_zone_near', sig.ict_htf_rev_zone_near)
+            _d_ssl     = locals().get('_disp_ssl_atr',       sig.ict_nearest_ssl_atr)
+            _d_bsl     = locals().get('_disp_bsl_atr',       sig.ict_nearest_bsl_atr)
             if _d_chain > 0:
                 _adv_parts.append(f"Chain={_d_chain:.2f}")
             if _d_ob > 0 or _d_fvg > 0:
@@ -4083,9 +4105,13 @@ class QuantStrategy:
         # detector requires AMD bias to match sweep direction), still recompute
         # so the gate always receives correctly-directed scores.
         #
-        # sig.composite is NOT touched — the signed boost was already applied
-        # in _evaluate_entry and correctly penalises confidence in this direction.
-        # sig.ict_boost_signed / sig.ict_direction are attribution fields — unchanged.
+        # Bug-2 fix: the original code added a signed boost in _evaluate_entry()
+        # using the AMD/ICT side (e.g. LONG) and then did NOT reverse it when
+        # evaluating the VWAP reversion side (e.g. SHORT). The ICT LONG boost
+        # (+0.086 to +0.108) was persistently making sig.composite LESS negative,
+        # so SHORT entries consistently fell short of the ±0.350 composite gate.
+        # Fix: when the ICT side opposes `side`, un-apply the original boost and
+        # apply a correctly-directed one for the actual entry side being evaluated.
         _ict_dir = sig.ict_direction   # +1.0=long, -1.0=short, 0.0=unset (B1 field)
         _ict_opposes_side = (
             (_ict_dir < 0 and side == "long") or
@@ -4128,13 +4154,27 @@ class QuantStrategy:
                             for z in _rz)
                     except Exception:
                         pass
+                # Bug-2 fix: un-apply the original opposite-direction boost and
+                # substitute a correctly-directed one for `side`.  Without this the
+                # original LONG boost (e.g. +0.097) stays embedded in sig.composite
+                # even when evaluating a SHORT entry, making the composite 0.19 less
+                # negative than the raw order-flow signals warrant and systematically
+                # blocking SHORT entries that would otherwise clear the ±0.350 gate.
+                _old_boost   = sig.ict_boost_signed          # was in opposite direction
+                _new_dir     = 1.0 if side == "long" else -1.0
+                _new_boost   = _recomp.total * 0.15 * _new_dir
+                sig.composite        = max(-1.0, min(1.0, sig.composite - _old_boost + _new_boost))
+                sig.ict_boost_signed = _new_boost
+                sig.ict_direction    = _new_dir
                 _prev_dir_lbl = "SHORT" if _ict_dir < 0 else "LONG"
                 logger.debug(
                     f"🔄 ICT re-computed for {side.upper()} "
                     f"(was {_prev_dir_lbl}): "
                     f"Σ={_recomp.total:.2f} "
                     f"[OB={_recomp.ob_score:.2f} "
-                    f"FVG={_recomp.fvg_score:.2f}]")
+                    f"FVG={_recomp.fvg_score:.2f}] "
+                    f"boost_corrected: {_old_boost:+.3f} → {_new_boost:+.3f} "
+                    f"composite_now={sig.composite:+.4f}")
             except Exception as _rce:
                 logger.debug(f"ICT side-recompute error (non-fatal): {_rce}")
                 # Zero out so gate cannot mistake opposite-side scores as support
@@ -4169,18 +4209,14 @@ class QuantStrategy:
                     side, sig, self._active_sweep_setup, price, quant_helpers)
 
                 if _tier == "BLOCKED":
-                    if self._ict_gate_start_time == 0.0:
-                        self._ict_gate_start_time = now
+                    if self._ict_gate_start_time_rev == 0.0:
+                        self._ict_gate_start_time_rev = now
                     if now - self._last_ict_gate_log >= 30.0:
                         self._last_ict_gate_log = now
                         logger.info(
                             f"⛔ ICTEntryGate BLOCKED [{side.upper()}]: {_tier_reason}")
-                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                        self._ict_gate_alerted = True
-                        # BUG-C FIX: sig has no htf_15m/htf_4h fields (those live on
-                        # QuantHelperSignals / HTFTrendFilter).  getattr(sig,'htf_15m')
-                        # always returned 0.0, making the Telegram alert useless for
-                        # diagnosing HTF veto situations. Use self._htf directly.
+                    if not self._ict_gate_alerted_rev and (now - self._ict_gate_start_time_rev) >= 900.0:
+                        self._ict_gate_alerted_rev = True
                         send_telegram_message(
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"No ICT confluence for ≥15 min.\n"
@@ -4193,7 +4229,7 @@ class QuantStrategy:
                     self._confirm_long = self._confirm_short = 0
                     return
 
-                self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+                self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
                 _effective_cn  = _cn_override
                 _is_sweep_path = (_tier in ("S", "A") and
                                   self._active_sweep_setup is not None and
@@ -4213,15 +4249,15 @@ class QuantStrategy:
             _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
             _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
             if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time == 0.0:
-                    self._ict_gate_start_time = now
+                if self._ict_gate_start_time_rev == 0.0:
+                    self._ict_gate_start_time_rev = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [{side.upper()} REVERSION]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f} [{sig.ict_details}]")
-                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                    self._ict_gate_alerted = True
+                if not self._ict_gate_alerted_rev and (now - self._ict_gate_start_time_rev) >= 900.0:
+                    self._ict_gate_alerted_rev = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
@@ -4238,7 +4274,7 @@ class QuantStrategy:
                             f"delivering {sig.amd_bias} (conf={sig.amd_conf:.2f})")
                     self._confirm_long = self._confirm_short = 0
                     return
-            self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
 
         # ══════════════════════════════════════════════════════════════════
         # PATH SPLIT: ICT SWEEP vs STANDARD QUANT
@@ -4399,48 +4435,51 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0; return
 
         # ── ICT gate for trend entries ───────────────────────────────────────
+        _t  = "B"   # Bug-4 fix: declare before conditional block so confirm-
+        _cn = QCfg.TREND_CONFIRM_TICKS()  # counter below can reference directly
+        _tr = ""
         if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
             try:
                 _qh = self._get_quant_helpers(sig, trend_side)
                 _t, _cn, _tr = ICTEntryGate.evaluate(trend_side, sig, None, price, _qh)
                 if _t == "BLOCKED":
-                    if self._ict_gate_start_time == 0.0:
-                        self._ict_gate_start_time = now
+                    if self._ict_gate_start_time_trend == 0.0:
+                        self._ict_gate_start_time_trend = now
                     if now - self._last_ict_gate_log >= 30.0:
                         self._last_ict_gate_log = now
                         logger.info(
                             f"⛔ ICT gate [TREND {trend_side.upper()}]: {_tr}")
-                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                        self._ict_gate_alerted = True
+                    if not self._ict_gate_alerted_trend and (now - self._ict_gate_start_time_trend) >= 900.0:
+                        self._ict_gate_alerted_trend = True
                         send_telegram_message(
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"TREND {trend_side.upper()}: {_tr}\n"
                             f"<i>Bot alive — waiting for structure.</i>")
                     self._confirm_trend_long = self._confirm_trend_short = 0
                     return
-                self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+                self._ict_gate_start_time_trend = 0.0; self._ict_gate_alerted_trend = False
             except Exception as _tge:
                 logger.debug(f"Trend ICTEntryGate error (non-fatal): {_tge}")
         elif self._ict is not None and self._ict._initialized:
             # Legacy flat threshold gate
             _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
             if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time == 0.0:
-                    self._ict_gate_start_time = now
+                if self._ict_gate_start_time_trend == 0.0:
+                    self._ict_gate_start_time_trend = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [TREND {trend_side.upper()}]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
-                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                    self._ict_gate_alerted = True
+                if not self._ict_gate_alerted_trend and (now - self._ict_gate_start_time_trend) >= 900.0:
+                    self._ict_gate_alerted_trend = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
                         f"{sig.ict_details}")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
-            self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            self._ict_gate_start_time_trend = 0.0; self._ict_gate_alerted_trend = False
 
         # Pullback-to-EMA depth check
         try: candles_5m = data_manager.get_candles("5m", limit=30)
@@ -4472,11 +4511,12 @@ class QuantStrategy:
         cn = QCfg.TREND_CONFIRM_TICKS()
         if trend_side == "long" and self._confirm_trend_long >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            _trend_tier = _t if "_t" in dir() else "B"
+            # Bug-4 fix: _t is initialised to "B" before the gate block above
+            _trend_tier = _t
             self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="trend", ict_tier=_trend_tier)
         elif trend_side == "short" and self._confirm_trend_short >= cn:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            _trend_tier = _t if "_t" in dir() else "B"
+            _trend_tier = _t   # Bug-4 fix: always defined, see above
             self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend", ict_tier=_trend_tier)
 
     def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
@@ -4547,46 +4587,49 @@ class QuantStrategy:
         # ── Gate 4: ICT structural confluence ───────────────────────────────
         # Momentum retest requires institutional structure in the retest zone.
         # A bounce without OBs/FVGs is noise — use ICTEntryGate for full check.
+        _t_mo     = "B"   # Bug-4 fix: declare before conditional block so
+        _tr_mo    = ""    # locals() check below always finds them, not dir()
+        _cn_mo    = QCfg.CONFIRM_TICKS()
         if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
             try:
                 _qh_mo = self._get_quant_helpers(sig, side)
                 _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(side, sig, None, price, _qh_mo)
                 if _t_mo == "BLOCKED":
-                    if self._ict_gate_start_time == 0.0:
-                        self._ict_gate_start_time = now
+                    if self._ict_gate_start_time_mom == 0.0:
+                        self._ict_gate_start_time_mom = now
                     if now - self._last_ict_gate_log >= 30.0:
                         self._last_ict_gate_log = now
                         logger.info(
                             f"⛔ ICT gate [MOMENTUM {side.upper()}]: {_tr_mo}")
-                    if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                        self._ict_gate_alerted = True
+                    if not self._ict_gate_alerted_mom and (now - self._ict_gate_start_time_mom) >= 900.0:
+                        self._ict_gate_alerted_mom = True
                         send_telegram_message(
                             f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                             f"MOMENTUM {side.upper()}: {_tr_mo}")
                     self._confirm_trend_long = self._confirm_trend_short = 0
                     return
-                self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+                self._ict_gate_start_time_mom = 0.0; self._ict_gate_alerted_mom = False
             except Exception as _mge:
                 logger.debug(f"Momentum ICTEntryGate error (non-fatal): {_mge}")
         elif self._ict is not None and self._ict._initialized:
             _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
             if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time == 0.0:
-                    self._ict_gate_start_time = now
+                if self._ict_gate_start_time_mom == 0.0:
+                    self._ict_gate_start_time_mom = now
                 if now - self._last_ict_gate_log >= 30.0:
                     self._last_ict_gate_log = now
                     logger.info(
                         f"⛔ ICT gate [MOMENTUM {side.upper()}]: "
                         f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
-                if not self._ict_gate_alerted and (now - self._ict_gate_start_time) >= 900.0:
-                    self._ict_gate_alerted = True
+                if not self._ict_gate_alerted_mom and (now - self._ict_gate_start_time_mom) >= 900.0:
+                    self._ict_gate_alerted_mom = True
                     send_telegram_message(
                         f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
                         f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
                         f"{sig.ict_details}")
                 self._confirm_trend_long = self._confirm_trend_short = 0
                 return
-            self._ict_gate_start_time = 0.0; self._ict_gate_alerted = False
+            self._ict_gate_start_time_mom = 0.0; self._ict_gate_alerted_mom = False
 
         # ── Phase 3: Confirmation counter ─────────────────────────────────
         if side == "long":
@@ -4601,7 +4644,9 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
-            _mo_tier = _t_mo if "_t_mo" in dir() else "B"
+            # Bug-4 fix: _t_mo is initialised to "B" before the ICT gate block
+            # above, so it is always defined here — no dir()/locals() probe needed.
+            _mo_tier = _t_mo
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_low=${self._breakout._retest_low:,.2f} | "
@@ -4611,7 +4656,7 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._last_momentum_attempt = now
             retest_sl = self._breakout.retest_sl
-            _mo_tier = _t_mo if "_t_mo" in dir() else "B"
+            _mo_tier = _t_mo   # Bug-4 fix: always defined, see initialisation above
             logger.info(
                 f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
                 f"retest_high=${self._breakout._retest_high:,.2f} | "
@@ -5946,7 +5991,7 @@ class QuantStrategy:
         expect = (wr/100 * avg_w) + ((1 - wr/100) * avg_l) if total_t > 0 else 0.0
 
         lines = [
-            "📊 <b>QUANT v4.9 STATUS</b>", "",
+            "📊 <b>QUANT v5.0 STATUS</b>", "",
             f"Regime: {self._regime.regime.value if self._regime else '?'} | "
             f"ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%}pctile)",
             f"HTF:  15m={self._htf.trend_15m:+.2f}  4h={self._htf.trend_4h:+.2f}",
