@@ -1833,8 +1833,25 @@ class ICTEntryGate:
         _tier_a_conditions = (
             _has_delivery_context and
             ict_total >= 0.55 and
-            (side == "long"  and not in_prem or
-             side == "short" and not in_disc) and
+            # P/D zone gate — RELAXED for active AMD DISTRIBUTION with matching bias.
+            # Design-flaw fix: AMD DISTRIBUTION naturally delivers FROM premium TOWARD
+            # discount. Applying a strict P/D gate here meant that after a BSL sweep at
+            # the top of the range, the bot could never take the short delivery once
+            # price moved below the 4H equilibrium (≈40%), because "SHORT_IN_DISCOUNT"
+            # would block every Tier-A evaluation for the entire 14-ATR delivery.
+            # Tier-A already requires _has_delivery_context (AMD phase + conf ≥ 0.50),
+            # so the P/D gate is redundant — it was added for standard entries where
+            # there is no sweep context. Exempt AMD DISTRIBUTION with correct bias.
+            (
+                (amd_phase == "DISTRIBUTION" and (
+                    (side == "short" and amd_bias == "bearish") or
+                    (side == "long"  and amd_bias == "bullish")
+                ))  # AMD delivery: P/D gate waived — delivery crosses zones by design
+                or
+                (side == "long"  and not in_prem)   # standard P/D gate for non-delivery
+                or
+                (side == "short" and not in_disc)
+            ) and
             not tf_opposes and
             _tier_a_htf_ok and
             # Light quant confirmation: composite must lean in ICT direction
@@ -1884,10 +1901,16 @@ class ICTEntryGate:
             block_reasons.append(f"ICT={ict_total:.2f}<0.40")
         if tf_opposes:
             block_reasons.append(f"TICK_OPPOSING({quant.tick_flow if quant else 0:.2f})")
-        # P/D zone mismatch
-        if (side == "long"  and in_prem):
+        # P/D zone mismatch (only reported when not in AMD delivery — delivery is exempt)
+        _in_amd_delivery = (
+            amd_phase == "DISTRIBUTION" and (
+                (side == "long"  and amd_bias == "bullish") or
+                (side == "short" and amd_bias == "bearish")
+            )
+        )
+        if (side == "long"  and in_prem  and not _in_amd_delivery):
             block_reasons.append("LONG_IN_PREMIUM")
-        if (side == "short" and in_disc):
+        if (side == "short" and in_disc  and not _in_amd_delivery):
             block_reasons.append("SHORT_IN_DISCOUNT")
         if htf_veto and not _tier_a_htf_ok:
             # Show exactly which gate failed so log analysis is unambiguous

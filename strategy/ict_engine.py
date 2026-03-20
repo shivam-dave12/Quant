@@ -2271,6 +2271,23 @@ class ICTEngine:
         out.pd_matrix = pdm["matrix_str"]
 
         # HTF reversal risk: if strong HTF OB opposes the trade within 2 ATR
+        #
+        # Design-flaw fix: the original code scored ALL opposing OBs regardless
+        # of AMD context. After a BSL sweep (bearish AMD), the bullish OBs
+        # BETWEEN the current price and the sweep level are the INTENDED entry
+        # zones — smart money distributes into retail buying at those OBs.
+        # Scoring those same OBs as "reversal risk" produced RevRisk ≈ 1.0
+        # every tick (because 1d OBs have strength 97.0), permanently blocking
+        # the pre-gate for all SHORT entries in a 14-ATR delivery move.
+        #
+        # Fix: skip opposing OBs that sit between the current price and the AMD
+        # sweep origin — they are part of the delivery corridor, not blockers.
+        # Only OBs that are ABOVE the sweep origin (for shorts) / BELOW the
+        # sweep origin (for longs) represent genuine structural reversal risk.
+        _amd_sweep_origin = self._amd.sweep_origin   # None if no active sweep
+        _amd_phase        = self._amd.phase
+        _amd_bias         = self._amd.bias
+        _in_distribution  = _amd_phase in ("DISTRIBUTION", "MANIPULATION")
         opp_obs = self.order_blocks_bear if side == "long" else self.order_blocks_bull
         rev_risk = 0.0
         for ob in opp_obs:
@@ -2278,6 +2295,17 @@ class ICTEngine:
                 continue
             dist = abs(ob.midpoint - price)
             if atr > 1e-9 and dist < 2.0 * atr:
+                # Delivery-corridor exclusion: skip OBs that are part of the
+                # active AMD delivery path so they aren't double-counted as risk.
+                if (_in_distribution and _amd_sweep_origin is not None):
+                    if (side == "short" and _amd_bias == "bearish" and
+                            ob.midpoint <= _amd_sweep_origin and ob.midpoint >= price):
+                        # Bull OB is between price and the BSL sweep → delivery corridor
+                        continue
+                    if (side == "long" and _amd_bias == "bullish" and
+                            ob.midpoint >= _amd_sweep_origin and ob.midpoint <= price):
+                        # Bear OB is between price and the SSL sweep → delivery corridor
+                        continue
                 rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)))
         out.htf_reversal_risk = min(1.0, rev_risk)
 
@@ -2809,6 +2837,12 @@ class ICTEngine:
                 "detail":     detail,
             })
 
+        # Delivery-corridor context (consistent with get_confluence RevRisk fix)
+        _gz_amd_sweep   = self._amd.sweep_origin
+        _gz_amd_phase   = self._amd.phase
+        _gz_amd_bias    = self._amd.bias
+        _gz_in_delivery = _gz_amd_phase in ("DISTRIBUTION", "MANIPULATION")
+
         # HTF OBs as base reversal zones
         for obs, direction in ((self.order_blocks_bull, "long"),
                                (self.order_blocks_bear, "short")):
@@ -2817,6 +2851,18 @@ class ICTEngine:
                     continue
                 if ob.strength < 70.0:  # HTF only
                     continue
+
+                # Delivery-corridor exclusion: skip OBs inside the active AMD
+                # delivery path — they are intended entry/support zones, not
+                # reversal risks.  Consistent with RevRisk calculation.
+                if _gz_in_delivery and _gz_amd_sweep is not None:
+                    if (direction == "long" and _gz_amd_bias == "bearish" and
+                            ob.midpoint <= _gz_amd_sweep and ob.midpoint >= price):
+                        continue   # bull OB between price and BSL sweep — delivery corridor
+                    if (direction == "short" and _gz_amd_bias == "bullish" and
+                            ob.midpoint >= _gz_amd_sweep and ob.midpoint <= price):
+                        continue   # bear OB between price and SSL sweep — delivery corridor
+
                 tf_st = self._tf.get(ob.timeframe, TFStructure(timeframe=ob.timeframe))
                 pd = tf_st.premium_discount
 
