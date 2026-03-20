@@ -535,43 +535,62 @@ class CVDEngine:
         true_cvd = self._get_true_cvd_array(window_sec=max(w * 60, 600.0))
         if true_cvd is not None and len(true_cvd) >= w + 10:
             arr = true_cvd; n = len(arr)
-            recent_cvd  = sum(arr[-(w//2):]); earlier_cvd = sum(arr[-w:-(w//2)])
+            # FIX 6: arr is a running cumulative sum. The old code did
+            # sum(arr[-(w//2):]) which summed already-cumulative values —
+            # a "sum of sums" that measures nothing about rate of change.
+            # Correct: use level differences to extract the actual CVD
+            # change over each half-window.
+            midpoint   = n - w // 2
+            recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD Δ in recent half
+            earlier_cvd = arr[midpoint - 1] - arr[max(0, n - w) - 1]  # earlier half
             cvd_slope   = recent_cvd - earlier_cvd
             closes      = [float(c['c']) for c in candles[-w:]] if len(candles) >= w else []
             if len(closes) < w: return 0.0
             mid = w // 2
             price_slope = sum(closes[mid:])/max(len(closes[mid:]),1) - sum(closes[:mid])/max(len(closes[:mid]),1)
             if abs(price_slope) < 1e-10: return 0.0
-            # Z-normalise cvd_slope against rolling distribution
-            all_sums = []; running = sum(arr[:w//2]); all_sums.append(running)
-            for i in range(w//2, n - w//2):
-                running += arr[i] - arr[i - w//2]; all_sums.append(running)
-            if len(all_sums) < 5: return 0.0
-            mu  = sum(all_sums)/len(all_sums)
-            std = math.sqrt(sum((s-mu)**2 for s in all_sums)/max(len(all_sums)-1,1))
+            # Z-score: build distribution of slopes (differences), not cumulative sums
+            slopes = []
+            for i in range(w, n):
+                s_recent  = arr[i - w//2] - arr[max(0, i - w//2) - 1] if i - w//2 >= 1 else arr[i - w//2]
+                s_earlier = arr[i - w]    - arr[max(0, i - w) - 1]    if i - w    >= 1 else arr[i - w]
+                slopes.append((arr[i] - arr[i - w//2]) - (arr[i - w//2] - arr[i - w]))
+            if len(slopes) < 5: return 0.0
+            mu  = sum(slopes)/len(slopes)
+            std = math.sqrt(sum((s-mu)**2 for s in slopes)/max(len(slopes)-1,1))
             if std < 1e-12: return 0.0
-            cvd_z     = cvd_slope / std
+            cvd_z     = (cvd_slope - mu) / std
             price_dir = 1.0 if price_slope > 0 else -1.0
             if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
             return -price_dir * min(abs(cvd_z), 3.0) / 3.0
 
         # ── Path 2: Candle OHLCV approximation (fallback) ─────────────
+        # FIX 10: The old code built all_sums as a rolling-sum distribution and
+        # divided cvd_slope (a difference of half-window sums) by its std.  These
+        # have different statistical distributions — difference-of-sums has variance
+        # 2σ², making the Z-score ~40% too small → CVD signal chronically underweighted.
+        # Fix: build the distribution from the SAME statistic as cvd_slope (slopes),
+        # so the Z-score is standardised against an identical distribution.
         arr = list(self._deltas); n = len(arr)
         if n < w + 10 or len(candles) < w: return 0.0
-        recent_cvd  = sum(arr[-w//2:]); earlier_cvd = sum(arr[-w:-w//2])
+        recent_cvd  = sum(arr[-w//2:])
+        earlier_cvd = sum(arr[-w:-w//2])
         cvd_slope   = recent_cvd - earlier_cvd
         closes      = [float(c['c']) for c in candles[-w:]]
         mid = w // 2
         price_slope = sum(closes[mid:])/max(len(closes[mid:]),1) - sum(closes[:mid])/max(len(closes[:mid]),1)
         if abs(price_slope) < 1e-10: return 0.0
-        all_sums = []; running = sum(arr[:w//2]); all_sums.append(running)
-        for i in range(w//2, n - w//2):
-            running += arr[i] - arr[i - w//2]; all_sums.append(running)
-        if len(all_sums) < 5: return 0.0
-        mu  = sum(all_sums)/len(all_sums)
-        std = math.sqrt(sum((s-mu)**2 for s in all_sums)/max(len(all_sums)-1,1))
+        # Build rolling slope distribution matching cvd_slope's statistic exactly
+        slopes = []
+        for i in range(w, n):
+            s_recent  = sum(arr[i - w//2 : i])
+            s_earlier = sum(arr[i - w    : i - w//2])
+            slopes.append(s_recent - s_earlier)
+        if len(slopes) < 5: return 0.0
+        mu  = sum(slopes) / len(slopes)
+        std = math.sqrt(sum((s - mu)**2 for s in slopes) / max(len(slopes) - 1, 1))
         if std < 1e-12: return 0.0
-        cvd_z     = cvd_slope / std
+        cvd_z     = (cvd_slope - mu) / std
         price_dir = 1.0 if price_slope > 0 else -1.0
         if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
         return -price_dir * min(abs(cvd_z), 3.0) / 3.0
@@ -1133,10 +1152,11 @@ class BreakoutDetector:
         body_atr = body_abs / atr
         is_bullish = body > 0
 
+        # FIX 12: Removed dead no-op `(score_up if is_bullish else score_down)`.
+        # Pure expression that evaluated and discarded the result — did nothing.
         if body_atr >= 1.5:
-            (score_up if is_bullish else score_down)  # don't modify — use ternary below
-            if is_bullish: score_up += 3
-            else: score_down += 3
+            if is_bullish: score_up   += 3
+            else:          score_down += 3
             details['candle'] = f'{body_atr:.1f}ATR(3)'
         elif body_atr >= 1.0:
             if is_bullish: score_up += 2
@@ -2763,6 +2783,10 @@ class PositionState:
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
     ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
+    # FIX 8: store actual HTF scores at entry time for post-trade attribution.
+    # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
+    entry_htf_15m: float = 0.0
+    entry_htf_4h:  float = 0.0
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -2809,6 +2833,12 @@ class DailyRiskGate:
             self._reset_if_new_day(); now = time.time()
             if now < self._loss_lockout_until:
                 return False, f"Loss lockout: {int(self._loss_lockout_until - now)}s remaining"
+            # FIX 2: Reset consec_losses when lockout expires so the bot can
+            # actually trade again.  Without this the lockout re-arms on every
+            # call after expiry because consec_losses is still ≥ MAX — infinite loop.
+            elif self._loss_lockout_until > 0 and now >= self._loss_lockout_until:
+                self._consec_losses = 0
+                self._loss_lockout_until = 0.0
             if self._daily_trades >= QCfg.MAX_DAILY_TRADES():
                 return False, f"Daily cap: {self._daily_trades}/{QCfg.MAX_DAILY_TRADES()}"
             if self._consec_losses >= QCfg.MAX_CONSEC_LOSSES():
@@ -3320,6 +3350,10 @@ class QuantStrategy:
         trend_score = max(-1.0, min(1.0, trend_score))
 
         # ── Build signal breakdown with full attribution ───────────────────────
+        # FIX 7: Store the raw order-flow composite BEFORE any ICT boost so
+        # the reversion entry can restore it when computing for the opposite side.
+        # Un-applying the boost from the clamped value gives a wrong pre-boost
+        # composite, systematically making shorts ~0.10 less negative than warranted.
         sig = SignalBreakdown(
             vwap_dev=vs, cvd_div=cs, orderbook=obs, tick_flow=ts, vol_exhaust=ve,
             composite=comp, atr=atr_5m, atr_pct=self._atr_5m.get_percentile(),
@@ -3335,6 +3369,7 @@ class QuantStrategy:
             htf_ict_source=self._htf.ict_source,
             cvd_tick_count=self._cvd.tick_count,
         )
+        sig._raw_composite = comp  # pre-boost composite (used in _evaluate_reversion_entry)
         self._last_sig = sig
         return sig
 
@@ -4160,10 +4195,14 @@ class QuantStrategy:
                 # even when evaluating a SHORT entry, making the composite 0.19 less
                 # negative than the raw order-flow signals warrant and systematically
                 # blocking SHORT entries that would otherwise clear the ±0.350 gate.
-                _old_boost   = sig.ict_boost_signed          # was in opposite direction
+                # FIX 7c: use stored raw composite (pre-boost) instead of
+                # un-applying the boost from the clamped value. The clamped
+                # composite makes un-apply give wrong results for SHORT entries
+                # (composite 0.05–0.15 less negative → systematically below ±0.30 gate).
                 _new_dir     = 1.0 if side == "long" else -1.0
                 _new_boost   = _recomp.total * 0.15 * _new_dir
-                sig.composite        = max(-1.0, min(1.0, sig.composite - _old_boost + _new_boost))
+                _raw_comp    = getattr(sig, '_raw_composite', sig.composite - sig.ict_boost_signed)
+                sig.composite        = max(-1.0, min(1.0, _raw_comp + _new_boost))
                 sig.ict_boost_signed = _new_boost
                 sig.ict_direction    = _new_dir
                 _prev_dir_lbl = "SHORT" if _ict_dir < 0 else "LONG"
@@ -4977,11 +5016,13 @@ class QuantStrategy:
             bids = (orderbook or {}).get("bids", [])
             asks = (orderbook or {}).get("asks", [])
             if bids and asks:
+                # FIX 1: _best_px hoisted above if/else — SHORT previously
+                # crashed with NameError as it was defined only in long branch.
+                def _best_px(lvl):
+                    if isinstance(lvl,(list,tuple)): return float(lvl[0])
+                    if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                    return 0.0
                 if side == "long":
-                    def _best_px(lvl):
-                        if isinstance(lvl,(list,tuple)): return float(lvl[0])
-                        if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
-                        return 0.0
                     limit_px  = round(_best_px(bids[0]), 1)   # join best bid
                     mt_reason = f"limit_long@bid={limit_px:.1f}"
                 else:
@@ -5228,6 +5269,9 @@ class QuantStrategy:
             trade_mode      = mode,
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
+            # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
+            entry_htf_15m   = self._htf.trend_15m,
+            entry_htf_4h    = self._htf.trend_4h,
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -5358,16 +5402,29 @@ class QuantStrategy:
         #   b) Only one trail operation is in flight at a time (no duplicate SL edits).
         if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time = now
-            if not self._trail_in_progress:
+            # FIX 3a: atomic flag check+set under lock to prevent two trail
+            # threads from racing through the guard simultaneously.
+            with self._lock:
+                if self._trail_in_progress:
+                    return
                 self._trail_in_progress = True
+            if True:
                 _snap_om  = order_manager   # capture for closure
                 _snap_dm  = data_manager
-                _snap_px  = price
+                _snap_px  = price           # fallback only
                 _snap_now = now
 
                 def _bg_trail():
                     try:
-                        self._update_trailing_sl(_snap_om, _snap_dm, _snap_px, _snap_now)
+                        # FIX 5: Fetch live price inside the trail thread.
+                        # The snapshot captured at dispatch can be 10–30s stale
+                        # by the time the thread runs (REST retries). At BTC
+                        # velocity that places SL $200+ away from market.
+                        live_price = _snap_dm.get_last_price()
+                        live_now   = time.time()
+                        if live_price < 1.0:
+                            live_price = _snap_px  # fallback to dispatch snapshot
+                        self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
                     except Exception as _te:
                         logger.error("Trail background error: %s", _te, exc_info=True)
                     finally:
@@ -5615,10 +5672,17 @@ class QuantStrategy:
             logger.warning("🚨 SL already fired"); self._record_exchange_exit(None); return True
         if isinstance(result, dict) and "error" in result: return False
         if result and isinstance(result, dict):
-            self._pos.sl_price = new_sl_tick; self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
-            self.current_sl_price = new_sl_tick
+            # FIX 3b: acquire lock before writing shared position state.
+            # The trail thread and main thread both read sl_price/sl_order_id
+            # — a lock-free write produces torn reads (old ID with new price).
+            with self._lock:
+                self._pos.sl_price = new_sl_tick
+                self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
+                self.current_sl_price = new_sl_tick
+                if not pos.trail_active:
+                    self._pos.trail_active = True
             if not pos.trail_active:
-                self._pos.trail_active = True; logger.info("✅ Trailing SL active")
+                logger.info("✅ Trailing SL active")
                 send_telegram_message("✅ Trailing SL now active")
         return False
 
@@ -5923,8 +5987,20 @@ class QuantStrategy:
         qty      = round(qty, 8)
         qty      = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
 
-        if (qty * price) / QCfg.LEVERAGE() > margin_alloc * 1.02:
-            return None
+        # FIX 9: The original guard (qty*price/LEVERAGE > margin_alloc*1.02) was
+        # algebraically impossible — floor(qty_raw/step)*step ≤ qty_raw always, so
+        # (qty*price)/LEVERAGE ≤ margin_alloc by construction. Replace with a guard
+        # that actually fires: reject if the required margin exceeds available balance.
+        required_margin = qty * price / QCfg.LEVERAGE()
+        if required_margin > available * 1.01:   # 1% rounding tolerance
+            logger.warning(
+                f"Sizing guard triggered: required_margin ${required_margin:.2f} "
+                f"> available ${available:.2f} — scaling qty down"
+            )
+            qty = math.floor((available * QCfg.LEVERAGE() / price) / step) * step
+            qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), round(qty, 8)))
+            if qty < QCfg.MIN_QTY():
+                return None
 
         logger.info(
             f"Sizing → avail=${available:.2f} | tier={ict_tier or 'none'} "
@@ -5936,17 +6012,47 @@ class QuantStrategy:
 
     @staticmethod
     def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
-        """v4.3 Bug 12 fix: uses correct fee rate based on actual entry fill type."""
-        gross = ((exit_price-pos.entry_price) if pos.side=="long" else (pos.entry_price-exit_price))*pos.quantity
-        # Entry fee: maker or taker based on how we actually entered
+        """
+        FIX 4: Correct PnL formula for both exchange types.
+
+        Delta BTCUSD is an inverse perpetual (1 contract = 1 USD notional).
+        PnL in BTC = contracts × (1/entry − 1/exit) for LONG.
+        Convert to USD by multiplying by exit_price.
+
+        CoinSwitch and USDT-margined contracts use the standard linear formula:
+        gross = price_delta × qty_btc.
+
+        The previous formula used the linear formula unconditionally, giving
+        wrong PnL on Delta — potentially 5–10% error at typical BTC moves.
+        """
+        import config as _cfg_pnl
+        _is_delta = (getattr(_cfg_pnl, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
+                     and getattr(_cfg_pnl, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
+
         if entry_fill_type == "maker":
-            entry_rate = float(getattr(config, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+            entry_rate = float(getattr(_cfg_pnl, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
         else:
             entry_rate = QCfg.COMMISSION_RATE()
-        # Exit fee: always taker (SL/TP are market orders)
         exit_rate = QCfg.COMMISSION_RATE()
-        entry_fee = pos.entry_price * pos.quantity * entry_rate
-        exit_fee = exit_price * pos.quantity * exit_rate
+
+        if _is_delta:
+            # Inverse perpetual: qty is stored in BTC; convert to USD contracts
+            _cv = float(getattr(_cfg_pnl, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
+            contracts = pos.quantity / _cv if _cv > 0 else pos.quantity
+            if pos.side == "long":
+                gross_btc = contracts * (1.0 / pos.entry_price - 1.0 / exit_price)
+            else:
+                gross_btc = contracts * (1.0 / exit_price - 1.0 / pos.entry_price)
+            gross     = gross_btc * exit_price  # BTC profit → USD
+            entry_fee = pos.entry_price * _cv * contracts * entry_rate
+            exit_fee  = exit_price * _cv * contracts * exit_rate
+        else:
+            # Linear (USDT-margined) — standard formula
+            gross     = ((exit_price - pos.entry_price) if pos.side == "long"
+                         else (pos.entry_price - exit_price)) * pos.quantity
+            entry_fee = pos.entry_price * pos.quantity * entry_rate
+            exit_fee  = exit_price * pos.quantity * exit_rate
+
         return gross - entry_fee - exit_fee
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0

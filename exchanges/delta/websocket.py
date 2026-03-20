@@ -569,15 +569,19 @@ class DeltaWebSocket:
                 p_f = float(p) if p else 0.0
                 s_f = float(s) if s else 0.0
                 if p_f > 0:
-                    return [str(p_f), str(s_f)]
-                # If price is 0 but size exists, this is a level deletion (size=0)
-                # Skip it — it has no useful data for us
+                    # BUG-DWS-1 FIX: return native floats, not strings.
+                    # Returning str(p_f) forced every consumer (market_aggregator,
+                    # fee_engine, orderbook engine) to silently re-cast on every
+                    # orderbook update — adding per-tick overhead and masking type
+                    # errors. All other exchanges already produce float pairs.
+                    return [p_f, s_f]
+                # price == 0 → level deletion message; no useful data
                 return None
             elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 p_f = float(lvl[0]) if lvl[0] else 0.0
                 s_f = float(lvl[1]) if lvl[1] else 0.0
                 if p_f > 0:
-                    return [str(p_f), str(s_f)]
+                    return [p_f, s_f]  # BUG-DWS-1 FIX: native floats
                 return None
             return None
 

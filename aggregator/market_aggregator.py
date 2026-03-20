@@ -146,7 +146,16 @@ class MarketAggregator:
         AFTER its own handler runs.  Thread-safe.
         """
         secondary = self._secondary
-        original_on_trade = secondary._on_trade
+        # BUG-AGG-1 FIX: guard against secondary DM that doesn't expose _on_trade.
+        # Without this, a secondary DM that lacks the method crashes the entire
+        # aggregator at construction time with AttributeError.
+        original_on_trade = getattr(secondary, '_on_trade', None)
+        if original_on_trade is None:
+            logger.warning(
+                f"Secondary DM {type(secondary).__name__} has no _on_trade — "
+                "trade tap not installed; secondary trades will not flow to aggregator"
+            )
+            return
 
         agg_ref = self   # closure capture
 
@@ -270,6 +279,20 @@ class MarketAggregator:
             # redirect get_candles / get_last_price to the new primary)
             self._primary, self._secondary = self._secondary, self._primary
             self._secondary_alive = True
+            # BUG-AGG-2 FIX: after promoting secondary to primary, re-register
+            # the strategy on the new primary so its _on_trade fires callbacks.
+            # Without this, the new primary's _strategy_ref is None and all
+            # real-time trade callbacks (tick-flow, CVD) are permanently severed.
+            if self._strategy_ref is not None:
+                try:
+                    self._primary.register_strategy(self._strategy_ref)
+                    logger.info(
+                        "✅ Strategy re-registered on new primary after failover"
+                    )
+                except Exception as _reg_e:
+                    logger.error(
+                        f"Failed to re-register strategy on new primary: {_reg_e}"
+                    )
             logger.info(
                 f"✅ Swapped: new primary={type(self._primary).__name__} "
                 f"new secondary={type(self._secondary).__name__}"

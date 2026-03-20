@@ -469,8 +469,12 @@ class ICTSweepDetector:
                 break
 
             if side == "long":
-                # Sweep candle: wicked below or to the SSL pool level
-                if float(c['l']) <= pool_price * 1.002:
+                # Sweep candle: wick must actually touch or breach the SSL level.
+                # FIX 11: old tolerance 0.2% = $140 at BTC $70k — candles that
+                # merely approached the level were wrongly classified as sweep candles,
+                # producing misplaced OTE zones. One tick tolerance is correct.
+                _tick = float(__import__('config').TICK_SIZE) if hasattr(__import__('config'), 'TICK_SIZE') else 0.5
+                if float(c['l']) <= pool_price + _tick:
                     sweep_extreme = float(c['l'])
                     # Displacement: next 1-3 candles — find first that closes above pool
                     for j in range(i + 1, min(i + 4, len(candles_5m))):
@@ -480,8 +484,10 @@ class ICTSweepDetector:
                                     float(d['h']), float(d['l']), float(d['c']))
                     break
             else:
-                # Sweep candle: wicked above or to the BSL pool level
-                if float(c['h']) >= pool_price * 0.998:
+                # Sweep candle: wick must actually touch or breach the BSL level.
+                # FIX 11: symmetric tight tolerance for short (BSL sweep).
+                _tick = float(__import__('config').TICK_SIZE) if hasattr(__import__('config'), 'TICK_SIZE') else 0.5
+                if float(c['h']) >= pool_price - _tick:
                     sweep_extreme = float(c['h'])
                     for j in range(i + 1, min(i + 4, len(candles_5m))):
                         d = candles_5m[j]
