@@ -353,7 +353,19 @@ class CoinSwitchDataManager:
             logger.debug(f"CoinSwitch OB callback: {e}")
 
     def _on_trade(self, data: Dict) -> None:
+        # BUG-DDM-1 FIX: snapshot state and release self._lock BEFORE firing the
+        # strategy callback. Previously, _on_realtime_trade() was called while
+        # self._lock was held. If the strategy (running in the same WS event thread)
+        # called get_candles / get_last_price / get_orderbook, those also acquire
+        # self._lock. Even though self._lock is an RLock (reentrant for the same
+        # thread), the callback could itself block on another lock that the main
+        # trading thread holds — creating a cross-thread deadlock.  The fix is
+        # the standard pattern: gather all shared-state reads under the lock,
+        # then release it, then run any external callbacks in clear air.
         try:
+            price = qty = 0.0
+            side  = "buy"
+            _callback = None
             with self._lock:
                 price = float(data.get("price", 0))
                 qty   = float(data.get("quantity", 0))
@@ -368,13 +380,14 @@ class CoinSwitchDataManager:
                         "timestamp": time.time(),
                     })
                     if self._strategy_ref is not None:
-                        try:
-                            on_rt = getattr(self._strategy_ref, "_on_realtime_trade", None)
-                            if on_rt:
-                                on_rt(price, qty, side)
-                        except Exception:
-                            pass
+                        _callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
+            # ── Lock released — fire callback in clear air ──────────────────
+            if _callback is not None and price > 0:
+                try:
+                    _callback(price, qty, side)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"CoinSwitch trade callback: {e}")
 
