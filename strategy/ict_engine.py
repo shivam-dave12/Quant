@@ -535,14 +535,27 @@ class ICTEngine:
             out.prev_sl_ = lows[-2][1] if len(lows) >= 2 else 0.0
 
         # ── BOS (Break of Structure) ──────────────────────────────────
-        # Current close through last confirmed swing in trend direction
-        last_close = float(recent[-1]['c'])
-        if out.last_sh > 0 and last_close > out.last_sh:
-            out.bos_level     = out.last_sh
-            out.bos_direction = "bullish"
-        elif out.last_sl_ > 0 and last_close < out.last_sl_:
-            out.bos_level     = out.last_sl_
-            out.bos_direction = "bearish"
+        # BUG-BOS FIX: Must use the last CLOSED candle's close, not recent[-1].
+        #
+        # recent[-1] is the LIVE FORMING candle — its 'c' is the current live
+        # price, not a closed value.  On the 1D timeframe this creates a
+        # permanent false BOS: BTC at $70,500 > any 1D swing high from the past
+        # 30 days, so bos_direction="bullish" fires on EVERY tick all day long.
+        # The result is "1D:bull" stuck permanently in the display.
+        #
+        # On 5m/15m the error is brief (<5 min per bar), but on 1D it falsely
+        # signals a structural break for the entire calendar day.
+        #
+        # Fix: use recent[-2]['c'] — the last CONFIRMED closed candle.
+        # Guard: need at least 2 candles so [-2] exists.
+        if len(recent) >= 2:
+            last_close = float(recent[-2]['c'])
+            if out.last_sh > 0 and last_close > out.last_sh:
+                out.bos_level     = out.last_sh
+                out.bos_direction = "bullish"
+            elif out.last_sl_ > 0 and last_close < out.last_sl_:
+                out.bos_level     = out.last_sl_
+                out.bos_direction = "bearish"
 
         # ── CHoCH (Change of Character) ───────────────────────────────
         # First higher-low in a downtrend or lower-high in an uptrend.
@@ -623,8 +636,28 @@ class ICTEngine:
                 details = f"Mid-trend pause | 15m:{st.trend} 5m:ranging"
             else:
                 phase   = "ACCUMULATION"
-                conf    = max(conf - 0.20, 0.25)
+                # BUG-AMD-ACCUM FIX 1: Aggressive confidence decay for expired sweeps.
+                # Old formula: conf = max(conf - 0.20, 0.25) kept conf at 0.50–0.60
+                # for hours after the sweep window closed. Since ICTEntryGate blocks
+                # ALL entries when ACCUMULATION conf >= 0.55, this permanently locked
+                # out trades in ranging markets with old sweep context.
+                #
+                # New formula: exponential decay beyond the distribution window.
+                # At 90min (window edge): conf *= 0.60 → max ~0.48 (below 0.55 gate)
+                # At 120min: conf *= 0.45 → max ~0.36
+                # At 180min+: conf decays toward 0.25 floor
+                # This lets the system trade again without waiting for sweep_pools to clear.
+                over_ms = age_ms - self.AMD_DISTRIB_WINDOW_MS  # ms past window
+                decay   = max(0.25, 0.60 - 0.30 * (over_ms / 3_600_000))  # 0.60→0.25 over 1h
+                conf    = max(conf * decay, 0.25)
                 details = f"Old {sweep_type} sweep {age_ms//60000:.0f}m ago"
+                # BUG-AMD-ACCUM FIX 2: Reset bias to neutral in ACCUMULATION.
+                # In ICT, after the AMD distribution window closes (>90min), the sweep
+                # context is EXPIRED — smart money has completed delivery.  Keeping
+                # bias="bullish" from the old sweep causes a permanent ICT↑LONG vs
+                # VWAP↓SHORT conflict that blocks every short entry for hours.
+                # Neutral bias means ICTEntryGate won't apply the sweep-bias constraint.
+                bias = "neutral"
 
         # Delivery target: nearest opposing unswept pool
         target = None

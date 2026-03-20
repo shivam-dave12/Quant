@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging, math, time, threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
@@ -2741,13 +2741,29 @@ class PositionState:
 # DAILY RISK GATE with consecutive loss lockout
 # ═══════════════════════════════════════════════════════════════
 class DailyRiskGate:
+    # BUG-TZ FIX: The trading day boundary must be midnight IST (UTC+5:30),
+    # not midnight UTC.  date.today() returns the server's local date — on a
+    # cloud server running UTC this flips at midnight UTC = 05:30 IST.
+    # Consequence: a trade that enters at 05:29 IST has its trade-count
+    # incremented in "old day N", but if it closes at 05:31 IST the PnL lands
+    # in "new day N+1" (after the reset fires).  Day N then shows: trades=1,
+    # pnl=0.  Day N+1 shows: trades=0, pnl=+X.  The daily loss cap is also
+    # corrupted because _daily_open_bal gets zeroed for the new day before
+    # the PnL from the previous day's trade is recorded.
+    # Fix: use IST-aware datetime for all day-boundary decisions.
+    _IST = timezone(timedelta(hours=5, minutes=30))
+
+    @staticmethod
+    def _today_ist() -> date:
+        return datetime.now(DailyRiskGate._IST).date()
+
     def __init__(self):
-        self._today = date.today(); self._daily_trades = 0; self._consec_losses = 0
+        self._today = self._today_ist(); self._daily_trades = 0; self._consec_losses = 0
         self._daily_pnl = 0.0; self._daily_open_bal = 0.0
         self._loss_lockout_until = 0.0; self._lock = threading.Lock()
 
     def _reset_if_new_day(self):
-        today = date.today()
+        today = self._today_ist()
         if today != self._today:
             self._today = today; self._daily_trades = 0; self._daily_pnl = 0.0
             self._daily_open_bal = 0.0; self._consec_losses = 0; self._loss_lockout_until = 0.0
