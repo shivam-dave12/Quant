@@ -80,6 +80,11 @@ class OrderBlock:
     has_wick_rejection: bool = False
     max_age_ms: int = 86_400_000   # 24 h default (HTF gets 72 h)
     _last_visit_time: int = 0
+    # BUG-OB-MITIGATION FIX: ICT defines an OB as MITIGATED when a candle
+    # CLOSES beyond the OB's far extreme (not just touches/wicks through it).
+    # visit_count alone is an incomplete proxy.  mitigated=True is set in
+    # _update_ob_mitigation() when a confirmed close breaches the OB extreme.
+    mitigated: bool = False
 
     @property
     def midpoint(self) -> float:
@@ -93,19 +98,29 @@ class OrderBlock:
         return self.low <= price <= self.high
 
     def in_optimal_zone(self, price: float) -> bool:
-        """OTE = 50%–79% retracement into OB body."""
+        """OTE = 61.8%–78.6% retracement into OB body (ICT standard Fibonacci).
+
+        BUG-OB-OTE-FIB FIX: old code used 50%–79%.  ICT defines OTE as the
+        61.8%–78.6% Fibonacci retracement of the DISPLACEMENT MOVE.  When
+        applied to the OB body as a proxy, the correct bounds are 61.8%–78.6%
+        of the body depth (not 50%), matching the fib levels used in
+        ICTSweepDetector.OTE_LOWER_FIB / OTE_UPPER_FIB.
+        """
         if self.size < 1e-10:
             return False
         if self.direction == "bullish":
-            top = self.high - 0.50 * self.size
-            bot = self.high - 0.79 * self.size
+            # Bullish OB body = [low, high]; OTE = deep into body from top
+            top = self.high - 0.618 * self.size   # 61.8% from top
+            bot = self.high - 0.786 * self.size   # 78.6% from top
         else:
-            bot = self.low + 0.50 * self.size
-            top = self.low + 0.79 * self.size
+            # Bearish OB body = [low, high]; OTE = deep into body from bottom
+            bot = self.low + 0.618 * self.size    # 61.8% from bottom
+            top = self.low + 0.786 * self.size    # 78.6% from bottom
         return bot <= price <= top
 
     def is_active(self, now_ms: int) -> bool:
-        return (now_ms - self.timestamp <= self.max_age_ms and
+        return (not self.mitigated and
+                now_ms - self.timestamp <= self.max_age_ms and
                 self.visit_count < 3)
 
     def virgin_multiplier(self) -> float:
@@ -142,16 +157,38 @@ class FairValueGap:
                 now_ms - self.timestamp <= self.max_age_ms)
 
     def update_fill(self, candles: List[Dict]) -> None:
+        """Track how much of the FVG has been filled by CLOSED candles.
+
+        BUG-FVG-FILL-WICK FIX: the old code measured wick overlap (h/l range)
+        against the gap.  In ICT, a candle's WICK touching the FVG is NOT a
+        fill — only a CLOSE into the gap counts.  The fill percentage now
+        measures how deeply the deepest CLOSE has penetrated the gap:
+
+          Bullish FVG (gap sits below current action, price fills downward):
+            fill = (top - best_close_inside) / size   (close moving down)
+          Bearish FVG (gap sits above current action, price fills upward):
+            fill = (best_close_inside - bottom) / size (close moving up)
+
+        ICT mitigation threshold: 50% fill (close reached or passed midpoint).
+        """
         if self.filled or self.size < 1e-10:
             self.filled = True
             return
-        max_overlap = 0.0
+        best_pen = 0.0
         for c in candles:
-            h, l = float(c['h']), float(c['l'])
-            overlap = max(0.0, min(h, self.top) - max(l, self.bottom))
-            max_overlap = max(max_overlap, overlap)
-        self.fill_percentage = min(1.0, max_overlap / self.size)
-        if self.fill_percentage >= 0.99:
+            cl = float(c['c'])
+            if self.direction == "bullish":
+                # Bullish FVG fills from TOP downward as price retraces into it
+                if cl <= self.top:
+                    pen = min(self.top - cl, self.size) / self.size
+                    best_pen = max(best_pen, pen)
+            else:
+                # Bearish FVG fills from BOTTOM upward as price retraces into it
+                if cl >= self.bottom:
+                    pen = min(cl - self.bottom, self.size) / self.size
+                    best_pen = max(best_pen, pen)
+        self.fill_percentage = min(1.0, best_pen)
+        if self.fill_percentage >= 0.50:   # ICT standard: 50% fill = mitigated
             self.filled = True
 
 
@@ -467,6 +504,11 @@ class ICTEngine:
         self._detect_sweeps(candles_5m, candles_15m, price, now_ms,
                             candles_1h=candles_1h)
 
+        # ── OB mitigation tracking ────────────────────────────────────
+        self._update_ob_mitigation(candles_5m)
+        if candles_15m:
+            self._update_ob_mitigation(candles_15m)
+
         # ── OB visit tracking ─────────────────────────────────────────
         self._update_ob_visits(price, now_ms)
 
@@ -501,13 +543,15 @@ class ICTEngine:
         for i in range(2, len(recent) - 2):
             h = float(recent[i]['h'])
             l = float(recent[i]['l'])
-            if (h >= float(recent[i-1]['h']) and h >= float(recent[i-2]['h']) and
-                    h >= float(recent[i+1]['h']) and h >= float(recent[i+2]['h']) and
-                    h > float(recent[i-1]['h']) + 1e-9):
+            # BUG-SWING-1 FIX: all four neighbours must be strict >.
+            # The old hybrid (>= on three, + tiny epsilon on one) lets
+            # two identical adjacent highs both qualify, inflating swing
+            # counts 2-5× in flat/choppy markets → wrong trend labels.
+            if (h > float(recent[i-1]['h']) and h > float(recent[i-2]['h']) and
+                    h > float(recent[i+1]['h']) and h > float(recent[i+2]['h'])):
                 highs.append((i, h))
-            if (l <= float(recent[i-1]['l']) and l <= float(recent[i-2]['l']) and
-                    l <= float(recent[i+1]['l']) and l <= float(recent[i+2]['l']) and
-                    l < float(recent[i-1]['l']) - 1e-9):
+            if (l < float(recent[i-1]['l']) and l < float(recent[i-2]['l']) and
+                    l < float(recent[i+1]['l']) and l < float(recent[i+2]['l'])):
                 lows.append((i, l))
 
         # ── Trend from swing sequence ─────────────────────────────────
@@ -535,8 +579,11 @@ class ICTEngine:
             out.prev_sl_ = lows[-2][1] if len(lows) >= 2 else 0.0
 
         # ── BOS (Break of Structure) ──────────────────────────────────
-        # Current close through last confirmed swing in trend direction
-        last_close = float(recent[-1]['c'])
+        # Use the last CLOSED candle (recent[-2]), not the still-forming
+        # candle (recent[-1]).  Using recent[-1] causes premature BOS
+        # signals on every tick of the live candle whose close hasn't
+        # been confirmed yet.
+        last_close = float(recent[-2]['c'])
         if out.last_sh > 0 and last_close > out.last_sh:
             out.bos_level     = out.last_sh
             out.bos_direction = "bullish"
@@ -575,16 +622,22 @@ class ICTEngine:
         AMD phase from liquidity sweep recency + structure.
 
         MANIPULATION  = sweep just happened (< 15 min)
-        DISTRIBUTION  = delivering after sweep (15 min → 90 min)
+        DISTRIBUTION  = delivering after sweep, WITH 5m BOS confirmation
+        DISTRIBUTION* = 15-90 min but 5m BOS not yet printed → extended manip
         REACCUM/REDIS = mid-trend pause (BOS on 15m but 5m ranging)
         ACCUMULATION  = no recent sweep, price consolidating
 
-        Bias:
-          SSL swept (sell-stops run below equal lows) → smart money went
-          LONG → bias BULLISH (price will be delivered upward)
+        BUG-AMD-DIST-NO-BOS FIX: previously DISTRIBUTION was declared purely
+        by elapsed time (15-90 min after sweep).  In ICT, the DISTRIBUTION
+        phase is confirmed when the execution timeframe (5m) prints a BOS in
+        the direction of the expected delivery.  Without that BOS, smart money
+        is still in the Judas-swing / manipulation phase and counter-direction
+        entries would be fighting the institutional move.
 
-          BSL swept (buy-stops run above equal highs) → smart money went
-          SHORT → bias BEARISH (price will be delivered downward)
+        BUG-AMD-DELIVERY-NEAREST FIX: delivery target now selects the most
+        SIGNIFICANT opposing pool (weighted by touch_count and proximity),
+        not simply the nearest one.  Higher touch_count = more clustered stops
+        = stronger institutional delivery magnet.
         """
         swept = [p for p in self.liquidity_pools if p.swept]
         if not swept:
@@ -607,13 +660,29 @@ class ICTEngine:
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
 
-        # Phase
+        # 5m BOS check: DISTRIBUTION requires a confirmed break of structure
+        # in the delivery direction on the execution timeframe.
+        tf5m = self._tf.get("5m", TFStructure(timeframe="5m"))
+        bos_in_delivery_dir = (
+            (bias == "bullish" and tf5m.bos_direction == "bullish") or
+            (bias == "bearish" and tf5m.bos_direction == "bearish")
+        )
+
+        # Phase determination
         if age_ms < self.AMD_MANIP_WINDOW_MS:
             phase   = "MANIPULATION"
             details = f"Judas swing {sweep_type} @ ${latest.price:.0f} | {age_ms//1000:.0f}s ago"
         elif age_ms < self.AMD_DISTRIB_WINDOW_MS:
-            phase   = "DISTRIBUTION"
-            details = f"Delivering after {sweep_type} sweep @ ${latest.price:.0f} | {age_ms//60000:.0f}m ago"
+            if bos_in_delivery_dir:
+                phase   = "DISTRIBUTION"
+                details = (f"Delivering after {sweep_type} sweep @ ${latest.price:.0f} | "
+                           f"{age_ms//60000:.0f}m ago | 5m_BOS={tf5m.bos_direction}")
+            else:
+                # Sweep happened but 5m hasn't printed BOS yet — still in extended manip
+                phase   = "MANIPULATION"
+                conf    = max(conf - 0.10, 0.40)
+                details = (f"Post-sweep {sweep_type} @ ${latest.price:.0f} | "
+                           f"{age_ms//60000:.0f}m ago | awaiting 5m BOS")
         else:
             st = self._tf.get("15m", TFStructure(timeframe="15m"))
             s5 = self._tf.get("5m",  TFStructure(timeframe="5m"))
@@ -623,20 +692,35 @@ class ICTEngine:
                 details = f"Mid-trend pause | 15m:{st.trend} 5m:ranging"
             else:
                 phase   = "ACCUMULATION"
-                conf    = max(conf - 0.20, 0.25)
+                # AMD-ACCUMULATION-DECAY FIX (from previous session)
+                excess_ms = age_ms - self.AMD_DISTRIB_WINDOW_MS
+                decay     = max(0.0, 1.0 - excess_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
+                conf      = max(conf * decay - 0.20, 0.20)
+                if decay < 0.15:
+                    bias = "neutral"
                 details = f"Old {sweep_type} sweep {age_ms//60000:.0f}m ago"
 
-        # Delivery target: nearest opposing unswept pool
+        # Delivery target: most SIGNIFICANT opposing unswept pool.
+        # BUG-AMD-DELIVERY-NEAREST FIX: weight by touch_count and proximity.
+        # More clustered stops = stronger institutional magnet; nearer is also
+        # preferred but high touch_count can outweigh extra distance.
         target = None
         unswept = [p for p in self.liquidity_pools if not p.swept]
+        safe_atr = max(self._tf.get("5m", TFStructure("5m")).range_high -
+                       self._tf.get("5m", TFStructure("5m")).range_low, 1.0) * 0.02
+
+        def _pool_score(p: 'LiquidityLevel') -> float:
+            dist = abs(p.price - price)
+            return float(p.touch_count) * 2.0 / (1.0 + dist / max(safe_atr, 1.0))
+
         if bias == "bullish":
             bsl = [p for p in unswept if p.level_type == "BSL" and p.price > price]
             if bsl:
-                target = min(bsl, key=lambda p: abs(p.price - price)).price
-        else:
+                target = max(bsl, key=_pool_score).price
+        elif bias == "bearish":
             ssl = [p for p in unswept if p.level_type == "SSL" and p.price < price]
             if ssl:
-                target = min(ssl, key=lambda p: abs(p.price - price)).price
+                target = max(ssl, key=_pool_score).price
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,
@@ -671,21 +755,33 @@ class ICTEngine:
         prior_l.sort()
 
         for i in range(2, len(candles) - 1):
-            cur, nxt = candles[i], candles[i + 1]
+            cur = candles[i]
             co, cc = float(cur['o']), float(cur['c'])
             ch, cl = float(cur['h']), float(cur['l'])
-            no, nc = float(nxt['o']), float(nxt['c'])
-            nh, nl = float(nxt['h']), float(nxt['l'])
             ts = int(cur.get('t', now_ms))
 
-            nr   = nh - nl
-            nb   = abs(nc - no)
-            imp_up   = (nc > no and
+            # BUG-OB-SINGLE-CANDLE-IMPULSE FIX: check up to 3 candles ahead.
+            # Original code only looked at candles[i+1]; if the impulse arrived
+            # 2-3 bars later (OB → doji → big move) the OB was silently missed.
+            imp_up   = False
+            imp_down = False
+            nh = nl = no = nc = nr = nb = 0.0
+            for _k in range(1, min(4, len(candles) - i)):
+                nxt = candles[i + _k]
+                no, nc = float(nxt['o']), float(nxt['c'])
+                nh, nl = float(nxt['h']), float(nxt['l'])
+                nr = nh - nl
+                nb = abs(nc - no)
+                if (nc > no and
                         (nc - no) / max(no, 1) * 100 >= min_impulse and
-                        nb / max(nr, 1e-9) >= self.OB_MIN_BODY_RATIO)
-            imp_down = (nc < no and
+                        nb / max(nr, 1e-9) >= self.OB_MIN_BODY_RATIO):
+                    imp_up = True
+                    break
+                if (nc < no and
                         (no - nc) / max(no, 1) * 100 >= min_impulse and
-                        nb / max(nr, 1e-9) >= self.OB_MIN_BODY_RATIO)
+                        nb / max(nr, 1e-9) >= self.OB_MIN_BODY_RATIO):
+                    imp_down = True
+                    break
 
             def _score(bos, disp, wick, large) -> float:
                 s = base_str
@@ -703,10 +799,16 @@ class ICTEngine:
                        (min(co, cc) - cl) / (ch - cl) >= 0.20
                 big  = nr >= self.OB_IMPULSE_SIZE_MULT * (ch - cl)
                 s    = _score(bos, disp, wk, big)
-                if not any(abs(ob.low - cl) <= tol and abs(ob.high - ch) <= tol
+                # BUG-OB-ZONE FIX: store the candle BODY (open-to-close),
+                # not the full wick range.  Using wick-to-wick meant
+                # contains_price() fired on wick touches above the body —
+                # a non-event in ICT.  Bullish OB body = [close, open]
+                # because this is a bearish candle (cc < co).
+                ob_low, ob_high = cc, co
+                if not any(abs(ob.low - ob_low) <= tol and abs(ob.high - ob_high) <= tol
                            for ob in self.order_blocks_bull):
                     self.order_blocks_bull.append(OrderBlock(
-                        low=cl, high=ch, timestamp=ts, direction="bullish",
+                        low=ob_low, high=ob_high, timestamp=ts, direction="bullish",
                         timeframe=tf, strength=s, bos_confirmed=bos,
                         has_displacement=disp, has_wick_rejection=wk,
                         max_age_ms=max_age))
@@ -719,10 +821,13 @@ class ICTEngine:
                        (ch - max(co, cc)) / (ch - cl) >= 0.20
                 big  = nr >= self.OB_IMPULSE_SIZE_MULT * (ch - cl)
                 s    = _score(bos, disp, wk, big)
-                if not any(abs(ob.low - cl) <= tol and abs(ob.high - ch) <= tol
+                # BUG-OB-ZONE FIX: store body [open, close] for bullish
+                # candle (co < cc).
+                ob_low, ob_high = co, cc
+                if not any(abs(ob.low - ob_low) <= tol and abs(ob.high - ob_high) <= tol
                            for ob in self.order_blocks_bear):
                     self.order_blocks_bear.append(OrderBlock(
-                        low=cl, high=ch, timestamp=ts, direction="bearish",
+                        low=ob_low, high=ob_high, timestamp=ts, direction="bearish",
                         timeframe=tf, strength=s, bos_confirmed=bos,
                         has_displacement=disp, has_wick_rejection=wk,
                         max_age_ms=max_age))
@@ -735,12 +840,17 @@ class ICTEngine:
                      price: float, now_ms: int, max_age: int) -> None:
         """
         3-candle FVG:
-          Bullish: candle[i-1].low > candle[i+1].high  (gap above c3, price filled downward)
-          Bearish: candle[i-1].high < candle[i+1].low  (gap below c3, price filled upward)
+          Bullish FVG (upward impulse): c3.low > c1.high
+            → gap_bot = c1.high (h1), gap_top = c3.low (l3)
+            → price attracted back DOWN to fill this upward imbalance.
+          Bearish FVG (downward impulse): c1.low > c3.high
+            → gap_bot = c3.high (h3), gap_top = c1.low (l1)
+            → price attracted back UP to fill this downward imbalance.
 
-        Note: "bullish FVG" = imbalance created by bullish impulse (buy-side),
-        price attracted back DOWN into it. "bearish FVG" = bearish impulse,
-        price attracted back UP. Direction = direction of impulse.
+        BUG-FVG-DIRECTION FIX: the original code had both definitions
+        completely swapped.  It stored downward-move gaps (l1 > h3) in
+        fvgs_bull and upward-move gaps (l3 > h1) in fvgs_bear, so every
+        FVG confluence score pointed the wrong direction.
         """
         if len(candles) < 3:
             return
@@ -753,9 +863,9 @@ class ICTEngine:
             h3, l3 = float(c3['h']), float(c3['l'])
             ts = int(c2.get('t', now_ms))
 
-            # Bullish FVG: created by upward impulse — gap between c1.low and c3.high
-            gap_top = l1
-            gap_bot = h3
+            # Bullish FVG: upward impulse left a gap above c1 and below c3
+            gap_bot = h1
+            gap_top = l3
             if gap_top > gap_bot + min_sz:
                 if not any(abs(f.bottom - gap_bot) < tol and abs(f.top - gap_top) < tol
                            for f in self.fvgs_bull):
@@ -763,9 +873,9 @@ class ICTEngine:
                         bottom=gap_bot, top=gap_top, timestamp=ts,
                         direction="bullish", timeframe=tf, max_age_ms=max_age))
 
-            # Bearish FVG: created by downward impulse — gap between c1.high and c3.low
-            gap_top2 = l3
-            gap_bot2 = h1
+            # Bearish FVG: downward impulse left a gap below c1 and above c3
+            gap_bot2 = h3
+            gap_top2 = l1
             if gap_top2 > gap_bot2 + min_sz:
                 if not any(abs(f.bottom - gap_bot2) < tol and abs(f.top - gap_top2) < tol
                            for f in self.fvgs_bear):
@@ -789,20 +899,29 @@ class ICTEngine:
 
     def _detect_swing_points(self, candles_5m: List[Dict],
                               candles_15m: List[Dict]) -> None:
-        """Fractal swings on 5m+15m for equal high/low liquidity clustering."""
+        """Fractal swings on 5m+15m for equal high/low liquidity clustering.
+
+        BUG-SWING-LOOKBACK FIX: the original used a 5-bar left / 3-bar right
+        asymmetric fractal.  A 5-bar left requirement is so restrictive that
+        nearly all real ICT swing highs/lows fail to qualify → _swing_highs
+        and _swing_lows stay nearly empty → _cluster_liq never finds 2+
+        touches → liquidity_pools stays empty → no sweeps → AMD stuck on
+        ACCUMULATION forever.  Fixed: symmetric 3/3, matching standard ICT
+        swing identification.
+        """
         self._swing_highs.clear()
         self._swing_lows.clear()
         for candles in (candles_5m, candles_15m):
             if len(candles) < 7:
                 continue
-            for i in range(5, len(candles) - 3):
+            for i in range(3, len(candles) - 3):
                 h = float(candles[i]['h'])
                 l = float(candles[i]['l'])
-                if (all(h > float(candles[j]['h']) for j in range(i-5, i)) and
-                        all(h > float(candles[j]['h']) for j in range(i+1, min(i+4, len(candles))))):
+                if (all(h > float(candles[j]['h']) for j in range(i-3, i)) and
+                        all(h > float(candles[j]['h']) for j in range(i+1, i+4))):
                     self._swing_highs.append(h)
-                if (all(l < float(candles[j]['l']) for j in range(i-5, i)) and
-                        all(l < float(candles[j]['l']) for j in range(i+1, min(i+4, len(candles))))):
+                if (all(l < float(candles[j]['l']) for j in range(i-3, i)) and
+                        all(l < float(candles[j]['l']) for j in range(i+1, i+4))):
                     self._swing_lows.append(l)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -810,8 +929,33 @@ class ICTEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _detect_liquidity_pools(self, price: float, now_ms: int) -> None:
-        """Cluster equal highs (BSL) and equal lows (SSL)."""
+        """Cluster equal highs (BSL) and equal lows (SSL).
+
+        BUG-LIQ-POOL-NO-EXPIRY FIX: the old code only appended to the deque
+        without ever removing stale entries.  Unswept pools from days ago
+        accumulated and distorted TP targeting and confluence scoring.
+
+        Rebuilt each cycle:
+          - Unswept pools: reconstructed from the CURRENT swing data (naturally
+            bounded to recent candle history).  Old swings that fell out of the
+            lookback window stop appearing in swing lists, so their pools are
+            naturally dropped.
+          - Swept pools: preserved for AMD delivery targeting, but expire after
+            3× the distribution window (~4.5 hours) from the sweep timestamp.
+        """
         tol = price * self.LIQ_TOUCH_TOL_PCT
+
+        # Preserve swept pools within age limit (AMD needs them)
+        max_swept_age = self.AMD_DISTRIB_WINDOW_MS * 3
+        swept_keep = [p for p in self.liquidity_pools
+                      if p.swept and now_ms - p.sweep_timestamp <= max_swept_age]
+
+        # Rebuild from scratch
+        self.liquidity_pools.clear()
+        for p in swept_keep:
+            self.liquidity_pools.append(p)
+
+        # Fresh unswept pools from current swing data
         self._cluster_liq(self._swing_highs, "BSL", tol, price)
         self._cluster_liq(self._swing_lows,  "SSL", tol, price)
 
@@ -896,6 +1040,51 @@ class ICTEngine:
                     break
 
     # ─────────────────────────────────────────────────────────────────────
+    # OB MITIGATION TRACKING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _update_ob_mitigation(self, candles: List[Dict]) -> None:
+        """
+        Mark an OB as MITIGATED when a candle CLOSES beyond its far extreme.
+
+        BUG-OB-MITIGATION-NO-CLOSE-CHECK FIX: the original code only used
+        visit_count as a proxy for mitigation.  In ICT, an OB is MITIGATED
+        when a candle CLOSES through the OB's opposite extreme — not when
+        price merely touches or wicks through it.
+
+          Bullish OB (body = [low, high], low=close, high=open of the bear candle):
+            Mitigated when a candle CLOSES BELOW the OB low (bearish close
+            pierces the bottom of the OB body).
+
+          Bearish OB (body = [low, high], low=open, high=close of the bull candle):
+            Mitigated when a candle CLOSES ABOVE the OB high (bullish close
+            pierces the top of the OB body).
+
+        Uses the last CLOSED candle ([-2]) — not the forming candle.
+        """
+        if len(candles) < 2:
+            return
+        last_close = float(candles[-2]['c'])
+
+        for ob in self.order_blocks_bull:
+            if ob.mitigated:
+                continue
+            if last_close < ob.low:
+                ob.mitigated = True
+                logger.debug(
+                    f"OB mitigated: bull ${ob.low:.0f}-${ob.high:.0f} "
+                    f"tf={ob.timeframe} close=${last_close:.0f} < ob.low")
+
+        for ob in self.order_blocks_bear:
+            if ob.mitigated:
+                continue
+            if last_close > ob.high:
+                ob.mitigated = True
+                logger.debug(
+                    f"OB mitigated: bear ${ob.low:.0f}-${ob.high:.0f} "
+                    f"tf={ob.timeframe} close=${last_close:.0f} > ob.high")
+
+    # ─────────────────────────────────────────────────────────────────────
     # OB VISIT TRACKING
     # ─────────────────────────────────────────────────────────────────────
 
@@ -931,13 +1120,17 @@ class ICTEngine:
                 elif self.KZ_NY_START <= ny < self.KZ_NY_END:
                     self._killzone = "NY_KZ"
 
+            # BUG-SESSION-TIMES FIX: correct UTC session windows.
+            # Old: NY=12–21 UTC, London=7–17 UTC (wrong, heavily overlapping).
+            # Fixed: NY=13:30–21:00 UTC, London=07:00–15:00 UTC,
+            #        Asia=23:00–07:00 UTC (wraps midnight).
             if wd >= 5:
                 self._session = "WEEKEND"
-            elif 12 <= uh < 21:
+            elif 13.5 <= uh < 21.0:
                 self._session = "NEW_YORK"
-            elif 7  <= uh < 17:
+            elif 7.0  <= uh < 15.0:
                 self._session = "LONDON"
-            elif 0  <= uh < 9:
+            elif uh >= 23.0 or uh < 7.0:
                 self._session = "ASIA"
             else:
                 self._session = "OFF_HOURS"
@@ -1145,19 +1338,30 @@ class ICTEngine:
                 active_fvg = fvg
                 break
 
-        # Proximity FVG
+        # Proximity FVG — price is approaching but hasn't entered yet
+        # BUG-FVG-PROX-DIR FIX: the old code had the direction inverted.
+        #   LONG entry: look for bullish FVG BELOW current price (price is
+        #     above the FVG, approaching from above — the FVG acts as support
+        #     for the retracement entry).  Check: fvg.top < price.
+        #   SHORT entry: look for bearish FVG ABOVE current price (price is
+        #     below the FVG, approaching from below — FVG acts as resistance).
+        #     Check: fvg.bottom > price.
+        # The original code had these REVERSED, scoring confluence for FVGs
+        # that were on the WRONG side of price entirely.
         if active_fvg is None and atr > 1e-10:
             for fvg in act_fvgs:
-                if side == "long" and fvg.bottom > price:
-                    da = (fvg.bottom - price) / atr
+                if side == "long" and fvg.top < price:
+                    # FVG is below — price is above it, could retrace into it
+                    da = (price - fvg.top) / atr
                     if da <= self.FVG_PROXIMITY_ATR:
                         pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                         s  = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
                         pd += s; active_fvg = fvg
                         details.append(f"FVG_PROX({da:.1f}ATR) tf={fvg.timeframe}")
                         break
-                elif side == "short" and fvg.top < price:
-                    da = (price - fvg.top) / atr
+                elif side == "short" and fvg.bottom > price:
+                    # FVG is above — price is below it, could retrace into it
+                    da = (fvg.bottom - price) / atr
                     if da <= self.FVG_PROXIMITY_ATR:
                         pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                         s  = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
@@ -1220,8 +1424,13 @@ class ICTEngine:
         out.killzone     = self._killzone
 
         # ── Total ─────────────────────────────────────────────────────
+        # BUG-AMD-OPPOSING-PENALTY-NULLIFIED FIX: the old code used
+        # max(0.0, out.amd_score) which silently floored the -0.05 penalty
+        # to zero, making opposing AMD have NO effect on the confluence total.
+        # The penalty is intentional — actively opposing AMD should reduce
+        # the total score to discourage entries against the delivery.
         raw = (out.structure_score +
-               max(0.0, out.amd_score) +
+               out.amd_score +       # allow negative AMD penalty to apply
                out.pd_array_score +
                out.liquidity_score +
                out.session_score)

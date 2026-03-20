@@ -145,6 +145,20 @@ class ICTSweepDetector:
         self._last_check_ms: int = 0
         self._CHECK_INTERVAL_MS = 5_000   # re-evaluate every 5 seconds
 
+        # BUG-STALE-SWEEP-REDETECT FIX:
+        # When a setup expires (OTE missed / blown through), the swept pool
+        # remains in ict_engine.liquidity_pools for up to 4.5h.  Without
+        # memory of which sweeps have been tried, _find_best_setup rebuilds
+        # an identical setup on every 5s tick and update() immediately
+        # expires it again — creating infinite detection→expiry spam.
+        #
+        # _expired_sweep_keys: set of (round(pool_price, 0), sweep_ts_ms)
+        # tuples that have already been attempted and missed.  When AMD
+        # phase resets to ACCUMULATION/neutral (new sweep context), the
+        # set is cleared so genuinely new sweeps can be tried.
+        self._expired_sweep_keys: set = set()
+        self._last_amd_phase: str = ""
+
     def update(self, ict_engine, price: float, atr: float, now_ms: int,
                candles_5m: List[Dict] = None,
                candles_15m: List[Dict] = None) -> Optional[ICTSweepSetup]:
@@ -159,6 +173,16 @@ class ICTSweepDetector:
         if ict_engine is None or not ict_engine._initialized:
             return None
 
+        # Clear expired sweep key memory when AMD resets to a fresh context.
+        # ACCUMULATION with neutral bias means the old sweep has decayed and
+        # any new sweep should be treated as a fresh setup.
+        current_amd_phase = getattr(ict_engine._amd, 'phase', '')
+        current_amd_bias  = getattr(ict_engine._amd, 'bias',  'neutral')
+        if (current_amd_phase == "ACCUMULATION" and current_amd_bias == "neutral"
+                and self._last_amd_phase not in ("", "ACCUMULATION")):
+            self._expired_sweep_keys.clear()
+        self._last_amd_phase = current_amd_phase
+
         # Check if current setup is still valid
         if self._active_setup is not None:
             if self._active_setup.status == "EXPIRED":
@@ -168,19 +192,13 @@ class ICTSweepDetector:
                 self._active_setup = None
                 logger.debug("ICTSweepDetector: setup expired (>90min)")
             else:
-                # FIX Bug-5: expire DETECTED setup when price has blown THROUGH
-                # the OTE zone without entering it — entry permanently missed.
-                # LONG: we need price to retrace DOWN into OTE; if price is now
-                #   BELOW ote_low (retraced too far), the zone is also missed.
-                # SHORT: symmetric — missed if price rallied above ote_high.
-                # Only applies to DETECTED (not yet OTE_READY). Once OTE_READY,
-                # the SL level handles invalidation via normal risk management.
+                # Expire DETECTED setup when price has blown THROUGH the OTE
+                # zone without entering it — entry permanently missed.
+                # Once OTE_READY, the SL level handles invalidation.
                 _s = self._active_setup
                 if _s.status == "DETECTED":
                     _ote_miss = False
                     if _s.side == "long":
-                        # Missed: price went up through zone without retracing, OR
-                        # retraced too far below the zone
                         if price > _s.ote_entry_zone_high + 0.5 * atr:
                             _ote_miss = True   # price never pulled back to OTE
                         elif price < _s.ote_entry_zone_low - 0.5 * atr:
@@ -189,13 +207,17 @@ class ICTSweepDetector:
                         if price < _s.ote_entry_zone_low - 0.5 * atr:
                             _ote_miss = True   # price never rallied to OTE
                         elif price > _s.ote_entry_zone_high + 0.5 * atr:
-                            _ote_miss = True   # price blew through OTE upward
+                            _ote_miss = True   # price rallied through OTE upward
                     if _ote_miss:
+                        # Record this sweep as expired so _find_best_setup will
+                        # not rebuild an identical setup from the same swept pool.
+                        _key = (round(_s.sweep_price, 0), _s.setup_time_ms)
+                        self._expired_sweep_keys.add(_key)
                         logger.info(
                             f"❌ ICTSweepDetector: {_s.side.upper()} OTE missed "
                             f"(price=${price:,.0f} outside "
                             f"[${_s.ote_entry_zone_low:.0f}–${_s.ote_entry_zone_high:.0f}]"
-                            f" ± {0.5*atr:.0f}) — setup expired")
+                            f" ± {0.5*atr:.0f}) — setup expired, sweep blacklisted")
                         self._active_setup = None
 
         # Find the best new setup
@@ -255,6 +277,13 @@ class ICTSweepDetector:
         if sweep_age_ms > ict_engine.AMD_DISTRIB_WINDOW_MS:
             return None
 
+        # BUG-STALE-SWEEP-REDETECT FIX: skip sweeps that have already been
+        # tried and had their OTE zone permanently missed.  Without this check
+        # the same swept pool rebuilds an identical setup every 5s indefinitely.
+        _sweep_key = (round(latest_sweep.price, 0), latest_sweep.sweep_timestamp)
+        if _sweep_key in self._expired_sweep_keys:
+            return None
+
         side = "long" if latest_sweep.level_type == "SSL" else "short"
 
         # The direction must match AMD bias
@@ -303,11 +332,33 @@ class ICTSweepDetector:
             sl_sweep = sweep_candle_extreme + 0.08 * atr
             sl_ob    = disp_high + 0.15 * atr
 
-        # Ensure OTE zone is above current price for long (in path)
-        if side == "long" and price > ote_high + 0.5 * atr:
-            return None  # price already through OTE — entry missed
-        if side == "short" and price < ote_low - 0.5 * atr:
-            return None  # price already through OTE — entry missed
+        # BUG-OTE-ASYMMETRIC-GUARD FIX: the old code only checked one boundary
+        # direction per side:
+        #   LONG  only checked: price > ote_high (price too far above)
+        #   SHORT only checked: price < ote_low  (price too far below)
+        # This allowed setups to be built (and immediately expired) when price
+        # had already blown THROUGH the OTE in the retracement direction — the
+        # exact case that drives the log-spam loop in the original code.
+        # Fixed: check BOTH boundaries for both sides before building a setup.
+        _half_atr = 0.5 * atr
+        if side == "long":
+            if price > ote_high + _half_atr:
+                # Price never pulled back to OTE — entry missed
+                self._expired_sweep_keys.add(_sweep_key)
+                return None
+            if price < ote_low - _half_atr:
+                # Price blew through OTE downward — invalidated
+                self._expired_sweep_keys.add(_sweep_key)
+                return None
+        else:  # short
+            if price < ote_low - _half_atr:
+                # Price never rallied to OTE — entry missed
+                self._expired_sweep_keys.add(_sweep_key)
+                return None
+            if price > ote_high + _half_atr:
+                # Price rallied through OTE upward — invalidated
+                self._expired_sweep_keys.add(_sweep_key)
+                return None
 
         # Find 15m swing SL fallback
         sl_15m = self._find_15m_swing_sl(side, price, atr, candles_15m)
