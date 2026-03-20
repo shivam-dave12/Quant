@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging, math, time, threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, timedelta
+from datetime import date
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
@@ -779,12 +779,8 @@ class ADXEngine:
 
     def compute(self, candles: List[Dict]) -> float:
         if len(candles) < 2: return self._adx
-        period  = QCfg.ADX_PERIOD()
-        # BUG-2 FIX: candles[-1].get('t', 0) silently returns 0 when candles
-        # are raw Candle dataclass objects (no __getitem__). After the first
-        # seed, self._last_ts = 0, and every subsequent call sees last_ts=0
-        # == self._last_ts=0, so the seeded early-return fires and ADX never
-        # updates again. Fix: read timestamp robustly from both Candle and dict.
+        period = QCfg.ADX_PERIOD()
+
         def _ts(c) -> int:
             try:
                 return int(c['t'])
@@ -794,24 +790,41 @@ class ADXEngine:
                 return int(getattr(c, 'timestamp', 0) * 1000)
             except Exception:
                 return 0
-        last_ts = _ts(candles[-1])
+
+        # ADX ROOT-CAUSE FIX: dedup on the LAST CLOSED candle (candles[-2]),
+        # NOT the forming candle (candles[-1]).
+        #
+        # candles[-1] is the live forming bar whose open-time is constant for
+        # the full 5-minute bar.  The old dedup fired every tick for 5 minutes;
+        # the incremental path only ran once at bar open when candles[-1] was
+        # brand-new (H=L=C≈open, flat) → DM≈0, TR≈0 → Wilder smoothing just
+        # decayed prior values by 13/14 → ADX appeared frozen.
+        #
+        # Correct contract: dedup on candles[-2]['t'] (last closed bar).
+        # That timestamp changes exactly once per 5m close.
+        # Incremental step uses candles[-2] vs candles[-3] (both fully formed).
+        last_ts = _ts(candles[-2]) if len(candles) >= 2 else _ts(candles[-1])
         if last_ts == self._last_ts and self._seeded: return self._adx
         if len(candles) < period * 2 + 1: return self._adx
 
         if not self._seeded:
+            # Seed on CLOSED bars only — exclude candles[-1] (forming).
+            closed = candles[:-1]
             plus_dms: List[float] = []
             minus_dms: List[float] = []
             trs: List[float] = []
-            for i in range(1, len(candles)):
-                h  = float(candles[i]['h']);   l  = float(candles[i]['l'])
-                ph = float(candles[i-1]['h']); pl = float(candles[i-1]['l'])
-                pc = float(candles[i-1]['c'])
+            for i in range(1, len(closed)):
+                h  = float(closed[i]['h']);   l  = float(closed[i]['l'])
+                ph = float(closed[i-1]['h']); pl = float(closed[i-1]['l'])
+                pc = float(closed[i-1]['c'])
                 up = h - ph; dn = pl - l
                 plus_dms.append(up  if up  > dn and up  > 0 else 0.0)
                 minus_dms.append(dn if dn  > up and dn  > 0 else 0.0)
                 trs.append(max(h - l, abs(h - pc), abs(l - pc)))
 
-            # Bootstrap Wilder sum with straight sum of first 'period' bars
+            if len(plus_dms) < period * 2:
+                return self._adx
+
             sp = sum(plus_dms[:period])
             sm = sum(minus_dms[:period])
             st = sum(trs[:period])
@@ -842,10 +855,13 @@ class ADXEngine:
             self._last_ts = last_ts
             return self._adx
 
-        # Incremental update — single new bar
-        h  = float(candles[-1]['h']); l  = float(candles[-1]['l'])
-        ph = float(candles[-2]['h']); pl = float(candles[-2]['l'])
-        pc = float(candles[-2]['c'])
+        # Incremental: candles[-2] = just-closed bar, candles[-3] = prior closed.
+        # candles[-1] (live forming bar) is intentionally excluded.
+        if len(candles) < 3:
+            return self._adx
+        h  = float(candles[-2]['h']); l  = float(candles[-2]['l'])
+        ph = float(candles[-3]['h']); pl = float(candles[-3]['l'])
+        pc = float(candles[-3]['c'])
         up = h - ph; dn = pl - l
         plus_dm  = up if up  > dn and up  > 0 else 0.0
         minus_dm = dn if dn  > up and dn  > 0 else 0.0
@@ -2349,9 +2365,9 @@ class ATREngine:
     def compute(self, candles: List[Dict]) -> float:
         if not candles: return self._atr
         period = QCfg.ATR_PERIOD()
-        # Same timestamp-read fix as ADXEngine: .get('t', 0) returns 0 for
-        # raw Candle dataclass objects, making _last_ts stick at 0 forever
-        # and the dedup early-return fire on every tick after the first seed.
+
+        # Same closed-candle fix as ADXEngine: dedup on candles[-2] (last
+        # closed bar), not candles[-1] (forming bar with partial H/L/C).
         def _ts(c) -> int:
             try:
                 return int(c['t'])
@@ -2361,31 +2377,35 @@ class ATREngine:
                 return int(getattr(c, 'timestamp', 0) * 1000)
             except Exception:
                 return 0
-        last_ts = _ts(candles[-1])
+
+        last_ts = _ts(candles[-2]) if len(candles) >= 2 else _ts(candles[-1])
         if last_ts == self._last_ts and self._seeded: return self._atr
         if len(candles) < period + 1: return self._atr
+
         if not self._seeded:
-            trs = [max(float(candles[i]['h'])-float(candles[i]['l']),
-                       abs(float(candles[i]['h'])-float(candles[i-1]['c'])),
-                       abs(float(candles[i]['l'])-float(candles[i-1]['c'])))
-                   for i in range(1, len(candles))]
+            # Seed on closed bars only — exclude forming candles[-1]
+            closed = candles[:-1]
+            trs = [max(float(closed[i]['h'])-float(closed[i]['l']),
+                       abs(float(closed[i]['h'])-float(closed[i-1]['c'])),
+                       abs(float(closed[i]['l'])-float(closed[i-1]['c'])))
+                   for i in range(1, len(closed))]
             if len(trs) < period: return self._atr
             atr = sum(trs[:period]) / period
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
-            # v4.3 CRITICAL FIX: Only keep the FINAL ATR value from warmup.
-            # Old code kept 20-35 historical values that poisoned the percentile
-            # ranking — if warmup came from a different vol regime, the current
-            # ATR ranked at 0% against all of them, permanently blocking trades.
-            # Now: keep ONLY the latest value. Percentile returns 0.5 (neutral)
-            # until we accumulate enough LIVE bars to rank meaningfully.
+            # Only keep the final seeded ATR — prevents warmup-era volatility
+            # from poisoning live percentile ranking.
             self._atr_hist.clear()
             self._atr_hist.append(atr)
             self._atr = atr; self._seeded = True
             self._last_ts = last_ts
             return self._atr
         else:
-            hi=float(candles[-1]['h']); lo=float(candles[-1]['l']); prc=float(candles[-2]['c'])
+            # Incremental: candles[-2] = just-closed, candles[-3] = prior closed
+            if len(candles) < 3: return self._atr
+            hi  = float(candles[-2]['h'])
+            lo  = float(candles[-2]['l'])
+            prc = float(candles[-3]['c'])
             self._atr = (self._atr*(period-1)+max(hi-lo,abs(hi-prc),abs(lo-prc)))/period
         self._atr_hist.append(self._atr); self._last_ts = last_ts
         return self._atr
@@ -2741,29 +2761,13 @@ class PositionState:
 # DAILY RISK GATE with consecutive loss lockout
 # ═══════════════════════════════════════════════════════════════
 class DailyRiskGate:
-    # BUG-TZ FIX: The trading day boundary must be midnight IST (UTC+5:30),
-    # not midnight UTC.  date.today() returns the server's local date — on a
-    # cloud server running UTC this flips at midnight UTC = 05:30 IST.
-    # Consequence: a trade that enters at 05:29 IST has its trade-count
-    # incremented in "old day N", but if it closes at 05:31 IST the PnL lands
-    # in "new day N+1" (after the reset fires).  Day N then shows: trades=1,
-    # pnl=0.  Day N+1 shows: trades=0, pnl=+X.  The daily loss cap is also
-    # corrupted because _daily_open_bal gets zeroed for the new day before
-    # the PnL from the previous day's trade is recorded.
-    # Fix: use IST-aware datetime for all day-boundary decisions.
-    _IST = timezone(timedelta(hours=5, minutes=30))
-
-    @staticmethod
-    def _today_ist() -> date:
-        return datetime.now(DailyRiskGate._IST).date()
-
     def __init__(self):
-        self._today = self._today_ist(); self._daily_trades = 0; self._consec_losses = 0
+        self._today = date.today(); self._daily_trades = 0; self._consec_losses = 0
         self._daily_pnl = 0.0; self._daily_open_bal = 0.0
         self._loss_lockout_until = 0.0; self._lock = threading.Lock()
 
     def _reset_if_new_day(self):
-        today = self._today_ist()
+        today = date.today()
         if today != self._today:
             self._today = today; self._daily_trades = 0; self._daily_pnl = 0.0
             self._daily_open_bal = 0.0; self._consec_losses = 0; self._loss_lockout_until = 0.0

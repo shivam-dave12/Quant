@@ -510,7 +510,10 @@ class DeltaAPI:
 
         resolution: candle size in minutes (1, 3, 5, 15, 30, 60, 120, 240, 360,
                     720, 1440, 10080)
-        start_time / end_time: Unix seconds (NOT milliseconds — Delta uses seconds)
+        start_time / end_time: Unix MILLISECONDS — this function converts to
+                    seconds internally (Delta API requires seconds). Callers
+                    must pass milliseconds so the interface is consistent with
+                    every other timestamp in the bot.
         limit:      max bars to return (default 200, max 2000 per request)
 
         Returns normalised list of dicts:
@@ -519,17 +522,19 @@ class DeltaAPI:
         """
         res_str = _RESOLUTION_MAP.get(resolution, str(resolution))
 
-        # start and end are REQUIRED by Delta API (bad_schema if omitted)
-        # Compute defaults: fetch `limit` bars ending now
+        # start and end are REQUIRED by Delta API (bad_schema if omitted).
+        # Compute defaults: fetch `limit` bars ending now.
         now_s = int(time.time())
         _resolution_seconds = resolution * 60
         _default_start = now_s - limit * _resolution_seconds
 
+        # BUG-API: old code used "if start_time" which is falsy for 0 (epoch).
+        # Use explicit None check so callers can safely pass 0 if needed.
         params: Dict[str, Any] = {
             "symbol":     symbol,
             "resolution": res_str,
-            "start":      int(start_time / 1000) if start_time else _default_start,
-            "end":        int(end_time   / 1000) if end_time   else now_s,
+            "start":      int(start_time / 1000) if start_time is not None else _default_start,
+            "end":        int(end_time   / 1000) if end_time   is not None else now_s,
         }
 
         resp = self._get("/v2/history/candles", params=params)

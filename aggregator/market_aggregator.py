@@ -156,8 +156,18 @@ class MarketAggregator:
             # Then tap into our merged stream
             try:
                 price = float(data.get("price") or data.get("p") or 0)
-                qty   = float(data.get("quantity") or data.get("q") or 0)
-                side  = data.get("side") or ("sell" if data.get("m") else "buy")
+                # BUG-TAP FIX: Delta WS trade messages use "size" for quantity,
+                # not "quantity". The old code read data.get("quantity") which
+                # always returned None for Delta → qty=0 for all secondary
+                # trades → CVD magnitude from secondary permanently zeroed.
+                # Fix: mirror the key-priority order used in DeltaDataManager._on_trade.
+                qty   = float(data.get("size") or data.get("quantity") or
+                              data.get("q") or 0)
+                side_raw = data.get("side") or ""
+                side = "buy" if str(side_raw).lower() == "buy" else "sell"
+                if not side_raw:
+                    # Fallback: "m"=True means buyer was maker = sell aggressor
+                    side = "sell" if data.get("m") else "buy"
                 if price > 0:
                     with agg_ref._lock:
                         agg_ref._merged_trades.append({

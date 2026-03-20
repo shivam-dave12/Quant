@@ -449,6 +449,8 @@ class DeltaWebSocket:
         # ── Candlestick: type = "candlestick_1m", "candlestick_5m", etc. ─────
         if msg_type.startswith("candlestick_"):
             interval_key = self._parse_candle_interval_from_type(msg_type)
+            if interval_key is None:
+                return   # unrecognised format — warning already logged, skip
             self._fire(
                 self.candlestick_callbacks.get(interval_key, []),
                 self._fmt_candle(data, interval_key),
@@ -497,7 +499,7 @@ class DeltaWebSocket:
         logger.debug(f"WS unhandled message type '{msg_type}' symbol={symbol}")
 
     @staticmethod
-    def _parse_candle_interval_from_type(msg_type: str) -> str:
+    def _parse_candle_interval_from_type(msg_type: str) -> Optional[str]:
         """
         Extract interval key from Delta message type string.
         Examples:
@@ -505,6 +507,11 @@ class DeltaWebSocket:
           "candlestick_5m"  → "5"
           "candlestick_1h"  → "60"
           "candlestick_1d"  → "1440"
+
+        Returns None on any parse failure — callers must guard against None
+        to avoid misdirecting candles to the wrong timeframe bucket.
+        Previously returned "1" as fallback, which silently routed 4h/1d
+        candles to the 1m callback if Delta sent an unexpected type string.
         """
         try:
             # Remove "candlestick_" prefix
@@ -519,7 +526,8 @@ class DeltaWebSocket:
                 return str(int(suffix[:-1]) * 10080)
         except Exception:
             pass
-        return "1"
+        logger.warning(f"WS: unrecognised candlestick type '{msg_type}' — skipping")
+        return None
 
     @staticmethod
     def _fire(callbacks: List[Callable], data: Any) -> None:

@@ -134,10 +134,32 @@ class DeltaDataManager:
             logger.info("✅ Delta WS streams started")
 
             # REST warmup
-            logger.info("Delta DM: REST warmup...")
+            logger.info("Delta DM: starting REST warmup...")
             for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
+
+            # BUG-DM FIX: After REST warmup, the last candle in each deque
+            # is the current partially-formed bar (Delta REST returns it).
+            # When the first WS candle arrives for that same bar, forming_ts
+            # is None (never set), so the comparison forming_ts == start_ts
+            # is False → WS appends a duplicate instead of replacing in-place.
+            # Fix: seed _forming_ts with each deque's last candle timestamp
+            # so the first WS tick correctly updates candles[-1] in-place.
+            _TF_KEY_MAP = {
+                "1m": ("1",    self._candles_1m),
+                "5m": ("5",    self._candles_5m),
+                "15m": ("15",  self._candles_15m),
+                "1h": ("60",   self._candles_1h),
+                "4h": ("240",  self._candles_4h),
+                "1d": ("1440", self._candles_1d),
+            }
+            with self._lock:
+                for tf_label, (tf_key, deq) in _TF_KEY_MAP.items():
+                    if deq:
+                        last_c = deq[-1]
+                        # Candle.timestamp is in seconds; forming_ts dict stores ms
+                        self._forming_ts[tf_key] = int(last_c.timestamp * 1000)
 
             self._warmup_complete = True
             logger.info("✅ Delta REST warmup complete")
