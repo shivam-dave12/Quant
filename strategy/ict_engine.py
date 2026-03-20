@@ -1380,6 +1380,23 @@ class ICTEngine:
         if candles_1h:
             all_c += list(candles_1h[-5:])
 
+        # BUG-SWEEP-DEDUP-FALLBACK FIX: the dedup key is (pool_price, candle_ts).
+        # When c['t'] is absent the original code used now_ms (wall-clock), which
+        # changes every millisecond.  Every call generates a new unique key → the
+        # same pool gets swept multiple times, corrupt AMD state, and the
+        # sweep-count keeps growing unboundedly.
+        # Fix: when 't' is missing, bucket now_ms into the nearest 5-minute
+        # open time (floor to 300_000ms boundary) so candles without a timestamp
+        # still produce stable, reproducible keys.
+        _5M_MS = 300_000   # 5 minutes in milliseconds
+
+        def _candle_ts(c: dict) -> int:
+            raw = c.get('t', 0)
+            if raw:
+                return int(raw)
+            # Stable fallback: floor now_ms to nearest 5-minute boundary
+            return (now_ms // _5M_MS) * _5M_MS
+
         for pool in list(self.liquidity_pools):
             if pool.swept:
                 continue
@@ -1388,23 +1405,14 @@ class ICTEngine:
                 cl, op = float(c['c']), float(c['o'])
                 body = abs(cl - op)
                 rng  = h - l
-                key  = (round(pool.price, 0), int(c.get('t', 0)))
+                key  = (round(pool.price, 0), _candle_ts(c))
                 if key in self._registered_sweeps:
                     continue
 
                 if pool.level_type == "BSL" and h > pool.price and cl < pool.price:
                     disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
                     pool.swept = True
-                    # BUG-SWEEP-TS FIX: Use the CANDLE'S timestamp, not now_ms.
-                    # Setting pool.sweep_timestamp = now_ms (wall-clock) makes
-                    # every sweep detected during REST warmup appear brand-new
-                    # regardless of when it actually happened on-chart.
-                    # Consequence: a BSL sweep from 90+ minutes ago appears to
-                    # be <15 minutes old → AMD phase = MANIPULATION → bot enters
-                    # MANIP_no_confirmed_sweep lockout for the entire session
-                    # because price has already moved past the OTE zone.
-                    # Fix: use the candle's open-time so age_ms is correct.
-                    pool.sweep_timestamp = int(c.get('t', now_ms))
+                    pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
                     self._registered_sweeps.append(key)
@@ -1415,7 +1423,7 @@ class ICTEngine:
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
                     disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
                     pool.swept = True
-                    pool.sweep_timestamp = int(c.get('t', now_ms))  # candle ts, not now_ms
+                    pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
                     self._registered_sweeps.append(key)

@@ -455,6 +455,16 @@ class ICTSweepDetector:
         sweep_ts   = sweep_pool.sweep_timestamp
         CANDLE_MS  = 5 * 60 * 1000   # 5 minutes in ms
 
+        # BUG-HOT-LOOP-IMPORT FIX: the original code called __import__('config')
+        # inside the candle-scan loop, which fires up to 13 times per call.
+        # Python caches the module but the attribute lookup + frame allocation
+        # still adds avoidable overhead in the hot path.  Cache once before the loop.
+        try:
+            import config as _cfg_mod
+            _tick = float(getattr(_cfg_mod, 'TICK_SIZE', 0.5))
+        except Exception:
+            _tick = 0.5
+
         # Find the sweep candle by timestamp proximity (allow ±1 candle)
         for i in range(len(candles_5m) - 1, 0, -1):
             c = candles_5m[i]
@@ -473,7 +483,6 @@ class ICTSweepDetector:
                 # FIX 11: old tolerance 0.2% = $140 at BTC $70k — candles that
                 # merely approached the level were wrongly classified as sweep candles,
                 # producing misplaced OTE zones. One tick tolerance is correct.
-                _tick = float(__import__('config').TICK_SIZE) if hasattr(__import__('config'), 'TICK_SIZE') else 0.5
                 if float(c['l']) <= pool_price + _tick:
                     sweep_extreme = float(c['l'])
                     # Displacement: next 1-3 candles — find first that closes above pool
@@ -486,7 +495,6 @@ class ICTSweepDetector:
             else:
                 # Sweep candle: wick must actually touch or breach the BSL level.
                 # FIX 11: symmetric tight tolerance for short (BSL sweep).
-                _tick = float(__import__('config').TICK_SIZE) if hasattr(__import__('config'), 'TICK_SIZE') else 0.5
                 if float(c['h']) >= pool_price - _tick:
                     sweep_extreme = float(c['h'])
                     for j in range(i + 1, min(i + 4, len(candles_5m))):

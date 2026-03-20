@@ -14,6 +14,7 @@ Report Types:
 """
 
 import logging
+import re
 import time
 import threading
 import requests
@@ -48,7 +49,6 @@ def _sanitize_html(text: str) -> str:
       2. Strip any remaining unsupported tags while preserving their inner text.
       3. Collapse runs of blank lines to at most two consecutive newlines.
     """
-    import re
 
     # Common safe substitutions
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
@@ -86,14 +86,31 @@ def _sanitize_html(text: str) -> str:
     # are those starting recognised safe tags.  Anything else must be escaped
     # so Telegram's HTML parser doesn't choke on them.
     #
-    # Matches `<` NOT followed by an optional `/` and then a valid tag name:
-    #   b, i, u, s, code, pre, tg-spoiler, a (with optional attrs)
-    text = re.sub(
-        r'<(?!/?(?:b|i|u|s|code|pre|tg-spoiler|a(?:[\s>\/]|$)))(?![^>]*>)',
-        r'&lt;',
-        text,
-        flags=re.IGNORECASE,
+    # BUG-SANITIZE-REGEX FIX: the original lookahead pattern
+    # `(?!/?(?:b|i|u|s|code|pre|tg-spoiler|a(?:[\s>\/]|$)))` used a simple
+    # character alternation that failed to match `tg-spoiler` when the `-`
+    # was preceded by other tag characters.  More fundamentally, the double
+    # negative lookahead `(?![^>]*>)` was overly greedy and swallowed the
+    # entire tag body, sometimes escaping the `<` of legitimate tags.
+    # Fix: use a single positive lookahead for the exact set of supported tag
+    # name prefixes; anything else gets escaped.
+    _SAFE_TAG_RE = re.compile(
+        r'<(?=/?(?:b|i|u|s|code|pre|tg-spoiler|a)(?:[\s>"/]|$))',
+        re.IGNORECASE,
     )
+    # Build the escaped version: replace any `<` NOT followed by a safe tag
+    # by splitting on `<` and re-joining, escaping those that don't open safe tags.
+    parts = text.split('<')
+    if len(parts) > 1:
+        rebuilt = [parts[0]]
+        for part in parts[1:]:
+            # Check if this segment opens a safe Telegram tag
+            if _SAFE_TAG_RE.match('<' + part):
+                rebuilt.append('<')
+            else:
+                rebuilt.append('&lt;')
+            rebuilt.append(part)
+        text = ''.join(rebuilt)
 
     # Collapse excessive blank lines (> 2 consecutive newlines → 2)
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -161,9 +178,8 @@ def _send_worker():
                     logger.warning(
                         f"Telegram HTML parse error — retrying as plain text: {resp.text[:120]}"
                     )
-                    import re as _re
                     # DOTALL: strip tags that span multiple lines (e.g. logged tracebacks)
-                    plain_text = _re.sub(r'<[^>]+>', '', send_text, flags=_re.DOTALL)
+                    plain_text = re.sub(r'<[^>]+>', '', send_text, flags=re.DOTALL)
                     plain_payload = {
                         "chat_id": telegram_config.TELEGRAM_CHAT_ID,
                         "text": plain_text[:4000],

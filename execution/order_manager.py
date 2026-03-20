@@ -530,10 +530,8 @@ class OrderManager:
         exch = exchange_name.lower()
         if exch == "delta":
             self._adapter = _DeltaAdapter(api)
-            GlobalRateLimiter.set_active(_DELTA_LIMITER)
         else:
             self._adapter = _CoinSwitchAdapter(api)
-            GlobalRateLimiter.set_active(_CS_LIMITER)
 
         self.api            = api         # kept for legacy access
         self._exchange_name = exch
@@ -546,6 +544,17 @@ class OrderManager:
 
         # Expose for callers that do order_manager.CancelResult
         self.CancelResult = CancelResult
+
+        # NOTE: GlobalRateLimiter is NOT set here.
+        # When the ExecutionRouter is used (the normal code path), the router
+        # owns both OMs and calls _sync_global_limiter() after construction,
+        # pointing GlobalRateLimiter at whichever exchange is currently active.
+        # Calling set_active() here caused a race: the last OM constructed
+        # (always delta, since it's created second) won, so GlobalRateLimiter
+        # always pointed at the delta limiter even when CoinSwitch was the active
+        # exchange — silently applying the wrong rate-limit interval to all calls.
+        # The single-OM legacy path (no router) can call GlobalRateLimiter.set_active()
+        # explicitly after construction if needed.
 
         logger.info(f"✅ OrderManager initialised (exchange={exch})")
 
@@ -574,40 +583,63 @@ class OrderManager:
         return True
 
     def _place_with_retry(self, **kwargs) -> Optional[Dict]:
-        """Place order with exponential-backoff retry on transient errors."""
+        """Place order with exponential-backoff retry on transient errors.
+
+        Retry matrix:
+          429 → notify limiter, exponential backoff, continue
+          5xx → exponential backoff, continue
+          401 → track consecutive 401s, sleep, continue; abort after MAX_401_RETRIES
+          other → non-retryable, return None immediately
+
+        consecutive_401s resets on any non-401 attempt so the counter
+        tracks CONSECUTIVE 401s, not total 401s across the entire loop.
+        """
         consecutive_401s = 0
-        for attempt in range(self._MAX_RETRIES + self._MAX_401_RETRIES):
+        max_attempts     = self._MAX_RETRIES + self._MAX_401_RETRIES
+        for attempt in range(max_attempts):
             result = self._adapter.place_order(**kwargs)
 
-            # Success
+            # ── Success ───────────────────────────────────────────────
             if result and not result.get("_error"):
                 return result
 
             sc  = (result or {}).get("_sc", 0)
             raw = (result or {}).get("_raw", {})
 
+            # ── 429 Too Many Requests ─────────────────────────────────
             if sc == 429:
+                consecutive_401s = 0   # reset; 429 breaks the 401 chain
                 self._adapter.limiter.notify_429()
                 time.sleep(self._RETRY_BASE_SLEEP * (2 ** min(attempt, 4)))
                 continue
 
+            # ── Transient server error ────────────────────────────────
             if sc in (500, 502, 503):
+                consecutive_401s = 0   # reset; server error breaks 401 chain
                 time.sleep(self._RETRY_BASE_SLEEP * (2 ** min(attempt, 3)))
                 continue
 
+            # ── Auth error ────────────────────────────────────────────
             if sc == 401:
                 consecutive_401s += 1
                 if consecutive_401s <= self._MAX_401_RETRIES:
+                    logger.warning(
+                        f"place_order 401 (attempt {attempt+1}/{max_attempts}, "
+                        f"consecutive={consecutive_401s}) — retrying"
+                    )
                     time.sleep(self._401_RETRY_DELAY * consecutive_401s)
                     continue
-                logger.error("401 persists after retries — giving up")
+                logger.error(
+                    f"place_order: 401 persisted {consecutive_401s} times — "
+                    f"check API credentials/signature"
+                )
                 return None
 
-            # Non-retryable
-            logger.error(f"place_order failed: sc={sc} raw={raw}")
+            # ── Non-retryable ─────────────────────────────────────────
+            logger.error(f"place_order non-retryable failure: sc={sc} raw={raw}")
             return None
 
-        logger.error("place_order exhausted all retries")
+        logger.error(f"place_order exhausted all {max_attempts} retries")
         return None
 
     def _record_order(self, order_id: str, meta: Dict) -> None:
@@ -1013,6 +1045,16 @@ class OrderManager:
             offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
             limit_offset = offset_ticks * tick
 
+            # Initialise limit_price to None; only assigned when use_limit=True.
+            # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
+            # limit_price before the if/else block, causing UnboundLocalError in
+            # _record_order when use_limit=False because the dict literal
+            # `"limit_price": limit_price if use_limit else None` was evaluated
+            # even on the False branch (Python evaluates the whole expression
+            # before checking the condition in some older CPython versions).
+            # Initialising to None is safe and makes the intent explicit.
+            limit_price: Optional[float] = None
+
             # Limit price: gives execution buffer past the stop trigger.
             # SHORT SL (buy to close): limit = stop + offset (max price we'll pay)
             # LONG  SL (sell to close): limit = stop - offset (min price we'll accept)
@@ -1238,24 +1280,41 @@ class OrderManager:
             if not isinstance(resp, dict):
                 return CancelResult.FAILED
 
-            # CoinSwitch: no "error" key in resp means success
-            # Delta: resp["success"] == True
-            success = (
-                ("error" not in resp) or
-                (isinstance(resp, dict) and resp.get("success"))
-            )
+            # Determine if the cancel API call itself succeeded.
+            # CoinSwitch: success = no "error" key in response body.
+            # Delta:       success = resp["success"] == True.
+            # Both can return {} on success (empty body = 200 OK).
+            has_error   = bool(resp.get("error"))
+            has_success = resp.get("success", None)
+            sc          = resp.get("status_code", 0)
 
-            if success:
-                # Verify state
+            if has_success is True:
+                api_succeeded = True
+            elif has_success is False:
+                api_succeeded = False
+            else:
+                # No "success" key (CoinSwitch style) — no error = success
+                api_succeeded = not has_error and sc not in (400, 401, 403, 404, 422)
+
+            if sc == 404:
+                self._remove_active_order(order_id)
+                return CancelResult.NOT_FOUND
+
+            if api_succeeded:
+                # Cancel was accepted — verify final state for correctness.
+                # Exchanges may have already filled the order before cancel landed.
                 current = self.get_order_status_safe(order_id)
                 if current == "FILLED":
                     return CancelResult.ALREADY_FILLED
                 if current == "PARTIAL_FILL":
                     return CancelResult.PARTIAL_FILL
+                # PENDING after a successful cancel request means the exchange
+                # accepted but hasn't settled yet (eventual consistency) — treat
+                # as SUCCESS; the position will be confirmed on next poll.
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
 
-            # Check if it was already filled before cancel
+            # Cancel API call failed — check if the order was already done
             current = self.get_order_status_safe(order_id)
             if current == "FILLED":
                 return CancelResult.ALREADY_FILLED
@@ -1264,9 +1323,8 @@ class OrderManager:
             if current == "CANCELLED":
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
-
-            sc = resp.get("status_code", 0)
-            if sc == 404:
+            if current == "UNKNOWN":
+                # Order gone from exchange (404 on status query)
                 self._remove_active_order(order_id)
                 return CancelResult.NOT_FOUND
 

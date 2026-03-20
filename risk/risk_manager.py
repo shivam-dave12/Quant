@@ -314,6 +314,13 @@ class RiskManager:
         with self._lock:
             now = time.time()
 
+            # ── Reset daily counters FIRST — must happen before any check ─────
+            # If the calendar day just changed, consecutive_losses and daily_pnl
+            # must be zeroed before the cooldown / loss-limit gates see them.
+            # Placing this call below the cooldown checks meant yesterday's losses
+            # blocked the first trade of the new trading day.
+            self._reset_daily_if_needed()
+
             # ── Min time between trades ───────────────────────────────────────
             time_since_last = now - self.last_trade_time
             if (self.last_trade_time > 0 and
@@ -322,16 +329,13 @@ class RiskManager:
                     config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
-            # ── Loss cooldown (new) ───────────────────────────────────────────
+            # ── Loss cooldown ─────────────────────────────────────────────────
             cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 300)
             if (self.consecutive_losses > 0 and
                     self.last_trade_time > 0 and
                     time_since_last < cooldown):
                 remaining = int(cooldown - time_since_last)
                 return False, f"Loss cooldown: {remaining}s remaining"
-
-            # ── Reset daily counters if new day ───────────────────────────────
-            self._reset_daily_if_needed()
 
             # ── Daily trade limit ─────────────────────────────────────────────
             if len(self.daily_trades) >= self.max_daily_trades:

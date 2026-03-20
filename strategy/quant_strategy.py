@@ -605,20 +605,32 @@ class CVDEngine:
         w = QCfg.CVD_WINDOW()
 
         # ── Path 1: True tick CVD ────────────────────────────────────
+        # BUG-CVD-TREND-CUMSUM FIX: arr is a running cumulative sum.
+        # The old code computed sum(arr[i:i+w]) which is the sum of already-
+        # cumulative values — a completely different statistic.  The correct
+        # measure of "how much did CVD change over window w?" is:
+        #     arr[i+w-1] - arr[i-1]   (delta = end - start of window)
+        # Using the wrong statistic made high-conviction buyside periods
+        # look identical to neutral periods because cumulative sums grow
+        # monotonically and the sum of a growing series always appears "high".
         true_cvd = self._get_true_cvd_array(window_sec=max(w * 90, 900.0))
         if true_cvd is not None and len(true_cvd) >= w + 10:
             arr = true_cvd; n = len(arr)
-            sums = []
-            for i in range(n - w * 2, n - w + 1):
-                if i >= 0:
-                    sums.append(sum(arr[i:i + w]))
-            if len(sums) < 5: return 0.0
-            recent_sum = sum(arr[-w:])
-            mu  = sum(sums) / len(sums)
-            std = math.sqrt(sum((s-mu)**2 for s in sums)/max(len(sums)-1, 1))
+            # Build distribution of per-window CVD deltas
+            deltas = []
+            for i in range(1, n - w + 1):
+                start_val = arr[i - 1]
+                end_val   = arr[i + w - 1]
+                deltas.append(end_val - start_val)
+            if len(deltas) < 5:
+                return 0.0
+            # Most-recent window delta
+            recent_delta = arr[-1] - arr[max(0, n - w - 1)]
+            mu  = sum(deltas) / len(deltas)
+            std = math.sqrt(sum((d - mu) ** 2 for d in deltas) / max(len(deltas) - 1, 1))
             if std < 1e-12:
-                return _sigmoid(recent_sum / (abs(mu) + 1e-10), 0.5)
-            return _sigmoid((recent_sum - mu) / std, 0.7)
+                return _sigmoid(recent_delta / (abs(mu) + 1e-10), 0.5)
+            return _sigmoid((recent_delta - mu) / std, 0.7)
 
         # ── Path 2: Candle OHLCV fallback ────────────────────────────
         arr = list(self._deltas); n = len(arr)
@@ -970,10 +982,12 @@ class RegimeClassifier:
             adx_trending = False
 
         # ATR expansion score
-        # BUG FIX: original code used hist[-20:] which INCLUDES hist[-1] (current ATR)
-        # as part of the baseline mean.  Dividing current by a mean that already
-        # contains current understates expansion (self-reference bias).
-        # Fix: use hist[-21:-1] — the 20 bars BEFORE the current bar.
+        # BUG-ATR-EXPANSION-SELF-REF FIX: the old code used hist[-20:] which
+        # INCLUDES hist[-1] (current ATR value) in the baseline mean.  This
+        # creates a self-reference: dividing current ATR by a mean that already
+        # contains it always understates true expansion (ratio drifts toward 1.0).
+        # Fix: use hist[-21:-1] — the 20 bars BEFORE the current bar — as the
+        # baseline, matching standard ATR-expansion calculation practice.
         hist = list(atr._atr_hist)
         expansion = 1.0
         if len(hist) >= 21:
@@ -981,8 +995,7 @@ class RegimeClassifier:
             if baseline > 1e-10:
                 expansion = hist[-1] / baseline
         elif len(hist) >= 2:
-            # Not enough history for a full 20-bar baseline — use what we have,
-            # still excluding the current value.
+            # Insufficient history for a full 20-bar baseline — use prior bars only
             prior = hist[:-1]
             baseline = sum(prior) / len(prior)
             if baseline > 1e-10:
@@ -2542,13 +2555,12 @@ class HTFTrendFilter:
                     score -= 0.15
                 elif trend == "bearish":
                     score += 0.15
-        elif tf_struct.choch_level > 0 and tf_struct.choch_bar_index < 0:
-            # Legacy TFStructure with no bar index (e.g. loaded from old state):
-            # apply conservatively — assume recent.
-            if trend == "bullish":
-                score -= 0.15
-            elif trend == "bearish":
-                score += 0.15
+        # BUG-STALE-CHOCH FIX: when choch_bar_index == -1 (no bar index, e.g. old
+        # serialised state) we have no way to know how stale this CHoCH is.
+        # Applying it unconditionally can permanently soften an established HTF
+        # score by ±0.15 — enough to flip the veto threshold on the 15m TF.
+        # Resolution: skip CHoCH entirely when the bar index is unavailable.
+        # The swing trend (±0.60) and BOS (±0.25) are sufficient without it.
         return max(-1.0, min(1.0, score))
 
     def update(self, candles_15m, candles_4h, atr_5m, ict_engine=None):
