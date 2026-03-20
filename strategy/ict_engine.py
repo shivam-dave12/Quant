@@ -701,6 +701,9 @@ class ICTEngine:
                              base_str=97.0, max_age=self.DAILY_OB_MAX_AGE_MS)
 
         # ── Fair Value Gaps — key timeframes ──────────────────────────
+        # 1m: micro-FVGs for structure in ranging markets (short life)
+        if candles_1m and len(candles_1m) >= 5:
+            self._detect_fvgs(candles_1m[-60:], "1m", price, now_ms, 1_800_000)  # 30 min
         self._detect_fvgs(candles_5m, "5m", price, now_ms, self.OB_MAX_AGE_MS)
         if len(candles_15m) >= 5:
             self._detect_fvgs(candles_15m, "15m", price, now_ms, self.OB_MAX_AGE_MS * 2)
@@ -1225,7 +1228,11 @@ class ICTEngine:
         """
         if len(candles) < 3:
             return
-        min_sz = price * self.FVG_MIN_SIZE_PCT / 100.0
+        # TF-adaptive minimum gap size: lower TFs need smaller threshold
+        # to detect micro-FVGs in ranging markets.  HTFs need larger to
+        # filter noise.  Base = FVG_MIN_SIZE_PCT (0.020% = ~$14 on BTC).
+        _tf_mult = {"1m": 0.40, "5m": 0.70, "15m": 1.0, "1h": 1.2, "4h": 1.5, "1d": 2.0}
+        min_sz = price * self.FVG_MIN_SIZE_PCT / 100.0 * _tf_mult.get(tf, 1.0)
         tol    = min_sz * 0.5
 
         for i in range(1, len(candles) - 1):
@@ -2384,7 +2391,12 @@ class ICTEngine:
                         if (ob.midpoint >= _amd_sweep_origin and
                                 ob.midpoint <= _upper):
                             continue   # bear OB inside LONG delivery corridor
-                rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)))
+                # Visit discount: each time an OB was tested and HELD, the reversal
+                # risk decreases.  A 4H bear OB visited 2× in a ranging market is the
+                # range ceiling — price bounces off it but doesn't break.  In ICT terms,
+                # virgin OBs (visit=0) have highest reversal conviction.
+                visit_discount = max(0.40, 1.0 - ob.visit_count * 0.25)
+                rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)) * visit_discount)
         out.htf_reversal_risk = min(1.0, rev_risk)
 
         # Judas swing active?

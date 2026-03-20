@@ -3540,7 +3540,7 @@ class QuantStrategy:
                             _disp_rev_risk      = _rc.htf_reversal_risk
                             _disp_rev_zone_near = (
                                 getattr(_rc, 'judas_swing_active', False) or
-                                _rc.htf_reversal_risk > 0.55
+                                _rc.htf_reversal_risk > (0.90 if sig.adx < 25.0 else 0.55)
                             )
                             _disp_chain_score   = sig.ict_chain_score  # chain = AMD side, unchanged
                             _disp_ssl_atr       = _rc.nearest_ssl_dist_atr
@@ -3771,14 +3771,14 @@ class QuantStrategy:
                     if (not ap and
                             sig.ict_htf_rev_zone_near and
                             not _disp_is_ote and
-                            sig.ict_htf_reversal_risk > 0.55):
+                            sig.ict_htf_reversal_risk > (0.90 if sig.adx < 25.0 else 0.55)):
                         _ap_reason = (
                             f"HTF_REV_ZONE(risk={sig.ict_htf_reversal_risk:.2f},"
                             f"zone<1ATR)")
                 except Exception:
                     ap = False
             else:
-                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.40)
+                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.35)
                 ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
                       sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
                 # FIX Bug-3 (non-ICT path): same breakout gate
@@ -4248,9 +4248,18 @@ class QuantStrategy:
         # zone is within 1 ATR, price is likely to stall or reverse there.
         # Only block Tier-B entries — sweep setups (Tier-S/A) have their own
         # structural invalidation via the OTE zone.
+        #
+        # ADX-ADAPTIVE THRESHOLD: In ranging markets (ADX < 25), opposing OBs
+        # within 1 ATR are NORMAL — they are the range boundaries that price
+        # bounces between.  RevRisk 0.70-0.85 is typical ranging structure,
+        # not a genuine reversal threat.  Only extreme risk (>0.90) blocks.
+        # In trending markets (ADX >= 25), price is leaving these zones behind
+        # so even moderate risk (>0.55) is meaningful.
+        _adx_val = getattr(sig, 'adx', 25.0)
+        _rev_zone_threshold = 0.90 if _adx_val < 25.0 else 0.55
         if (sig.ict_htf_rev_zone_near and
                 not _is_ote_sweep and
-                sig.ict_htf_reversal_risk > 0.55):
+                sig.ict_htf_reversal_risk > _rev_zone_threshold):
             if now - self._last_ict_gate_log >= 30.0:
                 self._last_ict_gate_log = now
                 logger.info(

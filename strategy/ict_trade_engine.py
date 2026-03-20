@@ -1641,7 +1641,7 @@ class ICTEntryGate:
       → Expected edge: 48–54% win rate, 1:1.8–2.5 R:R
 
     BLOCKED:
-      • AMD ACCUMULATION conf ≥ 0.55 (market consolidating, no delivery)
+      • AMD ACCUMULATION conf ≥ 0.75 (high-confidence consolidation, no delivery)
       • AMD MANIPULATION without sweep setup (Judas swing active)
       • AMD DISTRIBUTION strongly opposing (high conf, wrong direction)
       • Regime invalid (ATR extreme)
@@ -1771,8 +1771,22 @@ class ICTEntryGate:
         if quant is not None and not regime_ok:
             return "BLOCKED", 0, "REGIME_INVALID(ATR_extreme)"
 
-        # AMD Accumulation = no sweep = no delivery — waiting for setup
-        if amd_phase == "ACCUMULATION" and amd_conf >= 0.55:
+        # AMD Accumulation = no sweep = no delivery — waiting for setup.
+        #
+        # CRITICAL FIX: ACCUMULATION only hard-blocks at HIGH confidence (≥0.75),
+        # which indicates genuine tight-range consolidation with no directional bias.
+        #
+        # At moderate confidence (0.55-0.75), ACCUMULATION typically means a previous
+        # sweep has aged past 90 minutes and AMD decayed back — this is NOT the same
+        # as "no edge exists."  Tier-S and Tier-A will fail naturally because they
+        # require _has_delivery_context (DISTRIBUTION/REACCUMULATION/REDISTRIBUTION).
+        # Tier-B does NOT require AMD delivery context — it's a quant-primary entry
+        # where ICT provides confluence but not the primary setup.
+        #
+        # Previous threshold of 0.55 blocked ALL entries (including Tier-B) whenever
+        # no sweep had occurred in the last 90 minutes — which in a ranging market
+        # (ADX<20) is most of the session.  Result: zero trades per session.
+        if amd_phase == "ACCUMULATION" and amd_conf >= 0.75:
             return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_delivery"
 
         # AMD Manipulation without a sweep setup = Judas swing still active
