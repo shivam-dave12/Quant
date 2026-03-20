@@ -757,7 +757,16 @@ class ICTTPEngine:
         if sl_dist < 1e-10:
             return None
 
-        if mode in ("trend", "momentum"):
+        # TP-BUG-4 FIX: Sweep OTE entries are DIRECTIONAL (AMD delivery move),
+        # not mean-reversion entries. Applying reversion R:R (max 4R) caps the
+        # delivery target when AMD is delivering 4-6R away — forcing the engine
+        # to either reject valid setups or use a worse structural level as TP.
+        # Fix: sweep mode inherits trend R:R (2.5R–6.0R).
+        _is_sweep = (sweep_setup is not None and
+                     sweep_setup.status in ("OTE_READY", "ACTIVE"))
+        effective_mode = "trend" if _is_sweep and mode == "reversion" else mode
+
+        if effective_mode in ("trend", "momentum"):
             min_rr = 2.5;  max_rr = 6.0
         else:
             min_rr = 1.8;  max_rr = 4.0
@@ -765,14 +774,23 @@ class ICTTPEngine:
         min_tp_dist = sl_dist * min_rr
         max_tp_dist = sl_dist * max_rr
 
+        # TP-BUG-3 FIX: AMD delivery targets are institutional — they represent
+        # WHERE smart money is delivering price after the sweep. Capping them at
+        # max_rr rejects valid targets just because they are far away.
+        # AMD delivery targets bypass the upper R:R cap (max 8R hard ceiling only).
+        amd_max_dist = sl_dist * 8.0
+
         if now_ms <= 0:
             now_ms = int(time.time() * 1000)
 
         scored: List[Tuple[float, float, str]] = []   # (price, score, label)
 
-        def _add(tp_cand: float, score: float, label: str):
+        def _add(tp_cand: float, score: float, label: str,
+                 bypass_max_rr: bool = False):
+            """Add a TP candidate. AMD delivery targets pass bypass_max_rr=True."""
             dist = (tp_cand - price) if side == "long" else (price - tp_cand)
-            if dist < min_tp_dist or dist > max_tp_dist:
+            upper_cap = amd_max_dist if bypass_max_rr else max_tp_dist
+            if dist < min_tp_dist or dist > upper_cap:
                 return
             if side == "long"  and tp_cand <= price:
                 return
@@ -780,10 +798,11 @@ class ICTTPEngine:
                 return
             scored.append((tp_cand, score, label))
 
-        # ── TIER-S: Sweep delivery target ─────────────────────────────────
+        # ── TIER-S: Sweep delivery target (BYPASSES max_rr — AMD delivery) ─
         if sweep_setup is not None and sweep_setup.delivery_target is not None:
             _add(sweep_setup.delivery_target, 8.0,
-                 f"AMD_DELIVERY {sweep_setup.delivery_target_label}")
+                 f"AMD_DELIVERY {sweep_setup.delivery_target_label}",
+                 bypass_max_rr=True)
 
         # AMD engine delivery target (may differ from sweep_setup)
         if ict_engine is not None:
@@ -791,7 +810,8 @@ class ICTTPEngine:
             if (amd.delivery_target is not None and
                     amd.confidence >= 0.55):
                 _add(amd.delivery_target, 7.5,
-                     f"AMD_target(conf={amd.confidence:.2f})")
+                     f"AMD_target(conf={amd.confidence:.2f})",
+                     bypass_max_rr=True)
 
         # ── TIER-A: Opposing unswept liquidity pools ───────────────────────
         if ict_engine is not None:
@@ -1058,13 +1078,25 @@ class ICTTrailEngine:
             except Exception:
                 pass
 
-        # ── FVG FREEZE (price inside active FVG, SL trailing near it) ─────
+        # ── FVG FREEZE (price inside active FVG in the delivery path) ─────
+        #
+        # TRAIL-BUG-4 FIX: original code used fvgs_bull for LONG and fvgs_bear
+        # for SHORT. This is WRONG. For a LONG position, price is travelling
+        # UPWARD — the imbalances it is filling along the way are BEARISH FVGs
+        # (created by prior downward impulses) that sit ABOVE entry. These are
+        # the ones price fills going up, and they act as consolidation/pause
+        # zones where the SL should NOT be tightened.
+        #
+        # ICT: FVG freeze applies when price enters a delivery-path imbalance:
+        #   LONG (price going up) → freeze at BEARISH FVGs above (fvgs_bear)
+        #   SHORT (price going down) → freeze at BULLISH FVGs below (fvgs_bull)
         if ict_engine is not None and be_locked and hold_seconds < 600.0:
             try:
-                fvgs = (ict_engine.fvgs_bull if pos_side == "long"
-                        else ict_engine.fvgs_bear)
+                # Delivery-path FVGs: opposite direction to position (filled in direction of move)
+                fvgs_delivery_path = (ict_engine.fvgs_bear if pos_side == "long"
+                                      else ict_engine.fvgs_bull)
                 freeze_atr = 0.40 * atr
-                for fvg in fvgs:
+                for fvg in fvgs_delivery_path:
                     if not fvg.is_active(now_ms):
                         continue
                     if fvg.fill_percentage > 0.40:
@@ -1079,7 +1111,7 @@ class ICTTrailEngine:
                         if hold_reason is not None:
                             hold_reason.append(
                                 f"FVG_FREEZE@${fvg.midpoint:.0f}"
-                                f"(fill={fvg.fill_percentage:.0%})")
+                                f"(fill={fvg.fill_percentage:.0%} delivery_path)")
                         return None
             except Exception:
                 pass
@@ -1106,24 +1138,41 @@ class ICTTrailEngine:
         candidates.append((pf, "PROFIT_FLOOR"))
 
         # 2. ICT OB anchor (all phases) — highest institutional validity
+        #
+        # TRAIL-BUG-1 FIX: original code sorted by abs(midpoint - price) and took
+        # the NEAREST OB. In ICT, once price has moved away from an OB, the trail SL
+        # should be anchored BELOW the HIGHEST OB that price has already left behind —
+        # i.e. the most recently cleared OB, which is the strongest structural floor.
+        # Sorting by midpoint ascending for long (highest low below price wins) and
+        # midpoint descending for short (lowest high above price wins).
         if phase >= 1 and ict_engine is not None:
             try:
                 ob_buf = 0.35 * atr
                 obs = (ict_engine.order_blocks_bull if pos_side == "long"
                        else ict_engine.order_blocks_bear)
-                for ob in sorted([o for o in obs if o.is_active(now_ms)],
-                                  key=lambda x: abs(x.midpoint - price)):
-                    if pos_side == "long":
+                active_obs = [o for o in obs if o.is_active(now_ms)]
+                if pos_side == "long":
+                    # Sort by OB low DESCENDING — highest OB below price first
+                    # (the most recent structural level price has moved above)
+                    candidate_obs = sorted(
+                        [o for o in active_obs if o.low < price - min_dist],
+                        key=lambda x: x.low, reverse=True)
+                    for ob in candidate_obs:
                         cand = ob.low - ob_buf
                         if current_sl < cand < price - min_dist:
                             candidates.append((cand,
-                                               f"OB_ANCHOR@${ob.midpoint:.0f}"))
+                                               f"OB_ANCHOR@${ob.midpoint:.0f}(tf={ob.timeframe})"))
                             break
-                    else:
+                else:
+                    # Sort by OB high ASCENDING — lowest OB above price first
+                    candidate_obs = sorted(
+                        [o for o in active_obs if o.high > price + min_dist],
+                        key=lambda x: x.high)
+                    for ob in candidate_obs:
                         cand = ob.high + ob_buf
                         if price + min_dist < cand < current_sl:
                             candidates.append((cand,
-                                               f"OB_ANCHOR@${ob.midpoint:.0f}"))
+                                               f"OB_ANCHOR@${ob.midpoint:.0f}(tf={ob.timeframe})"))
                             break
             except Exception:
                 pass
@@ -1193,17 +1242,24 @@ class ICTTrailEngine:
             except Exception:
                 pass
 
-        # 4. FVG fill trigger (immediate lock on 70%+ fill)
+        # 4. FVG fill trigger (immediate lock on 70%+ fill in delivery path)
+        #
+        # When a bearish FVG above price (LONG delivery path) is 70%+ filled,
+        # price has absorbed that imbalance — lock profit just beyond its far edge.
+        # Uses delivery-path FVGs: fvgs_bear for long (filled going up),
+        # fvgs_bull for short (filled going down).
         if ict_engine is not None:
             try:
-                fvgs_delivery = (ict_engine.fvgs_bull if pos_side == "long"
-                                 else ict_engine.fvgs_bear)
+                fvgs_delivery = (ict_engine.fvgs_bear if pos_side == "long"
+                                 else ict_engine.fvgs_bull)
                 for fvg in fvgs_delivery:
                     if not fvg.is_active(now_ms):
                         continue
                     if fvg.fill_percentage < 0.70:
                         continue
                     # FVG mostly filled — lock just beyond its far edge
+                    # LONG: FVG is above, filled going up → lock above fvg.top
+                    # SHORT: FVG is below, filled going down → lock below fvg.bottom
                     lock_level = (fvg.top + 0.20 * atr if pos_side == "long"
                                   else fvg.bottom - 0.20 * atr)
                     if pos_side == "long" and current_sl < lock_level < price - min_dist:
