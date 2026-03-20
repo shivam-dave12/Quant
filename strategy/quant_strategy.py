@@ -3353,8 +3353,10 @@ class QuantStrategy:
         # +0.10 to trend_score, enough to flip a borderline TREND_COMPOSITE_MIN check
         # and block a valid SHORT with no logged reason.
         # Replacement: ADX +DI/-DI spread — structural and candle-frequency stable.
-        # Normalised to [-1, +1] by dividing by 50 (DI values rarely exceed 50).
-        _di_spread = (self._adx.plus_di - self._adx.minus_di) / 50.0
+        # Normalised to [-1, +1] using the sum of both DI values as denominator
+        # (dynamic, avoids the arbitrary /50 that underweighted the signal).
+        _di_sum = max(self._adx.plus_di + self._adx.minus_di, 20.0)
+        _di_spread = (self._adx.plus_di - self._adx.minus_di) / _di_sum
         _di_spread = max(-1.0, min(1.0, _di_spread))
         htf_comp    = self._htf.trend_4h * 0.60 + self._htf.trend_15m * 0.40
         cvd_trend   = self._cvd.get_trend_signal()
@@ -4052,6 +4054,9 @@ class QuantStrategy:
             # PATH-A SL/TP logic in _compute_sl_tp. The ICTEntryGate tier
             # determines confirm ticks (Tier-S=1, Tier-A=2, Tier-B=3).
             self._confirm_trend_long = self._confirm_trend_short = 0
+            # Clear reversion counters too: stale sweep-direction confirmations
+            # must not carry over if the setup expires mid-confirmation.
+            self._confirm_long = self._confirm_short = 0
             self._evaluate_reversion_entry(
                 data_manager, order_manager, risk_manager, sig, price, now)
         elif self._breakout.is_active and self._breakout.retest_ready:
@@ -4213,6 +4218,7 @@ class QuantStrategy:
                 # (composite 0.05–0.15 less negative → systematically below ±0.30 gate).
                 _new_dir     = 1.0 if side == "long" else -1.0
                 _new_boost   = _recomp.total * 0.15 * _new_dir
+                _old_boost   = sig.ict_boost_signed  # snapshot before overwrite
                 _raw_comp    = getattr(sig, '_raw_composite', sig.composite - sig.ict_boost_signed)
                 sig.composite        = max(-1.0, min(1.0, _raw_comp + _new_boost))
                 sig.ict_boost_signed = _new_boost

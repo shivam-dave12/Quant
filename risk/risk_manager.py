@@ -158,10 +158,14 @@ class RiskManager:
 
         except Exception as e:
             logger.error(f"Error fetching balance: {e}", exc_info=True)
-            with self._lock:
-                self._balance_fetch_in_progress = False
             return {"available": _fallback_avail, "total": _fallback_total,
                     "cached": True, "error": str(e)}
+        finally:
+            # Guarantee flag reset regardless of exception path — prevents
+            # permanent stale-cache mode if the REST call throws or the
+            # process is interrupted between flag set and flag clear.
+            with self._lock:
+                self._balance_fetch_in_progress = False
 
 
     def calculate_position_size(
@@ -234,11 +238,16 @@ class RiskManager:
             # ── Step 1: Dollar risk budget ────────────────────────────
             # RISK_PER_TRADE is the % of balance we accept LOSING if SL fires.
             # e.g. RISK_PER_TRADE=0.60 → risk $6 on a $1000 balance.
-            # BALANCE_USAGE_PERCENTAGE is a margin/capital allocation cap used
-            # only in Step 3, NOT as the risk input here.
+            # MAX_MARGIN_PER_TRADE is a capital allocation cap (Step 3), NOT a
+            # risk budget limit. Clamping dollar_risk by MAX_MARGIN confuses
+            # "how much I can lose" with "how much exchange holds as collateral".
             dollar_risk = available * (config.RISK_PER_TRADE / 100)
-            dollar_risk = max(config.MIN_MARGIN_PER_TRADE,
-                              min(dollar_risk, config.MAX_MARGIN_PER_TRADE))
+            # Floor only: ensure minimum viable trade size
+            dollar_risk = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
+            # Ceiling: cap at a sensible multiple of the risk percentage
+            # to prevent extreme sizing on very wide SLs
+            max_dollar_risk = available * (min(config.RISK_PER_TRADE * 3, 5.0) / 100)
+            dollar_risk = min(dollar_risk, max_dollar_risk)
 
             # ── Step 2: Risk-based notional + qty ─────────────────────
             # If we risk $dollar_risk at sl_pct, we can hold this notional:

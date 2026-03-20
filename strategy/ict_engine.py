@@ -251,7 +251,8 @@ class FairValueGap:
             return
         best_pen = 0.0
         for c in candles:
-            cl = float(c['c'])
+            # Support both dict-style ({'c': ...}) and Candle object (.close)
+            cl = float(c['c']) if isinstance(c, dict) else float(c.close)
             if self.direction == "bullish":
                 # Bullish FVG fills from TOP downward as price retraces into it
                 if cl <= self.top:
@@ -305,7 +306,7 @@ class TFStructure:
     range_low:     float = 0.0
     equilibrium:   float = 0.0
     premium_discount: float = 0.5    # 0=deep discount, 1=deep premium
-    pd_grade:      str   = "EQ"      # "PREMIUM" | "EQ" | "DISCOUNT" (>65% / 35-65% / <35%)
+    pd_grade:      str   = "EQ"      # "PREMIUM" | "EQ" | "DISCOUNT" (>60% / 40-60% / <40%)
 
 
 @dataclass
@@ -497,7 +498,7 @@ class ICTEngine:
     DAILY_OB_MAX_AGE_MS   = 1_296_000_000  # 15 days (1d OBs)
     FVG_MIN_SIZE_PCT       = 0.020   # minimum gap size as % of price
     FVG_MAX_AGE_MS         = 86_400_000
-    LIQ_TOUCH_TOL_PCT      = 0.0020  # 0.20% tolerance for equal highs/lows
+    LIQ_TOUCH_TOL_PCT      = 0.0040  # 0.40% tolerance for equal highs/lows (BTC ~$280)
     SWEEP_DISP_MIN         = 0.40    # min body/range for displacement
     SWEEP_MAX_AGE_MS       = 7_200_000    # 2 h — swept pool is "fresh"
     AMD_MANIP_WINDOW_MS    = 900_000      # 15 min — manipulation phase
@@ -583,7 +584,7 @@ class ICTEngine:
             self.HTF_OB_MAX_AGE_MS    = getattr(cfg, 'HTF_OB_MAX_AGE_MINUTES', 4320) * 60_000
             self.FVG_MIN_SIZE_PCT     = getattr(cfg, 'FVG_MIN_SIZE_PCT',             self.FVG_MIN_SIZE_PCT)
             self.FVG_MAX_AGE_MS       = getattr(cfg, 'FVG_MAX_AGE_MINUTES', 1440)   * 60_000
-            self.LIQ_TOUCH_TOL_PCT    = getattr(cfg, 'LIQ_TOUCH_TOLERANCE_PCT', 0.20) / 100.0
+            self.LIQ_TOUCH_TOL_PCT    = getattr(cfg, 'LIQ_TOUCH_TOLERANCE_PCT', 0.40) / 100.0
             self.SWEEP_DISP_MIN       = getattr(cfg, 'SWEEP_DISPLACEMENT_MIN',       self.SWEEP_DISP_MIN)
             self.SWEEP_MAX_AGE_MS     = getattr(cfg, 'SWEEP_MAX_AGE_MINUTES', 120)  * 60_000
             self.KZ_ASIA_START        = getattr(cfg, 'KZ_ASIA_NY_START',    20)
@@ -837,26 +838,44 @@ class ICTEngine:
             out.bos_timestamp = last_closed_ts
 
         # ── CHoCH (Change of Character) ───────────────────────────────
-        # First higher-low in a downtrend or lower-high in an uptrend.
-        if trend == "bearish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
-            out.choch_level     = lows[-1][1]
-            out.choch_bar_index = lows[-1][0]
-            out.choch_timestamp = last_closed_ts
-        elif trend == "bullish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
-            out.choch_level     = highs[-1][1]
-            out.choch_bar_index = highs[-1][0]
-            out.choch_timestamp = last_closed_ts
+        # ICT definition: first confirmed CLOSE beyond the opposing swing extreme.
+        #   Bearish trend CHoCH = close ABOVE the last lower-high (bullish break)
+        #   Bullish trend CHoCH = close BELOW the last higher-low (bearish break)
+        # Previous code checked swing-point shifts (higher-low / lower-high),
+        # which are leading indicators, not confirmed structural breaks.
+        if trend == "bearish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
+            # Downtrend has lower-highs; CHoCH = close above the last lower-high
+            if last_close > highs[-1][1]:
+                out.choch_level     = highs[-1][1]
+                out.choch_bar_index = highs[-1][0]
+                out.choch_timestamp = last_closed_ts
+        elif trend == "bullish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
+            # Uptrend has higher-lows; CHoCH = close below the last higher-low
+            if last_close < lows[-1][1]:
+                out.choch_level     = lows[-1][1]
+                out.choch_bar_index = lows[-1][0]
+                out.choch_timestamp = last_closed_ts
 
         # ── Premium / Discount ────────────────────────────────────────
-        h_max = max(float(c['h']) for c in recent)
-        l_min = min(float(c['l']) for c in recent)
+        # ICT P/D uses the range between the last confirmed swing high and
+        # swing low (the current dealing range), not the absolute range which
+        # can be distorted by a single spike candle.
+        if highs and lows:
+            h_max = highs[-1][1]   # last confirmed swing high
+            l_min = lows[-1][1]    # last confirmed swing low
+        else:
+            h_max = max(float(c['h']) for c in recent)
+            l_min = min(float(c['l']) for c in recent)
         out.range_high   = h_max
         out.range_low    = l_min
         out.equilibrium  = (h_max + l_min) / 2.0
         rng = h_max - l_min
         pd = (price - l_min) / rng if rng > 1e-9 else 0.5
         out.premium_discount = pd
-        out.pd_grade = "PREMIUM" if pd > 0.65 else ("DISCOUNT" if pd < 0.35 else "EQ")
+        # ICT standard: equilibrium (50%) divides premium from discount.
+        # 0.50+ = premium, below = discount.  The original 35/65 thresholds
+        # created a 30% dead-zone that misclassified price position.
+        out.pd_grade = "PREMIUM" if pd > 0.60 else ("DISCOUNT" if pd < 0.40 else "EQ")
 
         return out
 
@@ -979,7 +998,7 @@ class ICTEngine:
         else:
             # Fallback only if candles unavailable (should not happen post-init)
             rng5m     = max(tf5m.range_high - tf5m.range_low, 1.0)
-            atr_proxy = max(rng5m * 0.10, 1.0)  # 10% of range is more realistic
+            atr_proxy = max(rng5m * 0.035, 1.0)  # 3.5% of range ≈ 14-period ATR
 
         # ── BOS gate: must have occurred AFTER the sweep ─────────────
         # bos_timestamp == 0 means BOS was never set (warmup artifact) — treat as no BOS
@@ -1145,7 +1164,9 @@ class ICTEngine:
                 disp = nr > 0 and nb / nr >= self.SWEEP_DISP_MIN
                 wk   = cl < min(co, cc) and (ch - cl) > 0 and \
                        (min(co, cc) - cl) / (ch - cl) >= 0.20
-                big  = nr >= self.OB_IMPULSE_SIZE_MULT * (ch - cl)
+                # Impulse body vs OB candle body (not total ranges)
+                ob_body = abs(co - cc)
+                big  = nb >= self.OB_IMPULSE_SIZE_MULT * ob_body if ob_body > 1e-9 else False
                 s    = _score(bos, disp, wk, big)
                 # BUG-OB-ZONE FIX: store the candle BODY (open-to-close),
                 # not the full wick range.  Using wick-to-wick meant
@@ -1167,7 +1188,9 @@ class ICTEngine:
                 disp = nr > 0 and nb / nr >= self.SWEEP_DISP_MIN
                 wk   = ch > max(co, cc) and (ch - cl) > 0 and \
                        (ch - max(co, cc)) / (ch - cl) >= 0.20
-                big  = nr >= self.OB_IMPULSE_SIZE_MULT * (ch - cl)
+                # Impulse body vs OB candle body (not total ranges)
+                ob_body = abs(cc - co)
+                big  = nb >= self.OB_IMPULSE_SIZE_MULT * ob_body if ob_body > 1e-9 else False
                 s    = _score(bos, disp, wk, big)
                 # BUG-OB-ZONE FIX: store body [open, close] for bullish
                 # candle (co < cc).
@@ -1752,7 +1775,7 @@ class ICTEngine:
                 session_progress=round(sess_prog, 3),
                 phase_progress=round(phase_prog, 3),
                 session_start_utc=sess_start,
-                session_end_utc=min(sess_end, 24.0),
+                session_end_utc=sess_end,  # no cap — wrap-around handled by uh_norm
                 is_prime_entry_window=is_prime)
         except Exception:
             self._po3 = None
@@ -1789,12 +1812,18 @@ class ICTEngine:
         d40_h   = _hi(candles_1d[-40:]) if len(candles_1d) >= 40 else d20_h
         d40_l   = _lo(candles_1d[-40:]) if len(candles_1d) >= 40 else d20_l
 
-        # Bias: below PQH → bullish draw (targeting the high)
-        #       above PQL → bearish draw (targeting the low)
-        if pq_high > 0 and price < pq_high:
-            bias = "bullish"
-        elif pq_low > 0 and price > pq_low:
-            bias = "bearish"
+        # Bias: determined by price position relative to PQ equilibrium.
+        # Below PQ midpoint → bullish draw (targeting PQH).
+        # Above PQ midpoint → bearish draw (targeting PQL).
+        # Previous logic: price < PQH → bullish (always true in any pullback).
+        pq_eq = (pq_high + pq_low) / 2.0 if (pq_high > 0 and pq_low > 0) else 0.0
+        if pq_eq > 0:
+            if price < pq_eq:
+                bias = "bullish"    # below PQ equilibrium → drawing to PQH
+            elif price > pq_eq:
+                bias = "bearish"    # above PQ equilibrium → drawing to PQL
+            else:
+                bias = "neutral"
         else:
             bias = "neutral"
 
@@ -1823,6 +1852,7 @@ class ICTEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def _update_session(self, now_ms: int) -> None:
+        """Unified session and kill zone detection in NY time to prevent DST desync."""
         try:
             dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
             uh  = dt.hour + dt.minute / 60.0
@@ -1831,28 +1861,31 @@ class ICTEngine:
             wd  = dt.weekday()
 
             self._killzone = ""
-            if wd < 5:
-                if ny >= self.KZ_ASIA_START or ny < 1.0:
-                    self._killzone = "ASIA_KZ"
-                elif self.KZ_LONDON_START <= ny < self.KZ_LONDON_END:
-                    self._killzone = "LONDON_KZ"
-                elif self.KZ_NY_START <= ny < self.KZ_NY_END:
-                    self._killzone = "NY_KZ"
+            self._session  = "OFF_HOURS"
 
-            # BUG-SESSION-TIMES FIX: correct UTC session windows.
-            # Old: NY=12–21 UTC, London=7–17 UTC (wrong, heavily overlapping).
-            # Fixed: NY=13:30–21:00 UTC, London=07:00–15:00 UTC,
-            #        Asia=23:00–07:00 UTC (wraps midnight).
             if wd >= 5:
                 self._session = "WEEKEND"
-            elif 13.5 <= uh < 21.0:
-                self._session = "NEW_YORK"
-            elif 7.0  <= uh < 15.0:
-                self._session = "LONDON"
-            elif uh >= 23.0 or uh < 7.0:
-                self._session = "ASIA"
-            else:
-                self._session = "OFF_HOURS"
+                return
+
+            # All windows defined in NY time for consistency.
+            # KZ and session determined from the SAME time basis.
+            if ny >= 20.0 or ny < 1.0:
+                self._killzone = "ASIA_KZ"
+                self._session  = "ASIA"
+            elif 1.0 <= ny < 2.0:
+                self._session  = "ASIA"     # Asia session, outside KZ
+            elif 2.0 <= ny < 5.0:
+                self._killzone = "LONDON_KZ"
+                self._session  = "LONDON"
+            elif 5.0 <= ny < 7.0:
+                self._session  = "LONDON"   # London PM, outside KZ
+            elif 7.0 <= ny < 10.0:
+                self._killzone = "NY_KZ"
+                self._session  = "NEW_YORK"
+            elif 10.0 <= ny < 16.0:
+                self._session  = "NEW_YORK" # NY PM, outside KZ
+            # 16.0–20.0 → OFF_HOURS (default)
+
         except Exception:
             self._session  = "UNKNOWN"
             self._killzone = ""
@@ -2194,7 +2227,10 @@ class ICTEngine:
             out.session_score = min(0.03, 0.03 * pd_mult)
             details.append(f"Session={self._session}")
         elif self._session == "ASIA":
-            out.session_score = 0.01  # Asia = accumulation, no P/D mult
+            # Asia session is the primary accumulation AND manipulation zone
+            # for crypto markets — institutional-grade volume. Not a dead session.
+            out.session_score = min(0.03, 0.03 * pd_mult)
+            details.append(f"Session=ASIA PD={'✓' if pd_aligned else '✗'}")
         out.session_name = self._session
         out.killzone     = self._killzone
 

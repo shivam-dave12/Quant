@@ -1699,7 +1699,7 @@ class ICTEntryGate:
             sweep_setup.side == side and
             sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
         )
-        _ict_bar = 0.55 if _has_sweep_cover else 0.65
+        _ict_bar = 0.50 if _has_sweep_cover else 0.58
         if ict_total < _ict_bar:
             return False
 
@@ -1708,7 +1708,9 @@ class ICTEntryGate:
             return False
 
         # 15m must not be at extremes — the distribution/accumulation window is closed
-        _HTF_EXTREME_THRESHOLD = 0.55
+        # 0.70 = genuine structural extreme. The previous 0.55 threshold was too tight
+        # and blocked entries in normal ranging markets where 15m reads ±0.55-0.65.
+        _HTF_EXTREME_THRESHOLD = 0.70
         if side == "short" and htf_15m >= _HTF_EXTREME_THRESHOLD:
             return False
         if side == "long"  and htf_15m <= -_HTF_EXTREME_THRESHOLD:
@@ -1752,6 +1754,16 @@ class ICTEntryGate:
         # the 4H bias is already captured inside htf_veto (vetoes_trade fires
         # when both 15m AND 4h oppose). Only the 15m extreme check is needed.
         htf_15m     = quant.htf_15m             if quant is not None else 0.0
+        _adx        = quant.adx                 if quant is not None else 25.0
+
+        # ADX-AWARE HTF VETO: In ranging markets (ADX < 20), HTF "trend" signals
+        # are structure noise — the 15m/4H have no directional conviction.
+        # Treating them as hard vetoes blocks every entry in exactly the market
+        # condition (range-bound) where mean-reversion is the correct strategy.
+        # Downgrade HTF veto to a soft penalty when ADX proves no real trend.
+        if htf_veto and _adx < 20.0:
+            htf_veto = False   # Tier-A/B: HTF becomes advisory, not blocking
+            # (structure alignment still benefits scoring — just not a hard gate)
 
         # ── HARD BLOCKED conditions (no trade regardless of tier) ─────────
 
@@ -1880,7 +1892,7 @@ class ICTEntryGate:
         # P/D gate added: Tier-B entries require correct zone same as Tier-A.
         # LONG must NOT be in premium (4H PD > 60%); SHORT must NOT be in discount.
         _tier_b_conditions = (
-            ict_total >= 0.40 and
+            ict_total >= 0.35 and    # ICT provides directional context, quant is the edge
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
@@ -1907,8 +1919,8 @@ class ICTEntryGate:
                     "_no_delivery_context")
             else:
                 block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
-        if ict_total < 0.40:
-            block_reasons.append(f"ICT={ict_total:.2f}<0.40")
+        if ict_total < 0.35:
+            block_reasons.append(f"ICT={ict_total:.2f}<0.35")
         if _tf_opposes_tier_a:
             _tf_val = quant.tick_flow if quant else 0.0
             _tf_thr = 0.60 if htf_veto else 0.30
@@ -1931,7 +1943,7 @@ class ICTEntryGate:
                 sweep_setup.side == side and
                 sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
             )
-            _eff_bar = 0.55 if _has_sweep_cover else 0.65
+            _eff_bar = 0.50 if _has_sweep_cover else 0.58
             if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
                 block_reasons.append(
                     f"HTF_VETO+phase={amd_phase}(no_counter_htf_unlock)")
@@ -1943,9 +1955,9 @@ class ICTEntryGate:
                 block_reasons.append(
                     f"HTF_VETO+AMD_conf={amd_conf:.2f}<0.60(counter_htf_bar)")
             else:
-                _extreme_str = (f"{htf_15m:+.2f}≥+0.55"
+                _extreme_str = (f"{htf_15m:+.2f}≥+0.70"
                                 if side == "short"
-                                else f"{htf_15m:+.2f}≤-0.55")
+                                else f"{htf_15m:+.2f}≤-0.70")
                 block_reasons.append(
                     f"HTF_VETO+15m_extreme({_extreme_str}_dist_window_closed)")
         if not q_overext and ict_total < 0.55:

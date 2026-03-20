@@ -68,8 +68,13 @@ class CandleDict:
         self._candle = candle
 
     def __getitem__(self, key: str):
+        # Auto-detect: if timestamp < 1e12 it's seconds, convert to ms.
+        # If already ms, use as-is. Prevents nanosecond overflow when
+        # exchanges return timestamps in different units.
+        _raw_ts = self._candle.timestamp
+        _ts_ms = int(_raw_ts * 1000) if _raw_ts < 1e12 else int(_raw_ts)
         mapping = {
-            "t": int(self._candle.timestamp * 1000),
+            "t": _ts_ms,
             "o": self._candle.open,
             "h": self._candle.high,
             "l": self._candle.low,
