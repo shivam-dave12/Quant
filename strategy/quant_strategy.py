@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging, math, time, threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
@@ -2761,13 +2761,26 @@ class PositionState:
 # DAILY RISK GATE with consecutive loss lockout
 # ═══════════════════════════════════════════════════════════════
 class DailyRiskGate:
+    # BUG-TZ FIX: Trading day boundary must be midnight IST (UTC+5:30), not
+    # midnight UTC.  date.today() on a cloud server (UTC) flips at midnight
+    # UTC = 05:30 IST.  A trade opening at 05:29 IST has record_trade_start()
+    # increment day N; if it closes at 05:31 IST, _reset_if_new_day() fires
+    # first (UTC midnight passed), zeroes _daily_pnl, then record_trade_result()
+    # adds PnL to day N+1.  Day N: trades=1 pnl=0. Day N+1: trades=0 pnl=+X.
+    # The daily loss cap is also corrupted.  Fix: IST-aware date comparison.
+    _IST = timezone(timedelta(hours=5, minutes=30))
+
+    @staticmethod
+    def _today_ist() -> date:
+        return datetime.now(DailyRiskGate._IST).date()
+
     def __init__(self):
-        self._today = date.today(); self._daily_trades = 0; self._consec_losses = 0
+        self._today = self._today_ist(); self._daily_trades = 0; self._consec_losses = 0
         self._daily_pnl = 0.0; self._daily_open_bal = 0.0
         self._loss_lockout_until = 0.0; self._lock = threading.Lock()
 
     def _reset_if_new_day(self):
-        today = date.today()
+        today = self._today_ist()
         if today != self._today:
             self._today = today; self._daily_trades = 0; self._daily_pnl = 0.0
             self._daily_open_bal = 0.0; self._consec_losses = 0; self._loss_lockout_until = 0.0

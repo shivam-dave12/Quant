@@ -372,9 +372,9 @@ class TelegramBotController:
                           (htf_15m < -veto_both and htf_4h < -veto_both))
 
             if veto_short and not veto_long:
-                htf_verdict = f"❌ VETOING SHORT  (15m={htf_15m:+.2f} >{veto_15m:+.2f})"
+                htf_verdict = f"❌ VETOING SHORT  (15m={htf_15m:+.2f} &gt;{veto_15m:+.2f})"
             elif veto_long and not veto_short:
-                htf_verdict = f"❌ VETOING LONG   (15m={htf_15m:+.2f} <{-veto_15m:+.2f})"
+                htf_verdict = f"❌ VETOING LONG   (15m={htf_15m:+.2f} &lt;{-veto_15m:+.2f})"
             elif veto_short and veto_long:
                 htf_verdict = f"❌ VETOING BOTH   (15m={htf_15m:+.2f} 4h={htf_4h:+.2f})"
             else:

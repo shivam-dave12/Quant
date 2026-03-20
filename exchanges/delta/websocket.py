@@ -656,8 +656,9 @@ class DeltaWebSocket:
         }
 
     @staticmethod
-    def _parse_candle_interval(channel: str) -> str:
-        """Extract interval string from channel name, e.g. 'candlestick_5m:BTCUSDT' → '5'"""
+    def _parse_candle_interval(channel: str) -> Optional[str]:
+        """Extract interval string from channel name, e.g. 'candlestick_5m:BTCUSDT' → '5'.
+        Returns None on any parse failure — callers must guard against None."""
         # Channel format: candlestick_Xm:SYMBOL or candlestick_1h:SYMBOL
         try:
             part = channel.split(":")[0]          # e.g. 'candlestick_5m'
@@ -672,7 +673,8 @@ class DeltaWebSocket:
                 return str(int(suffix[:-1]) * 10080)
         except Exception:
             pass
-        return "1"
+        logger.warning(f"WS: unrecognised candle channel '{channel}' — skipping")
+        return None
 
     # =========================================================================
     # PUBLIC CHANNEL SUBSCRIPTIONS
