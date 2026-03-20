@@ -2166,12 +2166,33 @@ class ICTEngine:
         )
         out.mtf_ob_count = htf_ob_count
 
-        # MTF FVG stack: count TFs with unfilled FVG containing current price
+        # MTF FVG stack — SYNC FIX: must match EXACTLY what the FVG score counts.
+        #
+        # Root cause of "FVG=0.67 but Stack:0FVG" contradiction:
+        #   Scoring counted proximity FVGs (fvg.top < price within FVG_PROXIMITY_ATR).
+        #   Stack counted only is_price_in_gap() — a DIFFERENT, tighter membership test.
+        #   When price moved slightly above the FVG gap (proximity zone), score stayed
+        #   at 0.67 but stack dropped to 0. These two must use identical criteria.
+        #
+        # Fix: count any FVG that EITHER contains price OR is within proximity window,
+        # matching the scoring logic exactly. Fill threshold corrected to 0.50
+        # (ICT mitigation = 50% fill, same as update_fill() marks filled=True).
+        _fvg_stack = 0
         fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
-        out.fvg_stack_count = sum(
-            1 for f in fvgs_dir
-            if f.is_active(now_ms) and f.is_price_in_gap(price) and f.fill_percentage < 0.40
-        )
+        for _f in fvgs_dir:
+            if not _f.is_active(now_ms) or _f.fill_percentage >= 0.50:
+                continue
+            if _f.is_price_in_gap(price):
+                _fvg_stack += 1
+            elif atr > 1e-10:
+                # Proximity check: matches the scoring branch exactly
+                if side == "long" and _f.top < price:
+                    if (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
+                        _fvg_stack += 1
+                elif side == "short" and _f.bottom > price:
+                    if (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
+                        _fvg_stack += 1
+        out.fvg_stack_count = _fvg_stack
 
         # PD matrix string
         pdm = self.get_pd_matrix(price, now_ms)
@@ -2739,7 +2760,7 @@ class ICTEngine:
                 # Bonus: FVG overlap with this OB (PD array stacking)
                 fvg_pool = self.fvgs_bull if direction == "long" else self.fvgs_bear
                 fvg_overlap = any(
-                    f.is_active(now_ms) and f.fill_percentage < 0.40 and
+                    f.is_active(now_ms) and f.fill_percentage < 0.50 and
                     f.bottom <= ob.high and f.top >= ob.low
                     for f in fvg_pool)
                 if fvg_overlap:

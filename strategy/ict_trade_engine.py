@@ -298,6 +298,8 @@ class ICTSweepDetector:
 
         if sweep_candle_extreme is None:
             # Use approximation from pool price + ATR if candles not available
+            # Track that we're using approximation — OTE guards will be looser
+            _geometry_approx = True
             sweep_candle_extreme = (latest_sweep.price - 0.3 * atr
                                     if side == "long"
                                     else latest_sweep.price + 0.3 * atr)
@@ -309,6 +311,8 @@ class ICTSweepDetector:
                 disp_high  = latest_sweep.price
                 disp_low   = latest_sweep.price - 2.0 * atr
                 disp_close = latest_sweep.price - 1.5 * atr
+        else:
+            _geometry_approx = False
 
         # Compute OTE zone (61.8%–78.6% retracement of displacement impulse)
         #
@@ -345,33 +349,49 @@ class ICTSweepDetector:
             sl_sweep = sweep_candle_extreme + 0.08 * atr
             sl_ob    = disp_high + 0.15 * atr
 
-        # BUG-OTE-ASYMMETRIC-GUARD FIX: the old code only checked one boundary
-        # direction per side:
-        #   LONG  only checked: price > ote_high (price too far above)
-        #   SHORT only checked: price < ote_low  (price too far below)
-        # This allowed setups to be built (and immediately expired) when price
-        # had already blown THROUGH the OTE in the retracement direction — the
-        # exact case that drives the log-spam loop in the original code.
-        # Fixed: check BOTH boundaries for both sides before building a setup.
+        # OTE guard: check both boundaries before building setup.
+        #
+        # BUG-OTE-APPROX-GUARD FIX: when displacement geometry is approximated
+        # (no real candle data found), the OTE zone is constructed from a fixed
+        # 2.0×ATR estimate which may not reflect reality. The approximated OTE
+        # for SSL@$70,795 with ATR=141 gives ote_low≈$70,822 — but price at
+        # $70,215 is ~$600 below that, causing IMMEDIATE blacklisting even though
+        # price is still in a perfectly valid retracement zone below the sweep.
+        #
+        # Rule: for APPROXIMATED geometry, the only hard invalidation is price
+        # dropping BELOW the sweep wick (sweep_candle_extreme) by more than
+        # 1.0×ATR — meaning institutional structure has genuinely broken.
+        # The upper guard (price too far above OTE) remains strict either way.
         _half_atr = 0.5 * atr
         if side == "long":
             if price > ote_high + _half_atr:
                 # Price never pulled back to OTE — entry missed
                 self._expired_sweep_keys.add(_sweep_key)
                 return None
-            if price < ote_low - _half_atr:
-                # Price blew through OTE downward — invalidated
-                self._expired_sweep_keys.add(_sweep_key)
-                return None
+            if _geometry_approx:
+                # Loose lower guard: only invalidate if price is below sweep wick
+                if price < sweep_candle_extreme - 1.0 * atr:
+                    self._expired_sweep_keys.add(_sweep_key)
+                    return None
+            else:
+                if price < ote_low - _half_atr:
+                    # Price blew through OTE downward — invalidated
+                    self._expired_sweep_keys.add(_sweep_key)
+                    return None
         else:  # short
             if price < ote_low - _half_atr:
                 # Price never rallied to OTE — entry missed
                 self._expired_sweep_keys.add(_sweep_key)
                 return None
-            if price > ote_high + _half_atr:
-                # Price rallied through OTE upward — invalidated
-                self._expired_sweep_keys.add(_sweep_key)
-                return None
+            if _geometry_approx:
+                if price > sweep_candle_extreme + 1.0 * atr:
+                    self._expired_sweep_keys.add(_sweep_key)
+                    return None
+            else:
+                if price > ote_high + _half_atr:
+                    # Price rallied through OTE upward — invalidated
+                    self._expired_sweep_keys.add(_sweep_key)
+                    return None
 
         # Find 15m swing SL fallback
         sl_15m = self._find_15m_swing_sl(side, price, atr, candles_15m)
