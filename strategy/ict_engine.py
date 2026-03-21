@@ -2602,26 +2602,16 @@ class ICTEngine:
         """
         Block trailing SL from crossing fresh virgin ICT structure.
 
-        v5.1 — Pure structural overrides (no time-based decay):
+        Structural relaxation (pure structure, no timers):
+          - OBs visited 2+ times have been structurally tested — not virgin.
+          - FVGs 50%+ filled have had their imbalance absorbed.
 
-          1. STRUCTURAL TEST RELAXATION: OBs with visit_count >= 2 have been
-             structurally tested by price. A tested OB is no longer "virgin" in
-             any institutional sense — the market has shown it can trade through
-             that zone. Relax from visit_count > 1 to visit_count > 2.
-
-          2. FVG FILL RELAXATION: FVGs that are 50%+ filled have had their
-             imbalance substantially absorbed. They no longer represent a
-             meaningful structural barrier.
-
-        Note: BOS override and R-multiple override are handled by the CALLER
-        (ICTTrailEngine.compute) which skips this function entirely when those
-        conditions are met. This keeps the path-check logic purely about OB/FVG
-        structure without needing to know about R-multiples.
+        BOS override and R-multiple override are handled by the CALLER
+        (ICTTrailEngine.compute) which skips this function when those
+        conditions are met.
         """
-        # Structural relaxation: tested OBs (2+ visits) and mostly-filled FVGs
-        # are no longer institutionally virgin
-        _eff_ob_visits = max_ob_visits + 1   # allow 2 visits (structurally tested)
-        _eff_fvg_fill  = max(max_fvg_fill, 0.50)  # 50%+ filled = absorbed
+        _eff_ob_visits = max_ob_visits + 1   # tested = 2+ visits
+        _eff_fvg_fill  = max(max_fvg_fill, 0.50)
 
         if pos_side == "long":
             for ob in self.order_blocks_bull:
