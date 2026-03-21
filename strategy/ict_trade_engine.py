@@ -1057,9 +1057,23 @@ class ICTTrailEngine:
             # Exception: deep in profit during Judas swing — allow BE only
             phase = 1; min_dist = 1.5 * atr
         else:
-            # ACCUMULATION or unknown — conservative
+            # ACCUMULATION or unknown — conservative structure-based trail.
+            #
+            # v5.1 FIX: ACCUMULATION is the AMD engine's catch-all / decay state.
+            # Old code froze trail entirely below 1.5R — this caused trades at 0.80R
+            # to revert to full SL losses (Trade 1: +211pts peak → SL hit, 0 trail moves).
+            #
+            # Institutional reasoning: ACCUMULATION doesn't mean "thesis invalid" — it
+            # means "no clear AMD delivery bias." Trail behind WIDE structural levels
+            # (5m swings with 2.0–2.5× ATR buffer). Structure either holds or it doesn't.
+            # The buffer is wide enough that normal pullbacks won't trigger the SL, but
+            # a genuine structural break WILL — which is exactly what we want.
             if tier >= 1.5:
+                phase = 2; min_dist = 1.5 * atr
+            elif tier >= 1.0:
                 phase = 1; min_dist = 2.0 * atr
+            elif tier >= 0.50:
+                phase = 1; min_dist = 2.5 * atr  # very wide but NOT frozen
             else:
                 if hold_reason is not None:
                     hold_reason.append(
@@ -1399,11 +1413,57 @@ class ICTTrailEngine:
                         f"NO_IMPROVEMENT new={new_sl:.1f}>=cur={current_sl:.1f}")
                 return None
 
+        # ── v5.1 MINIMUM MEANINGFUL MOVE ──────────────────────────────────
+        # A trail move must improve the SL by at least 0.08×ATR to be worth
+        # the API call and the structural commitment. Prevents negligible
+        # 0.4pt moves on a 541pt SL distance (Trade 2 bug).
+        _min_meaningful = 0.08 * atr
+        if pos_side == "long":
+            if new_sl < current_sl + _min_meaningful:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"MIN_MOVE delta={new_sl - current_sl:.1f}<{_min_meaningful:.1f}")
+                return None
+        else:
+            if new_sl > current_sl - _min_meaningful:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"MIN_MOVE delta={current_sl - new_sl:.1f}<{_min_meaningful:.1f}")
+                return None
+
         # ── STRUCTURAL PATH CHECK (don't cross fresh ICT zones) ──────────
+        # v5.1: pure structure-based overrides — no timers, no age decay.
+        #
+        # OVERRIDE A — BOS SUPERSEDES: If a 5m BOS has confirmed in the trade
+        # direction, the continuation structure SUPERSEDES any virgin OB in
+        # the path. The BOS structurally proves the move is continuing — a
+        # virgin OB between old SL and new SL is now a cleared zone.
+        #
+        # OVERRIDE B — R-MULTIPLE STRUCTURAL CONFIRMATION: At tier >= 1.0R,
+        # the trade has structurally proven its thesis through price action
+        # alone (price moved 1× the original risk in the right direction).
+        # Capital protection takes priority over OB deference.
+        _bos_overrides_path = False
         if ict_engine is not None:
             try:
+                tf_st = ict_engine._tf.get("5m")
+                if tf_st is not None:
+                    if (pos_side == "long" and tf_st.bos_direction == "bullish"
+                            and tf_st.bos_level > current_sl):
+                        _bos_overrides_path = True
+                    elif (pos_side == "short" and tf_st.bos_direction == "bearish"
+                            and tf_st.bos_level < current_sl):
+                        _bos_overrides_path = True
+            except Exception:
+                pass
+
+        _path_override = _bos_overrides_path or tier >= 1.0
+
+        if ict_engine is not None and not _path_override:
+            try:
                 blocked, reason = ict_engine.check_sl_path_for_structure(
-                    pos_side, current_sl, new_sl, now_ms)
+                    pos_side, current_sl, new_sl, now_ms,
+                    tier=tier)
                 if blocked:
                     if hold_reason is not None:
                         hold_reason.append(f"PATH_BLOCKED:{reason}")

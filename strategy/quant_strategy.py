@@ -2794,6 +2794,11 @@ class PositionState:
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
+    # v5.1: Track consecutive trail holds for structural invalidation detection.
+    # NOT used for time-based exit — used to detect when a counter-trend BOS
+    # structurally invalidates the trade while the trail is frozen.
+    consecutive_trail_holds: int = 0
+    be_ratchet_applied: bool = False  # v5.1: once BE ratchet fires, don't re-check
     ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
     # FIX 8: store actual HTF scores at entry time for post-trade attribution.
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
@@ -5588,6 +5593,169 @@ class QuantStrategy:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
         # ══════════════════════════════════════════════════════════════════
+        # v5.1: INSTITUTIONAL R-MULTIPLE RATCHET FLOORS
+        # ══════════════════════════════════════════════════════════════════
+        # Pure profit-structure based — NOT time-based. Once the market has
+        # structurally proven the trade by delivering X×Risk in profit, the
+        # SL is ratcheted to a minimum floor. This is how every institutional
+        # desk operates: you never give back a structurally confirmed move.
+        #
+        # The ratchet does NOT tighten the trail — it only enforces MINIMUM
+        # acceptable SL positions. The trail engine still decides WHERE to
+        # put the SL; the ratchet ensures it's never WORSE than the floor.
+        #
+        # These floors are wide enough that normal pullbacks won't hit them:
+        #   MFE >= 0.50R → SL ≥ entry + fee_buffer  (breakeven protection)
+        #   MFE >= 1.00R → SL ≥ entry + 0.25×risk   (quarter-risk locked)
+        #   MFE >= 1.50R → SL ≥ entry + 0.50×risk   (half-risk locked)
+        #   MFE >= 2.00R → SL ≥ entry + 1.00×risk   (full-risk locked)
+        #
+        init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+        mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
+
+        _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.25 * atr
+        _ratchet_sl = None
+        _ratchet_label = ""
+
+        if mfe_r >= 2.00:
+            _lock_pts = 1.00 * init_dist_r
+            _ratchet_sl = (pos.entry_price + _lock_pts if pos.side == "long"
+                           else pos.entry_price - _lock_pts)
+            _ratchet_label = "1.00R lock"
+        elif mfe_r >= 1.50:
+            _lock_pts = 0.50 * init_dist_r
+            _ratchet_sl = (pos.entry_price + _lock_pts if pos.side == "long"
+                           else pos.entry_price - _lock_pts)
+            _ratchet_label = "0.50R lock"
+        elif mfe_r >= 1.00:
+            _lock_pts = 0.25 * init_dist_r
+            _ratchet_sl = (pos.entry_price + _lock_pts if pos.side == "long"
+                           else pos.entry_price - _lock_pts)
+            _ratchet_label = "0.25R lock"
+        elif mfe_r >= 0.50:
+            _ratchet_sl = (pos.entry_price + _fee_buf if pos.side == "long"
+                           else pos.entry_price - _fee_buf)
+            _ratchet_label = "BE"
+
+        if _ratchet_sl is not None:
+            _needs_force = False
+            if pos.side == "long" and pos.sl_price < _ratchet_sl:
+                _needs_force = True
+            elif pos.side == "short" and pos.sl_price > _ratchet_sl:
+                _needs_force = True
+
+            if _needs_force:
+                _ratchet_tick = _round_to_tick(_ratchet_sl)
+                # Sanity: ratchet must never be past current price
+                if pos.side == "long" and _ratchet_tick >= price:
+                    _ratchet_tick = _round_to_tick(price - 0.5 * atr)
+                elif pos.side == "short" and _ratchet_tick <= price:
+                    _ratchet_tick = _round_to_tick(price + 0.5 * atr)
+
+                # Only proceed if it's actually an improvement over current SL
+                _is_improvement = ((pos.side == "long" and _ratchet_tick > pos.sl_price) or
+                                   (pos.side == "short" and _ratchet_tick < pos.sl_price))
+                if _is_improvement:
+                    logger.info(
+                        f"🔒 RATCHET FORCE | MFE={mfe_r:.2f}R → "
+                        f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} ({_ratchet_label})")
+
+                    es = "sell" if pos.side == "long" else "buy"
+                    result = order_manager.replace_stop_loss(
+                        existing_sl_order_id=pos.sl_order_id,
+                        side=es, quantity=pos.quantity,
+                        new_trigger_price=_ratchet_tick)
+
+                    if result is None:
+                        logger.warning("🚨 SL already fired during ratchet")
+                        self._record_exchange_exit(None)
+                        return True
+                    if isinstance(result, dict) and "error" not in result:
+                        _new_oid = result.get("order_id") or pos.sl_order_id
+                        with self._lock:
+                            pos.sl_price = _ratchet_tick
+                            pos.sl_order_id = _new_oid
+                            pos.trail_active = True
+                            pos.consecutive_trail_holds = 0
+                            self.current_sl_price = _ratchet_tick
+                        send_telegram_message(
+                            f"🔒 <b>RATCHET SL</b> MFE={mfe_r:.2f}R\n"
+                            f"${pos.sl_price:,.2f} ({_ratchet_label})")
+                    return False  # Ratchet handled; skip normal trail this tick
+
+        # ══════════════════════════════════════════════════════════════════
+        # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
+        # ══════════════════════════════════════════════════════════════════
+        # Pure structure-based safety net — NOT time-based.
+        # If a 5m BOS has confirmed AGAINST the trade direction AND the SL
+        # is still worse than breakeven, the structural thesis is invalidated.
+        # Force the SL to breakeven. The market has structurally reversed —
+        # a new higher-high (for short) or lower-low (for long) is confirmed.
+        #
+        # This replaces the time-based "circuit breaker" with real structural
+        # evidence of invalidation.
+        if self._ict is not None and not pos.be_ratchet_applied:
+            try:
+                _tf_5m = self._ict._tf.get("5m")
+                if _tf_5m is not None:
+                    _counter_bos = False
+                    if (pos.side == "long" and _tf_5m.bos_direction == "bearish"
+                            and _tf_5m.bos_level < pos.entry_price):
+                        _counter_bos = True
+                    elif (pos.side == "short" and _tf_5m.bos_direction == "bullish"
+                            and _tf_5m.bos_level > pos.entry_price):
+                        _counter_bos = True
+
+                    if _counter_bos:
+                        # Check if SL is still worse than BE
+                        _be_level = (pos.entry_price + _fee_buf if pos.side == "long"
+                                     else pos.entry_price - _fee_buf)
+                        _sl_worse = ((pos.side == "long" and pos.sl_price < _be_level) or
+                                     (pos.side == "short" and pos.sl_price > _be_level))
+                        if _sl_worse and profit > 0:
+                            _be_tick = _round_to_tick(_be_level)
+                            # Sanity check
+                            if pos.side == "long" and _be_tick >= price:
+                                _be_tick = _round_to_tick(price - 0.5 * atr)
+                            elif pos.side == "short" and _be_tick <= price:
+                                _be_tick = _round_to_tick(price + 0.5 * atr)
+
+                            _is_better = ((pos.side == "long" and _be_tick > pos.sl_price) or
+                                          (pos.side == "short" and _be_tick < pos.sl_price))
+                            if _is_better:
+                                logger.warning(
+                                    f"🚨 COUNTER-BOS INVALIDATION: 5m BOS {_tf_5m.bos_direction} "
+                                    f"@ ${_tf_5m.bos_level:,.0f} vs entry ${pos.entry_price:,.0f} "
+                                    f"→ forcing SL to BE ${_be_tick:,.1f}")
+
+                                es = "sell" if pos.side == "long" else "buy"
+                                result = order_manager.replace_stop_loss(
+                                    existing_sl_order_id=pos.sl_order_id,
+                                    side=es, quantity=pos.quantity,
+                                    new_trigger_price=_be_tick)
+
+                                if result is None:
+                                    logger.warning("🚨 SL fired during counter-BOS ratchet")
+                                    self._record_exchange_exit(None)
+                                    return True
+                                if isinstance(result, dict) and "error" not in result:
+                                    _new_oid = result.get("order_id") or pos.sl_order_id
+                                    with self._lock:
+                                        pos.sl_price = _be_tick
+                                        pos.sl_order_id = _new_oid
+                                        pos.trail_active = True
+                                        pos.be_ratchet_applied = True
+                                        self.current_sl_price = _be_tick
+                                    send_telegram_message(
+                                        f"🚨 <b>COUNTER-BOS → BE FORCED</b>\n"
+                                        f"5m BOS {_tf_5m.bos_direction} "
+                                        f"@ ${_tf_5m.bos_level:,.0f}\n"
+                                        f"SL → ${_be_tick:,.2f} (BE floor)")
+                                return False
+            except Exception as _bos_e:
+                logger.debug(f"Counter-BOS check error (non-fatal): {_bos_e}")
+
+        # ══════════════════════════════════════════════════════════════════
         # v5.0: AMD-Phase-Aware Trail — ICTTrailEngine primary,
         #       InstitutionalLevels.compute_trail_sl legacy fallback.
         # ══════════════════════════════════════════════════════════════════
@@ -5628,6 +5796,7 @@ class QuantStrategy:
                 hold_reason=_hold_reason)
 
         if new_sl is None:
+            pos.consecutive_trail_holds += 1
             _trail_log_interval = 30.0
             if now - self._last_trail_block_log >= _trail_log_interval:
                 self._last_trail_block_log = now
@@ -5706,6 +5875,7 @@ class QuantStrategy:
                 self._pos.sl_price = new_sl_tick
                 self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
                 self.current_sl_price = new_sl_tick
+                self._pos.consecutive_trail_holds = 0  # v5.1: reset on successful move
                 if not pos.trail_active:
                     self._pos.trail_active = True
             if not pos.trail_active:

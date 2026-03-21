@@ -2597,27 +2597,51 @@ class ICTEngine:
     def check_sl_path_for_structure(self, pos_side: str, current_sl: float,
                                      new_sl: float, now_ms: int,
                                      max_ob_visits: int = 1,
-                                     max_fvg_fill: float = 0.30) -> Tuple[bool, str]:
-        """Block trailing SL from crossing fresh virgin ICT structure."""
+                                     max_fvg_fill: float = 0.30,
+                                     tier: float = 0.0) -> Tuple[bool, str]:
+        """
+        Block trailing SL from crossing fresh virgin ICT structure.
+
+        v5.1 — Pure structural overrides (no time-based decay):
+
+          1. STRUCTURAL TEST RELAXATION: OBs with visit_count >= 2 have been
+             structurally tested by price. A tested OB is no longer "virgin" in
+             any institutional sense — the market has shown it can trade through
+             that zone. Relax from visit_count > 1 to visit_count > 2.
+
+          2. FVG FILL RELAXATION: FVGs that are 50%+ filled have had their
+             imbalance substantially absorbed. They no longer represent a
+             meaningful structural barrier.
+
+        Note: BOS override and R-multiple override are handled by the CALLER
+        (ICTTrailEngine.compute) which skips this function entirely when those
+        conditions are met. This keeps the path-check logic purely about OB/FVG
+        structure without needing to know about R-multiples.
+        """
+        # Structural relaxation: tested OBs (2+ visits) and mostly-filled FVGs
+        # are no longer institutionally virgin
+        _eff_ob_visits = max_ob_visits + 1   # allow 2 visits (structurally tested)
+        _eff_fvg_fill  = max(max_fvg_fill, 0.50)  # 50%+ filled = absorbed
+
         if pos_side == "long":
             for ob in self.order_blocks_bull:
-                if not ob.is_active(now_ms) or ob.visit_count > max_ob_visits:
+                if not ob.is_active(now_ms) or ob.visit_count > _eff_ob_visits:
                     continue
                 if current_sl < ob.low < new_sl or current_sl < ob.high < new_sl:
                     return True, f"Virgin bull OB @ ${ob.midpoint:.0f} tf={ob.timeframe}"
             for fvg in self.fvgs_bull:
-                if not fvg.is_active(now_ms) or fvg.fill_percentage > max_fvg_fill:
+                if not fvg.is_active(now_ms) or fvg.fill_percentage > _eff_fvg_fill:
                     continue
                 if current_sl < fvg.bottom < new_sl or current_sl < fvg.top < new_sl:
                     return True, f"Fresh bull FVG @ ${fvg.midpoint:.0f} tf={fvg.timeframe}"
         else:
             for ob in self.order_blocks_bear:
-                if not ob.is_active(now_ms) or ob.visit_count > max_ob_visits:
+                if not ob.is_active(now_ms) or ob.visit_count > _eff_ob_visits:
                     continue
                 if new_sl < ob.low < current_sl or new_sl < ob.high < current_sl:
                     return True, f"Virgin bear OB @ ${ob.midpoint:.0f} tf={ob.timeframe}"
             for fvg in self.fvgs_bear:
-                if not fvg.is_active(now_ms) or fvg.fill_percentage > max_fvg_fill:
+                if not fvg.is_active(now_ms) or fvg.fill_percentage > _eff_fvg_fill:
                     continue
                 if new_sl < fvg.bottom < current_sl or new_sl < fvg.top < current_sl:
                     return True, f"Fresh bear FVG @ ${fvg.midpoint:.0f} tf={fvg.timeframe}"
