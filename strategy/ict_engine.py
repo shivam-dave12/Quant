@@ -712,10 +712,18 @@ class ICTEngine:
         if candles_4h and len(candles_4h) >= 5:
             self._detect_fvgs(candles_4h, "4h", price, now_ms, self.HTF_OB_MAX_AGE_MS * 2)
 
-        # ── FVG fill tracking ─────────────────────────────────────────
-        self._update_fvg_fills(candles_5m)
-        if candles_1m:
-            self._update_fvg_fills(candles_1m[-30:])
+        # ── FVG fill tracking (TF-specific — institutional) ──────────
+        # v5.1: each TF's FVGs are filled ONLY by candles from that TF.
+        # A 5m close into a 4h FVG is a reaction, not mitigation.
+        if candles_1m and len(candles_1m) >= 3:
+            self._update_fvg_fills(candles_1m[-30:], "1m")
+        self._update_fvg_fills(candles_5m, "5m")
+        if len(candles_15m) >= 3:
+            self._update_fvg_fills(candles_15m, "15m")
+        if candles_1h and len(candles_1h) >= 3:
+            self._update_fvg_fills(candles_1h, "1h")
+        if candles_4h and len(candles_4h) >= 3:
+            self._update_fvg_fills(candles_4h, "4h")
 
         # ── Liquidity pool detection + sweep ─────────────────────────
         self._detect_liquidity_pools(price, now_ms)
@@ -1265,10 +1273,29 @@ class ICTEngine:
     # FVG FILL TRACKING
     # ─────────────────────────────────────────────────────────────────────
 
-    def _update_fvg_fills(self, candles: List[Dict]) -> None:
+    def _update_fvg_fills(self, candles: List[Dict], tf: str = "") -> None:
+        """
+        Track FVG fill penetration.
+
+        v5.1 FIX: Timeframe-aware fill tracking.
+
+        ROOT CAUSE OF 0 FVGs: the old code used 5m and 1m candle closes to
+        fill ALL FVGs regardless of source timeframe. A 5m candle closing past
+        the midpoint of a 4h FVG marked it as "mitigated" — killing all HTF
+        FVGs in ranging markets.
+
+        Institutional ICT: FVG mitigation requires a CLOSE on the SAME
+        timeframe (or higher). A 5m close into a 4h FVG is a reaction/test,
+        not mitigation. Only a 4h close past the midpoint mitigates a 4h FVG.
+
+        When tf="" (legacy mode), fills all FVGs (backward compatible).
+        When tf is specified, only fills FVGs from that exact timeframe.
+        """
         check = candles[-10:] if len(candles) >= 10 else candles
         for fvg in list(self.fvgs_bull) + list(self.fvgs_bear):
             if not fvg.filled:
+                if tf and fvg.timeframe != tf:
+                    continue  # skip: wrong TF candles for this FVG
                 fvg.update_fill(check)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2602,15 +2629,12 @@ class ICTEngine:
         """
         Block trailing SL from crossing fresh virgin ICT structure.
 
-        Structural relaxation (pure structure, no timers):
-          - OBs visited 2+ times have been structurally tested — not virgin.
-          - FVGs 50%+ filled have had their imbalance absorbed.
-
-        BOS override and R-multiple override are handled by the CALLER
-        (ICTTrailEngine.compute) which skips this function when those
-        conditions are met.
+        v5.1 structural relaxation:
+          - OBs visited 2+ times: structurally tested, not virgin.
+          - FVGs 50%+ filled: imbalance absorbed.
+        BOS/R-multiple overrides handled by caller (ICTTrailEngine).
         """
-        _eff_ob_visits = max_ob_visits + 1   # tested = 2+ visits
+        _eff_ob_visits = max_ob_visits + 1
         _eff_fvg_fill  = max(max_fvg_fill, 0.50)
 
         if pos_side == "long":

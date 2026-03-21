@@ -2794,7 +2794,7 @@ class PositionState:
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
-    consecutive_trail_holds: int = 0  # v5.1: trail-hold counter for structural tracking
+    consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
     be_ratchet_applied: bool = False  # v5.1: counter-BOS BE already forced
     ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
     # FIX 8: store actual HTF scores at entry time for post-trade attribution.
@@ -5592,62 +5592,40 @@ class QuantStrategy:
         # ══════════════════════════════════════════════════════════════════
         # v5.1: STRUCTURE-AWARE R-MULTIPLE RATCHET
         # ══════════════════════════════════════════════════════════════════
-        # Institutional principle: R-multiple determines WHEN to ratchet,
-        # ICT structure determines WHERE to place the SL.
-        #
-        # A blind ratchet to entry+0.25R can land ON an unswept liquidity
-        # pool (smart money sweeps it = premature exit) or inside an FVG
-        # that price will test (normal retracement = false exit).
-        #
-        # Instead: scan for the nearest structural defense (OB boundary,
-        # 5m swing, FVG far-edge) between entry and price. Place SL BEHIND
-        # that structure. If no qualifying structure exists, fall back to
-        # the fee-adjusted BE level (widest acceptable floor).
-        #
-        # The structure either holds (SL survives, correct) or breaks
-        # (genuine thesis invalidation, correct exit).
-        # ══════════════════════════════════════════════════════════════════
+        # R-multiple determines WHEN; ICT structure determines WHERE.
+        # Scans OBs, 5m swings for structural defense. Avoids liquidity pools.
+        # Falls back to fee-adjusted BE floor only if no structure exists.
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
 
-        # Fee-adjusted breakeven — the absolute minimum acceptable SL
         _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.25 * atr
         _be_floor = (pos.entry_price + _fee_buf if pos.side == "long"
                      else pos.entry_price - _fee_buf)
 
-        # Determine if a ratchet is due (R-multiple threshold crossed)
         _ratchet_due = mfe_r >= 0.50
         _ratchet_label = ""
-        if mfe_r >= 2.00:
-            _ratchet_label = "2.00R"
-        elif mfe_r >= 1.50:
-            _ratchet_label = "1.50R"
-        elif mfe_r >= 1.00:
-            _ratchet_label = "1.00R"
-        elif mfe_r >= 0.50:
-            _ratchet_label = "0.50R"
+        if mfe_r >= 2.00:   _ratchet_label = "2.00R"
+        elif mfe_r >= 1.50: _ratchet_label = "1.50R"
+        elif mfe_r >= 1.00: _ratchet_label = "1.00R"
+        elif mfe_r >= 0.50: _ratchet_label = "0.50R"
 
         if _ratchet_due:
-            # Check if SL is currently worse than BE floor
             _sl_worse_than_be = ((pos.side == "long" and pos.sl_price < _be_floor) or
                                  (pos.side == "short" and pos.sl_price > _be_floor))
 
             if _sl_worse_than_be:
                 # ── Find structural defense between entry and price ────────
-                # Scan OBs, 5m swings, filled FVG edges for the best anchor
                 _struct_sl = None
                 _struct_label = ""
                 _ob_buf = 0.30 * atr
 
+                # 1. OB anchor
                 if self._ict is not None:
                     try:
-                        # 1. OB anchor — highest institutional validity
                         obs = (self._ict.order_blocks_bull if pos.side == "long"
                                else self._ict.order_blocks_bear)
                         active_obs = [o for o in obs if o.is_active(now_ms)]
-
                         if pos.side == "long":
-                            # Find highest OB low below price that's above BE floor
                             valid_obs = [o for o in active_obs
                                          if _be_floor < o.low - _ob_buf < price - 0.5 * atr]
                             if valid_obs:
@@ -5655,7 +5633,6 @@ class QuantStrategy:
                                 _struct_sl = best_ob.low - _ob_buf
                                 _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
                         else:
-                            # Find lowest OB high above price that's below BE floor
                             valid_obs = [o for o in active_obs
                                          if price + 0.5 * atr < o.high + _ob_buf < _be_floor]
                             if valid_obs:
@@ -5665,7 +5642,7 @@ class QuantStrategy:
                     except Exception:
                         pass
 
-                # 2. 5m swing structure — if no OB found
+                # 2. 5m swing structure
                 if _struct_sl is None and len(candles_5m) >= 6:
                     try:
                         from ict_trade_engine import _find_swings
@@ -5673,25 +5650,22 @@ class QuantStrategy:
                         highs_5m, lows_5m = _find_swings(
                             closed_5m, min(12, len(closed_5m) - 2))
                         sw_buf = 0.40 * atr
-
                         if pos.side == "long" and lows_5m:
                             valid_sw = [l for l in lows_5m
                                         if _be_floor < l - sw_buf < price - 0.5 * atr]
                             if valid_sw:
-                                best_sw = max(valid_sw)
-                                _struct_sl = best_sw - sw_buf
-                                _struct_label = f"5m_SW@${best_sw:.0f}"
+                                _struct_sl = max(valid_sw) - sw_buf
+                                _struct_label = f"5m_SW@${max(valid_sw):.0f}"
                         elif pos.side == "short" and highs_5m:
                             valid_sw = [h for h in highs_5m
                                         if price + 0.5 * atr < h + sw_buf < _be_floor]
                             if valid_sw:
-                                best_sw = min(valid_sw)
-                                _struct_sl = best_sw + sw_buf
-                                _struct_label = f"5m_SW@${best_sw:.0f}"
+                                _struct_sl = min(valid_sw) + sw_buf
+                                _struct_label = f"5m_SW@${min(valid_sw):.0f}"
                     except Exception:
                         pass
 
-                # 3. Liquidity pool avoidance — if structural SL lands on a pool, shift
+                # 3. Liquidity pool avoidance
                 if _struct_sl is not None and self._ict is not None:
                     try:
                         _liq_buf = 0.50 * atr
@@ -5699,16 +5673,13 @@ class QuantStrategy:
                             if pool.swept:
                                 continue
                             if pos.side == "long" and pool.pool_type == "EQL":
-                                # EQL below price — SL must not sit at/above pool
                                 if abs(_struct_sl - pool.price) < _liq_buf:
-                                    # SL is dangerously close to the pool — shift below it
                                     _shifted = pool.price - _liq_buf
-                                    if _shifted > pos.sl_price:  # still an improvement
+                                    if _shifted > pos.sl_price:
                                         _struct_sl = _shifted
                                         _struct_label += f"+LiqAvoid@${pool.price:.0f}"
                                     else:
-                                        _struct_sl = None  # can't avoid — use BE floor
-                                        _struct_label = ""
+                                        _struct_sl = None; _struct_label = ""
                             elif pos.side == "short" and pool.pool_type == "EQH":
                                 if abs(_struct_sl - pool.price) < _liq_buf:
                                     _shifted = pool.price + _liq_buf
@@ -5716,14 +5687,12 @@ class QuantStrategy:
                                         _struct_sl = _shifted
                                         _struct_label += f"+LiqAvoid@${pool.price:.0f}"
                                     else:
-                                        _struct_sl = None
-                                        _struct_label = ""
+                                        _struct_sl = None; _struct_label = ""
                     except Exception:
                         pass
 
-                # 4. Pick the best: structural defense if found, else BE floor
+                # 4. Best of structural defense or BE floor
                 if _struct_sl is not None:
-                    # Ensure structural SL is at least as good as BE floor
                     if pos.side == "long":
                         _ratchet_target = max(_struct_sl, _be_floor)
                     else:
@@ -5741,31 +5710,26 @@ class QuantStrategy:
                 elif pos.side == "short" and _ratchet_tick <= price:
                     _ratchet_tick = _round_to_tick(price + 0.5 * atr)
 
-                # Only fire if it's actually an improvement
                 _is_improvement = ((pos.side == "long" and _ratchet_tick > pos.sl_price) or
                                    (pos.side == "short" and _ratchet_tick < pos.sl_price))
 
                 if _is_improvement:
                     logger.info(
                         f"🔒 RATCHET [{_ratchet_label}] | MFE={mfe_r:.2f}R | "
-                        f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} "
-                        f"[{_final_label}]")
-
+                        f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} [{_final_label}]")
                     es = "sell" if pos.side == "long" else "buy"
                     result = order_manager.replace_stop_loss(
                         existing_sl_order_id=pos.sl_order_id,
                         side=es, quantity=pos.quantity,
                         new_trigger_price=_ratchet_tick)
-
                     if result is None:
                         logger.warning("🚨 SL already fired during ratchet")
                         self._record_exchange_exit(None)
                         return True
                     if isinstance(result, dict) and "error" not in result:
-                        _new_oid = result.get("order_id") or pos.sl_order_id
                         with self._lock:
                             pos.sl_price = _ratchet_tick
-                            pos.sl_order_id = _new_oid
+                            pos.sl_order_id = result.get("order_id") or pos.sl_order_id
                             pos.trail_active = True
                             pos.consecutive_trail_holds = 0
                             self.current_sl_price = _ratchet_tick
@@ -5773,15 +5737,11 @@ class QuantStrategy:
                             f"🔒 <b>RATCHET SL [{_ratchet_label}]</b>\n"
                             f"${pos.sl_price:,.2f} [{_final_label}]\n"
                             f"MFE: {mfe_r:.2f}R")
-                    return False  # Ratchet handled this tick
+                    return False
 
         # ══════════════════════════════════════════════════════════════════
         # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
         # ══════════════════════════════════════════════════════════════════
-        # If a 5m BOS confirms AGAINST the trade AND the SL is still worse
-        # than breakeven AND we're currently profitable → force SL to the
-        # best structural defense or BE floor. The market has structurally
-        # reversed — a confirmed BOS means a new HH (for short) or LL (for long).
         if self._ict is not None and not pos.be_ratchet_applied:
             try:
                 _tf_5m = self._ict._tf.get("5m")
@@ -5793,7 +5753,6 @@ class QuantStrategy:
                     elif (pos.side == "short" and _tf_5m.bos_direction == "bullish"
                             and _tf_5m.bos_level > pos.entry_price):
                         _counter_bos = True
-
                     if _counter_bos:
                         _sl_worse = ((pos.side == "long" and pos.sl_price < _be_floor) or
                                      (pos.side == "short" and pos.sl_price > _be_floor))
@@ -5803,33 +5762,29 @@ class QuantStrategy:
                                 _be_tick = _round_to_tick(price - 0.5 * atr)
                             elif pos.side == "short" and _be_tick <= price:
                                 _be_tick = _round_to_tick(price + 0.5 * atr)
-
                             _is_better = ((pos.side == "long" and _be_tick > pos.sl_price) or
                                           (pos.side == "short" and _be_tick < pos.sl_price))
                             if _is_better:
                                 logger.warning(
                                     f"🚨 COUNTER-BOS: 5m {_tf_5m.bos_direction} "
-                                    f"@ ${_tf_5m.bos_level:,.0f} → forcing BE ${_be_tick:,.1f}")
+                                    f"@ ${_tf_5m.bos_level:,.0f} → BE ${_be_tick:,.1f}")
                                 es = "sell" if pos.side == "long" else "buy"
                                 result = order_manager.replace_stop_loss(
                                     existing_sl_order_id=pos.sl_order_id,
                                     side=es, quantity=pos.quantity,
                                     new_trigger_price=_be_tick)
                                 if result is None:
-                                    self._record_exchange_exit(None)
-                                    return True
+                                    self._record_exchange_exit(None); return True
                                 if isinstance(result, dict) and "error" not in result:
-                                    _new_oid = result.get("order_id") or pos.sl_order_id
                                     with self._lock:
                                         pos.sl_price = _be_tick
-                                        pos.sl_order_id = _new_oid
+                                        pos.sl_order_id = result.get("order_id") or pos.sl_order_id
                                         pos.trail_active = True
                                         pos.be_ratchet_applied = True
                                         self.current_sl_price = _be_tick
                                     send_telegram_message(
                                         f"🚨 <b>COUNTER-BOS → BE</b>\n"
-                                        f"5m BOS {_tf_5m.bos_direction} "
-                                        f"@ ${_tf_5m.bos_level:,.0f}\n"
+                                        f"5m BOS {_tf_5m.bos_direction} @ ${_tf_5m.bos_level:,.0f}\n"
                                         f"SL → ${_be_tick:,.2f}")
                                 return False
             except Exception as _bos_e:
@@ -5955,7 +5910,7 @@ class QuantStrategy:
                 self._pos.sl_price = new_sl_tick
                 self._pos.sl_order_id = result.get("order_id", pos.sl_order_id)
                 self.current_sl_price = new_sl_tick
-                self._pos.consecutive_trail_holds = 0  # v5.1: reset on success
+                self._pos.consecutive_trail_holds = 0
                 if not pos.trail_active:
                     self._pos.trail_active = True
             if not pos.trail_active:

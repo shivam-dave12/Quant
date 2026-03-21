@@ -220,7 +220,22 @@ class ICTSweepDetector:
                             f" ± {0.5*atr:.0f}) — setup expired, sweep blacklisted")
                         self._active_setup = None
 
-        # Find the best new setup
+                # v5.1: If active setup survived validity checks, DON'T re-scan.
+                # The old code fell through to _find_best_setup every 5s, which
+                # re-detected the identical setup from the same swept pool and
+                # logged "SWEEP SETUP DETECTED" 20+ times for one setup.
+                if self._active_setup is not None:
+                    # Update OTE_READY status
+                    if self._active_setup.status == "DETECTED":
+                        if self._active_setup.price_in_ote(price):
+                            self._active_setup.status = "OTE_READY"
+                            logger.info(
+                                f"🟢 OTE ZONE REACHED: ${price:,.0f} in "
+                                f"[${self._active_setup.ote_entry_zone_low:.0f}–"
+                                f"${self._active_setup.ote_entry_zone_high:.0f}]")
+                    return self._active_setup
+
+        # Find the best new setup (only reached when no active setup exists)
         setup = self._find_best_setup(ict_engine, price, atr, now_ms,
                                        candles_5m or [], candles_15m or [])
         if setup is not None:
@@ -1037,9 +1052,7 @@ class ICTTrailEngine:
 
         # ── AMD MANIPULATION: structural freeze ─────────────────────────
         # At tier < 1.0R: Judas swing may still be active. Full freeze.
-        # At tier >= 1.0R: price has displaced 1× risk — Judas is structurally
-        # over. Allow conservative trail. AMD cycling back to MANIPULATION
-        # hours later doesn't mean a new Judas swing threatens THIS trade.
+        # At tier >= 1.0R: price displaced 1× risk — Judas structurally over.
         if amd_phase == "MANIPULATION" and tier < 1.0:
             if hold_reason is not None:
                 hold_reason.append(
@@ -1058,7 +1071,6 @@ class ICTTrailEngine:
             phase = max(1, min(3, int(tier)))
             min_dist = {1: 1.2, 2: 0.9, 3: 0.7}.get(phase, 1.2) * atr
         elif amd_phase == "MANIPULATION" and tier >= 1.0:
-            # Structurally proven trade during late MANIPULATION cycle
             if tier >= 1.5:
                 phase = 2; min_dist = 1.2 * atr
             else:
@@ -1066,7 +1078,6 @@ class ICTTrailEngine:
         else:
             # ACCUMULATION or unknown — conservative structure-based trail.
             # ACCUMULATION means "no clear AMD delivery bias," NOT "thesis invalid."
-            # Trail behind wide structural levels. Structure holds or it breaks.
             if tier >= 1.5:
                 phase = 2; min_dist = 1.5 * atr
             elif tier >= 1.0:
@@ -1413,8 +1424,6 @@ class ICTTrailEngine:
                 return None
 
         # ── MINIMUM MEANINGFUL MOVE ───────────────────────────────────────
-        # Trail moves must improve SL by at least 0.08×ATR. Prevents
-        # negligible 0.4pt moves on a 541pt SL (Trade 2 bug).
         _min_meaningful = 0.08 * atr
         if pos_side == "long":
             if new_sl < current_sl + _min_meaningful:
@@ -1430,9 +1439,7 @@ class ICTTrailEngine:
                 return None
 
         # ── STRUCTURAL PATH CHECK ─────────────────────────────────────────
-        # Pure structure overrides (no timers):
-        #  A) BOS in trade direction on 5m → continuation confirmed, path cleared
-        #  B) tier >= 1.0R → trade structurally proven by price displacement
+        # Overrides: BOS in trade direction OR tier >= 1.0R
         _path_override = False
         if tier >= 1.0:
             _path_override = True
@@ -1452,8 +1459,7 @@ class ICTTrailEngine:
         if ict_engine is not None and not _path_override:
             try:
                 blocked, reason = ict_engine.check_sl_path_for_structure(
-                    pos_side, current_sl, new_sl, now_ms,
-                    tier=tier)
+                    pos_side, current_sl, new_sl, now_ms, tier=tier)
                 if blocked:
                     if hold_reason is not None:
                         hold_reason.append(f"PATH_BLOCKED:{reason}")
