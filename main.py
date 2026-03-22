@@ -136,6 +136,9 @@ class QuantBot:
         self.last_health_check_sec = 0.0
         self.last_report_sec       = 0.0
         self.last_heartbeat_sec    = 0.0
+        # Lock protecting _last_tick_time which is written by the main thread
+        # and read by the watchdog daemon thread.
+        self._tick_lock = threading.Lock()
 
         self.data_manager:     Optional[MarketAggregator]  = None
         self.execution_router: Optional[ExecutionRouter]   = None
@@ -455,7 +458,9 @@ class QuantBot:
             time.sleep(5.0)
             if not self.running:
                 break
-            age = time.time() - self._last_tick_time
+            with self._tick_lock:
+                _ltt = self._last_tick_time
+            age = time.time() - _ltt
             if age > WATCHDOG_THRESH:
                 logger.error(
                     "🚨 WATCHDOG: main loop has not completed a tick in %.0fs "
@@ -476,7 +481,8 @@ class QuantBot:
             return
 
         logger.info("📊 Main loop active (250ms tick)")
-        self._last_tick_time = time.time()
+        with self._tick_lock:
+            self._last_tick_time = time.time()
 
         # Start watchdog — logs thread stacks if loop freezes >15s
         _wd = threading.Thread(target=self._watchdog_loop, daemon=True, name="watchdog")
@@ -500,7 +506,8 @@ class QuantBot:
                 if not self.trading_enabled and pos is None:
                     # Paused path — no on_tick call but we still completed this
                     # iteration; reset the watchdog so it doesn't false-trip.
-                    self._last_tick_time = time.time()
+                    with self._tick_lock:
+                        self._last_tick_time = time.time()
                     continue
 
                 _t0 = time.time()
@@ -518,7 +525,8 @@ class QuantBot:
                     )
 
                 # on_tick completed — now safe to reset watchdog timer
-                self._last_tick_time = time.time()
+                with self._tick_lock:
+                    self._last_tick_time = time.time()
 
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt — shutting down")

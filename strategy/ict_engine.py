@@ -588,6 +588,7 @@ class ICTEngine:
             self.SWEEP_DISP_MIN       = getattr(cfg, 'SWEEP_DISPLACEMENT_MIN',       self.SWEEP_DISP_MIN)
             self.SWEEP_MAX_AGE_MS     = getattr(cfg, 'SWEEP_MAX_AGE_MINUTES', 120)  * 60_000
             self.KZ_ASIA_START        = getattr(cfg, 'KZ_ASIA_NY_START',    20)
+            self.KZ_ASIA_END          = getattr(cfg, 'KZ_ASIA_NY_END',       1)
             self.KZ_LONDON_START      = getattr(cfg, 'KZ_LONDON_NY_START',   2)
             self.KZ_LONDON_END        = getattr(cfg, 'KZ_LONDON_NY_END',     5)
             self.KZ_NY_START          = getattr(cfg, 'KZ_NY_NY_START',       7)
@@ -1433,9 +1434,15 @@ class ICTEngine:
         The wick proves stops were harvested. Displacement (strong body) =
         institutional confirmation that the sweep was intentional.
         """
+        # Merge candle slices from multiple timeframes and sort by open-time so
+        # the sweep-detection loop always processes candles in chronological order.
+        # Without sorting, 15m and 1h candles (appended after 5m) could be older
+        # than some 5m candles, causing earlier historical candles to register a
+        # sweep and produce a stale sweep_timestamp that corrupts AMD age tracking.
         all_c = list(candles_5m[-25:]) + list(candles_15m[-10:])
         if candles_1h:
             all_c += list(candles_1h[-5:])
+        all_c.sort(key=lambda c: int(c.get("t", 0)))
 
         # BUG-SWEEP-DEDUP-FALLBACK FIX: the dedup key is (pool_price, candle_ts).
         # When c['t'] is absent the original code used now_ms (wall-clock), which
@@ -1902,23 +1909,33 @@ class ICTEngine:
                 return
 
             # All windows defined in NY time for consistency.
-            # KZ and session determined from the SAME time basis.
-            if ny >= 20.0 or ny < 1.0:
+            # KZ boundaries read from instance attributes (loaded from config in
+            # _load_config) so operator changes take effect without restart.
+            # KZ_ASIA_END wraps at midnight: Asia KZ runs from KZ_ASIA_START until
+            # midnight (24) and from midnight until KZ_ASIA_END the next morning.
+            _asia_kz   = (ny >= self.KZ_ASIA_START or ny < self.KZ_ASIA_END)
+            _asia_sess = (ny >= self.KZ_ASIA_START or ny < self.KZ_LONDON_START)
+            _lon_kz    = (self.KZ_LONDON_START <= ny < self.KZ_LONDON_END)
+            _lon_sess  = (self.KZ_LONDON_START <= ny < self.KZ_NY_START)
+            _ny_kz     = (self.KZ_NY_START <= ny < self.KZ_NY_END)
+            _ny_sess   = (self.KZ_NY_START <= ny < 16.0)
+
+            if _asia_kz:
                 self._killzone = "ASIA_KZ"
                 self._session  = "ASIA"
-            elif 1.0 <= ny < 2.0:
-                self._session  = "ASIA"     # Asia session, outside KZ
-            elif 2.0 <= ny < 5.0:
+            elif _asia_sess:
+                self._session  = "ASIA"
+            elif _lon_kz:
                 self._killzone = "LONDON_KZ"
                 self._session  = "LONDON"
-            elif 5.0 <= ny < 7.0:
-                self._session  = "LONDON"   # London PM, outside KZ
-            elif 7.0 <= ny < 10.0:
+            elif _lon_sess:
+                self._session  = "LONDON"
+            elif _ny_kz:
                 self._killzone = "NY_KZ"
                 self._session  = "NEW_YORK"
-            elif 10.0 <= ny < 16.0:
-                self._session  = "NEW_YORK" # NY PM, outside KZ
-            # 16.0–20.0 → OFF_HOURS (default)
+            elif _ny_sess:
+                self._session  = "NEW_YORK"
+            # 16.0–KZ_ASIA_START → OFF_HOURS (default)
 
         except Exception:
             self._session  = "UNKNOWN"
@@ -2398,7 +2415,9 @@ class ICTEngine:
         _amd_phase           = self._amd.phase
         _amd_bias            = self._amd.bias
         _amd_delivery_target = self._amd.delivery_target
-        _in_distribution     = _amd_phase in ("DISTRIBUTION", "MANIPULATION")
+        # REDISTRIBUTION is also an active delivery phase — OBs inside the
+        # delivery corridor must be excluded from reversal-risk scoring here too.
+        _in_distribution     = _amd_phase in ("DISTRIBUTION", "MANIPULATION", "REDISTRIBUTION")
         opp_obs = self.order_blocks_bear if side == "long" else self.order_blocks_bull
         rev_risk = 0.0
         for ob in opp_obs:
@@ -2969,7 +2988,7 @@ class ICTEngine:
         _gz_amd_sweep   = self._amd.sweep_origin
         _gz_amd_phase   = self._amd.phase
         _gz_amd_bias    = self._amd.bias
-        _gz_in_delivery = _gz_amd_phase in ("DISTRIBUTION", "MANIPULATION")
+        _gz_in_delivery = _gz_amd_phase in ("DISTRIBUTION", "MANIPULATION", "REDISTRIBUTION")
 
         # HTF OBs as base reversal zones
         for obs, direction in ((self.order_blocks_bull, "long"),
@@ -3114,16 +3133,26 @@ class ICTEngine:
 
         # OTE entry zone: 61.8%-78.6% retracement of the Judas move
         # We approximate using the displacement from the sweep pool
+        # OTE zone: 61.8%–78.6% retracement of the Judas move.
+        # The Judas move is from sweep_price to the current Judas extreme.
+        # For BSL swept (judas UP): institutional price moved UP from sweep level;
+        # OTE for a SHORT entry is a pullback to 61.8%–78.6% of that upward move.
+        # For SSL swept (judas DOWN): OTE for a LONG entry is a bounce to
+        # 61.8%–78.6% of the downward Judas move.
+        # The original code multiplied by 0.30 — a comment described it as "rough
+        # estimate" but it compressed the zone to ~9% of the actual retracement,
+        # making ENTERING_OTE trigger 3× too early and at the wrong price level.
+        move_approx = abs(price - sweep_price)
         if judas_dir == "up":
-            # Displacement moved price UP from sweep low to some high
-            # OTE for SHORT = retrace back down to 61.8%-78.6% of that move
-            move_approx = abs(price - sweep_price)
-            ote_low  = price + move_approx * 0.618 * 0.30  # rough estimate
-            ote_high = price + move_approx * 0.786 * 0.30
+            # BSL swept: Judas moved price UP. OTE for SHORT = retrace back.
+            # price is below sweep_price after the close-back-below.
+            # OTE zone sits between 61.8% and 78.6% retrace from sweep_price downward.
+            ote_high = sweep_price - move_approx * 0.618   # 61.8% retrace (shallower)
+            ote_low  = sweep_price - move_approx * 0.786   # 78.6% retrace (deeper)
         else:
-            move_approx = abs(price - sweep_price)
-            ote_high = price - move_approx * 0.618 * 0.30
-            ote_low  = price - move_approx * 0.786 * 0.30
+            # SSL swept: Judas moved price DOWN. OTE for LONG = bounce back.
+            ote_low  = sweep_price + move_approx * 0.618   # 61.8% retrace (shallower)
+            ote_high = sweep_price + move_approx * 0.786   # 78.6% retrace (deeper)
 
         # Is price still in the Judas swing territory?
         price_in_judas = (

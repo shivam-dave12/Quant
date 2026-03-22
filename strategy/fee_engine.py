@@ -102,12 +102,20 @@ class SpreadTracker:
             return len(self._hist)
 
     def _median_bps_unlocked(self) -> float:
-        """Compute median WITHOUT acquiring the lock — for use within locked sections."""
+        """Compute median WITHOUT acquiring the lock — for use within locked sections.
+
+        Uses the true median (average of two middle elements for even-length arrays)
+        rather than the upper-median, which biased spread estimates upward and caused
+        the fee floor to be slightly too aggressive on even sample counts.
+        """
         default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
         if len(self._hist) < 5:
             return default
         arr = sorted(self._hist)
-        return arr[len(arr) // 2]
+        n   = len(arr)
+        mid = n // 2
+        # True median: average the two central values for even-length arrays
+        return arr[mid] if n % 2 != 0 else (arr[mid - 1] + arr[mid]) / 2.0
 
     def median_bps(self) -> float:
         """Thread-safe median — acquires lock. Do NOT call from within update()."""
@@ -430,18 +438,23 @@ class MakerTakerDecision:
                 )
 
             # ── 5. Compute limit price — guarded against tight spreads ──────
-            # BUG FIX: bid+TICK on a 1-tick spread == ask → immediate taker fill.
-            # Clamp so the limit price stays strictly inside the spread.
+            # For LONG maker: post at bid+tick, clamped below ask so we never
+            # cross the spread and take immediately. Fallback: bid (guaranteed maker).
+            # For SHORT maker: post at ask-tick, clamped above bid. Fallback MUST be
+            # ask+tick (not ask), because ask itself is the taker-fill price for a
+            # SHORT sell — posting AT ask crosses the spread on many venues.
             if side == "long":
                 candidate   = round(bid + tick, 1)
                 limit_price = min(candidate, round(ask - tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    limit_price = bid   # guaranteed maker fallback
+                    limit_price = bid   # guaranteed maker fallback (post at bid)
             else:
                 candidate   = round(ask - tick, 1)
                 limit_price = max(candidate, round(bid + tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    limit_price = ask   # guaranteed maker fallback
+                    # ask itself is the taker-fill price for a SHORT — must post
+                    # strictly ABOVE the current ask so it rests in the book.
+                    limit_price = round(ask + tick, 1)   # guaranteed maker fallback
 
             return (
                 True, limit_price,

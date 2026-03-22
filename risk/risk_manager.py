@@ -158,14 +158,17 @@ class RiskManager:
 
         except Exception as e:
             logger.error(f"Error fetching balance: {e}", exc_info=True)
-            return {"available": _fallback_avail, "total": _fallback_total,
-                    "cached": True, "error": str(e)}
-        finally:
-            # Guarantee flag reset regardless of exception path — prevents
-            # permanent stale-cache mode if the REST call throws or the
-            # process is interrupted between flag set and flag clear.
             with self._lock:
                 self._balance_fetch_in_progress = False
+            return {"available": _fallback_avail, "total": _fallback_total,
+                    "cached": True, "error": str(e)}
+        # NOTE: No finally block here.  The flag is cleared in every explicit
+        # return path above (null response, error key, success block, exception
+        # handler).  A finally block would re-acquire the lock and unconditionally
+        # clear the flag — which would race against a NEW fetch that another thread
+        # legitimately started between the last flag-clear inside the try/except
+        # and the finally executing, silently clearing the wrong fetch's flag and
+        # opening a window for duplicate concurrent fetches.
 
 
     def calculate_position_size(

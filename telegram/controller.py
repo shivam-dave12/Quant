@@ -81,8 +81,12 @@ class TelegramBotController:
                     split_at = message.rfind('\n', 0, 4000)
                     if split_at == -1:
                         split_at = 4000
-                    chunks.append(message[:split_at])
-                    message = message[split_at:]
+                        chunks.append(message[:split_at])
+                        message = message[split_at:]
+                    else:
+                        chunks.append(message[:split_at])
+                        # Skip the newline itself so the next chunk has no leading blank line
+                        message = message[split_at + 1:]
                 for chunk in chunks:
                     self._send_raw(chunk, parse_mode)
                     time.sleep(0.5)
@@ -282,6 +286,7 @@ class TelegramBotController:
             "/trail [on|off|auto] — Toggle trailing SL\n"
             "/config — Show config values\n"
             "/set &lt;key&gt; &lt;value&gt; — Adjust config live\n"
+            "/setexchange &lt;delta|coinswitch&gt; — Switch execution exchange at runtime\n"
             "/killswitch — Emergency: close position + cancel orders\n"
             "/start — Start bot\n"
             "/stop — Stop bot\n"

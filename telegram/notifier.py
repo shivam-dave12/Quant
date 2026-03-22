@@ -596,12 +596,10 @@ def format_market_outlook(
                 price_delta = current_price - p_entry
             else:
                 price_delta = p_entry - current_price
-            try:
-                import config as _cfg
-                _leverage = getattr(_cfg, "LEVERAGE", 1)
-            except Exception:
-                _leverage = 1
-            usdt_pnl = price_delta * qty * _leverage if qty > 0 else price_delta
+            # Unrealised PnL = price_delta × qty_btc. Leverage is implicit in the
+            # position size itself; multiplying by leverage again inflates the figure by
+            # the leverage factor (40× at 40x) — a display error, not a calculation error.
+            usdt_pnl = price_delta * qty if qty > 0 else price_delta
             risk_price = abs(p_entry - current_sl) if current_sl else 0
             ur_r = price_delta / risk_price if risk_price > 0 else 0
             upnl_icon = "🟢" if price_delta >= 0 else "🔴"
@@ -901,9 +899,8 @@ def format_periodic_report(
                 price_delta = current_price - entry_p
             else:
                 price_delta = entry_p - current_price
-            import config as _cfg
-            _leverage = getattr(_cfg, "LEVERAGE", 1)
-            usdt_pnl = price_delta * qty * _leverage if qty > 0 else price_delta
+            # Unrealised PnL = price_delta × qty_btc (leverage already implicit in qty).
+            usdt_pnl = price_delta * qty if qty > 0 else price_delta
             risk_price = abs(entry_p - current_sl) if current_sl else 0
             ur_r = price_delta / risk_price if risk_price > 0 else 0
             upnl_icon = "🟢" if price_delta >= 0 else "🔴"
