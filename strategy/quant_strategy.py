@@ -1010,18 +1010,39 @@ class RegimeClassifier:
 
         confidence = adx_score * 0.50 + expansion_score * 0.30 + htf_score * 0.20
 
+        # ── v5.1: DI NEUTRAL OVERRIDE ─────────────────────────────────────
+        # ROOT CAUSE of missed crash: ADX=42 (strong trend) but +DI/-DI spread
+        # < 4pts → trend_dir="neutral" → regime stuck at TRANSITIONING.
+        # During flash crashes, Wilder-smoothed DI takes several candles to
+        # separate because it's an EMA of directional movement.
+        #
+        # Fix: when ADX >= 35 but DI is neutral, use 15m structure as the
+        # fast direction indicator. 15m BOS/CHoCH updates on confirmed swings.
+        # Also: ATR expansion >= 1.5× = volatility event, use 15m direction.
+        _di_override_dir = trend_dir
+        if trend_dir == "neutral" and adx_val >= 35.0:
+            if htf.trend_15m < -0.30:
+                _di_override_dir = "down"
+            elif htf.trend_15m > 0.30:
+                _di_override_dir = "up"
+        if expansion >= 1.50 and _di_override_dir == "neutral":
+            if htf.trend_15m < -0.20:
+                _di_override_dir = "down"
+            elif htf.trend_15m > 0.20:
+                _di_override_dir = "up"
+
         if confidence >= 0.55 and adx_trending:
-            di_up = (trend_dir == "up")
+            di_up = (_di_override_dir == "up")
             if di_up and htf_up:
                 regime = MarketRegime.TRENDING_UP
             elif not di_up and not htf_up:
                 regime = MarketRegime.TRENDING_DOWN
-            elif trend_dir == "up":
-                regime = MarketRegime.TRENDING_UP    # ADX clear; HTF still catching up
-            elif trend_dir == "down":
+            elif _di_override_dir == "up":
+                regime = MarketRegime.TRENDING_UP
+            elif _di_override_dir == "down":
                 regime = MarketRegime.TRENDING_DOWN
             else:
-                regime = MarketRegime.TRANSITIONING  # DI spread neutral
+                regime = MarketRegime.TRANSITIONING
         elif confidence < 0.30:
             regime = MarketRegime.RANGING
         else:
@@ -1029,7 +1050,7 @@ class RegimeClassifier:
 
         self._regime     = regime
         self._confidence = confidence
-        self._direction  = trend_dir
+        self._direction  = _di_override_dir
         return regime
 
     @property
@@ -1289,7 +1310,13 @@ class BreakoutDetector:
             return
 
         pullback_min = 0.3 * self._bo_atr
-        pullback_max = 2.0 * self._bo_atr  # v4.7: raised from 1.5 to 2.0 (BTC moves big)
+        # v5.1: Use max(breakout ATR, current ATR) for pullback_max.
+        # During crash volatility, ATR expands 2-3× but bo_atr was captured
+        # pre-crash. Using stale bo_atr causes retests to invalidate at
+        # 154pts vs max 138pts — missed by 16pts (actual retrace from logs).
+        # max() widens the threshold with expanding vol, never shrinks it.
+        _effective_atr = max(self._bo_atr, atr) if atr > 1e-10 else self._bo_atr
+        pullback_max = 2.5 * _effective_atr
 
         if self._breakout_dir == "up":
             if price < self._retest_low:
@@ -2905,6 +2932,10 @@ class QuantStrategy:
         self._active_sweep_setup: Optional[object] = None  # ICTSweepSetup | None
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
         self._confirm_trend_long = 0; self._confirm_trend_short = 0
+        self._confirm_flow_long = 0; self._confirm_flow_short = 0
+        self._last_flow_entry_time = 0.0
+        self._flow_tick_streak = 0       # consecutive extreme tick flow readings
+        self._flow_tick_direction = ""   # "long" | "short" | ""
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
@@ -3856,10 +3887,10 @@ class QuantStrategy:
         # v4.3 Solution 5: Spread cost gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
         if not spread_ok:
-            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0
+            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = 0
             return
         sig = self._compute_signals(data_manager)
-        if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = 0; return
+        if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = 0; return
         price = data_manager.get_last_price()
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
@@ -4006,6 +4037,31 @@ class QuantStrategy:
                     candles_5m=candles_5m_ict,
                     candles_15m=candles_15m_ict,
                 )
+
+                # ── v5.1: Structural distance invalidation ─────────────────
+                # A LONG sweep setup at OTE $70,223 was still OTE_READY when
+                # price crashed to $69,000 (17× ATR away). The sweep routing
+                # priority kept trying LONG entries during the entire crash.
+                # Fix: if price has moved > 3×ATR away from the OTE zone in
+                # the WRONG direction for the setup, invalidate it.
+                if (self._active_sweep_setup is not None and
+                        self._active_sweep_setup.status in ("DETECTED", "OTE_READY") and
+                        sig.atr > 1e-10):
+                    _ss = self._active_sweep_setup
+                    _max_dist = 3.0 * sig.atr
+                    _invalidate = False
+                    if _ss.side == "long" and price < _ss.ote_entry_zone_low - _max_dist:
+                        _invalidate = True  # price crashed below OTE
+                    elif _ss.side == "short" and price > _ss.ote_entry_zone_high + _max_dist:
+                        _invalidate = True  # price rallied above OTE
+                    if _invalidate:
+                        logger.info(
+                            f"❌ Sweep setup invalidated: price ${price:,.0f} is "
+                            f"{abs(price - _ss.ote_midpoint)/sig.atr:.1f}×ATR from "
+                            f"OTE [${_ss.ote_entry_zone_low:.0f}–${_ss.ote_entry_zone_high:.0f}] "
+                            f"— structural thesis broken")
+                        self._sweep_detector.invalidate()
+                        self._active_sweep_setup = None
                 # Throttled log of active setup quality
                 if (self._active_sweep_setup is not None and
                         now - self._last_sweep_log >= 60.0):
@@ -4040,10 +4096,11 @@ class QuantStrategy:
         # ── v5.0 Route by regime + breakout + sweep setup ────────────────────
         #
         # Priority (highest conviction first):
-        #   0. ICT Sweep OTE_READY → sweep entry (overrides all; highest win-rate)
-        #   1. Breakout retest ready → momentum entry
-        #   2. TRENDING regime → trend pullback entry
-        #   3. Normal → reversion entry (blocks_reversion handles counter-dir veto)
+        #   0. ICT Sweep OTE_READY → sweep entry (highest win-rate)
+        #   1. ORDER FLOW DISPLACEMENT → flow entry (institutional flow + BOS)
+        #   2. Breakout retest ready → momentum entry
+        #   3. TRENDING regime → trend pullback entry
+        #   4. Normal → reversion entry
         _has_sweep_entry = (
             _ICT_TRADE_ENGINE_AVAILABLE and
             QCfg.ICT_SWEEP_ENTRY_ENABLED() and
@@ -4051,16 +4108,100 @@ class QuantStrategy:
             self._active_sweep_setup.status == "OTE_READY"
         )
 
+        # ── v5.1: ORDER FLOW DISPLACEMENT detection ──────────────────────
+        # Institutional principle: when tick-level order flow is extreme AND
+        # 5m structure confirms via BOS, institutions are ACTIVELY positioning.
+        # This IS the signal — don't wait for VWAP reversion or breakout retest.
+        #
+        # Requirements (ALL must be true):
+        #   A) Tick flow extreme: |tick_flow| > 0.55 sustained (3+ ticks)
+        #   B) CVD direction agrees with tick flow
+        #   C) 5m BOS confirmed in flow direction
+        #   D) 5m displacement candle (body > 1.0×ATR) OR sustained flow streak ≥ 5
+        #   E) Cooldown: 120s since last flow entry attempt
+        _flow_side = ""
+        _flow_ready = False
+        _tick = self._tick_eng.get_signal()
+        _cvd = self._cvd.get_divergence_signal(
+            data_manager.get_candles("1m", limit=60) if hasattr(data_manager, 'get_candles') else [])
+        _cvd_trend = self._cvd.get_trend_signal()
+
+        # Track sustained tick flow streak
+        if _tick < -0.55:
+            if self._flow_tick_direction == "short":
+                self._flow_tick_streak += 1
+            else:
+                self._flow_tick_direction = "short"
+                self._flow_tick_streak = 1
+        elif _tick > 0.55:
+            if self._flow_tick_direction == "long":
+                self._flow_tick_streak += 1
+            else:
+                self._flow_tick_direction = "long"
+                self._flow_tick_streak = 1
+        else:
+            # Reset streak if tick flow drops below threshold
+            if self._flow_tick_streak > 0:
+                self._flow_tick_streak = max(0, self._flow_tick_streak - 1)
+            if self._flow_tick_streak == 0:
+                self._flow_tick_direction = ""
+
+        if (self._flow_tick_streak >= 3 and
+                now - self._last_flow_entry_time > 120.0):
+            _candidate_side = self._flow_tick_direction
+
+            # CVD must agree: bearish CVD for short, bullish for long
+            _cvd_agrees = False
+            if _candidate_side == "short" and (_cvd_trend < -0.15 or _cvd < -0.15):
+                _cvd_agrees = True
+            elif _candidate_side == "long" and (_cvd_trend > 0.15 or _cvd > 0.15):
+                _cvd_agrees = True
+
+            # 5m BOS must confirm flow direction
+            _bos_confirms = False
+            if self._ict is not None and getattr(self._ict, '_initialized', False):
+                try:
+                    _tf_5m = self._ict._tf.get("5m")
+                    if _tf_5m is not None:
+                        if (_candidate_side == "short" and
+                                _tf_5m.bos_direction == "bearish"):
+                            _bos_confirms = True
+                        elif (_candidate_side == "long" and
+                                _tf_5m.bos_direction == "bullish"):
+                            _bos_confirms = True
+                except Exception:
+                    pass
+
+            # Displacement candle OR sustained streak
+            _has_displacement = False
+            try:
+                c5m = data_manager.get_candles("5m", limit=3)
+                if len(c5m) >= 2:
+                    _last_closed = c5m[-2]  # last closed 5m candle
+                    _body = abs(float(_last_closed['c']) - float(_last_closed['o']))
+                    if _body > 1.0 * sig.atr:
+                        _has_displacement = True
+            except Exception:
+                pass
+            _sustained = self._flow_tick_streak >= 5
+
+            if _cvd_agrees and _bos_confirms and (_has_displacement or _sustained):
+                _flow_side = _candidate_side
+                _flow_ready = True
+
         if _has_sweep_entry:
-            # Sweep entry routes through the standard reversion path but with
-            # PATH-A SL/TP logic in _compute_sl_tp. The ICTEntryGate tier
-            # determines confirm ticks (Tier-S=1, Tier-A=2, Tier-B=3).
             self._confirm_trend_long = self._confirm_trend_short = 0
-            # Clear reversion counters too: stale sweep-direction confirmations
-            # must not carry over if the setup expires mid-confirmation.
             self._confirm_long = self._confirm_short = 0
+            self._confirm_flow_long = self._confirm_flow_short = 0
             self._evaluate_reversion_entry(
                 data_manager, order_manager, risk_manager, sig, price, now)
+        elif _flow_ready:
+            # Flow displacement: clear all other counters
+            self._confirm_long = self._confirm_short = 0
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            self._evaluate_flow_entry(
+                data_manager, order_manager, risk_manager, sig, price, now,
+                flow_side=_flow_side)
         elif self._breakout.is_active and self._breakout.retest_ready:
             self._confirm_long = self._confirm_short = 0
             self._evaluate_momentum_entry(data_manager, order_manager, risk_manager, sig, price, now)
@@ -4586,6 +4727,162 @@ class QuantStrategy:
             self._confirm_trend_long = self._confirm_trend_short = 0
             _trend_tier = _t   # Bug-4 fix: always defined, see above
             self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend", ict_tier=_trend_tier)
+
+    def _evaluate_flow_entry(self, data_manager, order_manager, risk_manager,
+                              sig, price, now, flow_side: str):
+        """
+        v5.1 — ICT Displacement Entry (institutional order flow + structure).
+
+        ICT MODEL: Sweep → Displacement → Distribution.
+
+        Institutions sweep liquidity (BSL/SSL), displace price with aggressive
+        volume (the displacement candle creates OBs and FVGs), then distribute
+        in the displacement direction. This IS the delivery — not a reaction.
+
+        PRIMARY signal: Recent ICT liquidity sweep with displacement confirmed.
+        CONFIRMATION: Order flow (tick + CVD) shows institutional aggression.
+        STRUCTURAL: 5m BOS confirms the break.
+
+        The sweet spot is WHERE sweep + displacement + order flow converge:
+          BSL swept + disp + bearish BOS + tick < -0.55 + CVD bearish → SHORT
+          SSL swept + disp + bullish BOS + tick > +0.55 + CVD bullish → LONG
+
+        SL: Behind the sweep candle (where liquidity was taken — institutional
+            orders sit behind that level; if price reclaims it, thesis is dead).
+        TP: Nearest opposing liquidity pool (where the next stops are — that's
+            where price is being delivered).
+        """
+        # ── Gate 1: Recent ICT sweep with displacement ────────────────────
+        # The sweep must be fresh (<5min) and displacement-confirmed.
+        # This is the institutional footprint — not a wick, but a close
+        # through the level with body > ATR (displacement).
+        _sweep_confirmed = False
+        _sweep_pool = None
+        _sweep_age_max_ms = 300_000  # 5 minutes
+
+        if self._ict is not None and getattr(self._ict, '_initialized', False):
+            try:
+                _now_ms = int(now * 1000) if now < 1e12 else int(now)
+                for pool in self._ict.liquidity_pools:
+                    if not pool.swept or not pool.displacement_confirmed:
+                        continue
+                    _age = _now_ms - pool.sweep_timestamp
+                    if _age > _sweep_age_max_ms or _age < 0:
+                        continue
+                    # BSL swept + displacement = bearish (smart money sold through buy stops)
+                    if pool.level_type == "BSL" and flow_side == "short":
+                        _sweep_confirmed = True
+                        _sweep_pool = pool
+                        break
+                    # SSL swept + displacement = bullish (smart money bought through sell stops)
+                    elif pool.level_type == "SSL" and flow_side == "long":
+                        _sweep_confirmed = True
+                        _sweep_pool = pool
+                        break
+            except Exception:
+                pass
+
+        if not _sweep_confirmed:
+            # No fresh displacement sweep — fall back to structural-only flow.
+            # Still require 5m BOS + extreme order flow, but with wider
+            # confirmation (5 ticks instead of 2) since there's no sweep anchor.
+            _FLOW_CONFIRM_NO_SWEEP = 5
+            if flow_side == "long":
+                self._confirm_flow_long += 1
+                self._confirm_flow_short = 0
+                if self._confirm_flow_long < _FLOW_CONFIRM_NO_SWEEP:
+                    return
+            else:
+                self._confirm_flow_short += 1
+                self._confirm_flow_long = 0
+                if self._confirm_flow_short < _FLOW_CONFIRM_NO_SWEEP:
+                    return
+
+            self._confirm_flow_long = self._confirm_flow_short = 0
+            self._last_flow_entry_time = now
+
+            logger.info(
+                f"⚡ FLOW DISPLACEMENT (no sweep anchor) — {flow_side.upper()} | "
+                f"tick={self._tick_eng.get_signal():+.2f} "
+                f"streak={self._flow_tick_streak} | "
+                f"CVD_trend={self._cvd.get_trend_signal():+.2f} | "
+                f"BOS=5m confirmed")
+
+            # Invalidate conflicting sweep setups
+            if (self._active_sweep_setup is not None and
+                    self._active_sweep_setup.side != flow_side):
+                if self._sweep_detector is not None:
+                    self._sweep_detector.invalidate()
+                self._active_sweep_setup = None
+
+            self._launch_entry_async(
+                data_manager, order_manager, risk_manager,
+                flow_side, sig, mode="flow", ict_tier="B")
+            return
+
+        # ── Gate 2: AMD phase alignment ───────────────────────────────────
+        # AMD should be MANIPULATION (Judas swing in progress) or early
+        # DISTRIBUTION (delivery has started). ACCUMULATION = no edge.
+        _amd = self._ict.get_amd_state()
+        _amd_ok = _amd.phase in ("MANIPULATION", "DISTRIBUTION",
+                                   "REDISTRIBUTION", "REACCUMULATION")
+        _bias_matches = (
+            (flow_side == "short" and _amd.bias == "bearish") or
+            (flow_side == "long" and _amd.bias == "bullish") or
+            _amd.bias == "neutral"  # neutral doesn't oppose
+        )
+
+        if not (_amd_ok or _bias_matches):
+            # AMD actively opposes — only proceed if sweep is very strong
+            if not (_sweep_pool and _sweep_pool.displacement_confirmed and
+                    _sweep_pool.wick_rejection):
+                self._confirm_flow_long = self._confirm_flow_short = 0
+                return
+
+        # ── Gate 3: Fast confirmation (sweep-backed = 2 ticks) ────────────
+        _FLOW_CONFIRM_SWEEP = 2
+        if flow_side == "long":
+            self._confirm_flow_long += 1
+            self._confirm_flow_short = 0
+            if self._confirm_flow_long < _FLOW_CONFIRM_SWEEP:
+                return
+        else:
+            self._confirm_flow_short += 1
+            self._confirm_flow_long = 0
+            if self._confirm_flow_short < _FLOW_CONFIRM_SWEEP:
+                return
+
+        # ── CONFIRMED: sweep + displacement + flow + BOS ──────────────────
+        self._confirm_flow_long = self._confirm_flow_short = 0
+        self._last_flow_entry_time = now
+
+        # Invalidate conflicting sweep setups
+        if (self._active_sweep_setup is not None and
+                self._active_sweep_setup.side != flow_side):
+            logger.info(
+                f"🔄 Displacement {flow_side.upper()} invalidates "
+                f"{self._active_sweep_setup.side.upper()} sweep setup")
+            if self._sweep_detector is not None:
+                self._sweep_detector.invalidate()
+            self._active_sweep_setup = None
+
+        _sweep_label = (f"{_sweep_pool.level_type}@${_sweep_pool.price:,.0f}"
+                        if _sweep_pool else "none")
+        logger.info(
+            f"⚡ ICT DISPLACEMENT ENTRY — {flow_side.upper()} | "
+            f"sweep={_sweep_label} disp=True | "
+            f"AMD={_amd.phase}({_amd.bias},conf={_amd.confidence:.2f}) | "
+            f"tick={self._tick_eng.get_signal():+.2f} "
+            f"streak={self._flow_tick_streak} | "
+            f"CVD_trend={self._cvd.get_trend_signal():+.2f}")
+
+        # Tier-A when sweep-backed (institutional footprint confirmed)
+        # Tier-B when structure-only (BOS + flow but no sweep anchor)
+        _tier = "A" if _sweep_confirmed else "B"
+
+        self._launch_entry_async(
+            data_manager, order_manager, risk_manager,
+            flow_side, sig, mode="flow", ict_tier=_tier)
 
     def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -5328,7 +5625,7 @@ class QuantStrategy:
         _sweep_badge = ""
         if _sweep_was_active:
             _sweep_badge = " 🏛️ SWEEP-AND-GO"
-        mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("📈" if side == "long" else "📉"))
+        mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("⚡" if mode == "flow" else ("📈" if side == "long" else "📉")))
 
         # ── v8.0: additive tier + counter-HTF + AMD + sweep context lines ────────
         # Tier badge line
@@ -5418,6 +5715,33 @@ class QuantStrategy:
                     if pos.side == "short" and sig.composite > 0.25:
                         logger.info(f"🔄 Breakout expired + composite bullish → exit SHORT [momentum]")
                         self._exit_trade(order_manager, price, "breakout_expired"); return
+
+            # v5.1: Flow trades exit when order flow structurally reverses.
+            # Not on a single tick flip — on sustained counter-flow + BOS reversal.
+            if pos.trade_mode == "flow":
+                _tick_now = self._tick_eng.get_signal()
+                _bos_reversed = False
+                if self._ict is not None and getattr(self._ict, '_initialized', False):
+                    try:
+                        _tf5 = self._ict._tf.get("5m")
+                        if _tf5 is not None:
+                            if (pos.side == "long" and _tf5.bos_direction == "bearish"):
+                                _bos_reversed = True
+                            elif (pos.side == "short" and _tf5.bos_direction == "bullish"):
+                                _bos_reversed = True
+                    except Exception:
+                        pass
+                # Exit: BOS reversed AND tick flow now opposing
+                if _bos_reversed:
+                    _flow_opposing = (
+                        (pos.side == "long" and _tick_now < -0.40) or
+                        (pos.side == "short" and _tick_now > 0.40))
+                    if _flow_opposing and profit > 0:
+                        logger.info(
+                            f"🔄 Flow reversal: 5m BOS + opposing tick "
+                            f"({_tick_now:+.2f}) → exit {pos.side.upper()} [flow]")
+                        self._exit_trade(order_manager, price, "flow_reversal")
+                        return
 
         # v5.0: max-hold time exit REMOVED.
         # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
