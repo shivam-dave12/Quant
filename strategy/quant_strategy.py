@@ -1825,6 +1825,24 @@ class InstitutionalLevels:
                 f"${tp:,.2f} = 1:{QCfg.REVERSION_MIN_RR():.1f}R floor "
                 f"| SL dist={abs(price-sl_price):.0f}pts [{min_tp_dist:.0f}–{max_tp_dist:.0f}pts window]")
 
+        # ── Universal minimum R:R gate ────────────────────────────────────────
+        # ICT TIER-S targets enter the scored pool at a 1.0×SL floor to avoid
+        # filtering nearby structural levels. However no TP is accepted if the
+        # realized R:R falls below REVERSION_MIN_RR — at sub-1.5R the after-fee
+        # R:R drops below 1:1, producing negative expected value over time.
+        # Structure is authoritative for WHICH target is chosen; R:R is the
+        # institutional viability gate that structure cannot override.
+        _tp_dist  = abs(tp - price)
+        _sl_dist  = abs(price - sl_price)
+        _rr_final = _tp_dist / _sl_dist if _sl_dist > 1e-10 else 0.0
+        _min_rr   = QCfg.REVERSION_MIN_RR()
+        if _rr_final < _min_rr - 1e-9:
+            logger.info(
+                f"⛔ TP R:R gate (PATH-B): {_rr_final:.2f} < {_min_rr:.1f} minimum "
+                f"— tp=${tp:,.1f} dist={_tp_dist:.0f}pts sl_dist={_sl_dist:.0f}pts "
+                f"— returning None (no trade)")
+            return None
+
         return tp
 
     @staticmethod

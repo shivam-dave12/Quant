@@ -354,11 +354,21 @@ class QuantBot:
             entry = pos.get("entry_price", 0.0)
             sl    = pos.get("sl_price", 0.0)
             tp    = pos.get("tp_price", 0.0)
-            pnl   = (price - entry) if side == "LONG" else (entry - price)
-            logger.info(
-                f"💓 ${price:,.2f} [{feed}] | IN {side} @ ${entry:,.2f} | "
-                f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl:+.2f} pts"
-            )
+
+            # Guard: between order placement and fill confirmation, entry_price=0
+            # and side="" — computing PnL as (price - 0) produces a spurious
+            # "-$69,000 unrealised" line that looks like a catastrophic loss.
+            # Show "PENDING FILL" instead so the operator knows the state.
+            if entry <= 0 or side not in ("LONG", "SHORT"):
+                logger.info(
+                    f"💓 ${price:,.2f} [{feed}] | ⏳ PENDING FILL — order placed, awaiting confirmation"
+                )
+            else:
+                pnl = (price - entry) if side == "LONG" else (entry - price)
+                logger.info(
+                    f"💓 ${price:,.2f} [{feed}] | IN {side} @ ${entry:,.2f} | "
+                    f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl:+.2f} pts"
+                )
         else:
             stats  = self.strategy.get_stats() if self.strategy else {}
             phase  = stats.get("current_phase", "FLAT")

@@ -2037,7 +2037,7 @@ class ICTEntryGate:
         # P/D gate added: Tier-B entries require correct zone same as Tier-A.
         # LONG must NOT be in premium (4H PD > 60%); SHORT must NOT be in discount.
         _tier_b_conditions = (
-            ict_total >= 0.35 and    # ICT provides directional context, quant is the edge
+            ict_total >= 0.35 - 1e-9 and    # ICT provides directional context, quant is the edge; epsilon guards floating point boundary
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
@@ -2064,7 +2064,7 @@ class ICTEntryGate:
                     "_no_delivery_context")
             else:
                 block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
-        if ict_total < 0.35:
+        if ict_total < 0.35 - 1e-9:  # epsilon matches TIER-B gate — avoids 0.35<0.35 display
             block_reasons.append(f"ICT={ict_total:.2f}<0.35")
         if _tf_opposes_tier_a:
             _tf_val = quant.tick_flow if quant else 0.0
