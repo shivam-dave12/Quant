@@ -446,9 +446,12 @@ class TelegramBotController:
                     if sig.mtf_details:
                         lines.append(f"  {_esc(sig.mtf_details)}")
 
-                    # AMD phase interpretation for entry
-                    if amd_phase == "ACCUMULATION" and amd_conf >= 0.55:
-                        lines.append("  ⛔ Hard block: accumulation — no delivery in progress")
+                    # AMD phase interpretation for entry — thresholds MUST match ICTEntryGate exactly.
+                    # Hard block threshold is 0.75 (changed from 0.55 to allow Tier-B in ranging markets).
+                    if amd_phase == "ACCUMULATION" and amd_conf >= 0.75:
+                        lines.append("  ⛔ Hard block: ACCUMULATION conf≥0.75 — no delivery in progress")
+                    elif amd_phase == "ACCUMULATION" and amd_conf >= 0.50:
+                        lines.append(f"  💤 ACCUMULATION (conf={amd_conf:.2f}) — Tier-B eligible (quant-primary)")
                     elif amd_phase == "MANIPULATION":
                         lines.append("  ⚡ Judas swing active — need confirmed sweep for Tier-S")
                     elif amd_phase in ("DISTRIBUTION", "REDISTRIBUTION"):
@@ -535,7 +538,16 @@ class TelegramBotController:
             if ict and ict._initialized:
                 try:
                     from strategy.ict_trade_engine import ICTEntryGate, QuantHelperSignals
-                    _side = sig.reversion_side or "long"
+                    # BUG-C FIX: Use sweep side when OTE_READY, else VWAP reversion side.
+                    # Previously always used sig.reversion_side — this is wrong for sweep
+                    # entries where side = sweep_setup.side (possibly opposite VWAP).
+                    # The gate evaluation must mirror the actual _evaluate_reversion_entry logic.
+                    _active_sweep = getattr(strat, '_active_sweep_setup', None)
+                    if (_active_sweep is not None and
+                            _active_sweep.status == "OTE_READY"):
+                        _side = _active_sweep.side
+                    else:
+                        _side = sig.reversion_side or "long"
                     _qh   = strat._get_quant_helpers(sig, _side)
                     _tier, _cn, _reason = ICTEntryGate.evaluate(
                         _side, sig, sweep, price, _qh)

@@ -2076,13 +2076,6 @@ class ICTEngine:
             # This is mathematically correct: ACCUMULATION means "consolidating,
             # not opposing" — it should not penalise the confluence score.
             out.amd_score = 0.02
-        else:
-            # ACCUMULATION / REACCUMULATION / REDISTRIBUTION with neutral or
-            # mismatched bias: no delivery context, but also not opposing.
-            # Small baseline prevents the score from being identically zero
-            # in low-signal ranging markets where all other components are also
-            # near their floor values.
-            out.amd_score = 0.02
 
         # ── 3. PD Array ───────────────────────────────────────────────
         pd = 0.0
@@ -2390,13 +2383,6 @@ class ICTEngine:
             # artificially suppressed by a timing boundary.
             out.session_score = 0.01 * pd_mult
             details.append(f"Session=OFF({self._session or 'AVOID'})")
-        else:
-            # Off-session / AVOID: minimal baseline so the score is not
-            # identically zero in a 24h crypto market during quiet hours.
-            # Does not contribute meaningfully to tier thresholds — it merely
-            # prevents a pure structural play from scoring 0.00 session credit
-            # when all other components are present.
-            out.session_score = 0.01
         out.session_name = self._session
         out.killzone     = self._killzone
 
