@@ -1866,15 +1866,42 @@ class ICTEntryGate:
             return "BLOCKED", 0, f"HTF_VETO+weak_ICT({ict_total:.2f}<0.45)"
 
         # ── TIER-S: ICT Sweep-and-Go in OTE zone ─────────────────────────
-        _tier_s_conditions = (
+        # v5.1: Sweep quality gates calibrated to institutional execution.
+        # A 0.79 quality sweep at OTE with AMD DISTRIBUTION should NOT be
+        # blocked because ICT total is 0.58 instead of 0.60. The sweep IS
+        # the institutional footprint — the ICT score is just confluence
+        # and it lags behind the sweep event.
+        _sweep_ote = (
             sweep_setup is not None and
             sweep_setup.status == "OTE_READY" and
-            sweep_setup.side == side and
+            sweep_setup.side == side
+        )
+        # Quality-adaptive ICT threshold:
+        #   quality >= 0.70 (high conviction sweep) → ICT >= 0.50
+        #   quality >= 0.50 (standard sweep)        → ICT >= 0.55
+        #   quality <  0.50 (weak sweep)            → ICT >= 0.60 (original)
+        _ict_bar_s = 0.60
+        if _sweep_ote:
+            _sq = sweep_setup.quality_score()
+            if _sq >= 0.70:
+                _ict_bar_s = 0.50
+            elif _sq >= 0.50:
+                _ict_bar_s = 0.55
+        _tier_s_conditions = (
+            _sweep_ote and
             amd_phase in ("MANIPULATION", "DISTRIBUTION") and
             amd_conf >= 0.62 and
-            ict_total >= 0.60 and
-            (side == "long" and (in_disc or not in_prem) or
-             side == "short" and (in_prem or not in_disc)) and
+            ict_total >= _ict_bar_s and
+            # P/D gate: relaxed during AMD delivery (delivery crosses zones)
+            (
+                (amd_phase == "DISTRIBUTION" and (
+                    (side == "short" and amd_bias == "bearish") or
+                    (side == "long"  and amd_bias == "bullish")))
+                or
+                (side == "long"  and (in_disc or not in_prem))
+                or
+                (side == "short" and (in_prem or not in_disc))
+            ) and
             not tf_opposes  # tick flow soft veto
         )
         if _tier_s_conditions:
@@ -1934,7 +1961,11 @@ class ICTEntryGate:
         )
         _tier_a_conditions = (
             _has_delivery_context and
-            ict_total >= 0.55 and
+            # v5.1: sweep-backed entries use lower ICT bar (0.50).
+            # The sweep geometry provides structural cover that the ICT
+            # score was independently requiring. 0.54 vs 0.55 shouldn't
+            # block a quality=0.79 sweep at OTE.
+            ict_total >= (0.50 if _sweep_ote else 0.55) and
             (
                 (amd_phase == "DISTRIBUTION" and (
                     (side == "short" and amd_bias == "bearish") or
@@ -1947,7 +1978,11 @@ class ICTEntryGate:
             ) and
             not _tf_opposes_tier_a and    # Fix 2: softer threshold for counter-HTF
             _tier_a_htf_ok and
-            (q_composite * (1 if side == "long" else -1)) >= 0.20
+            # v5.1: sweep-backed entries need less composite confirmation.
+            # The sweep is the signal — composite is soft confirmation, not a gate.
+            # Standard: composite * direction >= 0.20
+            # Sweep-backed: composite * direction >= 0.05 (just not STRONGLY opposing)
+            (q_composite * (1 if side == "long" else -1)) >= (0.05 if _sweep_ote else 0.20)
         )
         if _tier_a_conditions:
             _a_label = "⚡COUNTER-HTF" if htf_veto else "structural"
