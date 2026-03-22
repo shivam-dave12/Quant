@@ -244,15 +244,56 @@ class FairValueGap:
           Bearish FVG (gap sits above current action, price fills upward):
             fill = (best_close_inside - bottom) / size (close moving up)
 
-        ICT mitigation threshold: 50% fill (close reached or passed midpoint).
+        v6.0 FIX — 3 critical bugs that caused FVG=0.00 in all conditions:
+
+        BUG-FVG-FILL-1: Candles from BEFORE the FVG timestamp were checked.
+            A 5m FVG detected at candle 196 got fill-checked against candles
+            189-199, including pre-FVG candles. Now only checks candles whose
+            timestamp is strictly AFTER the FVG creation time.
+
+        BUG-FVG-FILL-2: No grace period. The candle immediately following
+            the impulse often retraces into the gap (normal ICT rebalancing).
+            This is NOT mitigation — it's the gap being respected. Now skips
+            the first candle after FVG creation (1 candle grace).
+
+        BUG-FVG-FILL-3: 50% fill threshold killed LTF FVGs instantly.
+            A $10 5m FVG needed only $5 retrace to be mitigated. At BTC
+            ATR=125, $5 is 19% of a typical 5m candle — guaranteed kill.
+            Now uses TF-scaled thresholds:
+              1m/5m:  65% fill = mitigated
+              15m:    55% fill = mitigated
+              1h+:    50% fill = mitigated (institutional standard)
         """
         if self.filled or self.size < 1e-10:
             self.filled = True
             return
+
+        # TF-scaled mitigation threshold
+        _tf_fill_threshold = {
+            "1m": 0.65, "5m": 0.65,
+            "15m": 0.55,
+            "1h": 0.50, "4h": 0.50, "1d": 0.50,
+        }
+        _fill_thresh = _tf_fill_threshold.get(self.timeframe, 0.50)
+
+        # Grace period: skip candles within 1 candle-period of FVG creation
+        # (the post-impulse candle's retrace is NOT mitigation)
+        _grace_ms = {
+            "1m": 60_000, "5m": 300_000, "15m": 900_000,
+            "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+        }
+        _grace = _grace_ms.get(self.timeframe, 300_000)
+
         best_pen = 0.0
         for c in candles:
-            # Support both dict-style ({'c': ...}) and Candle object (.close)
+            # Support both dict-style ({'c': ..., 't': ...}) and Candle object
             cl = float(c['c']) if isinstance(c, dict) else float(c.close)
+            c_ts = int(c.get('t', 0)) if isinstance(c, dict) else int(getattr(c, 'timestamp', 0) * 1000)
+
+            # FIX 1+2: Only check candles AFTER the FVG + grace period
+            if c_ts > 0 and c_ts <= self.timestamp + _grace:
+                continue
+
             if self.direction == "bullish":
                 # Bullish FVG fills from TOP downward as price retraces into it
                 if cl <= self.top:
@@ -263,8 +304,9 @@ class FairValueGap:
                 if cl >= self.bottom:
                     pen = min(cl - self.bottom, self.size) / self.size
                     best_pen = max(best_pen, pen)
+
         self.fill_percentage = min(1.0, best_pen)
-        if self.fill_percentage >= 0.50:   # ICT standard: 50% fill = mitigated
+        if self.fill_percentage >= _fill_thresh:
             self.filled = True
 
 
@@ -702,29 +744,43 @@ class ICTEngine:
                              base_str=97.0, max_age=self.DAILY_OB_MAX_AGE_MS)
 
         # ── Fair Value Gaps — key timeframes ──────────────────────────
+        # v6.0 FIX: Limit detection lookback per TF. Scanning full 199-candle
+        # history creates FVGs from 16+ hours ago that are immediately killed
+        # by fill tracking (price has crossed those levels many times since).
+        # Only detect FVGs from recent candles — dedup prevents re-adding
+        # on subsequent calls anyway.
         # 1m: micro-FVGs for structure in ranging markets (short life)
         if candles_1m and len(candles_1m) >= 5:
             self._detect_fvgs(candles_1m[-60:], "1m", price, now_ms, 1_800_000)  # 30 min
-        self._detect_fvgs(candles_5m, "5m", price, now_ms, self.OB_MAX_AGE_MS)
+        # 5m: last 40 candles = 3.3 hours (was full 199 = 16.6 hours)
+        self._detect_fvgs(candles_5m[-40:] if len(candles_5m) > 40 else candles_5m,
+                          "5m", price, now_ms, self.OB_MAX_AGE_MS)
+        # 15m: last 30 candles = 7.5 hours
         if len(candles_15m) >= 5:
-            self._detect_fvgs(candles_15m, "15m", price, now_ms, self.OB_MAX_AGE_MS * 2)
+            self._detect_fvgs(candles_15m[-30:] if len(candles_15m) > 30 else candles_15m,
+                              "15m", price, now_ms, self.OB_MAX_AGE_MS * 2)
+        # 1h: last 24 candles = 24 hours
         if candles_1h and len(candles_1h) >= 5:
-            self._detect_fvgs(candles_1h, "1h", price, now_ms, self.HTF_OB_MAX_AGE_MS)
+            self._detect_fvgs(candles_1h[-24:] if len(candles_1h) > 24 else candles_1h,
+                              "1h", price, now_ms, self.HTF_OB_MAX_AGE_MS)
+        # 4h: last 15 candles = 60 hours
         if candles_4h and len(candles_4h) >= 5:
-            self._detect_fvgs(candles_4h, "4h", price, now_ms, self.HTF_OB_MAX_AGE_MS * 2)
+            self._detect_fvgs(candles_4h[-15:] if len(candles_4h) > 15 else candles_4h,
+                              "4h", price, now_ms, self.HTF_OB_MAX_AGE_MS * 2)
 
         # ── FVG fill tracking (TF-specific — institutional) ──────────
         # v5.1: each TF's FVGs are filled ONLY by candles from that TF.
-        # A 5m close into a 4h FVG is a reaction, not mitigation.
+        # v6.0: update_fill now filters by FVG timestamp + grace period.
+        # Pass bounded recent history — update_fill handles the rest.
         if candles_1m and len(candles_1m) >= 3:
             self._update_fvg_fills(candles_1m[-30:], "1m")
-        self._update_fvg_fills(candles_5m, "5m")
+        self._update_fvg_fills(candles_5m[-30:] if len(candles_5m) > 30 else candles_5m, "5m")
         if len(candles_15m) >= 3:
-            self._update_fvg_fills(candles_15m, "15m")
+            self._update_fvg_fills(candles_15m[-20:] if len(candles_15m) > 20 else candles_15m, "15m")
         if candles_1h and len(candles_1h) >= 3:
-            self._update_fvg_fills(candles_1h, "1h")
+            self._update_fvg_fills(candles_1h[-15:] if len(candles_1h) > 15 else candles_1h, "1h")
         if candles_4h and len(candles_4h) >= 3:
-            self._update_fvg_fills(candles_4h, "4h")
+            self._update_fvg_fills(candles_4h[-10:] if len(candles_4h) > 10 else candles_4h, "4h")
 
         # ── Liquidity pool detection + sweep ─────────────────────────
         self._detect_liquidity_pools(price, now_ms)
@@ -1279,20 +1335,14 @@ class ICTEngine:
         Track FVG fill penetration.
 
         v5.1 FIX: Timeframe-aware fill tracking.
+        v6.0 FIX: Pass sufficient candle history for timestamp-based filtering.
 
-        ROOT CAUSE OF 0 FVGs: the old code used 5m and 1m candle closes to
-        fill ALL FVGs regardless of source timeframe. A 5m candle closing past
-        the midpoint of a 4h FVG marked it as "mitigated" — killing all HTF
-        FVGs in ranging markets.
-
-        Institutional ICT: FVG mitigation requires a CLOSE on the SAME
-        timeframe (or higher). A 5m close into a 4h FVG is a reaction/test,
-        not mitigation. Only a 4h close past the midpoint mitigates a 4h FVG.
-
-        When tf="" (legacy mode), fills all FVGs (backward compatible).
-        When tf is specified, only fills FVGs from that exact timeframe.
+        The old code used candles[-10:] but update_fill now filters by
+        timestamp internally. Pass candles[-30:] to cover more history
+        while keeping it bounded. update_fill skips candles that predate
+        the FVG + grace period, so passing more candles is safe.
         """
-        check = candles[-10:] if len(candles) >= 10 else candles
+        check = candles[-30:] if len(candles) >= 30 else candles
         for fvg in list(self.fvgs_bull) + list(self.fvgs_bear):
             if not fvg.filled:
                 if tf and fvg.timeframe != tf:
