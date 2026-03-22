@@ -63,13 +63,6 @@ except ImportError as _ite_e:
     logger = logging.getLogger(__name__)
     logger.warning(f"ict_trade_engine.py not found — using legacy SL/TP/Trail: {_ite_e}")
 
-# ── v6.0: Unified Dynamic Trail Engine ────────────────────────────────────
-try:
-    from dynamic_trail_engine import DynamicTrailEngine
-    _DYNAMIC_TRAIL_AVAILABLE = True
-except ImportError:
-    _DYNAMIC_TRAIL_AVAILABLE = False
-
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1956,11 +1949,7 @@ class InstitutionalLevels:
             impulse_vol = sum(float(c['v']) for c in candles_1m[-8:-3]) / 5.0
             if impulse_vol > 1e-10:
                 vol_ratio = retrace_vol / impulse_vol
-                # FIX: QCfg.TRAIL_PB_VOL_RATIO() defaults to 0.60 — a 40% volume
-                # DECLINE — that's a pullback, not expansion. Real expansion is 30%+
-                # above prior volume. Floor at 1.30 regardless of config.
-                _vol_expansion_threshold = max(QCfg.TRAIL_PB_VOL_RATIO(), 1.30)
-                if vol_ratio > _vol_expansion_threshold:
+                if vol_ratio > QCfg.TRAIL_PB_VOL_RATIO():
                     reversal_signals += 1
                     details.append(f"vol_expand({vol_ratio:.2f})")
                 else:
@@ -2414,6 +2403,20 @@ class InstitutionalLevels:
                 return None
 
         return new_sl
+
+# ═══════════════════════════════════════════════════════════════
+# DYNAMIC TRAIL ENGINE — imported from dynamic_trail_engine.py
+# ═══════════════════════════════════════════════════════════════
+# DynamicTrailEngine is the single source of truth for trailing SL.
+# It is a standalone module so it can be unit-tested independently
+# and imported by any other strategy module without circular deps.
+try:
+    from dynamic_trail_engine import DynamicTrailEngine  # noqa: F401
+    _DYNAMIC_TRAIL_AVAILABLE = True
+except ImportError:
+    _DYNAMIC_TRAIL_AVAILABLE = False
+    logger.warning("dynamic_trail_engine.py not found — trail engine unavailable")
+
 
 # ATR ENGINE
 # ═══════════════════════════════════════════════════════════════
@@ -5270,10 +5273,17 @@ class QuantStrategy:
                     now_ms=now_ms_slatp,
                     candles_15m=candles_15m)
 
-        # FIX: tp_price can be None when compute_tp()/compute_tp_trend() R:R gate
-        # returns None. _round_to_tick(None) crashes: TypeError NoneType / float.
+        # BUG-1 FIX: compute_tp returns None when R:R gate hard-rejects the setup.
+        # Calling _round_to_tick(None) raises TypeError: unsupported operand type(s)
+        # for /: 'NoneType' and 'float'.  Gate the None explicitly here so the
+        # traceback never propagates past this function.
         if tp_price is None:
-            logger.info("⛔ TP computation returned None — no valid target")
+            _tp_gate_rr = (QCfg.REVERSION_MIN_RR() if mode not in ("trend","momentum")
+                           else QCfg.TREND_MIN_RR())
+            logger.info(
+                f"⛔ TP gate (PATH-B): no valid TP target for {side.upper()} "
+                f"— minimum R:R={_tp_gate_rr:.1f} not achievable with current structure "
+                f"— rejecting trade (no entry)")
             return None, None
 
         tp_price = _round_to_tick(tp_price)
@@ -5418,9 +5428,7 @@ class QuantStrategy:
             signal_confidence=signal_confidence,
             use_maker_entry=use_maker,
         )
-        if sl_price is None or tp_price is None:
-            logger.info("⛔ SL/TP computation rejected — no trade")
-            return
+        if sl_price is None: return   # TP floor rejected the setup
 
         sd = abs(price - sl_price)
         td = abs(price - tp_price)
@@ -5756,6 +5764,9 @@ class QuantStrategy:
             # v5.1: Flow trades exit when order flow structurally reverses.
             # Not on a single tick flip — on sustained counter-flow + BOS reversal.
             if pos.trade_mode == "flow":
+                # BUG-FIX: compute profit here; it was used below without being defined
+                _flow_profit = ((price - pos.entry_price) if pos.side == "long"
+                                else (pos.entry_price - price))
                 _tick_now = self._tick_eng.get_signal()
                 _bos_reversed = False
                 if self._ict is not None and getattr(self._ict, '_initialized', False):
@@ -5773,7 +5784,7 @@ class QuantStrategy:
                     _flow_opposing = (
                         (pos.side == "long" and _tick_now < -0.40) or
                         (pos.side == "short" and _tick_now > 0.40))
-                    if _flow_opposing and profit > 0:
+                    if _flow_opposing and _flow_profit > 0:
                         logger.info(
                             f"🔄 Flow reversal: 5m BOS + opposing tick "
                             f"({_tick_now:+.2f}) → exit {pos.side.upper()} [flow]")
@@ -5963,9 +5974,142 @@ class QuantStrategy:
         _be_floor = (pos.entry_price + _fee_buf if pos.side == "long"
                      else pos.entry_price - _fee_buf)
 
-        # v6.0: Ratchet removed — BE floor competes as ONE CANDIDATE in the unified
-        # DynamicTrailEngine. No pre-emptive ratchet that blocks trail advancement.
-        # _be_floor kept for counter-BOS emergency (below).
+        _ratchet_due = mfe_r >= 0.50
+        _ratchet_label = ""
+        if mfe_r >= 2.00:   _ratchet_label = "2.00R"
+        elif mfe_r >= 1.50: _ratchet_label = "1.50R"
+        elif mfe_r >= 1.00: _ratchet_label = "1.00R"
+        elif mfe_r >= 0.50: _ratchet_label = "0.50R"
+
+        if _ratchet_due:
+            _sl_worse_than_be = ((pos.side == "long" and pos.sl_price < _be_floor) or
+                                 (pos.side == "short" and pos.sl_price > _be_floor))
+
+            if _sl_worse_than_be:
+                # ── Find structural defense between entry and price ────────
+                _struct_sl = None
+                _struct_label = ""
+                _ob_buf = 0.30 * atr
+
+                # 1. OB anchor
+                if self._ict is not None:
+                    try:
+                        obs = (self._ict.order_blocks_bull if pos.side == "long"
+                               else self._ict.order_blocks_bear)
+                        active_obs = [o for o in obs if o.is_active(now_ms)]
+                        if pos.side == "long":
+                            valid_obs = [o for o in active_obs
+                                         if _be_floor < o.low - _ob_buf < price - 0.5 * atr]
+                            if valid_obs:
+                                best_ob = max(valid_obs, key=lambda o: o.low)
+                                _struct_sl = best_ob.low - _ob_buf
+                                _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
+                        else:
+                            valid_obs = [o for o in active_obs
+                                         if price + 0.5 * atr < o.high + _ob_buf < _be_floor]
+                            if valid_obs:
+                                best_ob = min(valid_obs, key=lambda o: o.high)
+                                _struct_sl = best_ob.high + _ob_buf
+                                _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
+                    except Exception:
+                        pass
+
+                # 2. 5m swing structure
+                if _struct_sl is None and len(candles_5m) >= 6:
+                    try:
+                        from ict_trade_engine import _find_swings
+                        closed_5m = candles_5m[:-1]
+                        highs_5m, lows_5m = _find_swings(
+                            closed_5m, min(12, len(closed_5m) - 2))
+                        sw_buf = 0.40 * atr
+                        if pos.side == "long" and lows_5m:
+                            valid_sw = [l for l in lows_5m
+                                        if _be_floor < l - sw_buf < price - 0.5 * atr]
+                            if valid_sw:
+                                _struct_sl = max(valid_sw) - sw_buf
+                                _struct_label = f"5m_SW@${max(valid_sw):.0f}"
+                        elif pos.side == "short" and highs_5m:
+                            valid_sw = [h for h in highs_5m
+                                        if price + 0.5 * atr < h + sw_buf < _be_floor]
+                            if valid_sw:
+                                _struct_sl = min(valid_sw) + sw_buf
+                                _struct_label = f"5m_SW@${min(valid_sw):.0f}"
+                    except Exception:
+                        pass
+
+                # 3. Liquidity pool avoidance
+                if _struct_sl is not None and self._ict is not None:
+                    try:
+                        _liq_buf = 0.50 * atr
+                        for pool in self._ict.liquidity_pools:
+                            if pool.swept:
+                                continue
+                            if pos.side == "long" and pool.pool_type == "EQL":
+                                if abs(_struct_sl - pool.price) < _liq_buf:
+                                    _shifted = pool.price - _liq_buf
+                                    if _shifted > pos.sl_price:
+                                        _struct_sl = _shifted
+                                        _struct_label += f"+LiqAvoid@${pool.price:.0f}"
+                                    else:
+                                        _struct_sl = None; _struct_label = ""
+                            elif pos.side == "short" and pool.pool_type == "EQH":
+                                if abs(_struct_sl - pool.price) < _liq_buf:
+                                    _shifted = pool.price + _liq_buf
+                                    if _shifted < pos.sl_price:
+                                        _struct_sl = _shifted
+                                        _struct_label += f"+LiqAvoid@${pool.price:.0f}"
+                                    else:
+                                        _struct_sl = None; _struct_label = ""
+                    except Exception:
+                        pass
+
+                # 4. Best of structural defense or BE floor
+                if _struct_sl is not None:
+                    if pos.side == "long":
+                        _ratchet_target = max(_struct_sl, _be_floor)
+                    else:
+                        _ratchet_target = min(_struct_sl, _be_floor)
+                    _final_label = f"STRUCT({_struct_label})"
+                else:
+                    _ratchet_target = _be_floor
+                    _final_label = "BE_FLOOR"
+
+                _ratchet_tick = _round_to_tick(_ratchet_target)
+
+                # Sanity: never past current price
+                if pos.side == "long" and _ratchet_tick >= price:
+                    _ratchet_tick = _round_to_tick(price - 0.5 * atr)
+                elif pos.side == "short" and _ratchet_tick <= price:
+                    _ratchet_tick = _round_to_tick(price + 0.5 * atr)
+
+                _is_improvement = ((pos.side == "long" and _ratchet_tick > pos.sl_price) or
+                                   (pos.side == "short" and _ratchet_tick < pos.sl_price))
+
+                if _is_improvement:
+                    logger.info(
+                        f"🔒 RATCHET [{_ratchet_label}] | MFE={mfe_r:.2f}R | "
+                        f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} [{_final_label}]")
+                    es = "sell" if pos.side == "long" else "buy"
+                    result = order_manager.replace_stop_loss(
+                        existing_sl_order_id=pos.sl_order_id,
+                        side=es, quantity=pos.quantity,
+                        new_trigger_price=_ratchet_tick)
+                    if result is None:
+                        logger.warning("🚨 SL already fired during ratchet")
+                        self._record_exchange_exit(None)
+                        return True
+                    if isinstance(result, dict) and "error" not in result:
+                        with self._lock:
+                            pos.sl_price = _ratchet_tick
+                            pos.sl_order_id = result.get("order_id") or pos.sl_order_id
+                            pos.trail_active = True
+                            pos.consecutive_trail_holds = 0
+                            self.current_sl_price = _ratchet_tick
+                        send_telegram_message(
+                            f"🔒 <b>RATCHET SL [{_ratchet_label}]</b>\n"
+                            f"${pos.sl_price:,.2f} [{_final_label}]\n"
+                            f"MFE: {mfe_r:.2f}R")
+                    return False
 
         # ══════════════════════════════════════════════════════════════════
         # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
@@ -6019,82 +6163,50 @@ class QuantStrategy:
                 logger.debug(f"Counter-BOS check error (non-fatal): {_bos_e}")
 
         # ══════════════════════════════════════════════════════════════════
-        # v6.0: UNIFIED DYNAMIC TRAIL ENGINE
+        # v6.0: DYNAMIC TRAIL ENGINE — replaces static ICTTrailEngine.
+        # Every call reads live AMD phase, ATR percentile, OBs/FVGs,
+        # swing structure, liquidity pools, and delivery target proximity.
+        # No hardcoded phases, no fixed ATR multiples.
         # ══════════════════════════════════════════════════════════════════
-        # Replaces both the old ratchet system and ICTTrailEngine/legacy trail.
-        # BE floor is ONE candidate among many (OBs, swings, BOS). Best wins.
-        # Phase gates and min-distance adapt to AMD, ATR regime, ADX.
         _hold_reason: List[str] = []
-
         _atr_pctile = self._atr_5m.get_percentile()
-        _adx_val = self._adx.adx if hasattr(self._adx, 'adx') else 15.0
-        _amd_phase_str = ""
-        _amd_conf_val = 0.0
+
+        # Pull live AMD + ADX context for the external engine
+        _amd_phase  = "ACCUMULATION"
+        _amd_conf   = 0.0
+        _adx_now    = self._adx.adx
         if self._ict is not None:
             try:
-                _amd_phase_str = self._ict._amd.phase
-                _amd_conf_val = self._ict._amd.confidence
+                _amd_phase = self._ict._amd.phase
+                _amd_conf  = self._ict._amd.confidence
             except Exception:
                 pass
 
-        if _DYNAMIC_TRAIL_AVAILABLE:
-            new_sl = DynamicTrailEngine.compute(
-                pos_side         = pos.side,
-                price            = price,
-                entry_price      = pos.entry_price,
-                current_sl       = pos.sl_price,
-                atr              = atr,
-                initial_sl_dist  = pos.initial_sl_dist,
-                peak_profit      = pos.peak_profit,
-                peak_price_abs   = pos.peak_price_abs,
-                hold_seconds     = hold_secs,
-                candles_1m       = candles_1m,
-                candles_5m       = candles_5m,
-                orderbook        = orderbook,
-                entry_vol        = pos.entry_vol,
-                trade_mode       = pos.trade_mode,
-                ict_engine       = self._ict,
-                now_ms           = now_ms,
-                hold_reason      = _hold_reason,
-                atr_percentile   = _atr_pctile,
-                amd_phase        = _amd_phase_str,
-                amd_confidence   = _amd_conf_val,
-                adx              = _adx_val,
-                tick_size        = QCfg.TICK_SIZE(),
-            )
-        elif (_ICT_TRADE_ENGINE_AVAILABLE and
-                QCfg.ICT_TRAIL_AMD_PHASE_AWARE() and
-                self._ict is not None):
-            new_sl = ICTTrailEngine.compute(
-                pos_side         = pos.side,
-                price            = price,
-                entry_price      = pos.entry_price,
-                current_sl       = pos.sl_price,
-                atr              = atr,
-                initial_sl_dist  = pos.initial_sl_dist,
-                peak_profit      = pos.peak_profit,
-                peak_price_abs   = pos.peak_price_abs,
-                hold_seconds     = hold_secs,
-                candles_1m       = candles_1m,
-                candles_5m       = candles_5m,
-                orderbook        = orderbook,
-                entry_vol        = pos.entry_vol,
-                trade_mode       = pos.trade_mode,
-                ict_engine       = self._ict,
-                now_ms           = now_ms,
-                hold_reason      = _hold_reason,
-            )
-        else:
-            # ── Legacy v4.9 trail ─────────────────────────────────────────
-            new_sl = InstitutionalLevels.compute_trail_sl(
-                pos.side, price, pos.entry_price, pos.sl_price, atr,
-                candles_1m, orderbook, pos.peak_profit, pos.entry_vol,
-                hold_seconds=hold_secs, peak_price_abs=pos.peak_price_abs,
-                trade_mode=pos.trade_mode, candles_5m=candles_5m,
-                initial_sl_dist=pos.initial_sl_dist,
-                ict_engine=self._ict,
-                now_ms=now_ms,
-                hold_reason=_hold_reason)
+        new_sl = DynamicTrailEngine.compute(
+            pos_side        = pos.side,
+            price           = price,
+            entry_price     = pos.entry_price,
+            current_sl      = pos.sl_price,
+            atr             = atr,
+            initial_sl_dist = pos.initial_sl_dist,
+            peak_profit     = pos.peak_profit,
+            peak_price_abs  = pos.peak_price_abs,
+            hold_seconds    = hold_secs,
+            candles_1m      = candles_1m,
+            candles_5m      = candles_5m,
+            orderbook       = orderbook,
+            entry_vol       = pos.entry_vol,
+            trade_mode      = pos.trade_mode,
+            ict_engine      = self._ict,
+            now_ms          = now_ms,
+            hold_reason     = _hold_reason,
+            # Rich context — engine uses these to adapt thresholds dynamically
+            atr_percentile  = _atr_pctile,
+            amd_phase       = _amd_phase,
+            amd_confidence  = _amd_conf,
+            adx             = _adx_now,
+            tick_size       = QCfg.TICK_SIZE(),
+        )
 
         if new_sl is None:
             pos.consecutive_trail_holds += 1
@@ -6102,28 +6214,23 @@ class QuantStrategy:
             if now - self._last_trail_block_log >= _trail_log_interval:
                 self._last_trail_block_log = now
                 init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
-                tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
-                _mfe_r = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
-                hm = (now - pos.entry_time) / 60.0
-                _reason_str = " | ".join(_hold_reason) if _hold_reason else f"tier={tier:.2f}R"
-                # Show AMD phase in trail hold log
-                _amd_label = ""
+                tier      = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
+                hm        = (now - pos.entry_time) / 60.0
+                # Full context for trail hold: reason + AMD + profit + SL
+                _reason_str  = " | ".join(_hold_reason) if _hold_reason else f"tier={tier:.2f}R<ACT"
+                _amd_label   = ""
+                _vol_label   = f"pctile={_atr_pctile:.0%}"
                 if self._ict is not None:
                     try:
-                        _amd_label = f" | AMD={self._ict._amd.phase}({self._ict._amd.confidence:.2f})"
+                        _amd_ph  = self._ict._amd.phase
+                        _amd_cf  = self._ict._amd.confidence
+                        _amd_label = f" | AMD={_amd_ph}({_amd_cf:.2f})"
                     except Exception:
                         pass
-                # Show BE status for context
-                _be_status = ""
-                if pos.side == "long":
-                    _be_status = " BE✅" if pos.sl_price >= _be_floor else " BE❌"
-                else:
-                    _be_status = " BE✅" if pos.sl_price <= _be_floor else " BE❌"
                 logger.info(
                     f"🔒 Trail HOLD | {_reason_str}{_amd_label} | "
-                    f"profit={profit:.1f}pts peak={pos.peak_profit:.1f}pts "
-                    f"MFE={_mfe_r:.2f}R | "
-                    f"SL=${pos.sl_price:,.1f}{_be_status} | hold={hm:.0f}m")
+                    f"profit={profit:.1f}pts peak={pos.peak_profit:.1f}pts | "
+                    f"SL=${pos.sl_price:,.1f} | hold={hm:.0f}m | {_vol_label}")
             return False
 
         new_sl_tick = _round_to_tick(new_sl)
@@ -6147,29 +6254,45 @@ class QuantStrategy:
                 _amd_phase_label = f" AMD={_ap}({_ac:.2f})"
             except Exception:
                 pass
-        if tier < QCfg.TRAIL_BE_R():
-            phase_label = "⬜ P0 (hands off)"
-        elif tier < QCfg.TRAIL_LOCK_R():
-            phase_label = "🟡 P1 (structure)"
-        elif tier < QCfg.TRAIL_AGGRESSIVE_R():
-            phase_label = "🟠 P2 (locked)"
-        else:
-            phase_label = "🟢 P3 (full)"
 
-        min_d = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr if tier < QCfg.TRAIL_LOCK_R() else (
-                QCfg.TRAIL_MIN_DIST_ATR_P2() * atr if tier < QCfg.TRAIL_AGGRESSIVE_R() else
-                QCfg.TRAIL_MIN_DIST_ATR_P3() * atr)
+        # External DynamicTrailEngine logs the anchor via debug log internally.
+        # Extract anchor label from hold_reason debug entries when present.
+        _anchor_label = ""
+        for r in (_hold_reason or []):
+            for prefix in ("TRAIL→", "Trail "):
+                if prefix in r:
+                    b0 = r.find("["); b1 = r.find("]")
+                    if b0 != -1 and b1 != -1:
+                        _anchor_label = f" [{r[b0+1:b1]}]"
+                    break
+            if _anchor_label:
+                break
+
+        # Tier label derived from R-multiple (matches external engine's phase logic)
+        if tier >= 2.0:
+            phase_label = "🟢 P3"
+        elif tier >= 1.0:
+            phase_label = "🟠 P2"
+        elif tier >= 0.45:
+            phase_label = "🟡 P1"
+        else:
+            phase_label = "⬜ P0"
+
+        # Vol regime label (inline — no dependency on embedded methods)
+        _vol_tag = ("extreme" if _atr_pctile > 0.90 else
+                    "elevated" if _atr_pctile > 0.70 else
+                    "normal"   if _atr_pctile > 0.30 else "quiet")
         hm = (now - pos.entry_time) / 60.0
+        _improvement = new_sl_tick - pos.sl_price if pos.side == "long" else pos.sl_price - new_sl_tick
         logger.info(
-            f"🔒 Trail [{phase_label}]{_amd_phase_label} "
-            f"${pos.sl_price:,.1f} → ${new_sl_tick:,.1f} | "
-            f"R={tier:.2f} MFE={pos.peak_profit:.1f}pts hold={hm:.0f}m "
-            f"min_dist=${min_d:.0f}")
+            f"🔒 Trail [{phase_label}]{_anchor_label}{_amd_phase_label} "
+            f"${pos.sl_price:,.1f} → ${new_sl_tick:,.1f} (+{_improvement:.1f}pts) | "
+            f"R={tier:.2f}R MFE={pos.peak_profit:.1f}pts hold={hm:.0f}m vol={_vol_tag}")
         send_telegram_message(
-            f"🔒 <b>TRAIL SL</b> [{phase_label}]{_amd_phase_label}\n"
-            f"${pos.sl_price:,.2f} → ${new_sl_tick:,.2f}\n"
-            f"R: {tier:.2f} | MFE: {pos.peak_profit:.1f} pts | Hold: {hm:.0f}m\n"
-            f"Min dist: ${min_d:.0f} ({min_d/atr:.1f}×ATR)")
+            f"🔒 <b>TRAIL SL</b> [{phase_label}]{_anchor_label}{_amd_phase_label}\n"
+            f"${pos.sl_price:,.2f} → ${new_sl_tick:,.2f} (+{_improvement:.1f}pts)\n"
+            f"R: {tier:.2f}R | MFE: {pos.peak_profit:.1f}pts | Hold: {hm:.0f}m\n"
+            f"Vol: {_vol_tag} ({_atr_pctile:.0%} pctile) | ATR: ${atr:.1f}")
 
         es = "sell" if pos.side=="long" else "buy"
         result = order_manager.replace_stop_loss(existing_sl_order_id=pos.sl_order_id, side=es, quantity=pos.quantity, new_trigger_price=new_sl_tick)
@@ -6231,66 +6354,32 @@ class QuantStrategy:
 
     def _record_exchange_exit(self, ex_pos):
         """
-        v6.0: Accurate exit detection with exchange fill price lookup.
+        v4.9: Correct TP/SL detection, accurate PnL, reformatted notification.
 
-        IMPROVEMENTS over v4.9:
-        1. Attempts to get ACTUAL fill price from exchange order status
-           before falling back to SL/TP price heuristics.
-        2. For ambiguous exits (price between SL and TP), uses last known
-           price with proximity classification instead of defaulting to SL.
-        3. Properly handles trail SL where final SL price ≠ initial SL.
+        BUG FIXES:
+        1. _last_known_price between SL and TP was used as exit_price — gave wrong PnL
+           when SL fired during a pullback recovery. Now uses sl_price/tp_price directly.
+        2. Win counted as pnl>0, but pnl could be positive due to wrong exit_price.
+           Fixed by using actual sl_price when SL fired.
+        3. _total_trades now incremented HERE (at close) not at entry — win-rate
+           denominator only counts completed trades.
+        4. Full trade record stored in _trade_history for /trades command.
         """
         pos = self._pos
         if pos.phase == PositionPhase.FLAT:
             logger.debug("_record_exchange_exit skipped — already FLAT")
             return
 
-        # ─── Step 0: Try to get actual fill price from exchange ──────────────
-        actual_fill_price = 0.0
-        actual_exit_reason = ""
-        if self._om is not None:
-            try:
-                # Check SL order first (most common exit path)
-                if pos.sl_order_id:
-                    sl_status = self._om.get_order_status_safe(pos.sl_order_id)
-                    if sl_status and isinstance(sl_status, dict):
-                        _state = str(sl_status.get("state", sl_status.get("status", ""))).lower()
-                        if _state in ("filled", "closed", "executed"):
-                            _fp = (sl_status.get("average_fill_price")
-                                   or sl_status.get("fill_price")
-                                   or sl_status.get("price"))
-                            if _fp and float(_fp) > 1.0:
-                                actual_fill_price = float(_fp)
-                                actual_exit_reason = "trail_sl_hit" if pos.trail_active else "sl_hit"
-                # Check TP order if SL wasn't filled
-                if actual_fill_price < 1.0 and pos.tp_order_id:
-                    tp_status = self._om.get_order_status_safe(pos.tp_order_id)
-                    if tp_status and isinstance(tp_status, dict):
-                        _state = str(tp_status.get("state", tp_status.get("status", ""))).lower()
-                        if _state in ("filled", "closed", "executed"):
-                            _fp = (tp_status.get("average_fill_price")
-                                   or tp_status.get("fill_price")
-                                   or tp_status.get("price"))
-                            if _fp and float(_fp) > 1.0:
-                                actual_fill_price = float(_fp)
-                                actual_exit_reason = "tp_hit"
-            except Exception as _fill_e:
-                logger.debug(f"Fill price lookup error (non-fatal): {_fill_e}")
-
         # ─── Step 1: Determine exit type (SL or TP) and exit price ──────────────
+        # Priority: if last known price is at/past TP → TP hit.
+        #           if last known price is at/before SL → SL hit.
+        #           Otherwise default to SL (conservative — avoids false wins).
         exit_reason = "exchange_exit"
         exit_price  = 0.0
         is_tp_hit   = False
         is_sl_hit   = False
 
-        if actual_fill_price > 1.0:
-            # We got the actual fill from exchange — use it directly
-            exit_price = actual_fill_price
-            exit_reason = actual_exit_reason
-            is_tp_hit = (actual_exit_reason == "tp_hit")
-            is_sl_hit = not is_tp_hit
-            logger.info(f"📊 Actual fill from exchange: ${exit_price:,.2f} ({exit_reason})")
-        elif pos.entry_price > 0 and pos.quantity > 0:
+        if pos.entry_price > 0 and pos.quantity > 0:
             lkp = self._last_known_price if self._last_known_price > 1.0 else 0.0
             sp  = pos.sl_price
             tp  = pos.tp_price
@@ -6306,22 +6395,11 @@ class QuantStrategy:
                     exit_reason = "trail_sl_hit" if trailed else "sl_hit"
                     is_sl_hit   = True
                 else:
-                    # Ambiguous: price between SL and TP. Use LKP (closest to actual fill).
-                    if lkp > 0:
-                        exit_price = lkp
-                        # Classify by proximity to SL vs TP
-                        _sl_tp_range = abs(tp - sp) if tp > 0 and sp > 0 else 1.0
-                        _tp_dist_ratio = abs(lkp - tp) / max(_sl_tp_range, 1.0) if tp > 0 else 1.0
-                        if _tp_dist_ratio < 0.30:
-                            exit_reason = "tp_hit"
-                            is_tp_hit = True
-                        else:
-                            exit_reason = "trail_sl_hit" if trailed else "sl_hit"
-                            is_sl_hit = True
-                    else:
-                        exit_price  = sp if sp > 0 else pos.entry_price
-                        exit_reason = "trail_sl_hit" if trailed else "sl_hit"
-                        is_sl_hit   = True
+                    # Ambiguous: price between SL and TP when we detected exit.
+                    # Default to SL price — conservative (avoids false win PnL).
+                    exit_price  = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
             else:  # short
                 if tp > 0 and lkp <= tp * 1.0005:
                     exit_price  = tp
@@ -6332,20 +6410,9 @@ class QuantStrategy:
                     exit_reason = "trail_sl_hit" if trailed else "sl_hit"
                     is_sl_hit   = True
                 else:
-                    if lkp > 0:
-                        exit_price = lkp
-                        _sl_tp_range = abs(tp - sp) if tp > 0 and sp > 0 else 1.0
-                        _tp_dist_ratio = abs(lkp - tp) / max(_sl_tp_range, 1.0) if tp > 0 else 1.0
-                        if _tp_dist_ratio < 0.30:
-                            exit_reason = "tp_hit"
-                            is_tp_hit = True
-                        else:
-                            exit_reason = "trail_sl_hit" if trailed else "sl_hit"
-                            is_sl_hit = True
-                    else:
-                        exit_price  = sp if sp > 0 else pos.entry_price
-                        exit_reason = "trail_sl_hit" if trailed else "sl_hit"
-                        is_sl_hit   = True
+                    exit_price  = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
+                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"
+                    is_sl_hit   = True
 
         # ─── Step 2: Compute PnL ─────────────────────────────────────────────────
         pnl = 0.0
@@ -6375,16 +6442,25 @@ class QuantStrategy:
             result_color = "WIN ✅"
         elif is_sl_hit and pnl > 0:
             result_icon  = "🔒"
-            result_label = "TRAIL SL" if pos.trail_active else "SL HIT (profitable)"
+            result_label = "TRAIL SL (profitable)" if pos.trail_active else "SL HIT (profitable)"
             result_color = "WIN ✅"
+        elif is_sl_hit and pos.trail_active:
+            result_icon  = "🔒"
+            result_label = "TRAIL SL"
+            result_color = "LOSS ❌"
         else:
             result_icon  = "🛑"
             result_label = "SL HIT"
             result_color = "LOSS ❌"
 
-        mfe_r   = pos.peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        tp_dist = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
+        mfe_r      = pos.peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        tp_dist    = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
         planned_rr = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
+        # Trail SL quality: how much did the trail improve vs original SL?
+        _orig_sl_side = ((pos.entry_price - init_sl_dist)
+                         if pos.side == "long"
+                         else (pos.entry_price + init_sl_dist))
+        _trail_improvement = abs(pos.sl_price - _orig_sl_side) if pos.trail_active else 0.0
 
         send_telegram_message(
             f"{result_icon} <b>{result_color} — {result_label}</b>\n"
@@ -6395,7 +6471,8 @@ class QuantStrategy:
             f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
-            f"Trail:    {'✅ was active' if pos.trail_active else '— not activated'}\n"
+            + (f"Trail:    ✅ SL moved {_trail_improvement:+.1f}pts vs orig\n"
+               if pos.trail_active else "Trail:    — not activated\n") +
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
         )
@@ -6452,7 +6529,13 @@ class QuantStrategy:
                              if pos.entry_signal else ''),
             "amd_conf":     (round(pos.entry_signal.amd_conf, 3)
                              if pos.entry_signal else 0.0),
-            "htf_15m":      (round(pos.entry_signal.deviation_atr, 3)
+            # BUG-5 FIX: was storing deviation_atr (VWAP distance) under the key
+            # "htf_15m" — makes the entire HTF attribution analytics meaningless.
+            # Now reads the actual HTF scores captured at entry time from PositionState.
+            # entry_htf_15m and entry_htf_4h are set in _enter_trade from self._htf.
+            "htf_15m":      round(getattr(pos, 'entry_htf_15m', 0.0), 3),
+            "htf_4h":       round(getattr(pos, 'entry_htf_4h',  0.0), 3),
+            "vwap_dev_atr": (round(pos.entry_signal.deviation_atr, 3)
                              if pos.entry_signal else 0.0),
             "adx":          (round(pos.entry_signal.adx, 1)
                              if pos.entry_signal else 0.0),
@@ -6575,47 +6658,81 @@ class QuantStrategy:
     @staticmethod
     def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
         """
-        FIX 4: Correct PnL formula for both exchange types.
+        Corrected PnL formula — v5.1.
 
-        Delta BTCUSD is an inverse perpetual (1 contract = 1 USD notional).
-        PnL in BTC = contracts × (1/entry − 1/exit) for LONG.
-        Convert to USD by multiplying by exit_price.
+        ROOT CAUSE OF PREVIOUS BUG:
+        The old Delta branch computed:
+            contracts = pos.quantity / DELTA_CONTRACT_VALUE_BTC   # e.g. 0.005/0.001 = 5
+        But Delta BTCUSD inverse perp has 1 USD per contract — NOT 0.001 BTC per contract.
+        To hold 0.005 BTC exposure at $68,856, you need 0.005 × 68,856 = 344 USD contracts.
+        Dividing by 0.001 gave 5 contracts = $5 notional instead of $344 notional.
+        Result: gross PnL was ~68× too small; net was always dominated by fees → showed loss
+        even when trailing SL locked 98 points of profit.
 
-        CoinSwitch and USDT-margined contracts use the standard linear formula:
-        gross = price_delta × qty_btc.
+        FIX:
+        For Delta BTCUSD inverse perp, convert BTC quantity to USD contracts by
+        multiplying by entry_price (the correct economic relationship):
+            usd_contracts = pos.quantity × pos.entry_price
+        Then apply the standard inverse-perp formula.
 
-        The previous formula used the linear formula unconditionally, giving
-        wrong PnL on Delta — potentially 5–10% error at typical BTC moves.
+        Mathematical note: for moves < 3% (all our trades), the inverse-perp formula
+        is equivalent to the linear formula to 3 significant figures:
+            gross ≈ pos.quantity × |exit_price − entry_price|
+        We use the exact inverse formula for correctness, but the linear approximation
+        is included as a sanity check in debug logs.
+
+        Both Delta and CoinSwitch paths now produce identical results for small moves
+        because the inverse-perp formula converges to linear.
+
+        Fee basis: notional is measured at entry price (standard industry practice).
         """
         import config as _cfg_pnl
         _is_delta = (getattr(_cfg_pnl, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
                      and getattr(_cfg_pnl, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
 
         if entry_fill_type == "maker":
-            entry_rate = float(getattr(_cfg_pnl, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+            entry_rate = float(getattr(_cfg_pnl, "COMMISSION_RATE_MAKER",
+                                        QCfg.COMMISSION_RATE() * 0.40))
         else:
             entry_rate = QCfg.COMMISSION_RATE()
         exit_rate = QCfg.COMMISSION_RATE()
 
         if _is_delta:
-            # Inverse perpetual: qty is stored in BTC; convert to USD contracts
-            _cv = float(getattr(_cfg_pnl, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
-            contracts = pos.quantity / _cv if _cv > 0 else pos.quantity
+            # Exact inverse-perpetual PnL for Delta BTCUSD (1 USD per contract)
+            # usd_contracts = how many $1 contracts needed to hold qty_btc exposure
+            usd_contracts = pos.quantity * pos.entry_price
             if pos.side == "long":
-                gross_btc = contracts * (1.0 / pos.entry_price - 1.0 / exit_price)
+                # LONG: profit when exit > entry
+                gross_btc = usd_contracts * (1.0 / pos.entry_price - 1.0 / exit_price)
             else:
-                gross_btc = contracts * (1.0 / exit_price - 1.0 / pos.entry_price)
-            gross     = gross_btc * exit_price  # BTC profit → USD
-            entry_fee = pos.entry_price * _cv * contracts * entry_rate
-            exit_fee  = exit_price * _cv * contracts * exit_rate
+                # SHORT: profit when exit < entry
+                gross_btc = usd_contracts * (1.0 / exit_price - 1.0 / pos.entry_price)
+            gross = gross_btc * exit_price   # BTC profit → USD at exit price
+            # Fee basis: qty_btc × price (standard, matches exchange invoice)
+            entry_fee = pos.entry_price * pos.quantity * entry_rate
+            exit_fee  = exit_price      * pos.quantity * exit_rate
+            # Sanity: verify against linear approximation (should differ by < 0.1% for |Δ|<3%)
+            _linear = ((exit_price - pos.entry_price) if pos.side == "long"
+                       else (pos.entry_price - exit_price)) * pos.quantity
+            if abs(_linear) > 1e-10:
+                _discrepancy_pct = abs(gross - _linear) / abs(_linear)
+                if _discrepancy_pct > 0.005:   # > 0.5% discrepancy → log as warning
+                    logger.warning(
+                        f"PnL sanity: inverse={gross:.4f} linear={_linear:.4f} "
+                        f"discrepancy={_discrepancy_pct:.3%} — large move detected")
         else:
-            # Linear (USDT-margined) — standard formula
+            # Linear (USDT-margined, CoinSwitch) — standard formula
             gross     = ((exit_price - pos.entry_price) if pos.side == "long"
                          else (pos.entry_price - exit_price)) * pos.quantity
             entry_fee = pos.entry_price * pos.quantity * entry_rate
-            exit_fee  = exit_price * pos.quantity * exit_rate
+            exit_fee  = exit_price      * pos.quantity * exit_rate
 
-        return gross - entry_fee - exit_fee
+        net_pnl = gross - entry_fee - exit_fee
+        logger.debug(
+            f"PnL calc: {pos.side} qty={pos.quantity} entry=${pos.entry_price:,.2f} "
+            f"exit=${exit_price:,.2f} gross=${gross:.4f} fees=${entry_fee+exit_fee:.4f} "
+            f"net=${net_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
+        return net_pnl
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 
@@ -6703,15 +6820,34 @@ class QuantStrategy:
             mfe_r    = p.peak_profit / init_sl if init_sl > 1e-10 else 0.0
             tp_dist  = abs(p.tp_price - p.entry_price) if p.tp_price > 0 else 0.0
             planned  = tp_dist / init_sl if init_sl > 1e-10 else 0.0
-            upnl     = raw_pts * p.quantity
+            # BUG-6 FIX: use _estimate_pnl for live uPnL — raw_pts × qty is wrong
+            # for Delta inverse-perp (where notional scales with price).
+            # _estimate_pnl handles both exchange types correctly with fees included.
+            fill_type = getattr(p, 'entry_fill_type', 'taker')
+            upnl = self._estimate_pnl(p, price, entry_fill_type=fill_type) if price > 1.0 else 0.0
+            # Also compute gross (pre-fee) points for display
+            _gross_pts = raw_pts
+            _trail_label = ('✅ active' if p.trail_active else '⏳ waiting for 0.50R')
+            # Show AMD phase + delivery target if available
+            _amd_status = ""
+            if self._ict is not None:
+                try:
+                    _amd = self._ict._amd
+                    _dp  = self._ict.get_delivery_profile(p.side, price, self._atr_5m.atr,
+                                                           int(time.time() * 1000))
+                    _dt  = float(_dp.get("delivery_target", 0.0))
+                    _amd_status = (f"\n  AMD: {_amd.phase}(conf={_amd.confidence:.2f})"
+                                   + (f" | Target: ${_dt:,.0f}" if _dt > 1.0 else ""))
+                except Exception:
+                    pass
             lines += [
                 "",
                 f"<b>🟢 Active {p.side.upper()} [{p.trade_mode.upper()}]</b>",
                 f"  Entry: ${p.entry_price:,.2f}  |  Now: ${price:,.2f}",
                 f"  SL: ${p.sl_price:,.2f}  |  TP: ${p.tp_price:,.2f}",
-                f"  uPnL: ${upnl:+.2f}  |  R: {curr_r:+.2f}R  |  MFE: {mfe_r:.2f}R",
-                f"  Planned R:R: 1:{planned:.2f}  |  Hold: {hm:.1f}m",
-                f"  Trail: {'✅ active' if p.trail_active else '⏳ waiting'}",
+                f"  uPnL: <b>${upnl:+.2f}</b>  |  Pts: {_gross_pts:+.1f}  |  R: {curr_r:+.2f}R",
+                f"  MFE: {mfe_r:.2f}R  |  Planned R:R: 1:{planned:.2f}  |  Hold: {hm:.1f}m",
+                f"  Trail: {_trail_label}{_amd_status}",
             ]
         return "\n".join(lines)
 
