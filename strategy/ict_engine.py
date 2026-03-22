@@ -2132,10 +2132,39 @@ class ICTEngine:
         # exceed 0.15, giving ob_score > 1.0 — an impossible display value.
         _ob_pd_contrib = pd   # OB-only contribution, before FVG is added
 
-        # FVG scoring
-        fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
-        act_fvgs = [f for f in fvgs_dir if f.is_active(now_ms)]
-        for fvg in act_fvgs:
+        # FVG scoring — BUG-FVG-POOL FIX
+        #
+        # ROOT CAUSE: The code only searched same-direction FVGs for the trade side:
+        #   LONG  → fvgs_bull only   SHORT → fvgs_bear only
+        #
+        # This is wrong for reversion trades in a one-directional market.
+        # In a declining market (common LONG reversion setup):
+        #   - Downward impulse candles create BEARISH FVGs above current price.
+        #   - Those bearish FVGs represent the imbalances price will FILL on the
+        #     way back up — they ARE the delivery corridor for a LONG trade.
+        #   - They live in fvgs_bear, which was never checked for side="long".
+        #
+        # ICT delivery mechanics:
+        #   LONG:  fills BEARISH FVGs above price (gaps from prior decline)
+        #          fills BULLISH FVGs below price  (price tests prior support)
+        #   SHORT: fills BULLISH FVGs below price  (gaps from prior rally)
+        #          fills BEARISH FVGs above price  (price tests prior resistance)
+        #
+        # Fix: check BOTH pools. Score them with a direction-aware label so the
+        # display correctly identifies which type is active.
+        #
+        # Scoring weights:
+        #   In-gap price:    same-direction FVG = primary (support/resistance at entry)
+        #                    opposite-direction FVG above/below = delivery (slightly reduced)
+        #   Proximity:       same formula, but opposite-direction capped at 80% of primary
+        #
+        fvgs_same = self.fvgs_bull if side == "long" else self.fvgs_bear
+        fvgs_opp  = self.fvgs_bear if side == "long" else self.fvgs_bull
+        act_same  = [f for f in fvgs_same if f.is_active(now_ms)]
+        act_opp   = [f for f in fvgs_opp  if f.is_active(now_ms)]
+
+        # 1. Price INSIDE an FVG (highest conviction — entry is at a structural imbalance)
+        for fvg in act_same:
             if fvg.is_price_in_gap(price):
                 fresh = 1.0 - fvg.fill_percentage
                 fvg_r = 0.50 + 0.30 * fresh
@@ -2148,30 +2177,36 @@ class ICTEngine:
                 active_fvg = fvg
                 break
 
-        # Proximity FVG — price is approaching but hasn't entered yet.
+        # Check opposite-direction in-gap only if same-direction didn't match
+        # (lower conviction — delivery-path context rather than structural entry)
+        if active_fvg is None:
+            for fvg in act_opp:
+                if fvg.is_price_in_gap(price):
+                    fresh = 1.0 - fvg.fill_percentage
+                    fvg_r = (0.50 + 0.30 * fresh) * 0.85   # 15% reduction vs same-dir
+                    details.append(
+                        f"FVG_DELIVERY ${fvg.bottom:.0f}-${fvg.top:.0f} tf={fvg.timeframe}")
+                    pd += fvg_r * 0.10
+                    active_fvg = fvg
+                    break
+
+        # 2. Proximity FVG — price is approaching but hasn't entered yet.
         #
-        # Two approach directions must be checked:
+        # Checked pools:
+        #   PRIMARY (same-direction): support/resistance FVGs in the standard window
+        #   DELIVERY (opposite-direction): imbalances price will fill during the move
+        #     - LONG:  bearish FVGs ABOVE price (created by prior sell-off, filled on rally)
+        #     - SHORT: bullish FVGs BELOW price (created by prior rally, filled on decline)
         #
-        # REVERSION approach (price has overextended, retreating back):
-        #   LONG:  price came down from above, bullish FVG is below.
-        #          Check: fvg.top < price  (FVG below, price approaching from above)
-        #   SHORT: price pushed up from below, bearish FVG is above.
-        #          Check: fvg.bottom > price  (FVG above, price approaching from below)
-        #
-        # DELIVERY approach (sweep entry — price rallies/falls INTO the delivery corridor):
-        #   LONG:  SSL swept, price now below FVG, approaching from below as it
-        #          delivers upward.  Bullish FVGs above price are the path.
-        #          Check: fvg.bottom > price  (FVG above, price approaching from below)
-        #   SHORT: BSL swept, price now above FVG, approaching from above as it
-        #          delivers downward.  Bearish FVGs below price are the path.
-        #          Check: fvg.top < price  (FVG below, price approaching from above)
-        #
-        # Both directions use the same FVG pool (fvgs_bull for LONG, fvgs_bear for SHORT).
-        # Take the closest qualifying FVG regardless of which direction it is from price.
+        # Proximity window: same-direction = FVG_PROXIMITY_ATR (0.8×ATR)
+        #                   opposite-direction = up to 2.0×ATR (delivery targets can be further)
         if active_fvg is None and atr > 1e-10:
             _best_fvg   = None
             _best_score = 0.0
-            for fvg in act_fvgs:
+            _best_label = ""
+
+            # ── Same-direction FVGs ───────────────────────────────────────
+            for fvg in act_same:
                 score = 0.0
                 if side == "long":
                     # Reversion: FVG below price (price approaching from above)
@@ -2180,7 +2215,7 @@ class ICTEngine:
                         if da <= self.FVG_PROXIMITY_ATR:
                             pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                             score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                    # Delivery: FVG above price (price approaching from below)
+                    # Delivery: bullish FVG above price (sweep-and-go — price below FVG)
                     elif fvg.bottom > price:
                         da = (fvg.bottom - price) / atr
                         if da <= self.FVG_PROXIMITY_ATR:
@@ -2193,7 +2228,7 @@ class ICTEngine:
                         if da <= self.FVG_PROXIMITY_ATR:
                             pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                             score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                    # Delivery: FVG below price (price approaching from above)
+                    # Delivery: bearish FVG below price (sweep-and-go — price above FVG)
                     elif fvg.top < price:
                         da = (price - fvg.top) / atr
                         if da <= self.FVG_PROXIMITY_ATR:
@@ -2202,16 +2237,67 @@ class ICTEngine:
                 if score > _best_score:
                     _best_score = score
                     _best_fvg   = fvg
+                    _best_label = "same_dir"
+
+            # ── Opposite-direction delivery FVGs ─────────────────────────
+            # Extended proximity window: delivery targets can be 2×ATR away
+            _DELIVERY_PROX_ATR = max(self.FVG_PROXIMITY_ATR * 2.5, 2.0)
+            for fvg in act_opp:
+                score = 0.0
+                if side == "long":
+                    # Bearish FVG ABOVE price = delivery target as price rallies up
+                    if fvg.bottom > price:
+                        da = (fvg.bottom - price) / atr
+                        if da <= _DELIVERY_PROX_ATR:
+                            pf = 1.0 - da / _DELIVERY_PROX_ATR
+                            # 80% of same-direction weight — still meaningful
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10 * 0.80,
+                                        0.028)
+                    # Bearish FVG below price being tested from above (less common)
+                    elif fvg.top < price:
+                        da = (price - fvg.top) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10 * 0.60,
+                                        0.021)
+                else:  # short
+                    # Bullish FVG BELOW price = delivery target as price falls down
+                    if fvg.top < price:
+                        da = (price - fvg.top) / atr
+                        if da <= _DELIVERY_PROX_ATR:
+                            pf = 1.0 - da / _DELIVERY_PROX_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10 * 0.80,
+                                        0.028)
+                    # Bullish FVG above price being tested from below (less common)
+                    elif fvg.bottom > price:
+                        da = (fvg.bottom - price) / atr
+                        if da <= self.FVG_PROXIMITY_ATR:
+                            pf = 1.0 - da / self.FVG_PROXIMITY_ATR
+                            score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10 * 0.60,
+                                        0.021)
+                if score > _best_score:
+                    _best_score = score
+                    _best_fvg   = fvg
+                    _best_label = "delivery"
+
             if _best_fvg is not None:
                 pd += _best_score
                 active_fvg = _best_fvg
-                _prox_dir  = ("below" if (
-                    (side == "long"  and _best_fvg.top   < price) or
-                    (side == "short" and _best_fvg.bottom > price)
-                ) else "above")
-                details.append(
-                    f"FVG_PROX({abs((price - _best_fvg.midpoint) / atr):.1f}ATR,"
-                    f"{_prox_dir}) tf={_best_fvg.timeframe}")
+                if _best_label == "delivery":
+                    _opp_type = "bear" if side == "long" else "bull"
+                    _dir_str  = "above" if side == "long" else "below"
+                    _dist_atr = abs((price - _best_fvg.midpoint) / atr)
+                    details.append(
+                        f"FVG_DELIVERY({_opp_type},{_dir_str},"
+                        f"{_dist_atr:.1f}ATR) tf={_best_fvg.timeframe}")
+                else:
+                    _prox_dir = ("below" if (
+                        (side == "long"  and _best_fvg.top   < price) or
+                        (side == "short" and _best_fvg.bottom > price)
+                    ) else "above")
+                    details.append(
+                        f"FVG_PROX({abs((price - _best_fvg.midpoint) / atr):.1f}ATR,"
+                        f"{_prox_dir}) tf={_best_fvg.timeframe}")
 
         out.pd_array_score = min(0.25, pd)
         out.active_ob  = active_ob
@@ -2367,31 +2453,36 @@ class ICTEngine:
         )
         out.mtf_ob_count = htf_ob_count
 
-        # MTF FVG stack — count any active FVG within proximity in EITHER direction.
-        # Matches the scoring branch exactly (which now checks both reversion and
-        # delivery approach directions).
+        # MTF FVG stack — count active FVGs in BOTH same-direction AND opposite-direction
+        # pools. Opposite-direction FVGs in the delivery path are equally valid structure.
+        # This matches the fixed FVG scoring branch above that now checks both pools.
         _fvg_stack = 0
-        fvgs_dir = self.fvgs_bull if side == "long" else self.fvgs_bear
-        for _f in fvgs_dir:
-            if not _f.is_active(now_ms) or _f.fill_percentage >= 0.50:
-                continue
-            if _f.is_price_in_gap(price):
-                _fvg_stack += 1
-            elif atr > 1e-10:
-                if side == "long":
-                    # Reversion: FVG below price
-                    if _f.top < price and (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
-                        _fvg_stack += 1
-                    # Delivery: FVG above price
-                    elif _f.bottom > price and (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
-                        _fvg_stack += 1
-                else:
-                    # Reversion: FVG above price
-                    if _f.bottom > price and (_f.bottom - price) / atr <= self.FVG_PROXIMITY_ATR:
-                        _fvg_stack += 1
-                    # Delivery: FVG below price
-                    elif _f.top < price and (price - _f.top) / atr <= self.FVG_PROXIMITY_ATR:
-                        _fvg_stack += 1
+        _DELIVERY_PROX_STACK = max(self.FVG_PROXIMITY_ATR * 2.5, 2.0)
+        for _pool, _is_delivery in (
+            (self.fvgs_bull if side == "long" else self.fvgs_bear, False),  # same-dir
+            (self.fvgs_bear if side == "long" else self.fvgs_bull, True),   # opp-dir
+        ):
+            for _f in _pool:
+                if not _f.is_active(now_ms) or _f.fill_percentage >= 0.50:
+                    continue
+                _prox = _DELIVERY_PROX_STACK if _is_delivery else self.FVG_PROXIMITY_ATR
+                if _f.is_price_in_gap(price):
+                    _fvg_stack += 1
+                elif atr > 1e-10:
+                    if side == "long":
+                        # Same-dir reversion (FVG below) or delivery (FVG above)
+                        # Opp-dir: bear FVG above = delivery target
+                        if _f.top < price and (price - _f.top) / atr <= _prox:
+                            _fvg_stack += 1
+                        elif _f.bottom > price and (_f.bottom - price) / atr <= _prox:
+                            _fvg_stack += 1
+                    else:
+                        # Same-dir reversion (FVG above) or delivery (FVG below)
+                        # Opp-dir: bull FVG below = delivery target
+                        if _f.bottom > price and (_f.bottom - price) / atr <= _prox:
+                            _fvg_stack += 1
+                        elif _f.top < price and (price - _f.top) / atr <= _prox:
+                            _fvg_stack += 1
         out.fvg_stack_count = _fvg_stack
 
         # PD matrix string
@@ -2585,23 +2676,43 @@ class ICTEngine:
                 cands.append((level, score, f"SweepOrigin_{pool.level_type}@${level:.0f}"))
 
         # ── Open FVGs in trade direction ──────────────────────────────
-        fvgs_t = self.fvgs_bull if side == "short" else self.fvgs_bear
-        for fvg in fvgs_t:
-            if fvg.filled or not fvg.is_active(now_ms):
-                continue
-            ne = fvg.top    if side == "short" else fvg.bottom
-            fe = fvg.bottom if side == "short" else fvg.top
-            dn = price - ne if side == "short" else ne - price
-            df = price - fe if side == "short" else fe - price
-            if not (min_dist <= dn <= max_dist):
-                continue
-            fresh = 1.0 - fvg.fill_percentage
-            sf    = min(fvg.size / max(atr * 0.5, 1.0), 2.0)
-            score = 5.0 * fresh * (0.6 + 0.4 * sf)
-            cands.append((ne, score,
-                          f"FVG_near@${ne:.0f}(fill={fvg.fill_percentage:.0%}) tf={fvg.timeframe}"))
-            if min_dist <= df <= max_dist:
-                cands.append((fe, score * 0.85, f"FVG_far@${fe:.0f} tf={fvg.timeframe}"))
+        # TP target FVGs: for a LONG, the target imbalances are BEARISH FVGs above
+        # price (gaps created by prior sell-offs, price will fill on the way up).
+        # For a SHORT, target imbalances are BULLISH FVGs below price.
+        # Note: fvgs_bear used for LONG, fvgs_bull used for SHORT — this is correct.
+        # These are the delivery-path imbalances that act as TP magnets.
+        #
+        # ALSO include same-direction FVGs that are BEYOND current price in the
+        # trade direction — e.g. bullish FVGs that were created by an earlier up-move
+        # and sit above price are valid LONG TP zones too.
+        _fvg_pools_for_tp = []
+        if side == "long":
+            _fvg_pools_for_tp.append((self.fvgs_bear, "delivery"))  # primary: fill prior sell-gap
+            _fvg_pools_for_tp.append((self.fvgs_bull, "same"))      # secondary: old support above
+        else:
+            _fvg_pools_for_tp.append((self.fvgs_bull, "delivery"))  # primary: fill prior buy-gap
+            _fvg_pools_for_tp.append((self.fvgs_bear, "same"))      # secondary: old resistance below
+
+        for fvg_pool, pool_type in _fvg_pools_for_tp:
+            for fvg in fvg_pool:
+                if fvg.filled or not fvg.is_active(now_ms):
+                    continue
+                ne = fvg.top    if side == "short" else fvg.bottom
+                fe = fvg.bottom if side == "short" else fvg.top
+                dn = price - ne if side == "short" else ne - price
+                df = price - fe if side == "short" else fe - price
+                if not (min_dist <= dn <= max_dist):
+                    continue
+                fresh = 1.0 - fvg.fill_percentage
+                sf    = min(fvg.size / max(atr * 0.5, 1.0), 2.0)
+                # Delivery-path FVGs score higher (they're THE reason price moves)
+                _score_mult = 1.0 if pool_type == "delivery" else 0.80
+                score = 5.0 * fresh * (0.6 + 0.4 * sf) * _score_mult
+                _lbl  = "delivery" if pool_type == "delivery" else "same"
+                cands.append((ne, score,
+                              f"FVG_{_lbl}@${ne:.0f}(fill={fvg.fill_percentage:.0%}) tf={fvg.timeframe}"))
+                if min_dist <= df <= max_dist:
+                    cands.append((fe, score * 0.85, f"FVG_far@${fe:.0f} tf={fvg.timeframe}"))
 
         # ── Virgin OBs in path ────────────────────────────────────────
         obs_t = self.order_blocks_bull if side == "short" else self.order_blocks_bear
