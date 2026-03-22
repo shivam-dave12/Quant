@@ -158,6 +158,10 @@ class ICTSweepDetector:
         # set is cleared so genuinely new sweeps can be tried.
         self._expired_sweep_keys: set = set()
         self._last_amd_phase: str = ""
+        self._MAX_EXPIRED_KEYS = 100   # FIX 13: bound the set to prevent memory leak
+        # BUG-SWEEP-KEY-LEAK FIX: cap expired keys to prevent unbounded growth
+        # in long sessions with many detected-then-expired sweeps between AMD resets.
+        self._MAX_EXPIRED_KEYS = 100
 
     def update(self, ict_engine, price: float, atr: float, now_ms: int,
                candles_5m: List[Dict] = None,
@@ -218,6 +222,13 @@ class ICTSweepDetector:
                         # not rebuild an identical setup from the same swept pool.
                         _key = (round(_s.sweep_price, 0), _s.setup_time_ms)
                         self._expired_sweep_keys.add(_key)
+                        # BUG-SWEEP-KEY-LEAK FIX: cap set size to prevent unbounded growth
+                        if len(self._expired_sweep_keys) > self._MAX_EXPIRED_KEYS:
+                            # Discard oldest entries — sets have no ordering, so remove
+                            # arbitrary excess. In practice this fires very rarely.
+                            _excess = len(self._expired_sweep_keys) - self._MAX_EXPIRED_KEYS
+                            for _k in list(self._expired_sweep_keys)[:_excess]:
+                                self._expired_sweep_keys.discard(_k)
                         logger.info(
                             f"❌ ICTSweepDetector: {_s.side.upper()} OTE missed "
                             f"(price=${price:,.0f} outside "
@@ -1692,7 +1703,7 @@ class ICTEntryGate:
 
     TIER-B: Standard Quant + ICT Confluence
       Requirements:
-        • ICT confluence ≥ 0.40
+        • ICT confluence ≥ 0.12–0.35 (ADX-adaptive: 0.12 deep-ranging, 0.20 soft-ranging, 0.35 trending)
         • Quant composite ≥ 0.30 (meaningful signal)
         • n_confirming ≥ 3 (most signals agree)
         • VWAP overextended (meaningful deviation)
@@ -1707,6 +1718,7 @@ class ICTEntryGate:
       • AMD DISTRIBUTION strongly opposing (high conf, wrong direction)
       • Regime invalid (ATR extreme)
       • HTF veto present AND ICT weak (ICT < 0.40) — no structural cover
+      • Tier-B: ICT below ADX-adaptive floor (0.12–0.35) or composite < 0.30
     """
 
     # Bug-5 fix: single source of truth for the Tier-B composite threshold.
@@ -2036,8 +2048,38 @@ class ICTEntryGate:
         # Quant gates are REQUIRED here — ICT just provides structural context.
         # P/D gate added: Tier-B entries require correct zone same as Tier-A.
         # LONG must NOT be in premium (4H PD > 60%); SHORT must NOT be in discount.
+        #
+        # ADX-ADAPTIVE ICT FLOOR (root-cause fix for 0-trades-per-session):
+        # In ranging markets (ADX < 25) outside ICT kill zones, the maximum
+        # achievable ICT total is ≈ 0.15–0.17 (structure alignment only — no
+        # active OB at price, no recent sweep, no kill zone session credit).
+        # A hardcoded 0.35 floor is mathematically unreachable in these conditions,
+        # causing permanent BLOCKED status regardless of quant signal quality.
+        #
+        # IMPORTANT: Use sig.market_regime (RegimeClassifier output), NOT raw ADX.
+        # The RegimeClassifier can show RANGING even at ADX=31 because it weights
+        # HTF alignment and ATR expansion — raw ADX alone is insufficient.
+        # Using raw ADX=31 → floor=0.35 even when the bot classifies the market as
+        # RANGING, meaning the fix has no effect. sig.market_regime is the ground truth.
+        #
+        # Regime-adaptive floors:
+        #   RANGING      → 0.12 — structure alignment is sufficient (max ICT ≈ 0.15)
+        #   TRANSITIONING → 0.20 — partial alignment required (max ICT ≈ 0.22)
+        #   TRENDING_*   → 0.35 — full structural conviction required
+        #
+        # Quant gates (composite ≥ 0.30, n_conf ≥ 3, overextended) remain
+        # unchanged — they provide the primary edge in ranging conditions.
+        _market_regime = getattr(sig, 'market_regime', 'RANGING')
+        if _market_regime == 'RANGING':
+            _ict_b_floor = 0.12
+        elif _market_regime == 'TRANSITIONING':
+            _ict_b_floor = 0.20
+        else:
+            # TRENDING_UP, TRENDING_DOWN — full structural requirement
+            _ict_b_floor = 0.35
+
         _tier_b_conditions = (
-            ict_total >= 0.35 - 1e-9 and    # ICT provides directional context, quant is the edge; epsilon guards floating point boundary
+            ict_total >= _ict_b_floor and    # ADX-adaptive — see comment above
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
@@ -2064,8 +2106,9 @@ class ICTEntryGate:
                     "_no_delivery_context")
             else:
                 block_reasons.append(f"AMD={amd_phase}(conf={amd_conf:.2f})")
-        if ict_total < 0.35 - 1e-9:  # epsilon matches TIER-B gate — avoids 0.35<0.35 display
-            block_reasons.append(f"ICT={ict_total:.2f}<0.35")
+        if ict_total < _ict_b_floor:
+            block_reasons.append(f"ICT={ict_total:.2f}<{_ict_b_floor:.2f}"
+                                  f"(regime={_market_regime})")
         if _tf_opposes_tier_a:
             _tf_val = quant.tick_flow if quant else 0.0
             _tf_thr = 0.60 if htf_veto else 0.30
@@ -2115,7 +2158,7 @@ class ICTEntryGate:
                 f"Σ={q_composite:+.3f}<{ICTEntryGate.TIER_B_COMPOSITE_MIN:.2f}(TierB_min)")
 
         return ("BLOCKED", 0, "BELOW_MIN: " + " | ".join(block_reasons) if block_reasons
-                else f"BELOW_MIN ICT={ict_total:.2f} Σ={q_composite:+.3f}")
+                else f"BELOW_MIN ICT={ict_total:.2f} Σ={q_composite:+.3f} floor={_ict_b_floor:.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

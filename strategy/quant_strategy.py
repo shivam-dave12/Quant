@@ -458,7 +458,13 @@ class CVDEngine:
         """Reset timestamps so warmup data is reprocessed after stream restart."""
         self._last_bar_ts = 0
         self._deltas.clear()
-        # Preserve tick history — it may still be valid even after candle restart
+        # BUG-CVD-TICK-COUNT-STALE FIX: reset _tick_count so _get_true_cvd_array
+        # doesn't pass the ">= 50 ticks" warmup check using stale pre-restart data.
+        # The deques are preserved (their data may still be valid), but the count
+        # must reflect the actual number of ticks in the current window.
+        # Recount from the deque to preserve correctness after a reconnect.
+        with self._tick_cvd_lock:
+            self._tick_count = len(self._tick_cvd)
 
     def update_from_tick(self, price: float, qty: float, is_buy: bool) -> None:
         """
@@ -552,9 +558,11 @@ class CVDEngine:
             # Z-score: build distribution of slopes (differences), not cumulative sums
             slopes = []
             for i in range(w, n):
-                s_recent  = arr[i - w//2] - arr[max(0, i - w//2) - 1] if i - w//2 >= 1 else arr[i - w//2]
-                s_earlier = arr[i - w]    - arr[max(0, i - w) - 1]    if i - w    >= 1 else arr[i - w]
-                slopes.append((arr[i] - arr[i - w//2]) - (arr[i - w//2] - arr[i - w]))
+                # Each slope = CVD change over recent half minus CVD change over earlier half
+                # within a rolling window ending at position i.
+                _recent_half  = arr[i] - arr[i - w // 2]
+                _earlier_half = arr[i - w // 2] - arr[i - w]
+                slopes.append(_recent_half - _earlier_half)
             if len(slopes) < 5: return 0.0
             mu  = sum(slopes)/len(slopes)
             std = math.sqrt(sum((s-mu)**2 for s in slopes)/max(len(slopes)-1,1))
@@ -759,7 +767,10 @@ class VolumeExhaustionEngine:
     def __init__(self): self._last_signal = 0.0
 
     def compute(self, candles: List[Dict]) -> float:
-        if len(candles) < 20: return 0.0
+        if len(candles) < 20:
+            # FIX 11: update _last_signal so get_signal() returns 0.0 not stale value
+            self._last_signal = 0.0
+            return 0.0
         recent = candles[-10:]; earlier = candles[-20:-10]
         # v4.3 Bug 4 fix: use average close of each window instead of single endpoints
         avg_recent = sum(float(c['c']) for c in recent) / len(recent)
@@ -767,7 +778,10 @@ class VolumeExhaustionEngine:
         pc = avg_recent - avg_earlier
         pd = 1.0 if pc > 0 else -1.0
         rv = sum(float(c['v']) for c in recent); ev = sum(float(c['v']) for c in earlier)
-        if ev < 1e-10: return 0.0
+        if ev < 1e-10:
+            # FIX 11: zero-volume early session — reset signal, don't leave stale value
+            self._last_signal = 0.0
+            return 0.0
         vr = rv / ev
         if vr < 0.7: self._last_signal = -pd * min((0.7 - vr) / 0.4, 1.0)
         elif vr < 0.9: self._last_signal = -pd * (0.9 - vr) / 0.4 * 0.5
@@ -3121,6 +3135,12 @@ class QuantStrategy:
         if not _ICT_TRADE_ENGINE_AVAILABLE:
             return None
         try:
+            # BUG-HTF-VETO-DIRECTION FIX: sig.htf_veto is computed at signal time
+            # for self._vwap.reversion_side(price) — the VWAP direction.  When
+            # side is a sweep direction (opposite of VWAP), passing sig.htf_veto
+            # gives the wrong direction's veto to ICTEntryGate. Recompute for
+            # the actual entry side so the gate sees the correct structural opposition.
+            _htf_veto_for_side = self._htf.vetoes_trade(side)
             return QuantHelperSignals(
                 tick_flow    = self._tick_eng.get_signal(),
                 cvd_trend    = self._cvd.get_trend_signal(),
@@ -3128,14 +3148,9 @@ class QuantStrategy:
                 n_confirming = sig.n_confirming,
                 composite    = sig.composite,
                 regime_ok    = sig.regime_ok,
-                htf_veto     = sig.htf_veto,
+                htf_veto     = _htf_veto_for_side,
                 adx          = sig.adx,
                 overextended = sig.overextended,
-                # FIX Bug-1: htf_15m and htf_4h were never passed — they
-                # defaulted to 0.0 in every QuantHelperSignals, which silently
-                # disabled the ICTEntryGate's 15m-extreme counter-HTF guard
-                # (|0.0| < 0.55 always passes). Now they carry live values from
-                # HTFTrendFilter so the gate reflects actual structure.
                 htf_15m      = self._htf.trend_15m,
                 htf_4h       = self._htf.trend_4h,
             )
@@ -3843,7 +3858,11 @@ class QuantStrategy:
                 except Exception:
                     ap = False
             else:
-                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.35)
+                # FIX: Use the minimum ADX-adaptive floor (0.12) for display consistency.
+                # The old hardcoded 0.35 meant the display showed "👀 Watching" even when
+                # the gate (which has the 0.12 floor at ADX<20) would pass. Now the display
+                # reflects the same minimum threshold the gate actually enforces.
+                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.12)
                 ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
                       sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
                 # FIX Bug-3 (non-ICT path): same breakout gate
@@ -6017,25 +6036,34 @@ class QuantStrategy:
                 # 2. 5m swing structure
                 if _struct_sl is None and len(candles_5m) >= 6:
                     try:
-                        from ict_trade_engine import _find_swings
                         closed_5m = candles_5m[:-1]
-                        highs_5m, lows_5m = _find_swings(
-                            closed_5m, min(12, len(closed_5m) - 2))
-                        sw_buf = 0.40 * atr
-                        if pos.side == "long" and lows_5m:
-                            valid_sw = [l for l in lows_5m
-                                        if _be_floor < l - sw_buf < price - 0.5 * atr]
-                            if valid_sw:
-                                _struct_sl = max(valid_sw) - sw_buf
-                                _struct_label = f"5m_SW@${max(valid_sw):.0f}"
-                        elif pos.side == "short" and highs_5m:
-                            valid_sw = [h for h in highs_5m
-                                        if price + 0.5 * atr < h + sw_buf < _be_floor]
-                            if valid_sw:
-                                _struct_sl = min(valid_sw) + sw_buf
-                                _struct_label = f"5m_SW@${min(valid_sw):.0f}"
-                    except Exception:
-                        pass
+                        from strategy.ict_trade_engine import _find_swings as _fs_ratchet
+                    except ImportError:
+                        try:
+                            from ict_trade_engine import _find_swings as _fs_ratchet
+                        except ImportError:
+                            _fs_ratchet = None
+                    if _fs_ratchet is not None:
+                        try:
+                            highs_5m, lows_5m = _fs_ratchet(
+                                closed_5m, min(12, len(closed_5m) - 2))
+                        except Exception:
+                            highs_5m, lows_5m = [], []
+                    else:
+                        highs_5m, lows_5m = [], []
+                    sw_buf = 0.40 * atr
+                    if pos.side == "long" and lows_5m:
+                        valid_sw = [l for l in lows_5m
+                                    if _be_floor < l - sw_buf < price - 0.5 * atr]
+                        if valid_sw:
+                            _struct_sl = max(valid_sw) - sw_buf
+                            _struct_label = f"5m_SW@${max(valid_sw):.0f}"
+                    elif pos.side == "short" and highs_5m:
+                        valid_sw = [h for h in highs_5m
+                                    if price + 0.5 * atr < h + sw_buf < _be_floor]
+                        if valid_sw:
+                            _struct_sl = min(valid_sw) + sw_buf
+                            _struct_label = f"5m_SW@${min(valid_sw):.0f}"
 
                 # 3. Liquidity pool avoidance
                 if _struct_sl is not None and self._ict is not None:
@@ -6550,9 +6578,9 @@ class QuantStrategy:
             "htf_ict_src":  (pos.entry_signal.htf_ict_source
                              if pos.entry_signal and hasattr(pos.entry_signal, 'htf_ict_source') else False),
         })
-        # Keep last 200 trades in memory
+        # Keep last 200 trades in memory — in-place trim avoids allocating a new list
         if len(self._trade_history) > 200:
-            self._trade_history = self._trade_history[-200:]
+            del self._trade_history[:-200]
 
     def _finalise_exit(self):
         self._pos = PositionState(); self._last_exit_time = time.time()

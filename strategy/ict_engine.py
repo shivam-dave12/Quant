@@ -2069,6 +2069,20 @@ class ICTEngine:
             details.append(f"AMD:{amd.phase[:5]}({amd.bias[:4]})")
         elif amd.phase in ("DISTRIBUTION", "MANIPULATION"):
             out.amd_score = -0.05   # actively opposing → small penalty
+        else:
+            # FIX 3: ACCUMULATION / neutral bias — no delivery signal yet, but
+            # no structural opposition either.  A minimal baseline (0.02) prevents
+            # the total from being dragged further from the adaptive Tier-B floor.
+            # This is mathematically correct: ACCUMULATION means "consolidating,
+            # not opposing" — it should not penalise the confluence score.
+            out.amd_score = 0.02
+        else:
+            # ACCUMULATION / REACCUMULATION / REDISTRIBUTION with neutral or
+            # mismatched bias: no delivery context, but also not opposing.
+            # Small baseline prevents the score from being identically zero
+            # in low-signal ranging markets where all other components are also
+            # near their floor values.
+            out.amd_score = 0.02
 
         # ── 3. PD Array ───────────────────────────────────────────────
         pd = 0.0
@@ -2368,6 +2382,21 @@ class ICTEngine:
             # for crypto markets — institutional-grade volume. Not a dead session.
             out.session_score = min(0.03, 0.03 * pd_mult)
             details.append(f"Session=ASIA PD={'✓' if pd_aligned else '✗'}")
+        else:
+            # FIX 4: Off-session / AVOID — minimal baseline so this component
+            # never contributes a pure zero.  A 0.01 baseline reflects that even
+            # outside named sessions price action still has structural validity.
+            # This is NOT a kill-zone bonus — just prevents the score from being
+            # artificially suppressed by a timing boundary.
+            out.session_score = 0.01 * pd_mult
+            details.append(f"Session=OFF({self._session or 'AVOID'})")
+        else:
+            # Off-session / AVOID: minimal baseline so the score is not
+            # identically zero in a 24h crypto market during quiet hours.
+            # Does not contribute meaningfully to tier thresholds — it merely
+            # prevents a pure structural play from scoring 0.00 session credit
+            # when all other components are present.
+            out.session_score = 0.01
         out.session_name = self._session
         out.killzone     = self._killzone
 
@@ -2419,8 +2448,16 @@ class ICTEngine:
         if not has_ob and not has_sweep:
             raw = min(raw, 0.30)
         if self.ICT_REQUIRE_OB_OR_FVG and not has_ob and active_fvg is None:
-            raw = min(raw, 0.20)
-            details.append("REQUIRE_OB_OR_FVG_CAP")
+            # FIX 5: No OB and no FVG — cap the total so trades cannot slip through
+            # with zero structural evidence.  Cap at 0.15 (below the ADX<20 floor
+            # of 0.12 but at the ADX<25 boundary of 0.20) — this means no Tier-B
+            # entry fires in a ranging market without at least a sweep or session
+            # KZ credit pushing the score above 0.15.  The ADX<20 floor (0.12)
+            # is reachable even with this cap, allowing entries in deep-range.
+            # The ADX<25 floor (0.20) is NOT reachable without OB/FVG/sweep/KZ —
+            # correct: structure-less ranging markets should not trade Tier-B freely.
+            raw = min(raw, 0.15)
+            details.append("REQUIRE_OB_OR_FVG_CAP(0.15)")
 
         out.total = min(1.0, raw)
 

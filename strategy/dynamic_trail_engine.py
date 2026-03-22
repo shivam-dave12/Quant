@@ -43,6 +43,15 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Import _find_swings at module level to avoid repeated import overhead
+# inside the hot trail-candidate-building path (called every 10s per trade).
+try:
+    from ict_trade_engine import _find_swings as _find_swings_ict
+    _ICT_SWINGS_AVAILABLE = True
+except ImportError:
+    _find_swings_ict = None
+    _ICT_SWINGS_AVAILABLE = False
+
 
 def _round_tick(price: float, tick: float = 0.1) -> float:
     """Round price to nearest tick."""
@@ -60,6 +69,15 @@ def _safe_float(c, key: str, default: float = 0.0) -> float:
             return float(getattr(c, key, default))
         except (TypeError, ValueError):
             return default
+
+
+def _get_commission_rate() -> float:
+    """Read commission rate from config, with a safe fallback."""
+    try:
+        import config as _cfg_dt
+        return float(getattr(_cfg_dt, 'COMMISSION_RATE', 0.00055))
+    except Exception:
+        return 0.00055
 
 
 def _find_swings_internal(candles: list, lookback: int
@@ -153,8 +171,9 @@ class TrailContext:
         # Phase ratchets UP — tier uses peak, never current
         tier = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
 
-        # Fee-adjusted breakeven
-        rt_fee = entry_price * 0.00055 * 2.0  # conservative taker roundtrip
+        # Fee-adjusted breakeven — read rate from config, fall back to 0.00055
+        _rate = _get_commission_rate()
+        rt_fee = entry_price * _rate * 2.0
         be_buf = rt_fee + 0.25 * atr
         be_price = (entry_price + be_buf if pos_side == "long"
                     else entry_price - be_buf)
@@ -705,10 +724,13 @@ class DynamicTrailEngine:
         if ctx.phase >= 2 and len(candles_1m) >= 6:
             closed_1m = candles_1m[:-1]
             try:
-                from ict_trade_engine import _find_swings
-                sh_1m, sl_1m = _find_swings(
-                    closed_1m, min(10, len(closed_1m) - 2))
-            except (ImportError, Exception):
+                if _ICT_SWINGS_AVAILABLE:
+                    sh_1m, sl_1m = _find_swings_ict(
+                        closed_1m, min(10, len(closed_1m) - 2))
+                else:
+                    sh_1m, sl_1m = _find_swings_internal(
+                        closed_1m, min(10, len(closed_1m) - 2))
+            except Exception:
                 sh_1m, sl_1m = _find_swings_internal(
                     closed_1m, min(10, len(closed_1m) - 2))
 
