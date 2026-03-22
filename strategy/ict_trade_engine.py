@@ -1743,9 +1743,15 @@ class ICTEntryGate:
         if not htf_veto:
             return True  # no opposition — standard Tier-A path
 
-        # DISTRIBUTION and REDISTRIBUTION only — reaccumulation is with-trend
-        if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
+        # DISTRIBUTION, REDISTRIBUTION, and MANIPULATION (with sweep) only
+        if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION", "MANIPULATION"):
             return False
+        # MANIPULATION requires a confirmed sweep for counter-HTF unlock
+        if amd_phase == "MANIPULATION":
+            if not (sweep_setup is not None and
+                    sweep_setup.side == side and
+                    sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")):
+                return False
 
         # ICT bar: raised to 0.65 normally; drops to standard 0.55 when a
         # confirmed matching sweep setup is present because the sweep provides
@@ -1866,34 +1872,49 @@ class ICTEntryGate:
             return "BLOCKED", 0, f"HTF_VETO+weak_ICT({ict_total:.2f}<0.45)"
 
         # ── TIER-S: ICT Sweep-and-Go in OTE zone ─────────────────────────
-        # v5.1: Sweep quality gates calibrated to institutional execution.
-        # A 0.79 quality sweep at OTE with AMD DISTRIBUTION should NOT be
-        # blocked because ICT total is 0.58 instead of 0.60. The sweep IS
-        # the institutional footprint — the ICT score is just confluence
-        # and it lags behind the sweep event.
+        # v5.1 FIX: The sweep IS the institutional structure.
+        #
+        # The ICT confluence score measures OB/FVG/structure alignment.
+        # But during MANIPULATION, the sweep CREATES new OBs and FVGs —
+        # they appear on the NEXT candle close, not the current one.
+        # Requiring high ICT total during the sweep event is requiring
+        # evidence that the sweep itself is about to create.
+        #
+        # Live bug: quality=0.63 sweep at OTE, AMD=MANIPULATION 0.94,
+        #   but ICT=0.35 (0 OBs detected). The sweep was blocked because
+        #   ICT score hadn't caught up to the sweep event.
+        #
+        # Institutional reality: sweep at OTE + AMD confirmation IS the
+        # setup. The sweep candle defines SL, OTE is the entry zone,
+        # AMD provides the delivery target. That's the complete trade.
+        #
+        # Fix: for confirmed OTE sweeps with quality >= 0.50 and AMD
+        # conf >= 0.70, ICT total is not gated — the sweep is the signal.
+        # For lower quality/confidence, ICT provides a soft floor.
         _sweep_ote = (
             sweep_setup is not None and
             sweep_setup.status == "OTE_READY" and
             sweep_setup.side == side
         )
-        # Quality-adaptive ICT threshold:
-        #   quality >= 0.70 (high conviction sweep) → ICT >= 0.50
-        #   quality >= 0.50 (standard sweep)        → ICT >= 0.55
-        #   quality <  0.50 (weak sweep)            → ICT >= 0.60 (original)
-        _ict_bar_s = 0.60
+        _ict_bar_s = 0.60  # default (no sweep)
         if _sweep_ote:
             _sq = sweep_setup.quality_score()
-            if _sq >= 0.70:
-                _ict_bar_s = 0.50
+            if _sq >= 0.50 and amd_conf >= 0.70:
+                _ict_bar_s = 0.0   # sweep IS the structure — no ICT gate
             elif _sq >= 0.50:
-                _ict_bar_s = 0.55
+                _ict_bar_s = 0.35  # minimal: ICT engine running
+            else:
+                _ict_bar_s = 0.50  # weak sweep: need some ICT backup
         _tier_s_conditions = (
             _sweep_ote and
             amd_phase in ("MANIPULATION", "DISTRIBUTION") and
             amd_conf >= 0.62 and
             ict_total >= _ict_bar_s and
-            # P/D gate: relaxed during AMD delivery (delivery crosses zones)
+            # P/D gate: waived during MANIPULATION (sweep just happened,
+            # price is at OTE by definition — P/D zone is irrelevant)
             (
+                amd_phase == "MANIPULATION"  # P/D waived: sweep defines zone
+                or
                 (amd_phase == "DISTRIBUTION" and (
                     (side == "short" and amd_bias == "bearish") or
                     (side == "long"  and amd_bias == "bullish")))
@@ -1931,6 +1952,15 @@ class ICTEntryGate:
             amd_phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION")
             and amd_conf >= 0.50
             and not _amd_opposes   # Bug-1: opposing DISTRIBUTION excluded
+        ) or (
+            # v5.1: MANIPULATION + confirmed sweep = delivery imminent.
+            # In the ICT model, MANIPULATION IS the setup phase. Smart money
+            # sweeps liquidity (the manipulation), then delivers in the
+            # opposite direction. When we have a confirmed sweep at OTE
+            # during MANIPULATION, the delivery is about to start.
+            amd_phase == "MANIPULATION"
+            and _sweep_ote
+            and amd_conf >= 0.70
         )
         # v8.0: tier-aware HTF gate replaces the previous `not htf_veto` hard-block.
         # With-HTF path (htf_veto=False): identical behaviour to prior versions.
@@ -2049,9 +2079,12 @@ class ICTEntryGate:
                 sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
             )
             _eff_bar = 0.50 if _has_sweep_cover else 0.58
-            if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION"):
+            if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION", "MANIPULATION"):
                 block_reasons.append(
                     f"HTF_VETO+phase={amd_phase}(no_counter_htf_unlock)")
+            elif amd_phase == "MANIPULATION" and not _has_sweep_cover:
+                block_reasons.append(
+                    f"HTF_VETO+phase=MANIPULATION(no_sweep_for_counter_htf)")
             elif ict_total < _eff_bar:
                 block_reasons.append(
                     f"HTF_VETO+ICT={ict_total:.2f}<{_eff_bar:.2f}(counter_htf_bar"
