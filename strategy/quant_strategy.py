@@ -3523,7 +3523,7 @@ class QuantStrategy:
         gates = [
             f"{'✅' if sig.overextended else '⚪'} Overextended ({sig.deviation_atr:+.1f} ATR)  [quant-scout: VWAP deviation]",
             f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})  [ATR percentile gate]",
-            f"{'✅' if not sig.htf_veto else '❌'} HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
+            f"⚪ HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}) [info only — not a gate]",
             f"{'✅' if sig.n_confirming>=3 else '⚪'} Quant Confluence ({sig.n_confirming}/5) [scout: n_conf]",
             f"{'✅' if abs(c)>=_tierb_thr else '⚪'} Composite ({c:+.3f} vs ±{_tierb_thr:.3f}) [scout: order-flow]",
         ]
@@ -3859,11 +3859,9 @@ class QuantStrategy:
                     ap = False
             else:
                 # FIX: Use the minimum ADX-adaptive floor (0.12) for display consistency.
-                # The old hardcoded 0.35 meant the display showed "👀 Watching" even when
-                # the gate (which has the 0.12 floor at ADX<20) would pass. Now the display
-                # reflects the same minimum threshold the gate actually enforces.
+                # HTF veto removed from gate — informational only.
                 _ict_ok = (not _ict_init) or (sig.ict_total >= 0.12)
-                ap = (sig.overextended and sig.regime_ok and not sig.htf_veto and
+                ap = (sig.overextended and sig.regime_ok and
                       sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
                 # FIX Bug-3 (non-ICT path): same breakout gate
                 if ap and self._breakout.blocks_reversion(_ict_rev_side):
@@ -4272,16 +4270,17 @@ class QuantStrategy:
             • Entry side = sweep_setup.side (NOT VWAP reversion side)
             • VWAP overextension NOT required (price is at OTE, not VWAP extreme)
             • n_confirming NOT required (ICT sweep is the signal)
-            • HTF veto bypassed when ICT is strong (sweep > HTF noise)
+            • HTF is informational only — sweep geometry defines direction
             • Quant signals used as soft confirmation only:
-              - Tick flow not STRONGLY opposing
+              - Tick flow not STRONGLY opposing (−0.30 threshold)
               - ATR regime not extreme
             • Confirm counter uses SWEEP SIDE, not VWAP side
 
-          STANDARD QUANT PATH (Tier-B): Quant and ICT both required.
-            • All legacy gates: overextended, regime_ok, htf_veto, n_confirming
-            • Composite threshold enforced
-            • P/D zone gate active
+          STANDARD QUANT PATH (Tier-B): Order flow + ICT confluence.
+            • Gates: overextended, regime_ok, n_confirming ≥ 3, composite ≥ 0.30
+            • HTF: informational only — NOT a gate (removed by design)
+            • P/D zone gate active (long not in 4H premium, short not in discount)
+            • ICT floor: regime-adaptive (0.12 RANGING / 0.20 TRANSITIONING / 0.35 TRENDING)
             • Confirm counter uses VWAP reversion side
         """
         c    = sig.composite
@@ -4483,7 +4482,7 @@ class QuantStrategy:
                             f"Side: {side.upper()} | Reason: {_tier_reason}\n"
                             f"HTF: 15m={self._htf.trend_15m:+.2f}  "
                             f"4H={self._htf.trend_4h:+.2f}  "
-                            f"veto={'YES' if sig.htf_veto else 'no'}\n"
+                            f"(info-only — HTF is not a gate)\n"
                             f"AMD: {sig.amd_phase} conf={sig.amd_conf:.2f}\n"
                             f"<i>Bot alive — waiting for institutional setup.</i>")
                     self._confirm_long = self._confirm_short = 0
@@ -4583,9 +4582,12 @@ class QuantStrategy:
             # All legacy quant gates required.
             # Entry side = VWAP reversion side.
 
-            # Full gate stack: overextended + regime + HTF + confluence
+            # Full gate stack: overextended + regime + confluence
+            # HTF veto REMOVED — direction is encoded by ICT structure + order flow.
+            # Keeping HTF here would block VWAP reversion longs when 15m is bearish —
+            # exactly the setup the strategy is designed to take.
             if not (sig.overextended and sig.regime_ok and
-                    not sig.htf_veto and sig.n_confirming >= 3):
+                    sig.n_confirming >= 3):
                 self._confirm_long = self._confirm_short = 0; return
 
             # Opposite-side cooldown after recent exit
@@ -5698,14 +5700,10 @@ class QuantStrategy:
                         "B": "🥉 Tier-B — Quant+ICT Confluence",
                         "":  "⚪ No ICT tier"}
         _tier_badge  = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
-        # Counter-HTF flag — only shown when htf_veto was True at entry
+        # Counter-HTF flag removed — HTF is no longer a gate, so opposing HTF
+        # is no longer a special condition worth badging. All entries are
+        # structure-primary; HTF shown as context only.
         _counter_htf_line = ""
-        if getattr(sig, 'htf_veto', False) and ict_tier in ("A",):
-            # BUG-C FIX (part 2): sig has no htf_15m/htf_4h fields — use self._htf
-            _counter_htf_line = (
-                f"\n⚡ Counter-HTF entry  "
-                f"15m={self._htf.trend_15m:+.2f}  "
-                f"4H={self._htf.trend_4h:+.2f}")
         # AMD context line
         _amd_line = ""
         if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
@@ -5716,18 +5714,11 @@ class QuantStrategy:
                 f"\nAMD:      {_amd_icon} {sig.amd_phase}  "
                 f"conf={sig.amd_conf:.2f}  "
                 f"bias={getattr(sig,'amd_bias','?')}")
-        # Sweep geometry line — only when sweep was active
-        _sweep_geo_line = ""
-        if _sweep_was_active and self._active_sweep_setup is None:
-            # Setup was consumed — read geometry from sig (stored at entry time)
-            # Try the sweep detector's last known setup before invalidation
-            pass  # geometry already shown via _sweep_badge; detailed in SL/TP lines
-        # HTF structure line — always shown
-        # BUG-C FIX (part 3): sig has no htf_15m/htf_4h — use self._htf
+        # HTF structure line — informational context, not a gate
         _htf_line = (
             f"\nHTF:      15m={self._htf.trend_15m:+.2f}  "
             f"4H={self._htf.trend_4h:+.2f}  "
-            f"veto={'YES ⚠️' if sig.htf_veto else 'no ✅'}")
+            f"(context — not a gate)")
 
         send_telegram_message(
             f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]{_sweep_badge}</b>\n"

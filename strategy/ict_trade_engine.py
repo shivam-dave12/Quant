@@ -1658,67 +1658,75 @@ class QuantHelperSignals:
 
 class ICTEntryGate:
     """
-    Tier-based ICT entry quality classifier.
+    Tier-based ICT entry quality classifier — Pure Structure + Order Flow.
 
-    ARCHITECTURE: ICT is the COMMANDER, Quant is the SCOUT.
+    ARCHITECTURE: ICT is the COMMANDER, Order Flow is the SCOUT.
     ─────────────────────────────────────────────────────────────────────
-    ICT structure DEFINES the trade:
-      • Which side (AMD sweep bias → distribution direction)
-      • Where SL/TP (sweep wick, OTE zone, delivery target)
-      • Whether market is set up (sweep + displacement + OTE)
+    DIRECTION is determined exclusively by:
+      • AMD cycle phase + delivery bias  (where smart money is delivering)
+      • ICT OB/FVG orientation           (where orders were placed)
+      • Liquidity sweep side             (what pool was raided and why)
+      • 4H Premium/Discount zone         (where price is in the range)
 
-    Quant signals HELP time execution:
-      • Tick flow: is live order flow agreeing? (soft veto if strongly opposing)
-      • CVD: is cumulative buying/selling directional? (quality boost)
-      • Regime: is ATR in a tradeable range? (hard veto if extreme)
-      • HTF: is higher-timeframe trend blocking? (hard veto)
+    HTF EMA slope (15m/4h trend) is NOT a gate. Rationale:
+      Mean-reversion entries fire against the short-term directional move
+      by design — that IS the setup. The 15m slope is a lagging derivative
+      of the same price action that AMD phase and OB direction already encode
+      at higher precision. Blocking reversion longs when 15m is bearish is
+      structurally contradictory: the 15m is bearish BECAUSE price moved down,
+      which is exactly when VWAP long setups form. ICT structure (OBs, sweeps,
+      delivery corridors) tells us WHERE smart money is positioned; HTF slope
+      tells us nothing about that.
 
-    The quant composite, VWAP overextension, and n_confirming gates
-    ARE NOT REQUIRED for ICT sweep entries (Tier-S/A). They are required
-    only for standard quant entries (Tier-B) where ICT provides confluence
-    but not a primary structural setup.
+    Live order flow gates (RETAINED — these are real-time, not lagging):
+      • Tick flow: not STRONGLY opposing (< −0.30 for long). Sustained
+        extreme flow means the move is still in progress — wait for exhaustion.
+      • CVD: directional agreement check for Tier-A delivery context.
+      • ATR regime: extreme percentile (top 3%) = circuit breaker, not filter.
 
-    TIER-S: ICT Sweep-and-Go in OTE zone
+    TIER-S: ICT Sweep-and-Go in OTE zone (Institutional sweep entry)
       Requirements:
         • AMD phase MANIPULATION or DISTRIBUTION, confidence ≥ 0.62
-        • Active sweep setup with status == OTE_READY
-        • Sweep side matches requested entry side
-        • ICT confluence ≥ 0.60 (structure + sweep + session)
-        • Price in correct P/D zone (long in discount, short in premium)
-        • Quant soft veto: tick flow not STRONGLY opposing (< −0.30 for long)
-        • Regime: ATR percentile in range (no extreme vol)
+        • Active sweep setup with status == OTE_READY (price in 61.8–78.6% retrace)
+        • ICT confluence ≥ variable (0.0 if quality sweep, up to 0.60)
+        • P/D zone: MANIPULATION waived (sweep defines zone); DISTRIBUTION aligned
+        • Tick flow not STRONGLY opposing
+        • Regime OK
       → Confirm ticks: 1 (kill zone) or 2 (off-session)
-      → Expected edge: 58–66% win rate, 1:2.5–4.0 R:R
+      → Expected edge: 58–66% WR, 1:2.5–4.0 R:R
 
-    TIER-A: ICT Structural Alignment (sweep context, not OTE)
+    TIER-A: ICT Structural Alignment (delivery context without OTE)
       Requirements:
-        • AMD phase DISTRIBUTION/REACCUMULATION/REDISTRIBUTION, conf ≥ 0.50
-        • ICT confluence ≥ 0.55
-        • Quant composite in ICT direction ≥ 0.20 (light confirmation)
-        • Tick flow not strongly opposing
-        • No HTF veto
+        • AMD delivery context: DISTRIBUTION/REACCUMULATION/REDISTRIBUTION ≥ 0.50
+          OR MANIPULATION + confirmed sweep (delivery imminent)
+        • ICT confluence ≥ 0.55 (0.50 if sweep-backed)
+        • Quant composite in ICT direction ≥ 0.20 (light order-flow confirmation)
+        • Tick flow not STRONGLY opposing (−0.30 / +0.30)
+        • P/D zone aligned or AMD delivery corridor (delivery crosses zones by design)
         • Regime OK
       → Confirm ticks: 2
-      → Expected edge: 52–58% win rate, 1:2.0–3.5 R:R
+      → Expected edge: 52–58% WR, 1:2.0–3.5 R:R
 
-    TIER-B: Standard Quant + ICT Confluence
+    TIER-B: Standard Quant + ICT Confluence (order-flow primary)
       Requirements:
-        • ICT confluence ≥ 0.12–0.35 (ADX-adaptive: 0.12 deep-ranging, 0.20 soft-ranging, 0.35 trending)
-        • Quant composite ≥ 0.30 (meaningful signal)
-        • n_confirming ≥ 3 (most signals agree)
-        • VWAP overextended (meaningful deviation)
-        • No HTF veto, Regime OK
-        • AMD not opposing distribution
-      → Confirm ticks: 3 (config default)
-      → Expected edge: 48–54% win rate, 1:1.8–2.5 R:R
+        • ICT confluence ≥ regime-adaptive floor:
+            RANGING      → 0.12  (structure alignment, no OB/sweep needed)
+            TRANSITIONING → 0.20  (partial structure required)
+            TRENDING_*   → 0.35  (full conviction — trend entries not here anyway)
+        • Order-flow composite ≥ 0.30 (VWAP + CVD + OB + tick + VEX)
+        • n_confirming ≥ 3/5 (majority of order-flow signals agree)
+        • VWAP overextended (price meaningfully displaced from equilibrium)
+        • Tick flow not STRONGLY opposing
+        • P/D zone: long not in premium, short not in discount
+        • Regime OK
+      → Confirm ticks: 3 (default)
+      → Expected edge: 48–54% WR, 1:1.8–2.5 R:R
 
-    BLOCKED:
-      • AMD ACCUMULATION conf ≥ 0.75 (high-confidence consolidation, no delivery)
-      • AMD MANIPULATION without sweep setup (Judas swing active)
-      • AMD DISTRIBUTION strongly opposing (high conf, wrong direction)
-      • Regime invalid (ATR extreme)
-      • HTF veto present AND ICT weak (ICT < 0.40) — no structural cover
-      • Tier-B: ICT below ADX-adaptive floor (0.12–0.35) or composite < 0.30
+    HARD BLOCKED (no trade, any tier):
+      • AMD ACCUMULATION conf ≥ 0.75 — tight consolidation, no delivery context
+      • AMD MANIPULATION without matching sweep — Judas swing still active
+      • AMD DISTRIBUTION opposing at conf ≥ 0.65 — wrong side of delivery
+      • ATR regime extreme (top/bottom 3%) — microstructure unreliable
     """
 
     # Bug-5 fix: single source of truth for the Tier-B composite threshold.
@@ -1740,62 +1748,16 @@ class ICTEntryGate:
             sweep_setup: Optional['ICTSweepSetup'] = None,
     ) -> bool:
         """
-        Tier-A counter-HTF gate.
+        DEPRECATED — HTF is informational only; this method always returns True.
 
-        Returns True = Tier-A entry is allowed.
+        Direction is encoded by: AMD phase + delivery context, ICT OB/FVG
+        orientation, liquidity sweep side, and P/D zone (4H premium/discount).
+        These are all structurally superior to an EMA slope on a 15m chart.
 
-        Standard (with-HTF) path: htf_veto=False → allowed immediately.
-
-        Counter-HTF unlock (all conditions must hold):
-          1. Phase: DISTRIBUTION or REDISTRIBUTION only.
-          2. ICT confluence >= 0.65 (raised bar for structural cover).
-             EXCEPTION: when a confirmed matching sweep setup is present,
-             the sweep geometry itself IS the structural cover — bar drops
-             back to the normal Tier-A minimum of 0.55.  The sweep detected
-             the displacement, OTE zone, and SL level; that evidence is at
-             least as strong as requiring OB+FVG overlap in the ICT score.
-          3. AMD conviction >= 0.60.
-          4. 15m structure NOT at extreme (|htf_15m| < 0.55).
+        Retained for backward compatibility with any external callers.
+        Will be removed in a future refactor.
         """
-        if not htf_veto:
-            return True  # no opposition — standard Tier-A path
-
-        # DISTRIBUTION, REDISTRIBUTION, and MANIPULATION (with sweep) only
-        if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION", "MANIPULATION"):
-            return False
-        # MANIPULATION requires a confirmed sweep for counter-HTF unlock
-        if amd_phase == "MANIPULATION":
-            if not (sweep_setup is not None and
-                    sweep_setup.side == side and
-                    sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")):
-                return False
-
-        # ICT bar: raised to 0.65 normally; drops to standard 0.55 when a
-        # confirmed matching sweep setup is present because the sweep provides
-        # the same structural cover the higher bar was requiring.
-        _has_sweep_cover = (
-            sweep_setup is not None and
-            sweep_setup.side == side and
-            sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
-        )
-        _ict_bar = 0.50 if _has_sweep_cover else 0.58
-        if ict_total < _ict_bar:
-            return False
-
-        # Raised AMD bar: delivery phase must be confirmed, not marginal
-        if amd_conf < 0.60:
-            return False
-
-        # 15m must not be at extremes — the distribution/accumulation window is closed
-        # 0.70 = genuine structural extreme. The previous 0.55 threshold was too tight
-        # and blocked entries in normal ranging markets where 15m reads ±0.55-0.65.
-        _HTF_EXTREME_THRESHOLD = 0.70
-        if side == "short" and htf_15m >= _HTF_EXTREME_THRESHOLD:
-            return False
-        if side == "long"  and htf_15m <= -_HTF_EXTREME_THRESHOLD:
-            return False
-
-        return True
+        return True  # HTF no longer a gate — see ICTEntryGate.evaluate() docs
 
     @staticmethod
     def evaluate(
@@ -1819,30 +1781,23 @@ class ICTEntryGate:
         in_prem   = getattr(sig, 'in_premium',  False)
         mtf_align = getattr(sig, 'mtf_aligned', False)
 
-        # ── Quant helper signals (soft veto only) ─────────────────────────
+        # htf_veto: tracked for diagnostics and analytics — NOT a gate.
+        # Direction authority belongs to ICT structure (AMD phase, OB direction,
+        # sweep bias) and live order flow. HTF EMA/structure slope is a lagging
+        # derivative of the same price action ICT already encodes more precisely.
+        # Mean-reversion entries BY DEFINITION fire against short-term HTF — blocking
+        # them on HTF opposition is architecturally contradictory for this strategy.
+        # Informational label shown in BLOCKED reasons and entry notifications.
         tf_opposes  = quant.flow_opposes(side)  if quant is not None else False
         cvd_opposes = quant.cvd_opposes(side)   if quant is not None else False
         regime_ok   = quant.regime_ok           if quant is not None else True
-        htf_veto    = quant.htf_veto            if quant is not None else False
+        htf_veto    = quant.htf_veto            if quant is not None else False  # informational only
         q_overext   = quant.overextended        if quant is not None else True
         n_conf      = quant.n_confirming        if quant is not None else 0
         q_composite = quant.composite           if quant is not None else 0.0
         q_score     = quant.quant_quality_score(side) if quant is not None else 0.5
-        # v8.0: raw HTF structure scores for tier-aware counter-HTF gate
-        # htf_4h is available on QuantHelperSignals but not consumed here —
-        # the 4H bias is already captured inside htf_veto (vetoes_trade fires
-        # when both 15m AND 4h oppose). Only the 15m extreme check is needed.
         htf_15m     = quant.htf_15m             if quant is not None else 0.0
         _adx        = quant.adx                 if quant is not None else 25.0
-
-        # ADX-AWARE HTF VETO: In ranging markets (ADX < 20), HTF "trend" signals
-        # are structure noise — the 15m/4H have no directional conviction.
-        # Treating them as hard vetoes blocks every entry in exactly the market
-        # condition (range-bound) where mean-reversion is the correct strategy.
-        # Downgrade HTF veto to a soft penalty when ADX proves no real trend.
-        if htf_veto and _adx < 20.0:
-            htf_veto = False   # Tier-A/B: HTF becomes advisory, not blocking
-            # (structure alignment still benefits scoring — just not a hard gate)
 
         # ── HARD BLOCKED conditions (no trade regardless of tier) ─────────
 
@@ -1884,9 +1839,12 @@ class ICTEntryGate:
                  (side == "short" and amd_bias == "bullish"))):
             return "BLOCKED", 0, f"AMD_DIST_opposing_{amd_bias}(conf={amd_conf:.2f})"
 
-        # HTF veto with weak ICT = no structural cover for opposing HTF
-        if htf_veto and ict_total < 0.45:
-            return "BLOCKED", 0, f"HTF_VETO+weak_ICT({ict_total:.2f}<0.45)"
+        # HTF VETO REMOVED — direction authority delegated to ICT structure + order flow.
+        # HTF EMA/structure slope is a lagging derivative of the same price action that
+        # ICT already encodes more precisely (OB direction, AMD phase, sweep bias).
+        # Mean-reversion entries fire AGAINST the short-term HTF trend by design;
+        # blocking them on HTF opposition is structurally contradictory for this strategy.
+        # htf_veto remains tracked and shown in BLOCKED diagnostics (informational only).
 
         # ── TIER-S: ICT Sweep-and-Go in OTE zone ─────────────────────────
         # v5.1 FIX: The sweep IS the institutional structure.
@@ -1987,31 +1945,18 @@ class ICTEntryGate:
             and _sweep_active  # DETECTED or OTE_READY — sweep exists
             and amd_conf >= 0.70
         )
-        # v8.0: tier-aware HTF gate replaces the previous `not htf_veto` hard-block.
-        # With-HTF path (htf_veto=False): identical behaviour to prior versions.
-        # Counter-HTF path: narrow unlock — DISTRIBUTION/REDISTRIBUTION only,
-        # ICT>=0.65, AMD_conf>=0.60, 15m not at extremes (<0.55 absolute value).
-        # REACCUMULATION is a with-trend continuation — counter-HTF unlock is
-        # intentionally excluded; those setups need the HTF to agree.
-        _tier_a_htf_ok = ICTEntryGate._htf_allows_tier_a(
-            htf_veto=htf_veto,
-            ict_total=ict_total,
-            amd_phase=amd_phase,
-            amd_conf=amd_conf,
-            htf_15m=htf_15m,
-            side=side,
-            sweep_setup=sweep_setup,   # Fix 1: pass sweep for lower ICT bar
-        )
-        # Fix 2: counter-HTF entries use a softer tick flow threshold.
-        # Standard Tier-A (with-HTF): tf_opposes at −0.30 is appropriate.
-        # Counter-HTF Tier-A: the manipulation sweep naturally drives order flow
-        # AGAINST the trade direction — retail traders pile in while smart money
-        # distributes.  tick_flow < −0.30 is expected behaviour, not a veto signal.
-        # Use −0.60 so only extreme, sustained opposing flow blocks entry.
+        # _tier_a_htf_ok / _htf_allows_tier_a removed — HTF is informational only.
+        # Tier-A direction is encoded by _has_delivery_context (AMD phase + sweep),
+        # P/D zone alignment, ICT confluence score, and live tick flow.
+        # HTF VETO REMOVED — use a single tick flow threshold for all Tier-A entries.
+        # The counter-HTF softening (−0.60) vs standard (−0.30) is no longer needed
+        # because we are not distinguishing with-HTF vs counter-HTF paths.
+        # Keep the single standard threshold (−0.30 / +0.30): only sustained extreme
+        # opposing flow should block — momentary tick noise must not gate ICT setups.
         _tf_opposes_tier_a = (
             quant is not None and (
-                (side == "long"  and quant.tick_flow < (-0.60 if htf_veto else -0.30)) or
-                (side == "short" and quant.tick_flow >  ( 0.60 if htf_veto else  0.30))
+                (side == "long"  and quant.tick_flow < -0.30) or
+                (side == "short" and quant.tick_flow >  0.30)
             )
         )
         _tier_a_conditions = (
@@ -2028,8 +1973,9 @@ class ICTEntryGate:
                 or
                 (side == "short" and not in_disc)
             ) and
-            not _tf_opposes_tier_a and    # Fix 2: softer threshold for counter-HTF
-            _tier_a_htf_ok and
+            not _tf_opposes_tier_a and
+            # HTF gate removed — ICT structure (AMD phase, OB, sweep) encodes direction.
+            # _tier_a_htf_ok no longer required.
             # v5.1: sweep-backed entries need less composite confirmation.
             # The sweep is the signal — composite is soft confirmation, not a gate.
             # Standard: composite * direction >= 0.20
@@ -2037,11 +1983,11 @@ class ICTEntryGate:
             (q_composite * (1 if side == "long" else -1)) >= (0.05 if _sweep_active else 0.20)
         )
         if _tier_a_conditions:
-            _a_label = "⚡COUNTER-HTF" if htf_veto else "structural"
+            # Label no longer distinguishes counter-HTF — all entries are structure-primary
             return ("A", 2,
-                    f"TIER-A {_a_label} AMD={amd_phase}(conf={amd_conf:.2f}) "
+                    f"TIER-A structural AMD={amd_phase}(conf={amd_conf:.2f}) "
                     f"ICT={ict_total:.2f} q={q_score:.2f} "
-                    f"15m={htf_15m:+.2f} "
+                    f"15m={htf_15m:+.2f}(info) "
                     f"mtf={'✓' if mtf_align else '✗'}")
 
         # ── TIER-B: Standard Quant + ICT Confluence ───────────────────────
@@ -2083,7 +2029,7 @@ class ICTEntryGate:
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
             q_overext and          # VWAP overextension required for standard entries
             n_conf >= 3 and        # majority of quant signals agree
-            not htf_veto and
+            # HTF veto removed — direction determined by ICT + order flow
             not tf_opposes and
             # P/D zone gate: don't enter longs in premium or shorts in discount
             (side == "long"  and not in_prem or
@@ -2111,8 +2057,7 @@ class ICTEntryGate:
                                   f"(regime={_market_regime})")
         if _tf_opposes_tier_a:
             _tf_val = quant.tick_flow if quant else 0.0
-            _tf_thr = 0.60 if htf_veto else 0.30
-            block_reasons.append(f"TICK_OPPOSING({_tf_val:.2f},thr={_tf_thr:.2f})")
+            block_reasons.append(f"TICK_OPPOSING({_tf_val:.2f},thr=0.30)")
         # P/D zone mismatch (only reported when not in AMD delivery — delivery is exempt)
         _in_amd_delivery = (
             amd_phase == "DISTRIBUTION" and (
@@ -2124,33 +2069,9 @@ class ICTEntryGate:
             block_reasons.append("LONG_IN_PREMIUM")
         if (side == "short" and in_disc  and not _in_amd_delivery):
             block_reasons.append("SHORT_IN_DISCOUNT")
-        if htf_veto and not _tier_a_htf_ok:
-            # Compute the effective ICT bar (matches _htf_allows_tier_a logic)
-            _has_sweep_cover = (
-                sweep_setup is not None and
-                sweep_setup.side == side and
-                sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE")
-            )
-            _eff_bar = 0.50 if _has_sweep_cover else 0.58
-            if amd_phase not in ("DISTRIBUTION", "REDISTRIBUTION", "MANIPULATION"):
-                block_reasons.append(
-                    f"HTF_VETO+phase={amd_phase}(no_counter_htf_unlock)")
-            elif amd_phase == "MANIPULATION" and not _has_sweep_cover:
-                block_reasons.append(
-                    f"HTF_VETO+phase=MANIPULATION(no_sweep_for_counter_htf)")
-            elif ict_total < _eff_bar:
-                block_reasons.append(
-                    f"HTF_VETO+ICT={ict_total:.2f}<{_eff_bar:.2f}(counter_htf_bar"
-                    f"{'_sweep_reduced' if _has_sweep_cover else ''})")
-            elif amd_conf < 0.60:
-                block_reasons.append(
-                    f"HTF_VETO+AMD_conf={amd_conf:.2f}<0.60(counter_htf_bar)")
-            else:
-                _extreme_str = (f"{htf_15m:+.2f}≥+0.70"
-                                if side == "short"
-                                else f"{htf_15m:+.2f}≤-0.70")
-                block_reasons.append(
-                    f"HTF_VETO+15m_extreme({_extreme_str}_dist_window_closed)")
+        # HTF veto informational only — not a BLOCKED reason
+        if htf_veto:
+            block_reasons.append(f"HTF={htf_15m:+.2f}(info-only,not-blocking)")
         if not q_overext and ict_total < 0.55:
             block_reasons.append("NOT_OVEREXTENDED+weak_ICT")
         if abs(q_composite) < ICTEntryGate.TIER_B_COMPOSITE_MIN:

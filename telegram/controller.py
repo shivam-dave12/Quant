@@ -557,13 +557,11 @@ class TelegramBotController:
                         f"  {tier_icons.get(_tier,'❓')} <b>Tier-{_tier}</b>  "
                         f"side={_side.upper()}  confirm_ticks={_cn}")
                     lines.append(f"  {_esc(_reason)}")
-
-                    # Counter-HTF flag
-                    if _tier in ("A",) and getattr(sig, 'htf_veto', False):
+                    # HTF shown as context — not a gate condition
+                    if getattr(sig, 'htf_veto', False):
                         lines.append(
-                            f"  ⚡ Counter-HTF entry  "
-                            f"ICT={sig.ict_total:.2f}≥0.65  "
-                            f"AMD_conf={getattr(sig,'amd_conf',0):.2f}≥0.60")
+                            f"  ℹ️ HTF opposing (15m={htf_15m:+.2f}) — "
+                            f"informational only, direction set by ICT structure")
                 except Exception as _te:
                     lines.append(f"  ICT gate error: {_esc(str(_te))}")
 
@@ -610,7 +608,6 @@ class TelegramBotController:
 
             lines.append("\n<b>━ Entry Gates</b>")
             # Overextended: gate uses ADX-adaptive threshold (0.4/0.6/0.9 ATR)
-            # NOT the QUANT_VWAP_ENTRY_ATR_MULT config constant (which is unused in the gate)
             if adx_val < 25.0:
                 actual_thresh = 0.4
                 thresh_regime = "ranging"
@@ -622,7 +619,6 @@ class TelegramBotController:
                 thresh_regime = "trending"
             g_ext  = sig.overextended
             g_reg  = sig.regime_ok
-            g_htf  = not sig.htf_veto
             g_conf = sig.n_confirming >= 3
             g_comp = abs(c) >= thr
 
@@ -633,8 +629,8 @@ class TelegramBotController:
                 f"  {'✅' if g_reg  else '❌'} ATR regime     "
                 f"({atr_pct:.0%} pctile  valid 5–97%)")
             lines.append(
-                f"  {'✅' if g_htf  else '❌'} HTF veto       "
-                f"(4h={htf_4h:+.2f}  15m={htf_15m:+.2f})")
+                f"  ⚪ HTF (info)       "
+                f"(4h={htf_4h:+.2f}  15m={htf_15m:+.2f}  — directional context, not a gate)")
             lines.append(
                 f"  {'✅' if g_conf else '❌'} Confluence     "
                 f"({sig.n_confirming}/5 quant  need ≥3)")
@@ -729,7 +725,8 @@ class TelegramBotController:
             # 9. VERDICT
             # ══════════════════════════════════════════════════════════
             lines.append("\n<b>━ Verdict</b>")
-            all_pass = g_ext and g_reg and g_htf and g_conf and g_comp
+            # HTF is informational — not in all_pass
+            all_pass = g_ext and g_reg and g_conf and g_comp
 
             if pos.phase == PositionPhase.ACTIVE:
                 lines.append(f"  📍 Position ACTIVE — entry gate not evaluated")
@@ -748,12 +745,6 @@ class TelegramBotController:
                         f"VWAP: |{abs(dev_atr):.2f}|ATR &lt; {actual_thresh:.1f}ATR ({thresh_regime})")
                 if not g_reg:
                     missing.append(f"ATR regime ({atr_pct:.0%})")
-                if not g_htf:
-                    # Correct: what direction is actually being vetoed
-                    if veto_short:
-                        missing.append(f"HTF vetoing SHORT (15m={htf_15m:+.2f})")
-                    if veto_long:
-                        missing.append(f"HTF vetoing LONG (15m={htf_15m:+.2f})")
                 if not g_conf:
                     missing.append(f"Confluence {sig.n_confirming}/5 &lt; 3")
                 if not g_comp:
@@ -765,6 +756,10 @@ class TelegramBotController:
                 lines.append("  👀 <b>Watching</b>  —  blocked by:")
                 for m in missing:
                     lines.append(f"    • {m}")
+                # HTF shown as context even when not blocking
+                if sig.htf_veto:
+                    lines.append(
+                        f"    ℹ️ HTF opposing ({htf_15m:+.2f} 15m) — informational only")
 
             self.send_message("\n".join(lines))
             return None
