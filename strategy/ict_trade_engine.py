@@ -198,15 +198,20 @@ class ICTSweepDetector:
                 _s = self._active_setup
                 if _s.status == "DETECTED":
                     _ote_miss = False
+                    # v5.2: OTE miss threshold widened from 0.5×ATR to 1.5×ATR.
+                    # Sweeps detected from warmup data had price already outside
+                    # the old tight zone → instant expiry on first check (5s).
+                    # 1.5×ATR gives price room to approach the OTE zone.
+                    _miss_margin = 1.5 * atr
                     if _s.side == "long":
-                        if price > _s.ote_entry_zone_high + 0.5 * atr:
+                        if price > _s.ote_entry_zone_high + _miss_margin:
                             _ote_miss = True   # price never pulled back to OTE
-                        elif price < _s.ote_entry_zone_low - 0.5 * atr:
+                        elif price < _s.ote_entry_zone_low - _miss_margin:
                             _ote_miss = True   # price blew through OTE downward
                     else:  # short
-                        if price < _s.ote_entry_zone_low - 0.5 * atr:
+                        if price < _s.ote_entry_zone_low - _miss_margin:
                             _ote_miss = True   # price never rallied to OTE
-                        elif price > _s.ote_entry_zone_high + 0.5 * atr:
+                        elif price > _s.ote_entry_zone_high + _miss_margin:
                             _ote_miss = True   # price rallied through OTE upward
                     if _ote_miss:
                         # Record this sweep as expired so _find_best_setup will
@@ -1896,6 +1901,14 @@ class ICTEntryGate:
             sweep_setup.status == "OTE_READY" and
             sweep_setup.side == side
         )
+        # v5.2: _sweep_active includes DETECTED status — the sweep exists
+        # and side matches. Used for delivery context and MANIPULATION unlock.
+        # OTE_READY is stricter (price IN the zone) — used for Tier-S entry.
+        _sweep_active = (
+            sweep_setup is not None and
+            sweep_setup.status in ("DETECTED", "OTE_READY", "ACTIVE") and
+            sweep_setup.side == side
+        )
         _ict_bar_s = 0.60  # default (no sweep)
         if _sweep_ote:
             _sq = sweep_setup.quality_score()
@@ -1959,7 +1972,7 @@ class ICTEntryGate:
             # opposite direction. When we have a confirmed sweep at OTE
             # during MANIPULATION, the delivery is about to start.
             amd_phase == "MANIPULATION"
-            and _sweep_ote
+            and _sweep_active  # DETECTED or OTE_READY — sweep exists
             and amd_conf >= 0.70
         )
         # v8.0: tier-aware HTF gate replaces the previous `not htf_veto` hard-block.
@@ -1992,10 +2005,7 @@ class ICTEntryGate:
         _tier_a_conditions = (
             _has_delivery_context and
             # v5.1: sweep-backed entries use lower ICT bar (0.50).
-            # The sweep geometry provides structural cover that the ICT
-            # score was independently requiring. 0.54 vs 0.55 shouldn't
-            # block a quality=0.79 sweep at OTE.
-            ict_total >= (0.50 if _sweep_ote else 0.55) and
+            ict_total >= (0.50 if _sweep_active else 0.55) and
             (
                 (amd_phase == "DISTRIBUTION" and (
                     (side == "short" and amd_bias == "bearish") or
@@ -2012,7 +2022,7 @@ class ICTEntryGate:
             # The sweep is the signal — composite is soft confirmation, not a gate.
             # Standard: composite * direction >= 0.20
             # Sweep-backed: composite * direction >= 0.05 (just not STRONGLY opposing)
-            (q_composite * (1 if side == "long" else -1)) >= (0.05 if _sweep_ote else 0.20)
+            (q_composite * (1 if side == "long" else -1)) >= (0.05 if _sweep_active else 0.20)
         )
         if _tier_a_conditions:
             _a_label = "⚡COUNTER-HTF" if htf_veto else "structural"
