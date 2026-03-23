@@ -1765,6 +1765,44 @@ class InstitutionalLevels:
             except Exception as _ict_e:
                 logger.debug(f"ICT TP targets error (non-fatal): {_ict_e}")
 
+        # ── Fix 2: Opposing unswept liquidity pools (PATH-B) ─────────────────
+        # ICTTPEngine (PATH-A) already scans liquidity pools as TIER-A.
+        # PATH-B entries (no active sweep setup or fallback from PATH-A) previously
+        # had zero liquidity pool visibility for TP targeting, meaning the bot was
+        # exiting at random FVGs/VWAP instead of the institutional target pool that
+        # smart money is literally delivering price toward.
+        #
+        # Logic mirrors ICTTPEngine.compute() TIER-A exactly:
+        #   SHORT → target nearest unswept SSL below price (score 5.5 + touch bonus)
+        #   LONG  → target nearest unswept BSL above price (score 5.5 + touch bonus)
+        # touch_count bonus: each additional test of the pool = more stops clustered
+        # there = stronger magnetic pull.  Capped at +1.5 to prevent outliers dominating.
+        if ict_engine is not None:
+            try:
+                _liq_added = 0
+                for _lpool in ict_engine.liquidity_pools:
+                    if _lpool.swept:
+                        continue
+                    if side == "long" and _lpool.level_type == "BSL" and _lpool.price > price:
+                        _lpool_score = 5.5 + min(_lpool.touch_count * 0.25, 1.5)
+                        # Use add_tp_ict so the 1.0×SL minimum floor applies
+                        # (liquidity pools are structural, same conviction as OBs)
+                        _lpool_dist = _lpool.price - price
+                        if _lpool_dist >= max(sl_dist * 1.0, atr * 0.5) and _lpool_dist <= max_tp_dist:
+                            add_tp(_lpool.price - atr * 0.05, _lpool_score)
+                            _liq_added += 1
+                    elif side == "short" and _lpool.level_type == "SSL" and _lpool.price < price:
+                        _lpool_score = 5.5 + min(_lpool.touch_count * 0.25, 1.5)
+                        _lpool_dist = price - _lpool.price
+                        if _lpool_dist >= max(sl_dist * 1.0, atr * 0.5) and _lpool_dist <= max_tp_dist:
+                            add_tp(_lpool.price + atr * 0.05, _lpool_score)
+                            _liq_added += 1
+                if _liq_added:
+                    logger.info(
+                        f"💧 PATH-B liquidity pool TP: {_liq_added} opposing "                        f"{'BSL' if side == 'long' else 'SSL'} pool(s) added to candidate pool")
+            except Exception as _lp_tp_e:
+                logger.debug(f"PATH-B liquidity pool TP error (non-fatal): {_lp_tp_e}")
+
         # ── ICT-Primary Tiered Selection ─────────────────────────────────────
         #
         # Industry-grade ICT selection logic:
@@ -2796,6 +2834,7 @@ class WeightScheduler:
 class SignalBreakdown:
     vwap_dev: float = 0.0; cvd_div: float = 0.0; orderbook: float = 0.0
     tick_flow: float = 0.0; vol_exhaust: float = 0.0; composite: float = 0.0
+    delta_acc: float = 0.0   # Fix 3: directional delta pressure (replaces VWAP dev in composite)
     atr: float = 0.0; atr_pct: float = 0.0; regime_ok: bool = False
     regime_penalty: float = 1.0; htf_veto: bool = False
     overextended: bool = False; vwap_price: float = 0.0
@@ -3057,8 +3096,8 @@ class QuantStrategy:
                 f"LiqCeiling={QCfg.ICT_LIQ_CEILING_ENABLED()}"
             )
         logger.info(f"   ICT: {ict_status}")
-        logger.info(f"   Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
-                    f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}")
+        logger.info(f"   Weights: DELTA_ACC={QCfg.W_VWAP_DEV()} CVD_TREND={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
+                    f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()} "                    f"[Fix3: delta_acc→VWAP slot, Fix4: cvd_trend→cvd slot]")
         logger.info("=" * 72)
 
     def get_position(self) -> Optional[Dict]:
@@ -3440,15 +3479,35 @@ class QuantStrategy:
         w_vwap, w_cvd, w_ob, w_tick, w_vex = WeightScheduler.get(regime)
 
         # ── Mean-reversion signals ────────────────────────────────────────────
-        vs  = self._vwap.get_reversion_signal(price, atr_5m)
-        cs  = self._cvd.get_divergence_signal(candles_1m)
+        # VWAP reversion signal: retained as a display / gate value (overextended check,
+        # reversion_side label) but NO LONGER the primary composite weight driver.
+        # Root cause of Failure 5: in a trend, VWAP stays behind price permanently,
+        # so vs saturates at ±1.0 and never changes — contributing a constant −1.0
+        # to every tick regardless of actual selling/buying pressure.
+        # Replace with delta_acc (Fix 3): net directional buying/selling pressure
+        # over a rolling window.  +1 = sustained aggressive buying, −1 = net selling.
+        vs          = self._vwap.get_reversion_signal(price, atr_5m)   # gate/display only
+        delta_acc   = self._cvd.get_trend_signal()                      # Fix 3: directional pressure
+
+        # Fix 4: CVD component uses get_trend_signal() (directional delta accumulation)
+        # instead of get_divergence_signal() which returns 0.0 when CVD and price agree.
+        # In a trending move with aligned buying, divergence is permanently 0 — the
+        # strongest confirming signal is invisible to the composite.  Trend signal
+        # correctly represents "strong buying/selling pressure sustained over the window."
+        cs  = self._cvd.get_trend_signal()                              # Fix 4: trend not divergence
         obs = self._ob_eng.get_signal()
         ts  = self._tick_eng.get_signal()
         ve  = self._vol_exh.compute(candles_1m)
 
-        comp = (vs*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
+        # Composite: swap vs (VWAP constant bias) → delta_acc (real directional pressure)
+        # w_vwap weight now applied to delta_acc: highest weight in RANGING goes to the
+        # cleanest directional signal, not a distance measure that saturates in trends.
+        comp = (delta_acc*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
         comp = max(-1.0, min(1.0, comp))
         direction = 1.0 if comp >= 0 else -1.0
+        # n_confirming: include vs (VWAP dev) and delta_acc both so the count
+        # still reflects all 5 signal streams — just cs and delta_acc are now
+        # both CVD-derived (directional and trend), vs is VWAP-derived display.
         nc = sum(1 for s in [vs, cs, obs, ts, ve] if s * direction > 0.05)
 
         # ── Trend-following score (TRENDING regime) ───────────────────────────
@@ -3474,6 +3533,7 @@ class QuantStrategy:
         # composite, systematically making shorts ~0.10 less negative than warranted.
         sig = SignalBreakdown(
             vwap_dev=vs, cvd_div=cs, orderbook=obs, tick_flow=ts, vol_exhaust=ve,
+            delta_acc=delta_acc,
             composite=comp, atr=atr_5m, atr_pct=self._atr_5m.get_percentile(),
             regime_ok=self._atr_5m.regime_valid(), regime_penalty=self._atr_5m.regime_penalty(),
             htf_veto=self._htf.vetoes_trade(self._vwap.reversion_side(price)),
@@ -3908,10 +3968,10 @@ class QuantStrategy:
             f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────"]
         if _sweep_line:
             lines.append(f"  {_sweep_line}")
-        lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
+        lines += [fmt("DeltaAcc", sig.delta_acc), fmt("CVD", sig.cvd_div),
                   fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
                   fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
-                  f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()}",
+                  f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()} | VWAP-dev={sig.vwap_dev:+.3f}(display)",
                   f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
         for g in gates:
             lines.append(f"  {g}")
@@ -4338,6 +4398,62 @@ class QuantStrategy:
             side = self._active_sweep_setup.side  # "long" | "short"
         else:
             side = sig.reversion_side   # VWAP-based default for standard path
+
+        # ── Fix 6: MTF directional override ──────────────────────────────
+        # Problem: VWAP deviation saturates at ±1.0 in a trend and permanently
+        # biases the composite in one direction without measuring actual pressure.
+        # This can produce SHORT signals when 1D, 4H, 1H, and 15m are ALL bullish.
+        #
+        # Solution: count how many of the observable timeframe bias scores agree on
+        # direction.  When 3 or more are strongly aligned AGAINST the proposed entry
+        # side AND this is NOT an OTE sweep (which has its own structural validation),
+        # block the trade.  Rationale: 3+ timeframes at high conviction means the bot
+        # is fading an institutional delivery move, not a temporary overextension.
+        #
+        # Thresholds:
+        #   HTF score > +0.30 = that TF is bullish (ICT structure + EMA slope combined)
+        #   HTF score < -0.30 = that TF is bearish
+        #   CVD trend > +0.30 = sustained net buying in the window
+        #   AMD bias: bullish/bearish adds one count each
+        #
+        # We require ≥3 STRONG signals (not just any positive reading) to avoid
+        # triggering on noise in transitioning/ranging conditions where TF scores
+        # oscillate around ±0.2.
+        if not _is_ote_sweep:
+            _htf_15m_score = self._htf.trend_15m          # ICT structure [-1,+1]
+            _htf_4h_score  = self._htf.trend_4h           # ICT structure [-1,+1]
+            _cvd_trend     = self._cvd.get_trend_signal()  # net delta pressure [-1,+1]
+            _amd_bias_score = (
+                1.0 if sig.amd_bias == "bullish" else
+               -1.0 if sig.amd_bias == "bearish" else 0.0
+            )
+            _MTF_THRESHOLD = 0.30   # minimum score to count a TF as "strongly directional"
+
+            _bull_count = sum(1 for v in [
+                _htf_15m_score, _htf_4h_score, _cvd_trend, _amd_bias_score
+            ] if v > _MTF_THRESHOLD)
+            _bear_count = sum(1 for v in [
+                _htf_15m_score, _htf_4h_score, _cvd_trend, _amd_bias_score
+            ] if v < -_MTF_THRESHOLD)
+
+            _mtf_blocks = False
+            _mtf_block_reason = ""
+            if side == "short" and _bull_count >= 3:
+                _mtf_blocks = True
+                _mtf_block_reason = (
+                    f"MTF_BULL_OVERRIDE: {_bull_count}/4 TFs bullish "                    f"(15m={_htf_15m_score:+.2f} 4h={_htf_4h_score:+.2f} "                    f"CVD={_cvd_trend:+.2f} AMD={_amd_bias_score:+.1f}) "                    f"— refusing SHORT against {_bull_count}-TF alignment")
+            elif side == "long" and _bear_count >= 3:
+                _mtf_blocks = True
+                _mtf_block_reason = (
+                    f"MTF_BEAR_OVERRIDE: {_bear_count}/4 TFs bearish "                    f"(15m={_htf_15m_score:+.2f} 4h={_htf_4h_score:+.2f} "                    f"CVD={_cvd_trend:+.2f} AMD={_amd_bias_score:+.1f}) "                    f"— refusing LONG against {_bear_count}-TF alignment")
+
+            if _mtf_blocks:
+                self._confirm_long = self._confirm_short = 0
+                _now_log_key = f"mtf_{side}"
+                if now - self._last_pd_gate_log.get(_now_log_key, 0) >= 60.0:
+                    self._last_pd_gate_log[_now_log_key] = now
+                    logger.info(f"⛔ {_mtf_block_reason}")
+                return
 
         # ── Hard veto: trending against reversion trade ──────────────────
         # Skipped for sweep entries — institutional sweep setups are valid IN
@@ -5165,11 +5281,12 @@ class QuantStrategy:
             try:
                 sl_price, _sl_source = ICTSLEngine.compute(
                     side, price, atr,
-                    sweep_setup  = self._active_sweep_setup,
-                    ict_engine   = self._ict,
-                    candles_15m  = candles_15m,
-                    atr_pctile   = atr_pctile,
-                    mode         = mode,
+                    sweep_setup    = self._active_sweep_setup,
+                    ict_engine     = self._ict,
+                    candles_15m    = candles_15m,
+                    atr_pctile     = atr_pctile,
+                    mode           = mode,
+                    market_regime  = getattr(self._last_sig, 'market_regime', 'RANGING'),
                 )
                 tp_price = ICTTPEngine.compute(
                     side, price, atr, sl_price,
@@ -5235,7 +5352,15 @@ class QuantStrategy:
                 buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (
                     1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
                 _sl_buf  = buf_mult * atr
-                _min_dist = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
+                # Regime-adaptive min_dist consistent with PATH-A and Step 3
+                _sig_regime_sw = getattr(self._last_sig, 'market_regime', 'RANGING')
+                if mode in ("trend", "momentum"):
+                    _sw_atr_floor = 1.00 * atr
+                elif _sig_regime_sw == "TRANSITIONING":
+                    _sw_atr_floor = 0.70 * atr
+                else:
+                    _sw_atr_floor = 0.40 * atr
+                _min_dist = max(price * QCfg.MIN_SL_PCT(), _sw_atr_floor)
                 _max_dist = price * QCfg.MAX_SL_PCT()
                 _candidates: List[Tuple[float, float]] = []
 
@@ -5265,9 +5390,17 @@ class QuantStrategy:
                             f"📐 15m Swing SL: ${sl_price:,.2f} "
                             f"({sl_dist:.0f}pts / {sl_dist/atr:.2f}ATR)")
 
-            # ── Step 3: ATR fallback ───────────────────────────────────────────
+            # ── Step 3: ATR fallback (regime-adaptive floor) ─────────────────────
+            # Mirrors ICTSLEngine min_dist scaling so PATH-B ATR fallback is
+            # consistent with PATH-A sweep-engine floors.
             if sl_price is None:
-                _atr_floor  = 0.40 * atr
+                _sig_regime = getattr(self._last_sig, 'market_regime', 'RANGING')
+                if mode in ("trend", "momentum"):
+                    _atr_floor = 1.00 * atr   # 1.0×ATR in directional mode
+                elif _sig_regime == "TRANSITIONING":
+                    _atr_floor = 0.70 * atr   # transitioning: moderate
+                else:
+                    _atr_floor = 0.40 * atr   # ranging: original conservative floor
                 _pct_floor  = price * QCfg.MIN_SL_PCT()
                 _min_dist   = max(_pct_floor, _atr_floor)
                 _max_dist   = price * QCfg.MAX_SL_PCT()
@@ -5277,7 +5410,7 @@ class QuantStrategy:
                 _sl_source = "ATR_fallback"
                 logger.warning(
                     f"⚠️ SL ATR fallback: ${sl_price:,.2f} "
-                    f"({_atr_sl_dist:.0f}pts / 1.50ATR) — no 15m structure found")
+                    f"({_atr_sl_dist:.0f}pts / 1.50ATR regime={_sig_regime}) — no 15m structure found")
 
         # ── Mode-aware SL sizing (trend/momentum ATR cap) ──────────────────
         if mode in ("trend", "momentum"):
