@@ -778,14 +778,31 @@ class OrderManager:
             if filled_qty <= 0 and status == "FILLED":
                 filled_qty = req_qty
             fill_pct = (filled_qty / req_qty * 100) if req_qty > 0 else 0.0
+
+            # Extract exact paid_commission from Delta order response.
+            # data is the normalised dict from get_order_status; _raw holds the
+            # original Delta response which contains paid_commission (string).
+            _raw = data.get("_raw") or data
+            paid_commission = 0.0
+            for _fee_key in ("paid_commission", "commission"):
+                _fv = _raw.get(_fee_key)
+                if _fv is not None:
+                    try:
+                        paid_commission = float(_fv)
+                        if paid_commission > 0:
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
             return {
-                "status":        status,
-                "fill_price":    fill_price,
-                "filled_qty":    filled_qty,
-                "requested_qty": req_qty,
-                "is_partial":    is_partial,
-                "fill_pct":      fill_pct,
-                "raw_data":      data,
+                "status":           status,
+                "fill_price":       fill_price,
+                "filled_qty":       filled_qty,
+                "requested_qty":    req_qty,
+                "is_partial":       is_partial,
+                "fill_pct":         fill_pct,
+                "paid_commission":  paid_commission,
+                "raw_data":         data,
             }
         except Exception as e:
             logger.error(f"get_fill_details error: {e}", exc_info=True)
@@ -886,7 +903,9 @@ class OrderManager:
                 fill_px = float(details.get("fill_price") or limit_price)
                 data["fill_type"]  = "maker"
                 data["fill_price"] = fill_px
-                logger.info(f"✅ Maker fill: {order_id[:8]}… @ ${fill_px:.2f}")
+                data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
+                logger.info(f"✅ Maker fill: {order_id[:8]}… @ ${fill_px:.2f}"
+                            f" fee=${data['paid_commission']:.4f}")
                 return data
 
             if status == "CANCELLED":
@@ -901,6 +920,7 @@ class OrderManager:
                 data["fill_type"]  = "maker"
                 data["fill_price"] = fill_px
                 data["quantity"]   = filled_qty
+                data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 return data
 
         # Timeout
@@ -910,6 +930,7 @@ class OrderManager:
             fill_px = float((details or {}).get("fill_price") or limit_price)
             data["fill_type"]  = "maker"
             data["fill_price"] = fill_px
+            data["paid_commission"] = float((details or {}).get("paid_commission", 0) or 0)
             return data
 
         if fallback_to_market:
@@ -978,7 +999,10 @@ class OrderManager:
                 data["fill_type"]    = "maker"
                 data["fill_price"]   = fill_px
                 data["bracket_order"] = True
-                logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}")
+                # Propagate exact entry fee from Delta paid_commission
+                data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
+                logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
+                            f" fee=${data['paid_commission']:.4f}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
                 # Delta creates children asynchronously after fill.

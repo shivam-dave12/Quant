@@ -2865,6 +2865,7 @@ class PositionState:
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
     trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
+    entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
     consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
@@ -5498,6 +5499,10 @@ class QuantStrategy:
             or price
         )
         actual_fill_type = entry_data.get("fill_type", "taker")
+        # v8.1: exact entry fee from Delta paid_commission (propagated by order_manager)
+        entry_fee_paid = float(entry_data.get("paid_commission", 0) or 0)
+        if entry_fee_paid > 0:
+            logger.info(f"💰 Entry fee (exact): ${entry_fee_paid:.4f}")
 
         # v4.6 BUG FIX #8: Use actual filled quantity for partial fills
         # order_manager.place_limit_entry returns adjusted quantity on partial fill
@@ -5660,6 +5665,7 @@ class QuantStrategy:
             entry_vol       = entry_vol,
             trade_mode      = mode,
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
+            entry_fee_paid  = entry_fee_paid,     # v8.1: exact from Delta paid_commission
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
             entry_htf_15m   = self._htf.trend_15m,
@@ -6486,32 +6492,37 @@ class QuantStrategy:
             gross = ((fill_price - pos.entry_price) if pos.side == "long"
                      else (pos.entry_price - fill_price)) * pos.quantity
 
-        # Entry fee: commission_rate × entry_notional.
-        # Exact rate (taker or maker per entry fill type); value estimated because
-        # we do not yet capture paid_commission at entry order placement.
-        fill_type  = getattr(pos, "entry_fill_type", "taker")
-        entry_rate = (
-            float(getattr(_cfg_x, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
-            if fill_type == "maker" else QCfg.COMMISSION_RATE()
-        )
-        entry_fee = pos.entry_price * pos.quantity * entry_rate
+        # Entry fee: prefer exact paid_commission captured at entry (v8.1).
+        # Fallback: commission_rate × entry_notional (rate-exact, value estimated).
+        _entry_fee_exact = getattr(pos, "entry_fee_paid", 0.0) or 0.0
+        entry_fee_is_exact = _entry_fee_exact > 0
+        if entry_fee_is_exact:
+            entry_fee = _entry_fee_exact
+        else:
+            fill_type  = getattr(pos, "entry_fill_type", "taker")
+            entry_rate = (
+                float(getattr(_cfg_x, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+                if fill_type == "maker" else QCfg.COMMISSION_RATE()
+            )
+            entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid   # EXACT from Delta paid_commission
 
         pnl = gross - entry_fee - exit_fee
 
+        _entry_tag = "exact" if entry_fee_is_exact else "rate-est"
         fee_breakdown: Dict = {
             "gross_pnl":  round(gross, 4),
-            "entry_fee":  round(entry_fee, 4),   # estimated at exact rate
+            "entry_fee":  round(entry_fee, 4),
             "exit_fee":   round(exit_fee, 4),    # exact from paid_commission
             "total_fees": round(entry_fee + exit_fee, 4),
             "net_pnl":    round(pnl, 4),
-            "exact_fees": True,   # exit side is exact; entry side is rate-exact
+            "exact_fees": entry_fee_is_exact,  # True = both sides exact
         }
 
         logger.info(
             f"📊 Exit price=${fill_price:,.2f} reason={exit_reason} "
             f"entry=${pos.entry_price:,.2f} gross=${gross:+.4f} "
-            f"entry_fee=${entry_fee:.4f}(rate-est) exit_fee=${exit_fee:.4f}(exact) "
+            f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}(exact) "
             f"net=${pnl:+.4f}"
         )
 
@@ -6553,7 +6564,7 @@ class QuantStrategy:
             f"Exit:     <b>${fill_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
             f"Gross:    ${gross:+.4f}\n"
             f"Fees:     ${entry_fee + exit_fee:.4f} "
-            f"(exit exact ${exit_fee:.4f} + entry est ${entry_fee:.4f})\n"
+            f"(exit exact ${exit_fee:.4f} + entry {_entry_tag} ${entry_fee:.4f})\n"
             f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"

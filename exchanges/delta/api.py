@@ -1368,11 +1368,12 @@ class DeltaAPI:
         """GET /v2/fills — trade fill history."""
         params: Dict[str, Any] = {"page_size": page_size}
         if product_id:
-            params["product_id"] = product_id
+            # API docs: parameter is 'product_ids' (plural, comma-separated)
+            params["product_ids"] = str(product_id)
         elif symbol:
             pid = self._symbol_to_product_id(symbol)
             if pid:
-                params["product_id"] = pid
+                params["product_ids"] = str(pid)
         return self._get("/v2/fills", params=params)
 
     # =========================================================================

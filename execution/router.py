@@ -193,6 +193,7 @@ class ExecutionRouter:
     def get_active_orders(self, *a, **kw):  return self.active.get_active_orders(*a, **kw)
     def get_order_count(self, *a, **kw):    return self.active.get_order_count(*a, **kw)
     def get_recent_order_history(self, *a, **kw): return self.active.get_recent_order_history(*a, **kw)
+    def identify_exit_order(self, *a, **kw):     return self.active.identify_exit_order(*a, **kw)
 
     @staticmethod
     def compute_signal_urgency(*a, **kw):
