@@ -6373,174 +6373,158 @@ class QuantStrategy:
 
     def _record_exchange_exit(self, ex_pos):
         """
-        v5.0: API-confirmed exit type, exact fill price, exact commission from Delta.
+        v5.1: Exchange-confirmed exit only. No price heuristics. No estimated fees.
 
-        Step 1  — API-confirmed (Delta only, Strategy 1: fills, Strategy 2: history):
-          Call identify_exit_order() which queries GET /v2/fills then
-          GET /v2/orders/history. Returns the actual fill price and the actual
-          commission charged (fee_paid > 0 only when resolved via fills).
+        Calls identify_exit_order() which queries GET /v2/orders/{id} for both
+        the SL and TP order IDs directly — state:"closed" + paid_commission from
+        the exchange response. One retry after 1 s if both orders still show open
+        (covers the sub-second propagation window between fill and state update).
 
-        Step 2  — Price-heuristic fallback (CoinSwitch or API unresolved):
-          Unchanged logic: compare last known price to stored SL/TP levels.
+        If after the retry the exchange still cannot confirm which order closed:
+          - Position state is finalised to FLAT (mandatory — prevents orphaned state)
+          - PnL recorded as 0.0 with confirmed=False in the trade record
+          - Telegram alert sent with both order IDs for manual reconciliation
+          - Operator should verify on the Delta dashboard
 
-        Step 3  — PnL computation:
-          When API-confirmed + fee_paid > 0: compute gross PnL from the exact
-          fill price, subtract exact entry fee (from pos.entry_fee if recorded,
-          else estimated) and the exact exit commission from the API.
-          When fee_paid == 0 (order-history path or CoinSwitch): _estimate_pnl()
-          computes gross and subtracts estimated entry+exit fees as before.
-
-        Step 4  — fee_breakdown dict stored in trade record for /trades and /stats.
+        When confirmed (normal path):
+          - exit_type, fill_price, fee_paid all from exchange (exact)
+          - Gross PnL computed from actual fill price using exact inverse-perp formula
+          - Exit fee = paid_commission from Delta (exact USD)
+          - Entry fee = commission_rate × entry_notional (exact rate, estimated value
+            because we do not yet store paid_commission at entry order placement)
+          - fee_breakdown.exact_fees = True signals that exit side is exact
         """
         pos = self._pos
         if pos.phase == PositionPhase.FLAT:
             logger.debug("_record_exchange_exit skipped — already FLAT")
             return
 
-        # ─── Step 1: Determine exit type and exact fill price ─────────────────
-        # Priority 1 — API confirmed (Delta only)
-        # Priority 2 — Price heuristic fallback
-        exit_reason    = "exchange_exit"
-        exit_price     = 0.0
-        is_tp_hit      = False
-        is_sl_hit      = False
-        _exact_fee     = 0.0   # actual exit commission; 0.0 = not available
-        _api_confirmed = False
+        # ─── Step 1: Get exchange-confirmed exit data ──────────────────────────
+        # Query both order IDs directly. One retry after 1 s.
+        exit_info: Dict = {"confirmed": False}
 
         if self._om is not None:
             try:
-                _exit_info = self._om.identify_exit_order(
+                exit_info = self._om.identify_exit_order(
                     sl_order_id  = pos.sl_order_id,
                     tp_order_id  = pos.tp_order_id,
                     trail_active = pos.trail_active,
                 )
-                if _exit_info.get("confirmed"):
-                    _etype      = _exit_info["exit_type"]   # "tp"|"sl"|"trail_sl"
-                    _fprice     = float(_exit_info.get("fill_price") or 0)
-                    _oid        = _exit_info.get("order_id", "")
-                    _exact_fee  = float(_exit_info.get("fee_paid") or 0)
-                    if _fprice > 0:
-                        exit_price     = _fprice
-                        _api_confirmed = True
-                        if _etype == "tp":
-                            exit_reason = "tp_hit"
-                            is_tp_hit   = True
-                        else:
-                            exit_reason = f"{_etype}_hit"  # "sl_hit"|"trail_sl_hit"
-                            is_sl_hit   = True
-                        _oid_disp = (_oid[:10] + "…") if len(_oid) > 10 else _oid
-                        logger.info(
-                            f"✅ Exit API-confirmed: {exit_reason} "
-                            f"@ ${exit_price:,.2f} order={_oid_disp}"
-                            + (f" fee=${_exact_fee:.4f}" if _exact_fee > 0 else " (fee via estimate)")
-                        )
-            except Exception as _ei_err:
-                logger.debug(f"identify_exit_order error: {_ei_err}")
+            except Exception as e:
+                logger.error(f"identify_exit_order (attempt 1) error: {e}", exc_info=True)
 
-        # Price-heuristic fallback (CoinSwitch or API unresolved / fill_price=0)
-        if not _api_confirmed and pos.entry_price > 0 and pos.quantity > 0:
-            lkp     = self._last_known_price if self._last_known_price > 1.0 else 0.0
-            sp      = pos.sl_price
-            tp      = pos.tp_price
-            trailed = pos.trail_active
+            if not exit_info.get("confirmed"):
+                # Single retry: state update typically propagates within 500 ms
+                time.sleep(1.0)
+                try:
+                    exit_info = self._om.identify_exit_order(
+                        sl_order_id  = pos.sl_order_id,
+                        tp_order_id  = pos.tp_order_id,
+                        trail_active = pos.trail_active,
+                    )
+                except Exception as e:
+                    logger.error(f"identify_exit_order (retry) error: {e}", exc_info=True)
+
+        if not exit_info.get("confirmed"):
+            # Exchange did not confirm within 2 s. Finalise FLAT, record zero PnL.
+            # Operator must reconcile on Delta dashboard using the order IDs below.
+            _sl_disp = str(pos.sl_order_id or "unknown")
+            _tp_disp = str(pos.tp_order_id or "unknown")
+            logger.warning(
+                f"⚠️ EXIT UNCONFIRMED after retry — closing FLAT with pnl=0. "
+                f"SL order={_sl_disp} TP order={_tp_disp}"
+            )
+            send_telegram_message(
+                f"⚠️ <b>EXIT UNCONFIRMED</b>\n"
+                f"Exchange did not confirm which order fired within 2 s.\n"
+                f"PnL recorded as $0.00 — verify on Delta dashboard.\n"
+                f"Entry: ${pos.entry_price:,.2f} | "
+                f"SL: {_sl_disp} | TP: {_tp_disp}"
+            )
+            self._record_pnl(0.0, exit_reason="unconfirmed", exit_price=0.0,
+                             fee_breakdown=None)
+            self._last_exit_side = pos.side
+            self._finalise_exit()
+            return
+
+        # ─── Exchange-confirmed ─────────────────────────────────────────────────
+        exit_type  = exit_info["exit_type"]          # "tp" | "sl" | "trail_sl"
+        fill_price = float(exit_info["fill_price"])  # exact execution price
+        fee_paid   = float(exit_info["fee_paid"])    # paid_commission from Delta
+        fired_id   = exit_info["order_id"]
+
+        if exit_type == "tp":
+            exit_reason = "tp_hit";       is_tp_hit = True;  is_sl_hit = False
+        elif exit_type == "trail_sl":
+            exit_reason = "trail_sl_hit"; is_tp_hit = False; is_sl_hit = True
+        else:
+            exit_reason = "sl_hit";       is_tp_hit = False; is_sl_hit = True
+
+        _disp = (fired_id[:10] + "…") if len(fired_id) > 10 else fired_id
+        logger.info(
+            f"✅ Exit confirmed: {exit_reason} @ ${fill_price:,.2f} "
+            f"fee=${fee_paid:.4f} order={_disp}"
+        )
+
+        # ─── Step 2: PnL — exact gross from actual fill, exact exit fee ────────
+        import config as _cfg_x
+        _is_delta = (
+            getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
+            and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
+        )
+
+        if _is_delta and fill_price > 0:
+            # Exact inverse-perpetual formula for Delta BTCUSD (1 USD per contract)
+            usd_contracts = pos.quantity * pos.entry_price
             if pos.side == "long":
-                if tp > 0 and lkp >= tp * 0.9995:
-                    exit_price = tp;  exit_reason = "tp_hit";     is_tp_hit = True
-                elif sp > 0 and lkp <= sp * 1.0005:
-                    exit_price = sp;  exit_reason = "trail_sl_hit" if trailed else "sl_hit"; is_sl_hit = True
-                else:
-                    exit_price = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
-                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"; is_sl_hit = True
+                gross_btc = usd_contracts * (1.0 / pos.entry_price - 1.0 / fill_price)
             else:
-                if tp > 0 and lkp <= tp * 1.0005:
-                    exit_price = tp;  exit_reason = "tp_hit";     is_tp_hit = True
-                elif sp > 0 and lkp >= sp * 0.9995:
-                    exit_price = sp;  exit_reason = "trail_sl_hit" if trailed else "sl_hit"; is_sl_hit = True
-                else:
-                    exit_price = sp if sp > 0 else (lkp if lkp > 0 else pos.entry_price)
-                    exit_reason = "trail_sl_hit" if trailed else "sl_hit"; is_sl_hit = True
+                gross_btc = usd_contracts * (1.0 / fill_price - 1.0 / pos.entry_price)
+            gross = gross_btc * fill_price
+        else:
+            # Linear (USDT-margined) — CoinSwitch or fill_price unavailable
+            gross = ((fill_price - pos.entry_price) if pos.side == "long"
+                     else (pos.entry_price - fill_price)) * pos.quantity
 
-        # ─── Step 2: Compute PnL — exact when fee_paid available, estimated otherwise
-        pnl          = 0.0
-        fee_breakdown: Optional[Dict] = None
+        # Entry fee: commission_rate × entry_notional.
+        # Exact rate (taker or maker per entry fill type); value estimated because
+        # we do not yet capture paid_commission at entry order placement.
+        fill_type  = getattr(pos, "entry_fill_type", "taker")
+        entry_rate = (
+            float(getattr(_cfg_x, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
+            if fill_type == "maker" else QCfg.COMMISSION_RATE()
+        )
+        entry_fee = pos.entry_price * pos.quantity * entry_rate
+        exit_fee  = fee_paid   # EXACT from Delta paid_commission
 
-        if exit_price > 0:
-            fill_type  = getattr(pos, 'entry_fill_type', 'taker')
-            # entry_fee: use exact value stored at entry if available, else estimate
-            _entry_fee_exact = float(getattr(pos, 'entry_fee_paid', 0.0) or 0.0)
+        pnl = gross - entry_fee - exit_fee
 
-            if _api_confirmed and _exact_fee > 0:
-                # Full exact path: both gross and fees from exchange data
-                import config as _cfg_x
-                _is_delta = (
-                    getattr(_cfg_x, 'EXECUTION_EXCHANGE', '').lower() == 'delta'
-                    and getattr(_cfg_x, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD'
-                )
-                if _is_delta:
-                    usd_contracts = pos.quantity * pos.entry_price
-                    if pos.side == "long":
-                        gross_btc = usd_contracts * (1.0 / pos.entry_price - 1.0 / exit_price)
-                    else:
-                        gross_btc = usd_contracts * (1.0 / exit_price - 1.0 / pos.entry_price)
-                    gross = gross_btc * exit_price
-                else:
-                    gross = ((exit_price - pos.entry_price) if pos.side == "long"
-                             else (pos.entry_price - exit_price)) * pos.quantity
+        fee_breakdown: Dict = {
+            "gross_pnl":  round(gross, 4),
+            "entry_fee":  round(entry_fee, 4),   # estimated at exact rate
+            "exit_fee":   round(exit_fee, 4),    # exact from paid_commission
+            "total_fees": round(entry_fee + exit_fee, 4),
+            "net_pnl":    round(pnl, 4),
+            "exact_fees": True,   # exit side is exact; entry side is rate-exact
+        }
 
-                # Use exact entry fee if recorded at trade entry, else estimate
-                entry_fee = (_entry_fee_exact if _entry_fee_exact > 0
-                             else pos.entry_price * pos.quantity * QCfg.COMMISSION_RATE())
-                exit_fee  = _exact_fee
-                pnl       = gross - entry_fee - exit_fee
-                fee_breakdown = {
-                    "gross_pnl":   round(gross, 4),
-                    "entry_fee":   round(entry_fee, 4),
-                    "exit_fee":    round(exit_fee, 4),
-                    "total_fees":  round(entry_fee + exit_fee, 4),
-                    "net_pnl":     round(pnl, 4),
-                    "exact_fees":  True,
-                }
-                logger.info(
-                    f"📊 Exit price=${exit_price:,.2f} reason={exit_reason} "
-                    f"entry=${pos.entry_price:,.2f} "
-                    f"gross=${gross:+.4f} entry_fee=${entry_fee:.4f} "
-                    f"exit_fee=${exit_fee:.4f} net=${pnl:+.4f} [EXACT]"
-                )
-            else:
-                # Estimated path: _estimate_pnl handles gross + fee estimation
-                pnl = self._estimate_pnl(pos, exit_price, entry_fill_type=fill_type)
-                # Build breakdown from estimates for display consistency
-                _er = QCfg.COMMISSION_RATE()
-                _mr = float(getattr(
-                    __import__('config'), 'COMMISSION_RATE_MAKER',
-                    _er * 0.40))
-                _entry_rate = _mr if fill_type == "maker" else _er
-                _entry_fee  = (_entry_fee_exact if _entry_fee_exact > 0
-                               else pos.entry_price * pos.quantity * _entry_rate)
-                _exit_fee   = exit_price * pos.quantity * _er
-                _gross      = pnl + _entry_fee + _exit_fee
-                fee_breakdown = {
-                    "gross_pnl":   round(_gross, 4),
-                    "entry_fee":   round(_entry_fee, 4),
-                    "exit_fee":    round(_exit_fee, 4),
-                    "total_fees":  round(_entry_fee + _exit_fee, 4),
-                    "net_pnl":     round(pnl, 4),
-                    "exact_fees":  False,
-                }
-                logger.info(
-                    f"📊 Exit price=${exit_price:,.2f} reason={exit_reason} "
-                    f"entry=${pos.entry_price:,.2f} pnl=${pnl:+.2f} [estimated fees]"
-                )
+        logger.info(
+            f"📊 Exit price=${fill_price:,.2f} reason={exit_reason} "
+            f"entry=${pos.entry_price:,.2f} gross=${gross:+.4f} "
+            f"entry_fee=${entry_fee:.4f}(rate-est) exit_fee=${exit_fee:.4f}(exact) "
+            f"net=${pnl:+.4f}"
+        )
 
-        # ─── Step 3: Record PnL and trade history ────────────────────────────────
-        self._record_pnl(pnl, exit_reason=exit_reason, exit_price=exit_price,
+        # ─── Step 3: Record PnL and trade history ─────────────────────────────
+        self._record_pnl(pnl, exit_reason=exit_reason, exit_price=fill_price,
                          fee_breakdown=fee_breakdown)
 
-        # ─── Step 4: Build notification ──────────────────────────────────────────
+        # ─── Step 4: Telegram notification ────────────────────────────────────
         hold_min     = (time.time() - pos.entry_time) / 60.0 if pos.entry_time > 0 else 0.0
-        init_sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else abs(pos.entry_price - pos.sl_price)
-        raw_pts      = ((exit_price - pos.entry_price) if pos.side == "long"
-                        else (pos.entry_price - exit_price))
+        init_sl_dist = (pos.initial_sl_dist if pos.initial_sl_dist > 1e-10
+                        else abs(pos.entry_price - pos.sl_price))
+        raw_pts      = ((fill_price - pos.entry_price) if pos.side == "long"
+                        else (pos.entry_price - fill_price))
         achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
 
         if is_tp_hit:
@@ -6557,30 +6541,27 @@ class QuantStrategy:
         mfe_r      = pos.peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         tp_dist    = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
         planned_rr = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        _orig_sl_side = ((pos.entry_price - init_sl_dist) if pos.side == "long"
-                         else (pos.entry_price + init_sl_dist))
-        _trail_improvement = abs(pos.sl_price - _orig_sl_side) if pos.trail_active else 0.0
-
-        # Fee line for notification: show exact if available, flagged if estimated
-        _fb     = fee_breakdown or {}
-        _f_tot  = _fb.get("total_fees", 0.0)
-        _f_tag  = "exact" if _fb.get("exact_fees") else "est."
-        _fee_line = f"Fees:     ${_f_tot:.4f} ({_f_tag})\n" if _f_tot > 0 else ""
+        _orig_sl   = ((pos.entry_price - init_sl_dist) if pos.side == "long"
+                      else (pos.entry_price + init_sl_dist))
+        _trail_imp = abs(pos.sl_price - _orig_sl) if pos.trail_active else 0.0
 
         send_telegram_message(
             f"{result_icon} <b>{result_color} — {result_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
             f"Entry:    ${pos.entry_price:,.2f}\n"
-            f"Exit:     <b>${exit_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
+            f"Exit:     <b>${fill_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
+            f"Gross:    ${gross:+.4f}\n"
+            f"Fees:     ${entry_fee + exit_fee:.4f} "
+            f"(exit exact ${exit_fee:.4f} + entry est ${entry_fee:.4f})\n"
             f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
-            + _fee_line +
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
-            + (f"Trail:    ✅ SL moved {_trail_improvement:+.1f}pts vs orig\n"
+            + (f"Trail:    ✅ SL moved {_trail_imp:+.1f}pts vs orig\n"
                if pos.trail_active else "Trail:    — not activated\n") +
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
+            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | "
+            f"Total PnL: ${self._total_pnl:+.2f}</i>"
         )
         self._last_exit_side = pos.side
         self._finalise_exit()
