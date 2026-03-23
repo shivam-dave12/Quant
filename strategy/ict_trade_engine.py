@@ -656,30 +656,11 @@ class ICTSLEngine:
                 candles_15m: List[Dict] = None,
                 atr_pctile: float = 0.5,
                 mode: str = "reversion",
-                market_regime: str = "RANGING",
                 ) -> Tuple[float, str]:
         """
         Returns (sl_price, source_label).
-
-        Args:
-            market_regime: MarketRegime.value string — used to scale the ATR
-                floor.  In trending conditions a 0.4×ATR stop is within a single
-                candle wick; institutional SLs must sit structurally outside the
-                noise of the ongoing directional move.
         """
-        # ── ATR-adaptive SL floor (Fix 5) ─────────────────────────────────────
-        # Static 0.4×ATR floor was designed for ranging markets where average
-        # candle wicks are ~0.3–0.5×ATR.  In trending conditions (ADX > 25),
-        # momentum candle wicks regularly reach 0.8–1.5×ATR — the old floor
-        # placed the SL inside the normal noise range, guaranteeing stop-outs
-        # on healthy retracements before the trade had time to develop.
-        if mode in ("trend", "momentum"):
-            min_dist = max(price * 0.005, 1.0 * atr)    # 1.0 ATR minimum in trends
-        elif market_regime == "TRANSITIONING":
-            min_dist = max(price * 0.004, 0.70 * atr)   # transitioning: moderate floor
-        else:
-            min_dist = max(price * 0.003, 0.40 * atr)   # ranging: original conservative floor
-
+        min_dist = max(price * 0.003, 0.40 * atr)
         max_dist = price * 0.035
 
         if mode in ("trend", "momentum"):
@@ -773,57 +754,6 @@ class ICTSLEngine:
             logger.warning(
                 f"⚠️ SL ATR fallback: ${sl_price:,.2f} "
                 f"({sl_dist:.0f}pts / 1.5ATR) — no structure found")
-
-        # ── LIQUIDITY POOL PROXIMITY GUARD (Fix 1) ──────────────────────────
-        # Root cause of the "SL IS the liquidity pool" failure:
-        # The 4-tier SL hierarchy places stops at 15m swing highs (for shorts),
-        # which are EXACTLY where BSL clusters form.  Smart money sweeps those
-        # pools to fill their own orders, triggering this stop in the process.
-        #
-        # Solution: after computing sl_price, scan all unswept pools within
-        # 0.5×ATR.  If any pool is within that sweep range, move the SL BEHIND
-        # the pool (further from entry) so price must sweep through the pool AND
-        # continue past a structural buffer before the stop triggers.
-        #
-        # Why 0.5×ATR sweep range? Empirically, liquidity sweeps extend 0.3–0.7
-        # ATR beyond the pool price.  0.5 ATR catches the majority of sweep events
-        # while keeping the guard tight enough not to widen SLs unnecessarily.
-        if ict_engine is not None and sl_price is not None:
-            try:
-                _liq_sweep_range = 0.50 * atr    # how far a sweep typically extends
-                _behind_buffer   = 0.30 * atr    # structural gap BEHIND the pool
-
-                for _pool in ict_engine.liquidity_pools:
-                    if _pool.swept:
-                        continue
-                    _dist_to_pool = abs(sl_price - _pool.price)
-                    if _dist_to_pool > _liq_sweep_range:
-                        continue
-
-                    if side == "long":
-                        # For longs: watch for SSL pools below price that our SL
-                        # might coincide with.  Push the SL FURTHER below the pool.
-                        if _pool.level_type == "SSL" and _pool.price < price:
-                            _relocated = _pool.price - _behind_buffer
-                            if _relocated < sl_price:   # only if it widens the stop
-                                _old_sl   = sl_price
-                                sl_price  = _relocated
-                                source   += f"+LIQ_GUARD_SSL@${_pool.price:.0f}"
-                                logger.info(
-                                    f"⚠️  SL LIQUIDITY GUARD [{side.upper()}]: "                                    f"${_old_sl:,.2f} → ${sl_price:,.2f} | "                                    f"SSL pool@${_pool.price:.0f} was "                                    f"{_dist_to_pool:.0f}pts from SL — relocated BEHIND pool")
-                    else:
-                        # For shorts: watch for BSL pools above price.
-                        # Push the SL FURTHER above the pool.
-                        if _pool.level_type == "BSL" and _pool.price > price:
-                            _relocated = _pool.price + _behind_buffer
-                            if _relocated > sl_price:   # only if it widens the stop
-                                _old_sl   = sl_price
-                                sl_price  = _relocated
-                                source   += f"+LIQ_GUARD_BSL@${_pool.price:.0f}"
-                                logger.info(
-                                    f"⚠️  SL LIQUIDITY GUARD [{side.upper()}]: "                                    f"${_old_sl:,.2f} → ${sl_price:,.2f} | "                                    f"BSL pool@${_pool.price:.0f} was "                                    f"{_dist_to_pool:.0f}pts from SL — relocated BEHIND pool")
-            except Exception as _liq_guard_e:
-                logger.debug(f"SL liquidity guard error (non-fatal): {_liq_guard_e}")
 
         # ── ABSOLUTE SAFETY BOUNDS ────────────────────────────────────────
         sl_dist_final = abs(price - sl_price)
