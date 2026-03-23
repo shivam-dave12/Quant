@@ -1058,12 +1058,17 @@ class TelegramBotController:
                 ach_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
                 # Attribution fields (v7.0)
                 ict_tier   = t.get('ict_tier', '')
-                regime     = t.get('regime', '')
                 composite  = t.get('composite', 0.0)
                 ict_total  = t.get('ict_total', 0.0)
                 amd_phase  = t.get('amd_phase', '')
                 adx_val    = t.get('adx', 0.0)
                 tier_badge = f" [T{ict_tier}]" if ict_tier else ""
+                # Fee breakdown fields (exact from Delta /v2/fills, else estimated)
+                gross_pnl  = t.get('gross_pnl',  pnl)
+                entry_fee  = t.get('entry_fee',  0.0)
+                exit_fee   = t.get('exit_fee',   0.0)
+                total_fees = t.get('total_fees', 0.0)
+                exact_fees = t.get('exact_fees', False)
 
                 # Determine label
                 if reason == "tp_hit":
@@ -1075,8 +1080,21 @@ class TelegramBotController:
                 else:
                     label = f"🚪 {reason[:8]}"
 
-                result = "✅" if is_win else "❌"
+                result    = "✅" if is_win else "❌"
                 trail_tag = " [T]" if trailed else ""
+                fee_tag   = "exact" if exact_fees else "est."
+
+                # Fee line: show gross→net breakdown when fee data is present
+                if total_fees > 0:
+                    fee_line = (
+                        f"\n    Fees({fee_tag}): entry=${entry_fee:.4f} "
+                        f"exit=${exit_fee:.4f} "
+                        f"total=${total_fees:.4f} | "
+                        f"Gross=${gross_pnl:+.4f}"
+                    )
+                else:
+                    fee_line = ""
+
                 lines.append(
                     f"{result} {side} [{mode}]{tier_badge}  "
                     f"${entry:,.0f}→${exit_p:,.0f}  "
@@ -1085,21 +1103,22 @@ class TelegramBotController:
                     f"    {label}{trail_tag}  hold: {hold:.0f}m"
                     + (f"  Σ={composite:+.3f} ICT={ict_total:.2f}"
                        f"  {_esc(amd_phase[:5])}  ADX={adx_val:.0f}" if composite else "")
+                    + fee_line
                 )
         else:
             lines.append("  No trades recorded yet this session.")
 
         # ── Summary stats from strategy (ground truth) ──────────────────
-        total_t = getattr(strat, '_total_trades', 0)
-        wins    = getattr(strat, '_winning_trades', 0)
-        losses  = total_t - wins
-        wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_t   = getattr(strat, '_total_trades', 0)
+        wins      = getattr(strat, '_winning_trades', 0)
+        losses    = total_t - wins
+        wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
         total_pnl = getattr(strat, '_total_pnl', 0.0)
 
         # Daily stats from risk gate (authoritative daily counters)
-        daily_cnt  = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
-        consec     = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
-        max_d      = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
+        daily_cnt = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
+        consec    = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
+        max_d     = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
 
         # Avg win / avg loss from history
         win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
@@ -1108,6 +1127,18 @@ class TelegramBotController:
         avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
         expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
 
+        # Total fees paid — sum exact where available, estimated where not
+        fees_exact   = [t['total_fees'] for t in history if t.get('exact_fees') and t.get('total_fees', 0) > 0]
+        fees_est     = [t['total_fees'] for t in history if not t.get('exact_fees') and t.get('total_fees', 0) > 0]
+        total_fees_s = sum(fees_exact) + sum(fees_est)
+        n_exact      = len(fees_exact)
+        n_est        = len(fees_est)
+        if total_fees_s > 0:
+            fee_src_tag = f"({n_exact} exact, {n_est} est.)"
+            fee_summary = f"Total Fees:  ${total_fees_s:.4f} {fee_src_tag}"
+        else:
+            fee_summary = "Total Fees:  —"
+
         lines += [
             "",
             "━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1115,6 +1146,7 @@ class TelegramBotController:
             f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
             f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
             f"Expectancy: ${expectancy:+.2f}/trade",
+            fee_summary,
             f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
         ]
         return "\n".join(lines)
@@ -1123,6 +1155,7 @@ class TelegramBotController:
         """
         Signal attribution analysis — which signal combinations produce wins.
         Shows win-rate breakdown by ICT tier, regime, AMD phase and composite score.
+        Includes realised PnL and fees breakdown where available.
         Requires ≥5 trades to produce meaningful stats.
         """
         global bot_instance, bot_running
@@ -1155,11 +1188,16 @@ class TelegramBotController:
             grp = tier_groups.get(tier, [])
             if not grp:
                 continue
-            w  = sum(1 for t in grp if t.get('is_win'))
-            wr = w / len(grp) * 100.0
+            w       = sum(1 for t in grp if t.get('is_win'))
+            wr      = w / len(grp) * 100.0
             avg_pnl = sum(t.get('pnl', 0) for t in grp) / len(grp)
-            label = f"Tier-{tier}" if tier != 'none' else "No tier"
-            lines.append(f"  {label}: {len(grp)} trades  WR={wr:.0f}%  avg=${avg_pnl:+.2f}")
+            avg_fees= sum(t.get('total_fees', 0) for t in grp) / len(grp)
+            fee_tag = " (fees est.)" if not any(t.get('exact_fees') for t in grp) else ""
+            label   = f"Tier-{tier}" if tier != 'none' else "No tier"
+            lines.append(
+                f"  {label}: {len(grp)} trades  WR={wr:.0f}%  "
+                f"avg net=${avg_pnl:+.2f}  avg fees=${avg_fees:.4f}{fee_tag}"
+            )
 
         # ── By regime ────────────────────────────────────────────────────
         lines.append("\n<b>By Regime</b>")
@@ -1217,7 +1255,27 @@ class TelegramBotController:
                 tier_lbl, reg_lbl = combo.split('|')
                 lines.append(f"  Tier-{tier_lbl} + {_esc(reg_lbl)}: {cnt} trades  WR={wr:.0f}%")
 
-        return "\n".join(lines)
+        # ── Realised PnL and fee summary ──────────────────────────────────
+        lines.append("\n<b>Realised PnL &amp; Fees</b>")
+        total_gross  = sum(t.get('gross_pnl', t.get('pnl', 0)) for t in history)
+        total_net    = sum(t.get('pnl', 0) for t in history)
+        total_fees   = sum(t.get('total_fees', 0) for t in history)
+        total_entry  = sum(t.get('entry_fee', 0) for t in history)
+        total_exit   = sum(t.get('exit_fee',  0) for t in history)
+        n_exact      = sum(1 for t in history if t.get('exact_fees'))
+        n_est        = total - n_exact
+        fee_note     = f"({n_exact} exact from exchange, {n_est} estimated)" if n_exact > 0 \
+                       else "(all estimated — enable Delta for exact fees)"
+
+        lines += [
+            f"  Gross PnL:   ${total_gross:+.4f} USDT",
+            f"  Total Fees:  ${total_fees:.4f} USDT  {fee_note}",
+            f"    Entry fees: ${total_entry:.4f}  Exit fees: ${total_exit:.4f}",
+            f"  Net PnL:     <b>${total_net:+.4f}</b> USDT",
+            f"  Avg fee/trade: ${(total_fees/total):.4f}" if total > 0 else "",
+        ]
+
+        return "\n".join(l for l in lines if l is not None)
 
     def _cmd_balance(self) -> str:
         global bot_instance, bot_running

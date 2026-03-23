@@ -445,6 +445,79 @@ class _DeltaAdapter:
         raw = resp.get("result", [])
         return raw if isinstance(raw, list) else []
 
+    def get_fills(self, page_size: int = 5) -> Optional[list]:
+        """
+        GET /v2/fills — recent trade fill records for this symbol.
+
+        Used by OrderManager.identify_exit_order() to determine exactly which
+        exit order (SL or TP) fired and at what price, plus the actual
+        commission charged by Delta.
+
+        Delta fill object fields used here:
+          order_id   — integer; matches the placed SL/TP order id
+          price      — string; per-contract execution price
+          side       — "buy" | "sell"
+          size       — integer; contracts filled in this event
+          commission — string; fee charged for this fill event (USD-settled)
+                       Always positive. Sum across fills per order_id for
+                       multi-fill orders (rare for market SL/TP orders).
+
+        page_size capped at 5: exit fills are always the most recent events,
+        so we never need more than a handful. Keeps the rate-limit footprint
+        minimal (one 0.25s slot via self.limiter.wait()).
+
+        Returns a list of raw fill dicts, or None on any error.
+        """
+        self.limiter.wait()
+        try:
+            resp = self.api.get_fills(symbol=self.symbol, page_size=min(page_size, 5))
+            if not isinstance(resp, dict) or not resp.get("success"):
+                return None
+            raw = resp.get("result", []) or []
+            # Some Delta paginated responses wrap: {"result": [...], "meta": {...}}
+            if isinstance(raw, dict):
+                raw = raw.get("result", []) or []
+            return raw if isinstance(raw, list) else []
+        except Exception as e:
+            logger.debug(f"_DeltaAdapter.get_fills error: {e}")
+            return None
+
+    def get_order_history(self, page_size: int = 5) -> Optional[list]:
+        """
+        GET /v2/orders/history — recent closed/cancelled orders.
+
+        Fallback used by OrderManager.identify_exit_order() when the fill for
+        the exit order hasn't propagated to /v2/fills yet (Delta's fill
+        endpoint has eventual consistency; propagation is normally < 1 s).
+
+        Delta order history fields used here:
+          id                  — integer order id (matched against sl_order_id/tp_order_id)
+          state               — "closed" (filled) | "cancelled"
+          stop_order_type     — "stop_loss_order" | "take_profit_order"
+                                Unambiguous classifier regardless of base order_type.
+          average_fill_price  — string; VWAP fill price across all partial fills.
+                                More reliable than per-fill price for multi-fill orders.
+
+        Note: commission is NOT available in order history objects — it is
+        only in individual fill records. For orders resolved via this fallback,
+        fee_paid will be 0.0 and the caller will use estimated fees.
+
+        page_size capped at 5 for the same rate-limit reason as get_fills().
+        Returns a list of raw order dicts, or None on any error.
+        """
+        self.limiter.wait()
+        try:
+            resp = self.api.get_order_history(symbol=self.symbol, page_size=min(page_size, 5))
+            if not isinstance(resp, dict) or not resp.get("success"):
+                return None
+            raw = resp.get("result", []) or []
+            if isinstance(raw, dict):
+                raw = raw.get("result", []) or []
+            return raw if isinstance(raw, list) else []
+        except Exception as e:
+            logger.debug(f"_DeltaAdapter.get_order_history error: {e}")
+            return None
+
     def get_positions(self, symbol: str) -> Optional[Dict]:
         self.limiter.wait()
         # Delta get_positions uses product_symbol parameter
@@ -1423,6 +1496,176 @@ class OrderManager:
                     else logger.warning
             level(f"Swept {o['type']} {oid[:8]}… ({res.value})")
         return results
+
+    # ── Exit order identification (Delta only) ────────────────────────────────
+
+    def identify_exit_order(
+        self,
+        sl_order_id:  Optional[str],
+        tp_order_id:  Optional[str],
+        trail_active: bool = False,
+    ) -> Dict:
+        """
+        Query Delta Exchange to determine exactly which exit order fired,
+        at what actual fill price, and what commission was charged.
+
+        Two strategies, in reliability order:
+
+          Strategy 1 — GET /v2/fills  (ground truth)
+            Delta creates one fill record per execution event.
+            Each fill object contains: order_id, price, size, commission.
+            Commission is the actual fee charged for that fill event.
+            For market SL/TP orders Delta typically produces a single fill per
+            order, so one fill record = one order_id match = complete picture.
+            We sum commission across all fill records sharing the same order_id
+            to handle the (rare) case where a large order produces multiple fills.
+
+          Strategy 2 — GET /v2/orders/history  (fallback)
+            Used when the fill hasn't propagated yet (normally < 1 s).
+            Delta order history includes average_fill_price and stop_order_type.
+            stop_order_type unambiguously labels "stop_loss_order" vs
+            "take_profit_order" — id matching is still the primary criterion.
+            Commission is NOT available in order history objects; fee_paid=0.0
+            so the caller falls back to the estimated fee from _estimate_pnl().
+
+        Both strategies match sl_order_id / tp_order_id by EXACT integer-string
+        comparison. String normalisation handles the case where the exchange
+        returned id as int and we stored it as str.
+
+        Rate limiting:
+          Each of the two API calls costs exactly one _DELTA_LIMITER.wait() slot
+          (0.25 s minimum interval), already called inside get_fills() /
+          get_order_history() on the adapter. Total worst-case cost: 0.5 s.
+          This is called once per exit, not on every tick.
+
+        Returns:
+          {
+            "exit_type":  "tp" | "sl" | "trail_sl" | "unknown",
+            "fill_price": float,    # actual execution price; 0.0 if unresolved
+            "order_id":   str,      # matched order id; "" if unresolved
+            "confirmed":  bool,     # True = exchange-confirmed, False = use heuristics
+            "fee_paid":   float,    # actual commission in USD; 0.0 if unavailable
+          }
+
+        CoinSwitch adapters do not expose get_fills(); they always return the
+        "unresolved" dict so the caller transparently uses price heuristics.
+        All exceptions inside are caught at DEBUG — exit flow is never disrupted.
+        """
+        _UNRESOLVED: Dict = {
+            "exit_type": "unknown", "fill_price": 0.0,
+            "order_id":  "",        "confirmed":  False,
+            "fee_paid":  0.0,
+        }
+
+        # Only _DeltaAdapter exposes get_fills / get_order_history
+        if not hasattr(self._adapter, "get_fills"):
+            return _UNRESOLVED
+
+        known_sl = str(sl_order_id).strip() if sl_order_id else ""
+        known_tp = str(tp_order_id).strip() if tp_order_id else ""
+        if not known_sl and not known_tp:
+            return _UNRESOLVED
+
+        # ── Strategy 1: Recent fills  (GET /v2/fills) ─────────────────────────
+        # Fills are the authoritative record and include actual commission.
+        # We accumulate commission across all fill events for the same order
+        # to handle multi-fill market orders correctly.
+        try:
+            fills = self._adapter.get_fills(page_size=5)
+            # Aggregate per-order: {order_id_str: {"price": float, "commission": float}}
+            _agg: Dict[str, Dict] = {}
+            for fill in (fills or []):
+                foid = str(fill.get("order_id", "") or "").strip()
+                if not foid:
+                    continue
+                # Delta returns price and commission as strings
+                fprice = float(fill.get("price", 0) or 0)
+                fcomm  = float(fill.get("commission", 0) or 0)
+                fsize  = float(fill.get("size", 0) or 0)
+                if foid not in _agg:
+                    _agg[foid] = {"price": fprice, "commission": fcomm,
+                                  "size": fsize}
+                else:
+                    # Multi-fill: VWAP price, sum commission
+                    prev = _agg[foid]
+                    tot_size = prev["size"] + fsize
+                    if tot_size > 0:
+                        prev["price"] = (prev["price"] * prev["size"] +
+                                         fprice * fsize) / tot_size
+                    prev["commission"] += fcomm
+                    prev["size"]       = tot_size
+
+            for foid, agg in _agg.items():
+                fill_price = agg["price"]
+                fee_paid   = agg["commission"]
+                if fill_price <= 0:
+                    continue
+                if known_sl and foid == known_sl:
+                    exit_type = "trail_sl" if trail_active else "sl"
+                    logger.info(
+                        f"🔍 Exit confirmed via fills: {exit_type.upper()} "
+                        f"order={foid[:10]}… fill=${fill_price:,.2f} "
+                        f"fee=${fee_paid:.4f}"
+                    )
+                    return {"exit_type": exit_type, "fill_price": fill_price,
+                            "order_id": foid, "confirmed": True,
+                            "fee_paid": fee_paid}
+                if known_tp and foid == known_tp:
+                    logger.info(
+                        f"🔍 Exit confirmed via fills: TP "
+                        f"order={foid[:10]}… fill=${fill_price:,.2f} "
+                        f"fee=${fee_paid:.4f}"
+                    )
+                    return {"exit_type": "tp", "fill_price": fill_price,
+                            "order_id": foid, "confirmed": True,
+                            "fee_paid": fee_paid}
+        except Exception as e:
+            logger.debug(f"identify_exit_order fills lookup error: {e}")
+
+        # ── Strategy 2: Order history  (GET /v2/orders/history) ───────────────
+        # Fallback for propagation delay. No commission here — fee_paid stays 0.
+        try:
+            history = self._adapter.get_order_history(page_size=5)
+            for order in (history or []):
+                # Delta order history uses "id" (integer), not "order_id"
+                oid   = str(order.get("id", order.get("order_id", "")) or "").strip()
+                state = str(order.get("state", order.get("status", ""))).lower()
+                if not oid or state not in ("closed", "filled"):
+                    continue
+                fp         = float(order.get("average_fill_price", 0) or 0)
+                stop_otype = str(order.get("stop_order_type", "")).lower()
+
+                if known_sl and oid == known_sl:
+                    exit_type = "trail_sl" if trail_active else "sl"
+                    logger.info(
+                        f"🔍 Exit confirmed via order history: {exit_type.upper()} "
+                        f"order={oid[:10]}… fill=${fp:,.2f} "
+                        f"stop_order_type={stop_otype or 'n/a'} "
+                        f"(fee unavailable — estimated fees will be used)"
+                    )
+                    return {"exit_type": exit_type, "fill_price": fp,
+                            "order_id": oid, "confirmed": True,
+                            "fee_paid": 0.0}
+                if known_tp and oid == known_tp:
+                    logger.info(
+                        f"🔍 Exit confirmed via order history: TP "
+                        f"order={oid[:10]}… fill=${fp:,.2f} "
+                        f"stop_order_type={stop_otype or 'n/a'} "
+                        f"(fee unavailable — estimated fees will be used)"
+                    )
+                    return {"exit_type": "tp", "fill_price": fp,
+                            "order_id": oid, "confirmed": True,
+                            "fee_paid": 0.0}
+        except Exception as e:
+            logger.debug(f"identify_exit_order history lookup error: {e}")
+
+        _sl_disp = (known_sl[:10] + "…") if len(known_sl) > 10 else (known_sl or "none")
+        _tp_disp = (known_tp[:10] + "…") if len(known_tp) > 10 else (known_tp or "none")
+        logger.debug(
+            f"identify_exit_order: no exchange match "
+            f"(sl={_sl_disp} tp={_tp_disp}) — price heuristics will apply"
+        )
+        return _UNRESOLVED
 
     # ── Balance ───────────────────────────────────────────────────────────────
 
