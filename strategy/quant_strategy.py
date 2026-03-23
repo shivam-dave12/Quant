@@ -1790,47 +1790,70 @@ class InstitutionalLevels:
         # imbalance / reaches the swept level. A score-6 swept origin is the
         # REASON the trade exists — taking profit at a random FVG 90pts short
         # of the target means exiting before the structural move completes.
+        # ── ICT-Primary Tiered Selection with per-candidate R:R check ───────────
+        #
+        # FIX: Instead of picking the single best-scored candidate and then
+        # hard-failing the R:R gate (returning None immediately), we now iterate
+        # through every candidate within each tier — score-first, proximity as
+        # tiebreaker — and accept the first one that clears REVERSION_MIN_RR.
+        # If the highest-conviction candidate is too close (low R:R), we fall
+        # through to the next candidate (a farther structural level at 1h/4h/15m)
+        # rather than abandoning the entire trade.
+        #
+        # Only when ALL scored candidates across ALL tiers fail the R:R gate do
+        # we return None (genuinely no viable structural target exists).
+        #
+        # Tier priority (unchanged):
+        #   Tier-S (score ≥ 6.0): swept liquidity origin — highest conviction
+        #   Tier-A (score ≥ 4.0): FVGs, Virgin OBs, 15m/1h/4h swings
+        #   Tier-B (score ≥ 3.5): VWAP and σ-bands
+        #   Tier-F (score ≥ 0.0): any remaining scored candidate
+        _min_rr_gate = QCfg.REVERSION_MIN_RR()
+        _sl_dist_gate = abs(price - sl_price)
+
+        def _cand_rr(lvl: float) -> float:
+            return abs(lvl - price) / max(_sl_dist_gate, 1e-10)
+
+        tp = None
+
         if scored:
-            # Tier-S: swept liquidity origin (score ≥ 6.0) — mandatory target
-            tier_s = [(lvl, sc) for lvl, sc in scored if sc >= 6.0]
-            if tier_s:
-                tier_s.sort(key=lambda x: (-x[1], abs(x[0] - price)))
-                _winner = tier_s[0]
-                tp = _winner[0]
-                logger.info(
-                    f"🎯 TP: SWEEP ORIGIN ${tp:,.2f} score={_winner[1]:.1f} "
-                    f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
-                    f"R:R=1:{abs(tp-price)/max(abs(price-sl_price),1e-10):.2f} "
-                    f"[delivery to raided liquidity — highest ICT conviction]")
-            else:
-                # Tier-A: FVGs, Virgin OBs, 15m swings (score ≥ 4.0) — score-first
-                tier_a = [(lvl, sc) for lvl, sc in scored if sc >= 4.0]
-                if tier_a:
-                    tier_a.sort(key=lambda x: (-x[1], abs(x[0] - price)))
-                    _winner = tier_a[0]
-                    tp = _winner[0]
-                    logger.info(
-                        f"🎯 TP: STRUCTURAL ${tp:,.2f} score={_winner[1]:.1f} "
-                        f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
-                        f"R:R=1:{abs(tp-price)/max(abs(price-sl_price),1e-10):.2f} "
-                        f"| {len(tier_a)} structural / {len(scored)} total")
-                else:
-                    # Tier-B: VWAP and σ-bands (score 3.5–3.9) — highest-scored
-                    tier_b = [(lvl, sc) for lvl, sc in scored if sc >= 3.5]
-                    if tier_b:
-                        tier_b.sort(key=lambda x: (-x[1], abs(x[0] - price)))
-                        _winner = tier_b[0]
-                        tp = _winner[0]
+            for _tier_min, _tier_label in [
+                (6.0, "SWEEP ORIGIN"),
+                (4.0, "STRUCTURAL"),
+                (3.5, "VWAP/BAND"),
+                (0.0, "BEST AVAILABLE"),
+            ]:
+                _tier_cands = [(lvl, sc) for lvl, sc in scored if sc >= _tier_min]
+                if not _tier_cands:
+                    continue
+                # Score-first; nearest as tiebreaker (same ordering as before)
+                _tier_cands.sort(key=lambda x: (-x[1], abs(x[0] - price)))
+                for _cand_lvl, _cand_sc in _tier_cands:
+                    _rr = _cand_rr(_cand_lvl)
+                    if _rr >= _min_rr_gate - 1e-9:
+                        tp = _cand_lvl
                         logger.info(
-                            f"🎯 TP: VWAP/BAND ${tp:,.2f} score={_winner[1]:.1f} "
+                            f"🎯 TP: {_tier_label} ${tp:,.2f} score={_cand_sc:.1f} "
                             f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
-                            f"R:R=1:{abs(tp-price)/max(abs(price-sl_price),1e-10):.2f}")
+                            f"R:R=1:{_rr:.2f} "
+                            f"| {len(_tier_cands)} in tier / {len(scored)} total")
+                        break
                     else:
-                        scored.sort(key=lambda x: -x[1])
-                        tp = scored[0][0]
-                        logger.info(
-                            f"🎯 TP: BEST AVAILABLE ${tp:,.2f} score={scored[0][1]:.1f} "
-                            f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR")
+                        logger.debug(
+                            f"   TP candidate ${_cand_lvl:,.1f} score={_cand_sc:.1f} "
+                            f"R:R={_rr:.2f} < {_min_rr_gate:.1f} — trying next")
+                if tp is not None:
+                    break  # Valid TP found — stop checking lower tiers
+
+            if tp is None:
+                # Every scored structural candidate (all tiers, all TFs) failed
+                # the R:R gate — no viable target exists for this setup.
+                _best_rr = max((_cand_rr(lvl) for lvl, _ in scored), default=0.0)
+                logger.info(
+                    f"⛔ TP R:R gate (PATH-B): all {len(scored)} structural candidates "
+                    f"< {_min_rr_gate:.1f}R minimum (best={_best_rr:.2f}) "
+                    f"— returning None (no trade)")
+                return None
         else:
             # No structural target — minimum R:R floor
             tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
@@ -1838,24 +1861,6 @@ class InstitutionalLevels:
                 f"🎯 TP fallback (no 15m ICT structure in range): "
                 f"${tp:,.2f} = 1:{QCfg.REVERSION_MIN_RR():.1f}R floor "
                 f"| SL dist={abs(price-sl_price):.0f}pts [{min_tp_dist:.0f}–{max_tp_dist:.0f}pts window]")
-
-        # ── Universal minimum R:R gate ────────────────────────────────────────
-        # ICT TIER-S targets enter the scored pool at a 1.0×SL floor to avoid
-        # filtering nearby structural levels. However no TP is accepted if the
-        # realized R:R falls below REVERSION_MIN_RR — at sub-1.5R the after-fee
-        # R:R drops below 1:1, producing negative expected value over time.
-        # Structure is authoritative for WHICH target is chosen; R:R is the
-        # institutional viability gate that structure cannot override.
-        _tp_dist  = abs(tp - price)
-        _sl_dist  = abs(price - sl_price)
-        _rr_final = _tp_dist / _sl_dist if _sl_dist > 1e-10 else 0.0
-        _min_rr   = QCfg.REVERSION_MIN_RR()
-        if _rr_final < _min_rr - 1e-9:
-            logger.info(
-                f"⛔ TP R:R gate (PATH-B): {_rr_final:.2f} < {_min_rr:.1f} minimum "
-                f"— tp=${tp:,.1f} dist={_tp_dist:.0f}pts sl_dist={_sl_dist:.0f}pts "
-                f"— returning None (no trade)")
-            return None
 
         return tp
 
@@ -3314,11 +3319,29 @@ class QuantStrategy:
             finally:
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
-                        logger.warning(
-                            f"⚠️ Entry thread exited without activation "
-                            f"(mode={mode} side={side}) — resetting to FLAT")
-                        self._pos.phase      = PositionPhase.FLAT
-                        self._last_exit_time = time.time()
+                        # Distinguish pre-trade gate rejection (no order placed)
+                        # from a real order-level failure (order placed but aborted).
+                        #
+                        # Gate rejections (TP R:R, SL/TP sanity, fee floor) set
+                        # _last_tp_gate_rejection right before returning from
+                        # _enter_trade.  If that timestamp is within the last 5s
+                        # we know no order was ever sent — do NOT engage the
+                        # cooldown.  Signals resume immediately on the next tick.
+                        #
+                        # Real failures (exchange error, partial fill abort, etc.)
+                        # do not touch _last_tp_gate_rejection, so the gate will
+                        # be more than 5s old → full cooldown applies as before.
+                        _gate_reject = (time.time() - self._last_tp_gate_rejection) < 5.0
+                        if _gate_reject:
+                            logger.info(
+                                f"⚪ Entry gate rejected (mode={mode} side={side}) "
+                                f"— resetting to FLAT, no cooldown (signals resume immediately)")
+                        else:
+                            logger.warning(
+                                f"⚠️ Entry thread exited without activation "
+                                f"(mode={mode} side={side}) — resetting to FLAT")
+                            self._last_exit_time = time.time()
+                        self._pos.phase = PositionPhase.FLAT
 
         threading.Thread(
             target=_bg, daemon=True, name=f"enter-{mode}-{side}"
@@ -5450,7 +5473,13 @@ class QuantStrategy:
             signal_confidence=signal_confidence,
             use_maker_entry=use_maker,
         )
-        if sl_price is None: return   # TP floor rejected the setup
+        if sl_price is None:
+            # Pre-trade gate rejected the setup (no order was placed).
+            # Record the timestamp so _launch_entry_async's finally block can
+            # distinguish this from a real order failure and skip the cooldown.
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
 
         sd = abs(price - sl_price)
         td = abs(price - tp_price)
