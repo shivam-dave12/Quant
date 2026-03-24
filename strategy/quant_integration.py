@@ -454,25 +454,68 @@ class QuantStrategy:
         # Try bracket, fallback to separate
         entry_data=None; is_bracket=False
         try:
+            logger.info(f"[BRACKET] Attempting {('buy' if side=='long' else 'sell').upper()} "
+                        f"qty={qty} @ ${price:,.2f} SL=${sl:,.2f} TP=${tp:,.2f}")
             entry_data=om.place_bracket_limit_entry(side="buy" if side=="long" else "sell",
-                quantity=qty,limit_price=price,sl_trigger=sl,tp_trigger=tp)
-            if entry_data and entry_data.get("order_id"): is_bracket=True
-        except (AttributeError,TypeError): pass
+                quantity=qty,limit_price=price,sl_price=sl,tp_price=tp)
+            if entry_data and entry_data.get("order_id"):
+                is_bracket=True
+                logger.info(f"✅ Bracket accepted: {entry_data.get('order_id')}")
+            else:
+                logger.warning("⚠️ Bracket returned no order_id — fallback to market+SL/TP")
+        except (AttributeError,TypeError) as e:
+            logger.warning(f"⚠️ Bracket unsupported ({e}) — fallback to market+SL/TP")
         if not is_bracket:
             entry_data=om.place_market_order(side="buy" if side=="long" else "sell",quantity=qty)
         if not entry_data or not entry_data.get("order_id"): return
-        # Poll fill
-        fill_price=price
-        try:
-            for _ in range(10):
-                time.sleep(0.5)
-                fp=om.extract_fill_price(entry_data)
-                if fp and fp>1: fill_price=fp; break
-                st=om.get_order_status_safe(entry_data["order_id"])
-                if st and st.get("status") in ("closed","filled"):
-                    fp2=float(st.get("fill_price",0) or st.get("average_fill_price",0))
-                    if fp2>1: fill_price=fp2; break
-        except: pass
+        order_id = entry_data["order_id"]
+        logger.info(f"⏳ Polling fill for order {order_id} (is_bracket={is_bracket})...")
+
+        # ── Fill price extraction ──────────────────────────────────────────────
+        # Bracket: fill_price comes back from place_bracket_limit_entry directly.
+        # Market: poll get_fill_details up to 8s; guard against stale/wrong fields.
+        fill_price = price  # fallback to signal price
+        PRICE_SANITY = 0.05  # reject fill if >5% away from signal price (bad field)
+        if is_bracket:
+            fp = entry_data.get("fill_price", 0)
+            if fp and fp > 1 and abs(fp - price) / price < PRICE_SANITY:
+                fill_price = fp
+                logger.info(f"✅ Bracket fill price: ${fill_price:,.2f}")
+            else:
+                logger.warning(f"⚠️ Bracket fill_price={fp} looks wrong vs signal={price:.2f} — "
+                                f"querying exchange directly")
+                try:
+                    details = om.get_fill_details(order_id)
+                    if details:
+                        fp2 = float(details.get("fill_price") or details.get("average_fill_price") or 0)
+                        if fp2 > 1 and abs(fp2 - price) / price < PRICE_SANITY:
+                            fill_price = fp2
+                            logger.info(f"✅ Fill price from exchange query: ${fill_price:,.2f}")
+                        else:
+                            logger.warning(f"⚠️ Exchange fill_price={fp2} also suspect — "
+                                           f"using signal price ${price:,.2f}")
+                except Exception as e:
+                    logger.warning(f"Fill query failed: {e} — using signal price")
+        else:
+            try:
+                for attempt in range(8):
+                    time.sleep(1.0)
+                    details = om.get_fill_details(order_id)
+                    if details:
+                        status = details.get("status","")
+                        fp = float(details.get("fill_price") or details.get("average_fill_price") or 0)
+                        logger.info(f"  Fill poll {attempt+1}/8: status={status} fill_price={fp}")
+                        if fp > 1 and abs(fp - price) / price < PRICE_SANITY:
+                            fill_price = fp; break
+                        elif fp > 1:
+                            logger.warning(f"  fill_price={fp} is >{PRICE_SANITY*100:.0f}% from "
+                                           f"signal {price:.2f} — ignoring (bad field)")
+            except Exception as e:
+                logger.warning(f"Fill poll error: {e}")
+        logger.info(f"✅ Using fill_price=${fill_price:,.2f} "
+                    f"(signal=${price:,.2f} diff={fill_price-price:+.2f})")
+
+        # ── SL/TP order IDs ───────────────────────────────────────────────────
         exit_side="sell" if side=="long" else "buy"
         sl_oid=tp_oid=None
         if is_bracket:
@@ -480,13 +523,27 @@ class QuantStrategy:
             bsl=entry_data.get("bracket_sl_price",0); btp=entry_data.get("bracket_tp_price",0)
             if bsl>0: sl=bsl
             if btp>0: tp=btp
+            logger.info(f"  Bracket SL order: {sl_oid or 'pending'} @ ${sl:,.2f}")
+            logger.info(f"  Bracket TP order: {tp_oid or 'pending'} @ ${tp:,.2f}")
         else:
+            logger.info(f"  Placing separate SL @ ${sl:,.2f}...")
             sld=om.place_stop_loss(side=exit_side,quantity=qty,trigger_price=sl)
-            if not sld: om.place_market_order(side=exit_side,quantity=qty,reduce_only=True); self._last_exit_time=time.time(); return
+            if not sld:
+                logger.error("❌ SL placement failed — emergency flat")
+                om.place_market_order(side=exit_side,quantity=qty,reduce_only=True)
+                self._last_exit_time=time.time(); return
             sl_oid=sld.get("order_id")
+            logger.info(f"  ✅ SL placed: {sl_oid} @ ${sl:,.2f}")
+            logger.info(f"  Placing separate TP @ ${tp:,.2f}...")
             tpd=om.place_take_profit(side=exit_side,quantity=qty,trigger_price=tp)
-            if not tpd: om.cancel_order(sl_oid); om.place_market_order(side=exit_side,quantity=qty,reduce_only=True); self._last_exit_time=time.time(); return
+            if not tpd:
+                logger.error("❌ TP placement failed — cancelling SL and emergency flat")
+                om.cancel_order(sl_oid)
+                om.place_market_order(side=exit_side,quantity=qty,reduce_only=True)
+                self._last_exit_time=time.time(); return
             tp_oid=tpd.get("order_id")
+            logger.info(f"  ✅ TP placed: {tp_oid} @ ${tp:,.2f}")
+
         sdf=abs(fill_price-sl)
         with self._lock:
             self._pos=PositionState(phase=PositionPhase.ACTIVE,side=side,quantity=qty,entry_price=fill_price,
@@ -495,8 +552,10 @@ class QuantStrategy:
             self.current_sl_price=sl; self.current_tp_price=tp
             self._confirm_long=self._confirm_short=0; self._risk_gate.record_trade_start()
         rr=abs(tp-fill_price)/sdf if sdf>0 else 0
+        logger.info(f"🟢 POSITION OPEN {side.upper()}  fill=${fill_price:,.2f}  "
+                    f"SL=${sl:,.2f}  TP=${tp:,.2f}  qty={qty}  R:R=1:{rr:.2f}  [{src}]")
         send_telegram_message(f"🎯 <b>ENTRY {side.upper()}</b>\nConf={pred.confidence:.3f} {pred.regime}\n"
-            f"${fill_price:,.2f} SL=${sl:,.2f} TP=${tp:,.2f}\nR:R=1:{rr:.2f} [{src}]")
+            f"${fill_price:,.2f}  qty={qty}\nSL=${sl:,.2f}  TP=${tp:,.2f}\nR:R=1:{rr:.2f}  [{src}]")
 
     def _manage_active(self, dm, om, now):
         pos=self._pos; price=self._last_known_price
@@ -507,6 +566,32 @@ class QuantStrategy:
             if price>pos.peak_price_abs: pos.peak_price_abs=price
         else:
             if pos.peak_price_abs<1e-10 or price<pos.peak_price_abs: pos.peak_price_abs=price
+
+        # ── Per-tick position status log (every 30s) ──────────────────────────
+        if not hasattr(self,"_last_pos_log"): self._last_pos_log=0.0
+        if now-self._last_pos_log>=30.0:
+            self._last_pos_log=now
+            id_=pos.initial_sl_dist if pos.initial_sl_dist>1e-10 else abs(pos.entry_price-pos.sl_price)
+            r_now=profit/id_ if id_>0 else 0
+            r_peak=pos.peak_profit/id_ if id_>0 else 0
+            hm=(now-pos.entry_time)/60
+            upnl=self._estimate_pnl(pos,price)
+            sl_dist=abs(price-pos.sl_price); tp_dist=abs(pos.tp_price-price)
+            trail_next=max(0,QCfg.TRAIL_INTERVAL_S()-(now-pos.last_trail_time))
+            pred=self._quant.last_prediction
+            logger.info(
+                f"📍 {pos.side.upper()} {hm:.1f}m  "
+                f"entry=${pos.entry_price:,.2f} now=${price:,.2f}  "
+                f"uPnL=${upnl:+.2f}  R={r_now:+.2f} (peak={r_peak:.2f}R)\n"
+                f"   SL=${pos.sl_price:,.2f} (dist=${sl_dist:.1f})  "
+                f"TP=${pos.tp_price:,.2f} (dist=${tp_dist:.1f})  "
+                f"trail={'✅ active' if pos.trail_active else '⏳ waiting'}  "
+                f"next_check={trail_next:.0f}s\n"
+                f"   pred={pred.direction.upper()} conf={pred.confidence:.3f} "
+                f"{pred.regime}  VPIN={pred.vpin:.3f} ADX={self._adx.adx:.1f}"
+            )
+
+        # ── Trail check ───────────────────────────────────────────────────────
         if now-pos.last_trail_time>=QCfg.TRAIL_INTERVAL_S():
             self._pos.last_trail_time=now
             with self._lock:
@@ -515,14 +600,21 @@ class QuantStrategy:
             def _bg():
                 try:
                     lp=dm.get_last_price(); self._update_trail(om,dm,lp if lp>1 else price,time.time())
-                except Exception as e: logger.error(f"Trail: {e}",exc_info=True)
+                except Exception as e: logger.error(f"Trail error: {e}",exc_info=True)
                 finally: self._trail_in_progress=False
             threading.Thread(target=_bg,daemon=True,name="trail").start()
 
     def _update_trail(self, om, dm, price, now):
         pos=self._pos; atr=self._atr_5m.atr
-        if atr<1e-10 or pos.entry_price<1 or not pos.sl_order_id: return
+        id_=pos.initial_sl_dist if pos.initial_sl_dist>1e-10 else abs(pos.entry_price-pos.sl_price)
         profit=(price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
+        r_now=profit/id_ if id_>0 else 0
+
+        if atr<1e-10 or pos.entry_price<1:
+            logger.debug("Trail skip: no ATR or entry"); return
+        if not pos.sl_order_id:
+            logger.warning("⚠️ Trail skip: no sl_order_id — bracket SL pending resolution"); return
+
         if profit>pos.peak_profit: pos.peak_profit=profit
         try: c1m=dm.get_candles("1m",limit=60)
         except: c1m=[]
@@ -540,23 +632,37 @@ class QuantStrategy:
             candles_1m=c1m,candles_5m=c5m,orderbook=ob,ict_engine=self._ict,
             tick_size=QCfg.TICK_SIZE(),atr_percentile=self._atr_5m.get_percentile(),
             adx=self._adx.adx,hold_reason=hr)
-        if new_sl is None: return
-        nst=_rt(new_sl,QCfg.TICK_SIZE())
-        if abs(nst-pos.sl_price)<1e-6: return
-        old_sl=pos.sl_price; imp=abs(nst-old_sl)
-        id_=pos.initial_sl_dist if pos.initial_sl_dist>1e-10 else atr
-        rlvl=max(profit,pos.peak_profit)/id_ if id_>0 else 0
         rs=" | ".join(hr) if hr else "structural"
-        logger.info(f"🔒 Trail [{rs}] ${old_sl:,.1f}→${nst:,.1f} R={rlvl:.2f}")
+        if new_sl is None:
+            logger.info(f"🔒 Trail HOLD [{rs}]  R={r_now:+.2f} (activation >0.40R)  "
+                        f"SL=${pos.sl_price:,.2f}  price=${price:,.2f}  ATR={atr:.1f}")
+            return
+        nst=_rt(new_sl,QCfg.TICK_SIZE())
+        if abs(nst-pos.sl_price)<1e-6:
+            logger.info(f"🔒 Trail NO-MOVE [{rs}]  proposed=${nst:,.2f} == current  R={r_now:+.2f}")
+            return
+        old_sl=pos.sl_price
+        rlvl=max(profit,pos.peak_profit)/id_ if id_>0 else 0
+        move_dir="▲" if nst>old_sl else "▼"
+        logger.info(f"🔒 Trail MOVE [{rs}]  ${old_sl:,.2f} {move_dir} ${nst:,.2f}  "
+                    f"(Δ${abs(nst-old_sl):.1f})  R={rlvl:.2f}")
         es="sell" if pos.side=="long" else "buy"
-        result=om.replace_stop_loss(existing_sl_order_id=pos.sl_order_id,side=es,quantity=pos.quantity,new_trigger_price=nst)
-        if result is None: self._record_exchange_exit(None); return
+        result=om.replace_stop_loss(existing_sl_order_id=pos.sl_order_id,side=es,
+                                    quantity=pos.quantity,new_trigger_price=nst)
+        if result is None:
+            logger.warning("🔒 Trail: replace_stop_loss→None — SL likely fired, recording exit")
+            self._record_exchange_exit(None); return
         if isinstance(result,dict) and "error" not in result:
             with self._lock:
-                self._pos.sl_price=nst; self._pos.sl_order_id=result.get("order_id",pos.sl_order_id)
+                self._pos.sl_price=nst
+                self._pos.sl_order_id=result.get("order_id",pos.sl_order_id)
                 self.current_sl_price=nst
                 if not pos.trail_active: self._pos.trail_active=True
-            send_telegram_message(f"🔒 <b>TRAIL</b> [{rs}]\n${old_sl:,.2f}→${nst:,.2f} R={rlvl:.2f}R")
+            logger.info(f"✅ Trail confirmed on exchange: ${old_sl:,.2f} {move_dir} ${nst:,.2f}")
+            send_telegram_message(f"🔒 <b>TRAIL</b> [{rs}]\n${old_sl:,.2f} {move_dir} ${nst:,.2f}  R={rlvl:.2f}R")
+        else:
+            err=(result or {}).get("error","unknown")
+            logger.warning(f"⚠️ Trail replace failed ({err}) — SL stays at ${pos.sl_price:,.2f}")
 
     # ═══════ EXIT / PNL ═══════
     def _exit_trade(self, om, price, reason):
