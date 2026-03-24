@@ -2030,11 +2030,29 @@ class ICTEntryGate:
                     (side == "short" and amd_bias == "bearish") or
                     (side == "long"  and amd_bias == "bullish")))
                 or
+                _is_trending   # v6.1: P/D waived in trends
+                or
                 (side == "long"  and (in_disc or not in_prem))
                 or
                 (side == "short" and (in_prem or not in_disc))
-            ) and
-            not tf_opposes  # tick flow soft veto
+            )
+            # v6.1 ARCHITECTURAL FIX: NO TICK FLOW VETO ON TIER-S.
+            #
+            # The sweep at OTE IS the institutional signal. During MANIPULATION,
+            # tick flow is EXPECTED to oppose — that's the Judas swing. Smart
+            # money is accumulating against retail flow. Blocking the highest-
+            # conviction ICT setup on a lagging flow indicator is the single
+            # worst architectural decision in this codebase.
+            #
+            # Tier-S has its own validation:
+            #   - Sweep detected with displacement confirmation
+            #   - Price in OTE zone (61.8-78.6% retrace)
+            #   - AMD phase = MANIPULATION or DISTRIBUTION
+            #   - AMD confidence >= 0.62
+            #   - Quality score check on ICT bar
+            #
+            # These are MORE than sufficient. Tick flow adds nothing here
+            # because it measures the Judas swing, not the institutional intent.
         )
         if _tier_s_conditions:
             quality = sweep_setup.quality_score()
@@ -2081,10 +2099,15 @@ class ICTEntryGate:
         # because we are not distinguishing with-HTF vs counter-HTF paths.
         # Keep the single standard threshold (−0.30 / +0.30): only sustained extreme
         # opposing flow should block — momentary tick noise must not gate ICT setups.
+        # v6.1 FIX: During MANIPULATION, tick flow SHOULD be opposing — that's
+        # the Judas swing. Threshold relaxed from -0.30 to -0.70 during MANIP.
+        # During DISTRIBUTION, standard -0.30 applies (delivery should have
+        # positive flow in the trade direction).
+        _tf_manip_thr = -0.70 if amd_phase == "MANIPULATION" else -0.30
         _tf_opposes_tier_a = (
             quant is not None and (
-                (side == "long"  and quant.tick_flow < -0.30) or
-                (side == "short" and quant.tick_flow >  0.30)
+                (side == "long"  and quant.tick_flow < _tf_manip_thr) or
+                (side == "short" and quant.tick_flow > -_tf_manip_thr)
             )
         )
         _tier_a_conditions = (
@@ -2164,16 +2187,21 @@ class ICTEntryGate:
         # In a bull trend, price LIVES in premium — pullbacks to buy happen
         # in premium by definition. The P/D gate is valuable in ranging markets
         # where it prevents chasing. In trending markets, it prevents trading.
-        _pd_gate_active = not (_is_momentum or _is_trending)
+        # v6.1: P/D gate waiver for momentum, trending, AND sweep OTE entries.
+        # When a sweep OTE setup is active, price is at the optimal trade entry
+        # by definition — P/D zone is irrelevant. The sweep defines the zone.
+        _pd_gate_active = not (_is_momentum or _is_trending or _sweep_ote)
 
         _tier_b_conditions = (
             ict_total >= _ict_b_floor and    # ADX-adaptive — see comment above
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
-            (q_overext or _is_momentum) and  # momentum doesn't need VWAP overextension
-            (n_conf >= 3 or (_is_momentum and n_conf >= 2)) and  # relaxed for momentum
-            # HTF veto removed — direction determined by ICT + order flow
-            not tf_opposes and
-            # P/D zone gate: waived for momentum + trending markets
+            (q_overext or _is_momentum or _sweep_ote) and  # sweep OTE doesn't need overext
+            (n_conf >= 3 or (_is_momentum and n_conf >= 2) or
+             (_sweep_ote and n_conf >= 2)) and  # relaxed for sweep OTE
+            # v6.1: tick flow veto relaxed during MANIPULATION with active sweep
+            # During manipulation, flow SHOULD oppose — that's the Judas swing
+            (not tf_opposes or (_sweep_ote and amd_phase == "MANIPULATION")) and
+            # P/D zone gate: waived for momentum + trending + sweep OTE
             (not _pd_gate_active or (
                 (side == "long"  and not in_prem) or
                 (side == "short" and not in_disc)))
