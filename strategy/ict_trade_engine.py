@@ -1837,14 +1837,18 @@ class ICTEntryGate:
             quant: Optional['QuantHelperSignals'] = None,
             mode: str = "reversion",
             market_regime: str = "RANGING",
+            ict_engine=None,
     ) -> Tuple[str, int, str]:
         """
         Returns (tier: "S"|"A"|"B"|"BLOCKED", confirm_ticks: int, reason: str).
 
-        v6.0 UPGRADES:
-          1. mode="momentum" bypasses AMD ACCUMULATION gate and P/D gate
-          2. market_regime="TRENDING_*" waives P/D gate (trends live in premium)
-          3. Relaxed AMD ACCUMULATION blocking (only at conf >= 0.85, was 0.75)
+        v6.1 ARCHITECTURAL FIXES:
+          1. ict_engine parameter — gate can now check swept liquidity pools
+             directly, not just the formal ICTSweepSetup object
+          2. MANIPULATION gate checks swept pools: if BSL was swept recently
+             and side="short", the sweep IS confirmed — no block
+          3. mode="momentum" bypasses AMD ACCUMULATION gate and P/D gate
+          4. market_regime="TRENDING_*" waives P/D gate
 
         quant: QuantHelperSignals — order-flow helpers. If None, soft-veto
                checks based on quant are skipped (permissive fallback).
@@ -1898,15 +1902,64 @@ class ICTEntryGate:
                 and not _is_momentum):
             return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_delivery"
 
-        # AMD Manipulation without a sweep setup = Judas swing still active
-        # Price is making the fake move, not the real move.
-        # FIX Bug-MANIP: also block when a sweep setup EXISTS but it is for the
-        # OPPOSITE direction — e.g. evaluating SHORT while a LONG sweep just fired.
-        # In MANIPULATION phase, smart money just swept SSL (bullish) or BSL
-        # (bearish); trading the counter-direction is trading the Judas swing.
-        if amd_phase == "MANIPULATION" and (
-                sweep_setup is None or sweep_setup.side != side):
-            return "BLOCKED", 0, "MANIP_no_confirmed_sweep"
+        # AMD Manipulation = Judas swing active. Only trade WITH the sweep.
+        #
+        # v6.1 ARCHITECTURAL FIX: The original code only checked sweep_setup
+        # (formal ICTSweepSetup with OTE geometry). Most sweeps never produce
+        # a formal setup — they exist only as swept pools in ict_engine.
+        # The momentum path passes sweep_setup=None, so this gate blocked
+        # 100% of momentum entries during MANIPULATION, even when swept pools
+        # confirmed the entry direction.
+        #
+        # FIX: Check THREE sources for sweep confirmation:
+        #   1. Formal ICTSweepSetup (sweep_setup parameter)
+        #   2. Recently swept pools in ict_engine.liquidity_pools
+        #   3. AMD bias alignment (AMD bearish + side=short = confirmed)
+        #
+        # If ANY source confirms the sweep for this side, allow entry.
+        # Only block when NO source confirms = genuinely trading the Judas swing.
+        if amd_phase == "MANIPULATION":
+            _sweep_confirmed_for_side = False
+
+            # Source 1: formal ICTSweepSetup
+            if sweep_setup is not None and sweep_setup.side == side:
+                _sweep_confirmed_for_side = True
+
+            # Source 2: recently swept pools in ict_engine
+            # BSL swept = bearish manipulation → confirms SHORT
+            # SSL swept = bullish manipulation → confirms LONG
+            if not _sweep_confirmed_for_side and ict_engine is not None:
+                try:
+                    import time as _time_mod
+                    _now_ms = int(_time_mod.time() * 1000)
+                    _max_sweep_age_ms = 900_000  # 15 minutes
+                    for pool in ict_engine.liquidity_pools:
+                        if not pool.swept:
+                            continue
+                        _age = _now_ms - pool.sweep_timestamp
+                        if _age > _max_sweep_age_ms or _age < 0:
+                            continue
+                        # BSL swept (bearish) confirms SHORT entry
+                        if pool.level_type == "BSL" and side == "short":
+                            _sweep_confirmed_for_side = True
+                            break
+                        # SSL swept (bullish) confirms LONG entry
+                        elif pool.level_type == "SSL" and side == "long":
+                            _sweep_confirmed_for_side = True
+                            break
+                except Exception:
+                    pass
+
+            # Source 3: AMD bias alignment with high confidence
+            # If AMD engine says bearish with 0.80+ conf and we're going short,
+            # the sweep detection already fired — AMD phase IS the confirmation
+            if not _sweep_confirmed_for_side and amd_conf >= 0.80:
+                if (side == "short" and amd_bias == "bearish") or \
+                   (side == "long" and amd_bias == "bullish"):
+                    _sweep_confirmed_for_side = True
+
+            if not _sweep_confirmed_for_side:
+                return "BLOCKED", 0, "MANIP_no_confirmed_sweep"
 
         # AMD Distribution delivering AGAINST our trade direction = wrong side
         if (amd_phase == "DISTRIBUTION" and amd_conf >= 0.65 and

@@ -3534,13 +3534,25 @@ class QuantStrategy:
         # This turns 30-40% of the composite into a permanent directional bias
         # that measures DISTANCE, not selling pressure.
         #
-        # FIX: In trending markets, cap VWAP influence at ±0.5 so it doesn't
-        # dominate. The weight schedule already reduces VWAP to 0.15, but the
-        # -1.0 signal × 0.15 = -0.15 is still significant when other signals
-        # are near zero.
+        # FIX: In trending markets AND during AMD MANIPULATION, cap VWAP
+        # influence at ±0.5. During MANIPULATION, VWAP distance is irrelevant —
+        # the swept pool IS the signal. VWAP can point the opposite direction
+        # (price below VWAP = LONG signal) while AMD says SHORT (BSL swept).
+        # Without this cap, VWAP=+1.0 at 0.30 weight = +0.30 in composite,
+        # which alone clears the ±0.30 entry threshold in the WRONG direction.
         _vs_capped = vs
+        _amd_phase_live = ""
+        _amd_conf_live = 0.0
+        if self._ict is not None:
+            try:
+                _amd_phase_live = self._ict._amd.phase
+                _amd_conf_live = self._ict._amd.confidence
+            except Exception:
+                pass
         if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
             _vs_capped = max(-0.50, min(0.50, vs))
+        elif _amd_phase_live == "MANIPULATION" and _amd_conf_live >= 0.80:
+            _vs_capped = max(-0.40, min(0.40, vs))
 
         comp = (_vs_capped*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
         comp = max(-1.0, min(1.0, comp))
@@ -3756,7 +3768,8 @@ class QuantStrategy:
                             _td, _, _tdr = ICTEntryGate.evaluate(
                                 _disp_rev_side, sig,
                                 self._active_sweep_setup, price, _qh_d,
-                                mode="reversion", market_regime=sig.market_regime)
+                                mode="reversion", market_regime=sig.market_regime,
+                                ict_engine=self._ict)
                             _tier_display  = _td
                             _tier_reason_d = _tdr
                         except Exception:
@@ -3949,7 +3962,8 @@ class QuantStrategy:
                     _ap_tier, _, _ap_reason = ICTEntryGate.evaluate(
                         _ict_rev_side, sig,
                         self._active_sweep_setup, price, _qh_ap,
-                        mode="reversion", market_regime=sig.market_regime)
+                        mode="reversion", market_regime=sig.market_regime,
+                        ict_engine=self._ict)
                     ap = _ap_tier in ("S", "A", "B")
                     # FIX Bug-3: ICTEntryGate passed but breakout would block in
                     # _evaluate_entry — display must reflect the same gate.
@@ -4435,7 +4449,29 @@ class QuantStrategy:
         if _is_ote_sweep:
             side = self._active_sweep_setup.side  # "long" | "short"
         else:
-            side = sig.reversion_side   # VWAP-based default for standard path
+            # ── v6.1 ARCHITECTURAL FIX: AMD MANIPULATION overrides VWAP side ──
+            # PROBLEM: VWAP says LONG (price below VWAP), but AMD=MANIPULATION
+            # bearish 0.95 conf (BSL just swept = smart money is SHORT).
+            # VWAP is measuring distance, AMD is measuring institutional intent.
+            # In MANIPULATION phase, AMD IS the signal — it's the entire reason
+            # the ICT model exists. VWAP reversion is a statistical concept;
+            # AMD manipulation is a structural one. Structure wins.
+            #
+            # During high-confidence MANIPULATION, override VWAP side with AMD bias.
+            _amd_override = False
+            if (sig.amd_phase == "MANIPULATION" and sig.amd_conf >= 0.80
+                    and sig.amd_bias in ("bullish", "bearish")):
+                _amd_side = "long" if sig.amd_bias == "bullish" else "short"
+                if _amd_side != sig.reversion_side:
+                    side = _amd_side
+                    _amd_override = True
+                    logger.debug(
+                        f"🔄 AMD MANIPULATION override: VWAP says {sig.reversion_side}, "
+                        f"AMD says {side} (conf={sig.amd_conf:.2f}) — using AMD")
+                else:
+                    side = sig.reversion_side
+            else:
+                side = sig.reversion_side   # VWAP-based default for standard path
 
         # ── Hard veto: trending against reversion trade ──────────────────
         # Skipped for sweep entries — institutional sweep setups are valid IN
@@ -4622,7 +4658,8 @@ class QuantStrategy:
             try:
                 _tier, _cn_override, _tier_reason = ICTEntryGate.evaluate(
                     side, sig, self._active_sweep_setup, price, quant_helpers,
-                    mode="reversion", market_regime=sig.market_regime)
+                    mode="reversion", market_regime=sig.market_regime,
+                    ict_engine=self._ict)
 
                 if _tier == "BLOCKED":
                     if self._ict_gate_start_time_rev == 0.0:
@@ -4862,7 +4899,8 @@ class QuantStrategy:
                 _qh = self._get_quant_helpers(sig, trend_side)
                 _t, _cn, _tr = ICTEntryGate.evaluate(
                     trend_side, sig, None, price, _qh,
-                    mode="trend", market_regime=sig.market_regime)
+                    mode="trend", market_regime=sig.market_regime,
+                    ict_engine=self._ict)
                 if _t == "BLOCKED":
                     if self._ict_gate_start_time_trend == 0.0:
                         self._ict_gate_start_time_trend = now
@@ -5171,8 +5209,9 @@ class QuantStrategy:
             try:
                 _qh_mo = self._get_quant_helpers(sig, side)
                 _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(
-                    side, sig, None, price, _qh_mo,
-                    mode="momentum", market_regime=sig.market_regime)
+                    side, sig, self._active_sweep_setup, price, _qh_mo,
+                    mode="momentum", market_regime=sig.market_regime,
+                    ict_engine=self._ict)
                 if _t_mo == "BLOCKED":
                     if self._ict_gate_start_time_mom == 0.0:
                         self._ict_gate_start_time_mom = now
