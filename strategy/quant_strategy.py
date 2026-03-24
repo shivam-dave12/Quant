@@ -2935,6 +2935,7 @@ class PositionState:
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
     consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
     be_ratchet_applied: bool = False  # v5.1: counter-BOS BE already forced
+    last_ratchet_r: float = 0.0      # v6.1: last R-level ratcheted (prevents re-fire)
     ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
     # FIX 8: store actual HTF scores at entry time for post-trade attribution.
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
@@ -6224,163 +6225,223 @@ class QuantStrategy:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
         # ══════════════════════════════════════════════════════════════════
-        # v5.1: STRUCTURE-AWARE R-MULTIPLE RATCHET
+        # v6.1: INSTITUTIONAL R-MULTIPLE RATCHET (COMPLETE REWRITE)
         # ══════════════════════════════════════════════════════════════════
-        # R-multiple determines WHEN; ICT structure determines WHERE.
-        # Scans OBs, 5m swings for structural defense. Avoids liquidity pools.
-        # Falls back to fee-adjusted BE floor only if no structure exists.
+        #
+        # OLD PROBLEM: Ratchet fired EVERY TICK at 0.50R+. Sanity check
+        # capped SL at price ± 0.5 ATR. Result: SL tracked price at 0.5 ATR
+        # distance — a 53-point pullback kills every trade. Got stopped at
+        # $70,152 while TP was at $69,947, leaving 200 pts on the table.
+        #
+        # NEW DESIGN: Discrete R-level locks. Each level fires ONCE, locks SL
+        # to a structural level (OB, swing) with institutional breathing room.
+        # Between levels: HOLD. No tick tracking. Let the trade breathe.
+        #
+        # R-LEVEL TABLE (what to lock at each milestone):
+        #   0.50R MFE → Move SL to break-even + fees (lock $0 risk)
+        #   1.00R MFE → Lock SL at 0.25R profit (behind nearest OB/swing)
+        #   1.50R MFE → Lock SL at 0.65R profit (behind 5m structure)
+        #   2.00R MFE → Lock SL at 1.20R profit (tight to 1m structure)
+        #   2.50R+ MFE → Lock SL at MFE - 0.80R (aggressive lock)
+        #
+        # BREATHING ROOM: SL minimum distance = 1.2 ATR from price (was 0.5 ATR)
+        #
+        # STRUCTURAL SEARCH: OBs and swings searched BEHIND the lock level,
+        # not between BE and price. Structure BEHIND = defense that holds.
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
 
-        _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.25 * atr
+        _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.15 * atr
         _be_floor = (pos.entry_price + _fee_buf if pos.side == "long"
                      else pos.entry_price - _fee_buf)
 
-        _ratchet_due = mfe_r >= 0.50
+        # ── Determine which R-level has been reached ──────────────────────
+        # CRITICAL: only ratchet at DISCRETE levels, not every tick.
+        # Track which level was last applied to prevent re-firing.
+        _last_ratchet_r = getattr(pos, 'last_ratchet_r', 0.0)
+
+        _ratchet_level = 0.0
         _ratchet_label = ""
-        if mfe_r >= 2.00:   _ratchet_label = "2.00R"
-        elif mfe_r >= 1.50: _ratchet_label = "1.50R"
-        elif mfe_r >= 1.00: _ratchet_label = "1.00R"
-        elif mfe_r >= 0.50: _ratchet_label = "0.50R"
+        _lock_r = 0.0  # how many R to lock as profit
+
+        if mfe_r >= 2.50 and _last_ratchet_r < 2.50:
+            _ratchet_level = 2.50; _ratchet_label = "2.50R"
+            _lock_r = mfe_r - 0.80
+        elif mfe_r >= 2.00 and _last_ratchet_r < 2.00:
+            _ratchet_level = 2.00; _ratchet_label = "2.00R"
+            _lock_r = 1.20
+        elif mfe_r >= 1.50 and _last_ratchet_r < 1.50:
+            _ratchet_level = 1.50; _ratchet_label = "1.50R"
+            _lock_r = 0.65
+        elif mfe_r >= 1.00 and _last_ratchet_r < 1.00:
+            _ratchet_level = 1.00; _ratchet_label = "1.00R"
+            _lock_r = 0.25
+        elif mfe_r >= 0.50 and _last_ratchet_r < 0.50:
+            _ratchet_level = 0.50; _ratchet_label = "0.50R"
+            _lock_r = 0.0  # break-even only
+
+        _ratchet_due = _ratchet_level > 0.0
 
         if _ratchet_due:
-            _sl_worse_than_be = ((pos.side == "long" and pos.sl_price < _be_floor) or
-                                 (pos.side == "short" and pos.sl_price > _be_floor))
+            # ── Compute lock target from R-level ──────────────────────────
+            _lock_dist = _lock_r * init_dist_r
+            if pos.side == "long":
+                _target_price = pos.entry_price + _lock_dist
+                _target_price = max(_target_price, _be_floor)  # never worse than BE
+            else:
+                _target_price = pos.entry_price - _lock_dist
+                _target_price = min(_target_price, _be_floor)  # never worse than BE
 
-            if _sl_worse_than_be:
-                # ── Find structural defense between entry and price ────────
-                _struct_sl = None
-                _struct_label = ""
-                _ob_buf = 0.30 * atr
+            # ── Structural search: find OB/swing near the lock level ──────
+            _struct_sl = None
+            _struct_label = ""
+            _search_margin = 0.8 * atr  # search window around target
 
-                # 1. OB anchor
-                if self._ict is not None:
-                    try:
-                        obs = (self._ict.order_blocks_bull if pos.side == "long"
-                               else self._ict.order_blocks_bear)
-                        active_obs = [o for o in obs if o.is_active(now_ms)]
-                        if pos.side == "long":
-                            valid_obs = [o for o in active_obs
-                                         if _be_floor < o.low - _ob_buf < price - 0.5 * atr]
-                            if valid_obs:
-                                best_ob = max(valid_obs, key=lambda o: o.low)
-                                _struct_sl = best_ob.low - _ob_buf
-                                _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
-                        else:
-                            valid_obs = [o for o in active_obs
-                                         if price + 0.5 * atr < o.high + _ob_buf < _be_floor]
-                            if valid_obs:
-                                best_ob = min(valid_obs, key=lambda o: o.high)
-                                _struct_sl = best_ob.high + _ob_buf
-                                _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
-                    except Exception:
-                        pass
-
-                # 2. 5m swing structure
-                if _struct_sl is None and len(candles_5m) >= 6:
-                    try:
-                        closed_5m = candles_5m[:-1]
-                        from strategy.ict_trade_engine import _find_swings as _fs_ratchet
-                    except ImportError:
-                        try:
-                            from ict_trade_engine import _find_swings as _fs_ratchet
-                        except ImportError:
-                            _fs_ratchet = None
-                    if _fs_ratchet is not None:
-                        try:
-                            highs_5m, lows_5m = _fs_ratchet(
-                                closed_5m, min(12, len(closed_5m) - 2))
-                        except Exception:
-                            highs_5m, lows_5m = [], []
-                    else:
-                        highs_5m, lows_5m = [], []
-                    sw_buf = 0.40 * atr
-                    if pos.side == "long" and lows_5m:
-                        valid_sw = [l for l in lows_5m
-                                    if _be_floor < l - sw_buf < price - 0.5 * atr]
-                        if valid_sw:
-                            _struct_sl = max(valid_sw) - sw_buf
-                            _struct_label = f"5m_SW@${max(valid_sw):.0f}"
-                    elif pos.side == "short" and highs_5m:
-                        valid_sw = [h for h in highs_5m
-                                    if price + 0.5 * atr < h + sw_buf < _be_floor]
-                        if valid_sw:
-                            _struct_sl = min(valid_sw) + sw_buf
-                            _struct_label = f"5m_SW@${min(valid_sw):.0f}"
-
-                # 3. Liquidity pool avoidance
-                if _struct_sl is not None and self._ict is not None:
-                    try:
-                        _liq_buf = 0.50 * atr
-                        for pool in self._ict.liquidity_pools:
-                            if pool.swept:
-                                continue
-                            if pos.side == "long" and pool.pool_type == "EQL":
-                                if abs(_struct_sl - pool.price) < _liq_buf:
-                                    _shifted = pool.price - _liq_buf
-                                    if _shifted > pos.sl_price:
-                                        _struct_sl = _shifted
-                                        _struct_label += f"+LiqAvoid@${pool.price:.0f}"
-                                    else:
-                                        _struct_sl = None; _struct_label = ""
-                            elif pos.side == "short" and pool.pool_type == "EQH":
-                                if abs(_struct_sl - pool.price) < _liq_buf:
-                                    _shifted = pool.price + _liq_buf
-                                    if _shifted < pos.sl_price:
-                                        _struct_sl = _shifted
-                                        _struct_label += f"+LiqAvoid@${pool.price:.0f}"
-                                    else:
-                                        _struct_sl = None; _struct_label = ""
-                    except Exception:
-                        pass
-
-                # 4. Best of structural defense or BE floor
-                if _struct_sl is not None:
+            # 1. OB anchor near the lock level
+            if self._ict is not None:
+                try:
+                    obs = (self._ict.order_blocks_bull if pos.side == "long"
+                           else self._ict.order_blocks_bear)
+                    active_obs = [o for o in obs if o.is_active(now_ms)]
+                    _ob_buf = 0.30 * atr
                     if pos.side == "long":
-                        _ratchet_target = max(_struct_sl, _be_floor)
+                        # Find OB below target_price (structural defense)
+                        valid_obs = [o for o in active_obs
+                                     if o.low - _ob_buf < _target_price
+                                     and o.low - _ob_buf > pos.sl_price
+                                     and o.low < price - 1.0 * atr]
+                        if valid_obs:
+                            best_ob = max(valid_obs, key=lambda o: o.low)
+                            _struct_sl = best_ob.low - _ob_buf
+                            _struct_label = f"OB@${best_ob.midpoint:.0f}"
                     else:
-                        _ratchet_target = min(_struct_sl, _be_floor)
-                    _final_label = f"STRUCT({_struct_label})"
+                        # Find OB above target_price (structural defense)
+                        valid_obs = [o for o in active_obs
+                                     if o.high + _ob_buf > _target_price
+                                     and o.high + _ob_buf < pos.sl_price
+                                     and o.high > price + 1.0 * atr]
+                        if valid_obs:
+                            best_ob = min(valid_obs, key=lambda o: o.high)
+                            _struct_sl = best_ob.high + _ob_buf
+                            _struct_label = f"OB@${best_ob.midpoint:.0f}"
+                except Exception:
+                    pass
+
+            # 2. 5m swing structure near the lock level
+            if _struct_sl is None and len(candles_5m) >= 6:
+                try:
+                    closed_5m = candles_5m[:-1]
+                    from strategy.ict_trade_engine import _find_swings as _fs_ratchet
+                except ImportError:
+                    try:
+                        from ict_trade_engine import _find_swings as _fs_ratchet
+                    except ImportError:
+                        _fs_ratchet = None
+                if _fs_ratchet is not None:
+                    try:
+                        highs_5m, lows_5m = _fs_ratchet(
+                            closed_5m, min(12, len(closed_5m) - 2))
+                    except Exception:
+                        highs_5m, lows_5m = [], []
                 else:
-                    _ratchet_target = _be_floor
-                    _final_label = "BE_FLOOR"
+                    highs_5m, lows_5m = [], []
+                sw_buf = 0.40 * atr
+                if pos.side == "long" and lows_5m:
+                    valid_sw = [l for l in lows_5m
+                                if l - sw_buf < _target_price
+                                and l - sw_buf > pos.sl_price
+                                and l < price - 1.0 * atr]
+                    if valid_sw:
+                        _struct_sl = max(valid_sw) - sw_buf
+                        _struct_label = f"5m_SW@${max(valid_sw):.0f}"
+                elif pos.side == "short" and highs_5m:
+                    valid_sw = [h for h in highs_5m
+                                if h + sw_buf > _target_price
+                                and h + sw_buf < pos.sl_price
+                                and h > price + 1.0 * atr]
+                    if valid_sw:
+                        _struct_sl = min(valid_sw) + sw_buf
+                        _struct_label = f"5m_SW@${min(valid_sw):.0f}"
 
-                _ratchet_tick = _round_to_tick(_ratchet_target)
+            # 3. Liquidity pool avoidance
+            if _struct_sl is not None and self._ict is not None:
+                try:
+                    _liq_buf = 0.50 * atr
+                    for pool in self._ict.liquidity_pools:
+                        if pool.swept:
+                            continue
+                        if pos.side == "long" and pool.level_type == "SSL":
+                            if abs(_struct_sl - pool.price) < _liq_buf:
+                                _shifted = pool.price - _liq_buf
+                                if _shifted > pos.sl_price:
+                                    _struct_sl = _shifted
+                                    _struct_label += f"+LiqAvoid"
+                                else:
+                                    _struct_sl = None; _struct_label = ""
+                        elif pos.side == "short" and pool.level_type == "BSL":
+                            if abs(_struct_sl - pool.price) < _liq_buf:
+                                _shifted = pool.price + _liq_buf
+                                if _shifted < pos.sl_price:
+                                    _struct_sl = _shifted
+                                    _struct_label += f"+LiqAvoid"
+                                else:
+                                    _struct_sl = None; _struct_label = ""
+                except Exception:
+                    pass
 
-                # Sanity: never past current price
-                if pos.side == "long" and _ratchet_tick >= price:
-                    _ratchet_tick = _round_to_tick(price - 0.5 * atr)
-                elif pos.side == "short" and _ratchet_tick <= price:
-                    _ratchet_tick = _round_to_tick(price + 0.5 * atr)
+            # 4. Select best: structural level or computed target
+            if _struct_sl is not None:
+                if pos.side == "long":
+                    _ratchet_target = max(_struct_sl, _target_price)
+                else:
+                    _ratchet_target = min(_struct_sl, _target_price)
+                _final_label = f"STRUCT({_struct_label})"
+            else:
+                _ratchet_target = _target_price
+                _final_label = f"R_LOCK({_lock_r:.2f}R)"
 
-                _is_improvement = ((pos.side == "long" and _ratchet_tick > pos.sl_price) or
-                                   (pos.side == "short" and _ratchet_tick < pos.sl_price))
+            # ── BREATHING ROOM: minimum 1.2 ATR from current price ────────
+            # This is the critical fix. 0.5 ATR = certain death.
+            # 1.2 ATR allows normal pullbacks without getting stopped.
+            _min_breath = 1.2 * atr
+            if pos.side == "long" and _ratchet_target > price - _min_breath:
+                _ratchet_target = price - _min_breath
+                _final_label += "(breath_capped)"
+            elif pos.side == "short" and _ratchet_target < price + _min_breath:
+                _ratchet_target = price + _min_breath
+                _final_label += "(breath_capped)"
 
-                if _is_improvement:
-                    logger.info(
-                        f"🔒 RATCHET [{_ratchet_label}] | MFE={mfe_r:.2f}R | "
-                        f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} [{_final_label}]")
-                    es = "sell" if pos.side == "long" else "buy"
-                    result = order_manager.replace_stop_loss(
-                        existing_sl_order_id=pos.sl_order_id,
-                        side=es, quantity=pos.quantity,
-                        new_trigger_price=_ratchet_tick)
-                    if result is None:
-                        logger.warning("🚨 SL already fired during ratchet")
-                        self._record_exchange_exit(None)
-                        return True
-                    if isinstance(result, dict) and "error" not in result:
-                        with self._lock:
-                            pos.sl_price = _ratchet_tick
-                            pos.sl_order_id = result.get("order_id") or pos.sl_order_id
-                            pos.trail_active = True
-                            pos.consecutive_trail_holds = 0
-                            self.current_sl_price = _ratchet_tick
-                        send_telegram_message(
-                            f"🔒 <b>RATCHET SL [{_ratchet_label}]</b>\n"
-                            f"${pos.sl_price:,.2f} [{_final_label}]\n"
-                            f"MFE: {mfe_r:.2f}R")
-                    return False
+            _ratchet_tick = _round_to_tick(_ratchet_target)
+
+            _is_improvement = ((pos.side == "long" and _ratchet_tick > pos.sl_price) or
+                               (pos.side == "short" and _ratchet_tick < pos.sl_price))
+
+            if _is_improvement:
+                logger.info(
+                    f"🔒 RATCHET [{_ratchet_label}] | MFE={mfe_r:.2f}R | "
+                    f"SL ${pos.sl_price:,.1f} → ${_ratchet_tick:,.1f} [{_final_label}]")
+                es = "sell" if pos.side == "long" else "buy"
+                result = order_manager.replace_stop_loss(
+                    existing_sl_order_id=pos.sl_order_id,
+                    side=es, quantity=pos.quantity,
+                    new_trigger_price=_ratchet_tick)
+                if result is None:
+                    logger.warning("🚨 SL already fired during ratchet")
+                    self._record_exchange_exit(None)
+                    return True
+                if isinstance(result, dict) and "error" not in result:
+                    with self._lock:
+                        pos.sl_price = _ratchet_tick
+                        pos.sl_order_id = result.get("order_id") or pos.sl_order_id
+                        pos.trail_active = True
+                        pos.consecutive_trail_holds = 0
+                        self.current_sl_price = _ratchet_tick
+                        pos.last_ratchet_r = _ratchet_level  # mark this level as done
+                    send_telegram_message(
+                        f"🔒 <b>RATCHET SL [{_ratchet_label}]</b>\n"
+                        f"${pos.sl_price:,.2f} [{_final_label}]\n"
+                        f"MFE: {mfe_r:.2f}R | Lock: {_lock_r:.2f}R")
+                return False
 
         # ══════════════════════════════════════════════════════════════════
         # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
