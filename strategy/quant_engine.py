@@ -401,7 +401,7 @@ class KyleLambdaEngine:
 
     def on_trade(self, price: float, qty: float, is_buy: bool, ts: float):
         with self._lock:
-            signed_flow = price * qty * (1.0 if is_buy else -1.0)
+            signed_flow = qty * (1.0 if is_buy else -1.0)
             self._window_trades.append((ts, price, signed_flow))
 
     def compute(self) -> float:

@@ -303,6 +303,26 @@ class QuantStrategy:
             self._evaluate_entry(data_manager,order_manager,risk_manager,now)
 
     def _feed_microstructure(self, dm):
+        # ── One-time historical seed for MomentumEngine ──────────────────────
+        # MomentumEngine._ema_slope needs ≥15 closed 1m candles, ≥25 5m/15m.
+        # Without seeding it waits 15+ real-time minutes (1m), 2+ hours (5m),
+        # 6+ hours (15m) before producing any signal. DataManager already has
+        # full warmup history — feed it once at startup.
+        if not getattr(self, "_momentum_seeded", False):
+            self._momentum_seeded = True
+            _seed_limits = {"1m": 100, "5m": 60, "15m": 40}
+            for _tf, _lim in _seed_limits.items():
+                try:
+                    _hist = dm.get_candles(_tf, limit=_lim)
+                    if _hist and len(_hist) >= 2:
+                        for _c in _hist[:-1]:  # exclude the live/forming candle
+                            self._quant.on_candle(_tf, _c)
+                        # Update dedup timestamps so per-tick loop doesn't re-feed
+                        self._last_candle_ts[_tf] = int(_hist[-2].get("t", 0))
+                        logger.info(f"✅ MomentumEngine seeded: {_tf} × {len(_hist)-1} candles")
+                except Exception as _e:
+                    logger.warning(f"Momentum seed failed ({_tf}): {_e}")
+        # ─────────────────────────────────────────────────────────────────────
         try:
             ob=dm.get_orderbook(); price=dm.get_last_price()
             if ob and price>1:
@@ -702,9 +722,10 @@ class QuantStrategy:
         self.current_sl_price=self.current_tp_price=0.0
 
     def _record_exchange_exit(self, ex_pos):
-        if self._pos.phase not in (PositionPhase.ACTIVE,PositionPhase.EXITING): return
-        price=self._last_known_price; pnl=self._estimate_pnl(self._pos,price)
-        self._record_pnl(pnl,"exchange_exit",price,self._pos); self._finalise_exit()
+        with self._lock:
+            if self._pos.phase not in (PositionPhase.ACTIVE,PositionPhase.EXITING): return
+            price=self._last_known_price; pnl=self._estimate_pnl(self._pos,price)
+            self._record_pnl(pnl,"exchange_exit",price,self._pos); self._finalise_exit()
 
     # ═══════ RECONCILE ═══════
     def _reconcile_query(self, om):

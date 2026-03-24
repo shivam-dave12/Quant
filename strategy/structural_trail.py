@@ -99,9 +99,9 @@ def _find_swings(candles: list, lookback: int = 3
         )
 
         if is_swing_high:
-            highs_list.append((h, i))  # FIX-ST2: store index for recency
+            highs_list.append(h)
         if is_swing_low:
-            lows_list.append((l, i))
+            lows_list.append(l)
 
     return highs_list, lows_list
 

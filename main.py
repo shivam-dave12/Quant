@@ -200,7 +200,8 @@ class QuantBot:
         if pos:
             side = pos.get("side","?").upper(); entry = pos.get("entry_price",0)
             if entry > 0:
-                pnl = (price-entry) if side=="LONG" else (entry-price)
+                qty = pos.get("quantity", 0)
+                pnl = ((price-entry) if side=="LONG" else (entry-price)) * qty
                 logger.info(f"💓 ${price:,.2f} [{feed}] | {side} @ ${entry:,.2f} | uPnL {pnl:+.2f}")
             else:
                 logger.info(f"💓 ${price:,.2f} [{feed}] | PENDING FILL")
