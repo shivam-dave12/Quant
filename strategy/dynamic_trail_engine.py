@@ -256,7 +256,7 @@ class DynamicTrailEngine:
             elif tier >= 1.0:
                 phase = 2
                 base_min = 0.9 * atr
-            elif tier >= 0.45:
+            elif tier >= 0.70:
                 phase = 1
                 base_min = 1.3 * atr
             else:
@@ -269,7 +269,7 @@ class DynamicTrailEngine:
             elif tier >= 0.80:
                 phase = 2
                 base_min = 1.0 * atr
-            elif tier >= 0.45:
+            elif tier >= 0.70:
                 phase = 1
                 base_min = 1.3 * atr
             else:
@@ -295,7 +295,7 @@ class DynamicTrailEngine:
             elif tier >= 0.80:
                 phase = 1
                 base_min = 1.8 * atr
-            elif tier >= 0.45:
+            elif tier >= 0.70:
                 phase = 1
                 base_min = 2.2 * atr
             else:
@@ -797,16 +797,18 @@ class DynamicTrailEngine:
                 for pool in ict_engine.liquidity_pools:
                     if pool.swept:
                         continue
-                    if pos_side == "long" and pool.pool_type == "EQL":
+                    # BUG FIX: pool.pool_type doesn't exist on LiquidityLevel
+                    # Correct attribute: pool.level_type with values "SSL"/"BSL"
+                    if pos_side == "long" and pool.level_type == "SSL":
                         ceiling = pool.price - liq_buf
                         if current_sl < ceiling < new_sl:
                             new_sl = ceiling
-                            anchor += f"+LIQ@${pool.price:.0f}"
-                    elif pos_side == "short" and pool.pool_type == "EQH":
+                            anchor += f"+LIQ_SSL@${pool.price:.0f}"
+                    elif pos_side == "short" and pool.level_type == "BSL":
                         floor_p = pool.price + liq_buf
                         if current_sl > floor_p > new_sl:
                             new_sl = floor_p
-                            anchor += f"+LIQ@${pool.price:.0f}"
+                            anchor += f"+LIQ_BSL@${pool.price:.0f}"
             except Exception:
                 pass
 

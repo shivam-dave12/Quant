@@ -656,15 +656,30 @@ class ICTSLEngine:
                 candles_15m: List[Dict] = None,
                 atr_pctile: float = 0.5,
                 mode: str = "reversion",
+                market_regime: str = "RANGING",
                 ) -> Tuple[float, str]:
         """
         Returns (sl_price, source_label).
+
+        v6.0 UPGRADES:
+          1. Regime-adaptive SL floor (trending = wider, ranging = tighter)
+          2. Liquidity proximity guard — SL must not sit ON a BSL/SSL cluster
+          3. Trend/momentum max_dist widened to 3.0×ATR (was 2.0×)
         """
-        min_dist = max(price * 0.003, 0.40 * atr)
+        # ── Regime-adaptive SL floor ──────────────────────────────────────
+        # In trending markets, tight SLs get swept by normal volatility.
+        # In ranging markets, wider SLs give back too much.
+        if market_regime in ("TRENDING_UP", "TRENDING_DOWN"):
+            min_dist = max(price * 0.005, 1.0 * atr)   # 1.0 ATR min in trends
+        elif market_regime == "TRANSITIONING":
+            min_dist = max(price * 0.004, 0.7 * atr)
+        else:
+            min_dist = max(price * 0.003, 0.40 * atr)   # ranging default
+
         max_dist = price * 0.035
 
         if mode in ("trend", "momentum"):
-            max_dist = min(max_dist, 2.0 * atr)
+            max_dist = min(max_dist, 3.0 * atr)   # was 2.0 — too tight for trends
 
         sl_price = None
         source   = "none"
@@ -765,6 +780,49 @@ class ICTSLEngine:
             sl_price = (price - max_dist if side == "long"
                         else price + max_dist)
             source += "(capped_max)"
+
+        # ── LIQUIDITY PROXIMITY GUARD (v6.0) ──────────────────────────────
+        # INSTITUTIONAL PRINCIPLE: SL must NEVER sit on or near a liquidity
+        # pool (BSL/SSL cluster). Smart money sweeps these levels to fill
+        # their orders — your SL feeding their entry is the worst outcome.
+        #
+        # Check: if SL is within 0.6×ATR of an unswept liquidity pool,
+        # move SL BEHIND the pool (further from entry) so the sweep has to
+        # go through AND past the pool before reaching your SL.
+        if ict_engine is not None and hasattr(ict_engine, 'liquidity_pools'):
+            _liq_guard_dist = 0.6 * atr
+            _liq_buffer     = 0.35 * atr  # space behind the pool
+            for pool in ict_engine.liquidity_pools:
+                if pool.swept:
+                    continue
+                dist_sl_to_pool = abs(sl_price - pool.price)
+                if dist_sl_to_pool > _liq_guard_dist:
+                    continue  # SL is far enough from this pool
+
+                if side == "long":
+                    # SL is below price; if a SSL cluster is near our SL,
+                    # move SL below the pool
+                    if pool.level_type == "SSL" and pool.price < price:
+                        new_sl = pool.price - _liq_buffer
+                        if abs(price - new_sl) <= max_dist:
+                            logger.info(
+                                f"🛡️ SL LIQUIDITY GUARD: moved SL ${sl_price:,.2f} → "
+                                f"${new_sl:,.2f} (behind SSL@${pool.price:,.0f}, "
+                                f"touches={pool.touch_count})")
+                            sl_price = new_sl
+                            source += f"(liq_guard_SSL@{pool.price:.0f})"
+                elif side == "short":
+                    # SL is above price; if a BSL cluster is near our SL,
+                    # move SL above the pool
+                    if pool.level_type == "BSL" and pool.price > price:
+                        new_sl = pool.price + _liq_buffer
+                        if abs(new_sl - price) <= max_dist:
+                            logger.info(
+                                f"🛡️ SL LIQUIDITY GUARD: moved SL ${sl_price:,.2f} → "
+                                f"${new_sl:,.2f} (behind BSL@${pool.price:,.0f}, "
+                                f"touches={pool.touch_count})")
+                            sl_price = new_sl
+                            source += f"(liq_guard_BSL@{pool.price:.0f})"
 
         return _round_tick(sl_price), source
 
@@ -1046,9 +1104,12 @@ class ICTTrailEngine:
         tier = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
 
         # ── Phase-0: Hands off ────────────────────────────────────────────
-        if tier < 0.50:
+        # v6.0: raised from 0.50R to 0.70R. At 0.50R the trade barely covered
+        # fees + slippage. Trailing at this level gives back the profit on the
+        # first normal pullback. Smart money lets the move develop first.
+        if tier < 0.70:
             if hold_reason is not None:
-                hold_reason.append(f"PHASE0 tier={tier:.2f}R<0.50R")
+                hold_reason.append(f"PHASE0 tier={tier:.2f}R<0.70R")
             return None
 
         # ── AMD phase determination ───────────────────────────────────────
@@ -1403,23 +1464,31 @@ class ICTTrailEngine:
             if vol_tighten > 0:
                 new_sl = max(new_sl - vol_tighten, price + min_dist)
 
-        # ── LIQUIDITY POOL CEILING ────────────────────────────────────────
+        # ── LIQUIDITY POOL GUARD FOR TRAIL (v6.0 FIX) ─────────────────────
+        # BUG FIX: original used pool.pool_type=="EQL"/"EQH" — LiquidityLevel
+        # uses level_type=="SSL"/"BSL". The guard NEVER fired.
+        #
+        # LONG trail moving up: don't trail INTO an SSL cluster below price
+        # (smart money will sweep it, whipping price through your trailed SL).
+        # SHORT trail moving down: don't trail INTO a BSL cluster above price.
         if ict_engine is not None:
             try:
                 liq_buf = 0.50 * atr
                 for pool in ict_engine.liquidity_pools:
                     if pool.swept:
                         continue
-                    if pos_side == "long" and pool.pool_type == "EQL":
+                    if pos_side == "long" and pool.level_type == "SSL":
+                        # Don't trail above an SSL — it will get swept downward
                         ceiling = pool.price - liq_buf
                         if current_sl < ceiling < new_sl:
                             new_sl = ceiling
-                            anchor += f"+LIQ_CEIL@${pool.price:.0f}"
-                    elif pos_side == "short" and pool.pool_type == "EQH":
+                            anchor += f"+LIQ_CEIL_SSL@${pool.price:.0f}"
+                    elif pos_side == "short" and pool.level_type == "BSL":
+                        # Don't trail below a BSL — it will get swept upward
                         floor = pool.price + liq_buf
                         if current_sl > floor > new_sl:
                             new_sl = floor
-                            anchor += f"+LIQ_FLOOR@${pool.price:.0f}"
+                            anchor += f"+LIQ_FLOOR_BSL@${pool.price:.0f}"
             except Exception:
                 pass
 
@@ -1766,9 +1835,16 @@ class ICTEntryGate:
             sweep_setup: Optional['ICTSweepSetup'],
             price: float,
             quant: Optional['QuantHelperSignals'] = None,
+            mode: str = "reversion",
+            market_regime: str = "RANGING",
     ) -> Tuple[str, int, str]:
         """
         Returns (tier: "S"|"A"|"B"|"BLOCKED", confirm_ticks: int, reason: str).
+
+        v6.0 UPGRADES:
+          1. mode="momentum" bypasses AMD ACCUMULATION gate and P/D gate
+          2. market_regime="TRENDING_*" waives P/D gate (trends live in premium)
+          3. Relaxed AMD ACCUMULATION blocking (only at conf >= 0.85, was 0.75)
 
         quant: QuantHelperSignals — order-flow helpers. If None, soft-veto
                checks based on quant are skipped (permissive fallback).
@@ -1807,20 +1883,19 @@ class ICTEntryGate:
 
         # AMD Accumulation = no sweep = no delivery — waiting for setup.
         #
-        # CRITICAL FIX: ACCUMULATION only hard-blocks at HIGH confidence (≥0.75),
-        # which indicates genuine tight-range consolidation with no directional bias.
+        # v6.0 FIX: ACCUMULATION hard-blocks only at VERY HIGH confidence (≥0.85),
+        # AND is BYPASSED entirely for momentum entries (breakout retest).
+        # Momentum entries have their own validation (breakout detection + retest
+        # confirmation + bounce) — AMD delivery context is irrelevant.
         #
-        # At moderate confidence (0.55-0.75), ACCUMULATION typically means a previous
-        # sweep has aged past 90 minutes and AMD decayed back — this is NOT the same
-        # as "no edge exists."  Tier-S and Tier-A will fail naturally because they
-        # require _has_delivery_context (DISTRIBUTION/REACCUMULATION/REDISTRIBUTION).
-        # Tier-B does NOT require AMD delivery context — it's a quant-primary entry
-        # where ICT provides confluence but not the primary setup.
-        #
-        # Previous threshold of 0.55 blocked ALL entries (including Tier-B) whenever
-        # no sweep had occurred in the last 90 minutes — which in a ranging market
-        # (ADX<20) is most of the session.  Result: zero trades per session.
-        if amd_phase == "ACCUMULATION" and amd_conf >= 0.75:
+        # Previous threshold of 0.75 blocked too aggressively in trending markets
+        # where price grinds without sweeping. In a trend, AMD decays to
+        # ACCUMULATION simply because no sweep occurred — not because the market
+        # is actually accumulating.
+        _is_momentum = (mode == "momentum")
+        _is_trending = market_regime in ("TRENDING_UP", "TRENDING_DOWN")
+        if (amd_phase == "ACCUMULATION" and amd_conf >= 0.85
+                and not _is_momentum):
             return "BLOCKED", 0, f"AMD_ACCUM(conf={amd_conf:.2f})_no_delivery"
 
         # AMD Manipulation without a sweep setup = Judas swing still active
@@ -1969,6 +2044,8 @@ class ICTEntryGate:
                     (side == "long"  and amd_bias == "bullish")
                 ))  # AMD delivery: P/D gate waived — delivery crosses zones by design
                 or
+                _is_trending   # v6.0: trends live in premium/discount — P/D waived
+                or
                 (side == "long"  and not in_prem)   # standard P/D gate for non-delivery
                 or
                 (side == "short" and not in_disc)
@@ -2024,20 +2101,33 @@ class ICTEntryGate:
             # TRENDING_UP, TRENDING_DOWN — full structural requirement
             _ict_b_floor = 0.35
 
+        # v6.0: Momentum entries use a lower ICT floor — the breakout IS the
+        # institutional structure. When a breakout fires + retest confirms,
+        # requiring high ICT total is requiring evidence the breakout created.
+        if _is_momentum:
+            _ict_b_floor = min(_ict_b_floor, 0.08)
+
+        # v6.0: P/D gate waiver for momentum and trending markets.
+        # In a bull trend, price LIVES in premium — pullbacks to buy happen
+        # in premium by definition. The P/D gate is valuable in ranging markets
+        # where it prevents chasing. In trending markets, it prevents trading.
+        _pd_gate_active = not (_is_momentum or _is_trending)
+
         _tier_b_conditions = (
             ict_total >= _ict_b_floor and    # ADX-adaptive — see comment above
             abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
-            q_overext and          # VWAP overextension required for standard entries
-            n_conf >= 3 and        # majority of quant signals agree
+            (q_overext or _is_momentum) and  # momentum doesn't need VWAP overextension
+            (n_conf >= 3 or (_is_momentum and n_conf >= 2)) and  # relaxed for momentum
             # HTF veto removed — direction determined by ICT + order flow
             not tf_opposes and
-            # P/D zone gate: don't enter longs in premium or shorts in discount
-            (side == "long"  and not in_prem or
-             side == "short" and not in_disc)
+            # P/D zone gate: waived for momentum + trending markets
+            (not _pd_gate_active or (
+                (side == "long"  and not in_prem) or
+                (side == "short" and not in_disc)))
         )
         if _tier_b_conditions:
-            return ("B", 3,
-                    f"TIER-B std ICT={ict_total:.2f} "
+            return ("B", 3 if not _is_momentum else 2,
+                    f"TIER-B {'momentum' if _is_momentum else 'std'} ICT={ict_total:.2f} "
                     f"Σ={q_composite:+.3f} overext={q_overext} n={n_conf}/5")
 
         # ── Specific BLOCKED reason for diagnostics ───────────────────────
@@ -2065,9 +2155,9 @@ class ICTEntryGate:
                 (side == "short" and amd_bias == "bearish")
             )
         )
-        if (side == "long"  and in_prem  and not _in_amd_delivery):
+        if _pd_gate_active and (side == "long"  and in_prem  and not _in_amd_delivery):
             block_reasons.append("LONG_IN_PREMIUM")
-        if (side == "short" and in_disc  and not _in_amd_delivery):
+        if _pd_gate_active and (side == "short" and in_disc  and not _in_amd_delivery):
             block_reasons.append("SHORT_IN_DISCOUNT")
         # HTF veto informational only — not a BLOCKED reason
         if htf_veto:

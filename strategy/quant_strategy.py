@@ -978,7 +978,9 @@ class RegimeClassifier:
         self._confidence = 0.5
         self._direction  = "neutral"
 
-    def update(self, adx: ADXEngine, atr: ATREngine, htf: HTFTrendFilter) -> MarketRegime:
+    def update(self, adx: 'ADXEngine', atr: 'ATREngine', htf: 'HTFTrendFilter',
+               vwap_dev_atr: float = 0.0, breakout_active: bool = False,
+               breakout_dir: str = "") -> 'MarketRegime':
         adx_val    = adx.adx
         trend_dir  = adx.trend_direction()
         trend_thr  = QCfg.ADX_TREND_THRESH()
@@ -1061,6 +1063,29 @@ class RegimeClassifier:
             regime = MarketRegime.RANGING
         else:
             regime = MarketRegime.TRANSITIONING
+
+        # ── v6.0: BREAKOUT FAST-TRIGGER OVERLAY ──────────────────────────
+        # ADX is a lagging indicator (EMA of directional movement). In a fresh
+        # breakout, ADX takes 10-15 candles to react. By then the move is over.
+        #
+        # Fast-trigger: when breakout detector fires AND VWAP deviation exceeds
+        # 2.0×ATR, immediately promote to TRENDING regardless of ADX.
+        # This unlocks _evaluate_trend_entry within 1-2 candles of the move.
+        if breakout_active and abs(vwap_dev_atr) >= 2.0:
+            if breakout_dir == "up" and regime != MarketRegime.TRENDING_UP:
+                regime = MarketRegime.TRENDING_UP
+                confidence = max(confidence, 0.60)
+                _di_override_dir = "up"
+                logger.debug(
+                    f"🚀 Regime FAST-TRIGGER: → TRENDING_UP "
+                    f"(breakout_up + VWAP_dev={vwap_dev_atr:+.1f}ATR)")
+            elif breakout_dir == "down" and regime != MarketRegime.TRENDING_DOWN:
+                regime = MarketRegime.TRENDING_DOWN
+                confidence = max(confidence, 0.60)
+                _di_override_dir = "down"
+                logger.debug(
+                    f"🚀 Regime FAST-TRIGGER: → TRENDING_DOWN "
+                    f"(breakout_down + VWAP_dev={vwap_dev_atr:+.1f}ATR)")
 
         self._regime     = regime
         self._confidence = confidence
@@ -1764,6 +1789,41 @@ class InstitutionalLevels:
                         f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
             except Exception as _ict_e:
                 logger.debug(f"ICT TP targets error (non-fatal): {_ict_e}")
+
+        # ── v6.0: LIQUIDITY POOL TARGETING (PATH-B) ─────────────────────────
+        # CRITICAL FIX: PATH-B (non-sweep entries) never scanned liquidity pools.
+        # This meant non-sweep TPs had no real structural target — just VWAP or
+        # a blind R:R floor. Opposing liquidity pools are WHERE stops cluster =
+        # WHERE price is magnetically attracted to.
+        #
+        # For LONG: scan BSL pools above price (buy-side liquidity = target)
+        # For SHORT: scan SSL pools below price (sell-side liquidity = target)
+        if ict_engine is not None:
+            try:
+                for pool in ict_engine.liquidity_pools:
+                    if pool.swept:
+                        continue
+                    _pool_score = 5.5 + min(pool.touch_count * 0.25, 1.5)
+                    # Higher score for HTF pools (4H/1D pools are stronger magnets)
+                    _tf_bonus = {"1d": 1.0, "4h": 0.5, "1h": 0.25}.get(
+                        getattr(pool, 'timeframe', '5m'), 0.0)
+                    _pool_score += _tf_bonus
+                    if side == "long" and pool.level_type == "BSL" and pool.price > price:
+                        _tp_cand = pool.price - 0.05 * atr  # just before the pool
+                        add_tp_ict(_tp_cand, _pool_score,
+                                   max(sl_dist * 1.0, atr * 0.5))
+                        logger.debug(
+                            f"🎯 LIQ TP candidate: BSL@${pool.price:,.0f} "
+                            f"touches={pool.touch_count} score={_pool_score:.1f}")
+                    elif side == "short" and pool.level_type == "SSL" and pool.price < price:
+                        _tp_cand = pool.price + 0.05 * atr  # just before the pool
+                        add_tp_ict(_tp_cand, _pool_score,
+                                   max(sl_dist * 1.0, atr * 0.5))
+                        logger.debug(
+                            f"🎯 LIQ TP candidate: SSL@${pool.price:,.0f} "
+                            f"touches={pool.touch_count} score={_pool_score:.1f}")
+            except Exception as _liq_e:
+                logger.debug(f"LIQ TP targets error (non-fatal): {_liq_e}")
 
         # ── ICT-Primary Tiered Selection ─────────────────────────────────────
         #
@@ -3429,7 +3489,12 @@ class QuantStrategy:
 
         # ── Regime classification ─────────────────────────────────────────────
         self._adx.compute(candles_5m)
-        regime = self._regime.update(self._adx, self._atr_5m, self._htf)
+        regime = self._regime.update(
+            self._adx, self._atr_5m, self._htf,
+            vwap_dev_atr=self._vwap.deviation_atr if hasattr(self._vwap, 'deviation_atr') else 0.0,
+            breakout_active=self._breakout.is_active if hasattr(self, '_breakout') else False,
+            breakout_dir=self._breakout.direction if hasattr(self, '_breakout') and self._breakout.is_active else "",
+        )
 
         # ── Regime-adaptive weights (v7.0) ────────────────────────────────────
         # Signal weights shift based on market regime so the composite score
@@ -3441,15 +3506,46 @@ class QuantStrategy:
 
         # ── Mean-reversion signals ────────────────────────────────────────────
         vs  = self._vwap.get_reversion_signal(price, atr_5m)
-        cs  = self._cvd.get_divergence_signal(candles_1m)
         obs = self._ob_eng.get_signal()
         ts  = self._tick_eng.get_signal()
         ve  = self._vol_exh.compute(candles_1m)
 
-        comp = (vs*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
+        # ── v6.0 FIX: CVD signal = blend of DIVERGENCE + TREND ───────────────
+        # PROBLEM: get_divergence_signal() returns 0 when CVD and price AGREE.
+        # In a trend with strong buying AND rising price, CVD divergence = 0.
+        # The strongest possible order flow confirmation was invisible.
+        #
+        # FIX: Blend both signals with regime-adaptive mixing:
+        #   RANGING:    80% divergence + 20% trend (reversal detection primary)
+        #   TRENDING:   20% divergence + 80% trend (directional flow primary)
+        #   TRANSITION: 50% divergence + 50% trend (balanced)
+        _cvd_div   = self._cvd.get_divergence_signal(candles_1m)
+        _cvd_trend = self._cvd.get_trend_signal()
+        if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
+            cs = _cvd_div * 0.20 + _cvd_trend * 0.80
+        elif regime == MarketRegime.TRANSITIONING:
+            cs = _cvd_div * 0.50 + _cvd_trend * 0.50
+        else:
+            cs = _cvd_div * 0.80 + _cvd_trend * 0.20
+
+        # ── v6.0 FIX: Cap VWAP deviation influence ───────────────────────────
+        # PROBLEM: VWAP deviation maxes at -1.0 whenever price is >1.2 ATR away.
+        # In a trend, VWAP stays behind permanently, so vs = -1.0 ALWAYS.
+        # This turns 30-40% of the composite into a permanent directional bias
+        # that measures DISTANCE, not selling pressure.
+        #
+        # FIX: In trending markets, cap VWAP influence at ±0.5 so it doesn't
+        # dominate. The weight schedule already reduces VWAP to 0.15, but the
+        # -1.0 signal × 0.15 = -0.15 is still significant when other signals
+        # are near zero.
+        _vs_capped = vs
+        if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
+            _vs_capped = max(-0.50, min(0.50, vs))
+
+        comp = (_vs_capped*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
         comp = max(-1.0, min(1.0, comp))
         direction = 1.0 if comp >= 0 else -1.0
-        nc = sum(1 for s in [vs, cs, obs, ts, ve] if s * direction > 0.05)
+        nc = sum(1 for s in [_vs_capped, cs, obs, ts, ve] if s * direction > 0.05)
 
         # ── Trend-following score (TRENDING regime) ───────────────────────────
         # B4 FIX: The original formula used obs (Level-2 bid/ask z-score) at 20%
@@ -3659,7 +3755,8 @@ class QuantStrategy:
                             _qh_d = self._get_quant_helpers(sig, _disp_rev_side)
                             _td, _, _tdr = ICTEntryGate.evaluate(
                                 _disp_rev_side, sig,
-                                self._active_sweep_setup, price, _qh_d)
+                                self._active_sweep_setup, price, _qh_d,
+                                mode="reversion", market_regime=sig.market_regime)
                             _tier_display  = _td
                             _tier_reason_d = _tdr
                         except Exception:
@@ -3851,7 +3948,8 @@ class QuantStrategy:
                     # instead of the generic "👀 Watching" that obscures ICT blocks.
                     _ap_tier, _, _ap_reason = ICTEntryGate.evaluate(
                         _ict_rev_side, sig,
-                        self._active_sweep_setup, price, _qh_ap)
+                        self._active_sweep_setup, price, _qh_ap,
+                        mode="reversion", market_regime=sig.market_regime)
                     ap = _ap_tier in ("S", "A", "B")
                     # FIX Bug-3: ICTEntryGate passed but breakout would block in
                     # _evaluate_entry — display must reflect the same gate.
@@ -4345,6 +4443,40 @@ class QuantStrategy:
         if not _is_ote_sweep and not self._regime.allows_reversion(side):
             self._confirm_long = self._confirm_short = 0; return
 
+        # ── v6.0 MTF DIRECTIONAL OVERRIDE ─────────────────────────────────
+        # INSTITUTIONAL PRINCIPLE: don't fade 3+ aligned timeframes.
+        # When 1D, 1H, 15M are all bullish and you're trying to SHORT, you're
+        # fighting the entire institutional order flow. The composite may say
+        # SHORT because VWAP deviation = -1.0 (distance, not selling), but
+        # selling into 3+ bullish TFs is how retail gets destroyed.
+        #
+        # Skipped for sweep entries — sweeps are institutional setups that
+        # can be counter-trend by design (sweep of SSL in a downtrend).
+        if not _is_ote_sweep:
+            try:
+                _trend_scores = []
+                if hasattr(sig, 'trend_1d'): _trend_scores.append(sig.trend_1d)
+                if hasattr(sig, 'trend_4h'): _trend_scores.append(sig.trend_4h)
+                if hasattr(sig, 'trend_1h'): _trend_scores.append(sig.trend_1h)
+                if hasattr(sig, 'trend_15m'): _trend_scores.append(sig.trend_15m)
+                # Fallback: use HTF filter if individual trend scores not available
+                if not _trend_scores and hasattr(self, '_htf'):
+                    _h4 = self._htf.trend_4h
+                    _h15 = self._htf.trend_15m
+                    if side == "short" and _h4 > 0.3 and _h15 > 0.3:
+                        self._confirm_long = self._confirm_short = 0; return
+                    if side == "long" and _h4 < -0.3 and _h15 < -0.3:
+                        self._confirm_long = self._confirm_short = 0; return
+                elif _trend_scores:
+                    _bull_count = sum(1 for s in _trend_scores if s > 0.3)
+                    _bear_count = sum(1 for s in _trend_scores if s < -0.3)
+                    if side == "short" and _bull_count >= 3:
+                        self._confirm_long = self._confirm_short = 0; return
+                    if side == "long" and _bear_count >= 3:
+                        self._confirm_long = self._confirm_short = 0; return
+            except Exception:
+                pass
+
         # ── Breakout veto: never fade a detected breakout ─────────────────
         # Skipped for sweep entries — a LONG sweep entry WITH the breakout
         # direction is not a fade; blocks_reversion only protects counter-trend.
@@ -4489,7 +4621,8 @@ class QuantStrategy:
                 _ICT_TRADE_ENGINE_AVAILABLE):
             try:
                 _tier, _cn_override, _tier_reason = ICTEntryGate.evaluate(
-                    side, sig, self._active_sweep_setup, price, quant_helpers)
+                    side, sig, self._active_sweep_setup, price, quant_helpers,
+                    mode="reversion", market_regime=sig.market_regime)
 
                 if _tier == "BLOCKED":
                     if self._ict_gate_start_time_rev == 0.0:
@@ -4727,7 +4860,9 @@ class QuantStrategy:
         if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
             try:
                 _qh = self._get_quant_helpers(sig, trend_side)
-                _t, _cn, _tr = ICTEntryGate.evaluate(trend_side, sig, None, price, _qh)
+                _t, _cn, _tr = ICTEntryGate.evaluate(
+                    trend_side, sig, None, price, _qh,
+                    mode="trend", market_regime=sig.market_regime)
                 if _t == "BLOCKED":
                     if self._ict_gate_start_time_trend == 0.0:
                         self._ict_gate_start_time_trend = now
@@ -5035,7 +5170,9 @@ class QuantStrategy:
         if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
             try:
                 _qh_mo = self._get_quant_helpers(sig, side)
-                _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(side, sig, None, price, _qh_mo)
+                _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(
+                    side, sig, None, price, _qh_mo,
+                    mode="momentum", market_regime=sig.market_regime)
                 if _t_mo == "BLOCKED":
                     if self._ict_gate_start_time_mom == 0.0:
                         self._ict_gate_start_time_mom = now
@@ -5170,6 +5307,7 @@ class QuantStrategy:
                     candles_15m  = candles_15m,
                     atr_pctile   = atr_pctile,
                     mode         = mode,
+                    market_regime = self._regime.regime.value if hasattr(self._regime, 'regime') else "RANGING",
                 )
                 tp_price = ICTTPEngine.compute(
                     side, price, atr, sl_price,
@@ -5200,11 +5338,20 @@ class QuantStrategy:
                 sl_price = None; tp_price = None; _sl_source = "none"
 
         # ══════════════════════════════════════════════════════════════════════
-        # v5.0 PATH-B — LEGACY ICT HIERARCHY (unchanged from v4.9)
+        # v5.0 PATH-B — LEGACY ICT HIERARCHY (v6.0: regime-adaptive + liq guard)
         # ══════════════════════════════════════════════════════════════════════
         if sl_price is None:
+            # v6.0: regime-adaptive min_dist for PATH-B
+            _regime_str = self._regime.regime.value if hasattr(self._regime, 'regime') else "RANGING"
+            if _regime_str in ("TRENDING_UP", "TRENDING_DOWN"):
+                _path_b_min_dist = max(price * 0.005, 1.0 * atr)
+            elif _regime_str == "TRANSITIONING":
+                _path_b_min_dist = max(price * 0.004, 0.7 * atr)
+            else:
+                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
+
             # ── Step 1: ICT 15m OB ────────────────────────────────────────────
-            _ob_min_dist = 0.5 * atr
+            _ob_min_dist = max(0.5 * atr, _path_b_min_dist)
             _ob_max_dist = price * QCfg.MAX_SL_PCT()
             if self._ict is not None:
                 try:
@@ -5235,7 +5382,7 @@ class QuantStrategy:
                 buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (
                     1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
                 _sl_buf  = buf_mult * atr
-                _min_dist = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
+                _min_dist = _path_b_min_dist
                 _max_dist = price * QCfg.MAX_SL_PCT()
                 _candidates: List[Tuple[float, float]] = []
 
@@ -5267,9 +5414,7 @@ class QuantStrategy:
 
             # ── Step 3: ATR fallback ───────────────────────────────────────────
             if sl_price is None:
-                _atr_floor  = 0.40 * atr
-                _pct_floor  = price * QCfg.MIN_SL_PCT()
-                _min_dist   = max(_pct_floor, _atr_floor)
+                _min_dist   = _path_b_min_dist
                 _max_dist   = price * QCfg.MAX_SL_PCT()
                 _atr_sl_dist = max(_min_dist, min(_max_dist, 1.5 * atr))
                 sl_price   = _round_to_tick(
@@ -5277,11 +5422,44 @@ class QuantStrategy:
                 _sl_source = "ATR_fallback"
                 logger.warning(
                     f"⚠️ SL ATR fallback: ${sl_price:,.2f} "
-                    f"({_atr_sl_dist:.0f}pts / 1.50ATR) — no 15m structure found")
+                    f"({_atr_sl_dist:.0f}pts / {_atr_sl_dist/atr:.2f}ATR) — no 15m structure found")
+
+            # ── v6.0: PATH-B LIQUIDITY PROXIMITY GUARD ─────────────────────────
+            # Same logic as ICTSLEngine — if SL sits near a BSL/SSL cluster,
+            # move it behind the pool so the sweep doesn't take us out.
+            if sl_price is not None and self._ict is not None:
+                try:
+                    _liq_guard_dist = 0.6 * atr
+                    _liq_buffer     = 0.35 * atr
+                    _max_dist_liq   = price * QCfg.MAX_SL_PCT()
+                    for pool in self._ict.liquidity_pools:
+                        if pool.swept:
+                            continue
+                        dist_sl_to_pool = abs(sl_price - pool.price)
+                        if dist_sl_to_pool > _liq_guard_dist:
+                            continue
+                        if side == "long" and pool.level_type == "SSL" and pool.price < price:
+                            new_sl = pool.price - _liq_buffer
+                            if abs(price - new_sl) <= _max_dist_liq:
+                                logger.info(
+                                    f"🛡️ PATH-B LIQ GUARD: SL ${sl_price:,.2f} → "
+                                    f"${new_sl:,.2f} (behind SSL@${pool.price:,.0f})")
+                                sl_price = _round_to_tick(new_sl)
+                                _sl_source += "(liq_guard)"
+                        elif side == "short" and pool.level_type == "BSL" and pool.price > price:
+                            new_sl = pool.price + _liq_buffer
+                            if abs(new_sl - price) <= _max_dist_liq:
+                                logger.info(
+                                    f"🛡️ PATH-B LIQ GUARD: SL ${sl_price:,.2f} → "
+                                    f"${new_sl:,.2f} (behind BSL@${pool.price:,.0f})")
+                                sl_price = _round_to_tick(new_sl)
+                                _sl_source += "(liq_guard)"
+                except Exception:
+                    pass
 
         # ── Mode-aware SL sizing (trend/momentum ATR cap) ──────────────────
         if mode in ("trend", "momentum"):
-            max_sl_atr = float(_cfg("QUANT_TREND_SL_ATR_MULT", 2.0))
+            max_sl_atr = float(_cfg("QUANT_TREND_SL_ATR_MULT", 3.0))
             max_sl_dist = max_sl_atr * atr
             current_dist = abs(price - sl_price)
             if current_dist > max_sl_dist:
