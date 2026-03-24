@@ -1122,14 +1122,13 @@ class QuantEngine:
         """True when all components have enough data to produce valid signals."""
         with self._trade_count_lock:
             tc = self._trade_count
-        return (self._vpin.is_warmed and tc >= 200 and self._prediction_count >= 5)
+        return (self._vpin.is_warmed and tc >= 200)
 
     @property
     def warmup_status(self) -> Dict[str, bool]:
         return {
             "vpin": self._vpin.is_warmed,
             "trades": self._trade_count >= 200,
-            "predictions": self._prediction_count >= 5,
             "total_trades": self._trade_count,
         }
 
