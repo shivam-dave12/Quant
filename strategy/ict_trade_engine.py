@@ -1950,10 +1950,11 @@ class ICTEntryGate:
                 except Exception:
                     pass
 
-            # Source 3: AMD bias alignment with high confidence
-            # If AMD engine says bearish with 0.80+ conf and we're going short,
-            # the sweep detection already fired — AMD phase IS the confirmation
-            if not _sweep_confirmed_for_side and amd_conf >= 0.80:
+            # Source 3: AMD bias alignment with confident phase
+            # If AMD engine says bearish with 0.70+ conf and we're going short,
+            # the sweep detection already fired — AMD phase IS the confirmation.
+            # Threshold matches the side-override threshold in quant_strategy.
+            if not _sweep_confirmed_for_side and amd_conf >= 0.70:
                 if (side == "short" and amd_bias == "bearish") or \
                    (side == "long" and amd_bias == "bullish"):
                     _sweep_confirmed_for_side = True
@@ -2187,21 +2188,36 @@ class ICTEntryGate:
         # In a bull trend, price LIVES in premium — pullbacks to buy happen
         # in premium by definition. The P/D gate is valuable in ranging markets
         # where it prevents chasing. In trending markets, it prevents trading.
-        # v6.1: P/D gate waiver for momentum, trending, AND sweep OTE entries.
-        # When a sweep OTE setup is active, price is at the optimal trade entry
-        # by definition — P/D zone is irrelevant. The sweep defines the zone.
-        _pd_gate_active = not (_is_momentum or _is_trending or _sweep_ote)
+        # v6.2: P/D gate waiver expanded. During MANIPULATION/DISTRIBUTION with
+        # AMD-aligned entry, P/D is irrelevant — manipulation creates the zone,
+        # distribution delivers through it.
+        _amd_aligned = (
+            amd_phase in ("MANIPULATION", "DISTRIBUTION") and
+            amd_conf >= 0.70 and
+            ((side == "long" and amd_bias == "bullish") or
+             (side == "short" and amd_bias == "bearish"))
+        )
+        _pd_gate_active = not (_is_momentum or _is_trending or _sweep_ote or _amd_aligned)
+
+        # v6.2: During confirmed AMD MANIPULATION/DISTRIBUTION, the composite
+        # is dominated by VWAP distance which opposes the AMD direction by design.
+        # Requiring composite ≥ 0.30 in the AMD direction is asking mean-reversion
+        # signals to confirm a structural setup — circular. Lower threshold.
+        _comp_min = ICTEntryGate.TIER_B_COMPOSITE_MIN
+        if _amd_aligned:
+            _comp_min = 0.10  # structural entry, not statistical
 
         _tier_b_conditions = (
             ict_total >= _ict_b_floor and    # ADX-adaptive — see comment above
-            abs(q_composite) >= ICTEntryGate.TIER_B_COMPOSITE_MIN and
-            (q_overext or _is_momentum or _sweep_ote) and  # sweep OTE doesn't need overext
+            abs(q_composite) >= _comp_min and
+            (q_overext or _is_momentum or _sweep_ote or _amd_aligned) and
             (n_conf >= 3 or (_is_momentum and n_conf >= 2) or
-             (_sweep_ote and n_conf >= 2)) and  # relaxed for sweep OTE
-            # v6.1: tick flow veto relaxed during MANIPULATION with active sweep
-            # During manipulation, flow SHOULD oppose — that's the Judas swing
-            (not tf_opposes or (_sweep_ote and amd_phase == "MANIPULATION")) and
-            # P/D zone gate: waived for momentum + trending + sweep OTE
+             (_sweep_ote and n_conf >= 2) or
+             (_amd_aligned and n_conf >= 2)) and  # relaxed for AMD-aligned
+            # v6.1: tick flow veto relaxed during MANIPULATION/DISTRIBUTION
+            (not tf_opposes or _amd_aligned or
+             (_sweep_ote and amd_phase == "MANIPULATION")) and
+            # P/D zone gate: waived for momentum + trending + sweep OTE + AMD-aligned
             (not _pd_gate_active or (
                 (side == "long"  and not in_prem) or
                 (side == "short" and not in_disc)))

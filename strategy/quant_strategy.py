@@ -3552,7 +3552,7 @@ class QuantStrategy:
                 pass
         if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
             _vs_capped = max(-0.50, min(0.50, vs))
-        elif _amd_phase_live == "MANIPULATION" and _amd_conf_live >= 0.80:
+        elif _amd_phase_live in ("MANIPULATION", "DISTRIBUTION") and _amd_conf_live >= 0.70:
             _vs_capped = max(-0.40, min(0.40, vs))
 
         comp = (_vs_capped*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
@@ -4460,14 +4460,18 @@ class QuantStrategy:
             #
             # During high-confidence MANIPULATION, override VWAP side with AMD bias.
             _amd_override = False
-            if (sig.amd_phase == "MANIPULATION" and sig.amd_conf >= 0.80
+            # v6.2: Override VWAP side during MANIPULATION and DISTRIBUTION.
+            # MANIPULATION: institutional intent via sweep/Judas swing
+            # DISTRIBUTION: active delivery — fading delivery is suicidal
+            if (sig.amd_phase in ("MANIPULATION", "DISTRIBUTION")
+                    and sig.amd_conf >= 0.70
                     and sig.amd_bias in ("bullish", "bearish")):
                 _amd_side = "long" if sig.amd_bias == "bullish" else "short"
                 if _amd_side != sig.reversion_side:
                     side = _amd_side
                     _amd_override = True
                     logger.debug(
-                        f"🔄 AMD MANIPULATION override: VWAP says {sig.reversion_side}, "
+                        f"🔄 AMD {sig.amd_phase} override: VWAP says {sig.reversion_side}, "
                         f"AMD says {side} (conf={sig.amd_conf:.2f}) — using AMD")
                 else:
                     side = sig.reversion_side
