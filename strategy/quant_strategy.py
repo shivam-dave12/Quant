@@ -6823,15 +6823,27 @@ class QuantStrategy:
             logger.debug("_record_exchange_exit skipped — already FLAT")
             return
 
-        # ── DUPLICATE GUARD (v8.0): check _exit_completed FIRST ────────────
-        # This flag is set by whichever exit path (sync/reconcile/_exit_trade)
-        # finishes first.  All subsequent callers bail here before ANY telegram
-        # sends, preventing both double-counting AND double-reporting.
-        if self._exit_completed:
-            logger.info(
-                "_record_exchange_exit skipped — exit already completed "
-                f"(phase={pos.phase.name}, caller is a late duplicate)")
-            return
+        # ── ATOMIC EXIT CLAIM ──────────────────────────────────────────────
+        # ROOT CAUSE OF DOUBLE NOTIFICATION (observed in logs):
+        #   11:47:18.152  sync thread    → enters _record_exchange_exit, sees _exit_completed=False
+        #   11:47:18.775  reconcile thread → enters _record_exchange_exit, sees _exit_completed=False
+        #   11:47:18.906  sync thread    → finishes identify_exit_order, logs, sends telegram, records PnL
+        #   11:47:19.659  reconcile thread → finishes identify_exit_order, logs AGAIN, sends telegram AGAIN
+        #
+        # The old guard (checking _exit_completed without a lock) was non-atomic:
+        # both threads read False before either set True.  _exit_completed was only
+        # set inside _record_pnl() which runs AFTER identify_exit_order() (~1s of I/O).
+        #
+        # FIX: Atomic claim under the lock. The FIRST thread to arrive sets
+        # _exit_completed=True and proceeds. All others bail immediately.
+        # This happens BEFORE any I/O, logging, or telegram sends.
+        with self._lock:
+            if self._exit_completed:
+                logger.info(
+                    "_record_exchange_exit skipped — exit already claimed by another thread "
+                    f"(phase={pos.phase.name})")
+                return
+            self._exit_completed = True   # CLAIM: this thread owns the exit
 
         # ─── Step 1: Get exchange-confirmed exit data ──────────────────────────
         # Query both order IDs directly. One retry after 1 s.
@@ -7021,23 +7033,17 @@ class QuantStrategy:
         _total_trades incremented HERE (at close), not at entry — ensures
         win-rate denominator only counts closed trades.
 
-        DUPLICATE GUARD v2: Two-layer protection.
-          Layer 1: _exit_completed (bool) — fast bail for concurrent callers
-          Layer 2: _pnl_recorded_for (entry_time) — idempotency by position ID
+        IDEMPOTENCY: entry_time-based guard. Each position's PnL is recorded
+        exactly once. The _exit_completed flag is NOT checked here — it is used
+        as an atomic entry barrier in _record_exchange_exit() to prevent
+        concurrent threads from both entering that function.
 
         Returns False (no-op) if this position's PnL was already recorded.
         """
-        # Layer 1: fast check
-        if self._exit_completed:
-            logger.warning(
-                f"_record_pnl: _exit_completed already set "
-                f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) — skipped")
-            return False
-
         pos = self._pos
         pos_entry_time = getattr(pos, 'entry_time', 0.0)
 
-        # Layer 2: entry_time idempotency
+        # Entry_time idempotency: prevents double-counting if somehow called twice
         if pos_entry_time > 0 and abs(self._pnl_recorded_for - pos_entry_time) < 0.001:
             logger.warning(
                 f"_record_pnl: duplicate call for position entry_time={pos_entry_time:.3f} "
@@ -7046,7 +7052,6 @@ class QuantStrategy:
             return False
 
         # ── Record the trade ───────────────────────────────────────────────────
-        self._exit_completed = True
         self._pnl_recorded_for = pos_entry_time
 
         self._total_trades += 1
