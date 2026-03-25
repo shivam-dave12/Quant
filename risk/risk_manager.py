@@ -62,8 +62,10 @@ class RiskManager:
         # immediately instead of waiting — the main loop is never blocked.
         self._balance_fetch_in_progress = False
 
-        # Daily reset tracking — date-anchored, not trade-count dependent
-        self._last_reset_date = datetime.now(timezone.utc).date()
+        # Daily reset tracking — date-anchored using IST (UTC+5:30)
+        # Must match DailyRiskGate in quant_strategy to prevent cross-day PnL drift.
+        self._IST = timezone(timedelta(hours=5, minutes=30))
+        self._last_reset_date = datetime.now(self._IST).date()
 
         # Shared API — accepts CoinSwitchAPI, DeltaAPI, or ExecutionRouter.
         if shared_api is not None:
@@ -497,19 +499,14 @@ class RiskManager:
 
     def _reset_daily_if_needed(self):
         """
-        Reset all daily counters when a new UTC calendar day begins.
+        Reset all daily counters when a new IST calendar day begins.
 
-        CRITICAL BUGS FIXED vs previous version:
-        1. Old code returned immediately if daily_trades was empty — meaning
-           daily_pnl persisted across days when no trades were made, and
-           consecutive_losses was never reset. Both caused infinite gate locks.
-        2. consecutive_losses is now reset at day boundary. The previous version
-           never reset it in daily resets, creating an infinite deadlock:
-           losses → gate locked → can't trade → can't win → gate never unlocks.
-        3. Reset is now DATE-anchored (self._last_reset_date), not dependent
-           on having trade records. Even on days with 0 trades, the reset fires.
+        Uses IST (UTC+5:30) to match DailyRiskGate in quant_strategy.
+        This prevents cross-day PnL drift where a trade opening before
+        midnight UTC and closing after causes PnL to be assigned to the
+        wrong day.
         """
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(self._IST).date()
 
         if not hasattr(self, '_last_reset_date'):
             self._last_reset_date = today

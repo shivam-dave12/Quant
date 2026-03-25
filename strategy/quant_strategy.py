@@ -3112,11 +3112,18 @@ class QuantStrategy:
         self._total_trades = 0; self._winning_trades = 0; self._total_pnl = 0.0
         self._trade_history: List[Dict] = []   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
-        # DUPLICATE P&L GUARD: stores the entry_time (float) of the position
-        # whose close has already been recorded.  _record_pnl is a one-shot
-        # per position: the second call for the same entry_time is a no-op.
-        # This prevents sync-thread / reconcile-thread / _exit_trade races from
-        # double-counting trades and corrupting _total_pnl / win-rate.
+        # DUPLICATE P&L GUARD v2: two-layer protection.
+        #
+        # Layer 1: _exit_completed (bool) — set True the moment ANY exit path
+        #   finishes recording PnL.  Checked at the TOP of _record_exchange_exit()
+        #   BEFORE any telegram sends.  Never reset until a new position opens.
+        #   This prevents both double-counting AND double-reporting.
+        #
+        # Layer 2: _pnl_recorded_for (float) — stores the entry_time of the
+        #   position whose close has been recorded.  Checked inside _record_pnl()
+        #   as a secondary guard.  NOT reset in _finalise_exit() — only reset
+        #   when a new position enters ACTIVE phase.
+        self._exit_completed: bool = False
         self._pnl_recorded_for: float = 0.0
         # Track last known price for PnL fallback
         self._last_known_price = 0.0
@@ -3361,18 +3368,22 @@ class QuantStrategy:
                 threading.Thread(target=_bg_sync_exit, daemon=True,
                                  name="pos-sync-exit").start()
             if exiting_stuck:
-                logger.warning("⚠️ EXITING stuck >120s — recording PnL then force-finalising")
-                send_telegram_message(
-                    "⚠️ <b>EXITING TIMEOUT</b>\n"
-                    "Stuck in EXITING phase for >120s.\n"
-                    "Recording PnL=0 (unconfirmed) and resetting to FLAT.\n"
-                    "<b>Check exchange for open position!</b>")
-                # Record PnL as unconfirmed (0) — _pnl_recorded_for guard means
-                # if exchange already confirmed it via sync/reconcile this is a no-op.
-                self._record_pnl(0.0, exit_reason="exiting_timeout", exit_price=0.0,
-                                 fee_breakdown=None)
-                with self._lock:
-                    self._finalise_exit()
+                # v8.0: check if exit was already completed by sync/reconcile thread
+                if self._exit_completed:
+                    logger.info("EXITING stuck >120s but exit already completed — finalising")
+                    with self._lock:
+                        self._finalise_exit()
+                else:
+                    logger.warning("⚠️ EXITING stuck >120s — recording PnL then force-finalising")
+                    send_telegram_message(
+                        "⚠️ <b>EXITING TIMEOUT</b>\n"
+                        "Stuck in EXITING phase for >120s.\n"
+                        "Recording PnL=0 (unconfirmed) and resetting to FLAT.\n"
+                        "<b>Check exchange for open position!</b>")
+                    self._record_pnl(0.0, exit_reason="exiting_timeout", exit_price=0.0,
+                                     fee_breakdown=None)
+                    with self._lock:
+                        self._finalise_exit()
 
         elif phase == PositionPhase.ENTERING:
             # Bracket fill is being polled by a background thread.
@@ -5987,6 +5998,9 @@ class QuantStrategy:
         self.current_sl_price       = sl_price
         self.current_tp_price       = tp_price
         self._confirm_long          = self._confirm_short = 0
+        # Reset duplicate guards for the new position
+        self._exit_completed        = False
+        self._pnl_recorded_for     = 0.0
         # FIX Bug-C: record_trade_start() AFTER confirmed fill, not before.
         # Moving it here prevents aborted entries (TP-gate, fee-gate, exchange
         # error) from consuming the daily trade cap with no actual order sent.
@@ -6279,6 +6293,7 @@ class QuantStrategy:
         # might permanently overlap the trail zone, freezing the trail forever.
         # Fix: force ICT update here with live candles before every trail decision.
         # Now also passes candles_1m so fresh 1m OBs are detected for trail anchoring.
+        _trail_candles_15m = None   # v8.0: captured for trail engine Phase 3
         if self._ict is not None:
             try:
                 # Trail ICT update MUST use the same history depth as the
@@ -6288,6 +6303,7 @@ class QuantStrategy:
                 # entry engine — causing zone-freeze to compare trail price
                 # against OBs the entry engine had but the trail engine dropped.
                 candles_15m = data_manager.get_candles("15m", limit=200)
+                _trail_candles_15m = candles_15m   # v8.0: save for trail engine
                 _trail_5m   = data_manager.get_candles("5m",  limit=300)
                 _trail_1m   = data_manager.get_candles("1m",  limit=120)
                 self._ict.update(_trail_5m, candles_15m, price, now_ms,
@@ -6385,9 +6401,10 @@ class QuantStrategy:
                                      and o.low - _ob_buf > pos.sl_price
                                      and o.low < price - 1.0 * atr]
                         if valid_obs:
-                            best_ob = max(valid_obs, key=lambda o: o.low)
+                            # Prefer HTF OBs (higher strength), then closest to target
+                            best_ob = max(valid_obs, key=lambda o: (o.strength, o.low))
                             _struct_sl = best_ob.low - _ob_buf
-                            _struct_label = f"OB@${best_ob.midpoint:.0f}"
+                            _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
                     else:
                         # Find OB above target_price (structural defense)
                         valid_obs = [o for o in active_obs
@@ -6395,9 +6412,9 @@ class QuantStrategy:
                                      and o.high + _ob_buf < pos.sl_price
                                      and o.high > price + 1.0 * atr]
                         if valid_obs:
-                            best_ob = min(valid_obs, key=lambda o: o.high)
+                            best_ob = max(valid_obs, key=lambda o: (o.strength, -o.high))
                             _struct_sl = best_ob.high + _ob_buf
-                            _struct_label = f"OB@${best_ob.midpoint:.0f}"
+                            _struct_label = f"OB@${best_ob.midpoint:.0f}(tf={best_ob.timeframe})"
                 except Exception:
                     pass
 
@@ -6574,6 +6591,13 @@ class QuantStrategy:
         # swing structure, liquidity pools, and delivery target proximity.
         # No hardcoded phases, no fixed ATR multiples.
         # ══════════════════════════════════════════════════════════════════
+        # v8.0: fetch candles_15m for trail engine if not already fetched via ICT refresh
+        if _trail_candles_15m is None:
+            try:
+                _trail_candles_15m = data_manager.get_candles("15m", limit=100)
+            except Exception:
+                _trail_candles_15m = None
+
         _hold_reason: List[str] = []
         _atr_pctile = self._atr_5m.get_percentile()
 
@@ -6612,6 +6636,7 @@ class QuantStrategy:
             amd_confidence  = _amd_conf,
             adx             = _adx_now,
             tick_size       = QCfg.TICK_SIZE(),
+            candles_15m     = _trail_candles_15m,
         )
 
         if new_sl is None:
@@ -6756,17 +6781,13 @@ class QuantStrategy:
         result_icon  = "✅" if pnl_est > 0 else "❌"
 
         send_telegram_message(
-            f"{result_icon} <b>{'WIN' if pnl_est>0 else 'LOSS'} — MANUAL EXIT</b>\n"
+            f"🚪 <b>CLOSING POSITION — {reason.upper()}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
-            f"Reason:   {reason}\n"
             f"Entry:    ${pos.entry_price:,.2f}\n"
-            f"Exit:     <b>${price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
-            f"PnL est:  <b>${pnl_est:+.2f} USDT</b> <i>(exchange confirmation pending)</i>\n"
-            f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
-            f"Hold:     {hold_min:.1f}m\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
+            f"Est exit: ~${price:,.2f}  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
+            f"Est PnL:  ~${pnl_est:+.2f} USDT\n"
+            f"<i>Awaiting exchange confirmation...</i>"
         )
         self._last_exit_side = pos.side
         # _finalise_exit() is NOT called here — let _sync_position / _reconcile_apply
@@ -6800,6 +6821,16 @@ class QuantStrategy:
         pos = self._pos
         if pos.phase == PositionPhase.FLAT:
             logger.debug("_record_exchange_exit skipped — already FLAT")
+            return
+
+        # ── DUPLICATE GUARD (v8.0): check _exit_completed FIRST ────────────
+        # This flag is set by whichever exit path (sync/reconcile/_exit_trade)
+        # finishes first.  All subsequent callers bail here before ANY telegram
+        # sends, preventing both double-counting AND double-reporting.
+        if self._exit_completed:
+            logger.info(
+                "_record_exchange_exit skipped — exit already completed "
+                f"(phase={pos.phase.name}, caller is a late duplicate)")
             return
 
         # ─── Step 1: Get exchange-confirmed exit data ──────────────────────────
@@ -6983,32 +7014,39 @@ class QuantStrategy:
 
     def _record_pnl(self, pnl: float, exit_reason: str = "unknown",
                     exit_price: float = 0.0,
-                    fee_breakdown: Optional[Dict] = None):
+                    fee_breakdown: Optional[Dict] = None) -> bool:
         """
-        Record a completed trade. _total_trades incremented HERE (at close),
-        not at entry — ensures win-rate denominator only counts closed trades.
+        Record a completed trade. Returns True if recorded, False if duplicate.
 
-        fee_breakdown: dict with keys gross_pnl, entry_fee, exit_fee,
-          total_fees, net_pnl, exact_fees (bool). None for force-exit paths.
+        _total_trades incremented HERE (at close), not at entry — ensures
+        win-rate denominator only counts closed trades.
 
-        DUPLICATE GUARD: Each position is identified by pos.entry_time (set
-        once at fill confirmation and never modified).  The first call records
-        the trade; any subsequent call for the same entry_time is a silent
-        no-op.  This makes all three exit code-paths (_exit_trade,
-        _record_exchange_exit, reconcile) safe to call concurrently — only the
-        winner writes, the rest are dropped without corrupting stats.
+        DUPLICATE GUARD v2: Two-layer protection.
+          Layer 1: _exit_completed (bool) — fast bail for concurrent callers
+          Layer 2: _pnl_recorded_for (entry_time) — idempotency by position ID
+
+        Returns False (no-op) if this position's PnL was already recorded.
         """
+        # Layer 1: fast check
+        if self._exit_completed:
+            logger.warning(
+                f"_record_pnl: _exit_completed already set "
+                f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) — skipped")
+            return False
+
         pos = self._pos
         pos_entry_time = getattr(pos, 'entry_time', 0.0)
 
-        # ── Idempotency gate ──────────────────────────────────────────────────
-        # Use a small epsilon (0.001 s) to tolerate float precision drift.
+        # Layer 2: entry_time idempotency
         if pos_entry_time > 0 and abs(self._pnl_recorded_for - pos_entry_time) < 0.001:
             logger.warning(
                 f"_record_pnl: duplicate call for position entry_time={pos_entry_time:.3f} "
                 f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) — skipped to prevent double-count"
             )
-            return
+            return False
+
+        # ── Record the trade ───────────────────────────────────────────────────
+        self._exit_completed = True
         self._pnl_recorded_for = pos_entry_time
 
         self._total_trades += 1
@@ -7085,9 +7123,14 @@ class QuantStrategy:
         # Keep last 200 trades in memory — in-place trim avoids allocating a new list
         if len(self._trade_history) > 200:
             del self._trade_history[:-200]
+        return True
 
     def _finalise_exit(self):
-        self._pnl_recorded_for = 0.0   # reset guard so next position can record
+        # CRITICAL: do NOT reset _pnl_recorded_for or _exit_completed here.
+        # These guards must persist until a new position opens (in _enter_trade).
+        # Resetting them here was the v7.0 root cause of double-counting:
+        # _finalise_exit() ran, reset the guard, then a late sync/reconcile
+        # thread called _record_pnl() and the guard was open → duplicate.
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         logger.info("Position closed — FLAT")
@@ -7463,6 +7506,9 @@ class QuantStrategy:
                 entry_atr=self._atr_5m.atr)
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
+            # Reset duplicate guards for the newly adopted position
+            self._exit_completed = False
+            self._pnl_recorded_for = 0.0
             logger.warning(f"⚡ RECONCILE: adopted {ex_side} @ ${ex_entry:,.2f}")
             send_telegram_message(f"⚡ <b>POSITION ADOPTED</b>\nSide: {ex_side} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
             return
@@ -7491,4 +7537,11 @@ class QuantStrategy:
                 logger.info("📡 Sync: exchange FLAT → TP/SL fired")
                 self._record_exchange_exit(ex_pos)
         elif self._pos.phase==PositionPhase.EXITING:
-            if ex_size<QCfg.MIN_QTY(): self._finalise_exit()
+            if ex_size<QCfg.MIN_QTY():
+                # v8.0 FIX: call _record_exchange_exit, NOT _finalise_exit.
+                # The old code skipped PnL recording entirely for the normal
+                # EXITING→flat sync path.  _exit_trade sends estimated PnL via
+                # telegram but defers actual recording to this confirmation.
+                # Calling _finalise_exit directly meant PnL was never recorded.
+                logger.info("📡 Sync: EXITING confirmed FLAT → recording exit")
+                self._record_exchange_exit(ex_pos)

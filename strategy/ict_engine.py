@@ -636,6 +636,84 @@ class ICTEngine:
         self._initialized = False
 
     # ─────────────────────────────────────────────────────────────────────
+    # v8.0: PRUNE EXPIRED / MITIGATED ENTRIES
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _prune_expired(self, now_ms: int) -> None:
+        """
+        Remove expired and mitigated OBs/FVGs from all deques BEFORE
+        detection runs.
+
+        WHY THIS IS CRITICAL:
+        Without pruning, dead entries accumulate in the deques (up to maxlen=250).
+        The dedup check in _detect_obs/_detect_fvgs compares new candidates against
+        ALL entries (including dead ones). A new OB at the same structural level as
+        an expired OB is rejected by dedup — it looks like a duplicate. Consumer
+        code calls is_active() and doesn't see the dead entry, but the new one was
+        never added either. Result: OB count drops when entries expire and doesn't
+        recover until the dead entry is evicted by maxlen pressure.
+
+        This creates the observed fluctuation pattern:
+        1. OB detected at $70,000 from 5m candle, added to deque
+        2. 24h later: OB expires (is_active=False), but remains in deque
+        3. New 5m OB forms at ~$70,000 — dedup sees the dead one → blocks insert
+        4. Active OB count drops by 1 (dead one filtered, new one blocked)
+        5. Eventually maxlen evicts the dead one → new OB can be added → count jumps
+
+        Pruning before detection eliminates this entire failure mode.
+        """
+        # ── OBs: remove expired (age) and mitigated ───────────────────
+        for deq in (self.order_blocks_bull, self.order_blocks_bear):
+            to_remove = [
+                ob for ob in deq
+                if ob.mitigated
+                or (now_ms - ob.timestamp > ob.max_age_ms)
+                or ob.visit_count >= 3
+            ]
+            for ob in to_remove:
+                try:
+                    deq.remove(ob)
+                except ValueError:
+                    pass
+
+        # ── FVGs: remove expired (age) and fully filled ───────────────
+        for deq in (self.fvgs_bull, self.fvgs_bear):
+            to_remove = [
+                fvg for fvg in deq
+                if fvg.filled
+                or (now_ms - fvg.timestamp > fvg.max_age_ms)
+            ]
+            for fvg in to_remove:
+                try:
+                    deq.remove(fvg)
+                except ValueError:
+                    pass
+
+        # ── Breaker blocks: remove expired ─────────────────────────────
+        for deq in (self.breaker_blocks_bull, self.breaker_blocks_bear):
+            to_remove = [
+                bb for bb in deq
+                if (now_ms - bb.timestamp > bb.max_age_ms)
+                or bb.visit_count >= 2
+            ]
+            for bb in to_remove:
+                try:
+                    deq.remove(bb)
+                except ValueError:
+                    pass
+
+        # ── Rejection blocks: remove expired ───────────────────────────
+        to_remove = [
+            rb for rb in self.rejection_blocks
+            if not rb.is_active(now_ms)
+        ]
+        for rb in to_remove:
+            try:
+                self.rejection_blocks.remove(rb)
+            except ValueError:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────
     # MAIN UPDATE — called every 5s
     # ─────────────────────────────────────────────────────────────────────
 
@@ -656,6 +734,17 @@ class ICTEngine:
 
         if len(candles_5m) < 10:
             return
+
+        # ── v8.0: PRUNE EXPIRED/MITIGATED entries BEFORE detection ─────
+        # ROOT CAUSE OF OB/FVG COUNT FLUCTUATION:
+        # Expired OBs (past max_age) and mitigated OBs/FVGs stay in deques
+        # until the 250-entry maxlen evicts them. The dedup tolerance check
+        # in _detect_obs/_detect_fvgs matches against these dead entries,
+        # blocking legitimate new OBs at the same structural level from being
+        # added. Consumer code filters with is_active() and sees fewer OBs.
+        # When maxlen finally evicts dead entries, new ones appear → count jumps.
+        # Fix: remove all dead entries BEFORE running detection.
+        self._prune_expired(now_ms)
 
         # ── Session / Kill Zone ────────────────────────────────────────
         self._update_session(now_ms)
@@ -1397,37 +1486,85 @@ class ICTEngine:
     def _detect_liquidity_pools(self, price: float, now_ms: int) -> None:
         """Cluster equal highs (BSL) and equal lows (SSL).
 
-        BUG-LIQ-POOL-NO-EXPIRY FIX: rebuilt each cycle from current swing data.
-        Swept pools preserved up to 3× distribution window (~4.5h).
-        HTF pools now tagged with their source timeframe so delivery scoring
-        can weight 4H/1D pools more heavily than 5m/15m pools.
+        v8.0 STABILITY FIX: merge-update instead of clear-rebuild.
+
+        ROOT CAUSE OF POOL FLUCTUATION:
+        The old code did liquidity_pools.clear() + rebuild every 5s from
+        current swing points. Since _detect_swing_points() also clears
+        and rebuilds the swing lists, a single new candle shifting one
+        swing point could add or remove liquidity pools. Pools flickered
+        in and out between consecutive updates.
+
+        FIX: Keep existing unswept pools that are still structurally valid
+        (a swing cluster still exists within tolerance). Only ADD genuinely
+        new pools. Remove pools that lost all swing support.
+        Swept pools are always preserved within the age limit.
         """
         tol = price * self.LIQ_TOUCH_TOL_PCT
 
-        # Preserve swept pools within age limit
+        # ── Step 1: Build fresh candidate pools from current swing data ─
+        _fresh_pools: List[LiquidityLevel] = []
+        self._cluster_liq_into(_fresh_pools, self._swing_highs, "BSL", tol, price,
+                               meta=self._swing_highs_meta)
+        self._cluster_liq_into(_fresh_pools, self._swing_lows, "SSL", tol, price,
+                               meta=self._swing_lows_meta)
+
+        # ── Step 2: Partition existing pools ────────────────────────────
         max_swept_age = self.AMD_DISTRIB_WINDOW_MS * 3
-        swept_keep = [p for p in self.liquidity_pools
-                      if p.swept and now_ms - p.sweep_timestamp <= max_swept_age]
+        kept: List[LiquidityLevel] = []
+
+        for existing in self.liquidity_pools:
+            # Always keep swept pools within age limit
+            if existing.swept:
+                if now_ms - existing.sweep_timestamp <= max_swept_age:
+                    kept.append(existing)
+                continue
+
+            # Unswept: keep if a fresh cluster still supports it
+            still_valid = any(
+                abs(existing.price - fresh.price) <= tol
+                and existing.level_type == fresh.level_type
+                for fresh in _fresh_pools
+            )
+            if still_valid:
+                # Update touch count to reflect current cluster size
+                for fresh in _fresh_pools:
+                    if (abs(existing.price - fresh.price) <= tol
+                            and existing.level_type == fresh.level_type):
+                        existing.touch_count = max(existing.touch_count,
+                                                    fresh.touch_count)
+                        # Upgrade TF tag if a higher TF now supports it
+                        _TF_R = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
+                        if _TF_R.get(fresh.timeframe, 1) > _TF_R.get(existing.timeframe, 1):
+                            existing.timeframe = fresh.timeframe
+                        break
+                kept.append(existing)
+            # else: pool lost swing support → drop it (structural invalidation)
+
+        # ── Step 3: Add genuinely new pools not already in kept ─────────
+        for fresh in _fresh_pools:
+            already_exists = any(
+                abs(fresh.price - k.price) <= tol
+                and fresh.level_type == k.level_type
+                for k in kept
+            )
+            if not already_exists:
+                kept.append(fresh)
+
+        # ── Step 4: Replace the deque ──────────────────────────────────
         self.liquidity_pools.clear()
-        for p in swept_keep:
+        for p in kept:
             self.liquidity_pools.append(p)
 
-        # Cluster from current swing data — _cluster_liq handles TF tagging
-        # internally by reading the meta list for each cluster member.
-        self._cluster_liq(self._swing_highs, "BSL", tol, price,
-                          meta=self._swing_highs_meta)
-        self._cluster_liq(self._swing_lows,  "SSL", tol, price,
-                          meta=self._swing_lows_meta)
-
-    def _cluster_liq(self, prices: List[float], kind: str,
-                     tol: float, ref: float,
-                     meta: Optional[List[Tuple[float, str]]] = None) -> None:
+    def _cluster_liq_into(self, out: List, prices: List[float], kind: str,
+                          tol: float, ref: float,
+                          meta: Optional[List[Tuple[float, str]]] = None) -> None:
+        """Cluster swing points into liquidity pools, appending to `out` list."""
         if len(prices) < 2:
             return
         TF_RANK = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
-        sp   = sorted(prices)
+        sp = sorted(prices)
         used = set()
-        # Build a price→tf lookup from meta if provided
         price_tf: Dict[float, str] = {}
         if meta:
             for p, tf in meta:
@@ -1445,17 +1582,28 @@ class ICTEngine:
                     used.add(j)
             if len(cluster) >= 2:
                 avg = sum(cluster) / len(cluster)
-                # Assign the highest-TF source found in the cluster
                 best_tf = "5m"
                 for cp in cluster:
                     ct = price_tf.get(round(cp, 1), "5m")
                     if TF_RANK.get(ct, 1) > TF_RANK.get(best_tf, 1):
                         best_tf = ct
+                # Dedup against existing entries in out
                 if not any(abs(lp.price - avg) <= tol and lp.level_type == kind
-                           for lp in self.liquidity_pools):
-                    self.liquidity_pools.append(LiquidityLevel(
+                           for lp in out):
+                    out.append(LiquidityLevel(
                         price=avg, level_type=kind,
                         touch_count=len(cluster), timeframe=best_tf))
+
+    def _cluster_liq(self, prices: List[float], kind: str,
+                     tol: float, ref: float,
+                     meta: Optional[List[Tuple[float, str]]] = None) -> None:
+        """Legacy wrapper — delegates to _cluster_liq_into writing to self.liquidity_pools."""
+        _tmp: List = []
+        self._cluster_liq_into(_tmp, prices, kind, tol, ref, meta=meta)
+        for p in _tmp:
+            if not any(abs(lp.price - p.price) <= tol and lp.level_type == p.level_type
+                       for lp in self.liquidity_pools):
+                self.liquidity_pools.append(p)
 
     # ─────────────────────────────────────────────────────────────────────
     # LIQUIDITY SWEEP DETECTION
