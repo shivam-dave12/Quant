@@ -519,16 +519,23 @@ class ICTEngine:
     KZ_NY_START     = 7;  KZ_NY_END     = 10
 
     def __init__(self):
-        self.order_blocks_bull: Deque[OrderBlock]   = deque(maxlen=60)
-        self.order_blocks_bear: Deque[OrderBlock]   = deque(maxlen=60)
-        self.fvgs_bull:         Deque[FairValueGap] = deque(maxlen=60)
-        self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=60)
-        self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=80)
-        self._registered_sweeps: Deque[Tuple] = deque(maxlen=300)
-        # Advanced PD array types
-        self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=30)
-        self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=30)
-        self.rejection_blocks:    Deque[RejectionBlock] = deque(maxlen=30)
+        # Capacity: 6 TFs × up to 40 OBs each = 240 + headroom.
+        # Previous maxlen=60 caused eviction of older OBs which were then
+        # re-detected on the next scan and re-inserted as "new" — losing their
+        # true age, corrupting mitigation tracking, and causing OB count churn.
+        self.order_blocks_bull: Deque[OrderBlock]   = deque(maxlen=250)
+        self.order_blocks_bear: Deque[OrderBlock]   = deque(maxlen=250)
+        # FVG capacity: 6 TFs × every 3-candle pattern.  60 was too small for
+        # 300 5m candles + 200 15m candles scanned per update.
+        self.fvgs_bull:         Deque[FairValueGap] = deque(maxlen=250)
+        self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=250)
+        # Liquidity pools: 6 TFs × many swing points, need room for HTF pools
+        self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=200)
+        self._registered_sweeps: Deque[Tuple] = deque(maxlen=500)
+        # Advanced PD array types — doubled to accommodate HTF structures
+        self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=60)
+        self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=60)
+        self.rejection_blocks:    Deque[RejectionBlock] = deque(maxlen=60)
 
         # Per-TF structure snapshots
         self._tf: Dict[str, TFStructure] = {
@@ -1121,7 +1128,10 @@ class ICTEngine:
         """
         if len(candles) < 5:
             return
-        tol = price * 0.001
+        # Dedup tolerance: 0.2% of price (~$140 at $70k). Wide enough to collapse
+        # near-identical OBs from overlapping TF scans, tight enough to preserve
+        # genuinely distinct levels (typical OB bodies are $200-$2000 wide).
+        tol = price * 0.002
         min_impulse = self.OB_MIN_IMPULSE_PCT * (0.60 if tf == "1m" else 1.0)
 
         # Rolling prior highs/lows for BOS check
@@ -1133,11 +1143,25 @@ class ICTEngine:
         prior_h.sort(reverse=True)
         prior_l.sort()
 
+        # Age pre-filter: skip candles whose OB timestamp would be older than
+        # max_age already.  Without this, scanning 300 candles detects OBs that
+        # is_active() immediately rejects → they get re-inserted on the next call
+        # → detect/expire/re-detect churn that causes OB count fluctuation.
+        # A candle at bar i has timestamp ts = candle[i]['t'].  If ts < now_ms -
+        # max_age, that candle's OB would expire on the first is_active() call.
+        # We still need to scan it to provide context for impulse detection on
+        # candles after it — so we mark it rather than slicing the list.
+        _cutoff_ms = now_ms - max_age
+
         for i in range(2, len(candles) - 1):
             cur = candles[i]
             co, cc = float(cur['o']), float(cur['c'])
             ch, cl = float(cur['h']), float(cur['l'])
             ts = int(cur.get('t', now_ms))
+            # Skip OB candidates whose age would already exceed max_age at
+            # detection time — they would be immediately inactive on next call.
+            if ts > 0 and ts < _cutoff_ms:
+                continue
 
             # BUG-OB-SINGLE-CANDLE-IMPULSE FIX: check up to 3 candles ahead.
             # Original code only looked at candles[i+1]; if the impulse arrived
@@ -1242,13 +1266,24 @@ class ICTEngine:
         # filter noise.  Base = FVG_MIN_SIZE_PCT (0.020% = ~$14 on BTC).
         _tf_mult = {"1m": 0.40, "5m": 0.70, "15m": 1.0, "1h": 1.2, "4h": 1.5, "1d": 2.0}
         min_sz = price * self.FVG_MIN_SIZE_PCT / 100.0 * _tf_mult.get(tf, 1.0)
-        tol    = min_sz * 0.5
+        # FVG dedup tolerance: 0.15% of price (~$105 at $70k).
+        # Using min_sz*0.5 (~$5-$10) was far too tight — two FVGs detected
+        # from consecutive scans with microscopically different candle timestamps
+        # but identical levels would both be inserted, doubling FVG count.
+        tol    = price * 0.0015
+
+        # Age pre-filter: same logic as _detect_obs — skip candles that would
+        # produce FVGs already beyond max_age, preventing detect/expire churn.
+        _fvg_cutoff_ms = now_ms - max_age
 
         for i in range(1, len(candles) - 1):
             c1, c2, c3 = candles[i-1], candles[i], candles[i+1]
             h1, l1 = float(c1['h']), float(c1['l'])
             h3, l3 = float(c3['h']), float(c3['l'])
             ts = int(c2.get('t', now_ms))
+            # FVG timestamp is the middle candle's open-time; skip if already expired
+            if ts > 0 and ts < _fvg_cutoff_ms:
+                continue
 
             # Bullish FVG: upward impulse left a gap above c1 and below c3
             gap_bot = h1
@@ -2468,11 +2503,19 @@ class ICTEngine:
         # 4H premium/discount grade
         out.pd_grade = t4h.pd_grade
 
-        # MTF OB stack: count TFs that have an active OB for this side
+        # MTF OB stack: count HTF OBs structurally relevant to this trade.
+        # STABILITY FIX: old code used contains_price(price) — a boolean that
+        # flips on every tick as price moves in/out of the OB body, causing
+        # the Stack count to oscillate 3-5 OBs between consecutive updates.
+        # Fix: count all active HTF OBs within OB_PROXIMITY_ATR of price.
+        # This window is stable — price must move ~1.5×ATR to change whether an
+        # OB is "in range", vs the $5 needed to exit a body zone tick-to-tick.
         obs_dir = self.order_blocks_bull if side == "long" else self.order_blocks_bear
+        _prox_atr = max(atr, 1e-9) * self.OB_PROXIMITY_ATR
         htf_ob_count = sum(
             1 for ob in obs_dir
-            if ob.is_active(now_ms) and ob.strength >= 70.0 and ob.contains_price(price)
+            if (ob.is_active(now_ms) and ob.strength >= 70.0 and
+                abs(ob.midpoint - price) <= _prox_atr)
         )
         out.mtf_ob_count = htf_ob_count
 

@@ -4134,9 +4134,16 @@ class QuantStrategy:
         # always reflects the current tick's ICT scores (was stale prev-tick).
         if self._ict is not None:
             try:
-                candles_5m  = data_manager.get_candles("5m",  limit=100)
-                candles_15m = data_manager.get_candles("15m", limit=60)
-                candles_1m_ict = data_manager.get_candles("1m", limit=60)
+                # Candle limits sized to cover full OB/FVG max_age windows:
+                #   5m  OBs live 24h = 288 bars  → limit=300 (covers 25h)
+                #   15m OBs live 48h = 192 bars  → limit=200 (covers 50h)
+                #   1m  for sweep detection       → limit=120 (2h of 1m)
+                #   1h  OBs live 72h = 72 bars   → limit=100 (already sufficient)
+                #   4h  OBs live 144h = 36 bars  → limit=50  (already sufficient)
+                #   1d  OBs live 15d = 15 bars   → limit=30  (already sufficient)
+                candles_5m  = data_manager.get_candles("5m",  limit=300)
+                candles_15m = data_manager.get_candles("15m", limit=200)
+                candles_1m_ict = data_manager.get_candles("1m", limit=120)
                 candles_1h_ict = data_manager.get_candles("1h", limit=100)
                 candles_4h_ict = data_manager.get_candles("4h", limit=50)
                 candles_1d_ict = data_manager.get_candles("1d", limit=30)
@@ -4265,8 +4272,11 @@ class QuantStrategy:
                 self._ict is not None and
                 self._ict._initialized):
             try:
-                candles_5m_ict  = data_manager.get_candles("5m",  limit=60)
-                candles_15m_ict = data_manager.get_candles("15m", limit=60)
+                # Sweep detector needs the same history depth as the main ICT
+                # update — using limit=60 (5h) while OBs live 24h meant the
+                # detector was working from a truncated picture of structure.
+                candles_5m_ict  = data_manager.get_candles("5m",  limit=300)
+                candles_15m_ict = data_manager.get_candles("15m", limit=200)
                 _now_ms_sd = int(now * 1000) if now < 1e12 else int(now)
                 self._active_sweep_setup = self._sweep_detector.update(
                     self._ict, price, sig.atr, _now_ms_sd,
@@ -6271,12 +6281,20 @@ class QuantStrategy:
         # Now also passes candles_1m so fresh 1m OBs are detected for trail anchoring.
         if self._ict is not None:
             try:
-                candles_15m = data_manager.get_candles("15m", limit=30)
-                self._ict.update(candles_5m, candles_15m, price, now_ms,
-                                 candles_1m=candles_1m,
-                                 candles_1h=data_manager.get_candles("1h", limit=50),
-                                 candles_4h=data_manager.get_candles("4h", limit=30),
-                                 candles_1d=data_manager.get_candles("1d", limit=20))
+                # Trail ICT update MUST use the same history depth as the
+                # main entry-phase update. Using limit=30 for 5m (2.5h) while
+                # 5m OBs live 24h meant the trail engine had a completely
+                # different (and much shallower) view of structure than the
+                # entry engine — causing zone-freeze to compare trail price
+                # against OBs the entry engine had but the trail engine dropped.
+                candles_15m = data_manager.get_candles("15m", limit=200)
+                _trail_5m   = data_manager.get_candles("5m",  limit=300)
+                _trail_1m   = data_manager.get_candles("1m",  limit=120)
+                self._ict.update(_trail_5m, candles_15m, price, now_ms,
+                                 candles_1m=_trail_1m,
+                                 candles_1h=data_manager.get_candles("1h", limit=100),
+                                 candles_4h=data_manager.get_candles("4h", limit=50),
+                                 candles_1d=data_manager.get_candles("1d", limit=30))
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
