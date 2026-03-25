@@ -3007,11 +3007,51 @@ class DailyRiskGate:
     def record_trade_start(self):
         with self._lock: self._reset_if_new_day(); self._daily_trades += 1
 
+    def undo_trade_start(self):
+        """
+        Reverse a record_trade_start() when an entry is aborted before any
+        order reaches the exchange (TP-gate rejection, fee-gate, SL sanity).
+        Prevents aborted entries from consuming the daily trade cap.
+        """
+        with self._lock:
+            if self._daily_trades > 0:
+                self._daily_trades -= 1
+
     def record_trade_result(self, pnl):
         with self._lock:
             self._daily_pnl += pnl
             if pnl < 0: self._consec_losses += 1
             else: self._consec_losses = 0
+
+    def force_reset(self, reset_consec: bool = True, reset_daily: bool = False) -> str:
+        """
+        Manual override reset — callable from Telegram /resetrisk.
+
+        reset_consec: clears consecutive_losses + loss_lockout (default True)
+        reset_daily:  also clears daily_pnl + daily_trades counter (opt-in only)
+
+        Returns a human-readable summary of what was cleared.
+        """
+        with self._lock:
+            parts = []
+            if reset_consec:
+                prev_cl = self._consec_losses
+                prev_lo = self._loss_lockout_until
+                self._consec_losses       = 0
+                self._loss_lockout_until  = 0.0
+                parts.append(f"consec_losses {prev_cl}→0")
+                if prev_lo > 0:
+                    import time as _t
+                    remaining = max(0, int(prev_lo - _t.time()))
+                    parts.append(f"lockout cleared ({remaining}s was remaining)")
+            if reset_daily:
+                prev_dt  = self._daily_trades
+                prev_dp  = self._daily_pnl
+                self._daily_trades = 0
+                self._daily_pnl    = 0.0
+                parts.append(f"daily_trades {prev_dt}→0")
+                parts.append(f"daily_pnl ${prev_dp:+.2f}→$0.00")
+            return "; ".join(parts) if parts else "nothing to reset"
 
     @property
     def daily_trades(self):
@@ -3072,6 +3112,12 @@ class QuantStrategy:
         self._total_trades = 0; self._winning_trades = 0; self._total_pnl = 0.0
         self._trade_history: List[Dict] = []   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
+        # DUPLICATE P&L GUARD: stores the entry_time (float) of the position
+        # whose close has already been recorded.  _record_pnl is a one-shot
+        # per position: the second call for the same entry_time is a no-op.
+        # This prevents sync-thread / reconcile-thread / _exit_trade races from
+        # double-counting trades and corrupting _total_pnl / win-rate.
+        self._pnl_recorded_for: float = 0.0
         # Track last known price for PnL fallback
         self._last_known_price = 0.0
         # Bug 6 fix: pre-declare all hasattr-guarded attrs so the very first
@@ -3315,12 +3361,16 @@ class QuantStrategy:
                 threading.Thread(target=_bg_sync_exit, daemon=True,
                                  name="pos-sync-exit").start()
             if exiting_stuck:
-                logger.warning("⚠️ EXITING stuck >120s — force-finalising to unblock signals")
+                logger.warning("⚠️ EXITING stuck >120s — recording PnL then force-finalising")
                 send_telegram_message(
                     "⚠️ <b>EXITING TIMEOUT</b>\n"
                     "Stuck in EXITING phase for >120s.\n"
-                    "Close order may have failed silently.\n"
+                    "Recording PnL=0 (unconfirmed) and resetting to FLAT.\n"
                     "<b>Check exchange for open position!</b>")
+                # Record PnL as unconfirmed (0) — _pnl_recorded_for guard means
+                # if exchange already confirmed it via sync/reconcile this is a no-op.
+                self._record_pnl(0.0, exit_reason="exiting_timeout", exit_price=0.0,
+                                 fee_breakdown=None)
                 with self._lock:
                     self._finalise_exit()
 
@@ -5633,18 +5683,12 @@ class QuantStrategy:
             logger.info(f"Entry blocked: {reason}")
             return
 
-        # ── Confidence-weighted position sizing ───────────────────────────────────
-        qty = self._compute_quantity(risk_manager, price, sig=sig, ict_tier=ict_tier)
-        if qty is None or qty < QCfg.MIN_QTY(): return
-
         # ── Map composite score → signal_confidence [0, 1] (PATCH 5a) ───────────
+        # NOTE: moved BEFORE _compute_sl_tp so signal_confidence is available.
         raw_composite     = abs(sig.composite) if sig.composite is not None else 0.0
         signal_confidence = min(1.0, raw_composite / 0.6)   # 0.6 composite = full confidence
 
         # ── Always limit (maker) entry — price from live orderbook ─────────────
-        # Policy: never take liquidity on entry. Post a passive limit at best
-        # bid (long) or best ask (short). No market-order fallback — if the
-        # limit expires unfilled the signal is likely stale anyway.
         use_maker = True
         tick      = QCfg.TICK_SIZE()
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
@@ -5654,22 +5698,19 @@ class QuantStrategy:
             bids = (orderbook or {}).get("bids", [])
             asks = (orderbook or {}).get("asks", [])
             if bids and asks:
-                # FIX 1: _best_px hoisted above if/else — SHORT previously
-                # crashed with NameError as it was defined only in long branch.
                 def _best_px(lvl):
                     if isinstance(lvl,(list,tuple)): return float(lvl[0])
                     if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
                     return 0.0
                 if side == "long":
-                    limit_px  = round(_best_px(bids[0]), 1)   # join best bid
+                    limit_px  = round(_best_px(bids[0]), 1)
                     mt_reason = f"limit_long@bid={limit_px:.1f}"
                 else:
-                    limit_px  = round(_best_px(asks[0]), 1)   # join best ask
+                    limit_px  = round(_best_px(asks[0]), 1)
                     mt_reason = f"limit_short@ask={limit_px:.1f}"
             else:
                 raise ValueError("empty book")
         except Exception:
-            # Book unavailable — passive offset from last price
             if side == "long":
                 limit_px = round(price - offset, 1)
             else:
@@ -5687,18 +5728,17 @@ class QuantStrategy:
 
         logger.info(f"Entry routing: LIMIT | {mt_reason}")
 
-        # ── TP/SL viability check BEFORE placing the entry (PATCH 5d) ────────────
-        # Check fees against the planned TP before taking the position.
-        # If the setup doesn't clear the fee floor, skip entirely.
+        # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
+        # SL/TP computation does not depend on position size — it uses price, ATR,
+        # mode, and signal_confidence only.  Computing it first lets us pass the
+        # ACTUAL SL distance (not an ATR proxy) into position sizing, which is the
+        # correct industry-grade approach: risk-in-dollars / SL-distance = quantity.
         sl_price, tp_price = self._compute_sl_tp(
             data_manager, price, side, atr, mode=mode,
             signal_confidence=signal_confidence,
             use_maker_entry=use_maker,
         )
         if sl_price is None:
-            # Pre-trade gate rejected the setup (no order was placed).
-            # Record the timestamp so _launch_entry_async's finally block can
-            # distinguish this from a real order failure and skip the cooldown.
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
@@ -5707,6 +5747,15 @@ class QuantStrategy:
         td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
+
+        # ── FIX Bug-B STEP 2: Size using actual SL distance ──────────────────────
+        # Now that sl_price is known, pass it to _compute_quantity so the base size
+        # comes from risk_manager.calculate_position_size (dollar-risk / SL-dist).
+        # The tier/composite/AMD multiplier is applied on top of that base.
+        qty = self._compute_quantity(
+            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price
+        )
+        if qty is None or qty < QCfg.MIN_QTY(): return
         logger.info(
             f"🎯 ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
@@ -5928,6 +5977,9 @@ class QuantStrategy:
         self.current_sl_price       = sl_price
         self.current_tp_price       = tp_price
         self._confirm_long          = self._confirm_short = 0
+        # FIX Bug-C: record_trade_start() AFTER confirmed fill, not before.
+        # Moving it here prevents aborted entries (TP-gate, fee-gate, exchange
+        # error) from consuming the daily trade cap with no actual order sent.
         self._risk_gate.record_trade_start()
 
         # ── v5.0: Invalidate sweep detector — setup consumed ─────────────────────
@@ -6660,9 +6712,22 @@ class QuantStrategy:
         order_manager.cancel_all_exit_orders(sl_order_id=pos.sl_order_id, tp_order_id=pos.tp_order_id)
         es = "sell" if pos.side=="long" else "buy"
         order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
+
+        # FIX Bug-D: do NOT call _record_pnl here with an estimated PnL.
+        # _record_exchange_exit() (called by the reconcile / sync path once the
+        # exchange confirms the position is flat) will record the exact PnL.
+        # Calling _record_pnl here first created a guaranteed duplicate: this
+        # estimated entry fires immediately, then the exact entry fires ~1–30 s
+        # later when _sync_position or _reconcile_apply confirms the close.
+        # The _pnl_recorded_for guard would drop the second call — but the first
+        # call was the ESTIMATED one. Now we always record the exact value first.
+        #
+        # If the exchange confirmation never arrives (network failure), the
+        # EXITING watchdog fires after 120s and calls _finalise_exit() which
+        # records PnL=0 via the "unconfirmed" path — acceptable fallback.
+        # Telegram message still uses local price estimate for immediacy.
         fill_type = getattr(pos, 'entry_fill_type', 'taker')
-        pnl = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
-        self._record_pnl(pnl, exit_reason=reason, exit_price=price)
+        pnl_est = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
 
         hold_min     = (time.time() - pos.entry_time) / 60.0
         init_sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else abs(pos.entry_price - pos.sl_price)
@@ -6670,23 +6735,26 @@ class QuantStrategy:
         achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         tp_dist      = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
         planned_rr   = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        result_icon  = "✅" if pnl > 0 else "❌"
+        result_icon  = "✅" if pnl_est > 0 else "❌"
 
         send_telegram_message(
-            f"{result_icon} <b>{'WIN' if pnl>0 else 'LOSS'} — MANUAL EXIT</b>\n"
+            f"{result_icon} <b>{'WIN' if pnl_est>0 else 'LOSS'} — MANUAL EXIT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
             f"Reason:   {reason}\n"
             f"Entry:    ${pos.entry_price:,.2f}\n"
             f"Exit:     <b>${price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
-            f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
+            f"PnL est:  <b>${pnl_est:+.2f} USDT</b> <i>(exchange confirmation pending)</i>\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"Hold:     {hold_min:.1f}m\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | Total PnL: ${self._total_pnl:+.2f}</i>"
         )
         self._last_exit_side = pos.side
-        self._finalise_exit()
+        # _finalise_exit() is NOT called here — let _sync_position / _reconcile_apply
+        # confirm the position is flat on the exchange and then call _record_exchange_exit,
+        # which records exact PnL and calls _finalise_exit().  The EXITING watchdog (120s)
+        # is the safety net if exchange confirmation never arrives.
 
     def _record_exchange_exit(self, ex_pos):
         """
@@ -6811,10 +6879,17 @@ class QuantStrategy:
             entry_fee = _entry_fee_exact
         else:
             fill_type  = getattr(pos, "entry_fill_type", "taker")
-            entry_rate = (
-                float(getattr(_cfg_x, "COMMISSION_RATE_MAKER", QCfg.COMMISSION_RATE() * 0.40))
-                if fill_type == "maker" else QCfg.COMMISSION_RATE()
-            )
+            # FIX Bug-A: use exchange-specific maker rate.
+            # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
+            if fill_type == "maker":
+                if _is_delta:
+                    entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
+                else:
+                    entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER",
+                                               QCfg.COMMISSION_RATE() * 0.40))
+            else:
+                entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
+                              if _is_delta else QCfg.COMMISSION_RATE())
             entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid   # EXACT from Delta paid_commission
 
@@ -6897,8 +6972,27 @@ class QuantStrategy:
 
         fee_breakdown: dict with keys gross_pnl, entry_fee, exit_fee,
           total_fees, net_pnl, exact_fees (bool). None for force-exit paths.
+
+        DUPLICATE GUARD: Each position is identified by pos.entry_time (set
+        once at fill confirmation and never modified).  The first call records
+        the trade; any subsequent call for the same entry_time is a silent
+        no-op.  This makes all three exit code-paths (_exit_trade,
+        _record_exchange_exit, reconcile) safe to call concurrently — only the
+        winner writes, the rest are dropped without corrupting stats.
         """
         pos = self._pos
+        pos_entry_time = getattr(pos, 'entry_time', 0.0)
+
+        # ── Idempotency gate ──────────────────────────────────────────────────
+        # Use a small epsilon (0.001 s) to tolerate float precision drift.
+        if pos_entry_time > 0 and abs(self._pnl_recorded_for - pos_entry_time) < 0.001:
+            logger.warning(
+                f"_record_pnl: duplicate call for position entry_time={pos_entry_time:.3f} "
+                f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) — skipped to prevent double-count"
+            )
+            return
+        self._pnl_recorded_for = pos_entry_time
+
         self._total_trades += 1
         self._total_pnl    += pnl
         is_win = pnl > 0
@@ -6975,55 +7069,38 @@ class QuantStrategy:
             del self._trade_history[:-200]
 
     def _finalise_exit(self):
+        self._pnl_recorded_for = 0.0   # reset guard so next position can record
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,
-                           ict_tier: str = "") -> Optional[float]:
+                           ict_tier: str = "",
+                           sl_price: Optional[float] = None) -> Optional[float]:
         """
-        Confidence-weighted position sizing — v7.0.
+        Confidence-weighted position sizing — v8.0 (industry-grade, FIX Bug-B).
 
-        Base allocation: QUANT_MARGIN_PCT of available balance.
+        Base quantity source:
+          When sl_price is provided (normal flow after _compute_sl_tp), uses
+          risk_manager.calculate_position_size(entry, sl, side) as the base.
+          This correctly enforces RISK_PER_TRADE dollar-risk / SL-distance.
+          The old margin-pct formula ignored RISK_PER_TRADE entirely.
 
-        Tier multipliers (applied to base):
-          Tier-S (ICT sweep-and-go, AMD confirmed):  1.00×  — full size
-          Tier-A (ICT structural, strong confluence): 0.80×
-          Tier-B (standard quant + ICT gate):         0.65×
-          No tier / fallback:                         0.50×  — minimal exposure
+          Fallback to margin-pct when sl_price is absent (legacy/test paths).
 
-        Composite score modifier (on top of tier):
-          Composite ≥ 0.70: +10% (max confidence)
-          Composite ≥ 0.50: +5%
-          Composite < 0.35: −10% (marginal setup — reduce exposure)
-
-        ICT AMD confidence modifier:
-          AMD conf ≥ 0.85: +8%
-          AMD conf ≥ 0.70: +4%
-          AMD conf < 0.50: −5%
-
-        Total multiplier is capped to [0.40, 1.05] of base — never leverages
-        more than the base allocation, but can scale down significantly for
-        low-conviction setups.
+        Confidence multiplier applied on top of risk-based base:
+          Tier-S: 1.00× | Tier-A: 0.80× | Tier-B: 0.65× | none: 0.50×
+          Composite ≥0.70: +10% | ≥0.50: +5% | <0.35: -10%
+          AMD conf  ≥0.85: +8%  | ≥0.70: +4% | <0.50: -5%
+          Clamped to [0.40, 1.05] — never amplifies above base.
         """
-        bal = risk_manager.get_available_balance()
-        if bal is None:
-            return None
-        available = float(bal.get("available", 0.0))
-        if available < QCfg.MIN_MARGIN_USDT():
-            return None
+        step = QCfg.LOT_STEP()
 
-        base_pct = QCfg.MARGIN_PCT()
+        # ── Tier multiplier ───────────────────────────────────────────────────
+        tier_mult = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
 
-        # ── Tier multiplier ───────────────────────────────────────────
-        tier_mult = {
-            "S": 1.00,
-            "A": 0.80,
-            "B": 0.65,
-        }.get(ict_tier, 0.50)
-
-        # ── Composite score modifier ──────────────────────────────────
+        # ── Composite score modifier ──────────────────────────────────────────
         comp_mod = 0.0
         if sig is not None:
             abs_comp = abs(sig.composite)
@@ -7031,47 +7108,75 @@ class QuantStrategy:
             elif abs_comp >= 0.50: comp_mod = +0.05
             elif abs_comp <  0.35: comp_mod = -0.10
 
-        # ── AMD confidence modifier ───────────────────────────────────
+        # ── AMD confidence modifier ───────────────────────────────────────────
         amd_mod = 0.0
         if sig is not None and sig.amd_conf > 0:
             if   sig.amd_conf >= 0.85: amd_mod = +0.08
             elif sig.amd_conf >= 0.70: amd_mod = +0.04
             elif sig.amd_conf <  0.50: amd_mod = -0.05
 
-        # ── Combine and clamp ─────────────────────────────────────────
         total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
-        margin_alloc = available * base_pct * total_mult
 
-        if margin_alloc < QCfg.MIN_MARGIN_USDT():
-            return None
-
-        notional = margin_alloc * QCfg.LEVERAGE()
-        qty_raw  = notional / price
-        step     = QCfg.LOT_STEP()
-        qty      = math.floor(qty_raw / step) * step
-        qty      = round(qty, 8)
-        qty      = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
-
-        # FIX 9: The original guard (qty*price/LEVERAGE > margin_alloc*1.02) was
-        # algebraically impossible — floor(qty_raw/step)*step ≤ qty_raw always, so
-        # (qty*price)/LEVERAGE ≤ margin_alloc by construction. Replace with a guard
-        # that actually fires: reject if the required margin exceeds available balance.
-        required_margin = qty * price / QCfg.LEVERAGE()
-        if required_margin > available * 1.01:   # 1% rounding tolerance
-            logger.warning(
-                f"Sizing guard triggered: required_margin ${required_margin:.2f} "
-                f"> available ${available:.2f} — scaling qty down"
+        # ── Base quantity ─────────────────────────────────────────────────────
+        if sl_price is not None and sl_price > 0 and price > 0:
+            # Risk-based (preferred): dollar_risk / SL_distance = quantity.
+            _side_str = "LONG" if sl_price < price else "SHORT"
+            base_qty = risk_manager.calculate_position_size(
+                entry_price=price,
+                stop_loss=sl_price,
+                side=_side_str,
             )
-            qty = math.floor((available * QCfg.LEVERAGE() / price) / step) * step
+            if base_qty is None:
+                logger.warning("calculate_position_size returned None — cannot size position")
+                return None
+            qty_raw = base_qty * total_mult
+            sizing_method = "risk_based"
+            bal = risk_manager.get_available_balance()
+            available = float((bal or {}).get("available", 0.0))
+            sl_dist     = abs(price - sl_price)
+            dollar_risk = sl_dist * base_qty
+            risk_pct    = dollar_risk / available * 100.0 if available > 0 else 0.0
+        else:
+            # Margin-pct fallback (legacy — should not fire in normal entry flow).
+            bal = risk_manager.get_available_balance()
+            if bal is None:
+                return None
+            available = float(bal.get("available", 0.0))
+            if available < QCfg.MIN_MARGIN_USDT():
+                return None
+            margin_alloc = available * QCfg.MARGIN_PCT() * total_mult
+            if margin_alloc < QCfg.MIN_MARGIN_USDT():
+                return None
+            qty_raw = (margin_alloc * QCfg.LEVERAGE()) / price
+            sizing_method = "margin_pct_fallback"
+            sl_dist = dollar_risk = risk_pct = 0.0
+
+        # ── Lot-step + hard limits ────────────────────────────────────────────
+        qty = math.floor(qty_raw / step) * step
+        qty = round(qty, 8)
+        qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
+
+        # ── Margin guard ──────────────────────────────────────────────────────
+        required_margin = qty * price / QCfg.LEVERAGE()
+        bal2 = risk_manager.get_available_balance()
+        _avail2 = float((bal2 or {}).get("available", 0.0))
+        if _avail2 > 0 and required_margin > _avail2 * 1.01:
+            logger.warning(
+                f"Sizing guard: margin ${required_margin:.2f} > available ${_avail2:.2f} — scaling down"
+            )
+            qty = math.floor((_avail2 * QCfg.LEVERAGE() / price) / step) * step
             qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), round(qty, 8)))
             if qty < QCfg.MIN_QTY():
                 return None
 
+        if qty < QCfg.MIN_QTY():
+            return None
+
         logger.info(
-            f"Sizing → avail=${available:.2f} | tier={ict_tier or 'none'} "
-            f"tmult={total_mult:.2f} (tier={tier_mult:.2f} comp={comp_mod:+.2f} amd={amd_mod:+.2f}) "
-            f"| alloc={base_pct:.0%}×{total_mult:.2f}=${margin_alloc:.2f} "
-            f"| {QCfg.LEVERAGE()}x | qty={qty}"
+            f"✅ Sizing [{sizing_method}] | tier={ict_tier or 'none'} "
+            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f})"
+            + (f" | SL-dist={sl_dist:.1f}pts $risk=${dollar_risk:.2f} ({risk_pct:.2f}%)" if sl_dist > 0 else "")
+            + f" | margin=${qty * price / QCfg.LEVERAGE():.2f} | qty={qty}"
         )
         return qty
 
@@ -7110,12 +7215,24 @@ class QuantStrategy:
         _is_delta = (getattr(_cfg_pnl, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
                      and getattr(_cfg_pnl, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
 
+        # FIX Bug-A: use exchange-specific fee rates.
+        # Delta maker rate is NEGATIVE (rebate = -0.02%); CoinSwitch maker rate is
+        # positive (0.02%).  The old code always read COMMISSION_RATE_MAKER from config
+        # which is set to the CoinSwitch value (+0.00020), costing Delta maker entries
+        # 0.04% of notional instead of receiving the rebate.
         if entry_fill_type == "maker":
-            entry_rate = float(getattr(_cfg_pnl, "COMMISSION_RATE_MAKER",
-                                        QCfg.COMMISSION_RATE() * 0.40))
+            if _is_delta:
+                entry_rate = float(getattr(_cfg_pnl, "DELTA_COMMISSION_RATE_MAKER",
+                                           -0.00020))   # Delta rebate (negative = income)
+            else:
+                entry_rate = float(getattr(_cfg_pnl, "COMMISSION_RATE_MAKER",
+                                           QCfg.COMMISSION_RATE() * 0.40))
         else:
             entry_rate = QCfg.COMMISSION_RATE()
-        exit_rate = QCfg.COMMISSION_RATE()
+
+        # Exit is always taker (stop or TP market order)
+        exit_rate = (float(getattr(_cfg_pnl, "DELTA_COMMISSION_RATE", 0.00050))
+                     if _is_delta else QCfg.COMMISSION_RATE())
 
         if _is_delta:
             # Exact inverse-perpetual PnL for Delta BTCUSD (1 USD per contract)

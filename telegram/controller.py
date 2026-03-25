@@ -257,6 +257,8 @@ class TelegramBotController:
                 return self._cmd_config()
             elif cmd == "/killswitch":
                 return self._cmd_killswitch()
+            elif cmd == "/resetrisk":
+                return self._cmd_resetrisk(args)
             elif cmd == "/set":
                 return self._cmd_set(args)
             elif cmd == "/setexchange":
@@ -288,6 +290,8 @@ class TelegramBotController:
             "/set &lt;key&gt; &lt;value&gt; — Adjust config live\n"
             "/setexchange &lt;delta|coinswitch&gt; — Switch execution exchange at runtime\n"
             "/killswitch — Emergency: close position + cancel orders\n"
+            "/resetrisk — Clear consecutive-loss lockout so trading resumes\n"
+            "/resetrisk full — Also reset daily PnL + trade counters (new session)\n"
             "/start — Start bot\n"
             "/stop — Stop bot\n"
             "/help — This list"
@@ -1437,6 +1441,93 @@ class TelegramBotController:
         except Exception as e:
             logger.error(f"Killswitch error: {e}", exc_info=True)
             return f"❌ Killswitch error: {e}"
+
+    def _cmd_resetrisk(self, args: str) -> str:
+        """
+        /resetrisk          — clear consecutive-loss lockout only
+        /resetrisk full     — also reset daily PnL and daily trade counter
+
+        Operates on both DailyRiskGate (inside QuantStrategy) and the
+        standalone RiskManager so they stay in sync.
+
+        Safety rule: blocked while a position is ACTIVE — the risk gate must
+        not be cleared while in a trade (it would mask the loss count from a
+        currently open losing position).
+        """
+        global bot_instance
+        if not bot_instance:
+            return "Bot not running."
+
+        strat = getattr(bot_instance, 'strategy', None)
+        rm    = getattr(bot_instance, 'risk_manager', None)
+
+        if strat is None:
+            return "❌ Strategy not initialised."
+
+        # Block reset while a position is open
+        try:
+            from strategy.quant_strategy import PositionPhase
+            with strat._lock:
+                phase = strat._pos.phase
+            if phase not in (PositionPhase.FLAT, PositionPhase.ENTERING):
+                return (
+                    "❌ Cannot reset risk gate while position is open.\n"
+                    f"Current phase: {phase.name}\n"
+                    "Close the position first, then /resetrisk."
+                )
+        except Exception as e:
+            logger.warning(f"resetrisk phase check error: {e}")
+
+        reset_daily = "full" in args.lower()
+        lines = ["🔄 <b>Risk Gate Reset</b>"]
+
+        # ── 1. DailyRiskGate (inside strategy) ─────────────────────────────────
+        gate = getattr(strat, '_risk_gate', None)
+        if gate is not None:
+            try:
+                gate_result = gate.force_reset(reset_consec=True, reset_daily=reset_daily)
+                lines.append(f"  DailyRiskGate: {gate_result}")
+            except Exception as e:
+                lines.append(f"  DailyRiskGate error: {e}")
+        else:
+            lines.append("  ⚠️ DailyRiskGate not found on strategy")
+
+        # ── 2. RiskManager (standalone) ─────────────────────────────────────────
+        if rm is not None:
+            try:
+                with rm._lock:
+                    prev_cl = rm.consecutive_losses
+                    prev_dp = rm.daily_pnl
+                    rm.consecutive_losses = 0
+                    if reset_daily:
+                        rm.daily_pnl   = 0.0
+                        rm.daily_trades = []
+                detail = f"consec_losses {prev_cl}→0"
+                if reset_daily:
+                    detail += f" | daily_pnl ${prev_dp:+.2f}→$0.00 | daily_trades cleared"
+                lines.append(f"  RiskManager:   {detail}")
+            except Exception as e:
+                lines.append(f"  RiskManager error: {e}")
+        else:
+            lines.append("  ⚠️ RiskManager not attached to bot")
+
+        # ── 3. Current gate state after reset ───────────────────────────────────
+        try:
+            bal_info = rm.get_available_balance() if rm else None
+            total_bal = float((bal_info or {}).get("total", 0.0))
+            ok, reason = gate.can_trade(total_bal) if gate else (False, "no gate")
+            state_line = "✅ Gate OPEN — trading will resume on next signal" \
+                         if ok else f"⚠️ Gate still CLOSED: {reason}"
+            lines.append(f"\n{state_line}")
+        except Exception as e:
+            lines.append(f"\n  Gate state check error: {e}")
+
+        if reset_daily:
+            lines.append("\n<i>Full daily reset applied — counters treated as new session.</i>")
+        else:
+            lines.append("\n<i>Consecutive-loss lock cleared only. Daily PnL/trade count unchanged.</i>")
+
+        return "\n".join(lines)
 
     def _cmd_setexchange(self, args: str) -> str:
         """
