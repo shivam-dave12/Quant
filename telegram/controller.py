@@ -187,6 +187,7 @@ class TelegramBotController:
                 {"command": "config",     "description": "Show config values"},
                 {"command": "killswitch", "description": "Emergency close all"},
                 {"command": "set",        "description": "Set config value live"},
+                {"command": "huntstatus", "description": "Liquidity hunt engine status"},
                 {"command": "help",       "description": "Show commands"},
             ]
             payload = {
@@ -211,7 +212,7 @@ class TelegramBotController:
         bare_cmds = {
             "start", "stop", "status", "thinking", "structures", "position",
             "trades", "stats", "config", "pause", "resume", "balance", "trail",
-            "killswitch", "set", "help",
+            "killswitch", "set", "help", "huntstatus",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -263,6 +264,8 @@ class TelegramBotController:
                 return self._cmd_set(args)
             elif cmd == "/setexchange":
                 return self._cmd_setexchange(args)
+            elif cmd == "/huntstatus":
+                return self._cmd_huntstatus()
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
@@ -291,6 +294,7 @@ class TelegramBotController:
             "/setexchange &lt;delta|coinswitch&gt; — Switch execution exchange at runtime\n"
             "/killswitch — Emergency: close position + cancel orders\n"
             "/resetrisk — Clear consecutive-loss lockout so trading resumes\n"
+            "/huntstatus — Liquidity hunt engine state + prediction score\n"
             "/resetrisk full — Also reset daily PnL + trade counters (new session)\n"
             "/start — Start bot\n"
             "/stop — Stop bot\n"
@@ -1280,6 +1284,98 @@ class TelegramBotController:
         ]
 
         return "\n".join(l for l in lines if l is not None)
+
+    def _cmd_huntstatus(self) -> str:
+        """
+        /huntstatus — display LiquidityHunter state, prediction score, and
+        last signal if one is pending.
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = getattr(bot_instance, 'strategy', None)
+        dm    = getattr(bot_instance, 'data_manager', None)
+        if not strat or not dm:
+            return "Components not ready."
+
+        hunter = getattr(strat, '_liquidity_hunter', None)
+        if hunter is None:
+            return (
+                "❌ LiquidityHunter not available.\n"
+                "Ensure <code>liquidity_hunter.py</code> is in the strategy/ directory."
+            )
+
+        price  = dm.get_last_price()
+        atr    = strat._atr_5m.atr
+
+        st = hunter.get_status_dict()
+
+        # State icon
+        state_icons = {
+            "NO_RANGE":        "⚪",
+            "RANGING":         "🔵",
+            "STALKING":        "🟡",
+            "APPROACHING":     "🟠",
+            "SWEEP_CONFIRMED": "🟢",
+        }
+        s_icon = state_icons.get(st["state"], "❓")
+
+        lines = [f"<b>🎣 Liquidity Hunt Engine</b>"]
+        lines.append(f"Price: ${price:,.2f}  ATR: ${atr:.1f}")
+        lines.append("")
+        lines.append(f"<b>State:</b> {s_icon} {st['state']}")
+
+        if st["bsl"] is not None and st["ssl"] is not None:
+            bsl = st["bsl"]
+            ssl = st["ssl"]
+            rng_size = bsl - ssl
+            rng_atr  = rng_size / atr if atr > 1e-10 else 0
+            pd_pct   = (price - ssl) / rng_size * 100 if rng_size > 0 else 0
+            lines.append(
+                f"SSL ${ssl:,.1f}  ─  price ${price:,.2f} ({pd_pct:.0f}%)  ─  BSL ${bsl:,.1f}")
+            lines.append(
+                f"Range: {rng_size:.0f}pts / {rng_atr:.1f}ATR  "
+                f"(BSL x{st['bsl_touches']}  SSL x{st['ssl_touches']})")
+        else:
+            lines.append("No active BSL/SSL range detected.")
+
+        lines.append("")
+        pred_icon = "▲ BSL" if st["predicted_dir"] == "bsl" else ("▼ SSL" if st["predicted_dir"] == "ssl" else "─ none")
+        lines.append(f"<b>Prediction</b>: {pred_icon}")
+        lines.append(
+            f"  EMA score: {st['score_ema']:+.3f}  "
+            f"raw: {st['raw_score']:+.3f}")
+
+        # Component breakdown
+        comp = st.get("components", {})
+        if comp:
+            lines.append("  <b>Components</b>:")
+            weights = {
+                "flow": 0.18, "cvd": 0.15, "disp_bias": 0.12,
+                "ob_magnet": 0.15, "fvg_path": 0.10,
+                "dr_pos": 0.12, "session": 0.08, "micro": 0.10,
+            }
+            for key, val in comp.items():
+                w         = weights.get(key, 0)
+                contrib   = val * w
+                arrow     = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
+                lines.append(
+                    f"    {key:<10} {arrow} {val:+.3f}  × {w:.2f} = {contrib:+.4f}")
+
+        # Signal
+        lines.append("")
+        if st["signal_ready"]:
+            lines.append(f"<b>🎯 SIGNAL READY</b>")
+            lines.append(
+                f"  Side:   <b>{(st['signal_side'] or '?').upper()}</b>")
+            lines.append(
+                f"  SL:     ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
+            lines.append(f"  R:R:    1:{st['signal_rr']:.2f}")
+        else:
+            lines.append("  No pending signal.")
+
+        return "\n".join(lines)
 
     def _cmd_balance(self) -> str:
         global bot_instance, bot_running

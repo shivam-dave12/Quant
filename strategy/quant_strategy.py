@@ -46,6 +46,19 @@ try:
 except ImportError:
     ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
+# ── v5.2: Liquidity Hunt Engine ─────────────────────────────────────────────
+try:
+    from strategy.liquidity_hunter import LiquidityHunter
+    _HUNT_AVAILABLE = True
+except ImportError:
+    try:
+        from liquidity_hunter import LiquidityHunter
+        _HUNT_AVAILABLE = True
+    except ImportError:
+        _HUNT_AVAILABLE = False
+        logger = logging.getLogger(__name__)
+        logger.warning("liquidity_hunter.py not found — hunt engine disabled")
+
 # ── ICT Institutional Trade Engine (sweep-spot SL/TP/Trail/Entry) ──────────
 try:
     _ict_engine_dir = _os.path.dirname(_os.path.abspath(__file__))
@@ -3084,6 +3097,9 @@ class QuantStrategy:
             ICTSweepDetector() if _ICT_TRADE_ENGINE_AVAILABLE else None)
         self._active_sweep_setup: Optional[object] = None  # ICTSweepSetup | None
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
+        # v5.2: Liquidity hunt engine
+        self._liquidity_hunter = LiquidityHunter() if _HUNT_AVAILABLE else None
+        self._pending_hunt_signal = None   # active HuntSignal for _compute_sl_tp
         self._confirm_trend_long = 0; self._confirm_trend_short = 0
         self._confirm_flow_long = 0; self._confirm_flow_short = 0
         self._last_flow_entry_time = 0.0
@@ -3173,6 +3189,8 @@ class QuantStrategy:
         logger.info(f"   ICT: {ict_status}")
         logger.info(f"   Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
                     f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}")
+        hunt_status = "ENABLED (8-factor prediction, sweep-to-opposing-pool delivery)" if _HUNT_AVAILABLE else "DISABLED (liquidity_hunter.py not found)"
+        logger.info(f"   LiqHunter: {hunt_status}")
         logger.info("=" * 72)
 
     def get_position(self) -> Optional[Dict]:
@@ -3200,6 +3218,10 @@ class QuantStrategy:
             if self._sweep_detector is not None:
                 self._sweep_detector.invalidate()
             self._active_sweep_setup = None
+            # v5.2: reset hunt engine
+            if self._liquidity_hunter is not None:
+                self._liquidity_hunter.reset()
+            self._pending_hunt_signal = None
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
@@ -4333,6 +4355,29 @@ class QuantStrategy:
             except Exception as _sd_e:
                 logger.debug(f"Sweep detector error (non-fatal): {_sd_e}")
 
+        # ── v5.2: Liquidity Hunt Engine update ───────────────────────────────
+        # Runs after ICT update (needs fresh pools/OBs/FVGs).
+        # Throttled internally to _UPDATE_INTERVAL_S.
+        if (self._liquidity_hunter is not None and
+                self._ict is not None and
+                getattr(self._ict, '_initialized', False)):
+            try:
+                _candles_5m_hunt = data_manager.get_candles("5m", limit=50)
+                _candles_1m_hunt = data_manager.get_candles("1m", limit=30)
+                self._liquidity_hunter.update(
+                    price      = price,
+                    atr        = sig.atr,
+                    now        = now,
+                    now_ms     = int(now * 1000) if now < 1e12 else int(now),
+                    candles_5m = _candles_5m_hunt,
+                    candles_1m = _candles_1m_hunt,
+                    ict_engine = self._ict,
+                    tick_flow  = self._tick_eng.get_signal(),
+                    cvd_trend  = self._cvd.get_trend_signal(),
+                )
+            except Exception as _hunt_e:
+                logger.debug(f"LiqHunter update error (non-fatal): {_hunt_e}")
+
         # ── v4.6: Fast breakout detection — MUST run before _log_thinking ────
         # BUG-B FIX: _breakout.update() was previously called AFTER _log_thinking,
         # so whenever a breakout fired on this tick, the display showed "reversion"
@@ -4446,12 +4491,26 @@ class QuantStrategy:
                 _flow_side = _candidate_side
                 _flow_ready = True
 
+        # ── v5.2: Check hunt signal (between sweep OTE and flow displacement) ──
+        _hunt_signal = (
+            self._liquidity_hunter.get_signal()
+            if self._liquidity_hunter is not None else None
+        )
+        _hunt_ready = _hunt_signal is not None
+
         if _has_sweep_entry:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._confirm_long = self._confirm_short = 0
             self._confirm_flow_long = self._confirm_flow_short = 0
             self._evaluate_reversion_entry(
                 data_manager, order_manager, risk_manager, sig, price, now)
+        elif _hunt_ready:
+            # Hunt: confirmed sweep with opposing pool target
+            self._confirm_long = self._confirm_short = 0
+            self._confirm_trend_long = self._confirm_trend_short = 0
+            self._evaluate_hunt_entry(
+                data_manager, order_manager, risk_manager, sig, price, now,
+                _hunt_signal)
         elif _flow_ready:
             # Flow displacement: clear all other counters
             self._confirm_long = self._confirm_short = 0
@@ -4468,6 +4527,108 @@ class QuantStrategy:
         else:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
+
+    def _evaluate_hunt_entry(
+        self,
+        data_manager,
+        order_manager,
+        risk_manager,
+        sig,
+        price:       float,
+        now:         float,
+        hunt_signal,          # HuntSignal from LiquidityHunter
+    ) -> None:
+        """
+        v5.2 — Liquidity Hunt Entry.
+
+        Triggered when LiquidityHunter confirms a BSL or SSL sweep AND the
+        trade to the opposing pool meets the minimum R:R gate.
+
+        Entry rules:
+          • ATR regime must be valid (not extreme volatility)
+          • HTF structure must not strongly oppose the hunt direction
+          • ICT engine (if available) must not be in hard ACCUMULATION block
+          • 2 confirm ticks to avoid entering on a single noisy sweep detection
+
+        SL/TP are taken directly from the HuntSignal (pre-computed by the hunter):
+          SL  = behind swept pool wick + 0.5×ATR buffer
+          TP  = opposing pool level − 0.1×ATR buffer
+        """
+        side = hunt_signal.side   # "long" | "short"
+
+        # Gate 1: ATR regime
+        if not sig.regime_ok:
+            logger.debug("🎣 Hunt gate: ATR regime invalid — skipping")
+            if self._liquidity_hunter is not None:
+                self._liquidity_hunter.consume_signal()
+            return
+
+        # Gate 2: HTF must not be strongly opposed (informational threshold only)
+        if self._htf.vetoes_trade(side):
+            # HTF veto in hunt is soft — only block when score is extreme
+            _htf_block = (
+                (side == "long"  and self._htf.trend_15m < -0.50) or
+                (side == "short" and self._htf.trend_15m > +0.50)
+            )
+            if _htf_block:
+                logger.info(
+                    f"🎣 Hunt gate: HTF strongly opposes {side.upper()} "
+                    f"(15m={self._htf.trend_15m:+.2f}) — skipping sweep entry")
+                if self._liquidity_hunter is not None:
+                    self._liquidity_hunter.consume_signal()
+                return
+
+        # Gate 3: No ICT ACCUMULATION hard-block (no delivery in progress)
+        if (self._ict is not None and
+                getattr(self._ict, '_initialized', False) and
+                sig.amd_phase == "ACCUMULATION" and
+                sig.amd_conf >= 0.75):
+            logger.info(
+                f"🎣 Hunt gate: ICT ACCUMULATION ({sig.amd_conf:.2f} conf) "
+                f"— no delivery, skipping hunt entry")
+            if self._liquidity_hunter is not None:
+                self._liquidity_hunter.consume_signal()
+            return
+
+        # Gate 4: Confirm ticks (2 consecutive ticks to filter noise)
+        _cn = 2
+        if side == "long":
+            self._confirm_long += 1
+            self._confirm_short = 0
+            if self._confirm_long < _cn:
+                return
+        else:
+            self._confirm_short += 1
+            self._confirm_long = 0
+            if self._confirm_short < _cn:
+                return
+
+        # ── CONFIRMED — store signal and launch entry ────────────────────
+        self._confirm_long = self._confirm_short = 0
+        self._pending_hunt_signal = hunt_signal
+
+        # Consume from hunter so it doesn't re-fire on the next tick
+        if self._liquidity_hunter is not None:
+            self._liquidity_hunter.consume_signal()
+
+        swept_label = (
+            f"SSL@${hunt_signal.swept_pool_price:,.0f}"
+            if side == "long"
+            else f"BSL@${hunt_signal.swept_pool_price:,.0f}"
+        )
+        logger.info(
+            f"🎣 HUNT ENTRY {side.upper()} confirmed  "
+            f"swept={swept_label}  "
+            f"target=${hunt_signal.target_pool_price:,.0f}  "
+            f"SL=${hunt_signal.sl_price:,.1f}  "
+            f"TP=${hunt_signal.tp_price:,.1f}  "
+            f"R:R=1:{hunt_signal.rr:.2f}  "
+            f"pred_score={hunt_signal.prediction_score:+.3f}"
+        )
+        self._launch_entry_async(
+            data_manager, order_manager, risk_manager,
+            side, sig, mode="hunt", ict_tier="A"
+        )
 
     def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
         """
@@ -5404,11 +5565,39 @@ class QuantStrategy:
         sl_price    = None
         tp_price    = None
         _sl_source  = "none"
-        _used_path  = "B"   # "A" | "B" — for logging
+        _used_path  = "B"   # "A" | "B" | "C" — for logging
 
         now_ms_slatp = int(time.time() * 1000)
 
-        if (_ICT_TRADE_ENGINE_AVAILABLE and
+        # ══════════════════════════════════════════════════════════════════════
+        # v5.2 PATH-C — LIQUIDITY HUNT (pre-computed SL/TP from LiquidityHunter)
+        # ══════════════════════════════════════════════════════════════════════
+        # When mode=="hunt", _pending_hunt_signal holds SL/TP from the hunter.
+        # These levels are structurally superior: SL behind swept pool wick,
+        # TP at opposing liquidity pool — exactly where price is being delivered.
+        # Skip PATH-A and PATH-B entirely; apply the fee gate at the end.
+        if mode == "hunt" and self._pending_hunt_signal is not None:
+            _hs = self._pending_hunt_signal
+            _hs_sl  = _round_to_tick(_hs.sl_price)
+            _hs_tp  = _round_to_tick(_hs.tp_price)
+            # Direction sanity
+            _sl_ok = (side == "long"  and _hs_sl < price) or (side == "short" and _hs_sl > price)
+            _tp_ok = (side == "long"  and _hs_tp > price) or (side == "short" and _hs_tp < price)
+            if _sl_ok and _tp_ok:
+                sl_price   = _hs_sl
+                tp_price   = _hs_tp
+                _sl_source = "hunt_swept_pool"
+                _used_path = "C"
+                logger.info(
+                    f"🎣 PATH-C (HUNT): SL=${sl_price:,.1f}  TP=${tp_price:,.1f}  "
+                    f"R:R=1:{abs(tp_price-price)/max(abs(price-sl_price),1):.2f}  "
+                    f"swept=${_hs.swept_pool_price:,.0f}  target=${_hs.target_pool_price:,.0f}"
+                )
+                # Apply only the fee-gate at the end — skip all structural SL/TP logic
+                # (jump directly to the fee gate section below)
+
+        if (sl_price is None and  # PATH-C not active
+                _ICT_TRADE_ENGINE_AVAILABLE and
                 QCfg.ICT_SWEEP_ENTRY_ENABLED() and
                 self._active_sweep_setup is not None and
                 self._active_sweep_setup.status == "OTE_READY" and
@@ -6011,6 +6200,11 @@ class QuantStrategy:
             self._sweep_detector.invalidate()
         _sweep_was_active = self._active_sweep_setup is not None
         self._active_sweep_setup = None
+        # ── v5.2: Clear hunt signal — consumed by fill ────────────────────────
+        _hunt_was_active = self._pending_hunt_signal is not None
+        self._pending_hunt_signal = None
+        if self._liquidity_hunter is not None:
+            self._liquidity_hunter.reset()
 
         # ── Build clean entry notification ───────────────────────────────────────
         sl_dist_pts = abs(fill_price - sl_price)
@@ -6020,10 +6214,12 @@ class QuantStrategy:
         ict_line = ""
         if sig.ict_total > 0.01:
             ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{sig.ict_details}]"
-        # Sweep entry badge
+        # Sweep + hunt entry badges
         _sweep_badge = ""
         if _sweep_was_active:
             _sweep_badge = " 🏛️ SWEEP-AND-GO"
+        elif locals().get('_hunt_was_active', False) or mode == "hunt":
+            _sweep_badge = " 🎣 HUNT-AND-GO"
         mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("⚡" if mode == "flow" else ("📈" if side == "long" else "📉")))
 
         # ── v8.0: additive tier + counter-HTF + AMD + sweep context lines ────────
