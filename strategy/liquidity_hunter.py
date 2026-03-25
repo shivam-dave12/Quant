@@ -109,6 +109,11 @@ class HuntSignal:
     """
     Entry signal produced by LiquidityHunter on sweep confirmation.
     Consumed once by _evaluate_hunt_entry → _enter_trade.
+
+    created_at is set automatically to wall-clock seconds at instantiation.
+    get_signal() rejects this signal once (now - created_at) exceeds
+    _SWEEP_MAX_AGE_MS / 1000 seconds — preventing stale sweep entries when
+    ICT OTE routing delayed hunt processing for several minutes.
     """
     side:               str     # "long" (SSL swept) | "short" (BSL swept)
     entry_price:        float   # price at signal generation time
@@ -118,8 +123,9 @@ class HuntSignal:
     swept_pool_price:   float   # price of the pool that was swept
     target_pool_price:  float   # price of the opposing delivery target pool
     prediction_score:   float   # EMA-smoothed score that preceded the sweep
-    sweep_age_ms:       int     # ms since sweep was confirmed (≤ _SWEEP_MAX_AGE_MS)
+    sweep_age_ms:       int     # ms since sweep was confirmed at signal creation
     details:            str     = ""
+    created_at:         float   = field(default_factory=time.time)  # wall-clock seconds
 
 
 @dataclass
@@ -221,7 +227,23 @@ class LiquidityHunter:
         self._advance_state(price, atr)
 
     def get_signal(self) -> Optional[HuntSignal]:
-        """Return pending signal without consuming it."""
+        """
+        Return pending signal without consuming it.
+
+        Expiry guard (Bug B fix): if the signal has been sitting in _signal
+        for longer than _SWEEP_MAX_AGE_MS milliseconds — e.g. while ICT OTE
+        routing held priority for several ticks — the underlying sweep is now
+        stale and the SL/TP prices are no longer valid.  The signal is cleared
+        here so the caller always receives a fresh-or-None value.
+        """
+        if self._signal is not None:
+            age_s = time.time() - self._signal.created_at
+            if age_s > _SWEEP_MAX_AGE_MS / 1000.0:
+                logger.info(
+                    f"LiqHunter: signal expired "
+                    f"(age={age_s:.0f}s > {_SWEEP_MAX_AGE_MS//1000}s limit) — clearing"
+                )
+                self._signal = None
         return self._signal
 
     def consume_signal(self) -> Optional[HuntSignal]:
@@ -328,8 +350,14 @@ class LiquidityHunter:
                 logger.debug(f"LiqHunter: ICT pool read error: {e}")
 
         # ── Fallback: candle swing extremes ───────────────────────────────
+        # Pass candles_5m[:-1] to strip the forming (unclosed) bar at the
+        # slice level.  The original call used min(40, len-2) to "shift"
+        # the window but still included candles[-1] in the slice, which
+        # meant _find_swing_extremes used the forming bar as the right-hand
+        # confirmation neighbour (nh/nl) for the last closed pivot candidate.
+        # By slicing [:-1] here the forming bar never enters the function.
         if bsl is None or ssl is None:
-            sh, sl = _find_swing_extremes(candles_5m, min(40, len(candles_5m) - 2))
+            sh, sl = _find_swing_extremes(candles_5m[:-1], 40)
             if bsl is None:
                 above = [h for h in sh if h > price + 0.3 * atr]
                 if above:

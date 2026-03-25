@@ -3108,6 +3108,14 @@ class QuantStrategy:
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
+        # v5.2 Bug-C fix: dedicated confirm counters for hunt entries.
+        # These are intentionally separate from _confirm_long/_confirm_short so
+        # that ICT OTE routing (which resets the general counters every tick it
+        # fires) cannot wipe the hunt's 2-tick confirmation progress.
+        # They are only reset when: (a) a hunt entry fires, (b) the hunt signal
+        # is None / expired (checked in the routing block each tick), or
+        # (c) _enter_trade() resets all state after a confirmed fill.
+        self._confirm_hunt_long = 0; self._confirm_hunt_short = 0
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
         self._last_momentum_attempt = 0.0   # cooldown after any retest attempt (pass or fail)
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
@@ -4498,10 +4506,21 @@ class QuantStrategy:
         )
         _hunt_ready = _hunt_signal is not None
 
+        # Bug-C fix: if there is no active hunt signal (either never produced
+        # or just expired via get_signal()'s staleness guard), reset the
+        # dedicated hunt confirm counters so a future signal starts clean.
+        if not _hunt_ready:
+            self._confirm_hunt_long = self._confirm_hunt_short = 0
+
         if _has_sweep_entry:
             self._confirm_trend_long = self._confirm_trend_short = 0
             self._confirm_long = self._confirm_short = 0
             self._confirm_flow_long = self._confirm_flow_short = 0
+            # NOTE: _confirm_hunt_long/_confirm_hunt_short are intentionally NOT
+            # reset here.  Resetting them every time OTE fires was the root cause
+            # of Bug C — the hunt's 2-tick confirmation progress was wiped on
+            # every OTE tick, forcing the hunt to restart from scratch after OTE
+            # resolved, while holding an increasingly stale signal.
             self._evaluate_reversion_entry(
                 data_manager, order_manager, risk_manager, sig, price, now)
         elif _hunt_ready:
@@ -4591,20 +4610,24 @@ class QuantStrategy:
             return
 
         # Gate 4: Confirm ticks (2 consecutive ticks to filter noise)
+        # Uses dedicated _confirm_hunt_long / _confirm_hunt_short counters
+        # (Bug-C fix) so that ICT OTE routing — which resets _confirm_long /
+        # _confirm_short on every tick it fires — cannot interrupt hunt
+        # confirmation progress.
         _cn = 2
         if side == "long":
-            self._confirm_long += 1
-            self._confirm_short = 0
-            if self._confirm_long < _cn:
+            self._confirm_hunt_long += 1
+            self._confirm_hunt_short = 0
+            if self._confirm_hunt_long < _cn:
                 return
         else:
-            self._confirm_short += 1
-            self._confirm_long = 0
-            if self._confirm_short < _cn:
+            self._confirm_hunt_short += 1
+            self._confirm_hunt_long = 0
+            if self._confirm_hunt_short < _cn:
                 return
 
         # ── CONFIRMED — store signal and launch entry ────────────────────
-        self._confirm_long = self._confirm_short = 0
+        self._confirm_hunt_long = self._confirm_hunt_short = 0
         self._pending_hunt_signal = hunt_signal
 
         # Consume from hunter so it doesn't re-fire on the next tick
@@ -6187,6 +6210,7 @@ class QuantStrategy:
         self.current_sl_price       = sl_price
         self.current_tp_price       = tp_price
         self._confirm_long          = self._confirm_short = 0
+        self._confirm_hunt_long     = self._confirm_hunt_short = 0
         # Reset duplicate guards for the new position
         self._exit_completed        = False
         self._pnl_recorded_for     = 0.0
