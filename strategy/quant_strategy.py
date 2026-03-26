@@ -7542,21 +7542,41 @@ class QuantStrategy:
                            ict_tier: str = "",
                            sl_price: Optional[float] = None) -> Optional[float]:
         """
-        Confidence-weighted position sizing — v8.0 (industry-grade, FIX Bug-B).
+        Confidence-weighted position sizing — v8.1 (QUANT_MARGIN_PCT primary).
 
-        Base quantity source:
-          When sl_price is provided (normal flow after _compute_sl_tp), uses
-          risk_manager.calculate_position_size(entry, sl, side) as the base.
-          This correctly enforces RISK_PER_TRADE dollar-risk / SL-distance.
-          The old margin-pct formula ignored RISK_PER_TRADE entirely.
+        QUANT_MARGIN_PCT is the single controlling parameter for trade size.
+        Changing it in config.py takes immediate effect on the next trade.
 
-          Fallback to margin-pct when sl_price is absent (legacy/test paths).
+        Formula:
+          margin_alloc = available_balance × QUANT_MARGIN_PCT × total_mult
+          qty          = (margin_alloc × LEVERAGE) / price
 
-        Confidence multiplier applied on top of risk-based base:
-          Tier-S: 1.00× | Tier-A: 0.80× | Tier-B: 0.65× | none: 0.50×
-          Composite ≥0.70: +10% | ≥0.50: +5% | <0.35: -10%
-          AMD conf  ≥0.85: +8%  | ≥0.70: +4% | <0.50: -5%
-          Clamped to [0.40, 1.05] — never amplifies above base.
+        Example: balance=$500, QUANT_MARGIN_PCT=0.50, LEVERAGE=30, BTC=$85,000
+          margin_alloc = 500 × 0.50 × total_mult = $250 × total_mult
+          qty          = (250 × 30) / 85,000 = 0.0882 BTC (at total_mult=1.0)
+
+        Confidence multiplier (total_mult) is applied on top — it scales the
+        margin allocation up or down based on ICT tier and signal quality.
+        total_mult is always clamped to [0.40, 1.05].
+
+        ICT tier base:
+          Tier-S: 1.00×  (full conviction — OTE sweep + AMD confirmed)
+          Tier-A: 0.80×  (high conviction — ICT structural alignment)
+          Tier-B: 0.65×  (standard quant + ICT confluence gate)
+          "":     0.50×  (no ICT tier — reduced exposure)
+
+        Composite score modifier (additive):
+          |composite| ≥ 0.70 → +0.10
+          |composite| ≥ 0.50 → +0.05
+          |composite| <  0.35 → −0.10
+
+        AMD confidence modifier (additive):
+          amd_conf ≥ 0.85 → +0.08
+          amd_conf ≥ 0.70 → +0.04
+          amd_conf <  0.50 → −0.05
+
+        sl_price is used only for informational dollar-risk logging.
+        It does not alter the computed quantity.
         """
         step = QCfg.LOT_STEP()
 
@@ -7580,46 +7600,37 @@ class QuantStrategy:
 
         total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
 
-        # ── Base quantity ─────────────────────────────────────────────────────
-        if sl_price is not None and sl_price > 0 and price > 0:
-            # Risk-based (preferred): dollar_risk / SL_distance = quantity.
-            _side_str = "LONG" if sl_price < price else "SHORT"
-            base_qty = risk_manager.calculate_position_size(
-                entry_price=price,
-                stop_loss=sl_price,
-                side=_side_str,
+        # ── Available balance ─────────────────────────────────────────────────
+        bal = risk_manager.get_available_balance()
+        if bal is None:
+            logger.warning("_compute_quantity: get_available_balance returned None")
+            return None
+        available = float(bal.get("available", 0.0))
+        if available < QCfg.MIN_MARGIN_USDT():
+            logger.warning(
+                f"_compute_quantity: available ${available:.2f} < "
+                f"MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f}"
             )
-            if base_qty is None:
-                logger.warning("calculate_position_size returned None — cannot size position")
-                return None
-            qty_raw = base_qty * total_mult
-            sizing_method = "risk_based"
-            bal = risk_manager.get_available_balance()
-            available = float((bal or {}).get("available", 0.0))
-            sl_dist     = abs(price - sl_price)
-            dollar_risk = sl_dist * base_qty
-            risk_pct    = dollar_risk / available * 100.0 if available > 0 else 0.0
-        else:
-            # Margin-pct fallback (legacy — should not fire in normal entry flow).
-            bal = risk_manager.get_available_balance()
-            if bal is None:
-                return None
-            available = float(bal.get("available", 0.0))
-            if available < QCfg.MIN_MARGIN_USDT():
-                return None
-            margin_alloc = available * QCfg.MARGIN_PCT() * total_mult
-            if margin_alloc < QCfg.MIN_MARGIN_USDT():
-                return None
-            qty_raw = (margin_alloc * QCfg.LEVERAGE()) / price
-            sizing_method = "margin_pct_fallback"
-            sl_dist = dollar_risk = risk_pct = 0.0
+            return None
+
+        # ── Margin-pct sizing — QUANT_MARGIN_PCT is the sole controlling param ─
+        margin_alloc = available * QCfg.MARGIN_PCT() * total_mult
+        if margin_alloc < QCfg.MIN_MARGIN_USDT():
+            logger.warning(
+                f"_compute_quantity: margin_alloc ${margin_alloc:.2f} < "
+                f"MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f} "
+                f"(available=${available:.2f} MARGIN_PCT={QCfg.MARGIN_PCT():.2%} "
+                f"mult={total_mult:.2f})"
+            )
+            return None
+        qty_raw = (margin_alloc * QCfg.LEVERAGE()) / price
 
         # ── Lot-step + hard limits ────────────────────────────────────────────
         qty = math.floor(qty_raw / step) * step
         qty = round(qty, 8)
         qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
 
-        # ── Margin guard ──────────────────────────────────────────────────────
+        # ── Margin guard: ensure required margin never exceeds available ───────
         required_margin = qty * price / QCfg.LEVERAGE()
         bal2 = risk_manager.get_available_balance()
         _avail2 = float((bal2 or {}).get("available", 0.0))
@@ -7635,11 +7646,19 @@ class QuantStrategy:
         if qty < QCfg.MIN_QTY():
             return None
 
+        # ── Dollar-risk logging (informational — does not alter qty) ──────────
+        sl_dist     = abs(price - sl_price) if (sl_price is not None and sl_price > 0) else 0.0
+        dollar_risk = sl_dist * qty if sl_dist > 0 else 0.0
+        risk_pct    = dollar_risk / available * 100.0 if (dollar_risk > 0 and available > 0) else 0.0
+
         logger.info(
-            f"✅ Sizing [{sizing_method}] | tier={ict_tier or 'none'} "
-            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f})"
-            + (f" | SL-dist={sl_dist:.1f}pts $risk=${dollar_risk:.2f} ({risk_pct:.2f}%)" if sl_dist > 0 else "")
-            + f" | margin=${qty * price / QCfg.LEVERAGE():.2f} | qty={qty}"
+            f"✅ Sizing [margin_pct] | MARGIN_PCT={QCfg.MARGIN_PCT():.2%} | "
+            f"tier={ict_tier or 'none'} "
+            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f}) | "
+            f"alloc=${margin_alloc:.2f} | margin=${qty * price / QCfg.LEVERAGE():.2f}"
+            + (f" | SL-dist={sl_dist:.1f}pts $risk=${dollar_risk:.2f} ({risk_pct:.2f}%)"
+               if sl_dist > 0 else "")
+            + f" | qty={qty}"
         )
         return qty
 
