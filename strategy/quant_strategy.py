@@ -27,6 +27,7 @@ Trail: ICTTrailEngine AMD-phase state machine (MANIP→freeze, DIST P1-P3, BOS t
 from __future__ import annotations
 import logging, math, time, threading
 from collections import deque
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, timedelta
 from enum import Enum, auto
@@ -4164,10 +4165,14 @@ class QuantStrategy:
         # v4.3 Solution 5: Spread cost gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
         if not spread_ok:
-            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = 0
+            # BUG-3 FIX: _confirm_hunt counters must be included in every broad reset
+            # so stale confirmation progress can never leak into the next hunt cycle.
+            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = self._confirm_hunt_long = self._confirm_hunt_short = 0
             return
         sig = self._compute_signals(data_manager)
-        if sig is None: self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = 0; return
+        if sig is None:
+            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = self._confirm_hunt_long = self._confirm_hunt_short = 0
+            return
         price = data_manager.get_last_price()
 
         # ── v4.8: ICT/SMC structural confluence ──────────────────────────
@@ -4618,12 +4623,18 @@ class QuantStrategy:
                 _hp = getattr(self._ict, '_last_hunt_pred', {}) or {}
                 if _hp.get('opposing_pool') is not None:
                     _hunt_opposing_pool = _hp['opposing_pool']
-                    # Update the hunt signal TP to match ICT engine's target
-                    if (side == "long"  and _hunt_opposing_pool > price) or                        (side == "short" and _hunt_opposing_pool < price):
-                        hunt_signal = type(hunt_signal)(
-                            **{**hunt_signal.__dict__,
-                               'tp_price': _hunt_opposing_pool,
-                               'target_pool_price': _hunt_opposing_pool})
+                    # Update the hunt signal TP to match ICT engine's target.
+                    # BUG-4 FIX: The original code used type(hunt_signal)(**{**hunt_signal.__dict__, …})
+                    # which breaks silently if HuntSignal gains __slots__, __post_init__,
+                    # or is subclassed. dataclasses.replace() is the correct, future-proof API.
+                    # It also ensures created_at is preserved correctly (field copy semantics).
+                    if ((side == "long"  and _hunt_opposing_pool > price) or
+                            (side == "short" and _hunt_opposing_pool < price)):
+                        hunt_signal = dataclasses.replace(
+                            hunt_signal,
+                            tp_price          = _hunt_opposing_pool,
+                            target_pool_price = _hunt_opposing_pool,
+                        )
             except Exception:
                 pass
 
@@ -5755,17 +5766,35 @@ class QuantStrategy:
             _sl_ok = (side == "long"  and _hs_sl < price) or (side == "short" and _hs_sl > price)
             _tp_ok = (side == "long"  and _hs_tp > price) or (side == "short" and _hs_tp < price)
             if _sl_ok and _tp_ok:
-                sl_price   = _hs_sl
-                tp_price   = _hs_tp
-                _sl_source = "hunt_swept_pool"
-                _used_path = "C"
-                logger.info(
-                    f"🎣 PATH-C (HUNT): SL=${sl_price:,.1f}  TP=${tp_price:,.1f}  "
-                    f"R:R=1:{abs(tp_price-price)/max(abs(price-sl_price),1):.2f}  "
-                    f"swept=${_hs.swept_pool_price:,.0f}  target=${_hs.target_pool_price:,.0f}"
-                )
-                # Apply only the fee-gate at the end — skip all structural SL/TP logic
-                # (jump directly to the fee gate section below)
+                # BUG-2 FIX: _evaluate_hunt_entry may mutate tp_price (ICT opposing-pool
+                # update) AFTER the original HuntSignal R:R was validated by the hunter.
+                # The mutated TP could place the ratio below _MIN_RR (e.g. 0.9R).
+                # Re-validate here using the ACTUAL prices PATH-C will use.
+                _sl_dist = abs(price - _hs_sl)
+                _tp_dist = abs(price - _hs_tp)
+                _path_c_rr = _tp_dist / _sl_dist if _sl_dist > 1e-10 else 0.0
+                _min_rr_c  = QCfg.REVERSION_MIN_RR() if mode not in ("trend", "momentum") \
+                             else QCfg.TREND_MIN_RR()
+                if _path_c_rr < _min_rr_c:
+                    logger.info(
+                        f"⛔ PATH-C R:R gate: {_path_c_rr:.2f} < {_min_rr_c:.1f} "
+                        f"(SL={_sl_dist:.0f}pts TP={_tp_dist:.0f}pts) "
+                        f"— hunt signal R:R degraded after ICT TP update, rejecting"
+                    )
+                    # Clear the stale hunt signal so it is not re-evaluated
+                    self._pending_hunt_signal = None
+                    # Fall through to PATH-A / PATH-B
+                else:
+                    sl_price   = _hs_sl
+                    tp_price   = _hs_tp
+                    _sl_source = "hunt_swept_pool"
+                    _used_path = "C"
+                    logger.info(
+                        f"🎣 PATH-C (HUNT): SL=${sl_price:,.1f}  TP=${tp_price:,.1f}  "
+                        f"R:R=1:{_path_c_rr:.2f}  "
+                        f"swept=${_hs.swept_pool_price:,.0f}  target=${_hs.target_pool_price:,.0f}"
+                    )
+                    # Apply only the fee-gate at the end — skip all structural SL/TP logic
 
         if (sl_price is None and  # PATH-C not active
                 _ICT_TRADE_ENGINE_AVAILABLE and

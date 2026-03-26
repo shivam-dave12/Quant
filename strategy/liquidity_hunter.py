@@ -56,17 +56,12 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
 
-_WEIGHTS: Dict[str, float] = {
-    "flow":       0.18,
-    "cvd":        0.15,
-    "disp_bias":  0.12,
-    "ob_magnet":  0.15,
-    "fvg_path":   0.10,
-    "dr_pos":     0.12,
-    "session":    0.08,
-    "micro":      0.10,
-}
-assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
+# NOTE: The 8-factor _WEIGHTS dict has been removed (Bug 9 fix).
+# _compute_prediction_score() now delegates entirely to
+# ICTEngine.predict_next_hunt() which uses a superior 9-factor model
+# (AMD phase weight 0.25, the strongest single signal) with weights that
+# sum to 1.0.  Keeping a second weights table would be dead code and a
+# maintenance trap.
 
 # Range detection
 _RANGE_MIN_ATR       = 0.8    # pool-to-pool span must be ≥ 0.8 ATR to qualify
@@ -210,7 +205,7 @@ class LiquidityHunter:
         # 3. Check for fresh sweep — highest priority
         swept_side = self._check_sweep(price, atr, now_ms, candles_5m, ict_engine)
         if swept_side:
-            self._on_sweep_confirmed(swept_side, price, atr, now, now_ms)
+            self._on_sweep_confirmed(swept_side, price, atr, now, now_ms, ict_engine)
             return
 
         # 4. Recompute 8-factor prediction score
@@ -507,6 +502,7 @@ class LiquidityHunter:
         atr:        float,
         now:        float,
         now_ms:     int,
+        ict_engine  = None,  # BUG-7 FIX: passed through to compute real sweep age
     ) -> None:
         """
         Build HuntSignal after confirmed sweep.
@@ -556,6 +552,32 @@ class LiquidityHunter:
             self._state = HuntState.SWEEP_CONFIRMED
             return
 
+        # BUG-7 FIX: sweep_age_ms was hardcoded to 0, making it useless for
+        # debugging and misleading in status logs.  Compute the real age from the
+        # ICT pool's sweep_timestamp if available; fall back to the delta since
+        # the last _last_update tick (which is the tick that detected the sweep).
+        sweep_age_ms = 0
+        try:
+            if ict_engine is not None and getattr(ict_engine, '_initialized', False):
+                target_level_type = "BSL" if swept_side == "bsl" else "SSL"
+                best_age = _SWEEP_MAX_AGE_MS
+                for pool in ict_engine.liquidity_pools:
+                    if not pool.swept:
+                        continue
+                    if getattr(pool, 'level_type', '') not in (
+                            ('BSL', 'EQH') if swept_side == "bsl" else ('SSL', 'EQL')):
+                        continue
+                    age = now_ms - getattr(pool, 'sweep_timestamp', now_ms)
+                    if 0 <= age < best_age:
+                        best_age = age
+                sweep_age_ms = best_age if best_age < _SWEEP_MAX_AGE_MS else 0
+        except Exception:
+            pass
+
+        # Fallback: time since last update tick that detected the sweep
+        if sweep_age_ms == 0:
+            sweep_age_ms = int((now - self._last_update) * 1000)
+
         self._signal = HuntSignal(
             side              = side,
             entry_price       = price,
@@ -565,13 +587,14 @@ class LiquidityHunter:
             swept_pool_price  = swept_p,
             target_pool_price = target_p,
             prediction_score  = self._score_ema,
-            sweep_age_ms      = 0,
+            sweep_age_ms      = sweep_age_ms,
             details = (
                 f"swept={swept_side.upper()}@${swept_p:,.0f}  "
                 f"target=${target_p:,.0f}  "
                 f"R:R=1:{rr:.2f}  "
                 f"score_ema={self._score_ema:+.3f}  "
-                f"SL=${sl_raw:,.1f}  TP=${tp_raw:,.1f}"
+                f"SL=${sl_raw:,.1f}  TP=${tp_raw:,.1f}  "
+                f"sweep_age={sweep_age_ms}ms"
             ),
         )
         self._state = HuntState.SWEEP_CONFIRMED
@@ -580,7 +603,8 @@ class LiquidityHunter:
             f"🎯 LiqHunter: SIGNAL {side.upper()}  "
             f"swept={swept_side.upper()}@${swept_p:,.0f}  "
             f"SL=${sl_raw:,.1f}  TP=${tp_raw:,.1f}  "
-            f"R:R=1:{rr:.2f}  pred_score={self._score_ema:+.3f}"
+            f"R:R=1:{rr:.2f}  pred_score={self._score_ema:+.3f}  "
+            f"sweep_age={sweep_age_ms}ms"
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -672,185 +696,66 @@ class LiquidityHunter:
         cvd_trend:   float,
     ) -> float:
         """
-        Weighted 8-factor score.
-
-        Returns [-1, +1]:
+        Prediction score in [-1, +1]:
           Positive → price heading to BSL (buy stops above)
           Negative → price heading to SSL (sell stops below)
+
+        BUG-8 FIX: The old implementation computed `_now_ms` twice (as
+        `_now_ms_f4` and `_now_ms_f5`) in separate factor blocks.
+
+        BUG-9 FIX: The old 8-factor model directly duplicated
+        `ICTEngine.predict_next_hunt()` (9 factors, better weights, AMD
+        phase included at 0.25 weight — the strongest single signal).
+        The hunter's scoring was strictly inferior — it lacked the AMD
+        factor entirely.  Replace it entirely with a delegation to
+        `predict_next_hunt()`, which already receives tick_flow and
+        cvd_trend via `set_order_flow_data()` called on every tick.
+
+        The state machine, sweep detection, and signal packaging in
+        LiquidityHunter remain valuable and are kept unchanged.
+        Only the scoring step is replaced.
+
+        Fallback: if ict_engine is unavailable, returns 0.0 (neutral),
+        which prevents STALKING from being entered — a safe default.
         """
         if self._range is None:
             return 0.0
 
-        bsl = self._range.bsl_price
-        ssl = self._range.ssl_price
+        # BUG-8 FIX: compute _now_ms exactly once
+        _now_ms = int(now * 1000)
 
-        components: Dict[str, float] = {}
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 1: Order Flow Imbalance  (weight 0.18)
-        # tick_flow from TickFlowEngine — positive = net buying → BSL
-        # ─────────────────────────────────────────────────────────────────
-        f1 = _sigmoid(tick_flow, 1.5)
-        components["flow"] = f1
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 2: CVD Slope  (weight 0.15)
-        # cvd_trend from CVDEngine.get_trend_signal() — already in [-1,+1]
-        # ─────────────────────────────────────────────────────────────────
-        f2 = _sigmoid(cvd_trend, 1.2)
-        components["cvd"] = f2
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 3: Displacement Bias  (weight 0.12)
-        # Net body direction of last 4 CLOSED 5m candles.
-        # Large bullish candles → heading to BSL; bearish → SSL.
-        # Use closed candles only (candles_5m[-5:-1]).
-        # ─────────────────────────────────────────────────────────────────
-        f3 = 0.0
-        if len(candles_5m) >= 6 and atr > 1e-10:
-            net_body = sum(
-                float(c['c']) - float(c['o'])
-                for c in candles_5m[-5:-1]
-            )
-            f3 = _sigmoid(net_body / atr, 1.0)
-        components["disp_bias"] = f3
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 4: OB Magnet Pull  (weight 0.15)
-        # Bullish OBs between price and BSL attract price upward.
-        # Bearish OBs between price and SSL attract price downward.
-        # ─────────────────────────────────────────────────────────────────
-        f4 = 0.0
+        # ── Delegate to ICTEngine.predict_next_hunt() ─────────────────────
+        # This is the canonical 9-factor model with AMD phase (weight 0.25).
+        # We only call it when the ICT engine is available and initialised;
+        # the result is already normalised to a score convention where
+        # bsl_score - ssl_score gives a signed directional value analogous
+        # to the old 8-factor weighted sum.
         if ict_engine is not None and getattr(ict_engine, '_initialized', False):
             try:
-                _now_ms_f4 = int(now * 1000)
-                bull_q = sum(
-                    getattr(ob, 'strength', 50) / 100.0
-                    for ob in ict_engine.order_blocks_bull
-                    if (hasattr(ob, 'is_active') and ob.is_active(_now_ms_f4)
-                        and price < ob.midpoint < bsl)
+                pred = ict_engine.predict_next_hunt(price, atr, _now_ms, candles_5m)
+                # bsl_score positive → price going to BSL (matches our convention)
+                # ssl_score positive → price going to SSL
+                bsl_s = float(pred.get("bsl_score", 0.0))
+                ssl_s = float(pred.get("ssl_score", 0.0))
+                raw_score = max(-1.0, min(1.0, bsl_s - ssl_s))
+
+                # Store the 9-factor breakdown for /huntstatus display
+                self._score_components = pred.get("confidence_factors", {})
+
+                logger.debug(
+                    f"LiqHunter predict_next_hunt: {pred.get('predicted','?')} "
+                    f"conf={pred.get('confidence', 0):.2f} "
+                    f"bsl={bsl_s:+.3f} ssl={ssl_s:+.3f} → score={raw_score:+.3f}"
                 )
-                bear_q = sum(
-                    getattr(ob, 'strength', 50) / 100.0
-                    for ob in ict_engine.order_blocks_bear
-                    if (hasattr(ob, 'is_active') and ob.is_active(_now_ms_f4)
-                        and ssl < ob.midpoint < price)
-                )
-                f4 = _sigmoid(bull_q - bear_q, 0.8)
-            except Exception:
-                pass
-        components["ob_magnet"] = f4
+                return raw_score
+            except Exception as e:
+                logger.debug(f"LiqHunter: predict_next_hunt delegation error: {e}")
 
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 5: FVG Path Density  (weight 0.10)
-        # Unfilled bullish FVGs between price and BSL = upward delivery highway.
-        # Unfilled bearish FVGs between price and SSL = downward delivery highway.
-        # ─────────────────────────────────────────────────────────────────
-        f5 = 0.0
-        if ict_engine is not None and getattr(ict_engine, '_initialized', False):
-            try:
-                _now_ms_f5 = int(now * 1000)
-                bull_fvg = sum(
-                    1 for fvg in ict_engine.fvgs_bull
-                    if (hasattr(fvg, 'is_active') and fvg.is_active(_now_ms_f5)
-                        and price < fvg.top < bsl)
-                )
-                bear_fvg = sum(
-                    1 for fvg in ict_engine.fvgs_bear
-                    if (hasattr(fvg, 'is_active') and fvg.is_active(_now_ms_f5)
-                        and ssl < fvg.bottom < price)
-                )
-                f5 = _sigmoid((bull_fvg - bear_fvg) * 0.5, 0.8)
-            except Exception:
-                pass
-        components["fvg_path"] = f5
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 6: Dealing Range Position  (weight 0.12)
-        # Discount (<40% of range) → BSL hunt likely (accumulate low, deliver high).
-        # Premium  (>60% of range) → SSL hunt likely (distribute high, deliver low).
-        # Equilibrium (40–60%)     → neutral.
-        # ─────────────────────────────────────────────────────────────────
-        f6 = 0.0
-        range_size = max(bsl - ssl, 1e-10)
-        pd_ratio   = (price - ssl) / range_size   # 0 = at SSL, 1 = at BSL
-        if pd_ratio < 0.40:
-            f6 = 0.6 * (0.40 - pd_ratio) / 0.40      # 0 → +0.6 in discount
-        elif pd_ratio > 0.60:
-            f6 = -0.6 * (pd_ratio - 0.60) / 0.40     # 0 → -0.6 in premium
-        components["dr_pos"] = f6
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 7: Session Timing  (weight 0.08)
-        # London open (08:00–09:00 UTC): Judas swing = BSL swept first often.
-        # NY session  (13:30–15:30 UTC): delivery follows prior manipulation.
-        # Asia / off-session: neutral accumulation.
-        # ─────────────────────────────────────────────────────────────────
-        f7 = 0.0
-        try:
-            from datetime import datetime, timezone as _tz
-            _dt  = datetime.fromtimestamp(now, tz=_tz.utc)
-            _hm  = _dt.hour * 60 + _dt.minute
-            if 480 <= _hm <= 540:
-                # London Judas swing window — BSL often swept first in first 30 min,
-                # then price delivers down. Slight positive bias here.
-                f7 = 0.20
-            elif 810 <= _hm <= 930:
-                # NY delivery window — amplify existing EMA bias.
-                f7 = self._score_ema * 0.25
-        except Exception:
-            pass
-        components["session"] = f7
-
-        # ─────────────────────────────────────────────────────────────────
-        # Factor 8: 5m Micro-Structure  (weight 0.10)
-        # Count HH/HL (bullish) vs LH/LL (bearish) over last 6 closed candles.
-        # Bonus: 5m BOS direction from ICT engine (±0.20).
-        # ─────────────────────────────────────────────────────────────────
-        f8 = 0.0
-        if len(candles_5m) >= 8:
-            closed_slice = candles_5m[-8:-1]   # 7 closed candles
-            highs = [float(c['h']) for c in closed_slice]
-            lows  = [float(c['l']) for c in closed_slice]
-            hh = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
-            lh = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
-            hl = sum(1 for i in range(1, len(lows))  if lows[i]  > lows[i-1])
-            ll = sum(1 for i in range(1, len(lows))  if lows[i]  < lows[i-1])
-            bull = hh + hl
-            bear = lh + ll
-            total = max(bull + bear, 1)
-            f8 = _sigmoid((bull - bear) / total * 2.0, 1.0)
-
-        # 5m BOS direction bonus (read from ICT engine _tf layer)
-        if ict_engine is not None and getattr(ict_engine, '_initialized', False):
-            try:
-                tf5m = ict_engine._tf.get("5m")
-                if tf5m is not None:
-                    bos_dir = getattr(tf5m, 'bos_direction', '')
-                    if bos_dir == "bullish":
-                        f8 = min(1.0,  f8 + 0.20)
-                    elif bos_dir == "bearish":
-                        f8 = max(-1.0, f8 - 0.20)
-            except Exception:
-                pass
-        components["micro"] = f8
-
-        # ─────────────────────────────────────────────────────────────────
-        # Weighted sum → clamp to [-1, +1]
-        # ─────────────────────────────────────────────────────────────────
-        score = (
-            f1 * _WEIGHTS["flow"]      +
-            f2 * _WEIGHTS["cvd"]       +
-            f3 * _WEIGHTS["disp_bias"] +
-            f4 * _WEIGHTS["ob_magnet"] +
-            f5 * _WEIGHTS["fvg_path"]  +
-            f6 * _WEIGHTS["dr_pos"]    +
-            f7 * _WEIGHTS["session"]   +
-            f8 * _WEIGHTS["micro"]
-        )
-        score = max(-1.0, min(1.0, score))
-        self._score_components = components
-        return score
+        # ── Fallback: ICT engine unavailable — return neutral ─────────────
+        # Neutral score prevents erroneous STALKING when the ICT engine has
+        # not yet warmed up (first few ticks after bot start).
+        self._score_components = {}
+        return 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

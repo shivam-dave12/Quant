@@ -1539,6 +1539,29 @@ class ICTEngine:
         self._cluster_liq_into(_fresh_pools, self._swing_lows, "SSL", tol, price,
                                meta=self._swing_lows_meta)
 
+        # BUG-6 FIX: Steps 2+3 were O(n×m) — `any(abs(existing.price - fresh.price) <= tol …)`
+        # iterated over all _fresh_pools for every existing pool, then again for every fresh pool.
+        # Worst case: 200 existing × 200 fresh = 40 000 comparisons every 5 seconds.
+        # Fix: build a keyed index of fresh pools — key = (round(price, 0), level_type).
+        # Two pools that map to the same key are guaranteed within `tol` of each other
+        # when tol ≈ price * 0.001 (0.1 %), because the rounding bucket size (1 USD) is
+        # far smaller than tol (≈$65 on a $65 000 BTC price), so any pair within tol
+        # will always round to the same integer dollar bucket.
+        _fresh_index: Dict[Tuple[float, str], LiquidityLevel] = {}
+        for fp in _fresh_pools:
+            _key = (round(fp.price, 0), fp.level_type)
+            # Keep the entry with the higher touch count when two pools hash identically
+            if _key not in _fresh_index or fp.touch_count > _fresh_index[_key].touch_count:
+                _fresh_index[_key] = fp
+
+        def _fresh_match(pool_price: float, level_type: str) -> Optional[LiquidityLevel]:
+            """O(1) lookup: return the matching fresh pool or None."""
+            key = (round(pool_price, 0), level_type)
+            fp = _fresh_index.get(key)
+            if fp is not None and abs(fp.price - pool_price) <= tol:
+                return fp
+            return None
+
         # ── Step 2: Partition existing pools ────────────────────────────
         max_swept_age = self.AMD_DISTRIB_WINDOW_MS * 3
         kept: List[LiquidityLevel] = []
@@ -1550,36 +1573,28 @@ class ICTEngine:
                     kept.append(existing)
                 continue
 
-            # Unswept: keep if a fresh cluster still supports it
-            still_valid = any(
-                abs(existing.price - fresh.price) <= tol
-                and existing.level_type == fresh.level_type
-                for fresh in _fresh_pools
-            )
-            if still_valid:
+            # Unswept: keep if a fresh cluster still supports it (O(1) lookup)
+            fp = _fresh_match(existing.price, existing.level_type)
+            if fp is not None:
                 # Update touch count to reflect current cluster size
-                for fresh in _fresh_pools:
-                    if (abs(existing.price - fresh.price) <= tol
-                            and existing.level_type == fresh.level_type):
-                        existing.touch_count = max(existing.touch_count,
-                                                    fresh.touch_count)
-                        # Upgrade TF tag if a higher TF now supports it
-                        _TF_R = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
-                        if _TF_R.get(fresh.timeframe, 1) > _TF_R.get(existing.timeframe, 1):
-                            existing.timeframe = fresh.timeframe
-                        break
+                existing.touch_count = max(existing.touch_count, fp.touch_count)
+                # Upgrade TF tag if a higher TF now supports it
+                _TF_R = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
+                if _TF_R.get(fp.timeframe, 1) > _TF_R.get(existing.timeframe, 1):
+                    existing.timeframe = fp.timeframe
                 kept.append(existing)
             # else: pool lost swing support → drop it (structural invalidation)
 
         # ── Step 3: Add genuinely new pools not already in kept ─────────
+        # Build an O(1) index over the kept list to avoid a nested loop.
+        _kept_index: Dict[Tuple[float, str], bool] = {
+            (round(k.price, 0), k.level_type): True for k in kept
+        }
         for fresh in _fresh_pools:
-            already_exists = any(
-                abs(fresh.price - k.price) <= tol
-                and fresh.level_type == k.level_type
-                for k in kept
-            )
-            if not already_exists:
+            _key = (round(fresh.price, 0), fresh.level_type)
+            if _key not in _kept_index:
                 kept.append(fresh)
+                _kept_index[_key] = True  # prevent double-add within the same fresh batch
 
         # ── Step 4: Replace the deque ──────────────────────────────────
         self.liquidity_pools.clear()

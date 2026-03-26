@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional, Tuple
@@ -601,7 +602,10 @@ class OrderManager:
         self._exchange_name = exch
         self._orders_lock   = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
-        self.order_history: list            = []
+        # BUG-1 FIX: plain list grew forever — swap to deque so memory is bounded.
+        # 1 000 entries covers well over a year of daily trading; oldest records
+        # are evicted automatically once the cap is reached.
+        self.order_history: deque = deque(maxlen=1_000)
         self._rate_window_start = time.time()
         self._rate_window_count = 0
         self._open_orders_404   = False

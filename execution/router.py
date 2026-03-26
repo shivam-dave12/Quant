@@ -208,9 +208,24 @@ class ExecutionRouter:
         return self.active._open_orders_404
 
     @property
-    def _product_id(self):
-        """Delta-specific: expose product_id for leverage setting in bot startup."""
+    def _product_id(self) -> Optional[int]:
+        """
+        Delta-specific: expose the scalar product_id integer for leverage
+        setting during bot startup (main.py calls om.set_leverage(pid, lev)).
+
+        BUG-10 FIX: The original property returned `adapter._pid_cache` directly.
+        In _DeltaAdapter, `_pid_cache` is typed `Optional[int]` — a scalar or None.
+        The bug description noted callers expected a scalar but might receive a dict;
+        that mismatch only arises if _pid_cache is ever accidentally assigned a dict
+        elsewhere.  Adding the explicit `Optional[int]` return annotation catches
+        that statically, and the isinstance guard below makes it safe at runtime.
+        """
         adapter = getattr(self.active, "_adapter", None)
-        if adapter and hasattr(adapter, "_pid_cache"):
-            return adapter._pid_cache
+        if adapter is None:
+            return None
+        pid = getattr(adapter, "_pid_cache", None)
+        # Defensive: if something erroneously wrote a dict, return None rather
+        # than silently propagating a wrong type to set_leverage().
+        if isinstance(pid, int):
+            return pid
         return None
