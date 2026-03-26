@@ -64,6 +64,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# -- v9.0: Display engine --
+try:
+    from strategy.v9_display import format_heartbeat as _fmt_hb
+    _V9_DISPLAY = True
+except ImportError:
+    _V9_DISPLAY = False
+
 # ── Global exception hooks — no silent crash ever again ──────────────────────
 
 def _log_uncaught(exc_type, exc_value, exc_tb):
@@ -338,6 +345,7 @@ class QuantBot:
     # HEARTBEAT
     # =========================================================================
 
+
     def maybe_log_heartbeat(self) -> None:
         now = time.time()
         if now - self.last_heartbeat_sec < 60.0:
@@ -348,38 +356,72 @@ class QuantBot:
         pos   = self.strategy.get_position()       if self.strategy   else None
         agg   = self.data_manager.get_secondary_status() if self.data_manager else {}
         feed  = "dual" if agg.get("alive") else "single"
+        exch  = self.execution_router.active_exchange.upper() if self.execution_router else "?"
 
+        # v9.0: Use new display engine if available
+        if _V9_DISPLAY and self.strategy:
+            strat = self.strategy
+            engine_state = "SCANNING"
+            tracking_info = None
+            primary_target = None
+            n_bsl = 999.0
+            n_ssl = 999.0
+            sweep_count = 0
+            flow_conv = 0.0
+            flow_dir = ""
+
+            if hasattr(strat, '_entry_engine') and strat._entry_engine is not None:
+                engine_state = strat._entry_engine.state
+                tracking_info = strat._entry_engine.tracking_info
+
+            if hasattr(strat, '_liq_map') and strat._liq_map is not None:
+                try:
+                    snap = strat._liq_map.get_snapshot(price, strat._atr_5m.atr)
+                    primary_target = snap.primary_target
+                    n_bsl = snap.nearest_bsl_atr
+                    n_ssl = snap.nearest_ssl_atr
+                    sweep_count = len(snap.recent_sweeps)
+                except Exception:
+                    pass
+
+            stats = strat.get_stats() if strat else {}
+
+            msg = _fmt_hb(
+                price=price, feed=feed, exchange=exch,
+                position=pos, engine_state=engine_state,
+                tracking_info=tracking_info,
+                primary_target=primary_target,
+                nearest_bsl_atr=n_bsl, nearest_ssl_atr=n_ssl,
+                recent_sweep_count=sweep_count,
+                total_trades=stats.get("total_trades", 0),
+                total_pnl=stats.get("total_pnl", 0.0),
+                flow_conviction=flow_conv,
+                flow_direction=flow_dir,
+            )
+            logger.info(msg)
+            return
+
+        # Legacy heartbeat fallback
         if pos:
             side  = pos.get("side", "?").upper()
             entry = pos.get("entry_price", 0.0)
             sl    = pos.get("sl_price", 0.0)
             tp    = pos.get("tp_price", 0.0)
-
-            # Guard: between order placement and fill confirmation, entry_price=0
-            # and side="" — computing PnL as (price - 0) produces a spurious
-            # "-$69,000 unrealised" line that looks like a catastrophic loss.
-            # Show "PENDING FILL" instead so the operator knows the state.
             if entry <= 0 or side not in ("LONG", "SHORT"):
-                logger.info(
-                    f"💓 ${price:,.2f} [{feed}] | ⏳ PENDING FILL — order placed, awaiting confirmation"
-                )
+                logger.info(f"${price:,.2f} [{feed}] | PENDING FILL")
             else:
                 pnl = (price - entry) if side == "LONG" else (entry - price)
                 logger.info(
-                    f"💓 ${price:,.2f} [{feed}] | IN {side} @ ${entry:,.2f} | "
-                    f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl:+.2f} pts"
-                )
+                    f"${price:,.2f} [{feed}] | IN {side} @ ${entry:,.2f} | "
+                    f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl:+.2f} pts")
         else:
             stats  = self.strategy.get_stats() if self.strategy else {}
             phase  = stats.get("current_phase", "FLAT")
             trades = stats.get("daily_trades", 0)
             pnl    = stats.get("total_pnl", 0.0)
-            exch   = self.execution_router.active_exchange.upper() \
-                     if self.execution_router else "?"
             logger.info(
-                f"💓 ${price:,.2f} [{feed}|exec={exch}] | {phase} | "
-                f"trades today: {trades} | session PnL: ${pnl:+.2f}"
-            )
+                f"${price:,.2f} [{feed}|exec={exch}] | {phase} | "
+                f"trades today: {trades} | session PnL: ${pnl:+.2f}")
 
     # =========================================================================
     # STREAM SUPERVISOR

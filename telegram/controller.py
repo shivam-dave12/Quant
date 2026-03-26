@@ -42,6 +42,17 @@ from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
 
+# -- v9.0: Display engine --
+try:
+    from strategy.v9_display import (
+        format_thinking_telegram, format_pools_telegram,
+        format_flow_telegram, format_status_report_v9,
+        format_periodic_report_v9, HELP_TEXT as V9_HELP,
+    )
+    _V9_DISPLAY = True
+except ImportError:
+    _V9_DISPLAY = False
+
 def _esc(s) -> str:
     """Escape <, >, & in dynamic strings before embedding in Telegram HTML."""
     if s is None:
@@ -264,6 +275,10 @@ class TelegramBotController:
                 return self._cmd_set(args)
             elif cmd == "/setexchange":
                 return self._cmd_setexchange(args)
+            elif cmd == "/pools":
+                return self._cmd_pools()
+            elif cmd == "/flow":
+                return self._cmd_flow()
             elif cmd == "/huntstatus":
                 return self._cmd_huntstatus()
             else:
@@ -275,6 +290,97 @@ class TelegramBotController:
     # ================================================================
     # COMMAND IMPLEMENTATIONS
     # ================================================================
+
+
+    def _cmd_pools(self) -> str:
+        """Show full liquidity pool map."""
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        try:
+            strat = bot_instance.strategy
+            dm = bot_instance.data_manager
+            if not strat or not dm:
+                return "Components not ready."
+
+            price = dm.get_last_price()
+            atr = strat._atr_5m.atr
+            if not hasattr(strat, '_liq_map') or strat._liq_map is None:
+                return "Liquidity map not available (v9 engine not active)."
+
+            snap = strat._liq_map.get_snapshot(price, atr)
+            summary = strat._liq_map.get_status_summary(price, atr)
+
+            msg = format_pools_telegram(
+                price=price, atr=atr,
+                bsl_pools=snap.bsl_pools, ssl_pools=snap.ssl_pools,
+                primary_target=snap.primary_target,
+                recent_sweeps=snap.recent_sweeps,
+                tf_coverage=summary.get("tf_coverage", {}),
+            )
+            self.send_message(msg)
+            return None
+        except Exception as e:
+            logger.error(f"Pools error: {e}", exc_info=True)
+            return f"Error: {e}"
+
+
+    def _cmd_flow(self) -> str:
+        """Show detailed orderflow state."""
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        try:
+            strat = bot_instance.strategy
+            dm = bot_instance.data_manager
+            if not strat or not dm:
+                return "Components not ready."
+
+            price = dm.get_last_price()
+
+            tick_flow = strat._tick_eng.get_signal() if strat._tick_eng else 0.0
+            cvd_trend = strat._cvd.get_trend_signal() if strat._cvd else 0.0
+            cvd_div = 0.0
+            try:
+                cvd_div = strat._cvd.get_divergence_signal(
+                    dm.get_candles("1m", limit=60))
+            except Exception:
+                pass
+
+            ob_imbalance = 0.0
+            try:
+                ob = dm.get_orderbook()
+                if ob and ob.get("bids") and ob.get("asks"):
+                    bv = sum(float(b[1]) for b in ob["bids"][:10])
+                    av = sum(float(a[1]) for a in ob["asks"][:10])
+                    total = bv + av
+                    if total > 0:
+                        ob_imbalance = (bv - av) / total
+            except Exception:
+                pass
+
+            streak = getattr(strat, '_flow_streak_count_v2', 0)
+            streak_dir = getattr(strat, '_flow_streak_dir_v2', "")
+
+            # Compute conviction
+            signals = [tick_flow, cvd_trend]
+            if abs(ob_imbalance) > 0.1:
+                signals.append(ob_imbalance * 0.5)
+            conviction = sum(signals) / len(signals)
+            direction = "long" if conviction > 0.25 else ("short" if conviction < -0.25 else "")
+
+            msg = format_flow_telegram(
+                price=price, tick_flow=tick_flow,
+                cvd_trend=cvd_trend, cvd_divergence=cvd_div,
+                ob_imbalance=ob_imbalance,
+                tick_streak=streak, streak_direction=streak_dir,
+                flow_conviction=conviction, flow_direction=direction,
+            )
+            self.send_message(msg)
+            return None
+        except Exception as e:
+            logger.error(f"Flow error: {e}", exc_info=True)
+            return f"Error: {e}"
 
     def _cmd_help(self) -> str:
         return (
@@ -1290,6 +1396,9 @@ class TelegramBotController:
         /huntstatus — display LiquidityHunter state, prediction score, and
         last signal if one is pending.
         """
+
+        if _V9_DISPLAY and hasattr(self, "_cmd_pools"):
+            return self._cmd_pools()
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
