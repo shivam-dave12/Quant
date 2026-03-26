@@ -20,8 +20,8 @@ Quant signals used as entry helpers (NOT primary gates):
   → For Tier-B:   hard requirements (overextended, n_confirming≥3, composite≥threshold)
 
 SL: ICTSLEngine 4-tier (sweep wick → disp OB → 15m ICT OB → 15m swing)
-TP: ICTTPEngine AMD delivery (opposing pool → structural → VWAP)
-Trail: ICTTrailEngine AMD-phase state machine (MANIP→freeze, DIST P1-P3, BOS trigger)
+TP: ICTTPEngine delivery target (opposing pool → structural → VWAP)
+Trail: _ICTStructureTrail — BOS/CHoCH/OB/FVG/swing inline engine (no external deps)
 """
 
 from __future__ import annotations
@@ -47,19 +47,7 @@ try:
 except ImportError:
     ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
-# ── v5.2 / v9.0: Legacy LiquidityHunter (superseded by LiquidityMap in v9) ─
-# In v9, pool detection is handled by LiquidityMap + EntryEngine.
-# LiquidityHunter is only needed for the legacy _evaluate_entry_legacy path.
-try:
-    from strategy.liquidity_hunter import LiquidityHunter
-    _HUNT_AVAILABLE = True
-except ImportError:
-    try:
-        from liquidity_hunter import LiquidityHunter
-        _HUNT_AVAILABLE = True
-    except ImportError:
-        _HUNT_AVAILABLE = False
-        # v9 mode: LiquidityMap + EntryEngine replace this — non-fatal.
+_HUNT_AVAILABLE = False  # LiquidityHunter removed; v9 uses LiquidityMap + EntryEngine
 
 # ── ICT Institutional Trade Engine (sweep-spot SL/TP/Trail/Entry) ──────────
 try:
@@ -2527,17 +2515,537 @@ class InstitutionalLevels:
         return new_sl
 
 # ═══════════════════════════════════════════════════════════════
-# DYNAMIC TRAIL ENGINE — imported from dynamic_trail_engine.py
+# ICT STRUCTURE TRAIL — inline, no external dependency
+# Pure ICT logic: BOS, CHoCH, OBs, FVGs, swing structure only.
+# No AMD phase logic, no external file, always available.
 # ═══════════════════════════════════════════════════════════════
-# DynamicTrailEngine is the single source of truth for trailing SL.
-# It is a standalone module so it can be unit-tested independently
-# and imported by any other strategy module without circular deps.
-try:
-    from dynamic_trail_engine import DynamicTrailEngine  # noqa: F401
-    _DYNAMIC_TRAIL_AVAILABLE = True
-except ImportError:
-    _DYNAMIC_TRAIL_AVAILABLE = False
-    logger.warning("dynamic_trail_engine.py not found — trail engine unavailable")
+
+def _ict_find_swings_inline(candles: list, lookback: int):
+    """Find swing highs and lows from a candle list."""
+    if len(candles) < 3 or lookback < 1:
+        return [], []
+    lb = min(lookback, len(candles) - 2)
+    highs, lows = [], []
+    def _sf(c, k):
+        try: return float(c[k])
+        except Exception:
+            try: return float(getattr(c, k, 0.0))
+            except Exception: return 0.0
+    for i in range(lb, len(candles) - lb):
+        h = _sf(candles[i], 'h'); l = _sf(candles[i], 'l')
+        if all(h >= _sf(candles[j], 'h') for j in range(i - lb, i + lb + 1) if j != i):
+            highs.append(h)
+        if all(l <= _sf(candles[j], 'l') for j in range(i - lb, i + lb + 1) if j != i):
+            lows.append(l)
+    return highs, lows
+
+
+def _ict_atr_inline(candles: list, period: int) -> float:
+    """Compute ATR over last `period` bars."""
+    n = min(period, len(candles))
+    if n < 1:
+        return 0.0
+    trs = []
+    for i in range(1, n + 1):
+        idx = len(candles) - i
+        def sf(c, k):
+            try: return float(c[k])
+            except Exception:
+                try: return float(getattr(c, k, 0.0))
+                except Exception: return 0.0
+        h = sf(candles[idx], 'h'); l = sf(candles[idx], 'l')
+        pc = sf(candles[idx - 1], 'c') if idx > 0 else 0.0
+        tr = max(h - l, abs(h - pc), abs(l - pc)) if pc > 1e-10 else h - l
+        trs.append(tr)
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+class _ICTStructureTrail:
+    """
+    Institutional structure-only trailing SL.
+    Phases driven by ICT market structure events:
+      Phase 0 — no confirmation yet, SL stays put
+      Phase 1 — first BOS in trade direction OR BE reached
+      Phase 2 — 2+ BOS OR displacement bar
+      Phase 3 — 3+ BOS OR 15m structure available
+    No AMD, no fixed R-timers, no chandelier, no external deps.
+    """
+
+    @staticmethod
+    def _sf(c, k):
+        try: return float(c[k])
+        except Exception:
+            try: return float(getattr(c, k, 0.0))
+            except Exception: return 0.0
+
+    @staticmethod
+    def _bos_count(ict_engine, pos_side: str) -> int:
+        if ict_engine is None:
+            return 0
+        count = 0
+        for tf in ("1m", "5m", "15m"):
+            try:
+                st = ict_engine._tf.get(tf)
+                if st is None:
+                    continue
+                d = getattr(st, 'bos_direction', None)
+                if pos_side == "long" and d == "bullish":
+                    count += 1
+                elif pos_side == "short" and d == "bearish":
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    @staticmethod
+    def _bos_level(ict_engine, tf: str, pos_side: str):
+        if ict_engine is None:
+            return None
+        try:
+            st = ict_engine._tf.get(tf)
+            if st is None:
+                return None
+            d = getattr(st, 'bos_direction', None)
+            lvl = getattr(st, 'bos_level', 0.0)
+            if not d or not lvl:
+                return None
+            if pos_side == "long" and d == "bullish":
+                return float(lvl)
+            if pos_side == "short" and d == "bearish":
+                return float(lvl)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _choch(ict_engine, pos_side: str):
+        if ict_engine is None:
+            return None, 0.0
+        for tf in ("5m", "1m"):
+            try:
+                st = ict_engine._tf.get(tf)
+                if st is None:
+                    continue
+                d = getattr(st, 'choch_direction', None)
+                lvl = float(getattr(st, 'choch_level', 0.0))
+                if not d or not lvl:
+                    continue
+                if pos_side == "long" and d == "bearish":
+                    return tf, lvl
+                if pos_side == "short" and d == "bullish":
+                    return tf, lvl
+            except Exception:
+                pass
+        return None, 0.0
+
+    @staticmethod
+    def _has_displacement(candles: list, atr: float, pos_side: str) -> bool:
+        if atr < 1e-10 or len(candles) < 3:
+            return False
+        sf = _ICTStructureTrail._sf
+        for i in range(1, min(6, len(candles))):
+            c = candles[-i]
+            o, h, l, cl = sf(c, 'o'), sf(c, 'h'), sf(c, 'l'), sf(c, 'c')
+            rng = h - l
+            if rng < 1e-10:
+                continue
+            body = abs(cl - o)
+            bull = cl > o
+            if pos_side == "long" and not bull:
+                continue
+            if pos_side == "short" and bull:
+                continue
+            if body < 1.20 * atr:
+                continue
+            cp = (cl - l) / rng
+            if pos_side == "long" and cp < 0.55:
+                continue
+            if pos_side == "short" and cp > 0.45:
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _vol_regime(candles: list, atr: float):
+        if atr < 1e-10 or len(candles) < 7:
+            return 1.0, "NORMAL"
+        sh = _ict_atr_inline(candles, 5)
+        if sh < 1e-10:
+            return 1.0, "NORMAL"
+        r = sh / atr
+        if r > 1.25:
+            return r, "EXPANDING"
+        if r < 0.75:
+            return r, "CONTRACTING"
+        return r, "NORMAL"
+
+    @staticmethod
+    def _phase(bos: int, be_locked: bool, has_disp: bool, tier: float) -> int:
+        if bos >= 3 or (bos >= 2 and tier >= 2.5):
+            return 3
+        if bos >= 2 or (bos >= 1 and has_disp) or (be_locked and tier >= 1.5):
+            return 2
+        if bos >= 1 or be_locked or tier >= 0.8:
+            return 1
+        return 0
+
+    @staticmethod
+    def _swing_buf(atr: float, phase: int, vol_ratio: float,
+                   vol_regime: str, choch: bool) -> float:
+        base = {0: 0.50, 1: 0.50, 2: 0.30}.get(phase, 0.15) * atr
+        mult = (min(vol_ratio, 1.40) if vol_regime == "EXPANDING"
+                else max(vol_ratio, 0.65) if vol_regime == "CONTRACTING" else 1.0)
+        buf = base * mult
+        return buf * 0.70 if choch else buf
+
+    @staticmethod
+    def _min_dist(atr: float, phase: int, vol_ratio: float,
+                  vol_regime: str) -> float:
+        base = {0: 1.0, 1: 1.0, 2: 0.60}.get(phase, 0.35) * atr
+        if vol_regime == "EXPANDING":
+            base *= min(vol_ratio, 1.30)
+        elif vol_regime == "CONTRACTING":
+            base *= max(vol_ratio, 0.70)
+        return max(base, 0.25 * atr)
+
+    @staticmethod
+    def _hunt_guard(sl: float, pos_side: str, atr: float,
+                    candles=None, liq_pools=None) -> float:
+        if atr < 1e-10:
+            return sl
+        zone = 0.15 * atr
+        offset = 0.30 * atr
+        adj = sl
+        if liq_pools:
+            for p in liq_pools:
+                try:
+                    if getattr(p, 'swept', False):
+                        continue
+                    pp = float(p.price)
+                    if abs(adj - pp) < zone:
+                        adj = (min(adj, pp - offset) if pos_side == "long"
+                               else max(adj, pp + offset))
+                except Exception:
+                    pass
+        nearest = round(adj / 500.0) * 500.0
+        if abs(adj - nearest) < zone:
+            adj = nearest - offset if pos_side == "long" else nearest + offset
+        return adj
+
+    @staticmethod
+    def compute(pos_side: str, price: float, entry_price: float,
+                current_sl: float, atr: float,
+                initial_sl_dist: float, peak_profit: float,
+                peak_price_abs: float, hold_seconds: float,
+                candles_1m: list, candles_5m: list,
+                orderbook: dict, entry_vol: float, trade_mode: str,
+                ict_engine=None, now_ms: int = 0,
+                hold_reason=None,
+                atr_percentile: float = 0.50,
+                adx: float = 15.0,
+                tick_size: float = 0.1,
+                candles_15m: list = None) -> "Optional[float]":
+        """Compute next trailing SL or return None if no improvement qualifies."""
+        if atr < 1e-10:
+            return None
+
+        closed_1m = candles_1m[:-1] if len(candles_1m) > 1 else candles_1m
+        vol_ratio, vol_regime = _ICTStructureTrail._vol_regime(candles_1m, atr)
+        has_disp = _ICTStructureTrail._has_displacement(closed_1m, atr, pos_side)
+        bos = _ICTStructureTrail._bos_count(ict_engine, pos_side)
+        choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_engine, pos_side)
+        choch = choch_tf is not None
+
+        init_dist = (initial_sl_dist if initial_sl_dist > 1e-10
+                     else max(abs(entry_price - current_sl), atr))
+        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
+        tier = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
+
+        try:
+            from config import COMMISSION_RATE as _cr
+        except Exception:
+            _cr = 0.00055
+        be_buf = entry_price * _cr * 2.0 + 0.10 * atr
+        be_price = (entry_price + be_buf if pos_side == "long"
+                    else entry_price - be_buf)
+        be_locked = ((pos_side == "long" and current_sl >= be_price) or
+                     (pos_side == "short" and current_sl <= be_price))
+
+        phase = _ICTStructureTrail._phase(bos, be_locked, has_disp, tier)
+
+        if phase == 0:
+            if hold_reason is not None:
+                hold_reason.append(
+                    f"PHASE0 bos={bos} be={be_locked} tier={tier:.2f}R")
+            return None
+
+        min_dist = _ICTStructureTrail._min_dist(atr, phase, vol_ratio, vol_regime)
+        swing_buf = _ICTStructureTrail._swing_buf(atr, phase, vol_ratio, vol_regime, choch)
+
+        candidates = [(be_price, "BE_FLOOR")]
+
+        # ── 5m swing lows / highs ─────────────────────────────────────────
+        if candles_5m and len(candles_5m) >= 6:
+            closed_5m = candles_5m[:-1]
+            try:
+                if _ICT_TRADE_ENGINE_AVAILABLE:
+                    highs_5m, lows_5m = _find_swings(closed_5m,
+                                                      min(12, len(closed_5m) - 2))
+                else:
+                    highs_5m, lows_5m = _ict_find_swings_inline(
+                        closed_5m, min(12, len(closed_5m) - 2))
+            except Exception:
+                highs_5m, lows_5m = _ict_find_swings_inline(
+                    closed_5m, min(12, len(closed_5m) - 2))
+            if pos_side == "long" and lows_5m:
+                valid = [l for l in lows_5m
+                         if l > current_sl + 0.05 * atr
+                         and l - swing_buf < price - min_dist]
+                if valid:
+                    best = max(valid)
+                    cand = best - swing_buf
+                    if cand > current_sl:
+                        candidates.append((cand, f"5m_SW@${best:.0f}"))
+            elif pos_side == "short" and highs_5m:
+                valid = [h for h in highs_5m
+                         if h < current_sl - 0.05 * atr
+                         and h + swing_buf > price + min_dist]
+                if valid:
+                    best = min(valid)
+                    cand = best + swing_buf
+                    if cand < current_sl:
+                        candidates.append((cand, f"5m_SW@${best:.0f}"))
+
+        # ── 5m BOS level ──────────────────────────────────────────────────
+        if ict_engine is not None and phase >= 1:
+            bos_5m = _ICTStructureTrail._bos_level(ict_engine, "5m", pos_side)
+            if bos_5m is not None:
+                bb = 0.20 * atr
+                if pos_side == "long":
+                    cand = bos_5m - bb
+                    if current_sl < cand < price - min_dist:
+                        candidates.append((cand, f"5m_BOS@${bos_5m:.0f}"))
+                else:
+                    cand = bos_5m + bb
+                    if price + min_dist < cand < current_sl:
+                        candidates.append((cand, f"5m_BOS@${bos_5m:.0f}"))
+
+        # ── OB anchors ────────────────────────────────────────────────────
+        if ict_engine is not None and phase >= 1:
+            try:
+                ob_buf = 0.25 * atr
+                obs = (ict_engine.order_blocks_bull if pos_side == "long"
+                       else ict_engine.order_blocks_bear)
+                t_ms = now_ms or int(time.time() * 1000)
+                active = [o for o in obs if o.is_active(t_ms)]
+                added = 0
+                if pos_side == "long":
+                    for ob in sorted(
+                            [o for o in active if o.low > current_sl],
+                            key=lambda x: (x.strength, x.low), reverse=True):
+                        cand = ob.low - ob_buf
+                        if cand > current_sl and cand < price - min_dist:
+                            candidates.append(
+                                (cand, f"OB@${ob.midpoint:.0f}(tf={ob.timeframe})"))
+                            added += 1
+                            if added >= 2:
+                                break
+                else:
+                    for ob in sorted(
+                            [o for o in active if o.high < current_sl],
+                            key=lambda x: (x.strength, -x.high), reverse=True):
+                        cand = ob.high + ob_buf
+                        if cand < current_sl and cand > price + min_dist:
+                            candidates.append(
+                                (cand, f"OB@${ob.midpoint:.0f}(tf={ob.timeframe})"))
+                            added += 1
+                            if added >= 2:
+                                break
+            except Exception:
+                pass
+
+        # ── 1m micro-structure (phase ≥ 2) ────────────────────────────────
+        if phase >= 2 and candles_1m and len(candles_1m) >= 6:
+            try:
+                highs_1m, lows_1m = _ict_find_swings_inline(
+                    closed_1m, min(5, len(closed_1m) - 2))
+                if pos_side == "long" and lows_1m:
+                    valid = [l for l in lows_1m
+                             if l > current_sl + 0.05 * atr
+                             and l - swing_buf < price - min_dist]
+                    if valid:
+                        best = max(valid)
+                        cand = best - swing_buf
+                        if cand > current_sl:
+                            candidates.append((cand, f"1m_SW@${best:.0f}"))
+                elif pos_side == "short" and highs_1m:
+                    valid = [h for h in highs_1m
+                             if h < current_sl - 0.05 * atr
+                             and h + swing_buf > price + min_dist]
+                    if valid:
+                        best = min(valid)
+                        cand = best + swing_buf
+                        if cand < current_sl:
+                            candidates.append((cand, f"1m_SW@${best:.0f}"))
+            except Exception:
+                pass
+
+        # ── CHoCH tightening (phase ≥ 2) ──────────────────────────────────
+        if choch and choch_lvl > 0 and phase >= 2:
+            cb = 0.12 * atr
+            if pos_side == "long":
+                cand = choch_lvl - cb
+                if cand > current_sl and cand < price - min_dist:
+                    candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
+            else:
+                cand = choch_lvl + cb
+                if cand < current_sl and cand > price + min_dist:
+                    candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
+
+        # ── 15m macro swing (phase ≥ 3) ───────────────────────────────────
+        if phase >= 3 and candles_15m and len(candles_15m) >= 6:
+            try:
+                cl15 = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
+                highs_15m, lows_15m = _ict_find_swings_inline(
+                    cl15, min(8, len(cl15) - 2))
+                hbuf = 0.12 * atr
+                if pos_side == "long" and lows_15m:
+                    valid = [l for l in lows_15m
+                             if l > current_sl + 0.05 * atr
+                             and l - hbuf < price - min_dist]
+                    if valid:
+                        best = max(valid)
+                        cand = best - hbuf
+                        if cand > current_sl:
+                            candidates.append((cand, f"15m_SW@${best:.0f}"))
+                elif pos_side == "short" and highs_15m:
+                    valid = [h for h in highs_15m
+                             if h < current_sl - 0.05 * atr
+                             and h + hbuf > price + min_dist]
+                    if valid:
+                        best = min(valid)
+                        cand = best + hbuf
+                        if cand < current_sl:
+                            candidates.append((cand, f"15m_SW@${best:.0f}"))
+            except Exception:
+                pass
+
+        # ── FVG fill lock ──────────────────────────────────────────────────
+        if ict_engine is not None:
+            try:
+                fvgs = (ict_engine.fvgs_bear if pos_side == "long"
+                        else ict_engine.fvgs_bull)
+                t_ms = now_ms or int(time.time() * 1000)
+                for fvg in fvgs:
+                    if not fvg.is_active(t_ms) or fvg.fill_percentage < 0.70:
+                        continue
+                    lock = (fvg.top + 0.15 * atr if pos_side == "long"
+                            else fvg.bottom - 0.15 * atr)
+                    if pos_side == "long" and lock > current_sl and lock < price - min_dist:
+                        candidates.append((lock, f"FVG_FILL@${fvg.midpoint:.0f}"))
+                    elif pos_side == "short" and lock < current_sl and lock > price + min_dist:
+                        candidates.append((lock, f"FVG_FILL@${fvg.midpoint:.0f}"))
+            except Exception:
+                pass
+
+        if not candidates:
+            if hold_reason is not None:
+                hold_reason.append("NO_CANDIDATES")
+            return None
+
+        if pos_side == "long":
+            new_sl, anchor = max(candidates, key=lambda x: x[0])
+        else:
+            new_sl, anchor = min(candidates, key=lambda x: x[0])
+
+        # ── Liquidity pool ceiling ─────────────────────────────────────────
+        if ict_engine is not None:
+            try:
+                lb = 0.40 * atr
+                for pool in ict_engine.liquidity_pools:
+                    if pool.swept:
+                        continue
+                    if pos_side == "long" and pool.level_type == "SSL":
+                        ceil = pool.price - lb
+                        if current_sl < ceil < new_sl:
+                            new_sl = ceil
+                    elif pos_side == "short" and pool.level_type == "BSL":
+                        fl = pool.price + lb
+                        if current_sl > fl > new_sl:
+                            new_sl = fl
+            except Exception:
+                pass
+
+        # ── Minimum distance enforcement ──────────────────────────────────
+        if pos_side == "long":
+            new_sl = min(new_sl, price - min_dist)
+        else:
+            new_sl = max(new_sl, price + min_dist)
+
+        # ── Hunt guard (avoid liquidity clusters and round numbers) ───────
+        lp = None
+        if ict_engine is not None:
+            try:
+                lp = ict_engine.liquidity_pools
+            except Exception:
+                pass
+        new_sl = _ICTStructureTrail._hunt_guard(
+            new_sl, pos_side, atr, candles_1m, lp)
+        if pos_side == "long":
+            new_sl = min(new_sl, price - min_dist)
+        else:
+            new_sl = max(new_sl, price + min_dist)
+
+        # ── Ratchet: SL may only improve ──────────────────────────────────
+        if pos_side == "long":
+            if new_sl <= current_sl:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"NO_IMPROVEMENT {new_sl:.1f}<={current_sl:.1f}")
+                return None
+        else:
+            if new_sl >= current_sl:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"NO_IMPROVEMENT {new_sl:.1f}>={current_sl:.1f}")
+                return None
+
+        # ── Minimum meaningful move ────────────────────────────────────────
+        min_mv = 0.10 * atr
+        if pos_side == "long":
+            if new_sl < current_sl + min_mv:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"MIN_MOVE {new_sl - current_sl:.1f}<{min_mv:.1f}")
+                return None
+        else:
+            if new_sl > current_sl - min_mv:
+                if hold_reason is not None:
+                    hold_reason.append(
+                        f"MIN_MOVE {current_sl - new_sl:.1f}<{min_mv:.1f}")
+                return None
+
+        # ── Structural path check ──────────────────────────────────────────
+        if ict_engine is not None:
+            try:
+                blocked, reason = ict_engine.check_sl_path_for_structure(
+                    pos_side, current_sl, new_sl, now_ms, tier=tier)
+                if blocked and not (bos >= 2 or tier >= 1.5):
+                    if hold_reason is not None:
+                        hold_reason.append(f"PATH_BLOCKED:{reason}")
+                    return None
+            except Exception:
+                pass
+
+        ts = tick_size if tick_size > 0 else 0.1
+        rounded = round(round(new_sl / ts) * ts, 10)
+        logger.debug(
+            "ICTTrail %s: $%.1f→$%.1f [%s] P%d bos=%d tier=%.2fR",
+            pos_side.upper(), current_sl, rounded, anchor, phase, bos, tier)
+        return rounded
+
+
+_DYNAMIC_TRAIL_AVAILABLE = True   # inline class — always available
 
 
 # ATR ENGINE
@@ -3127,9 +3635,7 @@ class QuantStrategy:
             ICTSweepDetector() if _ICT_TRADE_ENGINE_AVAILABLE else None)
         self._active_sweep_setup: Optional[object] = None  # ICTSweepSetup | None
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
-        # v5.2: Liquidity hunt engine
-        self._liquidity_hunter = LiquidityHunter() if _HUNT_AVAILABLE else None
-        self._pending_hunt_signal = None   # active HuntSignal for _compute_sl_tp
+        self._pending_hunt_signal = None   # hunt signal for _compute_sl_tp (Tier-L path)
         self._confirm_trend_long = 0; self._confirm_trend_short = 0
         self._confirm_flow_long = 0; self._confirm_flow_short = 0
         self._last_flow_entry_time = 0.0
@@ -3159,7 +3665,7 @@ class QuantStrategy:
         self._trail_in_progress     = False   # trail REST call running in background
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
-        self._last_amd_veto_log = 0.0   # throttle AMD veto log spam
+
         self._last_pd_gate_log: dict = {}  # throttle P/D zone gate log
         self._last_reconcile_time = 0.0; self._RECONCILE_SEC = 30.0
         self._reconcile_pending = False; self._reconcile_data = None
@@ -3240,7 +3746,7 @@ class QuantStrategy:
             )
         logger.info(f"   ICT Engine: {ict_status}")
         # Trail
-        trail_status = "DynamicTrailEngine ACTIVE" if _DYNAMIC_TRAIL_AVAILABLE else "ICTTrailManager (built-in)"
+        trail_status = "_ICTStructureTrail (inline ICT BOS/CHoCH/OB/FVG engine)"
         logger.info(f"   Trail: {trail_status}")
         logger.info("=" * 72)
 
@@ -3269,9 +3775,6 @@ class QuantStrategy:
             if self._sweep_detector is not None:
                 self._sweep_detector.invalidate()
             self._active_sweep_setup = None
-            # v5.2: reset hunt engine
-            if self._liquidity_hunter is not None:
-                self._liquidity_hunter.reset()
             self._pending_hunt_signal = None
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
@@ -3676,18 +4179,8 @@ class QuantStrategy:
         # Without this cap, VWAP=+1.0 at 0.30 weight = +0.30 in composite,
         # which alone clears the ±0.30 entry threshold in the WRONG direction.
         _vs_capped = vs
-        _amd_phase_live = ""
-        _amd_conf_live = 0.0
-        if self._ict is not None:
-            try:
-                _amd_phase_live = self._ict._amd.phase
-                _amd_conf_live = self._ict._amd.confidence
-            except Exception:
-                pass
         if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
             _vs_capped = max(-0.50, min(0.50, vs))
-        elif _amd_phase_live in ("MANIPULATION", "DISTRIBUTION") and _amd_conf_live >= 0.70:
-            _vs_capped = max(-0.40, min(0.40, vs))
 
         comp = (_vs_capped*w_vwap + cs*w_cvd + obs*w_ob + ts*w_tick + ve*w_vex)
         comp = max(-1.0, min(1.0, comp))
@@ -4149,10 +4642,19 @@ class QuantStrategy:
                 _status = "👀 Watching"
 
         cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
-        _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
-        lines = [
-            f"┌─── 🧠 v5 ICT+QUANT  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}"
-            f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────"]
+        _in_pos = self._pos.is_active()
+        if _in_pos:
+            _header = (
+                f"┌─── 📊 IN-POSITION MONITOR [{self._pos.side.upper()}]"
+                f"  entry=${self._pos.entry_price:,.2f}"
+                f"  SL=${self._pos.sl_price:,.2f}"
+                f"  ${price:,.2f}  ATR={sig.atr:.1f} ────")
+        else:
+            _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
+            _header = (
+                f"┌─── 🧠 v9 ICT-COMMANDER  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}"
+                f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────")
+        lines = [_header]
         if _sweep_line:
             lines.append(f"  {_sweep_line}")
         lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
@@ -4210,7 +4712,8 @@ class QuantStrategy:
         Single decision flow. Falls back to legacy if new engine unavailable.
         """
         if not _ENTRY_ENGINE_AVAILABLE or self._entry_engine is None or self._liq_map is None:
-            return self._evaluate_entry_legacy(data_manager, order_manager, risk_manager, now)
+            logger.error("EntryEngine or LiquidityMap unavailable — no entry evaluation")
+            return
 
         # Step 1: Spread gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
@@ -4452,407 +4955,11 @@ class QuantStrategy:
             logger.info(f"[THINK] {' | '.join(parts)}")
 
 
-    def _evaluate_entry_legacy(self, data_manager, order_manager, risk_manager, now):
-        # v4.3 Solution 5: Spread cost gate
-        spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
-        if not spread_ok:
-            # BUG-3 FIX: _confirm_hunt counters must be included in every broad reset
-            # so stale confirmation progress can never leak into the next hunt cycle.
-            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = self._confirm_hunt_long = self._confirm_hunt_short = 0
-            return
-        sig = self._compute_signals(data_manager)
-        if sig is None:
-            self._confirm_long = self._confirm_short = self._confirm_trend_long = self._confirm_trend_short = self._confirm_flow_long = self._confirm_flow_short = self._confirm_hunt_long = self._confirm_hunt_short = 0
-            return
-        price = data_manager.get_last_price()
+    def _evaluate_entry_legacy(self, *args, **kwargs):
+        """Removed — v9 LiquidityMap + EntryEngine is always used."""
+        logger.warning("_evaluate_entry_legacy called but has been removed; ensure EntryEngine and LiquidityMap are available")
 
-        # ── v4.8: ICT/SMC structural confluence ──────────────────────────
-        # FIX: ICT update runs BEFORE _log_thinking so the thinking display
-        # always reflects the current tick's ICT scores (was stale prev-tick).
-        if self._ict is not None:
-            try:
-                # Candle limits sized to cover full OB/FVG max_age windows:
-                #   5m  OBs live 24h = 288 bars  → limit=300 (covers 25h)
-                #   15m OBs live 48h = 192 bars  → limit=200 (covers 50h)
-                #   1m  for sweep detection       → limit=120 (2h of 1m)
-                #   1h  OBs live 72h = 72 bars   → limit=100 (already sufficient)
-                #   4h  OBs live 144h = 36 bars  → limit=50  (already sufficient)
-                #   1d  OBs live 15d = 15 bars   → limit=30  (already sufficient)
-                candles_5m  = data_manager.get_candles("5m",  limit=300)
-                candles_15m = data_manager.get_candles("15m", limit=200)
-                candles_1m_ict = data_manager.get_candles("1m", limit=120)
-                candles_1h_ict = data_manager.get_candles("1h", limit=100)
-                candles_4h_ict = data_manager.get_candles("4h", limit=50)
-                candles_1d_ict = data_manager.get_candles("1d", limit=30)
-                now_ms = int(now * 1000) if now < 1e12 else int(now)
-                self._ict.update(candles_5m, candles_15m, price, now_ms,
-                                 candles_1m=candles_1m_ict,
-                                 candles_1h=candles_1h_ict,
-                                 candles_4h=candles_4h_ict,
-                                 candles_1d=candles_1d_ict)
-
-                # ── Inject live order-flow data into ICT for hunt prediction ──
-                # This MUST run immediately after ict.update() so predict_next_hunt()
-                # uses the current tick's order flow, not the previous tick's stale values.
-                # set_order_flow_data() stores the values in _tick_flow / _cvd_trend;
-                # they are consumed inside predict_next_hunt() and get_confluence().
-                if hasattr(self._ict, 'set_order_flow_data'):
-                    _tf_now  = self._tick_eng.get_signal() if self._tick_eng else 0.0
-                    _cvd_now = self._cvd.get_trend_signal() if self._cvd else 0.0
-                    self._ict.set_order_flow_data(_tf_now, _cvd_now)
-
-                # ── ICT side: use AMD sweep bias or sweep setup when available ──
-                # NOT sig.reversion_side (VWAP) — ICT direction ≠ VWAP reversion side.
-                # AMD bias reflects where smart money is DELIVERING after a sweep.
-                # For a long sweep entry (SSL swept), AMD bias = "bullish" even if
-                # price is ABOVE VWAP (VWAP would say "short" for reversion).
-                amd_st = self._ict.get_amd_state()
-                if (self._active_sweep_setup is not None and
-                        self._active_sweep_setup.status in ("DETECTED", "OTE_READY")):
-                    # Sweep setup defines the direction
-                    ict_side = self._active_sweep_setup.side
-                elif amd_st.bias in ("bullish", "bearish"):
-                    # AMD engine has a clear directional bias
-                    ict_side = "long" if amd_st.bias == "bullish" else "short"
-                else:
-                    # B3 FIX: When AMD is neutral, derive ICT side from the dominant
-                    # active OB structure rather than VWAP reversion direction.
-                    # VWAP direction and OB direction can oppose each other; using VWAP
-                    # here caused the ICT boost to work against the OB score it was
-                    # computed from (e.g. bullish OB below price getting a SHORT boost
-                    # because VWAP said short).
-                    ict_side = self._resolve_ict_side_from_structure(
-                        self._ict,
-                        fallback_side=(sig.reversion_side if sig.reversion_side
-                                       else ("long" if sig.composite > 0 else "short")),
-                        now_ms=int(now * 1000) if now < 1e12 else int(now),
-                    )
-
-                ict_conf = self._ict.get_confluence(ict_side, price, now_ms, atr=sig.atr)
-                sig.ict_ob      = ict_conf.ob_score
-                sig.ict_fvg     = ict_conf.fvg_score
-                sig.ict_sweep   = ict_conf.sweep_score
-                sig.ict_session = ict_conf.session_score
-                sig.ict_total   = ict_conf.total
-                sig.ict_details = ict_conf.details
-                # AMD + MTF context
-                sig.amd_phase   = ict_conf.amd_phase
-                sig.amd_bias    = ict_conf.amd_bias
-                sig.amd_conf    = amd_st.confidence
-                sig.mtf_aligned = ict_conf.mtf_aligned
-                sig.in_discount = ict_conf.in_discount
-                sig.in_premium  = ict_conf.in_premium
-                mb = self._ict.get_market_bias()
-                sig.mtf_details = mb.details
-
-                # ── v8.0: Advanced ICT context (non-fatal, best-effort) ──────
-                try:
-                    # Delivery target and confidence from ICTConfluence
-                    if ict_conf.delivery_target:
-                        sig.ict_delivery_target = ict_conf.delivery_target
-                        sig.ict_delivery_conf   = ict_conf.delivery_confidence
-                    # PD matrix
-                    sig.ict_pd_grade  = ict_conf.pd_grade
-                    sig.ict_pd_matrix = ict_conf.pd_matrix
-                    # Risk + stack counts
-                    sig.ict_htf_reversal_risk = ict_conf.htf_reversal_risk
-                    sig.ict_mtf_ob_count      = ict_conf.mtf_ob_count
-                    sig.ict_fvg_stack_count   = ict_conf.fvg_stack_count
-                    sig.ict_judas_active      = ict_conf.judas_swing_active
-                    sig.ict_nearest_bsl_atr   = ict_conf.nearest_bsl_dist_atr
-                    sig.ict_nearest_ssl_atr   = ict_conf.nearest_ssl_dist_atr
-                    # Session entry quality
-                    sess_ctx = self._ict.get_amd_session_context(now_ms)
-                    sig.ict_session_entry_q = sess_ctx.get("entry_quality", "")
-                    # Delivery profile chain score
-                    dp = self._ict.get_delivery_profile(ict_side, price, sig.atr, now_ms)
-                    sig.ict_chain_score = dp.get("chain_score", 0.0)
-                    # HTF reversal zone proximity (within 1 ATR)
-                    if sig.atr > 0:
-                        rev_zones = self._ict.get_htf_reversal_zones(price, sig.atr, now_ms)
-                        sig.ict_htf_rev_zone_near = any(
-                            z["dist_atr"] < 1.0 and z["direction"] != ict_side
-                            for z in rev_zones
-                        )
-                except Exception as _adv_e:
-                    pass  # advanced fields are informational only
-
-                # ── ICT composite boost: directional relative to ICT side ────
-                # Key fix: boost must align with ICT direction (AMD sweep bias),
-                # NOT with sig.composite direction (VWAP).
-                # Old: boost in direction composite is already going → self-reinforcing
-                # New: boost in ICT direction → may FLIP composite to align with ICT
-                ict_direction    = 1.0 if ict_side == "long" else -1.0
-                ict_boost_signed = ict_conf.total * 0.15 * ict_direction
-                sig.composite        = max(-1.0, min(1.0, sig.composite + ict_boost_signed))
-                # B1 FIX: store signed values so _log_thinking can display the actual
-                # contribution direction instead of the always-positive magnitude.
-                sig.ict_boost_signed = ict_boost_signed
-                sig.ict_direction    = ict_direction
-
-                # F FIX: Only count ICT as a confirming signal when its direction
-                # AGREES with the VWAP reversion side.
-                #
-                # Previously the check was `ict_conf.total >= 0.30` with no
-                # direction guard.  When ict_side="short" (AMD bearish MANIPULATION)
-                # and reversion_side="long" (VWAP says price is below), a SHORT
-                # confluence score of 0.52 was added to n_confirming — counted as
-                # a LONG signal confirmer.  The log showed "4/5 confluence" for a
-                # LONG where one of the 4 was actively bearish ICT structure.
-                #
-                # Correct rule: ICT counts as a confirming signal only when the
-                # ICT structural direction agrees with the direction being traded.
-                # For sweep entries (where ict_side drives the trade) this is
-                # already enforced by ICTEntryGate — n_confirming is irrelevant.
-                if ict_conf.total >= 0.30 and ict_side == sig.reversion_side:
-                    sig.n_confirming = min(sig.n_confirming + 1, 6)
-                # Store the resolved ICT side for downstream use
-                sig._ict_evaluated_side = ict_side  # type: ignore[attr-defined]
-            except Exception as e:
-                logger.debug(f"ICT update error: {e}")
-
-        # ── v5.0: ICT Sweep Detector update ────────────────────────────────────
-        # Runs after ICT engine update so AMD state is fresh.
-        # Updates self._active_sweep_setup every 5s.
-        if (_ICT_TRADE_ENGINE_AVAILABLE and
-                self._sweep_detector is not None and
-                self._ict is not None and
-                self._ict._initialized):
-            try:
-                # Sweep detector needs the same history depth as the main ICT
-                # update — using limit=60 (5h) while OBs live 24h meant the
-                # detector was working from a truncated picture of structure.
-                candles_5m_ict  = data_manager.get_candles("5m",  limit=300)
-                candles_15m_ict = data_manager.get_candles("15m", limit=200)
-                _now_ms_sd = int(now * 1000) if now < 1e12 else int(now)
-                self._active_sweep_setup = self._sweep_detector.update(
-                    self._ict, price, sig.atr, _now_ms_sd,
-                    candles_5m=candles_5m_ict,
-                    candles_15m=candles_15m_ict,
-                )
-
-                # ── v5.1: Structural distance invalidation ─────────────────
-                # A LONG sweep setup at OTE $70,223 was still OTE_READY when
-                # price crashed to $69,000 (17× ATR away). The sweep routing
-                # priority kept trying LONG entries during the entire crash.
-                # Fix: if price has moved > 3×ATR away from the OTE zone in
-                # the WRONG direction for the setup, invalidate it.
-                if (self._active_sweep_setup is not None and
-                        self._active_sweep_setup.status in ("DETECTED", "OTE_READY") and
-                        sig.atr > 1e-10):
-                    _ss = self._active_sweep_setup
-                    _max_dist = 3.0 * sig.atr
-                    _invalidate = False
-                    if _ss.side == "long" and price < _ss.ote_entry_zone_low - _max_dist:
-                        _invalidate = True  # price crashed below OTE
-                    elif _ss.side == "short" and price > _ss.ote_entry_zone_high + _max_dist:
-                        _invalidate = True  # price rallied above OTE
-                    if _invalidate:
-                        logger.info(
-                            f"❌ Sweep setup invalidated: price ${price:,.0f} is "
-                            f"{abs(price - _ss.ote_midpoint)/sig.atr:.1f}×ATR from "
-                            f"OTE [${_ss.ote_entry_zone_low:.0f}–${_ss.ote_entry_zone_high:.0f}] "
-                            f"— structural thesis broken")
-                        self._sweep_detector.invalidate()
-                        self._active_sweep_setup = None
-                # Throttled log of active setup quality
-                if (self._active_sweep_setup is not None and
-                        now - self._last_sweep_log >= 60.0):
-                    self._last_sweep_log = now
-                    setup = self._active_sweep_setup
-                    logger.info(
-                        f"🎯 Sweep setup active: {setup.side.upper()} "
-                        f"status={setup.status} quality={setup.quality_score():.2f} "
-                        f"OTE=[${setup.ote_entry_zone_low:.0f}–${setup.ote_entry_zone_high:.0f}] "
-                        f"SL=${setup.sl_sweep_candle:.0f} "
-                        f"delivery={'${:.0f}'.format(setup.delivery_target) if setup.delivery_target else 'N/A'}")
-            except Exception as _sd_e:
-                logger.debug(f"Sweep detector error (non-fatal): {_sd_e}")
-
-        # ── v5.2: Liquidity Hunt Engine update ───────────────────────────────
-        # Runs after ICT update (needs fresh pools/OBs/FVGs).
-        # Throttled internally to _UPDATE_INTERVAL_S.
-        if (self._liquidity_hunter is not None and
-                self._ict is not None and
-                getattr(self._ict, '_initialized', False)):
-            try:
-                _candles_5m_hunt = data_manager.get_candles("5m", limit=50)
-                _candles_1m_hunt = data_manager.get_candles("1m", limit=30)
-                self._liquidity_hunter.update(
-                    price      = price,
-                    atr        = sig.atr,
-                    now        = now,
-                    now_ms     = int(now * 1000) if now < 1e12 else int(now),
-                    candles_5m = _candles_5m_hunt,
-                    candles_1m = _candles_1m_hunt,
-                    ict_engine = self._ict,
-                    tick_flow  = self._tick_eng.get_signal(),
-                    cvd_trend  = self._cvd.get_trend_signal(),
-                )
-            except Exception as _hunt_e:
-                logger.debug(f"LiqHunter update error (non-fatal): {_hunt_e}")
-
-        # ── v4.6: Fast breakout detection — MUST run before _log_thinking ────
-        # BUG-B FIX: _breakout.update() was previously called AFTER _log_thinking,
-        # so whenever a breakout fired on this tick, the display showed "reversion"
-        # routing while _evaluate_entry would route to "momentum" — a one-tick
-        # display/routing mismatch that also caused ENTRY READY to appear when
-        # breakout would immediately veto it.  Moving it here means _log_thinking
-        # and _evaluate_entry both read the same up-to-date breakout state.
-        try:
-            candles_5m = data_manager.get_candles("5m", limit=20)
-        except Exception:
-            candles_5m = []
-        self._breakout.update(candles_5m, self._atr_5m, price, now,
-                             vwap_price=self._vwap.vwap)
-
-        # Log AFTER ICT update AND breakout update — display reflects current tick
-        self._log_thinking(sig, price, now)
-
-        # ── v5.0 Route by regime + breakout + sweep setup ────────────────────
-        #
-        # Priority (highest conviction first):
-        #   0. ICT Sweep OTE_READY → sweep entry (highest win-rate)
-        #   1. ORDER FLOW DISPLACEMENT → flow entry (institutional flow + BOS)
-        #   2. Breakout retest ready → momentum entry
-        #   3. TRENDING regime → trend pullback entry
-        #   4. Normal → reversion entry
-        _has_sweep_entry = (
-            _ICT_TRADE_ENGINE_AVAILABLE and
-            QCfg.ICT_SWEEP_ENTRY_ENABLED() and
-            self._active_sweep_setup is not None and
-            self._active_sweep_setup.status == "OTE_READY"
-        )
-
-        # ── v5.1: ORDER FLOW DISPLACEMENT detection ──────────────────────
-        # Institutional principle: when tick-level order flow is extreme AND
-        # 5m structure confirms via BOS, institutions are ACTIVELY positioning.
-        # This IS the signal — don't wait for VWAP reversion or breakout retest.
-        #
-        # Requirements (ALL must be true):
-        #   A) Tick flow extreme: |tick_flow| > 0.55 sustained (3+ ticks)
-        #   B) CVD direction agrees with tick flow
-        #   C) 5m BOS confirmed in flow direction
-        #   D) 5m displacement candle (body > 1.0×ATR) OR sustained flow streak ≥ 5
-        #   E) Cooldown: 120s since last flow entry attempt
-        _flow_side = ""
-        _flow_ready = False
-        _tick = self._tick_eng.get_signal()
-        _cvd = self._cvd.get_divergence_signal(
-            data_manager.get_candles("1m", limit=60) if hasattr(data_manager, 'get_candles') else [])
-        _cvd_trend = self._cvd.get_trend_signal()
-
-        # Track sustained tick flow streak
-        if _tick < -0.55:
-            if self._flow_tick_direction == "short":
-                self._flow_tick_streak += 1
-            else:
-                self._flow_tick_direction = "short"
-                self._flow_tick_streak = 1
-        elif _tick > 0.55:
-            if self._flow_tick_direction == "long":
-                self._flow_tick_streak += 1
-            else:
-                self._flow_tick_direction = "long"
-                self._flow_tick_streak = 1
-        else:
-            # Reset streak if tick flow drops below threshold
-            if self._flow_tick_streak > 0:
-                self._flow_tick_streak = max(0, self._flow_tick_streak - 1)
-            if self._flow_tick_streak == 0:
-                self._flow_tick_direction = ""
-
-        if (self._flow_tick_streak >= 3 and
-                now - self._last_flow_entry_time > 120.0):
-            _candidate_side = self._flow_tick_direction
-
-            # CVD must agree: bearish CVD for short, bullish for long
-            _cvd_agrees = False
-            if _candidate_side == "short" and (_cvd_trend < -0.15 or _cvd < -0.15):
-                _cvd_agrees = True
-            elif _candidate_side == "long" and (_cvd_trend > 0.15 or _cvd > 0.15):
-                _cvd_agrees = True
-
-            # 5m BOS must confirm flow direction
-            _bos_confirms = False
-            if self._ict is not None and getattr(self._ict, '_initialized', False):
-                try:
-                    _tf_5m = self._ict._tf.get("5m")
-                    if _tf_5m is not None:
-                        if (_candidate_side == "short" and
-                                _tf_5m.bos_direction == "bearish"):
-                            _bos_confirms = True
-                        elif (_candidate_side == "long" and
-                                _tf_5m.bos_direction == "bullish"):
-                            _bos_confirms = True
-                except Exception:
-                    pass
-
-            # Displacement candle OR sustained streak
-            _has_displacement = False
-            try:
-                c5m = data_manager.get_candles("5m", limit=3)
-                if len(c5m) >= 2:
-                    _last_closed = c5m[-2]  # last closed 5m candle
-                    _body = abs(float(_last_closed['c']) - float(_last_closed['o']))
-                    if _body > 1.0 * sig.atr:
-                        _has_displacement = True
-            except Exception:
-                pass
-            _sustained = self._flow_tick_streak >= 5
-
-            if _cvd_agrees and _bos_confirms and (_has_displacement or _sustained):
-                _flow_side = _candidate_side
-                _flow_ready = True
-
-        # ── v5.2: Check hunt signal (between sweep OTE and flow displacement) ──
-        _hunt_signal = (
-            self._liquidity_hunter.get_signal()
-            if self._liquidity_hunter is not None else None
-        )
-        _hunt_ready = _hunt_signal is not None
-
-        # Bug-C fix: if there is no active hunt signal (either never produced
-        # or just expired via get_signal()'s staleness guard), reset the
-        # dedicated hunt confirm counters so a future signal starts clean.
-        if not _hunt_ready:
-            self._confirm_hunt_long = self._confirm_hunt_short = 0
-
-        if _has_sweep_entry:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._confirm_long = self._confirm_short = 0
-            self._confirm_flow_long = self._confirm_flow_short = 0
-            # NOTE: _confirm_hunt_long/_confirm_hunt_short are intentionally NOT
-            # reset here.  Resetting them every time OTE fires was the root cause
-            # of Bug C — the hunt's 2-tick confirmation progress was wiped on
-            # every OTE tick, forcing the hunt to restart from scratch after OTE
-            # resolved, while holding an increasingly stale signal.
-            self._evaluate_reversion_entry(
-                data_manager, order_manager, risk_manager, sig, price, now)
-        elif _hunt_ready:
-            # Hunt: confirmed sweep with opposing pool target
-            self._confirm_long = self._confirm_short = 0
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._evaluate_hunt_entry(
-                data_manager, order_manager, risk_manager, sig, price, now,
-                _hunt_signal)
-        elif _flow_ready:
-            # Flow displacement: clear all other counters
-            self._confirm_long = self._confirm_short = 0
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._evaluate_flow_entry(
-                data_manager, order_manager, risk_manager, sig, price, now,
-                flow_side=_flow_side)
-        elif self._breakout.is_active and self._breakout.retest_ready:
-            self._confirm_long = self._confirm_short = 0
-            self._evaluate_momentum_entry(data_manager, order_manager, risk_manager, sig, price, now)
-        elif self._regime.is_trending():
-            self._confirm_long = self._confirm_short = 0
-            self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
-        else:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
-
+    
     def _evaluate_hunt_entry(
         self,
         data_manager,
@@ -4861,21 +4968,20 @@ class QuantStrategy:
         sig,
         price:       float,
         now:         float,
-        hunt_signal,          # HuntSignal from LiquidityHunter
+        hunt_signal,          # hunt signal (side/sl/tp/rr/pool prices)
     ) -> None:
         """
         v5.2 — Liquidity Hunt Entry.
 
-        Triggered when LiquidityHunter confirms a BSL or SSL sweep AND the
-        trade to the opposing pool meets the minimum R:R gate.
+        Triggered when a BSL or SSL sweep signal is confirmed by the ICT engine
+        and the trade to the opposing pool meets the minimum R:R gate.
 
         Entry rules:
           • ATR regime must be valid (not extreme volatility)
           • HTF structure must not strongly oppose the hunt direction
-          • ICT engine (if available) must not be in hard ACCUMULATION block
-          • 2 confirm ticks to avoid entering on a single noisy sweep detection
+          • Scenario-adaptive confirm ticks (1-3 based on post-sweep prediction)
 
-        SL/TP are taken directly from the HuntSignal (pre-computed by the hunter):
+        SL/TP sourced from the hunt_signal object (pre-computed by EntryEngine):
           SL  = behind swept pool wick + 0.5×ATR buffer
           TP  = opposing pool level − 0.1×ATR buffer
         """
@@ -4916,9 +5022,7 @@ class QuantStrategy:
                     _hunt_opposing_pool = _hp['opposing_pool']
                     # Update the hunt signal TP to match ICT engine's target.
                     # BUG-4 FIX: The original code used type(hunt_signal)(**{**hunt_signal.__dict__, …})
-                    # which breaks silently if HuntSignal gains __slots__, __post_init__,
-                    # or is subclassed. dataclasses.replace() is the correct, future-proof API.
-                    # It also ensures created_at is preserved correctly (field copy semantics).
+                    # dataclasses.replace() preserves created_at and any future fields.
                     if ((side == "long"  and _hunt_opposing_pool > price) or
                             (side == "short" and _hunt_opposing_pool < price)):
                         hunt_signal = dataclasses.replace(
@@ -4932,8 +5036,6 @@ class QuantStrategy:
         # Gate 1: ATR regime
         if not sig.regime_ok:
             logger.debug("🎣 Hunt gate: ATR regime invalid — skipping")
-            if self._liquidity_hunter is not None:
-                self._liquidity_hunter.consume_signal()
             return
 
         # Gate 2: HTF must not be strongly opposed (informational threshold only)
@@ -4947,23 +5049,9 @@ class QuantStrategy:
                 logger.info(
                     f"🎣 Hunt gate: HTF strongly opposes {side.upper()} "
                     f"(15m={self._htf.trend_15m:+.2f}) — skipping sweep entry")
-                if self._liquidity_hunter is not None:
-                    self._liquidity_hunter.consume_signal()
                 return
 
-        # Gate 3: No ICT ACCUMULATION hard-block (no delivery in progress)
-        if (self._ict is not None and
-                getattr(self._ict, '_initialized', False) and
-                sig.amd_phase == "ACCUMULATION" and
-                sig.amd_conf >= 0.75):
-            logger.info(
-                f"🎣 Hunt gate: ICT ACCUMULATION ({sig.amd_conf:.2f} conf) "
-                f"— no delivery, skipping hunt entry")
-            if self._liquidity_hunter is not None:
-                self._liquidity_hunter.consume_signal()
-            return
-
-        # Gate 4: Scenario-adaptive confirm ticks
+        # Gate 3: Scenario-adaptive confirm ticks
         #
         # The number of confirm ticks is determined by the post-hunt scenario:
         #   CONTINUATION  (price blasting through, no retrace expected): 1 tick
@@ -5004,9 +5092,6 @@ class QuantStrategy:
         self._confirm_hunt_long = self._confirm_hunt_short = 0
         self._pending_hunt_signal = hunt_signal
 
-        # Consume from hunter so it doesn't re-fire on the next tick
-        if self._liquidity_hunter is not None:
-            self._liquidity_hunter.consume_signal()
 
         swept_label = (
             f"SSL@${hunt_signal.swept_pool_price:,.0f}"
@@ -5091,33 +5176,7 @@ class QuantStrategy:
         if _is_ote_sweep:
             side = self._active_sweep_setup.side  # "long" | "short"
         else:
-            # ── v6.1 ARCHITECTURAL FIX: AMD MANIPULATION overrides VWAP side ──
-            # PROBLEM: VWAP says LONG (price below VWAP), but AMD=MANIPULATION
-            # bearish 0.95 conf (BSL just swept = smart money is SHORT).
-            # VWAP is measuring distance, AMD is measuring institutional intent.
-            # In MANIPULATION phase, AMD IS the signal — it's the entire reason
-            # the ICT model exists. VWAP reversion is a statistical concept;
-            # AMD manipulation is a structural one. Structure wins.
-            #
-            # During high-confidence MANIPULATION, override VWAP side with AMD bias.
-            _amd_override = False
-            # v6.2: Override VWAP side during MANIPULATION and DISTRIBUTION.
-            # MANIPULATION: institutional intent via sweep/Judas swing
-            # DISTRIBUTION: active delivery — fading delivery is suicidal
-            if (sig.amd_phase in ("MANIPULATION", "DISTRIBUTION")
-                    and sig.amd_conf >= 0.70
-                    and sig.amd_bias in ("bullish", "bearish")):
-                _amd_side = "long" if sig.amd_bias == "bullish" else "short"
-                if _amd_side != sig.reversion_side:
-                    side = _amd_side
-                    _amd_override = True
-                    logger.debug(
-                        f"🔄 AMD {sig.amd_phase} override: VWAP says {sig.reversion_side}, "
-                        f"AMD says {side} (conf={sig.amd_conf:.2f}) — using AMD")
-                else:
-                    side = sig.reversion_side
-            else:
-                side = sig.reversion_side   # VWAP-based default for standard path
+            side = sig.reversion_side   # VWAP-based direction for standard reversion path
 
         # ── Hard veto: trending against reversion trade ──────────────────
         # Skipped for sweep entries — institutional sweep setups are valid IN
@@ -5323,7 +5382,6 @@ class QuantStrategy:
                             f"HTF: 15m={self._htf.trend_15m:+.2f}  "
                             f"4H={self._htf.trend_4h:+.2f}  "
                             f"(info-only — HTF is not a gate)\n"
-                            f"AMD: {sig.amd_phase} conf={sig.amd_conf:.2f}\n"
                             f"<i>Bot alive — waiting for institutional setup.</i>")
                     self._confirm_long = self._confirm_short = 0
                     return
@@ -5366,9 +5424,16 @@ class QuantStrategy:
                                     _rr_l = (_tp_dist_l / _sl_dist_l
                                              if _sl_dist_l > 1e-9 else 0.0)
                                     if _rr_l >= 1.5:
-                                        from strategy.liquidity_hunter import HuntSignal
-                                        import time as _t_mod
-                                        _hs_l = HuntSignal(
+                                        @dataclass
+                                        class _HS:
+                                            side: str; entry_price: float
+                                            sl_price: float; tp_price: float
+                                            rr: float; swept_pool_price: float
+                                            target_pool_price: float
+                                            prediction_score: float
+                                            sweep_age_ms: int; details: str
+                                            created_at: float = field(default_factory=time.time)
+                                        _hs_l = _HS(
                                             side=side,
                                             entry_price=price,
                                             sl_price=_sl_l,
@@ -5427,16 +5492,6 @@ class QuantStrategy:
                         f"{sig.ict_details}")
                 self._confirm_long = self._confirm_short = 0
                 return
-            if (sig.amd_phase == "DISTRIBUTION" and sig.amd_conf >= 0.65):
-                if ((side == "long" and sig.amd_bias == "bearish") or
-                        (side == "short" and sig.amd_bias == "bullish")):
-                    if now - self._last_amd_veto_log >= 30.0:
-                        self._last_amd_veto_log = now
-                        logger.info(
-                            f"⛔ AMD VETO [{side.upper()}]: DISTRIBUTION "
-                            f"delivering {sig.amd_bias} (conf={sig.amd_conf:.2f})")
-                    self._confirm_long = self._confirm_short = 0
-                    return
             self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
 
         # ══════════════════════════════════════════════════════════════════
@@ -6043,7 +6098,7 @@ class QuantStrategy:
         now_ms_slatp = int(time.time() * 1000)
 
         # ══════════════════════════════════════════════════════════════════════
-        # v5.2 PATH-C — LIQUIDITY HUNT (pre-computed SL/TP from LiquidityHunter)
+        # PATH-C — LIQUIDITY HUNT (pre-computed SL/TP from Tier-L EntryEngine path)
         # ══════════════════════════════════════════════════════════════════════
         # When mode=="hunt", _pending_hunt_signal holds SL/TP from the hunter.
         # These levels are structurally superior: SL behind swept pool wick,
@@ -6058,7 +6113,7 @@ class QuantStrategy:
             _tp_ok = (side == "long"  and _hs_tp > price) or (side == "short" and _hs_tp < price)
             if _sl_ok and _tp_ok:
                 # BUG-2 FIX: _evaluate_hunt_entry may mutate tp_price (ICT opposing-pool
-                # update) AFTER the original HuntSignal R:R was validated by the hunter.
+                # update) AFTER the original hunt signal R:R was validated.
                 # The mutated TP could place the ratio below _MIN_RR (e.g. 0.9R).
                 # Re-validate here using the ACTUAL prices PATH-C will use.
                 _sl_dist = abs(price - _hs_sl)
@@ -6716,8 +6771,6 @@ class QuantStrategy:
         # ── v5.2: Clear hunt signal — consumed by fill ────────────────────────
         _hunt_was_active = self._pending_hunt_signal is not None
         self._pending_hunt_signal = None
-        if self._liquidity_hunter is not None:
-            self._liquidity_hunter.reset()
 
         # ── Build clean entry notification ───────────────────────────────────────
         sl_dist_pts = abs(fill_price - sl_price)
@@ -7309,19 +7362,9 @@ class QuantStrategy:
 
         _hold_reason: List[str] = []
         _atr_pctile = self._atr_5m.get_percentile()
-
-        # Pull live AMD + ADX context for the external engine
-        _amd_phase  = "ACCUMULATION"
-        _amd_conf   = 0.0
         _adx_now    = self._adx.adx
-        if self._ict is not None:
-            try:
-                _amd_phase = self._ict._amd.phase
-                _amd_conf  = self._ict._amd.confidence
-            except Exception:
-                pass
 
-        new_sl = DynamicTrailEngine.compute(
+        new_sl = _ICTStructureTrail.compute(
             pos_side        = pos.side,
             price           = price,
             entry_price     = pos.entry_price,
@@ -7339,10 +7382,7 @@ class QuantStrategy:
             ict_engine      = self._ict,
             now_ms          = now_ms,
             hold_reason     = _hold_reason,
-            # Rich context — engine uses these to adapt thresholds dynamically
             atr_percentile  = _atr_pctile,
-            amd_phase       = _amd_phase,
-            amd_confidence  = _amd_conf,
             adx             = _adx_now,
             tick_size       = QCfg.TICK_SIZE(),
             candles_15m     = _trail_candles_15m,
@@ -7356,19 +7396,10 @@ class QuantStrategy:
                 init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
                 tier      = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
                 hm        = (now - pos.entry_time) / 60.0
-                # Full context for trail hold: reason + AMD + profit + SL
-                _reason_str  = " | ".join(_hold_reason) if _hold_reason else f"tier={tier:.2f}R<ACT"
-                _amd_label   = ""
-                _vol_label   = f"pctile={_atr_pctile:.0%}"
-                if self._ict is not None:
-                    try:
-                        _amd_ph  = self._ict._amd.phase
-                        _amd_cf  = self._ict._amd.confidence
-                        _amd_label = f" | AMD={_amd_ph}({_amd_cf:.2f})"
-                    except Exception:
-                        pass
+                _reason_str = " | ".join(_hold_reason) if _hold_reason else f"tier={tier:.2f}R<ACT"
+                _vol_label  = f"pctile={_atr_pctile:.0%}"
                 logger.info(
-                    f"🔒 Trail HOLD | {_reason_str}{_amd_label} | "
+                    f"🔒 Trail HOLD | {_reason_str} | "
                     f"profit={profit:.1f}pts peak={pos.peak_profit:.1f}pts | "
                     f"SL=${pos.sl_price:,.1f} | hold={hm:.0f}m | {_vol_label}")
             return False
@@ -7383,30 +7414,10 @@ class QuantStrategy:
         if abs(new_sl_tick - pos.sl_price) < 1e-6:
             return False
 
-        # AMD-aware phase label for trail log
+        # Phase label derived from R-multiple
         init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
-        _amd_phase_label = ""
-        if self._ict is not None:
-            try:
-                _ap = self._ict._amd.phase
-                _ac = self._ict._amd.confidence
-                _amd_phase_label = f" AMD={_ap}({_ac:.2f})"
-            except Exception:
-                pass
-
-        # External DynamicTrailEngine logs the anchor via debug log internally.
-        # Extract anchor label from hold_reason debug entries when present.
         _anchor_label = ""
-        for r in (_hold_reason or []):
-            for prefix in ("TRAIL→", "Trail "):
-                if prefix in r:
-                    b0 = r.find("["); b1 = r.find("]")
-                    if b0 != -1 and b1 != -1:
-                        _anchor_label = f" [{r[b0+1:b1]}]"
-                    break
-            if _anchor_label:
-                break
 
         # Tier label derived from R-multiple (matches external engine's phase logic)
         if tier >= 2.0:
@@ -7425,11 +7436,11 @@ class QuantStrategy:
         hm = (now - pos.entry_time) / 60.0
         _improvement = new_sl_tick - pos.sl_price if pos.side == "long" else pos.sl_price - new_sl_tick
         logger.info(
-            f"🔒 Trail [{phase_label}]{_anchor_label}{_amd_phase_label} "
+            f"🔒 Trail [{phase_label}]{_anchor_label} "
             f"${pos.sl_price:,.1f} → ${new_sl_tick:,.1f} (+{_improvement:.1f}pts) | "
             f"R={tier:.2f}R MFE={pos.peak_profit:.1f}pts hold={hm:.0f}m vol={_vol_tag}")
         send_telegram_message(
-            f"🔒 <b>TRAIL SL</b> [{phase_label}]{_anchor_label}{_amd_phase_label}\n"
+            f"🔒 <b>TRAIL SL</b> [{phase_label}]{_anchor_label}\n"
             f"${pos.sl_price:,.2f} → ${new_sl_tick:,.2f} (+{_improvement:.1f}pts)\n"
             f"R: {tier:.2f}R | MFE: {pos.peak_profit:.1f}pts | Hold: {hm:.0f}m\n"
             f"Vol: {_vol_tag} ({_atr_pctile:.0%} pctile) | ATR: ${atr:.1f}")
