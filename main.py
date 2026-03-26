@@ -1,25 +1,40 @@
 """
-main.py — Unified Dual-Exchange Quant Bot
-==========================================
-Entry point for the combined CoinSwitch + Delta Exchange trading bot.
+main.py — Liquidity-First Dual-Exchange Quant Bot
+===================================================
+Entry point.
 
-Architecture:
-  - Both exchange data managers start concurrently
-  - MarketAggregator fuses orderbook depth + CVD + tick flow from both
-  - Candles come exclusively from the primary (execution) exchange
-  - ExecutionRouter owns both OrderManagers; routes to the active one
+Architecture (liquidity-first):
+  1. Multi-TF liquidity scanner tracks BSL/SSL pools on 1m, 5m, 15m, 1h, 4h.
+  2. Pool priority engine scores every pool by HTF confluence, touch count,
+     freshness, and volume at the level.
+  3. Directional intent detector (primary gate): CVD divergence + orderbook
+     delta + tick aggression determines whether flow is driving TOWARD the
+     highest-priority pool.  If not → wait.
+  4. ICT structure validation (secondary): AMD phase, OB/FVG alignment, and
+     premium/discount zone confirm the structural context for the trade.
+  5. Entry: limit at OTE inside the sweep zone, or market at confirmed sweep.
+  6. SL: placed at ICT structure — sweep wick → OB → swing low/high.
+  7. TP: set at the opposing liquidity pool's sweep price.
+  8. Trail: ICT structure only — BOS swing → CHoCH tighten → 15m structure.
+  9. Post-sweep engine: CVD + structure decides continue/reverse/range.
+
+Exchange routing:
+  - Both exchange data managers start concurrently.
+  - MarketAggregator fuses OB depth + CVD + tick flow from both.
+  - Candles come exclusively from the primary (execution) exchange.
+  - ExecutionRouter owns both OrderManagers; routes to the active one.
   - /setexchange <delta|coinswitch> switches execution at runtime
-    (blocked while a position is open; no restart needed)
+    (blocked while a position is open; no restart needed).
 
 Startup sequence:
-  1. Validate credentials for all configured exchanges
-  2. Construct API clients + OrderManagers for each exchange
-  3. Build ExecutionRouter (default from config.EXECUTION_EXCHANGE)
-  4. Construct data managers + MarketAggregator
-  5. Set leverage on active exchange
-  6. Start aggregator (boots both DMs concurrently)
-  7. Wait for primary DM readiness
-  8. Start strategy + main loop
+  1. Validate credentials for all configured exchanges.
+  2. Construct API clients + OrderManagers for each exchange.
+  3. Build ExecutionRouter (default from config.EXECUTION_EXCHANGE).
+  4. Construct data managers + MarketAggregator.
+  5. Set leverage on active exchange.
+  6. Start aggregator (boots both DMs concurrently).
+  7. Wait for primary DM readiness.
+  8. Start strategy + main loop.
 """
 
 from __future__ import annotations
@@ -64,14 +79,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -- v9.0: Display engine --
+# ── v9 display engine (optional) ─────────────────────────────────────────────
 try:
     from strategy.v9_display import format_heartbeat as _fmt_hb
     _V9_DISPLAY = True
 except ImportError:
     _V9_DISPLAY = False
 
-# ── Global exception hooks — no silent crash ever again ──────────────────────
+# ── Global exception hooks ────────────────────────────────────────────────────
 
 def _log_uncaught(exc_type, exc_value, exc_tb):
     """Log any uncaught main-thread exception before the process dies."""
@@ -88,6 +103,7 @@ def _log_uncaught(exc_type, exc_value, exc_tb):
     except Exception:
         pass
 
+
 sys.excepthook = _log_uncaught
 
 
@@ -101,9 +117,10 @@ def _log_thread_exception(args):
         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
     )
 
+
 threading.excepthook = _log_thread_exception
 
-# ── Deferred imports (after path is set up) ───────────────────────────────────
+# ── Deferred imports ──────────────────────────────────────────────────────────
 from exchanges.coinswitch.api          import FuturesAPI  as CoinSwitchAPI
 from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api               import DeltaAPI
@@ -127,7 +144,16 @@ install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=5.0)
 
 class QuantBot:
     """
-    Unified dual-exchange quant bot.
+    Liquidity-first dual-exchange quant bot.
+
+    Decision hierarchy on every tick:
+      1. Are there scored BSL/SSL pools within range?       → LiquidityMap
+      2. Is flow (CVD + OB delta + tick aggression)
+         driving toward the highest-priority pool?          → FlowDetector
+      3. Does ICT structure confirm the trade context?      → ICTEngine
+      4. Entry at OTE or market-at-sweep; SL at structure;
+         TP at opposing pool.                               → EntryEngine
+      5. Trail via ICT structure only (BOS/CHoCH).          → TrailEngine
 
     Public attributes accessed by the Telegram controller:
       .strategy          — QuantStrategy
@@ -143,8 +169,6 @@ class QuantBot:
         self.last_health_check_sec = 0.0
         self.last_report_sec       = 0.0
         self.last_heartbeat_sec    = 0.0
-        # Lock protecting _last_tick_time which is written by the main thread
-        # and read by the watchdog daemon thread.
         self._tick_lock = threading.Lock()
 
         self.data_manager:     Optional[MarketAggregator]  = None
@@ -163,8 +187,8 @@ class QuantBot:
     def initialize(self) -> bool:
         try:
             logger.info("=" * 80)
-            logger.info("⚡ UNIFIED QUANT BOT v5 — DUAL-EXCHANGE AGGREGATION")
-            logger.info("   VWAP | CVD | Orderbook | Tick Flow | ICT Confluence")
+            logger.info("⚡ LIQUIDITY-FIRST QUANT BOT — DUAL-EXCHANGE")
+            logger.info("   Pools → Flow → ICT → Entry at OTE → TP at Pool")
             logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
             logger.info("=" * 80)
@@ -212,7 +236,6 @@ class QuantBot:
             self.order_manager = self.execution_router  # alias for controller
 
             # ── Build data managers ───────────────────────────────────────────
-            # Determine which is primary (execution exchange) and which secondary
             exec_exch = config.EXECUTION_EXCHANGE.lower()
 
             if exec_exch == "delta" and has_delta:
@@ -237,8 +260,6 @@ class QuantBot:
             )
 
             # ── Risk manager ──────────────────────────────────────────────────
-            # Pass the router itself (not .api) so get_balance() always delegates
-            # to whichever exchange is currently active — survives /setexchange.
             self.risk_manager = RiskManager(
                 shared_api = self.execution_router
             )
@@ -247,7 +268,7 @@ class QuantBot:
             self.strategy = QuantStrategy(self.execution_router)
             self.data_manager.register_strategy(self.strategy)
 
-            logger.info("✅ Unified quant bot initialised")
+            logger.info("✅ Liquidity-first quant bot initialised")
             return True
 
         except Exception:
@@ -282,8 +303,8 @@ class QuantBot:
             try:
                 bal = self.execution_router.get_balance()
                 if bal and not bal.get("error"):
-                    avail = float(bal.get("available", 0))
-                    total = float(bal.get("total", avail))
+                    avail    = float(bal.get("available", 0))
+                    total    = float(bal.get("total", avail))
                     currency = bal.get("currency", "USD")
                     logger.info(f"Balance — Available: ${avail:,.2f} | "
                                 f"Total: ${total:,.2f} {currency}")
@@ -305,7 +326,7 @@ class QuantBot:
                 logger.error("❌ DataManager not ready within timeout")
                 return False
 
-            price = self.data_manager.get_last_price()
+            price      = self.data_manager.get_last_price()
             agg_status = self.data_manager.get_secondary_status()
             logger.info(f"✅ Data ready. Price: ${price:,.2f} | "
                         f"Dual-feed: {agg_status['alive']}")
@@ -314,27 +335,27 @@ class QuantBot:
 
             # ── Startup Telegram notification ─────────────────────────────────
             from strategy.quant_strategy import QCfg
-            dual_feed = agg_status["alive"]
+            dual_feed      = agg_status["alive"]
             secondary_name = agg_status.get("secondary", "none")
             send_telegram_message(
-                "⚡ <b>UNIFIED QUANT BOT v5 STARTED</b>\n\n"
+                "⚡ <b>LIQUIDITY-FIRST QUANT BOT STARTED</b>\n\n"
                 f"Symbol:    {QCfg.SYMBOL()}\n"
                 f"Price:     ${price:,.2f}\n"
                 f"Execution: {self.execution_router.active_exchange.upper()}\n"
-                f"Leverage:  {QCfg.LEVERAGE()}x\n"
-                f"Margin:    {QCfg.MARGIN_PCT():.0%} per trade\n"
-                f"Entry:     VWAP dev &gt; {QCfg.VWAP_ENTRY_ATR_MULT()}×ATR\n"
-                f"SL:        Swing + {QCfg.SL_BUFFER_ATR_MULT()}×ATR\n"
-                f"TP:        {QCfg.TP_VWAP_FRACTION():.0%} back to VWAP\n"
-                f"Min R:R:   {QCfg.MIN_RR_RATIO()}\n\n"
+                f"Leverage:  {QCfg.LEVERAGE()}x\n\n"
+                "<b>Architecture:</b>\n"
+                "  1️⃣  Multi-TF liquidity pool scanner\n"
+                "  2️⃣  Pool priority engine (HTF × touches × freshness)\n"
+                "  3️⃣  Flow detector: CVD + OB delta + tick aggression\n"
+                "  4️⃣  ICT validation: AMD + OB/FVG + P/D zone\n"
+                "  5️⃣  Entry at OTE · SL at ICT structure · TP at pool\n"
+                "  6️⃣  Trail: BOS → CHoCH → 15m structure only\n\n"
                 f"📡 <b>Data feed:</b> "
-                f"{'DUAL — ' + secondary_name.upper() + ' secondary active' if dual_feed else 'SINGLE — primary only'}\n"
-                f"<i>Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} "
-                f"OB={QCfg.W_OB()} TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}</i>\n\n"
+                f"{'DUAL — ' + secondary_name.upper() + ' secondary active' if dual_feed else 'SINGLE — primary only'}\n\n"
                 f"<i>/setexchange delta|coinswitch to switch execution exchange</i>"
             )
 
-            logger.info("🚀 UNIFIED QUANT BOT RUNNING")
+            logger.info("🚀 LIQUIDITY-FIRST QUANT BOT RUNNING")
             return True
 
         except Exception:
@@ -342,9 +363,8 @@ class QuantBot:
             return False
 
     # =========================================================================
-    # HEARTBEAT
+    # HEARTBEAT  (liquidity-first layout)
     # =========================================================================
-
 
     def maybe_log_heartbeat(self) -> None:
         now = time.time()
@@ -358,31 +378,36 @@ class QuantBot:
         feed  = "dual" if agg.get("alive") else "single"
         exch  = self.execution_router.active_exchange.upper() if self.execution_router else "?"
 
-        # v9.0: Use new display engine if available
+        # ── v9.0 display engine ───────────────────────────────────────────────
         if _V9_DISPLAY and self.strategy:
-            strat = self.strategy
-            engine_state = "SCANNING"
+            strat         = self.strategy
+            engine_state  = "SCANNING"
             tracking_info = None
             primary_target = None
             n_bsl = 999.0
             n_ssl = 999.0
-            sweep_count = 0
-            flow_conv = 0.0
-            flow_dir = ""
+            sweep_count  = 0
+            flow_conv    = 0.0
+            flow_dir     = ""
 
             if hasattr(strat, '_entry_engine') and strat._entry_engine is not None:
-                engine_state = strat._entry_engine.state
+                engine_state  = strat._entry_engine.state
                 tracking_info = strat._entry_engine.tracking_info
 
             if hasattr(strat, '_liq_map') and strat._liq_map is not None:
                 try:
-                    snap = strat._liq_map.get_snapshot(price, strat._atr_5m.atr)
+                    snap           = strat._liq_map.get_snapshot(price, strat._atr_5m.atr)
                     primary_target = snap.primary_target
-                    n_bsl = snap.nearest_bsl_atr
-                    n_ssl = snap.nearest_ssl_atr
-                    sweep_count = len(snap.recent_sweeps)
+                    n_bsl          = snap.nearest_bsl_atr
+                    n_ssl          = snap.nearest_ssl_atr
+                    sweep_count    = len(snap.recent_sweeps)
                 except Exception:
                     pass
+
+            # Flow conviction from detectors
+            if hasattr(strat, '_flow_conviction'):
+                flow_conv = getattr(strat, '_flow_conviction', 0.0)
+                flow_dir  = getattr(strat, '_flow_direction', "")
 
             stats = strat.get_stats() if strat else {}
 
@@ -401,7 +426,7 @@ class QuantBot:
             logger.info(msg)
             return
 
-        # Legacy heartbeat fallback
+        # ── Legacy heartbeat ──────────────────────────────────────────────────
         if pos:
             side  = pos.get("side", "?").upper()
             entry = pos.get("entry_price", 0.0)
@@ -415,12 +440,22 @@ class QuantBot:
                     f"${price:,.2f} [{feed}] | IN {side} @ ${entry:,.2f} | "
                     f"SL ${sl:,.2f}  TP ${tp:,.2f} | unrealised {pnl:+.2f} pts")
         else:
-            stats  = self.strategy.get_stats() if self.strategy else {}
-            phase  = stats.get("current_phase", "FLAT")
-            trades = stats.get("daily_trades", 0)
-            pnl    = stats.get("total_pnl", 0.0)
+            stats   = self.strategy.get_stats() if self.strategy else {}
+            phase   = stats.get("current_phase", "SCANNING")
+            trades  = stats.get("daily_trades", 0)
+            pnl     = stats.get("total_pnl", 0.0)
+            # Show pool state in fallback heartbeat
+            pool_str = ""
+            if self.strategy and hasattr(self.strategy, '_liq_map') and self.strategy._liq_map:
+                try:
+                    snap     = self.strategy._liq_map.get_snapshot(price, self.strategy._atr_5m.atr)
+                    tgt      = snap.primary_target
+                    pool_str = (f" | target={'BSL' if tgt and tgt.level_type == 'BSL' else 'SSL'}"
+                                f"@${tgt.price:,.0f}" if tgt else " | no target")
+                except Exception:
+                    pass
             logger.info(
-                f"${price:,.2f} [{feed}|exec={exch}] | {phase} | "
+                f"${price:,.2f} [{feed}|exec={exch}] | {phase}{pool_str} | "
                 f"trades today: {trades} | session PnL: ${pnl:+.2f}")
 
     # =========================================================================
@@ -491,18 +526,14 @@ class QuantBot:
                 logger.debug(f"Report error: {e}")
 
     # =========================================================================
-    # MAIN LOOP
-    # =========================================================================
-
-    # =========================================================================
-    # MAIN LOOP WATCHDOG — logs stuck threads before silently dying
+    # MAIN LOOP + WATCHDOG
     # =========================================================================
 
     def _watchdog_loop(self) -> None:
         """
-        Runs in a daemon thread. Every 5 seconds checks whether the main loop
-        completed its last tick within WATCHDOG_THRESH seconds. If not, dumps
-        a full Python thread stack trace to the log so the freeze is diagnosable.
+        Daemon thread — every 5 s checks whether the main loop completed
+        its last tick within WATCHDOG_THRESH_SEC.  If not, dumps a full
+        Python thread stack trace to the log so the freeze is diagnosable.
         """
         import traceback as _tb
         WATCHDOG_THRESH = float(getattr(config, "WATCHDOG_THRESH_SEC", 15.0))
@@ -520,7 +551,6 @@ class QuantBot:
                     age, WATCHDOG_THRESH,
                 )
                 frames = []
-                # Dump all thread stacks
                 for tid, frame in sys._current_frames().items():
                     stack = "".join(_tb.format_stack(frame))
                     frames.append(f"Thread id={tid}:\n{stack}")
@@ -536,19 +566,12 @@ class QuantBot:
         with self._tick_lock:
             self._last_tick_time = time.time()
 
-        # Start watchdog — logs thread stacks if loop freezes >15s
         _wd = threading.Thread(target=self._watchdog_loop, daemon=True, name="watchdog")
         _wd.start()
 
         while self.running:
             try:
                 time.sleep(0.25)
-                # Bug-18 fix: do NOT update _last_tick_time here at the top of
-                # the loop.  The watchdog measures how long since the last tick
-                # COMPLETED.  Setting it here meant a 14.9-second hang inside
-                # on_tick() looked like a 0.25-second tick to the watchdog — it
-                # would never fire.  The update now sits only at the two
-                # explicit completion points below.
 
                 self.maybe_supervise_streams()
                 self.maybe_send_report()
@@ -556,8 +579,6 @@ class QuantBot:
 
                 pos = self.strategy.get_position() if self.strategy else None
                 if not self.trading_enabled and pos is None:
-                    # Paused path — no on_tick call but we still completed this
-                    # iteration; reset the watchdog so it doesn't false-trip.
                     with self._tick_lock:
                         self._last_tick_time = time.time()
                     continue
@@ -576,7 +597,6 @@ class QuantBot:
                         _tick_ms,
                     )
 
-                # on_tick completed — now safe to reset watchdog timer
                 with self._tick_lock:
                     self._last_tick_time = time.time()
 
@@ -594,10 +614,10 @@ class QuantBot:
     # =========================================================================
 
     def stop(self) -> None:
-        logger.info("Stopping unified quant bot...")
+        logger.info("Stopping liquidity-first quant bot...")
         self.running = False
 
-        stop_msg = "🛑 <b>UNIFIED QUANT BOT STOPPED</b>\nShut down gracefully"
+        stop_msg = "🛑 <b>LIQUIDITY-FIRST QUANT BOT STOPPED</b>\nShut down gracefully"
         if self.strategy:
             pos = self.strategy.get_position()
             if pos:
@@ -618,7 +638,7 @@ class QuantBot:
             self.data_manager.stop()
 
         send_telegram_message(stop_msg)
-        logger.info("Unified quant bot stopped")
+        logger.info("Liquidity-first quant bot stopped")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
