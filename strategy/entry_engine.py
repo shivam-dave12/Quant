@@ -453,7 +453,20 @@ class EntryEngine:
             return
 
         # Check flow is still aligned
-        if flow.direction != tr.direction:
+        # BUG-FIX-5: The original code treated neutral ticks (flow.direction == "")
+        # as contrary, counting them toward the contrary_ticks abort threshold.
+        # Neutral ticks (conviction between -0.275 and +0.275) are temporary pauses,
+        # not genuine reversals.  Counting them caused TRACKING to abort within 3
+        # seconds of normal signal noise — most setups never built enough conviction.
+        # Fix: only count ACTIVE opposing-direction ticks as contrary.
+        #
+        # BUG-FIX-6: Target was overwritten by _find_flow_target with the REVERSED
+        # direction's pool before the contrary_ticks abort could fire.  If flow briefly
+        # flips to "long" on a short setup, we'd target a BSL pool for one tick, then
+        # abort, leaving the tracking state corrupted.
+        # Fix: only update target when flow direction still agrees with our setup.
+        if flow.direction and flow.direction != tr.direction:
+            # Active opposing flow — genuinely contrary
             tr.contrary_ticks += 1
             if tr.contrary_ticks >= 3:
                 logger.info(
@@ -463,15 +476,18 @@ class EntryEngine:
                 self._state = EngineState.SCANNING
                 self._state_entered = now
                 return
-        else:
+        elif flow.direction == tr.direction:
+            # Confirming tick — reset counter and increment
             tr.contrary_ticks = 0
             tr.flow_ticks += 1
             tr.peak_conviction = max(tr.peak_conviction, abs(flow.conviction))
+        # else: flow.direction == "" (neutral pause) — don't count as contrary or confirming
 
-        # Update target distance (pool may have shifted or price moved)
-        target = self._find_flow_target(snap, flow, price, atr)
-        if target is not None:
-            tr.target = target
+        # BUG-FIX-6 cont: Only update target when direction still agrees
+        if flow.direction == tr.direction:
+            target = self._find_flow_target(snap, flow, price, atr)
+            if target is not None:
+                tr.target = target
 
         # Conviction check: flow sustained + CVD agrees + target still valid
         ready = (
@@ -1170,7 +1186,14 @@ class ICTTrailManager:
         Find the appropriate swing level for SL placement.
         Hierarchy: 15m swing > 5m swing.
         """
-        from liquidity_map import _find_swing_highs, _find_swing_lows
+        # BUG-FIX-4: Bare "from liquidity_map import" inside a method raises
+        # ModuleNotFoundError when entry_engine is imported as strategy.entry_engine
+        # (Python's path doesn't include the strategy/ subdirectory for bare imports).
+        # This silently returned None for every trail SL computation.
+        try:
+            from strategy.liquidity_map import _find_swing_highs, _find_swing_lows
+        except ImportError:
+            from liquidity_map import _find_swing_highs, _find_swing_lows
 
         # Buffer scales with phase
         if self._choch_seen:

@@ -3209,6 +3209,11 @@ class QuantStrategy:
         self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
         self._flow_streak_dir_v2 = ""
         self._flow_streak_count_v2 = 0
+        # BUG-FIX-3: These attrs are read by main.py heartbeat via getattr().
+        # Without explicit assignment they're missing → heartbeat always shows
+        # "Flow: neutral(+0.00)" regardless of actual order-flow state.
+        self._flow_conviction: float = 0.0
+        self._flow_direction:  str   = ""
         self._last_think_log_v2 = 0.0
         self._force_sl = None
         self._force_tp = None
@@ -4213,8 +4218,7 @@ class QuantStrategy:
             return
 
         price = data_manager.get_last_price()
-        atr = self._atr_5m.atr
-        if atr < 1e-10 or price < 1.0:
+        if price < 1.0:
             return
 
         now_ms = int(now * 1000) if now < 1e12 else int(now)
@@ -4227,6 +4231,44 @@ class QuantStrategy:
                 candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit)
             except Exception:
                 candles_by_tf[tf] = []
+
+        # ── BUG-FIX-1: v9 path NEVER called _compute_signals(), which was the
+        # ONLY place ATREngine, VWAPEngine, CVDEngine, ADXEngine, and HTFTrendFilter
+        # were updated.  Result: atr_5m.atr == 0.0 forever → every tick exits at
+        # the ATR gate → _liq_map.update() never runs → "no pools in range" + "ATR: —"
+        # permanently.  Fix: update all engines from the freshly-fetched candles
+        # RIGHT HERE, before any logic that reads self._atr_5m.atr.
+        try:
+            _c5m  = candles_by_tf.get("5m",  [])
+            _c1m  = candles_by_tf.get("1m",  [])
+            _c15m = candles_by_tf.get("15m", [])
+            _c4h  = candles_by_tf.get("4h",  [])
+            if len(_c5m) >= QCfg.MIN_5M_BARS():
+                self._atr_5m.compute(_c5m)
+            if len(_c1m) >= QCfg.MIN_1M_BARS():
+                self._atr_1m.compute(_c1m)
+            if len(_c5m) >= 20:
+                self._adx.compute(_c5m)
+            _vwap_window = max(QCfg.VWAP_WINDOW(), 20)
+            if len(_c1m) >= _vwap_window:
+                self._vwap.update(_c1m, self._atr_5m.atr)
+                self._cvd.update(_c1m)
+            if len(_c15m) >= 10 and len(_c4h) >= 5:
+                self._htf.update(_c15m, _c4h, self._atr_5m.atr,
+                                 ict_engine=self._ict)
+        except Exception as _eng_e:
+            logger.debug(f"v9 engine update error (non-fatal): {_eng_e}")
+
+        atr = self._atr_5m.atr
+        if atr < 1e-10:
+            _now_ts = time.time()
+            if _now_ts - self._last_atr_warn >= 30.0:
+                self._last_atr_warn = _now_ts
+                logger.info(
+                    f"⏳ v9 entry: ATR not seeded yet "
+                    f"({len(candles_by_tf.get('5m', []))} 5m candles, "
+                    f"need {QCfg.MIN_5M_BARS()} — waiting for warmup)")
+            return
 
         # Step 3: Update ICT engine (preserved -- provides structural context)
         if self._ict is not None:
@@ -4302,6 +4344,11 @@ class QuantStrategy:
             tick_streak=self._flow_streak_count_v2,
             streak_direction=self._flow_streak_dir_v2,
         )
+        # BUG-FIX-3: Persist conviction/direction for main.py heartbeat display.
+        # getattr(strat, '_flow_conviction', 0.0) in heartbeat always returned 0
+        # because these attrs were never written in the v9 path.
+        self._flow_conviction = flow_state.conviction
+        self._flow_direction  = flow_state.direction
 
         # Step 6: Build ICT context
         ict_ctx = ICTContext()

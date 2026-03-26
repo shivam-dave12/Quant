@@ -314,17 +314,37 @@ class _TimeframeRegistry:
         self.tf = timeframe
         self._bsl: List[LiquidityPool] = []
         self._ssl: List[LiquidityPool] = []
-        self._last_candle_count = 0
+        # BUG-FIX-2: was _last_candle_count (int).  With a fixed fetch limit
+        # (e.g. 200), the count is ALWAYS 200 after warmup → update() returned
+        # immediately on every tick after the first → pools never refreshed.
+        # Fix: track the timestamp of the last CLOSED candle instead.
+        self._last_candle_ts: int = 0
 
     def update(self, candles: List[Dict], atr: float, now: float) -> None:
         """Rebuild pool list from swing structure."""
         if len(candles) < 15 or atr < 1e-10:
             return
 
-        # Don't recompute if candle count hasn't changed
-        if len(candles) == self._last_candle_count:
+        # BUG-FIX-2: Use the last CLOSED candle's timestamp for dedup.
+        # The old code used len(candles) which is always equal to the fetch limit
+        # (200, 50 etc.) after warmup — so update() was a no-op on every tick
+        # after the first, meaning pools never refreshed with new price action.
+        # We use candles[-2] (last confirmed-closed bar) so a new bar opening
+        # triggers a pool rebuild even if total count hasn't changed.
+        try:
+            _dedup_c = candles[-2] if len(candles) >= 2 else candles[-1]
+            if hasattr(_dedup_c, 'get'):
+                _last_ts = int(_dedup_c.get('t', 0) or 0)
+            else:
+                _last_ts = int(getattr(_dedup_c, 't',
+                               getattr(_dedup_c, 'timestamp', 0)) or 0)
+        except Exception:
+            _last_ts = 0
+
+        if _last_ts > 0 and _last_ts == self._last_candle_ts:
             return
-        self._last_candle_count = len(candles)
+        if _last_ts > 0:
+            self._last_candle_ts = _last_ts
 
         lookback = _SWING_LOOKBACK.get(self.tf, 5)
         cluster_r = _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
