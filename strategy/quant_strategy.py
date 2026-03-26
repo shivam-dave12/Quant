@@ -4195,6 +4195,16 @@ class QuantStrategy:
                                  candles_4h=candles_4h_ict,
                                  candles_1d=candles_1d_ict)
 
+                # ── Inject live order-flow data into ICT for hunt prediction ──
+                # This MUST run immediately after ict.update() so predict_next_hunt()
+                # uses the current tick's order flow, not the previous tick's stale values.
+                # set_order_flow_data() stores the values in _tick_flow / _cvd_trend;
+                # they are consumed inside predict_next_hunt() and get_confluence().
+                if hasattr(self._ict, 'set_order_flow_data'):
+                    _tf_now  = self._tick_eng.get_signal() if self._tick_eng else 0.0
+                    _cvd_now = self._cvd.get_trend_signal() if self._cvd else 0.0
+                    self._ict.set_order_flow_data(_tf_now, _cvd_now)
+
                 # ── ICT side: use AMD sweep bias or sweep setup when available ──
                 # NOT sig.reversion_side (VWAP) — ICT direction ≠ VWAP reversion side.
                 # AMD bias reflects where smart money is DELIVERING after a sweep.
@@ -4574,6 +4584,48 @@ class QuantStrategy:
           TP  = opposing pool level − 0.1×ATR buffer
         """
         side = hunt_signal.side   # "long" | "short"
+        price = data_manager.get_last_price()
+
+        # ── Scenario prediction (drives confirm count + timing) ──────────
+        # Before ANY gate, query ICT for post-hunt scenario. This determines
+        # whether we enter immediately (CONTINUATION), at OTE (REVERSAL), or
+        # after pullback confirmation (PULLBACK_CONT).
+        _hunt_scenario     = "REVERSAL"    # ICT default is OTE after sweep
+        _hunt_scenario_conf = 0.0
+        _hunt_timing        = "WAIT_OTE"
+        _hunt_opposing_pool = hunt_signal.target_pool_price
+        _hunt_swept_pool    = hunt_signal.swept_pool_price
+
+        if self._ict is not None and hasattr(self._ict, 'get_hunt_scenario'):
+            try:
+                _atr_h   = getattr(self, '_atr_val', None) or 1.0
+                _now_ms_h = int(now * 1000) if now < 1e12 else int(now)
+                _sc = self._ict.get_hunt_scenario(price, _atr_h, _now_ms_h)
+                _hunt_scenario      = _sc.get("scenario", "REVERSAL")
+                _hunt_scenario_conf = _sc.get("confidence", 0.0)
+                _hunt_timing        = _sc.get("entry_timing", "WAIT_OTE")
+                logger.info(
+                    f"🎣 HUNT SCENARIO: {_hunt_scenario} "
+                    f"(conf={_hunt_scenario_conf:.2f}) timing={_hunt_timing} | "
+                    f"{_sc.get('details','')}"
+                )
+            except Exception as _e:
+                logger.debug(f"Hunt scenario error: {_e}")
+
+        # Also check if we have an updated opposing pool from the ICT engine
+        if self._ict is not None:
+            try:
+                _hp = getattr(self._ict, '_last_hunt_pred', {}) or {}
+                if _hp.get('opposing_pool') is not None:
+                    _hunt_opposing_pool = _hp['opposing_pool']
+                    # Update the hunt signal TP to match ICT engine's target
+                    if (side == "long"  and _hunt_opposing_pool > price) or                        (side == "short" and _hunt_opposing_pool < price):
+                        hunt_signal = type(hunt_signal)(
+                            **{**hunt_signal.__dict__,
+                               'tp_price': _hunt_opposing_pool,
+                               'target_pool_price': _hunt_opposing_pool})
+            except Exception:
+                pass
 
         # Gate 1: ATR regime
         if not sig.regime_ok:
@@ -4609,21 +4661,41 @@ class QuantStrategy:
                 self._liquidity_hunter.consume_signal()
             return
 
-        # Gate 4: Confirm ticks (2 consecutive ticks to filter noise)
+        # Gate 4: Scenario-adaptive confirm ticks
+        #
+        # The number of confirm ticks is determined by the post-hunt scenario:
+        #   CONTINUATION  (price blasting through, no retrace expected): 1 tick
+        #   REVERSAL      (classic ICT sweep-and-go, OTE retrace):        2 ticks
+        #   PULLBACK_CONT (retrace first, then continue):                  3 ticks
+        #   UNCERTAIN     (no strong prediction):                          2 ticks
+        #
+        # High scenario confidence reduces the count by 1 (floor 1).
         # Uses dedicated _confirm_hunt_long / _confirm_hunt_short counters
         # (Bug-C fix) so that ICT OTE routing — which resets _confirm_long /
         # _confirm_short on every tick it fires — cannot interrupt hunt
         # confirmation progress.
-        _cn = 2
+        _cn_base = {"CONTINUATION": 1, "REVERSAL": 2,
+                    "PULLBACK_CONT": 3, "UNCERTAIN": 2}.get(_hunt_scenario, 2)
+        # High confidence reduces requirement by 1 (never below 1)
+        if _hunt_scenario_conf >= 0.70:
+            _cn_base = max(1, _cn_base - 1)
+        _cn = _cn_base
+
         if side == "long":
             self._confirm_hunt_long += 1
             self._confirm_hunt_short = 0
             if self._confirm_hunt_long < _cn:
+                logger.debug(
+                    f"🎣 Hunt confirm {self._confirm_hunt_long}/{_cn} "
+                    f"({_hunt_scenario} conf={_hunt_scenario_conf:.2f})")
                 return
         else:
             self._confirm_hunt_short += 1
             self._confirm_hunt_long = 0
             if self._confirm_hunt_short < _cn:
+                logger.debug(
+                    f"🎣 Hunt confirm {self._confirm_hunt_short}/{_cn} "
+                    f"({_hunt_scenario} conf={_hunt_scenario_conf:.2f})")
                 return
 
         # ── CONFIRMED — store signal and launch entry ────────────────────
@@ -4639,6 +4711,16 @@ class QuantStrategy:
             if side == "long"
             else f"BSL@${hunt_signal.swept_pool_price:,.0f}"
         )
+        # Determine ICT tier from scenario confidence
+        # CONTINUATION + high conf = Tier-S equivalent (immediate, tight SL)
+        # REVERSAL = Tier-A (OTE is the entry, institutional sweep confirmed)
+        # PULLBACK_CONT = Tier-B equivalent (need pullback confirmation)
+        _hunt_ict_tier = "A"
+        if _hunt_scenario == "CONTINUATION" and _hunt_scenario_conf >= 0.65:
+            _hunt_ict_tier = "S"
+        elif _hunt_scenario == "PULLBACK_CONT":
+            _hunt_ict_tier = "B"
+
         logger.info(
             f"🎣 HUNT ENTRY {side.upper()} confirmed  "
             f"swept={swept_label}  "
@@ -4646,11 +4728,13 @@ class QuantStrategy:
             f"SL=${hunt_signal.sl_price:,.1f}  "
             f"TP=${hunt_signal.tp_price:,.1f}  "
             f"R:R=1:{hunt_signal.rr:.2f}  "
-            f"pred_score={hunt_signal.prediction_score:+.3f}"
+            f"pred_score={hunt_signal.prediction_score:+.3f}  "
+            f"scenario={_hunt_scenario}(conf={_hunt_scenario_conf:.2f})  "
+            f"tier={_hunt_ict_tier}"
         )
         self._launch_entry_async(
             data_manager, order_manager, risk_manager,
-            side, sig, mode="hunt", ict_tier="A"
+            side, sig, mode="hunt", ict_tier=_hunt_ict_tier
         )
 
     def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
@@ -4944,6 +5028,70 @@ class QuantStrategy:
 
                 self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
                 _effective_cn  = _cn_override
+
+                # ── Tier-L: Liquidity-Hunt Driven entry ──────────────────
+                # Tier-L fires when predict_next_hunt() is very confident even
+                # without a formal ICTSweepSetup. Route via the hunt path for
+                # proper SL/TP using the opposing liquidity pool as target.
+                if _tier == "L":
+                    logger.info(
+                        f"🎣 TIER-L LIQUIDITY HUNT [{side.upper()}]: "
+                        f"{_tier_reason}")
+                    # Build a minimal hunt signal from ICT engine data
+                    if self._ict is not None:
+                        try:
+                            _hp_l    = getattr(self._ict, '_last_hunt_pred', {}) or {}
+                            _opp_l   = _hp_l.get('opposing_pool')
+                            _swept_l = _hp_l.get('swept_pool')
+                            _atr_l   = getattr(self, '_atr_val', None) or 1.0
+                            _now_l   = int(now * 1000) if now < 1e12 else int(now)
+                            if _opp_l is not None and _swept_l is not None:
+                                # Use ICT SL/TP engines for precise levels
+                                from strategy.ict_trade_engine import ICTSLEngine, ICTTPEngine
+                                _sl_l, _sl_src = ICTSLEngine.compute(
+                                    side, price, _atr_l,
+                                    sweep_setup=None,
+                                    ict_engine=self._ict,
+                                    now_ms=_now_l)
+                                _tp_l = ICTTPEngine.compute(
+                                    side, price, _atr_l, _sl_l,
+                                    sweep_setup=None,
+                                    ict_engine=self._ict,
+                                    now_ms=_now_l)
+                                if _sl_l is not None and _tp_l is not None:
+                                    _sl_dist_l = abs(price - _sl_l)
+                                    _tp_dist_l = abs(price - _tp_l)
+                                    _rr_l = (_tp_dist_l / _sl_dist_l
+                                             if _sl_dist_l > 1e-9 else 0.0)
+                                    if _rr_l >= 1.5:
+                                        from strategy.liquidity_hunter import HuntSignal
+                                        import time as _t_mod
+                                        _hs_l = HuntSignal(
+                                            side=side,
+                                            entry_price=price,
+                                            sl_price=_sl_l,
+                                            tp_price=_tp_l,
+                                            rr=_rr_l,
+                                            swept_pool_price=_swept_l,
+                                            target_pool_price=_opp_l,
+                                            prediction_score=_hp_l.get('confidence', 0.0),
+                                            sweep_age_ms=0,
+                                            details=f"TIER-L {_tier_reason}")
+                                        self._pending_hunt_signal = _hs_l
+                                        self._launch_entry_async(
+                                            data_manager, order_manager, risk_manager,
+                                            side, sig, mode="hunt", ict_tier="L")
+                                        return
+                                    else:
+                                        logger.info(
+                                            f"🎣 Tier-L R:R {_rr_l:.2f} < 1.5 — skipped")
+                                        self._confirm_long = self._confirm_short = 0
+                                        return
+                        except Exception as _le:
+                            logger.debug(f"Tier-L build error: {_le}")
+                    # Fallback if we can't build the hunt signal: treat as Tier-A
+                    _tier = "A"
+
                 _is_sweep_path = (_tier in ("S", "A") and
                                   self._active_sweep_setup is not None and
                                   self._active_sweep_setup.status == "OTE_READY")

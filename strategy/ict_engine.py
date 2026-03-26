@@ -61,6 +61,16 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE-LEVEL HELPER — used by predict_next_hunt()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fast_sigmoid(z: float, steepness: float = 1.0) -> float:
+    """Fast symmetric sigmoid mapping ℝ → (-1, 1). No math.exp needed."""
+    sz = z * steepness
+    return max(-1.0, min(1.0, sz / (1.0 + abs(sz) * 0.5)))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
 # ═══════════════════════════════════════════════════════════════════════════
@@ -475,6 +485,16 @@ class ICTConfluence:
 
     details: str = ""
 
+    # ── Unified Hunt Prediction (populated in get_confluence) ─────────────
+    # These fields let all downstream consumers (ICTEntryGate, ICTSLEngine,
+    # ICTTPEngine, ICTTrailEngine) use the hunt prediction without re-computing.
+    hunt_prediction:   Dict  = None    # full dict from predict_next_hunt()
+    hunt_aligns_trade: bool  = False   # True if hunt direction matches this trade
+
+    def __post_init__(self):
+        if self.hunt_prediction is None:
+            object.__setattr__(self, 'hunt_prediction', {})
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN ENGINE
@@ -564,6 +584,16 @@ class ICTEngine:
 
         self._session  = ""
         self._killzone = ""
+
+        # ── Order-flow data (set externally each tick via set_order_flow_data) ──
+        # These feed directly into predict_next_hunt() for real-time scoring.
+        # Range: [-1, +1]  positive = net buying pressure
+        self._tick_flow:  float = 0.0   # TickFlowEngine signal
+        self._cvd_trend:  float = 0.0   # CVD slope signal
+
+        # ── Cached hunt prediction (refreshed in update()) ─────────────────
+        self._last_hunt_pred: Dict = {}
+        self._last_hunt_ms:   int  = 0
 
         self._last_update    = 0.0
         self._UPDATE_INTERVAL = 5.0
@@ -2125,6 +2155,472 @@ class ICTEngine:
             self._killzone = ""
 
     # ─────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: ORDER-FLOW DATA INJECTION
+    # ─────────────────────────────────────────────────────────────────────
+
+    def set_order_flow_data(self, tick_flow: float, cvd_trend: float) -> None:
+        """
+        Inject live order-flow data from external engines.
+
+        Called by quant_strategy.py each tick BEFORE predict_next_hunt() /
+        get_confluence() so that the liquidity prediction reflects the most
+        current order-flow state.
+
+        tick_flow:  TickFlowEngine signal in [-1, +1].
+                    Positive = net buying pressure (price heading to BSL).
+                    Negative = net selling pressure (price heading to SSL).
+        cvd_trend:  CVD slope signal in [-1, +1].
+                    Positive = cumulative delta rising (sustained buying).
+                    Negative = cumulative delta falling (sustained selling).
+        """
+        self._tick_flow  = max(-1.0, min(1.0, float(tick_flow)))
+        self._cvd_trend  = max(-1.0, min(1.0, float(cvd_trend)))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PUBLIC: LIQUIDITY HUNT PREDICTION (CORE DECISION ENGINE)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def predict_next_hunt(self, price: float, atr: float, now_ms: int,
+                          candles_5m: Optional[List[Dict]] = None) -> Dict:
+        """
+        9-factor prediction of which liquidity pool gets hunted FIRST.
+
+        This is the primary decision signal for the unified engine.
+        All factors use data already available inside ICTEngine — no new
+        API calls, no external dependencies beyond set_order_flow_data().
+
+        Returns a dict:
+          predicted:          "BSL" | "SSL" | None
+          confidence:         0.0–1.0  (absolute prediction strength)
+          delivery_direction: "bearish" | "bullish"  (direction AFTER hunt)
+          scenario:           "CONTINUATION" | "REVERSAL" | "PULLBACK_CONT"
+          bsl_score:          raw score for BSL hunt
+          ssl_score:          raw score for SSL hunt
+          dealing_range_pd:   current P/D position 0–1
+          reason:             human-readable explanation string
+          swept_pool:         price of predicted target pool
+          opposing_pool:      price of post-hunt delivery target
+          confidence_factors: dict of per-factor contributions
+
+        Factor weights (sum to 1.0):
+          1. AMD phase + bias          0.25  — strongest signal
+          2. Dealing-range P/D         0.18  — position within range
+          3. Order-flow (tick_flow)    0.15  — real-time buying/selling
+          4. CVD slope                 0.12  — sustained volume pressure
+          5. OB magnet pull            0.10  — OBs between price and pool
+          6. FVG path density          0.08  — FVG delivery highways
+          7. Displacement bias         0.07  — recent candle body direction
+          8. Session timing            0.03  — London/NY session tendencies
+          9. Micro-structure (5m BOS)  0.02  — short-term structure break
+        """
+        _WEIGHTS = {
+            "amd":       0.25,
+            "dr_pos":    0.18,
+            "flow":      0.15,
+            "cvd":       0.12,
+            "ob_magnet": 0.10,
+            "fvg_path":  0.08,
+            "disp_bias": 0.07,
+            "session":   0.03,
+            "micro":     0.02,
+        }
+        assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
+
+        # Need a dealing range to have a proper BSL/SSL bracket.
+        # Fallback to swing extremes if dealing range is not computed yet.
+        dr = self._dealing_range
+        if dr is not None:
+            bsl_price = dr.high
+            ssl_price = dr.low
+            dr_pd     = dr.current_pd
+        else:
+            # Fallback: nearest unswept BSL above price, nearest SSL below
+            unswept = [p for p in self.liquidity_pools if not p.swept]
+            bsl_pools = sorted([p for p in unswept if p.level_type == "BSL"
+                                and p.price > price], key=lambda p: p.price)
+            ssl_pools = sorted([p for p in unswept if p.level_type == "SSL"
+                                and p.price < price], key=lambda p: -p.price)
+            if not bsl_pools or not ssl_pools:
+                return {
+                    "predicted": None, "confidence": 0.0,
+                    "delivery_direction": "", "scenario": "",
+                    "bsl_score": 0.0, "ssl_score": 0.0,
+                    "dealing_range_pd": 0.5,
+                    "reason": "no_dealing_range",
+                    "swept_pool": None, "opposing_pool": None,
+                    "confidence_factors": {},
+                }
+            bsl_price = bsl_pools[0].price
+            ssl_price = ssl_pools[0].price
+            range_size = max(bsl_price - ssl_price, 1e-9)
+            dr_pd = (price - ssl_price) / range_size
+
+        range_size = max(bsl_price - ssl_price, 1e-9)
+        a = max(atr, 1e-9)
+
+        # Score: positive → BSL hunt more likely, negative → SSL hunt
+        components: Dict[str, float] = {}
+
+        # ── Factor 1: AMD phase + bias (0.25) ─────────────────────────────
+        # MANIPULATION with bearish bias = price going to run BSL (Judas swing up)
+        # before delivering DOWN. Score: +BSL for bullish Judas, +SSL for bearish.
+        # DISTRIBUTION confirms which side was swept → score the opposing side.
+        f_amd = 0.0
+        amd = self._amd
+        if amd.phase == "MANIPULATION":
+            if amd.bias == "bullish":
+                # SSL was swept → bullish delivery → BSL is the next target
+                f_amd = +0.80
+            elif amd.bias == "bearish":
+                # BSL was swept → bearish delivery → SSL is the next target
+                f_amd = -0.80
+        elif amd.phase in ("DISTRIBUTION", "REDISTRIBUTION"):
+            if amd.bias == "bullish":
+                f_amd = +0.70   # delivering up to BSL
+            elif amd.bias == "bearish":
+                f_amd = -0.70   # delivering down to SSL
+        elif amd.phase == "REACCUMULATION":
+            f_amd = +0.40   # mid-trend pause → resume bullish → BSL
+        elif amd.phase == "ACCUMULATION":
+            f_amd = 0.0     # neutral — no directional AMD signal
+        f_amd *= amd.confidence
+        f_amd = max(-1.0, min(1.0, f_amd))
+        components["amd"] = f_amd
+
+        # ── Factor 2: Dealing-range P/D position (0.18) ──────────────────
+        # Deep discount → SSL unlikely target (price far from SSL), BSL likely.
+        # Deep premium → BSL unlikely, SSL likely.
+        # Linear: f_dr = +1.0 at dr_pd=0, -1.0 at dr_pd=1.0
+        f_dr = 1.0 - 2.0 * dr_pd   # discount=+1, premium=-1
+        f_dr = max(-1.0, min(1.0, f_dr))
+        components["dr_pos"] = f_dr
+
+        # ── Factor 3: Order-flow tick pressure (0.15) ─────────────────────
+        # tick_flow > 0 = net buying → BSL hunt; < 0 → SSL hunt
+        f_flow = _fast_sigmoid(self._tick_flow, steepness=1.5)
+        components["flow"] = f_flow
+
+        # ── Factor 4: CVD slope (0.12) ────────────────────────────────────
+        # Rising CVD = institutions buying → targeting BSL stops
+        f_cvd = _fast_sigmoid(self._cvd_trend, steepness=1.2)
+        components["cvd"] = f_cvd
+
+        # ── Factor 5: OB magnet pull (0.10) ───────────────────────────────
+        # Bullish OBs between price and BSL pull price toward BSL.
+        # Bearish OBs between price and SSL pull price toward SSL.
+        f_ob = 0.0
+        try:
+            bull_ob_score = sum(
+                (ob.strength / 100.0) * ob.virgin_multiplier()
+                for ob in self.order_blocks_bull
+                if (ob.is_active(now_ms) and price < ob.midpoint < bsl_price)
+            )
+            bear_ob_score = sum(
+                (ob.strength / 100.0) * ob.virgin_multiplier()
+                for ob in self.order_blocks_bear
+                if (ob.is_active(now_ms) and ssl_price < ob.midpoint < price)
+            )
+            f_ob = _fast_sigmoid(bull_ob_score - bear_ob_score, steepness=0.8)
+        except Exception:
+            pass
+        components["ob_magnet"] = f_ob
+
+        # ── Factor 6: FVG path density (0.08) ────────────────────────────
+        # Unfilled bullish FVGs between price and BSL = upward delivery highway.
+        # Unfilled bearish FVGs between price and SSL = downward delivery highway.
+        f_fvg = 0.0
+        try:
+            bull_fvg = sum(1 for fvg in self.fvgs_bull
+                           if (fvg.is_active(now_ms) and
+                               not fvg.filled and
+                               price < fvg.top < bsl_price))
+            bear_fvg = sum(1 for fvg in self.fvgs_bear
+                           if (fvg.is_active(now_ms) and
+                               not fvg.filled and
+                               ssl_price < fvg.bottom < price))
+            f_fvg = _fast_sigmoid((bull_fvg - bear_fvg) * 0.5, steepness=0.8)
+        except Exception:
+            pass
+        components["fvg_path"] = f_fvg
+
+        # ── Factor 7: Displacement bias from recent 5m candles (0.07) ────
+        # Net bullish bodies → BSL hunt; net bearish → SSL hunt
+        f_disp = 0.0
+        _c5 = candles_5m or []
+        if len(_c5) >= 6 and a > 1e-10:
+            net_body = sum(
+                float(c['c']) - float(c['o'])
+                for c in _c5[-5:-1]   # 4 closed candles
+            )
+            f_disp = _fast_sigmoid(net_body / a, steepness=1.0)
+        elif self._tf.get("5m") is not None:
+            # Fallback: use 5m trend from structure analysis
+            t5 = self._tf["5m"]
+            if t5.trend == "bullish":
+                f_disp = +0.50
+            elif t5.trend == "bearish":
+                f_disp = -0.50
+        components["disp_bias"] = f_disp
+
+        # ── Factor 8: Session timing (0.03) ───────────────────────────────
+        # London open (08:00-09:00 UTC): slight BSL sweep bias (Judas swing up)
+        # NY delivery (13:30-15:30 UTC): amplify existing direction
+        f_sess = 0.0
+        try:
+            from datetime import datetime, timezone as _tz
+            _dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=_tz.utc)
+            _hm  = _dt.hour * 60 + _dt.minute
+            if 480 <= _hm <= 540:      # London KZ 08:00-09:00 UTC
+                f_sess = +0.20         # London BSL sweep Judas bias
+            elif 810 <= _hm <= 930:    # NY 13:30-15:30 UTC
+                # Amplify existing EMA direction
+                _existing = sum(
+                    components[k] * _WEIGHTS[k]
+                    for k in ("amd", "dr_pos", "flow", "cvd")
+                ) / max(sum(_WEIGHTS[k] for k in ("amd", "dr_pos", "flow", "cvd")), 1e-9)
+                f_sess = _fast_sigmoid(_existing * 2.0, steepness=1.0)
+        except Exception:
+            pass
+        components["session"] = f_sess
+
+        # ── Factor 9: 5m micro-structure BOS (0.02) ───────────────────────
+        f_micro = 0.0
+        t5m = self._tf.get("5m")
+        if t5m is not None:
+            if t5m.bos_direction == "bullish":
+                f_micro = +0.80
+            elif t5m.bos_direction == "bearish":
+                f_micro = -0.80
+        components["micro"] = f_micro
+
+        # ── Weighted sum ───────────────────────────────────────────────────
+        score = sum(components[k] * _WEIGHTS[k] for k in _WEIGHTS)
+        score = max(-1.0, min(1.0, score))
+
+        # Convert to BSL/SSL directional scores for clarity
+        bsl_score = max(0.0, score)
+        ssl_score = max(0.0, -score)
+
+        # Confidence = normalised absolute score (how decisive the prediction is)
+        confidence = abs(score)
+
+        # Minimum confidence threshold to produce a prediction
+        if confidence < 0.15:
+            return {
+                "predicted": None, "confidence": round(confidence, 3),
+                "delivery_direction": "", "scenario": "UNCERTAIN",
+                "bsl_score": round(bsl_score, 3),
+                "ssl_score": round(ssl_score, 3),
+                "dealing_range_pd": round(dr_pd, 3),
+                "reason": f"low_confidence(score={score:+.3f})",
+                "swept_pool": None, "opposing_pool": None,
+                "confidence_factors": {k: round(v, 3) for k, v in components.items()},
+            }
+
+        # Determine predicted pool and delivery direction
+        if score > 0:
+            # Heading to BSL → BSL swept → delivery DOWN to SSL
+            predicted          = "BSL"
+            delivery_direction = "bearish"
+            swept_pool_price   = bsl_price
+            opposing_pool_price= ssl_price
+            reason = (f"BSL_hunt_predicted (score={score:+.3f}) | "
+                      f"AMD({amd.phase},{amd.bias},{amd.confidence:.2f}) | "
+                      f"DR_pd={dr_pd:.2f} | "
+                      f"flow={self._tick_flow:+.2f} cvd={self._cvd_trend:+.2f}")
+        else:
+            # Heading to SSL → SSL swept → delivery UP to BSL
+            predicted          = "SSL"
+            delivery_direction = "bullish"
+            swept_pool_price   = ssl_price
+            opposing_pool_price= bsl_price
+            reason = (f"SSL_hunt_predicted (score={score:+.3f}) | "
+                      f"AMD({amd.phase},{amd.bias},{amd.confidence:.2f}) | "
+                      f"DR_pd={dr_pd:.2f} | "
+                      f"flow={self._tick_flow:+.2f} cvd={self._cvd_trend:+.2f}")
+
+        # Cache prediction
+        result = {
+            "predicted":           predicted,
+            "confidence":          round(confidence, 3),
+            "delivery_direction":  delivery_direction,
+            "scenario":            "",            # filled by get_hunt_scenario
+            "bsl_score":           round(bsl_score, 3),
+            "ssl_score":           round(ssl_score, 3),
+            "dealing_range_pd":    round(dr_pd, 3),
+            "reason":              reason,
+            "swept_pool":          swept_pool_price,
+            "opposing_pool":       opposing_pool_price,
+            "confidence_factors":  {k: round(v, 3) for k, v in components.items()},
+            "raw_score":           round(score, 4),
+        }
+        self._last_hunt_pred = result
+        self._last_hunt_ms   = now_ms
+        return result
+
+    def get_hunt_scenario(self, price: float, atr: float, now_ms: int,
+                          hunt_pred: Optional[Dict] = None) -> Dict:
+        """
+        After the hunted pool is reached/swept, predict the POST-HUNT scenario.
+
+        Three scenarios (mutually exclusive, scored by evidence):
+          CONTINUATION    — price continues PAST the hunt target without reversing.
+                            Evidence: strong AMD, multiple TF alignment, no HTF opposing OB.
+          REVERSAL        — price sweeps the pool and reverses immediately.
+                            Evidence: AMD flip, displacement confirmed, OTE zone reached.
+          PULLBACK_CONT   — price reverses slightly (OTE retracement) then continues.
+                            Evidence: AMD distribution, FVG in OTE zone, moderate flow.
+
+        The scenario drives:
+          - CONTINUATION: enter early, trail aggressively
+          - REVERSAL:      enter at OTE, SL tight at sweep candle
+          - PULLBACK_CONT: enter at OTE after pullback confirmation
+
+        Returns:
+          scenario:       "CONTINUATION" | "REVERSAL" | "PULLBACK_CONT" | "UNCERTAIN"
+          confidence:     0.0–1.0
+          entry_timing:   "IMMEDIATE" | "WAIT_OTE" | "WAIT_PULLBACK_CONFIRM"
+          details:        human-readable explanation
+        """
+        if hunt_pred is None:
+            hunt_pred = self._last_hunt_pred
+
+        if not hunt_pred or hunt_pred.get("predicted") is None:
+            return {
+                "scenario": "UNCERTAIN", "confidence": 0.0,
+                "entry_timing": "WAIT_OTE",
+                "details": "no_hunt_prediction_available",
+            }
+
+        amd    = self._amd
+        a      = max(atr, 1e-9)
+        t4h    = self._tf.get("4h", TFStructure(timeframe="4h"))
+        t1h    = self._tf.get("1h", TFStructure(timeframe="1h"))
+        t15m   = self._tf.get("15m", TFStructure(timeframe="15m"))
+        deliv  = hunt_pred.get("delivery_direction", "")
+        conf   = hunt_pred.get("confidence", 0.0)
+
+        # ── Score each scenario ────────────────────────────────────────────
+        cont_score    = 0.0
+        rev_score     = 0.0
+        pullback_score= 0.0
+
+        # AMD phase
+        if amd.phase in ("DISTRIBUTION", "REDISTRIBUTION") and amd.confidence >= 0.60:
+            # Strong distribution = reversal after hunt (classic ICT sweep-and-go)
+            rev_score     += 0.35
+            pullback_score+= 0.20
+        elif amd.phase == "MANIPULATION" and amd.confidence >= 0.55:
+            # Manipulation = OTE reversal is THE primary setup
+            rev_score     += 0.40
+        elif amd.phase in ("REACCUMULATION",):
+            # Mid-trend pause then continuation
+            pullback_score += 0.35
+            cont_score     += 0.15
+        else:
+            cont_score     += 0.20
+
+        # MTF structure alignment
+        _side_str = "bullish" if deliv == "bullish" else "bearish"
+        _align_count = sum([
+            1 for st in (t4h, t1h, t15m) if st.trend == _side_str
+        ])
+        if _align_count >= 3:
+            # All three TFs aligned = momentum continuation likely after pullback
+            pullback_score += 0.25
+            cont_score     += 0.10
+        elif _align_count >= 2:
+            rev_score      += 0.15
+            pullback_score += 0.10
+
+        # FVG in path (delivery highway supports pullback-then-continue)
+        fvg_pool = self.fvgs_bull if deliv == "bullish" else self.fvgs_bear
+        fvgs_in_path = [
+            f for f in fvg_pool
+            if (f.is_active(now_ms) and not f.filled
+                and ((deliv == "bullish" and f.bottom > price) or
+                     (deliv == "bearish" and f.top < price)))
+        ]
+        if len(fvgs_in_path) >= 2:
+            pullback_score += 0.20
+        elif len(fvgs_in_path) == 1:
+            rev_score      += 0.10
+            pullback_score += 0.10
+
+        # OB between price and delivery target
+        ob_pool = (self.order_blocks_bull if deliv == "bullish"
+                   else self.order_blocks_bear)
+        obs_in_path = [
+            ob for ob in ob_pool
+            if (ob.is_active(now_ms) and
+                ((deliv == "bullish" and ob.low > price) or
+                 (deliv == "bearish" and ob.high < price)))
+        ]
+        if obs_in_path:
+            htf_obs = [ob for ob in obs_in_path if ob.strength >= 70.0]
+            if htf_obs:
+                # HTF OBs in path = price will retrace into them (pullback setup)
+                pullback_score += 0.15
+            else:
+                rev_score      += 0.10
+
+        # Displacement confirmation in AMD sweep
+        if amd.sweep_origin is not None:
+            for pool in self.liquidity_pools:
+                if (pool.swept and pool.displacement_confirmed
+                        and abs(pool.price - amd.sweep_origin) < 5.0 * a):
+                    rev_score += 0.15
+                    break
+
+        # Order flow alignment
+        flow_dir = self._tick_flow
+        cvd_dir  = self._cvd_trend
+        if deliv == "bullish":
+            if flow_dir > 0.40 and cvd_dir > 0.30:
+                cont_score     += 0.15
+            elif flow_dir > 0.20:
+                pullback_score += 0.10
+        else:
+            if flow_dir < -0.40 and cvd_dir < -0.30:
+                cont_score     += 0.15
+            elif flow_dir < -0.20:
+                pullback_score += 0.10
+
+        # Normalise scores
+        total = max(cont_score + rev_score + pullback_score, 1e-9)
+
+        scenarios = [
+            ("CONTINUATION",  cont_score     / total),
+            ("REVERSAL",      rev_score      / total),
+            ("PULLBACK_CONT", pullback_score  / total),
+        ]
+        best_scenario, best_conf = max(scenarios, key=lambda x: x[1])
+        best_conf = min(1.0, best_conf)
+
+        # Entry timing based on scenario
+        timing_map = {
+            "CONTINUATION":  "IMMEDIATE",
+            "REVERSAL":      "WAIT_OTE",
+            "PULLBACK_CONT": "WAIT_PULLBACK_CONFIRM",
+        }
+
+        return {
+            "scenario":      best_scenario,
+            "confidence":    round(best_conf, 3),
+            "entry_timing":  timing_map.get(best_scenario, "WAIT_OTE"),
+            "details": (
+                f"cont={cont_score:.2f} rev={rev_score:.2f} "
+                f"pullback={pullback_score:.2f} | "
+                f"AMD={amd.phase}({amd.confidence:.2f}) | "
+                f"deliv={deliv} | fvg_path={len(fvgs_in_path)} ob_path={len(obs_in_path)}"
+            ),
+            "cont_score":     round(cont_score, 3),
+            "rev_score":      round(rev_score, 3),
+            "pullback_score": round(pullback_score, 3),
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
     # PUBLIC: MARKET BIAS
     # ─────────────────────────────────────────────────────────────────────
 
@@ -2499,8 +2995,23 @@ class ICTEngine:
         out.ob_score  = min(1.0, _ob_pd_contrib / 0.15) if active_ob  else 0.0
         out.fvg_score = (1.0 - active_fvg.fill_percentage) if active_fvg else 0.0
 
-        # ── 4. Liquidity ──────────────────────────────────────────────
-        liq = 0.0
+        # ── 4. Liquidity + Hunt Prediction  (UNIFIED — core decision driver) ──
+        #
+        # Liquidity is NOT a peripheral metric — it IS the ICT setup.
+        # The 9-factor predict_next_hunt() runs inside this block and its
+        # confidence feeds the confluence score at the same weight as structure.
+        #
+        # Two sub-components:
+        #   A. Sweep freshness     (max 0.10) — same as before, slightly tighter
+        #   B. Hunt prediction     (max 0.20) — NEW: aligning with predicted
+        #                                        delivery direction gives a big bonus
+        #                                        opposing prediction gives a penalty
+        # Combined cap: 0.30  (was 0.15) — liquidity now equals structure weight.
+
+        liq        = 0.0
+        conf_sweep = False
+
+        # Sub-component A: sweep freshness
         for pool in reversed(list(self.liquidity_pools)):
             if not pool.swept:
                 continue
@@ -2510,17 +3021,17 @@ class ICTEngine:
             fresh = max(0.0, 1.0 - age / self.SWEEP_MAX_AGE_MS)
             aligns = ((side == "long"  and pool.level_type == "SSL") or
                       (side == "short" and pool.level_type == "BSL"))
-            base = 0.10 * fresh
-            if pool.displacement_confirmed: base += 0.03
-            if pool.wick_rejection:         base += 0.02
+            base = 0.08 * fresh
+            if pool.displacement_confirmed: base += 0.025
+            if pool.wick_rejection:         base += 0.015
             if aligns:
-                base += 0.05
+                base += 0.04
                 details.append(
                     f"Sweep {pool.level_type} ${pool.price:.0f} "
                     f"{'disp' if pool.displacement_confirmed else ''}")
                 conf_sweep = pool.displacement_confirmed and pool.wick_rejection
-            liq = max(liq, base)
-            break   # only the most recent sweep
+            liq = max(liq, min(0.10, base))
+            break   # only most recent sweep
 
         # Stacked pools ahead
         unswept = [p for p in self.liquidity_pools if not p.swept]
@@ -2528,11 +3039,46 @@ class ICTEngine:
                        if ((side == "long"  and p.level_type == "BSL" and p.price > price) or
                            (side == "short" and p.level_type == "SSL" and p.price < price))]
         if len(pools_ahead) >= 3:
-            liq = min(0.15, liq + 0.03)
-            details.append(f"Stacked {len(pools_ahead)} BSL/SSL pools ahead")
+            liq = min(0.10, liq + 0.02)
+            details.append(f"Stacked {len(pools_ahead)} pools ahead")
 
-        out.liquidity_score = min(0.15, liq)
-        out.sweep_score = liq  # legacy
+        # Sub-component B: hunt prediction alignment
+        hunt_pred  = None
+        hunt_score = 0.0
+        _hunt_cache_stale = (now_ms - self._last_hunt_ms) > 10_000  # 10 s
+        if _hunt_cache_stale or not self._last_hunt_pred:
+            try:
+                hunt_pred = self.predict_next_hunt(price, atr, now_ms)
+            except Exception:
+                hunt_pred = {}
+        else:
+            hunt_pred = self._last_hunt_pred
+
+        if hunt_pred and hunt_pred.get("predicted"):
+            hunt_conf = hunt_pred["confidence"]
+            hunt_dir  = hunt_pred.get("delivery_direction", "")
+            hunt_aligns = ((side == "long"  and hunt_dir == "bullish") or
+                           (side == "short" and hunt_dir == "bearish"))
+            if hunt_aligns:
+                hunt_score = hunt_conf * 0.20
+                details.append(
+                    f"HUNT_PRED {hunt_pred['predicted']}->{hunt_dir} "
+                    f"conf={hunt_conf:.2f} +{hunt_score:.3f}")
+            else:
+                hunt_score = -(hunt_conf * 0.08)
+                details.append(
+                    f"HUNT_PRED_OPP {hunt_pred['predicted']} "
+                    f"penalty={hunt_score:.3f}")
+
+        out.liquidity_score = max(0.0, min(0.30, liq + hunt_score))
+        out.sweep_score     = liq   # legacy: sweep-only component
+        # Attach hunt prediction to the confluence object so callers
+        # (ICTEntryGate, ICTSLEngine, ICTTPEngine) can use it directly.
+        out.hunt_prediction   = hunt_pred or {}
+        out.hunt_aligns_trade = bool(
+            hunt_pred and
+            hunt_pred.get("delivery_direction") ==
+            ("bullish" if side == "long" else "bearish"))
 
         # ── 5. Session / Kill Zone × P/D multiplier ──────────────────
         # ICT core principle: Kill Zone entries are ONLY high-probability
@@ -3675,6 +4221,8 @@ class ICTEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     def get_status(self) -> Dict:
+        # Include hunt prediction summary if available
+        _hp = self._last_hunt_pred or {}
         return {
             "ob_bull":       len([o for o in self.order_blocks_bull if o.visit_count < 3]),
             "ob_bear":       len([o for o in self.order_blocks_bear if o.visit_count < 3]),
@@ -3687,6 +4235,16 @@ class ICTEngine:
             "amd_phase":     self._amd.phase,
             "amd_bias":      self._amd.bias,
             "amd_conf":      round(self._amd.confidence, 2),
+            # Hunt prediction (NEW)
+            "hunt_predicted":    _hp.get("predicted"),
+            "hunt_confidence":   round(_hp.get("confidence", 0.0), 3),
+            "hunt_delivery_dir": _hp.get("delivery_direction", ""),
+            "hunt_swept_pool":   _hp.get("swept_pool"),
+            "hunt_opposing_pool":_hp.get("opposing_pool"),
+            "hunt_reason":       _hp.get("reason", ""),
+            "dealing_range_pd":  round(_hp.get("dealing_range_pd", 0.5), 3),
+            "tick_flow":         round(self._tick_flow, 3),
+            "cvd_trend":         round(self._cvd_trend, 3),
         }
 
     def get_full_status(self, price: float, atr: float, now_ms: int) -> Dict:

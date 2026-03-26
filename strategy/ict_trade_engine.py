@@ -684,6 +684,54 @@ class ICTSLEngine:
         sl_price = None
         source   = "none"
 
+        # ── TIER-0: Hunt-prediction SL (HIGHEST PRIORITY for sweep entries) ─
+        #
+        # When the hunt prediction engine has identified the swept pool
+        # AND it aligns with our trade direction, place SL BEHIND that
+        # swept pool with a proper buffer. This is tighter and more precise
+        # than a 15m swing because the EXACT wick extreme of the sweep is known.
+        #
+        # Activated when:
+        #   - ict_engine is present and has a valid hunt prediction
+        #   - hunt_pred["predicted"] pool is directionally correct for this trade
+        #   - hunt confidence >= 0.45 (enough conviction)
+        #
+        # SL placement:
+        #   SHORT (BSL swept): SL = BSL swept pool price + 0.35 ATR (above sweep)
+        #   LONG  (SSL swept): SL = SSL swept pool price - 0.35 ATR (below sweep)
+        if sl_price is None and ict_engine is not None:
+            try:
+                _hp = getattr(ict_engine, '_last_hunt_pred', {}) or {}
+                _hp_conf     = _hp.get("confidence", 0.0)
+                _hp_pred     = _hp.get("predicted")
+                _hp_swept    = _hp.get("swept_pool")
+                _hp_del_dir  = _hp.get("delivery_direction", "")
+                # Alignment: SSL swept → bullish delivery → LONG
+                #            BSL swept → bearish delivery → SHORT
+                _hp_aligns = (
+                    (side == "long"  and _hp_pred == "SSL" and _hp_del_dir == "bullish") or
+                    (side == "short" and _hp_pred == "BSL" and _hp_del_dir == "bearish")
+                )
+                if _hp_aligns and _hp_conf >= 0.45 and _hp_swept is not None:
+                    _buf = 0.35 * atr
+                    if side == "long":
+                        candidate = _hp_swept - _buf   # below SSL
+                    else:
+                        candidate = _hp_swept + _buf   # above BSL
+                    dist      = abs(price - candidate)
+                    valid_dir = ((side == "long"  and candidate < price) or
+                                 (side == "short" and candidate > price))
+                    if valid_dir and min_dist <= dist <= max_dist:
+                        sl_price = candidate
+                        source   = (f"HUNT_POOL_{_hp_pred}@${_hp_swept:.0f}"
+                                    f"_conf={_hp_conf:.2f}")
+                        logger.info(
+                            f"🎣 SL TIER-0 (hunt pool): ${sl_price:,.2f} | "
+                            f"{dist:.0f}pts / {dist/max(atr,1e-9):.2f}ATR | "
+                            f"pool={_hp_pred}@${_hp_swept:.0f} conf={_hp_conf:.2f}")
+            except Exception as _e:
+                logger.debug(f"ICTSLEngine hunt-pred SL error: {_e}")
+
         # ── TIER-1: Sweep candle wick ─────────────────────────────────────
         if sweep_setup is not None and sweep_setup.sl_sweep_candle > 0:
             candidate = sweep_setup.sl_sweep_candle
@@ -920,6 +968,39 @@ class ICTTPEngine:
             if side == "short" and tp_cand >= price:
                 return
             scored.append((tp_cand, score, label))
+
+        # ── TIER-0: Hunt prediction opposing pool (SUPREME PRIORITY) ─────
+        #
+        # The hunt prediction engine identifies the EXACT opposing liquidity
+        # pool that price will be DELIVERED to after the sweep. This is the
+        # highest-conviction TP because it uses ALL available evidence
+        # (AMD, order flow, OB magnets, FVG density, session, PD position).
+        #
+        # Bypasses max_rr cap — institutional delivery does not care about
+        # our R:R ceiling. If price is being delivered 6R away, let it run.
+        if ict_engine is not None:
+            try:
+                _hp = getattr(ict_engine, '_last_hunt_pred', {}) or {}
+                _hp_conf     = _hp.get("confidence", 0.0)
+                _hp_opp      = _hp.get("opposing_pool")
+                _hp_del_dir  = _hp.get("delivery_direction", "")
+                # Alignment: bullish delivery → LONG TP = opposing BSL
+                #            bearish delivery → SHORT TP = opposing SSL
+                _hp_tp_aligns = (
+                    (side == "long"  and _hp_del_dir == "bullish" and
+                     _hp_opp is not None and _hp_opp > price) or
+                    (side == "short" and _hp_del_dir == "bearish" and
+                     _hp_opp is not None and _hp_opp < price)
+                )
+                if _hp_tp_aligns and _hp_conf >= 0.40 and _hp_opp is not None:
+                    # Score: 9.0 base × confidence — this is the primary target
+                    _hp_score = 9.0 * _hp_conf
+                    _add(_hp_opp, _hp_score,
+                         f"HUNT_DELIVERY_TARGET@${_hp_opp:.0f}"
+                         f"(conf={_hp_conf:.2f})",
+                         bypass_max_rr=True)
+            except Exception as _e:
+                logger.debug(f"ICTTPEngine hunt-pred TP error: {_e}")
 
         # ── TIER-S: Sweep delivery target (BYPASSES max_rr — AMD delivery) ─
         if sweep_setup is not None and sweep_setup.delivery_target is not None:
@@ -1403,6 +1484,78 @@ class ICTTrailEngine:
                     elif pos_side == "short" and price + min_dist < lock_level < current_sl:
                         candidates.append((lock_level,
                                            f"FVG_FILL_LOCK@${fvg.midpoint:.0f}"))
+            except Exception:
+                pass
+
+        # 4b. Hunt-prediction liquidity level as trail anchor
+        #
+        # When price is in the delivery phase after a hunt, the trail should
+        # advance to SWEPT liquidity levels and then toward the OPPOSING pool
+        # (the delivery target). This is the ICT "trail-to-opposing-pool" concept.
+        #
+        # Logic:
+        #   a) If the swept pool is between current_sl and price → trail behind it
+        #      (price has moved away from the swept level → lock at swept level)
+        #   b) If price is past any intermediate unswept pools → trail behind them
+        #      (these are mini liquidity targets in the delivery path)
+        if ict_engine is not None and phase >= 2:
+            try:
+                _hp_t = getattr(ict_engine, '_last_hunt_pred', {}) or {}
+                _hp_t_pred  = _hp_t.get("predicted")
+                _hp_t_swept = _hp_t.get("swept_pool")
+                _hp_t_conf  = _hp_t.get("confidence", 0.0)
+                _hp_t_del   = _hp_t.get("delivery_direction", "")
+
+                # Check alignment
+                _hp_t_ok = (
+                    _hp_t_conf >= 0.40 and
+                    _hp_t_swept is not None and
+                    ((pos_side == "long"  and _hp_t_del == "bullish") or
+                     (pos_side == "short" and _hp_t_del == "bearish"))
+                )
+                if _hp_t_ok:
+                    _liq_buf_t = 0.30 * atr
+                    # a) Trail behind swept pool (if price has moved past it)
+                    if pos_side == "long":
+                        if (_hp_t_swept < price - min_dist and
+                                _hp_t_swept > current_sl):
+                            trail_cand = _hp_t_swept - _liq_buf_t
+                            if current_sl < trail_cand < price - min_dist:
+                                candidates.append((trail_cand,
+                                    f"HUNT_SWEPT_LOCK@${_hp_t_swept:.0f}"))
+                    else:  # short
+                        if (_hp_t_swept > price + min_dist and
+                                _hp_t_swept < current_sl):
+                            trail_cand = _hp_t_swept + _liq_buf_t
+                            if price + min_dist < trail_cand < current_sl:
+                                candidates.append((trail_cand,
+                                    f"HUNT_SWEPT_LOCK@${_hp_t_swept:.0f}"))
+
+                    # b) Intermediate unswept pools in delivery path
+                    for _pool in ict_engine.liquidity_pools:
+                        if _pool.swept:
+                            continue
+                        if pos_side == "long" and _pool.level_type == "SSL":
+                            # SSL below — don't advance trail ABOVE it (it will get swept)
+                            continue
+                        if pos_side == "short" and _pool.level_type == "BSL":
+                            # BSL above — don't advance trail BELOW it
+                            continue
+                        # BSL (for long) or SSL (for short) — price passed it
+                        if pos_side == "long" and _pool.level_type == "BSL":
+                            if (_pool.price < price - min_dist and
+                                    _pool.price > current_sl + 0.2 * atr):
+                                _trail_cand = _pool.price - _liq_buf_t
+                                if current_sl < _trail_cand < price - min_dist:
+                                    candidates.append((_trail_cand,
+                                        f"POOL_TRAIL_BSL@${_pool.price:.0f}"))
+                        elif pos_side == "short" and _pool.level_type == "SSL":
+                            if (_pool.price > price + min_dist and
+                                    _pool.price < current_sl - 0.2 * atr):
+                                _trail_cand = _pool.price + _liq_buf_t
+                                if price + min_dist < _trail_cand < current_sl:
+                                    candidates.append((_trail_cand,
+                                        f"POOL_TRAIL_SSL@${_pool.price:.0f}"))
             except Exception:
                 pass
 
@@ -2063,6 +2216,56 @@ class ICTEntryGate:
                     f"TIER-S OTE quality={quality:.2f} q={q_score:.2f} "
                     f"AMD={amd_phase}(conf={amd_conf:.2f}) "
                     f"ICT={ict_total:.2f} KZ={sweep_setup.kill_zone or 'none'}")
+
+        # ── TIER-L: Liquidity-Hunt Driven (no formal sweep setup required) ──
+        #
+        # This tier fires when predict_next_hunt() is EXTREMELY confident
+        # about the delivery direction AND AMD confirms — even without a
+        # formal ICTSweepSetup (OTE geometry not yet computed).
+        #
+        # Requirements:
+        #   - Hunt prediction confidence >= 0.72  (very high bar)
+        #   - Hunt delivery direction matches this trade side
+        #   - AMD phase DISTRIBUTION or MANIPULATION with matching bias >= 0.60
+        #   - ICT confluence total >= 0.45
+        #   - Tick flow not STRONGLY opposing
+        #
+        # This catches the case where the sweep is detected by the prediction
+        # engine before ICTSweepDetector has processed the OTE geometry.
+        # It gives 2 confirm ticks (slightly less urgent than Tier-S).
+        _hp_tier_l = None
+        if ict_engine is not None:
+            try:
+                _hp_l = getattr(ict_engine, '_last_hunt_pred', {}) or {}
+                _hp_l_conf   = _hp_l.get("confidence", 0.0)
+                _hp_l_deliv  = _hp_l.get("delivery_direction", "")
+                _hp_l_aligns = (
+                    (side == "long"  and _hp_l_deliv == "bullish") or
+                    (side == "short" and _hp_l_deliv == "bearish")
+                )
+                _hp_l_amd_ok = (
+                    amd_phase in ("DISTRIBUTION", "MANIPULATION", "REDISTRIBUTION") and
+                    amd_conf >= 0.60 and
+                    ((side == "long"  and amd_bias == "bullish") or
+                     (side == "short" and amd_bias == "bearish"))
+                )
+                if (_hp_l_aligns and
+                        _hp_l_conf  >= 0.72 and
+                        _hp_l_amd_ok and
+                        ict_total   >= 0.45 and
+                        not tf_opposes):
+                    _hp_tier_l = _hp_l
+            except Exception:
+                pass
+
+        if _hp_tier_l is not None:
+            _hunt_conf_l = _hp_tier_l["confidence"]
+            _cn_l = 2  # two confirm ticks (slightly more than Tier-S's 1-2)
+            return ("L", _cn_l,
+                    f"TIER-L HUNT conf={_hunt_conf_l:.2f} "
+                    f"AMD={amd_phase}({amd_conf:.2f}) ICT={ict_total:.2f} "
+                    f"delivery={_hp_tier_l.get('delivery_direction','')} "
+                    f"target=${_hp_tier_l.get('opposing_pool', 0):.0f}")
 
         # ── TIER-A: ICT Structural Alignment ─────────────────────────────
         # Bug-1 fix: DISTRIBUTION that is actively opposing the entry side must
