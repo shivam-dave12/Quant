@@ -542,16 +542,24 @@ class EntryEngine:
             return
 
         # Flow must still be alive
-        if flow.direction != tr.direction:
+        # BUG-FIX E1: The original code used `flow.direction != tr.direction` which
+        # treats neutral ticks (flow.direction == "") as contrary — exactly the same
+        # bug that was already fixed in _do_tracking() as BUG-FIX-5.  Neutral ticks
+        # are temporary signal pauses, not genuine reversals.  Counting them caused
+        # READY state to abort within 2 noisy ticks after conviction was confirmed,
+        # silently discarding valid signals.
+        # Fix: mirror BUG-FIX-5 — only ACTIVE opposing-direction ticks are contrary.
+        if flow.direction and flow.direction != tr.direction:
             tr.contrary_ticks += 1
             if tr.contrary_ticks >= 2:
-                logger.info("✅ READY: flow died — back to scanning")
+                logger.info("✅ READY: flow reversed — back to scanning")
                 self._tracking = None
                 self._state = EngineState.SCANNING
                 self._state_entered = now
                 return
-        else:
+        elif flow.direction == tr.direction:
             tr.contrary_ticks = 0
+        # else: flow.direction == "" (neutral pause) — don't count as contrary
 
         # Compute SL/TP
         sl = self._compute_sl(ict, tr.direction, price, atr)

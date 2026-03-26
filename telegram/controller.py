@@ -333,52 +333,63 @@ class TelegramBotController:
                     summary = liq_map.get_status_summary(price, atr)
 
                     # BSL pools above price
-                    bsl_near = [p for p in snap.bsl_pools if p.price > price][:4]
-                    ssl_near = [p for p in snap.ssl_pools if p.price < price][:4]
-                    bsl_near_sorted = sorted(bsl_near, key=lambda p: p.price)
-                    ssl_near_sorted = sorted(ssl_near, key=lambda p: p.price, reverse=True)
+                    # BUG-FIX: snap.bsl_pools contains PoolTarget objects.
+                    # Price lives at p.pool.price, not p.price.
+                    # priority_score→p.significance, touch_count→p.pool.touches,
+                    # timeframe→p.pool.timeframe, fresh→pool status check.
+                    bsl_near = [p for p in snap.bsl_pools if p.pool.price > price][:4]
+                    ssl_near = [p for p in snap.ssl_pools if p.pool.price < price][:4]
+                    bsl_near_sorted = sorted(bsl_near, key=lambda p: p.pool.price)
+                    ssl_near_sorted = sorted(ssl_near, key=lambda p: p.pool.price, reverse=True)
 
                     lines.append("  <b>BSL (Buy-side above)</b>")
                     for p in bsl_near_sorted:
-                        dist_atr = (p.price - price) / max(atr, 1)
-                        score    = getattr(p, 'priority_score', 0.0)
-                        touches  = getattr(p, 'touch_count', 0)
-                        tf       = getattr(p, 'timeframe', '?')
-                        fresh    = "✅" if getattr(p, 'fresh', True) else "♻️"
+                        dist_atr = (p.pool.price - price) / max(atr, 1)
+                        score    = p.significance
+                        touches  = p.pool.touches
+                        tf       = p.pool.timeframe
+                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
+                                    else "♻️")
                         lines.append(
-                            f"    ${p.price:,.1f}  dist={dist_atr:.1f}ATR  "
+                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
                             f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
 
                     lines.append("  <b>SSL (Sell-side below)</b>")
                     for p in ssl_near_sorted:
-                        dist_atr = (price - p.price) / max(atr, 1)
-                        score    = getattr(p, 'priority_score', 0.0)
-                        touches  = getattr(p, 'touch_count', 0)
-                        tf       = getattr(p, 'timeframe', '?')
-                        fresh    = "✅" if getattr(p, 'fresh', True) else "♻️"
+                        dist_atr = (price - p.pool.price) / max(atr, 1)
+                        score    = p.significance
+                        touches  = p.pool.touches
+                        tf       = p.pool.timeframe
+                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
+                                    else "♻️")
                         lines.append(
-                            f"    ${p.price:,.1f}  dist={dist_atr:.1f}ATR  "
+                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
                             f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
 
                     # Primary target
+                    # BUG-FIX C17-C19: PoolTarget has no .level_type or .price.
+                    # Correct paths: pt.pool.side.value, pt.pool.price, pt.significance.
                     pt = snap.primary_target
                     if pt:
-                        direction = "BSL ▲" if pt.level_type == "BSL" else "SSL ▼"
-                        pt_score  = getattr(pt, 'priority_score', 0.0)
+                        direction = "BSL ▲" if pt.pool.side.value == "BSL" else "SSL ▼"
+                        pt_score  = pt.significance
                         lines.append(
-                            f"\n  🎯 <b>Primary target: {direction} @ ${pt.price:,.1f}"
+                            f"\n  🎯 <b>Primary target: {direction} @ ${pt.pool.price:,.1f}"
                             f"  (score={pt_score:.2f})</b>")
                     else:
                         lines.append("\n  ─ No high-priority target pool identified")
 
                     # Recent sweeps
+                    # BUG-FIX C20-C23: SweepResult has no sweep_timestamp, level_type,
+                    # price, or displacement_confirmed. Correct attrs: detected_at (seconds),
+                    # pool.side.value, pool.price, quality (use ≥0.5 as displacement proxy).
                     if snap.recent_sweeps:
                         lines.append(f"  🌊 Recent sweeps: {len(snap.recent_sweeps)}")
                         for sw in snap.recent_sweeps[-2:]:
-                            age_m = (now_ms - getattr(sw, 'sweep_timestamp', now_ms)) / 60_000
-                            disp  = "DISP✓" if getattr(sw, 'displacement_confirmed', False) else "weak"
+                            age_m = (now - sw.detected_at) / 60.0
+                            disp  = "DISP✓" if sw.quality >= 0.5 else "weak"
                             lines.append(
-                                f"    {getattr(sw,'level_type','?')} ${sw.price:,.1f}"
+                                f"    {sw.pool.side.value} ${sw.pool.price:,.1f}"
                                 f"  [{disp}]  {age_m:.0f}m ago")
                 except Exception as _le:
                     lines.append(f"  LiqMap error: {_le}")
@@ -436,6 +447,11 @@ class TelegramBotController:
             flow_dir    = "long" if conviction > 0.20 else ("short" if conviction < -0.20 else "")
 
             # Is flow toward the target pool?
+            # BUG-FIX C24: Reuse the pt already fetched from the earlier snapshot
+            # rather than calling get_snapshot() a third time.  PoolTarget has no
+            # .level_type attribute — the correct path is .pool.side.value.
+            # Note: pt may already be set from the Layer 1 section above; if the
+            # liq_map block raised an exception pt remains None from the init below.
             pt = None
             if liq_map is not None:
                 try:
@@ -445,9 +461,9 @@ class TelegramBotController:
 
             toward_pool = False
             if pt is not None and flow_dir:
-                if pt.level_type == "BSL" and flow_dir == "long":
+                if pt.pool.side.value == "BSL" and flow_dir == "long":
                     toward_pool = True
-                elif pt.level_type == "SSL" and flow_dir == "short":
+                elif pt.pool.side.value == "SSL" and flow_dir == "short":
                     toward_pool = True
 
             flow_gate_str = (
@@ -548,8 +564,13 @@ class TelegramBotController:
                     # SL info
                     lines.append(f"  SL (ICT): wick ${sweep.sl_sweep_candle:,.0f}")
                 else:
-                    dist = abs(price - sweep.ote_entry_zone_low
-                               if sweep.side == "short" else sweep.ote_entry_zone_high - price)
+                    # BUG-FIX C31: Operator precedence in the original expression caused
+                    # both sides to use the wrong zone edge.  For a LONG setup price must
+                    # rise to the OTE LOW (discount zone entry); for SHORT, drop to HIGH.
+                    if sweep.side == "long":
+                        dist = max(0.0, sweep.ote_entry_zone_low - price)
+                    else:
+                        dist = max(0.0, price - sweep.ote_entry_zone_high)
                     lines.append(f"  ⏳ {dist:.0f}pts to OTE")
 
                 # TP = opposing pool
@@ -690,26 +711,47 @@ class TelegramBotController:
             # Fallback plain text pool display
             lines = [f"<b>💧 Liquidity Pool Map @ ${price:,.2f}</b>  ATR=${atr:.1f}"]
             pt = snap.primary_target
+            # BUG-FIX C25: PoolTarget has no .level_type or .price attributes.
+            # Correct paths: pt.pool.side.value and pt.pool.price.
             if pt:
-                lines.append(f"\n🎯 <b>Primary target: {'BSL' if pt.level_type == 'BSL' else 'SSL'} @ ${pt.price:,.1f}</b>")
+                lines.append(f"\n🎯 <b>Primary target: "
+                              f"{'BSL' if pt.pool.side.value == 'BSL' else 'SSL'} "
+                              f"@ ${pt.pool.price:,.1f}</b>")
 
+            # BUG-FIX C26: PoolTarget .price → .pool.price, priority_score → .significance,
+            # touch_count → .pool.touches. Filter and sort via .pool.price.
             lines.append("\n<b>▲ BSL pools</b>")
-            for p in sorted([p for p in snap.bsl_pools if p.price > price], key=lambda x: x.price)[:6]:
-                d = (p.price - price) / max(atr, 1)
-                s = getattr(p, 'priority_score', 0.0)
-                lines.append(f"  ${p.price:,.1f}  {d:.1f}ATR  x{getattr(p,'touch_count',0)}  score={s:.2f}")
+            for p in sorted(
+                [p for p in snap.bsl_pools if p.pool.price > price],
+                key=lambda x: x.pool.price,
+            )[:6]:
+                d = (p.pool.price - price) / max(atr, 1)
+                s = p.significance
+                lines.append(
+                    f"  ${p.pool.price:,.1f}  {d:.1f}ATR  "
+                    f"x{p.pool.touches}  score={s:.2f}")
 
+            # BUG-FIX C27: same fixes for SSL
             lines.append("\n<b>▼ SSL pools</b>")
-            for p in sorted([p for p in snap.ssl_pools if p.price < price], key=lambda x: x.price, reverse=True)[:6]:
-                d = (price - p.price) / max(atr, 1)
-                s = getattr(p, 'priority_score', 0.0)
-                lines.append(f"  ${p.price:,.1f}  {d:.1f}ATR  x{getattr(p,'touch_count',0)}  score={s:.2f}")
+            for p in sorted(
+                [p for p in snap.ssl_pools if p.pool.price < price],
+                key=lambda x: x.pool.price,
+                reverse=True,
+            )[:6]:
+                d = (price - p.pool.price) / max(atr, 1)
+                s = p.significance
+                lines.append(
+                    f"  ${p.pool.price:,.1f}  {d:.1f}ATR  "
+                    f"x{p.pool.touches}  score={s:.2f}")
 
+            # BUG-FIX C28: SweepResult has no .displacement_confirmed, .level_type,
+            # or .price. Correct attrs: quality, pool.side.value, pool.price.
             if snap.recent_sweeps:
                 lines.append(f"\n🌊 <b>Recent sweeps:</b> {len(snap.recent_sweeps)}")
                 for sw in snap.recent_sweeps[-3:]:
-                    disp = "DISP✓" if getattr(sw, 'displacement_confirmed', False) else "weak"
-                    lines.append(f"  {getattr(sw,'level_type','?')} ${sw.price:,.1f} [{disp}]")
+                    disp = "DISP✓" if sw.quality >= 0.5 else "weak"
+                    lines.append(
+                        f"  {sw.pool.side.value} ${sw.pool.price:,.1f} [{disp}]")
 
             self.send_message("\n".join(lines))
             return None
@@ -973,14 +1015,21 @@ class TelegramBotController:
         if hasattr(strat, '_liq_map') and strat._liq_map is not None:
             try:
                 snap = strat._liq_map.get_snapshot(price, atr)
-                opp_pools = (
-                    [pp for pp in snap.ssl_pools if pp.price < price] if side == "LONG"
-                    else [pp for pp in snap.bsl_pools if pp.price > price]
-                )
+                # BUG-FIX C29a: The pools were inverted.
+                # LONG trades ride UP to BSL (buy-side above); SHORT trades fall to SSL below.
+                # Old code gave LONG→SSL (below) and SHORT→BSL (above) — completely backwards.
+                # BUG-FIX C29b: PoolTarget has no .price — all lookups go through .pool.price.
+                if side == "LONG":
+                    opp_pools = [pp for pp in snap.bsl_pools if pp.pool.price > price]
+                else:
+                    opp_pools = [pp for pp in snap.ssl_pools if pp.pool.price < price]
                 if opp_pools:
                     opp = sorted(opp_pools,
-                                 key=lambda pp: abs(pp.price - tp))[0]
-                    pool_tp_note = f"\nPool TP basis: ${opp.price:,.1f} (opposing {'SSL' if side == 'LONG' else 'BSL'})"
+                                 key=lambda pp: abs(pp.pool.price - tp))[0]
+                    pool_tp_note = (
+                        f"\nPool TP basis: ${opp.pool.price:,.1f} "
+                        f"(opposing {'BSL' if side == 'LONG' else 'SSL'})"
+                    )
             except Exception:
                 pass
 
@@ -1385,7 +1434,9 @@ class TelegramBotController:
             strat = bot_instance.strategy
             if strat:
                 try:
-                    from quant_strategy import PositionState
+                    # BUG-FIX C30: bare 'from quant_strategy import' fails when the module
+                    # is loaded as strategy.quant_strategy (ModuleNotFoundError).
+                    from strategy.quant_strategy import PositionState
                     with strat._lock:
                         strat._pos = PositionState()
                         strat._confirm_long = strat._confirm_short = 0

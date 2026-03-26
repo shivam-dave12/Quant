@@ -170,6 +170,13 @@ class QuantBot:
         self.last_report_sec       = 0.0
         self.last_heartbeat_sec    = 0.0
         self._tick_lock = threading.Lock()
+        # BUG-FIX M1: _last_tick_time must be initialised here, not only inside run().
+        # The watchdog thread starts inside run() but sleep(5) before reading this value.
+        # If run() is called on a non-main thread and the watchdog fires before the
+        # first tick_lock write, it would raise AttributeError.  Initialising to 0.0
+        # means the watchdog will immediately log a stale-tick warning on the very
+        # first check, which is the safe/correct behaviour.
+        self._last_tick_time = 0.0
 
         self.data_manager:     Optional[MarketAggregator]  = None
         self.execution_router: Optional[ExecutionRouter]   = None
@@ -477,8 +484,13 @@ class QuantBot:
                 try:
                     snap     = self.strategy._liq_map.get_snapshot(price, self.strategy._atr_5m.atr)
                     tgt      = snap.primary_target
-                    pool_str = (f" | target={'BSL' if tgt and tgt.level_type == 'BSL' else 'SSL'}"
-                                f"@${tgt.price:,.0f}" if tgt else " | no target")
+                    # BUG-FIX M2: PoolTarget has no .level_type or .price attributes.
+                    # Correct paths: tgt.pool.side.value and tgt.pool.price.
+                    pool_str = (
+                        f" | target={'BSL' if tgt.pool.side.value == 'BSL' else 'SSL'}"
+                        f"@${tgt.pool.price:,.0f}"
+                        if tgt else " | no target"
+                    )
                 except Exception:
                     pass
             logger.info(
