@@ -389,18 +389,40 @@ class QuantBot:
             sweep_count  = 0
             flow_conv    = 0.0
             flow_dir     = ""
+            bsl_pools    = []
+            ssl_pools    = []
+            atr_val      = 0.0
+            cvd_trend    = 0.0
+            tick_flow    = 0.0
 
             if hasattr(strat, '_entry_engine') and strat._entry_engine is not None:
                 engine_state  = strat._entry_engine.state
                 tracking_info = strat._entry_engine.tracking_info
 
+            if hasattr(strat, '_atr_5m') and strat._atr_5m is not None:
+                atr_val = strat._atr_5m.atr
+
+            if hasattr(strat, '_cvd') and strat._cvd is not None:
+                try:
+                    cvd_trend = strat._cvd.get_trend_signal()
+                except Exception:
+                    pass
+
+            if hasattr(strat, '_tick_eng') and strat._tick_eng is not None:
+                try:
+                    tick_flow = strat._tick_eng.get_signal()
+                except Exception:
+                    pass
+
             if hasattr(strat, '_liq_map') and strat._liq_map is not None:
                 try:
-                    snap           = strat._liq_map.get_snapshot(price, strat._atr_5m.atr)
+                    snap           = strat._liq_map.get_snapshot(price, atr_val)
                     primary_target = snap.primary_target
                     n_bsl          = snap.nearest_bsl_atr
                     n_ssl          = snap.nearest_ssl_atr
                     sweep_count    = len(snap.recent_sweeps)
+                    bsl_pools      = getattr(snap, 'bsl_pools', None) or []
+                    ssl_pools      = getattr(snap, 'ssl_pools', None) or []
                 except Exception:
                     pass
 
@@ -422,6 +444,11 @@ class QuantBot:
                 total_pnl=stats.get("total_pnl", 0.0),
                 flow_conviction=flow_conv,
                 flow_direction=flow_dir,
+                bsl_pools=bsl_pools,
+                ssl_pools=ssl_pools,
+                atr=atr_val,
+                cvd_trend=cvd_trend,
+                tick_flow=tick_flow,
             )
             logger.info(msg)
             return

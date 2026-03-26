@@ -52,54 +52,149 @@ def format_heartbeat(
     total_pnl: float,
     flow_conviction: float = 0.0,
     flow_direction: str = "",
+    # v9 rich display
+    bsl_pools: Optional[list] = None,
+    ssl_pools: Optional[list] = None,
+    atr: float = 0.0,
+    cvd_trend: float = 0.0,
+    tick_flow: float = 0.0,
 ) -> str:
-    """One-line heartbeat for terminal. Called every 60s from main.py."""
+    """Rich multi-line heartbeat snapshot for terminal. Called every 60s from main.py."""
 
+    W = 66  # display width
+    SEP  = "─" * W
+    DSEP = "═" * W
+
+    now_str = datetime.now().strftime("%H:%M:%S")
+    atr_str = f"${atr:.1f}" if atr > 0 else "—"
+
+    # ── ACTIVE POSITION ──────────────────────────────────────────────────────
     if position:
-        side = position.get("side", "?").upper()
+        side  = position.get("side", "?").upper()
         entry = position.get("entry_price", 0.0)
-        sl = position.get("sl_price", 0.0)
-        tp = position.get("tp_price", 0.0)
+        sl    = position.get("sl_price", 0.0)
+        tp    = position.get("tp_price", 0.0)
         if entry <= 0 or side not in ("LONG", "SHORT"):
             return f"${price:,.2f} [{feed}] | PENDING FILL"
-        pnl = (price - entry) if side == "LONG" else (entry - price)
-        return (f"${price:,.2f} [{feed}] | {side} @ ${entry:,.2f} | "
-                f"SL ${sl:,.2f} TP ${tp:,.2f} | {pnl:+.1f}pts")
+        pnl      = (price - entry) if side == "LONG" else (entry - price)
+        init_sl  = position.get("initial_sl_dist", abs(entry - sl)) or abs(entry - sl)
+        curr_r   = pnl / init_sl if init_sl > 1e-10 else 0.0
+        sl_dist  = abs(price - sl)
+        tp_dist  = abs(price - tp)
+        sl_atr   = sl_dist / atr if atr > 1e-10 else 0.0
+        tp_atr   = tp_dist / atr if atr > 1e-10 else 0.0
+        pnl_icon = "+" if pnl >= 0 else ""
+        lines = [
+            DSEP,
+            f" 🟢 IN {side}   ${price:,.2f}   [{feed}|{exchange}]   {now_str}",
+            SEP,
+            f"   Entry:  ${entry:,.2f}",
+            f"   SL:     ${sl:,.2f}   (−${sl_dist:.1f} / {sl_atr:.2f}ATR)",
+            f"   TP:     ${tp:,.2f}   (+${tp_dist:.1f} / {tp_atr:.2f}ATR)",
+            f"   PnL:    {pnl_icon}{pnl:.1f}pts   R: {curr_r:+.2f}R   ATR: {atr_str}",
+            SEP,
+            f"   T={total_trades}   Session PnL=${total_pnl:+.2f}",
+            DSEP,
+        ]
+        return "\n".join(lines)
 
-    # FLAT -- show engine state and liquidity context
-    parts = [f"${price:,.2f} [{feed}|{exchange}]"]
+    # ── FLAT — rich scanning display ──────────────────────────────────────────
 
+    # Engine / state line
     if engine_state == "TRACKING" and tracking_info:
-        d = tracking_info.get("direction", "?")
-        tgt = tracking_info.get("target", "?")
+        d     = tracking_info.get("direction", "?")
+        tgt   = tracking_info.get("target", "?")
         ticks = tracking_info.get("flow_ticks", 0)
-        parts.append(f"TRACKING {d.upper()}->{tgt} ({ticks}t)")
+        state_str = f"TRACKING {d.upper()}→{tgt}  ({ticks} ticks)"
     elif engine_state == "READY":
-        parts.append("READY -- awaiting fill")
+        state_str = "READY — awaiting fill"
     elif engine_state == "POST_SWEEP":
-        parts.append("POST_SWEEP -- evaluating")
+        state_str = "POST_SWEEP — evaluating"
     else:
-        parts.append("SCANNING")
+        state_str = "SCANNING"
 
-    if flow_direction:
-        parts.append(f"Flow={flow_direction}({flow_conviction:+.2f})")
+    # Flow string
+    flow_dir  = flow_direction or ("long" if flow_conviction > 0.05 else ("short" if flow_conviction < -0.05 else ""))
+    flow_str  = f"Flow: {flow_dir}({flow_conviction:+.2f})" if flow_dir else f"Flow: neutral({flow_conviction:+.2f})"
+    cvd_str   = f"CVD: {cvd_trend:+.2f}" if abs(cvd_trend) > 0.01 else ""
+    tick_str  = f"Tick: {tick_flow:+.2f}" if abs(tick_flow) > 0.01 else ""
 
+    # ── Pool rows ──────────────────────────────────────────────────────────────
+    def _pool_rows(pools, side_label, nearest_atr):
+        rows = []
+        if pools:
+            for i, p in enumerate(pools[:4]):
+                try:
+                    flags = []
+                    if getattr(p.pool, 'ob_aligned', False):  flags.append("OB")
+                    if getattr(p.pool, 'fvg_aligned', False): flags.append("FVG")
+                    htf = getattr(p.pool, 'htf_count', 0)
+                    if htf >= 2: flags.append(f"HTFx{htf}")
+                    flag_str = f"[{','.join(flags)}]" if flags else ""
+                    is_tgt = (
+                        primary_target is not None and
+                        abs(p.pool.price - primary_target.pool.price) < max(atr * 0.3, 30)
+                    )
+                    tgt_mark = " ◀ TARGET" if is_tgt else ""
+                    tf_str   = getattr(p.pool, 'timeframe', '')
+                    tf_part  = f" {tf_str}" if tf_str else ""
+                    dist_atr = getattr(p, 'distance_atr', 0.0)
+                    sig      = getattr(p, 'significance', 0.0)
+                    touches  = getattr(p.pool, 'touches', 0)
+                    prefix   = f"  {side_label}" if i == 0 else "      "
+                    rows.append(
+                        f"{prefix}  ${p.pool.price:,.1f}"
+                        f"  {dist_atr:.1f}ATR"
+                        f"  sig={sig:.0f}"
+                        f"  t={touches}"
+                        f"{tf_part}"
+                        f"  {flag_str}"
+                        f"{tgt_mark}"
+                    )
+                except Exception:
+                    pass
+        elif nearest_atr < 50:
+            rows.append(f"  {side_label}  {nearest_atr:.1f}ATR away  (price not tracked yet)")
+        else:
+            rows.append(f"  {side_label}  no pools in range")
+        return rows
+
+    bsl_rows = _pool_rows(bsl_pools or [], "BSL↑", nearest_bsl_atr)
+    ssl_rows = _pool_rows(ssl_pools or [], "SSL↓", nearest_ssl_atr)
+
+    # Primary target summary
     if primary_target:
         try:
-            parts.append(f"Tgt={primary_target.direction}->"
-                         f"${primary_target.pool.price:,.0f}"
-                         f"({primary_target.distance_atr:.1f}A)")
+            t = primary_target
+            tgt_line = (
+                f"  Target: {t.direction.upper()} → ${t.pool.price:,.1f}"
+                f"  ({t.distance_atr:.1f}ATR  sig={t.significance:.0f}  t={t.pool.touches})"
+            )
         except Exception:
-            pass
+            tgt_line = "  Target: data pending"
+    else:
+        tgt_line = "  Target: none detected"
 
-    parts.append(f"BSL={nearest_bsl_atr:.1f}A SSL={nearest_ssl_atr:.1f}A")
+    # Footer stats
+    sweep_part = f"Sweeps={recent_sweep_count}" if recent_sweep_count > 0 else ""
+    stats_parts = [p for p in [sweep_part, f"T={total_trades}", f"PnL=${total_pnl:+.2f}"] if p]
+    flow_parts  = [p for p in [flow_str, cvd_str, tick_str] if p]
 
-    if recent_sweep_count > 0:
-        parts.append(f"Sweeps={recent_sweep_count}")
-
-    parts.append(f"T={total_trades} PnL=${total_pnl:+.2f}")
-
-    return " | ".join(parts)
+    lines = [
+        DSEP,
+        f" ⚡ v9 LIQUIDITY-FIRST   ${price:,.2f}   [{feed}|{exchange}]   {now_str}",
+        f" {state_str}   ATR: {atr_str}",
+        SEP,
+    ]
+    lines.extend(bsl_rows)
+    lines.append("")
+    lines.extend(ssl_rows)
+    lines.append(SEP)
+    lines.append(tgt_line)
+    lines.append(f"  {' | '.join(flow_parts)}")
+    lines.append(f"  {' | '.join(stats_parts)}")
+    lines.append(DSEP)
+    return "\n".join(lines)
 
 
 # =====================================================================

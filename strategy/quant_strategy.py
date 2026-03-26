@@ -47,7 +47,9 @@ try:
 except ImportError:
     ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
-# ── v5.2: Liquidity Hunt Engine ─────────────────────────────────────────────
+# ── v5.2 / v9.0: Legacy LiquidityHunter (superseded by LiquidityMap in v9) ─
+# In v9, pool detection is handled by LiquidityMap + EntryEngine.
+# LiquidityHunter is only needed for the legacy _evaluate_entry_legacy path.
 try:
     from strategy.liquidity_hunter import LiquidityHunter
     _HUNT_AVAILABLE = True
@@ -57,8 +59,7 @@ except ImportError:
         _HUNT_AVAILABLE = True
     except ImportError:
         _HUNT_AVAILABLE = False
-        logger = logging.getLogger(__name__)
-        logger.warning("liquidity_hunter.py not found — hunt engine disabled")
+        # v9 mode: LiquidityMap + EntryEngine replace this — non-fatal.
 
 # ── ICT Institutional Trade Engine (sweep-spot SL/TP/Trail/Entry) ──────────
 try:
@@ -3216,17 +3217,15 @@ class QuantStrategy:
 
     def _log_init(self):
         logger.info("=" * 72)
-        logger.info("⚡ QuantStrategy v5.0 — ORDER FLOW + ICT SWEEP ENGINE")
+        logger.info("⚡ QuantStrategy v9.0 — LIQUIDITY-FIRST")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-        logger.info(f"   Entry: VWAP dev ≥ 0.4–0.9×ATR (ADX-adaptive) | Confirm: {QCfg.CONFIRM_TICKS()} ticks")
-        logger.info(f"   SL: ICT sweep-wick hierarchy | TP: AMD delivery targeting")
-        logger.info(f"   Trail: AMD-phase-aware (MANIP→freeze DIST→OB/swing AGGR→1m)")
-        sweep_status = (
-            "ENABLED (Tier-S/A/B entry routing, OTE zone, AMD delivery TP)"
-            if _ICT_TRADE_ENGINE_AVAILABLE else
-            "DISABLED (ict_trade_engine.py not found — using legacy logic)"
-        )
-        logger.info(f"   Sweep Engine: {sweep_status}")
+        # Entry engine
+        entry_status = "ACTIVE (LiquidityMap → FlowDetector → EntryEngine)" if _ENTRY_ENGINE_AVAILABLE else "LEGACY (entry_engine.py not found)"
+        logger.info(f"   Entry Engine: {entry_status}")
+        # Liquidity map
+        liq_status = "ACTIVE (multi-TF pool scanner, pool priority, sweep detection)" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE (liquidity_map.py not found)"
+        logger.info(f"   LiquidityMap: {liq_status}")
+        # ICT engine
         ict_status = "DISABLED (ict_engine.py not found)"
         if self._ict:
             ict_status = (
@@ -3234,11 +3233,10 @@ class QuantStrategy:
                 f"OBanchor={QCfg.ICT_OB_SL_ANCHOR()} "
                 f"LiqCeiling={QCfg.ICT_LIQ_CEILING_ENABLED()}"
             )
-        logger.info(f"   ICT: {ict_status}")
-        logger.info(f"   Weights: VWAP={QCfg.W_VWAP_DEV()} CVD={QCfg.W_CVD_DIV()} OB={QCfg.W_OB()} "
-                    f"TF={QCfg.W_TICK_FLOW()} VEX={QCfg.W_VOL_EXHAUSTION()}")
-        hunt_status = "ENABLED (8-factor prediction, sweep-to-opposing-pool delivery)" if _HUNT_AVAILABLE else "DISABLED (liquidity_hunter.py not found)"
-        logger.info(f"   LiqHunter: {hunt_status}")
+        logger.info(f"   ICT Engine: {ict_status}")
+        # Trail
+        trail_status = "DynamicTrailEngine ACTIVE" if _DYNAMIC_TRAIL_AVAILABLE else "ICTTrailManager (built-in)"
+        logger.info(f"   Trail: {trail_status}")
         logger.info("=" * 72)
 
     def get_position(self) -> Optional[Dict]:
