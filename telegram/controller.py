@@ -1318,6 +1318,8 @@ class TelegramBotController:
             "STALKING":        "🟡",
             "APPROACHING":     "🟠",
             "SWEEP_CONFIRMED": "🟢",
+            "CISD_WAIT":       "🔍",
+            "OTE_WAIT":        "📐",
         }
         s_icon = state_icons.get(st["state"], "❓")
 
@@ -1347,17 +1349,26 @@ class TelegramBotController:
             f"  EMA score: {st['score_ema']:+.3f}  "
             f"raw: {st['raw_score']:+.3f}")
 
-        # Component breakdown
+        # Component breakdown — weights imported from HUNT_WEIGHTS (single source of truth)
+        # Previously this block had a hardcoded dict with AMD missing (weight=0.00),
+        # causing AMD (the strongest signal, weight=0.25) to appear to contribute nothing.
         comp = st.get("components", {})
         if comp:
             lines.append("  <b>Components</b>:")
-            weights = {
-                "flow": 0.18, "cvd": 0.15, "disp_bias": 0.12,
-                "ob_magnet": 0.15, "fvg_path": 0.10,
-                "dr_pos": 0.12, "session": 0.08, "micro": 0.10,
-            }
+            try:
+                from strategy.liquidity_hunter import HUNT_WEIGHTS as _display_weights
+            except ImportError:
+                try:
+                    from liquidity_hunter import HUNT_WEIGHTS as _display_weights
+                except ImportError:
+                    # Last-resort fallback using correct ICT engine weights (not old 8-factor)
+                    _display_weights = {
+                        "amd": 0.25, "dr_pos": 0.16, "flow": 0.14,
+                        "cvd": 0.12, "pool_sig": 0.10, "ob_magnet": 0.09,
+                        "fvg_path": 0.07, "session": 0.04, "micro": 0.03,
+                    }
             for key, val in comp.items():
-                w         = weights.get(key, 0)
+                w         = _display_weights.get(key, 0)
                 contrib   = val * w
                 arrow     = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
                 lines.append(
@@ -1366,12 +1377,18 @@ class TelegramBotController:
         # Signal
         lines.append("")
         if st["signal_ready"]:
-            lines.append(f"<b>🎯 SIGNAL READY</b>")
+            sig_type = st.get("signal_type", "SIGNAL")
+            sig_qual = st.get("signal_quality", 0)
+            cisd_flag = "✅ CISD" if st.get("cisd_confirmed") else "❌ no CISD"
+            ote_flag  = "OTE entry" if st.get("ote_entry") else "market entry"
+            lines.append(f"<b>🎯 {sig_type} READY</b>")
             lines.append(
                 f"  Side:   <b>{(st['signal_side'] or '?').upper()}</b>")
             lines.append(
                 f"  SL:     ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
             lines.append(f"  R:R:    1:{st['signal_rr']:.2f}")
+            lines.append(
+                f"  Quality: {sig_qual:.2f}  {cisd_flag}  {ote_flag}")
         else:
             lines.append("  No pending signal.")
 
