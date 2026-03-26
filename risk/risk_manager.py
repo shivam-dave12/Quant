@@ -41,6 +41,14 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
 
+        # Risk limits — must be assigned BEFORE trade-history deques so that
+        # BUG-14 FIX: daily_trades deque's maxlen can reference max_daily_trades.
+        # Previously these three lines appeared *after* the deque construction,
+        # causing an AttributeError on 'self.max_daily_trades' at startup.
+        self.daily_loss_limit = config.MAX_DAILY_LOSS
+        self.max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
+        self.max_daily_trades = config.MAX_DAILY_TRADES
+
         # Trade history — both bounded to prevent unbounded memory growth.
         # BUG-5 FIX: daily_trades was a plain list (inconsistent with trade_history deque).
         # At MAX_DAILY_TRADES=8 the risk is harmless today, but it is a maintenance trap
@@ -49,11 +57,6 @@ class RiskManager:
         self.trade_history: deque = deque(maxlen=1000)
         self.daily_trades:  deque = deque(maxlen=self.max_daily_trades + 10)
         self.last_trade_time = 0.0
-
-        # Risk limits
-        self.daily_loss_limit = config.MAX_DAILY_LOSS
-        self.max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
-        self.max_daily_trades = config.MAX_DAILY_TRADES
 
         # Balance tracking
         self.initial_balance = 0.0
