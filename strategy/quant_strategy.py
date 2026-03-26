@@ -79,6 +79,34 @@ except ImportError as _ite_e:
 
 logger = logging.getLogger(__name__)
 
+# -- v9.0: Liquidity-First Entry Engine ------------------------------------
+try:
+    from strategy.liquidity_map import LiquidityMap
+    _LIQ_MAP_AVAILABLE = True
+except ImportError:
+    try:
+        from liquidity_map import LiquidityMap
+        _LIQ_MAP_AVAILABLE = True
+    except ImportError:
+        _LIQ_MAP_AVAILABLE = False
+
+try:
+    from strategy.entry_engine import (
+        EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
+        EntryType,
+    )
+    _ENTRY_ENGINE_AVAILABLE = True
+except ImportError:
+    try:
+        from entry_engine import (
+            EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
+            EntryType,
+        )
+        _ENTRY_ENGINE_AVAILABLE = True
+    except ImportError:
+        _ENTRY_ENGINE_AVAILABLE = False
+
+
 # ═══════════════════════════════════════════════════════════════
 # CONFIG ACCESSOR
 # ═══════════════════════════════════════════════════════════════
@@ -327,42 +355,6 @@ class QCfg:
     # ── v5.1: CHoCH staleness expiry ─────────────────────────────────────────
     @staticmethod
     def CHOCH_EXPIRY_BARS() -> int: return int(_cfg("QUANT_CHOCH_EXPIRY_BARS", 10))
-    # ── v8.1: Flow → Liquidity directional engine ────────────────────────────
-    # Primary entry model: order flow aligned with nearest unswept pool → trade.
-    # Flow score = tick_flow * TICK_W + cvd_trend * CVD_W  (both [-1, +1])
-    # Entry only when |flow_score| >= MIN_SCORE AND nearest pool ≤ MAX_POOL_ATR away.
-    @staticmethod
-    def FLOW_LIQ_MIN_SCORE() -> float:
-        """Minimum combined flow score magnitude to signal directional conviction."""
-        return float(_cfg("QUANT_FLOW_LIQ_MIN_SCORE", 0.15))
-    @staticmethod
-    def FLOW_LIQ_MAX_POOL_ATR() -> float:
-        """Maximum ATR distance to nearest unswept pool for entry to be valid."""
-        return float(_cfg("QUANT_FLOW_LIQ_MAX_POOL_ATR", 4.0))
-    @staticmethod
-    def FLOW_LIQ_COOLDOWN_SEC() -> float:
-        """Minimum seconds between consecutive flow-liq entries."""
-        return float(_cfg("QUANT_FLOW_LIQ_COOLDOWN_SEC", 120.0))
-    @staticmethod
-    def FLOW_LIQ_CONFIRM_TICKS() -> int:
-        """Consecutive ticks required before flow-liq entry fires."""
-        return int(_cfg("QUANT_FLOW_LIQ_CONFIRM_TICKS", 2))
-    @staticmethod
-    def FLOW_LIQ_TICK_WEIGHT() -> float:
-        """Weight of tick_flow in combined flow score (tick is real-time; preferred)."""
-        return float(_cfg("QUANT_FLOW_LIQ_TICK_WEIGHT", 0.55))
-    @staticmethod
-    def FLOW_LIQ_CVD_WEIGHT() -> float:
-        """Weight of cvd_trend in combined flow score."""
-        return float(_cfg("QUANT_FLOW_LIQ_CVD_WEIGHT", 0.45))
-    @staticmethod
-    def FLOW_LIQ_HTF_VETO_THRESH() -> float:
-        """15m HTF score beyond which flow-liq entry is hard-vetoed (stronger than std)."""
-        return float(_cfg("QUANT_FLOW_LIQ_HTF_VETO_THRESH", 0.55))
-    @staticmethod
-    def FLOW_LIQ_POST_SWEEP_REVERSAL_MIN_SCORE() -> float:
-        """Flow score needed in REVERSAL direction after a pool sweep for continuation block."""
-        return float(_cfg("QUANT_FLOW_LIQ_POST_SWEEP_REV_MIN", 0.20))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -2952,20 +2944,6 @@ class SignalBreakdown:
     ict_session_entry_q:     str   = ""    # "HIGH"|"MEDIUM"|"LOW"|"AVOID"
     ict_chain_score:         float = 0.0   # delivery profile chain conviction 0-1
     ict_htf_rev_zone_near:   bool  = False # True if within 1 ATR of HTF reversal zone
-    # ── v8.1: Flow → Liquidity engine fields ──────────────────────────────────
-    # These are populated by _compute_flow_liq_direction() inside _compute_signals().
-    # They represent the NEW primary entry decision: does real-time order flow point
-    # toward an unswept institutional liquidity pool?
-    flow_score:              float = 0.0   # combined tick+cvd score [-1,+1]; + = bullish
-    flow_direction:          str   = ""    # "long"|"short"|"" (blank if |score|<threshold)
-    flow_liq_aligned:        bool  = False # True when flow_direction == nearest pool direction
-    nearest_liq_pool_price:  float = 0.0  # price of nearest unswept pool in flow direction
-    nearest_liq_pool_type:   str   = ""   # "BSL" (above price)|"SSL" (below price)|""
-    nearest_liq_pool_atr:    float = 0.0  # ATR distance to that pool
-    post_sweep_active:       bool  = False # a pool was swept within last _SWEEP_MAX_AGE_MS ms
-    post_sweep_scenario:     str   = ""    # "REVERSAL"|"CONTINUATION"|"UNCERTAIN"|""
-    post_sweep_conf:         float = 0.0   # 0-1 scenario confidence
-    post_sweep_pool_price:   float = 0.0   # price of the swept pool
 
     def __str__(self):
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
@@ -3171,12 +3149,6 @@ class QuantStrategy:
         self._last_momentum_attempt = 0.0   # cooldown after any retest attempt (pass or fail)
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
-        # ── v8.1: Flow → Liquidity entry engine state ─────────────────────────
-        # Separate confirm counters so ICT OTE resets cannot wipe flow-liq progress.
-        self._confirm_fliq_long:  int   = 0
-        self._confirm_fliq_short: int   = 0
-        self._last_flow_liq_entry_time: float = 0.0   # cooldown anchor
-        self._pending_flow_liq_tp:      float = 0.0   # pool price used as TP for PATH-D
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
         # Concurrency guards: position sync runs in a background thread so the
@@ -3229,6 +3201,17 @@ class QuantStrategy:
         self._ict_gate_alerted_mom      = False
         self._ict_gate_start_time_trend = 0.0   # trend pullback path
         self._ict_gate_alerted_trend    = False
+
+        # -- v9.0: New liquidity-first engines --
+        self._liq_map = LiquidityMap() if _LIQ_MAP_AVAILABLE else None
+        self._entry_engine = EntryEngine() if _ENTRY_ENGINE_AVAILABLE else None
+        self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
+        self._flow_streak_dir_v2 = ""
+        self._flow_streak_count_v2 = 0
+        self._last_think_log_v2 = 0.0
+        self._force_sl = None
+        self._force_tp = None
+
         self._log_init()
 
     def _log_init(self):
@@ -3585,249 +3568,6 @@ class QuantStrategy:
             self._tick_eng.compute_signal()
         except Exception: pass
 
-    def _compute_flow_liq_direction(
-            self,
-            price:      float,
-            atr:        float,
-            tick_flow:  float,
-            cvd_trend:  float,
-            sig:        'SignalBreakdown',
-            now:        float,
-    ) -> None:
-        """
-        v8.1 — Flow → Liquidity Direction Engine.
-
-        PRIMARY ENTRY LOGIC (replaces VWAP divergence as signal source):
-        ─────────────────────────────────────────────────────────────────
-        1. Compute a combined ORDER-FLOW SCORE from tick_flow + cvd_trend.
-           tick_flow is real-time (sub-second tape); cvd_trend is sustained
-           (10-min rolling delta). Together they capture BOTH flash pressure
-           AND sustained institutional accumulation/distribution.
-
-           flow_score = tick_flow × TICK_W  +  cvd_trend × CVD_W
-           Both inputs are already normalised to [-1, +1].
-
-        2. Derive FLOW DIRECTION:
-           flow_score > +MIN_SCORE  → "long"  (buying pressure detected)
-           flow_score < -MIN_SCORE  → "short" (selling pressure detected)
-           |score| < MIN_SCORE      → ""       (no conviction; no trade)
-
-        3. Query the nearest UNSWEPT LIQUIDITY POOL in the flow direction:
-           long  flow → look for the nearest BSL (buy-side liquidity / equal highs)
-           short flow → look for the nearest SSL (sell-side liquidity / equal lows)
-
-           Data source (priority order):
-             a) LiquidityHunter._range (already-clustered, quality-scored pools)
-             b) sig.ict_nearest_bsl_atr / ssl_atr (pre-computed in _evaluate_entry)
-             c) Raw 15m swing high/low scan as last resort
-
-        4. ALIGNMENT CHECK:
-           flow_liq_aligned = True when:
-             • flow_direction == "long"  AND  a BSL exists within MAX_POOL_ATR distance
-             • flow_direction == "short" AND  an SSL exists within MAX_POOL_ATR distance
-
-           When aligned → _evaluate_flow_liq_entry() fires.
-
-        5. POST-SWEEP STATE:
-           If LiquidityHunter has a recent sweep event (within 5 min), determine
-           whether price is CONTINUING through the sweep or REVERSING:
-             CONTINUATION: flow direction SAME as sweep direction, no BOS/CHoCH
-               → existing pool below/above still valid target
-             REVERSAL:     flow direction OPPOSITE to sweep, or BOS confirmed
-               → _evaluate_hunt_entry() handles this path (CISD→OTE pipeline)
-           Sets sig.post_sweep_* fields so routing can distinguish the two.
-
-        This method ONLY writes to sig; it does not fire entries or side-effects.
-        """
-        if atr < 1e-10 or price < 1.0:
-            return
-
-        w_tick = QCfg.FLOW_LIQ_TICK_WEIGHT()
-        w_cvd  = QCfg.FLOW_LIQ_CVD_WEIGHT()
-        # Normalise weights so they always sum to 1.0 even if config is wrong
-        w_sum  = w_tick + w_cvd
-        if w_sum < 1e-10:
-            return
-        w_tick /= w_sum
-        w_cvd  /= w_sum
-
-        flow_score = tick_flow * w_tick + cvd_trend * w_cvd
-        flow_score = max(-1.0, min(1.0, flow_score))
-        sig.flow_score = flow_score
-
-        min_score = QCfg.FLOW_LIQ_MIN_SCORE()
-        if flow_score >= min_score:
-            flow_direction = "long"
-        elif flow_score <= -min_score:
-            flow_direction = "short"
-        else:
-            flow_direction = ""
-        sig.flow_direction = flow_direction
-
-        if not flow_direction:
-            return   # no conviction — leave alignment flags False
-
-        max_pool_atr = QCfg.FLOW_LIQ_MAX_POOL_ATR()
-
-        # ── Step 3a: LiquidityHunter pool data (highest quality) ────────────
-        # The hunter clusters equal highs/lows, scores them by touches, HTF
-        # alignment, OB/FVG backing — far superior to a raw swing scan.
-        nearest_pool_price = 0.0
-        nearest_pool_type  = ""
-        nearest_pool_atr   = 999.0
-
-        if self._liquidity_hunter is not None:
-            try:
-                _range = getattr(self._liquidity_hunter, '_range', None)
-                if _range is not None:
-                    if flow_direction == "long":
-                        # BSL is above price (buy-side liquidity = equal highs)
-                        _bsl_price = _range.bsl_price
-                        if _bsl_price > price:
-                            _dist = (_bsl_price - price) / atr
-                            if _dist <= max_pool_atr:
-                                nearest_pool_price = _bsl_price
-                                nearest_pool_type  = "BSL"
-                                nearest_pool_atr   = _dist
-                    else:
-                        # SSL is below price (sell-side liquidity = equal lows)
-                        _ssl_price = _range.ssl_price
-                        if _ssl_price < price:
-                            _dist = (price - _ssl_price) / atr
-                            if _dist <= max_pool_atr:
-                                nearest_pool_price = _ssl_price
-                                nearest_pool_type  = "SSL"
-                                nearest_pool_atr   = _dist
-            except Exception:
-                pass
-
-        # ── Step 3b: ICT engine pre-computed distances (fallback) ────────────
-        # sig.ict_nearest_bsl_atr and ssl_atr are set in _evaluate_entry from
-        # ICTEngine.get_confluence().  Use them when hunter range is unavailable.
-        if nearest_pool_price < 1.0 and self._ict is not None:
-            if flow_direction == "long" and sig.ict_nearest_bsl_atr > 0:
-                _dist = sig.ict_nearest_bsl_atr
-                if _dist <= max_pool_atr:
-                    # Reconstruct approximate BSL price from distance
-                    nearest_pool_price = price + _dist * atr
-                    nearest_pool_type  = "BSL"
-                    nearest_pool_atr   = _dist
-            elif flow_direction == "short" and sig.ict_nearest_ssl_atr > 0:
-                _dist = sig.ict_nearest_ssl_atr
-                if _dist <= max_pool_atr:
-                    nearest_pool_price = price - _dist * atr
-                    nearest_pool_type  = "SSL"
-                    nearest_pool_atr   = _dist
-
-        # ── Step 3c: Raw 15m swing scan (last resort) ────────────────────────
-        # Only if both upstream sources gave nothing. Swings are unscored but
-        # directionally correct. We restrict to the two nearest extremes.
-        if nearest_pool_price < 1.0:
-            try:
-                _c15 = data_manager.get_candles("15m", limit=40) \
-                    if hasattr(self, '_last_c15') else []
-                # Prefer the already-fetched candles stored on self if available
-                _c15 = getattr(self, '_last_c15_cache', []) or _c15
-                if len(_c15) >= 5:
-                    _sh, _sl = InstitutionalLevels.find_swing_extremes(_c15, min(20, len(_c15)-2))
-                    if flow_direction == "long" and _sh:
-                        # Nearest swing high above price = proxy BSL
-                        valid = [h for h in _sh if h > price]
-                        if valid:
-                            _nearest = min(valid)
-                            _dist = (_nearest - price) / atr
-                            if _dist <= max_pool_atr:
-                                nearest_pool_price = _nearest
-                                nearest_pool_type  = "BSL"
-                                nearest_pool_atr   = _dist
-                    elif flow_direction == "short" and _sl:
-                        # Nearest swing low below price = proxy SSL
-                        valid = [l for l in _sl if l < price]
-                        if valid:
-                            _nearest = max(valid)
-                            _dist = (price - _nearest) / atr
-                            if _dist <= max_pool_atr:
-                                nearest_pool_price = _nearest
-                                nearest_pool_type  = "SSL"
-                                nearest_pool_atr   = _dist
-            except Exception:
-                pass
-
-        # ── Write pool data to sig ──────────────────────────────────────────
-        sig.nearest_liq_pool_price = nearest_pool_price
-        sig.nearest_liq_pool_type  = nearest_pool_type
-        sig.nearest_liq_pool_atr   = nearest_pool_atr
-
-        # ── Step 4: Alignment check ─────────────────────────────────────────
-        pool_valid = (
-            nearest_pool_price > 1.0
-            and nearest_pool_atr <= max_pool_atr
-            and (
-                (flow_direction == "long"  and nearest_pool_type == "BSL") or
-                (flow_direction == "short" and nearest_pool_type == "SSL")
-            )
-        )
-        sig.flow_liq_aligned = pool_valid
-
-        # ── Step 5: Post-sweep state detection ─────────────────────────────
-        # Query LiquidityHunter for a recent sweep event and assess scenario.
-        # This informs the routing block: if a pool was JUST swept, the dominant
-        # path is _evaluate_hunt_entry (CISD→OTE reversal pipeline). We only
-        # set flow_liq_aligned = True for the CONTINUATION sub-scenario here.
-        _sweep_ev = None
-        if self._liquidity_hunter is not None:
-            try:
-                _sweep_ev = getattr(self._liquidity_hunter, '_sweep_event', None)
-            except Exception:
-                pass
-
-        if _sweep_ev is not None:
-            _sweep_age = now - _sweep_ev.detected_at
-            # 5-minute window matches LiquidityHunter's _SWEEP_MAX_AGE_MS
-            if _sweep_age <= 300.0:
-                sig.post_sweep_active = True
-                sig.post_sweep_pool_price = _sweep_ev.pool_price
-
-                # Determine scenario:
-                # After a BSL sweep (smart money grabbed stops above = bearish intent):
-                #   REVERSAL: flow turns negative → short toward SSL (standard ICT)
-                #   CONTINUATION: flow still positive → rare — market buying through
-                # After an SSL sweep (smart money grabbed stops below = bullish intent):
-                #   REVERSAL: flow turns positive → long toward BSL (standard ICT)
-                #   CONTINUATION: flow still negative → rare exhaustion continuation
-                _swept_side = _sweep_ev.side   # "bsl" | "ssl"
-                _flow_sign  = 1 if flow_score > 0 else -1
-
-                # REVERSAL: flow opposes the sweep direction (most common ICT)
-                if _swept_side == "bsl" and flow_score <= -QCfg.FLOW_LIQ_POST_SWEEP_REVERSAL_MIN_SCORE():
-                    sig.post_sweep_scenario = "REVERSAL"
-                    sig.post_sweep_conf     = min(1.0, abs(flow_score) / 0.5)
-                elif _swept_side == "ssl" and flow_score >= QCfg.FLOW_LIQ_POST_SWEEP_REVERSAL_MIN_SCORE():
-                    sig.post_sweep_scenario = "REVERSAL"
-                    sig.post_sweep_conf     = min(1.0, abs(flow_score) / 0.5)
-                # CONTINUATION: flow persists in same direction as sweep
-                elif _swept_side == "bsl" and flow_score > QCfg.FLOW_LIQ_MIN_SCORE():
-                    sig.post_sweep_scenario = "CONTINUATION"
-                    sig.post_sweep_conf     = min(1.0, abs(flow_score) / 0.6)
-                elif _swept_side == "ssl" and flow_score < -QCfg.FLOW_LIQ_MIN_SCORE():
-                    sig.post_sweep_scenario = "CONTINUATION"
-                    sig.post_sweep_conf     = min(1.0, abs(flow_score) / 0.6)
-                else:
-                    sig.post_sweep_scenario = "UNCERTAIN"
-                    sig.post_sweep_conf     = 0.0
-
-                # CRITICAL: post-sweep REVERSAL is handled by _evaluate_hunt_entry
-                # (CISD→OTE pipeline). Do NOT let flow_liq_aligned fire a duplicate
-                # entry in the opposite direction. Suppress flow-liq alignment
-                # entirely when the sweep REVERSAL scenario is active so the hunt
-                # path has sole ownership.
-                if sig.post_sweep_scenario == "REVERSAL":
-                    sig.flow_liq_aligned = False
-                    logger.debug(
-                        f"🌊 FlowLiq: post-sweep REVERSAL active "
-                        f"({_swept_side.upper()} swept, flow={flow_score:+.3f}) "
-                        f"— hunt path has priority, flow-liq suppressed")
-
     def _compute_signals(self, data_manager) -> Optional[SignalBreakdown]:
         candles_1m = data_manager.get_candles("1m", limit=300)
         candles_5m = data_manager.get_candles("5m", limit=100)
@@ -3988,31 +3728,6 @@ class QuantStrategy:
             cvd_tick_count=self._cvd.tick_count,
         )
         sig._raw_composite = comp  # pre-boost composite (used in _evaluate_reversion_entry)
-
-        # ── v8.1: Populate flow → liquidity direction fields ─────────────────
-        # Must run AFTER all signal engines have updated (tick_flow, cvd_trend
-        # are fully computed by this point).  Writes directly to sig fields.
-        # Pass the data_manager reference for optional 15m swing fallback.
-        try:
-            _tf_fl  = self._tick_eng.get_signal()
-            _cvd_fl = self._cvd.get_trend_signal()
-            # Cache 15m candles on self so _compute_flow_liq_direction can use
-            # them in the swing fallback without an extra data_manager call.
-            try:
-                self._last_c15_cache = data_manager.get_candles("15m", limit=40)
-            except Exception:
-                self._last_c15_cache = []
-            self._compute_flow_liq_direction(
-                price      = price,
-                atr        = atr_5m,
-                tick_flow  = _tf_fl,
-                cvd_trend  = _cvd_fl,
-                sig        = sig,
-                now        = time.time(),
-            )
-        except Exception as _fl_e:
-            logger.debug(f"flow_liq_direction error (non-fatal): {_fl_e}")
-
         self._last_sig = sig
         return sig
 
@@ -4047,8 +3762,6 @@ class QuantStrategy:
             _routing_path = "momentum"
         elif self._regime.is_trending():
             _routing_path = "trend"
-        elif getattr(sig, 'flow_liq_aligned', False):
-            _routing_path = "flow_liq"
         else:
             _routing_path = "reversion"
 
@@ -4303,34 +4016,8 @@ class QuantStrategy:
             if _adv_parts:
                 gates.append(f"🔬 ICT: {' | '.join(_adv_parts)}")
 
-        # ── v8.1: Flow → Liquidity display ───────────────────────────────────
-        _fl_score = getattr(sig, 'flow_score', 0.0)
-        _fl_dir   = getattr(sig, 'flow_direction', '')
-        _fl_aln   = getattr(sig, 'flow_liq_aligned', False)
-        _fl_pool  = getattr(sig, 'nearest_liq_pool_price', 0.0)
-        _fl_ptype = getattr(sig, 'nearest_liq_pool_type', '')
-        _fl_patr  = getattr(sig, 'nearest_liq_pool_atr', 0.0)
-        _ps_act   = getattr(sig, 'post_sweep_active', False)
-        _ps_sc    = getattr(sig, 'post_sweep_scenario', '')
-        _ps_cf    = getattr(sig, 'post_sweep_conf', 0.0)
-        _fl_icon  = "✅" if _fl_aln else ("⚪" if _fl_dir else "─")
-        _fl_cd    = max(0.0, QCfg.FLOW_LIQ_COOLDOWN_SEC()
-                        - (now - self._last_flow_liq_entry_time))
-        _fl_parts = [
-            f"flow={_fl_score:+.3f}",
-            f"dir={'─' if not _fl_dir else _fl_dir.upper()}",
-        ]
-        if _fl_pool > 1.0:
-            _fl_parts.append(
-                f"→{_fl_ptype}@${_fl_pool:,.0f}({_fl_patr:.1f}ATR)")
-        if _ps_act:
-            _ps_icon = "🔄" if _ps_sc == "REVERSAL" else ("➡️" if _ps_sc == "CONTINUATION" else "❓")
-            _fl_parts.append(f"PostSweep:{_ps_icon}{_ps_sc}(c={_ps_cf:.2f})")
-        if _fl_cd > 0:
-            _fl_parts.append(f"cd={_fl_cd:.0f}s")
-        gates.append(f"🌊 FlowLiq: {' '.join(_fl_parts)} {_fl_icon}")
-
         gates.append(f"📊 {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
+
         # ── B2/B8 FIX: routing-aware all-pass and status label ────────────
         # Previously the all-pass check and "👀 Watching" label always showed
         # reversion gates regardless of which path (_evaluate_trend_entry,
@@ -4379,34 +4066,6 @@ class QuantStrategy:
             _status = (f"🏛️ SWEEP OTE "
                        f"[{self._active_sweep_setup.side.upper()}] "
                        f"q={self._active_sweep_setup.quality_score():.2f}")
-
-        elif _routing_path == "flow_liq":
-            # v8.1: Flow-liq path status display
-            _fl_side = getattr(sig, 'flow_direction', '?').upper()
-            _fl_pool_disp = getattr(sig, 'nearest_liq_pool_price', 0.0)
-            _fl_patr_disp = getattr(sig, 'nearest_liq_pool_atr', 0.0)
-            _fl_ptype_disp = getattr(sig, 'nearest_liq_pool_type', '')
-            _fl_cd_disp = max(0.0, QCfg.FLOW_LIQ_COOLDOWN_SEC()
-                              - (now - self._last_flow_liq_entry_time))
-            gates.append(
-                f"🔀 ACTIVE PATH: FLOW-LIQ [{_fl_side}] "
-                f"→{_fl_ptype_disp}@${_fl_pool_disp:,.0f}({_fl_patr_disp:.1f}ATR)"
-            )
-            _fl_cd_ok = _fl_cd_disp <= 0
-            _fl_htf_ok = (
-                (sig.flow_direction == "long"  and self._htf.trend_15m >= -QCfg.FLOW_LIQ_HTF_VETO_THRESH()) or
-                (sig.flow_direction == "short" and self._htf.trend_15m <= +QCfg.FLOW_LIQ_HTF_VETO_THRESH())
-            )
-            gates.append(
-                f"  {'✅' if sig.regime_ok else '❌'} ATR regime")
-            gates.append(
-                f"  {'✅' if _fl_htf_ok else '❌'} HTF not opposing "
-                f"(15m={self._htf.trend_15m:+.2f} thresh={QCfg.FLOW_LIQ_HTF_VETO_THRESH():.2f})")
-            gates.append(
-                f"  {'✅' if _fl_cd_ok else '⏳'} Cooldown "
-                f"({'ready' if _fl_cd_ok else f'{_fl_cd_disp:.0f}s'})")
-            ap = sig.regime_ok and _fl_htf_ok and _fl_cd_ok
-            _status = "🌊 FLOW-LIQ READY" if ap else "⏳ FLOW-LIQ WAIT"
 
         else:
             # Reversion path
@@ -4541,7 +4200,214 @@ class QuantStrategy:
             pass
         return fallback_side
 
+
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
+        """
+        v9.0 -- Liquidity-First Entry Engine.
+        Single decision flow. Falls back to legacy if new engine unavailable.
+        """
+        if not _ENTRY_ENGINE_AVAILABLE or self._entry_engine is None or self._liq_map is None:
+            return self._evaluate_entry_legacy(data_manager, order_manager, risk_manager, now)
+
+        # Step 1: Spread gate
+        spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
+        if not spread_ok:
+            return
+
+        price = data_manager.get_last_price()
+        atr = self._atr_5m.atr
+        if atr < 1e-10 or price < 1.0:
+            return
+
+        now_ms = int(now * 1000) if now < 1e12 else int(now)
+
+        # Step 2: Gather candles (all timeframes)
+        candles_by_tf = {}
+        for tf, limit in [("1m", 200), ("5m", 300), ("15m", 200),
+                          ("1h", 100), ("4h", 50), ("1d", 30)]:
+            try:
+                candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit)
+            except Exception:
+                candles_by_tf[tf] = []
+
+        # Step 3: Update ICT engine (preserved -- provides structural context)
+        if self._ict is not None:
+            try:
+                self._ict.update(
+                    candles_by_tf.get("5m", []),
+                    candles_by_tf.get("15m", []),
+                    price, now_ms,
+                    candles_1m=candles_by_tf.get("1m"),
+                    candles_1h=candles_by_tf.get("1h"),
+                    candles_4h=candles_by_tf.get("4h"),
+                    candles_1d=candles_by_tf.get("1d"),
+                )
+                if hasattr(self._ict, 'set_order_flow_data'):
+                    tf_now = self._tick_eng.get_signal() if self._tick_eng else 0.0
+                    cvd_now = self._cvd.get_trend_signal() if self._cvd else 0.0
+                    self._ict.set_order_flow_data(tf_now, cvd_now)
+            except Exception as e:
+                logger.debug(f"ICT update error: {e}")
+
+        # Step 4: Update liquidity map
+        self._liq_map.update(
+            candles_by_tf=candles_by_tf,
+            price=price, atr=atr, now=now,
+            ict_engine=self._ict,
+        )
+        liq_snapshot = self._liq_map.get_snapshot(price, atr)
+
+        # Step 5: Build orderflow state
+        tick_flow = self._tick_eng.get_signal() if self._tick_eng else 0.0
+        cvd_trend = self._cvd.get_trend_signal() if self._cvd else 0.0
+        cvd_div = 0.0
+        try:
+            cvd_div = self._cvd.get_divergence_signal(
+                candles_by_tf.get("1m", []))
+        except Exception:
+            pass
+
+        if tick_flow > 0.4:
+            if self._flow_streak_dir_v2 == "long":
+                self._flow_streak_count_v2 += 1
+            else:
+                self._flow_streak_dir_v2 = "long"
+                self._flow_streak_count_v2 = 1
+        elif tick_flow < -0.4:
+            if self._flow_streak_dir_v2 == "short":
+                self._flow_streak_count_v2 += 1
+            else:
+                self._flow_streak_dir_v2 = "short"
+                self._flow_streak_count_v2 = 1
+        else:
+            self._flow_streak_count_v2 = max(0, self._flow_streak_count_v2 - 1)
+            if self._flow_streak_count_v2 == 0:
+                self._flow_streak_dir_v2 = ""
+
+        ob_imbalance = 0.0
+        try:
+            ob = data_manager.get_orderbook()
+            if ob and ob.get("bids") and ob.get("asks"):
+                bid_vol = sum(float(b[1]) for b in ob["bids"][:10])
+                ask_vol = sum(float(a[1]) for a in ob["asks"][:10])
+                total = bid_vol + ask_vol
+                if total > 0:
+                    ob_imbalance = (bid_vol - ask_vol) / total
+        except Exception:
+            pass
+
+        flow_state = OrderFlowState(
+            tick_flow=tick_flow,
+            cvd_trend=cvd_trend,
+            cvd_divergence=cvd_div,
+            ob_imbalance=ob_imbalance,
+            tick_streak=self._flow_streak_count_v2,
+            streak_direction=self._flow_streak_dir_v2,
+        )
+
+        # Step 6: Build ICT context
+        ict_ctx = ICTContext()
+        if self._ict is not None and getattr(self._ict, '_initialized', False):
+            try:
+                amd = self._ict.get_amd_state()
+                ict_ctx.amd_phase = getattr(amd, 'phase', "")
+                ict_ctx.amd_bias = getattr(amd, 'bias', "")
+                ict_ctx.amd_confidence = getattr(amd, 'confidence', 0.0)
+                mb = self._ict.get_market_bias()
+                ict_ctx.in_premium = getattr(mb, 'in_premium', False)
+                ict_ctx.in_discount = getattr(mb, 'in_discount', False)
+                tf_5m = self._ict._tf.get("5m")
+                if tf_5m:
+                    ict_ctx.structure_5m = getattr(tf_5m, 'structure', "neutral")
+                    ict_ctx.bos_5m = getattr(tf_5m, 'bos_direction', "")
+                    ict_ctx.choch_5m = getattr(tf_5m, 'choch_direction', "")
+                tf_15m = self._ict._tf.get("15m")
+                if tf_15m:
+                    ict_ctx.structure_15m = getattr(tf_15m, 'structure', "neutral")
+                try:
+                    ob_sl = self._ict.get_ob_sl_level("long", price, atr, now_ms)
+                    if ob_sl:
+                        ict_ctx.nearest_ob_price = ob_sl
+                except Exception:
+                    pass
+                try:
+                    sess = self._ict.get_amd_session_context(now_ms)
+                    ict_ctx.kill_zone = sess.get("session", "")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"ICT context build error: {e}")
+
+        # Step 7: Feed to entry engine
+        self._entry_engine.update(
+            liq_snapshot=liq_snapshot,
+            flow_state=flow_state,
+            ict_ctx=ict_ctx,
+            price=price, atr=atr, now=now,
+        )
+
+        # Step 8: Check for signal and execute
+        signal = self._entry_engine.get_signal()
+        if signal is not None:
+            bal_info = risk_manager.get_available_balance()
+            total_bal = float((bal_info or {}).get("total", 0))
+            allowed, reason = self._risk_gate.can_trade(total_bal)
+            if not allowed:
+                logger.info(f"Signal blocked by risk manager: {reason}")
+                self._entry_engine.consume_signal()
+                return
+
+            logger.info(
+                f"SIGNAL: {signal.entry_type.value} {signal.side.upper()} "
+                f"@ ${signal.entry_price:,.1f} | "
+                f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
+                f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
+
+            _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
+            _min_sig.atr = atr
+
+            self._force_sl = signal.sl_price
+            self._force_tp = signal.tp_price
+
+            _tier_map = {
+                EntryType.SWEEP_REVERSAL: "S",
+                EntryType.PRE_SWEEP_APPROACH: "A",
+                EntryType.SWEEP_CONTINUATION: "B",
+            }
+            _tier = _tier_map.get(signal.entry_type, "A")
+
+            self._launch_entry_async(
+                data_manager, order_manager, risk_manager,
+                side=signal.side, sig=_min_sig,
+                mode=signal.entry_type.value.lower(),
+                ict_tier=_tier,
+            )
+            self._entry_engine.consume_signal()
+            self._entry_engine.on_entry_placed()
+
+        # Step 9: Periodic thinking log
+        if now - self._last_think_log_v2 >= 30.0:
+            self._last_think_log_v2 = now
+            state = self._entry_engine.state
+            flow_dir = flow_state.direction or "neutral"
+            conv = flow_state.conviction
+            parts = [f"State={state}", f"Flow={flow_dir}({conv:+.2f})",
+                     f"CVD={cvd_trend:+.2f}"]
+            if liq_snapshot.primary_target:
+                t = liq_snapshot.primary_target
+                parts.append(f"Target={t.direction}->${t.pool.price:,.0f}"
+                             f"({t.distance_atr:.1f}ATR)")
+            if ict_ctx.amd_phase:
+                parts.append(f"AMD={ict_ctx.amd_phase[:4]}")
+            parts.append(f"BSL={liq_snapshot.nearest_bsl_atr:.1f}ATR")
+            parts.append(f"SSL={liq_snapshot.nearest_ssl_atr:.1f}ATR")
+            tracking = self._entry_engine.tracking_info
+            if tracking:
+                parts.append(f"Track={tracking['direction']}->{tracking['target']}")
+            logger.info(f"[THINK] {' | '.join(parts)}")
+
+
+    def _evaluate_entry_legacy(self, data_manager, order_manager, risk_manager, now):
         # v4.3 Solution 5: Spread cost gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
         if not spread_ok:
@@ -4922,251 +4788,25 @@ class QuantStrategy:
             # Hunt: confirmed sweep with opposing pool target
             self._confirm_long = self._confirm_short = 0
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
             self._evaluate_hunt_entry(
                 data_manager, order_manager, risk_manager, sig, price, now,
                 _hunt_signal)
-        elif sig.flow_liq_aligned:
-            # v8.1: Flow → Liquidity primary entry.
-            # Flow conviction aligned with nearest unswept pool.
-            # Post-sweep REVERSAL is suppressed by _compute_flow_liq_direction
-            # (hunt path owns that scenario), so only genuine un-swept pool
-            # approach or post-sweep CONTINUATION lands here.
-            self._confirm_long = self._confirm_short = 0
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._evaluate_flow_liq_entry(
-                data_manager, order_manager, risk_manager, sig, price, now)
         elif _flow_ready:
             # Flow displacement: clear all other counters
             self._confirm_long = self._confirm_short = 0
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
             self._evaluate_flow_entry(
                 data_manager, order_manager, risk_manager, sig, price, now,
                 flow_side=_flow_side)
         elif self._breakout.is_active and self._breakout.retest_ready:
             self._confirm_long = self._confirm_short = 0
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
             self._evaluate_momentum_entry(data_manager, order_manager, risk_manager, sig, price, now)
         elif self._regime.is_trending():
             self._confirm_long = self._confirm_short = 0
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
             self._evaluate_trend_entry(data_manager, order_manager, risk_manager, sig, price, now)
         else:
             self._confirm_trend_long = self._confirm_trend_short = 0
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
             self._evaluate_reversion_entry(data_manager, order_manager, risk_manager, sig, price, now)
-
-    def _evaluate_flow_liq_entry(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        sig,
-        price: float,
-        now:   float,
-    ) -> None:
-        """
-        v8.1 — Flow → Liquidity Primary Entry.
-
-        ═══════════════════════════════════════════════════════════════════
-        INSTITUTIONAL LOGIC
-        ═══════════════════════════════════════════════════════════════════
-        Smart money moves price FROM one liquidity pool TO another.
-        When order flow (tick + CVD) is pushing price TOWARD an unswept
-        pool, institutions are ENGINEERING the sweep.  Enter in the same
-        direction as the flow — price will DELIVER to that pool.
-
-        The trade has a clean structural TP (pool price) and a clean ICT SL
-        (swept-pool wick or nearest OB), giving institutional-grade R:R.
-
-        ENTRY SCENARIOS (sig.flow_liq_aligned must be True):
-        ─────────────────────────────────────────────────────
-        A) NORMAL (no recent sweep):
-             • flow → "long"  + BSL above within 4 ATR
-             • flow → "short" + SSL below within 4 ATR
-             • TP = pool price (where price is being delivered)
-             • SL = ICTSLEngine (nearest OB below/above OR 15m swing)
-
-        B) POST-SWEEP CONTINUATION (pool just swept, flow persists):
-             • BSL swept + flow still positive → price continuing UP to next BSL
-             • SSL swept + flow still negative → price continuing DOWN to next SSL
-             • RARE scenario; _compute_flow_liq_direction only sets
-               flow_liq_aligned=True for CONTINUATION (not REVERSAL — hunt owns that)
-             • Higher confirm count required (post-sweep price action is noisy)
-
-        GATE STACK (ordered cheapest → most expensive check):
-        ──────────────────────────────────────────────────────
-        G1: flow_liq_aligned already confirmed by caller (routing guard)
-        G2: ATR regime valid (not extreme volatility — unreliable flow readings)
-        G3: Pool distance ≤ MAX_POOL_ATR (pool must be reachable)
-        G4: HTF hard veto — only block extreme opposition (threshold higher
-            than standard; flow-toward-pool is institutional, not mean-reversion)
-        G5: AMD phase veto — never enter during DISTRIBUTION against flow direction
-        G6: ICT structural gate (via ICTEntryGate) — assigns tier + confirm count
-        G7: Cooldown since last flow-liq entry
-        G8: Confirm ticks (scenario-adaptive)
-
-        SL/TP via PATH-D in _compute_sl_tp:
-          SL: ICTSLEngine — sweep wick or nearest OB/swing
-          TP: _pending_flow_liq_tp = sig.nearest_liq_pool_price ± 0.1×ATR buffer
-        """
-        side = sig.flow_direction   # "long" | "short"
-        if side not in ("long", "short"):
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
-            return
-
-        atr = sig.atr
-
-        # G2: ATR regime
-        if not sig.regime_ok:
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
-            logger.debug("🌊 FlowLiq G2: ATR regime invalid — skipping")
-            return
-
-        # G3: Pool reachability
-        pool_atr = sig.nearest_liq_pool_atr
-        pool_price = sig.nearest_liq_pool_price
-        if pool_atr <= 0 or pool_atr > QCfg.FLOW_LIQ_MAX_POOL_ATR() or pool_price < 1.0:
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
-            logger.debug(
-                f"🌊 FlowLiq G3: pool out of range "
-                f"(pool_atr={pool_atr:.1f}, pool=${pool_price:,.0f}) — skipping")
-            return
-
-        # G4: HTF hard veto — higher threshold than standard (0.55 vs 0.35)
-        # Flow-toward-pool is a DIRECTIONAL institutional setup; only block when
-        # HTF structure is STRONGLY opposed (momentum divergence too large to ignore).
-        _htf_thresh = QCfg.FLOW_LIQ_HTF_VETO_THRESH()
-        if side == "long"  and self._htf.trend_15m < -_htf_thresh:
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
-            logger.debug(
-                f"🌊 FlowLiq G4: HTF hard-vetoes LONG "
-                f"(15m={self._htf.trend_15m:+.2f} < -{_htf_thresh:.2f})")
-            return
-        if side == "short" and self._htf.trend_15m > +_htf_thresh:
-            self._confirm_fliq_long = self._confirm_fliq_short = 0
-            logger.debug(
-                f"🌊 FlowLiq G4: HTF hard-vetoes SHORT "
-                f"(15m={self._htf.trend_15m:+.2f} > +{_htf_thresh:.2f})")
-            return
-
-        # G5: AMD phase veto — DISTRIBUTION delivering opposite direction is certain death
-        if (self._ict is not None
-                and getattr(self._ict, '_initialized', False)
-                and sig.amd_phase == "DISTRIBUTION"
-                and sig.amd_conf >= 0.70):
-            if side == "long"  and sig.amd_bias == "bearish":
-                self._confirm_fliq_long = self._confirm_fliq_short = 0
-                logger.debug(
-                    f"🌊 FlowLiq G5: AMD DISTRIBUTION bearish vetoes LONG "
-                    f"(conf={sig.amd_conf:.2f})")
-                return
-            if side == "short" and sig.amd_bias == "bullish":
-                self._confirm_fliq_long = self._confirm_fliq_short = 0
-                logger.debug(
-                    f"🌊 FlowLiq G5: AMD DISTRIBUTION bullish vetoes SHORT "
-                    f"(conf={sig.amd_conf:.2f})")
-                return
-
-        # G6: ICT structural gate
-        _tier    = "B"
-        _cn_gate = QCfg.FLOW_LIQ_CONFIRM_TICKS()
-        _t_reason = ""
-        if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
-            try:
-                _now_ms_fl = int(now * 1000) if now < 1e12 else int(now)
-                # Recompute confluence for the exact entry side
-                _recomp_fl = self._ict.get_confluence(side, price, _now_ms_fl, atr=atr)
-                sig.ict_ob      = _recomp_fl.ob_score
-                sig.ict_fvg     = _recomp_fl.fvg_score
-                sig.ict_sweep   = _recomp_fl.sweep_score
-                sig.ict_session = _recomp_fl.session_score
-                sig.ict_total   = _recomp_fl.total
-                sig.ict_details = _recomp_fl.details
-                _qh_fl = self._get_quant_helpers(sig, side)
-                _tier, _cn_gate, _t_reason = ICTEntryGate.evaluate(
-                    side, sig, self._active_sweep_setup, price, _qh_fl,
-                    mode="reversion",
-                    market_regime=sig.market_regime,
-                    ict_engine=self._ict,
-                )
-                if _tier == "BLOCKED":
-                    self._confirm_fliq_long = self._confirm_fliq_short = 0
-                    logger.debug(
-                        f"🌊 FlowLiq G6: ICT gate BLOCKED [{side.upper()}] "
-                        f"flow={sig.flow_score:+.3f} pool={sig.nearest_liq_pool_type}"
-                        f"@${pool_price:,.0f}({pool_atr:.1f}ATR) | {_t_reason}")
-                    return
-            except Exception as _fl_ict_e:
-                logger.debug(f"FlowLiq ICTEntryGate error (non-fatal): {_fl_ict_e}")
-                _tier    = "B"
-                _cn_gate = QCfg.FLOW_LIQ_CONFIRM_TICKS()
-
-        # G7: Cooldown
-        if now - self._last_flow_liq_entry_time < QCfg.FLOW_LIQ_COOLDOWN_SEC():
-            _remaining = QCfg.FLOW_LIQ_COOLDOWN_SEC() - (now - self._last_flow_liq_entry_time)
-            logger.debug(
-                f"🌊 FlowLiq G7: cooldown {_remaining:.0f}s remaining")
-            return
-
-        # G8: Confirm ticks
-        # Post-sweep CONTINUATION requires an extra confirm tick because price
-        # action near a swept pool is inherently noisy (smart money distributes
-        # into the sweep aftermath).
-        _base_cn = _cn_gate
-        if sig.post_sweep_active and sig.post_sweep_scenario == "CONTINUATION":
-            _base_cn = max(_base_cn, _base_cn + 1)   # +1 confirm for noisy environment
-
-        if side == "long":
-            self._confirm_fliq_long += 1
-            self._confirm_fliq_short = 0
-            if self._confirm_fliq_long < _base_cn:
-                logger.debug(
-                    f"🌊 FlowLiq confirm {self._confirm_fliq_long}/{_base_cn} LONG "
-                    f"flow={sig.flow_score:+.3f} → {sig.nearest_liq_pool_type}"
-                    f"@${pool_price:,.0f}({pool_atr:.1f}ATR)")
-                return
-        else:
-            self._confirm_fliq_short += 1
-            self._confirm_fliq_long  = 0
-            if self._confirm_fliq_short < _base_cn:
-                logger.debug(
-                    f"🌊 FlowLiq confirm {self._confirm_fliq_short}/{_base_cn} SHORT "
-                    f"flow={sig.flow_score:+.3f} → {sig.nearest_liq_pool_type}"
-                    f"@${pool_price:,.0f}({pool_atr:.1f}ATR)")
-                return
-
-        # ── All gates passed — CONFIRMED ────────────────────────────────────
-        self._confirm_fliq_long = self._confirm_fliq_short = 0
-        self._last_flow_liq_entry_time = now
-
-        # Store the pool price as TP anchor for PATH-D in _compute_sl_tp.
-        # Apply a 0.1×ATR buffer INSIDE the pool so TP fires before the actual
-        # sweep extreme (avoid the wick tail that follows). Smart money delivers
-        # price TO the pool — not past it — so we take profits at the boundary.
-        _tp_buf = 0.10 * atr
-        if side == "long":
-            self._pending_flow_liq_tp = pool_price - _tp_buf   # just below BSL
-        else:
-            self._pending_flow_liq_tp = pool_price + _tp_buf   # just above SSL
-
-        _scenario_lbl = ""
-        if sig.post_sweep_active:
-            _scenario_lbl = f" [PostSweep:{sig.post_sweep_scenario}({sig.post_sweep_conf:.2f})]"
-
-        logger.info(
-            f"🌊 FLOW-LIQ ENTRY {side.upper()} confirmed  "
-            f"flow={sig.flow_score:+.3f}  "
-            f"→{sig.nearest_liq_pool_type}@${pool_price:,.0f}({pool_atr:.1f}ATR)  "
-            f"TP=${self._pending_flow_liq_tp:,.1f}  "
-            f"Tier={_tier}  cn={_base_cn}"
-            f"{_scenario_lbl}"
-        )
-        self._launch_entry_async(
-            data_manager, order_manager, risk_manager,
-            side, sig, mode="flow_liq", ict_tier=_tier,
-        )
 
     def _evaluate_hunt_entry(
         self,
@@ -6402,112 +6042,13 @@ class QuantStrategy:
                     )
                     # Apply only the fee-gate at the end — skip all structural SL/TP logic
 
-        # ══════════════════════════════════════════════════════════════════════
-        # v8.1 PATH-D — FLOW → LIQUIDITY (pool-anchored TP, ICT SL hierarchy)
-        # ══════════════════════════════════════════════════════════════════════
-        # Activated when mode == "flow_liq" and _pending_flow_liq_tp is set.
-        #
-        # TP rationale:  price is being DELIVERED to the liquidity pool that the
-        # flow engine identified.  The pool price IS the institutional target —
-        # not a statistical level, not a VWAP fraction.  Use it directly.
-        #
-        # SL rationale:  ICTSLEngine gives the best available structural SL.
-        # When a sweep setup is active we use its wick extreme; otherwise the
-        # 4-tier hierarchy (disp OB → 15m OB → 15m swing → ATR fallback).
-        # This ensures SL is always BEHIND institutional order flow, never
-        # inside a distribution zone or at an arbitrary ATR multiple.
-        #
-        # R:R gate:  pool distance / SL distance must be ≥ REVERSION_MIN_RR.
-        # If the pool is too close or the SL is too wide, PATH-D falls through
-        # to PATH-B so the trade can still be taken with a VWAP-anchored TP.
-        if (sl_price is None and
-                mode == "flow_liq" and
-                self._pending_flow_liq_tp is not None and
-                self._pending_flow_liq_tp > 1.0):
-
-            _fliq_tp = _round_to_tick(self._pending_flow_liq_tp)
-            _tp_dir_ok = (
-                (side == "long"  and _fliq_tp > price) or
-                (side == "short" and _fliq_tp < price)
-            )
-
-            if _tp_dir_ok:
-                # Compute SL via ICTSLEngine when sweep engine available,
-                # otherwise fall through to PATH-B SL computation.
-                _fliq_sl: Optional[float] = None
-                _fliq_sl_source = "none"
-                if (_ICT_TRADE_ENGINE_AVAILABLE and
-                        self._ict is not None and
-                        getattr(self._ict, '_initialized', False)):
-                    try:
-                        _fliq_sl, _fliq_sl_source = ICTSLEngine.compute(
-                            side         = side,
-                            price        = price,
-                            atr          = atr,
-                            sweep_setup  = self._active_sweep_setup,
-                            ict_engine   = self._ict,
-                            candles_15m  = candles_15m,
-                            atr_pctile   = atr_pctile,
-                            mode         = "reversion",   # flow-liq is directional delivery
-                            market_regime = (
-                                self._regime.regime.value
-                                if hasattr(self._regime, 'regime') else "RANGING"),
-                        )
-                    except Exception as _pd_sl_e:
-                        logger.debug(
-                            f"PATH-D ICTSLEngine error (falling to PATH-B SL): {_pd_sl_e}")
-                        _fliq_sl = None
-
-                if _fliq_sl is not None:
-                    _fliq_sl = _round_to_tick(_fliq_sl)
-                    _sl_dir_ok = (
-                        (side == "long"  and _fliq_sl < price) or
-                        (side == "short" and _fliq_sl > price)
-                    )
-                    if _sl_dir_ok:
-                        _sl_dist_d = abs(price - _fliq_sl)
-                        _tp_dist_d = abs(price - _fliq_tp)
-                        _rr_d      = _tp_dist_d / _sl_dist_d if _sl_dist_d > 1e-10 else 0.0
-                        _min_rr_d  = QCfg.REVERSION_MIN_RR()
-
-                        if _rr_d >= _min_rr_d:
-                            sl_price   = _fliq_sl
-                            tp_price   = _fliq_tp
-                            _sl_source = _fliq_sl_source
-                            _used_path = "D"
-                            logger.info(
-                                f"🌊 PATH-D (FLOW-LIQ): "
-                                f"SL=${sl_price:,.1f}({_sl_source})  "
-                                f"TP=${tp_price:,.1f}(pool_anchor)  "
-                                f"R:R=1:{_rr_d:.2f}"
-                            )
-                        else:
-                            logger.info(
-                                f"🌊 PATH-D R:R gate: {_rr_d:.2f} < {_min_rr_d:.1f} "
-                                f"(SL_dist={_sl_dist_d:.0f}pts "
-                                f"TP_dist={_tp_dist_d:.0f}pts) "
-                                f"— pool too close or SL too wide; falling to PATH-B")
-                            # Clear pending TP so PATH-B computes its own
-                            self._pending_flow_liq_tp = 0.0
-                    else:
-                        logger.debug(
-                            f"PATH-D: ICT SL on wrong side of price "
-                            f"(sl={_fliq_sl:,.1f}, side={side}) — falling to PATH-B")
-                else:
-                    logger.debug(
-                        "PATH-D: ICT SL unavailable — PATH-B will compute SL and TP")
-            else:
-                logger.debug(
-                    f"PATH-D: pending TP ${_fliq_tp:,.1f} wrong side for {side} "
-                    f"— clearing and falling to PATH-B")
-                self._pending_flow_liq_tp = 0.0
-
-        if (sl_price is None and  # PATH-C / PATH-D not active
+        if (sl_price is None and  # PATH-C not active
                 _ICT_TRADE_ENGINE_AVAILABLE and
                 QCfg.ICT_SWEEP_ENTRY_ENABLED() and
                 self._active_sweep_setup is not None and
                 self._active_sweep_setup.status == "OTE_READY" and
                 self._active_sweep_setup.side == side):
+
             try:
                 sl_price, _sl_source = ICTSLEngine.compute(
                     side, price, atr,
@@ -6848,6 +6389,25 @@ class QuantStrategy:
         # mode, and signal_confidence only.  Computing it first lets us pass the
         # ACTUAL SL distance (not an ATR proxy) into position sizing, which is the
         # correct industry-grade approach: risk-in-dollars / SL-distance = quantity.
+
+        # -- v9.0: Use force SL/TP from entry engine if available --
+        _force_sl = getattr(self, '_force_sl', None)
+        _force_tp = getattr(self, '_force_tp', None)
+        if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
+            _fsl = _round_to_tick(_force_sl)
+            _ftp = _round_to_tick(_force_tp)
+            _dir_ok = False
+            if side == "long" and _fsl < price and _ftp > price:
+                _dir_ok = True
+            elif side == "short" and _fsl > price and _ftp < price:
+                _dir_ok = True
+            if _dir_ok:
+                sl_price = _fsl
+                tp_price = _ftp
+                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
+                self._force_sl = None
+                self._force_tp = None
+
         sl_price, tp_price = self._compute_sl_tp(
             data_manager, price, side, atr, mode=mode,
             signal_confidence=signal_confidence,
@@ -7100,6 +6660,8 @@ class QuantStrategy:
         # Moving it here prevents aborted entries (TP-gate, fee-gate, exchange
         # error) from consuming the daily trade cap with no actual order sent.
         self._risk_gate.record_trade_start()
+        if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+            self._entry_engine.on_position_opened()
 
         # ── v5.0: Invalidate sweep detector — setup consumed ─────────────────────
         if self._sweep_detector is not None:
@@ -8233,6 +7795,8 @@ class QuantStrategy:
         return True
 
     def _finalise_exit(self):
+        if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+            self._entry_engine.on_position_closed()
         # CRITICAL: do NOT reset _pnl_recorded_for or _exit_completed here.
         # These guards must persist until a new position opens (in _enter_trade).
         # Resetting them here was the v7.0 root cause of double-counting:
