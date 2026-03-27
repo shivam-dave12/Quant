@@ -96,10 +96,10 @@ _CLUSTER_RADIUS_ATR: Dict[str, float] = {
 
 # FIX-8: Extended pool max ages
 _POOL_MAX_AGE: Dict[str, float] = {
-    "1m": 1800,     # 30 min
-    "5m": 7200,     # 2 hours
-    "15m": 43200,   # 12 hours (was 8h)
-    "1h": 172800,   # 48 hours (was 24h)
+    "1m": 7200,      # 2 hours (1m pools are micro-structure, keep short)
+    "5m": 259200,    # 3 days — user requirement: full session + prior sessions
+    "15m": 259200,  # 3 days — key intraday structure persists across sessions
+    "1h": 259200,   # 3 days — hourly structure anchors multi-session ranges
     "4h": 259200,   # 3 days
     "1d": 604800,   # 7 days
 }

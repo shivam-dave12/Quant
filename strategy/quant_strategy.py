@@ -1685,265 +1685,209 @@ class InstitutionalLevels:
                    candles_5m: Optional[List[Dict]] = None,
                    ict_engine=None,
                    now_ms: int = 0,
-                   candles_15m: Optional[List[Dict]] = None) -> float:
+                   candles_15m: Optional[List[Dict]] = None,
+                   liq_map=None) -> Optional[float]:
         """
-        Initial TP placement — v5.0 (15m ICT structure primary).
+        Initial TP placement — v7.0 INSTITUTIONAL PRIORITY.
 
-        Candidate priority (score):
-          6.0+ ICT swept liquidity origin    — mandatory delivery target after sweep-reverse
-          5.0+ ICT unfilled FVG              — imbalance fill target
-          4.0+ ICT virgin OB (htf_only)      — 15m institutional footprint
-          4.0  15m swing extreme             — structural supply/demand level
-          3.5  VWAP                          — full mean-reversion target
-          3.0  VWAP σ-bands                  — statistical reference
-          2.0  VWAP partial fraction         — minimum floor
+        HIERARCHY (all candidates scored; highest wins):
 
-        Selection: score-first (see tiered selection block).
-        Swept origin (score ≥ 6.0) is MANDATORY when present — it is the reason
-        the trade exists in ICT methodology.
+          TIER-S  score ≥ 7.0  Liquidity pool (LiquidityMap)
+                                The LiquidityMap has the richest multi-TF pool data.
+                                BSL above (for LONG) / SSL below (for SHORT) is
+                                WHERE price is magnetically attracted to — stop
+                                clusters draw price like gravity. This is always
+                                the PRIMARY TP in ICT methodology.
+
+          TIER-A  score ≥ 6.0  ICT swept liquidity origin
+                                After a sweep-and-reverse, price delivers back to
+                                the raid origin. Mandatory when present.
+
+          TIER-B  score ≥ 5.0  ICT structural (FVG, virgin OB, ict_engine pools)
+                                Imbalances and institutional footprints in the
+                                delivery direction.
+
+          TIER-C  score ≥ 4.0  15m swing extremes
+                                Confirmed structural swing levels.
+
+          TIER-D  score ≥ 3.5  VWAP / σ-bands
+                                Statistical reference levels.
+
+          REJECT  If NO candidate survives the R:R gate → return None.
+                  The caller must NOT enter this trade — no naked R-floor.
+
+        CRITICAL: There is NO R-floor fallback. If no structural target
+        exists that satisfies the minimum R:R, the trade is rejected.
+        Entering without a real target is guessing, not ICT.
         """
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-10:
-            return price + atr if side == "long" else price - atr
+            return None
 
-        min_tp_dist = sl_dist * QCfg.REVERSION_MIN_RR()
-        max_tp_dist = sl_dist * QCfg.REVERSION_MAX_RR()
+        _ict_now_ms  = now_ms if now_ms > 0 else int(time.time() * 1000)
+        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
+        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
+        _min_rr_gate = QCfg.REVERSION_MIN_RR()
 
-        # ── 15m swing targets ─────────────────────────────────────────────────
-        sh_15m: List[float] = []
-        sl_15m: List[float] = []
-        if candles_15m and len(candles_15m) >= 3:
-            _lb = min(40, len(candles_15m) - 2)
-            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
+        # ── scored candidates pool ─────────────────────────────────────────────
+        scored: List[Tuple[float, float, str]] = []   # (level, score, label)
 
-        # ── Scored candidate pool ─────────────────────────────────────────────
-        scored: List[Tuple[float, float]] = []
-
-        def add_tp(level: float, score: float) -> None:
+        def _valid(level: float, min_dist: float = None) -> bool:
             dist = abs(level - price)
-            if dist < min_tp_dist or dist > max_tp_dist:
-                return
-            if side == "long" and level <= price:
-                return
-            if side == "short" and level >= price:
-                return
-            scored.append((level, score))
+            lo   = min_dist if min_dist is not None else min_tp_dist
+            if dist < lo or dist > max_tp_dist:
+                return False
+            if side == "long"  and level <= price: return False
+            if side == "short" and level >= price: return False
+            return True
 
-        def add_tp_ict(level: float, score: float, ict_min_dist: float) -> None:
-            # ICT structural targets use 1.0×SL floor (1:1 R:R minimum)
-            dist = abs(level - price)
-            if dist < ict_min_dist or dist > max_tp_dist:
-                return
-            if side == "long" and level <= price:
-                return
-            if side == "short" and level >= price:
-                return
-            scored.append((level, score))
+        def add(level: float, score: float, label: str, min_dist: float = None):
+            if _valid(level, min_dist):
+                scored.append((level, score, label))
 
-        if side == "long":
-            # 15m swing highs in reversion direction — structural supply above price
-            for sh in sh_15m:
-                if sh > price + min_tp_dist and (vwap <= 0 or sh <= vwap * 1.015):
-                    add_tp(sh - atr * 0.08, 4.0)
+        # ══ TIER-S: LiquidityMap pools (primary target — richest data) ═══════
+        # LiquidityMap tracks equal highs/lows across all TFs with clustering,
+        # HTF confluence promotion, and proximity weighting. These are the real
+        # liquidity clusters smart money hunts.
+        if liq_map is not None:
+            try:
+                liq_snap = liq_map.get_snapshot(price, atr)
+                pool_list = liq_snap.bsl_pools if side == "long" else liq_snap.ssl_pools
+                for pt in pool_list:
+                    pool = pt.pool
+                    # Score = 7 + significance bonus + HTF confluence bonus
+                    # Proximity-weighted significance ensures near pools beat far ones
+                    _adj_sig = pool.proximity_adjusted_sig(pt.distance_atr)
+                    _score   = 7.0 + min(_adj_sig * 0.15, 2.0)
+                    # HTF confluence multiplier
+                    if pool.htf_count >= 2:
+                        _score += 0.5
+                    # Touch count bonus — more touches = deeper stop cluster
+                    _score += min(pool.touches * 0.1, 0.5)
+                    # Target is just BEFORE the pool (so we don't trigger the stops,
+                    # we exit into the liquidity that attracts price there)
+                    _target = pool.price - 0.05 * atr if side == "long" else pool.price + 0.05 * atr
+                    add(_target, _score, f"LIQ_POOL[{pool.timeframe}]@${pool.price:,.0f}(tc={pool.touches})")
+            except Exception as _le:
+                logger.debug(f"LiqMap TP scan error: {_le}")
 
-            if vwap > price:
-                add_tp(vwap, 3.5)
-
-            if vwap > 0 and vwap_std > 0:
-                for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                    lvl = vwap - mult * vwap_std
-                    if lvl > price:
-                        add_tp(lvl, bscore)
-
-            if vwap > price:
-                partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0)
-
-        else:  # short
-            # 15m swing lows in reversion direction — structural demand below price
-            for sl_v in sl_15m:
-                if sl_v < price - min_tp_dist and (vwap <= 0 or sl_v >= vwap * 0.985):
-                    add_tp(sl_v + atr * 0.08, 4.0)
-
-            if vwap < price:
-                add_tp(vwap, 3.5)
-
-            if vwap > 0 and vwap_std > 0:
-                for mult, bscore in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                    lvl = vwap + mult * vwap_std
-                    if lvl < price:
-                        add_tp(lvl, bscore)
-
-            if vwap < price:
-                partial = price + (vwap - price) * QCfg.TP_VWAP_FRACTION()
-                add_tp(partial, 2.0)
-
-        # ── v4.9: ICT Structural TP targets ──────────────────────────────────
-        # Swept liquidity origins, unfilled FVGs, and virgin OBs in trade direction.
-        # These carry the highest institutional conviction — they are WHERE smart
-        # money is delivering price to. Add them to the scored pool with priority
-        # scores that beat every quant-only candidate.
-        #
-        # Issue 3 fix: ICT targets use a LOWER minimum distance floor (1.0×SL
-        # instead of 1.5×SL) so nearby 15m FVGs and OBs aren't filtered out.
-        # The quant pool still enforces min_tp_dist (1.5×SL), but ICT structure
-        # is authoritative enough to accept lower R:R — structure IS the reason
-        # to take the trade, not just a boost on top of quant signals.
+        # ══ TIER-A: ICT swept liquidity origin ═══════════════════════════════
+        # After a sweep-and-reverse, AMD delivery target is the most important level.
         if ict_engine is not None:
             try:
-                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                # Issue 3: use sl_dist (1.0×) as ICT min distance, not min_tp_dist (1.5×)
-                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)   # at least 1:1 R:R or 0.5ATR
-                _ict_max_dist = max_tp_dist                       # same upper cap
-                # htf_only=True: only 15m OBs in ICT pool.
-                # FVGs and swept pools are always included (not TF-filtered).
-                _ict_targets = ict_engine.get_structural_tp_targets(
-                    side, price, atr, _ict_now_ms, _ict_min_dist, _ict_max_dist,
-                    htf_only=True)
-                for _lvl, _sc, _lbl in _ict_targets:
-                    add_tp_ict(_lvl, _sc, _ict_min_dist)   # uses 1.0× floor, not 1.5×
-                    logger.debug(f"ICT TP candidate: ${_lvl:,.1f} score={_sc:.1f} [{_lbl}]")
-                if _ict_targets:
-                    logger.info(
-                        f"📐 ICT TP pool: {len(_ict_targets)} candidates "
-                        f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
-            except Exception as _ict_e:
-                logger.debug(f"ICT TP targets error (non-fatal): {_ict_e}")
+                _amd = ict_engine.get_amd_state()
+                if _amd.delivery_target is not None:
+                    add(_amd.delivery_target, 6.5, "AMD_DELIVERY_TARGET")
+            except Exception:
+                pass
 
-        # ── v6.0: LIQUIDITY POOL TARGETING (PATH-B) ─────────────────────────
-        # CRITICAL FIX: PATH-B (non-sweep entries) never scanned liquidity pools.
-        # This meant non-sweep TPs had no real structural target — just VWAP or
-        # a blind R:R floor. Opposing liquidity pools are WHERE stops cluster =
-        # WHERE price is magnetically attracted to.
-        #
-        # For LONG: scan BSL pools above price (buy-side liquidity = target)
-        # For SHORT: scan SSL pools below price (sell-side liquidity = target)
+        # ══ TIER-B: ICT structural targets (FVGs, OBs, ict_engine pools) ════
         if ict_engine is not None:
+            try:
+                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)
+                _ict_targets  = ict_engine.get_structural_tp_targets(
+                    side, price, atr, _ict_now_ms, _ict_min_dist, max_tp_dist,
+                    htf_only=False)
+                for _lvl, _sc, _lbl in _ict_targets:
+                    add(_lvl, 5.0 + min(_sc * 0.1, 1.5), f"ICT_{_lbl}", _ict_min_dist)
+                if _ict_targets:
+                    logger.debug(
+                        f"ICT TP pool: {len(_ict_targets)} candidates "
+                        f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
+            except Exception as _ie:
+                logger.debug(f"ICT structural TP error: {_ie}")
+
+            # ict_engine.liquidity_pools (LiquidityLevel objects from ICT engine)
             try:
                 for pool in ict_engine.liquidity_pools:
                     if pool.swept:
                         continue
-                    _pool_score = 5.5 + min(pool.touch_count * 0.25, 1.5)
-                    # Higher score for HTF pools (4H/1D pools are stronger magnets)
+                    _score = 5.5 + min(pool.touch_count * 0.25, 1.5)
                     _tf_bonus = {"1d": 1.0, "4h": 0.5, "1h": 0.25}.get(
-                        getattr(pool, 'timeframe', '5m'), 0.0)
-                    _pool_score += _tf_bonus
+                        getattr(pool, "timeframe", "5m"), 0.0)
+                    _score += _tf_bonus
                     if side == "long" and pool.level_type == "BSL" and pool.price > price:
-                        _tp_cand = pool.price - 0.05 * atr  # just before the pool
-                        add_tp_ict(_tp_cand, _pool_score,
-                                   max(sl_dist * 1.0, atr * 0.5))
-                        logger.debug(
-                            f"🎯 LIQ TP candidate: BSL@${pool.price:,.0f} "
-                            f"touches={pool.touch_count} score={_pool_score:.1f}")
+                        add(pool.price - 0.05 * atr, _score,
+                            f"ICT_BSL@${pool.price:,.0f}",
+                            max(sl_dist * 1.0, atr * 0.5))
                     elif side == "short" and pool.level_type == "SSL" and pool.price < price:
-                        _tp_cand = pool.price + 0.05 * atr  # just before the pool
-                        add_tp_ict(_tp_cand, _pool_score,
-                                   max(sl_dist * 1.0, atr * 0.5))
-                        logger.debug(
-                            f"🎯 LIQ TP candidate: SSL@${pool.price:,.0f} "
-                            f"touches={pool.touch_count} score={_pool_score:.1f}")
-            except Exception as _liq_e:
-                logger.debug(f"LIQ TP targets error (non-fatal): {_liq_e}")
+                        add(pool.price + 0.05 * atr, _score,
+                            f"ICT_SSL@${pool.price:,.0f}",
+                            max(sl_dist * 1.0, atr * 0.5))
+            except Exception:
+                pass
 
-        # ── ICT-Primary Tiered Selection ─────────────────────────────────────
-        #
-        # Industry-grade ICT selection logic:
-        #
-        #   TIER-S (score ≥ 6.0) — Swept liquidity origin:
-        #     The canonical ICT delivery target. After a liquidity raid (sweep-
-        #     and-reverse), price is DELIVERING back to the raid origin. This is
-        #     the highest-conviction TP in the ICT framework. Always take the
-        #     highest-scored sweep origin — proximity is irrelevant here.
-        #
-        #   TIER-A (score 4.0–5.9) — FVGs, Virgin OBs, 15m swings:
-        #     Structural imbalances and institutional footprints. Select by
-        #     highest score (conviction), then nearest as tiebreaker. These
-        #     levels ATTRACT price — pick the most significant one.
-        #
-        #   TIER-B (score 3.5–3.9) — VWAP and σ-bands:
-        #     Statistical reference levels. Select by highest score.
-        #
-        #   FALLBACK: minimum 1:1 R:R floor.
-        #
-        # WHY NOT NEAREST? The "take the closest target to maximise win-rate"
-        # logic is retail thinking. ICT delivery is specific: price fills the
-        # imbalance / reaches the swept level. A score-6 swept origin is the
-        # REASON the trade exists — taking profit at a random FVG 90pts short
-        # of the target means exiting before the structural move completes.
-        # ── ICT-Primary Tiered Selection with per-candidate R:R check ───────────
-        #
-        # FIX: Instead of picking the single best-scored candidate and then
-        # hard-failing the R:R gate (returning None immediately), we now iterate
-        # through every candidate within each tier — score-first, proximity as
-        # tiebreaker — and accept the first one that clears REVERSION_MIN_RR.
-        # If the highest-conviction candidate is too close (low R:R), we fall
-        # through to the next candidate (a farther structural level at 1h/4h/15m)
-        # rather than abandoning the entire trade.
-        #
-        # Only when ALL scored candidates across ALL tiers fail the R:R gate do
-        # we return None (genuinely no viable structural target exists).
-        #
-        # Tier priority (unchanged):
-        #   Tier-S (score ≥ 6.0): swept liquidity origin — highest conviction
-        #   Tier-A (score ≥ 4.0): FVGs, Virgin OBs, 15m/1h/4h swings
-        #   Tier-B (score ≥ 3.5): VWAP and σ-bands
-        #   Tier-F (score ≥ 0.0): any remaining scored candidate
-        _min_rr_gate = QCfg.REVERSION_MIN_RR()
-        _sl_dist_gate = abs(price - sl_price)
+        # ══ TIER-C: 15m swing extremes ════════════════════════════════════════
+        if candles_15m and len(candles_15m) >= 3:
+            _lb   = min(40, len(candles_15m) - 2)
+            sh_15, sl_15 = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
+            _buf = atr * 0.08
+            if side == "long":
+                for sh in sh_15:
+                    if sh > price + min_tp_dist:
+                        add(sh - _buf, 4.0, f"15m_SWING_HIGH@${sh:,.0f}")
+            else:
+                for sl_v in sl_15:
+                    if sl_v < price - min_tp_dist:
+                        add(sl_v + _buf, 4.0, f"15m_SWING_LOW@${sl_v:,.0f}")
 
-        def _cand_rr(lvl: float) -> float:
-            return abs(lvl - price) / max(_sl_dist_gate, 1e-10)
+        # ══ TIER-D: VWAP / σ-bands ════════════════════════════════════════════
+        if vwap > 0:
+            if side == "long" and vwap > price:
+                add(vwap, 3.5, "VWAP")
+                if vwap_std > 0:
+                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                        add(vwap - mult * vwap_std, sc, f"VWAP-{mult}σ")
+            elif side == "short" and vwap < price:
+                add(vwap, 3.5, "VWAP")
+                if vwap_std > 0:
+                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                        add(vwap + mult * vwap_std, sc, f"VWAP+{mult}σ")
 
+        # ══ TIERED SELECTION ══════════════════════════════════════════════════
         tp = None
-
         if scored:
-            for _tier_min, _tier_label in [
-                (6.0, "SWEEP ORIGIN"),
-                (4.0, "STRUCTURAL"),
-                (3.5, "VWAP/BAND"),
-                (0.0, "BEST AVAILABLE"),
+            for tier_min, tier_lbl in [
+                (7.0, "LIQ_POOL"),
+                (6.0, "SWEEP_ORIGIN"),
+                (5.0, "ICT_STRUCTURAL"),
+                (4.0, "SWING_15M"),
+                (3.5, "VWAP"),
+                (0.0, "BEST_AVAILABLE"),
             ]:
-                _tier_cands = [(lvl, sc) for lvl, sc in scored if sc >= _tier_min]
-                if not _tier_cands:
+                tier_cands = [(lvl, sc, lb) for lvl, sc, lb in scored if sc >= tier_min]
+                if not tier_cands:
                     continue
-                # Score-first; nearest as tiebreaker (same ordering as before)
-                _tier_cands.sort(key=lambda x: (-x[1], abs(x[0] - price)))
-                for _cand_lvl, _cand_sc in _tier_cands:
-                    _rr = _cand_rr(_cand_lvl)
-                    if _rr >= _min_rr_gate - 1e-9:
-                        tp = _cand_lvl
+                # Score-first; nearest as tiebreaker within same score
+                tier_cands.sort(key=lambda x: (-x[1], abs(x[0] - price)))
+                for cand_lvl, cand_sc, cand_lb in tier_cands:
+                    rr = abs(cand_lvl - price) / max(sl_dist, 1e-10)
+                    if rr >= _min_rr_gate - 1e-9:
+                        tp = cand_lvl
                         logger.info(
-                            f"🎯 TP: {_tier_label} ${tp:,.2f} score={_cand_sc:.1f} "
+                            f"🎯 TP [{tier_lbl}] ${tp:,.2f} ({cand_lb}) "
+                            f"score={cand_sc:.1f} "
                             f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
-                            f"R:R=1:{_rr:.2f} "
-                            f"| {len(_tier_cands)} in tier / {len(scored)} total")
+                            f"R:R=1:{rr:.2f} | {len(scored)} candidates total")
                         break
                     else:
                         logger.debug(
-                            f"   TP candidate ${_cand_lvl:,.1f} score={_cand_sc:.1f} "
-                            f"R:R={_rr:.2f} < {_min_rr_gate:.1f} — trying next")
+                            f"   TP candidate ${cand_lvl:,.1f} [{cand_lb}] "
+                            f"score={cand_sc:.1f} R:R={rr:.2f} < {_min_rr_gate:.1f} — skip")
                 if tp is not None:
-                    break  # Valid TP found — stop checking lower tiers
+                    break
 
-            if tp is None:
-                # Every scored structural candidate (all tiers, all TFs) failed
-                # the R:R gate — no viable target exists for this setup.
-                _best_rr = max((_cand_rr(lvl) for lvl, _ in scored), default=0.0)
-                logger.info(
-                    f"⛔ TP R:R gate (PATH-B): all {len(scored)} structural candidates "
-                    f"< {_min_rr_gate:.1f}R minimum (best={_best_rr:.2f}) "
-                    f"— returning None (no trade)")
-                return None
-        else:
-            # No structural target — minimum R:R floor
-            tp = (price + min_tp_dist) if side == "long" else (price - min_tp_dist)
+        if tp is None:
+            # Every structural candidate failed minimum R:R.
+            # DO NOT return a naked R-floor — that is not a trade, it is gambling.
+            _best = max((abs(c[0]-price)/max(sl_dist,1e-10) for c in scored), default=0.0)
             logger.info(
-                f"🎯 TP fallback (no 15m ICT structure in range): "
-                f"${tp:,.2f} = 1:{QCfg.REVERSION_MIN_RR():.1f}R floor "
-                f"| SL dist={abs(price-sl_price):.0f}pts [{min_tp_dist:.0f}–{max_tp_dist:.0f}pts window]")
+                f"⛔ TP: NO VALID TARGET for {side.upper()} "
+                f"— {len(scored)} candidates, best R:R={_best:.2f} < {_min_rr_gate:.1f} required. "
+                f"Trade rejected — no liquidity zone in reach.")
+            return None
 
         return tp
-
     @staticmethod
     def compute_tp_trend(price: float, side: str, atr: float, sl_price: float,
                          candles_5m: List[Dict], orderbook: Dict,
@@ -4735,7 +4679,7 @@ class QuantStrategy:
             mfe_r      = max(cur_r, peak_r)
 
             # ── BOS count and CHoCH from the live ICT engine ─────────────
-            _now_ms_disp = now_ms if now_ms > 0 else int(time.time() * 1000)
+            _now_ms_disp = int(now * 1000) if now > 0 else int(time.time() * 1000)
             bos_cnt   = 0
             choch_tf  = None
             choch_lvl = 0.0
@@ -6572,7 +6516,8 @@ class QuantStrategy:
                     candles_5m=candles_5m,
                     ict_engine=self._ict,
                     now_ms=now_ms_slatp,
-                    candles_15m=candles_15m)
+                    candles_15m=candles_15m,
+                    liq_map=self._liq_map)
 
         # BUG-1 FIX: compute_tp returns None when R:R gate hard-rejects the setup.
         # Calling _round_to_tick(None) raises TypeError: unsupported operand type(s)
