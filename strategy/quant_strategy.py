@@ -4702,31 +4702,153 @@ class QuantStrategy:
 
         cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
         _in_pos = self._pos.is_active()
+
         if _in_pos:
-            _header = (
-                f"┌─── 📊 IN-POSITION MONITOR [{self._pos.side.upper()}]"
-                f"  entry=${self._pos.entry_price:,.2f}"
-                f"  SL=${self._pos.sl_price:,.2f}"
-                f"  ${price:,.2f}  ATR={sig.atr:.1f} ────")
+            # ════════════════════════════════════════════════════════════════
+            # IN-POSITION MONITOR — shows ONLY what is actually managing the
+            # position: _ICTStructureTrail (BOS/CHoCH/phase/R-multiples).
+            # Old quant-scout gates (VWAP/CVD/composite/n_confirming) are NOT
+            # shown here because they play zero role once we are in a trade.
+            # ════════════════════════════════════════════════════════════════
+            pos       = self._pos
+            profit_pts = ((price - pos.entry_price) if pos.side == "long"
+                          else (pos.entry_price - price))
+            init_dist  = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+            cur_r      = profit_pts / init_dist if init_dist > 1e-10 else 0.0
+            peak_r     = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r      = max(cur_r, peak_r)
+
+            # ── BOS count and CHoCH from the live ICT engine ─────────────
+            bos_cnt   = 0
+            choch_tf  = None
+            choch_lvl = 0.0
+            if self._ict is not None:
+                try:
+                    bos_cnt = _ICTStructureTrail._bos_count(self._ict, pos.side)
+                    choch_tf, choch_lvl = _ICTStructureTrail._choch(self._ict, pos.side)
+                except Exception:
+                    pass
+            choch_active = choch_tf is not None and choch_lvl > 0.0
+
+            # ── Break-even lock ───────────────────────────────────────────
+            _fee_buf  = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.10 * atr
+            _be_price = (pos.entry_price + _fee_buf if pos.side == "long"
+                         else pos.entry_price - _fee_buf)
+            be_locked = ((pos.side == "long"  and pos.sl_price >= _be_price) or
+                         (pos.side == "short" and pos.sl_price <= _be_price))
+
+            # ── Trail phase (mirrors _ICTStructureTrail._phase logic) ────
+            try:
+                trail_phase = _ICTStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
+            except Exception:
+                trail_phase = 0
+
+            _phase_labels = {
+                0: "⬜ PHASE 0 — HANDS OFF (waiting for BOS / displacement)",
+                1: "🟡 PHASE 1 — BOS SWING TRAIL (SL behind 5m swing lows/highs)",
+                2: "🟠 PHASE 2 — CHoCH TIGHTEN  (SL pulled to CHoCH level)",
+                3: "🟢 PHASE 3 — 15m STRUCTURE TRAIL (tight to 15m OB/swing)",
+            }
+            phase_lbl = _phase_labels.get(trail_phase, f"Phase {trail_phase}")
+
+            # ── Ratchet milestone reached ─────────────────────────────────
+            _last_ratchet_r = getattr(pos, 'last_ratchet_r', 0.0)
+            _ratchet_milestones = [2.50, 2.00, 1.50, 1.00, 0.50]
+            _next_ratchet = next(
+                (m for m in _ratchet_milestones if mfe_r < m), None)
+            _next_ratchet_str = (f"{_next_ratchet:.2f}R" if _next_ratchet
+                                 else "all milestones hit")
+
+            # ── Progress bar ──────────────────────────────────────────────
+            _bar_filled = min(int(mfe_r * 4), 16)
+            _prog_bar   = "█" * _bar_filled + "░" * (16 - _bar_filled)
+
+            # ── SL / TP distances ─────────────────────────────────────────
+            sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
+            tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
+
+            # ── AMD and dealing range at a glance ─────────────────────────
+            _amd_brief = ""
+            _dr_brief  = ""
+            if self._ict is not None and self._ict._initialized:
+                try:
+                    _amd_brief = (
+                        f"{self._ict._amd.phase}  bias={self._ict._amd.bias}"
+                        f"  conf={self._ict._amd.confidence:.2f}")
+                except Exception:
+                    pass
+                try:
+                    _dr = getattr(self._ict, '_dealing_range', None)
+                    if _dr:
+                        _pd = getattr(_dr, 'current_pd', 0.5)
+                        _pd_lbl = ("DEEP DISC" if _pd < 0.25 else
+                                   "DISCOUNT"  if _pd < 0.40 else
+                                   "EQ"        if _pd < 0.60 else
+                                   "PREMIUM"   if _pd < 0.75 else "DEEP PREM")
+                        _dr_brief = f"{_pd_lbl} ({_pd:.0%})  range=[${_dr.low:,.0f}–${_dr.high:,.0f}]"
+                except Exception:
+                    pass
+
+            # ── Pool TP target (stored from entry signal) ─────────────────
+            _pool_tp_str = ""
+            _es = getattr(self, '_last_entry_signal', None)
+            if _es is not None:
+                try:
+                    _pt = _es.target_pool
+                    if _pt and hasattr(_pt, 'pool'):
+                        _pool_tp_str = (
+                            f"{_pt.pool.side.value} @ ${_pt.pool.price:,.0f}"
+                            f"  sig={_pt.significance:.2f}")
+                except Exception:
+                    pass
+
+            lines = [
+                f"┌─── 📊 IN-POSITION MONITOR [{pos.side.upper()}] ────────────────────────",
+                f"  Price  ${price:,.2f}  │  ATR={atr:.1f}  │  Hold={now - pos.entry_time:.0f}s",
+                f"  Entry  ${pos.entry_price:,.2f}  SL ${pos.sl_price:,.2f}  TP ${pos.tp_price:,.2f}",
+                f"  SL dist: {sl_dist_atr:.1f}ATR  │  TP dist: {tp_dist_atr:.1f}ATR",
+            ]
+            if _pool_tp_str:
+                lines.append(f"  Pool TP: {_pool_tp_str}")
+            lines += [
+                f"  {'─'*60}",
+                f"  R-PROGRESS:  current={cur_r:+.2f}R  peak(MFE)={mfe_r:.2f}R",
+                f"  [{_prog_bar}] {mfe_r:.2f}R  │  next ratchet @ {_next_ratchet_str}",
+                f"  {'─'*60}",
+                f"  TRAIL ENGINE: {phase_lbl}",
+                f"  BOS confirmed: {bos_cnt}  │  CHoCH: "
+                + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none"),
+                f"  Break-even:  "
+                + ("✅ LOCKED — risk-free trade" if be_locked
+                   else f"❌ not yet  (SL needs to reach ${_be_price:,.2f})"),
+            ]
+            if _amd_brief:
+                lines.append(f"  AMD: {_amd_brief}")
+            if _dr_brief:
+                lines.append(f"  Zone: {_dr_brief}")
+            lines.append(f"└{'─'*66}")
+            logger.info("\n" + "\n".join(lines))
+
         else:
+            # ── SCANNING / IDLE — show quant-scout gate table (unchanged) ──
             _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
             _header = (
                 f"┌─── 🧠 v9 ICT-COMMANDER  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}"
                 f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────")
-        lines = [_header]
-        if _sweep_line:
-            lines.append(f"  {_sweep_line}")
-        lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
-                  fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
-                  fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
-                  f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()}",
-                  f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
-        for g in gates:
-            lines.append(f"  {g}")
-        lines.append(f"  {_status}")
-        lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
-        lines.append(f"└{'─'*66}")
-        logger.info("\n" + "\n".join(lines))
+            lines = [_header]
+            if _sweep_line:
+                lines.append(f"  {_sweep_line}")
+            lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
+                      fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
+                      fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
+                      f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()}",
+                      f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
+            for g in gates:
+                lines.append(f"  {g}")
+            lines.append(f"  {_status}")
+            lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
+            lines.append(f"└{'─'*66}")
+            logger.info("\n" + "\n".join(lines))
 
 
     @staticmethod
@@ -4995,6 +5117,9 @@ class QuantStrategy:
                 EntryType.SWEEP_CONTINUATION: "B",
             }
             _tier = _tier_map.get(signal.entry_type, "A")
+
+            # v9: capture full EntrySignal before the thread consumes it
+            self._last_entry_signal = signal
 
             self._launch_entry_async(
                 data_manager, order_manager, risk_manager,
@@ -6888,63 +7013,150 @@ class QuantStrategy:
         _hunt_was_active = self._pending_hunt_signal is not None
         self._pending_hunt_signal = None
 
-        # ── Build clean entry notification ───────────────────────────────────────
+        # ── v9 Entry Telegram notification — pool-first, not quant-scout ─────────
         sl_dist_pts = abs(fill_price - sl_price)
         tp_dist_pts = abs(fill_price - tp_price)
         rr_a        = tp_dist_pts / sl_dist_pts if sl_dist_pts > 1e-10 else 0.0
         dollar_risk = sl_dist_pts * qty
-        ict_line = ""
-        if sig.ict_total > 0.01:
-            ict_line = f"\nICT:      Σ={sig.ict_total:.2f} [{sig.ict_details}]"
-        # Sweep + hunt entry badges
-        _sweep_badge = ""
-        if _sweep_was_active:
-            _sweep_badge = " 🏛️ SWEEP-AND-GO"
-        elif locals().get('_hunt_was_active', False) or mode == "hunt":
-            _sweep_badge = " 🎣 HUNT-AND-GO"
-        mode_icon = "🚀" if mode == "momentum" else ("📈📈" if mode == "trend" else ("⚡" if mode == "flow" else ("📈" if side == "long" else "📉")))
 
-        # ── v8.0: additive tier + counter-HTF + AMD + sweep context lines ────────
-        # Tier badge line
+        # ── Entry type label (from EntrySignal.entry_type) ───────────────────────
+        _et_labels = {
+            "sweep_reversal":     "🏛️ SWEEP REVERSAL",
+            "pre_sweep_approach": "⚡ PRE-SWEEP APPROACH",
+            "sweep_continuation": "📈 SWEEP CONTINUATION",
+        }
+        if _sweep_was_active:
+            _et_label = "🏛️ SWEEP-AND-GO REVERSAL"
+        elif locals().get('_hunt_was_active', False) or mode == "hunt":
+            _et_label = "🎣 LIQUIDITY HUNT"
+        else:
+            _et_label = _et_labels.get(mode, mode.upper())
+
+        # ── Pool target, flow conviction, entry reason — from EntrySignal ────────
+        # _last_entry_signal is stored on self by the v9 tick loop just before
+        # _launch_entry_async is called, so it is always available here.
+        _es = getattr(self, '_last_entry_signal', None)
+        _pool_tp_str   = "—"
+        _swept_str     = ""
+        _flow_conv_str = "—"
+        _entry_reason  = "—"
+        _ict_val_str   = ""
+
+        if _es is not None:
+            try:
+                # Pool being targeted → this IS the TP origin
+                _pt = _es.target_pool
+                if _pt and hasattr(_pt, 'pool'):
+                    _pool_tp_str = (
+                        f"{'BSL ▲' if _pt.pool.side.value == 'BSL' else 'SSL ▼'}"
+                        f" @ ${_pt.pool.price:,.0f}"
+                        f"  (sig={_pt.significance:.2f}"
+                        f"  x{_pt.pool.touches} touches)")
+            except Exception:
+                pass
+            try:
+                # Sweep that triggered the entry
+                if _es.sweep_result is not None:
+                    _sw = _es.sweep_result
+                    _sw_side  = _sw.pool.side.value if hasattr(_sw, 'pool') else "?"
+                    _sw_px    = _sw.pool.price      if hasattr(_sw, 'pool') else 0.0
+                    _sw_qual  = getattr(_sw, 'quality', 0.0)
+                    _sw_disp  = "✅DISP" if getattr(_sw, 'displacement_confirmed', False) else "⚠️weak"
+                    _swept_str = (
+                        f"\nSwept:    {_sw_side} @ ${_sw_px:,.0f}"
+                        f"  quality={_sw_qual:.0%}  {_sw_disp}")
+            except Exception:
+                pass
+            try:
+                _flow_conv_str = f"{_es.conviction:+.3f}"
+            except Exception:
+                pass
+            try:
+                if _es.reason:
+                    _entry_reason = _es.reason
+            except Exception:
+                pass
+            try:
+                if _es.ict_validation:
+                    _ict_val_str = _es.ict_validation
+            except Exception:
+                pass
+
+        # ── ICT / AMD context ─────────────────────────────────────────────────────
+        _amd_str = ""
+        if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
+            _amd_icons = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
+                          "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
+                          "ACCUMULATION": "💤"}
+            _amd_i   = _amd_icons.get(sig.amd_phase, "❓")
+            _bias_i  = "🟢" if getattr(sig,'amd_bias','') == "bullish" else ("🔴" if getattr(sig,'amd_bias','') == "bearish" else "⚪")
+            _amd_str = (
+                f"\nAMD:      {_amd_i} {sig.amd_phase}"
+                f"  {_bias_i}{getattr(sig,'amd_bias','?')}"
+                f"  conf={sig.amd_conf:.2f}")
+
+        # OB / FVG in OTE (from active sweep setup at time of entry)
+        _ict_in_ote_str = ""
+        if getattr(sig, 'ict_total', 0.0) > 0.01:
+            _ob_n  = min(getattr(sig, 'ict_ob', 0.0) / 2.0, 1.0)
+            _fvg_n = min(getattr(sig, 'ict_fvg', 0.0) / 1.5, 1.0)
+            _ict_in_ote_str = (
+                f"\nICT:      Σ={sig.ict_total:.2f}"
+                f"  OB={_ob_n:.2f}  FVG={_fvg_n:.2f}"
+                f"  Swp={getattr(sig,'ict_sweep',0.0):.2f}")
+            if _ict_val_str:
+                _ict_in_ote_str += f"\n          {_ict_val_str}"
+
+        # HTF MTF context
+        _htf_str = (
+            f"\nHTF:      15m={self._htf.trend_15m:+.2f}"
+            f"  4H={self._htf.trend_4h:+.2f}"
+            f"  (structure context)")
+
+        # Tier
         _tier_labels = {"S": "🥇 Tier-S — OTE Sweep-and-Go",
                         "A": "🥈 Tier-A — ICT Structural",
                         "B": "🥉 Tier-B — Quant+ICT Confluence",
                         "":  "⚪ No ICT tier"}
-        _tier_badge  = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
-        # Counter-HTF flag removed — HTF is no longer a gate, so opposing HTF
-        # is no longer a special condition worth badging. All entries are
-        # structure-primary; HTF shown as context only.
-        _counter_htf_line = ""
-        # AMD context line
-        _amd_line = ""
-        if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
-            _amd_icon = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
-                         "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
-                         "ACCUMULATION": "💤"}.get(sig.amd_phase, "❓")
-            _amd_line = (
-                f"\nAMD:      {_amd_icon} {sig.amd_phase}  "
-                f"conf={sig.amd_conf:.2f}  "
-                f"bias={getattr(sig,'amd_bias','?')}")
-        # HTF structure line — informational context, not a gate
-        _htf_line = (
-            f"\nHTF:      15m={self._htf.trend_15m:+.2f}  "
-            f"4H={self._htf.trend_4h:+.2f}  "
-            f"(context — not a gate)")
+        _tier_badge = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
+
+        # Side icon
+        _side_icon = "🟢" if side == "long" else "🔴"
+
+        # Trail plan for "what's next"
+        _trail_plan = (
+            "BOS confirmed → P1 swing trail"
+            " → CHoCH tighten (P2)"
+            " → 15m structure (P3 at 1.5R+)")
+        _ratchet_plan = "BE @0.5R → +0.15R@1R → +0.5R@1.5R → +1R@2R → trailing@2.5R+"
 
         send_telegram_message(
-            f"{mode_icon} <b>NEW TRADE — {side.upper()} [{mode.upper()}]{_sweep_badge}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{_side_icon} <b>{side.upper()} ENTERED — {_et_label}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>💰 LEVELS</b>\n"
             f"Entry:    <b>${fill_price:,.2f}</b>\n"
-            f"SL:       ${sl_price:,.2f}  (−${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
-            f"TP:       ${tp_price:,.2f}  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
-            f"R:R:      1:{rr_a:.2f}  |  Risk: ${dollar_risk:.2f} USDT\n"
+            f"SL:       ${sl_price:,.2f}"
+            f"  (−${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
+            f"TP:       ${tp_price:,.2f}"
+            f"  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}×ATR)\n"
+            f"R:R:      1:{rr_a:.2f}  │  Risk: ${dollar_risk:.2f} USDT\n"
             f"Qty:      {qty:.4f} BTC\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Regime:   {sig.market_regime} | ADX={sig.adx:.1f} | Mode: {mode.capitalize()}\n"
-            f"VWAP:     ${sig.vwap_price:,.2f} ({sig.deviation_atr:+.1f}×ATR)\n"
-            f"Signals:  {sig.n_confirming}/5 agree | Σ={sig.composite:+.3f}{ict_line}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Gate:     {_tier_badge}{_counter_htf_line}{_amd_line}{_htf_line}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>🎯 WHY WE ENTERED</b>\n"
+            f"Pool TP:  {_pool_tp_str}"
+            f"{_swept_str}\n"
+            f"Reason:   {_entry_reason}\n"
+            f"Flow:     conviction={_flow_conv_str}\n"
+            f"Tier:     {_tier_badge}"
+            f"{_amd_str}"
+            f"{_ict_in_ote_str}"
+            f"{_htf_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>⏩ WHAT'S NEXT</b>\n"
+            f"Trail:    {_trail_plan}\n"
+            f"Ratchet:  {_ratchet_plan}\n"
+            f"Exits:    SL hit │ TP (pool) hit │ Regime flip │ Max-hold\n"
+            f"Monitor:  /position  or  /thinking"
         )
         logger.info(
             f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "

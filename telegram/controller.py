@@ -996,8 +996,8 @@ class TelegramBotController:
                         f"{fvg['dist_pts']:+.0f}pts/{fvg['dist_atr']:.2f}ATR{in_tag}"
                     )
 
-            long_c  = ict.get_confluence("long",  price, now_ms, atr)
-            short_c = ict.get_confluence("short", price, now_ms, atr)
+            long_c  = ict.get_confluence("long",  price, now_ms, atr_v)
+            short_c = ict.get_confluence("short", price, now_ms, atr_v)
             lines.append("\n<b>Confluence Scores (ICT secondary)</b>")
             lines.append(
                 f"  LONG  Σ={long_c.total:.2f}  "
@@ -1090,22 +1090,127 @@ class TelegramBotController:
             except Exception:
                 pass
 
+        # ── ICT trail engine state ────────────────────────────────────────────────
+        from strategy.quant_strategy import _ICTStructureTrail
+        bos_cnt   = 0
+        choch_tf  = None
+        choch_lvl = 0.0
+        ict_eng   = getattr(strat, '_ict', None)
+        if ict_eng is not None:
+            try:
+                bos_cnt             = _ICTStructureTrail._bos_count(ict_eng, p.side)
+                choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_eng, p.side)
+            except Exception:
+                pass
+        choch_active = choch_tf is not None and choch_lvl > 0.0
+
+        # Break-even threshold (mirrors _update_trailing_sl)
+        import config as _cfg_mod
+        _comm = float(getattr(_cfg_mod, 'COMMISSION_RATE', 0.00055))
+        _fee_buf  = entry * _comm * 2.0 + 0.10 * atr
+        _be_price = (entry + _fee_buf if side == "LONG" else entry - _fee_buf)
+        be_locked = ((side == "LONG"  and sl >= _be_price) or
+                     (side == "SHORT" and sl <= _be_price and sl > 0))
+
+        # Trail phase
+        try:
+            trail_phase = _ICTStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
+        except Exception:
+            trail_phase = 0
+        _phase_labels = {
+            0: "⬜ P0 — HANDS OFF  (BOS not yet confirmed)",
+            1: "🟡 P1 — BOS SWING TRAIL  (SL behind 5m swing)",
+            2: "🟠 P2 — CHoCH TIGHTEN  (SL pulled to CHoCH)",
+            3: "🟢 P3 — 15m STRUCTURE TRAIL  (tight to OB/swing)",
+        }
+        trail_phase_lbl = _phase_labels.get(trail_phase, f"Phase {trail_phase}")
+
+        # Ratchet next milestone
+        _ratchet_milestones = [0.50, 1.00, 1.50, 2.00, 2.50]
+        last_ratchet_r      = getattr(p, 'last_ratchet_r', 0.0)
+        _next_ratchet       = next((m for m in _ratchet_milestones if mfe_r < m), None)
+        _next_ratchet_str   = (f"next @ {_next_ratchet:.2f}R" if _next_ratchet
+                               else "✅ all ratchets hit")
+
+        # Progress bar (4 blocks per R, max 16 blocks = 4R)
+        _bar_filled = min(int(mfe_r * 4), 16)
+        _prog_bar   = "█" * _bar_filled + "░" * (16 - _bar_filled)
+
+        # Pool TP source from stored entry signal
+        _pool_tp_src = ""
+        _es = getattr(strat, '_last_entry_signal', None)
+        if _es is not None:
+            try:
+                _pt = _es.target_pool
+                if _pt and hasattr(_pt, 'pool'):
+                    _pool_tp_src = (
+                        f"  ← {'BSL ▲' if _pt.pool.side.value == 'BSL' else 'SSL ▼'}"
+                        f" pool  sig={_pt.significance:.2f}"
+                        f"  x{_pt.pool.touches} touches")
+            except Exception:
+                pass
+
+        # Entry signal type
+        _es_type = ""
+        if _es is not None:
+            try:
+                _es_type = f"  [{_es.entry_type.value}]"
+            except Exception:
+                pass
+
+        # AMD + dealing range context
+        _amd_line = ""
+        _dr_line  = ""
+        if ict_eng is not None and ict_eng._initialized:
+            try:
+                _amd = ict_eng._amd
+                _amd_icon = {"DISTRIBUTION":"🎯","MANIPULATION":"⚡",
+                             "REACCUMULATION":"🔄","REDISTRIBUTION":"🔄",
+                             "ACCUMULATION":"💤"}.get(_amd.phase,"❓")
+                _amd_line = (f"\nAMD:      {_amd_icon} {_amd.phase}"
+                             f"  bias={_amd.bias}  conf={_amd.confidence:.2f}")
+            except Exception:
+                pass
+            try:
+                _dr = getattr(ict_eng, '_dealing_range', None)
+                if _dr:
+                    _pd = getattr(_dr, 'current_pd', 0.5)
+                    _pd_lbl = ("DEEP DISC" if _pd < 0.25 else
+                               "DISCOUNT"  if _pd < 0.40 else
+                               "EQ"        if _pd < 0.60 else
+                               "PREMIUM"   if _pd < 0.75 else "DEEP PREM")
+                    _dr_line = (f"\nZone:     {_pd_lbl} ({_pd:.0%})"
+                                f"  range=[${_dr.low:,.0f}–${_dr.high:,.0f}]")
+            except Exception:
+                pass
+
+        _side_icon = "🟢" if side == "LONG" else "🔴"
+        _upnl_icon = "🟢" if upnl >= 0 else "🔴"
+
         return (
-            f"<b>Active Position — {side}</b>\n"
-            f"Mode: {mode.upper()}  |  Phase: {phase}\n\n"
+            f"{_side_icon} <b>Position: {side}{_es_type}</b>"
+            f"  Mode: {mode.upper()}  Tier: {getattr(p,'ict_entry_tier','?') or '—'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>💰 LEVELS</b>\n"
             f"Entry:   ${entry:,.2f}\n"
             f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
-            f"uPnL:    ${upnl:+,.2f}\n"
-            f"Qty:     {qty:.4f} BTC\n\n"
-            f"SL (ICT struct): ${sl:,.2f}  "
-            f"(init dist: ${sl_dist:.0f} / {sl_dist/max(atr,1):.2f}ATR  "
-            f"current dist: ${current_sl_dist:.0f})\n"
-            f"TP (pool):       ${tp:,.2f}{pool_tp_note}\n"
-            f"Planned R:R: 1:{planned_rr:.2f}\n"
-            f"MFE: {mfe_r:.2f}R\n\n"
-            f"Hold:  {hold_min:.1f}m\n"
-            f"Trail: {'✅ BOS/CHoCH active' if p.trail_active else '⏳ waiting for R threshold'}\n"
-            f"BE:    {'Yes ✅' if be_moved else 'No'}"
+            f"{_upnl_icon} uPnL:  ${upnl:+,.2f}  |  Qty: {qty:.4f} BTC\n"
+            f"SL:      ${sl:,.2f}  (dist: ${current_sl_dist:.0f} / {current_sl_dist/max(atr,1):.2f}ATR)\n"
+            f"TP:      ${tp:,.2f}{_pool_tp_src}{pool_tp_note}\n"
+            f"R:R planned: 1:{planned_rr:.2f}  |  Hold: {hold_min:.1f}m\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📈 R-PROGRESS</b>\n"
+            f"[{_prog_bar}] MFE={mfe_r:.2f}R  cur={current_r:+.2f}R\n"
+            f"{_next_ratchet_str}  |  last ratchet: {last_ratchet_r:.2f}R\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>🏛️ TRAIL ENGINE</b>\n"
+            f"{trail_phase_lbl}\n"
+            f"BOS confirmed: {bos_cnt}  │  CHoCH: "
+            + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none") +
+            f"\nBE lock: "
+            + ("✅ risk-free (SL ≥ entry)" if be_locked
+               else f"❌ not yet  (SL needs ${_be_price:,.2f})")
+            + _amd_line + _dr_line
         )
 
     # ================================================================

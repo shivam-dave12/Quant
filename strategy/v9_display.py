@@ -585,7 +585,7 @@ def format_pools_telegram(
                 if p.pool.htf_count >= 2:
                     flags.append(f"HTFx{p.pool.htf_count}")
                 f_str = f" [{','.join(flags)}]" if flags else ""
-                marker = " <--" if (primary_target and
+                marker = " ←" if (primary_target and
                     abs(p.pool.price - primary_target.pool.price) < atr * 0.3) else ""
                 lines.append(f"  {i+1}. ${p.pool.price:,.1f}"
                              f" | {p.distance_atr:.1f}ATR"
@@ -611,7 +611,7 @@ def format_pools_telegram(
                 if p.pool.htf_count >= 2:
                     flags.append(f"HTFx{p.pool.htf_count}")
                 f_str = f" [{','.join(flags)}]" if flags else ""
-                marker = " <--" if (primary_target and
+                marker = " ←" if (primary_target and
                     abs(p.pool.price - primary_target.pool.price) < atr * 0.3) else ""
                 lines.append(f"  {i+1}. ${p.pool.price:,.1f}"
                              f" | {p.distance_atr:.1f}ATR"
@@ -673,7 +673,7 @@ def format_flow_telegram(
     # Component breakdown
     lines.append(f"\n<b>Components</b>")
     lines.append(f"  Tick flow:    {tick_flow:+.2f}"
-                 f"  {'<< strong sell' if tick_flow < -0.5 else ('>> strong buy' if tick_flow > 0.5 else '-- neutral')}")
+                 f"  {'↓↓ strong sell' if tick_flow < -0.5 else ('↑↑ strong buy' if tick_flow > 0.5 else '── neutral')}")
     lines.append(f"  CVD trend:    {cvd_trend:+.2f}"
                  f"  {'bearish' if cvd_trend < -0.2 else ('bullish' if cvd_trend > 0.2 else 'flat')}")
     lines.append(f"  CVD diverg:   {cvd_divergence:+.2f}")
