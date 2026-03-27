@@ -2568,17 +2568,31 @@ class _ICTStructureTrail:
             except Exception: return 0.0
 
     @staticmethod
-    def _bos_count(ict_engine, pos_side: str) -> int:
+    def _bos_count(ict_engine, pos_side: str, now_ms: int = 0) -> int:
+        """
+        Count BOS confirmations across 1m/5m/15m in trade direction.
+
+        BUG-12 FIX: Age-gated. Only counts BOS whose bos_timestamp is within
+        the last 100 minutes. Historical BOS from prior sessions (hours old)
+        were inflating bos_count to 3 on brand-new entries with zero post-entry
+        structure, causing Phase 3 trail to activate immediately and tighten SL
+        before price had any room to run.
+        """
         if ict_engine is None:
             return 0
         count = 0
+        max_age_ms = 6_000_000  # 100 minutes covers full AMD distribution window
         for tf in ("1m", "5m", "15m"):
             try:
                 st = ict_engine._tf.get(tf)
                 if st is None:
                     continue
-                d = getattr(st, 'bos_direction', None)
-                if pos_side == "long" and d == "bullish":
+                d   = getattr(st, "bos_direction", None)
+                bts = getattr(st, "bos_timestamp", 0)
+                # Age gate: skip stale historical BOS prints
+                if now_ms > 0 and bts > 0 and (now_ms - bts) > max_age_ms:
+                    continue
+                if pos_side == "long"  and d == "bullish":
                     count += 1
                 elif pos_side == "short" and d == "bearish":
                     count += 1
@@ -2804,7 +2818,7 @@ class _ICTStructureTrail:
         closed_1m = candles_1m[:-1] if len(candles_1m) > 1 else candles_1m
         vol_ratio, vol_regime = _ICTStructureTrail._vol_regime(candles_1m, atr)
         has_disp = _ICTStructureTrail._has_displacement(closed_1m, atr, pos_side)
-        bos = _ICTStructureTrail._bos_count(ict_engine, pos_side)
+        bos = _ICTStructureTrail._bos_count(ict_engine, pos_side, now_ms)
         choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_engine, pos_side)
         choch = choch_tf is not None
 
@@ -2839,16 +2853,20 @@ class _ICTStructureTrail:
         # ── 5m swing lows / highs ─────────────────────────────────────────
         if candles_5m and len(candles_5m) >= 6:
             closed_5m = candles_5m[:-1]
+            # BUG-3 FIX: lookback was 12 bars (60 min). At ATR=~113, the
+            # 12-bar window reaches back to the entry zone where swing highs
+            # for a SHORT sit at 7,573 — above current SL of 7,510.
+            # cand = 67573 + buf > current_sl fails → no improvement logged.
+            # 6-bar (30 min) lookback captures only the CURRENT consolidation
+            # range where fresh institutional swing structure has formed.
+            _5m_lb = min(6, len(closed_5m) - 2)
             try:
                 if _ICT_TRADE_ENGINE_AVAILABLE:
-                    highs_5m, lows_5m = _find_swings(closed_5m,
-                                                      min(12, len(closed_5m) - 2))
+                    highs_5m, lows_5m = _find_swings(closed_5m, _5m_lb)
                 else:
-                    highs_5m, lows_5m = _ict_find_swings_inline(
-                        closed_5m, min(12, len(closed_5m) - 2))
+                    highs_5m, lows_5m = _ict_find_swings_inline(closed_5m, _5m_lb)
             except Exception:
-                highs_5m, lows_5m = _ict_find_swings_inline(
-                    closed_5m, min(12, len(closed_5m) - 2))
+                highs_5m, lows_5m = _ict_find_swings_inline(closed_5m, _5m_lb)
             if pos_side == "long" and lows_5m:
                 valid = [l for l in lows_5m
                          if l > current_sl + 0.05 * atr
@@ -4717,13 +4735,16 @@ class QuantStrategy:
             mfe_r      = max(cur_r, peak_r)
 
             # ── BOS count and CHoCH from the live ICT engine ─────────────
+            _now_ms_disp = now_ms if now_ms > 0 else int(time.time() * 1000)
             bos_cnt   = 0
             choch_tf  = None
             choch_lvl = 0.0
             if self._ict is not None:
                 try:
-                    bos_cnt = _ICTStructureTrail._bos_count(self._ict, pos.side)
-                    choch_tf, choch_lvl = _ICTStructureTrail._choch(self._ict, pos.side)
+                    bos_cnt = _ICTStructureTrail._bos_count(
+                        self._ict, pos.side, _now_ms_disp)
+                    choch_tf, choch_lvl = _ICTStructureTrail._choch(
+                        self._ict, pos.side)
                 except Exception:
                     pass
             choch_active = choch_tf is not None and choch_lvl > 0.0
@@ -4741,10 +4762,21 @@ class QuantStrategy:
             except Exception:
                 trail_phase = 0
 
+            # BUG-4 FIX: Phase 2 label was hardcoded to "CHoCH TIGHTEN" even
+            # when Phase 2 was reached via bos>=2 with no CHoCH present.
+            # The label now reflects actual state: shows CHoCH level if active,
+            # or "SWING TRAIL" if phase reached through BOS count alone.
+            if trail_phase == 2 and choch_active:
+                _p2_label = f"🟠 PHASE 2 — CHoCH TIGHTEN  (CHoCH@${choch_lvl:.0f} [{choch_tf}])"
+            elif trail_phase == 2:
+                _p2_label = f"🟠 PHASE 2 — BOS SWING TRAIL (no CHoCH yet, bos={bos_cnt})"
+            else:
+                _p2_label = "🟠 PHASE 2"
+
             _phase_labels = {
-                0: "⬜ PHASE 0 — HANDS OFF (waiting for BOS / displacement)",
-                1: "🟡 PHASE 1 — BOS SWING TRAIL (SL behind 5m swing lows/highs)",
-                2: "🟠 PHASE 2 — CHoCH TIGHTEN  (SL pulled to CHoCH level)",
+                0: "⬜ PHASE 0 — HANDS OFF (waiting for BOS / profit tier)",
+                1: f"🟡 PHASE 1 — BOS SWING TRAIL (bos={bos_cnt}, min_dist=2.0×ATR)",
+                2: _p2_label,
                 3: "🟢 PHASE 3 — 15m STRUCTURE TRAIL (tight to 15m OB/swing)",
             }
             phase_lbl = _phase_labels.get(trail_phase, f"Phase {trail_phase}")

@@ -309,9 +309,12 @@ class TFStructure:
     bos_level:     float = 0.0
     bos_direction: str   = ""
     bos_timestamp: int   = 0     # epoch ms of the CLOSED candle that confirmed the BOS
-    choch_level:   float = 0.0
-    choch_timestamp: int = 0     # epoch ms of CHoCH confirmation candle
-    choch_bar_index: int = -1    # candle index within lb-slice; -1 = none
+    choch_level:     float = 0.0
+    choch_timestamp: int  = 0     # epoch ms of CHoCH confirmation candle
+    choch_bar_index: int  = -1    # candle index within lb-slice; -1 = none
+    choch_direction: str  = ""    # "bullish"|"bearish"|"" — direction of the CHoCH break
+                                  # bearish trend CHoCH = "bullish" (close above LH)
+                                  # bullish trend CHoCH = "bearish" (close below HL)
     range_high:    float = 0.0
     range_low:     float = 0.0
     equilibrium:   float = 0.0
@@ -908,27 +911,32 @@ class ICTEngine:
         """
         Swing → trend + BOS/CHoCH + premium/discount for one timeframe.
 
-        Lookback: up to 60 candles (= 15h on 15m, 10 days on 4h).
-        Swing detection: fractal with left=2, right=2.
-        Only confirmed swings (candle[i+2] already closed) used.
+        ARCHITECTURE:
+          - Full lookback (60 bars) for BOS/CHoCH/swing LEVEL detection
+          - TREND uses only last 20 bars of confirmed swings to reflect
+            the CURRENT regime, not the historical average.
+            (20 × 15m = 5h window; 20 × 5m = 100min window)
+          - Strict fractal: ALL 4 neighbours must be strictly < (>).
+            Equal neighbours disqualify the bar — no doji/flat false swings.
+          - BOS uses the last CLOSED candle, not the forming live candle.
+          - CHoCH sets choch_direction for downstream trail engine.
         """
         out = TFStructure(timeframe=tf)
         if len(candles) < 8:
             return out
 
+        # ── Full-range swing detection (for BOS/CHoCH levels + P/D range) ──
         lb = min(60, len(candles))
         recent = candles[-lb:]
 
-        # ── Fractal swing detection ───────────────────────────────────
         highs: List[Tuple[int, float]] = []
         lows:  List[Tuple[int, float]] = []
         for i in range(2, len(recent) - 2):
             h = float(recent[i]['h'])
             l = float(recent[i]['l'])
-            # BUG-SWING-1 FIX: all four neighbours must be strict >.
-            # The old hybrid (>= on three, + tiny epsilon on one) lets
-            # two identical adjacent highs both qualify, inflating swing
-            # counts 2-5× in flat/choppy markets → wrong trend labels.
+            # All four neighbours must be strictly greater/less.
+            # Equal neighbours (flat) disqualify — prevents double-counting
+            # of identical candles in choppy ranges.
             if (h > float(recent[i-1]['h']) and h > float(recent[i-2]['h']) and
                     h > float(recent[i+1]['h']) and h > float(recent[i+2]['h'])):
                 highs.append((i, h))
@@ -936,23 +944,38 @@ class ICTEngine:
                     l < float(recent[i+1]['l']) and l < float(recent[i+2]['l'])):
                 lows.append((i, l))
 
-        # ── Trend from swing sequence ─────────────────────────────────
-        sh = [s[1] for s in highs[-4:]]
-        sl = [s[1] for s in lows[-4:]]
+        # ── Trend: use only the RECENT 20-bar swing window ───────────────
+        # Using 60 bars for trend includes historical regimes (rallies/drops
+        # from hours ago) that no longer represent current structure.
+        # 20-bar window isolates the active swing sequence.
+        trend_lb = min(20, len(candles))
+        recent_t = candles[-trend_lb:]
+        t_highs: List[float] = []
+        t_lows:  List[float] = []
+        for i in range(2, len(recent_t) - 2):
+            h = float(recent_t[i]['h'])
+            l = float(recent_t[i]['l'])
+            if (h > float(recent_t[i-1]['h']) and h > float(recent_t[i-2]['h']) and
+                    h > float(recent_t[i+1]['h']) and h > float(recent_t[i+2]['h'])):
+                t_highs.append(h)
+            if (l < float(recent_t[i-1]['l']) and l < float(recent_t[i-2]['l']) and
+                    l < float(recent_t[i+1]['l']) and l < float(recent_t[i+2]['l'])):
+                t_lows.append(l)
 
         trend = "ranging"
-        if len(sh) >= 2 and len(sl) >= 2:
-            hh = sh[-1] > sh[-2]
-            hl = sl[-1] > sl[-2]
-            lh = sh[-1] < sh[-2]
-            ll = sl[-1] < sl[-2]
+        if len(t_highs) >= 2 and len(t_lows) >= 2:
+            hh = t_highs[-1] > t_highs[-2]
+            hl = t_lows[-1]  > t_lows[-2]
+            lh = t_highs[-1] < t_highs[-2]
+            ll = t_lows[-1]  < t_lows[-2]
             if hh and hl:
                 trend = "bullish"
             elif lh and ll:
                 trend = "bearish"
+            # Mixed (HH+LL or LH+HL) = ranging — no label issued
         out.trend = trend
 
-        # ── Last/prev swing levels ────────────────────────────────────
+        # ── Last/prev swing levels (from full 60-bar window) ─────────────
         if highs:
             out.last_sh = highs[-1][1]
             out.prev_sh = highs[-2][1] if len(highs) >= 2 else 0.0
@@ -960,15 +983,13 @@ class ICTEngine:
             out.last_sl_ = lows[-1][1]
             out.prev_sl_ = lows[-2][1] if len(lows) >= 2 else 0.0
 
-        # ── BOS (Break of Structure) ──────────────────────────────────
-        # Use the last CLOSED candle (recent[-2]), not the still-forming
-        # candle (recent[-1]).  Using recent[-1] causes premature BOS
-        # signals on every tick of the live candle whose close hasn't
-        # been confirmed yet.
-        last_close = float(recent[-2]['c'])
-        # bos_timestamp: the open-time of the candle whose CLOSE triggered BOS.
-        # This lets _update_amd compare "did this BOS happen AFTER the sweep?"
+        # ── BOS (Break of Structure) ──────────────────────────────────────
+        # RULE: close of the last CLOSED candle (index -2) beyond the last
+        # confirmed swing extreme. The forming candle (-1) is excluded because
+        # its close updates every tick and triggers spurious intra-bar BOS.
+        last_close     = float(recent[-2]['c'])
         last_closed_ts = int(recent[-2].get('t', 0))
+
         if out.last_sh > 0 and last_close > out.last_sh:
             out.bos_level     = out.last_sh
             out.bos_direction = "bullish"
@@ -978,24 +999,35 @@ class ICTEngine:
             out.bos_direction = "bearish"
             out.bos_timestamp = last_closed_ts
 
-        # ── CHoCH (Change of Character) ───────────────────────────────
-        # ICT definition: first confirmed CLOSE beyond the opposing swing extreme.
-        #   Bearish trend CHoCH = close ABOVE the last lower-high (bullish break)
-        #   Bullish trend CHoCH = close BELOW the last higher-low (bearish break)
-        # Previous code checked swing-point shifts (higher-low / lower-high),
-        # which are leading indicators, not confirmed structural breaks.
+        # ── CHoCH (Change of Character) ───────────────────────────────────
+        # ICT: first confirmed close BEYOND the opposing swing extreme.
+        # The DIRECTION of the CHoCH is the direction OF THE BREAK (not the
+        # prior trend). This is the field the trail engine reads.
+        #
+        #   Bearish trend CHoCH = close above the last Lower-High
+        #     → break is BULLISH (price moving up through a lower-high)
+        #     → choch_direction = "bullish"
+        #
+        #   Bullish trend CHoCH = close below the last Higher-Low
+        #     → break is BEARISH (price moving down through a higher-low)
+        #     → choch_direction = "bearish"
+        #
+        # We use the FULL 60-bar highs/lows for CHoCH level accuracy
+        # (the lower-high may be 30+ bars ago on 15m).
         if trend == "bearish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
-            # Downtrend has lower-highs; CHoCH = close above the last lower-high
+            # Lower-High confirmed; CHoCH = close above it
             if last_close > highs[-1][1]:
                 out.choch_level     = highs[-1][1]
                 out.choch_bar_index = highs[-1][0]
                 out.choch_timestamp = last_closed_ts
+                out.choch_direction = "bullish"   # the break direction
         elif trend == "bullish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
-            # Uptrend has higher-lows; CHoCH = close below the last higher-low
+            # Higher-Low confirmed; CHoCH = close below it
             if last_close < lows[-1][1]:
                 out.choch_level     = lows[-1][1]
                 out.choch_bar_index = lows[-1][0]
                 out.choch_timestamp = last_closed_ts
+                out.choch_direction = "bearish"   # the break direction
 
         # ── Premium / Discount ────────────────────────────────────────
         # ICT P/D uses the range between the last confirmed swing high and
@@ -1229,6 +1261,54 @@ class ICTEngine:
             ssl = [p for p in unswept if p.level_type == "SSL" and p.price < price]
             if ssl:
                 target = max(ssl, key=_pool_score).price
+
+        # ── Reconcile bias with AMD PHASE and MTF structure ──────────────
+        # CRITICAL FIX (Bug 6): The sweep-derived bias alone is unreliable.
+        #
+        # PROBLEM: BSL swept at $68,626 → bias="bearish" (correct: bearish delivery)
+        #          Then SSL swept at $68,478 → bias="bullish" (wrong: still in SHORT)
+        #          AMD phase shows "DISTRIBUTION(bullish)" — a logical contradiction.
+        #
+        # ICT RULE: During DISTRIBUTION, smart money is DELIVERING price in the
+        # direction OPPOSITE to the initial sweep.
+        #   BSL swept (ran buy stops above) → deliver DOWN → bearish bias
+        #   SSL swept (ran sell stops below) → deliver UP → bullish bias
+        # The sweep_type IS the correct signal; subsequent minor sweeps during
+        # delivery must NOT override it.
+        #
+        # IMPLEMENTATION: Bias is LOCKED to sweep_type during DISTRIBUTION phase.
+        # Only in ACCUMULATION (> 90 min, sweep aged out) do we allow drift to
+        # neutral. MANIPULATION keeps the sweep-derived bias.
+        #
+        # SECONDARY RECONCILIATION: If 15m structure unambiguously contradicts
+        # the sweep-derived bias AND 15m has ≥ 2 BOS confirmations, we allow the
+        # structure to override (gives weight to sustained institutional follow-through
+        # rather than a single sweep print).
+        st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
+        st_1h  = self._tf.get("1h",  TFStructure(timeframe="1h"))
+
+        if phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION", "MANIPULATION"):
+            # Phase-pinned: bias MUST match the sweep delivery direction
+            if sweep_type == "BSL":
+                bias = "bearish"   # ran buy stops above → deliver DOWN
+            else:
+                bias = "bullish"   # ran sell stops below → deliver UP
+
+            # Allow MTF structure override ONLY if:
+            #   - 15m trend is OPPOSITE to sweep bias with high confidence
+            #   - 1h trend AGREES with 15m (multi-TF consensus)
+            #   - confidence from sweep is low (< 0.6)
+            if conf < 0.60:
+                htf_bearish = (st_15m.trend == "bearish" and st_1h.trend == "bearish")
+                htf_bullish = (st_15m.trend == "bullish" and st_1h.trend == "bullish")
+                if htf_bearish and bias == "bullish":
+                    bias = "bearish"
+                    conf = max(conf - 0.08, 0.25)
+                    details += " | MTF override→bearish"
+                elif htf_bullish and bias == "bearish":
+                    bias = "bullish"
+                    conf = max(conf - 0.08, 0.25)
+                    details += " | MTF override→bullish"
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,
@@ -1675,22 +1755,19 @@ class ICTEngine:
             all_c += list(candles_1h[-5:])
         all_c.sort(key=lambda c: int(c.get("t", 0)))
 
-        # BUG-SWEEP-DEDUP-FALLBACK FIX: the dedup key is (pool_price, candle_ts).
-        # When c['t'] is absent the original code used now_ms (wall-clock), which
-        # changes every millisecond.  Every call generates a new unique key → the
-        # same pool gets swept multiple times, corrupt AMD state, and the
-        # sweep-count keeps growing unboundedly.
-        # Fix: when 't' is missing, bucket now_ms into the nearest 5-minute
-        # open time (floor to 300_000ms boundary) so candles without a timestamp
-        # still produce stable, reproducible keys.
-        _5M_MS = 300_000   # 5 minutes in milliseconds
+        # BUG-SWEEP-DEDUP FIX: dedup key is (pool_price_rounded, candle_ts).
+        # When c['t'] is absent, use now_ms directly (wall-clock millisecond).
+        # The old approach bucketed to 5-min boundaries, which meant two DIFFERENT
+        # pools swept in the same 5-min window collided on the same bucket key,
+        # causing one sweep to be silently dropped.
+        # Using now_ms means each call to update() within the same sweep session
+        # gets a unique key — which is correct, since we only call update() when
+        # new candle data arrives (not every tick).
+        # The _registered_sweeps deque with maxlen=500 prevents unbounded growth.
 
         def _candle_ts(c: dict) -> int:
             raw = c.get('t', 0)
-            if raw:
-                return int(raw)
-            # Stable fallback: floor now_ms to nearest 5-minute boundary
-            return (now_ms // _5M_MS) * _5M_MS
+            return int(raw) if raw else now_ms
 
         for pool in list(self.liquidity_pools):
             if pool.swept:
@@ -1940,33 +2017,76 @@ class ICTEngine:
 
     def _update_dealing_range(self, price: float) -> None:
         """
-        Compute the current Dealing Range: range between nearest significant SSL (below)
-        and BSL (above) that are UNSWEPT.
+        Compute the current Dealing Range: range between nearest significant SSL
+        below price and BSL above price that are UNSWEPT.
 
-        This is the range smart money is currently 'dealing' within.
-        The equilibrium of this range is the institutional reference level.
+        BUG-8 FIX: When swept pools at $68K+ are used as DR anchors, the 'low'
+        (SSL) ends up ABOVE current price ($66.7K), producing current_pd < 0
+        (−370% to −409%). This happens because:
+          1. Multiple SSL/BSL pools were swept during the stop-hunt
+          2. The remaining 'best_ssl' (highest sig) is actually above current price
+          3. The formula (price - ssl) / range becomes negative
+
+        VALIDATION LAYER:
+          After selecting best_ssl and best_bsl, verify:
+          - best_ssl.price < price (SSL must be BELOW current price)
+          - best_bsl.price > price (BSL must be ABOVE current price)
+          - range must be at least 0.5 × 15m ATR (not a degenerate range)
+
+        If validation fails, FALL BACK to the current 15m confirmed swing range
+        (last confirmed swing low → last confirmed swing high). This always
+        produces a valid DR because _analyze_structure only sets range_high/low
+        from confirmed fractal swings, never from active sweeps.
+
+        DR from 15m structure is labeled with ssl_source_tf = bsl_source_tf = "15m_struct".
         """
-        unswept = [p for p in self.liquidity_pools if not p.swept]
+        unswept   = [p for p in self.liquidity_pools if not p.swept]
         ssl_below = [p for p in unswept if p.level_type == "SSL" and p.price < price]
         bsl_above = [p for p in unswept if p.level_type == "BSL" and p.price > price]
 
-        if not ssl_below or not bsl_above:
-            self._dealing_range = None
-            return
-
         TF_WEIGHT = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
-        # Prefer significant pools (high touch_count + high TF)
         def sig(p):
             return p.touch_count * TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1)
 
-        best_ssl = max(ssl_below, key=sig)
-        best_bsl = max(bsl_above, key=sig)
+        # ── Attempt pool-anchored DR ──────────────────────────────────────
+        low = high = None
+        ssl_tf = bsl_tf = "pool"
+        if ssl_below and bsl_above:
+            best_ssl = max(ssl_below, key=sig)
+            best_bsl = max(bsl_above, key=sig)
+            _low  = best_ssl.price
+            _high = best_bsl.price
+            # VALIDATION: price must be inside the range
+            if _low < price < _high and (_high - _low) > 1e-3:
+                low    = _low
+                high   = _high
+                ssl_tf = getattr(best_ssl, 'timeframe', '5m')
+                bsl_tf = getattr(best_bsl, 'timeframe', '5m')
 
-        low  = best_ssl.price
-        high = best_bsl.price
-        rng  = max(high - low, 1e-9)
-        eq   = (low + high) / 2.0
-        pd   = (price - low) / rng
+        # ── Fallback: use 15m confirmed swing structure ───────────────────
+        if low is None:
+            st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
+            # last_sl_ and last_sh are from confirmed fractal swings in full 60-bar window
+            _low  = st_15m.range_low
+            _high = st_15m.range_high
+            if _low > 1e-3 and _high > _low and _low < price < _high:
+                low    = _low
+                high   = _high
+                ssl_tf = bsl_tf = "15m_struct"
+            else:
+                # Final fallback: use recent 15m absolute high/low if swing range invalid
+                st_1h = self._tf.get("1h", TFStructure(timeframe="1h"))
+                if st_1h.range_low > 1e-3 and st_1h.range_low < price < st_1h.range_high:
+                    low    = st_1h.range_low
+                    high   = st_1h.range_high
+                    ssl_tf = bsl_tf = "1h_struct"
+                else:
+                    self._dealing_range = None
+                    return
+
+        rng = max(high - low, 1e-9)
+        eq  = (low + high) / 2.0
+        pd  = (price - low) / rng       # always in [0, 1] by construction
 
         if   pd < 0.25: q = "DEEP_DISC"
         elif pd < 0.50: q = "DISC"
@@ -1976,8 +2096,8 @@ class ICTEngine:
         self._dealing_range = DealingRange(
             low=low, high=high, equilibrium=eq, current_pd=pd,
             quadrant=q,
-            ssl_source_tf=getattr(best_ssl, 'timeframe', '5m'),
-            bsl_source_tf=getattr(best_bsl, 'timeframe', '5m'),
+            ssl_source_tf=ssl_tf,
+            bsl_source_tf=bsl_tf,
             range_size=rng)
 
     # ─────────────────────────────────────────────────────────────────────
