@@ -619,6 +619,21 @@ class EntryEngine:
         now: float,
     ) -> None:
         """Transition into POST_SWEEP state after a sweep is detected."""
+        # ── Quality floor by timeframe ────────────────────────────────────────
+        # 1m sweeps are dominated by noise — require strong displacement (0.65).
+        # 5m sweeps need moderate displacement (0.55).
+        # Lower timeframes fire on every small wick; set strict gates so only
+        # genuinely displaced sweeps enter the evaluator at all.
+        _TF_QUALITY_MIN = {'1m': 0.65, '5m': 0.55, '15m': 0.45, '4h': 0.35}
+        _tf = getattr(sweep.pool, 'timeframe', '5m')
+        _required_quality = _TF_QUALITY_MIN.get(_tf, 0.45)
+        if sweep.quality < _required_quality:
+            logger.debug(
+                f"🌊 SWEEP SKIPPED: [{_tf}] quality={sweep.quality:.2f} "
+                f"< required {_required_quality:.2f} — ignoring micro-sweep noise")
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
         self._post_sweep = _PostSweepState(
             sweep=sweep,
             entered_at=now,
@@ -726,6 +741,84 @@ class EntryEngine:
         cont_score = 0.0
         rev_reasons = []
         cont_reasons = []
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 0: AMD PHASE + BIAS — INSTITUTIONAL DELIVERY CONTEXT
+        # ───────────────────────────────────────────────────────────────
+        # This is the highest-priority gate. AMD phase tells us WHAT
+        # smart money is doing RIGHT NOW — it must dominate all other
+        # factors or the engine will fire reversals into active delivery.
+        #
+        # DISTRIBUTION (bearish): institutions are selling/delivering down.
+        #   BSL sweep + bearish = buy stops absorbed for continuation short.
+        #     → strong cont bonus (+25×conf).
+        #   SSL sweep + bearish = price pushed into discount during delivery.
+        #     → moderate cont bonus (+20×conf) AND rev_score penalty (−12×conf).
+        #     The rev penalty directly counteracts the "DEEP DISCOUNT" bonus
+        #     in Factor 3 which would otherwise push rev_score above 55.
+        #
+        # DISTRIBUTION (bullish): mirror of above for long delivery.
+        #
+        # MANIPULATION: Judas swing — this IS the reversal setup.
+        #   BSL swept + bearish bias = classic stop hunt before drop.
+        #   SSL swept + bullish bias = classic stop hunt before pump.
+        #     → strong rev bonus (+22×conf).
+        #
+        # ACCUMULATION: range building. Sweeps at range extremes → reversal.
+        #     → moderate rev bonus (+12×conf).
+        #
+        # WHY rev_score PENALTY for DISTRIBUTION?
+        # Factor 3 (HTF Dealing Range) adds +15 to rev_score whenever SSL
+        # is swept in deep discount. During bearish DISTRIBUTION this is
+        # WRONG — deep discount is where delivery is heading, not from where
+        # it reverses. Without the penalty, Factor 3 alone inflates rev_score
+        # past the 55-point threshold even against AMD context. The −12×conf
+        # penalty exactly offsets this and keeps the engine from fighting the
+        # institutional order flow.
+        # ═══════════════════════════════════════════════════════════════
+        amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
+        amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
+        amd_conf  = float(getattr(ict, 'amd_confidence', 0.0) or 0.0)
+
+        if amd_phase == 'MANIPULATION':
+            # Judas swing. Bias AGAINST sweep direction = classic reversal setup.
+            if sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish':
+                pts = 22.0 * max(amd_conf, 0.5)
+                rev_score += pts
+                rev_reasons.append(f"AMD MANIP bear+BSL ({amd_conf:.0%})")
+            elif sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish':
+                pts = 22.0 * max(amd_conf, 0.5)
+                rev_score += pts
+                rev_reasons.append(f"AMD MANIP bull+SSL ({amd_conf:.0%})")
+
+        elif amd_phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
+            if sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish':
+                # Buy stops absorbed during bearish delivery — continuation short.
+                pts = 25.0 * max(amd_conf, 0.5)
+                cont_score += pts
+                cont_reasons.append(f"AMD DIST bear+BSL ({amd_conf:.0%})")
+            elif sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish':
+                # Sell stops absorbed during bullish delivery — continuation long.
+                pts = 25.0 * max(amd_conf, 0.5)
+                cont_score += pts
+                cont_reasons.append(f"AMD DIST bull+SSL ({amd_conf:.0%})")
+            elif sweep.pool.side == PoolSide.SSL and amd_bias == 'bearish':
+                # SSL swept during bearish distribution. Price being delivered lower.
+                # cont bonus + rev PENALTY to counteract Factor-3 "DEEP DISCOUNT" bias.
+                cont_score += 20.0 * max(amd_conf, 0.5)
+                rev_score  -= 12.0 * max(amd_conf, 0.5)   # penalise going long vs delivery
+                cont_reasons.append(f"AMD DIST bear+SSL ({amd_conf:.0%})")
+            elif sweep.pool.side == PoolSide.BSL and amd_bias == 'bullish':
+                # BSL swept during bullish distribution — mirror case.
+                cont_score += 20.0 * max(amd_conf, 0.5)
+                rev_score  -= 12.0 * max(amd_conf, 0.5)
+                cont_reasons.append(f"AMD DIST bull+BSL ({amd_conf:.0%})")
+
+        elif amd_phase == 'ACCUMULATION':
+            # Range building. Sweeps at extremes = range manipulation → reversal.
+            pts = 12.0 * max(amd_conf, 0.4)
+            rev_score += pts
+            rev_reasons.append(f"AMD ACCUM ({amd_conf:.0%})")
 
         # ═══════════════════════════════════════════════════════════════
         # FACTOR 1: DISPLACEMENT QUALITY (0-20)
@@ -914,8 +1007,8 @@ class EntryEngine:
         # Strong opposing pool = good TP → reversal more attractive
         # Strong next pool in continuation = good continuation target
         # ═══════════════════════════════════════════════════════════════
-        opp_target = self._find_opposing_target(sweep_dir, snap, price, atr)
-        cont_target = self._find_continuation_target(cont_dir, snap, price, atr)
+        opp_target = self._find_opposing_target(sweep_dir, snap, price, atr, ict)
+        cont_target = self._find_continuation_target(cont_dir, snap, price, atr, ict)
 
         if opp_target and opp_target.significance >= _MIN_POOL_SIGNIFICANCE:
             rev_score += min(5.0, opp_target.significance * 0.5)
@@ -1180,11 +1273,17 @@ class EntryEngine:
         snap: LiquidityMapSnapshot,
         price: float,
         atr: float,
+        ict: Optional["ICTContext"] = None,
     ) -> Optional[PoolTarget]:
         """
         Find the opposing pool (for reversal TP).
         If swept SSL → going long → target is BSL above.
         If swept BSL → going short → target is SSL below.
+
+        AMD-aware: in DISTRIBUTION/REDISTRIBUTION context prefer the NEAREST
+        reachable pool. Delivery is already underway — targeting the far BSL
+        above a descending trendline sets TP beyond what the move will reach.
+        In all other AMD phases use the highest-significance pool (best R:R).
         """
         if direction == "long":
             candidates = snap.bsl_pools
@@ -1198,6 +1297,12 @@ class EntryEngine:
         if not reachable:
             return None
 
+        # In active delivery phases, prefer the nearest pool so TP sits
+        # inside the delivery structure rather than overshooting it.
+        amd_phase = (getattr(ict, 'amd_phase', '') or '').upper() if ict else ''
+        if amd_phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
+            return min(reachable, key=lambda t: t.distance_atr)
+
         return max(reachable, key=lambda t: t.significance)
 
     def _find_continuation_target(
@@ -1206,9 +1311,10 @@ class EntryEngine:
         snap: LiquidityMapSnapshot,
         price: float,
         atr: float,
+        ict: Optional["ICTContext"] = None,
     ) -> Optional[PoolTarget]:
         """Find the next pool in continuation direction."""
-        return self._find_opposing_target(direction, snap, price, atr)
+        return self._find_opposing_target(direction, snap, price, atr, ict)
 
     def _compute_sl(
         self,
