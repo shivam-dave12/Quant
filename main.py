@@ -438,6 +438,54 @@ class QuantBot:
                 flow_conv = getattr(strat, '_flow_conviction', 0.0)
                 flow_dir  = getattr(strat, '_flow_direction', "")
 
+            # ── v10: Extract ICT context for institutional display ─────────
+            _session     = ""
+            _kill_zone   = ""
+            _amd_phase   = ""
+            _amd_bias    = ""
+            _dr_pd       = 0.5
+            _s15m        = ""
+            _s4h         = ""
+            _htf_bias    = ""
+            _sweep_anal  = None
+
+            if hasattr(strat, '_ict') and strat._ict is not None:
+                try:
+                    _ict = strat._ict
+                    _session   = getattr(_ict, '_session', '')
+                    _kill_zone = getattr(_ict, '_killzone', '')
+                    _amd       = getattr(_ict, '_amd', None)
+                    if _amd:
+                        _amd_phase = getattr(_amd, 'phase', '')
+                        _amd_bias  = getattr(_amd, 'bias', '')
+                    # Per-TF structure
+                    _tf = getattr(_ict, '_tf', {})
+                    if '15m' in _tf:
+                        _s15m = getattr(_tf['15m'], 'trend', '')
+                    if '4h' in _tf:
+                        _s4h = getattr(_tf['4h'], 'trend', '')
+                    # Dealing range
+                    _dr = getattr(_ict, '_dealing_range', None)
+                    if _dr:
+                        _dr_pd = getattr(_dr, 'current_pd', 0.5)
+                except Exception:
+                    pass
+
+            # HTF bias
+            if hasattr(strat, '_htf') and strat._htf is not None:
+                try:
+                    _htf_bias = (f"15m={strat._htf.trend_15m:+.1f} "
+                                 f"4h={strat._htf.trend_4h:+.1f}")
+                except Exception:
+                    pass
+
+            # Sweep analysis from entry engine
+            if hasattr(strat, '_entry_engine') and strat._entry_engine is not None:
+                try:
+                    _sweep_anal = getattr(strat._entry_engine, '_last_sweep_analysis', None)
+                except Exception:
+                    pass
+
             stats = strat.get_stats() if strat else {}
 
             msg = _fmt_hb(
@@ -456,6 +504,16 @@ class QuantBot:
                 atr=atr_val,
                 cvd_trend=cvd_trend,
                 tick_flow=tick_flow,
+                # v10 institutional context
+                session=_session,
+                kill_zone=_kill_zone,
+                amd_phase=_amd_phase,
+                amd_bias=_amd_bias,
+                dealing_range_pd=_dr_pd,
+                structure_15m=_s15m,
+                structure_4h=_s4h,
+                sweep_analysis=_sweep_anal,
+                htf_bias=_htf_bias,
             )
             logger.info(msg)
             return

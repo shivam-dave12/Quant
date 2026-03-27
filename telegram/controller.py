@@ -260,26 +260,25 @@ class TelegramBotController:
             "🧠 <b>ANALYSIS</b>\n"
             "  /thinking — 5-layer decision stack\n"
             "  /pools — BSL/SSL pool map + priority\n"
-            "  /flow — Order flow state (CVD, OB, tick)\n"
-            "  /structures — ICT structures (OB/FVG/AMD)\n"
-            "  /huntstatus — Liquidity hunt prediction\n\n"
+            "  /flow — Order flow (CVD, OB, tick)\n"
+            "  /structures — ICT OB/FVG/AMD\n"
+            "  /huntstatus — Hunt prediction\n\n"
             "📊 <b>POSITION</b>\n"
-            "  /position — Current position + trail state\n"
-            "  /trades — Recent trade history\n"
-            "  /stats — Win rate / attribution analysis\n"
-            "  /balance — Wallet balance\n\n"
+            "  /position — Current pos + trail\n"
+            "  /trades — Recent history\n"
+            "  /stats — Win rate / attribution\n"
+            "  /balance — Wallet\n\n"
             "⚙️ <b>CONTROL</b>\n"
-            "  /status — Full bot dashboard\n"
-            "  /start / /stop — Start/stop bot\n"
-            "  /pause / /resume — Pause/resume trading\n"
-            "  /trail [on|off|auto] — Trail SL mode\n"
-            "  /config — Show config values\n"
-            "  /set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
-            "  /setexchange &lt;delta|cs&gt; — Switch exchange\n\n"
+            "  /status — Full dashboard\n"
+            "  /start / /stop — Start/stop\n"
+            "  /pause / /resume — Pause/resume\n"
+            "  /trail [on|off|auto] — Trail mode\n"
+            "  /config — Show config\n"
+            "  /set &lt;key&gt; &lt;val&gt; — Adjust live\n"
+            "  /setexchange &lt;delta|cs&gt;\n\n"
             "🚨 <b>EMERGENCY</b>\n"
-            "  /killswitch — Close all + cancel orders\n"
-            "  /resetrisk — Clear loss lockout\n"
-            "  /resetrisk full — Reset all counters\n"
+            "  /killswitch — Close + cancel all\n"
+            "  /resetrisk [full] — Clear lockout\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -517,8 +516,8 @@ class TelegramBotController:
 
                 # OB/FVG in path toward target pool
                 try:
-                    long_c  = ict.get_confluence("long",  price, now_ms)
-                    short_c = ict.get_confluence("short", price, now_ms)
+                    long_c  = ict.get_confluence("long",  price, now_ms, atr)
+                    short_c = ict.get_confluence("short", price, now_ms, atr)
                     active_c = long_c if flow_dir == "long" else (short_c if flow_dir == "short" else long_c)
                     lines.append(
                         f"  ICT confluence ({flow_dir or 'n/a'}): Σ={active_c.total:.2f}  "
@@ -529,12 +528,35 @@ class TelegramBotController:
                 except Exception:
                     pass
 
-                # Premium / discount zone
+                # Premium / discount zone + dealing range
                 mtf_in_disc  = getattr(sig, 'in_discount', False)
                 mtf_in_prem  = getattr(sig, 'in_premium',  False)
                 zone_str     = ("💰 DISCOUNT" if mtf_in_disc
                                 else ("💸 PREMIUM" if mtf_in_prem else "〰️ EQUILIBRIUM"))
                 lines.append(f"  Price zone: {zone_str}")
+
+                # Dealing range position
+                _dr = getattr(ict, '_dealing_range', None)
+                if _dr:
+                    _pd = getattr(_dr, 'current_pd', 0.5)
+                    _pd_label = ("DEEP DISC" if _pd < 0.25 else
+                                 "DISCOUNT" if _pd < 0.40 else
+                                 "EQ" if _pd < 0.60 else
+                                 "PREMIUM" if _pd < 0.75 else "DEEP PREM")
+                    lines.append(f"  Dealing range: {_pd_label} ({_pd:.0%})  "
+                                 f"[${_dr.low:,.0f}–${_dr.high:,.0f}]")
+
+                # HTF structure
+                _htf_parts = []
+                _tf = getattr(ict, '_tf', {})
+                for _tfk in ("1d", "4h", "1h", "15m", "5m"):
+                    _tfs = _tf.get(_tfk)
+                    if _tfs:
+                        _trend = getattr(_tfs, 'trend', 'ranging')
+                        _icon = "🟢" if _trend == "bullish" else ("🔴" if _trend == "bearish" else "⚪")
+                        _htf_parts.append(f"{_icon}{_tfk}:{_trend[:4]}")
+                if _htf_parts:
+                    lines.append(f"  MTF: {' | '.join(_htf_parts)}")
             else:
                 lines.append("  ⏳ ICT engine initialising")
 
@@ -620,10 +642,10 @@ class TelegramBotController:
                 lock_r = float(getattr(cfg, 'QUANT_TRAIL_LOCK_R',       0.8))
                 aggr_r = float(getattr(cfg, 'QUANT_TRAIL_AGGRESSIVE_R', 1.5))
 
-                if   tier_r < be_r:   phase_lbl = f"⬜ HANDS OFF (<{be_r:.1f}R) — no trail yet"
+                if   tier_r < be_r:   phase_lbl = f"⬜ HANDS OFF (&lt;{be_r:.1f}R) — no trail yet"
                 elif tier_r < lock_r: phase_lbl = f"🟡 BOS SWING TRAIL ({be_r:.1f}→{lock_r:.1f}R)"
                 elif tier_r < aggr_r: phase_lbl = f"🟠 CHoCH TIGHTEN ({lock_r:.1f}→{aggr_r:.1f}R)"
-                else:                 phase_lbl = f"🟢 15m STRUCTURE TRAIL (>{aggr_r:.1f}R)"
+                else:                 phase_lbl = f"🟢 15m STRUCTURE TRAIL (&gt;{aggr_r:.1f}R)"
 
                 lines.append(f"  {pos.side.upper()}  {phase_lbl}")
                 lines.append(
@@ -631,19 +653,53 @@ class TelegramBotController:
                     f"SL ${pos.sl_price:,.2f}  "
                     f"TP ${pos.tp_price:,.2f}  ({tier_r:.2f}R)")
 
-                # Post-sweep decision
-                lines.append(f"\n  Post-sweep: CVD + structure → continue/reverse/range")
-                if abs(cvd_div) > 0.3:
-                    post_bias = "continue ▲" if (cvd_div > 0 and pos.side == "long") else \
-                                "continue ▼" if (cvd_div < 0 and pos.side == "short") else \
-                                "⚠️ flow diverging — watch for reversal"
-                    lines.append(f"  CVD signal: {post_bias}")
+                # SL distance in ATR
+                sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
+                tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
+                lines.append(f"  SL dist: {sl_dist_atr:.1f}ATR  |  TP dist: {tp_dist_atr:.1f}ATR")
+
+                # Progress bar
+                total_move = abs(pos.tp_price - pos.entry_price)
+                if total_move > 0:
+                    prog = min(1.0, max(0, abs(price - pos.entry_price) / total_move))
+                    if profit_pts < 0: prog = 0
+                    bar = "█" * int(prog * 16) + "░" * (16 - int(prog * 16))
+                    lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
+
             else:
                 lines.append("  ─ No active position")
-                if toward_pool:
-                    lines.append(f"  Scanning for sweep entry toward {'BSL' if flow_dir == 'long' else 'SSL'}...")
+
+                # Show sweep analysis if in POST_SWEEP
+                entry_eng = getattr(strat, '_entry_engine', None)
+                if entry_eng:
+                    _sa = getattr(entry_eng, '_last_sweep_analysis', None)
+                    if _sa and engine_state == "POST_SWEEP":
+                        rs = _sa.get('rev_score', 0)
+                        cs = _sa.get('cont_score', 0)
+                        rr = _sa.get('rev_reasons', [])
+                        cr = _sa.get('cont_reasons', [])
+                        sw_side = _sa.get('sweep_side', '?')
+                        sw_price = _sa.get('sweep_price', 0)
+                        sw_qual = _sa.get('sweep_quality', 0)
+                        gap = abs(rs - cs)
+
+                        winner = "REVERSAL" if rs > cs + 15 else ("CONTINUATION" if cs > rs + 15 else "UNDECIDED")
+                        bar_total = max(rs + cs, 1)
+                        rev_pct = int(rs / bar_total * 16)
+                        cont_pct = 16 - rev_pct
+                        score_bar = "◀" + "█" * rev_pct + "░" * cont_pct + "▶"
+
+                        lines.append(f"\n  🌊 <b>SWEEP ANALYSIS</b> ({sw_side} @ ${sw_price:,.0f} q={sw_qual:.0%})")
+                        lines.append(f"  {score_bar}")
+                        lines.append(f"  REV={rs:.0f}: {', '.join(_esc(r) for r in rr[:3])}")
+                        lines.append(f"  CONT={cs:.0f}: {', '.join(_esc(r) for r in cr[:3])}")
+                        lines.append(f"  → <b>{winner}</b> (gap={gap:.0f}, need≥15)")
+                    elif toward_pool:
+                        lines.append(f"  Scanning for sweep entry toward {'BSL' if flow_dir == 'long' else 'SSL'}...")
+                    else:
+                        lines.append("  Waiting for flow to align with pool direction")
                 else:
-                    lines.append("  Waiting for flow to align with pool direction")
+                    lines.append("  Entry engine not available")
 
             # ══════════════════════════════════════════════════════════
             # VERDICT
@@ -940,8 +996,8 @@ class TelegramBotController:
                         f"{fvg['dist_pts']:+.0f}pts/{fvg['dist_atr']:.2f}ATR{in_tag}"
                     )
 
-            long_c  = ict.get_confluence("long",  price, now_ms)
-            short_c = ict.get_confluence("short", price, now_ms)
+            long_c  = ict.get_confluence("long",  price, now_ms, atr)
+            short_c = ict.get_confluence("short", price, now_ms, atr)
             lines.append("\n<b>Confluence Scores (ICT secondary)</b>")
             lines.append(
                 f"  LONG  Σ={long_c.total:.2f}  "

@@ -2682,59 +2682,41 @@ class _ICTStructureTrail:
     @staticmethod
     def _phase(bos: int, be_locked: bool, has_disp: bool, tier: float) -> int:
         """
-        Determine trail phase from ICT structure + profit tier.
+        Trail phase from ICT structure + profit tier.
         
-        CRITICAL FIX: Old logic required BOS>=1 to enter Phase 1. In ranging
-        markets or fast moves without confirmed structure breaks, BOS stays
-        at 0 indefinitely. Trade peaked at 0.76R and got stopped at BE because
-        the trail never activated.
+        CRITICAL FIX: Old logic required BOS>=1 for Phase 1. In ranging 
+        markets BOS stays at 0 — trade peaked at 0.76R (under 0.8 threshold)
+        and trail NEVER activated. Got stopped at BE while TP was 200pts away.
         
-        New logic: Profit tier ALSO advances phase. ICT structure events
-        ACCELERATE the phase (lower tier threshold) but are not required.
-        
-        Phase 0: No trail action (< 0.40R and no BOS)
-        Phase 1: Trail activates with wide buffer (0.40R OR 1 BOS)
-        Phase 2: Moderate tightening (1.00R OR 2 BOS + disp)
-        Phase 3: Aggressive (2.00R OR 3 BOS)
+        New: Profit tier advances phase independently. ICT events accelerate.
+        Phase 0: < 0.40R and no BOS → HOLD
+        Phase 1: >= 0.40R OR 1 BOS → wide trail
+        Phase 2: >= 1.00R OR 2 BOS → moderate  
+        Phase 3: >= 2.00R OR 3 BOS → tight
         """
-        # Structure-based advancement (fast track)
+        # Structure-based (fast track)
         if bos >= 3 or (bos >= 2 and tier >= 1.5):
             return 3
         if bos >= 2 or (bos >= 1 and has_disp) or (be_locked and tier >= 1.0):
             return 2
         if bos >= 1 or be_locked:
             return 1
-        
-        # Profit-based advancement (guarantees trail activates)
+        # Profit-based (guarantees trail activates)
         try:
-            from config import (
-                QUANT_TRAIL_PHASE1_TIER, QUANT_TRAIL_PHASE2_TIER,
-                QUANT_TRAIL_PHASE3_TIER,
-            )
-            p1_tier = QUANT_TRAIL_PHASE1_TIER
-            p2_tier = QUANT_TRAIL_PHASE2_TIER
-            p3_tier = QUANT_TRAIL_PHASE3_TIER
+            from config import (QUANT_TRAIL_PHASE1_TIER, QUANT_TRAIL_PHASE2_TIER,
+                                QUANT_TRAIL_PHASE3_TIER)
+            p1, p2, p3 = QUANT_TRAIL_PHASE1_TIER, QUANT_TRAIL_PHASE2_TIER, QUANT_TRAIL_PHASE3_TIER
         except (ImportError, AttributeError):
-            p1_tier, p2_tier, p3_tier = 0.40, 1.00, 2.00
-        
-        if tier >= p3_tier:
-            return 3
-        if tier >= p2_tier:
-            return 2
-        if tier >= p1_tier:
-            return 1
+            p1, p2, p3 = 0.40, 1.00, 2.00
+        if tier >= p3: return 3
+        if tier >= p2: return 2
+        if tier >= p1: return 1
         return 0
 
     @staticmethod
     def _swing_buf(atr: float, phase: int, vol_ratio: float,
                    vol_regime: str, choch: bool) -> float:
-        """
-        Buffer below/above swing level for SL placement.
-        
-        FIX: Old buffers (0.15-0.50 ATR) placed SL right at swing levels
-        where stop clusters sit. Market makers hunt these exact levels.
-        New: Wider buffers clear the stop cluster zone.
-        """
+        """Buffer below/above swing for SL. Wider = survives stop hunts."""
         base = {0: 0.60, 1: 0.50, 2: 0.40}.get(phase, 0.25) * atr
         mult = (min(vol_ratio, 1.40) if vol_regime == "EXPANDING"
                 else max(vol_ratio, 0.65) if vol_regime == "CONTRACTING" else 1.0)
@@ -2745,23 +2727,15 @@ class _ICTStructureTrail:
     def _min_dist(atr: float, phase: int, vol_ratio: float,
                   vol_regime: str) -> float:
         """
-        Minimum trail distance from price.
+        Min trail distance from price. Session-aware.
         
-        CRITICAL FIX: Phase 1 was 1.0 ATR — way too tight for BTC.
-        A normal 1m pullback can be 0.8-1.2 ATR. SL at 1.0 ATR from price
-        guarantees getting stopped on any healthy retracement.
-        
-        New values anchored to observed BTC volatility:
-          Phase 0: 2.5 ATR (should not trail at all, but safety floor)
-          Phase 1: 2.0 ATR (wide — thesis not yet confirmed)
-          Phase 2: 1.5 ATR (moderate — structure confirming)
-          Phase 3: 1.0 ATR (tight — strong conviction)
+        FIX: Phase 1 was 1.0 ATR — normal BTC pullbacks are 0.8-1.2 ATR.
+        Guaranteed stop-out on any healthy retracement.
+        New: P1=2.0, P2=1.5, P3=1.0 ATR base, widened during Asia session.
         """
         try:
-            from config import (
-                QUANT_TRAIL_MIN_DIST_ATR_P1, QUANT_TRAIL_MIN_DIST_ATR_P2,
-                QUANT_TRAIL_MIN_DIST_ATR_P3,
-            )
+            from config import (QUANT_TRAIL_MIN_DIST_ATR_P1, QUANT_TRAIL_MIN_DIST_ATR_P2,
+                                QUANT_TRAIL_MIN_DIST_ATR_P3)
             p1 = QUANT_TRAIL_MIN_DIST_ATR_P1
             p2 = QUANT_TRAIL_MIN_DIST_ATR_P2
             p3 = QUANT_TRAIL_MIN_DIST_ATR_P3
@@ -2774,23 +2748,14 @@ class _ICTStructureTrail:
         # Session-aware widening
         try:
             from config import SESSION_TRAIL_WIDTH_MULT
-            from strategy.ict_engine import ICTEngine
-            # Get current session from time
             from datetime import datetime, timezone, timedelta
-            utc_now = datetime.now(timezone.utc)
-            ny_hour = (utc_now - timedelta(hours=5)).hour  # EST approximation
-            if 20 <= ny_hour or ny_hour < 1:
-                session = "asia"
-            elif 2 <= ny_hour < 5:
-                session = "london"
-            elif 7 <= ny_hour < 11:
-                session = "ny"
-            elif 11 <= ny_hour < 16:
-                session = "late_ny"
-            else:
-                session = "off"
-            sess_mult = SESSION_TRAIL_WIDTH_MULT.get(session, 1.0)
-            base *= sess_mult
+            ny_hour = (datetime.now(timezone.utc) - timedelta(hours=5)).hour
+            if 20 <= ny_hour or ny_hour < 1:   sess = "asia"
+            elif 2 <= ny_hour < 5:              sess = "london"
+            elif 7 <= ny_hour < 11:             sess = "ny"
+            elif 11 <= ny_hour < 16:            sess = "late_ny"
+            else:                               sess = "off"
+            base *= SESSION_TRAIL_WIDTH_MULT.get(sess, 1.0)
         except (ImportError, AttributeError):
             pass
         
@@ -2994,16 +2959,15 @@ class _ICTStructureTrail:
                 if cand < current_sl and cand > price + min_dist:
                     candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
 
-        # ── 15m macro swing (phase ≥ 2 — CRITICAL: 15m is PRIMARY SL anchor) ─
-        # FIX: Was phase >= 3 which required 3+ BOS. 15m swings are the most
-        # reliable SL anchors because they survive stop hunts that clip 5m swings.
-        # Activating at phase 2 ensures 15m protection during trend development.
+        # ── 15m macro swing (phase ≥ 2 — CRITICAL: 15m PRIMARY SL anchor) ─
+        # FIX: Was phase >= 3 (needed 3+ BOS). 15m swings survive the stop
+        # hunts that clip 5m swings. Activate at phase 2 for protection.
         if phase >= 2 and candles_15m and len(candles_15m) >= 6:
             try:
                 cl15 = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
                 highs_15m, lows_15m = _ict_find_swings_inline(
                     cl15, min(8, len(cl15) - 2))
-                hbuf = 0.12 * atr
+                hbuf = 0.25 * atr   # was 0.12 — too tight, placed SL at the stop cluster
                 if pos_side == "long" and lows_15m:
                     valid = [l for l in lows_15m
                              if l > current_sl + 0.05 * atr
@@ -4961,12 +4925,25 @@ class QuantStrategy:
                 ict_ctx.in_discount = getattr(mb, 'in_discount', False)
                 tf_5m = self._ict._tf.get("5m")
                 if tf_5m:
-                    ict_ctx.structure_5m = getattr(tf_5m, 'structure', "neutral")
+                    # BUG FIX: TFStructure uses 'trend' not 'structure'
+                    ict_ctx.structure_5m = getattr(tf_5m, 'trend', "ranging")
                     ict_ctx.bos_5m = getattr(tf_5m, 'bos_direction', "")
                     ict_ctx.choch_5m = getattr(tf_5m, 'choch_direction', "")
                 tf_15m = self._ict._tf.get("15m")
                 if tf_15m:
-                    ict_ctx.structure_15m = getattr(tf_15m, 'structure', "neutral")
+                    ict_ctx.structure_15m = getattr(tf_15m, 'trend', "ranging")
+                # v10: 4H structure for HTF trend analysis
+                tf_4h = self._ict._tf.get("4h")
+                if tf_4h:
+                    ict_ctx.structure_4h = getattr(tf_4h, 'trend', "ranging")
+                # v10: Dealing range position
+                _dr = getattr(self._ict, '_dealing_range', None)
+                if _dr:
+                    ict_ctx.dealing_range_pd = getattr(_dr, 'current_pd', 0.5)
+                else:
+                    # Fallback: use 15m premium/discount
+                    if tf_15m:
+                        ict_ctx.dealing_range_pd = getattr(tf_15m, 'premium_discount', 0.5)
                 try:
                     ob_sl = self._ict.get_ob_sl_level("long", price, atr, now_ms)
                     if ob_sl:
@@ -5028,25 +5005,69 @@ class QuantStrategy:
             self._entry_engine.consume_signal()
             self._entry_engine.on_entry_placed()
 
-        # Step 9: Periodic thinking log
+        # Step 9: Periodic thinking log — institutional context
         if now - self._last_think_log_v2 >= 30.0:
             self._last_think_log_v2 = now
             state = self._entry_engine.state
             flow_dir = flow_state.direction or "neutral"
             conv = flow_state.conviction
+
+            # Core state
             parts = [f"State={state}", f"Flow={flow_dir}({conv:+.2f})",
                      f"CVD={cvd_trend:+.2f}"]
+
+            # Target
             if liq_snapshot.primary_target:
                 t = liq_snapshot.primary_target
                 parts.append(f"Target={t.direction}->${t.pool.price:,.0f}"
                              f"({t.distance_atr:.1f}ATR)")
+
+            # AMD + session
             if ict_ctx.amd_phase:
                 parts.append(f"AMD={ict_ctx.amd_phase[:4]}")
+            if ict_ctx.amd_bias:
+                parts.append(f"Bias={ict_ctx.amd_bias[:4]}")
+
+            # Pool distances
             parts.append(f"BSL={liq_snapshot.nearest_bsl_atr:.1f}ATR")
             parts.append(f"SSL={liq_snapshot.nearest_ssl_atr:.1f}ATR")
+
+            # Structure
+            _s15 = ""
+            _s4h = ""
+            if self._ict:
+                try:
+                    _tf = getattr(self._ict, '_tf', {})
+                    if '15m' in _tf: _s15 = getattr(_tf['15m'], 'trend', '')
+                    if '4h' in _tf:  _s4h = getattr(_tf['4h'], 'trend', '')
+                except Exception:
+                    pass
+            if _s15 or _s4h:
+                parts.append(f"Struct=15m:{_s15 or '?'}/4H:{_s4h or '?'}")
+
+            # Dealing range
+            _dr_pd = getattr(ict_ctx, 'dealing_range_pd', 0.5)
+            pd_l = ("DD" if _dr_pd < 0.25 else "D" if _dr_pd < 0.40 else
+                    "EQ" if _dr_pd < 0.60 else "P" if _dr_pd < 0.75 else "DP")
+            parts.append(f"DR={pd_l}({_dr_pd:.0%})")
+
+            # Session
+            if ict_ctx.kill_zone:
+                parts.append(f"KZ={ict_ctx.kill_zone}")
+
+            # Tracking
             tracking = self._entry_engine.tracking_info
             if tracking:
                 parts.append(f"Track={tracking['direction']}->{tracking['target']}")
+
+            # Sweep analysis score (if in POST_SWEEP)
+            if state == "POST_SWEEP":
+                _sa = getattr(self._entry_engine, '_last_sweep_analysis', None)
+                if _sa:
+                    rs = _sa.get('rev_score', 0)
+                    cs = _sa.get('cont_score', 0)
+                    parts.append(f"SweepScore=R{rs:.0f}/C{cs:.0f}")
+
             logger.info(f"[THINK] {' | '.join(parts)}")
 
 
@@ -7213,19 +7234,19 @@ class QuantStrategy:
 
         if mfe_r >= 2.50 and _last_ratchet_r < 2.50:
             _ratchet_level = 2.50; _ratchet_label = "2.50R"
-            _lock_r = mfe_r - 0.60   # Aggressive lock — keep 0.60R cushion
+            _lock_r = mfe_r - 0.60   # Keep 0.60R cushion (was 0.80 — too tight at high R)
         elif mfe_r >= 2.00 and _last_ratchet_r < 2.00:
             _ratchet_level = 2.00; _ratchet_label = "2.00R"
-            _lock_r = 1.00            # Lock 1.0R profit (was 1.20 — too tight)
+            _lock_r = 1.00            # Lock 1.0R (was 1.20 — too aggressive)
         elif mfe_r >= 1.50 and _last_ratchet_r < 1.50:
             _ratchet_level = 1.50; _ratchet_label = "1.50R"
-            _lock_r = 0.50            # Lock 0.50R profit (was 0.65)
+            _lock_r = 0.50            # Lock 0.50R (was 0.65)
         elif mfe_r >= 1.00 and _last_ratchet_r < 1.00:
             _ratchet_level = 1.00; _ratchet_label = "1.00R"
-            _lock_r = 0.15            # Lock 0.15R profit (was 0.25 — too aggressive)
+            _lock_r = 0.15            # Lock 0.15R (was 0.25 — caused premature BE stops)
         elif mfe_r >= 0.50 and _last_ratchet_r < 0.50:
             _ratchet_level = 0.50; _ratchet_label = "0.50R"
-            _lock_r = 0.0  # Break-even ONLY — no structural search at this level
+            _lock_r = 0.0  # Break-even ONLY
 
         _ratchet_due = _ratchet_level > 0.0
 
@@ -7349,10 +7370,9 @@ class QuantStrategy:
                 _final_label = f"R_LOCK({_lock_r:.2f}R)"
 
             # ── BREATHING ROOM: minimum 1.8 ATR from current price ────────
-            # CRITICAL FIX: 1.2 ATR is death zone for BTC — normal pullbacks
-            # are 0.8-1.5 ATR. Even 1.2 ATR gets clipped on healthy retracements.
-            # 1.8 ATR gives institutional breathing room while still protecting.
-            # At 2.0R+ ratchet, tighten to 1.5 ATR (confirmed strong trend).
+            # CRITICAL FIX: 1.2 ATR is death zone — normal BTC pullbacks
+            # are 0.8-1.5 ATR. 1.8 ATR gives institutional breathing room.
+            # Tighten to 1.5 ATR only at 2.0R+ (confirmed strong trend).
             _breath_mult = 1.5 if _ratchet_level >= 2.0 else 1.8
             _min_breath = _breath_mult * atr
             if pos.side == "long" and _ratchet_target > price - _min_breath:
@@ -8197,101 +8217,218 @@ class QuantStrategy:
 
     def format_status_report(self):
         """
-        v4.9: Status report reads from _trade_history (ground truth).
-        Correct win-rate, expectancy, and live position R display.
+        v10: Institutional status report for 15-minute Telegram notification.
+        Passes full ICT/pool/flow context to format_periodic_report.
         """
+        from telegram.notifier import format_periodic_report
         p   = self._pos
         atr = self._atr_5m.atr
+        price = self._last_known_price
 
         # ── Session stats from _trade_history ────────────────────────────
-        hist     = self._trade_history
         total_t  = self._total_trades
         wins     = self._winning_trades
-        losses   = total_t - wins
         wr       = wins / total_t * 100.0 if total_t > 0 else 0.0
         total_pnl = self._total_pnl
+        daily_pnl = getattr(self, '_daily_pnl', total_pnl)
 
-        win_pnls  = [t['pnl'] for t in hist if t.get('is_win')]
-        loss_pnls = [t['pnl'] for t in hist if not t.get('is_win')]
-        avg_w  = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
-        avg_l  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
-        expect = (wr/100 * avg_w) + ((1 - wr/100) * avg_l) if total_t > 0 else 0.0
+        # ── Balance ──────────────────────────────────────────────────────
+        balance = 0.0
+        try:
+            if hasattr(self, '_risk_manager') and self._risk_manager:
+                balance = self._risk_manager.current_balance
+        except Exception:
+            pass
 
-        lines = [
-            "📊 <b>QUANT v5.0 STATUS</b>", "",
-            f"Regime: {self._regime.regime.value if self._regime else '?'} | "
-            f"ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%}pctile)",
-            f"HTF:  15m={self._htf.trend_15m:+.2f}  4h={self._htf.trend_4h:+.2f}",
-            f"VWAP: ${self._vwap.vwap:,.2f}  (dev={self._vwap.deviation_atr:+.1f}ATR)",
-            "",
-            "<b>Session P&L</b>",
-            f"  Trades: {total_t}  W:{wins} L:{losses}  WR: {wr:.0f}%",
-            f"  Total PnL: ${total_pnl:+.2f} USDT",
-            f"  Avg W: ${avg_w:+.2f}  Avg L: ${avg_l:+.2f}",
-            f"  Expectancy: ${expect:+.2f}/trade",
-            f"  Daily: {self._risk_gate.daily_trades}/{QCfg.MAX_DAILY_TRADES()} "
-            f"| ConsecL: {self._risk_gate.consec_losses}/{QCfg.MAX_CONSEC_LOSSES()}",
-        ]
+        # ── ICT context ──────────────────────────────────────────────────
+        session      = ""
+        kill_zone    = ""
+        amd_phase    = ""
+        amd_bias     = ""
+        dr_pd        = 0.5
+        s15m         = ""
+        s4h          = ""
+        regime       = ""
 
-        # ── Execution cost diagnostics ──────────────────────────────────
+        if self._ict is not None:
+            try:
+                session   = getattr(self._ict, '_session', '')
+                kill_zone = getattr(self._ict, '_killzone', '')
+                _amd = getattr(self._ict, '_amd', None)
+                if _amd:
+                    amd_phase = getattr(_amd, 'phase', '')
+                    amd_bias  = getattr(_amd, 'bias', '')
+                _tf = getattr(self._ict, '_tf', {})
+                if '15m' in _tf:
+                    s15m = getattr(_tf['15m'], 'trend', '')
+                if '4h' in _tf:
+                    s4h = getattr(_tf['4h'], 'trend', '')
+                _dr = getattr(self._ict, '_dealing_range', None)
+                if _dr:
+                    dr_pd = getattr(_dr, 'current_pd', 0.5)
+            except Exception:
+                pass
+
+        if self._regime:
+            try:
+                regime = self._regime.regime.value
+            except Exception:
+                regime = str(self._regime.regime) if self._regime else ""
+
+        # ── HTF bias ─────────────────────────────────────────────────────
+        htf_bias = ""
+        if self._htf:
+            try:
+                htf_bias = f"15m={self._htf.trend_15m:+.1f} 4h={self._htf.trend_4h:+.1f}"
+            except Exception:
+                pass
+
+        # ── Pool map summary ─────────────────────────────────────────────
+        n_bsl = 0
+        n_ssl = 0
+        target_str = "—"
+        flow_conv = getattr(self, '_flow_conviction', 0.0)
+        flow_dir  = getattr(self, '_flow_direction', '')
+        nearest_bsl = None
+        nearest_ssl = None
+        sweep_anal = None
+
+        if hasattr(self, '_liq_map') and self._liq_map is not None:
+            try:
+                snap = self._liq_map.get_snapshot(price, atr)
+                n_bsl = len([p for p in snap.bsl_pools if p.pool.price > price])
+                n_ssl = len([p for p in snap.ssl_pools if p.pool.price < price])
+                pt = snap.primary_target
+                if pt:
+                    direction = "BSL ▲" if pt.pool.side.value == "BSL" else "SSL ▼"
+                    target_str = (f"{direction} ${pt.pool.price:,.0f} "
+                                  f"({pt.distance_atr:.1f}ATR sig={pt.significance:.0f})")
+
+                # Nearest pools for display
+                bsl_near = sorted([p for p in snap.bsl_pools if p.pool.price > price],
+                                  key=lambda x: x.pool.price)
+                ssl_near = sorted([p for p in snap.ssl_pools if p.pool.price < price],
+                                  key=lambda x: x.pool.price, reverse=True)
+                if bsl_near:
+                    bp = bsl_near[0]
+                    nearest_bsl = {
+                        "price": bp.pool.price,
+                        "dist_atr": bp.distance_atr,
+                        "significance": bp.significance,
+                        "timeframe": bp.pool.timeframe,
+                    }
+                if ssl_near:
+                    sp = ssl_near[0]
+                    nearest_ssl = {
+                        "price": sp.pool.price,
+                        "dist_atr": sp.distance_atr,
+                        "significance": sp.significance,
+                        "timeframe": sp.pool.timeframe,
+                    }
+            except Exception:
+                pass
+
+        # ── Sweep analysis ───────────────────────────────────────────────
+        if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+            try:
+                sweep_anal = getattr(self._entry_engine, '_last_sweep_analysis', None)
+            except Exception:
+                pass
+
+        # ── Engine state ─────────────────────────────────────────────────
+        engine_state = "SCANNING"
+        if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+            engine_state = self._entry_engine.state
+
+        # ── Position dict ────────────────────────────────────────────────
+        pos_dict = None
+        pos_entry = None
+        pos_sl = None
+        pos_tp = None
+        be_moved = False
+        locked_r = 0.0
+        if not p.is_flat():
+            pos_dict = {
+                "side": p.side,
+                "entry_price": p.entry_price,
+                "quantity": p.quantity,
+                "peak_profit": p.peak_profit,
+                "trail_active": p.trail_active,
+            }
+            pos_entry = p.entry_price
+            pos_sl = p.sl_price
+            pos_tp = p.tp_price
+            init_sl = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(p.entry_price - p.sl_price)
+            if init_sl > 1e-10:
+                raw_pts = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+                locked_r = max(0, raw_pts / init_sl) if raw_pts > 0 else 0.0
+            _fee_buf = p.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.10 * atr
+            _be_price = (p.entry_price + _fee_buf if p.side == "long"
+                         else p.entry_price - _fee_buf)
+            be_moved = ((p.side == "long" and p.sl_price >= _be_price) or
+                        (p.side == "short" and p.sl_price <= _be_price))
+
+        # ── Build extra lines (execution costs + expectancy) ─────────────
+        extra = []
+        hist = self._trade_history
+        if total_t > 0:
+            win_pnls  = [t['pnl'] for t in hist if t.get('is_win')]
+            loss_pnls = [t['pnl'] for t in hist if not t.get('is_win')]
+            avg_w = sum(win_pnls) / len(win_pnls) if win_pnls else 0.0
+            avg_l = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+            expect = (wr/100 * avg_w) + ((1 - wr/100) * avg_l)
+            extra.append(f"  Avg W: ${avg_w:+.2f} | Avg L: ${avg_l:+.2f}")
+            extra.append(f"  Expectancy: ${expect:+.2f}/trade")
+
         if self._fee_engine is not None:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()
                 warmed = snap.get('engine_warmed', False)
-                warmup_tag = "✅" if warmed else f"⏳ warming ({snap.get('spread_samples',0)} samples)"
-                lines += [
-                    "",
-                    f"<b>Execution costs</b> [{warmup_tag}]",
-                    f"  Spread: {snap['spread_median_bps']:.1f}bps "
-                    f"(p90: {snap['spread_p90_bps']:.1f})",
-                    f"  Slip EWMA: {snap['slippage_ewma_bps']:.1f}bps",
-                    f"  RT taker: {snap['rt_cost_taker_bps']:.1f}bps "
-                    f"| maker: {snap['rt_cost_maker_bps']:.1f}bps "
-                    f"| saving: {snap['maker_saving_bps']:.1f}bps",
-                ]
+                tag = "✅" if warmed else f"⏳ ({snap.get('spread_samples',0)} samples)"
+                extra.append(f"  Costs {tag}: spread={snap['spread_median_bps']:.1f}bps "
+                             f"slip={snap['slippage_ewma_bps']:.1f}bps")
             except Exception:
                 pass
 
-        # ── Active position ──────────────────────────────────────────────
-        if not p.is_flat():
-            price    = self._last_known_price
-            hm       = (time.time() - p.entry_time) / 60.0
-            init_sl  = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(p.entry_price - p.sl_price)
-            raw_pts  = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
-            curr_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
-            mfe_r    = p.peak_profit / init_sl if init_sl > 1e-10 else 0.0
-            tp_dist  = abs(p.tp_price - p.entry_price) if p.tp_price > 0 else 0.0
-            planned  = tp_dist / init_sl if init_sl > 1e-10 else 0.0
-            # BUG-6 FIX: use _estimate_pnl for live uPnL — raw_pts × qty is wrong
-            # for Delta inverse-perp (where notional scales with price).
-            # _estimate_pnl handles both exchange types correctly with fees included.
-            fill_type = getattr(p, 'entry_fill_type', 'taker')
-            upnl = self._estimate_pnl(p, price, entry_fill_type=fill_type) if price > 1.0 else 0.0
-            # Also compute gross (pre-fee) points for display
-            _gross_pts = raw_pts
-            _trail_label = ('✅ active' if p.trail_active else '⏳ waiting for 0.50R')
-            # Show AMD phase + delivery target if available
-            _amd_status = ""
-            if self._ict is not None:
-                try:
-                    _amd = self._ict._amd
-                    _dp  = self._ict.get_delivery_profile(p.side, price, self._atr_5m.atr,
-                                                           int(time.time() * 1000))
-                    _dt  = float(_dp.get("delivery_target", 0.0))
-                    _amd_status = (f"\n  AMD: {_amd.phase}(conf={_amd.confidence:.2f})"
-                                   + (f" | Target: ${_dt:,.0f}" if _dt > 1.0 else ""))
-                except Exception:
-                    pass
-            lines += [
-                "",
-                f"<b>🟢 Active {p.side.upper()} [{p.trade_mode.upper()}]</b>",
-                f"  Entry: ${p.entry_price:,.2f}  |  Now: ${price:,.2f}",
-                f"  SL: ${p.sl_price:,.2f}  |  TP: ${p.tp_price:,.2f}",
-                f"  uPnL: <b>${upnl:+.2f}</b>  |  Pts: {_gross_pts:+.1f}  |  R: {curr_r:+.2f}R",
-                f"  MFE: {mfe_r:.2f}R  |  Planned R:R: 1:{planned:.2f}  |  Hold: {hm:.1f}m",
-                f"  Trail: {_trail_label}{_amd_status}",
-            ]
-        return "\n".join(lines)
+        extra.append(f"  ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%} pctile)")
+        extra.append(f"  VWAP: ${self._vwap.vwap:,.0f} (dev={self._vwap.deviation_atr:+.1f}ATR)")
+
+        return format_periodic_report(
+            current_price=price,
+            balance=balance,
+            total_trades=total_t,
+            win_rate=wr,
+            daily_pnl=daily_pnl,
+            total_pnl=total_pnl,
+            consecutive_losses=self._risk_gate.consec_losses,
+            bot_state=engine_state,
+            n_bsl_pools=n_bsl,
+            n_ssl_pools=n_ssl,
+            primary_target_str=target_str,
+            flow_conviction=flow_conv,
+            flow_direction=flow_dir,
+            amd_phase=amd_phase,
+            session=session,
+            in_killzone=bool(kill_zone),
+            regime=regime,
+            position=pos_dict,
+            current_sl=pos_sl,
+            current_tp=pos_tp,
+            entry_price=pos_entry,
+            breakeven_moved=be_moved,
+            profit_locked_pct=locked_r,
+            extra_lines=extra,
+            # v10 extended
+            atr=atr,
+            htf_bias=htf_bias,
+            dealing_range_pd=dr_pd,
+            structure_15m=s15m,
+            structure_4h=s4h,
+            amd_bias=amd_bias,
+            nearest_bsl=nearest_bsl,
+            nearest_ssl=nearest_ssl,
+            sweep_analysis=sweep_anal,
+        )
 
     # ─── RECONCILIATION (unchanged logic, fixed PnL) ───
     def _reconcile_query_thread(self, order_manager):
