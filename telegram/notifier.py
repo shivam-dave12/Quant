@@ -224,6 +224,22 @@ def _time_ago(ts_ms: int) -> str:
     return f"{elapsed/3600:.1f}h ago"
 
 
+def _flow_bar(conviction: float) -> str:
+    """Visual flow conviction bar for Telegram messages."""
+    n = max(0, min(5, int(abs(conviction) * 5)))
+    if conviction > 0.05:
+        return "▁" * (5 - n) + "▓" * n + " ▲"
+    elif conviction < -0.05:
+        return "▓" * n + "▁" * (5 - n) + " ▼"
+    return "▁▁▁▁▁ ─"
+
+
+def _session_icon(session: str) -> str:
+    """Session emoji for Telegram."""
+    return {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}.get(
+        (session or "").lower().replace(" ", "_"), "⚪")
+
+
 def _pool_label(pool) -> str:
     level_type = getattr(pool, 'level_type', getattr(pool, 'pool_type', '?'))
     touches    = getattr(pool, 'touch_count', 0)
@@ -492,10 +508,6 @@ def format_entry_alert(
     htf_bias:       str = "?",
     regime:         str = "?",
     current_price:  float = 0.0,
-    # Extended context
-    atr:            float = 0.0,
-    nearest_liq_dist_atr: float = 0.0,
-    dealing_range_pd: float = 0.5,
     # Legacy
     score:          float = 0.0,
     threshold:      float = 0.0,
@@ -503,93 +515,63 @@ def format_entry_alert(
     **kwargs,
 ) -> str:
     """
-    Institutional entry alert — pool-first layout with full context.
+    Entry alert in pool-first layout:
+      Pool target → Flow confirmation → OTE/sweep entry → ICT SL basis → Pool TP
     """
     reasons   = reasons or []
     risk      = abs(entry_price - sl_price)
     reward    = abs(tp_price - entry_price)
     side_icon = "🟢" if side.upper() == "LONG" else "🔴"
-    kz        = " 🔥 KILLZONE" if in_killzone else ""
+    kz        = " 🔥KZ" if in_killzone else ""
     mode_str  = f"[{entry_mode}]" if entry_mode else ""
     tier_str  = f" Tier-{ict_tier}" if ict_tier else ""
 
-    # Session quality indicator
-    sess_quality = {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}.get(
-        session.lower().replace(" ", "_"), "⚪")
-
-    # Dealing range position
-    pd_label = ("DEEP DISC" if dealing_range_pd < 0.25 else
-                "DISCOUNT" if dealing_range_pd < 0.40 else
-                "EQUILIBRIUM" if dealing_range_pd < 0.60 else
-                "PREMIUM" if dealing_range_pd < 0.75 else "DEEP PREM")
-
     lines = []
-    lines.append(f"{'━' * 32}")
-    lines.append(f"{side_icon} <b>ENTRY {side.upper()}</b>  {mode_str}{tier_str}")
-    lines.append(f"{'━' * 32}")
-
-    # ── Pool target ──────────────────────────────────────────
+    lines.append(f"{side_icon} <b>ENTRY: {side.upper()}</b>  {mode_str}{tier_str}{kz}")
     lines.append("")
-    lines.append("🎯 <b>TRADE THESIS</b>")
+
+    # ── Pool target (why we entered) ─────────────────────────────────
+    lines.append("<b>🎯 POOL TARGET</b>")
     if pool_price and pool_type:
-        pool_dir = "BSL ▲" if pool_type == "BSL" else "SSL ▼"
-        lines.append(f"  Target: {pool_dir} @ {_fmt_price(pool_price)}")
-        if atr > 0:
-            dist_atr = abs(pool_price - entry_price) / atr
-            lines.append(f"  Distance: {dist_atr:.1f} ATR ({_fmt_price(abs(pool_price - entry_price))})")
+        lines.append(f"  {'BSL ▲' if pool_type == 'BSL' else 'SSL ▼'} target: {_fmt_price(pool_price)}")
+        dist_to_pool = abs(pool_price - entry_price)
+        lines.append(f"  Distance from entry: {_fmt_price(dist_to_pool)}")
     if sweep_price:
-        lines.append(f"  Sweep origin: {_fmt_price(sweep_price)}")
-    lines.append(f"  Dealing range: {pd_label} ({dealing_range_pd:.0%})")
-
-    # ── Flow state ───────────────────────────────────────────
+        lines.append(f"  Sweep that triggered: {_fmt_price(sweep_price)}")
     lines.append("")
-    lines.append("📊 <b>ORDER FLOW</b>")
-    flow_str = f"{flow_conviction:+.2f}"
-    flow_bar = _flow_bar(flow_conviction)
-    lines.append(f"  Conviction: {flow_bar} {flow_str}")
-    lines.append(f"  CVD: {cvd_divergence:+.2f}  OB: {ob_imbalance:+.2f}  Tick: {tick_aggression:+.2f}")
 
-    # ── Entry levels ─────────────────────────────────────────
+    # ── Flow confirmation ─────────────────────────────────────────────
+    lines.append("<b>📊 FLOW CONFIRMATION</b>")
+    flow_icon = "✅" if abs(flow_conviction) > 0.20 else "⚠️"
+    lines.append(f"  {flow_icon} Conviction: {flow_conviction:+.3f}")
+    lines.append(f"  CVD div={cvd_divergence:+.3f}  OB={ob_imbalance:+.3f}  Tick={tick_aggression:+.3f}")
     lines.append("")
-    lines.append("💰 <b>LEVELS</b>")
-    lines.append(f"  Entry:  <b>{_fmt_price(entry_price)}</b>")
-    lines.append(f"  SL:     {_fmt_price(sl_price)}  ({_fmt_price(risk)} risk)")
-    lines.append(f"  TP:     {_fmt_price(tp_price)}  ({_fmt_price(reward)} reward)")
-    lines.append(f"  R:R:    <b>{rr:.1f}:1</b>")
-    lines.append(f"  Size:   {position_size:.4f} BTC")
-    if atr > 0:
-        sl_atr = risk / atr
-        tp_atr = reward / atr
-        lines.append(f"  ATR:    SL={sl_atr:.1f}x  TP={tp_atr:.1f}x  (ATR={_fmt_price(atr)})")
 
-    # ── ICT context ──────────────────────────────────────────
+    # ── Entry levels ──────────────────────────────────────────────────
+    lines.append("<b>💰 ENTRY LEVELS</b>")
+    lines.append(f"  Price now: {_fmt_price(current_price)}")
+    lines.append(f"  Entry:     <b>{_fmt_price(entry_price)}</b>  ({entry_mode})")
+    lines.append(f"  SL (ICT):  <b>{_fmt_price(sl_price)}</b>  (risk: {_fmt_price(risk)})")
+    lines.append(f"  TP (pool): <b>{_fmt_price(tp_price)}</b>  (reward: {_fmt_price(reward)})")
+    lines.append(f"  R:R:       <b>{rr:.1f}:1</b>")
+    lines.append(f"  Size:      {position_size:.4f} BTC")
     lines.append("")
-    lines.append("🏛️ <b>ICT</b>")
-    ob_str = "✅ OB" if ob_in_ote else "—"
-    fvg_str = "✅ FVG" if fvg_in_ote else "—"
-    lines.append(f"  AMD: {_esc(amd_phase)}  |  {ob_str}  {fvg_str}")
-    lines.append(f"  HTF: {_esc(htf_bias)}  |  Regime: {_esc(regime)}")
+
+    # ── ICT structural context ────────────────────────────────────────
+    lines.append("<b>🏛️ ICT CONTEXT</b>")
+    lines.append(f"  AMD phase: {_esc(amd_phase)}")
+    lines.append(f"  OB in OTE: {'✅' if ob_in_ote else '—'}"
+                 f"  FVG in OTE: {'✅' if fvg_in_ote else '—'}")
     if reasons:
         lines.append(f"  Confluence: {', '.join(_esc(r) for r in reasons[:5])}")
-
-    # ── Session ──────────────────────────────────────────────
     lines.append("")
-    lines.append(f"{sess_quality} Session: {_esc(session)}{kz}")
-    if nearest_liq_dist_atr > 0:
-        lines.append(f"  Nearest opposing liq: {nearest_liq_dist_atr:.1f} ATR")
-    lines.append(f"{'━' * 32}")
+
+    # ── Environment ───────────────────────────────────────────────────
+    lines.append("<b>🌍 ENVIRONMENT</b>")
+    lines.append(f"  HTF: {_esc(htf_bias)}  Regime: {_esc(regime)}")
+    lines.append(f"  Session: {_esc(session)}{kz}")
 
     return "\n".join(lines)
-
-
-def _flow_bar(conviction: float) -> str:
-    """Visual flow conviction bar."""
-    n = max(0, min(5, int(abs(conviction) * 5)))
-    if conviction > 0:
-        return "▁" * (5 - n) + "▓" * n + " ▲"
-    elif conviction < 0:
-        return "▓" * n + "▁" * (5 - n) + " ▼"
-    return "▁▁▁▁▁ ─"
 
 
 # ======================================================================
@@ -652,70 +634,33 @@ def format_trail_update(
     profit_locked_pct: float = 0.0,
     breakeven_moved:   bool  = False,
     pool_tp:           float = 0.0,
-    # Extended
-    atr:               float = 0.0,
-    peak_rr:           float = 0.0,
-    session:           str   = "",
-    sl_dist_atr:       float = 0.0,
-    nearest_liq_price: float = 0.0,
 ) -> str:
     """
-    Trail SL update — institutional format with progress visualization.
+    Trail SL update notification.  Emphasises the ICT structural basis
+    (BOS swing → CHoCH tighten → 15m structure) rather than ATR mechanics.
     """
     side_icon = "🟢" if side.upper() == "LONG" else "🔴"
-    improvement = abs(new_sl - old_sl)
+    direction = "⬆️" if (side.upper() == "LONG" and new_sl > old_sl) else "⬇️"
 
     phase_labels = {
-        "P1_BOS":    "🟡 Phase 1 — BOS swing",
-        "P2_CHOCH":  "🟠 Phase 2 — Structure confirmed",
-        "P3_15m":    "🟢 Phase 3 — 15m macro trail",
+        "P1_BOS":    "🟡 P1 — BOS swing trail",
+        "P2_CHOCH":  "🟠 P2 — CHoCH tighten",
+        "P3_15m":    "🟢 P3 — 15m structure trail",
     }
     phase_str = phase_labels.get(trail_phase, trail_phase)
 
-    # Progress bar: how far from entry to TP
-    if pool_tp and entry_price:
-        total_dist = abs(pool_tp - entry_price)
-        if total_dist > 0:
-            progress = min(1.0, abs(current_price - entry_price) / total_dist)
-            bar_len = 20
-            filled = int(progress * bar_len)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            pct = progress * 100
-        else:
-            bar = "░" * 20
-            pct = 0
-    else:
-        bar = "░" * 20
-        pct = 0
-
     lines = [
-        f"🔒 <b>TRAIL SL</b>  {phase_str}",
-        "",
-        f"  {side_icon} SL: {_fmt_price(old_sl)} → <b>{_fmt_price(new_sl)}</b> (+{_fmt_price(improvement)})",
-        f"  Entry: {_fmt_price(entry_price)}  |  Now: {_fmt_price(current_price)}",
+        f"{side_icon} <b>TRAIL UPDATE</b>  {phase_str}",
+        f"  {direction} SL: {_fmt_price(old_sl)} → <b>{_fmt_price(new_sl)}</b>",
+        f"  Entry: {_fmt_price(entry_price)} | Price: {_fmt_price(current_price)}",
+        f"  Current R: {current_rr:.2f}R | Locked: {profit_locked_pct:.1f}R",
+        f"  ICT basis: {_esc(trail_reason)}",
     ]
 
-    if atr > 0:
-        dist_from_price = abs(current_price - new_sl) / atr
-        lines.append(f"  Distance: {dist_from_price:.1f} ATR from price")
-
-    lines.append(f"  R: {current_rr:+.2f}R  |  Peak: {peak_rr:.2f}R  |  Locked: {profit_locked_pct:.1f}R")
-    lines.append(f"  Basis: {_esc(trail_reason)}")
-
     if pool_tp:
-        lines.append(f"  Progress to TP: [{bar}] {pct:.0f}%")
-        lines.append(f"  TP target: {_fmt_price(pool_tp)}")
-
+        lines.append(f"  Pool TP target: {_fmt_price(pool_tp)}")
     if breakeven_moved:
-        lines.append("  🔒 Risk-free — break-even locked")
-
-    if nearest_liq_price > 0:
-        lines.append(f"  ⚡ Nearest liq: {_fmt_price(nearest_liq_price)}")
-
-    if session:
-        sess_icon = {"asia": "🌙", "london": "🌅", "ny": "🏛️"}.get(
-            session.lower().replace(" ", "_"), "⚪")
-        lines.append(f"  {sess_icon} {_esc(session)}")
+        lines.append("  🔒 Break-even active — risk-free trade")
 
     return "\n".join(lines)
 
@@ -751,126 +696,68 @@ def format_position_close(
     win_rate:      float = 0.0,
     total_trades:  int   = 0,
     consecutive_losses: int = 0,
-    # Extended
-    hold_minutes:  float = 0.0,
-    entry_session: str   = "",
-    exit_session:  str   = "",
-    atr:           float = 0.0,
 ) -> str:
-    """Position close with comprehensive post-trade analysis."""
+    """Position close with pool TP analysis."""
     side_icon   = "🟢" if side.upper() == "LONG" else "🔴"
+    result_icon = "✅" if pnl > 0 else "❌"
     risk        = abs(entry_price - sl_price) if sl_price else 0
     price_move  = ((close_price - entry_price) if side.upper() == "LONG"
                    else (entry_price - close_price))
     rr_achieved = price_move / risk if risk > 0 else 0
-
-    # Trade grading
-    if pnl > 0 and rr_achieved >= 2.0:
-        grade = "A+"
-        grade_icon = "🏆"
-    elif pnl > 0 and rr_achieved >= 1.0:
-        grade = "A"
-        grade_icon = "✅"
-    elif pnl > 0:
-        grade = "B"
-        grade_icon = "✅"
-    elif pnl == 0 or abs(rr_achieved) < 0.1:
-        grade = "C"
-        grade_icon = "⚪"
-    elif max_favorable > risk and pnl < 0:
-        grade = "D"
-        grade_icon = "⚠️"  # Had profit but gave it back — trail issue
-    else:
-        grade = "F"
-        grade_icon = "❌"
 
     # Pool TP analysis
     pool_analysis = ""
     if pool_tp_price and pool_tp_price > 0:
         pool_dist    = abs(pool_tp_price - entry_price)
         pool_rr      = pool_dist / risk if risk > 0 else 0
-        close_pct_of_pool = (abs(price_move) / pool_dist * 100) if pool_dist > 0 else 0
+        close_pct_of_pool = (price_move / pool_dist * 100) if pool_dist > 0 else 0
         if pool_reached:
-            pool_analysis = f"\n  🎯 Pool {_fmt_price(pool_tp_price)} REACHED ✅"
+            pool_analysis = f"\n  🎯 Pool target {_fmt_price(pool_tp_price)} REACHED"
         else:
-            remaining = abs(pool_tp_price - close_price)
             pool_analysis = (f"\n  ─ Pool {_fmt_price(pool_tp_price)} "
-                             f"({close_pct_of_pool:.0f}% captured, "
-                             f"{_fmt_price(remaining)} remaining)")
+                             f"({close_pct_of_pool:.0f}% reached, {pool_rr:.1f}R potential)")
 
-    # MFE analysis — did we leave money on the table?
-    mfe_analysis = ""
-    if max_favorable > 0 and risk > 0:
-        mfe_r = max_favorable / risk
-        if pnl <= 0 and mfe_r >= 0.5:
-            left_on_table = max_favorable - price_move
-            mfe_analysis = (f"\n  ⚠️ Peak was +{_fmt_price(max_favorable)} "
-                            f"({mfe_r:.1f}R) — gave back {_fmt_price(left_on_table)}")
-
-    tier_str    = f" Tier-{ict_tier}" if ict_tier else ""
+    tier_str    = f"  Tier-{ict_tier}" if ict_tier else ""
+    trail_str   = f"  Trail: {_esc(trail_phase)}" if trail_phase else ""
     total_fees  = entry_fee + exit_fee
     fee_tag     = "exact" if exact_fees else "est."
 
     lines = [
-        f"{'━' * 32}",
-        f"{grade_icon} <b>CLOSED {side.upper()}</b> — Grade: <b>{grade}</b>{tier_str}",
-        f"{'━' * 32}",
+        f"{result_icon} <b>POSITION CLOSED: {side.upper()}</b>",
         "",
+        "<b>💰 RESULT</b>",
+        f"  PnL: <b>{_fmt_price(pnl)}</b> ({rr_achieved:+.1f}R)",
+        f"  Reason: {_esc(close_reason)}{pool_analysis}",
+        "",
+        "<b>📊 LEVELS</b>",
+        f"  Entry: {_fmt_price(entry_price)}",
+        f"  Exit:  {_fmt_price(close_price)}",
+        f"  SL (ICT struct): {_fmt_price(sl_price)}",
+        f"  TP (pool):       {_fmt_price(tp_price)}",
     ]
 
-    # ── Result ───────────────────────────────────────────────
-    lines.append("💰 <b>RESULT</b>")
-    pnl_icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
-    lines.append(f"  {pnl_icon} PnL: <b>{_fmt_price(pnl)}</b> ({rr_achieved:+.2f}R)")
-    lines.append(f"  Reason: {_esc(close_reason)}")
-    if pool_analysis:
-        lines.append(pool_analysis)
-    if mfe_analysis:
-        lines.append(mfe_analysis)
-
-    # ── Levels ───────────────────────────────────────────────
     lines.append("")
-    lines.append("📊 <b>LEVELS</b>")
-    lines.append(f"  Entry: {_fmt_price(entry_price)}  →  Exit: {_fmt_price(close_price)}")
-    lines.append(f"  SL: {_fmt_price(sl_price)}  |  TP: {_fmt_price(tp_price)}")
-    if atr > 0:
-        move_atr = abs(price_move) / atr
-        lines.append(f"  Move: {move_atr:.1f} ATR  |  ATR: {_fmt_price(atr)}")
-
-    # ── Trade quality metrics ────────────────────────────────
-    lines.append("")
-    lines.append("📈 <b>METRICS</b>")
-    if max_favorable > 0:
+    lines.append("<b>📈 TRADE METRICS</b>")
+    if max_favorable:
         mfe_r = max_favorable / risk if risk > 0 else 0
-        lines.append(f"  MFE: +{_fmt_price(max_favorable)} ({mfe_r:.1f}R)")
-    if max_adverse > 0:
+        lines.append(f"  MFE: {_fmt_price(max_favorable)} ({mfe_r:.1f}R)")
+    if max_adverse:
         mae_r = max_adverse / risk if risk > 0 else 0
-        lines.append(f"  MAE: -{_fmt_price(max_adverse)} ({mae_r:.1f}R)")
-    if hold_minutes > 0:
-        lines.append(f"  Hold: {hold_minutes:.0f}m")
+        lines.append(f"  MAE: {_fmt_price(max_adverse)} ({mae_r:.1f}R)")
     if breakeven_moved:
-        lines.append("  🔒 BE was moved")
+        lines.append("  🔒 Break-even was moved")
     if total_fees > 0:
-        lines.append(f"  Fees: ${total_fees:.4f} ({fee_tag})")
-    if trail_phase:
-        lines.append(f"  Trail: {_esc(trail_phase)}")
-    if amd_phase:
-        lines.append(f"  AMD: {_esc(amd_phase)}")
+        lines.append(f"  Fees ({fee_tag}): ${total_fees:.4f}  (entry ${entry_fee:.4f} + exit ${exit_fee:.4f})")
+    if tier_str: lines.append(tier_str)
+    if trail_str: lines.append(trail_str)
+    if amd_phase: lines.append(f"  AMD at entry: {_esc(amd_phase)}")
 
-    # ── Session context ──────────────────────────────────────
-    if entry_session or exit_session:
-        lines.append("")
-        lines.append(f"  📍 {_esc(entry_session or '?')} → {_esc(exit_session or '?')}")
-
-    # ── Session stats ────────────────────────────────────────
     lines.append("")
-    lines.append("📊 <b>SESSION</b>")
-    pnl_total_icon = "🟢" if total_pnl >= 0 else "🔴"
-    lines.append(f"  {pnl_total_icon} Total PnL: {_fmt_price(total_pnl)}")
+    lines.append("<b>📊 SESSION</b>")
+    lines.append(f"  Total PnL: {_fmt_price(total_pnl)}")
     lines.append(f"  Trades: {total_trades} | WR: {win_rate:.1f}%")
     if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consecutive losses: {consecutive_losses}")
-    lines.append(f"{'━' * 32}")
+        lines.append(f"  ⚠️ Consec Losses: {consecutive_losses}")
 
     return "\n".join(lines)
 
@@ -907,21 +794,30 @@ def format_periodic_report(
     breakeven_moved:    bool  = False,
     profit_locked_pct:  float = 0.0,
     extra_lines:        Optional[List[str]] = None,
-    # Extended
+    # v10 extended
     atr:                float = 0.0,
     htf_bias:           str   = "",
     dealing_range_pd:   float = 0.5,
+    structure_15m:      str   = "",
+    structure_4h:       str   = "",
+    amd_bias:           str   = "",
+    nearest_bsl:        Optional[Dict] = None,
+    nearest_ssl:        Optional[Dict] = None,
+    sweep_analysis:     Optional[Dict] = None,
     **kwargs,
 ) -> str:
-    """Periodic status — institutional dashboard format."""
-    now_str = datetime.now(timezone.utc).strftime('%H:%M UTC')
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
-    flow_bar = _flow_bar(flow_conviction)
+    """
+    15-minute periodic Telegram report — INSTITUTIONAL DASHBOARD.
+    Shows everything a trader needs to make decisions at a glance.
+    """
+    from datetime import timedelta
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist_tz).strftime('%H:%M IST')
+    now_utc = datetime.now(timezone.utc).strftime('%H:%M UTC')
 
-    # Session icon
-    sess_icon = {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}.get(
-        session.lower().replace(" ", "_"), "⚪")
-    kz_str = " 🔥 KILLZONE" if in_killzone else ""
+    sess_icon = _session_icon(session)
+    kz_str = " 🔥KZ" if in_killzone else ""
+    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
 
     # State icon
     state_icons = {
@@ -930,57 +826,109 @@ def format_periodic_report(
     }
     state_icon = state_icons.get(bot_state.upper(), "⚪")
 
+    # Dealing range
+    pd_label = ("DEEP DISC" if dealing_range_pd < 0.25 else
+                "DISCOUNT" if dealing_range_pd < 0.40 else
+                "EQ" if dealing_range_pd < 0.60 else
+                "PREMIUM" if dealing_range_pd < 0.75 else "DEEP PREM")
+
+    # Flow bar
+    fbar = _flow_bar(flow_conviction)
+    flow_label = flow_direction.upper() if flow_direction else "NEUTRAL"
+
     lines = [
-        f"{'═' * 28}",
-        f"📊 <b>BOT STATUS</b>  {now_str}",
-        f"{'═' * 28}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>STATUS</b>  {now_ist} / {now_utc}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"💰 BTC: <b>{_fmt_price(current_price)}</b>",
     ]
 
-    if atr > 0:
-        lines.append(f"   ATR: {_fmt_price(atr)}  |  Regime: {_esc(regime)}")
+    # ── PRICE + BALANCE ──────────────────────────────────────
+    lines.append(f"💰 BTC: <b>{_fmt_price(current_price)}</b>")
+    atr_part = f"  ATR: {_fmt_price(atr)}" if atr > 0 else ""
+    lines.append(f"  💵 Bal: {_fmt_price(balance)}{atr_part}")
+    lines.append(f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  Total: {_fmt_price(total_pnl)}")
 
-    lines.append(f"   💵 Bal: {_fmt_price(balance)}  |  {pnl_icon} Day: {_fmt_price(daily_pnl)}")
-
-    # ── State + Session ──────────────────────────────────────
+    # ── STATE + SESSION ──────────────────────────────────────
     lines.append("")
-    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>")
-    lines.append(f"{sess_icon} {_esc(session)}{kz_str}")
+    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  {sess_icon} {_esc(session)}{kz_str}")
 
-    # ── Pool map summary ─────────────────────────────────────
+    # ── HTF CONTEXT — what the big picture says ──────────────
+    lines.append("")
+    lines.append("🏛️ <b>MARKET STRUCTURE</b>")
+    lines.append(f"  AMD: {_esc(amd_phase)} ({_esc(amd_bias)})")
+    htf_parts = []
+    if structure_4h:
+        htf_parts.append(f"4H:{_esc(structure_4h)}")
+    if structure_15m:
+        htf_parts.append(f"15m:{_esc(structure_15m)}")
+    if htf_bias:
+        htf_parts.append(f"HTF:{_esc(htf_bias)}")
+    if htf_parts:
+        lines.append(f"  {' | '.join(htf_parts)}")
+    lines.append(f"  Dealing range: {pd_label} ({dealing_range_pd:.0%})")
+    lines.append(f"  Regime: {_esc(regime)}")
+
+    # ── LIQUIDITY MAP — where are the stops? ─────────────────
     lines.append("")
     lines.append("🎯 <b>LIQUIDITY</b>")
     lines.append(f"  BSL ▲ {n_bsl_pools} pools  |  SSL ▼ {n_ssl_pools} pools")
+
+    # Nearest pools with distances
+    if nearest_bsl:
+        bsl_price = nearest_bsl.get("price", 0)
+        bsl_dist = nearest_bsl.get("dist_atr", 0)
+        bsl_sig = nearest_bsl.get("significance", 0)
+        bsl_tf = nearest_bsl.get("timeframe", "")
+        lines.append(f"  ▲ Nearest BSL: {_fmt_price(bsl_price)} ({bsl_dist:.1f}ATR sig={bsl_sig:.0f} {bsl_tf})")
+    if nearest_ssl:
+        ssl_price = nearest_ssl.get("price", 0)
+        ssl_dist = nearest_ssl.get("dist_atr", 0)
+        ssl_sig = nearest_ssl.get("significance", 0)
+        ssl_tf = nearest_ssl.get("timeframe", "")
+        lines.append(f"  ▼ Nearest SSL: {_fmt_price(ssl_price)} ({ssl_dist:.1f}ATR sig={ssl_sig:.0f} {ssl_tf})")
+
     lines.append(f"  Target: {_esc(primary_target_str)}")
-    lines.append(f"  Flow: {flow_bar}")
 
-    # ── ICT context ──────────────────────────────────────────
+    # ── FLOW — where is the market being pushed? ─────────────
     lines.append("")
-    lines.append("🏛️ <b>ICT</b>")
-    lines.append(f"  AMD: {_esc(amd_phase)}")
-    if htf_bias:
-        lines.append(f"  HTF: {_esc(htf_bias)}")
-    if dealing_range_pd != 0.5:
-        pd_label = ("DEEP DISC" if dealing_range_pd < 0.25 else
-                    "DISCOUNT" if dealing_range_pd < 0.40 else
-                    "EQ" if dealing_range_pd < 0.60 else
-                    "PREMIUM" if dealing_range_pd < 0.75 else "DEEP PREM")
-        lines.append(f"  Dealing range: {pd_label} ({dealing_range_pd:.0%})")
+    lines.append("📊 <b>ORDER FLOW</b>")
+    lines.append(f"  {fbar}  {flow_label}({flow_conviction:+.2f})")
 
-    # ── Position ─────────────────────────────────────────────
+    # ── SWEEP ANALYSIS (if in POST_SWEEP) ────────────────────
+    if sweep_analysis and bot_state.upper() == "POST_SWEEP":
+        rs = sweep_analysis.get("rev_score", 0)
+        cs = sweep_analysis.get("cont_score", 0)
+        rr = sweep_analysis.get("rev_reasons", [])
+        cr = sweep_analysis.get("cont_reasons", [])
+        sw_side = sweep_analysis.get("sweep_side", "?")
+        sw_price = sweep_analysis.get("sweep_price", 0)
+
+        winner = "REVERSAL" if rs > cs + 15 else ("CONTINUATION" if cs > rs + 15 else "UNDECIDED")
+        lines.append("")
+        lines.append(f"🌊 <b>SWEEP ANALYSIS</b> ({sw_side} @ {_fmt_price(sw_price)})")
+        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{winner}</b>")
+        if rr:
+            lines.append(f"  Rev: {', '.join(rr[:3])}")
+        if cr:
+            lines.append(f"  Cont: {', '.join(cr[:3])}")
+
+    # ── POSITION ─────────────────────────────────────────────
     if position:
         side    = position.get("side", "?").upper()
         p_entry = entry_price or position.get("entry_price", 0)
         qty     = float(position.get("quantity", 0) or 0)
+
         lines.append("")
         side_icon = "🟢" if side == "LONG" else "🔴"
         lines.append(f"{side_icon} <b>POSITION: {side}</b>")
         lines.append(f"  Entry: {_fmt_price(p_entry)}")
         if current_sl:
-            lines.append(f"  SL: {_fmt_price(current_sl)}")
+            sl_dist_atr = abs(current_price - current_sl) / max(atr, 1) if atr > 0 else 0
+            lines.append(f"  SL: {_fmt_price(current_sl)} ({sl_dist_atr:.1f}ATR)")
         if current_tp:
-            lines.append(f"  TP: {_fmt_price(current_tp)}")
+            tp_dist_atr = abs(current_tp - current_price) / max(atr, 1) if atr > 0 else 0
+            lines.append(f"  TP: {_fmt_price(current_tp)} ({tp_dist_atr:.1f}ATR)")
 
         if p_entry and current_price:
             move = (current_price - p_entry) if side == "LONG" else (p_entry - current_price)
@@ -988,33 +936,38 @@ def format_periodic_report(
             ur_r = move / risk_d if risk_d > 0 else 0
             upnl = move * qty if qty > 0 else move
             icon = "🟢" if move >= 0 else "🔴"
-            if qty > 0:
-                lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.1f}R)")
+
+            # Progress bar
+            if current_tp:
+                total = abs(current_tp - p_entry)
+                if total > 0:
+                    prog = min(1.0, max(0, abs(current_price - p_entry) / total))
+                    if move < 0: prog = 0
+                    bar_len = 16
+                    filled = int(prog * bar_len)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                else:
+                    bar = "░" * 16
+                    prog = 0
             else:
-                lines.append(f"  {icon} {move:+.1f}pts ({ur_r:+.1f}R)")
+                bar = "░" * 16
+                prog = 0
+
+            if qty > 0:
+                lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.2f}R)")
+            else:
+                lines.append(f"  {icon} {move:+.1f}pts ({ur_r:+.2f}R)")
+            lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
 
         if breakeven_moved:
             lines.append(f"  🔒 BE locked | {profit_locked_pct:.1f}R secured")
 
-        # Progress bar
-        if current_tp and p_entry and current_price:
-            total = abs(current_tp - p_entry)
-            if total > 0:
-                prog = min(1.0, max(0, abs(current_price - p_entry) / total))
-                if move < 0:
-                    prog = 0
-                bar_len = 16
-                filled = int(prog * bar_len)
-                bar = "█" * filled + "░" * (bar_len - filled)
-                lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
-
-    # ── Performance ──────────────────────────────────────────
+    # ── PERFORMANCE ──────────────────────────────────────────
     lines.append("")
     lines.append("📈 <b>PERFORMANCE</b>")
-    lines.append(f"  Trades: {total_trades} | WR: {win_rate:.1f}%")
-    lines.append(f"  Total PnL: {_fmt_price(total_pnl)}")
+    lines.append(f"  Trades: {total_trades}  |  WR: {win_rate:.1f}%")
     if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consec losses: {consecutive_losses}")
+        lines.append(f"  ⚠️ Consecutive losses: {consecutive_losses}")
 
     if extra_lines:
         lines.append("")
@@ -1022,7 +975,7 @@ def format_periodic_report(
             if el and el.strip():
                 lines.append(el)
 
-    lines.append(f"{'═' * 28}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 

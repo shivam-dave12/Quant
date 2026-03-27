@@ -58,15 +58,39 @@ def format_heartbeat(
     atr: float = 0.0,
     cvd_trend: float = 0.0,
     tick_flow: float = 0.0,
+    # v10 institutional context
+    session: str = "",
+    kill_zone: str = "",
+    amd_phase: str = "",
+    amd_bias: str = "",
+    dealing_range_pd: float = 0.5,
+    structure_15m: str = "",
+    structure_4h: str = "",
+    sweep_analysis: Optional[Dict] = None,
+    htf_bias: str = "",
 ) -> str:
     """Rich multi-line heartbeat snapshot for terminal. Called every 60s from main.py."""
 
-    W = 66  # display width
+    W = 72  # display width
     SEP  = "─" * W
     DSEP = "═" * W
+    from datetime import datetime, timezone, timedelta
+    # IST time
+    ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    now_str = ist_now.strftime("%H:%M:%S IST")
 
-    now_str = datetime.now().strftime("%H:%M:%S")
     atr_str = f"${atr:.1f}" if atr > 0 else "—"
+
+    # Session determination
+    sess_icon = {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}.get(
+        (session or "").lower().replace(" ", "_"), "⚪")
+    kz_str = " 🔥KZ" if kill_zone else ""
+
+    # Dealing range label
+    pd_label = ("DEEP-DISC" if dealing_range_pd < 0.25 else
+                "DISCOUNT" if dealing_range_pd < 0.40 else
+                "EQUILIBRIUM" if dealing_range_pd < 0.60 else
+                "PREMIUM" if dealing_range_pd < 0.75 else "DEEP-PREM")
 
     # ── ACTIVE POSITION ──────────────────────────────────────────────────────
     if position:
@@ -83,17 +107,35 @@ def format_heartbeat(
         tp_dist  = abs(price - tp)
         sl_atr   = sl_dist / atr if atr > 1e-10 else 0.0
         tp_atr   = tp_dist / atr if atr > 1e-10 else 0.0
-        pnl_icon = "+" if pnl >= 0 else ""
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+
+        # Progress bar
+        total_move = abs(tp - entry)
+        progress = min(1.0, max(0, abs(price - entry) / total_move)) if total_move > 0 else 0
+        if pnl < 0: progress = 0
+        bar_len = 20
+        filled = int(progress * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        # MFE tracking
+        peak_profit = position.get("peak_profit", pnl)
+        peak_r = peak_profit / init_sl if init_sl > 1e-10 else 0.0
+        trail_active = position.get("trail_active", False)
+
         lines = [
             DSEP,
-            f" 🟢 IN {side}   ${price:,.2f}   [{feed}|{exchange}]   {now_str}",
+            f" {pnl_icon} IN {side}   ${price:,.2f}   {sess_icon}{(session or '').upper()}{kz_str}   {now_str}",
             SEP,
-            f"   Entry:  ${entry:,.2f}",
-            f"   SL:     ${sl:,.2f}   (−${sl_dist:.1f} / {sl_atr:.2f}ATR)",
-            f"   TP:     ${tp:,.2f}   (+${tp_dist:.1f} / {tp_atr:.2f}ATR)",
-            f"   PnL:    {pnl_icon}{pnl:.1f}pts   R: {curr_r:+.2f}R   ATR: {atr_str}",
+            f"   Entry:  ${entry:,.2f}   |   ATR: {atr_str}   |   {pd_label}",
+            f"   SL:     ${sl:,.2f}   ({sl_atr:.1f} ATR from price){'  🔒TRAIL' if trail_active else ''}",
+            f"   TP:     ${tp:,.2f}   ({tp_atr:.1f} ATR from price)",
+            f"   PnL:    {pnl:+.1f}pts   R: {curr_r:+.2f}R   Peak: {peak_r:.2f}R",
+            f"   [{bar}] {progress*100:.0f}% → TP",
             SEP,
-            f"   T={total_trades}   Session PnL=${total_pnl:+.2f}",
+            f"   AMD: {amd_phase or '—'}({amd_bias or '—'})  |  15m: {structure_15m or '—'}  |  4H: {structure_4h or '—'}",
+            f"   Flow: {flow_direction or 'neutral'}({flow_conviction:+.2f})  CVD: {cvd_trend:+.2f}  Tick: {tick_flow:+.2f}",
+            SEP,
+            f"   T={total_trades}  |  Session PnL=${total_pnl:+.2f}",
             DSEP,
         ]
         return "\n".join(lines)
@@ -105,19 +147,25 @@ def format_heartbeat(
         d     = tracking_info.get("direction", "?")
         tgt   = tracking_info.get("target", "?")
         ticks = tracking_info.get("flow_ticks", 0)
-        state_str = f"TRACKING {d.upper()}→{tgt}  ({ticks} ticks)"
+        state_str = f"📡 TRACKING {d.upper()}→{tgt} ({ticks} ticks)"
     elif engine_state == "READY":
-        state_str = "READY — awaiting fill"
+        state_str = "🎯 READY — awaiting fill"
     elif engine_state == "POST_SWEEP":
-        state_str = "POST_SWEEP — evaluating"
+        state_str = "🌊 POST_SWEEP — scoring rev vs cont"
     else:
-        state_str = "SCANNING"
+        state_str = "🔍 SCANNING"
 
-    # Flow string
-    flow_dir  = flow_direction or ("long" if flow_conviction > 0.05 else ("short" if flow_conviction < -0.05 else ""))
-    flow_str  = f"Flow: {flow_dir}({flow_conviction:+.2f})" if flow_dir else f"Flow: neutral({flow_conviction:+.2f})"
-    cvd_str   = f"CVD: {cvd_trend:+.2f}" if abs(cvd_trend) > 0.01 else ""
-    tick_str  = f"Tick: {tick_flow:+.2f}" if abs(tick_flow) > 0.01 else ""
+    # Flow visual bar
+    flow_n = max(0, min(5, int(abs(flow_conviction) * 5)))
+    if flow_conviction > 0.05:
+        flow_bar = "▁" * (5 - flow_n) + "▓" * flow_n + " ▲"
+        flow_label = "LONG"
+    elif flow_conviction < -0.05:
+        flow_bar = "▓" * flow_n + "▁" * (5 - flow_n) + " ▼"
+        flow_label = "SHORT"
+    else:
+        flow_bar = "▁▁▁▁▁ ─"
+        flow_label = "NEUTRAL"
 
     # ── Pool rows ──────────────────────────────────────────────────────────────
     def _pool_rows(pools, side_label, nearest_atr):
@@ -141,7 +189,7 @@ def format_heartbeat(
                     dist_atr = getattr(p, 'distance_atr', 0.0)
                     sig      = getattr(p, 'significance', 0.0)
                     touches  = getattr(p.pool, 'touches', 0)
-                    prefix   = f"  {side_label}" if i == 0 else "      "
+                    prefix   = f"  {side_label}" if i == 0 else "       "
                     rows.append(
                         f"{prefix}  ${p.pool.price:,.1f}"
                         f"  {dist_atr:.1f}ATR"
@@ -154,7 +202,7 @@ def format_heartbeat(
                 except Exception:
                     pass
         elif nearest_atr < 50:
-            rows.append(f"  {side_label}  {nearest_atr:.1f}ATR away  (price not tracked yet)")
+            rows.append(f"  {side_label}  {nearest_atr:.1f}ATR away")
         else:
             rows.append(f"  {side_label}  no pools in range")
         return rows
@@ -167,23 +215,49 @@ def format_heartbeat(
         try:
             t = primary_target
             tgt_line = (
-                f"  Target: {t.direction.upper()} → ${t.pool.price:,.1f}"
-                f"  ({t.distance_atr:.1f}ATR  sig={t.significance:.0f}  t={t.pool.touches})"
+                f"  🎯 Target: {t.direction.upper()} → ${t.pool.price:,.1f}"
+                f"  ({t.distance_atr:.1f}ATR  sig={t.significance:.0f})"
             )
         except Exception:
-            tgt_line = "  Target: data pending"
+            tgt_line = "  🎯 Target: data pending"
     else:
-        tgt_line = "  Target: none detected"
+        tgt_line = "  🎯 Target: none detected"
+
+    # Post-sweep analysis display
+    sweep_lines = []
+    if engine_state == "POST_SWEEP" and sweep_analysis:
+        rs = sweep_analysis.get("rev_score", 0)
+        cs = sweep_analysis.get("cont_score", 0)
+        rr = sweep_analysis.get("rev_reasons", [])
+        cr = sweep_analysis.get("cont_reasons", [])
+        sw_side = sweep_analysis.get("sweep_side", "?")
+        sw_price = sweep_analysis.get("sweep_price", 0)
+        sw_qual = sweep_analysis.get("sweep_quality", 0)
+
+        winner = "REVERSAL" if rs > cs else ("CONTINUATION" if cs > rs else "UNDECIDED")
+        gap = abs(rs - cs)
+        bar_total = max(rs + cs, 1)
+        rev_pct = int(rs / bar_total * 20)
+        cont_pct = 20 - rev_pct
+        score_bar = "◀" + "█" * rev_pct + "░" * cont_pct + "▶"
+
+        sweep_lines.extend([
+            "",
+            f"  🌊 SWEEP: {sw_side} @ ${sw_price:,.0f} (quality={sw_qual:.0%})",
+            f"  {score_bar}",
+            f"  REV={rs:.0f}  {' + '.join(rr[:3]) if rr else '—'}",
+            f"  CONT={cs:.0f} {' + '.join(cr[:3]) if cr else '—'}",
+            f"  → {winner} (gap={gap:.0f}, need≥15)",
+        ])
 
     # Footer stats
     sweep_part = f"Sweeps={recent_sweep_count}" if recent_sweep_count > 0 else ""
     stats_parts = [p for p in [sweep_part, f"T={total_trades}", f"PnL=${total_pnl:+.2f}"] if p]
-    flow_parts  = [p for p in [flow_str, cvd_str, tick_str] if p]
 
     lines = [
         DSEP,
-        f" ⚡ v9 LIQUIDITY-FIRST   ${price:,.2f}   [{feed}|{exchange}]   {now_str}",
-        f" {state_str}   ATR: {atr_str}",
+        f" ⚡ v10 LIQUIDITY-FIRST   ${price:,.2f}   {sess_icon}{(session or '').upper()}{kz_str}   {now_str}",
+        f" {state_str}   ATR: {atr_str}   {pd_label}",
         SEP,
     ]
     lines.extend(bsl_rows)
@@ -191,7 +265,11 @@ def format_heartbeat(
     lines.extend(ssl_rows)
     lines.append(SEP)
     lines.append(tgt_line)
-    lines.append(f"  {' | '.join(flow_parts)}")
+    lines.append(f"  Flow: {flow_bar}  {flow_label}({flow_conviction:+.2f})  CVD: {cvd_trend:+.2f}  Tick: {tick_flow:+.2f}")
+    lines.append(f"  AMD: {amd_phase or '—'}({amd_bias or '—'})  |  15m: {structure_15m or '—'}  |  4H: {structure_4h or '—'}")
+    if sweep_lines:
+        lines.extend(sweep_lines)
+    lines.append(SEP)
     lines.append(f"  {' | '.join(stats_parts)}")
     lines.append(DSEP)
     return "\n".join(lines)

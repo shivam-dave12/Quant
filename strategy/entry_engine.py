@@ -198,8 +198,10 @@ class ICTContext:
     amd_confidence:   float = 0.0    # 0–1
     in_premium:       bool  = False  # Price above 50% of dealing range
     in_discount:      bool  = False  # Price below 50% of dealing range
+    dealing_range_pd: float = 0.5    # 0=deep discount, 1=deep premium
     structure_5m:     str   = ""     # "bullish" | "bearish" | "neutral"
     structure_15m:    str   = ""     # "bullish" | "bearish" | "neutral"
+    structure_4h:     str   = ""     # "bullish" | "bearish" | "neutral"
     bos_5m:           str   = ""     # Direction of latest 5m BOS
     choch_5m:         str   = ""     # Direction of latest 5m CHoCH
     nearest_ob_price: float = 0.0    # Nearest OB price in trade direction
@@ -272,6 +274,7 @@ class EntryEngine:
         self._post_sweep:   Optional[_PostSweepState] = None
         self._last_entry_at = 0.0
         self._state_entered = time.time()
+        self._last_sweep_analysis: Dict = {}  # Cached for display/logging
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -626,10 +629,11 @@ class EntryEngine:
         self._state_entered = now
         self._tracking = None
         self._signal = None
+        # Log ONCE — no per-tick spam
         logger.info(
-            f"🌊 POST_SWEEP: {sweep.pool.side.value} swept "
+            f"🌊 SWEEP DETECTED: {sweep.pool.side.value} "
             f"${sweep.pool.price:,.1f} quality={sweep.quality:.2f} "
-            f"→ evaluating next move...")
+            f"| Scoring reversal vs continuation...")
 
     def _do_post_sweep(
         self,
@@ -642,21 +646,7 @@ class EntryEngine:
     ) -> None:
         """
         After a sweep, decide: reverse, continue, or wait.
-
-        REVERSAL (sweep was a stop hunt → expect opposite move):
-          - Flow reverses AWAY from swept pool
-          - CISD (break of structure in reversal direction) confirms
-          - Look for OTE entry in reversal direction
-          - TP at opposing pool
-
-        CONTINUATION (sweep was a breakout → more to go):
-          - Flow continues in same direction as pre-sweep
-          - Price is NOT rejecting — closing through the pool
-          - Target = next pool in continuation direction
-
-        WAIT (unclear → don't trade):
-          - Mixed flow, no CISD, no clear structure
-          - Return to SCANNING after timeout
+        Uses multi-factor scoring (see _evaluate_post_sweep).
         """
         ps = self._post_sweep
         if ps is None:
@@ -685,7 +675,7 @@ class EntryEngine:
         elif decision.action == "continue":
             self._handle_sweep_continuation(
                 ps.sweep, decision, snap, flow, ict, price, atr, now)
-        # "wait" → stay in POST_SWEEP, keep evaluating
+        # "wait" → stay in POST_SWEEP, keep evaluating (no log spam)
 
     def _evaluate_post_sweep(
         self,
@@ -698,82 +688,319 @@ class EntryEngine:
         now: float,
     ) -> PostSweepDecision:
         """
-        Core post-sweep decision logic.
+        INSTITUTIONAL POST-SWEEP DECISION ENGINE
+        ==========================================
+        Multi-factor scoring: reverse vs continue vs wait.
 
-        Reversal signals:
-          - Price rejected sharply from sweep wick (sweep quality > 0.5)
-          - Flow has reversed from pre-sweep direction
-          - 5m BOS confirms reversal direction
-          - Price is in OTE zone of the displacement leg
+        The question: "Was this sweep a STOP HUNT (reversal) or a BREAKOUT (continuation)?"
 
-        Continuation signals:
-          - Flow continues in same direction as before sweep
-          - Price is closing above/below the swept pool (not rejecting)
-          - Structure still agrees with continuation
+        REVERSAL FACTORS (sweep was manipulation → expect opposite delivery):
+          1. Displacement: strong body close opposite to sweep direction     [0-20]
+          2. Wick rejection: price closes back inside the pre-sweep range    [0-15]
+          3. HTF dealing range: sweep at premium BSL or discount SSL         [0-15]
+          4. HTF trend AGAINST sweep: 4H/1D structure opposes continuation   [0-15]
+          5. Flow reversal: order flow has reversed post-sweep               [0-10]
+          6. CISD: 5m/15m break of structure confirms reversal direction     [0-15]
+          7. Session: Asia/London manipulation phase favors reversal         [0-5]
+          8. Opposing pool quality: strong TP target in reversal direction   [0-5]
+
+        CONTINUATION FACTORS (sweep was a genuine breakout):
+          1. No displacement: price holds beyond swept level                 [0-20]
+          2. HTF trend WITH sweep: 4H/1D momentum supports continuation     [0-15]
+          3. Flow continuation: order flow drives in sweep direction         [0-15]
+          4. No wick rejection: candle body closes through pool              [0-10]
+          5. Volume expansion: increasing volume = institutional commitment  [0-10]
+          6. Next pool in range: there IS another pool to target             [0-5]
+          7. No HTF OB blocking: path to next pool is clear structurally     [0-10]
+          8. Price beyond sweep level + 0.5 ATR: breakout confirmed          [0-15]
+
+        Decision thresholds:
+          REVERSAL:      rev_score >= 55 AND rev_score > cont_score + 15
+          CONTINUATION:  cont_score >= 50 AND cont_score > rev_score + 15
+          WAIT:          insufficient edge (neither threshold met)
         """
         sweep_dir = sweep.direction  # Direction to go IF reversing
+        cont_dir = "short" if sweep_dir == "long" else "long"
 
-        # Check flow vs sweep direction
-        flow_agrees_reversal = (flow.direction == sweep_dir
-                                and flow.cvd_agrees)
-        flow_agrees_continuation = (flow.direction != sweep_dir
-                                    and flow.direction != ""
-                                    and abs(flow.conviction) > _FLOW_CONV_THRESHOLD * 0.7)
+        rev_score  = 0.0
+        cont_score = 0.0
+        rev_reasons = []
+        cont_reasons = []
 
-        # Check 5m BOS for CISD confirmation
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 1: DISPLACEMENT QUALITY (0-20)
+        # Strong body close away from sweep = institutional reversal
+        # No rejection + price holds beyond = breakout
+        # ═══════════════════════════════════════════════════════════════
+        if sweep.quality >= 0.70:
+            rev_score += 20.0
+            rev_reasons.append(f"DISP strong ({sweep.quality:.0%})")
+        elif sweep.quality >= 0.50:
+            rev_score += 12.0
+            rev_reasons.append(f"DISP moderate ({sweep.quality:.0%})")
+        elif sweep.quality >= 0.35:
+            rev_score += 5.0
+            rev_reasons.append(f"DISP weak ({sweep.quality:.0%})")
+        else:
+            cont_score += 12.0
+            cont_reasons.append(f"NO DISP ({sweep.quality:.0%})")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 2: WICK REJECTION vs BREAKOUT (0-15)
+        # Price back inside range = rejection (reversal)
+        # Price closing beyond sweep wick = breakout (continuation)
+        # ═══════════════════════════════════════════════════════════════
+        if sweep.pool.side == PoolSide.BSL:
+            rejecting = price < sweep.pool.price
+            breaking_through = price > sweep.pool.price + 0.3 * atr
+            deep_break = price > sweep.wick_extreme
+        else:
+            rejecting = price > sweep.pool.price
+            breaking_through = price < sweep.pool.price - 0.3 * atr
+            deep_break = price < sweep.wick_extreme
+
+        if rejecting:
+            rej_depth = abs(price - sweep.pool.price) / max(atr, 1e-10)
+            rej_pts = min(15.0, 8.0 + rej_depth * 5.0)
+            rev_score += rej_pts
+            rev_reasons.append(f"REJECTED {rej_depth:.1f}ATR")
+        elif deep_break:
+            cont_score += 15.0
+            cont_reasons.append("DEEP BREAK beyond wick")
+        elif breaking_through:
+            cont_score += 10.0
+            cont_reasons.append("BREAKOUT +0.3ATR past pool")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 3: HTF DEALING RANGE POSITION (0-15)
+        # Sweep at the EXTREME of dealing range = manipulation (reversal)
+        # Sweep in the MIDDLE = could go either way
+        # ═══════════════════════════════════════════════════════════════
+        pd = ict.dealing_range_pd if hasattr(ict, 'dealing_range_pd') else 0.5
+
+        if sweep.pool.side == PoolSide.BSL:
+            # BSL swept (above) — if in deep premium, this is a stop hunt
+            if pd > 0.80:
+                rev_score += 15.0
+                rev_reasons.append(f"DEEP PREMIUM ({pd:.0%})")
+            elif pd > 0.65:
+                rev_score += 8.0
+                rev_reasons.append(f"PREMIUM ({pd:.0%})")
+            elif pd < 0.35:
+                cont_score += 10.0
+                cont_reasons.append(f"DISCOUNT→BSL break ({pd:.0%})")
+        else:
+            # SSL swept (below) — if in deep discount, this is a stop hunt
+            if pd < 0.20:
+                rev_score += 15.0
+                rev_reasons.append(f"DEEP DISCOUNT ({pd:.0%})")
+            elif pd < 0.35:
+                rev_score += 8.0
+                rev_reasons.append(f"DISCOUNT ({pd:.0%})")
+            elif pd > 0.65:
+                cont_score += 10.0
+                cont_reasons.append(f"PREMIUM→SSL break ({pd:.0%})")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 4: HTF TREND ALIGNMENT (0-15)
+        # Sweep AGAINST HTF trend = manipulation → reversal
+        # Sweep WITH HTF trend = breakout → continuation
+        # ═══════════════════════════════════════════════════════════════
+        htf_trend = getattr(ict, 'structure_15m', '') or ''
+        htf_4h = getattr(ict, 'structure_4h', '') or ''
+
+        # Check if sweep direction opposes HTF trend
+        if sweep.pool.side == PoolSide.BSL:
+            # BSL swept = price went UP. If HTF is bearish, this is manipulation
+            if htf_4h == "bearish":
+                rev_score += 15.0
+                rev_reasons.append("4H BEARISH vs BSL sweep")
+            elif htf_trend == "bearish":
+                rev_score += 10.0
+                rev_reasons.append("15m BEARISH vs BSL sweep")
+            elif htf_4h == "bullish":
+                cont_score += 12.0
+                cont_reasons.append("4H BULLISH aligns BSL break")
+            elif htf_trend == "bullish":
+                cont_score += 7.0
+                cont_reasons.append("15m BULLISH aligns BSL")
+        else:
+            # SSL swept = price went DOWN. If HTF is bullish, this is manipulation
+            if htf_4h == "bullish":
+                rev_score += 15.0
+                rev_reasons.append("4H BULLISH vs SSL sweep")
+            elif htf_trend == "bullish":
+                rev_score += 10.0
+                rev_reasons.append("15m BULLISH vs SSL sweep")
+            elif htf_4h == "bearish":
+                cont_score += 12.0
+                cont_reasons.append("4H BEARISH aligns SSL break")
+            elif htf_trend == "bearish":
+                cont_score += 7.0
+                cont_reasons.append("15m BEARISH aligns SSL")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 5: ORDER FLOW DIRECTION (0-15)
+        # Flow reversed after sweep = institutions reversed
+        # Flow continues = institutions are pushing through
+        # ═══════════════════════════════════════════════════════════════
+        flow_agrees_reversal = (flow.direction == sweep_dir and flow.cvd_agrees)
+        flow_agrees_continuation = (
+            flow.direction and flow.direction != sweep_dir
+            and abs(flow.conviction) > _FLOW_CONV_THRESHOLD * 0.6
+        )
+
+        if flow_agrees_reversal:
+            strength = min(15.0, abs(flow.conviction) * 15.0)
+            rev_score += strength
+            rev_reasons.append(f"FLOW REV {flow.conviction:+.2f}")
+        elif flow_agrees_continuation:
+            strength = min(15.0, abs(flow.conviction) * 12.0)
+            cont_score += strength
+            cont_reasons.append(f"FLOW CONT {flow.conviction:+.2f}")
+
+        # CVD divergence: if CVD disagrees with price direction post-sweep
+        if flow.cvd_divergence != 0:
+            if sweep.pool.side == PoolSide.BSL and flow.cvd_divergence < -0.2:
+                rev_score += 5.0
+                rev_reasons.append("CVD BEARISH div")
+            elif sweep.pool.side == PoolSide.SSL and flow.cvd_divergence > 0.2:
+                rev_score += 5.0
+                rev_reasons.append("CVD BULLISH div")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 6: CISD / BOS CONFIRMATION (0-15)
+        # Break of structure in reversal direction = strongest confirmation
+        # ═══════════════════════════════════════════════════════════════
         cisd_confirmed = False
         if ict.bos_5m:
             expected_bos = "bullish" if sweep_dir == "long" else "bearish"
             cisd_confirmed = (ict.bos_5m == expected_bos)
 
-        # Check if price is rejecting or breaking through
-        if sweep.pool.side == PoolSide.BSL:
-            # BSL was swept (above) → reversal = short
-            rejecting = price < sweep.pool.price  # Back below pool
-            breaking_through = price > sweep.wick_extreme  # Above sweep wick
-        else:
-            # SSL was swept (below) → reversal = long
-            rejecting = price > sweep.pool.price  # Back above pool
-            breaking_through = price < sweep.wick_extreme  # Below sweep wick
+        choch_confirmed = False
+        if ict.choch_5m:
+            expected_choch = "bullish" if sweep_dir == "long" else "bearish"
+            choch_confirmed = (ict.choch_5m == expected_choch)
 
-        # Decision logic
-        if (sweep.quality >= 0.45
-                and rejecting
-                and (cisd_confirmed or flow_agrees_reversal)):
-            # Strong reversal setup
-            opp_target = self._find_opposing_target(
-                sweep_dir, snap, price, atr)
+        if cisd_confirmed:
+            rev_score += 15.0
+            rev_reasons.append("CISD ✅ (5m BOS)")
+        elif choch_confirmed:
+            rev_score += 10.0
+            rev_reasons.append("CHoCH ✅ (5m)")
+
+        # BOS in continuation direction = trend continuing
+        if ict.bos_5m:
+            cont_bos = "bullish" if cont_dir == "long" else "bearish"
+            if ict.bos_5m == cont_bos:
+                cont_score += 10.0
+                cont_reasons.append("BOS aligns continuation")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 7: SESSION CONTEXT (0-5)
+        # Asia/early London sweeps = manipulation (reversal bias)
+        # NY session sweeps = delivery (could be either, but real)
+        # ═══════════════════════════════════════════════════════════════
+        session = getattr(ict, 'kill_zone', '') or ''
+        if 'asia' in session.lower():
+            rev_score += 5.0
+            rev_reasons.append("ASIA session (manipulation)")
+        elif 'london' in session.lower() and not 'ny' in session.lower():
+            rev_score += 3.0
+            rev_reasons.append("LONDON (possible Judas)")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 8: TARGET QUALITY (0-10)
+        # Strong opposing pool = good TP → reversal more attractive
+        # Strong next pool in continuation = good continuation target
+        # ═══════════════════════════════════════════════════════════════
+        opp_target = self._find_opposing_target(sweep_dir, snap, price, atr)
+        cont_target = self._find_continuation_target(cont_dir, snap, price, atr)
+
+        if opp_target and opp_target.significance >= _MIN_POOL_SIGNIFICANCE:
+            rev_score += min(5.0, opp_target.significance * 0.5)
+            rev_reasons.append(f"TP pool sig={opp_target.significance:.1f}")
+
+        if cont_target and cont_target.significance >= _MIN_POOL_SIGNIFICANCE:
+            cont_score += min(5.0, cont_target.significance * 0.5)
+            cont_reasons.append(f"Next pool sig={cont_target.significance:.1f}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FACTOR 9: OB BLOCKING (0-10) — continuation only
+        # Is there a HTF OB blocking the continuation path?
+        # ═══════════════════════════════════════════════════════════════
+        ob_price = getattr(ict, 'nearest_ob_price', 0.0) or 0.0
+        if ob_price > 0:
+            if cont_dir == "long" and ob_price > price:
+                ob_dist_atr = (ob_price - price) / max(atr, 1e-10)
+                if ob_dist_atr < 2.0:
+                    rev_score += 8.0
+                    rev_reasons.append(f"OB BLOCKS cont at {ob_dist_atr:.1f}ATR")
+            elif cont_dir == "short" and ob_price < price:
+                ob_dist_atr = (price - ob_price) / max(atr, 1e-10)
+                if ob_dist_atr < 2.0:
+                    rev_score += 8.0
+                    rev_reasons.append(f"OB BLOCKS cont at {ob_dist_atr:.1f}ATR")
+
+        # ═══════════════════════════════════════════════════════════════
+        # DECISION: score comparison with confidence gap requirement
+        # ═══════════════════════════════════════════════════════════════
+        rev_total  = round(rev_score, 1)
+        cont_total = round(cont_score, 1)
+        gap = abs(rev_total - cont_total)
+
+        # Store scores for display
+        self._last_sweep_analysis = {
+            "rev_score": rev_total, "cont_score": cont_total,
+            "rev_reasons": rev_reasons, "cont_reasons": cont_reasons,
+            "sweep_side": sweep.pool.side.value,
+            "sweep_price": sweep.pool.price,
+            "sweep_quality": sweep.quality,
+        }
+
+        if rev_total >= 55.0 and gap >= 15.0:
+            confidence = min(1.0, rev_total / 100.0)
+            reason_str = " + ".join(rev_reasons[:4])
+            logger.info(
+                f"🔄 SWEEP VERDICT: REVERSAL {sweep_dir.upper()} "
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f} gap={gap:.0f}) "
+                f"| {reason_str}")
             return PostSweepDecision(
                 action="reverse",
                 direction=sweep_dir,
-                confidence=min(1.0, sweep.quality + (0.2 if cisd_confirmed else 0.0)),
+                confidence=confidence,
                 next_target=opp_target,
-                reason=(f"Sweep quality={sweep.quality:.2f} + "
-                        f"{'CISD confirmed' if cisd_confirmed else 'flow reversal'}")
+                reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] {reason_str}",
             )
 
-        elif (breaking_through
-              and flow_agrees_continuation
-              and not rejecting):
-            # Continuation — swept pool was a breakout
-            cont_dir = "long" if sweep_dir == "short" else "short"
-            next_target = self._find_continuation_target(
-                cont_dir, snap, price, atr)
-            if next_target is not None:
-                return PostSweepDecision(
-                    action="continue",
-                    direction=cont_dir,
-                    confidence=abs(flow.conviction),
-                    next_target=next_target,
-                    reason=f"Flow continues {cont_dir} post-sweep",
-                )
+        elif cont_total >= 50.0 and gap >= 15.0:
+            confidence = min(1.0, cont_total / 100.0)
+            reason_str = " + ".join(cont_reasons[:4])
+            logger.info(
+                f"➡️ SWEEP VERDICT: CONTINUATION {cont_dir.upper()} "
+                f"(cont={cont_total:.0f} vs rev={rev_total:.0f} gap={gap:.0f}) "
+                f"| {reason_str}")
+            return PostSweepDecision(
+                action="continue",
+                direction=cont_dir,
+                confidence=confidence,
+                next_target=cont_target,
+                reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] {reason_str}",
+            )
 
-        return PostSweepDecision(
-            action="wait",
-            direction="",
-            confidence=0.0,
-            reason="Mixed signals post-sweep",
-        )
+        else:
+            # Log the indecision with full scoring for debugging
+            logger.debug(
+                f"⏳ SWEEP WAIT: rev={rev_total:.0f} cont={cont_total:.0f} "
+                f"gap={gap:.0f} (need ≥15) | "
+                f"R:[{', '.join(rev_reasons[:3])}] "
+                f"C:[{', '.join(cont_reasons[:3])}]")
+            return PostSweepDecision(
+                action="wait",
+                direction="",
+                confidence=0.0,
+                reason=f"WAIT [{rev_total:.0f}v{cont_total:.0f}] gap={gap:.0f}<15",
+            )
 
     def _handle_sweep_reversal(
         self,
@@ -1116,22 +1343,15 @@ class _PostSweepState:
 
 class ICTTrailManager:
     """
-    Trailing stop management using ICT structures + Liquidity awareness.
-    
-    INSTITUTIONAL TRAIL RULES:
-    1. 15m structure is PRIMARY — wider swings survive stop hunts
-    2. 5m structure for refinement once trend is confirmed (BOS >= 2)
-    3. SL must CLEAR nearby liquidity pools by 0.5 ATR minimum
-    4. BOS in trade direction → tighten buffer  
-    5. CHoCH against trade → tighten aggressively
-    6. Never move SL backward (ratchet-only)
-    7. Session-aware buffer widening (Asia = wider, NY = standard)
-    
-    PHASE LOGIC (profit-tier + structure):
-      Phase 0: tier < 0.40R and no BOS → HOLD (no trail)
-      Phase 1: tier >= 0.40R OR 1 BOS → 15m swing trail, wide buffer
-      Phase 2: tier >= 1.00R OR 2 BOS → 15m+5m trail, moderate buffer
-      Phase 3: tier >= 2.00R OR 3 BOS → All TF trail, tight buffer
+    Trailing stop management using ICT structures ONLY.
+    No ATR multipliers, no R-multiple gates, no time-based rules.
+
+    Rules:
+    1. SL moves ONLY when a new swing forms behind the trade
+    2. BOS in trade direction → tighten buffer
+    3. CHoCH against trade → tighten aggressively
+    4. 15m structure takes precedence over 5m
+    5. Never move SL backward (closer to entry)
     """
 
     def __init__(self) -> None:
@@ -1140,7 +1360,6 @@ class ICTTrailManager:
         self._side:         str   = ""
         self._bos_count:    int   = 0
         self._choch_seen:   bool  = False
-        self._peak_profit:  float = 0.0
 
     def initialize(self, side: str, entry_price: float, initial_sl: float) -> None:
         self._side = side
@@ -1148,7 +1367,6 @@ class ICTTrailManager:
         self._current_sl = initial_sl
         self._bos_count = 0
         self._choch_seen = False
-        self._peak_profit = 0.0
 
     def compute(
         self,
@@ -1157,21 +1375,12 @@ class ICTTrailManager:
         atr: float,
         candles_5m: List[Dict],
         candles_15m: Optional[List[Dict]] = None,
-        initial_sl_dist: float = 0.0,
-        liq_pools: Optional[List] = None,
     ) -> Optional[float]:
         """
         Returns new SL if it should move, None if no change.
         """
         if not self._side or atr < 1e-10:
             return None
-
-        # Track profit
-        profit = (price - self._entry_price) if self._side == "long" else (self._entry_price - price)
-        self._peak_profit = max(self._peak_profit, profit)
-        
-        init_dist = initial_sl_dist if initial_sl_dist > 1e-10 else abs(self._entry_price - self._current_sl)
-        tier = self._peak_profit / init_dist if init_dist > 1e-10 else 0.0
 
         # Check for BOS in trade direction → count it
         if ict_ctx.bos_5m:
@@ -1185,27 +1394,11 @@ class ICTTrailManager:
             if ict_ctx.choch_5m == against:
                 self._choch_seen = True
 
-        # Determine phase (profit + structure)
-        phase = self._determine_phase(tier)
-        if phase == 0:
-            return None
-
-        # Find the latest swing behind the trade (15m priority)
-        new_sl = self._find_structural_sl(candles_5m, candles_15m, atr, phase)
+        # Find the latest swing behind the trade
+        new_sl = self._find_structural_sl(candles_5m, candles_15m, atr)
 
         if new_sl is None:
             return None
-
-        # Liquidity pool clearance — don't place SL where stops cluster
-        if liq_pools:
-            new_sl = self._clear_liquidity(new_sl, liq_pools, atr)
-
-        # Minimum distance enforcement
-        min_dist = self._get_min_dist(atr, phase)
-        if self._side == "long":
-            new_sl = min(new_sl, price - min_dist)
-        else:
-            new_sl = max(new_sl, price + min_dist)
 
         # Never move backward
         if self._side == "long":
@@ -1218,132 +1411,62 @@ class ICTTrailManager:
         self._current_sl = new_sl
         return new_sl
 
-    def _determine_phase(self, tier: float) -> int:
-        """Phase from BOS count + profit tier (matches quant_strategy logic)."""
-        if self._bos_count >= 3 or tier >= 2.0:
-            return 3
-        if self._bos_count >= 2 or (self._bos_count >= 1 and tier >= 0.8) or tier >= 1.0:
-            return 2
-        if self._bos_count >= 1 or tier >= 0.40:
-            return 1
-        return 0
-
-    def _get_min_dist(self, atr: float, phase: int) -> float:
-        """Minimum trail distance — session-aware."""
-        base_mult = {1: 2.0, 2: 1.5}.get(phase, 1.0)
-        
-        # Session widening
-        try:
-            from datetime import datetime, timezone, timedelta
-            utc_now = datetime.now(timezone.utc)
-            ny_hour = (utc_now - timedelta(hours=5)).hour
-            if 20 <= ny_hour or ny_hour < 1:
-                base_mult *= 1.50   # Asia — wide
-            elif 2 <= ny_hour < 5:
-                base_mult *= 1.15   # London
-            elif 11 <= ny_hour < 16:
-                base_mult *= 1.25   # Late NY
-        except Exception:
-            pass
-        
-        return max(base_mult * atr, 0.50 * atr)
-
-    def _clear_liquidity(self, sl: float, liq_pools: list, atr: float) -> float:
-        """Push SL away from nearby liquidity pools to avoid stop hunts."""
-        clearance = 0.50 * atr
-        for pool in liq_pools:
-            try:
-                pp = float(pool.price) if hasattr(pool, 'price') else float(pool.get('price', 0))
-                swept = getattr(pool, 'swept', False) or pool.get('swept', False) if isinstance(pool, dict) else False
-                if swept:
-                    continue
-                if abs(sl - pp) < clearance:
-                    if self._side == "long":
-                        sl = min(sl, pp - clearance)
-                    else:
-                        sl = max(sl, pp + clearance)
-            except Exception:
-                continue
-        return sl
-
     def _find_structural_sl(
         self,
         candles_5m: List[Dict],
         candles_15m: Optional[List[Dict]],
         atr: float,
-        phase: int,
     ) -> Optional[float]:
         """
         Find the appropriate swing level for SL placement.
-        
-        INSTITUTIONAL HIERARCHY:
-          Phase 1-3: 15m swing (primary — survives stop hunts)
-          Phase 2-3: 5m swing (refinement — tighter when trend confirmed)
-          Phase 3:   Use the better of 15m and 5m
+        Hierarchy: 15m swing > 5m swing.
         """
+        # BUG-FIX-4: Bare "from liquidity_map import" inside a method raises
+        # ModuleNotFoundError when entry_engine is imported as strategy.entry_engine
+        # (Python's path doesn't include the strategy/ subdirectory for bare imports).
+        # This silently returned None for every trail SL computation.
         try:
             from strategy.liquidity_map import _find_swing_highs, _find_swing_lows
         except ImportError:
             from liquidity_map import _find_swing_highs, _find_swing_lows
 
-        # Buffer scales with phase + CHoCH
+        # Buffer scales with phase
         if self._choch_seen:
-            buffer_mult = 0.10   # Tight — market warned us
+            buffer_mult = 0.05  # Very tight — market warned us
         elif self._bos_count >= 2:
-            buffer_mult = 0.20   # Moderate — thesis proven
-        elif self._bos_count >= 1:
-            buffer_mult = 0.30   # Standard
+            buffer_mult = 0.10  # Moderate — thesis proven
         else:
-            buffer_mult = 0.40   # Wide — no structure confirmation
+            buffer_mult = _SL_BUFFER_ATR  # Standard
+
         buffer = atr * buffer_mult
 
-        candidates = []
-
-        # ── 15m PRIMARY anchor (Phase 1+) ─────────────────────────────
+        # Try 15m first
         if candles_15m and len(candles_15m) >= 12:
             if self._side == "long":
                 lows = _find_swing_lows(candles_15m, lookback=3)
                 if lows:
-                    # Use the most recent swing low that's behind the trade
-                    valid = [l for l in lows if l[1] < self._entry_price]
-                    if valid:
-                        latest_low = valid[-1][1]
-                        candidates.append(latest_low - buffer)
+                    latest_low = lows[-1][1]
+                    return latest_low - buffer
             else:
                 highs = _find_swing_highs(candles_15m, lookback=3)
                 if highs:
-                    valid = [h for h in highs if h[1] > self._entry_price]
-                    if valid:
-                        latest_high = valid[-1][1]
-                        candidates.append(latest_high + buffer)
+                    latest_high = highs[-1][1]
+                    return latest_high + buffer
 
-        # ── 5m refinement (Phase 2+) ──────────────────────────────────
-        if phase >= 2 and candles_5m and len(candles_5m) >= 12:
-            tighter_buffer = atr * max(buffer_mult - 0.10, 0.10)
+        # Fall back to 5m
+        if candles_5m and len(candles_5m) >= 12:
             if self._side == "long":
                 lows = _find_swing_lows(candles_5m, lookback=5)
                 if lows:
-                    valid = [l for l in lows if l[1] > self._current_sl]
-                    if valid:
-                        latest_low = valid[-1][1]
-                        candidates.append(latest_low - tighter_buffer)
+                    latest_low = lows[-1][1]
+                    return latest_low - buffer
             else:
                 highs = _find_swing_highs(candles_5m, lookback=5)
                 if highs:
-                    valid = [h for h in highs if h[1] < self._current_sl]
-                    if valid:
-                        latest_high = valid[-1][1]
-                        candidates.append(latest_high + tighter_buffer)
+                    latest_high = highs[-1][1]
+                    return latest_high + buffer
 
-        if not candidates:
-            return None
-
-        # Select the tightest valid candidate (best improvement)
-        if self._side == "long":
-            return max(c for c in candidates if c > self._current_sl) if any(c > self._current_sl for c in candidates) else None
-        else:
-            valid = [c for c in candidates if c < self._current_sl]
-            return min(valid) if valid else None
+        return None
 
     @property
     def current_sl(self) -> float:
@@ -1354,6 +1477,4 @@ class ICTTrailManager:
         parts = [f"BOS×{self._bos_count}"]
         if self._choch_seen:
             parts.append("CHoCH⚠️")
-        peak_r = self._peak_profit / max(abs(self._entry_price - self._current_sl), 1) if self._current_sl else 0
-        parts.append(f"peak={peak_r:.1f}R")
         return " ".join(parts)
