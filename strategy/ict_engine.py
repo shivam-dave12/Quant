@@ -533,8 +533,11 @@ class ICTEngine:
     # HTF OB threshold for htf_only filtering
     HTF_STRENGTH_THRESHOLD = 70.0
 
-    # Kill zone hours (NY time = UTC + offset)
-    KZ_ASIA_START   = 20; KZ_ASIA_END   = 24
+    # Kill zone hours (NY time = UTC + offset).
+    # KZ_ASIA_END wraps across midnight: Asia KZ is ny >= 20 OR ny < 1.
+    # Default of 24 was a latent bug — if _load_config ever fails to set the
+    # instance attribute, ny < 24 is always True, making every hour ASIA_KZ.
+    KZ_ASIA_START   = 20; KZ_ASIA_END   = 1
     KZ_LONDON_START = 2;  KZ_LONDON_END  = 5
     KZ_NY_START     = 7;  KZ_NY_END     = 10
 
@@ -2379,17 +2382,19 @@ class ICTEngine:
         components["disp_bias"] = f_disp
 
         # ── Factor 8: Session timing (0.03) ───────────────────────────────
-        # London open (08:00-09:00 UTC): slight BSL sweep bias (Judas swing up)
-        # NY delivery (13:30-15:30 UTC): amplify existing direction
+        # Uses self._session / self._killzone already computed by _update_session()
+        # (called in update()).  This avoids the previous DST bug (hardcoded UTC
+        # minutes 480-540 / 810-930 were only correct for EDT, wrong by 1h in EST)
+        # and guarantees this factor stays in sync with the session display.
+        #
+        # London KZ: slight BSL sweep bias (Judas swing up during London open).
+        # NY KZ:     amplify whichever direction the primary factors already favour.
         f_sess = 0.0
         try:
-            from datetime import datetime, timezone as _tz
-            _dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=_tz.utc)
-            _hm  = _dt.hour * 60 + _dt.minute
-            if 480 <= _hm <= 540:      # London KZ 08:00-09:00 UTC
-                f_sess = +0.20         # London BSL sweep Judas bias
-            elif 810 <= _hm <= 930:    # NY 13:30-15:30 UTC
-                # Amplify existing EMA direction
+            if self._killzone == "LONDON_KZ":
+                f_sess = +0.20          # London BSL sweep / Judas swing bias
+            elif self._killzone == "NY_KZ":
+                # Amplify the existing composite of primary factors
                 _existing = sum(
                     components[k] * _WEIGHTS[k]
                     for k in ("amd", "dr_pos", "flow", "cvd")

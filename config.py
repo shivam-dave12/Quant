@@ -295,11 +295,16 @@ FVG_MAX_AGE_MINUTES         = 1440
 LIQ_TOUCH_TOLERANCE_PCT     = 0.20
 SWEEP_DISPLACEMENT_MIN      = 0.40
 SWEEP_MAX_AGE_MINUTES       = 120
-KZ_ASIA_NY_START            = 20
-KZ_LONDON_NY_START          = 2
-KZ_LONDON_NY_END            = 5
-KZ_NY_NY_START              = 7
-KZ_NY_NY_END                = 10
+# Kill-zone windows in NY time (EST/EDT — ICTEngine applies DST automatically).
+# KZ_ASIA_NY_END wraps across midnight: Asia KZ = ny >= KZ_ASIA_NY_START OR ny < KZ_ASIA_NY_END.
+# The old default of KZ_ASIA_END=24 in the class attribute caused a latent always-True
+# bug when config import failed.  Explicitly setting 1 here prevents that.
+KZ_ASIA_NY_START            = 20   # 8 PM NY
+KZ_ASIA_NY_END              = 1    # 1 AM NY  (wraps midnight)
+KZ_LONDON_NY_START          = 2    # 2 AM NY
+KZ_LONDON_NY_END            = 5    # 5 AM NY
+KZ_NY_NY_START              = 7    # 7 AM NY
+KZ_NY_NY_END                = 10   # 10 AM NY
 
 # ── ICT Gate ──────────────────────────────────────────────────────────────────
 # Minimum ICT structural confluence score required before any trade entry.

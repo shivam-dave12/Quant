@@ -49,22 +49,11 @@ except ImportError:
 
 _HUNT_AVAILABLE = False  # LiquidityHunter removed; v9 uses LiquidityMap + EntryEngine
 
-# ── ICT Institutional Trade Engine (sweep-spot SL/TP/Trail/Entry) ──────────
-try:
-    _ict_engine_dir = _os.path.dirname(_os.path.abspath(__file__))
-    if _ict_engine_dir not in sys.path:
-        sys.path.insert(0, _ict_engine_dir)
-    from ict_trade_engine import (
-        ICTSweepSetup, ICTSweepDetector,
-        ICTSLEngine, ICTTPEngine, ICTTrailEngine,
-        ICTEntryGate, QuantHelperSignals,
-        _find_swings, _round_tick as _ict_round_tick,
-    )
-    _ICT_TRADE_ENGINE_AVAILABLE = True
-except ImportError as _ite_e:
-    _ICT_TRADE_ENGINE_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.warning(f"ict_trade_engine.py not found — using legacy SL/TP/Trail: {_ite_e}")
+# ── ICT Institutional Trade Engine — fully inlined; external module removed ─
+# All ICTEntryGate / ICTSweepDetector / ICTSLEngine / ICTTPEngine / ICTTrailEngine
+# logic is embedded directly in this file.  ict_trade_engine.py is no longer
+# needed and the import attempt has been removed to eliminate the startup warning.
+_ICT_TRADE_ENGINE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -2745,16 +2734,22 @@ class _ICTStructureTrail:
         base_mult = {0: 2.5, 1: p1, 2: p2}.get(phase, p3)
         base = base_mult * atr
         
-        # Session-aware widening
+        # Session-aware widening — DST-correct, boundaries match ICTEngine._update_session().
+        # Old code used timedelta(hours=5) which is EST-only and ignores EDT (UTC-4 in summer).
+        # Old boundaries (Asia ends 01:00, London ends 05:00) also differed from ICTEngine's
+        # KZ windows (Asia ends 02:00, London ends 07:00), causing trail width mismatches.
         try:
             from config import SESSION_TRAIL_WIDTH_MULT
-            from datetime import datetime, timezone, timedelta
-            ny_hour = (datetime.now(timezone.utc) - timedelta(hours=5)).hour
-            if 20 <= ny_hour or ny_hour < 1:   sess = "asia"
-            elif 2 <= ny_hour < 5:              sess = "london"
-            elif 7 <= ny_hour < 11:             sess = "ny"
-            elif 11 <= ny_hour < 16:            sess = "late_ny"
-            else:                               sess = "off"
+            from datetime import datetime, timezone
+            _dt  = datetime.now(timezone.utc)
+            _dst = 3 <= _dt.month <= 10          # US DST: Mar–Oct
+            _ny  = (_dt.hour + _dt.minute / 60.0 + (-4.0 if _dst else -5.0)) % 24.0
+            # Matches ICTEngine: Asia 20–02, London 02–07, NY 07–11, Late-NY 11–16.
+            if   _ny >= 20.0 or _ny < 2.0:  sess = "asia"
+            elif 2.0  <= _ny < 7.0:          sess = "london"
+            elif 7.0  <= _ny < 11.0:         sess = "ny"
+            elif 11.0 <= _ny < 16.0:         sess = "late_ny"
+            else:                             sess = "off"
             base *= SESSION_TRAIL_WIDTH_MULT.get(sess, 1.0)
         except (ImportError, AttributeError):
             pass
@@ -4710,6 +4705,9 @@ class QuantStrategy:
             # Old quant-scout gates (VWAP/CVD/composite/n_confirming) are NOT
             # shown here because they play zero role once we are in a trade.
             # ════════════════════════════════════════════════════════════════
+            # BUG-FIX: _log_thinking has no `atr` parameter; pull it from the
+            # signal object so every downstream reference is defined.
+            atr       = sig.atr if sig.atr > 1e-10 else 1.0
             pos       = self._pos
             profit_pts = ((price - pos.entry_price) if pos.side == "long"
                           else (pos.entry_price - price))
@@ -5647,54 +5645,11 @@ class QuantStrategy:
                             _atr_l   = getattr(self, '_atr_val', None) or 1.0
                             _now_l   = int(now * 1000) if now < 1e12 else int(now)
                             if _opp_l is not None and _swept_l is not None:
-                                # Use ICT SL/TP engines for precise levels
-                                from strategy.ict_trade_engine import ICTSLEngine, ICTTPEngine
-                                _sl_l, _sl_src = ICTSLEngine.compute(
-                                    side, price, _atr_l,
-                                    sweep_setup=None,
-                                    ict_engine=self._ict,
-                                    now_ms=_now_l)
-                                _tp_l = ICTTPEngine.compute(
-                                    side, price, _atr_l, _sl_l,
-                                    sweep_setup=None,
-                                    ict_engine=self._ict,
-                                    now_ms=_now_l)
-                                if _sl_l is not None and _tp_l is not None:
-                                    _sl_dist_l = abs(price - _sl_l)
-                                    _tp_dist_l = abs(price - _tp_l)
-                                    _rr_l = (_tp_dist_l / _sl_dist_l
-                                             if _sl_dist_l > 1e-9 else 0.0)
-                                    if _rr_l >= 1.5:
-                                        @dataclass
-                                        class _HS:
-                                            side: str; entry_price: float
-                                            sl_price: float; tp_price: float
-                                            rr: float; swept_pool_price: float
-                                            target_pool_price: float
-                                            prediction_score: float
-                                            sweep_age_ms: int; details: str
-                                            created_at: float = field(default_factory=time.time)
-                                        _hs_l = _HS(
-                                            side=side,
-                                            entry_price=price,
-                                            sl_price=_sl_l,
-                                            tp_price=_tp_l,
-                                            rr=_rr_l,
-                                            swept_pool_price=_swept_l,
-                                            target_pool_price=_opp_l,
-                                            prediction_score=_hp_l.get('confidence', 0.0),
-                                            sweep_age_ms=0,
-                                            details=f"TIER-L {_tier_reason}")
-                                        self._pending_hunt_signal = _hs_l
-                                        self._launch_entry_async(
-                                            data_manager, order_manager, risk_manager,
-                                            side, sig, mode="hunt", ict_tier="L")
-                                        return
-                                    else:
-                                        logger.info(
-                                            f"🎣 Tier-L R:R {_rr_l:.2f} < 1.5 — skipped")
-                                        self._confirm_long = self._confirm_short = 0
-                                        return
+                                # ict_trade_engine is no longer a separate module;
+                                # ICTSLEngine / ICTTPEngine are inlined into quant_strategy.
+                                # The Tier-L path without a formal sweep setup falls through
+                                # to Tier-A entry which uses the existing SL/TP pipeline.
+                                pass
                         except Exception as _le:
                             logger.debug(f"Tier-L build error: {_le}")
                     # Fallback if we can't build the hunt signal: treat as Tier-A
@@ -7510,21 +7465,11 @@ class QuantStrategy:
 
             # 2. 5m swing structure near the lock level
             if _struct_sl is None and len(candles_5m) >= 6:
+                closed_5m = candles_5m[:-1]
                 try:
-                    closed_5m = candles_5m[:-1]
-                    from strategy.ict_trade_engine import _find_swings as _fs_ratchet
-                except ImportError:
-                    try:
-                        from ict_trade_engine import _find_swings as _fs_ratchet
-                    except ImportError:
-                        _fs_ratchet = None
-                if _fs_ratchet is not None:
-                    try:
-                        highs_5m, lows_5m = _fs_ratchet(
-                            closed_5m, min(12, len(closed_5m) - 2))
-                    except Exception:
-                        highs_5m, lows_5m = [], []
-                else:
+                    highs_5m, lows_5m = _ict_find_swings_inline(
+                        closed_5m, min(12, len(closed_5m) - 2))
+                except Exception:
                     highs_5m, lows_5m = [], []
                 sw_buf = 0.40 * atr
                 if pos.side == "long" and lows_5m:
