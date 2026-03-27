@@ -1116,15 +1116,22 @@ class _PostSweepState:
 
 class ICTTrailManager:
     """
-    Trailing stop management using ICT structures ONLY.
-    No ATR multipliers, no R-multiple gates, no time-based rules.
-
-    Rules:
-    1. SL moves ONLY when a new swing forms behind the trade
-    2. BOS in trade direction → tighten buffer
-    3. CHoCH against trade → tighten aggressively
-    4. 15m structure takes precedence over 5m
-    5. Never move SL backward (closer to entry)
+    Trailing stop management using ICT structures + Liquidity awareness.
+    
+    INSTITUTIONAL TRAIL RULES:
+    1. 15m structure is PRIMARY — wider swings survive stop hunts
+    2. 5m structure for refinement once trend is confirmed (BOS >= 2)
+    3. SL must CLEAR nearby liquidity pools by 0.5 ATR minimum
+    4. BOS in trade direction → tighten buffer  
+    5. CHoCH against trade → tighten aggressively
+    6. Never move SL backward (ratchet-only)
+    7. Session-aware buffer widening (Asia = wider, NY = standard)
+    
+    PHASE LOGIC (profit-tier + structure):
+      Phase 0: tier < 0.40R and no BOS → HOLD (no trail)
+      Phase 1: tier >= 0.40R OR 1 BOS → 15m swing trail, wide buffer
+      Phase 2: tier >= 1.00R OR 2 BOS → 15m+5m trail, moderate buffer
+      Phase 3: tier >= 2.00R OR 3 BOS → All TF trail, tight buffer
     """
 
     def __init__(self) -> None:
@@ -1133,6 +1140,7 @@ class ICTTrailManager:
         self._side:         str   = ""
         self._bos_count:    int   = 0
         self._choch_seen:   bool  = False
+        self._peak_profit:  float = 0.0
 
     def initialize(self, side: str, entry_price: float, initial_sl: float) -> None:
         self._side = side
@@ -1140,6 +1148,7 @@ class ICTTrailManager:
         self._current_sl = initial_sl
         self._bos_count = 0
         self._choch_seen = False
+        self._peak_profit = 0.0
 
     def compute(
         self,
@@ -1148,12 +1157,21 @@ class ICTTrailManager:
         atr: float,
         candles_5m: List[Dict],
         candles_15m: Optional[List[Dict]] = None,
+        initial_sl_dist: float = 0.0,
+        liq_pools: Optional[List] = None,
     ) -> Optional[float]:
         """
         Returns new SL if it should move, None if no change.
         """
         if not self._side or atr < 1e-10:
             return None
+
+        # Track profit
+        profit = (price - self._entry_price) if self._side == "long" else (self._entry_price - price)
+        self._peak_profit = max(self._peak_profit, profit)
+        
+        init_dist = initial_sl_dist if initial_sl_dist > 1e-10 else abs(self._entry_price - self._current_sl)
+        tier = self._peak_profit / init_dist if init_dist > 1e-10 else 0.0
 
         # Check for BOS in trade direction → count it
         if ict_ctx.bos_5m:
@@ -1167,11 +1185,27 @@ class ICTTrailManager:
             if ict_ctx.choch_5m == against:
                 self._choch_seen = True
 
-        # Find the latest swing behind the trade
-        new_sl = self._find_structural_sl(candles_5m, candles_15m, atr)
+        # Determine phase (profit + structure)
+        phase = self._determine_phase(tier)
+        if phase == 0:
+            return None
+
+        # Find the latest swing behind the trade (15m priority)
+        new_sl = self._find_structural_sl(candles_5m, candles_15m, atr, phase)
 
         if new_sl is None:
             return None
+
+        # Liquidity pool clearance — don't place SL where stops cluster
+        if liq_pools:
+            new_sl = self._clear_liquidity(new_sl, liq_pools, atr)
+
+        # Minimum distance enforcement
+        min_dist = self._get_min_dist(atr, phase)
+        if self._side == "long":
+            new_sl = min(new_sl, price - min_dist)
+        else:
+            new_sl = max(new_sl, price + min_dist)
 
         # Never move backward
         if self._side == "long":
@@ -1184,62 +1218,132 @@ class ICTTrailManager:
         self._current_sl = new_sl
         return new_sl
 
+    def _determine_phase(self, tier: float) -> int:
+        """Phase from BOS count + profit tier (matches quant_strategy logic)."""
+        if self._bos_count >= 3 or tier >= 2.0:
+            return 3
+        if self._bos_count >= 2 or (self._bos_count >= 1 and tier >= 0.8) or tier >= 1.0:
+            return 2
+        if self._bos_count >= 1 or tier >= 0.40:
+            return 1
+        return 0
+
+    def _get_min_dist(self, atr: float, phase: int) -> float:
+        """Minimum trail distance — session-aware."""
+        base_mult = {1: 2.0, 2: 1.5}.get(phase, 1.0)
+        
+        # Session widening
+        try:
+            from datetime import datetime, timezone, timedelta
+            utc_now = datetime.now(timezone.utc)
+            ny_hour = (utc_now - timedelta(hours=5)).hour
+            if 20 <= ny_hour or ny_hour < 1:
+                base_mult *= 1.50   # Asia — wide
+            elif 2 <= ny_hour < 5:
+                base_mult *= 1.15   # London
+            elif 11 <= ny_hour < 16:
+                base_mult *= 1.25   # Late NY
+        except Exception:
+            pass
+        
+        return max(base_mult * atr, 0.50 * atr)
+
+    def _clear_liquidity(self, sl: float, liq_pools: list, atr: float) -> float:
+        """Push SL away from nearby liquidity pools to avoid stop hunts."""
+        clearance = 0.50 * atr
+        for pool in liq_pools:
+            try:
+                pp = float(pool.price) if hasattr(pool, 'price') else float(pool.get('price', 0))
+                swept = getattr(pool, 'swept', False) or pool.get('swept', False) if isinstance(pool, dict) else False
+                if swept:
+                    continue
+                if abs(sl - pp) < clearance:
+                    if self._side == "long":
+                        sl = min(sl, pp - clearance)
+                    else:
+                        sl = max(sl, pp + clearance)
+            except Exception:
+                continue
+        return sl
+
     def _find_structural_sl(
         self,
         candles_5m: List[Dict],
         candles_15m: Optional[List[Dict]],
         atr: float,
+        phase: int,
     ) -> Optional[float]:
         """
         Find the appropriate swing level for SL placement.
-        Hierarchy: 15m swing > 5m swing.
+        
+        INSTITUTIONAL HIERARCHY:
+          Phase 1-3: 15m swing (primary — survives stop hunts)
+          Phase 2-3: 5m swing (refinement — tighter when trend confirmed)
+          Phase 3:   Use the better of 15m and 5m
         """
-        # BUG-FIX-4: Bare "from liquidity_map import" inside a method raises
-        # ModuleNotFoundError when entry_engine is imported as strategy.entry_engine
-        # (Python's path doesn't include the strategy/ subdirectory for bare imports).
-        # This silently returned None for every trail SL computation.
         try:
             from strategy.liquidity_map import _find_swing_highs, _find_swing_lows
         except ImportError:
             from liquidity_map import _find_swing_highs, _find_swing_lows
 
-        # Buffer scales with phase
+        # Buffer scales with phase + CHoCH
         if self._choch_seen:
-            buffer_mult = 0.05  # Very tight — market warned us
+            buffer_mult = 0.10   # Tight — market warned us
         elif self._bos_count >= 2:
-            buffer_mult = 0.10  # Moderate — thesis proven
+            buffer_mult = 0.20   # Moderate — thesis proven
+        elif self._bos_count >= 1:
+            buffer_mult = 0.30   # Standard
         else:
-            buffer_mult = _SL_BUFFER_ATR  # Standard
-
+            buffer_mult = 0.40   # Wide — no structure confirmation
         buffer = atr * buffer_mult
 
-        # Try 15m first
+        candidates = []
+
+        # ── 15m PRIMARY anchor (Phase 1+) ─────────────────────────────
         if candles_15m and len(candles_15m) >= 12:
             if self._side == "long":
                 lows = _find_swing_lows(candles_15m, lookback=3)
                 if lows:
-                    latest_low = lows[-1][1]
-                    return latest_low - buffer
+                    # Use the most recent swing low that's behind the trade
+                    valid = [l for l in lows if l[1] < self._entry_price]
+                    if valid:
+                        latest_low = valid[-1][1]
+                        candidates.append(latest_low - buffer)
             else:
                 highs = _find_swing_highs(candles_15m, lookback=3)
                 if highs:
-                    latest_high = highs[-1][1]
-                    return latest_high + buffer
+                    valid = [h for h in highs if h[1] > self._entry_price]
+                    if valid:
+                        latest_high = valid[-1][1]
+                        candidates.append(latest_high + buffer)
 
-        # Fall back to 5m
-        if candles_5m and len(candles_5m) >= 12:
+        # ── 5m refinement (Phase 2+) ──────────────────────────────────
+        if phase >= 2 and candles_5m and len(candles_5m) >= 12:
+            tighter_buffer = atr * max(buffer_mult - 0.10, 0.10)
             if self._side == "long":
                 lows = _find_swing_lows(candles_5m, lookback=5)
                 if lows:
-                    latest_low = lows[-1][1]
-                    return latest_low - buffer
+                    valid = [l for l in lows if l[1] > self._current_sl]
+                    if valid:
+                        latest_low = valid[-1][1]
+                        candidates.append(latest_low - tighter_buffer)
             else:
                 highs = _find_swing_highs(candles_5m, lookback=5)
                 if highs:
-                    latest_high = highs[-1][1]
-                    return latest_high + buffer
+                    valid = [h for h in highs if h[1] < self._current_sl]
+                    if valid:
+                        latest_high = valid[-1][1]
+                        candidates.append(latest_high + tighter_buffer)
 
-        return None
+        if not candidates:
+            return None
+
+        # Select the tightest valid candidate (best improvement)
+        if self._side == "long":
+            return max(c for c in candidates if c > self._current_sl) if any(c > self._current_sl for c in candidates) else None
+        else:
+            valid = [c for c in candidates if c < self._current_sl]
+            return min(valid) if valid else None
 
     @property
     def current_sl(self) -> float:
@@ -1250,4 +1354,6 @@ class ICTTrailManager:
         parts = [f"BOS×{self._bos_count}"]
         if self._choch_seen:
             parts.append("CHoCH⚠️")
+        peak_r = self._peak_profit / max(abs(self._entry_price - self._current_sl), 1) if self._current_sl else 0
+        parts.append(f"peak={peak_r:.1f}R")
         return " ".join(parts)

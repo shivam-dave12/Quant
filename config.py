@@ -83,10 +83,34 @@ MIN_CANDLES_1D       = 7
 LOOKBACK_CANDLES_1M  = 150   # strategy requests up to 120; +30 headroom
 LOOKBACK_CANDLES_5M  = 300   # strategy requests 300 (main ICT + trail + sweep)
 LOOKBACK_CANDLES_15M = 200   # strategy requests 200
+LOOKBACK_CANDLES_1H  = 100   # 1H liquidity crucial for trend/reversal levels
 LOOKBACK_CANDLES_4H  = 50    # unchanged
-CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "4h"]
-PRIMARY_TIMEFRAME    = "5m"
+LOOKBACK_CANDLES_1D  = 30    # 1D for macro dealing range + IPDA levels
+CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "1h", "4h", "1d"]
+PRIMARY_TIMEFRAME    = "15m"     # 15m is primary for SL/TP structure
+ENTRY_TIMEFRAME      = "5m"      # 5m/1m for entry timing + trail micro-structure
 HTF_TIMEFRAME        = "4h"
+
+# ── Session configuration (NY-hour equivalents, UTC-based) ────────────────
+# BTC session behaviour:
+#   Asia (20:00-01:00 NY / 01:30-06:30 IST)  → Low vol, range-bound, stop hunts
+#   London (02:00-05:00 NY / 07:30-10:30 IST) → Volatility expansion, trend start
+#   NY (07:00-11:00 NY / 12:30-16:30 IST)    → Highest vol, institutional delivery
+#   Late NY (11:00-16:00 NY / 16:30-21:30 IST) → Consolidation, reversal risk
+SESSION_TRAIL_WIDTH_MULT = {
+    "asia":     1.60,   # Wide trail — stop hunts in thin liquidity
+    "london":   1.20,   # Moderate — trending but volatile
+    "ny":       1.00,   # Standard — highest conviction moves
+    "late_ny":  1.30,   # Wider — reversals and consolidation
+    "off":      1.50,   # Wide — low conviction
+}
+SESSION_ENTRY_QUALITY = {
+    "asia":     "LOW",      # Avoid entries unless Tier-S sweep setup
+    "london":   "HIGH",     # Prime entry window
+    "ny":       "HIGH",     # Prime entry window
+    "late_ny":  "MEDIUM",   # Acceptable with strong confluence
+    "off":      "LOW",      # Avoid
+}
 
 # ── Health / Supervisor ───────────────────────────────────────────────────────
 WS_STALE_SECONDS                   = 35.0
@@ -160,16 +184,33 @@ QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.40   # was 0.50 — trail starts a little earlier
-QUANT_TRAIL_LOCK_R             = 1.00
-QUANT_TRAIL_AGGRESSIVE_R       = 2.00
-QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.50
-QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.10
-QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.70
+QUANT_TRAIL_BE_R               = 0.30   # BE lock starts at 0.30R (was 0.40)
+QUANT_TRAIL_LOCK_R             = 0.80   # Profit lock starts at 0.80R
+QUANT_TRAIL_AGGRESSIVE_R       = 1.80   # Aggressive tightening at 1.80R (was 2.00)
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 2.00   # Phase 1: 2.0 ATR min distance (was 1.50 — too tight)
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.50   # Phase 2: 1.5 ATR (was 1.10)
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 1.00   # Phase 3: 1.0 ATR (was 0.70)
 QUANT_TRAIL_PULLBACK_FREEZE    = True
 QUANT_TRAIL_PB_VOL_RATIO       = 0.65
 QUANT_TRAIL_PB_DEPTH_ATR       = 1.20
 QUANT_TRAIL_REV_MIN_SIGNALS    = 2     # was 4 — 2 reversal signals sufficient to unfreeze trail
+
+# ── 15m-FIRST Trail Anchoring ────────────────────────────────────────────
+# 15m is the PRIMARY SL anchor — wider structures survive stop hunts
+# 5m/1m used for ENTRY timing and aggressive phase tightening only
+QUANT_TRAIL_15M_PRIORITY       = True   # 15m swings/OBs take precedence over 5m
+QUANT_TRAIL_15M_BUFFER_ATR     = 0.35   # Buffer below 15m swing for SL
+QUANT_TRAIL_5M_BUFFER_ATR      = 0.25   # Buffer below 5m swing (tighter, phase 2+)
+QUANT_TRAIL_1M_BUFFER_ATR      = 0.15   # Buffer below 1m swing (phase 3 only)
+QUANT_TRAIL_LIQ_CLEARANCE_ATR  = 0.50   # SL must clear liquidity pools by 0.5 ATR
+
+# ── Phase Entry Thresholds (CRITICAL FIX) ────────────────────────────────
+# Old: Phase 1 required bos>=1 OR be_locked OR tier>=0.8
+# Problem: In ranging markets BOS may never fire, and tier peaked at 0.76R
+# New: Profit-based phase advancement ensures trail activates
+QUANT_TRAIL_PHASE1_TIER        = 0.40   # Phase 1 at 0.40R profit (was implicit 0.8R)
+QUANT_TRAIL_PHASE2_TIER        = 1.00   # Phase 2 at 1.00R
+QUANT_TRAIL_PHASE3_TIER        = 2.00   # Phase 3 at 2.00R
 QUANT_ICT_ZONE_FREEZE_ENABLED  = True
 QUANT_ICT_ZONE_FREEZE_ATR      = 0.40
 QUANT_ICT_OB_SL_ANCHOR         = True

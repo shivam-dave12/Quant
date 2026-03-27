@@ -2681,18 +2681,61 @@ class _ICTStructureTrail:
 
     @staticmethod
     def _phase(bos: int, be_locked: bool, has_disp: bool, tier: float) -> int:
-        if bos >= 3 or (bos >= 2 and tier >= 2.5):
+        """
+        Determine trail phase from ICT structure + profit tier.
+        
+        CRITICAL FIX: Old logic required BOS>=1 to enter Phase 1. In ranging
+        markets or fast moves without confirmed structure breaks, BOS stays
+        at 0 indefinitely. Trade peaked at 0.76R and got stopped at BE because
+        the trail never activated.
+        
+        New logic: Profit tier ALSO advances phase. ICT structure events
+        ACCELERATE the phase (lower tier threshold) but are not required.
+        
+        Phase 0: No trail action (< 0.40R and no BOS)
+        Phase 1: Trail activates with wide buffer (0.40R OR 1 BOS)
+        Phase 2: Moderate tightening (1.00R OR 2 BOS + disp)
+        Phase 3: Aggressive (2.00R OR 3 BOS)
+        """
+        # Structure-based advancement (fast track)
+        if bos >= 3 or (bos >= 2 and tier >= 1.5):
             return 3
-        if bos >= 2 or (bos >= 1 and has_disp) or (be_locked and tier >= 1.5):
+        if bos >= 2 or (bos >= 1 and has_disp) or (be_locked and tier >= 1.0):
             return 2
-        if bos >= 1 or be_locked or tier >= 0.8:
+        if bos >= 1 or be_locked:
+            return 1
+        
+        # Profit-based advancement (guarantees trail activates)
+        try:
+            from config import (
+                QUANT_TRAIL_PHASE1_TIER, QUANT_TRAIL_PHASE2_TIER,
+                QUANT_TRAIL_PHASE3_TIER,
+            )
+            p1_tier = QUANT_TRAIL_PHASE1_TIER
+            p2_tier = QUANT_TRAIL_PHASE2_TIER
+            p3_tier = QUANT_TRAIL_PHASE3_TIER
+        except (ImportError, AttributeError):
+            p1_tier, p2_tier, p3_tier = 0.40, 1.00, 2.00
+        
+        if tier >= p3_tier:
+            return 3
+        if tier >= p2_tier:
+            return 2
+        if tier >= p1_tier:
             return 1
         return 0
 
     @staticmethod
     def _swing_buf(atr: float, phase: int, vol_ratio: float,
                    vol_regime: str, choch: bool) -> float:
-        base = {0: 0.50, 1: 0.50, 2: 0.30}.get(phase, 0.15) * atr
+        """
+        Buffer below/above swing level for SL placement.
+        
+        FIX: Old buffers (0.15-0.50 ATR) placed SL right at swing levels
+        where stop clusters sit. Market makers hunt these exact levels.
+        New: Wider buffers clear the stop cluster zone.
+        """
+        base = {0: 0.60, 1: 0.50, 2: 0.40}.get(phase, 0.25) * atr
         mult = (min(vol_ratio, 1.40) if vol_regime == "EXPANDING"
                 else max(vol_ratio, 0.65) if vol_regime == "CONTRACTING" else 1.0)
         buf = base * mult
@@ -2701,12 +2744,61 @@ class _ICTStructureTrail:
     @staticmethod
     def _min_dist(atr: float, phase: int, vol_ratio: float,
                   vol_regime: str) -> float:
-        base = {0: 1.0, 1: 1.0, 2: 0.60}.get(phase, 0.35) * atr
+        """
+        Minimum trail distance from price.
+        
+        CRITICAL FIX: Phase 1 was 1.0 ATR — way too tight for BTC.
+        A normal 1m pullback can be 0.8-1.2 ATR. SL at 1.0 ATR from price
+        guarantees getting stopped on any healthy retracement.
+        
+        New values anchored to observed BTC volatility:
+          Phase 0: 2.5 ATR (should not trail at all, but safety floor)
+          Phase 1: 2.0 ATR (wide — thesis not yet confirmed)
+          Phase 2: 1.5 ATR (moderate — structure confirming)
+          Phase 3: 1.0 ATR (tight — strong conviction)
+        """
+        try:
+            from config import (
+                QUANT_TRAIL_MIN_DIST_ATR_P1, QUANT_TRAIL_MIN_DIST_ATR_P2,
+                QUANT_TRAIL_MIN_DIST_ATR_P3,
+            )
+            p1 = QUANT_TRAIL_MIN_DIST_ATR_P1
+            p2 = QUANT_TRAIL_MIN_DIST_ATR_P2
+            p3 = QUANT_TRAIL_MIN_DIST_ATR_P3
+        except (ImportError, AttributeError):
+            p1, p2, p3 = 2.0, 1.5, 1.0
+        
+        base_mult = {0: 2.5, 1: p1, 2: p2}.get(phase, p3)
+        base = base_mult * atr
+        
+        # Session-aware widening
+        try:
+            from config import SESSION_TRAIL_WIDTH_MULT
+            from strategy.ict_engine import ICTEngine
+            # Get current session from time
+            from datetime import datetime, timezone, timedelta
+            utc_now = datetime.now(timezone.utc)
+            ny_hour = (utc_now - timedelta(hours=5)).hour  # EST approximation
+            if 20 <= ny_hour or ny_hour < 1:
+                session = "asia"
+            elif 2 <= ny_hour < 5:
+                session = "london"
+            elif 7 <= ny_hour < 11:
+                session = "ny"
+            elif 11 <= ny_hour < 16:
+                session = "late_ny"
+            else:
+                session = "off"
+            sess_mult = SESSION_TRAIL_WIDTH_MULT.get(session, 1.0)
+            base *= sess_mult
+        except (ImportError, AttributeError):
+            pass
+        
         if vol_regime == "EXPANDING":
             base *= min(vol_ratio, 1.30)
         elif vol_regime == "CONTRACTING":
             base *= max(vol_ratio, 0.70)
-        return max(base, 0.25 * atr)
+        return max(base, 0.50 * atr)
 
     @staticmethod
     def _hunt_guard(sl: float, pos_side: str, atr: float,
@@ -2902,8 +2994,11 @@ class _ICTStructureTrail:
                 if cand < current_sl and cand > price + min_dist:
                     candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
 
-        # ── 15m macro swing (phase ≥ 3) ───────────────────────────────────
-        if phase >= 3 and candles_15m and len(candles_15m) >= 6:
+        # ── 15m macro swing (phase ≥ 2 — CRITICAL: 15m is PRIMARY SL anchor) ─
+        # FIX: Was phase >= 3 which required 3+ BOS. 15m swings are the most
+        # reliable SL anchors because they survive stop hunts that clip 5m swings.
+        # Activating at phase 2 ensures 15m protection during trend development.
+        if phase >= 2 and candles_15m and len(candles_15m) >= 6:
             try:
                 cl15 = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
                 highs_15m, lows_15m = _ict_find_swings_inline(
@@ -7118,19 +7213,19 @@ class QuantStrategy:
 
         if mfe_r >= 2.50 and _last_ratchet_r < 2.50:
             _ratchet_level = 2.50; _ratchet_label = "2.50R"
-            _lock_r = mfe_r - 0.80
+            _lock_r = mfe_r - 0.60   # Aggressive lock — keep 0.60R cushion
         elif mfe_r >= 2.00 and _last_ratchet_r < 2.00:
             _ratchet_level = 2.00; _ratchet_label = "2.00R"
-            _lock_r = 1.20
+            _lock_r = 1.00            # Lock 1.0R profit (was 1.20 — too tight)
         elif mfe_r >= 1.50 and _last_ratchet_r < 1.50:
             _ratchet_level = 1.50; _ratchet_label = "1.50R"
-            _lock_r = 0.65
+            _lock_r = 0.50            # Lock 0.50R profit (was 0.65)
         elif mfe_r >= 1.00 and _last_ratchet_r < 1.00:
             _ratchet_level = 1.00; _ratchet_label = "1.00R"
-            _lock_r = 0.25
+            _lock_r = 0.15            # Lock 0.15R profit (was 0.25 — too aggressive)
         elif mfe_r >= 0.50 and _last_ratchet_r < 0.50:
             _ratchet_level = 0.50; _ratchet_label = "0.50R"
-            _lock_r = 0.0  # break-even only
+            _lock_r = 0.0  # Break-even ONLY — no structural search at this level
 
         _ratchet_due = _ratchet_level > 0.0
 
@@ -7253,10 +7348,13 @@ class QuantStrategy:
                 _ratchet_target = _target_price
                 _final_label = f"R_LOCK({_lock_r:.2f}R)"
 
-            # ── BREATHING ROOM: minimum 1.2 ATR from current price ────────
-            # This is the critical fix. 0.5 ATR = certain death.
-            # 1.2 ATR allows normal pullbacks without getting stopped.
-            _min_breath = 1.2 * atr
+            # ── BREATHING ROOM: minimum 1.8 ATR from current price ────────
+            # CRITICAL FIX: 1.2 ATR is death zone for BTC — normal pullbacks
+            # are 0.8-1.5 ATR. Even 1.2 ATR gets clipped on healthy retracements.
+            # 1.8 ATR gives institutional breathing room while still protecting.
+            # At 2.0R+ ratchet, tighten to 1.5 ATR (confirmed strong trend).
+            _breath_mult = 1.5 if _ratchet_level >= 2.0 else 1.8
+            _min_breath = _breath_mult * atr
             if pos.side == "long" and _ratchet_target > price - _min_breath:
                 _ratchet_target = price - _min_breath
                 _final_label += "(breath_capped)"
