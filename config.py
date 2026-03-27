@@ -63,7 +63,7 @@ MAX_ORDER_RETRIES                = 2
 MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
-LIMIT_ORDER_FILL_TIMEOUT_SEC     = 45.0  # 45s for reversion fill; expired = cancel + cooldown
+LIMIT_ORDER_FILL_TIMEOUT_SEC     = 120.0  # 120s for reversion fill; expired = cancel + cooldown
 REQUEST_TIMEOUT                  = 30
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
