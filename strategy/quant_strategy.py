@@ -873,7 +873,13 @@ class ADXEngine:
         # Incremental step uses candles[-2] vs candles[-3] (both fully formed).
         last_ts = _ts(candles[-2]) if len(candles) >= 2 else _ts(candles[-1])
         if last_ts == self._last_ts and self._seeded: return self._adx
-        if len(candles) < period * 2 + 1: return self._adx
+        # BUG-6 FIX: was period*2+1. With that guard, len(candles)=period*2+1=29:
+        #   closed = candles[:-1] has 28 bars -> loop produces 27 DM values
+        #   inner check (len(plus_dms) < period*2) -> 27 < 28 -> True -> returns early.
+        # Outer gate passed but inner seed gate failed — silent 5-min extra delay.
+        # Fix: require period*2+2 so closed has period*2+1 bars -> period*2 DM values
+        # -> inner check (period*2 < period*2) -> False -> seeds correctly.
+        if len(candles) < period * 2 + 2: return self._adx
 
         if not self._seeded:
             # Seed on CLOSED bars only — exclude candles[-1] (forming).
