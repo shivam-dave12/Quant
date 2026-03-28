@@ -132,6 +132,64 @@ _TP_BUFFER_ATR          = 0.08    # was 0.10
 _ENTRY_COOLDOWN_SEC     = 30.0    # was 45.0
 _POST_SWEEP_EVAL_SEC    = 10.0    # was 15.0 — faster evaluation
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v3.0 INSTITUTIONAL-GRADE ADDITIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── EWMA Flow Tracking ────────────────────────────────────────────────
+# Replaces binary tick counters with exponentially-weighted moving average.
+# Institutional desks use smoothed order-flow aggregation to filter
+# microstructure noise while preserving directional momentum.
+#
+# Alpha=0.15 → effective half-life of ~4.3 ticks (~1.1s at 250ms).
+# This means a single contrary tick decays the signal by 15% — far more
+# forgiving than the old "3 contrary ticks = instant kill" logic.
+_FLOW_EWMA_ALPHA        = 0.15    # base smoothing factor
+_FLOW_EWMA_ADAPTIVE_CAP = 0.40   # max alpha when flow is very strong
+
+# ── Minimum Hold Times ────────────────────────────────────────────────
+# Prevents microstructure oscillation from killing valid setups.
+# Institutional algos enforce minimum observation windows before
+# aborting — a 500ms flow reversal is noise, not signal.
+_TRACKING_MIN_HOLD_SEC  = 5.0     # 5s before any tracking abort allowed
+_READY_MIN_HOLD_SEC     = 8.0     # 8s before any ready abort allowed
+
+# ── Conviction Decay (READY state) ───────────────────────────────────
+# Instead of binary kill on 2 contrary ticks, conviction decays
+# gradually. Only abort when conviction falls below kill threshold.
+# Models institutional commitment: strong setups survive brief pullbacks.
+_READY_DECAY_RATE       = 0.06    # conviction reduction per second of contrary flow
+_READY_MIN_CONVICTION   = 0.18    # abort only below this
+
+# ── AMD Conviction Modifiers ─────────────────────────────────────────
+# AMD phase INFLUENCES sizing and conviction threshold, never blocks.
+# Institutional desks adjust position size based on macro context —
+# they don't refuse to trade a confirmed setup.
+#
+# Against MANIPULATION: reduce conviction by 40% (need stronger flow)
+# Against DISTRIBUTION: reduce conviction by 20% (mild headwind)
+# Aligned: no penalty (1.0 multiplier)
+_AMD_MANIP_CONTRA_MULT  = 0.60    # conviction × 0.60 when against MANIPULATION
+_AMD_DIST_CONTRA_MULT   = 0.80    # conviction × 0.80 when against DISTRIBUTION
+_AMD_ALIGNED_BONUS      = 1.10    # conviction × 1.10 when aligned with AMD
+
+# ── Displacement / Momentum Entry ────────────────────────────────────
+# Third entry mode: institutional expansion entries.
+# When a candle prints clean displacement (large body, high volume,
+# breaking structure), enter the continuation. ICT calls this the
+# "FVG entry" — enter the fair value gap left by displacement.
+#
+# No nearby pool required. SL behind the displacement candle.
+# TP at the next opposing liquidity pool or 2×ATR projection.
+_MOMENTUM_MIN_BODY_RATIO   = 0.65   # candle body/range (clean displacement)
+_MOMENTUM_MIN_VOL_RATIO    = 1.3    # volume vs 20-bar average
+_MOMENTUM_MIN_ATR_MOVE     = 0.6    # candle range must be >= 0.6×ATR
+_MOMENTUM_LOOKBACK_CANDLES  = 3     # check last 3 closed candles
+_MOMENTUM_SL_BUFFER_ATR    = 0.15   # SL = displacement candle extreme ± buffer
+_MOMENTUM_MIN_RR           = 1.3    # minimum R:R for momentum entry
+_MOMENTUM_COOLDOWN_SEC     = 60.0   # don't fire momentum within 60s of last entry
+_MOMENTUM_MAX_ENTRIES_PER_HOUR = 3  # cap momentum entries to prevent overtrading
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -150,6 +208,7 @@ class EntryType(Enum):
     PRE_SWEEP_APPROACH = "APPROACH"
     SWEEP_REVERSAL     = "REVERSAL"
     SWEEP_CONTINUATION = "CONTINUATION"
+    DISPLACEMENT_MOMENTUM = "MOMENTUM"
 
 
 @dataclass
@@ -271,6 +330,17 @@ class EntryEngine:
         self._last_sweep_reversal_time: float = 0.0
         # Liquidity snapshot reference for SL liquidity-awareness
         self._last_liq_snapshot = None
+        # ── v3.0: EWMA flow tracking ─────────────────────────────────────
+        self._flow_ewma:             float = 0.0
+        self._flow_ewma_last_update: float = 0.0
+        # ── v3.0: Conviction decay state (READY) ─────────────────────────
+        self._ready_conviction:      float = 0.0
+        self._ready_peak_conviction: float = 0.0
+        self._ready_last_agree_ts:   float = 0.0
+        # ── v3.0: Momentum entry tracking ─────────────────────────────────
+        self._momentum_entries_1h:   int   = 0     # count in current hour
+        self._momentum_hour_start:   float = 0.0   # hour boundary timestamp
+        self._last_momentum_candle_ts: int = 0     # dedup: last displacement candle ts
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -282,12 +352,17 @@ class EntryEngine:
         price:        float,
         atr:          float,
         now:          float,
+        candles_1m:   Optional[List[Dict]] = None,
+        candles_5m:   Optional[List[Dict]] = None,
     ) -> None:
         if atr < 1e-10:
             return
 
         # Store snapshot for _compute_sl liquidity awareness
         self._last_liq_snapshot = liq_snapshot
+
+        # ── v3.0: Update EWMA flow ───────────────────────────────────────
+        self._update_flow_ewma(flow_state, now)
 
         # Check for new sweeps first — but NOT if already evaluating one
         new_sweeps = [s for s in liq_snapshot.recent_sweeps
@@ -306,6 +381,13 @@ class EntryEngine:
         if self._state in (EngineState.SCANNING, EngineState.TRACKING):
             if self._check_proximity_approach(liq_snapshot, flow_state,
                                               ict_ctx, price, atr, now):
+                return
+
+        # ── v3.0: Displacement/Momentum check (runs in SCANNING only) ────
+        if self._state == EngineState.SCANNING:
+            if self._check_displacement_momentum(
+                    liq_snapshot, flow_state, ict_ctx,
+                    price, atr, now, candles_1m, candles_5m):
                 return
 
         # State machine dispatch
@@ -369,6 +451,10 @@ class EntryEngine:
             self._proximity_confirms = 0
             self._proximity_target = None
 
+    def on_position_opened(self) -> None:
+        self._state = EngineState.IN_POSITION
+        self._state_entered = time.time()
+
     def on_entry_cancelled(self) -> None:
         """
         Called when an entry order is explicitly cancelled (timeout, watchdog,
@@ -397,10 +483,6 @@ class EntryEngine:
             self._tracking = None
             self._proximity_confirms = 0
             self._proximity_target = None
-
-    def on_position_opened(self) -> None:
-        self._state = EngineState.IN_POSITION
-        self._state_entered = time.time()
 
     def on_position_closed(self) -> None:
         self._state = EngineState.SCANNING
@@ -437,6 +519,322 @@ class EntryEngine:
 
     # ── FIX-E: Proximity Approach ─────────────────────────────────────────
 
+    # ── v3.0: EWMA Flow Tracker ──────────────────────────────────────────
+
+    def _update_flow_ewma(self, flow: OrderFlowState, now: float) -> float:
+        """
+        Institutional EWMA flow tracker.
+
+        Produces a single signed value: positive = long, negative = short.
+        Uses adaptive alpha: stronger flow → faster adaptation (institutional
+        desks increase tracking speed during high-conviction moves).
+
+        Unlike tick counters which reset on a single contrary tick, EWMA
+        decays gradually — a brief 250ms noise tick reduces the signal by
+        ~15%, not 100%.
+        """
+        dt = now - self._flow_ewma_last_update if self._flow_ewma_last_update > 0 else 0.25
+        self._flow_ewma_last_update = now
+
+        # Signed conviction: positive = long, negative = short, zero = neutral
+        if flow.direction == "long":
+            signed = abs(flow.conviction)
+        elif flow.direction == "short":
+            signed = -abs(flow.conviction)
+        else:
+            signed = 0.0
+
+        # Adaptive alpha: stronger readings get faster smoothing
+        # This models institutional response — strong signals deserve
+        # faster integration than weak noise
+        base_alpha = _FLOW_EWMA_ALPHA
+        conviction_boost = min(abs(flow.conviction), 1.0)
+        alpha = min(base_alpha * (1.0 + conviction_boost), _FLOW_EWMA_ADAPTIVE_CAP)
+
+        self._flow_ewma = alpha * signed + (1.0 - alpha) * self._flow_ewma
+        return self._flow_ewma
+
+    def _ewma_direction(self) -> str:
+        """Derive direction from EWMA state."""
+        if self._flow_ewma > _FLOW_CONV_THRESHOLD * 0.4:
+            return "long"
+        elif self._flow_ewma < -_FLOW_CONV_THRESHOLD * 0.4:
+            return "short"
+        return ""
+
+    # ── v3.0: AMD Conviction Modifier ────────────────────────────────────
+
+    def _amd_conviction_modifier(self, ict: ICTContext, direction: str) -> float:
+        """
+        Institutional AMD conviction modifier.
+
+        AMD phase modifies conviction and sizing — it NEVER blocks.
+        Smart money desks adjust position size when trading against
+        macro context. They don't refuse a confirmed setup.
+
+        Returns a multiplier in [0.60, 1.10]:
+          • Aligned with AMD:     1.10 (bonus for confluence)
+          • Neutral / no phase:   1.00
+          • Against DISTRIBUTION: 0.80 (mild headwind)
+          • Against MANIPULATION: 0.60 (strong headwind, need very
+            strong flow to overcome)
+
+        The caller applies this to:
+          - The conviction threshold for TRACKING → READY transition
+          - The entry tier (S→A when against MANIPULATION)
+        """
+        _phase = (ict.amd_phase or '').upper()
+        _bias  = (ict.amd_bias or '').lower()
+
+        if not _phase or not _bias or _bias == "neutral":
+            return 1.0
+
+        # Determine if direction is against AMD bias
+        is_against = (
+            (direction == "long" and _bias == "bearish") or
+            (direction == "short" and _bias == "bullish")
+        )
+        is_aligned = (
+            (direction == "long" and _bias == "bullish") or
+            (direction == "short" and _bias == "bearish")
+        )
+
+        if is_aligned:
+            return _AMD_ALIGNED_BONUS
+
+        if not is_against:
+            return 1.0
+
+        if _phase == 'MANIPULATION':
+            return _AMD_MANIP_CONTRA_MULT
+        elif _phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
+            return _AMD_DIST_CONTRA_MULT
+
+        return 1.0
+
+    # ── v3.0: Displacement / Momentum Entry ──────────────────────────────
+
+    def _check_displacement_momentum(
+        self,
+        snap: LiquidityMapSnapshot,
+        flow: OrderFlowState,
+        ict: ICTContext,
+        price: float,
+        atr: float,
+        now: float,
+        candles_1m: Optional[List[Dict]] = None,
+        candles_5m: Optional[List[Dict]] = None,
+    ) -> bool:
+        """
+        Institutional displacement entry — the "FVG continuation" in ICT.
+
+        When a candle prints clean displacement (large body relative to range,
+        elevated volume, breaking structural levels), enter the continuation.
+        This captures trend moves that have NO nearby pool to target — the
+        entry engine's biggest blind spot until now.
+
+        Detection criteria (ALL must pass):
+          1. Recent closed candle with body/range >= 0.65 (clean displacement)
+          2. Candle range >= 0.6×ATR (meaningful move, not micro-noise)
+          3. Volume >= 1.3× 20-bar average (institutional participation)
+          4. Flow EWMA agrees with displacement direction
+          5. Not within cooldown window
+          6. Hourly rate limit not exceeded
+
+        SL: behind the displacement candle extreme + 0.15×ATR buffer
+        TP: nearest opposing liquidity pool, or 2×risk projection
+
+        Returns True if a signal was emitted.
+        """
+        if now - self._last_entry_at < _MOMENTUM_COOLDOWN_SEC:
+            return False
+
+        # ── Hourly rate limiter ───────────────────────────────────────────
+        if now - self._momentum_hour_start > 3600.0:
+            self._momentum_entries_1h = 0
+            self._momentum_hour_start = now
+        if self._momentum_entries_1h >= _MOMENTUM_MAX_ENTRIES_PER_HOUR:
+            return False
+
+        # ── Find displacement candle ──────────────────────────────────────
+        # Check 5m first (higher conviction), then 1m
+        disp_candle = None
+        disp_tf = ""
+        disp_direction = ""
+
+        for candles, tf_label in [(candles_5m, "5m"), (candles_1m, "1m")]:
+            if not candles or len(candles) < _MOMENTUM_LOOKBACK_CANDLES + 20:
+                continue
+
+            # 20-bar average volume (exclude last forming candle)
+            vol_window = candles[-(20 + 2):-2]
+            avg_vol = sum(float(c.get('v', 0)) for c in vol_window) / max(len(vol_window), 1)
+
+            # Check the last N CLOSED candles (skip [-1] which is forming)
+            for offset in range(2, 2 + _MOMENTUM_LOOKBACK_CANDLES):
+                if offset >= len(candles):
+                    break
+                c = candles[-offset]
+                c_o = float(c['o'])
+                c_c = float(c['c'])
+                c_h = float(c['h'])
+                c_l = float(c['l'])
+                c_v = float(c.get('v', 0))
+                c_ts = int(c.get('t', 0) or 0)
+
+                # Dedup: don't re-signal same candle
+                if c_ts > 0 and c_ts == self._last_momentum_candle_ts:
+                    continue
+
+                body = abs(c_c - c_o)
+                rng  = c_h - c_l
+                if rng < 1e-10:
+                    continue
+
+                body_ratio = body / rng
+                vol_ratio  = c_v / max(avg_vol, 1e-10)
+                atr_move   = rng / max(atr, 1e-10)
+
+                # ── ALL criteria must pass ────────────────────────────
+                if body_ratio < _MOMENTUM_MIN_BODY_RATIO:
+                    continue
+                if atr_move < _MOMENTUM_MIN_ATR_MOVE:
+                    continue
+                if vol_ratio < _MOMENTUM_MIN_VOL_RATIO:
+                    continue
+
+                # Direction from candle body
+                candle_dir = "long" if c_c > c_o else "short"
+
+                # Flow EWMA must agree with displacement direction
+                ewma_dir = self._ewma_direction()
+                if ewma_dir and ewma_dir != candle_dir:
+                    continue
+
+                # Found a valid displacement candle
+                disp_candle = c
+                disp_tf = tf_label
+                disp_direction = candle_dir
+                break
+
+            if disp_candle is not None:
+                break
+
+        if disp_candle is None:
+            return False
+
+        # ── AMD modifier (influences, never blocks) ───────────────────────
+        amd_mult = self._amd_conviction_modifier(ict, disp_direction)
+
+        # ── BUG-2: Don't trade opposite of recent sweep reversal ──────────
+        _sweep_cd = 60.0
+        if (self._last_sweep_reversal_dir
+                and now - self._last_sweep_reversal_time < _sweep_cd
+                and disp_direction != self._last_sweep_reversal_dir):
+            return False
+
+        # ── Compute SL ────────────────────────────────────────────────────
+        c_h = float(disp_candle['h'])
+        c_l = float(disp_candle['l'])
+        buffer = atr * _MOMENTUM_SL_BUFFER_ATR
+
+        if disp_direction == "long":
+            sl = c_l - buffer
+        else:
+            sl = c_h + buffer
+
+        # Also check ICT OB for structural SL
+        ict_sl = self._compute_sl(ict, disp_direction, price, atr)
+        if ict_sl is not None:
+            # Use the wider (safer) of candle SL and ICT SL
+            if disp_direction == "long":
+                sl = min(sl, ict_sl)
+            else:
+                sl = max(sl, ict_sl)
+
+        # ── Compute TP ────────────────────────────────────────────────────
+        # First choice: nearest opposing liquidity pool
+        tp = None
+        if disp_direction == "long":
+            for t in snap.bsl_pools:
+                if t.pool.price > price and t.distance_atr <= _MAX_TARGET_ATR:
+                    tp_candidate = self._compute_tp_approach(t, "long", price, atr)
+                    if tp_candidate is not None:
+                        tp = tp_candidate
+                        break
+        else:
+            for t in snap.ssl_pools:
+                if t.pool.price < price and t.distance_atr <= _MAX_TARGET_ATR:
+                    tp_candidate = self._compute_tp_approach(t, "short", price, atr)
+                    if tp_candidate is not None:
+                        tp = tp_candidate
+                        break
+
+        # Fallback: 2× risk projection
+        if tp is None:
+            risk = abs(price - sl)
+            if disp_direction == "long":
+                tp = price + risk * 2.0
+            else:
+                tp = price - risk * 2.0
+
+        # ── R:R validation ────────────────────────────────────────────────
+        risk = abs(price - sl)
+        reward = abs(tp - price)
+        if risk < 1e-10:
+            return False
+        rr = reward / risk
+        # AMD-adjusted R:R threshold: need better R:R when against AMD
+        adjusted_min_rr = _MOMENTUM_MIN_RR / max(amd_mult, 0.50)
+        if rr < adjusted_min_rr:
+            return False
+
+        # ── SL sanity ─────────────────────────────────────────────────────
+        sl_dist_pct = abs(price - sl) / price
+        if sl_dist_pct < 0.001 or sl_dist_pct > 0.035:
+            return False
+
+        # ── Build the primary target for the signal ───────────────────────
+        _target_pool = None
+        if disp_direction == "long" and snap.bsl_pools:
+            _target_pool = snap.bsl_pools[0]
+        elif disp_direction == "short" and snap.ssl_pools:
+            _target_pool = snap.ssl_pools[0]
+
+        if _target_pool is None:
+            return False
+
+        # ── Emit signal ───────────────────────────────────────────────────
+        c_ts = int(disp_candle.get('t', 0) or 0)
+        self._last_momentum_candle_ts = c_ts
+        self._momentum_entries_1h += 1
+
+        vol_ratio = float(disp_candle.get('v', 0)) / max(1.0, atr)  # approx
+        self._signal = EntrySignal(
+            side=disp_direction,
+            entry_type=EntryType.DISPLACEMENT_MOMENTUM,
+            entry_price=price,
+            sl_price=sl,
+            tp_price=tp,
+            rr_ratio=rr,
+            target_pool=_target_pool,
+            conviction=abs(flow.conviction) * amd_mult,
+            reason=(
+                f"DISPLACEMENT {disp_direction.upper()} [{disp_tf}] | "
+                f"body={float(disp_candle['c'])-float(disp_candle['o']):+.1f} "
+                f"range={float(disp_candle['h'])-float(disp_candle['l']):.1f} "
+                f"vol={vol_ratio:.1f}x | "
+                f"AMD×{amd_mult:.2f} R:R={rr:.1f}"
+            ),
+            ict_validation=self._ict_summary(ict, disp_direction),
+        )
+        logger.info(
+            f"⚡ MOMENTUM SIGNAL: {disp_direction.upper()} [{disp_tf}] | "
+            f"body/range={abs(float(disp_candle['c'])-float(disp_candle['o']))/(float(disp_candle['h'])-float(disp_candle['l'])+1e-10):.2f} "
+            f"R:R={rr:.1f} AMD×{amd_mult:.2f}"
+        )
+        return True
+
     def _check_proximity_approach(
         self,
         snap: LiquidityMapSnapshot,
@@ -464,12 +862,6 @@ class EntryEngine:
                 and now - self._last_sweep_reversal_time < _sweep_cooldown):
             # Will be checked per-side below after we determine approach_side
             pass  # guard applied after approach_side is determined
-
-        # ── BUG-3 FIX: Hard-block entries AGAINST AMD MANIPULATION bias ──
-        # AMD MANIPULATION + BULLISH = smart money buying → NEVER short here
-        # AMD MANIPULATION + BEARISH = smart money selling → NEVER long here
-        _amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
-        _amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
 
         # Find the closest approaching pool
         best_approach: Optional[PoolTarget] = None
@@ -509,17 +901,20 @@ class EntryEngine:
                 f"({now - self._last_sweep_reversal_time:.0f}s ago)")
             return False
 
-        # ── BUG-3 GUARD: Don't trade against AMD MANIPULATION bias ────────
-        if _amd_phase == 'MANIPULATION':
-            if approach_side == "short" and _amd_bias == "bullish":
+        # ── BUG-3 FIX: AMD conviction modifier (influences, never blocks) ──
+        # v3.0: AMD reduces conviction for proximity entries against bias,
+        # but does not prevent them. Strong proximity + strong flow can
+        # still override a stale AMD bias.
+        _amd_mult = self._amd_conviction_modifier(ict, approach_side)
+        if _amd_mult < 1.0:
+            _amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
+            _amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
+            # Only block if conviction is genuinely weak AND AMD is contra
+            if abs(flow.conviction) < _FLOW_CONV_THRESHOLD * 0.7:
                 logger.debug(
-                    f"⛔ Proximity SHORT BLOCKED — AMD MANIPULATION+BULLISH "
-                    f"(smart money buying, never sell here)")
-                return False
-            if approach_side == "long" and _amd_bias == "bearish":
-                logger.debug(
-                    f"⛔ Proximity LONG BLOCKED — AMD MANIPULATION+BEARISH "
-                    f"(smart money selling, never buy here)")
+                    f"⛔ Proximity {approach_side} weakened by AMD "
+                    f"{_amd_phase}+{_amd_bias} (conv={flow.conviction:+.2f} "
+                    f"× AMD={_amd_mult:.2f} too low)")
                 return False
 
         # Changed pool target — reset counter
@@ -626,26 +1021,22 @@ class EntryEngine:
         if target is None:
             return
 
-        # AMD soft filter
-        if (ict.amd_phase == "DISTRIBUTION"
-                and ict.amd_bias
-                and ict.amd_bias != ("bullish" if flow.direction == "long" else "bearish")):
-            logger.debug(
-                f"EntryEngine: flow {flow.direction} vs AMD DISTRIBUTION "
-                f"{ict.amd_bias} — skipping")
-            return
-
-        # ── BUG-3 FIX: Hard-block entries against AMD MANIPULATION bias ──
-        _amd_upper = (ict.amd_phase or '').upper()
-        _bias_lower = (ict.amd_bias or '').lower()
-        if _amd_upper == 'MANIPULATION':
-            if flow.direction == "short" and _bias_lower == "bullish":
+        # ── v3.0: AMD conviction modifier (influences, never blocks) ─────
+        # Compute the modifier and apply it to the conviction threshold
+        # for entering TRACKING. Against-AMD entries need proportionally
+        # stronger flow to begin tracking — but they CAN enter.
+        amd_mult = self._amd_conviction_modifier(ict, flow.direction)
+        if amd_mult < 1.0:
+            # Check if flow is strong enough to overcome AMD headwind
+            # Required: |conviction| >= threshold / amd_mult
+            # This means MANIPULATION+against needs ~67% more conviction
+            # and DISTRIBUTION+against needs ~25% more conviction
+            adjusted_threshold = _FLOW_CONV_THRESHOLD * 0.5 / max(amd_mult, 0.50)
+            if abs(flow.conviction) < adjusted_threshold:
                 logger.debug(
-                    f"EntryEngine: SHORT blocked — AMD MANIPULATION+BULLISH")
-                return
-            if flow.direction == "long" and _bias_lower == "bearish":
-                logger.debug(
-                    f"EntryEngine: LONG blocked — AMD MANIPULATION+BEARISH")
+                    f"EntryEngine: {flow.direction} flow {flow.conviction:+.2f} "
+                    f"too weak against AMD {ict.amd_phase}+{ict.amd_bias} "
+                    f"(need {adjusted_threshold:.2f}, AMD×{amd_mult:.2f})")
                 return
 
         self._tracking = _TrackingState(
@@ -654,6 +1045,8 @@ class EntryEngine:
             started_at=now,
             flow_ticks=1,
             peak_conviction=abs(flow.conviction),
+            amd_mult=amd_mult,
+            flow_ewma=self._flow_ewma,
         )
         self._state = EngineState.TRACKING
         self._state_entered = now
@@ -663,6 +1056,7 @@ class EntryEngine:
             f"dist={target.distance_atr:.1f} ATR, "
             f"sig={target.significance:.1f}, "
             f"flow={flow.conviction:+.2f}"
+            f"{f' AMD×{amd_mult:.2f}' if amd_mult < 1.0 else ''}"
         )
 
     # ── State: TRACKING ──────────────────────────────────────────────────
@@ -689,19 +1083,57 @@ class EntryEngine:
             self._state_entered = now
             return
 
-        # FIX-F/FIX-G: Neutral ticks not counted as contrary
-        if flow.direction and flow.direction != tr.direction:
-            tr.contrary_ticks += 1
-            if tr.contrary_ticks >= 3:
-                logger.info(f"📡 TRACKING aborted: flow reversed ({tr.direction} → {flow.direction})")
-                self._tracking = None
-                self._state = EngineState.SCANNING
-                self._state_entered = now
-                return
-        elif flow.direction == tr.direction:
-            tr.contrary_ticks = 0
+        hold_time = now - tr.started_at
+
+        # ── v3.0: EWMA-based flow evaluation ─────────────────────────────
+        # Instead of binary tick counters, use the smoothed EWMA signal.
+        # EWMA already incorporates flow history with exponential decay —
+        # a single contrary tick reduces it by ~15%, not 100%.
+        tr.flow_ewma = self._flow_ewma
+
+        # Determine if EWMA is aligned, neutral, or contrary
+        ewma_agrees = (
+            (tr.direction == "long" and self._flow_ewma > 0.05) or
+            (tr.direction == "short" and self._flow_ewma < -0.05)
+        )
+        ewma_contrary = (
+            (tr.direction == "long" and self._flow_ewma < -_FLOW_CONV_THRESHOLD * 0.3) or
+            (tr.direction == "short" and self._flow_ewma > _FLOW_CONV_THRESHOLD * 0.3)
+        )
+
+        # Track agreeing vs contrary ticks (for compatibility and logging)
+        if flow.direction == tr.direction:
             tr.flow_ticks += 1
+            tr.contrary_ticks = 0
             tr.peak_conviction = max(tr.peak_conviction, abs(flow.conviction))
+            tr.last_contrary_ts = 0.0
+        elif flow.direction and flow.direction != tr.direction:
+            tr.contrary_ticks += 1
+            if tr.last_contrary_ts == 0.0:
+                tr.last_contrary_ts = now
+        # Neutral ticks: don't count as contrary (FIX-F preserved)
+
+        # ── v3.0: Abort decision uses EWMA + minimum hold time ────────────
+        # Three conditions must ALL be true to abort:
+        #   1. Minimum hold time elapsed (prevents micro-oscillation kills)
+        #   2. EWMA is contrary (smoothed signal, not instantaneous)
+        #   3. Sustained contrary for at least 3 seconds
+        _sustained_contrary_sec = (
+            now - tr.last_contrary_ts
+            if tr.last_contrary_ts > 0 else 0.0
+        )
+
+        if (hold_time >= _TRACKING_MIN_HOLD_SEC
+                and ewma_contrary
+                and _sustained_contrary_sec >= 3.0):
+            logger.info(
+                f"📡 TRACKING aborted: flow reversed ({tr.direction} → "
+                f"{flow.direction}) EWMA={self._flow_ewma:+.2f} "
+                f"sustained={_sustained_contrary_sec:.1f}s")
+            self._tracking = None
+            self._state = EngineState.SCANNING
+            self._state_entered = now
+            return
 
         # FIX-G: Only update target when direction agrees
         if flow.direction == tr.direction:
@@ -709,29 +1141,51 @@ class EntryEngine:
             if target is not None:
                 tr.target = target
 
-        # FIX-C: reduced sustained ticks requirement
+        # ── TRACKING → READY transition ───────────────────────────────────
+        # v3.0: AMD-adjusted conviction threshold.
+        # Against-AMD entries need proportionally stronger flow.
+        adjusted_conv_thresh = _FLOW_CONV_THRESHOLD / max(tr.amd_mult, 0.50)
+
         ready = (
             tr.flow_ticks >= _FLOW_SUSTAINED_TICKS
             and flow.cvd_agrees
-            and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD
+            and abs(flow.conviction) >= adjusted_conv_thresh
             and tr.target.distance_atr >= _MIN_TARGET_ATR
             and tr.target.distance_atr <= _MAX_TARGET_ATR
         )
 
-        # ICT bonus: lower bar if structure strongly agrees
+        # ICT bonus: lower bar if structure strongly agrees (preserved)
         if not ready and tr.flow_ticks >= 1:
             ict_boost = self._ict_structure_agrees(ict, tr.direction)
-            if ict_boost and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.65:
+            if ict_boost and abs(flow.conviction) >= adjusted_conv_thresh * 0.65:
+                ready = True
+
+        # v3.0: EWMA fast-track — if EWMA is strongly directional and
+        # has been consistent, allow READY even without CVD agreement.
+        # This captures momentum moves where tick flow is strong but
+        # CVD hasn't caught up yet.
+        if not ready and tr.flow_ticks >= 3:
+            ewma_strong = abs(self._flow_ewma) >= _FLOW_CONV_THRESHOLD * 0.8
+            ewma_dir_agrees = (
+                (tr.direction == "long" and self._flow_ewma > 0) or
+                (tr.direction == "short" and self._flow_ewma < 0)
+            )
+            if ewma_strong and ewma_dir_agrees:
                 ready = True
 
         if ready:
             self._state = EngineState.READY
             self._state_entered = now
+            # ── v3.0: Initialize conviction decay state ───────────────
+            self._ready_conviction = abs(flow.conviction) * tr.amd_mult
+            self._ready_peak_conviction = self._ready_conviction
+            self._ready_last_agree_ts = now
             logger.info(
                 f"✅ READY: {tr.direction.upper()} → "
                 f"${tr.target.pool.price:,.1f} "
                 f"conviction={flow.conviction:+.2f} "
                 f"ticks={tr.flow_ticks}"
+                f"{f' AMD×{tr.amd_mult:.2f}' if tr.amd_mult < 1.0 else ''}"
             )
 
     # ── State: READY ─────────────────────────────────────────────────────
@@ -757,42 +1211,62 @@ class EntryEngine:
             self._state_entered = now
             return
 
-        # FIX-F: Neutral ticks not contrary
-        if flow.direction and flow.direction != tr.direction:
-            tr.contrary_ticks += 1
-            if tr.contrary_ticks >= 2:
-                logger.info("✅ READY: flow reversed — back to scanning")
-                self._tracking = None
-                self._state = EngineState.SCANNING
-                self._state_entered = now
-                return
-        elif flow.direction == tr.direction:
-            tr.contrary_ticks = 0
+        hold_time = now - self._state_entered
 
+        # ── v3.0: Conviction decay instead of binary kill ─────────────────
+        # Track whether current flow agrees or is contrary.
+        # Contrary flow DECAYS conviction gradually.
+        # Only abort when conviction drops below kill threshold.
+        flow_agrees = (flow.direction == tr.direction)
+        flow_contrary = (
+            flow.direction != ""
+            and flow.direction != tr.direction
+        )
+
+        if flow_agrees:
+            self._ready_last_agree_ts = now
+            # Conviction recovers (slowly) when flow re-aligns
+            recovery = min(0.02, abs(flow.conviction) * 0.05)
+            self._ready_conviction = min(
+                self._ready_peak_conviction,
+                self._ready_conviction + recovery
+            )
+            tr.contrary_ticks = 0
+        elif flow_contrary:
+            tr.contrary_ticks += 1
+            # Decay proportional to how contrary the flow is
+            decay_strength = abs(flow.conviction)
+            decay = _READY_DECAY_RATE * max(decay_strength, 0.3)
+            self._ready_conviction -= decay
+        # Neutral flow: no change to conviction
+
+        # ── Abort conditions (ALL must be true): ──────────────────────────
+        #   1. Minimum hold time elapsed
+        #   2. Conviction has decayed below kill threshold
+        #   3. EWMA confirms contrary direction (not just a single tick)
+        ewma_contrary = (
+            (tr.direction == "long" and self._flow_ewma < -0.10) or
+            (tr.direction == "short" and self._flow_ewma > 0.10)
+        )
+
+        if (hold_time >= _READY_MIN_HOLD_SEC
+                and self._ready_conviction < _READY_MIN_CONVICTION
+                and ewma_contrary):
+            logger.info(
+                f"✅ READY: conviction decayed {self._ready_conviction:.2f} "
+                f"< {_READY_MIN_CONVICTION} — back to scanning "
+                f"(held {hold_time:.0f}s, peak={self._ready_peak_conviction:.2f})")
+            self._tracking = None
+            self._state = EngineState.SCANNING
+            self._state_entered = now
+            return
+
+        # ── Compute SL/TP ─────────────────────────────────────────────────
         sl = self._compute_sl(ict, tr.direction, price, atr)
         tp = self._compute_tp_approach(tr.target, tr.direction, price, atr)
 
         if sl is None or tp is None:
             return
-
-        # ── BUG-3 FIX: Hard-block against AMD MANIPULATION bias ──────────
-        _amd_upper = (ict.amd_phase or '').upper()
-        _bias_lower = (ict.amd_bias or '').lower()
-        if _amd_upper == 'MANIPULATION':
-            if tr.direction == "short" and _bias_lower == "bullish":
-                logger.info(
-                    f"⛔ READY: SHORT blocked — AMD MANIPULATION+BULLISH")
-                self._tracking = None
-                self._state = EngineState.SCANNING
-                self._state_entered = now
-                return
-            if tr.direction == "long" and _bias_lower == "bearish":
-                logger.info(
-                    f"⛔ READY: LONG blocked — AMD MANIPULATION+BEARISH")
-                self._tracking = None
-                self._state = EngineState.SCANNING
-                self._state_entered = now
-                return
 
         # ── BUG-2 FIX: Block opposite of recent sweep reversal ───────────
         _sweep_cd = 60.0
@@ -813,9 +1287,16 @@ class EntryEngine:
             return
         rr = reward / risk
 
-        if rr < _MIN_RR_RATIO:
+        # ── v3.0: AMD-adjusted R:R threshold ─────────────────────────────
+        # Against-AMD entries need a better R:R to compensate for
+        # the macro headwind. This is how institutional desks handle it —
+        # they demand more edge when context is unfavorable.
+        adjusted_min_rr = _MIN_RR_RATIO / max(tr.amd_mult, 0.50)
+
+        if rr < adjusted_min_rr:
             logger.debug(
-                f"✅ READY: R:R {rr:.2f} < {_MIN_RR_RATIO} — skipping "
+                f"✅ READY: R:R {rr:.2f} < {adjusted_min_rr:.2f} "
+                f"(AMD×{tr.amd_mult:.2f}) — skipping "
                 f"(entry=${price:,.1f} SL=${sl:,.1f} TP=${tp:,.1f})"
             )
             return
@@ -828,12 +1309,13 @@ class EntryEngine:
             tp_price=tp,
             rr_ratio=rr,
             target_pool=tr.target,
-            conviction=flow.conviction,
+            conviction=self._ready_conviction,
             reason=(
                 f"Flow {tr.direction} → {tr.target.pool.side.value} "
                 f"${tr.target.pool.price:,.1f} | "
                 f"flow={flow.conviction:+.2f} CVD={flow.cvd_trend:+.2f} | "
                 f"R:R={rr:.1f}"
+                f"{f' AMD×{tr.amd_mult:.2f}' if tr.amd_mult < 1.0 else ''}"
             ),
             ict_validation=self._ict_summary(ict, tr.direction),
         )
@@ -1573,6 +2055,9 @@ class _TrackingState:
     flow_ticks:      int   = 0
     contrary_ticks:  int   = 0
     peak_conviction: float = 0.0
+    amd_mult:        float = 1.0      # AMD conviction modifier (0.60-1.10)
+    flow_ewma:       float = 0.0      # EWMA of signed flow conviction
+    last_contrary_ts: float = 0.0     # timestamp of last contrary flow reading
 
 
 @dataclass

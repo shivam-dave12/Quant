@@ -76,13 +76,16 @@ MIN_CANDLES_4H       = 40
 MIN_CANDLES_1D       = 7
 # LOOKBACK_CANDLES_* must be >= the highest limit= argument passed to
 # get_candles() in quant_strategy.py for that timeframe.
-# Delta API returns max ~200 candles per REST call — don't request more.
-LOOKBACK_CANDLES_1M  = 200   # Delta caps at ~200 per REST call
-LOOKBACK_CANDLES_5M  = 300   # strategy requests 300
-LOOKBACK_CANDLES_15M = 200   # strategy requests 200
-LOOKBACK_CANDLES_1H  = 100   # strategy requests 100
-LOOKBACK_CANDLES_4H  = 50    # unchanged
-LOOKBACK_CANDLES_1D  = 30    # unchanged
+# Delta API returns max ~200 candles per REST call — but the data manager
+# accumulates candles via WebSocket after startup. Over 7 days of
+# continuous operation, the buffer will hold the full structural history.
+# These limits set the BUFFER SIZE, not the REST call size.
+LOOKBACK_CANDLES_1M  = 300   # 5 hours of 1m (micro-structure + CVD)
+LOOKBACK_CANDLES_5M  = 2100  # 7 days of 5m = 2016 candles (intraday pools)
+LOOKBACK_CANDLES_15M = 700   # 7 days of 15m = 672 candles (key structure)
+LOOKBACK_CANDLES_1H  = 200   # 8.3 days of 1h = 200 candles (hourly pivots)
+LOOKBACK_CANDLES_4H  = 50    # unchanged — 50 × 4h = 8.3 days, sufficient
+LOOKBACK_CANDLES_1D  = 30    # unchanged — 30 days of daily
 CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "1h", "4h", "1d"]
 PRIMARY_TIMEFRAME    = "15m"     # 15m is primary for SL/TP structure
 ENTRY_TIMEFRAME      = "5m"      # 5m/1m for entry timing

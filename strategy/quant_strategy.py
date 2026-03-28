@@ -4942,9 +4942,15 @@ class QuantStrategy:
         now_ms = int(now * 1000) if now < 1e12 else int(now)
 
         # Step 2: Gather candles (all timeframes)
+        # v3.0: Request full buffer depth for structural timeframes.
+        # The data manager returns whatever it has — on fresh startup
+        # this will be ~200 (REST warmup limit), but after continuous
+        # operation the WebSocket feed accumulates 7 days of history.
+        # This gives the liquidity map progressively deeper structure
+        # detection as the bot runs longer.
         candles_by_tf = {}
-        for tf, limit in [("1m", 200), ("5m", 300), ("15m", 200),
-                          ("1h", 100), ("4h", 50), ("1d", 30)]:
+        for tf, limit in [("1m", 300), ("5m", 2100), ("15m", 700),
+                          ("1h", 200), ("4h", 50), ("1d", 30)]:
             try:
                 candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit)
             except Exception:
@@ -5120,6 +5126,8 @@ class QuantStrategy:
             flow_state=flow_state,
             ict_ctx=ict_ctx,
             price=price, atr=atr, now=now,
+            candles_1m=candles_by_tf.get("1m"),
+            candles_5m=candles_by_tf.get("5m"),
         )
 
         # Step 8: Check for signal and execute
@@ -5149,6 +5157,7 @@ class QuantStrategy:
                 EntryType.SWEEP_REVERSAL: "S",
                 EntryType.PRE_SWEEP_APPROACH: "A",
                 EntryType.SWEEP_CONTINUATION: "B",
+                EntryType.DISPLACEMENT_MOMENTUM: "A",
             }
             _tier = _tier_map.get(signal.entry_type, "A")
 

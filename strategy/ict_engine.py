@@ -286,9 +286,10 @@ class LiquidityLevel:
     level_type:  str   # "BSL" | "SSL"
     touch_count: int
     swept:       bool = False
-    sweep_timestamp:        int  = 0
-    displacement_confirmed: bool = False
-    wick_rejection:         bool = False
+    sweep_timestamp:        int   = 0
+    displacement_confirmed: bool  = False
+    displacement_score:     float = 0.0    # v3.0: continuous 0.0-1.0 score
+    wick_rejection:         bool  = False
     timeframe: str = "5m"   # source TF: "5m"|"15m"|"1h"|"4h"|"1d"
 
     @property
@@ -1083,7 +1084,15 @@ class ICTEngine:
             age_ms    = now_ms - p.sweep_timestamp
             freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
             q = freshness * 0.40
-            if p.displacement_confirmed: q += 0.35
+            # v3.0: Use continuous displacement_score instead of binary flag.
+            # A sweep with disp_score=0.35 gets 0.35×0.35=0.12 quality credit,
+            # not zero. This prevents high-wick sweeps from being completely
+            # ignored when they still carry meaningful institutional signal.
+            _disp_score = getattr(p, 'displacement_score', 0.0)
+            if _disp_score > 0:
+                q += _disp_score * 0.35
+            elif p.displacement_confirmed:
+                q += 0.35  # backward compat
             if p.wick_rejection:         q += 0.15
             q += min(0.10, getattr(p, 'touch_count', 1) * 0.03)
             return q
@@ -1144,7 +1153,12 @@ class ICTEngine:
 
         # ── Confidence from sweep quality ────────────────────────────
         conf = 0.50
-        if latest.displacement_confirmed: conf += 0.20
+        # v3.0: graduated displacement confidence using continuous score
+        _disp_sc = getattr(latest, 'displacement_score', 0.0)
+        if _disp_sc > 0:
+            conf += _disp_sc * 0.25   # max +0.25 at score=1.0
+        elif latest.displacement_confirmed:
+            conf += 0.20              # backward compat
         if latest.wick_rejection:         conf += 0.10
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
@@ -1798,25 +1812,31 @@ class ICTEngine:
                     continue
 
                 if pool.level_type == "BSL" and h > pool.price and cl < pool.price:
-                    disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
+                    disp_score = (body / rng) if rng > 0 else 0.0
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.65
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
+                    pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     logger.info(
-                        f"🔱 ICT BSL SWEPT @ ${pool.price:.0f} disp={disp} → BEARISH BIAS")
+                        f"🔱 ICT BSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) → BEARISH BIAS")
                     break
 
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
-                    disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
+                    disp_score = (body / rng) if rng > 0 else 0.0
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.65
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
+                    pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     logger.info(
-                        f"🔱 ICT SSL SWEPT @ ${pool.price:.0f} disp={disp} → BULLISH BIAS")
+                        f"🔱 ICT SSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) → BULLISH BIAS")
                     break
 
     # ─────────────────────────────────────────────────────────────────────
