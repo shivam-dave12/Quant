@@ -75,16 +75,14 @@ MIN_CANDLES_1H       = 20
 MIN_CANDLES_4H       = 40
 MIN_CANDLES_1D       = 7
 # LOOKBACK_CANDLES_* must be >= the highest limit= argument passed to
-# get_candles() in quant_strategy.py for that timeframe.  These values
-# also drive _WARMUP_CONFIG in data_manager.py so both must stay in sync.
-# 7-DAY COVERAGE: pools persist 7 days, so candle history must match
-# where the exchange API allows it.
-LOOKBACK_CANDLES_1M  = 200   # 3.3 hours (1m is micro — more isn't useful)
-LOOKBACK_CANDLES_5M  = 2000  # 7 days (2016 candles). DM paginates or caps at API limit.
-LOOKBACK_CANDLES_15M = 700   # 7 days (672 candles). Most exchanges support this.
-LOOKBACK_CANDLES_1H  = 200   # 8.3 days. Easy for any exchange.
-LOOKBACK_CANDLES_4H  = 50    # 8.3 days. Unchanged.
-LOOKBACK_CANDLES_1D  = 30    # 30 days. Unchanged.
+# get_candles() in quant_strategy.py for that timeframe.
+# Delta API returns max ~200 candles per REST call — don't request more.
+LOOKBACK_CANDLES_1M  = 200   # Delta caps at ~200 per REST call
+LOOKBACK_CANDLES_5M  = 300   # strategy requests 300
+LOOKBACK_CANDLES_15M = 200   # strategy requests 200
+LOOKBACK_CANDLES_1H  = 100   # strategy requests 100
+LOOKBACK_CANDLES_4H  = 50    # unchanged
+LOOKBACK_CANDLES_1D  = 30    # unchanged
 CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "1h", "4h", "1d"]
 PRIMARY_TIMEFRAME    = "15m"     # 15m is primary for SL/TP structure
 ENTRY_TIMEFRAME      = "5m"      # 5m/1m for entry timing

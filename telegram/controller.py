@@ -166,20 +166,26 @@ class TelegramBotController:
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
                 {"command": "thinking",    "description": "5-layer liquidity-first decision stack"},
+                {"command": "position",    "description": "Current position + trail"},
+                {"command": "pnl",         "description": "Quick PnL snapshot"},
+                {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
                 {"command": "pools",       "description": "Live liquidity pool map"},
                 {"command": "flow",        "description": "CVD + OB delta + tick aggression"},
                 {"command": "structures",  "description": "ICT structure map (secondary layer)"},
-                {"command": "position",    "description": "Current position + pool TP"},
+                {"command": "sl",          "description": "Current SL/TP levels + distances"},
                 {"command": "trades",      "description": "Recent trade history"},
                 {"command": "stats",       "description": "Signal attribution analysis"},
                 {"command": "balance",     "description": "Wallet balance"},
+                {"command": "equity",      "description": "Balance + unrealised PnL"},
+                {"command": "risk",        "description": "Risk gate status + limits"},
                 {"command": "pause",       "description": "Pause trading"},
                 {"command": "resume",      "description": "Resume trading"},
                 {"command": "trail",       "description": "Toggle trailing SL on/off/auto"},
                 {"command": "config",      "description": "Show config values"},
-                {"command": "killswitch",  "description": "Emergency close all"},
                 {"command": "set",         "description": "Set config value live"},
-                {"command": "huntstatus",  "description": "Liquidity hunt engine state"},
+                {"command": "setexchange", "description": "Switch execution exchange"},
+                {"command": "killswitch",  "description": "Emergency close all"},
+                {"command": "resetrisk",   "description": "Clear risk lockout"},
                 {"command": "help",        "description": "Show commands"},
             ]
             payload = {
@@ -206,6 +212,7 @@ class TelegramBotController:
             "structures", "position", "trades", "stats", "config",
             "pause", "resume", "balance", "trail", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
+            "pnl", "market", "risk", "equity", "sl", "tp",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -242,6 +249,11 @@ class TelegramBotController:
             elif cmd == "/set":                 return self._cmd_set(args)
             elif cmd == "/setexchange":         return self._cmd_setexchange(args)
             elif cmd == "/huntstatus":          return self._cmd_huntstatus()
+            elif cmd == "/pnl":                 return self._cmd_pnl()
+            elif cmd == "/market":              return self._cmd_market()
+            elif cmd == "/risk":                return self._cmd_risk()
+            elif cmd == "/equity":              return self._cmd_equity()
+            elif cmd in ("/sl", "/tp"):         return self._cmd_sl_tp()
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
@@ -257,20 +269,24 @@ class TelegramBotController:
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🏛️ <b>LIQUIDITY-FIRST BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 <b>QUICK VIEW</b>\n"
+            "  /pnl — PnL snapshot (1 tap)\n"
+            "  /market — Price + bias + session\n"
+            "  /sl — SL/TP levels + distance\n"
+            "  /equity — Balance + unrealised\n\n"
             "🧠 <b>ANALYSIS</b>\n"
             "  /thinking — 5-layer decision stack\n"
-            "  /pools — BSL/SSL pool map + priority\n"
+            "  /pools — BSL/SSL pool map\n"
             "  /flow — Order flow (CVD, OB, tick)\n"
-            "  /structures — ICT OB/FVG/AMD\n"
-            "  /huntstatus — Hunt prediction\n\n"
-            "📊 <b>POSITION</b>\n"
-            "  /position — Current pos + trail\n"
+            "  /structures — ICT OB/FVG/AMD\n\n"
+            "📈 <b>POSITION</b>\n"
+            "  /position — Full pos + trail state\n"
             "  /trades — Recent history\n"
             "  /stats — Win rate / attribution\n"
-            "  /balance — Wallet\n\n"
+            "  /balance — Wallet balance\n"
+            "  /risk — Risk gate status\n\n"
             "⚙️ <b>CONTROL</b>\n"
-            "  /status — Full dashboard\n"
-            "  /start / /stop — Start/stop\n"
+            "  /start / /stop — Start/stop bot\n"
             "  /pause / /resume — Pause/resume\n"
             "  /trail [on|off|auto] — Trail mode\n"
             "  /config — Show config\n"
@@ -1796,6 +1812,311 @@ class TelegramBotController:
         setattr(cfg, attr_name, new_val)
         logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
         return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
+
+    # ================================================================
+    # /pnl — Quick PnL snapshot (most used command)
+    # ================================================================
+
+    def _cmd_pnl(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
+        rm    = bot_instance.risk_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        price   = dm.get_last_price()
+        pos     = strat.get_position()
+        history = getattr(strat, '_trade_history', [])
+        total_t = getattr(strat, '_total_trades', 0)
+        wins    = getattr(strat, '_winning_trades', 0)
+        wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = getattr(strat, '_total_pnl', 0.0)
+
+        pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+        lines = [f"{pnl_icon} <b>PnL @ ${price:,.2f}</b>"]
+
+        # Unrealised PnL if in position
+        if pos:
+            p = strat._pos
+            side = p.side.upper()
+            entry = p.entry_price
+            upnl_pts = (price - entry) if side == "LONG" else (entry - price)
+            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(entry - p.sl_price)
+            cur_r = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+            hold_m = (time.time() - p.entry_time) / 60.0
+
+            u_icon = "🟢" if upnl_pts >= 0 else "🔴"
+            lines.append(
+                f"\n{u_icon} <b>{side}</b> @ ${entry:,.2f}"
+                f"\n  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)"
+                f"\n  MFE: {mfe_r:.2f}R | Hold: {hold_m:.0f}m"
+                f"\n  SL: ${p.sl_price:,.2f} | TP: ${p.tp_price:,.2f}"
+            )
+
+        # Realised PnL
+        lines.append(f"\n<b>Realised</b>: ${total_pnl:+.4f}")
+        lines.append(f"Trades: {total_t} | W:{wins} L:{total_t - wins} | WR: {wr:.0f}%")
+
+        # Last 3 trades
+        if history:
+            lines.append("\n<b>Recent:</b>")
+            for t in reversed(history[-3:]):
+                pnl = t.get('pnl', 0.0)
+                side = t.get('side', '?').upper()
+                reason = t.get('reason', '?')
+                icon = "✅" if t.get('is_win') else "❌"
+                lines.append(f"  {icon} {side} ${pnl:+.4f} [{reason[:10]}]")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /market — Quick market snapshot
+    # ================================================================
+
+    def _cmd_market(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        price = dm.get_last_price()
+        atr   = strat._atr_5m.atr
+        ict   = getattr(strat, '_ict', None)
+
+        lines = [f"📊 <b>MARKET @ ${price:,.2f}</b>"]
+        lines.append(f"ATR(5m): ${atr:.1f}")
+
+        # AMD bias
+        if ict and ict._initialized:
+            try:
+                amd = ict._amd
+                bias_icon = "🔴" if amd.bias == "bearish" else ("🟢" if amd.bias == "bullish" else "⚪")
+                lines.append(f"AMD: {amd.phase} {bias_icon}{amd.bias} ({amd.confidence:.0%})")
+            except Exception:
+                pass
+
+            # MTF structure
+            _tf = getattr(ict, '_tf', {})
+            parts = []
+            for k in ("4h", "1h", "15m", "5m"):
+                s = _tf.get(k)
+                if s:
+                    t = getattr(s, 'trend', 'ranging')
+                    icon = "🟢" if t == "bullish" else ("🔴" if t == "bearish" else "⚪")
+                    parts.append(f"{icon}{k}")
+            if parts:
+                lines.append(f"MTF: {' '.join(parts)}")
+
+            # Dealing range
+            _dr = getattr(ict, '_dealing_range', None)
+            if _dr:
+                _pd = getattr(_dr, 'current_pd', 0.5)
+                _lbl = ("DEEP DISC" if _pd < 0.25 else "DISCOUNT" if _pd < 0.40
+                        else "EQ" if _pd < 0.60 else "PREMIUM" if _pd < 0.75 else "DEEP PREM")
+                lines.append(f"Zone: {_lbl} ({_pd:.0%})")
+
+            # Session
+            _sess = getattr(ict, '_session', '')
+            _kz = getattr(ict, '_killzone', '')
+            if _sess:
+                lines.append(f"Session: {_sess}" + (f" [{_kz}]" if _kz else ""))
+
+        # Nearest pools
+        liq_map = getattr(strat, '_liq_map', None)
+        if liq_map and atr > 1e-10:
+            try:
+                snap = liq_map.get_snapshot(price, atr)
+                if snap.bsl_pools:
+                    nearest_bsl = min(snap.bsl_pools, key=lambda t: t.distance_atr)
+                    lines.append(f"BSL: ${nearest_bsl.pool.price:,.0f} ({nearest_bsl.distance_atr:.1f}ATR)")
+                if snap.ssl_pools:
+                    nearest_ssl = min(snap.ssl_pools, key=lambda t: t.distance_atr)
+                    lines.append(f"SSL: ${nearest_ssl.pool.price:,.0f} ({nearest_ssl.distance_atr:.1f}ATR)")
+            except Exception:
+                pass
+
+        # Flow
+        tick_flow = 0.0
+        cvd_trend = 0.0
+        try:
+            tick_flow = strat._tick_eng.get_signal()
+            cvd_trend = strat._cvd.get_trend_signal()
+        except Exception:
+            pass
+        flow_dir = "▲ LONG" if tick_flow > 0.3 else ("▼ SHORT" if tick_flow < -0.3 else "─ neutral")
+        lines.append(f"Flow: {flow_dir} (tick={tick_flow:+.2f} cvd={cvd_trend:+.2f})")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /risk — Risk gate status
+    # ================================================================
+
+    def _cmd_risk(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        rm    = bot_instance.risk_manager
+        if not strat or not rm:
+            return "Components not ready."
+
+        import config as cfg
+        gate = getattr(strat, '_risk_gate', None)
+
+        lines = ["🛡️ <b>RISK STATUS</b>\n"]
+
+        # Risk gate
+        can_ok, reason = rm.can_trade()
+        lines.append(f"{'✅' if can_ok else '🚫'} Trade gate: {'OPEN' if can_ok else reason}")
+
+        # Daily stats
+        if gate:
+            daily  = gate.daily_trades
+            max_d  = int(getattr(cfg, 'MAX_DAILY_TRADES', 8))
+            consec = gate.consec_losses
+            max_c  = int(getattr(cfg, 'MAX_CONSECUTIVE_LOSSES', 5))
+            lines.append(f"\nDaily trades: {daily}/{max_d}")
+            lines.append(f"Consec losses: {consec}/{max_c}")
+
+        # Daily PnL
+        dpnl = getattr(rm, 'daily_pnl', 0.0)
+        max_loss = float(getattr(cfg, 'MAX_DAILY_LOSS_PCT', 5.0))
+        init_bal = getattr(rm, 'initial_balance', 0.0)
+        dpct = dpnl / init_bal * 100 if init_bal > 1e-10 else 0.0
+        lines.append(f"Daily PnL: ${dpnl:+.2f} ({dpct:+.1f}% of ${init_bal:.2f})")
+        lines.append(f"Max daily loss: {max_loss:.1f}%")
+
+        # Cooldown
+        now = time.time()
+        last_exit = getattr(strat, '_last_exit_time', 0)
+        cd = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
+        cd_rem = max(0, cd - (now - last_exit))
+        lines.append(f"\nCooldown: {'ready' if cd_rem == 0 else f'{cd_rem:.0f}s remaining'}")
+
+        # Position status
+        pos = strat.get_position()
+        lines.append(f"Position: {'ACTIVE' if pos else 'FLAT'}")
+        lines.append(f"Trading: {'ENABLED' if bot_instance.trading_enabled else 'PAUSED'}")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /equity — Balance + unrealised PnL
+    # ================================================================
+
+    def _cmd_equity(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        rm = bot_instance.risk_manager
+        strat = bot_instance.strategy
+        dm = bot_instance.data_manager
+        if not rm or not strat or not dm:
+            return "Components not ready."
+
+        try:
+            bal = rm.get_available_balance()
+            if not bal:
+                return "Could not fetch balance."
+
+            avail = float(bal.get("available", 0))
+            total = float(bal.get("total", avail))
+            init_bal = getattr(rm, 'initial_balance', 0.0)
+            total_pnl = getattr(strat, '_total_pnl', 0.0)
+
+            lines = ["💰 <b>EQUITY</b>\n"]
+            lines.append(f"Balance: <b>${total:,.2f}</b>")
+            lines.append(f"Available: ${avail:,.2f}")
+            lines.append(f"Starting: ${init_bal:,.2f}")
+
+            # Unrealised
+            pos = strat.get_position()
+            if pos:
+                p = strat._pos
+                price = dm.get_last_price()
+                upnl = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+                upnl_usd = upnl * p.quantity
+                lines.append(f"\nUnrealised: ${upnl_usd:+.4f} ({upnl:+.1f}pts)")
+                lines.append(f"Equity: <b>${total + upnl_usd:,.2f}</b>")
+            else:
+                lines.append(f"\nEquity: <b>${total:,.2f}</b>")
+
+            lines.append(f"\nRealised PnL: ${total_pnl:+.4f}")
+            if init_bal > 0:
+                session_ret = (total - init_bal) / init_bal * 100
+                lines.append(f"Session return: {session_ret:+.2f}%")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Equity error: {e}"
+
+    # ================================================================
+    # /sl or /tp — Quick SL/TP view
+    # ================================================================
+
+    def _cmd_sl_tp(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        dm = bot_instance.data_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        pos = strat.get_position()
+        if not pos:
+            return "📭 No active position — no SL/TP."
+
+        p = strat._pos
+        price = dm.get_last_price()
+        atr = strat._atr_5m.atr
+        side = p.side.upper()
+
+        sl_dist = abs(price - p.sl_price)
+        tp_dist = abs(p.tp_price - price)
+        sl_atr = sl_dist / atr if atr > 1e-10 else 0
+        tp_atr = tp_dist / atr if atr > 1e-10 else 0
+
+        init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(p.entry_price - p.sl_price)
+        profit = (price - p.entry_price) if side == "LONG" else (p.entry_price - price)
+        cur_r = profit / init_dist if init_dist > 1e-10 else 0
+
+        # Break-even check
+        import config as _cfg
+        _cr = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+        be_buf = p.entry_price * _cr * 2.0 + 0.10 * atr
+        be_price = p.entry_price + be_buf if side == "LONG" else p.entry_price - be_buf
+        be_locked = (side == "LONG" and p.sl_price >= be_price) or \
+                    (side == "SHORT" and p.sl_price <= be_price)
+
+        side_icon = "🟢" if side == "LONG" else "🔴"
+        be_icon = "🔒" if be_locked else "❌"
+
+        lines = [
+            f"{side_icon} <b>{side} SL/TP</b>\n",
+            f"Price: ${price:,.2f} | ATR: ${atr:.1f}",
+            f"Entry: ${p.entry_price:,.2f}\n",
+            f"🛑 SL: <b>${p.sl_price:,.2f}</b>",
+            f"   {sl_dist:.1f}pts / {sl_atr:.1f}ATR from price",
+            f"\n🎯 TP: <b>${p.tp_price:,.2f}</b>",
+            f"   {tp_dist:.1f}pts / {tp_atr:.1f}ATR from price",
+            f"\nR-multiple: {cur_r:+.2f}R",
+            f"Break-even: {be_icon} {'LOCKED' if be_locked else f'needs SL at ${be_price:,.2f}'}",
+        ]
+
+        return "\n".join(lines)
 
     # ================================================================
     # BOT THREAD

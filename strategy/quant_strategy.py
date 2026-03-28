@@ -4917,27 +4917,10 @@ class QuantStrategy:
 
         now_ms = int(now * 1000) if now < 1e12 else int(now)
 
-        # ── BUG-5 FIX: Block entries during WEEKEND sessions ─────────────
-        # Institutional flow is absent on weekends. BTC moves on retail
-        # noise and thin liquidity — ICT concepts don't apply.
-        # Block entry entirely; existing positions still trail/manage.
-        try:
-            from datetime import datetime, timezone as _tz
-            _dt = datetime.now(_tz.utc)
-            _weekday = _dt.weekday()  # 0=Mon, 5=Sat, 6=Sun
-            if _weekday >= 5:  # Saturday or Sunday
-                _now_t = time.time()
-                if not hasattr(self, '_last_weekend_warn') or _now_t - self._last_weekend_warn >= 120.0:
-                    self._last_weekend_warn = _now_t
-                    logger.info("⛔ Weekend session — entries blocked (no institutional flow)")
-                return
-        except Exception:
-            pass
-
-        # Step 2: Gather candles (all timeframes) — 7-day coverage where practical
+        # Step 2: Gather candles (all timeframes)
         candles_by_tf = {}
-        for tf, limit in [("1m", 200), ("5m", 2000), ("15m", 700),
-                          ("1h", 200), ("4h", 50), ("1d", 30)]:
+        for tf, limit in [("1m", 200), ("5m", 300), ("15m", 200),
+                          ("1h", 100), ("4h", 50), ("1d", 30)]:
             try:
                 candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit)
             except Exception:
