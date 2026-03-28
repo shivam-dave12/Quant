@@ -317,6 +317,23 @@ class EntryEngine:
             self._do_ready(liq_snapshot, flow_state, ict_ctx, price, atr, now)
         elif self._state == EngineState.POST_SWEEP:
             self._do_post_sweep(liq_snapshot, flow_state, ict_ctx, price, atr, now)
+        elif self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            # SELF-RECOVERY: If stuck in ENTERING for >120s, the order failed
+            # and neither the background thread nor the watchdog reset us.
+            # If stuck in IN_POSITION for >4h, position was closed externally
+            # and on_position_closed() was never called.
+            # Either way, recover to SCANNING so the bot isn't brain-dead.
+            _stuck_limit = 120.0 if self._state == EngineState.ENTERING else 14400.0
+            if now - self._state_entered > _stuck_limit:
+                logger.warning(
+                    f"🔄 Entry engine SELF-RECOVERY: stuck in {self._state.name} "
+                    f"for {now - self._state_entered:.0f}s — forcing SCANNING")
+                self._state = EngineState.SCANNING
+                self._state_entered = now
+                self._signal = None
+                self._tracking = None
+                self._proximity_confirms = 0
+                self._proximity_target = None
 
     def get_signal(self) -> Optional[EntrySignal]:
         return self._signal
@@ -333,6 +350,24 @@ class EntryEngine:
         self._signal = None
         self._proximity_confirms = 0
         self._proximity_target = None
+
+    def on_entry_failed(self) -> None:
+        """
+        Called when an entry order fails, times out, or is cancelled.
+        Resets the engine back to SCANNING so it can generate new signals.
+
+        Without this, the engine stays in ENTERING state forever because
+        the state machine has no handler for ENTERING — update() silently
+        returns, and the bot becomes brain-dead (cannot generate signals).
+        """
+        if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            logger.info(f"🔄 Entry engine: {self._state.name} → SCANNING (entry failed/cancelled)")
+            self._state = EngineState.SCANNING
+            self._state_entered = time.time()
+            self._signal = None
+            self._tracking = None
+            self._proximity_confirms = 0
+            self._proximity_target = None
 
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION

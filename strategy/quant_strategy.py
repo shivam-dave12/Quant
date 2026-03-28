@@ -4032,6 +4032,18 @@ class QuantStrategy:
                             "<b>Check exchange for open position!</b>")
                         self._pos.phase = PositionPhase.FLAT
                         self._last_exit_time = now
+                        # CRITICAL: Reset entry engine too — otherwise it stays
+                        # stuck in EngineState.ENTERING forever and the bot
+                        # cannot generate new signals (brain-dead state).
+                        if self._entry_engine is not None:
+                            self._entry_engine.on_entry_failed()
+                            logger.info("🔄 Entry engine reset to SCANNING after watchdog")
+                        # CRITICAL: Reset entry engine state machine too.
+                        # Without this, the entry engine stays in ENTERING
+                        # forever — update() skips all processing, no new
+                        # signals can be produced, and the bot is paralyzed.
+                        if self._entry_engine is not None:
+                            self._entry_engine.on_entry_cancelled()
 
         elif phase == PositionPhase.FLAT:
             if cooldown_ok:
@@ -4092,6 +4104,18 @@ class QuantStrategy:
                                 f"(mode={mode} side={side}) — resetting to FLAT")
                             self._last_exit_time = time.time()
                         self._pos.phase = PositionPhase.FLAT
+                    # CRITICAL: Always reset entry engine when thread exits
+                    # without opening a position. If the order failed/timed out,
+                    # the entry engine is stuck in ENTERING state with no handler
+                    # in the state machine — it will never recover on its own.
+                    if (self._entry_engine is not None
+                            and self._pos.phase != PositionPhase.ACTIVE):
+                        self._entry_engine.on_entry_failed()
+                        # CRITICAL: Reset entry engine from ENTERING → SCANNING.
+                        # Without this, entry engine stays in ENTERING state
+                        # and update() skips all processing forever.
+                        if self._entry_engine is not None:
+                            self._entry_engine.on_entry_cancelled()
 
         threading.Thread(
             target=_bg, daemon=True, name=f"enter-{mode}-{side}"
