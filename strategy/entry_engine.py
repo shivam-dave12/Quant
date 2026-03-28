@@ -289,13 +289,13 @@ class EntryEngine:
         # Store snapshot for _compute_sl liquidity awareness
         self._last_liq_snapshot = liq_snapshot
 
-        # Check for new sweeps first
+        # Check for new sweeps first — but NOT if already evaluating one
         new_sweeps = [s for s in liq_snapshot.recent_sweeps
                       if s.detected_at > now - 10.0
                       and s.quality >= _MIN_SWEEP_QUALITY]
 
         if new_sweeps and self._state not in (
-            EngineState.IN_POSITION, EngineState.ENTERING
+            EngineState.IN_POSITION, EngineState.ENTERING, EngineState.POST_SWEEP
         ):
             best_sweep = max(new_sweeps, key=lambda s: s.quality)
             self._enter_post_sweep(best_sweep, liq_snapshot, flow_state,
@@ -940,10 +940,14 @@ class EntryEngine:
                 rev_score  -= 12.0 * max(amd_conf, 0.5)
                 cont_reasons.append(f"AMD DIST bull+BSL ({amd_conf:.0%})")
 
-        elif amd_phase == 'ACCUMULATION':
+        elif amd_phase in ('ACCUMULATION', 'REACCUMULATION'):
+            # REACCUMULATION = mid-trend pause (15m trending, 5m ranging).
+            # Smart money re-loads during the pause. A sweep with displacement
+            # + rejection here is a Judas swing — same logic as ACCUMULATION
+            # but slightly weighted because there IS a trend in play.
             pts = 12.0 * max(amd_conf, 0.4)
             rev_score += pts
-            rev_reasons.append(f"AMD ACCUM ({amd_conf:.0%})")
+            rev_reasons.append(f"AMD {'REAC' if 'REAC' in amd_phase else 'ACCUM'} ({amd_conf:.0%})")
 
         # ── FACTOR 1: DISPLACEMENT QUALITY (0-20) ────────────────────────
         if sweep.quality >= 0.70:

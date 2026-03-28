@@ -699,7 +699,8 @@ class TelegramBotController:
                         sw_qual = _sa.get('sweep_quality', 0)
                         gap = abs(rs - cs)
 
-                        winner = "REVERSAL" if rs > cs + 15 else ("CONTINUATION" if cs > rs + 15 else "UNDECIDED")
+                        winner = ("REVERSAL" if rs >= 45 and gap >= 10 else
+                                  ("CONTINUATION" if cs >= 40 and gap >= 10 else "WAIT"))
                         bar_total = max(rs + cs, 1)
                         rev_pct = int(rs / bar_total * 16)
                         cont_pct = 16 - rev_pct
@@ -709,7 +710,7 @@ class TelegramBotController:
                         lines.append(f"  {score_bar}")
                         lines.append(f"  REV={rs:.0f}: {', '.join(_esc(r) for r in rr[:3])}")
                         lines.append(f"  CONT={cs:.0f}: {', '.join(_esc(r) for r in cr[:3])}")
-                        lines.append(f"  → <b>{winner}</b> (gap={gap:.0f}, need≥15)")
+                        lines.append(f"  → <b>{winner}</b> (rev{'≥' if rs>=45 else '<'}45 gap={gap:.0f})")
                     elif toward_pool:
                         lines.append(f"  Scanning for sweep entry toward {'BSL' if flow_dir == 'long' else 'SSL'}...")
                     else:
@@ -1548,6 +1549,7 @@ class TelegramBotController:
             "  Trail:     ICT structure (BOS→CHoCH→15m)",
             "",
             "<b>Position Sizing</b>",
+            f"  Margin/trade: <b>{getattr(cfg,'QUANT_MARGIN_PCT',0.20):.0%}</b> of balance",
             f"  Risk/trade:   {getattr(cfg,'RISK_PER_TRADE',0.60):.2f}% of balance",
             f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',4.0):.2f} USDT",
             f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',1.0)} BTC",
@@ -1747,6 +1749,7 @@ class TelegramBotController:
                 "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
                 "<b>Adjustable:</b>\n"
                 "  leverage          int   (e.g. 20)\n"
+                "  margin            float (0.05–1.0, e.g. 0.20)\n"
                 "  cooldown          int   seconds\n"
                 "  max_daily_trades  int\n"
                 "  max_daily_loss    float %\n"
@@ -1762,6 +1765,7 @@ class TelegramBotController:
 
         allowed = {
             "leverage":         ("LEVERAGE",             int),
+            "margin":           ("QUANT_MARGIN_PCT",     float),
             "cooldown":         ("QUANT_COOLDOWN_SEC",   int),
             "max_daily_trades": ("MAX_DAILY_TRADES",     int),
             "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
@@ -1808,6 +1812,28 @@ class TelegramBotController:
                         setattr(cfg, attr_name, old_val)
                         return f"❌ Exchange API error: {e}\nConfig reverted to {old_val}x."
             return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (exchange not updated — bot not running)"
+
+        # ── Margin PCT validation ─────────────────────────────────────────
+        if key == "margin":
+            if not (0.05 <= new_val <= 1.0):
+                return (
+                    f"❌ Margin must be 0.05–1.0 (5%–100%).\n"
+                    f"You entered: {new_val}\n"
+                    f"Example: /set margin 0.30 (= 30% of balance per trade)"
+                )
+            if bot_running and bot_instance and bot_instance.strategy:
+                pos = bot_instance.strategy.get_position()
+                if pos:
+                    return (
+                        f"❌ Cannot change margin while position is open.\n"
+                        f"Close position first, then /set margin {new_val}."
+                    )
+            setattr(cfg, attr_name, new_val)
+            logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+            return (
+                f"✅ <b>MARGIN</b>: {old_val:.0%} → <b>{new_val:.0%}</b>\n"
+                f"Next trade will use {new_val:.0%} of available balance as margin."
+            )
 
         setattr(cfg, attr_name, new_val)
         logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")

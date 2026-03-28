@@ -234,7 +234,8 @@ def format_heartbeat(
         sw_price = sweep_analysis.get("sweep_price", 0)
         sw_qual = sweep_analysis.get("sweep_quality", 0)
 
-        winner = "REVERSAL" if rs > cs else ("CONTINUATION" if cs > rs else "UNDECIDED")
+        winner = ("REVERSAL" if rs >= 45 and abs(rs - cs) >= 10 else
+                  ("CONTINUATION" if cs >= 40 and abs(rs - cs) >= 10 else "WAIT"))
         gap = abs(rs - cs)
         bar_total = max(rs + cs, 1)
         rev_pct = int(rs / bar_total * 20)
@@ -247,7 +248,7 @@ def format_heartbeat(
             f"  {score_bar}",
             f"  REV={rs:.0f}  {' + '.join(rr[:3]) if rr else '—'}",
             f"  CONT={cs:.0f} {' + '.join(cr[:3]) if cr else '—'}",
-            f"  → {winner} (gap={gap:.0f}, need≥15)",
+            f"  → {winner} (rev{'≥' if rs>=45 else '<'}45 gap={gap:.0f})",
         ])
 
     # Footer stats
