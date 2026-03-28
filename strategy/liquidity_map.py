@@ -94,17 +94,18 @@ _CLUSTER_RADIUS_ATR: Dict[str, float] = {
     "1h": 0.45, "4h": 0.60, "1d": 0.90,
 }
 
-# FIX-8: Extended pool max ages
+# 7-day retention for all timeframes — institutional structure persists
+# across sessions. A 4H OB from Tuesday is still valid on Friday.
 _POOL_MAX_AGE: Dict[str, float] = {
-    "1m": 7200,      # 2 hours (1m pools are micro-structure, keep short)
-    "5m": 259200,    # 3 days — user requirement: full session + prior sessions
-    "15m": 259200,  # 3 days — key intraday structure persists across sessions
-    "1h": 259200,   # 3 days — hourly structure anchors multi-session ranges
-    "4h": 259200,   # 3 days
-    "1d": 604800,   # 7 days
+    "1m": 14400,      # 4 hours (1m is micro, but 2h was losing intraday context)
+    "5m": 604800,     # 7 days — full week of intraday structure
+    "15m": 604800,    # 7 days — key intraday/swing structure
+    "1h": 604800,     # 7 days — hourly structure anchors weekly ranges
+    "4h": 604800,     # 7 days — swing/position levels
+    "1d": 2592000,    # 30 days — macro levels persist across months
 }
 
-_MAX_POOLS_PER_TF = 15   # increased from 12
+_MAX_POOLS_PER_TF = 30   # was 15 — with 7-day retention we need more capacity
 
 # FIX-2: Lowered significance threshold — allows new 5m pools (sig≈2.0)
 TRADEABLE_POOL_MIN_SIG = 1.8  # was 3.0
@@ -115,9 +116,9 @@ _HTF_CONFLUENCE_MULT = 2.5
 _SWEEP_WICK_MIN_ATR  = 0.03
 _SWEEP_REJECT_MIN_ATR = 0.02
 
-# FIX-3: Swept pool history retention
-_SWEPT_HISTORY_MAX = 200  # store up to 200 swept pools per side; bounded deque in _TimeframeRegistry
-_SWEPT_HISTORY_AGE = 172800.0  # 48 hours — institutional memory; pools from prior session remain relevant
+# FIX-3: Swept pool history — 7 days retention for institutional memory
+_SWEPT_HISTORY_MAX = 500  # store up to 500 swept pools per side
+_SWEPT_HISTORY_AGE = 604800.0  # 7 days — full week of sweep context
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -668,9 +669,10 @@ class LiquidityMap:
 
     def get_snapshot(self, price: float, atr: float) -> LiquidityMapSnapshot:
         """
-        Build snapshot. FIX-5: Tighter dedup radius (0.2 ATR).
-        FIX-10: Proximity-adjusted significance for primary target selection.
-        FIX-3: Include swept pool history in snapshot.
+        Build snapshot with institutional-grade scoring:
+        - Proximity-adjusted significance
+        - Swept-pool adjacency bonus (pools near recent sweeps score higher)
+        - 7-day swept history for context
         """
         now = time.time()
 
@@ -684,6 +686,14 @@ class LiquidityMap:
         )
         if atr < 1e-10:
             return empty
+
+        # ── Collect all swept pool prices for adjacency scoring ──────────
+        _all_swept_prices = []
+        for reg in self._registries.values():
+            for p in reg.swept_bsl:
+                _all_swept_prices.append(p.price)
+            for p in reg.swept_ssl:
+                _all_swept_prices.append(p.price)
 
         bsl_targets: List[PoolTarget] = []
         ssl_targets: List[PoolTarget] = []
@@ -723,6 +733,20 @@ class LiquidityMap:
         bsl_targets = self._deduplicate_targets(bsl_targets, atr, radius_mult=0.20)
         ssl_targets = self._deduplicate_targets(ssl_targets, atr, radius_mult=0.20)
 
+        # ── Swept-adjacency bonus: pools near recently-swept pools are ───
+        # more likely to be targeted next (institutional delivery targets
+        # adjacent stop clusters — "run the SSL, then deliver to the BSL
+        # above" or vice versa). Bonus = +2.0 if a swept pool is within
+        # 3 ATR of this pool (decays linearly with distance).
+        if _all_swept_prices and atr > 1e-10:
+            for t in bsl_targets + ssl_targets:
+                _min_dist_to_swept = min(
+                    abs(t.pool.price - sp) / atr
+                    for sp in _all_swept_prices)
+                if _min_dist_to_swept < 3.0:
+                    _bonus = 2.0 * (1.0 - _min_dist_to_swept / 3.0)
+                    t.significance += _bonus
+
         # Sort by raw significance DESC (for display priority)
         bsl_targets.sort(key=lambda t: t.significance, reverse=True)
         ssl_targets.sort(key=lambda t: t.significance, reverse=True)
@@ -730,12 +754,7 @@ class LiquidityMap:
         nearest_bsl = min((t.distance_atr for t in bsl_targets), default=999.0)
         nearest_ssl = min((t.distance_atr for t in ssl_targets), default=999.0)
 
-        # FIX-10 + BUG-7 FIX: Primary target = highest PROXIMITY-ADJUSTED significance.
-        # Old threshold was 8 ATR. After 2-3 trades sweep all near-term pools,
-        # only distant HTF pools (15-50 ATR) remain. With 8 ATR cutoff the engine
-        # reported "no target" even though valid 7K-9K BSL clusters existed.
-        # New: 25 ATR threshold. Proximity-adjusted significance naturally penalizes
-        # distant pools (exp decay), so a nearby 5m pool still beats a far 4h pool.
+        # Primary target = highest PROXIMITY-ADJUSTED significance
         all_reachable = [t for t in bsl_targets + ssl_targets if t.distance_atr < 25.0]
         primary = None
         if all_reachable:
@@ -744,12 +763,10 @@ class LiquidityMap:
                 key=lambda t: t.pool.proximity_adjusted_sig(t.distance_atr)
             )
         elif bsl_targets or ssl_targets:
-            # Final fallback: if everything is beyond 25 ATR, pick the nearest
-            # of all available targets (no proximity cutoff — blind spot is worse)
             all_targets = bsl_targets + ssl_targets
             primary = min(all_targets, key=lambda t: t.distance_atr)
 
-        # FIX-3: Collect swept pool history
+        # Collect swept pool history (7 days)
         swept_bsl_levels = []
         swept_ssl_levels = []
         for reg in self._registries.values():
@@ -759,12 +776,12 @@ class LiquidityMap:
                 swept_ssl_levels.append(p.price)
 
         snap = LiquidityMapSnapshot(
-            bsl_pools=bsl_targets[:12],
-            ssl_pools=ssl_targets[:12],
+            bsl_pools=bsl_targets[:20],   # was 12 — more visibility with 7-day data
+            ssl_pools=ssl_targets[:20],
             primary_target=primary,
             recent_sweeps=list(self._recent_sweeps),
-            swept_bsl_levels=sorted(set(swept_bsl_levels), reverse=True)[:10],
-            swept_ssl_levels=sorted(set(swept_ssl_levels))[:10],
+            swept_bsl_levels=sorted(set(swept_bsl_levels), reverse=True)[:20],
+            swept_ssl_levels=sorted(set(swept_ssl_levels))[:20],
             nearest_bsl_atr=nearest_bsl,
             nearest_ssl_atr=nearest_ssl,
             timestamp=now,

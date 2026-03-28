@@ -96,11 +96,11 @@ except ImportError:
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# FIX-B: lowered conviction threshold — BTC consolidation rarely exceeds 0.25
-_FLOW_CONV_THRESHOLD    = 0.25    # was 0.40 (too high for BTC consolidation)
-_FLOW_CVD_AGREE_MIN     = 0.10    # was 0.15 (CVD often weak in ranges)
-# FIX-C: single tick + CVD is sufficient institutional confirmation
-_FLOW_SUSTAINED_TICKS   = 1       # was 2 (neutral ticks reset counter too easily)
+# FIX-B: lowered conviction threshold
+_FLOW_CONV_THRESHOLD    = 0.40    # was 0.55
+_FLOW_CVD_AGREE_MIN     = 0.15    # was 0.20
+# FIX-C: reduced sustained ticks
+_FLOW_SUSTAINED_TICKS   = 2       # was 3
 
 # Pool targeting
 _MAX_TARGET_ATR         = 8.0     # was 6.0 — allow slightly farther targets
@@ -108,11 +108,10 @@ _MIN_TARGET_ATR         = 0.25    # was 0.3
 # FIX-A: lowered significance threshold
 _MIN_POOL_SIGNIFICANCE  = 2.0     # was 3.0
 
-# Proximity approach trigger (FIX-E) — INSTITUTIONAL: approach entries are
-# the bread-and-butter; most sweeps start as approaches. Loosen these.
-_PROXIMITY_ENTRY_ATR_MAX    = 3.0     # was 2.0 — detect approaches earlier
-_PROXIMITY_ENTRY_ATR_MIN    = 0.10    # was 0.15 — allow very close pools
-_PROXIMITY_MIN_SIG          = 2.5     # was 4.0 — most intraday pools score 2-3
+# Proximity approach trigger (FIX-E)
+_PROXIMITY_ENTRY_ATR_MAX    = 2.0     # Pool within 2.0 ATR triggers proximity check
+_PROXIMITY_ENTRY_ATR_MIN    = 0.15    # Must be at least 0.15 ATR from pool
+_PROXIMITY_MIN_SIG          = 4.0     # Higher bar for proximity approach
 _PROXIMITY_CONFIRM_COUNT    = 1       # Only 1 confirm tick needed
 
 # Sweep detection
@@ -124,15 +123,14 @@ _OTE_MAX_WAIT_SEC       = 480     # was 600
 _TRACKING_TIMEOUT_SEC   = 180     # was 300
 _READY_TIMEOUT_SEC      = 90      # was 120
 
-# Risk management — INSTITUTIONAL: 1.2 R:R is standard for sweep entries
-# with tight SL behind wick. Higher bars = missed valid setups.
-_MIN_RR_RATIO           = 1.2     # was 1.4 — institutional minimum
-_SL_BUFFER_ATR          = 0.08    # was 0.12 — tighter SL = better R:R
-_TP_BUFFER_ATR          = 0.05    # was 0.08 — closer to pool = more fills
+# Risk management
+_MIN_RR_RATIO           = 1.4     # was 1.5 — slightly more permissive
+_SL_BUFFER_ATR          = 0.12    # was 0.15
+_TP_BUFFER_ATR          = 0.08    # was 0.10
 
-# Cooldowns — faster re-engagement after missed sweeps
-_ENTRY_COOLDOWN_SEC     = 15.0    # was 30.0 — BTC moves fast
-_POST_SWEEP_EVAL_SEC    = 5.0     # was 10.0 — evaluate sweep immediately
+# Cooldowns
+_ENTRY_COOLDOWN_SEC     = 30.0    # was 45.0
+_POST_SWEEP_EVAL_SEC    = 10.0    # was 15.0 — faster evaluation
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,24 +164,17 @@ class OrderFlowState:
 
     @property
     def conviction(self) -> float:
-        """
-        Weighted flow conviction — tick_flow and CVD are primary signals.
-        OB imbalance is secondary confirmation, not a diluter.
-        """
-        # Primary signals weighted equally (0.40 each)
-        conv = self.tick_flow * 0.40 + self.cvd_trend * 0.40
-        # OB imbalance as secondary confirmation (0.20 weight)
-        if abs(self.ob_imbalance) > 0.05:
-            conv += self.ob_imbalance * 0.20
-        return conv
+        signals = [self.tick_flow, self.cvd_trend]
+        if abs(self.ob_imbalance) > 0.1:
+            signals.append(self.ob_imbalance * 0.5)
+        return sum(signals) / len(signals)
 
     @property
     def direction(self) -> str:
         c = self.conviction
-        # Lower threshold: 0.125 (was 0.20 effectively)
-        if c > 0.125:
+        if c > _FLOW_CONV_THRESHOLD * 0.5:
             return "long"
-        elif c < -0.125:
+        elif c < -_FLOW_CONV_THRESHOLD * 0.5:
             return "short"
         return ""
 
@@ -274,6 +265,12 @@ class EntryEngine:
         self._proximity_confirms: int = 0
         self._proximity_target:   Optional[PoolTarget] = None
         self._proximity_side:     str = ""
+        # BUG-2 FIX: sweep reversal direction memory — prevents proximity
+        # from immediately entering OPPOSITE of a just-identified reversal
+        self._last_sweep_reversal_dir:  str   = ""
+        self._last_sweep_reversal_time: float = 0.0
+        # Liquidity snapshot reference for SL liquidity-awareness
+        self._last_liq_snapshot = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -288,6 +285,9 @@ class EntryEngine:
     ) -> None:
         if atr < 1e-10:
             return
+
+        # Store snapshot for _compute_sl liquidity awareness
+        self._last_liq_snapshot = liq_snapshot
 
         # Check for new sweeps first
         new_sweeps = [s for s in liq_snapshot.recent_sweeps
@@ -391,6 +391,22 @@ class EntryEngine:
         if now - self._last_entry_at < _ENTRY_COOLDOWN_SEC:
             return False
 
+        # ── BUG-2 FIX: Block proximity signals OPPOSITE of recent sweep reversal ──
+        # If sweep analysis just said REVERSAL LONG (SSL swept, go long),
+        # don't let proximity immediately enter SHORT. That's fighting the
+        # institutional sweep — the dumbest possible trade.
+        _sweep_cooldown = 60.0  # seconds
+        if (self._last_sweep_reversal_dir
+                and now - self._last_sweep_reversal_time < _sweep_cooldown):
+            # Will be checked per-side below after we determine approach_side
+            pass  # guard applied after approach_side is determined
+
+        # ── BUG-3 FIX: Hard-block entries AGAINST AMD MANIPULATION bias ──
+        # AMD MANIPULATION + BULLISH = smart money buying → NEVER short here
+        # AMD MANIPULATION + BEARISH = smart money selling → NEVER long here
+        _amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
+        _amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
+
         # Find the closest approaching pool
         best_approach: Optional[PoolTarget] = None
         approach_side: str = ""
@@ -418,6 +434,29 @@ class EntryEngine:
             self._proximity_target = None
             self._proximity_side = ""
             return False
+
+        # ── BUG-2 GUARD: Don't trade opposite of recent sweep reversal ────
+        if (self._last_sweep_reversal_dir
+                and now - self._last_sweep_reversal_time < _sweep_cooldown
+                and approach_side != self._last_sweep_reversal_dir):
+            logger.debug(
+                f"⛔ Proximity {approach_side} BLOCKED — recent sweep reversal "
+                f"said {self._last_sweep_reversal_dir.upper()} "
+                f"({now - self._last_sweep_reversal_time:.0f}s ago)")
+            return False
+
+        # ── BUG-3 GUARD: Don't trade against AMD MANIPULATION bias ────────
+        if _amd_phase == 'MANIPULATION':
+            if approach_side == "short" and _amd_bias == "bullish":
+                logger.debug(
+                    f"⛔ Proximity SHORT BLOCKED — AMD MANIPULATION+BULLISH "
+                    f"(smart money buying, never sell here)")
+                return False
+            if approach_side == "long" and _amd_bias == "bearish":
+                logger.debug(
+                    f"⛔ Proximity LONG BLOCKED — AMD MANIPULATION+BEARISH "
+                    f"(smart money selling, never buy here)")
+                return False
 
         # Changed pool target — reset counter
         if (self._proximity_target is None
@@ -516,58 +555,46 @@ class EntryEngine:
         if now - self._last_entry_at < _ENTRY_COOLDOWN_SEC:
             return
 
-        # FIX: Don't require strong flow direction to start tracking.
-        # Allow target identification when pools are nearby even with weak flow.
-        # The tracking state will build conviction before entering READY.
-        target = None
-        direction = flow.direction
+        if not flow.direction:
+            return
 
-        if direction:
-            # Standard path: flow direction guides target selection
-            target = self._find_flow_target(snap, flow, price, atr)
-        else:
-            # Weak-flow path: find nearest significant pool and infer direction
-            # This captures the pre-positioning phase before institutional flow shows
-            all_pools = []
-            for t in snap.bsl_pools:
-                if t.distance_atr <= _MAX_TARGET_ATR and t.significance >= _MIN_POOL_SIGNIFICANCE:
-                    all_pools.append(("long", t))
-            for t in snap.ssl_pools:
-                if t.distance_atr <= _MAX_TARGET_ATR and t.significance >= _MIN_POOL_SIGNIFICANCE:
-                    all_pools.append(("short", t))
-            if all_pools:
-                # Pick highest proximity-adjusted significance
-                best_dir, best_t = max(
-                    all_pools,
-                    key=lambda x: x[1].pool.proximity_adjusted_sig(x[1].distance_atr))
-                # Only auto-track if pool is close and significant
-                if best_t.distance_atr <= 4.0 and best_t.significance >= 3.0:
-                    target = best_t
-                    direction = best_dir
-
+        target = self._find_flow_target(snap, flow, price, atr)
         if target is None:
             return
 
         # AMD soft filter
         if (ict.amd_phase == "DISTRIBUTION"
                 and ict.amd_bias
-                and ict.amd_bias != ("bullish" if direction == "long" else "bearish")):
+                and ict.amd_bias != ("bullish" if flow.direction == "long" else "bearish")):
             logger.debug(
-                f"EntryEngine: flow {direction} vs AMD DISTRIBUTION "
+                f"EntryEngine: flow {flow.direction} vs AMD DISTRIBUTION "
                 f"{ict.amd_bias} — skipping")
             return
 
+        # ── BUG-3 FIX: Hard-block entries against AMD MANIPULATION bias ──
+        _amd_upper = (ict.amd_phase or '').upper()
+        _bias_lower = (ict.amd_bias or '').lower()
+        if _amd_upper == 'MANIPULATION':
+            if flow.direction == "short" and _bias_lower == "bullish":
+                logger.debug(
+                    f"EntryEngine: SHORT blocked — AMD MANIPULATION+BULLISH")
+                return
+            if flow.direction == "long" and _bias_lower == "bearish":
+                logger.debug(
+                    f"EntryEngine: LONG blocked — AMD MANIPULATION+BEARISH")
+                return
+
         self._tracking = _TrackingState(
-            direction=direction,
+            direction=flow.direction,
             target=target,
             started_at=now,
-            flow_ticks=1 if flow.direction == direction else 0,
+            flow_ticks=1,
             peak_conviction=abs(flow.conviction),
         )
         self._state = EngineState.TRACKING
         self._state_entered = now
         logger.info(
-            f"📡 TRACKING: {direction.upper()} → "
+            f"📡 TRACKING: {flow.direction.upper()} → "
             f"${target.pool.price:,.1f} ({target.pool.side.value}) "
             f"dist={target.distance_atr:.1f} ATR, "
             f"sig={target.significance:.1f}, "
@@ -618,9 +645,8 @@ class EntryEngine:
             if target is not None:
                 tr.target = target
 
-        # FIX-C: Disjunctive ready condition — any of these paths is sufficient
-        # Path 1: Standard flow confirmation (sustained ticks + CVD)
-        path_1 = (
+        # FIX-C: reduced sustained ticks requirement
+        ready = (
             tr.flow_ticks >= _FLOW_SUSTAINED_TICKS
             and flow.cvd_agrees
             and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD
@@ -628,28 +654,11 @@ class EntryEngine:
             and tr.target.distance_atr <= _MAX_TARGET_ATR
         )
 
-        # Path 2: High conviction single reading (institutional absorption)
-        path_2 = (
-            abs(flow.conviction) >= 0.45
-            and tr.target.distance_atr >= _MIN_TARGET_ATR
-            and tr.target.distance_atr <= _MAX_TARGET_ATR
-        )
-
-        # Path 3: Moderate flow + ICT structure alignment (institutional setup)
-        path_3 = False
-        if tr.flow_ticks >= 1 and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.5:
-            if self._ict_structure_agrees(ict, tr.direction):
-                path_3 = True
-
-        # Path 4: Pool very close (< 1.5 ATR) with any confirming flow
-        path_4 = (
-            tr.target.distance_atr <= 1.5
-            and tr.target.significance >= 3.0
-            and tr.flow_ticks >= 1
-            and not (flow.direction and flow.direction != tr.direction)
-        )
-
-        ready = (path_1 or path_2 or path_3 or path_4)
+        # ICT bonus: lower bar if structure strongly agrees
+        if not ready and tr.flow_ticks >= 1:
+            ict_boost = self._ict_structure_agrees(ict, tr.direction)
+            if ict_boost and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.65:
+                ready = True
 
         if ready:
             self._state = EngineState.READY
@@ -700,6 +709,38 @@ class EntryEngine:
         tp = self._compute_tp_approach(tr.target, tr.direction, price, atr)
 
         if sl is None or tp is None:
+            return
+
+        # ── BUG-3 FIX: Hard-block against AMD MANIPULATION bias ──────────
+        _amd_upper = (ict.amd_phase or '').upper()
+        _bias_lower = (ict.amd_bias or '').lower()
+        if _amd_upper == 'MANIPULATION':
+            if tr.direction == "short" and _bias_lower == "bullish":
+                logger.info(
+                    f"⛔ READY: SHORT blocked — AMD MANIPULATION+BULLISH")
+                self._tracking = None
+                self._state = EngineState.SCANNING
+                self._state_entered = now
+                return
+            if tr.direction == "long" and _bias_lower == "bearish":
+                logger.info(
+                    f"⛔ READY: LONG blocked — AMD MANIPULATION+BEARISH")
+                self._tracking = None
+                self._state = EngineState.SCANNING
+                self._state_entered = now
+                return
+
+        # ── BUG-2 FIX: Block opposite of recent sweep reversal ───────────
+        _sweep_cd = 60.0
+        if (self._last_sweep_reversal_dir
+                and now - self._last_sweep_reversal_time < _sweep_cd
+                and tr.direction != self._last_sweep_reversal_dir):
+            logger.info(
+                f"⛔ READY: {tr.direction.upper()} blocked — "
+                f"recent sweep reversal said {self._last_sweep_reversal_dir.upper()}")
+            self._tracking = None
+            self._state = EngineState.SCANNING
+            self._state_entered = now
             return
 
         risk = abs(price - sl)
@@ -1032,10 +1073,8 @@ class EntryEngine:
             "sweep_quality": sweep.quality,
         }
 
-        # FIX-D: aggressive thresholds — institutional sweeps are high-probability
-        # setups, the scoring already requires multi-factor confirmation.
-        # rev >= 35 with gap >= 8 means reversal clearly dominates continuation.
-        if rev_total >= 35.0 and gap >= 8.0:
+        # FIX-D: relaxed thresholds — was rev>=55 gap>=15
+        if rev_total >= 45.0 and gap >= 10.0:
             confidence = min(1.0, rev_total / 90.0)
             reason_str = " + ".join(rev_reasons[:4])
             logger.info(
@@ -1049,7 +1088,7 @@ class EntryEngine:
                 reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] {reason_str}",
             )
 
-        elif cont_total >= 35.0 and gap >= 8.0:
+        elif cont_total >= 40.0 and gap >= 10.0:
             confidence = min(1.0, cont_total / 90.0)
             reason_str = " + ".join(cont_reasons[:4])
             logger.info(
@@ -1093,24 +1132,53 @@ class EntryEngine:
         else:
             sl = sweep.wick_extreme + atr * _SL_BUFFER_ATR
 
-        if decision.next_target:
-            tp = decision.next_target.pool.price
+        # ── Liquidity-aware SL push: don't place SL inside pool clusters ──
+        if self._last_liq_snapshot is not None:
+            _lb = 0.25 * atr
             if side == "long":
-                tp -= atr * _TP_BUFFER_ATR
+                for t in self._last_liq_snapshot.ssl_pools:
+                    if sl < t.pool.price < price:
+                        sl = min(sl, t.pool.price - _lb)
             else:
-                tp += atr * _TP_BUFFER_ATR
-        else:
-            risk = abs(price - sl)
-            tp = price + (risk * 2.0) if side == "long" else price - (risk * 2.0)
+                for t in self._last_liq_snapshot.bsl_pools:
+                    if price < t.pool.price < sl:
+                        sl = max(sl, t.pool.price + _lb)
 
         risk = abs(price - sl)
-        reward = abs(tp - price)
         if risk < 1e-10:
             return
+
+        # BUG-1 FIX: Try opposing pool TP first; if R:R is bad, use
+        # risk-multiple fallback (2.0x risk). The old code rejected the
+        # entire reversal when the nearest pool was too close — missing
+        # valid sweep setups where the pool scanner had no far targets yet.
+        tp = None
+        if decision.next_target:
+            _pool_tp = decision.next_target.pool.price
+            if side == "long":
+                _pool_tp -= atr * _TP_BUFFER_ATR
+            else:
+                _pool_tp += atr * _TP_BUFFER_ATR
+            _pool_reward = abs(_pool_tp - price)
+            if _pool_reward / risk >= _MIN_RR_RATIO:
+                tp = _pool_tp
+
+        # Fallback: risk-multiple TP (always meets R:R)
+        if tp is None:
+            tp = price + (risk * 2.0) if side == "long" else price - (risk * 2.0)
+
+        reward = abs(tp - price)
         rr = reward / risk
 
+        # BUG-2 FIX: Record the sweep reversal direction even if R:R
+        # fails — prevents proximity from immediately going opposite.
+        self._last_sweep_reversal_dir = side
+        self._last_sweep_reversal_time = now
+
         if rr < _MIN_RR_RATIO:
-            logger.debug(f"🌊 Reversal R:R {rr:.2f} < {_MIN_RR_RATIO} — skipping")
+            logger.info(
+                f"🌊 Reversal R:R {rr:.2f} < {_MIN_RR_RATIO} — skipping "
+                f"(but blocking opposite proximity for 60s)")
             self._post_sweep = None
             self._state = EngineState.SCANNING
             self._state_entered = now
@@ -1157,16 +1225,30 @@ class EntryEngine:
             self._state_entered = now
             return
 
+        # SL behind the swept pool + buffer
         if side == "long":
-            sl = sweep.pool.price - atr * _SL_BUFFER_ATR
+            sl = sweep.pool.price - atr * 0.20
         else:
-            sl = sweep.pool.price + atr * _SL_BUFFER_ATR
+            sl = sweep.pool.price + atr * 0.20
 
+        # ── Liquidity-aware SL push ───────────────────────────────────
+        if self._last_liq_snapshot is not None:
+            _lb = 0.25 * atr
+            if side == "long":
+                for t in self._last_liq_snapshot.ssl_pools:
+                    if sl < t.pool.price < price:
+                        sl = min(sl, t.pool.price - _lb)
+            else:
+                for t in self._last_liq_snapshot.bsl_pools:
+                    if price < t.pool.price < sl:
+                        sl = max(sl, t.pool.price + _lb)
+
+        # TP: front-run the target pool (0.35×ATR before)
         tp = next_target.pool.price
         if side == "long":
-            tp -= atr * _TP_BUFFER_ATR
+            tp -= atr * 0.35
         else:
-            tp += atr * _TP_BUFFER_ATR
+            tp += atr * 0.35
 
         risk = abs(price - sl)
         reward = abs(tp - price)
@@ -1274,30 +1356,73 @@ class EntryEngine:
         atr: float,
     ) -> Optional[float]:
         """
-        FIX-J: Fallback SL reduced from 1.2 ATR → 1.0 ATR.
-        Try ICT OB first; fallback to 1.0× ATR.
+        Institutional SL computation — NO ATR FALLBACK.
+
+        RULES:
+          1. Primary: ICT OB edge + buffer
+          2. Liquidity-aware: if opposing liquidity pools sit between
+             entry and SL, push SL beyond them (stops WILL be hunted)
+          3. No structure = no trade (return None)
+
+        The buffer is placed BEYOND the OB, not at its edge.
+        Smart money targets the OB edge for entries; SL must survive
+        a wick through the OB by at least 0.15×ATR.
         """
+        sl = None
+
+        # ── PRIMARY: ICT OB anchor ─────────────────────────────────────
         if ict.nearest_ob_price > 0:
             ob_price = ict.nearest_ob_price
             if side == "long" and ob_price < price:
-                sl = ob_price - atr * _SL_BUFFER_ATR
-                dist_pct = abs(price - sl) / price
-                if 0.001 <= dist_pct <= 0.035:
-                    return sl
+                sl = ob_price - atr * 0.20  # buffer beyond OB
             elif side == "short" and ob_price > price:
-                sl = ob_price + atr * _SL_BUFFER_ATR
-                dist_pct = abs(price - sl) / price
-                if 0.001 <= dist_pct <= 0.035:
-                    return sl
+                sl = ob_price + atr * 0.20  # buffer beyond OB
 
-        # FIX-J: 0.80 ATR fallback (was 1.0, before that 1.2)
-        # Institutional: SL should be tight behind structure. 0.80 ATR
-        # on BTC at ATR=$112 = $90 SL — enough to survive a wick,
-        # tight enough to produce 1.5:1+ R:R on most setups.
-        if side == "long":
-            return price - atr * 0.80
-        else:
-            return price + atr * 0.80
+        # ── GUARD: Check for opposing liquidity between entry and SL ───
+        # If BSL/SSL pools sit between price and SL, push SL beyond them.
+        # Market makers WILL sweep those pools; SL inside the splash zone
+        # is guaranteed to get hit before the trade has a chance to work.
+        if sl is not None and hasattr(self, '_last_liq_snapshot') and self._last_liq_snapshot is not None:
+            snap = self._last_liq_snapshot
+            _liq_buffer = 0.25 * atr  # buffer beyond the liquidity cluster
+
+            if side == "long":
+                # For LONG: SSL pools below entry can sweep down to SL
+                for t in snap.ssl_pools:
+                    pool_price = t.pool.price
+                    # Pool is between SL and entry — SL is in the splash zone
+                    if sl < pool_price < price:
+                        new_sl = pool_price - _liq_buffer
+                        if new_sl < sl:
+                            sl = new_sl
+                            logger.debug(
+                                f"SL pushed: SSL@${pool_price:,.0f} between entry and SL "
+                                f"→ SL=${sl:,.1f}")
+            else:
+                # For SHORT: BSL pools above entry can sweep up to SL
+                for t in snap.bsl_pools:
+                    pool_price = t.pool.price
+                    if price < pool_price < sl:
+                        new_sl = pool_price + _liq_buffer
+                        if new_sl > sl:
+                            sl = new_sl
+                            logger.debug(
+                                f"SL pushed: BSL@${pool_price:,.0f} between entry and SL "
+                                f"→ SL=${sl:,.1f}")
+
+        # ── VALIDATION ─────────────────────────────────────────────────
+        if sl is not None:
+            dist_pct = abs(price - sl) / price
+            # SL too tight (< 0.1%) or too wide (> 3.5%) → reject
+            if dist_pct < 0.001 or dist_pct > 0.035:
+                sl = None
+
+        # ── NO FALLBACK — no structure means no trade ──────────────────
+        if sl is None:
+            logger.debug(
+                f"⛔ No valid SL for {side.upper()} — no ICT structure found "
+                f"(OB={ict.nearest_ob_price:.1f})")
+        return sl
 
     def _compute_tp_approach(
         self,
@@ -1306,11 +1431,30 @@ class EntryEngine:
         price: float,
         atr: float,
     ) -> Optional[float]:
-        tp = target.pool.price
+        """
+        Institutional TP — FRONT-RUN the liquidity pool.
+
+        Smart money does NOT wait for price to reach the exact pool level.
+        They start covering/exiting 0.3-0.5×ATR BEFORE the pool because:
+          - Other algos front-run the same level
+          - Iceberg orders absorb momentum before the exact price
+          - The last 20-50pts of a move are the hardest to capture
+
+        TP = pool_price ± 0.35×ATR buffer (toward entry, not past pool)
+        """
+        pool_price = target.pool.price
+        # Front-run buffer: 0.35×ATR BEFORE the pool level
+        buffer = atr * 0.35
         if side == "long":
-            tp -= atr * _TP_BUFFER_ATR
+            tp = pool_price - buffer
         else:
-            tp += atr * _TP_BUFFER_ATR
+            tp = pool_price + buffer
+
+        # Sanity: TP must be profitable
+        if side == "long" and tp <= price:
+            return None
+        if side == "short" and tp >= price:
+            return None
         return tp
 
     def _ict_structure_agrees(self, ict: ICTContext, direction: str) -> bool:

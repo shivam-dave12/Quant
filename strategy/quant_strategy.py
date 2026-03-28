@@ -569,7 +569,6 @@ class CVDEngine:
             midpoint   = n - w // 2
             recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD Δ in recent half
             # FIX: max(0, n-w)-1 can be -1 when n==w, wrapping to last element.
-            # Use 0.0 as baseline when window starts at the beginning of the array.
             _start_idx  = max(0, n - w)
             _start_val  = arr[_start_idx] if _start_idx > 0 else 0.0
             earlier_cvd = arr[midpoint - 1] - _start_val  # earlier half
@@ -4918,10 +4917,27 @@ class QuantStrategy:
 
         now_ms = int(now * 1000) if now < 1e12 else int(now)
 
-        # Step 2: Gather candles (all timeframes)
+        # ── BUG-5 FIX: Block entries during WEEKEND sessions ─────────────
+        # Institutional flow is absent on weekends. BTC moves on retail
+        # noise and thin liquidity — ICT concepts don't apply.
+        # Block entry entirely; existing positions still trail/manage.
+        try:
+            from datetime import datetime, timezone as _tz
+            _dt = datetime.now(_tz.utc)
+            _weekday = _dt.weekday()  # 0=Mon, 5=Sat, 6=Sun
+            if _weekday >= 5:  # Saturday or Sunday
+                _now_t = time.time()
+                if not hasattr(self, '_last_weekend_warn') or _now_t - self._last_weekend_warn >= 120.0:
+                    self._last_weekend_warn = _now_t
+                    logger.info("⛔ Weekend session — entries blocked (no institutional flow)")
+                return
+        except Exception:
+            pass
+
+        # Step 2: Gather candles (all timeframes) — 7-day coverage where practical
         candles_by_tf = {}
-        for tf, limit in [("1m", 200), ("5m", 300), ("15m", 200),
-                          ("1h", 100), ("4h", 50), ("1d", 30)]:
+        for tf, limit in [("1m", 200), ("5m", 2000), ("15m", 700),
+                          ("1h", 200), ("4h", 50), ("1d", 30)]:
             try:
                 candles_by_tf[tf] = data_manager.get_candles(tf, limit=limit)
             except Exception:
@@ -6701,8 +6717,13 @@ class QuantStrategy:
         # correct industry-grade approach: risk-in-dollars / SL-distance = quantity.
 
         # -- v9.0: Use force SL/TP from entry engine if available --
+        # BUG-4 FIX: When the v9 entry engine provides force_sl/force_tp,
+        # use them DIRECTLY. The old code set sl_price/tp_price here but
+        # then immediately called _compute_sl_tp() which OVERWROTE them
+        # with PATH-B values (widening SL from 53pts to 162pts).
         _force_sl = getattr(self, '_force_sl', None)
         _force_tp = getattr(self, '_force_tp', None)
+        _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
             _fsl = _round_to_tick(_force_sl)
             _ftp = _round_to_tick(_force_tp)
@@ -6714,15 +6735,32 @@ class QuantStrategy:
             if _dir_ok:
                 sl_price = _fsl
                 tp_price = _ftp
-                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
-                self._force_sl = None
-                self._force_tp = None
+                _using_force_levels = True
+                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f} (skipping PATH-B)")
+            self._force_sl = None
+            self._force_tp = None
 
-        sl_price, tp_price = self._compute_sl_tp(
-            data_manager, price, side, atr, mode=mode,
-            signal_confidence=signal_confidence,
-            use_maker_entry=use_maker,
-        )
+        if not _using_force_levels:
+            sl_price, tp_price = self._compute_sl_tp(
+                data_manager, price, side, atr, mode=mode,
+                signal_confidence=signal_confidence,
+                use_maker_entry=use_maker,
+            )
+        else:
+            # Force levels active — still validate with fee engine if available
+            if self._fee_engine is not None and self._fee_engine.is_warmed_up():
+                try:
+                    _tp_dist = abs(tp_price - price)
+                    _min_tp = self._fee_engine.min_required_tp_move(
+                        price=price, atr=atr,
+                        atr_percentile=self._atr_5m.get_percentile(),
+                        use_maker_entry=use_maker,
+                        signal_confidence=signal_confidence)
+                    if _tp_dist < _min_tp:
+                        logger.info(f"⛔ Force TP fee gate: {_tp_dist:.0f} < {_min_tp:.0f}")
+                        sl_price = None
+                except Exception:
+                    pass
         if sl_price is None:
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
@@ -7374,17 +7412,14 @@ class QuantStrategy:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
         # ══════════════════════════════════════════════════════════════════
-        # LEGACY R-MULTIPLE RATCHET REMOVED — v2.0 Chandelier handles all
-        # trailing via _ICTStructureTrail.compute() below.
-        # Keep metrics computation for display/heartbeat compatibility.
+        # RATCHET REMOVED — v2.0 Chandelier trail handles all trailing.
+        # Keep metrics for display/heartbeat compatibility.
         # ══════════════════════════════════════════════════════════════════
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
-
         _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.15 * atr
         _be_floor = (pos.entry_price + _fee_buf if pos.side == "long"
                      else pos.entry_price - _fee_buf)
-
 
         # ══════════════════════════════════════════════════════════════════
         # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION

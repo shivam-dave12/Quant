@@ -1262,53 +1262,69 @@ class ICTEngine:
             if ssl:
                 target = max(ssl, key=_pool_score).price
 
-        # ── Reconcile bias with AMD PHASE and MTF structure ──────────────
-        # CRITICAL FIX (Bug 6): The sweep-derived bias alone is unreliable.
+        # ── Reconcile bias with HTF MARKET STRUCTURE ─────────────────────
+        # CRITICAL FIX: The sweep-derived bias is WRONG when the sweep is a
+        # CONTINUATION sweep (liquidity consumed during a trend) rather than
+        # a MANIPULATION sweep (Judas swing that reverses).
         #
-        # PROBLEM: BSL swept at $68,626 → bias="bearish" (correct: bearish delivery)
-        #          Then SSL swept at $68,478 → bias="bullish" (wrong: still in SHORT)
-        #          AMD phase shows "DISTRIBUTION(bullish)" — a logical contradiction.
+        # EXAMPLE FROM LIVE BUG:
+        #   Price drops from $66,600 → $65,300 (clearly bearish distribution)
+        #   SSL @ $65,916 swept on the way down (continuation — not reversal)
+        #   SSL @ $66,067 swept with displacement (continuation during drop)
+        #   Code says: SSL swept → bullish bias (WRONG — price is distributing DOWN)
         #
-        # ICT RULE: During DISTRIBUTION, smart money is DELIVERING price in the
-        # direction OPPOSITE to the initial sweep.
-        #   BSL swept (ran buy stops above) → deliver DOWN → bearish bias
-        #   SSL swept (ran sell stops below) → deliver UP → bullish bias
-        # The sweep_type IS the correct signal; subsequent minor sweeps during
-        # delivery must NOT override it.
+        # ICT INSTITUTIONAL RULE:
+        #   HTF structure (4H/1H) determines the MACRO bias.
+        #   Sweeps DURING an established HTF trend are CONTINUATION sweeps
+        #   (stops consumed along the delivery path), NOT manipulation sweeps.
+        #   Only sweeps at the END of a trend (reversal structure) flip bias.
         #
-        # IMPLEMENTATION: Bias is LOCKED to sweep_type during DISTRIBUTION phase.
-        # Only in ACCUMULATION (> 90 min, sweep aged out) do we allow drift to
-        # neutral. MANIPULATION keeps the sweep-derived bias.
-        #
-        # SECONDARY RECONCILIATION: If 15m structure unambiguously contradicts
-        # the sweep-derived bias AND 15m has ≥ 2 BOS confirmations, we allow the
-        # structure to override (gives weight to sustained institutional follow-through
-        # rather than a single sweep print).
+        # IMPLEMENTATION:
+        #   1. Read 4H and 1H structure from ICT engine
+        #   2. If HTF is directionally aligned (both bearish or both bullish),
+        #      OVERRIDE sweep-derived bias to match HTF — NO confidence gate.
+        #   3. If HTF is mixed/ranging, keep sweep-derived bias (no override)
+        #   4. If only 15m is available, require it to be strong to override
         st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
         st_1h  = self._tf.get("1h",  TFStructure(timeframe="1h"))
+        st_4h  = self._tf.get("4h",  TFStructure(timeframe="4h"))
 
         if phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION", "MANIPULATION"):
-            # Phase-pinned: bias MUST match the sweep delivery direction
+            # Start with sweep-derived bias
             if sweep_type == "BSL":
                 bias = "bearish"   # ran buy stops above → deliver DOWN
             else:
                 bias = "bullish"   # ran sell stops below → deliver UP
 
-            # Allow MTF structure override ONLY if:
-            #   - 15m trend is OPPOSITE to sweep bias with high confidence
-            #   - 1h trend AGREES with 15m (multi-TF consensus)
-            #   - confidence from sweep is low (< 0.6)
-            if conf < 0.60:
-                htf_bearish = (st_15m.trend == "bearish" and st_1h.trend == "bearish")
-                htf_bullish = (st_15m.trend == "bullish" and st_1h.trend == "bullish")
-                if htf_bearish and bias == "bullish":
-                    bias = "bearish"
-                    conf = max(conf - 0.08, 0.25)
-                    details += " | MTF override→bearish"
-                elif htf_bullish and bias == "bearish":
-                    bias = "bullish"
-                    conf = max(conf - 0.08, 0.25)
-                    details += " | MTF override→bullish"
+            # ── HTF OVERRIDE (no confidence gate — structure > sweep) ─────
+            # 4H is the dominant timeframe for institutional bias.
+            # If 4H is clearly directional, it overrides sweep-derived bias.
+            _4h_bearish = st_4h.trend == "bearish"
+            _4h_bullish = st_4h.trend == "bullish"
+            _1h_bearish = st_1h.trend == "bearish"
+            _1h_bullish = st_1h.trend == "bullish"
+            _15m_bearish = st_15m.trend == "bearish"
+            _15m_bullish = st_15m.trend == "bullish"
+
+            # Count bearish/bullish aligned timeframes
+            _bear_count = sum([_4h_bearish, _1h_bearish, _15m_bearish])
+            _bull_count = sum([_4h_bullish, _1h_bullish, _15m_bullish])
+
+            # Strong HTF consensus (2+ timeframes agree) overrides sweep
+            if _bear_count >= 2 and bias == "bullish":
+                bias = "bearish"
+                details += f" | HTF OVERRIDE→bearish ({_bear_count}/3 TFs bearish)"
+            elif _bull_count >= 2 and bias == "bearish":
+                bias = "bullish"
+                details += f" | HTF OVERRIDE→bullish ({_bull_count}/3 TFs bullish)"
+
+            # Single strong 4H override (4H is institutional anchor)
+            elif _4h_bearish and bias == "bullish":
+                bias = "bearish"
+                details += " | 4H OVERRIDE→bearish"
+            elif _4h_bullish and bias == "bearish":
+                bias = "bullish"
+                details += " | 4H OVERRIDE→bullish"
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,

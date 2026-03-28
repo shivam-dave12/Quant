@@ -77,15 +77,14 @@ MIN_CANDLES_1D       = 7
 # LOOKBACK_CANDLES_* must be >= the highest limit= argument passed to
 # get_candles() in quant_strategy.py for that timeframe.  These values
 # also drive _WARMUP_CONFIG in data_manager.py so both must stay in sync.
-# Mismatched values (100 < 300) caused get_candles("5m", limit=300) to
-# silently cap at the warmup fetch size and return only 200 candles at
-# startup, starving ICT OB/FVG detection and producing count instability.
-LOOKBACK_CANDLES_1M  = 150   # strategy requests up to 120; +30 headroom
-LOOKBACK_CANDLES_5M  = 300   # strategy requests 300 (main ICT + trail + sweep)
-LOOKBACK_CANDLES_15M = 200   # strategy requests 200
-LOOKBACK_CANDLES_1H  = 100   # 1H pools crucial for trend/reversal levels
-LOOKBACK_CANDLES_4H  = 50    # unchanged
-LOOKBACK_CANDLES_1D  = 30    # 1D for macro dealing range
+# 7-DAY COVERAGE: pools persist 7 days, so candle history must match
+# where the exchange API allows it.
+LOOKBACK_CANDLES_1M  = 200   # 3.3 hours (1m is micro — more isn't useful)
+LOOKBACK_CANDLES_5M  = 2000  # 7 days (2016 candles). DM paginates or caps at API limit.
+LOOKBACK_CANDLES_15M = 700   # 7 days (672 candles). Most exchanges support this.
+LOOKBACK_CANDLES_1H  = 200   # 8.3 days. Easy for any exchange.
+LOOKBACK_CANDLES_4H  = 50    # 8.3 days. Unchanged.
+LOOKBACK_CANDLES_1D  = 30    # 30 days. Unchanged.
 CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "1h", "4h", "1d"]
 PRIMARY_TIMEFRAME    = "15m"     # 15m is primary for SL/TP structure
 ENTRY_TIMEFRAME      = "5m"      # 5m/1m for entry timing
