@@ -369,6 +369,35 @@ class EntryEngine:
             self._proximity_confirms = 0
             self._proximity_target = None
 
+    def on_entry_cancelled(self) -> None:
+        """
+        Called when an entry order is explicitly cancelled (timeout, watchdog,
+        or manual cancellation).  Always invoked AFTER on_entry_failed() which
+        handles the ENTERING → SCANNING state transition.
+
+        This method performs cancellation-specific cleanup that on_entry_failed
+        does not cover:
+          • clears stale post-sweep evaluation state
+          • resets proximity approach side tracking
+          • resets the last-entry timestamp so the cooldown window is measured
+            from the cancellation, not the original placement
+        """
+        self._post_sweep = None
+        self._proximity_side = ""
+        self._last_entry_at = time.time()
+        # Defensive: guarantee SCANNING in case on_entry_failed was not
+        # called or the state was something unexpected.
+        if self._state not in (EngineState.SCANNING, EngineState.IN_POSITION):
+            logger.info(
+                f"🔄 Entry engine: {self._state.name} → SCANNING "
+                f"(entry cancelled — defensive reset)")
+            self._state = EngineState.SCANNING
+            self._state_entered = time.time()
+            self._signal = None
+            self._tracking = None
+            self._proximity_confirms = 0
+            self._proximity_target = None
+
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION
         self._state_entered = time.time()
