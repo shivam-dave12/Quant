@@ -1813,7 +1813,7 @@ class ICTEngine:
 
                 if pool.level_type == "BSL" and h > pool.price and cl < pool.price:
                     disp_score = (body / rng) if rng > 0 else 0.0
-                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.65
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
@@ -1827,7 +1827,7 @@ class ICTEngine:
 
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
                     disp_score = (body / rng) if rng > 0 else 0.0
-                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.65
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True

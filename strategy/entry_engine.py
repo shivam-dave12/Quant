@@ -337,6 +337,7 @@ class EntryEngine:
         self._ready_conviction:      float = 0.0
         self._ready_peak_conviction: float = 0.0
         self._ready_last_agree_ts:   float = 0.0
+        self._ready_rr_fail_count:   int   = 0
         # ── v3.0: Momentum entry tracking ─────────────────────────────────
         self._momentum_entries_1h:   int   = 0     # count in current hour
         self._momentum_hour_start:   float = 0.0   # hour boundary timestamp
@@ -416,6 +417,10 @@ class EntryEngine:
                 self._tracking = None
                 self._proximity_confirms = 0
                 self._proximity_target = None
+                self._proximity_side = ""
+                self._ready_conviction = 0.0
+                self._ready_peak_conviction = 0.0
+                self._ready_rr_fail_count = 0
 
     def get_signal(self) -> Optional[EntrySignal]:
         return self._signal
@@ -450,6 +455,10 @@ class EntryEngine:
             self._tracking = None
             self._proximity_confirms = 0
             self._proximity_target = None
+            self._proximity_side = ""
+            self._ready_conviction = 0.0
+            self._ready_peak_conviction = 0.0
+            self._ready_rr_fail_count = 0
 
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION
@@ -471,6 +480,7 @@ class EntryEngine:
         self._post_sweep = None
         self._proximity_side = ""
         self._last_entry_at = time.time()
+        self._ready_rr_fail_count = 0
         # Defensive: guarantee SCANNING in case on_entry_failed was not
         # called or the state was something unexpected.
         if self._state not in (EngineState.SCANNING, EngineState.IN_POSITION):
@@ -483,6 +493,8 @@ class EntryEngine:
             self._tracking = None
             self._proximity_confirms = 0
             self._proximity_target = None
+            self._ready_conviction = 0.0
+            self._ready_peak_conviction = 0.0
 
     def on_position_closed(self) -> None:
         self._state = EngineState.SCANNING
@@ -491,6 +503,12 @@ class EntryEngine:
         self._post_sweep = None
         self._proximity_confirms = 0
         self._proximity_target = None
+        self._proximity_side = ""
+        # v3.0: reset conviction state (EWMA preserved — it tracks
+        # market flow which persists across positions)
+        self._ready_conviction = 0.0
+        self._ready_peak_conviction = 0.0
+        self._ready_rr_fail_count = 0
 
     def force_reset(self) -> None:
         self._state = EngineState.SCANNING
@@ -500,6 +518,15 @@ class EntryEngine:
         self._post_sweep = None
         self._proximity_confirms = 0
         self._proximity_target = None
+        self._proximity_side = ""
+        # v3.0 state cleanup
+        self._flow_ewma = 0.0
+        self._flow_ewma_last_update = 0.0
+        self._ready_conviction = 0.0
+        self._ready_peak_conviction = 0.0
+        self._ready_rr_fail_count = 0
+        self._momentum_entries_1h = 0
+        self._last_momentum_candle_ts = 0
 
     @property
     def state(self) -> str:
@@ -1046,7 +1073,6 @@ class EntryEngine:
             flow_ticks=1,
             peak_conviction=abs(flow.conviction),
             amd_mult=amd_mult,
-            flow_ewma=self._flow_ewma,
         )
         self._state = EngineState.TRACKING
         self._state_entered = now
@@ -1089,7 +1115,6 @@ class EntryEngine:
         # Instead of binary tick counters, use the smoothed EWMA signal.
         # EWMA already incorporates flow history with exponential decay —
         # a single contrary tick reduces it by ~15%, not 100%.
-        tr.flow_ewma = self._flow_ewma
 
         # Determine if EWMA is aligned, neutral, or contrary
         ewma_agrees = (
@@ -1164,14 +1189,44 @@ class EntryEngine:
         # has been consistent, allow READY even without CVD agreement.
         # This captures momentum moves where tick flow is strong but
         # CVD hasn't caught up yet.
+        # BUG-FIX: Also require current flow isn't STRONGLY contrary —
+        # EWMA lags, so it can be +0.35 while instant flow is -0.53.
+        # Entering READY in an already-decaying state wastes the timeout.
         if not ready and tr.flow_ticks >= 3:
             ewma_strong = abs(self._flow_ewma) >= _FLOW_CONV_THRESHOLD * 0.8
             ewma_dir_agrees = (
                 (tr.direction == "long" and self._flow_ewma > 0) or
                 (tr.direction == "short" and self._flow_ewma < 0)
             )
-            if ewma_strong and ewma_dir_agrees:
+            flow_not_strongly_contrary = (
+                not flow.direction
+                or flow.direction == tr.direction
+                or abs(flow.conviction) < _FLOW_CONV_THRESHOLD
+            )
+            if ewma_strong and ewma_dir_agrees and flow_not_strongly_contrary:
                 ready = True
+
+        if ready:
+            # ── BUG-FIX: R:R pre-check before entering READY ─────────
+            # If the target is too close for a viable R:R, don't waste
+            # 90s in READY state — reject immediately and keep scanning.
+            # This prevents the engine from burning its entire timeout
+            # on a mathematically impossible trade.
+            _pre_sl = self._compute_sl(ict, tr.direction, price, atr)
+            _pre_tp = self._compute_tp_approach(tr.target, tr.direction, price, atr)
+            if _pre_sl is not None and _pre_tp is not None:
+                _pre_risk = abs(price - _pre_sl)
+                _pre_reward = abs(_pre_tp - price)
+                if _pre_risk > 1e-10:
+                    _pre_rr = _pre_reward / _pre_risk
+                    _adj_rr = _MIN_RR_RATIO / max(tr.amd_mult, 0.50)
+                    if _pre_rr < _adj_rr * 0.7:
+                        # R:R is less than 70% of required — hopeless
+                        logger.debug(
+                            f"📡 READY rejected: R:R {_pre_rr:.2f} < "
+                            f"{_adj_rr * 0.7:.2f} (70% of {_adj_rr:.2f}) — "
+                            f"target too close for viable trade")
+                        ready = False
 
         if ready:
             self._state = EngineState.READY
@@ -1180,10 +1235,12 @@ class EntryEngine:
             self._ready_conviction = abs(flow.conviction) * tr.amd_mult
             self._ready_peak_conviction = self._ready_conviction
             self._ready_last_agree_ts = now
+            # Track R:R failures for early READY abort
+            self._ready_rr_fail_count = 0
             logger.info(
                 f"✅ READY: {tr.direction.upper()} → "
                 f"${tr.target.pool.price:,.1f} "
-                f"conviction={flow.conviction:+.2f} "
+                f"conviction={self._ready_conviction:+.2f} "
                 f"ticks={tr.flow_ticks}"
                 f"{f' AMD×{tr.amd_mult:.2f}' if tr.amd_mult < 1.0 else ''}"
             )
@@ -1237,7 +1294,9 @@ class EntryEngine:
             # Decay proportional to how contrary the flow is
             decay_strength = abs(flow.conviction)
             decay = _READY_DECAY_RATE * max(decay_strength, 0.3)
-            self._ready_conviction -= decay
+            # BUG-FIX: Floor at 0.0 — negative conviction makes recovery
+            # impossibly slow (needs 25+ ticks just to reach zero)
+            self._ready_conviction = max(0.0, self._ready_conviction - decay)
         # Neutral flow: no change to conviction
 
         # ── Abort conditions (ALL must be true): ──────────────────────────
@@ -1253,9 +1312,10 @@ class EntryEngine:
                 and self._ready_conviction < _READY_MIN_CONVICTION
                 and ewma_contrary):
             logger.info(
-                f"✅ READY: conviction decayed {self._ready_conviction:.2f} "
+                f"✅ READY: conviction decayed {self._ready_conviction:.3f} "
                 f"< {_READY_MIN_CONVICTION} — back to scanning "
-                f"(held {hold_time:.0f}s, peak={self._ready_peak_conviction:.2f})")
+                f"(held {hold_time:.0f}s, peak={self._ready_peak_conviction:.2f}, "
+                f"EWMA={self._flow_ewma:+.2f})")
             self._tracking = None
             self._state = EngineState.SCANNING
             self._state_entered = now
@@ -1266,6 +1326,24 @@ class EntryEngine:
         tp = self._compute_tp_approach(tr.target, tr.direction, price, atr)
 
         if sl is None or tp is None:
+            # BUG-FIX: Log SL/TP computation failures — silent return
+            # made it impossible to diagnose why READY burned full timeout.
+            _fail_count = self._ready_rr_fail_count + 1
+            self._ready_rr_fail_count = _fail_count
+            if _fail_count == 1 or _fail_count % 40 == 0:
+                logger.debug(
+                    f"✅ READY: SL={'None' if sl is None else f'${sl:,.1f}'} "
+                    f"TP={'None' if tp is None else f'${tp:,.1f}'} — "
+                    f"no valid levels (fail #{_fail_count})")
+            # Early abort: if SL/TP fails 120 consecutive times (~30s),
+            # the ICT structure is simply not there. Don't burn 90s.
+            if _fail_count >= 120:
+                logger.info(
+                    f"✅ READY: SL/TP failed {_fail_count} consecutive ticks "
+                    f"— no ICT structure, aborting early")
+                self._tracking = None
+                self._state = EngineState.SCANNING
+                self._state_entered = now
             return
 
         # ── BUG-2 FIX: Block opposite of recent sweep reversal ───────────
@@ -1294,12 +1372,30 @@ class EntryEngine:
         adjusted_min_rr = _MIN_RR_RATIO / max(tr.amd_mult, 0.50)
 
         if rr < adjusted_min_rr:
-            logger.debug(
-                f"✅ READY: R:R {rr:.2f} < {adjusted_min_rr:.2f} "
-                f"(AMD×{tr.amd_mult:.2f}) — skipping "
-                f"(entry=${price:,.1f} SL=${sl:,.1f} TP=${tp:,.1f})"
-            )
+            # BUG-FIX: Track R:R failures for early abort
+            _fail_count = self._ready_rr_fail_count + 1
+            self._ready_rr_fail_count = _fail_count
+            if _fail_count == 1 or _fail_count % 60 == 0:
+                logger.debug(
+                    f"✅ READY: R:R {rr:.2f} < {adjusted_min_rr:.2f} "
+                    f"(AMD×{tr.amd_mult:.2f}) — skipping "
+                    f"(entry=${price:,.1f} SL=${sl:,.1f} TP=${tp:,.1f}) "
+                    f"[fail #{_fail_count}]"
+                )
+            # If R:R fails 80 consecutive times (~20s), target is too
+            # close for viable trade at current price. Abort early.
+            if _fail_count >= 80:
+                logger.info(
+                    f"✅ READY: R:R failed {_fail_count} consecutive ticks "
+                    f"(best={rr:.2f} vs required={adjusted_min_rr:.2f}) "
+                    f"— target too close, aborting")
+                self._tracking = None
+                self._state = EngineState.SCANNING
+                self._state_entered = now
             return
+
+        # R:R passed — reset failure counter
+        self._ready_rr_fail_count = 0
 
         self._signal = EntrySignal(
             side=tr.direction,
@@ -2056,7 +2152,6 @@ class _TrackingState:
     contrary_ticks:  int   = 0
     peak_conviction: float = 0.0
     amd_mult:        float = 1.0      # AMD conviction modifier (0.60-1.10)
-    flow_ewma:       float = 0.0      # EWMA of signed flow conviction
     last_contrary_ts: float = 0.0     # timestamp of last contrary flow reading
 
 
