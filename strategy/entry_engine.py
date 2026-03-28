@@ -96,11 +96,11 @@ except ImportError:
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# FIX-B: lowered conviction threshold
-_FLOW_CONV_THRESHOLD    = 0.40    # was 0.55
-_FLOW_CVD_AGREE_MIN     = 0.15    # was 0.20
-# FIX-C: reduced sustained ticks
-_FLOW_SUSTAINED_TICKS   = 2       # was 3
+# FIX-B: lowered conviction threshold — BTC consolidation rarely exceeds 0.25
+_FLOW_CONV_THRESHOLD    = 0.25    # was 0.40 (too high for BTC consolidation)
+_FLOW_CVD_AGREE_MIN     = 0.10    # was 0.15 (CVD often weak in ranges)
+# FIX-C: single tick + CVD is sufficient institutional confirmation
+_FLOW_SUSTAINED_TICKS   = 1       # was 2 (neutral ticks reset counter too easily)
 
 # Pool targeting
 _MAX_TARGET_ATR         = 8.0     # was 6.0 — allow slightly farther targets
@@ -108,10 +108,11 @@ _MIN_TARGET_ATR         = 0.25    # was 0.3
 # FIX-A: lowered significance threshold
 _MIN_POOL_SIGNIFICANCE  = 2.0     # was 3.0
 
-# Proximity approach trigger (FIX-E)
-_PROXIMITY_ENTRY_ATR_MAX    = 2.0     # Pool within 2.0 ATR triggers proximity check
-_PROXIMITY_ENTRY_ATR_MIN    = 0.15    # Must be at least 0.15 ATR from pool
-_PROXIMITY_MIN_SIG          = 4.0     # Higher bar for proximity approach
+# Proximity approach trigger (FIX-E) — INSTITUTIONAL: approach entries are
+# the bread-and-butter; most sweeps start as approaches. Loosen these.
+_PROXIMITY_ENTRY_ATR_MAX    = 3.0     # was 2.0 — detect approaches earlier
+_PROXIMITY_ENTRY_ATR_MIN    = 0.10    # was 0.15 — allow very close pools
+_PROXIMITY_MIN_SIG          = 2.5     # was 4.0 — most intraday pools score 2-3
 _PROXIMITY_CONFIRM_COUNT    = 1       # Only 1 confirm tick needed
 
 # Sweep detection
@@ -123,14 +124,15 @@ _OTE_MAX_WAIT_SEC       = 480     # was 600
 _TRACKING_TIMEOUT_SEC   = 180     # was 300
 _READY_TIMEOUT_SEC      = 90      # was 120
 
-# Risk management
-_MIN_RR_RATIO           = 1.4     # was 1.5 — slightly more permissive
-_SL_BUFFER_ATR          = 0.12    # was 0.15
-_TP_BUFFER_ATR          = 0.08    # was 0.10
+# Risk management — INSTITUTIONAL: 1.2 R:R is standard for sweep entries
+# with tight SL behind wick. Higher bars = missed valid setups.
+_MIN_RR_RATIO           = 1.2     # was 1.4 — institutional minimum
+_SL_BUFFER_ATR          = 0.08    # was 0.12 — tighter SL = better R:R
+_TP_BUFFER_ATR          = 0.05    # was 0.08 — closer to pool = more fills
 
-# Cooldowns
-_ENTRY_COOLDOWN_SEC     = 30.0    # was 45.0
-_POST_SWEEP_EVAL_SEC    = 10.0    # was 15.0 — faster evaluation
+# Cooldowns — faster re-engagement after missed sweeps
+_ENTRY_COOLDOWN_SEC     = 15.0    # was 30.0 — BTC moves fast
+_POST_SWEEP_EVAL_SEC    = 5.0     # was 10.0 — evaluate sweep immediately
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -164,17 +166,24 @@ class OrderFlowState:
 
     @property
     def conviction(self) -> float:
-        signals = [self.tick_flow, self.cvd_trend]
-        if abs(self.ob_imbalance) > 0.1:
-            signals.append(self.ob_imbalance * 0.5)
-        return sum(signals) / len(signals)
+        """
+        Weighted flow conviction — tick_flow and CVD are primary signals.
+        OB imbalance is secondary confirmation, not a diluter.
+        """
+        # Primary signals weighted equally (0.40 each)
+        conv = self.tick_flow * 0.40 + self.cvd_trend * 0.40
+        # OB imbalance as secondary confirmation (0.20 weight)
+        if abs(self.ob_imbalance) > 0.05:
+            conv += self.ob_imbalance * 0.20
+        return conv
 
     @property
     def direction(self) -> str:
         c = self.conviction
-        if c > _FLOW_CONV_THRESHOLD * 0.5:
+        # Lower threshold: 0.125 (was 0.20 effectively)
+        if c > 0.125:
             return "long"
-        elif c < -_FLOW_CONV_THRESHOLD * 0.5:
+        elif c < -0.125:
             return "short"
         return ""
 
@@ -507,33 +516,58 @@ class EntryEngine:
         if now - self._last_entry_at < _ENTRY_COOLDOWN_SEC:
             return
 
-        if not flow.direction:
-            return
+        # FIX: Don't require strong flow direction to start tracking.
+        # Allow target identification when pools are nearby even with weak flow.
+        # The tracking state will build conviction before entering READY.
+        target = None
+        direction = flow.direction
 
-        target = self._find_flow_target(snap, flow, price, atr)
+        if direction:
+            # Standard path: flow direction guides target selection
+            target = self._find_flow_target(snap, flow, price, atr)
+        else:
+            # Weak-flow path: find nearest significant pool and infer direction
+            # This captures the pre-positioning phase before institutional flow shows
+            all_pools = []
+            for t in snap.bsl_pools:
+                if t.distance_atr <= _MAX_TARGET_ATR and t.significance >= _MIN_POOL_SIGNIFICANCE:
+                    all_pools.append(("long", t))
+            for t in snap.ssl_pools:
+                if t.distance_atr <= _MAX_TARGET_ATR and t.significance >= _MIN_POOL_SIGNIFICANCE:
+                    all_pools.append(("short", t))
+            if all_pools:
+                # Pick highest proximity-adjusted significance
+                best_dir, best_t = max(
+                    all_pools,
+                    key=lambda x: x[1].pool.proximity_adjusted_sig(x[1].distance_atr))
+                # Only auto-track if pool is close and significant
+                if best_t.distance_atr <= 4.0 and best_t.significance >= 3.0:
+                    target = best_t
+                    direction = best_dir
+
         if target is None:
             return
 
         # AMD soft filter
         if (ict.amd_phase == "DISTRIBUTION"
                 and ict.amd_bias
-                and ict.amd_bias != ("bullish" if flow.direction == "long" else "bearish")):
+                and ict.amd_bias != ("bullish" if direction == "long" else "bearish")):
             logger.debug(
-                f"EntryEngine: flow {flow.direction} vs AMD DISTRIBUTION "
+                f"EntryEngine: flow {direction} vs AMD DISTRIBUTION "
                 f"{ict.amd_bias} — skipping")
             return
 
         self._tracking = _TrackingState(
-            direction=flow.direction,
+            direction=direction,
             target=target,
             started_at=now,
-            flow_ticks=1,
+            flow_ticks=1 if flow.direction == direction else 0,
             peak_conviction=abs(flow.conviction),
         )
         self._state = EngineState.TRACKING
         self._state_entered = now
         logger.info(
-            f"📡 TRACKING: {flow.direction.upper()} → "
+            f"📡 TRACKING: {direction.upper()} → "
             f"${target.pool.price:,.1f} ({target.pool.side.value}) "
             f"dist={target.distance_atr:.1f} ATR, "
             f"sig={target.significance:.1f}, "
@@ -584,8 +618,9 @@ class EntryEngine:
             if target is not None:
                 tr.target = target
 
-        # FIX-C: reduced sustained ticks requirement
-        ready = (
+        # FIX-C: Disjunctive ready condition — any of these paths is sufficient
+        # Path 1: Standard flow confirmation (sustained ticks + CVD)
+        path_1 = (
             tr.flow_ticks >= _FLOW_SUSTAINED_TICKS
             and flow.cvd_agrees
             and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD
@@ -593,11 +628,28 @@ class EntryEngine:
             and tr.target.distance_atr <= _MAX_TARGET_ATR
         )
 
-        # ICT bonus: lower bar if structure strongly agrees
-        if not ready and tr.flow_ticks >= 1:
-            ict_boost = self._ict_structure_agrees(ict, tr.direction)
-            if ict_boost and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.65:
-                ready = True
+        # Path 2: High conviction single reading (institutional absorption)
+        path_2 = (
+            abs(flow.conviction) >= 0.45
+            and tr.target.distance_atr >= _MIN_TARGET_ATR
+            and tr.target.distance_atr <= _MAX_TARGET_ATR
+        )
+
+        # Path 3: Moderate flow + ICT structure alignment (institutional setup)
+        path_3 = False
+        if tr.flow_ticks >= 1 and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.5:
+            if self._ict_structure_agrees(ict, tr.direction):
+                path_3 = True
+
+        # Path 4: Pool very close (< 1.5 ATR) with any confirming flow
+        path_4 = (
+            tr.target.distance_atr <= 1.5
+            and tr.target.significance >= 3.0
+            and tr.flow_ticks >= 1
+            and not (flow.direction and flow.direction != tr.direction)
+        )
+
+        ready = (path_1 or path_2 or path_3 or path_4)
 
         if ready:
             self._state = EngineState.READY
@@ -980,8 +1032,10 @@ class EntryEngine:
             "sweep_quality": sweep.quality,
         }
 
-        # FIX-D: relaxed thresholds — was rev>=55 gap>=15
-        if rev_total >= 45.0 and gap >= 10.0:
+        # FIX-D: aggressive thresholds — institutional sweeps are high-probability
+        # setups, the scoring already requires multi-factor confirmation.
+        # rev >= 35 with gap >= 8 means reversal clearly dominates continuation.
+        if rev_total >= 35.0 and gap >= 8.0:
             confidence = min(1.0, rev_total / 90.0)
             reason_str = " + ".join(rev_reasons[:4])
             logger.info(
@@ -995,7 +1049,7 @@ class EntryEngine:
                 reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] {reason_str}",
             )
 
-        elif cont_total >= 40.0 and gap >= 10.0:
+        elif cont_total >= 35.0 and gap >= 8.0:
             confidence = min(1.0, cont_total / 90.0)
             reason_str = " + ".join(cont_reasons[:4])
             logger.info(
@@ -1236,11 +1290,14 @@ class EntryEngine:
                 if 0.001 <= dist_pct <= 0.035:
                     return sl
 
-        # FIX-J: 1.0 ATR fallback (was 1.2)
+        # FIX-J: 0.80 ATR fallback (was 1.0, before that 1.2)
+        # Institutional: SL should be tight behind structure. 0.80 ATR
+        # on BTC at ATR=$112 = $90 SL — enough to survive a wick,
+        # tight enough to produce 1.5:1+ R:R on most setups.
         if side == "long":
-            return price - atr * 1.0
+            return price - atr * 0.80
         else:
-            return price + atr * 1.0
+            return price + atr * 0.80
 
     def _compute_tp_approach(
         self,
