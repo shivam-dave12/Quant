@@ -1,5 +1,5 @@
 """
-liquidity_map.py — Multi-Timeframe Liquidity Map Engine v2.0
+liquidity_map.py — Multi-Timeframe Liquidity Map Engine v2.1
 =============================================================
 FIXES IN THIS VERSION
 ─────────────────────
@@ -62,6 +62,23 @@ FIX-10: get_snapshot() now includes a DISTANCE-weighted score so that
          At 5 ATR, penalty is 0.61×. At 20 ATR, penalty is 0.13×.
          This ensures the engine targets REACHABLE pools, not just
          the most historically significant level on the chart.
+
+FIX-11 (v2.1): PoolTarget.adjusted_sig() added.
+         Old: the adjacency bonus was applied to PoolTarget.significance
+         but ALL decision functions (primary target, _find_flow_target,
+         _find_opposing_target) called pool.proximity_adjusted_sig() which
+         reads pool.significance — bypassing the bonus entirely. The bonus
+         was only visible in the display sort (which used t.significance).
+         New: PoolTarget.adjusted_sig() computes significance × exp(dist/10)
+         using the wrapper's (possibly boosted) significance field. All
+         decision logic in entry_engine.py uses t.adjusted_sig() instead
+         of t.pool.proximity_adjusted_sig(t.distance_atr).
+
+FIX-12 (v2.1): Primary target in get_snapshot() uses t.adjusted_sig().
+         Old: primary = max(reachable, key=lambda t: t.pool.proximity_adjusted_sig(...))
+         This ignored the adjacency bonus applied just above. The primary
+         target shown in [THINK] logs could differ from what the entry
+         engine actually targeted. Now consistent.
 """
 
 from __future__ import annotations
@@ -201,6 +218,24 @@ class PoolTarget:
     direction:     str
     significance:  float
     tf_sources:    List[str]
+
+    def adjusted_sig(self) -> float:
+        """
+        FIX-11 (v2.1): Proximity-adjusted significance using THIS target's
+        significance field, which may include an adjacency bonus applied
+        during snapshot construction.
+
+        Unlike pool.proximity_adjusted_sig(), this method uses the wrapper's
+        significance — ensuring adjacency bonuses are visible to all decision
+        functions (target selection, primary target ranking, HTF TP escalation).
+
+        Formula: significance × exp(-distance_atr / 10.0)
+          At  2 ATR: 0.82× (nearby pool, minimal decay)
+          At  5 ATR: 0.61× (moderate distance)
+          At 10 ATR: 0.37× (distant, penalised)
+          At 20 ATR: 0.14× (very distant, rarely selected)
+        """
+        return self.significance * math.exp(-self.distance_atr / 10.0)
 
 
 @dataclass
@@ -509,35 +544,38 @@ class _TimeframeRegistry:
 
         return results
 
-    def check_consumed(self, price: float, atr: float) -> None:
-        threshold = atr * 0.5
-        for pool in self._bsl:
-            if pool.status == PoolStatus.SWEPT:
-                if price > pool.price + threshold:
-                    pool.status = PoolStatus.CONSUMED
-        for pool in self._ssl:
-            if pool.status == PoolStatus.SWEPT:
-                if price < pool.price - threshold:
-                    pool.status = PoolStatus.CONSUMED
-
     @staticmethod
     def _score_sweep(
-        penetration_atr: float,
-        rejection_pct:   float,
-        volume_ratio:    float,
+        wick_atr:     float,
+        rejection:    float,
+        vol_ratio:    float,
     ) -> float:
-        pen_score = min(1.0, penetration_atr / 0.5)
-        rej_score = min(1.0, rejection_pct  / 0.8)
-        vol_score = min(1.0, volume_ratio   / 3.0)
-        return (pen_score + rej_score + vol_score) / 3.0
+        """
+        Composite sweep quality score [0.0, 1.0].
+        Higher = cleaner rejection = stronger reversal signal.
+
+        Components:
+          wick_atr  (0.35 weight): wick beyond pool relative to ATR
+                                   0.05 ATR = noise, 0.5 ATR = strong
+          rejection (0.40 weight): (H - C) / (H - L) for BSL sweep
+                                   0.3 = partial, 0.7 = full wick rejection
+          vol_ratio (0.25 weight): candle volume vs 20-bar average
+                                   1.0 = average, 2.0 = institutional
+        """
+        wick_score = min(wick_atr / 0.5, 1.0)
+        rej_score  = min(rejection / 0.7, 1.0)
+        vol_score  = min((vol_ratio - 0.5) / 1.5, 1.0) if vol_ratio > 0.5 else 0.0
+        return round(0.35 * wick_score + 0.40 * rej_score + 0.25 * vol_score, 2)
 
     @property
     def bsl_pools(self) -> List[LiquidityPool]:
-        return [p for p in self._bsl if p.status != PoolStatus.CONSUMED]
+        return [p for p in self._bsl
+                if p.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)]
 
     @property
     def ssl_pools(self) -> List[LiquidityPool]:
-        return [p for p in self._ssl if p.status != PoolStatus.CONSUMED]
+        return [p for p in self._ssl
+                if p.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)]
 
     @property
     def swept_bsl(self) -> List[LiquidityPool]:
@@ -549,19 +587,26 @@ class _TimeframeRegistry:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN ENGINE
+# MAIN LIQUIDITY MAP
 # ═══════════════════════════════════════════════════════════════════════════
 
 class LiquidityMap:
     """
-    Tracks liquidity pools across all timeframes independently.
-    v2.0: FIX-1 through FIX-10 applied.
+    Multi-timeframe liquidity pool map.
+
+    Maintained registries: 1m, 5m, 15m, 1h, 4h, 1d
+    Each registry tracks BSL (buy-stop liquidity) and SSL (sell-stop
+    liquidity) pools as swing high/low clusters.
+
+    Sweep detection fires when a closed candle breaks through a pool
+    with a wick and then rejects back through (FIX-6).
     """
+
+    _TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 
     def __init__(self) -> None:
         self._registries: Dict[str, _TimeframeRegistry] = {
-            tf: _TimeframeRegistry(tf)
-            for tf in TF_HIERARCHY
+            tf: _TimeframeRegistry(tf) for tf in self._TIMEFRAMES
         }
         self._recent_sweeps: List[SweepResult] = []
         self._last_snapshot: Optional[LiquidityMapSnapshot] = None
@@ -569,110 +614,123 @@ class LiquidityMap:
     def update(
         self,
         candles_by_tf: Dict[str, List[Dict]],
-        price: float,
         atr: float,
         now: float,
-        ict_engine=None,
     ) -> None:
-        if atr < 1e-10:
-            return
+        """Update all timeframe registries from fresh candle data."""
+        for tf, reg in self._registries.items():
+            if tf in candles_by_tf and candles_by_tf[tf]:
+                reg.update(candles_by_tf[tf], atr, now)
 
-        for tf, candles in candles_by_tf.items():
-            if tf in self._registries and candles:
-                self._registries[tf].update(candles, atr, now)
-
-        # FIX-7: wider HTF confluence radius
-        self._promote_htf_confluence(atr)
-
-        if ict_engine is not None:
-            self._align_with_ict(ict_engine, price, atr, now)
-
-        new_sweeps = []
-        for tf, candles in candles_by_tf.items():
-            if tf in self._registries and candles:
-                sweeps = self._registries[tf].check_sweeps(candles, atr, now)
-                new_sweeps.extend(sweeps)
-
-        for reg in self._registries.values():
-            reg.check_consumed(price, atr)
-
-        self._recent_sweeps.extend(new_sweeps)
-        cutoff = now - 300.0
-        self._recent_sweeps = [s for s in self._recent_sweeps if s.detected_at > cutoff]
-
-        for sweep in new_sweeps:
-            logger.info(
-                f"🎯 SWEEP [{sweep.pool.timeframe}] {sweep.pool.side.value} "
-                f"${sweep.pool.price:,.1f} → direction={sweep.direction} "
-                f"quality={sweep.quality:.2f} wick=${sweep.wick_extreme:,.1f} "
-                f"vol_ratio={sweep.volume_ratio:.1f}x"
-            )
-
-    def _promote_htf_confluence(self, atr: float) -> None:
-        """FIX-7: widened confluence radius from 0.5 → 0.7 ATR."""
-        all_bsl: List[LiquidityPool] = []
-        all_ssl: List[LiquidityPool] = []
-        for reg in self._registries.values():
-            all_bsl.extend(reg.bsl_pools)
-            all_ssl.extend(reg.ssl_pools)
-
-        confluence_radius = atr * 0.7  # FIX-7: was 0.5
-
-        for pool in all_bsl + all_ssl:
-            same_side = all_bsl if pool.side == PoolSide.BSL else all_ssl
-            tf_set = set()
-            for other in same_side:
-                if abs(other.price - pool.price) <= confluence_radius:
-                    tf_set.add(other.timeframe)
-            pool.htf_count = len(tf_set)
-
-    def _align_with_ict(
+    def check_sweeps(
         self,
-        ict_engine,
-        price: float,
+        candles_by_tf: Dict[str, List[Dict]],
         atr: float,
         now: float,
+    ) -> List[SweepResult]:
+        """Check all registered timeframes for new sweeps."""
+        new_sweeps: List[SweepResult] = []
+        for tf, reg in self._registries.items():
+            if tf in candles_by_tf and candles_by_tf[tf]:
+                tf_sweeps = reg.check_sweeps(candles_by_tf[tf], atr, now)
+                for s in tf_sweeps:
+                    logger.info(
+                        f"🎯 SWEEP [{tf}] {s.pool.side.value} "
+                        f"${s.pool.price:,.1f} → direction={s.direction} "
+                        f"quality={s.quality:.2f} wick=${s.wick_extreme:,.1f} "
+                        f"vol_ratio={s.volume_ratio:.1f}x"
+                    )
+                new_sweeps.extend(tf_sweeps)
+
+        # Append to recent sweeps, keep last 20
+        self._recent_sweeps.extend(new_sweeps)
+        self._recent_sweeps = self._recent_sweeps[-20:]
+        return new_sweeps
+
+    def mark_ict_alignment(
+        self,
+        ict_obs: List[Dict],
+        ict_fvgs: List[Dict],
+        price: float,
+        atr: float,
     ) -> None:
-        now_ms = int(now * 1000)
+        """
+        Mark pools as OB-aligned or FVG-aligned based on ICT engine output.
+        Called after each ICT engine update to keep pool metadata fresh.
+        """
         try:
-            for reg in self._registries.values():
+            radius = atr * 0.7   # FIX-7: widened to 0.7 ATR (was 0.5)
+            for tf, reg in self._registries.items():
                 for pool in reg.bsl_pools + reg.ssl_pools:
-                    pool.ob_aligned  = False
-                    pool.fvg_aligned = False
-
-                    if hasattr(ict_engine, '_obs'):
-                        for tf_key, ob_list in ict_engine._obs.items():
-                            for ob in ob_list:
-                                ob_mid = (float(ob.high) + float(ob.low)) / 2.0
-                                if abs(ob_mid - pool.price) < atr * 0.5:
-                                    pool.ob_aligned = True
-                                    break
-                            if pool.ob_aligned:
+                    # OB alignment
+                    for ob in ict_obs:
+                        ob_price = float(ob.get('price', 0) or ob.get('high', 0) or ob.get('low', 0))
+                        if ob_price > 0 and abs(ob_price - pool.price) <= radius:
+                            pool.ob_aligned = True
+                            break
+                    # FVG alignment — check if an FVG gap sits between pool and current price
+                    for fvg in ict_fvgs:
+                        fvg_high = float(fvg.get('high', 0))
+                        fvg_low  = float(fvg.get('low', 0))
+                        if fvg_high <= 0 or fvg_low <= 0:
+                            continue
+                        fvg_mid = (fvg_high + fvg_low) / 2.0
+                        if pool.side == PoolSide.BSL:
+                            if price < fvg_mid < pool.price:
+                                pool.fvg_aligned = True
                                 break
-
-                    if hasattr(ict_engine, '_fvgs'):
-                        for tf_key, fvg_list in ict_engine._fvgs.items():
-                            for fvg in fvg_list:
-                                fvg_mid = (float(fvg.high) + float(fvg.low)) / 2.0
-                                if pool.side == PoolSide.BSL:
-                                    if price < fvg_mid < pool.price:
-                                        pool.fvg_aligned = True
-                                        break
-                                else:
-                                    if pool.price < fvg_mid < price:
-                                        pool.fvg_aligned = True
-                                        break
-                            if pool.fvg_aligned:
+                        else:
+                            if pool.price < fvg_mid < price:
+                                pool.fvg_aligned = True
                                 break
+                        if pool.fvg_aligned:
+                            break
         except Exception as e:
             logger.debug(f"ICT alignment error (non-fatal): {e}")
+
+    def mark_htf_confluence(self, atr: float) -> None:
+        """
+        Promote pools that cluster with higher-timeframe pools.
+        A 5m pool near a 4h pool gets htf_count += 1, which triggers
+        the _HTF_CONFLUENCE_MULT in significance scoring.
+
+        FIX-7: Confluence radius widened from 0.5 → 0.7 ATR so that
+        nearby but not identical HTF levels correctly merge.
+        """
+        radius = atr * 0.7   # FIX-7: was 0.5
+
+        tf_order = list(self._TIMEFRAMES)
+        for i, tf_low in enumerate(tf_order):
+            reg_low = self._registries[tf_low]
+            for pool in reg_low.bsl_pools + reg_low.ssl_pools:
+                pool.htf_count = 0  # reset before recount
+            for j, tf_high in enumerate(tf_order):
+                if j <= i:
+                    continue
+                reg_high = self._registries[tf_high]
+                high_prices_bsl = [p.price for p in reg_high.bsl_pools]
+                high_prices_ssl = [p.price for p in reg_high.ssl_pools]
+                for pool in reg_low.bsl_pools:
+                    for hp in high_prices_bsl:
+                        if abs(pool.price - hp) <= radius:
+                            pool.htf_count += 1
+                for pool in reg_low.ssl_pools:
+                    for hp in high_prices_ssl:
+                        if abs(pool.price - hp) <= radius:
+                            pool.htf_count += 1
 
     def get_snapshot(self, price: float, atr: float) -> LiquidityMapSnapshot:
         """
         Build snapshot with institutional-grade scoring:
-        - Proximity-adjusted significance
+        - Proximity-adjusted significance (FIX-10)
         - Swept-pool adjacency bonus (pools near recent sweeps score higher)
-        - 7-day swept history for context
+        - 7-day swept history for context (FIX-3)
+
+        FIX-11/12 (v2.1): The adjacency bonus is applied to PoolTarget.significance.
+        Primary target selection now uses t.adjusted_sig() (which reads the wrapper's
+        significance) instead of t.pool.proximity_adjusted_sig() (which reads the
+        base pool significance, ignoring the bonus). This makes adjacency bonuses
+        actually affect target selection, not just the display sort.
         """
         now = time.time()
 
@@ -738,6 +796,8 @@ class LiquidityMap:
         # adjacent stop clusters — "run the SSL, then deliver to the BSL
         # above" or vice versa). Bonus = +2.0 if a swept pool is within
         # 3 ATR of this pool (decays linearly with distance).
+        # NOTE (FIX-11): This bonus is applied to PoolTarget.significance.
+        # All decision functions must use t.adjusted_sig() to see it.
         if _all_swept_prices and atr > 1e-10:
             for t in bsl_targets + ssl_targets:
                 _min_dist_to_swept = min(
@@ -754,13 +814,15 @@ class LiquidityMap:
         nearest_bsl = min((t.distance_atr for t in bsl_targets), default=999.0)
         nearest_ssl = min((t.distance_atr for t in ssl_targets), default=999.0)
 
-        # Primary target = highest PROXIMITY-ADJUSTED significance
+        # ── Primary target — FIX-12 (v2.1): use t.adjusted_sig() ───────
+        # Old code used t.pool.proximity_adjusted_sig() which bypassed the
+        # adjacency bonus applied above. Now consistent with entry_engine.py.
         all_reachable = [t for t in bsl_targets + ssl_targets if t.distance_atr < 25.0]
         primary = None
         if all_reachable:
             primary = max(
                 all_reachable,
-                key=lambda t: t.pool.proximity_adjusted_sig(t.distance_atr)
+                key=lambda t: t.adjusted_sig()  # FIX-12: was t.pool.proximity_adjusted_sig(t.distance_atr)
             )
         elif bsl_targets or ssl_targets:
             all_targets = bsl_targets + ssl_targets
