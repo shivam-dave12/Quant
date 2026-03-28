@@ -811,8 +811,8 @@ class EntryEngine:
         if risk < 1e-10:
             return False
         rr = reward / risk
-        # AMD-adjusted R:R threshold: need better R:R when against AMD
-        adjusted_min_rr = _MOMENTUM_MIN_RR / max(amd_mult, 0.50)
+        # AMD-adjusted R:R threshold: gentle adjustment, not 1/mult
+        adjusted_min_rr = _MOMENTUM_MIN_RR * (2.0 - amd_mult)
         if rr < adjusted_min_rr:
             return False
 
@@ -1049,21 +1049,52 @@ class EntryEngine:
             return
 
         # ── v3.0: AMD conviction modifier (influences, never blocks) ─────
-        # Compute the modifier and apply it to the conviction threshold
-        # for entering TRACKING. Against-AMD entries need proportionally
-        # stronger flow to begin tracking — but they CAN enter.
+        # AMD modifies the SIGNAL tier and conviction output — NOT the
+        # flow threshold. The bar to enter TRACKING is the same regardless
+        # of AMD phase. What changes is position size and tier.
         amd_mult = self._amd_conviction_modifier(ict, flow.direction)
-        if amd_mult < 1.0:
-            # Check if flow is strong enough to overcome AMD headwind
-            # Required: |conviction| >= threshold / amd_mult
-            # This means MANIPULATION+against needs ~67% more conviction
-            # and DISTRIBUTION+against needs ~25% more conviction
-            adjusted_threshold = _FLOW_CONV_THRESHOLD * 0.5 / max(amd_mult, 0.50)
-            if abs(flow.conviction) < adjusted_threshold:
+
+        # ── v3.0: Directional preference ─────────────────────────────────
+        # When AMD bias + dealing range position agree on a direction,
+        # institutional desks have a DIRECTIONAL PREFERENCE. The aligned
+        # direction enters tracking at normal flow threshold; the contra
+        # direction needs stronger conviction to overcome the structural
+        # headwind.
+        #
+        # Example: AMD=bearish + DEEP PREMIUM (76%) → prefer SHORT.
+        # A LONG entry needs 50% stronger flow conviction to start
+        # tracking. This prevents the bot from chasing random long ticks
+        # in an environment where shorts are structurally favored.
+        #
+        # This is NOT blocking — it's asymmetric conviction gating.
+        _pd = getattr(ict, 'dealing_range_pd', 0.5)
+        _bias = (ict.amd_bias or '').lower()
+        _phase = (ict.amd_phase or '').upper()
+
+        _structural_short_bias = (
+            _bias == 'bearish'
+            and _pd > 0.60
+            and _phase in ('MANIPULATION', 'DISTRIBUTION', 'REDISTRIBUTION')
+        )
+        _structural_long_bias = (
+            _bias == 'bullish'
+            and _pd < 0.40
+            and _phase in ('MANIPULATION', 'DISTRIBUTION', 'REDISTRIBUTION')
+        )
+
+        # Contra-directional flow needs 50% more conviction
+        _contra_penalty = 1.5
+        if _structural_short_bias and flow.direction == "long":
+            if abs(flow.conviction) < _FLOW_CONV_THRESHOLD * 0.5 * _contra_penalty:
                 logger.debug(
-                    f"EntryEngine: {flow.direction} flow {flow.conviction:+.2f} "
-                    f"too weak against AMD {ict.amd_phase}+{ict.amd_bias} "
-                    f"(need {adjusted_threshold:.2f}, AMD×{amd_mult:.2f})")
+                    f"EntryEngine: LONG flow {flow.conviction:+.2f} too weak "
+                    f"in PREMIUM+bearish (need {_FLOW_CONV_THRESHOLD * 0.5 * _contra_penalty:.2f})")
+                return
+        elif _structural_long_bias and flow.direction == "short":
+            if abs(flow.conviction) < _FLOW_CONV_THRESHOLD * 0.5 * _contra_penalty:
+                logger.debug(
+                    f"EntryEngine: SHORT flow {flow.conviction:+.2f} too weak "
+                    f"in DISCOUNT+bullish (need {_FLOW_CONV_THRESHOLD * 0.5 * _contra_penalty:.2f})")
                 return
 
         self._tracking = _TrackingState(
@@ -1167,14 +1198,13 @@ class EntryEngine:
                 tr.target = target
 
         # ── TRACKING → READY transition ───────────────────────────────────
-        # v3.0: AMD-adjusted conviction threshold.
-        # Against-AMD entries need proportionally stronger flow.
-        adjusted_conv_thresh = _FLOW_CONV_THRESHOLD / max(tr.amd_mult, 0.50)
-
+        # Flow threshold is UNCHANGED by AMD. AMD only affects the signal
+        # conviction and tier AFTER READY is reached. This is the
+        # institutional approach: same entry criteria, different sizing.
         ready = (
             tr.flow_ticks >= _FLOW_SUSTAINED_TICKS
             and flow.cvd_agrees
-            and abs(flow.conviction) >= adjusted_conv_thresh
+            and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD
             and tr.target.distance_atr >= _MIN_TARGET_ATR
             and tr.target.distance_atr <= _MAX_TARGET_ATR
         )
@@ -1182,7 +1212,7 @@ class EntryEngine:
         # ICT bonus: lower bar if structure strongly agrees (preserved)
         if not ready and tr.flow_ticks >= 1:
             ict_boost = self._ict_structure_agrees(ict, tr.direction)
-            if ict_boost and abs(flow.conviction) >= adjusted_conv_thresh * 0.65:
+            if ict_boost and abs(flow.conviction) >= _FLOW_CONV_THRESHOLD * 0.65:
                 ready = True
 
         # v3.0: EWMA fast-track — if EWMA is strongly directional and
@@ -1219,7 +1249,7 @@ class EntryEngine:
                 _pre_reward = abs(_pre_tp - price)
                 if _pre_risk > 1e-10:
                     _pre_rr = _pre_reward / _pre_risk
-                    _adj_rr = _MIN_RR_RATIO / max(tr.amd_mult, 0.50)
+                    _adj_rr = _MIN_RR_RATIO * (2.0 - tr.amd_mult)
                     if _pre_rr < _adj_rr * 0.7:
                         # R:R is less than 70% of required — hopeless
                         logger.debug(
@@ -1232,7 +1262,11 @@ class EntryEngine:
             self._state = EngineState.READY
             self._state_entered = now
             # ── v3.0: Initialize conviction decay state ───────────────
-            self._ready_conviction = abs(flow.conviction) * tr.amd_mult
+            # Conviction is initialized at RAW flow conviction — NOT
+            # AMD-adjusted. AMD modifier is applied to the SIGNAL output
+            # only (tier and sizing). Internal decay dynamics should not
+            # be affected by AMD or conviction decays too fast.
+            self._ready_conviction = abs(flow.conviction)
             self._ready_peak_conviction = self._ready_conviction
             self._ready_last_agree_ts = now
             # Track R:R failures for early READY abort
@@ -1366,10 +1400,12 @@ class EntryEngine:
         rr = reward / risk
 
         # ── v3.0: AMD-adjusted R:R threshold ─────────────────────────────
-        # Against-AMD entries need a better R:R to compensate for
-        # the macro headwind. This is how institutional desks handle it —
-        # they demand more edge when context is unfavorable.
-        adjusted_min_rr = _MIN_RR_RATIO / max(tr.amd_mult, 0.50)
+        # Against-AMD entries demand modestly better R:R to compensate.
+        # Formula: base × (2.0 - mult). Against MANIP (0.60): 1.4×1.40 = 1.96
+        # Against DIST (0.80): 1.4×1.20 = 1.68. Aligned (1.10): 1.4×0.90 = 1.26.
+        # This is much more reasonable than the old 1/mult formula which
+        # produced 2.33 for MANIPULATION — effectively blocking all entries.
+        adjusted_min_rr = _MIN_RR_RATIO * (2.0 - tr.amd_mult)
 
         if rr < adjusted_min_rr:
             # BUG-FIX: Track R:R failures for early abort
@@ -1405,7 +1441,7 @@ class EntryEngine:
             tp_price=tp,
             rr_ratio=rr,
             target_pool=tr.target,
-            conviction=self._ready_conviction,
+            conviction=self._ready_conviction * tr.amd_mult,
             reason=(
                 f"Flow {tr.direction} → {tr.target.pool.side.value} "
                 f"${tr.target.pool.price:,.1f} | "
@@ -2081,16 +2117,26 @@ class EntryEngine:
         Institutional TP — FRONT-RUN the liquidity pool.
 
         Smart money does NOT wait for price to reach the exact pool level.
-        They start covering/exiting 0.3-0.5×ATR BEFORE the pool because:
+        They start covering/exiting BEFORE the pool because:
           - Other algos front-run the same level
           - Iceberg orders absorb momentum before the exact price
           - The last 20-50pts of a move are the hardest to capture
 
-        TP = pool_price ± 0.35×ATR buffer (toward entry, not past pool)
+        v3.0: Buffer SCALES with pool distance. A flat 0.35×ATR buffer
+        eats 17.5% of reward for a 2.0 ATR target — killing R:R for
+        viable nearby trades. Scaling formula:
+          buffer = 0.10×ATR + 0.05×distance_atr×ATR
+          At 1 ATR distance: 0.15×ATR (tight — close pool is certain)
+          At 3 ATR distance: 0.25×ATR (moderate)
+          At 8 ATR distance: 0.50×ATR (wide — distant pool, more uncertainty)
+        Capped at 0.50×ATR to avoid excessive haircuts.
         """
         pool_price = target.pool.price
-        # Front-run buffer: 0.35×ATR BEFORE the pool level
-        buffer = atr * 0.35
+        dist_atr = target.distance_atr
+
+        # Scaled buffer: tight for close pools, wider for distant ones
+        buffer = atr * min(0.50, 0.10 + 0.05 * dist_atr)
+
         if side == "long":
             tp = pool_price - buffer
         else:
