@@ -1,6 +1,42 @@
 """
-entry_engine.py — Liquidity-First Entry Decision Engine v3.1
+entry_engine.py — Liquidity-First Entry Decision Engine v3.3
 =============================================================
+FIXES IN v3.3
+─────────────
+BUG-FIX-CRITICAL: ICT sweep bridge — two disconnected sweep systems.
+  The ICT engine detects dozens of sweeps (BSL SWEPT, SSL SWEPT) but the
+  LiquidityMap's check_sweeps() detects zero. These are completely separate
+  pool registries. The entry engine only reads LiquidityMap sweeps, so the
+  post-sweep pipeline NEVER fired at all — 34+ sweeps per session wasted.
+  Fix: Bridge ICT sweeps via ICTSweepEvent → ict_ctx.ict_sweeps → entry engine.
+  Synthesize SweepResult from ICT sweep data when LiquidityMap has no sweeps.
+
+POST-SWEEP v3.3: Multi-phase accumulative evidence model.
+  Old: Stateless recalculation each tick with fixed thresholds. Evidence from
+  previous ticks was thrown away — momentary flow noise killed valid setups.
+  New: 4-phase evaluation (DISPLACEMENT→CISD→OTE→MATURE) with evidence that
+  BUILDS over the evaluation window. Phase-adaptive thresholds: early phase
+  requires 1.3× evidence (overwhelming only); mature phase accepts 0.75×.
+
+CISD detection: Tracks CHoCH/BOS in reversal direction as structural
+  confirmation. CISD provides the green-light for reversal entries.
+
+Displacement measurement: Tracks how far and how fast price moves from
+  sweep level. Strong displacement (>1.2 ATR) is the strongest reversal signal.
+
+OTE zone tracking: Detects when price retraces to the 50%-78.6% Fibonacci
+  zone of the displacement move — the optimal institutional entry point.
+
+SL buffer widened: 0.35×ATR (was 0.12×ATR). The old buffer was a death zone
+  for sweep retests — price routinely wicked past 0.12 ATR on retests.
+
+Continuation SL fixed: Placed BEYOND the swept pool + 0.40×ATR buffer.
+  Old code placed SL AT the swept pool price (0.20×ATR) where stops already
+  triggered — worst possible placement.
+
+Synthetic TP gated: 2R fallback only fires when CISD is confirmed, preventing
+  structureless trades from generating signals.
+
 FIXES IN v3.1
 ─────────────
 BUG-FIX-1: EWMA alpha was NOT time-normalised.
@@ -88,11 +124,33 @@ _TRACKING_TIMEOUT_SEC   = 180
 _READY_TIMEOUT_SEC      = 90
 
 _MIN_RR_RATIO           = 1.4
-_SL_BUFFER_ATR          = 0.12
+_SL_BUFFER_ATR          = 0.35    # v3.3: widened from 0.12 — old buffer was death zone for sweep retests
 _TP_BUFFER_ATR          = 0.08
 
 _ENTRY_COOLDOWN_SEC     = 30.0
 _POST_SWEEP_EVAL_SEC    = 10.0
+
+# ── Post-Sweep Pipeline v3.3 Constants ────────────────────────────────────
+_PS_PHASE_DISPLACEMENT_SEC =  30.0   # first 30s after sweep: expect displacement
+_PS_PHASE_CISD_SEC         =  90.0   # 30-90s: expect CISD (CHoCH/BOS reversal)
+_PS_PHASE_OTE_SEC          = 180.0   # 90-180s: expect OTE retrace to 50-78.6%
+_PS_PHASE_MATURE_SEC       = 240.0   # 180-240s: relaxed thresholds, final chance
+
+_PS_DISP_MIN_ATR           = 0.5     # minimum displacement from sweep level
+_PS_DISP_STRONG_ATR        = 1.2     # strong displacement threshold
+_PS_OTE_FIB_LOW            = 0.50    # OTE zone lower bound (50% retrace)
+_PS_OTE_FIB_HIGH           = 0.786   # OTE zone upper bound (78.6% retrace)
+
+_PS_CONTINUATION_SL_BUFFER = 0.40    # ATR buffer BEYOND swept pool for continuation SL
+_PS_REVERSAL_SL_BUFFER     = 0.35    # ATR buffer beyond sweep wick for reversal SL
+
+_PS_SCORE_THRESHOLD_EARLY  = 55.0    # early phase: overwhelming evidence required
+_PS_SCORE_THRESHOLD_NORMAL = 45.0    # standard phase
+_PS_SCORE_THRESHOLD_MATURE = 35.0    # mature phase: accept weaker setups
+_PS_SCORE_GAP_MIN          = 8.0     # minimum gap between rev/cont scores
+
+_PS_DISP_SCORE_MULT        = 1.30    # during displacement phase, need 1.3× score
+_PS_MATURE_SCORE_MULT      = 0.75    # during mature phase, accept 0.75× score
 
 # BUG-FIX-1: time-normalised EWMA
 # alpha_per_sec calibrated: at dt=0.25s -> alpha = 1 - exp(-0.648*0.25) = 0.15 (original)
@@ -185,6 +243,20 @@ class OrderFlowState:
 
 
 @dataclass
+class ICTSweepEvent:
+    """Bridged sweep from ICT engine's liquidity_pools into entry engine."""
+    pool_price:     float
+    pool_type:      str       # "BSL" or "SSL"
+    sweep_ts:       int       # ms epoch when the sweep occurred
+    displacement:   bool      # displacement_confirmed flag
+    disp_score:     float     # continuous displacement score 0.0-1.0
+    wick_reject:    bool      # wick rejection confirmed
+    candle_high:    float     # high of the candle that swept
+    candle_low:     float     # low of the candle that swept
+    candle_close:   float     # close of the candle that swept
+
+
+@dataclass
 class ICTContext:
     amd_phase:        str   = ""
     amd_bias:         str   = ""
@@ -200,6 +272,7 @@ class ICTContext:
     nearest_ob_price: float = 0.0        # OB below price (long SL anchor)
     nearest_ob_price_short: float = 0.0  # BUG-FIX: OB above price (short SL anchor)
     kill_zone:        str   = ""
+    ict_sweeps:       list  = field(default_factory=list)  # List[ICTSweepEvent]
 
     @property
     def session_quality(self) -> str:
@@ -253,10 +326,50 @@ class _TrackingState:
 
 @dataclass
 class _PostSweepState:
+    """
+    Accumulative evidence tracker for post-sweep evaluation v3.3.
+
+    Instead of stateless recalculation each tick, evidence BUILDS over the
+    evaluation window. Each tick adds/removes evidence; the decision uses
+    the accumulated peak, not just the instantaneous snapshot.
+    """
     sweep:            SweepResult
     entered_at:       float
     initial_flow:     float = 0.0
     initial_flow_dir: str   = ""
+
+    # ── Accumulative evidence ─────────────────────────────────────────
+    rev_evidence:     float = 0.0     # accumulated reversal evidence
+    cont_evidence:    float = 0.0     # accumulated continuation evidence
+    peak_rev:         float = 0.0     # peak reversal evidence seen
+    peak_cont:        float = 0.0     # peak continuation evidence seen
+    tick_count:       int   = 0       # number of evaluation ticks
+
+    # ── CISD tracking (Change in State of Delivery) ───────────────────
+    cisd_detected:    bool  = False   # CHoCH or BOS in reversal direction
+    cisd_timestamp:   float = 0.0     # when CISD was detected
+    cisd_type:        str   = ""      # "choch" or "bos"
+
+    # ── Displacement tracking ─────────────────────────────────────────
+    max_displacement: float = 0.0     # max distance price moved from sweep level (ATR)
+    displacement_dir: str   = ""      # "toward_reversal" or "continuation"
+    disp_velocity:    float = 0.0     # displacement speed (ATR per second)
+
+    # ── OTE zone tracking ─────────────────────────────────────────────
+    ote_reached:      bool  = False   # price retraced to 50%-78.6% Fibonacci zone
+    ote_timestamp:    float = 0.0     # when OTE was first reached
+    ote_holding:      bool  = False   # price still in OTE zone
+
+    # ── Price extremes since sweep ────────────────────────────────────
+    highest_since:    float = 0.0     # highest price since sweep entered
+    lowest_since:     float = float('inf')  # lowest price since sweep entered
+
+    # ── Flow accumulation ─────────────────────────────────────────────
+    rev_flow_ticks:   int   = 0       # ticks where flow agreed with reversal
+    cont_flow_ticks:  int   = 0       # ticks where flow agreed with continuation
+
+    # ── ICT sweep source (if bridged from ICT engine) ─────────────────
+    ict_sweep_event:  Optional['ICTSweepEvent'] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -264,7 +377,7 @@ class _PostSweepState:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class EntryEngine:
-    """Single-flow entry decision engine v3.1."""
+    """Single-flow entry decision engine v3.3 — ICT sweep bridge + multi-phase post-sweep."""
 
     def __init__(self) -> None:
         self._state         = EngineState.SCANNING
@@ -317,16 +430,63 @@ class EntryEngine:
         self._last_liq_snapshot = liq_snapshot
         self._update_flow_ewma(flow_state, now)
 
+        # ── Check for sweeps from BOTH systems ────────────────────────
+        # System 1: LiquidityMap sweeps (candle-based detection)
         new_sweeps = [s for s in liq_snapshot.recent_sweeps
                       if s.detected_at > now - 10.0
                       and s.quality >= _MIN_SWEEP_QUALITY]
+
+        # System 2: ICT engine sweeps (bridged via ict_ctx.ict_sweeps)
+        # These are sweeps the ICT engine detected on its own liquidity_pools
+        # that the LiquidityMap missed entirely. Convert to SweepResult.
+        _ict_bridge_event = None
+        if not new_sweeps and hasattr(ict_ctx, 'ict_sweeps') and ict_ctx.ict_sweeps:
+            _age_limit_ms = int(now * 1000) - 30_000
+            for ict_sw in ict_ctx.ict_sweeps:
+                if ict_sw.sweep_ts < _age_limit_ms:
+                    continue
+                _synth_side = PoolSide.BSL if ict_sw.pool_type == "BSL" else PoolSide.SSL
+                _synth_direction = "short" if ict_sw.pool_type == "BSL" else "long"
+                _synth_pool = type('_SynthPool', (), {
+                    'price': ict_sw.pool_price, 'side': _synth_side,
+                    'timeframe': '5m', 'status': PoolStatus.SWEPT,
+                    'significance': 3.0, 'ob_aligned': False,
+                    'fvg_aligned': False, 'htf_count': 0,
+                    'is_tradeable': False,
+                    'sweep_wick': (ict_sw.candle_high if ict_sw.pool_type == "BSL"
+                                   else ict_sw.candle_low),
+                })()
+                _synth_quality = min(1.0, 0.35 + 0.35 * ict_sw.disp_score
+                                     + (0.15 if ict_sw.wick_reject else 0.0))
+                if _synth_quality < _MIN_SWEEP_QUALITY:
+                    continue
+                _wick = (ict_sw.candle_high if ict_sw.pool_type == "BSL"
+                         else ict_sw.candle_low)
+                new_sweeps.append(SweepResult(
+                    pool=_synth_pool, sweep_candle_idx=0,
+                    wick_extreme=_wick, rejection_pct=ict_sw.disp_score,
+                    volume_ratio=1.0, quality=_synth_quality,
+                    direction=_synth_direction,
+                    detected_at=ict_sw.sweep_ts / 1000.0,
+                ))
+                _ict_bridge_event = ict_sw
+                logger.info(
+                    f"🔗 ICT SWEEP BRIDGED: {ict_sw.pool_type} "
+                    f"${ict_sw.pool_price:,.1f} disp={ict_sw.disp_score:.2f} "
+                    f"quality={_synth_quality:.2f} → {_synth_direction.upper()}")
 
         if new_sweeps and self._state not in (
             EngineState.IN_POSITION, EngineState.ENTERING, EngineState.POST_SWEEP
         ):
             best_sweep = max(new_sweeps, key=lambda s: s.quality)
+            # Attach ICT sweep event if this came from the bridge
+            if _ict_bridge_event is None and hasattr(ict_ctx, 'ict_sweeps'):
+                for ict_sw in ict_ctx.ict_sweeps:
+                    if abs(ict_sw.pool_price - best_sweep.pool.price) < atr * 0.1:
+                        _ict_bridge_event = ict_sw
+                        break
             self._enter_post_sweep(best_sweep, liq_snapshot, flow_state,
-                                   ict_ctx, price, atr, now)
+                                   ict_ctx, price, atr, now, _ict_bridge_event)
             return
 
         if self._state in (EngineState.SCANNING, EngineState.TRACKING):
@@ -1186,7 +1346,43 @@ class EntryEngine:
         logger.info(f"SIGNAL: {self._signal.entry_type.value} "
                     f"{self._signal.side.upper()} | {self._signal.reason}")
 
-    # ── State: POST_SWEEP ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # POST-SWEEP PIPELINE v3.3 — Industry-Grade Multi-Phase Evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    #
+    # Architecture:
+    #   Phase 1 — DISPLACEMENT (0-30s):  Expect strong price rejection from sweep.
+    #             Requires overwhelming evidence (1.3× score threshold).
+    #   Phase 2 — CISD (30-90s):  Expect CHoCH/BOS confirming reversal or BOS
+    #             confirming continuation. Standard thresholds apply.
+    #   Phase 3 — OTE (90-180s):  Expect price retracement to 50%-78.6% Fibonacci
+    #             zone of the sweep displacement move. Standard thresholds.
+    #   Phase 4 — MATURE (180-240s):  Relaxed thresholds (0.75× score). Final
+    #             opportunity before timeout. Stale setups accepted if evidence
+    #             accumulated over earlier phases.
+    #
+    # Evidence model: ACCUMULATIVE. Each tick adds/removes evidence to running
+    # totals. Decision uses peak accumulated evidence, not just instantaneous
+    # snapshot. This prevents momentary flow noise from killing valid setups.
+    #
+    # CISD: Tracks CHoCH and BOS in the reversal direction. CISD confirmation
+    # provides the structural green-light for reversal entries.
+    #
+    # Displacement: Measures how far and how fast price moved away from the
+    # sweep level. Strong displacement (>1.2 ATR) is the strongest reversal
+    # signal. Weak displacement favors continuation.
+    #
+    # OTE: When price retraces to the 50%-78.6% Fibonacci zone of the
+    # displacement move, it's the optimal institutional entry point.
+    #
+    # SL: Reversal SL uses 0.35×ATR buffer beyond sweep wick (was 0.12×ATR
+    # which sat in the death zone for sweep retests). Continuation SL placed
+    # BEYOND the swept pool with 0.40×ATR buffer (was AT the pool where
+    # stops already triggered).
+    #
+    # Synthetic TP: 2R fallback only fires when CISD is confirmed, preventing
+    # structureless trades from generating signals.
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _enter_post_sweep(
         self,
@@ -1197,7 +1393,9 @@ class EntryEngine:
         price:  float,
         atr:    float,
         now:    float,
+        ict_sweep_event: Optional['ICTSweepEvent'] = None,
     ) -> None:
+        """Initialize post-sweep evaluation with accumulative evidence tracker."""
         _TF_QUALITY_MIN = {'1m': 0.65, '5m': 0.55, '15m': 0.45, '4h': 0.35}
         _tf             = getattr(sweep.pool, 'timeframe', '5m')
         _req            = _TF_QUALITY_MIN.get(_tf, 0.45)
@@ -1205,17 +1403,23 @@ class EntryEngine:
             logger.debug(f"SWEEP SKIPPED [{_tf}]: quality={sweep.quality:.2f} < {_req:.2f}")
             return
 
-        self._post_sweep    = _PostSweepState(
+        self._post_sweep = _PostSweepState(
             sweep=sweep, entered_at=now,
-            initial_flow=flow.conviction, initial_flow_dir=flow.direction)
+            initial_flow=flow.conviction, initial_flow_dir=flow.direction,
+            highest_since=price, lowest_since=price,
+            ict_sweep_event=ict_sweep_event,
+        )
         self._state         = EngineState.POST_SWEEP
         self._state_entered = now
         self._tracking      = None
         self._signal        = None
+
+        _src = "ICT-BRIDGE" if ict_sweep_event else "LIQ-MAP"
         logger.info(
-            f"SWEEP DETECTED: {sweep.pool.side.value} "
+            f"🎯 POST-SWEEP ENTERED [{_src}]: {sweep.pool.side.value} "
             f"${sweep.pool.price:,.1f} quality={sweep.quality:.2f} "
-            f"| Scoring reversal vs continuation...")
+            f"wick=${sweep.wick_extreme:,.1f} "
+            f"| Multi-phase evaluation started...")
 
     def _do_post_sweep(
         self,
@@ -1226,6 +1430,17 @@ class EntryEngine:
         atr:   float,
         now:   float,
     ) -> None:
+        """
+        Multi-phase post-sweep evaluation with accumulative evidence.
+
+        Each tick:
+          1. Update price extremes and displacement tracking
+          2. Check for CISD (CHoCH/BOS in reversal direction)
+          3. Check for OTE zone entry/exit
+          4. Accumulate evidence from all sources
+          5. Determine current phase and apply phase-adaptive thresholds
+          6. Make decision when thresholds are met or timeout
+        """
         ps = self._post_sweep
         if ps is None:
             self._state = EngineState.SCANNING
@@ -1234,22 +1449,109 @@ class EntryEngine:
         elapsed = now - ps.entered_at
         if elapsed < _POST_SWEEP_EVAL_SEC:
             return
+
         if elapsed > _CISD_MAX_WAIT_SEC:
-            logger.info("POST_SWEEP: timeout — back to scanning")
+            _peak = max(ps.peak_rev, ps.peak_cont)
+            logger.info(
+                f"POST_SWEEP: timeout after {elapsed:.0f}s — "
+                f"peak_rev={ps.peak_rev:.0f} peak_cont={ps.peak_cont:.0f} "
+                f"CISD={'YES' if ps.cisd_detected else 'NO'} "
+                f"disp={ps.max_displacement:.2f}ATR "
+                f"OTE={'YES' if ps.ote_reached else 'NO'}")
             self._post_sweep    = None
             self._state         = EngineState.SCANNING
             self._state_entered = now
             return
 
-        decision = self._evaluate_post_sweep(ps.sweep, snap, flow, ict, price, atr, now)
+        ps.tick_count += 1
+
+        # ── 1. Update price extremes ──────────────────────────────────
+        ps.highest_since = max(ps.highest_since, price)
+        ps.lowest_since  = min(ps.lowest_since, price)
+
+        # ── 2. Displacement tracking ─────────────────────────────────
+        sweep_price = ps.sweep.pool.price
+        sweep_dir   = ps.sweep.direction  # "short" = BSL swept, "long" = SSL swept
+        # Reversal direction: opposite of what was swept
+        # BSL swept → direction="short" → reversal = SHORT (price should drop)
+        # SSL swept → direction="long"  → reversal = LONG (price should rise)
+        rev_dir = sweep_dir  # sweep.direction IS the reversal direction
+
+        if rev_dir == "long":
+            # SSL swept, expect price to rise
+            disp_from_sweep = (price - sweep_price) / max(atr, 1e-10)
+            max_disp = (ps.highest_since - sweep_price) / max(atr, 1e-10)
+        else:
+            # BSL swept, expect price to drop
+            disp_from_sweep = (sweep_price - price) / max(atr, 1e-10)
+            max_disp = (sweep_price - ps.lowest_since) / max(atr, 1e-10)
+
+        if max_disp > ps.max_displacement:
+            ps.max_displacement = max_disp
+            ps.displacement_dir = "toward_reversal" if max_disp > 0 else "continuation"
+            if elapsed > 0:
+                ps.disp_velocity = max_disp / elapsed
+
+        # ── 3. CISD detection (Change in State of Delivery) ──────────
+        if not ps.cisd_detected:
+            choch_5m = getattr(ict, 'choch_5m', '') or ''
+            bos_5m   = getattr(ict, 'bos_5m', '') or ''
+            # For reversal: need CHoCH or BOS in the reversal direction
+            _rev_struct = "bearish" if rev_dir == "short" else "bullish"
+            if choch_5m == _rev_struct:
+                ps.cisd_detected  = True
+                ps.cisd_timestamp = now
+                ps.cisd_type      = "choch"
+                logger.info(f"POST_SWEEP: 🔄 CISD CONFIRMED (CHoCH {_rev_struct}) "
+                           f"at {elapsed:.0f}s post-sweep")
+            elif bos_5m == _rev_struct:
+                ps.cisd_detected  = True
+                ps.cisd_timestamp = now
+                ps.cisd_type      = "bos"
+                logger.info(f"POST_SWEEP: 🔄 CISD CONFIRMED (BOS {_rev_struct}) "
+                           f"at {elapsed:.0f}s post-sweep")
+
+        # ── 4. OTE zone tracking (50%-78.6% Fibonacci retrace) ───────
+        if ps.max_displacement >= _PS_DISP_MIN_ATR:
+            # Calculate Fibonacci retracement of the displacement move
+            if rev_dir == "long":
+                # SSL swept, price rose. OTE = retrace back down to 50-78.6%
+                swing_low  = sweep_price
+                swing_high = ps.highest_since
+            else:
+                # BSL swept, price dropped. OTE = retrace back up to 50-78.6%
+                swing_high = sweep_price
+                swing_low  = ps.lowest_since
+
+            swing_range = abs(swing_high - swing_low)
+            if swing_range > 1e-10:
+                if rev_dir == "long":
+                    # Retracement down from high
+                    retrace_pct = (ps.highest_since - price) / swing_range
+                else:
+                    # Retracement up from low
+                    retrace_pct = (price - ps.lowest_since) / swing_range
+
+                in_ote = _PS_OTE_FIB_LOW <= retrace_pct <= _PS_OTE_FIB_HIGH
+                if in_ote and not ps.ote_reached:
+                    ps.ote_reached   = True
+                    ps.ote_timestamp = now
+                    logger.info(f"POST_SWEEP: 📐 OTE ZONE REACHED "
+                               f"(retrace={retrace_pct:.1%}) at {elapsed:.0f}s")
+                ps.ote_holding = in_ote
+
+        # ── 5. Accumulate evidence ────────────────────────────────────
+        decision = self._evaluate_post_sweep_accumulative(
+            ps, snap, flow, ict, price, atr, now)
+
         if decision.action == "reverse":
             self._handle_sweep_reversal(ps.sweep, decision, snap, flow, ict, price, atr, now)
         elif decision.action == "continue":
             self._handle_sweep_continuation(ps.sweep, decision, snap, flow, ict, price, atr, now)
 
-    def _evaluate_post_sweep(
+    def _evaluate_post_sweep_accumulative(
         self,
-        sweep: SweepResult,
+        ps:    _PostSweepState,
         snap:  LiquidityMapSnapshot,
         flow:  OrderFlowState,
         ict:   ICTContext,
@@ -1257,155 +1559,281 @@ class EntryEngine:
         atr:   float,
         now:   float,
     ) -> PostSweepDecision:
-        sweep_dir = sweep.direction
+        """
+        Accumulative evidence model for post-sweep evaluation.
+
+        Evidence is ADDED to running totals each tick (with decay for
+        contradictory signals). The decision checks accumulated peaks
+        against phase-adaptive thresholds.
+        """
+        sweep     = ps.sweep
+        sweep_dir = sweep.direction  # reversal direction
         cont_dir  = "short" if sweep_dir == "long" else "long"
-        rev_score = cont_score = 0.0
-        rev_reasons: List[str]  = []
+        elapsed   = now - ps.entered_at
+
+        # ── Determine current phase ──────────────────────────────────
+        if elapsed < _PS_PHASE_DISPLACEMENT_SEC:
+            phase = "DISPLACEMENT"
+            score_mult = _PS_DISP_SCORE_MULT       # 1.30 — need overwhelming evidence
+            base_threshold = _PS_SCORE_THRESHOLD_EARLY
+        elif elapsed < _PS_PHASE_CISD_SEC:
+            phase = "CISD"
+            score_mult = 1.0
+            base_threshold = _PS_SCORE_THRESHOLD_NORMAL
+        elif elapsed < _PS_PHASE_OTE_SEC:
+            phase = "OTE"
+            score_mult = 1.0
+            base_threshold = _PS_SCORE_THRESHOLD_NORMAL
+        else:
+            phase = "MATURE"
+            score_mult = _PS_MATURE_SCORE_MULT      # 0.75 — accept weaker setups
+            base_threshold = _PS_SCORE_THRESHOLD_MATURE
+
+        # ── Instantaneous evidence this tick ──────────────────────────
+        rev_delta  = 0.0
+        cont_delta = 0.0
+        rev_reasons:  List[str] = []
         cont_reasons: List[str] = []
 
+        # AMD phase scoring
         amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
         amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
         amd_conf  = float(getattr(ict, 'amd_confidence', 0.0) or 0.0)
 
         if amd_phase == 'MANIPULATION':
-            if (sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or \
-               (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish'):
+            if ((sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or
+                    (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')):
                 pts = 22.0 * max(amd_conf, 0.5)
-                rev_score += pts
+                rev_delta += pts
                 rev_reasons.append(f"AMD MANIP {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
-
         elif amd_phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
-            if (sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or \
-               (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish'):
+            if ((sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or
+                    (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')):
                 pts = 25.0 * max(amd_conf, 0.5)
-                cont_score += pts
+                cont_delta += pts
                 cont_reasons.append(f"AMD DIST {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
             else:
-                cont_score += 20.0 * max(amd_conf, 0.5)
-                rev_score  -= 12.0 * max(amd_conf, 0.5)
+                cont_delta += 20.0 * max(amd_conf, 0.5)
+                rev_delta  -= 12.0 * max(amd_conf, 0.5)
                 cont_reasons.append(f"AMD DIST contra ({amd_conf:.0%})")
-
         elif amd_phase in ('ACCUMULATION', 'REACCUMULATION'):
             pts = 12.0 * max(amd_conf, 0.4)
-            rev_score += pts
+            rev_delta += pts
             rev_reasons.append(f"AMD ACCUM ({amd_conf:.0%})")
 
         # Sweep quality / displacement
         if sweep.quality >= 0.70:
-            rev_score += 12.0; rev_reasons.append(f"DISP strong ({sweep.quality:.0%})")
+            rev_delta += 12.0; rev_reasons.append(f"DISP strong ({sweep.quality:.0%})")
         elif sweep.quality >= 0.50:
-            rev_score += 7.0;  rev_reasons.append(f"DISP moderate ({sweep.quality:.0%})")
+            rev_delta += 7.0;  rev_reasons.append(f"DISP moderate ({sweep.quality:.0%})")
         elif sweep.quality >= 0.35:
-            rev_score += 3.0;  rev_reasons.append(f"DISP weak ({sweep.quality:.0%})")
+            rev_delta += 3.0;  rev_reasons.append(f"DISP weak ({sweep.quality:.0%})")
 
-        # Dealing range
+        # Live displacement from sweep level
+        if ps.max_displacement >= _PS_DISP_STRONG_ATR:
+            rev_delta += 10.0
+            rev_reasons.append(f"LIVE DISP {ps.max_displacement:.1f}ATR")
+        elif ps.max_displacement >= _PS_DISP_MIN_ATR:
+            rev_delta += 5.0
+            rev_reasons.append(f"LIVE DISP moderate {ps.max_displacement:.1f}ATR")
+        elif ps.max_displacement < 0.2 and elapsed > 15.0:
+            cont_delta += 6.0
+            cont_reasons.append(f"NO DISP ({ps.max_displacement:.2f}ATR)")
+
+        # CISD confirmation (major structural signal)
+        if ps.cisd_detected:
+            _cisd_age = now - ps.cisd_timestamp
+            _cisd_freshness = max(0.5, 1.0 - _cisd_age / 120.0)
+            rev_delta += 15.0 * _cisd_freshness
+            rev_reasons.append(f"CISD {ps.cisd_type.upper()} ({_cisd_freshness:.0%})")
+
+        # OTE zone (optimal entry point)
+        if ps.ote_reached:
+            if ps.ote_holding:
+                rev_delta += 12.0
+                rev_reasons.append("IN OTE ZONE")
+            else:
+                rev_delta += 6.0
+                rev_reasons.append("OTE REACHED (exited)")
+
+        # Dealing range position
         pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
         if sweep_dir == "short":
-            if   pd >= 0.80: rev_score  += 10.0; rev_reasons.append(f"DEEP PREMIUM ({pd:.0%})")
-            elif pd >= 0.65: rev_score  +=  7.0; rev_reasons.append(f"PREMIUM ({pd:.0%})")
-            elif pd >= 0.50: rev_score  +=  3.0; rev_reasons.append(f"SLIGHT PREM ({pd:.0%})")
-            else:            cont_score +=  6.0; cont_reasons.append("DEEP BREAK")
+            if   pd >= 0.80: rev_delta  += 10.0; rev_reasons.append(f"DEEP PREMIUM ({pd:.0%})")
+            elif pd >= 0.65: rev_delta  +=  7.0; rev_reasons.append(f"PREMIUM ({pd:.0%})")
+            elif pd >= 0.50: rev_delta  +=  3.0; rev_reasons.append(f"SLIGHT PREM ({pd:.0%})")
+            else:            cont_delta +=  6.0; cont_reasons.append("DEEP BREAK")
         else:
-            if   pd <= 0.20: rev_score  += 10.0; rev_reasons.append(f"DEEP DISCOUNT ({pd:.0%})")
-            elif pd <= 0.35: rev_score  +=  7.0; rev_reasons.append(f"DISCOUNT ({pd:.0%})")
-            elif pd <= 0.50: rev_score  +=  3.0; rev_reasons.append(f"SLIGHT DISC ({pd:.0%})")
-            else:            cont_score +=  6.0; cont_reasons.append("DEEP BREAK")
+            if   pd <= 0.20: rev_delta  += 10.0; rev_reasons.append(f"DEEP DISCOUNT ({pd:.0%})")
+            elif pd <= 0.35: rev_delta  +=  7.0; rev_reasons.append(f"DISCOUNT ({pd:.0%})")
+            elif pd <= 0.50: rev_delta  +=  3.0; rev_reasons.append(f"SLIGHT DISC ({pd:.0%})")
+            else:            cont_delta +=  6.0; cont_reasons.append("DEEP BREAK")
 
-        # Flow
-        rev_dir_needed = "short" if sweep_dir == "short" else "long"
+        # Order flow (instantaneous)
+        rev_dir_needed = sweep_dir
         if flow.direction == rev_dir_needed and abs(flow.conviction) >= 0.40:
-            rev_score  += 8.0; rev_reasons.append(f"FLOW REV {flow.conviction:+.2f}")
+            rev_delta  += 8.0; rev_reasons.append(f"FLOW REV {flow.conviction:+.2f}")
+            ps.rev_flow_ticks += 1
         elif flow.direction == rev_dir_needed:
-            rev_score  += 4.0; rev_reasons.append(f"FLOW weak rev {flow.conviction:+.2f}")
+            rev_delta  += 4.0; rev_reasons.append(f"FLOW weak rev {flow.conviction:+.2f}")
+            ps.rev_flow_ticks += 1
         elif flow.direction and flow.direction != rev_dir_needed:
-            cont_score += 8.0; cont_reasons.append(f"FLOW CONT {flow.conviction:+.2f}")
+            cont_delta += 8.0; cont_reasons.append(f"FLOW CONT {flow.conviction:+.2f}")
+            ps.cont_flow_ticks += 1
 
-        # CVD
+        # EWMA flow (trend)
+        ewma_rev = (
+            (rev_dir_needed == "long"  and self._flow_ewma > 0.10) or
+            (rev_dir_needed == "short" and self._flow_ewma < -0.10)
+        )
+        ewma_cont = (
+            (rev_dir_needed == "long"  and self._flow_ewma < -0.15) or
+            (rev_dir_needed == "short" and self._flow_ewma > 0.15)
+        )
+        if ewma_rev:
+            rev_delta += 5.0; rev_reasons.append(f"EWMA rev {self._flow_ewma:+.2f}")
+        elif ewma_cont:
+            cont_delta += 5.0; cont_reasons.append(f"EWMA cont {self._flow_ewma:+.2f}")
+
+        # CVD alignment
         cvd = flow.cvd_trend
-        if   sweep_dir == "short" and cvd < -0.30: rev_score  += 8.0; rev_reasons.append(f"CVD bearish {cvd:+.2f}")
-        elif sweep_dir == "short" and cvd <    0:   rev_score  += 3.0; rev_reasons.append(f"CVD slight bear {cvd:+.2f}")
-        elif sweep_dir == "long"  and cvd >  0.30: rev_score  += 8.0; rev_reasons.append(f"CVD bullish {cvd:+.2f}")
-        elif sweep_dir == "long"  and cvd >    0:   rev_score  += 3.0; rev_reasons.append(f"CVD slight bull {cvd:+.2f}")
-        else:                                       cont_score += 4.0; cont_reasons.append(f"CVD cont {cvd:+.2f}")
+        if   sweep_dir == "short" and cvd < -0.30: rev_delta  += 8.0; rev_reasons.append(f"CVD bearish {cvd:+.2f}")
+        elif sweep_dir == "short" and cvd <    0:   rev_delta  += 3.0; rev_reasons.append(f"CVD slight bear {cvd:+.2f}")
+        elif sweep_dir == "long"  and cvd >  0.30: rev_delta  += 8.0; rev_reasons.append(f"CVD bullish {cvd:+.2f}")
+        elif sweep_dir == "long"  and cvd >    0:   rev_delta  += 3.0; rev_reasons.append(f"CVD slight bull {cvd:+.2f}")
+        else:                                       cont_delta += 4.0; cont_reasons.append(f"CVD cont {cvd:+.2f}")
 
-        # Structure
+        # 5m Structure
         choch_5m = getattr(ict, 'choch_5m', '') or ''
         bos_5m   = getattr(ict, 'bos_5m',   '') or ''
         if choch_5m:
             choch_rev = "bearish" if rev_dir_needed == "short" else "bullish"
             if choch_5m == choch_rev:
-                rev_score += 10.0; rev_reasons.append("CHoCH (5m)")
+                rev_delta += 10.0; rev_reasons.append("CHoCH (5m)")
         if bos_5m:
             cont_bos = "bullish" if cont_dir == "long" else "bearish"
             if bos_5m == cont_bos:
-                cont_score += 10.0; cont_reasons.append("BOS continuation")
+                cont_delta += 10.0; cont_reasons.append("BOS continuation")
 
-        # Session
+        # 15m Structure reinforcement
+        struct_15m = getattr(ict, 'structure_15m', '') or ''
+        if struct_15m:
+            _rev_15m = "bearish" if rev_dir_needed == "short" else "bullish"
+            if struct_15m == _rev_15m:
+                rev_delta += 6.0; rev_reasons.append(f"15m struct {struct_15m}")
+
+        # Session quality
         session = (getattr(ict, 'kill_zone', '') or '').lower()
-        if 'asia'   in session: rev_score  += 5.0; rev_reasons.append("ASIA manipulation")
-        elif 'london' in session: rev_score += 3.0; rev_reasons.append("LONDON Judas")
+        if 'asia'   in session: rev_delta  += 5.0; rev_reasons.append("ASIA manipulation")
+        elif 'london' in session: rev_delta += 3.0; rev_reasons.append("LONDON Judas")
+        elif 'ny'   in session: rev_delta += 2.0; rev_reasons.append("NY session")
 
-        # Target quality
+        # Target quality (reversal and continuation targets)
         opp_target  = self._find_opposing_target(sweep_dir, snap, price, atr, ict)
         cont_target = self._find_continuation_target(cont_dir, snap, price, atr, ict)
-        if opp_target  and opp_target.significance  >= _MIN_POOL_SIGNIFICANCE:
-            rev_score  += min(5.0, opp_target.significance  * 0.5)
+        if opp_target and opp_target.significance >= _MIN_POOL_SIGNIFICANCE:
+            rev_delta  += min(5.0, opp_target.significance * 0.5)
             rev_reasons.append(f"TP pool sig={opp_target.significance:.1f}")
         if cont_target and cont_target.significance >= _MIN_POOL_SIGNIFICANCE:
-            cont_score += min(5.0, cont_target.significance * 0.5)
+            cont_delta += min(5.0, cont_target.significance * 0.5)
             cont_reasons.append(f"Next pool sig={cont_target.significance:.1f}")
 
-        # OB blocking
-        # Use side-appropriate OB price: for short continuation, check short-side OB
+        # OB blocking (OB between price and continuation target blocks continuation)
         if cont_dir == "long":
             ob_price = float(getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
         else:
             ob_price = float(getattr(ict, 'nearest_ob_price_short', 0.0)
                              or getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
         if ob_price > 0:
-            if cont_dir == "long"  and ob_price > price:
+            if cont_dir == "long" and ob_price > price:
                 ob_dist = (ob_price - price) / max(atr, 1e-10)
                 if ob_dist < 2.0:
-                    rev_score += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
+                    rev_delta += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
             elif cont_dir == "short" and ob_price < price:
                 ob_dist = (price - ob_price) / max(atr, 1e-10)
                 if ob_dist < 2.0:
-                    rev_score += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
+                    rev_delta += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
 
-        rev_total  = round(max(rev_score,  0), 1)
-        cont_total = round(max(cont_score, 0), 1)
+        # Sustained flow consistency bonus (accumulated over ticks)
+        if ps.rev_flow_ticks >= 5:
+            rev_delta += 4.0; rev_reasons.append(f"SUSTAINED rev flow ({ps.rev_flow_ticks} ticks)")
+        if ps.cont_flow_ticks >= 5:
+            cont_delta += 4.0; cont_reasons.append(f"SUSTAINED cont flow ({ps.cont_flow_ticks} ticks)")
+
+        # ── Accumulate evidence with decay ────────────────────────────
+        # New evidence is added; contradictory evidence decays the opposite
+        _decay = 0.92  # per-tick decay for the weaker side
+        if rev_delta > 0:
+            ps.rev_evidence += rev_delta
+            ps.cont_evidence *= _decay
+        if cont_delta > 0:
+            ps.cont_evidence += cont_delta
+            ps.rev_evidence *= _decay
+
+        ps.peak_rev  = max(ps.peak_rev,  ps.rev_evidence)
+        ps.peak_cont = max(ps.peak_cont, ps.cont_evidence)
+
+        rev_total  = round(max(ps.rev_evidence,  0), 1)
+        cont_total = round(max(ps.cont_evidence, 0), 1)
         gap        = abs(rev_total - cont_total)
 
         self._last_sweep_analysis = {
             "rev_score": rev_total, "cont_score": cont_total,
             "rev_reasons": rev_reasons, "cont_reasons": cont_reasons,
+            "phase": phase, "cisd": ps.cisd_detected,
+            "displacement_atr": ps.max_displacement, "ote": ps.ote_reached,
         }
 
-        if rev_total >= 45.0 and gap >= 10.0:
+        # ── Phase-adaptive decision thresholds ────────────────────────
+        _adj_threshold = base_threshold * score_mult
+        _adj_gap       = _PS_SCORE_GAP_MIN
+
+        # Log every 10 ticks for observability
+        if ps.tick_count == 1 or ps.tick_count % 10 == 0:
+            logger.info(
+                f"POST_SWEEP [{phase}] tick={ps.tick_count} "
+                f"rev={rev_total:.0f} cont={cont_total:.0f} "
+                f"(need {_adj_threshold:.0f}, gap>={_adj_gap:.0f}) "
+                f"CISD={'✓' if ps.cisd_detected else '✗'} "
+                f"DISP={ps.max_displacement:.1f}ATR "
+                f"OTE={'✓' if ps.ote_reached else '✗'}")
+
+        if rev_total >= _adj_threshold and gap >= _adj_gap:
             confidence  = min(1.0, rev_total / 90.0)
-            reason_str  = " + ".join(rev_reasons[:4])
-            logger.info(f"SWEEP VERDICT: REVERSAL {sweep_dir.upper()} "
-                        f"(rev={rev_total:.0f} vs cont={cont_total:.0f} gap={gap:.0f})")
+            # Boost confidence for structural confirmations
+            if ps.cisd_detected:
+                confidence = min(1.0, confidence + 0.15)
+            if ps.ote_reached:
+                confidence = min(1.0, confidence + 0.10)
+            reason_str  = " + ".join(rev_reasons[:5])
+            logger.info(
+                f"🎯 SWEEP VERDICT: REVERSAL {sweep_dir.upper()} [{phase}] "
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f} gap={gap:.0f}) "
+                f"CISD={ps.cisd_type or 'none'} DISP={ps.max_displacement:.1f}ATR "
+                f"OTE={'✓' if ps.ote_reached else '✗'}")
             return PostSweepDecision(
                 action="reverse", direction=sweep_dir,
                 confidence=confidence, next_target=opp_target,
-                reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] {reason_str}",
+                reason=(f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] "
+                        f"[{phase}] {reason_str}"),
             )
-        elif cont_total >= 40.0 and gap >= 10.0:
+        elif cont_total >= _adj_threshold * 0.9 and gap >= _adj_gap:
             confidence  = min(1.0, cont_total / 90.0)
-            reason_str  = " + ".join(cont_reasons[:4])
-            logger.info(f"SWEEP VERDICT: CONTINUATION {cont_dir.upper()} "
-                        f"(cont={cont_total:.0f} vs rev={rev_total:.0f} gap={gap:.0f})")
+            reason_str  = " + ".join(cont_reasons[:5])
+            logger.info(
+                f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}] "
+                f"(cont={cont_total:.0f} vs rev={rev_total:.0f} gap={gap:.0f})")
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
                 confidence=confidence, next_target=cont_target,
-                reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] {reason_str}",
+                reason=(f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
+                        f"[{phase}] {reason_str}"),
             )
         else:
-            logger.debug(f"SWEEP WAIT: rev={rev_total:.0f} cont={cont_total:.0f} gap={gap:.0f}<10")
             return PostSweepDecision(
                 action="wait", direction="", confidence=0.0,
-                reason=f"WAIT [{rev_total:.0f}v{cont_total:.0f}] gap={gap:.0f}<10",
+                reason=(f"WAIT [{rev_total:.0f}v{cont_total:.0f}] "
+                        f"gap={gap:.0f}<{_adj_gap:.0f} phase={phase}"),
             )
 
     def _handle_sweep_reversal(
@@ -1419,13 +1847,22 @@ class EntryEngine:
         atr:      float,
         now:      float,
     ) -> None:
+        """
+        Reversal entry handler with widened SL buffer and gated synthetic TP.
+
+        SL: 0.35×ATR beyond sweep wick (was 0.12×ATR — death zone for retests).
+        TP: Primary pool → HTF escalation → 2R synthetic (ONLY if CISD confirmed).
+        """
         side = decision.direction
+        ps   = self._post_sweep
 
+        # ── SL: Sweep wick + widened buffer ──────────────────────────
         if side == "long":
-            sl = sweep.wick_extreme - atr * _SL_BUFFER_ATR
+            sl = sweep.wick_extreme - atr * _PS_REVERSAL_SL_BUFFER
         else:
-            sl = sweep.wick_extreme + atr * _SL_BUFFER_ATR
+            sl = sweep.wick_extreme + atr * _PS_REVERSAL_SL_BUFFER
 
+        # Liquidity-aware SL push
         if self._last_liq_snapshot is not None:
             _lb = 0.25 * atr
             if side == "long":
@@ -1439,17 +1876,32 @@ class EntryEngine:
 
         risk = abs(price - sl)
         if risk < 1e-10:
+            self._post_sweep    = None
+            self._state         = EngineState.SCANNING
+            self._state_entered = now
+            return
+
+        # SL distance validation
+        sl_dist_pct = risk / price
+        if sl_dist_pct < 0.001 or sl_dist_pct > 0.035:
+            logger.debug(f"REVERSAL: SL rejected — distance {sl_dist_pct:.3%} "
+                        f"out of [0.1%, 3.5%] range")
+            self._post_sweep    = None
+            self._state         = EngineState.SCANNING
+            self._state_entered = now
             return
 
         # Record sweep direction BEFORE any R:R gate
         self._last_sweep_reversal_dir  = side
         self._last_sweep_reversal_time = now
 
+        # ── TP: Pool target → HTF escalation → gated synthetic ───────
         _signal_target = decision.next_target
         tp = None
         if decision.next_target:
             _pool_tp = decision.next_target.pool.price
-            _pool_tp -= atr * _TP_BUFFER_ATR if side == "long" else -atr * _TP_BUFFER_ATR
+            _buf = atr * _TP_BUFFER_ATR
+            _pool_tp = _pool_tp - _buf if side == "long" else _pool_tp + _buf
             if abs(_pool_tp - price) / risk >= _MIN_RR_RATIO:
                 tp = _pool_tp
 
@@ -1462,8 +1914,17 @@ class EntryEngine:
                 logger.info(f"Sweep reversal HTF TP: [{_htf_target.pool.timeframe}] "
                             f"${_htf_target.pool.price:,.1f}")
 
-        if tp is None:
+        # Synthetic 2R TP: ONLY if CISD confirmed (prevents structureless trades)
+        _cisd_ok = ps is not None and ps.cisd_detected
+        if tp is None and _cisd_ok:
             tp = price + risk * 2.0 if side == "long" else price - risk * 2.0
+            logger.info(f"REVERSAL: using 2R synthetic TP (CISD confirmed)")
+        elif tp is None:
+            logger.info(f"REVERSAL: no TP available and no CISD — aborting")
+            self._post_sweep    = None
+            self._state         = EngineState.SCANNING
+            self._state_entered = now
+            return
 
         reward = abs(tp - price)
         rr     = reward / risk
@@ -1473,19 +1934,26 @@ class EntryEngine:
             self._state_entered = now
             return
 
+        # ── Build entry signal ────────────────────────────────────────
+        _disp_info = f" DISP={ps.max_displacement:.1f}ATR" if ps else ""
+        _cisd_info = f" CISD={ps.cisd_type}" if ps and ps.cisd_detected else ""
+        _ote_info  = " OTE=✓" if ps and ps.ote_reached else ""
+
         self._signal = EntrySignal(
             side=side,
             entry_type=EntryType.SWEEP_REVERSAL,
             entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
             target_pool=_signal_target or PoolTarget(
                 pool=sweep.pool, distance_atr=0, direction=side,
-                significance=sweep.pool.significance, tf_sources=[]),
+                significance=getattr(sweep.pool, 'significance', 3.0),
+                tf_sources=[]),
             sweep_result=sweep, conviction=decision.confidence,
-            reason=decision.reason,
+            reason=f"{decision.reason}{_cisd_info}{_disp_info}{_ote_info}",
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"SIGNAL: REVERSAL {side.upper()} | "
-                    f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}")
+        logger.info(f"🎯 SIGNAL: REVERSAL {side.upper()} | "
+                    f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}"
+                    f"{_cisd_info}{_disp_info}{_ote_info}")
         self._post_sweep = None
 
     def _handle_sweep_continuation(
@@ -1499,6 +1967,12 @@ class EntryEngine:
         atr:      float,
         now:      float,
     ) -> None:
+        """
+        Continuation entry handler with fixed SL placement.
+
+        SL: 0.40×ATR BEYOND the swept pool (was AT the pool where stops
+        already triggered — the worst possible SL placement for continuations).
+        """
         side        = decision.direction
         next_target = decision.next_target
         if next_target is None:
@@ -1507,9 +1981,15 @@ class EntryEngine:
             self._state_entered = now
             return
 
-        sl = (sweep.pool.price - atr * 0.20 if side == "long"
-              else sweep.pool.price + atr * 0.20)
+        # ── SL: BEYOND the swept pool, not AT it ─────────────────────
+        if side == "long":
+            # Continuation long after SSL sweep → SL below the swept SSL pool
+            sl = sweep.pool.price - atr * _PS_CONTINUATION_SL_BUFFER
+        else:
+            # Continuation short after BSL sweep → SL above the swept BSL pool
+            sl = sweep.pool.price + atr * _PS_CONTINUATION_SL_BUFFER
 
+        # Liquidity-aware SL push
         if self._last_liq_snapshot is not None:
             _lb = 0.25 * atr
             if side == "long":
@@ -1527,8 +2007,36 @@ class EntryEngine:
         risk   = abs(price - sl)
         reward = abs(tp - price)
         if risk < 1e-10:
+            self._post_sweep    = None
+            self._state         = EngineState.SCANNING
+            self._state_entered = now
             return
+
+        # SL distance validation
+        sl_dist_pct = risk / price
+        if sl_dist_pct < 0.001 or sl_dist_pct > 0.035:
+            logger.debug(f"CONTINUATION: SL rejected — distance {sl_dist_pct:.3%}")
+            self._post_sweep    = None
+            self._state         = EngineState.SCANNING
+            self._state_entered = now
+            return
+
         rr = reward / risk
+        if rr < _MIN_RR_RATIO:
+            # Try HTF escalation for continuation
+            _htf_tp, _htf_target = self._find_htf_tp(
+                snap, side, price, atr, sl, _MIN_RR_RATIO)
+            if _htf_tp is not None:
+                tp = _htf_tp
+                next_target = _htf_target
+                reward = abs(tp - price)
+                rr = reward / risk
+            else:
+                self._post_sweep    = None
+                self._state         = EngineState.SCANNING
+                self._state_entered = now
+                return
+
         if rr < _MIN_RR_RATIO:
             self._post_sweep    = None
             self._state         = EngineState.SCANNING
@@ -1543,7 +2051,7 @@ class EntryEngine:
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"SIGNAL: CONTINUATION {side.upper()} -> "
+        logger.info(f"🎯 SIGNAL: CONTINUATION {side.upper()} -> "
                     f"${next_target.pool.price:,.1f} R:R={rr:.1f}")
         self._post_sweep = None
 

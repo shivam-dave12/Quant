@@ -71,14 +71,14 @@ except ImportError:
 try:
     from strategy.entry_engine import (
         EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
-        EntryType,
+        EntryType, ICTSweepEvent,
     )
     _ENTRY_ENGINE_AVAILABLE = True
 except ImportError:
     try:
         from entry_engine import (
             EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
-            EntryType,
+            EntryType, ICTSweepEvent,
         )
         _ENTRY_ENGINE_AVAILABLE = True
     except ImportError:
@@ -5134,6 +5134,37 @@ class QuantStrategy:
                     pass
             except Exception as e:
                 logger.debug(f"ICT context build error: {e}")
+
+        # Step 6b: Bridge ICT sweeps into entry engine context
+        # The ICT engine detects sweeps on its own liquidity_pools via
+        # _detect_sweeps(). These sweeps are INVISIBLE to the LiquidityMap's
+        # check_sweeps() because the two systems track separate pool registries.
+        # Without this bridge, 34+ ICT sweeps per session are completely lost
+        # and the post-sweep pipeline never fires.
+        if (self._ict is not None
+                and hasattr(self._ict, 'liquidity_pools')
+                and _ENTRY_ENGINE_AVAILABLE):
+            try:
+                _sweep_age_limit = now_ms - 30_000  # sweeps from last 30s
+                for pool in self._ict.liquidity_pools:
+                    if pool.swept and pool.sweep_timestamp > _sweep_age_limit:
+                        c5 = candles_by_tf.get("5m", [])
+                        _ch = float(c5[-2]['h']) if len(c5) >= 2 else price
+                        _cl = float(c5[-2]['l']) if len(c5) >= 2 else price
+                        _cc = float(c5[-2]['c']) if len(c5) >= 2 else price
+                        ict_ctx.ict_sweeps.append(ICTSweepEvent(
+                            pool_price=pool.price,
+                            pool_type=pool.level_type,
+                            sweep_ts=pool.sweep_timestamp,
+                            displacement=pool.displacement_confirmed,
+                            disp_score=pool.displacement_score,
+                            wick_reject=pool.wick_rejection,
+                            candle_high=_ch,
+                            candle_low=_cl,
+                            candle_close=_cc,
+                        ))
+            except Exception as e:
+                logger.debug(f"ICT sweep bridge error: {e}")
 
         # Step 7: Feed to entry engine
         self._entry_engine.update(
