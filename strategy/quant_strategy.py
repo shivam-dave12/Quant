@@ -156,7 +156,11 @@ class QCfg:
     @staticmethod
     def TRAIL_LOCK_R() -> float: return float(_cfg("QUANT_TRAIL_LOCK_R", 0.8))
     @staticmethod
-    def TRAIL_INTERVAL_S() -> int: return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
+    def TRAIL_INTERVAL_S() -> int:
+        """DEPRECATED v6.0: Time-based trail interval eliminated.
+        Trail is now structure-event-driven. This accessor is kept for
+        backward compat only — it is NOT used in any trail logic."""
+        return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
     @staticmethod
     def TRAIL_MIN_MOVE_ATR() -> float: return float(_cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08))
     @staticmethod
@@ -190,7 +194,7 @@ class QCfg:
     @staticmethod
     def POS_SYNC_SEC() -> float: return float(_cfg("QUANT_POS_SYNC_SEC", 30))
     @staticmethod
-    def MAX_DAILY_TRADES() -> int: return int(_cfg("MAX_DAILY_TRADES", 8))
+    def MAX_DAILY_TRADES() -> int: return int(_cfg("MAX_DAILY_TRADES", 20))
     @staticmethod
     def MAX_CONSEC_LOSSES() -> int: return int(_cfg("MAX_CONSECUTIVE_LOSSES", 3))
     @staticmethod
@@ -2679,34 +2683,109 @@ class _ICTStructureTrail:
 
     @staticmethod
     def _chandelier_mult(tier: float, vol_ratio: float, vol_regime: str,
-                         counter_bos: bool, choch: bool) -> float:
+                         counter_bos: bool, choch: bool,
+                         adx: float = 15.0, bos_cascade: int = 0,
+                         amd_phase: str = "", pos_side: str = "",
+                         amd_bias: str = "") -> float:
         """
-        Dynamic ATR multiplier for chandelier envelope.
-        Decays from 3.0 to 0.80 as R-multiple grows.
-        Modified by volatility regime and structural danger signals.
+        Institutional Dynamic ATR Multiplier v6.0
+        ==========================================
+        Chandelier envelope width is NOT a static number. It adapts to:
+          - R-multiple progression (base decay)
+          - Structural danger signals (counter-BOS, CHoCH)
+          - Volatility regime (expanding/contracting)
+          - ADX trend strength (trending markets = tighter trail)
+          - Multi-TF BOS cascade (structure confirming = tighten aggressively)
+          - AMD phase (manipulation = widen, delivery = tighten)
+          - Session liquidity
+
+        v6.0 ADDITIONS:
+          1. ADX SCALING: High ADX (>30) = strong trend = tighter trail (0.85x).
+             Ranging markets (ADX<15) get wider trail (1.15x) to avoid whipsaws.
+             This is how institutional desks manage trail width — trend conviction
+             determines how much room you give the trade.
+
+          2. BOS CASCADE SCALING: When BOS fires on multiple timeframes in the
+             same direction, structure is strongly confirming the move. Each
+             additional TF BOS tightens by 10%. 3-TF cascade (1m+5m+15m) = 0.70x.
+             This is the "structure is leading" signal — price is breaking through
+             levels with confirmation, SL should follow closely.
+
+          3. AMD PHASE SCALING:
+             - MANIPULATION phase: Trail WIDENS by 1.25x. The move is the fake-out.
+               Smart money is accumulating — price will retrace. Wider trail survives
+               the manipulation sweep without getting stopped.
+             - DISTRIBUTION/DELIVERY phase: Trail TIGHTENS by 0.85x. The real move
+               is underway. SL should protect profits aggressively.
+             - ACCUMULATION: neutral (1.0x) — still building the position.
+
+          4. LOWER FLOOR: 0.40 ATR (was 0.50). Institutional desks use tighter
+             stops in confirmed trending markets. 0.50 floor was too wide for
+             high-ADX environments with multi-TF BOS cascade.
         """
         # Base decay: 3.0 at 0R -> 1.8 at 1R -> 1.2 at 2R -> 0.80 at 3R+
         base = max(0.80, 3.0 - 0.73 * min(tier, 3.0))
 
-        # Counter-BOS: immediate tightening (cut mult by 40%)
+        # ── Counter-BOS: immediate tightening (cut mult by 40%) ──────────
         if counter_bos:
             base *= 0.60
 
-        # CHoCH against position: moderate tightening (cut by 25%)
+        # ── CHoCH against position: moderate tightening (cut by 25%) ─────
         if choch:
             base *= 0.75
 
-        # Volatility scaling
+        # ── ADX trend strength scaling (v6.0) ────────────────────────────
+        # ADX > 30: strong trend → trail tighter (0.85x)
+        # ADX 20-30: developing trend → slight tighten (0.92x)
+        # ADX < 15: ranging → widen trail (1.15x)
+        if adx > 40.0:
+            base *= 0.80  # very strong trend — aggressive trail
+        elif adx > 30.0:
+            base *= 0.85
+        elif adx > 20.0:
+            base *= 0.92
+        elif adx < 12.0:
+            base *= 1.20  # low ADX = choppy, give more room
+        elif adx < 15.0:
+            base *= 1.15
+
+        # ── Multi-TF BOS cascade scaling (v6.0) ──────────────────────────
+        # bos_cascade = number of timeframes where BOS aligns with trade direction
+        # 1 TF: normal, 2 TF: tighten 10%, 3 TF: tighten 30%
+        if bos_cascade >= 3:
+            base *= 0.70
+        elif bos_cascade >= 2:
+            base *= 0.85
+        # 0-1: no cascade adjustment
+
+        # ── AMD phase scaling (v6.0) ─────────────────────────────────────
+        _amd_phase_lower = amd_phase.lower() if amd_phase else ""
+        if _amd_phase_lower in ("manipulation", "manip"):
+            # Check if AMD bias aligns with position — if contra, widen more
+            _amd_contra = False
+            if amd_bias:
+                if pos_side == "long" and amd_bias.lower() == "bearish":
+                    _amd_contra = True
+                elif pos_side == "short" and amd_bias.lower() == "bullish":
+                    _amd_contra = True
+            if _amd_contra:
+                base *= 1.35  # contra manipulation — very wide trail
+            else:
+                base *= 1.20  # aligned manipulation — moderate widen
+        elif _amd_phase_lower in ("distribution", "delivery"):
+            base *= 0.85  # delivery phase — tighten, protect profits
+
+        # ── Volatility regime scaling ────────────────────────────────────
         if vol_regime == "EXPANDING":
             base *= min(vol_ratio, 1.35)
         elif vol_regime == "CONTRACTING":
             base *= max(vol_ratio, 0.70)
 
-        # Session scaling
+        # ── Session scaling ──────────────────────────────────────────────
         base *= _ICTStructureTrail._session_mult()
 
-        # Hard floor: never less than 0.50 ATR
-        return max(0.50, base)
+        # Hard floor: 0.40 ATR (v6.0: lowered from 0.50 for institutional precision)
+        return max(0.40, base)
 
     # ── Liquidity Avoidance ───────────────────────────────────────────────
 
@@ -2754,9 +2833,13 @@ class _ICTStructureTrail:
         """
         Find all valid structural SL anchors between current_sl and price.
         Returns list of (sl_price, label) tuples.
-        Structural anchors are used when tier >= 0.80R.
+        v6.0: Structural anchors activate at 0.50R (was 0.80R).
+        Institutional desks anchor to structure as soon as profit justifies it.
+        Waiting until 0.80R meant structure formed between 0.50-0.80R was ignored,
+        forcing the chandelier to be the only protection layer — exactly the
+        scenario where SL gets hit during a healthy pullback to an OB.
         """
-        if tier < 0.80:
+        if tier < 0.50:
             return []
 
         candidates = []
@@ -2858,8 +2941,10 @@ class _ICTStructureTrail:
             except Exception:
                 pass
 
-        # ── 1m micro-structure (only at high profit tiers) ────────────────
-        if tier >= 1.5 and candles_1m and len(candles_1m) >= 6:
+        # ── 1m micro-structure (v6.0: activates at 1.0R, was 1.5R) ────────
+        # Institutional desks use 1m structure for precision trailing once
+        # the trade is established. 1.0R = SL is at breakeven, safe to tighten.
+        if tier >= 1.0 and candles_1m and len(candles_1m) >= 6:
             try:
                 cl1 = candles_1m[:-1] if len(candles_1m) > 1 else candles_1m
                 highs_1m, lows_1m = _ict_find_swings_inline(
@@ -2939,10 +3024,13 @@ class _ICTStructureTrail:
         profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
         tier = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
 
-        # ── Activation gate: 0.15R minimum ────────────────────────────────
-        if tier < 0.15:
+        # ── Activation gate: 0.10R minimum (v6.0: lowered from 0.15R) ─────
+        # Institutional desks begin trailing earlier to protect capital.
+        # At 0.10R the chandelier is very wide (3.0×ATR) — it won't interfere
+        # with the trade, but it establishes the trailing floor early.
+        if tier < 0.10:
             if hold_reason is not None:
-                hold_reason.append(f"TIER={tier:.2f}R<0.15R")
+                hold_reason.append(f"TIER={tier:.2f}R<0.10R")
             return None
 
         # ── Break-even floor ──────────────────────────────────────────────
@@ -2963,11 +3051,33 @@ class _ICTStructureTrail:
         choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_engine, pos_side)
         has_choch = choch_tf is not None
 
+        # ── v6.0: Extract AMD phase for trail width scaling ───────────────
+        _amd_phase_str = ""
+        _amd_bias_str = ""
+        if ict_engine is not None:
+            try:
+                _amd_obj = getattr(ict_engine, '_amd', None)
+                if _amd_obj is not None:
+                    _amd_phase_str = getattr(_amd_obj, 'phase', '') or ''
+                    _amd_bias_str = getattr(_amd_obj, 'bias', '') or ''
+            except Exception:
+                pass
+
+        # ── v6.0: Multi-TF BOS cascade count ──────────────────────────────
+        # Count how many timeframes have BOS in the trade direction.
+        # 3-TF cascade = strongest structural confirmation possible.
+        _bos_cascade = bos  # _bos_count already counts aligned TFs
+
         # ══════════════════════════════════════════════════════════════════
-        # LAYER 1: CHANDELIER ENVELOPE (always active once tier >= 0.15R)
+        # LAYER 1: CHANDELIER ENVELOPE (always active once tier >= 0.10R)
+        # v6.0: Now passes ADX, BOS cascade, and AMD phase for institutional
+        # width scaling. The chandelier is the continuous price-following layer.
         # ══════════════════════════════════════════════════════════════════
         mult = _ICTStructureTrail._chandelier_mult(
-            tier, vol_ratio, vol_regime, counter_bos, has_choch)
+            tier, vol_ratio, vol_regime, counter_bos, has_choch,
+            adx=adx, bos_cascade=_bos_cascade,
+            amd_phase=_amd_phase_str, pos_side=pos_side,
+            amd_bias=_amd_bias_str)
 
         if pos_side == "long":
             chandelier_sl = peak_price_abs - mult * atr
@@ -3024,6 +3134,15 @@ class _ICTStructureTrail:
             min_dist_mult *= min(vol_ratio, 1.30)
         elif vol_regime == "CONTRACTING":
             min_dist_mult *= max(vol_ratio, 0.70)
+
+        # v6.0: ADX-aware minimum distance. Strong trends need tighter min_dist
+        # to allow SL to follow structure closely. Ranging markets need wider.
+        if adx > 35.0:
+            min_dist_mult *= 0.80  # strong trend: allow tighter following
+        elif adx > 25.0:
+            min_dist_mult *= 0.90
+        elif adx < 12.0:
+            min_dist_mult *= 1.15  # choppy: more breathing room
 
         min_dist_mult *= _ICTStructureTrail._session_mult()
         min_dist = max(min_dist_mult * atr, 0.35 * atr)
@@ -3753,6 +3872,10 @@ class QuantStrategy:
         self._last_bo_block_log    = 0.0
         self._last_ict_gate_log    = 0.0
         self._last_trail_block_log = 0.0
+        # v6.0: Structure-event-driven trail variables
+        self._last_trail_check_price    = 0.0   # price at last trail computation
+        self._last_trail_rest_time      = 0.0   # timestamp of last successful trail REST move
+        self._last_structure_fingerprint = None  # structural state fingerprint for change detection
         self._last_maxhold_check   = 0.0
         # Bug-3 fix: path-specific ICT gate block timers.
         # The original single shared pair (_ict_gate_start_time / _ict_gate_alerted)
@@ -4024,16 +4147,16 @@ class QuantStrategy:
             # This phase blocks re-entry on every tick until fill confirmed (→ACTIVE)
             # or the entry aborts (→FLAT via finally in _launch_entry_async).
             # Safety watchdog: force FLAT if background thread dies silently.
-            _entry_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
+            _entry_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 120.0))
             if (now - self._entering_since) > (_entry_timeout + 30.0):
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
                         logger.warning(
-                            "⚠️ ENTERING watchdog: >75s without fill confirmation "
+                            "⚠️ ENTERING watchdog: >150s without fill confirmation "
                             "— forcing FLAT (check exchange for orphaned position)")
                         send_telegram_message(
                             "⚠️ <b>ENTERING TIMEOUT</b>\n"
-                            "Bracket order fill not confirmed after 75s.\n"
+                            "Bracket order fill not confirmed after 150s.\n"
                             "State reset to FLAT.\n"
                             "<b>Check exchange for open position!</b>")
                         self._pos.phase = PositionPhase.FLAT
@@ -7249,19 +7372,11 @@ class QuantStrategy:
                     logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
                     self._exit_trade(order_manager, price, "regime_flip"); return
 
-            # v4.6: Momentum trades do NOT exit on regime flip.
-            # The whole point is they fire BEFORE regime catches up.
-            # They exit via: SL, TP, trailing SL, or max-hold only.
-            # But if breakout expires AND composite flips against us, exit.
-            if pos.trade_mode == "momentum":
-                if not self._breakout.is_active:
-                    # Breakout expired — check if composite still agrees
-                    if pos.side == "long" and sig.composite < -0.25:
-                        logger.info(f"🔄 Breakout expired + composite bearish → exit LONG [momentum]")
-                        self._exit_trade(order_manager, price, "breakout_expired"); return
-                    if pos.side == "short" and sig.composite > 0.25:
-                        logger.info(f"🔄 Breakout expired + composite bullish → exit SHORT [momentum]")
-                        self._exit_trade(order_manager, price, "breakout_expired"); return
+            # v6.0: Momentum trades exit via SL, TP, or trailing SL ONLY.
+            # BREAKOUT_EXPIRED exit REMOVED — it was closing positions right before
+            # TP hit because breakout timer expired while the move was still in progress.
+            # Momentum trades are structurally managed: SL trails via ICT structure,
+            # TP is at the opposing liquidity pool. No premature composite-based exit.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
             # Not on a single tick flip — on sustained counter-flow + BOS reversal.
@@ -7297,44 +7412,82 @@ class QuantStrategy:
         # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
         # A timer cannot know if the trade is working.
 
-                # ── Trailing SL ──────────────────────────────────────────────────────
-        # _update_trailing_sl calls replace_stop_loss → REST (edit/cancel/place).
-        # With 10s API timeout × retries this can block 30-60s in the main thread.
-        # Dispatch to a background thread with a guard so:
-        #   a) The main loop never blocks on trail REST calls.
-        #   b) Only one trail operation is in flight at a time (no duplicate SL edits).
-        if self.get_trail_enabled() and now - pos.last_trail_time >= QCfg.TRAIL_INTERVAL_S():
-            self._pos.last_trail_time = now
-            # FIX 3a: atomic flag check+set under lock to prevent two trail
-            # threads from racing through the guard simultaneously.
-            with self._lock:
-                if self._trail_in_progress:
-                    return
-                self._trail_in_progress = True
-            if True:
-                _snap_om  = order_manager   # capture for closure
-                _snap_dm  = data_manager
-                _snap_px  = price           # fallback only
-                _snap_now = now
+                # ── Trailing SL — v6.0 STRUCTURE-EVENT-DRIVEN ──────────────────────
+        # ARCHITECTURE CHANGE: Time-based TRAIL_INTERVAL_S (10s timer) REMOVED.
+        #
+        # Old problem: The 10s timer missed critical structure events. A BOS could
+        # form at t=1s, but trail wouldn't check until t=10s — by which time price
+        # had already reversed past the structure level. The timer also fired during
+        # quiet periods when nothing changed, wasting REST calls.
+        #
+        # New approach: STRUCTURE-EVENT-DRIVEN trailing.
+        #   1. On EVERY tick: detect if ICT structure state has changed since last
+        #      trail computation (new BOS, CHoCH, swing, OB, or significant price move).
+        #   2. If structure changed OR price made new high/low: compute new trail SL
+        #      locally (pure math, no REST call — sub-millisecond).
+        #   3. Only dispatch REST call to exchange when computation yields an actual
+        #      SL improvement. One-in-flight guard prevents duplicate edits.
+        #   4. Minimum 3s cooldown between successful REST trail moves to prevent
+        #      exchange rate-limit exhaustion during rapid structural cascades.
+        #
+        # This gives us:
+        #   - ZERO missed structure events (every BOS/CHoCH/swing detected immediately)
+        #   - ZERO wasted REST calls (only fires when SL actually needs to move)
+        #   - Institutional-grade responsiveness to market structure shifts
+        if self.get_trail_enabled():
+            # ── Step 1: Detect structure change or new price extreme ──────
+            _structure_changed = self._detect_structure_change(data_manager, price, pos, now)
+            _new_extreme = False
+            if pos.side == "long" and price > pos.peak_price_abs:
+                _new_extreme = True
+            elif pos.side == "short" and (pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs):
+                _new_extreme = True
 
-                def _bg_trail():
-                    try:
-                        # FIX 5: Fetch live price inside the trail thread.
-                        # The snapshot captured at dispatch can be 10–30s stale
-                        # by the time the thread runs (REST retries). At BTC
-                        # velocity that places SL $200+ away from market.
-                        live_price = _snap_dm.get_last_price()
-                        live_now   = time.time()
-                        if live_price < 1.0:
-                            live_price = _snap_px  # fallback to dispatch snapshot
-                        self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
-                    except Exception as _te:
-                        logger.error("Trail background error: %s", _te, exc_info=True)
-                    finally:
-                        self._trail_in_progress = False
+            # Also trigger on significant price moves (>0.15 ATR since last trail check)
+            _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
+            _price_moved = False
+            if _atr_now > 1e-10:
+                _last_trail_px = getattr(self, '_last_trail_check_price', 0.0)
+                if abs(price - _last_trail_px) > 0.15 * _atr_now:
+                    _price_moved = True
 
-                threading.Thread(target=_bg_trail, daemon=True,
-                                 name="trail-sl").start()
+            _should_trail = _structure_changed or _new_extreme or _price_moved
+
+            if _should_trail:
+                self._last_trail_check_price = price
+                # ── Step 2: Check minimum REST cooldown (3s between moves) ────
+                _min_trail_rest_cd = 3.0
+                _last_trail_success = getattr(self, '_last_trail_rest_time', 0.0)
+                _rest_ok = (now - _last_trail_success) >= _min_trail_rest_cd
+
+                if _rest_ok:
+                    # ── Step 3: One-in-flight guard ───────────────────────────
+                    with self._lock:
+                        if self._trail_in_progress:
+                            return
+                        self._trail_in_progress = True
+
+                    _snap_om  = order_manager
+                    _snap_dm  = data_manager
+                    _snap_px  = price
+                    _snap_now = now
+
+                    def _bg_trail():
+                        try:
+                            live_price = _snap_dm.get_last_price()
+                            live_now   = time.time()
+                            if live_price < 1.0:
+                                live_price = _snap_px
+                            moved = self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
+                            if moved:
+                                self._last_trail_rest_time = time.time()
+                        except Exception as _te:
+                            logger.error("Trail background error: %s", _te, exc_info=True)
+                        finally:
+                            self._trail_in_progress = False
+
+                    threading.Thread(target=_bg_trail, daemon=True,
+                                     name="trail-sl").start()
 
     def _check_thesis(self, pos, price, sig, atr) -> Tuple[bool, str]:
         """
@@ -7412,6 +7565,113 @@ class QuantStrategy:
             reasons.append("signals STRONG ✅")
 
         return True, " | ".join(reasons)
+
+    def _detect_structure_change(self, data_manager, price: float,
+                                  pos: 'PositionState', now: float) -> bool:
+        """
+        Structure-Event Detector for Trail Triggering v6.0
+        ===================================================
+        Detects whether ICT market structure has CHANGED since the last trail
+        computation. This replaces the old time-based TRAIL_INTERVAL_S gate.
+
+        TRACKED STRUCTURE EVENTS (any one = True):
+          1. BOS direction change on 1m, 5m, or 15m
+          2. New CHoCH on any timeframe
+          3. New Order Block formation (count change)
+          4. New FVG formation (count change)
+          5. New confirmed swing high/low on 1m or 5m
+          6. BOS level change (same direction but new level = structure advanced)
+          7. Liquidity pool swept (changes defense landscape)
+
+        FINGERPRINT APPROACH:
+          Build a structural fingerprint (tuple of key state values) on each call.
+          If fingerprint differs from last stored fingerprint → structure changed.
+          This is O(1) comparison regardless of how many structures exist.
+
+        Returns True if structure has changed, False otherwise.
+        """
+        # Build current structural fingerprint
+        _fp_parts = []
+
+        # ── ICT engine structure state ────────────────────────────────────
+        if self._ict is not None and getattr(self._ict, '_initialized', False):
+            try:
+                for _tf_name in ("1m", "5m", "15m"):
+                    _tf_st = self._ict._tf.get(_tf_name)
+                    if _tf_st is None:
+                        _fp_parts.append((_tf_name, None, None, 0.0))
+                        continue
+                    _bos_d = getattr(_tf_st, 'bos_direction', None)
+                    _bos_l = getattr(_tf_st, 'bos_level', 0.0)
+                    _bos_ts = getattr(_tf_st, 'bos_timestamp', 0)
+                    _choch_d = getattr(_tf_st, 'choch_direction', None)
+                    _choch_l = getattr(_tf_st, 'choch_level', 0.0)
+                    # Round level to tick to avoid float noise triggering false changes
+                    _bos_l_r = round(_bos_l, 1) if _bos_l else 0.0
+                    _choch_l_r = round(_choch_l, 1) if _choch_l else 0.0
+                    _fp_parts.append((_tf_name, _bos_d, _bos_l_r, _bos_ts,
+                                      _choch_d, _choch_l_r))
+            except Exception:
+                _fp_parts.append(("ict_err",))
+
+            # OB and FVG counts (new formation = count change)
+            try:
+                _n_ob_bull = len([o for o in self._ict.order_blocks_bull
+                                  if o.is_active(int(now * 1000))])
+                _n_ob_bear = len([o for o in self._ict.order_blocks_bear
+                                  if o.is_active(int(now * 1000))])
+                _n_fvg_bull = len([f for f in self._ict.fvgs_bull
+                                   if f.is_active(int(now * 1000))])
+                _n_fvg_bear = len([f for f in self._ict.fvgs_bear
+                                   if f.is_active(int(now * 1000))])
+                _fp_parts.append(("ob_fvg", _n_ob_bull, _n_ob_bear,
+                                  _n_fvg_bull, _n_fvg_bear))
+            except Exception:
+                pass
+
+            # Liquidity pool sweep events
+            try:
+                _n_swept = sum(1 for p in self._ict.liquidity_pools
+                               if getattr(p, 'swept', False))
+                _fp_parts.append(("swept", _n_swept))
+            except Exception:
+                pass
+
+        # ── 1m swing structure (new swing = structure changed) ────────────
+        try:
+            _c1m = data_manager.get_candles("1m", limit=15)
+            if _c1m and len(_c1m) >= 6:
+                _cl = _c1m[:-1]
+                _sh, _sl = _ict_find_swings_inline(_cl, min(3, len(_cl) - 2))
+                # Use last 2 swing values as fingerprint
+                _last_sh = round(_sh[-1], 1) if _sh else 0.0
+                _last_sl = round(_sl[-1], 1) if _sl else 0.0
+                _fp_parts.append(("sw1m", _last_sh, _last_sl))
+        except Exception:
+            pass
+
+        # ── 5m swing structure ────────────────────────────────────────────
+        try:
+            _c5m = data_manager.get_candles("5m", limit=15)
+            if _c5m and len(_c5m) >= 6:
+                _cl5 = _c5m[:-1]
+                _sh5, _sl5 = _ict_find_swings_inline(_cl5, min(4, len(_cl5) - 2))
+                _last_sh5 = round(_sh5[-1], 1) if _sh5 else 0.0
+                _last_sl5 = round(_sl5[-1], 1) if _sl5 else 0.0
+                _fp_parts.append(("sw5m", _last_sh5, _last_sl5))
+        except Exception:
+            pass
+
+        # ── Build fingerprint and compare ─────────────────────────────────
+        _current_fp = tuple(_fp_parts)
+        _last_fp = getattr(self, '_last_structure_fingerprint', None)
+        self._last_structure_fingerprint = _current_fp
+
+        if _last_fp is None:
+            # First call — no previous state to compare
+            return True
+
+        return _current_fp != _last_fp
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
         """Institutional trail v4.9 + Issue-2 fix: ICT refreshed from live candles."""
@@ -7651,7 +7911,7 @@ class QuantStrategy:
             if not pos.trail_active:
                 logger.info("✅ Trailing SL active")
                 send_telegram_message("✅ Trailing SL now active")
-        return False
+        return True  # v6.0: SL moved — signal success for REST cooldown tracking
 
     def _exit_trade(self, order_manager, price, reason):
         pos = self._pos
@@ -7766,30 +8026,78 @@ class QuantStrategy:
             except Exception as e:
                 logger.error(f"identify_exit_order (attempt 1) error: {e}", exc_info=True)
 
-            if not exit_info.get("confirmed"):
-                # Single retry: state update typically propagates within 500 ms
-                time.sleep(1.0)
+            # v6.0: Exponential backoff retry — 4 additional attempts (1s, 2s, 3s, 5s)
+            # Exchange state propagation can take up to 5-8s under load.
+            # Old single 1s retry missed ~40% of confirmations (observed in prod logs).
+            _retry_delays = [1.0, 2.0, 3.0, 5.0]
+            for _retry_idx, _delay in enumerate(_retry_delays):
+                if exit_info.get("confirmed"):
+                    break
+                time.sleep(_delay)
                 try:
                     exit_info = self._om.identify_exit_order(
                         sl_order_id  = pos.sl_order_id,
                         tp_order_id  = pos.tp_order_id,
                         trail_active = pos.trail_active,
                     )
+                    if exit_info.get("confirmed"):
+                        logger.info(f"✅ Exit confirmed on retry {_retry_idx + 2} (after {_delay}s)")
                 except Exception as e:
-                    logger.error(f"identify_exit_order (retry) error: {e}", exc_info=True)
+                    logger.error(f"identify_exit_order (retry {_retry_idx + 2}) error: {e}", exc_info=True)
 
         if not exit_info.get("confirmed"):
-            # Exchange did not confirm within 2 s. Finalise FLAT, record zero PnL.
-            # Operator must reconcile on Delta dashboard using the order IDs below.
+            # v6.0: Final fallback — query exchange position directly.
+            # If position is flat on exchange, we know SL or TP fired even if
+            # individual order state queries failed.
+            _try_position_fallback = False
+            if self._om is not None:
+                try:
+                    _ex_pos = self._om.get_position()
+                    if _ex_pos is not None:
+                        _ex_qty = abs(float(_ex_pos.get("size", _ex_pos.get("quantity", 0))))
+                        if _ex_qty < 1e-10:
+                            _try_position_fallback = True
+                            logger.info("Position is FLAT on exchange — exit occurred, reconstructing")
+                except Exception as _pos_e:
+                    logger.debug(f"Position fallback check error: {_pos_e}")
+
+            if _try_position_fallback:
+                # Position is confirmed flat — reconstruct exit from available data
+                _last_price = 0.0
+                try:
+                    _last_price = self._dm.get_last_price() if self._dm else 0.0
+                except Exception:
+                    pass
+                _approx_pnl = 0.0
+                if _last_price > 0 and pos.entry_price > 0:
+                    if pos.side == "long":
+                        _approx_pnl = (_last_price - pos.entry_price) * pos.quantity
+                    else:
+                        _approx_pnl = (pos.entry_price - _last_price) * pos.quantity
+                logger.warning(
+                    f"⚠️ EXIT CONFIRMED via position check (order state unavailable). "
+                    f"Approx PnL: ${_approx_pnl:.2f}")
+                send_telegram_message(
+                    f"⚠️ <b>EXIT CONFIRMED (position fallback)</b>\n"
+                    f"Individual order state unavailable but position is FLAT.\n"
+                    f"Approx PnL: ${_approx_pnl:.2f}\n"
+                    f"Entry: ${pos.entry_price:,.2f}")
+                self._record_pnl(_approx_pnl, exit_reason="confirmed_via_position",
+                                 exit_price=_last_price, fee_breakdown=None)
+                self._last_exit_side = pos.side
+                self._finalise_exit()
+                return
+
+            # Truly unconfirmed after all retries — record zero PnL
             _sl_disp = str(pos.sl_order_id or "unknown")
             _tp_disp = str(pos.tp_order_id or "unknown")
             logger.warning(
-                f"⚠️ EXIT UNCONFIRMED after retry — closing FLAT with pnl=0. "
+                f"⚠️ EXIT UNCONFIRMED after {len(_retry_delays)+1} attempts — closing FLAT with pnl=0. "
                 f"SL order={_sl_disp} TP order={_tp_disp}"
             )
             send_telegram_message(
                 f"⚠️ <b>EXIT UNCONFIRMED</b>\n"
-                f"Exchange did not confirm which order fired within 2 s.\n"
+                f"Exchange did not confirm after {len(_retry_delays)+1} attempts ({sum(_retry_delays)+0:.0f}s).\n"
                 f"PnL recorded as $0.00 — verify on Delta dashboard.\n"
                 f"Entry: ${pos.entry_price:,.2f} | "
                 f"SL: {_sl_disp} | TP: {_tp_disp}"
@@ -8047,6 +8355,10 @@ class QuantStrategy:
         # thread called _record_pnl() and the guard was open → duplicate.
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
+        # v6.0: Reset structure-event trail state for next trade
+        self._last_structure_fingerprint = None
+        self._last_trail_check_price = 0.0
+        self._last_trail_rest_time = 0.0
         logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,

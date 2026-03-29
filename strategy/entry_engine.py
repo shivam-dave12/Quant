@@ -155,10 +155,10 @@ _PROXIMITY_CONFIRM_COUNT    = 1
 
 _MIN_SWEEP_QUALITY      = 0.35
 
-_CISD_MAX_WAIT_SEC      = 240
-_OTE_MAX_WAIT_SEC       = 480
-_TRACKING_TIMEOUT_SEC   = 180
-_READY_TIMEOUT_SEC      = 90
+_CISD_MAX_WAIT_SEC      = 360
+_OTE_MAX_WAIT_SEC       = 600
+_TRACKING_TIMEOUT_SEC   = 300
+_READY_TIMEOUT_SEC      = 150
 
 _MIN_RR_RATIO           = 1.4
 _SL_BUFFER_ATR          = 0.35    # v3.3: widened from 0.12 — old buffer was death zone for sweep retests
@@ -168,10 +168,10 @@ _ENTRY_COOLDOWN_SEC     = 30.0
 _POST_SWEEP_EVAL_SEC    = 10.0
 
 # ── Post-Sweep Pipeline v3.3 Constants ────────────────────────────────────
-_PS_PHASE_DISPLACEMENT_SEC =  30.0   # first 30s after sweep: expect displacement
-_PS_PHASE_CISD_SEC         =  90.0   # 30-90s: expect CISD (CHoCH/BOS reversal)
-_PS_PHASE_OTE_SEC          = 180.0   # 90-180s: expect OTE retrace to 50-78.6%
-_PS_PHASE_MATURE_SEC       = 240.0   # 180-240s: relaxed thresholds, final chance
+_PS_PHASE_DISPLACEMENT_SEC =  45.0   # first 45s after sweep: expect displacement
+_PS_PHASE_CISD_SEC         = 120.0   # 45-120s: expect CISD (CHoCH/BOS reversal)
+_PS_PHASE_OTE_SEC          = 240.0   # 120-240s: expect OTE retrace to 50-78.6%
+_PS_PHASE_MATURE_SEC       = 360.0   # 240-360s: relaxed thresholds, final chance
 
 _PS_DISP_MIN_ATR           = 0.5     # minimum displacement from sweep level
 _PS_DISP_STRONG_ATR        = 1.2     # strong displacement threshold
