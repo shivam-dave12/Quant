@@ -1,6 +1,43 @@
 """
-entry_engine.py — Liquidity-First Entry Decision Engine v3.3
+entry_engine.py — Liquidity-First Entry Decision Engine v3.4
 =============================================================
+FIXES IN v3.4
+─────────────
+FIX-FLAW1: AMD contra-penalty in MANIPULATION phase (critical logic gap).
+  The MANIPULATION phase scoring only rewarded AMD-aligned setups (+22 × conf)
+  but applied ZERO penalty when AMD was contra.  In the logged trade
+  (AMD: MANIPULATION bias=bullish conf=0.95, BSL swept → short entered), the
+  system assigned +0 from AMD when it should have penalised the reversal
+  heavily.  The BSL sweep IS the manipulation fake-out before bullish delivery
+  — going short here trades the wrong side of the AMD cycle.
+  Fix: add elif branch for contra MANIPULATION:
+    - rev_delta  -= 18.0 × max(conf, 0.5)   [penalty proportional to confidence]
+    - cont_delta += 10.8 × max(conf, 0.5)   [60% of penalty → cont bonus]
+    - Logged at INFO level for every contra firing (observable in prod logs)
+  Penalty is intentionally smaller than the aligned bonus (22) so that strong
+  structural evidence (CISD + OTE + sustained flow) can still override a
+  contra AMD reading on high-probability setups.
+
+FIX-FLAW2: Static evidence double-counting in the accumulative model.
+  The old _evaluate_post_sweep_accumulative() rescored ALL factors — including
+  time-invariant ones — on every tick, then added them to ps.rev_evidence.
+  This inflated the accumulated total by ~44 pts/tick, allowing a marginal
+  setup to reach the DISPLACEMENT threshold (55 × 1.30 = 71.5) in exactly
+  2 ticks regardless of actual price action:
+    tick 1: 44.25 → ×0.92 = 40.7;  tick 2: 40.7 + 44.25 = 84.95 → 78.2 ✓
+  The arithmetic was correct; the architecture was wrong.
+
+  Fix: strict static/dynamic separation.
+    STATIC (scored once into ps.static_rev_base / ps.static_cont_base):
+      AMD phase/bias, sweep quality, dealing range P/D, pool target
+      significance, OB blocking, session kill-zone.
+    DYNAMIC (fed into per-tick decay accumulator ps.rev_evidence):
+      live displacement growth, CISD freshness decay, OTE zone entry/exit,
+      instantaneous flow, EWMA flow, CVD, 5m CHoCH/BOS, 15m structure,
+      sustained flow consistency bonus.
+    Final totals: rev_total = static_rev_base + rev_evidence (dynamic)
+    The _PostSweepState dataclass gains: static_scored bool + two float bases.
+
 FIXES IN v3.3
 ─────────────
 BUG-FIX-CRITICAL: ICT sweep bridge — two disconnected sweep systems.
@@ -371,13 +408,27 @@ class _PostSweepState:
     # ── ICT sweep source (if bridged from ICT engine) ─────────────────
     ict_sweep_event:  Optional['ICTSweepEvent'] = None
 
+    # ── Static evidence baseline (FIX-FLAW2) ─────────────────────────
+    # Time-invariant factors (sweep quality, AMD bias, dealing range,
+    # pool significance, OB blocking, session) are scored exactly ONCE
+    # into these accumulators.  Per-tick scoring re-adds them every tick,
+    # inflating the accumulated totals and defeating the phase-adaptive
+    # gating — a setup scoring 44 pts/tick reaches the 71.5 DISPLACEMENT
+    # threshold in 2 ticks purely by re-adding static facts.
+    # Only truly dynamic factors (flow, CVD, CISD freshness, OTE holding,
+    # live displacement growth, CHoCH/BOS events) feed the per-tick decay
+    # model in rev_evidence / cont_evidence.
+    static_scored:     bool  = False   # True after first scoring pass
+    static_rev_base:   float = 0.0     # one-time reversal baseline
+    static_cont_base:  float = 0.0     # one-time continuation baseline
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRY ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
 class EntryEngine:
-    """Single-flow entry decision engine v3.3 — ICT sweep bridge + multi-phase post-sweep."""
+    """Single-flow entry decision engine v3.4 — AMD contra-penalty + static/dynamic evidence split."""
 
     def __init__(self) -> None:
         self._state         = EngineState.SCANNING
@@ -1600,41 +1651,170 @@ class EntryEngine:
         rev_reasons:  List[str] = []
         cont_reasons: List[str] = []
 
-        # AMD phase scoring
+        # ─────────────────────────────────────────────────────────────
+        # FIX-FLAW2: STATIC FACTORS — scored ONCE into ps.static_*_base
+        # ─────────────────────────────────────────────────────────────
+        # These factors are time-invariant (or near-invariant) between
+        # ticks: sweep quality never changes; AMD phase/bias updates
+        # every few minutes at most; dealing range, OB blocking, and
+        # pool significance are slow-changing structural facts.
+        #
+        # Under the old design they were re-added every tick into
+        # ps.rev_evidence.  At ~44 pts/tick a marginal setup reached
+        # the DISPLACEMENT threshold (55 × 1.30 = 71.5) in exactly
+        # 2 ticks, making the phase-adaptive gating effectively useless.
+        #
+        # Fix: score them into ps.static_rev_base / ps.static_cont_base
+        # on ps.tick_count == 1, then add those fixed bases to the final
+        # totals without re-adding each tick.  Only truly dynamic signals
+        # (flow, CVD, CISD freshness, OTE holding, live displacement
+        # growth, CHoCH/BOS events, sustained flow) feed the per-tick
+        # decay accumulator in ps.rev_evidence / ps.cont_evidence.
+        # ─────────────────────────────────────────────────────────────
+
+        _score_static = not ps.static_scored
+        _s_rev  = 0.0   # static rev pts accumulated this pass
+        _s_cont = 0.0   # static cont pts accumulated this pass
+
+        # AMD phase scoring  [STATIC]
+        # ─────────────────────────────────────────────────────────────
+        # FIX-FLAW1: AMD CONTRA-PENALTY in MANIPULATION phase
+        # ─────────────────────────────────────────────────────────────
+        # Old: BSL swept + bullish AMD bias → +0 (bonus not fired, no
+        #   penalty either).  With amd_conf=0.95 this is a high-confidence
+        #   contra-signal being completely ignored.
+        # New: BSL + bullish or SSL + bearish during MANIPULATION applies
+        #   a 18 × conf penalty to reversal AND a 10.8 × conf bonus to
+        #   continuation, proportional to confidence.  The penalty is
+        #   deliberately smaller than the alignment bonus (22) to avoid
+        #   over-blocking — it should make the setup marginal, not
+        #   impossible, so that strong structural evidence (CISD, OTE,
+        #   flow) can still overcome a contra AMD reading.
+        # ─────────────────────────────────────────────────────────────
         amd_phase = (getattr(ict, 'amd_phase', '') or '').upper()
         amd_bias  = (getattr(ict, 'amd_bias',  '') or '').lower()
         amd_conf  = float(getattr(ict, 'amd_confidence', 0.0) or 0.0)
 
-        if amd_phase == 'MANIPULATION':
-            if ((sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or
-                    (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')):
-                pts = 22.0 * max(amd_conf, 0.5)
-                rev_delta += pts
-                rev_reasons.append(f"AMD MANIP {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
-        elif amd_phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
-            if ((sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or
-                    (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')):
-                pts = 25.0 * max(amd_conf, 0.5)
-                cont_delta += pts
-                cont_reasons.append(f"AMD DIST {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
+        if _score_static:
+            if amd_phase == 'MANIPULATION':
+                _bsl_with_bear = (sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish')
+                _ssl_with_bull = (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')
+                _bsl_with_bull = (sweep.pool.side == PoolSide.BSL and amd_bias == 'bullish')
+                _ssl_with_bear = (sweep.pool.side == PoolSide.SSL and amd_bias == 'bearish')
+                if _bsl_with_bear or _ssl_with_bull:
+                    # AMD ALIGNED: sweep IS the manipulation phase fake-out before
+                    # delivery in the opposite direction — strongly supports reversal.
+                    pts = 22.0 * max(amd_conf, 0.5)
+                    _s_rev += pts
+                    rev_reasons.append(
+                        f"AMD MANIP aligned {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
+                elif _bsl_with_bull or _ssl_with_bear:
+                    # AMD CONTRA: the sweep is occurring INTO the manipulation phase
+                    # with the bias pointing THE SAME WAY as the sweep — meaning the
+                    # market is being driven upward and this BSL sweep is the
+                    # manipulation high before bullish delivery continues (ICT AMD
+                    # cycle: accumulate → manipulate UP → distribute higher).
+                    # Going short (reversal) here trades against the manipulation.
+                    penalty = 18.0 * max(amd_conf, 0.5)
+                    _s_rev  -= penalty
+                    _s_cont += penalty * 0.6
+                    rev_reasons.append(
+                        f"AMD CONTRA {amd_bias} MANIP contra-reversal ({amd_conf:.0%})")
+                    cont_reasons.append(
+                        f"AMD CONTRA {amd_bias} MANIP supports cont ({amd_conf:.0%})")
+                    logger.info(
+                        f"POST_SWEEP: ⚠️  AMD CONTRA — {sweep.pool.side.value} swept "
+                        f"but AMD bias={amd_bias} conf={amd_conf:.0%}: "
+                        f"rev penalty={penalty:.1f} cont bonus={penalty*0.6:.1f}")
+
+            elif amd_phase in ('DISTRIBUTION', 'REDISTRIBUTION'):
+                if ((sweep.pool.side == PoolSide.BSL and amd_bias == 'bearish') or
+                        (sweep.pool.side == PoolSide.SSL and amd_bias == 'bullish')):
+                    pts = 25.0 * max(amd_conf, 0.5)
+                    _s_cont += pts
+                    cont_reasons.append(
+                        f"AMD DIST {amd_bias}+{sweep.pool.side.value} ({amd_conf:.0%})")
+                else:
+                    _s_cont += 20.0 * max(amd_conf, 0.5)
+                    _s_rev  -= 12.0 * max(amd_conf, 0.5)
+                    cont_reasons.append(f"AMD DIST contra ({amd_conf:.0%})")
+
+            elif amd_phase in ('ACCUMULATION', 'REACCUMULATION'):
+                pts = 12.0 * max(amd_conf, 0.4)
+                _s_rev += pts
+                rev_reasons.append(f"AMD ACCUM ({amd_conf:.0%})")
+
+            # Sweep quality / displacement  [STATIC — immutable after sweep]
+            if sweep.quality >= 0.70:
+                _s_rev += 12.0; rev_reasons.append(f"DISP strong ({sweep.quality:.0%})")
+            elif sweep.quality >= 0.50:
+                _s_rev +=  7.0; rev_reasons.append(f"DISP moderate ({sweep.quality:.0%})")
+            elif sweep.quality >= 0.35:
+                _s_rev +=  3.0; rev_reasons.append(f"DISP weak ({sweep.quality:.0%})")
+
+            # Dealing range position  [STATIC — updates on minute-bar cadence]
+            pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
+            if sweep_dir == "short":
+                if   pd >= 0.80: _s_rev  += 10.0; rev_reasons.append(f"DEEP PREMIUM ({pd:.0%})")
+                elif pd >= 0.65: _s_rev  +=  7.0; rev_reasons.append(f"PREMIUM ({pd:.0%})")
+                elif pd >= 0.50: _s_rev  +=  3.0; rev_reasons.append(f"SLIGHT PREM ({pd:.0%})")
+                else:            _s_cont +=  6.0; cont_reasons.append("DEALING-RANGE BREAK")
             else:
-                cont_delta += 20.0 * max(amd_conf, 0.5)
-                rev_delta  -= 12.0 * max(amd_conf, 0.5)
-                cont_reasons.append(f"AMD DIST contra ({amd_conf:.0%})")
-        elif amd_phase in ('ACCUMULATION', 'REACCUMULATION'):
-            pts = 12.0 * max(amd_conf, 0.4)
-            rev_delta += pts
-            rev_reasons.append(f"AMD ACCUM ({amd_conf:.0%})")
+                if   pd <= 0.20: _s_rev  += 10.0; rev_reasons.append(f"DEEP DISCOUNT ({pd:.0%})")
+                elif pd <= 0.35: _s_rev  +=  7.0; rev_reasons.append(f"DISCOUNT ({pd:.0%})")
+                elif pd <= 0.50: _s_rev  +=  3.0; rev_reasons.append(f"SLIGHT DISC ({pd:.0%})")
+                else:            _s_cont +=  6.0; cont_reasons.append("DEALING-RANGE BREAK")
 
-        # Sweep quality / displacement
-        if sweep.quality >= 0.70:
-            rev_delta += 12.0; rev_reasons.append(f"DISP strong ({sweep.quality:.0%})")
-        elif sweep.quality >= 0.50:
-            rev_delta += 7.0;  rev_reasons.append(f"DISP moderate ({sweep.quality:.0%})")
-        elif sweep.quality >= 0.35:
-            rev_delta += 3.0;  rev_reasons.append(f"DISP weak ({sweep.quality:.0%})")
+            # Target quality (reversal and continuation targets)  [STATIC — pool map slow-changing]
+            opp_target  = self._find_opposing_target(sweep_dir, snap, price, atr, ict)
+            cont_target = self._find_continuation_target(cont_dir, snap, price, atr, ict)
+            if opp_target and opp_target.significance >= _MIN_POOL_SIGNIFICANCE:
+                _s_rev  += min(5.0, opp_target.significance * 0.5)
+                rev_reasons.append(f"TP pool sig={opp_target.significance:.1f}")
+            if cont_target and cont_target.significance >= _MIN_POOL_SIGNIFICANCE:
+                _s_cont += min(5.0, cont_target.significance * 0.5)
+                cont_reasons.append(f"Next pool sig={cont_target.significance:.1f}")
 
-        # Live displacement from sweep level
+            # OB blocking  [STATIC — OB positions update on bar cadence]
+            if cont_dir == "long":
+                ob_price = float(getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
+            else:
+                ob_price = float(getattr(ict, 'nearest_ob_price_short', 0.0)
+                                 or getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
+            if ob_price > 0:
+                if cont_dir == "long" and ob_price > price:
+                    ob_dist = (ob_price - price) / max(atr, 1e-10)
+                    if ob_dist < 2.0:
+                        _s_rev += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
+                elif cont_dir == "short" and ob_price < price:
+                    ob_dist = (price - ob_price) / max(atr, 1e-10)
+                    if ob_dist < 2.0:
+                        _s_rev += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
+
+            # Session quality  [STATIC — kill-zone changes at most once per hour]
+            session = (getattr(ict, 'kill_zone', '') or '').lower()
+            if 'asia'     in session: _s_rev += 5.0; rev_reasons.append("ASIA manipulation")
+            elif 'london' in session: _s_rev += 3.0; rev_reasons.append("LONDON Judas")
+            elif 'ny'     in session: _s_rev += 2.0; rev_reasons.append("NY session")
+
+            # Commit static baseline — never re-scored
+            ps.static_rev_base  = _s_rev
+            ps.static_cont_base = _s_cont
+            ps.static_scored    = True
+            logger.debug(
+                f"POST_SWEEP static baseline: rev={_s_rev:.1f} cont={_s_cont:.1f} "
+                f"AMD={amd_phase}/{amd_bias} quality={sweep.quality:.2f} "
+                f"pd={getattr(ict,'dealing_range_pd',0.5):.2f}")
+        else:
+            # Resolve targets for decision output (needed outside static block)
+            opp_target  = self._find_opposing_target(sweep_dir, snap, price, atr, ict)
+            cont_target = self._find_continuation_target(cont_dir, snap, price, atr, ict)
+
+        # ─────────────────────────────────────────────────────────────
+        # DYNAMIC FACTORS — scored every tick, feed decay accumulator
+        # ─────────────────────────────────────────────────────────────
+
+        # Live displacement from sweep level  [DYNAMIC — grows as price moves]
         if ps.max_displacement >= _PS_DISP_STRONG_ATR:
             rev_delta += 10.0
             rev_reasons.append(f"LIVE DISP {ps.max_displacement:.1f}ATR")
@@ -1645,36 +1825,21 @@ class EntryEngine:
             cont_delta += 6.0
             cont_reasons.append(f"NO DISP ({ps.max_displacement:.2f}ATR)")
 
-        # CISD confirmation (major structural signal)
+        # CISD confirmation  [DYNAMIC — event fires once, freshness decays per-tick]
         if ps.cisd_detected:
             _cisd_age = now - ps.cisd_timestamp
             _cisd_freshness = max(0.5, 1.0 - _cisd_age / 120.0)
             rev_delta += 15.0 * _cisd_freshness
             rev_reasons.append(f"CISD {ps.cisd_type.upper()} ({_cisd_freshness:.0%})")
 
-        # OTE zone (optimal entry point)
+        # OTE zone  [DYNAMIC — price can enter/exit zone between ticks]
         if ps.ote_reached:
             if ps.ote_holding:
-                rev_delta += 12.0
-                rev_reasons.append("IN OTE ZONE")
+                rev_delta += 12.0; rev_reasons.append("IN OTE ZONE")
             else:
-                rev_delta += 6.0
-                rev_reasons.append("OTE REACHED (exited)")
+                rev_delta +=  6.0; rev_reasons.append("OTE REACHED (exited)")
 
-        # Dealing range position
-        pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
-        if sweep_dir == "short":
-            if   pd >= 0.80: rev_delta  += 10.0; rev_reasons.append(f"DEEP PREMIUM ({pd:.0%})")
-            elif pd >= 0.65: rev_delta  +=  7.0; rev_reasons.append(f"PREMIUM ({pd:.0%})")
-            elif pd >= 0.50: rev_delta  +=  3.0; rev_reasons.append(f"SLIGHT PREM ({pd:.0%})")
-            else:            cont_delta +=  6.0; cont_reasons.append("DEEP BREAK")
-        else:
-            if   pd <= 0.20: rev_delta  += 10.0; rev_reasons.append(f"DEEP DISCOUNT ({pd:.0%})")
-            elif pd <= 0.35: rev_delta  +=  7.0; rev_reasons.append(f"DISCOUNT ({pd:.0%})")
-            elif pd <= 0.50: rev_delta  +=  3.0; rev_reasons.append(f"SLIGHT DISC ({pd:.0%})")
-            else:            cont_delta +=  6.0; cont_reasons.append("DEEP BREAK")
-
-        # Order flow (instantaneous)
+        # Order flow (instantaneous)  [DYNAMIC]
         rev_dir_needed = sweep_dir
         if flow.direction == rev_dir_needed and abs(flow.conviction) >= 0.40:
             rev_delta  += 8.0; rev_reasons.append(f"FLOW REV {flow.conviction:+.2f}")
@@ -1686,21 +1851,21 @@ class EntryEngine:
             cont_delta += 8.0; cont_reasons.append(f"FLOW CONT {flow.conviction:+.2f}")
             ps.cont_flow_ticks += 1
 
-        # EWMA flow (trend)
+        # EWMA flow (trend)  [DYNAMIC]
         ewma_rev = (
-            (rev_dir_needed == "long"  and self._flow_ewma > 0.10) or
+            (rev_dir_needed == "long"  and self._flow_ewma >  0.10) or
             (rev_dir_needed == "short" and self._flow_ewma < -0.10)
         )
         ewma_cont = (
             (rev_dir_needed == "long"  and self._flow_ewma < -0.15) or
-            (rev_dir_needed == "short" and self._flow_ewma > 0.15)
+            (rev_dir_needed == "short" and self._flow_ewma >  0.15)
         )
         if ewma_rev:
-            rev_delta += 5.0; rev_reasons.append(f"EWMA rev {self._flow_ewma:+.2f}")
+            rev_delta  += 5.0; rev_reasons.append(f"EWMA rev {self._flow_ewma:+.2f}")
         elif ewma_cont:
             cont_delta += 5.0; cont_reasons.append(f"EWMA cont {self._flow_ewma:+.2f}")
 
-        # CVD alignment
+        # CVD alignment  [DYNAMIC]
         cvd = flow.cvd_trend
         if   sweep_dir == "short" and cvd < -0.30: rev_delta  += 8.0; rev_reasons.append(f"CVD bearish {cvd:+.2f}")
         elif sweep_dir == "short" and cvd <    0:   rev_delta  += 3.0; rev_reasons.append(f"CVD slight bear {cvd:+.2f}")
@@ -1708,7 +1873,7 @@ class EntryEngine:
         elif sweep_dir == "long"  and cvd >    0:   rev_delta  += 3.0; rev_reasons.append(f"CVD slight bull {cvd:+.2f}")
         else:                                       cont_delta += 4.0; cont_reasons.append(f"CVD cont {cvd:+.2f}")
 
-        # 5m Structure
+        # 5m Structure  [DYNAMIC — CHoCH/BOS events update on bar close]
         choch_5m = getattr(ict, 'choch_5m', '') or ''
         bos_5m   = getattr(ict, 'bos_5m',   '') or ''
         if choch_5m:
@@ -1720,66 +1885,36 @@ class EntryEngine:
             if bos_5m == cont_bos:
                 cont_delta += 10.0; cont_reasons.append("BOS continuation")
 
-        # 15m Structure reinforcement
+        # 15m Structure reinforcement  [DYNAMIC — updates on 15m bar close]
         struct_15m = getattr(ict, 'structure_15m', '') or ''
         if struct_15m:
             _rev_15m = "bearish" if rev_dir_needed == "short" else "bullish"
             if struct_15m == _rev_15m:
                 rev_delta += 6.0; rev_reasons.append(f"15m struct {struct_15m}")
 
-        # Session quality
-        session = (getattr(ict, 'kill_zone', '') or '').lower()
-        if 'asia'   in session: rev_delta  += 5.0; rev_reasons.append("ASIA manipulation")
-        elif 'london' in session: rev_delta += 3.0; rev_reasons.append("LONDON Judas")
-        elif 'ny'   in session: rev_delta += 2.0; rev_reasons.append("NY session")
-
-        # Target quality (reversal and continuation targets)
-        opp_target  = self._find_opposing_target(sweep_dir, snap, price, atr, ict)
-        cont_target = self._find_continuation_target(cont_dir, snap, price, atr, ict)
-        if opp_target and opp_target.significance >= _MIN_POOL_SIGNIFICANCE:
-            rev_delta  += min(5.0, opp_target.significance * 0.5)
-            rev_reasons.append(f"TP pool sig={opp_target.significance:.1f}")
-        if cont_target and cont_target.significance >= _MIN_POOL_SIGNIFICANCE:
-            cont_delta += min(5.0, cont_target.significance * 0.5)
-            cont_reasons.append(f"Next pool sig={cont_target.significance:.1f}")
-
-        # OB blocking (OB between price and continuation target blocks continuation)
-        if cont_dir == "long":
-            ob_price = float(getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
-        else:
-            ob_price = float(getattr(ict, 'nearest_ob_price_short', 0.0)
-                             or getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
-        if ob_price > 0:
-            if cont_dir == "long" and ob_price > price:
-                ob_dist = (ob_price - price) / max(atr, 1e-10)
-                if ob_dist < 2.0:
-                    rev_delta += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
-            elif cont_dir == "short" and ob_price < price:
-                ob_dist = (price - ob_price) / max(atr, 1e-10)
-                if ob_dist < 2.0:
-                    rev_delta += 8.0; rev_reasons.append(f"OB blocks cont {ob_dist:.1f}ATR")
-
-        # Sustained flow consistency bonus (accumulated over ticks)
+        # Sustained flow consistency bonus  [DYNAMIC — by design accumulative]
         if ps.rev_flow_ticks >= 5:
-            rev_delta += 4.0; rev_reasons.append(f"SUSTAINED rev flow ({ps.rev_flow_ticks} ticks)")
+            rev_delta  += 4.0; rev_reasons.append(f"SUSTAINED rev flow ({ps.rev_flow_ticks} ticks)")
         if ps.cont_flow_ticks >= 5:
             cont_delta += 4.0; cont_reasons.append(f"SUSTAINED cont flow ({ps.cont_flow_ticks} ticks)")
 
-        # ── Accumulate evidence with decay ────────────────────────────
-        # New evidence is added; contradictory evidence decays the opposite
+        # ── Accumulate DYNAMIC evidence with decay ────────────────────
+        # Static baseline is already locked in ps.static_*_base.
+        # Only dynamic deltas feed the decay accumulator.
         _decay = 0.92  # per-tick decay for the weaker side
         if rev_delta > 0:
-            ps.rev_evidence += rev_delta
+            ps.rev_evidence  += rev_delta
             ps.cont_evidence *= _decay
         if cont_delta > 0:
             ps.cont_evidence += cont_delta
-            ps.rev_evidence *= _decay
+            ps.rev_evidence  *= _decay
 
-        ps.peak_rev  = max(ps.peak_rev,  ps.rev_evidence)
-        ps.peak_cont = max(ps.peak_cont, ps.cont_evidence)
+        ps.peak_rev  = max(ps.peak_rev,  ps.static_rev_base  + ps.rev_evidence)
+        ps.peak_cont = max(ps.peak_cont, ps.static_cont_base + ps.cont_evidence)
 
-        rev_total  = round(max(ps.rev_evidence,  0), 1)
-        cont_total = round(max(ps.cont_evidence, 0), 1)
+        # Combined totals = immutable static base + dynamic accumulated evidence
+        rev_total  = round(max(ps.static_rev_base  + ps.rev_evidence,  0.0), 1)
+        cont_total = round(max(ps.static_cont_base + ps.cont_evidence, 0.0), 1)
         gap        = abs(rev_total - cont_total)
 
         self._last_sweep_analysis = {
