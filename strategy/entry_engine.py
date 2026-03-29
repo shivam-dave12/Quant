@@ -197,7 +197,8 @@ class ICTContext:
     structure_4h:     str   = ""
     bos_5m:           str   = ""
     choch_5m:         str   = ""
-    nearest_ob_price: float = 0.0
+    nearest_ob_price: float = 0.0        # OB below price (long SL anchor)
+    nearest_ob_price_short: float = 0.0  # BUG-FIX: OB above price (short SL anchor)
     kill_zone:        str   = ""
 
     @property
@@ -719,6 +720,13 @@ class EntryEngine:
         BUG-FIX-3: BSL and SSL selection now use t.adjusted_sig() for both sides
         so the cross-side comparison is consistent (was: BSL by distance, SSL by sig).
         HTF escalation applied if the approaching pool's TP fails R:R.
+
+        BUG-FIX-DIRECTIONAL (v3.2): Evaluate sides independently based on flow.
+          Old: BSL and SSL competed by adjusted_sig(). BSL pools in declining
+          markets accumulate higher significance (untouched), so LONG always won
+          even when price was sliding >10%. Now flow direction gates which side
+          is evaluated. When flow is neutral, both sides are checked but the
+          side matching EWMA direction is preferred.
         """
         if now - self._last_entry_at < _ENTRY_COOLDOWN_SEC:
             return False
@@ -726,20 +734,63 @@ class EntryEngine:
         best_approach: Optional[PoolTarget] = None
         approach_side: str                  = ""
 
-        for t in snap.bsl_pools:
-            if (_PROXIMITY_ENTRY_ATR_MIN <= t.distance_atr <= _PROXIMITY_ENTRY_ATR_MAX
-                    and t.significance >= _PROXIMITY_MIN_SIG):
-                # BUG-FIX-3: use adjusted_sig() — not distance for BSL
-                if best_approach is None or t.adjusted_sig() > best_approach.adjusted_sig():
-                    best_approach = t
-                    approach_side = "long"
+        # ── BUG-FIX-DIRECTIONAL: Gate by flow + EWMA direction ──────────
+        # In a sliding/declining market, flow is SHORT → only look at SSL pools
+        # In a rising market, flow is LONG → only look at BSL pools
+        # When neutral, check both but prefer EWMA-matching side
+        _ewma_dir   = self._ewma_direction()
+        _check_long = True
+        _check_short = True
 
-        for t in snap.ssl_pools:
-            if (_PROXIMITY_ENTRY_ATR_MIN <= t.distance_atr <= _PROXIMITY_ENTRY_ATR_MAX
-                    and t.significance >= _PROXIMITY_MIN_SIG):
-                if best_approach is None or t.adjusted_sig() > best_approach.adjusted_sig():
-                    best_approach = t
-                    approach_side = "short"
+        # Strong directional flow gates out the opposing side
+        if flow.direction == "long" and abs(flow.conviction) > 0.25:
+            _check_short = False
+        elif flow.direction == "short" and abs(flow.conviction) > 0.25:
+            _check_long = False
+        # EWMA as tiebreaker when flow is neutral
+        elif _ewma_dir == "long":
+            _check_short = abs(self._flow_ewma) < 0.15  # allow short only if EWMA is weak
+        elif _ewma_dir == "short":
+            _check_long = abs(self._flow_ewma) < 0.15
+
+        best_long: Optional[PoolTarget] = None
+        best_short: Optional[PoolTarget] = None
+
+        if _check_long:
+            for t in snap.bsl_pools:
+                if (_PROXIMITY_ENTRY_ATR_MIN <= t.distance_atr <= _PROXIMITY_ENTRY_ATR_MAX
+                        and t.significance >= _PROXIMITY_MIN_SIG):
+                    if best_long is None or t.adjusted_sig() > best_long.adjusted_sig():
+                        best_long = t
+
+        if _check_short:
+            for t in snap.ssl_pools:
+                if (_PROXIMITY_ENTRY_ATR_MIN <= t.distance_atr <= _PROXIMITY_ENTRY_ATR_MAX
+                        and t.significance >= _PROXIMITY_MIN_SIG):
+                    if best_short is None or t.adjusted_sig() > best_short.adjusted_sig():
+                        best_short = t
+
+        # Pick the side matching flow direction; if both exist and flow is neutral,
+        # take the one with higher adjusted significance
+        if best_long is not None and best_short is not None:
+            if flow.direction == "long":
+                best_approach = best_long; approach_side = "long"
+            elif flow.direction == "short":
+                best_approach = best_short; approach_side = "short"
+            elif _ewma_dir == "short":
+                best_approach = best_short; approach_side = "short"
+            elif _ewma_dir == "long":
+                best_approach = best_long; approach_side = "long"
+            else:
+                # True neutral — take best significance
+                if best_short.adjusted_sig() >= best_long.adjusted_sig():
+                    best_approach = best_short; approach_side = "short"
+                else:
+                    best_approach = best_long; approach_side = "long"
+        elif best_long is not None:
+            best_approach = best_long; approach_side = "long"
+        elif best_short is not None:
+            best_approach = best_short; approach_side = "short"
 
         if best_approach is None:
             self._proximity_confirms = 0
@@ -1305,7 +1356,12 @@ class EntryEngine:
             cont_reasons.append(f"Next pool sig={cont_target.significance:.1f}")
 
         # OB blocking
-        ob_price = float(getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
+        # Use side-appropriate OB price: for short continuation, check short-side OB
+        if cont_dir == "long":
+            ob_price = float(getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
+        else:
+            ob_price = float(getattr(ict, 'nearest_ob_price_short', 0.0)
+                             or getattr(ict, 'nearest_ob_price', 0.0) or 0.0)
         if ob_price > 0:
             if cont_dir == "long"  and ob_price > price:
                 ob_dist = (ob_price - price) / max(atr, 1e-10)
@@ -1559,17 +1615,32 @@ class EntryEngine:
           (a) no ICT OB found at all
           (b) OB exists but too close (<0.1% from price)
           (c) OB exists but too far  (>3.5% from price)
-        Old code: always logged "no ICT structure found" regardless of cause.
+
+        BUG-FIX-CRITICAL (v3.2): Use side-specific OB price.
+          Old: always read nearest_ob_price (long-side OB below price).
+          For shorts, this OB is BELOW price so `ob > price` was always False
+          → _compute_sl returned None for EVERY short → shorts never fired.
+          Fix: read nearest_ob_price_short (OB above price) for short side.
+
+        BUG-FIX-FALLBACK (v3.2): ATR-based fallback SL when no OB is available.
+          Old: returned None when no OB was found → entry killed.
+          Fix: use 1.5×ATR default SL distance with liquidity-pool push.
+          This ensures entries are never blocked solely by missing OB data.
         """
         sl = None
         _rejected_reason = ""
 
-        if ict.nearest_ob_price > 0:
-            ob = ict.nearest_ob_price
-            if side == "long"  and ob < price:
-                sl = ob - atr * 0.20
-            elif side == "short" and ob > price:
-                sl = ob + atr * 0.20
+        # Select the correct OB for this side
+        if side == "long":
+            ob_price = ict.nearest_ob_price
+        else:
+            ob_price = getattr(ict, 'nearest_ob_price_short', 0.0) or 0.0
+
+        if ob_price > 0:
+            if side == "long" and ob_price < price:
+                sl = ob_price - atr * 0.20
+            elif side == "short" and ob_price > price:
+                sl = ob_price + atr * 0.20
 
         # Liquidity-aware SL push
         if sl is not None and self._last_liq_snapshot is not None:
@@ -1587,21 +1658,52 @@ class EntryEngine:
         if sl is not None:
             dist_pct = abs(price - sl) / price
             if dist_pct < 0.001:
-                # BUG-FIX-4: specific log
-                _rejected_reason = (f"OB@${ict.nearest_ob_price:.1f} too close "
+                _rejected_reason = (f"OB@${ob_price:.1f} too close "
                                     f"({dist_pct:.3%} < 0.1%)")
                 sl = None
             elif dist_pct > 0.035:
-                # BUG-FIX-4: specific log
-                _rejected_reason = (f"OB@${ict.nearest_ob_price:.1f} too far "
+                _rejected_reason = (f"OB@${ob_price:.1f} too far "
                                     f"({dist_pct:.3%} > 3.5%)")
                 sl = None
 
+        # ── BUG-FIX-FALLBACK: ATR-based fallback SL ──────────────────────
+        # When no OB is available for this side, use 1.5×ATR as default SL
+        # distance. This prevents entries from being permanently blocked
+        # by missing OB data (which was killing ALL short entries).
         if sl is None:
-            if ict.nearest_ob_price > 0 and _rejected_reason:
-                logger.debug(f"SL rejected for {side.upper()}: {_rejected_reason}")
-            elif ict.nearest_ob_price <= 0:
-                logger.debug(f"SL rejected for {side.upper()}: no ICT OB found near price")
+            _fallback_dist = 1.5 * atr
+            if side == "long":
+                sl = price - _fallback_dist
+            else:
+                sl = price + _fallback_dist
+
+            # Apply liquidity-aware push on fallback SL too
+            if self._last_liq_snapshot is not None:
+                snap = self._last_liq_snapshot
+                _lb  = 0.25 * atr
+                if side == "long":
+                    for t in snap.ssl_pools:
+                        if sl < t.pool.price < price:
+                            sl = min(sl, t.pool.price - _lb)
+                else:
+                    for t in snap.bsl_pools:
+                        if price < t.pool.price < sl:
+                            sl = max(sl, t.pool.price + _lb)
+
+            # Validate fallback SL distance
+            dist_pct = abs(price - sl) / price
+            if dist_pct < 0.001 or dist_pct > 0.035:
+                if ob_price > 0 and _rejected_reason:
+                    logger.debug(f"SL rejected for {side.upper()}: {_rejected_reason}, "
+                                 f"fallback also out of range ({dist_pct:.3%})")
+                else:
+                    logger.debug(f"SL fallback for {side.upper()}: distance {dist_pct:.3%} "
+                                 f"out of [0.1%, 3.5%] range")
+                return None
+
+            logger.debug(f"SL for {side.upper()}: using ATR fallback "
+                         f"${sl:,.1f} (1.5×ATR={_fallback_dist:.1f}pts)"
+                         f"{f' [OB rejected: {_rejected_reason}]' if _rejected_reason else ' [no OB found]'}")
 
         return sl
 
@@ -1646,6 +1748,15 @@ class EntryEngine:
         elif ict.in_premium: parts.append("PREMIUM")
         if ict.structure_5m: parts.append(f"5m={ict.structure_5m}")
         if ict.kill_zone:    parts.append(f"KZ={ict.kill_zone}")
+        # Show which OB is being used for SL
+        if side == "long" and ict.nearest_ob_price > 0:
+            parts.append(f"OB_L=${ict.nearest_ob_price:,.0f}")
+        elif side == "short":
+            ob_short = getattr(ict, 'nearest_ob_price_short', 0.0) or 0.0
+            if ob_short > 0:
+                parts.append(f"OB_S=${ob_short:,.0f}")
+            else:
+                parts.append("OB_S=ATR_fallback")
         return " | ".join(parts) if parts else "no ICT context"
 
 

@@ -5113,9 +5113,18 @@ class QuantStrategy:
                     if tf_15m:
                         ict_ctx.dealing_range_pd = getattr(tf_15m, 'premium_discount', 0.5)
                 try:
-                    ob_sl = self._ict.get_ob_sl_level("long", price, atr, now_ms)
-                    if ob_sl:
-                        ict_ctx.nearest_ob_price = ob_sl
+                    ob_sl_long = self._ict.get_ob_sl_level("long", price, atr, now_ms)
+                    if ob_sl_long:
+                        ict_ctx.nearest_ob_price = ob_sl_long
+                except Exception:
+                    pass
+                # BUG-FIX-CRITICAL: Also fetch SHORT-side OB (above price).
+                # Without this, _compute_sl in entry_engine ALWAYS returned None
+                # for shorts because nearest_ob_price was always below price.
+                try:
+                    ob_sl_short = self._ict.get_ob_sl_level("short", price, atr, now_ms)
+                    if ob_sl_short:
+                        ict_ctx.nearest_ob_price_short = ob_sl_short
                 except Exception:
                     pass
                 try:
