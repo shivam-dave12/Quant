@@ -1267,6 +1267,7 @@ class TelegramBotController:
 
                 total_fees = t.get('total_fees', 0.0)
                 exact_fees = t.get('exact_fees', False)
+                margin_pct = t.get('margin_pnl_pct', 0.0)
 
                 if   reason == "tp_hit":       label = "🎯 TP (pool sweep)"
                 elif reason == "trail_sl_hit": label = "🔒 TRAIL (ICT struct)"
@@ -1283,10 +1284,13 @@ class TelegramBotController:
                     fee_tag  = "exact" if exact_fees else "est."
                     fee_line = f"\n    Fees({fee_tag}): ${total_fees:.4f}"
 
+                # v6.0: margin % P&L display
+                margin_tag = f"  ({margin_pct:+.1f}% margin)" if abs(margin_pct) > 0.01 else ""
+
                 lines.append(
                     f"{result} {side} [{mode}]{tier_badge}  "
                     f"${entry:,.0f}→${exit_p:,.0f}  "
-                    f"PnL: <b>${pnl:+.2f}</b>  R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
+                    f"PnL: <b>${pnl:+.2f}</b>{margin_tag}  R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
                     f"    {label}{trail_tag}  hold: {hold:.0f}m{pool_tp_tag}"
                     + fee_line
                 )
@@ -1311,11 +1315,17 @@ class TelegramBotController:
 
         total_fees_s = sum(t.get('total_fees', 0) for t in history)
 
+        # v6.0: Aggregate margin % P&L
+        margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        avg_margin_pct = sum(margin_pcts) / len(margin_pcts) if margin_pcts else 0.0
+        total_margin_pct = sum(margin_pcts)
+
         lines += [
             "",
             "━━━━━━━━━━━━━━━━━━━━━━━━",
             f"Session:   {total_t} trades  W:{wins} L:{losses}  WR: <b>{wr:.0f}%</b>",
             f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
+            f"Margin %:  <b>{total_margin_pct:+.1f}%</b> total  (avg {avg_margin_pct:+.1f}%/trade)",
             f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
             f"Expectancy: ${expectancy:+.2f}/trade",
             f"Total Fees: ${total_fees_s:.4f}" if total_fees_s > 0 else "Total Fees: —",
@@ -1876,16 +1886,35 @@ class TelegramBotController:
             mfe_r = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
             hold_m = (time.time() - p.entry_time) / 60.0
 
+            # v6.0: Margin-based unrealised PnL %
+            _u_margin_pct = 0.0
+            _u_margin_used = 0.0
+            try:
+                if entry > 0 and p.quantity > 0:
+                    _u_notional = entry * p.quantity
+                    _u_lev = int(getattr(__import__('config'), 'LEVERAGE', 30))
+                    _u_margin_used = _u_notional / _u_lev if _u_lev > 0 else _u_notional
+                    if _u_margin_used > 1e-10:
+                        _u_upnl_usd = upnl_pts * p.quantity
+                        _u_margin_pct = (_u_upnl_usd / _u_margin_used) * 100.0
+            except Exception:
+                pass
+
             u_icon = "🟢" if upnl_pts >= 0 else "🔴"
             lines.append(
                 f"\n{u_icon} <b>{side}</b> @ ${entry:,.2f}"
                 f"\n  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)"
+                f"\n  Margin: <b>{_u_margin_pct:+.1f}%</b> on ${_u_margin_used:.2f}"
                 f"\n  MFE: {mfe_r:.2f}R | Hold: {hold_m:.0f}m"
                 f"\n  SL: ${p.sl_price:,.2f} | TP: ${p.tp_price:,.2f}"
             )
 
         # Realised PnL
-        lines.append(f"\n<b>Realised</b>: ${total_pnl:+.4f}")
+        # v6.0: Show total margin % from trade history
+        _r_margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        _r_total_margin_pct = sum(_r_margin_pcts)
+        _margin_disp = f"  ({_r_total_margin_pct:+.1f}% margin)" if _r_margin_pcts else ""
+        lines.append(f"\n<b>Realised</b>: ${total_pnl:+.4f}{_margin_disp}")
         lines.append(f"Trades: {total_t} | W:{wins} L:{total_t - wins} | WR: {wr:.0f}%")
 
         # Last 3 trades
@@ -1895,8 +1924,10 @@ class TelegramBotController:
                 pnl = t.get('pnl', 0.0)
                 side = t.get('side', '?').upper()
                 reason = t.get('reason', '?')
+                m_pct = t.get('margin_pnl_pct', 0.0)
                 icon = "✅" if t.get('is_win') else "❌"
-                lines.append(f"  {icon} {side} ${pnl:+.4f} [{reason[:10]}]")
+                m_tag = f" ({m_pct:+.1f}%)" if abs(m_pct) > 0.01 else ""
+                lines.append(f"  {icon} {side} ${pnl:+.4f}{m_tag} [{reason[:10]}]")
 
         return "\n".join(lines)
 

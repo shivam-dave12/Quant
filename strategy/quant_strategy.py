@@ -3010,7 +3010,8 @@ class _ICTStructureTrail:
                 atr_percentile: float = 0.50,
                 adx: float = 15.0,
                 tick_size: float = 0.1,
-                candles_15m: list = None) -> "Optional[float]":
+                candles_15m: list = None,
+                anchor_out: "Optional[List[str]]" = None) -> "Optional[float]":
         """
         Compute next trailing SL using Chandelier-Structure Hybrid.
         Returns new SL price or None if no improvement qualifies.
@@ -3213,6 +3214,13 @@ class _ICTStructureTrail:
         # ── Tick rounding ─────────────────────────────────────────────────
         ts = tick_size if tick_size > 0 else 0.1
         rounded = round(round(new_sl / ts) * ts, 10)
+        # v6.0: Output the winning anchor label for caller logging
+        if anchor_out is not None:
+            # Build descriptive trail reason
+            _tier_label = ("P3-AGGR" if tier >= 2.0 else
+                          "P2-LOCK" if tier >= 1.0 else
+                          "P1-BE" if tier >= 0.40 else "P0-CHAND")
+            anchor_out.append(f"{anchor}|{_tier_label}|{tier:.2f}R|m={mult:.2f}")
         logger.debug(
             "ChandelierTrail %s: $%.1f->$%.1f [%s] tier=%.2fR mult=%.2f "
             "bos=%d cbos=%s choch=%s vol=%s",
@@ -4889,30 +4897,50 @@ class QuantStrategy:
             be_locked = ((pos.side == "long"  and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
-            # ── Trail phase (mirrors _ICTStructureTrail._phase logic) ────
-            try:
-                trail_phase = _ICTStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
-            except Exception:
-                trail_phase = 0
-
-            # BUG-4 FIX: Phase 2 label was hardcoded to "CHoCH TIGHTEN" even
-            # when Phase 2 was reached via bos>=2 with no CHoCH present.
-            # The label now reflects actual state: shows CHoCH level if active,
-            # or "SWING TRAIL" if phase reached through BOS count alone.
-            if trail_phase == 2 and choch_active:
-                _p2_label = f"🟠 PHASE 2 — CHoCH TIGHTEN  (CHoCH@${choch_lvl:.0f} [{choch_tf}])"
-            elif trail_phase == 2:
-                _p2_label = f"🟠 PHASE 2 — BOS SWING TRAIL (no CHoCH yet, bos={bos_cnt})"
+            # ── Trail phase (v6.0: derived from tier, not old _phase method) ─
+            # The _ICTStructureTrail uses continuous tier-based logic, not discrete
+            # phases. Map tier to meaningful labels for display.
+            if mfe_r >= 2.0:
+                trail_phase = 3
+            elif mfe_r >= 1.0:
+                trail_phase = 2
+            elif mfe_r >= 0.40:
+                trail_phase = 1
+            elif mfe_r >= 0.10:
+                trail_phase = 0  # chandelier active but early
             else:
-                _p2_label = "🟠 PHASE 2"
+                trail_phase = -1  # below activation threshold
 
-            _phase_labels = {
-                0: "⬜ PHASE 0 — HANDS OFF (waiting for BOS / profit tier)",
-                1: f"🟡 PHASE 1 — BOS SWING TRAIL (bos={bos_cnt}, min_dist=2.0×ATR)",
-                2: _p2_label,
-                3: "🟢 PHASE 3 — 15m STRUCTURE TRAIL (tight to 15m OB/swing)",
-            }
-            phase_lbl = _phase_labels.get(trail_phase, f"Phase {trail_phase}")
+            # v6.0: Dynamic phase labels reflecting actual trail state
+            if trail_phase == 3:
+                phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE STRUCTURE TRAIL (R={mfe_r:.2f}R, tight to 1m/5m)"
+            elif trail_phase == 2:
+                if choch_active:
+                    phase_lbl = f"🟠 PHASE 2 — CHoCH TIGHTEN  (CHoCH@${choch_lvl:.0f} [{choch_tf}])"
+                elif bos_cnt >= 2:
+                    phase_lbl = f"🟠 PHASE 2 — BOS SWING TRAIL (bos={bos_cnt})"
+                else:
+                    phase_lbl = f"🟠 PHASE 2 — STRUCTURE + CHANDELIER (R={mfe_r:.2f}R)"
+            elif trail_phase == 1:
+                phase_lbl = f"🟡 PHASE 1 — BE FLOOR + CHANDELIER (bos={bos_cnt}, R={mfe_r:.2f}R)"
+            elif trail_phase == 0:
+                phase_lbl = f"⬜ PHASE 0 — CHANDELIER ENVELOPE ACTIVE (R={mfe_r:.2f}R, wide trail)"
+            else:
+                phase_lbl = f"⬜ PHASE 0 — HANDS OFF (R={mfe_r:.2f}R < 0.10R activation)"
+
+            # ── Margin % P&L ───────────────────────────────────────────────
+            _margin_pnl_pct_disp = 0.0
+            _margin_used_disp = 0.0
+            try:
+                if pos.entry_price > 0 and pos.quantity > 0:
+                    _notional_d = pos.entry_price * pos.quantity
+                    _lev_d = QCfg.LEVERAGE()
+                    _margin_used_disp = _notional_d / _lev_d if _lev_d > 0 else _notional_d
+                    if _margin_used_disp > 1e-10:
+                        _unrealised_d = profit_pts * pos.quantity
+                        _margin_pnl_pct_disp = (_unrealised_d / _margin_used_disp) * 100.0
+            except Exception:
+                pass
 
             # ── Ratchet milestone reached ─────────────────────────────────
             _last_ratchet_r = getattr(pos, 'last_ratchet_r', 0.0)
@@ -4977,6 +5005,7 @@ class QuantStrategy:
                 f"  {'─'*60}",
                 f"  R-PROGRESS:  current={cur_r:+.2f}R  peak(MFE)={mfe_r:.2f}R",
                 f"  [{_prog_bar}] {mfe_r:.2f}R  │  next ratchet @ {_next_ratchet_str}",
+                f"  MARGIN PnL: {_margin_pnl_pct_disp:+.1f}% on ${_margin_used_disp:.2f} margin",
                 f"  {'─'*60}",
                 f"  TRAIL ENGINE: {phase_lbl}",
                 f"  BOS confirmed: {bos_cnt}  │  CHoCH: "
@@ -7808,6 +7837,7 @@ class QuantStrategy:
                 _trail_candles_15m = None
 
         _hold_reason: List[str] = []
+        _anchor_out: List[str] = []
         _atr_pctile = self._atr_5m.get_percentile()
         _adx_now    = self._adx.adx
 
@@ -7833,6 +7863,7 @@ class QuantStrategy:
             adx             = _adx_now,
             tick_size       = QCfg.TICK_SIZE(),
             candles_15m     = _trail_candles_15m,
+            anchor_out      = _anchor_out,
         )
 
         if new_sl is None:
@@ -7864,7 +7895,11 @@ class QuantStrategy:
         # Phase label derived from R-multiple
         init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         tier = max(profit, pos.peak_profit) / init_dist if init_dist > 1e-10 else 0.0
+
+        # v6.0: Extract anchor reason from compute() output
         _anchor_label = ""
+        if _anchor_out:
+            _anchor_label = f" [{_anchor_out[0]}]"
 
         # Tier label derived from R-multiple (matches external engine's phase logic)
         if tier >= 2.0:
@@ -7882,15 +7917,43 @@ class QuantStrategy:
                     "normal"   if _atr_pctile > 0.30 else "quiet")
         hm = (now - pos.entry_time) / 60.0
         _improvement = new_sl_tick - pos.sl_price if pos.side == "long" else pos.sl_price - new_sl_tick
+
+        # v6.0: Compute margin % P&L for reporting
+        _margin_pnl_pct = 0.0
+        _margin_used = 0.0
+        try:
+            if pos.entry_price > 0 and pos.quantity > 0:
+                _notional = pos.entry_price * pos.quantity
+                _leverage = QCfg.LEVERAGE()
+                _margin_used = _notional / _leverage if _leverage > 0 else _notional
+                if _margin_used > 1e-10:
+                    # Current unrealised P&L in USD
+                    _unrealised_pnl = profit * pos.quantity
+                    _margin_pnl_pct = (_unrealised_pnl / _margin_used) * 100.0
+        except Exception:
+            pass
+
+        # v6.0: Compute what SL lock means for worst-case margin %
+        _sl_locked_pnl_pct = 0.0
+        try:
+            _new_sl_dist = abs(new_sl_tick - pos.entry_price)
+            _new_sl_profit = (pos.entry_price - new_sl_tick) if pos.side == "short" else (new_sl_tick - pos.entry_price)
+            if _margin_used > 1e-10 and pos.quantity > 0:
+                _sl_locked_pnl_pct = (_new_sl_profit * pos.quantity / _margin_used) * 100.0
+        except Exception:
+            pass
+
         logger.info(
             f"🔒 Trail [{phase_label}]{_anchor_label} "
             f"${pos.sl_price:,.1f} → ${new_sl_tick:,.1f} (+{_improvement:.1f}pts) | "
-            f"R={tier:.2f}R MFE={pos.peak_profit:.1f}pts hold={hm:.0f}m vol={_vol_tag}")
+            f"R={tier:.2f}R MFE={pos.peak_profit:.1f}pts hold={hm:.0f}m | "
+            f"margin%={_margin_pnl_pct:+.1f}% SL-lock={_sl_locked_pnl_pct:+.1f}% vol={_vol_tag}")
         send_telegram_message(
             f"🔒 <b>TRAIL SL</b> [{phase_label}]{_anchor_label}\n"
             f"${pos.sl_price:,.2f} → ${new_sl_tick:,.2f} (+{_improvement:.1f}pts)\n"
             f"R: {tier:.2f}R | MFE: {pos.peak_profit:.1f}pts | Hold: {hm:.0f}m\n"
-            f"Vol: {_vol_tag} ({_atr_pctile:.0%} pctile) | ATR: ${atr:.1f}")
+            f"Margin PnL: {_margin_pnl_pct:+.1f}% | SL locks: {_sl_locked_pnl_pct:+.1f}%\n"
+            f"Vol: {_vol_tag} ({_atr_pctile:.0%} pctile) | ATR: ${atr:.1f} | ADX: {_adx_now:.0f}")
 
         es = "sell" if pos.side=="long" else "buy"
         result = order_manager.replace_stop_loss(existing_sl_order_id=pos.sl_order_id, side=es, quantity=pos.quantity, new_trigger_price=new_sl_tick)
@@ -8218,6 +8281,19 @@ class QuantStrategy:
                       else (pos.entry_price + init_sl_dist))
         _trail_imp = abs(pos.sl_price - _orig_sl) if pos.trail_active else 0.0
 
+        # v6.0: Margin-based P&L %
+        _exit_margin_pct = 0.0
+        _exit_margin_used = 0.0
+        try:
+            if pos.entry_price > 0 and pos.quantity > 0:
+                _exit_notional = pos.entry_price * pos.quantity
+                _exit_lev = QCfg.LEVERAGE()
+                _exit_margin_used = _exit_notional / _exit_lev if _exit_lev > 0 else _exit_notional
+                if _exit_margin_used > 1e-10:
+                    _exit_margin_pct = (pnl / _exit_margin_used) * 100.0
+        except Exception:
+            pass
+
         send_telegram_message(
             f"{result_icon} <b>{result_color} — {result_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -8227,7 +8303,7 @@ class QuantStrategy:
             f"Gross:    ${gross:+.4f}\n"
             f"Fees:     ${entry_fee + exit_fee:.4f} "
             f"(exit exact ${exit_fee:.4f} + entry {_entry_tag} ${entry_fee:.4f})\n"
-            f"PnL:      <b>${pnl:+.2f} USDT</b>\n"
+            f"PnL:      <b>${pnl:+.2f} USDT</b>  ({_exit_margin_pct:+.1f}% on ${_exit_margin_used:.2f} margin)\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
             + (f"Trail:    ✅ SL moved {_trail_imp:+.1f}pts vs orig\n"
@@ -8297,6 +8373,8 @@ class QuantStrategy:
             "trailed":      getattr(pos, 'trail_active', False),
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
+            # ── v6.0: Margin-based P&L % ─────────────────────────────────────
+            "margin_pnl_pct": 0.0,  # filled below
             # ── Fee breakdown (exact from Delta /v2/fills, estimated otherwise) ──
             "gross_pnl":    _fb.get("gross_pnl",  pnl),
             "entry_fee":    _fb.get("entry_fee",  0.0),
@@ -8343,6 +8421,32 @@ class QuantStrategy:
         # Keep last 200 trades in memory — in-place trim avoids allocating a new list
         if len(self._trade_history) > 200:
             del self._trade_history[:-200]
+
+        # v6.0: Compute margin-based P&L % and update the record
+        _margin_pnl_pct_final = 0.0
+        _margin_used_final = 0.0
+        try:
+            _entry_px = getattr(pos, 'entry_price', 0.0)
+            _qty = getattr(pos, 'quantity', 0.0)
+            if _entry_px > 0 and _qty > 0:
+                _notional_f = _entry_px * _qty
+                _lev_f = QCfg.LEVERAGE()
+                _margin_used_final = _notional_f / _lev_f if _lev_f > 0 else _notional_f
+                if _margin_used_final > 1e-10:
+                    _margin_pnl_pct_final = (pnl / _margin_used_final) * 100.0
+                    if self._trade_history:
+                        self._trade_history[-1]["margin_pnl_pct"] = round(_margin_pnl_pct_final, 2)
+        except Exception:
+            pass
+
+        # v6.0: Log margin % P&L
+        _wl = "WIN" if is_win else "LOSS"
+        logger.info(
+            f"📊 TRADE {_wl}: PnL=${pnl:+.4f} | margin%={_margin_pnl_pct_final:+.1f}% "
+            f"on ${_margin_used_final:.2f} margin | reason={exit_reason} | "
+            f"trades={self._total_trades} WR={self._winning_trades}/{self._total_trades} "
+            f"session=${self._total_pnl:+.4f}")
+
         return True
 
     def _finalise_exit(self):
@@ -8760,6 +8864,27 @@ class QuantStrategy:
             expect = (wr/100 * avg_w) + ((1 - wr/100) * avg_l)
             extra.append(f"  Avg W: ${avg_w:+.2f} | Avg L: ${avg_l:+.2f}")
             extra.append(f"  Expectancy: ${expect:+.2f}/trade")
+
+            # v6.0: Margin-based P&L %
+            _m_pcts = [t.get('margin_pnl_pct', 0.0) for t in hist if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+            if _m_pcts:
+                _m_total = sum(_m_pcts)
+                _m_avg = _m_total / len(_m_pcts)
+                extra.append(f"  Margin PnL: {_m_total:+.1f}% total ({_m_avg:+.1f}%/trade)")
+
+        # v6.0: Unrealised margin % if in position
+        if not p.is_flat() and p.entry_price > 0 and p.quantity > 0:
+            try:
+                _rpt_notional = p.entry_price * p.quantity
+                _rpt_lev = QCfg.LEVERAGE()
+                _rpt_margin = _rpt_notional / _rpt_lev if _rpt_lev > 0 else _rpt_notional
+                if _rpt_margin > 1e-10:
+                    _rpt_profit = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+                    _rpt_upnl = _rpt_profit * p.quantity
+                    _rpt_pct = (_rpt_upnl / _rpt_margin) * 100.0
+                    extra.append(f"  Open P&L: {_rpt_pct:+.1f}% on ${_rpt_margin:.2f} margin")
+            except Exception:
+                pass
 
         if self._fee_engine is not None:
             try:
