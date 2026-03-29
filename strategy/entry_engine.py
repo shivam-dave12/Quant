@@ -439,8 +439,13 @@ class EntryEngine:
         # System 2: ICT engine sweeps (bridged via ict_ctx.ict_sweeps)
         # These are sweeps the ICT engine detected on its own liquidity_pools
         # that the LiquidityMap missed entirely. Convert to SweepResult.
+        # Only bridge when we're in a state that can actually enter POST_SWEEP.
         _ict_bridge_event = None
-        if not new_sweeps and hasattr(ict_ctx, 'ict_sweeps') and ict_ctx.ict_sweeps:
+        if (not new_sweeps
+                and self._state not in (EngineState.POST_SWEEP,
+                                        EngineState.IN_POSITION,
+                                        EngineState.ENTERING)
+                and hasattr(ict_ctx, 'ict_sweeps') and ict_ctx.ict_sweeps):
             _age_limit_ms = int(now * 1000) - 30_000
             for ict_sw in ict_ctx.ict_sweeps:
                 if ict_sw.sweep_ts < _age_limit_ms:
