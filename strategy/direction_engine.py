@@ -271,6 +271,7 @@ class DirectionEngine:
         self._HUNT_CACHE_SEC = 5   # refresh prediction every 5s
 
         self._ps_state: Optional[PostSweepState] = None
+        self._ps_state_quality: float = 0.0   # displacement_score of the active sweep (0–1)
         self._last_ps_analysis: Dict = {}
 
     # =========================================================================
@@ -624,21 +625,6 @@ class DirectionEngine:
         ssl_score  = max(0.0, -score)
 
         # ─────────────────────────────────────────────────────────────────────
-        # DEALING RANGE GATE: Cap confidence if in wrong zone
-        # ─────────────────────────────────────────────────────────────────────
-        # If predicting BSL hunt (price going UP) but we're already in DEEP PREMIUM,
-        # confidence is structurally capped. Smart money does NOT hunt BSL from premium.
-        # If predicting SSL hunt from DEEP DISCOUNT, same logic applies.
-        if score > 0 and dr_pd > 0.75:
-            # BSL hunt predicted but in deep premium → reduce confidence
-            _zone_penalty = (dr_pd - 0.75) / 0.25   # 0→1 as pd goes 0.75→1.0
-            confidence = max(0.0, confidence - _zone_penalty * 0.30)
-        elif score < 0 and dr_pd < 0.25:
-            # SSL hunt predicted but in deep discount → reduce confidence
-            _zone_penalty = (0.25 - dr_pd) / 0.25
-            confidence = max(0.0, confidence - _zone_penalty * 0.30)
-
-        # ─────────────────────────────────────────────────────────────────────
         # HTF STRUCTURE OVERRIDE
         # ─────────────────────────────────────────────────────────────────────
         # When 3 HTF timeframes (4H, 1H, 15m) are all bearish and the composite
@@ -665,10 +651,27 @@ class DirectionEngine:
             score = +abs(score) * 0.70
             _override_applied = True
 
-        # Recompute after override
+        # Recompute after override — confidence is reset here, so the DR gate
+        # MUST come after this block (not before) to avoid being silently erased.
         confidence = abs(score)
         bsl_score  = max(0.0, score)
         ssl_score  = max(0.0, -score)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # DEALING RANGE GATE: Cap confidence if in wrong zone
+        # ─────────────────────────────────────────────────────────────────────
+        # Applied AFTER the HTF override recompute so the penalty survives it.
+        # If predicting BSL hunt (price going UP) but we're already in DEEP PREMIUM,
+        # confidence is structurally capped. Smart money does NOT hunt BSL from premium.
+        # If predicting SSL hunt from DEEP DISCOUNT, same logic applies.
+        if score > 0 and dr_pd > 0.75:
+            # BSL hunt predicted but in deep premium → reduce confidence
+            _zone_penalty = (dr_pd - 0.75) / 0.25   # 0→1 as pd goes 0.75→1.0
+            confidence = max(0.0, confidence - _zone_penalty * 0.30)
+        elif score < 0 and dr_pd < 0.25:
+            # SSL hunt predicted but in deep discount → reduce confidence
+            _zone_penalty = (0.25 - dr_pd) / 0.25
+            confidence = max(0.0, confidence - _zone_penalty * 0.30)
 
         # ─────────────────────────────────────────────────────────────────────
         # BUILD RESULT
@@ -741,11 +744,29 @@ class DirectionEngine:
         price:            float,
         atr:              float,
         now:              float,
+        quality:          float = 0.5,  # displacement_score from pool (0–1); higher = better sweep
     ) -> None:
         """
         Call this immediately when a pool sweep is detected.
         Initialises the accumulative evidence tracker for the post-sweep evaluation.
+
+        Concurrent sweep priority: if an existing PostSweepState is less than
+        15 seconds old AND the incoming sweep has a lower quality score, the
+        existing state is retained and the new sweep is silently discarded.
+        This prevents a lower-quality simultaneous sweep (e.g. a weak SSL hit
+        arriving 1 tick after a strong BSL sweep) from wiping accumulated evidence.
         """
+        if self._ps_state is not None:
+            existing_age = now - self._ps_state.entered_at
+            if existing_age < 15.0 and quality <= self._ps_state_quality:
+                logger.debug(
+                    f"DirectionEngine: sweep {pool_type} @ ${swept_pool_price:,.1f} "
+                    f"DISCARDED — existing {self._ps_state.swept_pool_type} state "
+                    f"age={existing_age:.1f}s quality={quality:.2f} "
+                    f"<= existing={self._ps_state_quality:.2f}")
+                return
+
+        self._ps_state_quality = quality
         self._ps_state = PostSweepState(
             swept_pool_price = swept_pool_price,
             swept_pool_type  = pool_type,
@@ -755,7 +776,8 @@ class DirectionEngine:
         )
         logger.info(
             f"🌊 DirectionEngine: POST-SWEEP STARTED | "
-            f"{pool_type} @ ${swept_pool_price:,.1f} | price=${price:,.2f}")
+            f"{pool_type} @ ${swept_pool_price:,.1f} | price=${price:,.2f} "
+            f"| quality={quality:.2f}")
 
     def clear_sweep(self) -> None:
         """Call when post-sweep evaluation is complete or aborted."""
@@ -926,7 +948,7 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         if not ps.static_scored:
             ps.static_rev_base, ps.static_cont_base = \
-                self._score_sweep_static(ps, ict_engine, rev_dir, cont_dir)
+                self._score_sweep_static(ps, ict_engine, rev_dir, cont_dir, atr=a)
             ps.static_scored = True
             logger.debug(
                 f"POST-SWEEP static: rev={ps.static_rev_base:.1f} "
@@ -941,13 +963,31 @@ class DirectionEngine:
                 price, a, now, tick_flow, cvd_trend)
 
         # ── Accumulate with decay ──────────────────────────────────────────
-        _decay = 0.92  # per-tick decay for the losing side
-        if rev_delta > 0:
+        # _decay is applied to the LOSING side each tick to prevent stale
+        # evidence from dominating indefinitely.
+        #
+        # ASYMMETRY FIX: the old two-`if` block applied decay inside each
+        # branch independently.  When both rev_delta > 0 AND cont_delta > 0
+        # in the same tick (e.g. displacement fires rev, flow fires cont),
+        # rev_evidence got its new delta added and then immediately decayed
+        # again inside the second `if cont_delta` branch — penalising rev by
+        # ~8% of its own new delta on every mixed-signal tick.  Cont did not
+        # suffer the same treatment.  Fix: handle all three cases explicitly.
+        _decay = 0.92  # per-tick decay applied to the losing side
+        if rev_delta > 0 and cont_delta > 0:
+            # Mixed signal: accumulate both, then decay both symmetrically.
             ps.rev_evidence  += rev_delta
-            ps.cont_evidence *= _decay
-        if cont_delta > 0:
             ps.cont_evidence += cont_delta
             ps.rev_evidence  *= _decay
+            ps.cont_evidence *= _decay
+        elif rev_delta > 0:
+            ps.rev_evidence  += rev_delta
+            ps.cont_evidence *= _decay
+        elif cont_delta > 0:
+            ps.cont_evidence += cont_delta
+            ps.rev_evidence  *= _decay
+        # If both deltas are 0 (no signal this tick), no decay is applied —
+        # stale evidence persists until the next directional tick overwrites it.
 
         # Update peaks
         ps.peak_rev  = max(ps.peak_rev,  ps.static_rev_base  + ps.rev_evidence)
@@ -1062,6 +1102,7 @@ class DirectionEngine:
         ict_engine,
         rev_dir:    str,
         cont_dir:   str,
+        atr:        float = 0.0,
     ) -> Tuple[float, float]:
         """
         Score the TIME-INVARIANT factors for the post-sweep decision.
@@ -1211,8 +1252,7 @@ class DirectionEngine:
                     continue
                 if ob.strength < 70.0:
                     continue
-                ob_dist_atr = abs(ob.midpoint - ps.swept_pool_price) / max(atr, 1.0) \
-                    if atr > 1e-10 else 0.0
+                ob_dist_atr = abs(ob.midpoint - ps.swept_pool_price) / max(atr, 1.0)
                 if ob_dist_atr < 2.0:
                     s_rev += 10.0
                     break
@@ -1321,20 +1361,27 @@ class DirectionEngine:
             rev_delta  += 2.0
 
         # ── 5m Structure ──────────────────────────────────────────────────
+        # CRITICAL: only count CHoCH/BOS events that occurred AFTER the sweep.
+        # A CHoCH that printed hours before the sweep adds 12 pts per tick
+        # indefinitely, creating permanent artificial reversal bias.
         if ict_engine is not None:
             try:
                 _tf = getattr(ict_engine, '_tf', {})
                 _t5 = _tf.get("5m")
                 if _t5 is not None:
-                    _choch = getattr(_t5, 'choch_direction', '') or ''
-                    _bos   = getattr(_t5, 'bos_direction', '') or ''
-                    _rev_struct_label = "bearish" if rev_dir == "short" else "bullish"
+                    _choch    = getattr(_t5, 'choch_direction', '') or ''
+                    _bos      = getattr(_t5, 'bos_direction',   '') or ''
+                    _choch_ts = getattr(_t5, 'choch_timestamp',  0)
+                    _bos_ts   = getattr(_t5, 'bos_timestamp',    0)
+                    _sweep_ms = ps.entered_at * 1000   # sweep time in milliseconds
+                    _rev_struct_label  = "bearish" if rev_dir == "short" else "bullish"
                     _cont_struct_label = "bullish" if rev_dir == "short" else "bearish"
-                    if _choch == _rev_struct_label:
+                    # Only count structural events that happened AFTER the sweep
+                    if _choch == _rev_struct_label and _choch_ts > _sweep_ms:
                         rev_delta  += 12.0; rev_reasons.append("CHoCH_5m_REVERSAL")
-                    if _bos == _rev_struct_label:
-                        rev_delta  += 8.0; rev_reasons.append("BOS_5m_REVERSAL")
-                    if _bos == _cont_struct_label:
+                    if _bos == _rev_struct_label and _bos_ts > _sweep_ms:
+                        rev_delta  +=  8.0; rev_reasons.append("BOS_5m_REVERSAL")
+                    if _bos == _cont_struct_label and _bos_ts > _sweep_ms:
                         cont_delta += 10.0; cont_reasons.append("BOS_5m_CONT")
             except Exception:
                 pass

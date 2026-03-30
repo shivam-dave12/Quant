@@ -310,6 +310,16 @@ class ICTContext:
     nearest_ob_price_short: float = 0.0  # BUG-FIX: OB above price (short SL anchor)
     kill_zone:        str   = ""
     ict_sweeps:       list  = field(default_factory=list)  # List[ICTSweepEvent]
+    # DirectionEngine post-sweep verdict injection (Bug-4 fix).
+    # When DirectionEngine.evaluate_sweep() returns action="reverse" or
+    # "continue", quant_strategy.py writes the verdict here before calling
+    # entry_engine.update().  _evaluate_post_sweep_accumulative() reads these
+    # fields to weight its own evidence model, making DirectionEngine the
+    # authoritative source for post-sweep direction rather than a disconnected
+    # observer that only sends Telegram messages.
+    direction_hint:            str   = ""    # "reverse" | "continue" | ""
+    direction_hint_side:       str   = ""    # "long" | "short" | ""
+    direction_hint_confidence: float = 0.0   # 0.0–1.0 from PostSweepDecision
 
     @property
     def session_quality(self) -> str:
@@ -1813,6 +1823,31 @@ class EntryEngine:
         # ─────────────────────────────────────────────────────────────
         # DYNAMIC FACTORS — scored every tick, feed decay accumulator
         # ─────────────────────────────────────────────────────────────
+
+        # DirectionEngine direction_hint  [DYNAMIC — injected by quant_strategy.py]
+        # Bug-4 fix: DirectionEngine.evaluate_sweep() produces a verdict
+        # (reverse/continue) that was previously only logged and Telegrammed —
+        # it never reached the entry engine.  The two post-sweep systems ran
+        # in parallel and could disagree; only entry_engine drove actual entries.
+        # Fix: quant_strategy.py writes the verdict into ict_ctx.direction_hint
+        # before calling entry_engine.update().  Here we consume it as a dynamic
+        # factor so that a high-confidence DirectionEngine reversal verdict
+        # meaningfully boosts the reversal case, and a continuation verdict boosts
+        # the continuation case.  The weight is proportional to confidence so a
+        # low-confidence hint adds little signal.
+        _dir_hint      = (getattr(ict, 'direction_hint',            '') or '').lower()
+        _dir_hint_side = (getattr(ict, 'direction_hint_side',       '') or '').lower()
+        _dir_hint_conf = float(getattr(ict, 'direction_hint_confidence', 0.0) or 0.0)
+        if _dir_hint and _dir_hint_conf >= 0.30:
+            _hint_pts = round(20.0 * _dir_hint_conf, 1)   # max +20 pts at conf=1.0
+            if _dir_hint == "reverse" and _dir_hint_side == sweep_dir:
+                rev_delta  += _hint_pts
+                rev_reasons.append(
+                    f"DIR_ENGINE_REVERSE({_dir_hint_conf:.0%})")
+            elif _dir_hint == "continue" and _dir_hint_side == cont_dir:
+                cont_delta += _hint_pts
+                cont_reasons.append(
+                    f"DIR_ENGINE_CONTINUE({_dir_hint_conf:.0%})")
 
         # Live displacement from sweep level  [DYNAMIC — grows as price moves]
         if ps.max_displacement >= _PS_DISP_STRONG_ATR:

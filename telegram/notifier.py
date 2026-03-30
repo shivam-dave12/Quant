@@ -804,6 +804,9 @@ def format_periodic_report(
     nearest_bsl:        Optional[Dict] = None,
     nearest_ssl:        Optional[Dict] = None,
     sweep_analysis:     Optional[Dict] = None,
+    # DirectionEngine state
+    direction_hunt:       Optional[Any] = None,
+    direction_ps_analysis: Optional[Any] = None,
     **kwargs,
 ) -> str:
     """
@@ -913,6 +916,92 @@ def format_periodic_report(
         if cr:
             lines.append(f"  Cont: {', '.join(cr[:3])}")
 
+    # ── DIRECTION ENGINE — hunt prediction snapshot ───────────
+    if direction_hunt is not None:
+        _dh_pred   = getattr(direction_hunt, 'predicted', None)
+        _dh_conf   = getattr(direction_hunt, 'confidence', 0.0)
+        _dh_deliv  = getattr(direction_hunt, 'delivery_direction', '')
+        _dh_raw    = getattr(direction_hunt, 'raw_score', 0.0)
+        _dh_bsl    = getattr(direction_hunt, 'bsl_score', 0.0)
+        _dh_ssl    = getattr(direction_hunt, 'ssl_score', 0.0)
+        _dh_fac    = getattr(direction_hunt, 'factors', None)
+
+        hunt_icon  = "🔵" if _dh_pred == "BSL" else ("🟠" if _dh_pred == "SSL" else "⚪")
+        deliv_icon = "🟢" if _dh_deliv == "bullish" else ("🔴" if _dh_deliv == "bearish" else "⚪")
+        _conf_filled = min(10, int(_dh_conf * 10))
+        _conf_bar    = "█" * _conf_filled + "░" * (10 - _conf_filled)
+
+        lines.append("")
+        lines.append(f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(_dh_pred or 'NEUTRAL')}")
+        lines.append(f"  [{_conf_bar}] {_dh_conf:.0%}  {deliv_icon} {_esc(_dh_deliv or '—')}")
+        lines.append(f"  BSL={_dh_bsl:.3f}  SSL={_dh_ssl:.3f}  raw={_dh_raw:+.3f}")
+
+        if _dh_fac is not None:
+            def _fbar10_rpt(v: float) -> str:
+                half = 4
+                mag = min(half, int(abs(v) * half + 0.5))
+                if v >= 0:
+                    return "░" * half + "█" * mag + "░" * (half - mag)
+                else:
+                    return "░" * (half - mag) + "█" * mag + "░" * half
+
+            _FACTOR_PAIRS = [
+                ("amd",           "amd"),
+                ("htf_structure", "htf"),
+                ("dealing_range", "dr "),
+                ("order_flow",    "of "),
+                ("pool_asymmetry","pa "),
+                ("ob_fvg_pull",   "obf"),
+                ("displacement",  "dsp"),
+                ("session",       "ses"),
+                ("micro_bos",     "bos"),
+                ("volume",        "vol"),
+            ]
+            # Render in two-column pairs to keep the block compact
+            factor_rows = []
+            row = []
+            for attr, short in _FACTOR_PAIRS:
+                val = getattr(_dh_fac, attr, 0.0)
+                sign = "+" if val >= 0 else ""
+                row.append(f"{short}[{_fbar10_rpt(val)}]{sign}{val:.2f}")
+                if len(row) == 2:
+                    factor_rows.append("  " + "   ".join(row))
+                    row = []
+            if row:
+                factor_rows.append("  " + row[0])
+            lines.extend(factor_rows)
+
+    # ── DIRECTION ENGINE — post-sweep verdict snapshot ────────
+    if direction_ps_analysis is not None:
+        _ps_action = getattr(direction_ps_analysis, 'action',    '?')
+        _ps_dir    = getattr(direction_ps_analysis, 'direction',  '')
+        _ps_conf   = getattr(direction_ps_analysis, 'confidence', 0.0)
+        _ps_phase  = getattr(direction_ps_analysis, 'phase',      '')
+        _ps_rev    = getattr(direction_ps_analysis, 'rev_score',  0.0)
+        _ps_cont   = getattr(direction_ps_analysis, 'cont_score', 0.0)
+        _ps_cisd   = getattr(direction_ps_analysis, 'cisd_active', False)
+        _ps_ote    = getattr(direction_ps_analysis, 'ote_active',  False)
+        _ps_disp   = getattr(direction_ps_analysis, 'displacement_atr', 0.0)
+
+        _ps_winner = ("REVERSAL"     if _ps_rev  > _ps_cont + 15 else
+                      "CONTINUATION" if _ps_cont > _ps_rev  + 15 else "CONTESTED")
+        _ps_ai     = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(_ps_action.lower(), "❓")
+        _ps_di     = "🟢" if _ps_dir == "long" else ("🔴" if _ps_dir == "short" else "⚪")
+
+        lines.append("")
+        lines.append(f"{_ps_ai} <b>POST-SWEEP VERDICT</b>: {_ps_action.upper()}  {_ps_di} {_ps_dir.upper() or '—'}")
+        lines.append(f"  conf={_ps_conf:.0%}  phase={_esc(_ps_phase)}")
+        lines.append(f"  REV={_ps_rev:.1f}  CONT={_ps_cont:.1f}  → {_ps_winner}")
+        _ps_flags = []
+        if _ps_cisd:
+            _ps_flags.append("CISD✓")
+        if _ps_ote:
+            _ps_flags.append("OTE✓")
+        if _ps_disp > 0:
+            _ps_flags.append(f"disp={_ps_disp:.2f}ATR")
+        if _ps_flags:
+            lines.append("  " + "  ".join(_ps_flags))
+
     # ── POSITION ─────────────────────────────────────────────
     if position:
         side    = position.get("side", "?").upper()
@@ -1001,6 +1090,7 @@ def format_direction_hunt_alert(
     htf_bias:           str = "",
     session:            str = "",
     in_killzone:        bool = False,
+    factors:            Optional[Any] = None,
 ) -> str:
     """
     DirectionEngine hunt prediction Telegram alert.
@@ -1025,6 +1115,40 @@ def format_direction_hunt_alert(
         f"  [{conf_bar}] {confidence:.0%}",
         f"  BSL score: {bsl_score:.3f}  |  SSL score: {ssl_score:.3f}",
         f"  Raw (±1): {raw_score:+.3f}",
+    ]
+
+    # ── 10-Factor breakdown ─────────────────────────────────────────────
+    if factors is not None:
+        def _fbar10(v: float) -> str:
+            """Signed bar: negative fills left, positive fills right, width=10."""
+            half = 5
+            mag = min(half, int(abs(v) * half + 0.5))
+            if v >= 0:
+                return "░" * half + "█" * mag + "░" * (half - mag)
+            else:
+                return "░" * (half - mag) + "█" * mag + "░" * half
+
+        _FACTOR_LABELS = [
+            ("amd",            "AMD phase  "),
+            ("htf_structure",  "HTF struct "),
+            ("dealing_range",  "Deal range "),
+            ("order_flow",     "Order flow "),
+            ("pool_asymmetry", "Pool asym  "),
+            ("ob_fvg_pull",    "OB/FVG pull"),
+            ("displacement",   "Displacemnt"),
+            ("session",        "Session    "),
+            ("micro_bos",      "Micro BOS  "),
+            ("volume",         "Volume     "),
+        ]
+        lines.append("")
+        lines.append("<b>🔢 10-FACTOR BREAKDOWN</b>")
+        for attr, label in _FACTOR_LABELS:
+            val = getattr(factors, attr, 0.0)
+            bar = _fbar10(val)
+            sign = "+" if val >= 0 else ""
+            lines.append(f"  {label}  [{bar}] {sign}{val:.2f}")
+
+    lines += [
         "",
         f"<b>🎯 TARGETS</b>",
     ]
@@ -1108,6 +1232,113 @@ def format_pool_gate_alert(
         lines += ["", f"<b>🎯 NEXT TARGET</b>", f"  {_fmt_price(next_target)}"]
 
     lines += ["", f"<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
+
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 9. DIRECTION ENGINE — POST-SWEEP VERDICT
+# ======================================================================
+
+def format_post_sweep_verdict(
+    action:           str,              # "reverse" | "continue" | "wait"
+    direction:        str,              # "long" | "short" | ""
+    confidence:       float,
+    phase:            str,              # "DISPLACEMENT" | "CISD" | "OTE" | "MATURE"
+    cisd_active:      bool  = False,
+    ote_active:       bool  = False,
+    displacement_atr: float = 0.0,
+    rev_score:        float = 0.0,
+    cont_score:       float = 0.0,
+    rev_reasons:      Optional[List[str]] = None,
+    cont_reasons:     Optional[List[str]] = None,
+    reason:           str   = "",
+    swept_pool_price: Optional[float] = None,
+    swept_pool_type:  str   = "",
+    current_price:    float = 0.0,
+) -> str:
+    """
+    Post-sweep accumulative evidence model verdict from DirectionEngine.
+    Sent when action is 'reverse' or 'continue' (not 'wait').
+    Shows the full evidence breakdown: static + dynamic scores, phase,
+    CISD/OTE flags, and the reason behind the decision.
+    """
+    rev_reasons  = rev_reasons  or []
+    cont_reasons = cont_reasons or []
+
+    action_icons = {
+        "reverse":  "🔄",
+        "continue": "➡️",
+        "wait":     "⏳",
+    }
+    action_icon = action_icons.get(action.lower(), "❓")
+    dir_icon    = "🟢" if direction.lower() == "long" else ("🔴" if direction.lower() == "short" else "⚪")
+    conf_bar_filled = min(10, int(confidence * 10))
+    conf_bar = "█" * conf_bar_filled + "░" * (10 - conf_bar_filled)
+
+    phase_icons = {
+        "DISPLACEMENT": "⚡",
+        "CISD":         "🔀",
+        "OTE":          "🎯",
+        "MATURE":       "📐",
+    }
+    phase_icon = phase_icons.get(phase.upper(), "📍")
+
+    # Score bar — shows relative weight of reversal vs continuation evidence
+    total_evidence = rev_score + cont_score
+    if total_evidence > 0:
+        rev_pct  = rev_score  / total_evidence
+        cont_pct = cont_score / total_evidence
+    else:
+        rev_pct = cont_pct = 0.0
+
+    rev_bar_filled  = min(10, int(rev_pct  * 10))
+    cont_bar_filled = min(10, int(cont_pct * 10))
+    rev_bar  = "█" * rev_bar_filled  + "░" * (10 - rev_bar_filled)
+    cont_bar = "█" * cont_bar_filled + "░" * (10 - cont_bar_filled)
+
+    winner = ("REVERSAL"     if rev_score  > cont_score + 15 else
+              "CONTINUATION" if cont_score > rev_score  + 15 else "CONTESTED")
+
+    lines = [
+        f"{action_icon} <b>POST-SWEEP: {action.upper()}</b>  {dir_icon} {direction.upper() or '—'}",
+        f"  [{conf_bar}] {confidence:.0%}  |  {phase_icon} Phase: <b>{_esc(phase)}</b>",
+    ]
+
+    # Sweep context
+    if swept_pool_price or swept_pool_type:
+        sweep_ctx = f"  Swept: {_esc(swept_pool_type)} @ {_fmt_price(swept_pool_price)}"
+        if current_price:
+            sweep_ctx += f"  |  Now: {_fmt_price(current_price)}"
+        lines.append(sweep_ctx)
+
+    # Flags
+    flags = []
+    if cisd_active:
+        flags.append("🔀 CISD confirmed")
+    if ote_active:
+        flags.append("🎯 OTE reached")
+    if displacement_atr > 0:
+        flags.append(f"⚡ Disp {displacement_atr:.2f}ATR")
+    if flags:
+        lines.append("  " + "  |  ".join(flags))
+
+    # Evidence scoreboard
+    lines += [
+        "",
+        f"<b>⚖️ EVIDENCE SCOREBOARD</b>",
+        f"  REV  [{rev_bar}] {rev_score:.1f}",
+        f"  CONT [{cont_bar}] {cont_score:.1f}",
+        f"  → <b>{winner}</b>",
+    ]
+
+    if rev_reasons:
+        lines.append(f"  Rev:  {', '.join(_esc(r) for r in rev_reasons[:4])}")
+    if cont_reasons:
+        lines.append(f"  Cont: {', '.join(_esc(r) for r in cont_reasons[:4])}")
+
+    if reason:
+        lines += ["", f"<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
 
     return "\n".join(lines)
 

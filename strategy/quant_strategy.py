@@ -3933,6 +3933,14 @@ class QuantStrategy:
         self._last_think_log_v2 = 0.0
         self._force_sl = None
         self._force_tp = None
+        # Bug-1 fix: deduplication set for DirectionEngine.on_sweep() calls.
+        # The sweep bridge loop runs every 250ms and visits every swept pool
+        # whose sweep_timestamp falls within the last 30s.  Without this guard,
+        # on_sweep() is called ~120 times per pool, resetting the PostSweepState
+        # and wiping all accumulated evidence on every tick.
+        # Key format: (pool_price_float, sweep_timestamp_int_ms)
+        # Entries are pruned when older than 60s to prevent unbounded growth.
+        self._notified_sweeps: set = set()
 
         self._log_init()
 
@@ -5284,6 +5292,7 @@ class QuantStrategy:
                             current_price       = price,
                             amd_phase           = _amd_ph,
                             htf_bias            = _htf_b,
+                            factors             = _hunt.factors,
                         ))
                     except Exception as _tg_e:
                         logger.debug(f"DirectionEngine hunt Telegram error: {_tg_e}")
@@ -5436,15 +5445,32 @@ class QuantStrategy:
                         ))
                         # Notify DirectionEngine so it can open a PostSweepState
                         # and begin the accumulative Bayesian evidence model.
+                        # DEDUPLICATION: the bridge loop runs every 250ms and
+                        # visits all swept pools within the last 30s window.
+                        # Without this guard, on_sweep() is called ~120 times
+                        # for a single pool, resetting PostSweepState every tick
+                        # and making accumulated evidence impossible to build.
                         if self._dir_engine is not None:
                             try:
-                                self._dir_engine.on_sweep(
-                                    swept_pool_price = pool.price,
-                                    pool_type        = pool.level_type,  # "BSL" | "SSL"
-                                    price            = price,
-                                    atr              = atr,
-                                    now              = now,
-                                )
+                                _sweep_key = (pool.price, pool.sweep_timestamp)
+                                if _sweep_key not in self._notified_sweeps:
+                                    self._notified_sweeps.add(_sweep_key)
+                                    self._dir_engine.on_sweep(
+                                        swept_pool_price = pool.price,
+                                        pool_type        = pool.level_type,  # "BSL" | "SSL"
+                                        price            = price,
+                                        atr              = atr,
+                                        now              = now,
+                                        quality          = float(
+                                            getattr(pool, 'displacement_score', 0.5) or 0.5),
+                                    )
+                                # Prune stale entries — keep only sweeps from the
+                                # last 60s so the set does not grow unboundedly.
+                                _cutoff_ms = now_ms - 60_000
+                                self._notified_sweeps = {
+                                    k for k in self._notified_sweeps
+                                    if k[1] > _cutoff_ms
+                                }
                             except Exception:
                                 pass
             except Exception as e:
@@ -5453,6 +5479,11 @@ class QuantStrategy:
         # Step 6c: Post-sweep evaluation (DirectionEngine accumulative model)
         # Runs every tick while DirectionEngine has an open PostSweepState.
         # Evidence builds across ticks — momentary noise cannot flip the decision.
+        # Bug-4 fix: the verdict (action/direction/confidence) is written into
+        # ict_ctx.direction_hint* BEFORE entry_engine.update() so that
+        # _evaluate_post_sweep_accumulative() can consume it as a dynamic
+        # weighting factor.  Previously the verdict was only logged and Telegrammed
+        # — DirectionEngine was purely observational and had no effect on entries.
         if self._dir_engine is not None and getattr(self._dir_engine, 'in_post_sweep', False):
             try:
                 _tf_ps  = self._tick_eng.get_signal() if self._tick_eng else 0.0
@@ -5466,18 +5497,42 @@ class QuantStrategy:
                     cvd_trend  = _cvd_ps,
                 )
                 if _ps_decision is not None and _ps_decision.action in ("reverse", "continue"):
+                    # Inject verdict into ICTContext so entry_engine can weight it
+                    ict_ctx.direction_hint            = _ps_decision.action
+                    ict_ctx.direction_hint_side       = getattr(_ps_decision, 'direction', '')
+                    ict_ctx.direction_hint_confidence = _ps_decision.confidence
                     logger.info(
                         f"🔁 POST-SWEEP [{_ps_decision.action.upper()}]: "
                         f"dir={getattr(_ps_decision, 'direction', '?')} "
                         f"conf={_ps_decision.confidence:.2f} "
                         f"| {_ps_decision.reason[:80]}")
-                    send_telegram_message(
-                        f"🌊 <b>POST-SWEEP: {_ps_decision.action.upper()}</b>\n"
-                        f"Direction: {getattr(_ps_decision, 'direction', '?')}\n"
-                        f"Confidence: {_ps_decision.confidence:.2f}\n"
-                        f"{_ps_decision.reason[:200]}")
+                    try:
+                        from telegram.notifier import format_post_sweep_verdict
+                        _ps_state = getattr(self._dir_engine, '_ps_state', None)
+                        send_telegram_message(format_post_sweep_verdict(
+                            action           = _ps_decision.action,
+                            direction        = getattr(_ps_decision, 'direction', ''),
+                            confidence       = _ps_decision.confidence,
+                            phase            = getattr(_ps_decision, 'phase', ''),
+                            cisd_active      = getattr(_ps_decision, 'cisd_active', False),
+                            ote_active       = getattr(_ps_decision, 'ote_active', False),
+                            displacement_atr = getattr(_ps_decision, 'displacement_atr', 0.0),
+                            rev_score        = getattr(_ps_decision, 'rev_score', 0.0),
+                            cont_score       = getattr(_ps_decision, 'cont_score', 0.0),
+                            rev_reasons      = getattr(_ps_decision, 'rev_reasons', []),
+                            cont_reasons     = getattr(_ps_decision, 'cont_reasons', []),
+                            reason           = _ps_decision.reason,
+                            swept_pool_price = getattr(_ps_state, 'swept_pool_price', None) if _ps_state else None,
+                            swept_pool_type  = getattr(_ps_state, 'swept_pool_type',  '')   if _ps_state else '',
+                            current_price    = price,
+                        ))
+                    except Exception as _tg_ps:
+                        logger.debug(f"DirectionEngine post-sweep Telegram error: {_tg_ps}")
                 elif _ps_decision is not None:
-                    # "wait" or "abandon" — throttled debug so it doesn't spam at 250ms tick rate
+                    # "wait" — clear any stale hint so entry_engine doesn't act on it
+                    ict_ctx.direction_hint            = ""
+                    ict_ctx.direction_hint_side       = ""
+                    ict_ctx.direction_hint_confidence = 0.0
                     logger.debug(
                         f"⏳ POST-SWEEP [{_ps_decision.action.upper()}]: "
                         f"{_ps_decision.reason[:80]}")
@@ -9203,6 +9258,29 @@ class QuantStrategy:
         extra.append(f"  ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%} pctile)")
         extra.append(f"  VWAP: ${self._vwap.vwap:,.0f} (dev={self._vwap.deviation_atr:+.1f}ATR)")
 
+        # ── DirectionEngine state for periodic report ────────────────────
+        direction_hunt       = None
+        direction_ps_analysis = None
+        if _DIRECTION_ENGINE_AVAILABLE and self._dir_engine is not None:
+            try:
+                direction_hunt = self._dir_engine.last_hunt
+            except Exception:
+                pass
+            try:
+                if self._dir_engine.in_post_sweep:
+                    _ps_eval = self._dir_engine.evaluate_sweep(
+                        price      = price,
+                        atr        = atr,
+                        now        = time.time(),
+                        ict_engine = self._ict,
+                        tick_flow  = getattr(self, '_flow_conviction', 0.0),
+                        cvd_trend  = 0.0,
+                    )
+                    if _ps_eval is not None:
+                        direction_ps_analysis = _ps_eval
+            except Exception:
+                pass
+
         return format_periodic_report(
             current_price=price,
             balance=balance,
@@ -9238,6 +9316,9 @@ class QuantStrategy:
             nearest_bsl=nearest_bsl,
             nearest_ssl=nearest_ssl,
             sweep_analysis=sweep_anal,
+            # DirectionEngine state
+            direction_hunt=direction_hunt,
+            direction_ps_analysis=direction_ps_analysis,
         )
 
     # ─── RECONCILIATION (unchanged logic, fixed PnL) ───
