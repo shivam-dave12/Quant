@@ -84,6 +84,22 @@ except ImportError:
     except ImportError:
         _ENTRY_ENGINE_AVAILABLE = False
 
+# ── DirectionEngine — hunt prediction, post-sweep evaluation, pool-hit gate ─
+# Replaces ICTEngine.predict_next_hunt() with a dedicated 10-factor engine.
+# ICTEngine retains structural context; DirectionEngine owns the decisions.
+_DIRECTION_ENGINE_AVAILABLE = False
+try:
+    from strategy.direction_engine import DirectionEngine, HuntPrediction, DirectionBias
+    _DIRECTION_ENGINE_AVAILABLE = True
+except ImportError:
+    try:
+        from direction_engine import DirectionEngine, HuntPrediction, DirectionBias
+        _DIRECTION_ENGINE_AVAILABLE = True
+    except ImportError:
+        DirectionEngine  = None   # type: ignore
+        HuntPrediction   = None   # type: ignore
+        DirectionBias    = None   # type: ignore
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG ACCESSOR
@@ -3815,6 +3831,11 @@ class QuantStrategy:
         self._breakout = BreakoutDetector()  # v4.6: fast breakout detection
         # v4.8: ICT/SMC structural confluence engine
         self._ict = ICTEngine() if _ICT_AVAILABLE else None
+        # DirectionEngine — owns hunt prediction, post-sweep eval, pool-hit gate.
+        # Reads structural context from self._ict; writes results back via
+        # inject_hunt_prediction() so the rest of the stack is unaware of the split.
+        self._dir_engine: Optional[object] = (
+            DirectionEngine() if _DIRECTION_ENGINE_AVAILABLE else None)
         # v5.0: ICT Sweep-and-Go institutional engine
         self._sweep_detector: Optional[object] = (
             ICTSweepDetector() if _ICT_TRADE_ENGINE_AVAILABLE else None)
@@ -3965,6 +3986,13 @@ class QuantStrategy:
                 self._sweep_detector.invalidate()
             self._active_sweep_setup = None
             self._pending_hunt_signal = None
+            # Clear any open DirectionEngine post-sweep state so evidence from
+            # before the reconnect doesn't bleed into the first new setup.
+            if self._dir_engine is not None and hasattr(self._dir_engine, '_ps_state'):
+                try:
+                    self._dir_engine._ps_state = None
+                except Exception:
+                    pass
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
@@ -5171,6 +5199,49 @@ class QuantStrategy:
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
 
+        # Step 3b: DirectionEngine — hunt prediction
+        # Runs AFTER ICT update so structural context (AMD, MTF, pools, OBs/FVGs)
+        # is fully refreshed.  Result is injected into ICT cache so every downstream
+        # caller (get_confluence, get_status, Tier-L) reads DirectionEngine output
+        # without knowing the computation moved here.
+        if self._dir_engine is not None and self._ict is not None:
+            try:
+                _tf_de  = self._tick_eng.get_signal() if self._tick_eng else 0.0
+                _cvd_de = self._cvd.get_trend_signal() if self._cvd else 0.0
+                _hunt: HuntPrediction = self._dir_engine.predict_hunt(
+                    price      = price,
+                    atr        = atr,
+                    now_ms     = now_ms,
+                    ict_engine = self._ict,
+                    tick_flow  = _tf_de,
+                    cvd_trend  = _cvd_de,
+                    candles_5m = candles_by_tf.get("5m", []),
+                )
+                # Bridge HuntPrediction dataclass → legacy dict shape that the
+                # rest of the codebase already consumes via _last_hunt_pred.
+                self._ict.inject_hunt_prediction({
+                    "predicted":          _hunt.predicted,
+                    "confidence":         round(_hunt.confidence, 3),
+                    "delivery_direction": _hunt.delivery_direction,
+                    "raw_score":          round(_hunt.raw_score, 4),
+                    "bsl_score":          round(_hunt.bsl_score, 3),
+                    "ssl_score":          round(_hunt.ssl_score, 3),
+                    "dealing_range_pd":   round(_hunt.dealing_range_pd, 3),
+                    "swept_pool":         _hunt.swept_pool_price,
+                    "opposing_pool":      _hunt.opposing_pool_price,
+                    "reason":             _hunt.reason,
+                    "scenario":           "",   # filled by get_hunt_scenario if needed
+                    "confidence_factors": {},   # DirectionEngine uses HuntFactors dataclass
+                }, now_ms)
+                if _hunt.predicted:
+                    logger.debug(
+                        f"🧭 DIR_ENGINE: hunt={_hunt.predicted} "
+                        f"conf={_hunt.confidence:.2f} "
+                        f"delivery={_hunt.delivery_direction} | "
+                        f"{_hunt.reason[:80]}")
+            except Exception as _de:
+                logger.debug(f"DirectionEngine.predict_hunt error: {_de}")
+
         # Step 4: Update liquidity map
         self._liq_map.update(
             candles_by_tf=candles_by_tf,
@@ -5315,8 +5386,45 @@ class QuantStrategy:
                             candle_low=_cl,
                             candle_close=_cc,
                         ))
+                        # Notify DirectionEngine so it can open a PostSweepState
+                        # and begin the accumulative Bayesian evidence model.
+                        if self._dir_engine is not None:
+                            try:
+                                self._dir_engine.on_sweep(
+                                    swept_pool_price = pool.price,
+                                    pool_type        = pool.level_type,  # "BSL" | "SSL"
+                                    price            = price,
+                                    atr              = atr,
+                                    now              = now,
+                                )
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")
+
+        # Step 6c: Post-sweep evaluation (DirectionEngine accumulative model)
+        # Runs every tick while DirectionEngine has an open PostSweepState.
+        # Evidence builds across ticks — momentary noise cannot flip the decision.
+        if self._dir_engine is not None and getattr(self._dir_engine, 'in_post_sweep', False):
+            try:
+                _tf_ps  = self._tick_eng.get_signal() if self._tick_eng else 0.0
+                _cvd_ps = self._cvd.get_trend_signal() if self._cvd else 0.0
+                _ps_decision = self._dir_engine.evaluate_sweep(
+                    price      = price,
+                    atr        = atr,
+                    now        = now,
+                    ict_engine = self._ict,
+                    tick_flow  = _tf_ps,
+                    cvd_trend  = _cvd_ps,
+                )
+                if _ps_decision is not None and _ps_decision.action in ("reverse", "continue"):
+                    logger.info(
+                        f"🔁 POST-SWEEP [{_ps_decision.action.upper()}]: "
+                        f"dir={getattr(_ps_decision, 'direction', '?')} "
+                        f"conf={_ps_decision.confidence:.2f} "
+                        f"| {_ps_decision.reason[:80]}")
+            except Exception as _pse:
+                logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
 
         # Step 7: Feed to entry engine
         self._entry_engine.update(
@@ -5496,15 +5604,22 @@ class QuantStrategy:
             except Exception as _e:
                 logger.debug(f"Hunt scenario error: {_e}")
 
-        # Also check if we have an updated opposing pool from the ICT engine
+        # Also check if we have an updated opposing pool from the Direction/ICT engine.
+        # DirectionEngine is the authoritative source; ICT injected cache is the fallback.
         if self._ict is not None:
             try:
-                _hp = getattr(self._ict, '_last_hunt_pred', {}) or {}
+                _hunt_obj_oe = (self._dir_engine.last_hunt
+                                if self._dir_engine is not None else None)
+                if _hunt_obj_oe is not None:
+                    _hp = {
+                        "opposing_pool": getattr(_hunt_obj_oe, 'opposing_pool_price', None),
+                    }
+                else:
+                    _hp = getattr(self._ict, '_last_hunt_pred', {}) or {}
                 if _hp.get('opposing_pool') is not None:
                     _hunt_opposing_pool = _hp['opposing_pool']
-                    # Update the hunt signal TP to match ICT engine's target.
-                    # BUG-4 FIX: The original code used type(hunt_signal)(**{**hunt_signal.__dict__, …})
-                    # dataclasses.replace() preserves created_at and any future fields.
+                    # Update the hunt signal TP to match the engine's target.
+                    # BUG-4 FIX: dataclasses.replace() preserves created_at and any future fields.
                     if ((side == "long"  and _hunt_opposing_pool > price) or
                             (side == "short" and _hunt_opposing_pool < price)):
                         hunt_signal = dataclasses.replace(
@@ -5882,7 +5997,17 @@ class QuantStrategy:
                     # Build a minimal hunt signal from ICT engine data
                     if self._ict is not None:
                         try:
-                            _hp_l    = getattr(self._ict, '_last_hunt_pred', {}) or {}
+                            # Read from DirectionEngine (authoritative) and fall back
+                            # to ICT injected cache if DirectionEngine unavailable.
+                            _hunt_obj = (self._dir_engine.last_hunt
+                                         if self._dir_engine is not None else None)
+                            if _hunt_obj is not None:
+                                _hp_l    = {
+                                    "opposing_pool": getattr(_hunt_obj, 'opposing_pool_price', None),
+                                    "swept_pool":    getattr(_hunt_obj, 'swept_pool_price', None),
+                                }
+                            else:
+                                _hp_l = getattr(self._ict, '_last_hunt_pred', {}) or {}
                             _opp_l   = _hp_l.get('opposing_pool')
                             _swept_l = _hp_l.get('swept_pool')
                             _atr_l   = getattr(self, '_atr_val', None) or 1.0
@@ -7233,6 +7358,15 @@ class QuantStrategy:
         # ── v5.2: Clear hunt signal — consumed by fill ────────────────────────
         _hunt_was_active = self._pending_hunt_signal is not None
         self._pending_hunt_signal = None
+        # ── DirectionEngine: clear post-sweep evidence — trade now open ──────
+        # The sweep that triggered this entry has been acted on. Reset the
+        # accumulative PostSweepState so evaluate_sweep() doesn't keep firing
+        # after the position is live (pool-hit gate takes over from here).
+        if self._dir_engine is not None and hasattr(self._dir_engine, '_ps_state'):
+            try:
+                self._dir_engine._ps_state = None
+            except Exception:
+                pass
 
         # ── v9 Entry Telegram notification — pool-first, not quant-scout ─────────
         sl_dist_pts = abs(fill_price - sl_price)

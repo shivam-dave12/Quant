@@ -62,13 +62,16 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL HELPER — used by predict_next_hunt()
+# MODULE-LEVEL HELPER — used by _predict_next_hunt() (private/deprecated path)
+# Direction logic has moved to direction_engine.DirectionEngine which carries
+# its own _sigmoid.  This stays to avoid breaking the private fallback.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fast_sigmoid(z: float, steepness: float = 1.0) -> float:
     """Fast symmetric sigmoid mapping ℝ → (-1, 1). No math.exp needed."""
     sz = z * steepness
     return max(-1.0, min(1.0, sz / (1.0 + abs(sz) * 0.5)))
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -492,7 +495,7 @@ class ICTConfluence:
     # ── Unified Hunt Prediction (populated in get_confluence) ─────────────
     # These fields let all downstream consumers (ICTEntryGate, ICTSLEngine,
     # ICTTPEngine, ICTTrailEngine) use the hunt prediction without re-computing.
-    hunt_prediction:   Dict  = None    # full dict from predict_next_hunt()
+    hunt_prediction:   Dict  = None    # full dict from DirectionEngine.predict_hunt()
     hunt_aligns_trade: bool  = False   # True if hunt direction matches this trade
 
     def __post_init__(self):
@@ -593,7 +596,8 @@ class ICTEngine:
         self._killzone = ""
 
         # ── Order-flow data (set externally each tick via set_order_flow_data) ──
-        # These feed directly into predict_next_hunt() for real-time scoring.
+        # These are injected via set_order_flow_data() and also forwarded to
+        # DirectionEngine by quant_strategy Step 3b for hunt prediction.
         # Range: [-1, +1]  positive = net buying pressure
         self._tick_flow:  float = 0.0   # TickFlowEngine signal
         self._cvd_trend:  float = 0.0   # CVD slope signal
@@ -2337,9 +2341,10 @@ class ICTEngine:
         """
         Inject live order-flow data from external engines.
 
-        Called by quant_strategy.py each tick BEFORE predict_next_hunt() /
-        get_confluence() so that the liquidity prediction reflects the most
-        current order-flow state.
+        Called by quant_strategy.py each tick BEFORE get_confluence() so that
+        the liquidity score reflects the most current order-flow state.
+        Hunt prediction is now delegated to DirectionEngine — see
+        inject_hunt_prediction() below.
 
         tick_flow:  TickFlowEngine signal in [-1, +1].
                     Positive = net buying pressure (price heading to BSL).
@@ -2351,12 +2356,34 @@ class ICTEngine:
         self._tick_flow  = max(-1.0, min(1.0, float(tick_flow)))
         self._cvd_trend  = max(-1.0, min(1.0, float(cvd_trend)))
 
+    def inject_hunt_prediction(self, pred_dict: Dict, now_ms: int) -> None:
+        """
+        Accept a hunt prediction computed externally by DirectionEngine.
+
+        Called by quant_strategy.py immediately after DirectionEngine.predict_hunt()
+        so that get_confluence(), get_status(), and get_full_status() continue to
+        consume hunt data without modification.  ICTEngine no longer owns the
+        prediction logic — it owns the structural context that DirectionEngine reads.
+
+        pred_dict keys (mirrors old predict_next_hunt return shape):
+          predicted, confidence, delivery_direction, raw_score,
+          bsl_score, ssl_score, dealing_range_pd, swept_pool,
+          opposing_pool, reason, scenario
+        """
+        self._last_hunt_pred = pred_dict or {}
+        self._last_hunt_ms   = now_ms
+
     # ─────────────────────────────────────────────────────────────────────
-    # PUBLIC: LIQUIDITY HUNT PREDICTION (CORE DECISION ENGINE)
+    # DEPRECATED: predict_next_hunt() — kept as private fallback only.
+    # Hunt prediction has been moved to direction_engine.DirectionEngine.
+    # ICTEngine exposes inject_hunt_prediction() so callers (get_confluence,
+    # get_status, Tier-L) remain unchanged.  Do NOT promote this back to
+    # public — it would create a split-brain where two engines produce
+    # conflicting hunt signals with different factor weights.
     # ─────────────────────────────────────────────────────────────────────
 
-    def predict_next_hunt(self, price: float, atr: float, now_ms: int,
-                          candles_5m: Optional[List[Dict]] = None) -> Dict:
+    def _predict_next_hunt(self, price: float, atr: float, now_ms: int,
+                           candles_5m: Optional[List[Dict]] = None) -> Dict:
         """
         9-factor prediction of which liquidity pool gets hunted FIRST.
 
@@ -3174,13 +3201,15 @@ class ICTEngine:
         # ── 4. Liquidity + Hunt Prediction  (UNIFIED — core decision driver) ──
         #
         # Liquidity is NOT a peripheral metric — it IS the ICT setup.
-        # The 9-factor predict_next_hunt() runs inside this block and its
-        # confidence feeds the confluence score at the same weight as structure.
+        # DirectionEngine.predict_hunt() runs in quant_strategy Step 3b and its
+        # result is injected via inject_hunt_prediction() before get_confluence()
+        # is called.  The confidence feeds the confluence score at the same weight
+        # as structure.
         #
         # Two sub-components:
         #   A. Sweep freshness     (max 0.10) — same as before, slightly tighter
-        #   B. Hunt prediction     (max 0.20) — NEW: aligning with predicted
-        #                                        delivery direction gives a big bonus
+        #   B. Hunt prediction     (max 0.20) — aligning with predicted delivery
+        #                                        direction gives a big bonus;
         #                                        opposing prediction gives a penalty
         # Combined cap: 0.30  (was 0.15) — liquidity now equals structure weight.
 
@@ -3219,18 +3248,13 @@ class ICTEngine:
             details.append(f"Stacked {len(pools_ahead)} pools ahead")
 
         # Sub-component B: hunt prediction alignment
-        hunt_pred  = None
+        # Prediction is injected externally by DirectionEngine via
+        # inject_hunt_prediction() before get_confluence() is called.
+        # No self-computation here — ICTEngine owns context, not the decision.
+        hunt_pred  = self._last_hunt_pred or {}
         hunt_score = 0.0
-        _hunt_cache_stale = (now_ms - self._last_hunt_ms) > 10_000  # 10 s
-        if _hunt_cache_stale or not self._last_hunt_pred:
-            try:
-                hunt_pred = self.predict_next_hunt(price, atr, now_ms)
-            except Exception:
-                hunt_pred = {}
-        else:
-            hunt_pred = self._last_hunt_pred
 
-        if hunt_pred and hunt_pred.get("predicted"):
+        if hunt_pred.get("predicted"):
             hunt_conf = hunt_pred["confidence"]
             hunt_dir  = hunt_pred.get("delivery_direction", "")
             hunt_aligns = ((side == "long"  and hunt_dir == "bullish") or
@@ -3250,9 +3274,9 @@ class ICTEngine:
         out.sweep_score     = liq   # legacy: sweep-only component
         # Attach hunt prediction to the confluence object so callers
         # (ICTEntryGate, ICTSLEngine, ICTTPEngine) can use it directly.
-        out.hunt_prediction   = hunt_pred or {}
+        out.hunt_prediction   = hunt_pred
         out.hunt_aligns_trade = bool(
-            hunt_pred and
+            hunt_pred.get("predicted") and
             hunt_pred.get("delivery_direction") ==
             ("bullish" if side == "long" else "bearish"))
 
