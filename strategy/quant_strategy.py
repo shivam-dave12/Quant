@@ -3955,6 +3955,13 @@ class QuantStrategy:
                 f"LiqCeiling={QCfg.ICT_LIQ_CEILING_ENABLED()}"
             )
         logger.info(f"   ICT Engine: {ict_status}")
+        # Direction engine
+        dir_status = (
+            "ACTIVE (10-factor hunt prediction | post-sweep eval | pool-hit gate)"
+            if self._dir_engine is not None
+            else "UNAVAILABLE (direction_engine.py not found)"
+        )
+        logger.info(f"   DirectionEngine: {dir_status}")
         # Trail
         trail_status = "_ICTStructureTrail (inline ICT BOS/CHoCH/OB/FVG engine)"
         logger.info(f"   Trail: {trail_status}")
@@ -5233,12 +5240,53 @@ class QuantStrategy:
                     "scenario":           "",   # filled by get_hunt_scenario if needed
                     "confidence_factors": {},   # DirectionEngine uses HuntFactors dataclass
                 }, now_ms)
-                if _hunt.predicted:
-                    logger.debug(
-                        f"🧭 DIR_ENGINE: hunt={_hunt.predicted} "
-                        f"conf={_hunt.confidence:.2f} "
-                        f"delivery={_hunt.delivery_direction} | "
-                        f"{_hunt.reason[:80]}")
+                logger.info(
+                    f"🧭 DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                    f"conf={_hunt.confidence:.2f} "
+                    f"delivery={_hunt.delivery_direction} "
+                    f"raw={_hunt.raw_score:+.3f} "
+                    f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
+                    f"| {_hunt.reason[:100]}")
+                # Send Telegram only when a high-confidence directional call is made
+                # (>=0.55 = "strong" threshold from direction_engine constants).
+                # Throttle to once per 5 minutes per direction to avoid spam on
+                # slow-moving markets where the signal stays high for many ticks.
+                _de_conf_thresh = 0.55
+                _de_tg_key = f"_dir_tg_last_{_hunt.predicted or 'NEUTRAL'}"
+                _de_last_tg = getattr(self, _de_tg_key, 0.0)
+                if (_hunt.predicted is not None
+                        and _hunt.confidence >= _de_conf_thresh
+                        and (now - _de_last_tg) >= 300.0):
+                    setattr(self, _de_tg_key, now)
+                    try:
+                        from telegram.notifier import format_direction_hunt_alert
+                        _amd_ph = ""
+                        _htf_b  = ""
+                        _sess   = ""
+                        _in_kz  = False
+                        if self._ict is not None:
+                            try:
+                                _amd_ph = str(getattr(self._ict, 'amd_phase', '') or '')
+                                _htf_b  = str(getattr(self._htf, 'htf_bias', '') or '') if self._htf else ''
+                            except Exception:
+                                pass
+                        send_telegram_message(format_direction_hunt_alert(
+                            predicted           = _hunt.predicted,
+                            confidence          = _hunt.confidence,
+                            delivery_direction  = _hunt.delivery_direction,
+                            raw_score           = _hunt.raw_score,
+                            bsl_score           = _hunt.bsl_score,
+                            ssl_score           = _hunt.ssl_score,
+                            reason              = _hunt.reason,
+                            dealing_range_pd    = _hunt.dealing_range_pd,
+                            swept_pool_price    = _hunt.swept_pool_price,
+                            opposing_pool_price = _hunt.opposing_pool_price,
+                            current_price       = price,
+                            amd_phase           = _amd_ph,
+                            htf_bias            = _htf_b,
+                        ))
+                    except Exception as _tg_e:
+                        logger.debug(f"DirectionEngine hunt Telegram error: {_tg_e}")
             except Exception as _de:
                 logger.debug(f"DirectionEngine.predict_hunt error: {_de}")
 
@@ -5423,6 +5471,16 @@ class QuantStrategy:
                         f"dir={getattr(_ps_decision, 'direction', '?')} "
                         f"conf={_ps_decision.confidence:.2f} "
                         f"| {_ps_decision.reason[:80]}")
+                    send_telegram_message(
+                        f"🌊 <b>POST-SWEEP: {_ps_decision.action.upper()}</b>\n"
+                        f"Direction: {getattr(_ps_decision, 'direction', '?')}\n"
+                        f"Confidence: {_ps_decision.confidence:.2f}\n"
+                        f"{_ps_decision.reason[:200]}")
+                elif _ps_decision is not None:
+                    # "wait" or "abandon" — throttled debug so it doesn't spam at 250ms tick rate
+                    logger.debug(
+                        f"⏳ POST-SWEEP [{_ps_decision.action.upper()}]: "
+                        f"{_ps_decision.reason[:80]}")
             except Exception as _pse:
                 logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
 
@@ -7574,6 +7632,118 @@ class QuantStrategy:
         # v5.0: max-hold time exit REMOVED.
         # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
         # A timer cannot know if the trade is working.
+
+        # ── DirectionEngine: pool-hit gate ────────────────────────────────────
+        # Runs every tick while in position. When price is near a pool, the gate
+        # determines whether to exit (TP hit), reverse, continue to next pool, or hold.
+        # action="exit"     → close position now (pool TP reached)
+        # action="reverse"  → close and open opposite
+        # action="continue" → update TP to next pool, tighten SL
+        # action="hold"     → nothing, let existing SL/TP manage
+        if self._dir_engine is not None and not pos.is_flat():
+            try:
+                _tf_ph  = self._tick_eng.get_signal() if self._tick_eng else 0.0
+                _cvd_ph = self._cvd.get_trend_signal() if self._cvd else 0.0
+                _gate = self._dir_engine.pool_hit_gate(
+                    pos_side   = pos.side,
+                    pos_entry  = pos.entry_price,
+                    pos_sl     = pos.sl_price,
+                    pos_tp     = pos.tp_price,
+                    price      = price,
+                    atr        = self._atr_5m.atr if self._atr_5m else 1.0,
+                    ict_engine = self._ict,
+                    tick_flow  = _tf_ph,
+                    cvd_trend  = _cvd_ph,
+                )
+                if _gate is not None and _gate.action == "exit":
+                    logger.info(
+                        f"🚧 DIR_ENGINE POOL-GATE: EXIT "
+                        f"conf={_gate.confidence:.2f} "
+                        f"| {_gate.reason[:100]}")
+                    try:
+                        from telegram.notifier import format_pool_gate_alert
+                        send_telegram_message(format_pool_gate_alert(
+                            action        = "exit",
+                            confidence    = _gate.confidence,
+                            reason        = _gate.reason,
+                            pos_side      = pos.side,
+                            pos_entry     = pos.entry_price,
+                            current_price = price,
+                            pos_sl        = pos.sl_price,
+                            pos_tp        = pos.tp_price,
+                            atr           = self._atr_5m.atr if self._atr_5m else 0.0,
+                        ))
+                    except Exception:
+                        send_telegram_message(
+                            f"🚧 <b>POOL-GATE: EXIT TRIGGERED</b>\n"
+                            f"Pool reached — gate recommends close\n"
+                            f"Confidence: {_gate.confidence:.2f}\n"
+                            f"{_gate.reason[:200]}")
+                    self._exit_trade(order_manager, price, "pool_gate_exit")
+                    return
+                elif _gate is not None and _gate.action == "reverse":
+                    logger.info(
+                        f"🚧 DIR_ENGINE POOL-GATE: REVERSE "
+                        f"conf={_gate.confidence:.2f} "
+                        f"| {_gate.reason[:100]}")
+                    try:
+                        from telegram.notifier import format_pool_gate_alert
+                        send_telegram_message(format_pool_gate_alert(
+                            action        = "reverse",
+                            confidence    = _gate.confidence,
+                            reason        = _gate.reason,
+                            pos_side      = pos.side,
+                            pos_entry     = pos.entry_price,
+                            current_price = price,
+                            pos_sl        = pos.sl_price,
+                            pos_tp        = pos.tp_price,
+                            atr           = self._atr_5m.atr if self._atr_5m else 0.0,
+                        ))
+                    except Exception:
+                        send_telegram_message(
+                            f"🚧 <b>POOL-GATE: REVERSE TRIGGERED</b>\n"
+                            f"Structure invalidated — gate recommends reversal\n"
+                            f"Confidence: {_gate.confidence:.2f}\n"
+                            f"{_gate.reason[:200]}")
+                    self._exit_trade(order_manager, price, "pool_gate_reverse")
+                    return
+                elif _gate is not None and _gate.action == "continue" and _gate.next_target:
+                    logger.info(
+                        f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
+                        f"next target=${_gate.next_target:,.0f} "
+                        f"conf={_gate.confidence:.2f} "
+                        f"| {_gate.reason[:80]}")
+                    # Update TP to the next pool target — let the exchange bracket
+                    # order be amended by the trail engine's REST mechanism on the
+                    # next trail tick that detects the TP distance change.
+                    # We update local state here so the in-position monitor shows
+                    # the correct target immediately.
+                    if pos.tp_price != _gate.next_target:
+                        pos.tp_price = _gate.next_target
+                        self.current_tp_price = _gate.next_target
+                        try:
+                            from telegram.notifier import format_pool_gate_alert
+                            send_telegram_message(format_pool_gate_alert(
+                                action        = "continue",
+                                confidence    = _gate.confidence,
+                                reason        = _gate.reason,
+                                pos_side      = pos.side,
+                                pos_entry     = pos.entry_price,
+                                current_price = price,
+                                pos_sl        = pos.sl_price,
+                                pos_tp        = pos.tp_price,
+                                next_target   = _gate.next_target,
+                                atr           = self._atr_5m.atr if self._atr_5m else 0.0,
+                            ))
+                        except Exception:
+                            send_telegram_message(
+                                f"🚧 <b>POOL-GATE: TP EXTENDED</b>\n"
+                                f"New target: ${_gate.next_target:,.0f}\n"
+                                f"Confidence: {_gate.confidence:.2f}\n"
+                                f"{_gate.reason[:200]}")
+                # action="hold" → do nothing, let existing SL/TP manage
+            except Exception as _pg:
+                logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
 
                 # ── Trailing SL — v6.0 STRUCTURE-EVENT-DRIVEN ──────────────────────
         # ARCHITECTURE CHANGE: Time-based TRAIL_INTERVAL_S (10s timer) REMOVED.

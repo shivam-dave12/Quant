@@ -979,6 +979,139 @@ def format_periodic_report(
     return "\n".join(lines)
 
 
+
+
+# ======================================================================
+# 7. DIRECTION ENGINE — HUNT PREDICTION ALERT
+# ======================================================================
+
+def format_direction_hunt_alert(
+    predicted:          Optional[str],    # "BSL" | "SSL" | None
+    confidence:         float,
+    delivery_direction: str,              # "bullish" | "bearish" | ""
+    raw_score:          float,
+    bsl_score:          float,
+    ssl_score:          float,
+    reason:             str = "",
+    dealing_range_pd:   float = 0.5,
+    swept_pool_price:   Optional[float] = None,
+    opposing_pool_price: Optional[float] = None,
+    current_price:      float = 0.0,
+    amd_phase:          str = "",
+    htf_bias:           str = "",
+    session:            str = "",
+    in_killzone:        bool = False,
+) -> str:
+    """
+    DirectionEngine hunt prediction Telegram alert.
+    Sent when the 10-factor model reaches a high-confidence directional call.
+    """
+    hunt_icon = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
+    delivery_icon = "🟢" if delivery_direction == "bullish" else ("🔴" if delivery_direction == "bearish" else "⚪")
+    conf_bar_filled = min(10, int(confidence * 10))
+    conf_bar = "█" * conf_bar_filled + "░" * (10 - conf_bar_filled)
+    kz_str = " 🔥KZ" if in_killzone else ""
+
+    pd_label = ("DEEP DISC" if dealing_range_pd < 0.25 else
+                "DISCOUNT" if dealing_range_pd < 0.40 else
+                "EQ" if dealing_range_pd < 0.60 else
+                "PREMIUM" if dealing_range_pd < 0.75 else "DEEP PREM")
+
+    lines = [
+        f"{hunt_icon} <b>HUNT PREDICTION: {_esc(predicted or 'NEUTRAL')}</b>",
+        f"  {delivery_icon} Delivery: <b>{_esc(delivery_direction or '—')}</b>",
+        "",
+        f"<b>📊 CONFIDENCE</b>",
+        f"  [{conf_bar}] {confidence:.0%}",
+        f"  BSL score: {bsl_score:.3f}  |  SSL score: {ssl_score:.3f}",
+        f"  Raw (±1): {raw_score:+.3f}",
+        "",
+        f"<b>🎯 TARGETS</b>",
+    ]
+    if swept_pool_price:
+        lines.append(f"  Hunt target (sweep): {_fmt_price(swept_pool_price)}")
+    if opposing_pool_price:
+        lines.append(f"  Delivery target (TP): {_fmt_price(opposing_pool_price)}")
+    if current_price:
+        lines.append(f"  Current price: {_fmt_price(current_price)}")
+
+    lines += [
+        "",
+        f"<b>🏛️ CONTEXT</b>",
+        f"  Dealing range: {pd_label} ({dealing_range_pd:.0%})",
+    ]
+    if amd_phase:
+        lines.append(f"  AMD: {_esc(amd_phase)}")
+    if htf_bias:
+        lines.append(f"  HTF bias: {_esc(htf_bias)}")
+    if session:
+        lines.append(f"  Session: {_esc(session)}{kz_str}")
+
+    if reason:
+        lines += ["", f"<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
+
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 8. DIRECTION ENGINE — POOL-HIT GATE ALERT
+# ======================================================================
+
+def format_pool_gate_alert(
+    action:       str,           # "exit" | "reverse" | "continue" | "hold"
+    confidence:   float,
+    reason:       str,
+    pos_side:     str,
+    pos_entry:    float,
+    current_price: float,
+    pos_sl:       float = 0.0,
+    pos_tp:       float = 0.0,
+    next_target:  Optional[float] = None,
+    atr:          float = 0.0,
+) -> str:
+    """
+    Pool-hit gate decision alert from DirectionEngine.
+    Sent when action is exit, reverse, or continue (not hold).
+    """
+    action_icons = {
+        "exit":     "🏁",
+        "reverse":  "🔄",
+        "continue": "➡️",
+        "hold":     "🔒",
+    }
+    action_icon = action_icons.get(action.lower(), "❓")
+    side_icon = "🟢" if pos_side.upper() == "LONG" else "🔴"
+    conf_bar_filled = min(10, int(confidence * 10))
+    conf_bar = "█" * conf_bar_filled + "░" * (10 - conf_bar_filled)
+
+    profit = ((current_price - pos_entry) if pos_side.upper() == "LONG"
+              else (pos_entry - current_price))
+    risk = abs(pos_entry - pos_sl) if pos_sl else 0
+    cur_r = profit / risk if risk > 0 else 0.0
+
+    lines = [
+        f"{action_icon} <b>POOL-GATE: {action.upper()}</b>  {side_icon} {pos_side.upper()}",
+        f"  [{conf_bar}] {confidence:.0%}",
+        "",
+        f"<b>📊 POSITION</b>",
+        f"  Entry: {_fmt_price(pos_entry)} | Price: {_fmt_price(current_price)}",
+        f"  R now: {cur_r:+.2f}R | Profit: {profit:+.1f}pts",
+    ]
+    if pos_sl:
+        sl_dist_atr = abs(current_price - pos_sl) / max(atr, 1) if atr > 0 else 0
+        lines.append(f"  SL: {_fmt_price(pos_sl)} ({sl_dist_atr:.1f}ATR from price)")
+    if pos_tp:
+        tp_dist_atr = abs(pos_tp - current_price) / max(atr, 1) if atr > 0 else 0
+        lines.append(f"  TP: {_fmt_price(pos_tp)} ({tp_dist_atr:.1f}ATR from price)")
+
+    if action.lower() == "continue" and next_target:
+        lines += ["", f"<b>🎯 NEXT TARGET</b>", f"  {_fmt_price(next_target)}"]
+
+    lines += ["", f"<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
+
+    return "\n".join(lines)
+
+
 # ======================================================================
 # LOGGING HANDLER — forward WARNING+ to Telegram
 # ======================================================================
