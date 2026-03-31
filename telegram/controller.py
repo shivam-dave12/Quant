@@ -1108,15 +1108,15 @@ class TelegramBotController:
                 pass
 
         # ── ICT trail engine state ────────────────────────────────────────────────
-        from strategy.quant_strategy import _ICTStructureTrail
+        from strategy.quant_strategy import _DynamicStructureTrail
         bos_cnt   = 0
         choch_tf  = None
         choch_lvl = 0.0
         ict_eng   = getattr(strat, '_ict', None)
         if ict_eng is not None:
             try:
-                bos_cnt             = _ICTStructureTrail._bos_count(ict_eng, p.side)
-                choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_eng, p.side)
+                bos_cnt             = _DynamicStructureTrail._bos_count(ict_eng, p.side)
+                choch_tf, choch_lvl = _DynamicStructureTrail._choch(ict_eng, p.side)
             except Exception:
                 pass
         choch_active = choch_tf is not None and choch_lvl > 0.0
@@ -1131,7 +1131,7 @@ class TelegramBotController:
 
         # Trail phase
         try:
-            trail_phase = _ICTStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
+            trail_phase = _DynamicStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
         except Exception:
             trail_phase = 0
         _phase_labels = {

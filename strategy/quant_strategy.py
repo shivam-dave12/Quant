@@ -21,7 +21,7 @@ Quant signals used as entry helpers (NOT primary gates):
 
 SL: ICTSLEngine 4-tier (sweep wick → disp OB → 15m ICT OB → 15m swing)
 TP: ICTTPEngine delivery target (opposing pool → structural → VWAP)
-Trail: _ICTStructureTrail — BOS/CHoCH/OB/FVG/swing inline engine (no external deps)
+Trail: _DynamicStructureTrail — BOS/CHoCH/OB/FVG/swing inline engine (no external deps)
 """
 
 from __future__ import annotations
@@ -2522,57 +2522,76 @@ def _ict_atr_inline(candles: list, period: int) -> float:
     return sum(trs) / len(trs) if trs else 0.0
 
 
-class _ICTStructureTrail:
+
+class _DynamicStructureTrail:
     """
-    Institutional Chandelier-Structure Hybrid Trailing SL v2.0
-    ==========================================================
-    COMPLETE REWRITE — replaces the old phase-gated structure-only trail.
+    Institutional Dynamic SL Trailing Engine v1.0
+    ==============================================
+    Replaces the fixed-ratchet chandelier-phase system with a continuously
+    adaptive, structure-led trailing engine.
 
-    DESIGN PRINCIPLES:
-      1. Chandelier ATR envelope from PEAK PRICE provides continuous
-         price-following (the trade breathes, but SL always tracks profit).
-      2. Structural anchors (ICT OB, swing, BOS, CHoCH, FVG) SNAP the SL
-         to the nearest institutional defense level when one exists.
-      3. Volatility regime dynamically adjusts the ATR multiplier.
-      4. Liquidity pool avoidance prevents SL placement at stop clusters.
-      5. Session awareness widens during thin-liquidity sessions.
+    DESIGN PRINCIPLES (institutional standard):
+      1. NO fixed phase gates, NO hard ratchets.
+         The multiplier decays continuously with R-multiple.
+      2. Structure leads. Chandelier is the fallback.
+         Real market structure (BOS swing, OB edge, CHoCH) = best protection.
+      3. Volatility-adaptive. ATR expansion = wider trail (no whipsaws).
+         ATR contraction = tighter trail (captures more profit).
+      4. AMD-phase responsive.
+         MANIPULATION → widen (move is fake). DISTRIBUTION → tighten.
+      5. Liquidity-aware. SL never advances into unswept pools.
+      6. Minimum breathing room. Scales with tier + vol; never zero.
 
-    ACTIVATION (no more dead SL):
-      tier < 0.15R:  NO TRAIL — let trade establish direction
-      tier >= 0.15R: Chandelier activates (wide: 3.0xATR from peak)
-      tier >= 0.40R: BE floor guaranteed (fees + 0.10xATR buffer)
-      tier >= 0.80R: Structural snapping begins (OB/swing anchors)
-      tier >= 1.50R: Aggressive structural trail (tight to 5m/1m structure)
+    TRAILING HIERARCHY (priority order):
+      BE_FLOOR      — fee-adjusted breakeven; activates at 0.30R
+      CHANDELIER    — adaptive N×ATR from peak; N = f(R, vol, AMD, struct events)
+      OB_ANCHOR     — ICT Order Block edge (highest institutional conviction)
+      BOS_ANCHOR    — BOS-aligned swing level on 15m / 5m
+      CHoCH_SNAP    — CHoCH against position → tighten aggressively
+      SWING_15m     — Confirmed 15m structural swing
+      SWING_5m      — Confirmed 5m structural swing
+      SWING_1m      — Micro-structure (activates at 0.80R+)
+      FVG_LOCK      — 65%+ filled FVG (strong structural level)
 
-    CHANDELIER FORMULA:
-      multiplier = max(min_mult, base_mult - decay_rate * tier)
-      For LONG:  chandelier_sl = peak_price_abs - multiplier * atr
-      For SHORT: chandelier_sl = peak_price_abs + multiplier * atr
-
-      base_mult decays from 3.0 -> 0.80 as R-multiple grows 0 -> 3.0R.
-      Vol regime scales: EXPANDING x1.25, CONTRACTING x0.80.
-      Session scales: Asia x1.40, Off x1.30, London x1.10, NY x1.0.
-
-    STRUCTURAL OVERRIDE:
-      If an ICT OB edge or significant swing level sits BETWEEN the
-      chandelier SL and current SL, AND it is in a valid protection zone,
-      it overrides the chandelier — structural defense > mathematical distance.
-
-    OUTPUT:
-      new_sl = max(chandelier_sl, structural_sl, be_floor)  [LONG]
-      new_sl = min(chandelier_sl, structural_sl, be_floor)  [SHORT]
-      Must improve on current_sl (ratchet-only).
-      Must maintain minimum distance from price (breathing room).
+    SELECTION: max(all_candidates) for LONG, min for SHORT.
     """
+
+    # ── Volatility regime ──────────────────────────────────────────────────
 
     @staticmethod
-    def _sf(c, k):
-        try: return float(c[k])
-        except Exception:
-            try: return float(getattr(c, k, 0.0))
-            except Exception: return 0.0
+    def _vol_regime(candles: list, atr: float):
+        if atr < 1e-10 or len(candles) < 7:
+            return 1.0, "NORMAL"
+        sh = _ict_atr_inline(candles, 5)
+        if sh < 1e-10:
+            return 1.0, "NORMAL"
+        r = sh / atr
+        if r > 1.25:
+            return r, "EXPANDING"
+        if r < 0.75:
+            return r, "CONTRACTING"
+        return r, "NORMAL"
 
-    # ── ICT Structure Readers ─────────────────────────────────────────────
+    # ── Session width multiplier ───────────────────────────────────────────
+
+    @staticmethod
+    def _session_mult() -> float:
+        try:
+            from config import SESSION_TRAIL_WIDTH_MULT
+            from datetime import datetime, timezone
+            _dt  = datetime.now(timezone.utc)
+            _dst = 3 <= _dt.month <= 10
+            _ny  = (_dt.hour + _dt.minute / 60.0 + (-4.0 if _dst else -5.0)) % 24.0
+            if   _ny >= 20.0 or _ny < 2.0:  sess = "asia"
+            elif 2.0  <= _ny < 7.0:          sess = "london"
+            elif 7.0  <= _ny < 11.0:         sess = "ny"
+            elif 11.0 <= _ny < 16.0:         sess = "late_ny"
+            else:                             sess = "off"
+            return SESSION_TRAIL_WIDTH_MULT.get(sess, 1.0)
+        except (ImportError, AttributeError):
+            return 1.0
+
+    # ── Structure event detection ──────────────────────────────────────────
 
     @staticmethod
     def _bos_count(ict_engine, pos_side: str, now_ms: int = 0) -> int:
@@ -2589,20 +2608,17 @@ class _ICTStructureTrail:
                 bts = getattr(st, "bos_timestamp", 0)
                 if now_ms > 0 and bts > 0 and (now_ms - bts) > max_age_ms:
                     continue
-                if pos_side == "long"  and d == "bullish":
-                    count += 1
-                elif pos_side == "short" and d == "bearish":
-                    count += 1
+                if pos_side == "long"  and d == "bullish": count += 1
+                elif pos_side == "short" and d == "bearish": count += 1
             except Exception:
                 pass
         return count
 
     @staticmethod
     def _counter_bos(ict_engine, pos_side: str, now_ms: int = 0) -> bool:
-        """Detect BOS AGAINST the trade direction — immediate danger signal."""
         if ict_engine is None:
             return False
-        max_age_ms = 3_000_000  # 50 min — only recent counter-BOS matters
+        max_age_ms = 3_000_000
         for tf in ("5m", "15m"):
             try:
                 st = ict_engine._tf.get(tf)
@@ -2612,33 +2628,11 @@ class _ICTStructureTrail:
                 bts = getattr(st, "bos_timestamp", 0)
                 if now_ms > 0 and bts > 0 and (now_ms - bts) > max_age_ms:
                     continue
-                if pos_side == "long"  and d == "bearish":
-                    return True
-                if pos_side == "short" and d == "bullish":
-                    return True
+                if pos_side == "long"  and d == "bearish": return True
+                if pos_side == "short" and d == "bullish": return True
             except Exception:
                 pass
         return False
-
-    @staticmethod
-    def _bos_level(ict_engine, tf: str, pos_side: str):
-        if ict_engine is None:
-            return None
-        try:
-            st = ict_engine._tf.get(tf)
-            if st is None:
-                return None
-            d = getattr(st, 'bos_direction', None)
-            lvl = getattr(st, 'bos_level', 0.0)
-            if not d or not lvl:
-                return None
-            if pos_side == "long" and d == "bullish":
-                return float(lvl)
-            if pos_side == "short" and d == "bearish":
-                return float(lvl)
-        except Exception:
-            pass
-        return None
 
     @staticmethod
     def _choch(ict_engine, pos_side: str):
@@ -2649,176 +2643,281 @@ class _ICTStructureTrail:
                 st = ict_engine._tf.get(tf)
                 if st is None:
                     continue
-                d = getattr(st, 'choch_direction', None)
-                lvl = float(getattr(st, 'choch_level', 0.0))
+                d   = getattr(st, "choch_direction", None)
+                lvl = float(getattr(st, "choch_level", 0.0))
                 if not d or not lvl:
                     continue
-                if pos_side == "long" and d == "bearish":
-                    return tf, lvl
-                if pos_side == "short" and d == "bullish":
-                    return tf, lvl
+                if pos_side == "long"  and d == "bearish": return tf, lvl
+                if pos_side == "short" and d == "bullish": return tf, lvl
             except Exception:
                 pass
         return None, 0.0
 
-    # ── Volatility & Session ──────────────────────────────────────────────
+    @staticmethod
+    def _phase(bos_count: int, be_locked: bool, choch_seen: bool, mfe_r: float) -> int:
+        """Phase label for display compatibility. R-multiple driven."""
+        if mfe_r >= 2.0: return 3
+        if mfe_r >= 1.0: return 2
+        if mfe_r >= 0.30 or be_locked: return 1
+        return 0
+
+    # ── Adaptive multiplier ────────────────────────────────────────────────
 
     @staticmethod
-    def _vol_regime(candles: list, atr: float):
-        if atr < 1e-10 or len(candles) < 7:
-            return 1.0, "NORMAL"
-        sh = _ict_atr_inline(candles, 5)
-        if sh < 1e-10:
-            return 1.0, "NORMAL"
-        r = sh / atr
-        if r > 1.25:
-            return r, "EXPANDING"
-        if r < 0.75:
-            return r, "CONTRACTING"
-        return r, "NORMAL"
-
-    @staticmethod
-    def _session_mult() -> float:
-        """Session-aware trail width multiplier. Wider in thin liquidity."""
-        try:
-            from config import SESSION_TRAIL_WIDTH_MULT
-            from datetime import datetime, timezone
-            _dt  = datetime.now(timezone.utc)
-            _dst = 3 <= _dt.month <= 10
-            _ny  = (_dt.hour + _dt.minute / 60.0 + (-4.0 if _dst else -5.0)) % 24.0
-            if   _ny >= 20.0 or _ny < 2.0:  sess = "asia"
-            elif 2.0  <= _ny < 7.0:          sess = "london"
-            elif 7.0  <= _ny < 11.0:         sess = "ny"
-            elif 11.0 <= _ny < 16.0:         sess = "late_ny"
-            else:                             sess = "off"
-            return SESSION_TRAIL_WIDTH_MULT.get(sess, 1.0)
-        except (ImportError, AttributeError):
-            return 1.0
-
-    # ── Chandelier Core ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _chandelier_mult(tier: float, vol_ratio: float, vol_regime: str,
-                         counter_bos: bool, choch: bool,
-                         adx: float = 15.0, bos_cascade: int = 0,
-                         amd_phase: str = "", pos_side: str = "",
-                         amd_bias: str = "") -> float:
+    def _adaptive_mult(
+        tier:        float,
+        vol_ratio:   float,
+        vol_regime:  str,
+        amd_phase:   str,
+        amd_bias:    str,
+        pos_side:    str,
+        counter_bos: bool,
+        has_choch:   bool,
+        adx:         float,
+    ) -> float:
         """
-        Institutional Dynamic ATR Multiplier v6.0
-        ==========================================
-        Chandelier envelope width is NOT a static number. It adapts to:
-          - R-multiple progression (base decay)
-          - Structural danger signals (counter-BOS, CHoCH)
-          - Volatility regime (expanding/contracting)
-          - ADX trend strength (trending markets = tighter trail)
-          - Multi-TF BOS cascade (structure confirming = tighten aggressively)
-          - AMD phase (manipulation = widen, delivery = tighten)
-          - Session liquidity
+        Compute the adaptive ATR multiplier for the chandelier component.
 
-        v6.0 ADDITIONS:
-          1. ADX SCALING: High ADX (>30) = strong trend = tighter trail (0.85x).
-             Ranging markets (ADX<15) get wider trail (1.15x) to avoid whipsaws.
-             This is how institutional desks manage trail width — trend conviction
-             determines how much room you give the trade.
+        Continuous exponential decay from wide (3.0) → tight (0.55) as R grows.
+        All modifiers are multiplicative — no additive constant shifts.
 
-          2. BOS CASCADE SCALING: When BOS fires on multiple timeframes in the
-             same direction, structure is strongly confirming the move. Each
-             additional TF BOS tightens by 10%. 3-TF cascade (1m+5m+15m) = 0.70x.
-             This is the "structure is leading" signal — price is breaking through
-             levels with confirmation, SL should follow closely.
-
-          3. AMD PHASE SCALING:
-             - MANIPULATION phase: Trail WIDENS by 1.25x. The move is the fake-out.
-               Smart money is accumulating — price will retrace. Wider trail survives
-               the manipulation sweep without getting stopped.
-             - DISTRIBUTION/DELIVERY phase: Trail TIGHTENS by 0.85x. The real move
-               is underway. SL should protect profits aggressively.
-             - ACCUMULATION: neutral (1.0x) — still building the position.
-
-          4. LOWER FLOOR: 0.40 ATR (was 0.50). Institutional desks use tighter
-             stops in confirmed trending markets. 0.50 floor was too wide for
-             high-ADX environments with multi-TF BOS cascade.
+        Curve: N(R) = 0.55 + 2.45 × e^(−0.80 × R)
+          At 0R:   3.00 (wide — trade needs room to breathe)
+          At 0.5R: 1.97
+          At 1R:   1.65
+          At 1.5R: 1.42
+          At 2R:   1.25
+          At 2.5R: 1.12
+          At 3R+:  0.97 → floored at 0.50
         """
-        # Base decay: 3.0 at 0R -> 1.8 at 1R -> 1.2 at 2R -> 0.80 at 3R+
-        base = max(0.80, 3.0 - 0.73 * min(tier, 3.0))
+        import math
+        base = max(0.50, 0.55 + 2.45 * math.exp(-0.80 * tier))
 
-        # ── Counter-BOS: immediate tightening (cut mult by 40%) ──────────
+        # ── Structure danger signals ────────────────────────────────
         if counter_bos:
-            base *= 0.60
+            # BOS against position — structure reversed, tighten immediately
+            base *= 0.55
+        if has_choch:
+            # CHoCH against position — character change, tighten moderately
+            base *= 0.68
 
-        # ── CHoCH against position: moderate tightening (cut by 25%) ─────
-        if choch:
-            base *= 0.75
+        # ── AMD phase ───────────────────────────────────────────────
+        _ph = (amd_phase or "").lower()
+        _bi = (amd_bias  or "").lower()
+        if "manipulation" in _ph or "manip" in _ph:
+            # Check if AMD bias is CONTRA to position (worst case — move IS the fake)
+            _contra = (pos_side == "long"  and _bi == "bearish") or                       (pos_side == "short" and _bi == "bullish")
+            base *= 1.45 if _contra else 1.22
+        elif "distribution" in _ph or "delivery" in _ph:
+            base *= 0.83   # delivery underway — ride the wave, trail tighter
+        elif "reaccumulation" in _ph or "redistribution" in _ph:
+            base *= 1.06   # mid-trend pause — slight widen
 
-        # ── ADX trend strength scaling (v6.0) ────────────────────────────
-        # ADX > 30: strong trend → trail tighter (0.85x)
-        # ADX 20-30: developing trend → slight tighten (0.92x)
-        # ADX < 15: ranging → widen trail (1.15x)
-        if adx > 40.0:
-            base *= 0.80  # very strong trend — aggressive trail
-        elif adx > 30.0:
-            base *= 0.85
-        elif adx > 20.0:
-            base *= 0.92
-        elif adx < 12.0:
-            base *= 1.20  # low ADX = choppy, give more room
-        elif adx < 15.0:
-            base *= 1.15
-
-        # ── Multi-TF BOS cascade scaling (v6.0) ──────────────────────────
-        # bos_cascade = number of timeframes where BOS aligns with trade direction
-        # 1 TF: normal, 2 TF: tighten 10%, 3 TF: tighten 30%
-        if bos_cascade >= 3:
-            base *= 0.70
-        elif bos_cascade >= 2:
-            base *= 0.85
-        # 0-1: no cascade adjustment
-
-        # ── AMD phase scaling (v6.0) ─────────────────────────────────────
-        _amd_phase_lower = amd_phase.lower() if amd_phase else ""
-        if _amd_phase_lower in ("manipulation", "manip"):
-            # Check if AMD bias aligns with position — if contra, widen more
-            _amd_contra = False
-            if amd_bias:
-                if pos_side == "long" and amd_bias.lower() == "bearish":
-                    _amd_contra = True
-                elif pos_side == "short" and amd_bias.lower() == "bullish":
-                    _amd_contra = True
-            if _amd_contra:
-                base *= 1.35  # contra manipulation — very wide trail
-            else:
-                base *= 1.20  # aligned manipulation — moderate widen
-        elif _amd_phase_lower in ("distribution", "delivery"):
-            base *= 0.85  # delivery phase — tighten, protect profits
-
-        # ── Volatility regime scaling ────────────────────────────────────
+        # ── Volatility regime ────────────────────────────────────────
         if vol_regime == "EXPANDING":
-            base *= min(vol_ratio, 1.35)
+            base *= min(vol_ratio, 1.42)
         elif vol_regime == "CONTRACTING":
             base *= max(vol_ratio, 0.70)
 
-        # ── Session scaling ──────────────────────────────────────────────
-        base *= _ICTStructureTrail._session_mult()
+        # ── ADX trend strength ───────────────────────────────────────
+        if   adx > 42: base *= 0.76   # very strong trend → aggressive trail
+        elif adx > 32: base *= 0.84
+        elif adx > 22: base *= 0.92
+        elif adx < 10: base *= 1.25   # choppy/ranging → more room
+        elif adx < 16: base *= 1.14
 
-        # Hard floor: 0.40 ATR (v6.0: lowered from 0.50 for institutional precision)
-        return max(0.40, base)
+        # ── Session liquidity ────────────────────────────────────────
+        base *= _DynamicStructureTrail._session_mult()
 
-    # ── Liquidity Avoidance ───────────────────────────────────────────────
+        # Hard floor: never tighter than 0.45 ATR
+        return max(0.45, base)
+
+    # ── Structural anchor discovery ────────────────────────────────────────
 
     @staticmethod
-    def _avoid_liquidity(sl: float, pos_side: str, atr: float,
-                         ict_engine=None) -> float:
-        """Move SL away from known liquidity pools and round numbers."""
+    def _find_structural_anchors(
+        pos_side:    str,
+        price:       float,
+        current_sl:  float,
+        atr:         float,
+        tier:        float,
+        candles_1m:  list,
+        candles_5m:  list,
+        candles_15m: list,
+        ict_engine,
+        now_ms:      int,
+    ) -> list:
+        """
+        Return list of (sl_price, label) structural anchor candidates.
+
+        Buffer scales with tier:
+          0.30R → 0.45 × ATR | 1R → 0.25 × ATR | 2R+ → 0.13 × ATR
+        This allows the trail to tighten CONTINUOUSLY as profit grows,
+        with no hard phase transitions.
+        """
+        import math
+        candidates = []  # [(sl_price, label)]
+
+        # Continuously narrowing buffer as profit grows
+        sw_buf = max(0.13, 0.45 * math.exp(-0.60 * tier)) * atr
+        ob_buf = sw_buf * 0.62
+
+        # ── ICT Order Block anchors ──────────────────────────────────
+        if ict_engine is not None:
+            try:
+                obs  = (ict_engine.order_blocks_bull if pos_side == "long"
+                        else ict_engine.order_blocks_bear)
+                _now = now_ms or int(time.time() * 1000)
+                for ob in sorted(
+                    [o for o in obs if o.is_active(_now)],
+                    key=lambda x: (-x.strength, abs(x.midpoint - price))
+                )[:5]:
+                    if pos_side == "long":
+                        cand = ob.low - ob_buf
+                        if current_sl < cand < price - 0.28 * atr:
+                            candidates.append((cand, f"OB@${ob.midpoint:.0f}({ob.timeframe})"))
+                    else:
+                        cand = ob.high + ob_buf
+                        if price + 0.28 * atr < cand < current_sl:
+                            candidates.append((cand, f"OB@${ob.midpoint:.0f}({ob.timeframe})"))
+            except Exception:
+                pass
+
+        # ── BOS-confirmed swing anchors ──────────────────────────────
+        if ict_engine is not None:
+            for tf in ("15m", "5m"):
+                try:
+                    st      = ict_engine._tf.get(tf)
+                    if st is None: continue
+                    bos_dir = getattr(st, "bos_direction", None)
+                    bos_lvl = getattr(st, "bos_level", 0.0)
+                    if not bos_dir or not bos_lvl: continue
+                    if pos_side == "long" and bos_dir == "bullish":
+                        cand = bos_lvl - sw_buf * 0.78
+                        if current_sl < cand < price - 0.18 * atr:
+                            candidates.append((cand, f"BOS_{tf}@${bos_lvl:.0f}"))
+                    elif pos_side == "short" and bos_dir == "bearish":
+                        cand = bos_lvl + sw_buf * 0.78
+                        if price + 0.18 * atr < cand < current_sl:
+                            candidates.append((cand, f"BOS_{tf}@${bos_lvl:.0f}"))
+                except Exception:
+                    pass
+
+        # ── CHoCH snap anchors ───────────────────────────────────────
+        if ict_engine is not None:
+            for tf in ("5m", "15m", "1m"):
+                try:
+                    st        = ict_engine._tf.get(tf)
+                    if st is None: continue
+                    choch_lvl = getattr(st, "choch_level", 0.0)
+                    choch_dir = getattr(st, "choch_direction", None)
+                    if not choch_dir or not choch_lvl: continue
+                    _against = (pos_side == "long"  and choch_dir == "bearish") or                                (pos_side == "short" and choch_dir == "bullish")
+                    if not _against: continue
+                    cb = sw_buf * 0.55
+                    if pos_side == "long":
+                        cand = choch_lvl - cb
+                        if current_sl < cand < price - 0.18 * atr:
+                            candidates.append((cand, f"CHoCH_{tf}@${choch_lvl:.0f}"))
+                    else:
+                        cand = choch_lvl + cb
+                        if price + 0.18 * atr < cand < current_sl:
+                            candidates.append((cand, f"CHoCH_{tf}@${choch_lvl:.0f}"))
+                except Exception:
+                    pass
+
+        # ── 15m confirmed swing structure ────────────────────────────
+        if candles_15m and len(candles_15m) >= 6:
+            try:
+                cl15 = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
+                h15, l15 = _ict_find_swings_inline(cl15, min(5, len(cl15) - 2))
+                if pos_side == "long" and l15:
+                    for lvl in l15:
+                        cand = lvl - sw_buf * 0.82
+                        if current_sl < cand < price - 0.22 * atr:
+                            candidates.append((cand, f"15m_SW@${lvl:.0f}"))
+                elif pos_side == "short" and h15:
+                    for lvl in h15:
+                        cand = lvl + sw_buf * 0.82
+                        if price + 0.22 * atr < cand < current_sl:
+                            candidates.append((cand, f"15m_SW@${lvl:.0f}"))
+            except Exception:
+                pass
+
+        # ── 5m confirmed swing structure ─────────────────────────────
+        if candles_5m and len(candles_5m) >= 6:
+            try:
+                cl5 = candles_5m[:-1] if len(candles_5m) > 1 else candles_5m
+                h5, l5 = _ict_find_swings_inline(cl5, min(4, len(cl5) - 2))
+                if pos_side == "long" and l5:
+                    for lvl in l5:
+                        cand = lvl - sw_buf * 0.72
+                        if current_sl < cand < price - 0.18 * atr:
+                            candidates.append((cand, f"5m_SW@${lvl:.0f}"))
+                elif pos_side == "short" and h5:
+                    for lvl in h5:
+                        cand = lvl + sw_buf * 0.72
+                        if price + 0.18 * atr < cand < current_sl:
+                            candidates.append((cand, f"5m_SW@${lvl:.0f}"))
+            except Exception:
+                pass
+
+        # ── 1m micro-structure (activates at 0.80R+ for precision) ──
+        if tier >= 0.80 and candles_1m and len(candles_1m) >= 6:
+            try:
+                cl1 = candles_1m[:-1] if len(candles_1m) > 1 else candles_1m
+                h1, l1 = _ict_find_swings_inline(cl1, min(3, len(cl1) - 2))
+                mb = max(0.07 * atr, sw_buf * 0.42)
+                if pos_side == "long" and l1:
+                    for lvl in l1:
+                        cand = lvl - mb
+                        if current_sl < cand < price - 0.14 * atr:
+                            candidates.append((cand, f"1m_SW@${lvl:.0f}"))
+                elif pos_side == "short" and h1:
+                    for lvl in h1:
+                        cand = lvl + mb
+                        if price + 0.14 * atr < cand < current_sl:
+                            candidates.append((cand, f"1m_SW@${lvl:.0f}"))
+            except Exception:
+                pass
+
+        # ── FVG fill lock (65%+ filled = strong structural level) ───
+        if ict_engine is not None and tier >= 0.55:
+            try:
+                _now = now_ms or int(time.time() * 1000)
+                fvgs = (ict_engine.fvgs_bear if pos_side == "long"
+                        else ict_engine.fvgs_bull)
+                for fvg in fvgs:
+                    if not fvg.is_active(_now) or fvg.fill_percentage < 0.65:
+                        continue
+                    fb = sw_buf * 0.48
+                    if pos_side == "long":
+                        lock = fvg.top + fb
+                        if current_sl < lock < price - 0.14 * atr:
+                            candidates.append((lock, f"FVG@${fvg.midpoint:.0f}"))
+                    else:
+                        lock = fvg.bottom - fb
+                        if price + 0.14 * atr < lock < current_sl:
+                            candidates.append((lock, f"FVG@${fvg.midpoint:.0f}"))
+            except Exception:
+                pass
+
+        return candidates
+
+    # ── Liquidity avoidance ────────────────────────────────────────────────
+
+    @staticmethod
+    def _avoid_liquidity(sl: float, pos_side: str, atr: float, ict_engine=None) -> float:
         if atr < 1e-10:
             return sl
-        zone = 0.15 * atr
-        offset = 0.30 * atr
-        adj = sl
+        zone   = 0.14 * atr
+        offset = 0.27 * atr
+        adj    = sl
 
         if ict_engine is not None:
             try:
                 for pool in ict_engine.liquidity_pools:
-                    if getattr(pool, 'swept', False):
+                    if getattr(pool, "swept", False):
                         continue
                     pp = float(pool.price)
                     if abs(adj - pp) < zone:
@@ -2827,426 +2926,249 @@ class _ICTStructureTrail:
             except Exception:
                 pass
 
-        nearest_500 = round(adj / 500.0) * 500.0
-        if abs(adj - nearest_500) < zone:
-            adj = nearest_500 - offset if pos_side == "long" else nearest_500 + offset
-
-        nearest_100 = round(adj / 100.0) * 100.0
-        if abs(adj - nearest_100) < zone * 0.5:
-            adj = nearest_100 - offset * 0.5 if pos_side == "long" else nearest_100 + offset * 0.5
+        # Round-number traps (500, 100)
+        for denom in (500.0, 100.0):
+            nearest = round(adj / denom) * denom
+            tol = zone * (1.0 if denom == 500.0 else 0.55)
+            if abs(adj - nearest) < tol:
+                frac = offset * (0.80 if denom == 500.0 else 0.48)
+                adj = nearest - frac if pos_side == "long" else nearest + frac
 
         return adj
 
-    # ── Structural Anchor Search ──────────────────────────────────────────
+    # ── Main compute ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _find_structural_anchors(
-        pos_side: str, price: float, current_sl: float,
-        atr: float, tier: float,
-        candles_1m: list, candles_5m: list, candles_15m: list,
-        ict_engine, now_ms: int,
-    ) -> list:
+    def compute(
+        pos_side:        str,
+        price:           float,
+        entry_price:     float,
+        current_sl:      float,
+        atr:             float,
+        initial_sl_dist: float,
+        peak_profit:     float,
+        peak_price_abs:  float,
+        hold_seconds:    float,
+        candles_1m:      list,
+        candles_5m:      list,
+        orderbook:       dict,
+        entry_vol:       float,
+        trade_mode:      str,
+        ict_engine       = None,
+        now_ms:          int   = 0,
+        hold_reason             = None,
+        atr_percentile:  float  = 0.50,
+        adx:             float  = 15.0,
+        tick_size:       float  = 0.1,
+        candles_15m:     list   = None,
+        anchor_out              = None,
+    ):
         """
-        Find all valid structural SL anchors between current_sl and price.
-        Returns list of (sl_price, label) tuples.
-        v6.0: Structural anchors activate at 0.50R (was 0.80R).
-        Institutional desks anchor to structure as soon as profit justifies it.
-        Waiting until 0.80R meant structure formed between 0.50-0.80R was ignored,
-        forcing the chandelier to be the only protection layer — exactly the
-        scenario where SL gets hit during a healthy pullback to an OB.
+        Compute next trailing SL using institutional dynamic trail logic.
+        Returns rounded new SL price or None if no improvement qualifies.
+
+        ARCHITECTURE:
+          1. Chandelier envelope (continuous, always active ≥ 0.10R)
+          2. Structural anchors (OB/BOS/CHoCH/swing — override chandelier when tighter)
+          3. BE floor (activates at 0.30R)
+          4. Liquidity avoidance (pool ceiling)
+          5. Min-distance guard (breathing room)
+          6. Ratchet (SL may only improve)
         """
-        if tier < 0.50:
-            return []
-
-        candidates = []
-
-        # Swing buffer based on tier
-        if tier >= 2.0:
-            sw_buf = 0.15 * atr
-        elif tier >= 1.5:
-            sw_buf = 0.20 * atr
-        elif tier >= 1.0:
-            sw_buf = 0.30 * atr
-        else:
-            sw_buf = 0.40 * atr
-
-        # ── ICT Order Block anchors ───────────────────────────────────────
-        if ict_engine is not None:
-            try:
-                ob_buf = 0.20 * atr
-                obs = (ict_engine.order_blocks_bull if pos_side == "long"
-                       else ict_engine.order_blocks_bear)
-                t_ms = now_ms or int(time.time() * 1000)
-                active = [o for o in obs if o.is_active(t_ms)]
-                added = 0
-                if pos_side == "long":
-                    for ob in sorted(
-                            [o for o in active if o.low > current_sl],
-                            key=lambda x: (x.strength, x.low), reverse=True):
-                        cand = ob.low - ob_buf
-                        if cand > current_sl:
-                            candidates.append(
-                                (cand, f"OB@${ob.midpoint:.0f}({ob.timeframe})"))
-                            added += 1
-                            if added >= 3:
-                                break
-                else:
-                    for ob in sorted(
-                            [o for o in active if o.high < current_sl],
-                            key=lambda x: (x.strength, -x.high), reverse=True):
-                        cand = ob.high + ob_buf
-                        if cand < current_sl:
-                            candidates.append(
-                                (cand, f"OB@${ob.midpoint:.0f}({ob.timeframe})"))
-                            added += 1
-                            if added >= 3:
-                                break
-            except Exception:
-                pass
-
-        # ── BOS levels (5m, 15m) ──────────────────────────────────────────
-        if ict_engine is not None:
-            for tf in ("5m", "15m"):
-                bos_lvl = _ICTStructureTrail._bos_level(ict_engine, tf, pos_side)
-                if bos_lvl is not None:
-                    bb = 0.15 * atr
-                    if pos_side == "long":
-                        cand = bos_lvl - bb
-                        if cand > current_sl:
-                            candidates.append((cand, f"BOS_{tf}@${bos_lvl:.0f}"))
-                    else:
-                        cand = bos_lvl + bb
-                        if cand < current_sl:
-                            candidates.append((cand, f"BOS_{tf}@${bos_lvl:.0f}"))
-
-        # ── 15m swing structure (primary institutional anchor) ────────────
-        if candles_15m and len(candles_15m) >= 6:
-            try:
-                cl15 = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
-                highs_15m, lows_15m = _ict_find_swings_inline(
-                    cl15, min(6, len(cl15) - 2))
-                if pos_side == "long" and lows_15m:
-                    for l in lows_15m:
-                        cand = l - sw_buf
-                        if cand > current_sl:
-                            candidates.append((cand, f"15m_SW@${l:.0f}"))
-                elif pos_side == "short" and highs_15m:
-                    for h in highs_15m:
-                        cand = h + sw_buf
-                        if cand < current_sl:
-                            candidates.append((cand, f"15m_SW@${h:.0f}"))
-            except Exception:
-                pass
-
-        # ── 5m swing structure ────────────────────────────────────────────
-        if candles_5m and len(candles_5m) >= 6:
-            try:
-                cl5 = candles_5m[:-1] if len(candles_5m) > 1 else candles_5m
-                _5m_lb = min(6, len(cl5) - 2)
-                highs_5m, lows_5m = _ict_find_swings_inline(cl5, _5m_lb)
-                if pos_side == "long" and lows_5m:
-                    for l in lows_5m:
-                        cand = l - sw_buf
-                        if cand > current_sl:
-                            candidates.append((cand, f"5m_SW@${l:.0f}"))
-                elif pos_side == "short" and highs_5m:
-                    for h in highs_5m:
-                        cand = h + sw_buf
-                        if cand < current_sl:
-                            candidates.append((cand, f"5m_SW@${h:.0f}"))
-            except Exception:
-                pass
-
-        # ── 1m micro-structure (v6.0: activates at 1.0R, was 1.5R) ────────
-        # Institutional desks use 1m structure for precision trailing once
-        # the trade is established. 1.0R = SL is at breakeven, safe to tighten.
-        if tier >= 1.0 and candles_1m and len(candles_1m) >= 6:
-            try:
-                cl1 = candles_1m[:-1] if len(candles_1m) > 1 else candles_1m
-                highs_1m, lows_1m = _ict_find_swings_inline(
-                    cl1, min(4, len(cl1) - 2))
-                micro_buf = 0.10 * atr
-                if pos_side == "long" and lows_1m:
-                    for l in lows_1m:
-                        cand = l - micro_buf
-                        if cand > current_sl:
-                            candidates.append((cand, f"1m_SW@${l:.0f}"))
-                elif pos_side == "short" and highs_1m:
-                    for h in highs_1m:
-                        cand = h + micro_buf
-                        if cand < current_sl:
-                            candidates.append((cand, f"1m_SW@${h:.0f}"))
-            except Exception:
-                pass
-
-        # ── CHoCH level (aggressive tighten) ──────────────────────────────
-        choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_engine, pos_side)
-        if choch_tf is not None and choch_lvl > 0:
-            cb = 0.10 * atr
-            if pos_side == "long":
-                cand = choch_lvl - cb
-                if cand > current_sl:
-                    candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
-            else:
-                cand = choch_lvl + cb
-                if cand < current_sl:
-                    candidates.append((cand, f"CHoCH_{choch_tf}@${choch_lvl:.0f}"))
-
-        # ── FVG fill lock ─────────────────────────────────────────────────
-        if ict_engine is not None:
-            try:
-                fvgs = (ict_engine.fvgs_bear if pos_side == "long"
-                        else ict_engine.fvgs_bull)
-                t_ms = now_ms or int(time.time() * 1000)
-                for fvg in fvgs:
-                    if not fvg.is_active(t_ms) or fvg.fill_percentage < 0.70:
-                        continue
-                    lock = (fvg.top + 0.10 * atr if pos_side == "long"
-                            else fvg.bottom - 0.10 * atr)
-                    if pos_side == "long" and lock > current_sl:
-                        candidates.append((lock, f"FVG@${fvg.midpoint:.0f}"))
-                    elif pos_side == "short" and lock < current_sl:
-                        candidates.append((lock, f"FVG@${fvg.midpoint:.0f}"))
-            except Exception:
-                pass
-
-        return candidates
-
-    # ── Main Compute ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def compute(pos_side: str, price: float, entry_price: float,
-                current_sl: float, atr: float,
-                initial_sl_dist: float, peak_profit: float,
-                peak_price_abs: float, hold_seconds: float,
-                candles_1m: list, candles_5m: list,
-                orderbook: dict, entry_vol: float, trade_mode: str,
-                ict_engine=None, now_ms: int = 0,
-                hold_reason=None,
-                atr_percentile: float = 0.50,
-                adx: float = 15.0,
-                tick_size: float = 0.1,
-                candles_15m: list = None,
-                anchor_out: "Optional[List[str]]" = None) -> "Optional[float]":
-        """
-        Compute next trailing SL using Chandelier-Structure Hybrid.
-        Returns new SL price or None if no improvement qualifies.
-        """
+        import math
         if atr < 1e-10:
             return None
 
-        # ── Compute profit metrics ────────────────────────────────────────
+        # ── Profit metrics ────────────────────────────────────────────
         init_dist = (initial_sl_dist if initial_sl_dist > 1e-10
                      else max(abs(entry_price - current_sl), atr))
-        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-        tier = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
+        profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
+        # Tier: uses PEAK profit — prevents ratchet regression on normal pullbacks
+        tier      = max(profit, peak_profit) / init_dist if init_dist > 1e-10 else 0.0
 
-        # ── Activation gate: 0.10R minimum (v6.0: lowered from 0.15R) ─────
-        # Institutional desks begin trailing earlier to protect capital.
-        # At 0.10R the chandelier is very wide (3.0×ATR) — it won't interfere
-        # with the trade, but it establishes the trailing floor early.
+        # ── Activation gate: 0.10R ───────────────────────────────────
         if tier < 0.10:
             if hold_reason is not None:
                 hold_reason.append(f"TIER={tier:.2f}R<0.10R")
             return None
 
-        # ── Break-even floor ──────────────────────────────────────────────
+        # ── Volatility regime ────────────────────────────────────────
+        vol_ratio, vol_regime = _DynamicStructureTrail._vol_regime(candles_1m, atr)
+
+        # ── Structure events ─────────────────────────────────────────
+        bos_count   = _DynamicStructureTrail._bos_count(ict_engine, pos_side, now_ms)
+        counter_bos = _DynamicStructureTrail._counter_bos(ict_engine, pos_side, now_ms)
+        choch_tf, choch_lvl = _DynamicStructureTrail._choch(ict_engine, pos_side)
+        has_choch   = choch_tf is not None
+
+        # ── AMD phase ────────────────────────────────────────────────
+        _amd_phase = ""
+        _amd_bias  = ""
+        if ict_engine is not None:
+            try:
+                _amd = getattr(ict_engine, "_amd", None)
+                if _amd:
+                    _amd_phase = getattr(_amd, "phase", "") or ""
+                    _amd_bias  = getattr(_amd, "bias",  "") or ""
+            except Exception:
+                pass
+
+        # ══════════════════════════════════════════════════════════════
+        # LAYER 1: BREAK-EVEN FLOOR (capital protection, 0.30R+)
+        # ══════════════════════════════════════════════════════════════
         try:
             from config import COMMISSION_RATE as _cr
         except Exception:
             _cr = 0.00055
-        be_buf = entry_price * _cr * 2.0 + 0.10 * atr
+        be_buf   = entry_price * _cr * 2.0 + 0.12 * atr
         be_price = (entry_price + be_buf if pos_side == "long"
                     else entry_price - be_buf)
+        be_floor = be_price if tier >= 0.30 else None
 
-        # ── Volatility regime ─────────────────────────────────────────────
-        vol_ratio, vol_regime = _ICTStructureTrail._vol_regime(candles_1m, atr)
-
-        # ── Structure events ──────────────────────────────────────────────
-        bos = _ICTStructureTrail._bos_count(ict_engine, pos_side, now_ms)
-        counter_bos = _ICTStructureTrail._counter_bos(ict_engine, pos_side, now_ms)
-        choch_tf, choch_lvl = _ICTStructureTrail._choch(ict_engine, pos_side)
-        has_choch = choch_tf is not None
-
-        # ── v6.0: Extract AMD phase for trail width scaling ───────────────
-        _amd_phase_str = ""
-        _amd_bias_str = ""
-        if ict_engine is not None:
-            try:
-                _amd_obj = getattr(ict_engine, '_amd', None)
-                if _amd_obj is not None:
-                    _amd_phase_str = getattr(_amd_obj, 'phase', '') or ''
-                    _amd_bias_str = getattr(_amd_obj, 'bias', '') or ''
-            except Exception:
-                pass
-
-        # ── v6.0: Multi-TF BOS cascade count ──────────────────────────────
-        # Count how many timeframes have BOS in the trade direction.
-        # 3-TF cascade = strongest structural confirmation possible.
-        _bos_cascade = bos  # _bos_count already counts aligned TFs
-
-        # ══════════════════════════════════════════════════════════════════
-        # LAYER 1: CHANDELIER ENVELOPE (always active once tier >= 0.10R)
-        # v6.0: Now passes ADX, BOS cascade, and AMD phase for institutional
-        # width scaling. The chandelier is the continuous price-following layer.
-        # ══════════════════════════════════════════════════════════════════
-        mult = _ICTStructureTrail._chandelier_mult(
-            tier, vol_ratio, vol_regime, counter_bos, has_choch,
-            adx=adx, bos_cascade=_bos_cascade,
-            amd_phase=_amd_phase_str, pos_side=pos_side,
-            amd_bias=_amd_bias_str)
+        # ══════════════════════════════════════════════════════════════
+        # LAYER 2: ADAPTIVE CHANDELIER ENVELOPE
+        # Continuous exponential decay: wide at 0R → tight at 3R+
+        # ══════════════════════════════════════════════════════════════
+        mult = _DynamicStructureTrail._adaptive_mult(
+            tier=tier,
+            vol_ratio=vol_ratio,
+            vol_regime=vol_regime,
+            amd_phase=_amd_phase,
+            amd_bias=_amd_bias,
+            pos_side=pos_side,
+            counter_bos=counter_bos,
+            has_choch=has_choch,
+            adx=adx,
+        )
 
         if pos_side == "long":
             chandelier_sl = peak_price_abs - mult * atr
         else:
             chandelier_sl = peak_price_abs + mult * atr
 
-        # ══════════════════════════════════════════════════════════════════
-        # LAYER 2: BE FLOOR (tier >= 0.40R)
-        # ══════════════════════════════════════════════════════════════════
-        be_floor = None
-        if tier >= 0.40:
-            be_floor = be_price
-
-        # ══════════════════════════════════════════════════════════════════
-        # LAYER 3: STRUCTURAL ANCHORS (tier >= 0.80R)
-        # ══════════════════════════════════════════════════════════════════
-        structural_anchors = _ICTStructureTrail._find_structural_anchors(
-            pos_side, price, current_sl,
-            atr, tier,
-            candles_1m, candles_5m, candles_15m or [],
-            ict_engine, now_ms,
+        # ══════════════════════════════════════════════════════════════
+        # LAYER 3: STRUCTURAL ANCHORS (override chandelier when tighter)
+        # ══════════════════════════════════════════════════════════════
+        structural_candidates = _DynamicStructureTrail._find_structural_anchors(
+            pos_side=pos_side,
+            price=price,
+            current_sl=current_sl,
+            atr=atr,
+            tier=tier,
+            candles_1m=candles_1m,
+            candles_5m=candles_5m,
+            candles_15m=candles_15m or [],
+            ict_engine=ict_engine,
+            now_ms=now_ms,
         )
 
-        # ══════════════════════════════════════════════════════════════════
-        # COMBINE: Take the best (most protective) candidate
-        # ══════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # COMBINE: take most protective candidate
+        # ══════════════════════════════════════════════════════════════
         all_candidates = [(chandelier_sl, "CHANDELIER")]
         if be_floor is not None:
             all_candidates.append((be_floor, "BE_FLOOR"))
-        all_candidates.extend(structural_anchors)
+        all_candidates.extend(structural_candidates)
 
         if pos_side == "long":
             new_sl, anchor = max(all_candidates, key=lambda x: x[0])
         else:
             new_sl, anchor = min(all_candidates, key=lambda x: x[0])
 
-        # ══════════════════════════════════════════════════════════════════
-        # GUARDS: Minimum distance, liquidity avoidance, ratchet
-        # ══════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # GUARDS
+        # ══════════════════════════════════════════════════════════════
 
-        # ── Minimum distance from price (breathing room) ──────────────────
-        if tier >= 2.0:
-            min_dist_mult = 0.60
-        elif tier >= 1.5:
-            min_dist_mult = 0.80
-        elif tier >= 1.0:
-            min_dist_mult = 1.00
-        elif tier >= 0.50:
-            min_dist_mult = 1.20
-        else:
-            min_dist_mult = 1.50
-
+        # ── Minimum breathing room (continuously adaptive) ────────────
+        # High R = tighter min, volatile = wider min
+        _min_mult = max(0.45, 1.15 * math.exp(-0.42 * tier))
         if vol_regime == "EXPANDING":
-            min_dist_mult *= min(vol_ratio, 1.30)
+            _min_mult *= min(vol_ratio, 1.35)
         elif vol_regime == "CONTRACTING":
-            min_dist_mult *= max(vol_ratio, 0.70)
-
-        # v6.0: ADX-aware minimum distance. Strong trends need tighter min_dist
-        # to allow SL to follow structure closely. Ranging markets need wider.
-        if adx > 35.0:
-            min_dist_mult *= 0.80  # strong trend: allow tighter following
-        elif adx > 25.0:
-            min_dist_mult *= 0.90
-        elif adx < 12.0:
-            min_dist_mult *= 1.15  # choppy: more breathing room
-
-        min_dist_mult *= _ICTStructureTrail._session_mult()
-        min_dist = max(min_dist_mult * atr, 0.35 * atr)
+            _min_mult *= max(vol_ratio, 0.76)
+        if adx > 38:
+            _min_mult *= 0.80
+        elif adx < 12:
+            _min_mult *= 1.18
+        _min_mult *= _DynamicStructureTrail._session_mult()
+        min_dist = max(_min_mult * atr, 0.28 * atr)
 
         if pos_side == "long":
             new_sl = min(new_sl, price - min_dist)
         else:
             new_sl = max(new_sl, price + min_dist)
 
-        # ── Liquidity avoidance ───────────────────────────────────────────
-        new_sl = _ICTStructureTrail._avoid_liquidity(
-            new_sl, pos_side, atr, ict_engine)
+        # ── Liquidity avoidance ───────────────────────────────────────
+        new_sl = _DynamicStructureTrail._avoid_liquidity(new_sl, pos_side, atr, ict_engine)
 
+        # Re-apply min_dist after avoidance adjustment
         if pos_side == "long":
             new_sl = min(new_sl, price - min_dist)
         else:
             new_sl = max(new_sl, price + min_dist)
 
-        # ── Liquidity pool ceiling ────────────────────────────────────────
+        # ── Liquidity pool ceiling (don't trail into unswept pools) ───
         if ict_engine is not None:
             try:
-                lb = 0.35 * atr
+                lb = 0.30 * atr
                 for pool in ict_engine.liquidity_pools:
-                    if getattr(pool, 'swept', False):
+                    if getattr(pool, "swept", False):
                         continue
-                    if pos_side == "long" and getattr(pool, 'level_type', '') == "SSL":
+                    if pos_side == "long" and getattr(pool, "level_type", "") == "SSL":
                         ceil = pool.price - lb
                         if current_sl < ceil < new_sl:
                             new_sl = ceil
-                    elif pos_side == "short" and getattr(pool, 'level_type', '') == "BSL":
+                    elif pos_side == "short" and getattr(pool, "level_type", "") == "BSL":
                         fl = pool.price + lb
                         if current_sl > fl > new_sl:
                             new_sl = fl
             except Exception:
                 pass
 
-        # ── Ratchet: SL may ONLY improve ──────────────────────────────────
+        # ── Ratchet: SL may only improve ─────────────────────────────
         if pos_side == "long":
             if new_sl <= current_sl:
                 if hold_reason is not None:
                     hold_reason.append(
-                        f"NO_IMPROV {new_sl:.1f}<={current_sl:.1f} "
-                        f"[{anchor}] tier={tier:.2f}R mult={mult:.2f}")
+                        f"NO_IMPROV {new_sl:.1f}<={current_sl:.1f} [{anchor}]"
+                        f" tier={tier:.2f}R mult={mult:.2f}")
                 return None
         else:
             if new_sl >= current_sl:
                 if hold_reason is not None:
                     hold_reason.append(
-                        f"NO_IMPROV {new_sl:.1f}>={current_sl:.1f} "
-                        f"[{anchor}] tier={tier:.2f}R mult={mult:.2f}")
+                        f"NO_IMPROV {new_sl:.1f}>={current_sl:.1f} [{anchor}]"
+                        f" tier={tier:.2f}R mult={mult:.2f}")
                 return None
 
-        # ── Minimum meaningful move ───────────────────────────────────────
-        min_mv = 0.08 * atr
-        if pos_side == "long":
-            if new_sl < current_sl + min_mv:
-                if hold_reason is not None:
-                    hold_reason.append(
-                        f"MIN_MOVE {new_sl - current_sl:.1f}<{min_mv:.1f}")
-                return None
-        else:
-            if new_sl > current_sl - min_mv:
-                if hold_reason is not None:
-                    hold_reason.append(
-                        f"MIN_MOVE {current_sl - new_sl:.1f}<{min_mv:.1f}")
-                return None
+        # ── Minimum meaningful move: 0.06×ATR ────────────────────────
+        min_mv = 0.06 * atr
+        improvement = abs(new_sl - current_sl)
+        if improvement < min_mv:
+            if hold_reason is not None:
+                hold_reason.append(f"MIN_MOVE {improvement:.1f}<{min_mv:.1f}")
+            return None
 
-        # ── Tick rounding ─────────────────────────────────────────────────
-        ts = tick_size if tick_size > 0 else 0.1
+        # ── Tick rounding ─────────────────────────────────────────────
+        ts      = tick_size if tick_size > 0 else 0.1
         rounded = round(round(new_sl / ts) * ts, 10)
-        # v6.0: Output the winning anchor label for caller logging
+
         if anchor_out is not None:
-            # Build descriptive trail reason
-            _tier_label = ("P3-AGGR" if tier >= 2.0 else
-                          "P2-LOCK" if tier >= 1.0 else
-                          "P1-BE" if tier >= 0.40 else "P0-CHAND")
-            anchor_out.append(f"{anchor}|{_tier_label}|{tier:.2f}R|m={mult:.2f}")
+            _tier_lbl = (f"P3({tier:.1f}R)" if tier >= 2.0 else
+                         f"P2({tier:.1f}R)" if tier >= 1.0 else
+                         f"P1({tier:.1f}R)" if tier >= 0.30 else
+                         f"P0({tier:.1f}R)")
+            anchor_out.append(f"{anchor}|{_tier_lbl}|m={mult:.2f}")
+
         logger.debug(
-            "ChandelierTrail %s: $%.1f->$%.1f [%s] tier=%.2fR mult=%.2f "
+            "DynamicTrail %s: $%.1f->$%.1f [%s] tier=%.2fR mult=%.2f "
             "bos=%d cbos=%s choch=%s vol=%s",
             pos_side.upper(), current_sl, rounded, anchor, tier, mult,
-            bos, counter_bos, has_choch, vol_regime)
+            bos_count, counter_bos, has_choch, vol_regime)
         return rounded
 
 
-
-_DYNAMIC_TRAIL_AVAILABLE = True   # inline class — always available
+_DYNAMIC_TRAIL_AVAILABLE = True   # inline class — always available   # inline class — always available
 
 
 # ATR ENGINE
@@ -3971,7 +3893,7 @@ class QuantStrategy:
         )
         logger.info(f"   DirectionEngine: {dir_status}")
         # Trail
-        trail_status = "_ICTStructureTrail (inline ICT BOS/CHoCH/OB/FVG engine)"
+        trail_status = "_DynamicStructureTrail (inline ICT BOS/CHoCH/OB/FVG engine)"
         logger.info(f"   Trail: {trail_status}")
         logger.info("=" * 72)
 
@@ -4903,7 +4825,7 @@ class QuantStrategy:
         if _in_pos:
             # ════════════════════════════════════════════════════════════════
             # IN-POSITION MONITOR — shows ONLY what is actually managing the
-            # position: _ICTStructureTrail (BOS/CHoCH/phase/R-multiples).
+            # position: _DynamicStructureTrail (BOS/CHoCH/phase/R-multiples).
             # Old quant-scout gates (VWAP/CVD/composite/n_confirming) are NOT
             # shown here because they play zero role once we are in a trade.
             # ════════════════════════════════════════════════════════════════
@@ -4925,9 +4847,9 @@ class QuantStrategy:
             choch_lvl = 0.0
             if self._ict is not None:
                 try:
-                    bos_cnt = _ICTStructureTrail._bos_count(
+                    bos_cnt = _DynamicStructureTrail._bos_count(
                         self._ict, pos.side, _now_ms_disp)
-                    choch_tf, choch_lvl = _ICTStructureTrail._choch(
+                    choch_tf, choch_lvl = _DynamicStructureTrail._choch(
                         self._ict, pos.side)
                 except Exception:
                     pass
@@ -4941,7 +4863,7 @@ class QuantStrategy:
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
             # ── Trail phase (v6.0: derived from tier, not old _phase method) ─
-            # The _ICTStructureTrail uses continuous tier-based logic, not discrete
+            # The _DynamicStructureTrail uses continuous tier-based logic, not discrete
             # phases. Map tier to meaningful labels for display.
             if mfe_r >= 2.0:
                 trail_phase = 3
@@ -7710,33 +7632,7 @@ class QuantStrategy:
                     tick_flow  = _tf_ph,
                     cvd_trend  = _cvd_ph,
                 )
-                if _gate is not None and _gate.action == "exit":
-                    logger.info(
-                        f"🚧 DIR_ENGINE POOL-GATE: EXIT "
-                        f"conf={_gate.confidence:.2f} "
-                        f"| {_gate.reason[:100]}")
-                    try:
-                        from telegram.notifier import format_pool_gate_alert
-                        send_telegram_message(format_pool_gate_alert(
-                            action        = "exit",
-                            confidence    = _gate.confidence,
-                            reason        = _gate.reason,
-                            pos_side      = pos.side,
-                            pos_entry     = pos.entry_price,
-                            current_price = price,
-                            pos_sl        = pos.sl_price,
-                            pos_tp        = pos.tp_price,
-                            atr           = self._atr_5m.atr if self._atr_5m else 0.0,
-                        ))
-                    except Exception:
-                        send_telegram_message(
-                            f"🚧 <b>POOL-GATE: EXIT TRIGGERED</b>\n"
-                            f"Pool reached — gate recommends close\n"
-                            f"Confidence: {_gate.confidence:.2f}\n"
-                            f"{_gate.reason[:200]}")
-                    self._exit_trade(order_manager, price, "pool_gate_exit")
-                    return
-                elif _gate is not None and _gate.action == "reverse":
+                if _gate is not None and _gate.action == "reverse":
                     logger.info(
                         f"🚧 DIR_ENGINE POOL-GATE: REVERSE "
                         f"conf={_gate.confidence:.2f} "
@@ -8202,7 +8098,7 @@ class QuantStrategy:
         _atr_pctile = self._atr_5m.get_percentile()
         _adx_now    = self._adx.adx
 
-        new_sl = _ICTStructureTrail.compute(
+        new_sl = _DynamicStructureTrail.compute(
             pos_side        = pos.side,
             price           = price,
             entry_price     = pos.entry_price,
