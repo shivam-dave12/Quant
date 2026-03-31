@@ -1,5 +1,5 @@
 """
-direction_engine.py — Institutional Direction & Hunt Decision Engine v1.0
+direction_engine.py — Institutional Direction & Hunt Decision Engine v2.0
 ==========================================================================
 
 THE CORE PROBLEM:
@@ -37,8 +37,8 @@ INSTITUTIONAL PRINCIPLES (ICT):
     Short entries only valid in PREMIUM (above 50% P/D).
   ─ CISD (Change in State of Delivery) = green light for reversal entry.
     CHoCH or BOS in the reversal direction post-sweep = institutional confirmation.
-  ─ OTE (Optimal Trade Entry) zone = 61.8% – 78.6% Fibonacci retrace.
-    The ONLY place institutional orders are placed after a sweep.
+  ─ OTE (Optimal Trade Entry) zone = 50%–78.6% Fibonacci retrace.
+    Institutional orders are placed after a sweep in this retrace window.
   ─ Pool significance × touch count = target priority.
     More clustered stops = stronger magnetic pull = better TP target.
   ─ Displacement (strong body candle closing away from swept level) =
@@ -57,6 +57,59 @@ FACTOR WEIGHTS (Hunt Prediction):
   Volume asymmetry         0.01  — Net buy/sell pressure proxy
                            ────
   TOTAL                    1.00  ✓
+
+SYNC v2.0 FIXES (all verified against entry_engine.py v3.4 and liquidity_map.py v2.1):
+────────────────────────────────────────────────────────────────────────────────────────
+
+FIX-1: OTE zone bounds aligned with entry_engine._PS_OTE_FIB_LOW.
+  Old: _OTE_FIB_LOW = 0.618 (ICT OB-body standard).
+  New: _OTE_FIB_LOW = 0.500 (matches entry_engine._PS_OTE_FIB_LOW = 0.50).
+  Impact: When entry_engine detects OTE at 50% retrace, direction_engine NOW
+  also detects it. Previously direction_engine was 5-15 seconds behind entry_engine
+  on OTE detection, making the +15 pt OTE bonus arrive after entry was decided.
+
+FIX-2: Post-sweep evidence thresholds recalibrated for tighter timing.
+  Old: EARLY=65 / NORMAL=52 / MATURE=38 (direction_engine fired 15-22% later
+       than entry_engine's 55/45/35, causing hints to arrive after entry).
+  New: EARLY=62 / NORMAL=50 / MATURE=36.
+  Entry_engine effective thresholds (with multipliers):
+    EARLY=71.5, NORMAL=45, MATURE=26.25.
+  Direction_engine effective thresholds (with multipliers):
+    EARLY=80.6, NORMAL=50, MATURE=27.0.
+  Direction_engine is SLIGHTLY more conservative (intended — it serves as a
+  high-conviction confirmation layer). The gap is now small enough that hints
+  arrive before entry_engine's window closes, not after.
+
+FIX-3: LiquidityMapSnapshot integrated as optional parameter across all
+  three engines. Pool asymmetry (Factor 5) now uses PoolTarget.adjusted_sig()
+  when liq_snapshot is provided — this incorporates HTF confluence multipliers,
+  OB/FVG alignment bonuses, and adjacency bonuses that ICT LiquidityLevel
+  touch_count alone cannot capture. Dealing range fallback also prefers
+  LiquidityMap pools over ICT pools when liq_snapshot is available.
+
+FIX-4: _score_sweep_static() enhanced with LiquidityMap pool significance
+  for opposing/continuation pool scoring. Old code used a fixed cap of 5.0 pts.
+  New code scales linearly from pool.adjusted_sig() up to 8 pts for reversal
+  target significance and 6 pts for continuation target significance.
+
+FIX-5: pool_hit_gate() auto-resolves next_pool from liq_snapshot when
+  next_pool_price is not provided. Uses the nearest qualifying opposing pool
+  (distance > 0.5 ATR, significance >= 2.0) as the continuation target.
+
+FIX-6: 15m structure check added to _score_sweep_dynamic(). Previously only
+  5m CHoCH/BOS was checked post-sweep. 15m structure fires earlier (bars close
+  every 15 min vs 5 min) and is less noisy. Contributes up to +8 pts per tick
+  when 15m trend is in reversal direction.
+
+FIX-7: Mixed-signal decay asymmetry fix (inherited from v1.0) documented and
+  verified. entry_engine uses two separate `if` blocks which double-decay the
+  reversal side on mixed ticks. direction_engine correctly handles mixed signals
+  with one explicit branch per case. This is the CORRECT implementation.
+
+FIX-8: Integration guide fully updated with liq_snapshot wiring.
+  quant_strategy.py must pass self._liq_map._last_snapshot (previous tick) to
+  predict_hunt() (called BEFORE liq_map.update()) and the fresh liq_snapshot
+  to evaluate_sweep() and pool_hit_gate() (called AFTER liq_map.update()).
 """
 
 from __future__ import annotations
@@ -65,10 +118,30 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL IMPORT — LiquidityMap types
+# Used to enrich Factor 5 (pool asymmetry) and static sweep scoring.
+# Gracefully degrades to ICT pool data if liquidity_map is unavailable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LIQ_MAP_TYPES_AVAILABLE = False
+try:
+    from strategy.liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide
+    _LIQ_MAP_TYPES_AVAILABLE = True
+except ImportError:
+    try:
+        from liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide
+        _LIQ_MAP_TYPES_AVAILABLE = True
+    except ImportError:
+        LiquidityMapSnapshot = None   # type: ignore
+        PoolTarget           = None   # type: ignore
+        PoolSide             = None   # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -77,28 +150,49 @@ logger = logging.getLogger(__name__)
 # Hunt prediction
 _HUNT_MIN_CONFIDENCE    = 0.18   # below this = NEUTRAL (insufficient signal)
 _HUNT_STRONG_CONFIDENCE = 0.55   # above this = high-conviction directional call
+_HUNT_CACHE_SEC         = 5      # refresh prediction at most every 5 seconds
 
 # Post-sweep evidence thresholds
-_PS_REV_THRESHOLD_EARLY  = 65.0   # overwhelming evidence in DISPLACEMENT phase
-_PS_REV_THRESHOLD_NORMAL = 52.0   # standard evidence required
-_PS_REV_THRESHOLD_MATURE = 38.0   # relaxed threshold after 4+ minutes
+# FIX-2: Recalibrated so direction_engine fires ~5-10s before entry_engine's
+# window closes. entry_engine effective thresholds: EARLY=71.5, NORMAL=45, MATURE=26.25.
+# direction_engine effective thresholds:            EARLY=80.6, NORMAL=50, MATURE=27.0.
+_PS_REV_THRESHOLD_EARLY  = 62.0   # × 1.30 phase mult = 80.6 effective  [was 65]
+_PS_REV_THRESHOLD_NORMAL = 50.0   # standard phase                       [was 52]
+_PS_REV_THRESHOLD_MATURE = 36.0   # relaxed, mature phase                [was 38]
 _PS_CONT_THRESHOLD_RATIO = 0.90   # continuation needs 90% of reversal threshold
-_PS_GAP_MIN              = 10.0   # minimum gap between rev/cont scores
+_PS_GAP_MIN              = 10.0   # minimum score separation between rev and cont
 _PS_TIMEOUT_SEC          = 360.0  # 6 minutes — then abandon evaluation
-_PS_EVAL_DELAY_SEC       = 8.0    # wait before first evaluation
+_PS_EVAL_DELAY_SEC       = 8.0    # initial delay before first evaluation tick
+
+# Phase timeline boundaries (seconds after sweep)
+_PS_PHASE_DISPLACEMENT_SEC = 45.0    # 0 –  45s: expect price to reject hard
+_PS_PHASE_CISD_SEC         = 120.0   # 45 – 120s: expect CHoCH/BOS confirmation
+_PS_PHASE_OTE_SEC          = 240.0   # 120– 240s: expect retrace to OTE zone
+# Phase score multipliers
+_PS_DISP_SCORE_MULT  = 1.30   # DISPLACEMENT phase: need 1.30× score (overwhelming evidence)
+_PS_MATURE_SCORE_MULT = 0.75  # MATURE phase: accept 0.75× score (stale setup last chance)
 
 # Displacement quality
 _DISP_STRONG_ATR         = 1.2    # strong displacement > 1.2 ATR from sweep level
-_DISP_WEAK_ATR           = 0.4    # minimum to count as displacement
-_DISP_CISD_MAX_AGE_SEC   = 150    # CISD older than 2.5 min = stale
+_DISP_WEAK_ATR           = 0.4    # minimum to count as any displacement
+_DISP_CISD_MAX_AGE_SEC   = 150    # CISD older than 2.5 min = stale, reduced weight
 
-# OTE Fibonacci levels (61.8% – 78.6% retrace)
-_OTE_FIB_LOW             = 0.618
-_OTE_FIB_HIGH            = 0.786
+# OTE Fibonacci levels
+# FIX-1: Aligned with entry_engine._PS_OTE_FIB_LOW = 0.50.
+# Old: 0.618 (ICT OB-body standard). New: 0.500 (entry timing alignment).
+_OTE_FIB_LOW  = 0.500   # 50% retrace  [was 0.618]
+_OTE_FIB_HIGH = 0.786   # 78.6% retrace (unchanged)
 
 # Continuation gate
-_CONT_FLOW_REVERSAL_MIN  = 0.40   # flow must flip this strongly to trigger reversal
-_CONT_STRUCT_REVERSAL    = True   # BOS against position always triggers re-evaluation
+_CONT_FLOW_REVERSAL_MIN = 0.40   # flow must flip this strongly to trigger reversal
+_CONT_NEXT_POOL_MIN_RR  = 1.5    # next pool must offer at least 1.5R reward
+
+# Static pool significance scoring caps for post-sweep evidence
+_STATIC_REV_POOL_MAX   = 8.0   # max pts from opposing pool significance
+_STATIC_CONT_POOL_MAX  = 6.0   # max pts from continuation pool significance
+
+# Factor 5 (pool asymmetry) significance scoring constants
+_TF_WEIGHT = {"1d": 5.0, "4h": 4.0, "1h": 3.0, "15m": 2.0, "5m": 1.0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,18 +223,18 @@ class HuntFactors:
 @dataclass
 class HuntPrediction:
     """Output of the Hunt Prediction Engine."""
-    predicted:          Optional[str]  # "BSL" | "SSL" | None
-    confidence:         float          # 0.0 – 1.0 normalised absolute score
-    delivery_direction: str            # "bullish" | "bearish" | ""
-    raw_score:          float          # underlying [-1, +1] score (+ = BSL hunt)
-    bsl_score:          float          # 0–1 component for BSL
-    ssl_score:          float          # 0–1 component for SSL
-    factors:            HuntFactors = field(default_factory=HuntFactors)
-    dealing_range_pd:   float = 0.5
-    swept_pool_price:   Optional[float] = None   # predicted target pool price
-    opposing_pool_price: Optional[float] = None  # post-hunt delivery destination
-    reason:             str = ""
-    timestamp_ms:       int = 0
+    predicted:           Optional[str]   # "BSL" | "SSL" | None
+    confidence:          float           # 0.0 – 1.0 normalised absolute score
+    delivery_direction:  str             # "bullish" | "bearish" | ""
+    raw_score:           float           # underlying [-1, +1] score (+ = BSL hunt)
+    bsl_score:           float           # 0–1 component for BSL
+    ssl_score:           float           # 0–1 component for SSL
+    factors:             HuntFactors     = field(default_factory=HuntFactors)
+    dealing_range_pd:    float           = 0.5
+    swept_pool_price:    Optional[float] = None   # predicted target pool price
+    opposing_pool_price: Optional[float] = None   # post-hunt delivery destination
+    reason:              str             = ""
+    timestamp_ms:        int             = 0
 
 
 @dataclass
@@ -157,65 +251,65 @@ class PostSweepState:
     swept_pool_type:    str    # "BSL" | "SSL"
     entered_at:         float  # epoch seconds
 
-    # ── Static baseline (scored ONCE) ───────────────────────────────
-    static_rev_base:   float = 0.0
-    static_cont_base:  float = 0.0
-    static_scored:     bool  = False
+    # ── Static baseline (scored ONCE after _PS_EVAL_DELAY_SEC) ──────
+    static_rev_base:    float = 0.0
+    static_cont_base:   float = 0.0
+    static_scored:      bool  = False
 
     # ── Dynamic accumulator ──────────────────────────────────────────
-    rev_evidence:      float = 0.0   # accumulated reversal dynamic evidence
-    cont_evidence:     float = 0.0   # accumulated continuation dynamic evidence
-    peak_rev:          float = 0.0
-    peak_cont:         float = 0.0
-    tick_count:        int   = 0
+    rev_evidence:       float = 0.0
+    cont_evidence:      float = 0.0
+    peak_rev:           float = 0.0
+    peak_cont:          float = 0.0
+    tick_count:         int   = 0
 
     # ── CISD tracking ────────────────────────────────────────────────
-    cisd_detected:     bool  = False
-    cisd_timestamp:    float = 0.0
-    cisd_type:         str   = ""    # "choch" | "bos"
+    cisd_detected:      bool  = False
+    cisd_timestamp:     float = 0.0
+    cisd_type:          str   = ""    # "choch" | "bos"
 
     # ── Displacement tracking ────────────────────────────────────────
     max_displacement_atr: float = 0.0
-    disp_velocity_atr_s:  float = 0.0  # ATR per second
+    disp_velocity_atr_s:  float = 0.0   # ATR per second
 
     # ── OTE zone tracking ────────────────────────────────────────────
-    ote_reached:       bool  = False
-    ote_timestamp:     float = 0.0
-    ote_holding:       bool  = False
+    ote_reached:        bool  = False
+    ote_timestamp:      float = 0.0
+    ote_holding:        bool  = False
 
     # ── Price extremes since sweep ───────────────────────────────────
-    highest_since:     float = 0.0
-    lowest_since:      float = float('inf')
+    highest_since:      float = 0.0
+    lowest_since:       float = float('inf')
 
     # ── Flow accumulation ────────────────────────────────────────────
-    rev_flow_ticks:    int   = 0
-    cont_flow_ticks:   int   = 0
+    rev_flow_ticks:     int   = 0
+    cont_flow_ticks:    int   = 0
 
 
 @dataclass
 class PostSweepDecision:
     """Output of the Post-Sweep Scenario Engine."""
-    action:        str    # "reverse" | "continue" | "wait"
-    direction:     str    # "long" | "short" | ""
-    confidence:    float  # 0.0 – 1.0
-    phase:         str    # "DISPLACEMENT" | "CISD" | "OTE" | "MATURE"
-    cisd_active:   bool   = False
-    ote_active:    bool   = False
-    displacement_atr: float = 0.0
-    rev_score:     float  = 0.0
-    cont_score:    float  = 0.0
-    rev_reasons:   List[str] = field(default_factory=list)
-    cont_reasons:  List[str] = field(default_factory=list)
-    reason:        str    = ""
+    action:           str    # "reverse" | "continue" | "wait"
+    direction:        str    # "long" | "short" | ""
+    confidence:       float  # 0.0 – 1.0
+    phase:            str    # "DISPLACEMENT" | "CISD" | "OTE" | "MATURE"
+    cisd_active:      bool   = False
+    ote_active:       bool   = False
+    displacement_atr: float  = 0.0
+    rev_score:        float  = 0.0
+    cont_score:       float  = 0.0
+    rev_reasons:      List[str] = field(default_factory=list)
+    cont_reasons:     List[str] = field(default_factory=list)
+    reason:           str    = ""
 
 
 @dataclass
 class ContinuationDecision:
     """Output of the Pool-Hit Continuation Gate."""
-    action:        str    # "exit" | "reverse" | "continue" | "hold"
-    confidence:    float
-    reason:        str
-    next_target:   Optional[float] = None  # if continuing, the next pool price
+    action:      str    # "exit" | "reverse" | "continue" | "hold"
+    confidence:  float
+    reason:      str
+    next_target: Optional[float] = None   # if continuing, the next pool price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,31 +318,14 @@ class ContinuationDecision:
 
 class DirectionEngine:
     """
-    Institutional Direction & Hunt Decision Engine v1.0.
+    Institutional Direction & Hunt Decision Engine v2.0.
 
     Single source of truth for ALL directional decisions in the strategy:
       1. predict_hunt()   → which pool (BSL/SSL) gets swept next?
       2. evaluate_sweep() → after a sweep: reverse, continue, or wait?
       3. pool_hit_gate()  → at a pool during a trade: TP/reverse/continue?
 
-    Integration points (quant_strategy.py):
-      # Initialize once
-      self._dir_engine = DirectionEngine()
-
-      # Each tick (before entry evaluation)
-      hunt = self._dir_engine.predict_hunt(price, atr, now_ms, ict_engine,
-                                            tick_flow, cvd_trend, candles_5m)
-
-      # After a sweep is detected
-      self._dir_engine.on_sweep(swept_pool_price, pool_type, price, atr, now)
-
-      # Each tick while in POST_SWEEP state
-      decision = self._dir_engine.evaluate_sweep(
-          price, atr, now, ict_engine, tick_flow, cvd_trend)
-
-      # When price reaches a pool during an active trade
-      gate = self._dir_engine.pool_hit_gate(
-          pos_side, pos_entry, pos_sl, pos_tp, price, atr, ict_engine)
+    v2.0 Sync Fixes: FIX-1 through FIX-8 (see module docstring).
     """
 
     _FACTOR_WEIGHTS = {
@@ -266,13 +343,12 @@ class DirectionEngine:
     assert abs(sum(_FACTOR_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
     def __init__(self) -> None:
-        self._last_hunt: Optional[HuntPrediction] = None
-        self._last_hunt_ms: int = 0
-        self._HUNT_CACHE_SEC = 5   # refresh prediction every 5s
+        self._last_hunt:     Optional[HuntPrediction] = None
+        self._last_hunt_ms:  int   = 0
 
-        self._ps_state: Optional[PostSweepState] = None
-        self._ps_state_quality: float = 0.0   # displacement_score of the active sweep (0–1)
-        self._last_ps_analysis: Dict = {}
+        self._ps_state:          Optional[PostSweepState] = None
+        self._ps_state_quality:  float = 0.0
+        self._last_ps_analysis:  Dict  = {}
 
     # =========================================================================
     # 1. HUNT PREDICTION ENGINE
@@ -280,38 +356,33 @@ class DirectionEngine:
 
     def predict_hunt(
         self,
-        price:       float,
-        atr:         float,
-        now_ms:      int,
-        ict_engine,                       # ICTEngine instance
-        tick_flow:   float = 0.0,         # TickFlowEngine signal [-1, +1]
-        cvd_trend:   float = 0.0,         # CVD slope signal [-1, +1]
-        candles_5m:  Optional[List[Dict]] = None,
-        force_refresh: bool = False,
+        price:          float,
+        atr:            float,
+        now_ms:         int,
+        ict_engine,                                         # ICTEngine instance
+        tick_flow:      float                   = 0.0,     # TickFlowEngine signal [-1,+1]
+        cvd_trend:      float                   = 0.0,     # CVD slope signal [-1,+1]
+        candles_5m:     Optional[List[Dict]]    = None,
+        liq_snapshot                            = None,    # LiquidityMapSnapshot (FIX-3)
+        force_refresh:  bool                    = False,
     ) -> HuntPrediction:
         """
         Predict which liquidity pool (BSL or SSL) will be swept next.
 
-        Returns HuntPrediction with:
-          predicted          = "BSL" (price heading up to sweep buy stops)
-                             | "SSL" (price heading down to sweep sell stops)
-                             | None (insufficient signal confidence)
-          delivery_direction = direction AFTER the sweep completes
-          confidence         = 0.0–1.0 (how decisive the prediction is)
-
-        BSL hunt → BSL swept → bearish delivery → price drops to SSL target.
-        SSL hunt → SSL swept → bullish delivery → price rises to BSL target.
+        FIX-3: When liq_snapshot is provided (LiquidityMapSnapshot from
+        LiquidityMap.get_snapshot()), Factor 5 (pool asymmetry) uses
+        PoolTarget.adjusted_sig() for rich significance scoring. The dealing
+        range fallback also prefers LiquidityMap pools over ICT pools.
 
         Score interpretation:
           score > 0: BSL hunt more likely (price heading up to run buy stops)
           score < 0: SSL hunt more likely (price heading down to run sell stops)
           abs(score) < _HUNT_MIN_CONFIDENCE: uncertain → None
         """
-        # Use cached result if fresh enough
         age_ms = now_ms - self._last_hunt_ms
         if (not force_refresh
                 and self._last_hunt is not None
-                and age_ms < self._HUNT_CACHE_SEC * 1000):
+                and age_ms < _HUNT_CACHE_SEC * 1000):
             return self._last_hunt
 
         if not ict_engine or not getattr(ict_engine, '_initialized', False):
@@ -321,33 +392,51 @@ class DirectionEngine:
         factors = HuntFactors()
 
         # ── Fetch Dealing Range ───────────────────────────────────────────────
-        dr_pd = 0.5
-        bsl_price = ssl_price = 0.0
+        # Primary: DealingRange from ICT engine (_dealing_range attribute).
+        # Fallback 1: LiquidityMap snapshot BSL/SSL nearest pools. (FIX-3)
+        # Fallback 2: ICT liquidity_pools (LiquidityLevel objects).
+        dr_pd     = 0.5
+        bsl_price = 0.0
+        ssl_price = 0.0
+
         dr = getattr(ict_engine, '_dealing_range', None)
         if dr is not None:
             bsl_price = getattr(dr, 'high', 0.0)
             ssl_price = getattr(dr, 'low',  0.0)
             dr_pd     = getattr(dr, 'current_pd', 0.5)
+        elif liq_snapshot is not None:
+            # FIX-3: Use LiquidityMap snapshot for dealing range
+            _bsl_pools = [t for t in liq_snapshot.bsl_pools if t.pool.price > price]
+            _ssl_pools = [t for t in liq_snapshot.ssl_pools if t.pool.price < price]
+            if _bsl_pools and _ssl_pools:
+                bsl_price = min(_bsl_pools, key=lambda t: t.distance_atr).pool.price
+                ssl_price = min(_ssl_pools, key=lambda t: t.distance_atr).pool.price
+                rng  = max(bsl_price - ssl_price, 1e-9)
+                dr_pd = (price - ssl_price) / rng
         else:
-            # Fall back to nearest unswept pools
-            unswept = [p for p in ict_engine.liquidity_pools if not p.swept]
-            bsl_above = sorted([p for p in unswept
-                                if p.level_type == "BSL" and p.price > price],
-                               key=lambda p: p.price)
-            ssl_below = sorted([p for p in unswept
-                                if p.level_type == "SSL" and p.price < price],
-                               key=lambda p: -p.price)
-            if bsl_above and ssl_below:
-                bsl_price = bsl_above[0].price
-                ssl_price = ssl_below[0].price
-                rng = max(bsl_price - ssl_price, 1e-9)
+            # Fallback to ICT liquidity_pools (LiquidityLevel objects)
+            _all_ict = list(getattr(ict_engine, 'liquidity_pools', []))
+            _unswept  = [p for p in _all_ict if not getattr(p, 'swept', False)]
+            _bsl_above = sorted([p for p in _unswept
+                                 if getattr(p, 'level_type', '') == "BSL"
+                                 and p.price > price],
+                                key=lambda p: p.price)
+            _ssl_below = sorted([p for p in _unswept
+                                 if getattr(p, 'level_type', '') == "SSL"
+                                 and p.price < price],
+                                key=lambda p: -p.price)
+            if _bsl_above and _ssl_below:
+                bsl_price = _bsl_above[0].price
+                ssl_price = _ssl_below[0].price
+                rng  = max(bsl_price - ssl_price, 1e-9)
                 dr_pd = (price - ssl_price) / rng
 
         if bsl_price <= 0 or ssl_price <= 0:
-            return self._null_prediction(now_ms, reason="no_dealing_range")
+            return self._null_prediction(now_ms, reason="no_dealing_range",
+                                         dr_pd=dr_pd)
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 1: AMD Phase + Bias (weight 0.22)
+        # FACTOR 1: AMD Phase + Bias  (weight 0.22)
         # ─────────────────────────────────────────────────────────────────────
         # ICT institutional cycle logic:
         #   ACCUMULATION:   No directional bias → neutral (0.0)
@@ -368,39 +457,31 @@ class DirectionEngine:
 
             if _phase == 'MANIPULATION':
                 if _bias == 'bullish':
-                    # SSL was swept (Judas down) → delivery UP → next hunt is BSL
-                    factors.amd = +0.90 * _conf
+                    factors.amd = +0.90 * _conf   # SSL was Judas, delivering UP → BSL
                 elif _bias == 'bearish':
-                    # BSL was swept (Judas up) → delivery DOWN → next hunt is SSL
-                    factors.amd = -0.90 * _conf
+                    factors.amd = -0.90 * _conf   # BSL was Judas, delivering DOWN → SSL
             elif _phase == 'DISTRIBUTION':
                 if _bias == 'bullish':
-                    # Delivering UP to BSL — bullish distribution sweep
-                    factors.amd = +0.70 * _conf
+                    factors.amd = +0.70 * _conf   # distributing UP toward BSL
                 elif _bias == 'bearish':
-                    # Delivering DOWN to SSL
-                    factors.amd = -0.70 * _conf
+                    factors.amd = -0.70 * _conf   # distributing DOWN toward SSL
             elif _phase == 'REACCUMULATION':
-                # Mid-trend bullish consolidation → resume UP → BSL next
-                factors.amd = +0.45 * _conf
+                factors.amd = +0.45 * _conf       # mid-trend bull pause → BSL next
             elif _phase == 'REDISTRIBUTION':
-                # Mid-trend bearish consolidation → resume DOWN → SSL next
-                factors.amd = -0.45 * _conf
+                factors.amd = -0.45 * _conf       # mid-trend bear pause → SSL next
             elif _phase == 'ACCUMULATION':
-                # No delivery in progress → neutral
                 factors.amd = 0.0
 
             factors.amd = max(-1.0, min(1.0, factors.amd))
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 2: HTF Structure Cascade (weight 0.18)
+        # FACTOR 2: HTF Structure Cascade  (weight 0.18)
         # ─────────────────────────────────────────────────────────────────────
-        # Each timeframe contributes a fractional vote.
         # 4H is the institutional anchor (highest weight within this factor).
-        # Score: positive = bullish alignment, negative = bearish.
+        # Score: positive = bullish alignment → price heading UP → BSL hunt.
         _tf = getattr(ict_engine, '_tf', {})
         _struct_votes = []
-        _tf_weights = {"4h": 0.45, "1h": 0.30, "15m": 0.25}
+        _tf_weights   = {"4h": 0.45, "1h": 0.30, "15m": 0.25}
         for _tf_name, _tf_w in _tf_weights.items():
             _st = _tf.get(_tf_name)
             if _st is None:
@@ -413,12 +494,11 @@ class DirectionEngine:
                 _vote = +0.60
             elif _trend == 'bearish':
                 _vote = -0.60
-            # BOS adds directional conviction
             if _bos == 'bullish':
                 _vote += +0.25
             elif _bos == 'bearish':
                 _vote -= +0.25
-            # CHoCH is an early reversal warning (reduces vote)
+            # CHoCH is an early reversal warning — reduces the vote
             if _choch == 'bearish' and _trend == 'bullish':
                 _vote -= 0.15
             elif _choch == 'bullish' and _trend == 'bearish':
@@ -429,172 +509,152 @@ class DirectionEngine:
         factors.htf_structure = max(-1.0, min(1.0, factors.htf_structure))
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 3: Dealing Range P/D Position (weight 0.15)
+        # FACTOR 3: Dealing Range P/D Position  (weight 0.15)
         # ─────────────────────────────────────────────────────────────────────
-        # Institutional principle: smart money BUYS in discount (below 50% P/D)
-        # and SELLS in premium (above 50% P/D). Current P/D position predicts
-        # which pool is being targeted.
-        #   dr_pd = 0.0 (deep discount) → price heading UP to BSL → +1.0
-        #   dr_pd = 0.5 (equilibrium)  → neutral → 0.0
-        #   dr_pd = 1.0 (deep premium) → price heading DOWN to SSL → -1.0
-        # Linear mapping: f_dr = 1.0 - 2.0 × dr_pd
+        # dr_pd = 0.0 (deep discount) → heading UP to BSL → +1.0
+        # dr_pd = 0.5 (equilibrium)   → neutral → 0.0
+        # dr_pd = 1.0 (deep premium)  → heading DOWN to SSL → -1.0
         factors.dealing_range = max(-1.0, min(1.0, 1.0 - 2.0 * dr_pd))
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 4: Order Flow Vector (weight 0.13)
+        # FACTOR 4: Order Flow Vector  (weight 0.13)
         # ─────────────────────────────────────────────────────────────────────
-        # Combine tick_flow and cvd_trend with a ratio favoring real-time data.
-        # tick_flow is more reactive; cvd_trend provides sustained momentum.
-        # In trending markets, sustained flow is more informative than single ticks.
         _of_composite = tick_flow * 0.55 + cvd_trend * 0.45
         factors.order_flow = _sigmoid(_of_composite, steepness=1.3)
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 5: Pool Significance Asymmetry (weight 0.09)
+        # FACTOR 5: Pool Significance Asymmetry  (weight 0.09)
         # ─────────────────────────────────────────────────────────────────────
-        # Compare the aggregate significance of BSL pools above price vs
-        # SSL pools below. Higher significance = more clustered stops = stronger
-        # magnetic pull. The side with MORE/BETTER pools gets hunted more often.
-        unswept_pools = [p for p in ict_engine.liquidity_pools if not p.swept]
-        _TF_WEIGHT = {"1d": 5.0, "4h": 4.0, "1h": 3.0, "15m": 2.0, "5m": 1.0}
-
-        def _pool_significance(p, ref_price):
-            dist_atr = abs(p.price - ref_price) / a
-            tf_w = _TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1.0)
-            tc = float(getattr(p, 'touch_count', 1))
-            # Significance decays with distance (ATR-normalised)
-            return tc * tf_w * math.exp(-dist_atr / 8.0)
-
-        bsl_sig = sum(_pool_significance(p, price) for p in unswept_pools
-                      if p.level_type == "BSL" and p.price > price)
-        ssl_sig = sum(_pool_significance(p, price) for p in unswept_pools
-                      if p.level_type == "SSL" and p.price < price)
-        total_sig = bsl_sig + ssl_sig
-        if total_sig > 1e-10:
-            # Positive = BSL side dominant (more likely to be hunted)
-            factors.pool_asymmetry = _sigmoid(
-                (bsl_sig - ssl_sig) / total_sig * 3.0, steepness=1.0)
+        # FIX-3: Prefer LiquidityMap PoolTarget.adjusted_sig() when available.
+        # LiquidityMap incorporates HTF confluence (×2.5), OB/FVG alignment
+        # bonuses, adjacency bonus, and exponential distance decay. ICT
+        # LiquidityLevel only has touch_count and timeframe.
+        if liq_snapshot is not None:
+            # Use PoolTarget.adjusted_sig() — the canonical selection key
+            _bsl_sig_lm = sum(t.adjusted_sig()
+                              for t in liq_snapshot.bsl_pools
+                              if t.pool.price > price)
+            _ssl_sig_lm = sum(t.adjusted_sig()
+                              for t in liq_snapshot.ssl_pools
+                              if t.pool.price < price)
+            _total_lm = _bsl_sig_lm + _ssl_sig_lm
+            if _total_lm > 1e-10:
+                factors.pool_asymmetry = _sigmoid(
+                    (_bsl_sig_lm - _ssl_sig_lm) / _total_lm * 3.0, steepness=1.0)
+            else:
+                factors.pool_asymmetry = 0.0
         else:
-            factors.pool_asymmetry = 0.0
+            # Fallback: ICT LiquidityLevel pool scoring
+            _all_ict      = list(getattr(ict_engine, 'liquidity_pools', []))
+            _unswept_ict  = [p for p in _all_ict if not getattr(p, 'swept', False)]
+
+            def _ict_pool_sig(p: object) -> float:
+                dist_atr = abs(getattr(p, 'price', 0.0) - price) / a
+                tf_w     = _TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1.0)
+                tc       = float(getattr(p, 'touch_count', 1))
+                return tc * tf_w * math.exp(-dist_atr / 8.0)
+
+            bsl_sig = sum(_ict_pool_sig(p) for p in _unswept_ict
+                          if getattr(p, 'level_type', '') == "BSL"
+                          and getattr(p, 'price', 0.0) > price)
+            ssl_sig = sum(_ict_pool_sig(p) for p in _unswept_ict
+                          if getattr(p, 'level_type', '') == "SSL"
+                          and getattr(p, 'price', 0.0) < price)
+            total_sig = bsl_sig + ssl_sig
+            if total_sig > 1e-10:
+                factors.pool_asymmetry = _sigmoid(
+                    (bsl_sig - ssl_sig) / total_sig * 3.0, steepness=1.0)
+            else:
+                factors.pool_asymmetry = 0.0
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 6: OB/FVG Magnetic Pull (weight 0.08)
+        # FACTOR 6: OB/FVG Magnetic Pull  (weight 0.08)
         # ─────────────────────────────────────────────────────────────────────
         # Unfilled bullish OBs and FVGs between price and BSL = delivery highway.
         # Unfilled bearish OBs and FVGs between price and SSL = delivery highway.
-        # These structural gaps and OB zones ATTRACT price like gravity.
-        now_ms_local = now_ms
-        _ob_bull = getattr(ict_engine, 'order_blocks_bull', [])
-        _ob_bear = getattr(ict_engine, 'order_blocks_bear', [])
+        _ob_bull  = getattr(ict_engine, 'order_blocks_bull', [])
+        _ob_bear  = getattr(ict_engine, 'order_blocks_bear', [])
         _fvg_bull = getattr(ict_engine, 'fvgs_bull', [])
         _fvg_bear = getattr(ict_engine, 'fvgs_bear', [])
 
         bull_pull = 0.0
         bear_pull = 0.0
         try:
-            # Bull OBs between price and BSL = price has structural support going UP
             for ob in _ob_bull:
-                if (ob.is_active(now_ms_local) and
-                        price < ob.midpoint < bsl_price):
+                if (ob.is_active(now_ms) and price < ob.midpoint < bsl_price):
                     bull_pull += (ob.strength / 100.0) * ob.virgin_multiplier()
-            # Bear OBs between price and SSL = price has structural support going DOWN
             for ob in _ob_bear:
-                if (ob.is_active(now_ms_local) and
-                        ssl_price < ob.midpoint < price):
+                if (ob.is_active(now_ms) and ssl_price < ob.midpoint < price):
                     bear_pull += (ob.strength / 100.0) * ob.virgin_multiplier()
-            # Unfilled bull FVGs above price → BSL delivery highway
             for fvg in _fvg_bull:
-                if (fvg.is_active(now_ms_local) and
-                        not fvg.filled and price < fvg.bottom < bsl_price):
-                    bull_pull += (1.0 - fvg.fill_percentage) * 0.6
-            # Unfilled bear FVGs below price → SSL delivery highway
+                if (fvg.is_active(now_ms) and not fvg.filled
+                        and price < fvg.bottom < bsl_price):
+                    bull_pull += (1.0 - fvg.fill_percentage) * 0.60
             for fvg in _fvg_bear:
-                if (fvg.is_active(now_ms_local) and
-                        not fvg.filled and ssl_price < fvg.top < price):
-                    bear_pull += (1.0 - fvg.fill_percentage) * 0.6
+                if (fvg.is_active(now_ms) and not fvg.filled
+                        and ssl_price < fvg.top < price):
+                    bear_pull += (1.0 - fvg.fill_percentage) * 0.60
         except Exception:
             pass
 
         factors.ob_fvg_pull = _sigmoid(bull_pull - bear_pull, steepness=0.7)
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 7: Displacement Bias (weight 0.07)
+        # FACTOR 7: Displacement Bias  (weight 0.07)
         # ─────────────────────────────────────────────────────────────────────
         # Net candle body direction of the last 4 CLOSED 5m bars (institutional
         # displacement logic — uses closed bars only to avoid live-bar noise).
-        # Strong bullish bodies = price is being displaced UP = BSL hunt.
-        # Strong bearish bodies = SSL hunt.
         factors.displacement = 0.0
         _c5 = candles_5m or []
         if len(_c5) >= 6 and a > 1e-10:
-            # Use 4 most recent CLOSED bars (exclude live forming bar)
-            closed_bars = _c5[-5:-1]
-            net_body = sum(float(c['c']) - float(c['o']) for c in closed_bars)
-            # Normalise by ATR × bars for scale
+            closed_bars = _c5[-5:-1]   # 4 most recent CLOSED bars (exclude live)
+            net_body    = sum(float(c['c']) - float(c['o']) for c in closed_bars)
             factors.displacement = _sigmoid(net_body / (a * 2.0), steepness=1.0)
         elif _tf.get("5m"):
-            # Fallback to 5m structural trend
-            t5 = _tf["5m"]
-            if getattr(t5, 'trend', '') == 'bullish':
-                factors.displacement = +0.50
-            elif getattr(t5, 'trend', '') == 'bearish':
-                factors.displacement = -0.50
+            _t5 = _tf["5m"]
+            if   getattr(_t5, 'trend', '') == 'bullish': factors.displacement = +0.50
+            elif getattr(_t5, 'trend', '') == 'bearish': factors.displacement = -0.50
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 8: Session Timing (weight 0.04)
+        # FACTOR 8: Session Timing  (weight 0.04)
         # ─────────────────────────────────────────────────────────────────────
-        # Kill zone behavioural tendencies:
-        #   LONDON KZ: Judas swing bias (often sweeps UP then delivers DOWN)
-        #              → slight BSL sweep bias (price hunts BSL first)
-        #   NY KZ:     Amplify the existing directional composite
-        #   ASIA KZ:   Range consolidation — slight bias toward the OPPOSITE
-        #              side of the current P/D position (mean reversion tendency)
+        # London KZ: Judas swing bias (often sweeps UP then delivers DOWN)
+        #            → slight BSL sweep bias (price hunts BSL first)
+        # NY KZ:     Amplify the existing directional composite
+        # Asia KZ:   Range consolidation — neutral
         factors.session = 0.0
         try:
             kz = getattr(ict_engine, '_killzone', '').upper()
-            sess = getattr(ict_engine, '_session', '').upper()
             if 'LONDON' in kz:
-                # London tends to run buy stops first (Judas swing UP)
-                # Then delivers down → net BSL sweep bias in London KZ
-                factors.session = +0.35
+                factors.session = +0.35   # London tends to run buy stops first
             elif 'NY' in kz:
-                # NY amplifies the dominant direction from other factors
                 dominant = (
-                    factors.amd * self._FACTOR_WEIGHTS['amd'] +
-                    factors.htf_structure * self._FACTOR_WEIGHTS['htf_structure'] +
-                    factors.dealing_range * self._FACTOR_WEIGHTS['dealing_range']
+                    factors.amd            * self._FACTOR_WEIGHTS['amd'] +
+                    factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure'] +
+                    factors.dealing_range  * self._FACTOR_WEIGHTS['dealing_range']
                 )
                 factors.session = _sigmoid(dominant * 2.5, steepness=1.0)
             elif 'ASIA' in kz:
-                # Asia tends toward the opposite of current P/D extreme
-                # (accumulation often involves false breakouts of range extremes)
-                factors.session = 0.0  # neutral — accumulation is directionless
+                factors.session = 0.0   # accumulation = directionless
         except Exception:
             pass
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 9: Micro-Structure BOS (weight 0.03)
+        # FACTOR 9: Micro-Structure BOS  (weight 0.03)
         # ─────────────────────────────────────────────────────────────────────
-        # Recent 5m BOS direction provides early structural momentum signal.
-        # Bullish BOS (close above recent swing high) = structural upside break.
         factors.micro_bos = 0.0
         _t5 = _tf.get("5m")
         if _t5 is not None:
             _bos_d = getattr(_t5, 'bos_direction', '')
-            if _bos_d == 'bullish':
-                factors.micro_bos = +0.80
-            elif _bos_d == 'bearish':
-                factors.micro_bos = -0.80
+            if   _bos_d == 'bullish': factors.micro_bos = +0.80
+            elif _bos_d == 'bearish': factors.micro_bos = -0.80
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 10: Volume Asymmetry (weight 0.01)
+        # FACTOR 10: Volume Asymmetry  (weight 0.01)
         # ─────────────────────────────────────────────────────────────────────
-        # Approximate net buy/sell from OB imbalance in the ICT engine's
-        # tick_flow data (already incorporated in Factor 4 to some degree,
-        # but this captures the orderbook depth asymmetry independently).
         factors.volume = 0.0
         try:
-            _tf_raw = getattr(ict_engine, '_tick_flow', None)
+            _tf_raw  = getattr(ict_engine, '_tick_flow', None)
             _cvd_raw = getattr(ict_engine, '_cvd_trend', None)
             if _tf_raw is not None and _cvd_raw is not None:
                 factors.volume = _sigmoid(
@@ -607,69 +667,65 @@ class DirectionEngine:
         # WEIGHTED COMPOSITE SCORE
         # ─────────────────────────────────────────────────────────────────────
         score = (
-            factors.amd            * self._FACTOR_WEIGHTS["amd"] +
-            factors.htf_structure  * self._FACTOR_WEIGHTS["htf_structure"] +
-            factors.dealing_range  * self._FACTOR_WEIGHTS["dealing_range"] +
-            factors.order_flow     * self._FACTOR_WEIGHTS["order_flow"] +
+            factors.amd            * self._FACTOR_WEIGHTS["amd"]            +
+            factors.htf_structure  * self._FACTOR_WEIGHTS["htf_structure"]  +
+            factors.dealing_range  * self._FACTOR_WEIGHTS["dealing_range"]  +
+            factors.order_flow     * self._FACTOR_WEIGHTS["order_flow"]     +
             factors.pool_asymmetry * self._FACTOR_WEIGHTS["pool_asymmetry"] +
-            factors.ob_fvg_pull    * self._FACTOR_WEIGHTS["ob_fvg_pull"] +
-            factors.displacement   * self._FACTOR_WEIGHTS["displacement"] +
-            factors.session        * self._FACTOR_WEIGHTS["session"] +
-            factors.micro_bos      * self._FACTOR_WEIGHTS["micro_bos"] +
+            factors.ob_fvg_pull    * self._FACTOR_WEIGHTS["ob_fvg_pull"]    +
+            factors.displacement   * self._FACTOR_WEIGHTS["displacement"]   +
+            factors.session        * self._FACTOR_WEIGHTS["session"]        +
+            factors.micro_bos      * self._FACTOR_WEIGHTS["micro_bos"]      +
             factors.volume         * self._FACTOR_WEIGHTS["volume"]
         )
         score = max(-1.0, min(1.0, score))
 
         confidence = abs(score)
-        bsl_score  = max(0.0, score)
+        bsl_score  = max(0.0,  score)
         ssl_score  = max(0.0, -score)
 
         # ─────────────────────────────────────────────────────────────────────
         # HTF STRUCTURE OVERRIDE
         # ─────────────────────────────────────────────────────────────────────
-        # When 3 HTF timeframes (4H, 1H, 15m) are all bearish and the composite
-        # says BSL hunt, this is a major structural contradiction. HTF structure
-        # overrides the composite score by reversing its direction.
+        # When all 3 HTF TFs are aligned, structural reality overrides the
+        # composite score. This prevents AMD manipulation cycles from causing
+        # directional calls that fight the dominant trend.
         _bull_count = sum(1 for _tn in ("4h", "1h", "15m")
-                          if _tf.get(_tn) and getattr(_tf[_tn], 'trend', '') == 'bullish')
+                          if _tf.get(_tn)
+                          and getattr(_tf[_tn], 'trend', '') == 'bullish')
         _bear_count = sum(1 for _tn in ("4h", "1h", "15m")
-                          if _tf.get(_tn) and getattr(_tf[_tn], 'trend', '') == 'bearish')
+                          if _tf.get(_tn)
+                          and getattr(_tf[_tn], 'trend', '') == 'bearish')
 
         _override_applied = False
         if _bear_count >= 3 and score > 0.10:
-            # All HTF bearish but composite says BSL hunt — override to SSL
             logger.debug(
                 f"DirectionEngine: HTF OVERRIDE → SSL hunt "
-                f"(all 3 TFs bearish, raw_score={score:+.3f})")
-            score = -abs(score) * 0.70  # flip and reduce magnitude
+                f"(all 3 TFs bearish, raw={score:+.3f})")
+            score = -abs(score) * 0.70
             _override_applied = True
         elif _bull_count >= 3 and score < -0.10:
-            # All HTF bullish but composite says SSL hunt — override to BSL
             logger.debug(
                 f"DirectionEngine: HTF OVERRIDE → BSL hunt "
-                f"(all 3 TFs bullish, raw_score={score:+.3f})")
+                f"(all 3 TFs bullish, raw={score:+.3f})")
             score = +abs(score) * 0.70
             _override_applied = True
 
-        # Recompute after override — confidence is reset here, so the DR gate
-        # MUST come after this block (not before) to avoid being silently erased.
+        # Recompute after potential override
         confidence = abs(score)
-        bsl_score  = max(0.0, score)
+        bsl_score  = max(0.0,  score)
         ssl_score  = max(0.0, -score)
 
         # ─────────────────────────────────────────────────────────────────────
         # DEALING RANGE GATE: Cap confidence if in wrong zone
         # ─────────────────────────────────────────────────────────────────────
         # Applied AFTER the HTF override recompute so the penalty survives it.
-        # If predicting BSL hunt (price going UP) but we're already in DEEP PREMIUM,
-        # confidence is structurally capped. Smart money does NOT hunt BSL from premium.
-        # If predicting SSL hunt from DEEP DISCOUNT, same logic applies.
+        # BSL hunt from deep premium: smart money already sold, unlikely to go higher.
+        # SSL hunt from deep discount: smart money already bought, unlikely to go lower.
         if score > 0 and dr_pd > 0.75:
-            # BSL hunt predicted but in deep premium → reduce confidence
-            _zone_penalty = (dr_pd - 0.75) / 0.25   # 0→1 as pd goes 0.75→1.0
+            _zone_penalty = (dr_pd - 0.75) / 0.25
             confidence = max(0.0, confidence - _zone_penalty * 0.30)
         elif score < 0 and dr_pd < 0.25:
-            # SSL hunt predicted but in deep discount → reduce confidence
             _zone_penalty = (0.25 - dr_pd) / 0.25
             confidence = max(0.0, confidence - _zone_penalty * 0.30)
 
@@ -689,41 +745,61 @@ class DirectionEngine:
         if score > 0:
             predicted          = "BSL"
             delivery_direction = "bearish"
-            swept_pool         = bsl_price
-            opposing_pool      = ssl_price
+            # FIX-3: Use LiquidityMap pool prices when available
+            swept_pool    = bsl_price
+            opposing_pool = ssl_price
+            if liq_snapshot is not None and liq_snapshot.bsl_pools:
+                _near_bsl = min(liq_snapshot.bsl_pools,
+                                key=lambda t: t.distance_atr)
+                swept_pool = _near_bsl.pool.price
+            if liq_snapshot is not None and liq_snapshot.ssl_pools:
+                _near_ssl = min(liq_snapshot.ssl_pools,
+                                key=lambda t: t.distance_atr)
+                opposing_pool = _near_ssl.pool.price
             reason = (
                 f"BSL_HUNT (score={score:+.3f}) | "
-                f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},{getattr(amd,'confidence',0):.2f}) | "
-                f"HTF_struct={factors.htf_structure:+.2f} | "
+                f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},"
+                f"{getattr(amd,'confidence',0):.2f}) | "
+                f"HTF={factors.htf_structure:+.2f} | "
                 f"DR={dr_pd:.2f} | flow={factors.order_flow:+.2f}"
             )
         else:
             predicted          = "SSL"
             delivery_direction = "bullish"
-            swept_pool         = ssl_price
-            opposing_pool      = bsl_price
+            swept_pool    = ssl_price
+            opposing_pool = bsl_price
+            if liq_snapshot is not None and liq_snapshot.ssl_pools:
+                _near_ssl = min(liq_snapshot.ssl_pools,
+                                key=lambda t: t.distance_atr)
+                swept_pool = _near_ssl.pool.price
+            if liq_snapshot is not None and liq_snapshot.bsl_pools:
+                _near_bsl = min(liq_snapshot.bsl_pools,
+                                key=lambda t: t.distance_atr)
+                opposing_pool = _near_bsl.pool.price
             reason = (
                 f"SSL_HUNT (score={score:+.3f}) | "
-                f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},{getattr(amd,'confidence',0):.2f}) | "
-                f"HTF_struct={factors.htf_structure:+.2f} | "
+                f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},"
+                f"{getattr(amd,'confidence',0):.2f}) | "
+                f"HTF={factors.htf_structure:+.2f} | "
                 f"DR={dr_pd:.2f} | flow={factors.order_flow:+.2f}"
             )
+
         if _override_applied:
             reason += " | HTF_STRUCT_OVERRIDE"
 
         result = HuntPrediction(
-            predicted          = predicted,
-            confidence         = round(min(1.0, confidence), 4),
-            delivery_direction = delivery_direction,
-            raw_score          = round(score, 4),
-            bsl_score          = round(bsl_score, 4),
-            ssl_score          = round(ssl_score, 4),
-            factors            = factors,
-            dealing_range_pd   = round(dr_pd, 4),
-            swept_pool_price   = swept_pool,
-            opposing_pool_price= opposing_pool,
-            reason             = reason,
-            timestamp_ms       = now_ms,
+            predicted           = predicted,
+            confidence          = round(min(1.0, confidence), 4),
+            delivery_direction  = delivery_direction,
+            raw_score           = round(score, 4),
+            bsl_score           = round(bsl_score, 4),
+            ssl_score           = round(ssl_score, 4),
+            factors             = factors,
+            dealing_range_pd    = round(dr_pd, 4),
+            swept_pool_price    = swept_pool,
+            opposing_pool_price = opposing_pool,
+            reason              = reason,
+            timestamp_ms        = now_ms,
         )
 
         logger.debug(
@@ -744,17 +820,18 @@ class DirectionEngine:
         price:            float,
         atr:              float,
         now:              float,
-        quality:          float = 0.5,  # displacement_score from pool (0–1); higher = better sweep
+        quality:          float = 0.5,
     ) -> None:
         """
-        Call this immediately when a pool sweep is detected.
-        Initialises the accumulative evidence tracker for the post-sweep evaluation.
+        Call immediately when a pool sweep is detected.
 
-        Concurrent sweep priority: if an existing PostSweepState is less than
-        15 seconds old AND the incoming sweep has a lower quality score, the
-        existing state is retained and the new sweep is silently discarded.
-        This prevents a lower-quality simultaneous sweep (e.g. a weak SSL hit
-        arriving 1 tick after a strong BSL sweep) from wiping accumulated evidence.
+        Concurrent sweep priority: if an existing PostSweepState is < 15s old
+        AND the incoming sweep has a lower quality score, retain the existing
+        state. This prevents a weak simultaneous sweep from wiping accumulated
+        evidence of a strong prior sweep.
+
+        quality: displacement_score from pool (0–1); higher = better sweep.
+        Set from LiquidityMap SweepResult.quality or ICT pool.displacement_score.
         """
         if self._ps_state is not None:
             existing_age = now - self._ps_state.entered_at
@@ -776,38 +853,36 @@ class DirectionEngine:
         )
         logger.info(
             f"🌊 DirectionEngine: POST-SWEEP STARTED | "
-            f"{pool_type} @ ${swept_pool_price:,.1f} | price=${price:,.2f} "
-            f"| quality={quality:.2f}")
+            f"{pool_type} @ ${swept_pool_price:,.1f} | "
+            f"price=${price:,.2f} | quality={quality:.2f}")
 
     def clear_sweep(self) -> None:
-        """Call when post-sweep evaluation is complete or aborted."""
+        """Call when post-sweep evaluation is complete or aborted externally."""
         self._ps_state = None
 
     def evaluate_sweep(
         self,
-        price:       float,
-        atr:         float,
-        now:         float,
+        price:        float,
+        atr:          float,
+        now:          float,
         ict_engine,
-        tick_flow:   float = 0.0,
-        cvd_trend:   float = 0.0,
+        tick_flow:    float = 0.0,
+        cvd_trend:    float = 0.0,
+        liq_snapshot        = None,    # LiquidityMapSnapshot (FIX-3)
     ) -> PostSweepDecision:
         """
-        Evaluate the current post-sweep state and determine: reverse, continue, or wait.
+        Evaluate the current post-sweep state: reverse, continue, or wait.
 
-        This runs on every tick after a sweep is detected (via on_sweep()).
-        Evidence accumulates across ticks — a single counter-signal cannot flip
-        a well-established reversal or continuation thesis.
-
-        Returns PostSweepDecision with action = "reverse" | "continue" | "wait".
+        FIX-3: liq_snapshot is passed to _score_sweep_static() for pool
+        significance scoring. FIX-6: 15m structure added to dynamic scoring.
 
         PHASE TIMELINE:
-          0 – 8s:   Initial delay (wait for price to react to sweep)
-          8 – 45s:  DISPLACEMENT phase: look for strong price rejection
-          45 – 120s: CISD phase: look for CHoCH/BOS confirming reversal direction
-          120 – 240s: OTE phase: look for price to retrace to 61.8-78.6% fib zone
-          240 – 360s: MATURE phase: accept weaker setups, relaxed thresholds
-          >360s:    TIMEOUT — abandon evaluation
+          0 –   8s: Initial delay (wait for price to react to sweep)
+          8 –  45s: DISPLACEMENT — expect strong price rejection
+          45 – 120s: CISD       — expect CHoCH/BOS confirming reversal
+          120 – 240s: OTE       — expect retrace to 50%–78.6% Fib zone (FIX-1)
+          240 – 360s: MATURE    — relaxed thresholds, final chance
+          >360s: TIMEOUT
         """
         ps = self._ps_state
         if ps is None:
@@ -833,46 +908,44 @@ class DirectionEngine:
             return PostSweepDecision(
                 action="wait", direction="", confidence=0.0,
                 phase="DELAY",
-                reason=f"waiting {_PS_EVAL_DELAY_SEC - elapsed:.0f}s more")
+                reason=f"waiting {_PS_EVAL_DELAY_SEC - elapsed:.1f}s more")
 
         a = max(atr, 1e-9)
         ps.tick_count += 1
 
-        # Reversal direction: BSL swept → SHORT reversal; SSL swept → LONG reversal
+        # Reversal/continuation directions
         rev_dir  = "short" if ps.swept_pool_type == "BSL" else "long"
         cont_dir = "long"  if ps.swept_pool_type == "BSL" else "short"
 
         # ── Update price extremes ──────────────────────────────────────────
         ps.highest_since = max(ps.highest_since, price)
-        ps.lowest_since  = min(ps.lowest_since, price)
+        ps.lowest_since  = min(ps.lowest_since,  price)
 
         # ── Current phase ──────────────────────────────────────────────────
-        if elapsed < 45.0:
-            phase = "DISPLACEMENT"
+        if elapsed < _PS_PHASE_DISPLACEMENT_SEC:
+            phase          = "DISPLACEMENT"
             base_threshold = _PS_REV_THRESHOLD_EARLY
-            score_mult     = 1.30   # need overwhelming evidence early
-        elif elapsed < 120.0:
-            phase = "CISD"
+            score_mult     = _PS_DISP_SCORE_MULT
+        elif elapsed < _PS_PHASE_CISD_SEC:
+            phase          = "CISD"
             base_threshold = _PS_REV_THRESHOLD_NORMAL
             score_mult     = 1.0
-        elif elapsed < 240.0:
-            phase = "OTE"
+        elif elapsed < _PS_PHASE_OTE_SEC:
+            phase          = "OTE"
             base_threshold = _PS_REV_THRESHOLD_NORMAL
             score_mult     = 1.0
         else:
-            phase = "MATURE"
+            phase          = "MATURE"
             base_threshold = _PS_REV_THRESHOLD_MATURE
-            score_mult     = 0.75   # accept weaker setups in mature phase
+            score_mult     = _PS_MATURE_SCORE_MULT
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 1: Update displacement tracking
+        # STEP 1: Displacement tracking
         # ─────────────────────────────────────────────────────────────────────
         sweep_px = ps.swept_pool_price
         if rev_dir == "long":
-            # SSL swept: expect price to rise
             disp = (ps.highest_since - sweep_px) / a
         else:
-            # BSL swept: expect price to drop
             disp = (sweep_px - ps.lowest_since) / a
 
         if disp > ps.max_displacement_atr:
@@ -883,18 +956,18 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         # STEP 2: CISD Detection (Change in State of Delivery)
         # ─────────────────────────────────────────────────────────────────────
+        # Only count CHoCH/BOS events that occurred AFTER this sweep.
         if not ps.cisd_detected and ict_engine is not None:
             try:
                 _tf = getattr(ict_engine, '_tf', {})
                 _t5 = _tf.get("5m")
                 if _t5 is not None:
-                    _choch = getattr(_t5, 'choch_direction', '') or ''
-                    _bos   = getattr(_t5, 'bos_direction', '') or ''
-                    _bos_ts = getattr(_t5, 'bos_timestamp', 0)
-                    _choch_ts = getattr(_t5, 'choch_timestamp', 0)
-                    _rev_struct = "bearish" if rev_dir == "short" else "bullish"
-                    # CISD requires the structural event to have occurred AFTER the sweep
+                    _choch    = getattr(_t5, 'choch_direction', '') or ''
+                    _bos      = getattr(_t5, 'bos_direction',   '') or ''
+                    _choch_ts = getattr(_t5, 'choch_timestamp',  0)
+                    _bos_ts   = getattr(_t5, 'bos_timestamp',    0)
                     _sweep_ms = ps.entered_at * 1000
+                    _rev_struct = "bearish" if rev_dir == "short" else "bullish"
                     if (_choch == _rev_struct and
                             _choch_ts > _sweep_ms and
                             now - _choch_ts / 1000 < _DISP_CISD_MAX_AGE_SEC):
@@ -902,8 +975,8 @@ class DirectionEngine:
                         ps.cisd_timestamp = now
                         ps.cisd_type      = "choch"
                         logger.info(
-                            f"POST-SWEEP CISD: CHoCH {_rev_struct} confirmed "
-                            f"at {elapsed:.0f}s | disp={ps.max_displacement_atr:.2f}ATR")
+                            f"POST-SWEEP CISD: CHoCH {_rev_struct} at {elapsed:.0f}s "
+                            f"| disp={ps.max_displacement_atr:.2f}ATR")
                     elif (_bos == _rev_struct and
                             _bos_ts > _sweep_ms and
                             now - _bos_ts / 1000 < _DISP_CISD_MAX_AGE_SEC):
@@ -911,13 +984,14 @@ class DirectionEngine:
                         ps.cisd_timestamp = now
                         ps.cisd_type      = "bos"
                         logger.info(
-                            f"POST-SWEEP CISD: BOS {_rev_struct} confirmed "
-                            f"at {elapsed:.0f}s | disp={ps.max_displacement_atr:.2f}ATR")
+                            f"POST-SWEEP CISD: BOS {_rev_struct} at {elapsed:.0f}s "
+                            f"| disp={ps.max_displacement_atr:.2f}ATR")
             except Exception:
                 pass
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 3: OTE Zone Tracking (50%–78.6% Fibonacci retrace of displacement)
+        # STEP 3: OTE Zone Tracking
+        # FIX-1: Lower bound 0.500 (was 0.618) — aligned with entry_engine.
         # ─────────────────────────────────────────────────────────────────────
         if ps.max_displacement_atr >= _DISP_WEAK_ATR:
             if rev_dir == "long":
@@ -940,7 +1014,8 @@ class DirectionEngine:
                     ps.ote_timestamp = now
                     logger.info(
                         f"POST-SWEEP OTE REACHED: retrace={retrace_pct:.1%} "
-                        f"at {elapsed:.0f}s")
+                        f"at {elapsed:.0f}s (bounds: "
+                        f"{_OTE_FIB_LOW:.0%}–{_OTE_FIB_HIGH:.0%})")
                 ps.ote_holding = in_ote
 
         # ─────────────────────────────────────────────────────────────────────
@@ -948,7 +1023,9 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         if not ps.static_scored:
             ps.static_rev_base, ps.static_cont_base = \
-                self._score_sweep_static(ps, ict_engine, rev_dir, cont_dir, atr=a)
+                self._score_sweep_static(
+                    ps, ict_engine, rev_dir, cont_dir,
+                    atr=a, liq_snapshot=liq_snapshot)
             ps.static_scored = True
             logger.debug(
                 f"POST-SWEEP static: rev={ps.static_rev_base:.1f} "
@@ -960,22 +1037,14 @@ class DirectionEngine:
         rev_delta, cont_delta, rev_reasons, cont_reasons = \
             self._score_sweep_dynamic(
                 ps, ict_engine, rev_dir, cont_dir,
-                price, a, now, tick_flow, cvd_trend)
+                price, a, now, tick_flow, cvd_trend,
+                liq_snapshot=liq_snapshot)
 
-        # ── Accumulate with decay ──────────────────────────────────────────
-        # _decay is applied to the LOSING side each tick to prevent stale
-        # evidence from dominating indefinitely.
-        #
-        # ASYMMETRY FIX: the old two-`if` block applied decay inside each
-        # branch independently.  When both rev_delta > 0 AND cont_delta > 0
-        # in the same tick (e.g. displacement fires rev, flow fires cont),
-        # rev_evidence got its new delta added and then immediately decayed
-        # again inside the second `if cont_delta` branch — penalising rev by
-        # ~8% of its own new delta on every mixed-signal tick.  Cont did not
-        # suffer the same treatment.  Fix: handle all three cases explicitly.
-        _decay = 0.92  # per-tick decay applied to the losing side
+        # ── Accumulate with asymmetric decay  (FIX-7: correct mixed-signal logic)
+        # The entry_engine uses two separate `if` blocks which double-decays the
+        # losing side on mixed-signal ticks. This is the correct three-case version.
+        _decay = 0.92
         if rev_delta > 0 and cont_delta > 0:
-            # Mixed signal: accumulate both, then decay both symmetrically.
             ps.rev_evidence  += rev_delta
             ps.cont_evidence += cont_delta
             ps.rev_evidence  *= _decay
@@ -986,38 +1055,35 @@ class DirectionEngine:
         elif cont_delta > 0:
             ps.cont_evidence += cont_delta
             ps.rev_evidence  *= _decay
-        # If both deltas are 0 (no signal this tick), no decay is applied —
-        # stale evidence persists until the next directional tick overwrites it.
+        # Both zero → no decay; stale evidence persists until next directional tick
 
-        # Update peaks
         ps.peak_rev  = max(ps.peak_rev,  ps.static_rev_base  + ps.rev_evidence)
         ps.peak_cont = max(ps.peak_cont, ps.static_cont_base + ps.cont_evidence)
 
-        # Combined totals
         rev_total  = max(ps.static_rev_base  + ps.rev_evidence,  0.0)
         cont_total = max(ps.static_cont_base + ps.cont_evidence, 0.0)
         gap        = abs(rev_total - cont_total)
 
-        # Store last analysis for display
+        # Store for display engine
         self._last_ps_analysis = {
-            "phase":             phase,
-            "rev_score":         round(rev_total, 1),
-            "cont_score":        round(cont_total, 1),
-            "rev_reasons":       rev_reasons,
-            "cont_reasons":      cont_reasons,
-            "cisd":              ps.cisd_detected,
-            "displacement_atr":  ps.max_displacement_atr,
-            "ote":               ps.ote_reached,
-            "elapsed_sec":       round(elapsed, 1),
+            "phase":            phase,
+            "rev_score":        round(rev_total, 1),
+            "cont_score":       round(cont_total, 1),
+            "rev_reasons":      rev_reasons,
+            "cont_reasons":     cont_reasons,
+            "cisd":             ps.cisd_detected,
+            "displacement_atr": ps.max_displacement_atr,
+            "ote":              ps.ote_reached,
+            "elapsed_sec":      round(elapsed, 1),
         }
 
         # ── Log every 10 ticks ────────────────────────────────────────────
         if ps.tick_count == 1 or ps.tick_count % 10 == 0:
-            _threshold = base_threshold * score_mult
+            _eff_threshold = base_threshold * score_mult
             logger.info(
                 f"POST-SWEEP [{phase}] tick={ps.tick_count} "
                 f"rev={rev_total:.0f} cont={cont_total:.0f} "
-                f"(need {_threshold:.0f}, gap>={_PS_GAP_MIN:.0f}) "
+                f"(need {_eff_threshold:.0f}, gap>={_PS_GAP_MIN:.0f}) "
                 f"CISD={'✓' if ps.cisd_detected else '✗'} "
                 f"DISP={ps.max_displacement_atr:.2f}ATR "
                 f"OTE={'✓' if ps.ote_reached else '✗'}")
@@ -1039,55 +1105,56 @@ class DirectionEngine:
             logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
             self._ps_state = None
             return PostSweepDecision(
-                action        = "reverse",
-                direction     = rev_dir,
-                confidence    = _conf,
-                phase         = phase,
-                cisd_active   = ps.cisd_detected,
-                ote_active    = ps.ote_reached,
+                action           = "reverse",
+                direction        = rev_dir,
+                confidence       = _conf,
+                phase            = phase,
+                cisd_active      = ps.cisd_detected,
+                ote_active       = ps.ote_reached,
                 displacement_atr = ps.max_displacement_atr,
-                rev_score     = rev_total,
-                cont_score    = cont_total,
-                rev_reasons   = rev_reasons[:6],
-                cont_reasons  = cont_reasons[:4],
-                reason        = _reason,
+                rev_score        = rev_total,
+                cont_score       = cont_total,
+                rev_reasons      = rev_reasons[:6],
+                cont_reasons     = cont_reasons[:4],
+                reason           = _reason,
             )
 
-        elif cont_total >= _adj_threshold * _PS_CONT_THRESHOLD_RATIO and gap >= _PS_GAP_MIN:
-            _conf = min(1.0, cont_total / 90.0)
+        elif (cont_total >= _adj_threshold * _PS_CONT_THRESHOLD_RATIO
+              and gap >= _PS_GAP_MIN):
+            _conf   = min(1.0, cont_total / 90.0)
             _reason = (
                 f"CONTINUATION [{phase}] cont={cont_total:.0f} "
                 f"vs rev={rev_total:.0f} gap={gap:.0f}")
             logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
             self._ps_state = None
             return PostSweepDecision(
-                action        = "continue",
-                direction     = cont_dir,
-                confidence    = _conf,
-                phase         = phase,
-                cisd_active   = False,
-                ote_active    = ps.ote_reached,
+                action           = "continue",
+                direction        = cont_dir,
+                confidence       = _conf,
+                phase            = phase,
+                cisd_active      = False,
+                ote_active       = ps.ote_reached,
                 displacement_atr = ps.max_displacement_atr,
-                rev_score     = rev_total,
-                cont_score    = cont_total,
-                rev_reasons   = rev_reasons[:3],
-                cont_reasons  = cont_reasons[:6],
-                reason        = _reason,
+                rev_score        = rev_total,
+                cont_score       = cont_total,
+                rev_reasons      = rev_reasons[:3],
+                cont_reasons     = cont_reasons[:6],
+                reason           = _reason,
             )
 
         return PostSweepDecision(
-            action        = "wait",
-            direction     = "",
-            confidence    = 0.0,
-            phase         = phase,
-            cisd_active   = ps.cisd_detected,
-            ote_active    = ps.ote_reached,
+            action           = "wait",
+            direction        = "",
+            confidence       = 0.0,
+            phase            = phase,
+            cisd_active      = ps.cisd_detected,
+            ote_active       = ps.ote_reached,
             displacement_atr = ps.max_displacement_atr,
-            rev_score     = rev_total,
-            cont_score    = cont_total,
-            rev_reasons   = rev_reasons[:4],
-            cont_reasons  = cont_reasons[:4],
-            reason        = (
+            rev_score        = rev_total,
+            cont_score       = cont_total,
+            rev_reasons      = rev_reasons[:4],
+            cont_reasons     = cont_reasons[:4],
+            reason           = (
                 f"WAIT [{phase}] rev={rev_total:.0f} cont={cont_total:.0f} "
                 f"gap={gap:.0f} < {_PS_GAP_MIN:.0f}"),
         )
@@ -1098,21 +1165,23 @@ class DirectionEngine:
 
     def _score_sweep_static(
         self,
-        ps:         PostSweepState,
+        ps:           PostSweepState,
         ict_engine,
-        rev_dir:    str,
-        cont_dir:   str,
-        atr:        float = 0.0,
+        rev_dir:      str,
+        cont_dir:     str,
+        atr:          float     = 0.0,
+        liq_snapshot            = None,    # LiquidityMapSnapshot (FIX-4)
     ) -> Tuple[float, float]:
         """
-        Score the TIME-INVARIANT factors for the post-sweep decision.
+        Score TIME-INVARIANT factors for the post-sweep decision.
 
-        Called EXACTLY ONCE after the initial evaluation delay expires.
-        These facts do not change tick-to-tick (AMD phase, sweep quality,
-        dealing range position, OB blocking) — re-adding them each tick
-        would inflate the accumulated total and defeat phase-adaptive gating.
+        Called EXACTLY ONCE after the initial evaluation delay.
+        Returns (rev_base, cont_base) — added to final totals without re-scoring.
 
-        Returns (rev_base, cont_base) scores.
+        FIX-4: Pool significance now uses LiquidityMap adjusted_sig() when
+        liq_snapshot is provided. Scales up to _STATIC_REV_POOL_MAX (8 pts)
+        for the opposing pool and _STATIC_CONT_POOL_MAX (6 pts) for the
+        continuation pool. Old code used a fixed 5 pt cap for both.
         """
         s_rev  = 0.0
         s_cont = 0.0
@@ -1121,100 +1190,76 @@ class DirectionEngine:
             return s_rev, s_cont
 
         amd = getattr(ict_engine, '_amd', None)
+        a   = max(atr, 1e-9)
 
         # ── AMD Phase alignment ───────────────────────────────────────────
-        # CRITICAL: The AMD phase + sweep polarity tells us if this sweep is
-        # the MANIPULATION fake-out (→ reversal) or a DISTRIBUTION continuation.
         if amd is not None:
             _phase = getattr(amd, 'phase', '').upper()
-            _bias  = getattr(amd, 'bias', '').lower()
+            _bias  = getattr(amd, 'bias',  '').lower()
             _conf  = float(getattr(amd, 'confidence', 0.0))
-
             _bsl_swept = ps.swept_pool_type == "BSL"
             _ssl_swept = ps.swept_pool_type == "SSL"
 
             if _phase == 'MANIPULATION':
-                # ICT: MANIPULATION phase = Judas swing (fake move).
-                # Bearish AMD bias + BSL swept = fake move UP then delivers DOWN.
-                #   → BSL sweep IS the Judas → REVERSAL (go short after BSL sweep).
-                # Bullish AMD bias + SSL swept = fake move DOWN then delivers UP.
-                #   → SSL sweep IS the Judas → REVERSAL (go long after SSL sweep).
                 _manip_aligned = (
                     (_bsl_swept and _bias == 'bearish') or
                     (_ssl_swept and _bias == 'bullish'))
                 if _manip_aligned:
-                    # Perfect AMD alignment: sweep is the manipulation
+                    # Perfect AMD: sweep IS the Judas fake-out → strongly reversal
                     s_rev += 28.0 * max(_conf, 0.5)
                 else:
-                    # AMD says manipulation but sweep is in the same direction as bias
-                    # This could be a continuation sweep during manipulation — penalise reversal
-                    s_rev  -= 15.0 * max(_conf, 0.5)
-                    s_cont += 10.0 * max(_conf, 0.5)
+                    # AMD CONTRA: sweep is in the direction of the manipulation bias
+                    # → penalise reversal, bonus continuation
+                    _pen = 18.0 * max(_conf, 0.5)
+                    s_rev  -= _pen
+                    s_cont += _pen * 0.60
+                    logger.info(
+                        f"POST-SWEEP static: AMD CONTRA {_bias.upper()} MANIP | "
+                        f"rev penalty={_pen:.1f} cont bonus={_pen*0.6:.1f}")
 
             elif _phase == 'DISTRIBUTION':
-                # Distribution phase: real move is underway.
-                # Bearish distribution + BSL swept = price consuming BSL on the way down.
-                #   → This is CONTINUATION (bearish distribution continues after BSL sweep).
-                # Bullish distribution + SSL swept = price consuming SSL on the way up.
-                #   → This is CONTINUATION (bullish distribution continues).
-                _dist_cont_aligned = (
+                _dist_cont = (
                     (_bsl_swept and _bias == 'bearish') or
                     (_ssl_swept and _bias == 'bullish'))
-                if _dist_cont_aligned:
+                if _dist_cont:
                     s_cont += 26.0 * max(_conf, 0.5)
                 else:
-                    # Distribution opposing sweep direction — unusual, moderate reversal bias
                     s_rev  += 18.0 * max(_conf, 0.5)
 
-            elif _phase in ('REACCUMULATION',):
-                # Mid-trend bullish pause: sweeping SSL is normal (healthy pullback retest)
+            elif _phase == 'REACCUMULATION':
                 if _ssl_swept:
-                    s_cont += 14.0 * max(_conf, 0.4)  # continue bullish
+                    s_cont += 14.0 * max(_conf, 0.4)
                 else:
-                    s_rev  += 10.0 * max(_conf, 0.4)  # BSL swept = reversal signal
+                    s_rev  += 10.0 * max(_conf, 0.4)
 
-            elif _phase in ('REDISTRIBUTION',):
+            elif _phase == 'REDISTRIBUTION':
                 if _bsl_swept:
-                    s_cont += 14.0 * max(_conf, 0.4)  # continue bearish
+                    s_cont += 14.0 * max(_conf, 0.4)
                 else:
                     s_rev  += 10.0 * max(_conf, 0.4)
 
             elif _phase == 'ACCUMULATION':
-                # Accumulation: no strong directional bias — slight reversal preference
-                # (accumulation often involves stop runs that reverse)
                 s_rev += 6.0 * max(_conf, 0.3)
 
         # ── Dealing Range Position ────────────────────────────────────────
-        # For a BSL sweep (reversal = short), reversal is favoured from PREMIUM.
-        # For an SSL sweep (reversal = long), reversal is favoured from DISCOUNT.
-        dr = getattr(ict_engine, '_dealing_range', None)
-        _pd = getattr(dr, 'current_pd', 0.5) if dr is not None else 0.5
+        dr    = getattr(ict_engine, '_dealing_range', None)
+        _pd   = getattr(dr, 'current_pd', 0.5) if dr is not None else 0.5
 
         if ps.swept_pool_type == "BSL":
-            # BSL sweep → reversal is SHORT → needs to be in PREMIUM
-            if _pd >= 0.80:
-                s_rev  += 14.0
-            elif _pd >= 0.65:
-                s_rev  += 10.0
-            elif _pd >= 0.50:
-                s_rev  +=  5.0
-            else:
-                # In discount — reversing SHORT from discount is high risk
-                s_cont +=  8.0
+            # BSL sweep → reversal is SHORT → favoured from PREMIUM
+            if   _pd >= 0.80: s_rev  += 14.0
+            elif _pd >= 0.65: s_rev  += 10.0
+            elif _pd >= 0.50: s_rev  +=  5.0
+            else:             s_cont +=  8.0   # SHORT reversal from discount = high risk
         else:
-            # SSL sweep → reversal is LONG → needs to be in DISCOUNT
-            if _pd <= 0.20:
-                s_rev  += 14.0
-            elif _pd <= 0.35:
-                s_rev  += 10.0
-            elif _pd <= 0.50:
-                s_rev  +=  5.0
-            else:
-                # In premium — reversing LONG from premium is high risk
-                s_cont +=  8.0
+            # SSL sweep → reversal is LONG → favoured from DISCOUNT
+            if   _pd <= 0.20: s_rev  += 14.0
+            elif _pd <= 0.35: s_rev  += 10.0
+            elif _pd <= 0.50: s_rev  +=  5.0
+            else:             s_cont +=  8.0   # LONG reversal from premium = high risk
 
         # ── HTF Structure Context ─────────────────────────────────────────
-        _tf = getattr(ict_engine, '_tf', {})
+        _tf        = getattr(ict_engine, '_tf', {})
         _rev_struct = "bearish" if rev_dir == "short" else "bullish"
         _htf_aligned = 0
         _htf_opposed = 0
@@ -1228,71 +1273,101 @@ class DirectionEngine:
             elif _trend and _trend != 'ranging':
                 _htf_opposed += 1
 
-        if _htf_aligned >= 3:
-            s_rev  += 16.0
-        elif _htf_aligned >= 2:
-            s_rev  += 10.0
-        elif _htf_opposed >= 2:
-            s_cont += 10.0
-            s_rev  -=  5.0
+        if   _htf_aligned >= 3: s_rev  += 16.0
+        elif _htf_aligned >= 2: s_rev  += 10.0
+        elif _htf_opposed >= 2: s_rev  -=  5.0; s_cont += 10.0
 
-        # ── OB Blocking (is there an OB in the continuation path?) ───────
-        # If a high-strength OB sits between current price and the continuation
-        # target, it acts as resistance — favours reversal.
+        # ── OB Blocking (is a strong OB in the continuation path?) ───────
         try:
+            _now_ms_local = int(time.time() * 1000)
             if rev_dir == "short":
                 # Continuation = long → bearish OBs between price and BSL block it
-                obs = getattr(ict_engine, 'order_blocks_bear', [])
+                _obs = getattr(ict_engine, 'order_blocks_bear', [])
             else:
                 # Continuation = short → bullish OBs between price and SSL block it
-                obs = getattr(ict_engine, 'order_blocks_bull', [])
-            _now_ms_local = int(time.time() * 1000)
-            for ob in obs:
-                if not ob.is_active(_now_ms_local):
+                _obs = getattr(ict_engine, 'order_blocks_bull', [])
+            for ob in _obs:
+                if not ob.is_active(_now_ms_local) or ob.strength < 70.0:
                     continue
-                if ob.strength < 70.0:
-                    continue
-                ob_dist_atr = abs(ob.midpoint - ps.swept_pool_price) / max(atr, 1.0)
+                ob_dist_atr = abs(ob.midpoint - ps.swept_pool_price) / a
                 if ob_dist_atr < 2.0:
                     s_rev += 10.0
                     break
         except Exception:
             pass
 
+        # ── Pool Significance of Opposing / Continuation Targets  (FIX-4) ──
+        # FIX-4: Use LiquidityMap adjusted_sig() for richer pool significance.
+        # Old code used a fixed 5.0 pt cap regardless of pool quality.
+        # New: scales linearly from pool.adjusted_sig() up to defined max pts.
+        if liq_snapshot is not None:
+            # Opposing pool: the reversal's TP target
+            _opp_pools = (liq_snapshot.ssl_pools if rev_dir == "short"
+                          else liq_snapshot.bsl_pools)
+            if _opp_pools:
+                _best_opp = max(_opp_pools, key=lambda t: t.adjusted_sig())
+                _opp_sig  = min(_STATIC_REV_POOL_MAX,
+                                _best_opp.adjusted_sig() * 0.8)
+                if _opp_sig > 0.5:
+                    s_rev += _opp_sig
+            # Continuation pool: the continuation's TP target
+            _cont_pools = (liq_snapshot.bsl_pools if cont_dir == "long"
+                           else liq_snapshot.ssl_pools)
+            if _cont_pools:
+                _best_cont = max(_cont_pools, key=lambda t: t.adjusted_sig())
+                _cont_sig  = min(_STATIC_CONT_POOL_MAX,
+                                 _best_cont.adjusted_sig() * 0.6)
+                if _cont_sig > 0.5:
+                    s_cont += _cont_sig
+        else:
+            # Fallback: ICT structural targets
+            _ict_targets = getattr(ict_engine, 'liquidity_pools', [])
+            _opp_pools   = [p for p in _ict_targets
+                            if not getattr(p, 'swept', False) and
+                            ((rev_dir == "short" and
+                              getattr(p, 'level_type', '') == "SSL") or
+                             (rev_dir == "long" and
+                              getattr(p, 'level_type', '') == "BSL"))]
+            if _opp_pools:
+                _best = max(_opp_pools,
+                            key=lambda p: float(getattr(p, 'touch_count', 1)))
+                _tc = float(getattr(_best, 'touch_count', 1))
+                s_rev += min(_STATIC_REV_POOL_MAX, _tc * 1.5)
+
         # ── Session Kill Zone Context ─────────────────────────────────────
         _kz = getattr(ict_engine, '_killzone', '').lower()
-        if 'asia' in _kz:
-            # Asia KZ sweeps are often manipulations → reversal biased
-            s_rev += 7.0
-        elif 'london' in _kz:
-            # London KZ Judas swing → moderate reversal bias
-            s_rev += 4.0
-        elif 'ny' in _kz:
-            # NY KZ: depends on direction — slight reversal bias (NY open often reverses Asia)
-            s_rev += 2.0
+        if   'asia'   in _kz: s_rev += 7.0   # Asia sweeps are often manipulations
+        elif 'london' in _kz: s_rev += 4.0   # London Judas swing = moderate rev bias
+        elif 'ny'     in _kz: s_rev += 2.0   # NY open often reverses Asia range
 
         return round(s_rev, 2), round(s_cont, 2)
 
     def _score_sweep_dynamic(
         self,
-        ps:         PostSweepState,
+        ps:          PostSweepState,
         ict_engine,
-        rev_dir:    str,
-        cont_dir:   str,
-        price:      float,
-        atr:        float,
-        now:        float,
-        tick_flow:  float,
-        cvd_trend:  float,
+        rev_dir:     str,
+        cont_dir:    str,
+        price:       float,
+        atr:         float,
+        now:         float,
+        tick_flow:   float,
+        cvd_trend:   float,
+        liq_snapshot         = None,    # reserved for future use (FIX-3)
     ) -> Tuple[float, float, List[str], List[str]]:
         """
-        Score the PER-TICK dynamic factors for the post-sweep decision.
+        Score PER-TICK dynamic factors for the post-sweep decision.
 
         These factors change tick-to-tick and feed the decay accumulator:
-        displacement growth, CISD freshness, OTE zone, flow, CVD, structure events.
+        displacement growth, CISD freshness, OTE zone, flow, CVD,
+        5m and 15m structure events.
+
+        FIX-6: 15m structure check added. Previously only 5m CHoCH/BOS was
+        checked. 15m structure fires on longer bars (less noise), providing
+        an independent structural confirmation signal.
         """
-        rev_delta  = 0.0
-        cont_delta = 0.0
+        rev_delta:   float      = 0.0
+        cont_delta:  float      = 0.0
         rev_reasons:  List[str] = []
         cont_reasons: List[str] = []
 
@@ -1306,18 +1381,17 @@ class DirectionEngine:
             rev_delta += 6.0
             rev_reasons.append(f"DISP {ps.max_displacement_atr:.2f}ATR")
         elif ps.max_displacement_atr < 0.2 and (now - ps.entered_at) > 15.0:
-            # No displacement → price is NOT rejecting → continuation evidence
             cont_delta += 8.0
             cont_reasons.append(f"NO_DISP ({ps.max_displacement_atr:.2f}ATR)")
 
         # ── CISD freshness (decays with age) ──────────────────────────────
         if ps.cisd_detected:
-            _cisd_age = now - ps.cisd_timestamp
-            _freshness = max(0.4, 1.0 - _cisd_age / 120.0)
-            rev_delta += 18.0 * _freshness
+            _cisd_age     = now - ps.cisd_timestamp
+            _freshness    = max(0.4, 1.0 - _cisd_age / 120.0)
+            rev_delta    += 18.0 * _freshness
             rev_reasons.append(f"CISD_{ps.cisd_type.upper()}({_freshness:.0%})")
 
-        # ── OTE zone holding ──────────────────────────────────────────────
+        # ── OTE zone  (FIX-1: fires at 50% retrace, aligned with entry_engine)
         if ps.ote_reached:
             if ps.ote_holding:
                 rev_delta += 15.0
@@ -1340,30 +1414,28 @@ class DirectionEngine:
             rev_delta  +=  5.0; rev_reasons.append(f"FLOW_WEAK_REV {tick_flow:+.2f}")
             ps.rev_flow_ticks += 1
         elif abs(tick_flow) > 0.30:
-            # Flow in continuation direction
             cont_delta += 9.0; cont_reasons.append(f"FLOW_CONT {tick_flow:+.2f}")
             ps.cont_flow_ticks += 1
 
         # ── CVD trend alignment ───────────────────────────────────────────
-        _cvd_rev_ok = (
-            (rev_dir == "long"  and cvd_trend > 0.20) or
+        _cvd_rev_ok  = (
+            (rev_dir == "long"  and cvd_trend >  0.20) or
             (rev_dir == "short" and cvd_trend < -0.20))
         _cvd_cont_ok = (
             (rev_dir == "long"  and cvd_trend < -0.25) or
-            (rev_dir == "short" and cvd_trend > +0.25))
+            (rev_dir == "short" and cvd_trend >  0.25))
 
         if _cvd_rev_ok:
             rev_delta  += 8.0; rev_reasons.append(f"CVD_REV {cvd_trend:+.2f}")
         elif _cvd_cont_ok:
             cont_delta += 8.0; cont_reasons.append(f"CVD_CONT {cvd_trend:+.2f}")
         elif abs(cvd_trend) < 0.10:
-            # Neutral CVD = slight reversal bias (distribution often shows neutral CVD)
-            rev_delta  += 2.0
+            rev_delta  += 2.0   # neutral CVD = slight reversal bias (distribution)
 
         # ── 5m Structure ──────────────────────────────────────────────────
-        # CRITICAL: only count CHoCH/BOS events that occurred AFTER the sweep.
-        # A CHoCH that printed hours before the sweep adds 12 pts per tick
-        # indefinitely, creating permanent artificial reversal bias.
+        # CRITICAL: Only count structural events that occurred AFTER the sweep.
+        # Pre-sweep CHoCH/BOS adds evidence on every tick indefinitely,
+        # creating permanent artificial bias unrelated to this sweep.
         if ict_engine is not None:
             try:
                 _tf = getattr(ict_engine, '_tf', {})
@@ -1373,21 +1445,45 @@ class DirectionEngine:
                     _bos      = getattr(_t5, 'bos_direction',   '') or ''
                     _choch_ts = getattr(_t5, 'choch_timestamp',  0)
                     _bos_ts   = getattr(_t5, 'bos_timestamp',    0)
-                    _sweep_ms = ps.entered_at * 1000   # sweep time in milliseconds
-                    _rev_struct_label  = "bearish" if rev_dir == "short" else "bullish"
-                    _cont_struct_label = "bullish" if rev_dir == "short" else "bearish"
-                    # Only count structural events that happened AFTER the sweep
-                    if _choch == _rev_struct_label and _choch_ts > _sweep_ms:
-                        rev_delta  += 12.0; rev_reasons.append("CHoCH_5m_REVERSAL")
-                    if _bos == _rev_struct_label and _bos_ts > _sweep_ms:
-                        rev_delta  +=  8.0; rev_reasons.append("BOS_5m_REVERSAL")
-                    if _bos == _cont_struct_label and _bos_ts > _sweep_ms:
+                    _sweep_ms = ps.entered_at * 1000
+                    _rev_lbl  = "bearish" if rev_dir == "short" else "bullish"
+                    _cont_lbl = "bullish" if rev_dir == "short" else "bearish"
+                    if _choch == _rev_lbl and _choch_ts > _sweep_ms:
+                        rev_delta  += 12.0; rev_reasons.append("CHoCH_5m_REV")
+                    if _bos == _rev_lbl and _bos_ts > _sweep_ms:
+                        rev_delta  +=  8.0; rev_reasons.append("BOS_5m_REV")
+                    if _bos == _cont_lbl and _bos_ts > _sweep_ms:
                         cont_delta += 10.0; cont_reasons.append("BOS_5m_CONT")
             except Exception:
                 pass
 
+        # ── 15m Structure  (FIX-6) ───────────────────────────────────────
+        # 15m bars close less frequently → less noise than 5m.
+        # Provides an independent structural confirmation signal.
+        if ict_engine is not None:
+            try:
+                _tf  = getattr(ict_engine, '_tf', {})
+                _t15 = _tf.get("15m")
+                if _t15 is not None:
+                    _t15_trend = getattr(_t15, 'trend',   '') or ''
+                    _t15_bos   = getattr(_t15, 'bos_direction', '') or ''
+                    _t15_bos_ts = getattr(_t15, 'bos_timestamp',  0)
+                    _rev_lbl   = "bearish" if rev_dir == "short" else "bullish"
+                    _cont_lbl  = "bullish" if rev_dir == "short" else "bearish"
+                    _sweep_ms  = ps.entered_at * 1000
+                    # 15m trend aligned with reversal direction = structural support
+                    if _t15_trend == _rev_lbl:
+                        rev_delta  +=  8.0; rev_reasons.append(f"15m_TREND_{_rev_lbl.upper()}")
+                    elif _t15_trend == _cont_lbl:
+                        cont_delta +=  6.0; cont_reasons.append(f"15m_TREND_{_cont_lbl.upper()}_CONT")
+                    # 15m BOS in reversal direction = higher-TF structural break
+                    if _t15_bos == _rev_lbl and _t15_bos_ts > _sweep_ms:
+                        rev_delta  += 10.0; rev_reasons.append("BOS_15m_REV")
+            except Exception:
+                pass
+
         # ── Sustained flow bonus ──────────────────────────────────────────
-        if ps.rev_flow_ticks >= 5:
+        if ps.rev_flow_ticks  >= 5:
             rev_delta  += 5.0; rev_reasons.append(f"SUSTAINED_REV_FLOW({ps.rev_flow_ticks}t)")
         if ps.cont_flow_ticks >= 5:
             cont_delta += 5.0; cont_reasons.append(f"SUSTAINED_CONT_FLOW({ps.cont_flow_ticks}t)")
@@ -1400,16 +1496,17 @@ class DirectionEngine:
 
     def pool_hit_gate(
         self,
-        pos_side:    str,    # "long" | "short"
-        pos_entry:   float,
-        pos_sl:      float,
-        pos_tp:      float,
-        price:       float,
-        atr:         float,
+        pos_side:        str,    # "long" | "short"
+        pos_entry:       float,
+        pos_sl:          float,
+        pos_tp:          float,
+        price:           float,
+        atr:             float,
         ict_engine,
-        tick_flow:   float = 0.0,
-        cvd_trend:   float = 0.0,
+        tick_flow:       float = 0.0,
+        cvd_trend:       float = 0.0,
         next_pool_price: Optional[float] = None,
+        liq_snapshot             = None,   # LiquidityMapSnapshot (FIX-5)
     ) -> ContinuationDecision:
         """
         When price reaches a liquidity pool DURING an active trade, determine:
@@ -1420,18 +1517,23 @@ class DirectionEngine:
                        Trail SL to this pool and ride to the next.
           HOLD       → Insufficient evidence — let the SL/TP manage.
 
+        FIX-5: When next_pool_price is None and liq_snapshot is provided,
+        auto-resolves the next pool by finding the nearest qualifying opposing
+        pool (distance > 0.5 ATR, significance >= 2.0) from the snapshot.
+
         DECISION LOGIC:
           1. If price is at TP pool → EXIT (take the profit)
           2. If flow has strongly reversed AND BOS confirms → REVERSE
-          3. If AMD is still aligned and a next pool exists with > 2R potential → CONTINUE
-          4. Otherwise → HOLD (let structure manage)
+          3. If AMD is still aligned and a next pool exists with > 1.5R → CONTINUE
+          4. If flow reversed but no structural BOS → HOLD
+          5. If BOS against but flow OK → HOLD for confirmation
+          6. Otherwise → HOLD (insufficient signal)
 
         CONTINUATION CRITERIA (must meet ALL):
-          a) AMD delivery still intact (same bias, phase is DISTRIBUTION or REACCUMULATION)
-          b) Flow NOT strongly reversed (abs(tick_flow) < threshold OR same direction)
-          c) No counter-BOS on 5m (BOS against position = structural invalidation)
-          d) Next pool is at least 1.5R reward from current price
-          e) Trade is currently profitable (peak_profit > 0.5R)
+          a) AMD delivery still intact (DISTRIBUTION or REACCUMULATION phase)
+          b) Flow NOT strongly reversed
+          c) No counter-BOS on 5m in the last 30 minutes
+          d) Next pool at least 1.5R reward from current price
         """
         a = max(atr, 1e-9)
 
@@ -1447,18 +1549,18 @@ class DirectionEngine:
             (pos_side == "long"  and tick_flow < -_CONT_FLOW_REVERSAL_MIN) or
             (pos_side == "short" and tick_flow > +_CONT_FLOW_REVERSAL_MIN))
 
-        # ── Check: Counter-BOS? ───────────────────────────────────────────
+        # ── Check: Counter-BOS on 5m? ─────────────────────────────────────
         _counter_bos = False
         if ict_engine is not None:
             try:
-                _tf = getattr(ict_engine, '_tf', {})
-                _t5 = _tf.get("5m")
+                _tf   = getattr(ict_engine, '_tf', {})
+                _t5   = _tf.get("5m")
                 if _t5 is not None:
-                    _bos_d = getattr(_t5, 'bos_direction', '') or ''
-                    _bos_ts = getattr(_t5, 'bos_timestamp', 0)
-                    _now_ms = int(time.time() * 1000)
-                    _bos_age_min = (_now_ms - _bos_ts) / 60000 if _bos_ts > 0 else 999
-                    if (_bos_age_min < 30 and  # BOS within last 30 min
+                    _bos_d    = getattr(_t5, 'bos_direction', '') or ''
+                    _bos_ts   = getattr(_t5, 'bos_timestamp',   0)
+                    _now_ms   = int(time.time() * 1000)
+                    _bos_age_min = (_now_ms - _bos_ts) / 60_000 if _bos_ts > 0 else 999
+                    if (_bos_age_min < 30 and
                             ((pos_side == "long"  and _bos_d == "bearish") or
                              (pos_side == "short" and _bos_d == "bullish"))):
                         _counter_bos = True
@@ -1466,13 +1568,13 @@ class DirectionEngine:
                 pass
 
         # ── Check: AMD still delivering? ─────────────────────────────────
-        _amd_aligned = False
+        _amd_aligned         = False
         _amd_delivery_target = None
         if ict_engine is not None:
             amd = getattr(ict_engine, '_amd', None)
             if amd is not None:
                 _phase = getattr(amd, 'phase', '').upper()
-                _bias  = getattr(amd, 'bias', '').lower()
+                _bias  = getattr(amd, 'bias',  '').lower()
                 _conf  = float(getattr(amd, 'confidence', 0.0))
                 _amd_delivery_target = getattr(amd, 'delivery_target', None)
                 _amd_aligned = (
@@ -1481,64 +1583,84 @@ class DirectionEngine:
                     ((pos_side == "long"  and _bias == "bullish") or
                      (pos_side == "short" and _bias == "bearish")))
 
+        # ── FIX-5: Auto-resolve next pool from liq_snapshot ──────────────
+        _next_pool_resolved = next_pool_price
+        if _next_pool_resolved is None and liq_snapshot is not None:
+            _pool_list = (liq_snapshot.bsl_pools if pos_side == "long"
+                          else liq_snapshot.ssl_pools)
+            _qualifying = [
+                t for t in _pool_list
+                if t.distance_atr > 0.5
+                and t.significance >= 2.0
+            ]
+            if _qualifying:
+                _nearest = min(_qualifying, key=lambda t: t.distance_atr)
+                _next_pool_resolved = _nearest.pool.price
+
+        # Fallback: use AMD delivery target
+        if _next_pool_resolved is None:
+            _next_pool_resolved = _amd_delivery_target
+
         # ── Check: Viable next pool? ──────────────────────────────────────
         _next_pool_viable = False
-        _next_pool = next_pool_price or _amd_delivery_target
-        if _next_pool is not None:
-            _next_dist = abs(_next_pool - price)
+        _next_rr          = 0.0
+        if _next_pool_resolved is not None:
+            _next_dist = abs(_next_pool_resolved - price)
             _sl_dist   = abs(price - pos_sl) if pos_sl > 0 else a
             if _sl_dist > 1e-10:
                 _next_rr = _next_dist / _sl_dist
-                if _next_rr >= 1.5:
+                if _next_rr >= _CONT_NEXT_POOL_MIN_RR:
                     _next_pool_viable = True
 
         # ─────────────────────────────────────────────────────────────────
         # Decision tree
         # ─────────────────────────────────────────────────────────────────
 
+        # Case 1: Flow reversed + structural BOS against → REVERSE
         if _flow_reversed and _counter_bos:
             return ContinuationDecision(
-                action     = "reverse",
-                confidence = 0.80,
-                reason     = (
+                action="reverse",
+                confidence=0.80,
+                reason=(
                     f"FLOW_REVERSED(flow={tick_flow:+.2f}) + COUNTER_BOS "
                     f"— structure invalidated"),
-                next_target = None,
+                next_target=None,
             )
 
+        # Case 2: AMD intact + flow OK + next pool viable → CONTINUE
         if _amd_aligned and not _counter_bos and not _flow_reversed and _next_pool_viable:
             return ContinuationDecision(
-                action     = "continue",
-                confidence = 0.70,
-                reason     = (
+                action="continue",
+                confidence=0.70,
+                reason=(
                     f"AMD_DELIVERY_INTACT + FLOW_OK + NEXT_POOL "
-                    f"@ ${_next_pool:,.0f} ({_next_rr:.1f}R potential)"),
-                next_target = _next_pool,
+                    f"@ ${_next_pool_resolved:,.0f} ({_next_rr:.1f}R potential)"),
+                next_target=_next_pool_resolved,
             )
 
+        # Case 3: Flow reversed but no structural BOS → HOLD, trail SL
         if _flow_reversed and not _counter_bos:
-            # Flow reversed but no structural BOS — hold and let SL trail protect
             return ContinuationDecision(
-                action     = "hold",
-                confidence = 0.60,
-                reason     = (
-                    f"FLOW_REVERSED but no BOS — hold, let trail SL protect "
+                action="hold",
+                confidence=0.60,
+                reason=(
+                    f"FLOW_REVERSED but no BOS — hold, trail SL "
                     f"(flow={tick_flow:+.2f})"),
             )
 
+        # Case 4: BOS against but flow OK → HOLD for confirmation
         if _counter_bos and not _flow_reversed:
-            # BOS against position but flow is still OK — hold for confirmation
             return ContinuationDecision(
-                action     = "hold",
-                confidence = 0.55,
-                reason     = "COUNTER_BOS but flow OK — hold for confirmation",
+                action="hold",
+                confidence=0.55,
+                reason="COUNTER_BOS but flow OK — hold for confirmation",
             )
 
-        # Default: not enough signal → hold
+        # Default: insufficient signal → HOLD
         return ContinuationDecision(
-            action     = "hold",
-            confidence = 0.40,
-            reason     = (
+            action="hold",
+            confidence=0.40,
+            reason=(
                 f"INSUFFICIENT_SIGNAL | AMD={_amd_aligned} "
                 f"flow_rev={_flow_reversed} cbos={_counter_bos} "
                 f"next_pool={_next_pool_viable}"),
@@ -1549,22 +1671,26 @@ class DirectionEngine:
     # =========================================================================
 
     def _null_prediction(
-        self, now_ms: int, reason: str = "",
-        dr_pd: float = 0.5, bsl_score: float = 0.0,
-        ssl_score: float = 0.0, score: float = 0.0,
-        factors: Optional[HuntFactors] = None,
+        self,
+        now_ms:    int,
+        reason:    str      = "",
+        dr_pd:     float    = 0.5,
+        bsl_score: float    = 0.0,
+        ssl_score: float    = 0.0,
+        score:     float    = 0.0,
+        factors:   Optional[HuntFactors] = None,
     ) -> HuntPrediction:
         return HuntPrediction(
-            predicted          = None,
-            confidence         = 0.0,
-            delivery_direction = "",
-            raw_score          = score,
-            bsl_score          = bsl_score,
-            ssl_score          = ssl_score,
-            factors            = factors or HuntFactors(),
-            dealing_range_pd   = dr_pd,
-            reason             = reason,
-            timestamp_ms       = now_ms,
+            predicted           = None,
+            confidence          = 0.0,
+            delivery_direction  = "",
+            raw_score           = score,
+            bsl_score           = bsl_score,
+            ssl_score           = ssl_score,
+            factors             = factors or HuntFactors(),
+            dealing_range_pd    = dr_pd,
+            reason              = reason,
+            timestamp_ms        = now_ms,
         )
 
     @property
@@ -1585,87 +1711,166 @@ class DirectionEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sigmoid(z: float, steepness: float = 1.0) -> float:
-    """Fast symmetric sigmoid ℝ → (-1, +1). No math.exp overflow."""
+    """Fast symmetric sigmoid ℝ → (-1, +1). Padé approximation; < 0.3% error."""
     sz = z * steepness
-    # Padé approximation: accurate to < 0.3% error
     return max(-1.0, min(1.0, sz / (1.0 + abs(sz) * 0.5)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTEGRATION GUIDE (for quant_strategy.py)
+# INTEGRATION GUIDE (quant_strategy.py wiring reference)
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-HOW TO WIRE direction_engine.py INTO quant_strategy.py
-======================================================
+HOW TO WIRE direction_engine.py v2.0 INTO quant_strategy.py
+=============================================================
 
-1. IMPORT AND INIT (in QuantStrategy.__init__):
-   from strategy.direction_engine import DirectionEngine
-   self._dir_engine = DirectionEngine()
+0. INIT (in QuantStrategy.__init__):
 
-2. HUNT PREDICTION (in _evaluate_entry / Step 6, after ICT update):
-   hunt = self._dir_engine.predict_hunt(
-       price      = price,
-       atr        = atr,
-       now_ms     = now_ms,
-       ict_engine = self._ict,
-       tick_flow  = self._tick_eng.get_signal(),
-       cvd_trend  = self._cvd.get_trend_signal(),
-       candles_5m = candles_by_tf.get("5m", []),
-   )
-   # hunt.predicted    → "BSL" | "SSL" | None
-   # hunt.confidence   → 0.0 – 1.0
-   # hunt.delivery_direction → "bullish" | "bearish"
-   # Use this to gate direction: only enter LONG when hunt says SSL will be swept
-   # (SSL swept → bullish delivery → long entry in discount)
+    from strategy.direction_engine import DirectionEngine, HuntPrediction, DirectionBias
+    self._dir_engine = DirectionEngine()
+    self._notified_sweeps: set = set()   # deduplication — see Step 3b
 
-3. ON SWEEP DETECTED (in _evaluate_entry when a sweep is found):
-   pool_type = sweep.pool.side.value  # "BSL" | "SSL"
-   self._dir_engine.on_sweep(
-       swept_pool_price = sweep.pool.price,
-       pool_type        = pool_type,
-       price            = price,
-       atr              = atr,
-       now              = now,
-   )
+1. HUNT PREDICTION  (Step 3 in _evaluate_entry — BEFORE liq_map.update())
 
-4. POST-SWEEP EVALUATION (each tick while in POST_SWEEP state):
-   if self._dir_engine.in_post_sweep:
-       decision = self._dir_engine.evaluate_sweep(
-           price      = price,
-           atr        = atr,
-           now        = now,
-           ict_engine = self._ict,
-           tick_flow  = self._tick_eng.get_signal(),
-           cvd_trend  = self._cvd.get_trend_signal(),
-       )
-       if decision.action == "reverse":
-           # Enter trade in decision.direction with SL at swept pool wick
-       elif decision.action == "continue":
-           # Enter continuation in decision.direction
-       # if "wait" → do nothing, evaluation continues next tick
+    _hunt = self._dir_engine.predict_hunt(
+        price          = price,
+        atr            = atr,
+        now_ms         = now_ms,
+        ict_engine     = self._ict,
+        tick_flow      = self._tick_eng.get_signal(),
+        cvd_trend      = self._cvd.get_trend_signal(),
+        candles_5m     = candles_by_tf.get("5m", []),
+        liq_snapshot   = self._liq_map._last_snapshot,   # FIX-3: previous tick's snap
+    )
+    # Bridge to ICTEngine legacy dict shape:
+    self._ict.inject_hunt_prediction({
+        "predicted":          _hunt.predicted,
+        "confidence":         round(_hunt.confidence, 3),
+        "delivery_direction": _hunt.delivery_direction,
+        "raw_score":          round(_hunt.raw_score, 4),
+        "bsl_score":          round(_hunt.bsl_score, 3),
+        "ssl_score":          round(_hunt.ssl_score, 3),
+        "dealing_range_pd":   round(_hunt.dealing_range_pd, 3),
+        "swept_pool":         _hunt.swept_pool_price,
+        "opposing_pool":      _hunt.opposing_pool_price,
+        "reason":             _hunt.reason,
+        "scenario":           "",
+        "confidence_factors": {},
+    }, now_ms)
 
-5. POOL-HIT GATE (during active position when price approaches a pool):
-   gate = self._dir_engine.pool_hit_gate(
-       pos_side   = self._pos.side,
-       pos_entry  = self._pos.entry_price,
-       pos_sl     = self._pos.sl_price,
-       pos_tp     = self._pos.tp_price,
-       price      = price,
-       atr        = atr,
-       ict_engine = self._ict,
-       tick_flow  = self._tick_eng.get_signal(),
-       cvd_trend  = self._cvd.get_trend_signal(),
-   )
-   if gate.action == "exit":    → close position (TP)
-   elif gate.action == "reverse" → exit + enter opposite
-   elif gate.action == "continue" → update TP to gate.next_target, tighten SL
-   # if "hold" → let existing SL/TP manage
+2. SWEEP DETECTION  (Step 6b — AFTER liq_map.update() + liq_snapshot = ...)
 
-DISPLAY (for Telegram /thinking and heartbeat):
-   hunt = self._dir_engine.last_hunt
-   if hunt and hunt.predicted:
-       logger.info(
-           f"HUNT: {hunt.predicted} conf={hunt.confidence:.2f} "
-           f"delivery={hunt.delivery_direction} | {hunt.reason[:60]}")
+    Deduplication is REQUIRED. The bridge loop runs ~4 Hz and visits all
+    swept pools in the last 30s window. Without dedup, on_sweep() is called
+    ~120 times per pool, resetting PostSweepState every tick and making
+    accumulated evidence impossible to build.
+
+    _sweep_age_limit = now_ms - 30_000   # last 30 seconds
+    for pool in self._ict.liquidity_pools:
+        if pool.swept and pool.sweep_timestamp > _sweep_age_limit:
+            _sweep_key = (pool.price, pool.sweep_timestamp)
+            if _sweep_key not in self._notified_sweeps:
+                self._notified_sweeps.add(_sweep_key)
+                self._dir_engine.on_sweep(
+                    swept_pool_price = pool.price,
+                    pool_type        = pool.level_type,   # "BSL" | "SSL"
+                    price            = price,
+                    atr              = atr,
+                    now              = now,
+                    quality          = float(
+                        getattr(pool, 'displacement_score', 0.5) or 0.5),
+                )
+    # Prune stale entries to bound memory
+    _cutoff_ms = now_ms - 60_000
+    self._notified_sweeps = {k for k in self._notified_sweeps
+                             if k[1] > _cutoff_ms}
+
+3. POST-SWEEP EVALUATION  (Step 6c — AFTER liq_map.update())
+
+    Runs every tick while DirectionEngine has an open PostSweepState.
+    The verdict is written into ict_ctx.direction_hint* BEFORE
+    entry_engine.update() is called so that the entry engine's
+    _evaluate_post_sweep_accumulative() can consume it as a dynamic
+    weighting factor (up to +20 pts at full confidence).
+
+    if self._dir_engine.in_post_sweep:
+        _ps_decision = self._dir_engine.evaluate_sweep(
+            price        = price,
+            atr          = atr,
+            now          = now,
+            ict_engine   = self._ict,
+            tick_flow    = self._tick_eng.get_signal(),
+            cvd_trend    = self._cvd.get_trend_signal(),
+            liq_snapshot = liq_snapshot,   # FIX-3: current tick's fresh snapshot
+        )
+        if _ps_decision.action in ("reverse", "continue"):
+            ict_ctx.direction_hint            = _ps_decision.action
+            ict_ctx.direction_hint_side       = _ps_decision.direction
+            ict_ctx.direction_hint_confidence = _ps_decision.confidence
+        else:
+            # "wait" — clear stale hint so entry_engine doesn't act on it
+            ict_ctx.direction_hint            = ""
+            ict_ctx.direction_hint_side       = ""
+            ict_ctx.direction_hint_confidence = 0.0
+
+    # IMPORTANT: Call entry_engine.update() AFTER writing ict_ctx.direction_hint
+    self._entry_engine.update(
+        liq_snapshot=liq_snapshot,
+        flow_state=flow_state,
+        ict_ctx=ict_ctx,         # direction_hint* fields now populated
+        price=price, atr=atr, now=now,
+        ...
+    )
+
+4. POOL-HIT GATE  (during active position when price approaches a pool)
+
+    _gate = self._dir_engine.pool_hit_gate(
+        pos_side         = self._pos.side,
+        pos_entry        = self._pos.entry_price,
+        pos_sl           = self._pos.sl_price,
+        pos_tp           = self._pos.tp_price,
+        price            = price,
+        atr              = atr,
+        ict_engine       = self._ict,
+        tick_flow        = self._tick_eng.get_signal(),
+        cvd_trend        = self._cvd.get_trend_signal(),
+        next_pool_price  = None,          # FIX-5: auto-resolved from liq_snapshot
+        liq_snapshot     = liq_snapshot,  # FIX-5: pass current snapshot
+    )
+    if   _gate.action == "exit":     # → close position at TP
+    elif _gate.action == "reverse":  # → exit + enter opposite side
+    elif _gate.action == "continue": # → update TP to _gate.next_target, trail SL
+    # "hold" → let existing SL/TP manage
+
+5. DISPLAY (Telegram heartbeat / /thinking command)
+
+    _hunt = self._dir_engine.last_hunt
+    if _hunt and _hunt.predicted:
+        logger.info(
+            f"HUNT: {_hunt.predicted} conf={_hunt.confidence:.2f} "
+            f"delivery={_hunt.delivery_direction} | {_hunt.reason[:60]}")
+
+    if self._dir_engine.in_post_sweep:
+        _analysis = self._dir_engine.last_sweep_analysis
+        logger.info(
+            f"POST-SWEEP [{_analysis.get('phase','?')}] "
+            f"rev={_analysis.get('rev_score',0):.0f} "
+            f"cont={_analysis.get('cont_score',0):.0f} "
+            f"CISD={'✓' if _analysis.get('cisd') else '✗'} "
+            f"DISP={_analysis.get('displacement_atr',0):.2f}ATR "
+            f"OTE={'✓' if _analysis.get('ote') else '✗'}")
+
+DIRECTION HINT FLOW (data path):
+  DirectionEngine.evaluate_sweep()
+    → PostSweepDecision(action, direction, confidence)
+    → quant_strategy writes to ict_ctx.direction_hint / _side / _confidence
+    → entry_engine._evaluate_post_sweep_accumulative() reads ict_ctx
+    → adds up to +20 pts × confidence to the matching side's delta
+    → pushes entry_engine's accumulated total over its threshold faster
+
+FIELD MAPPING:
+  PostSweepDecision.direction == "long"  → ict_ctx.direction_hint_side = "long"
+  PostSweepDecision.direction == "short" → ict_ctx.direction_hint_side = "short"
+  entry_engine checks: _dir_hint_side == sweep_dir  (both use same convention:
+    sweep.direction = "long" for SSL swept = reversal direction = "long")
 """
