@@ -7763,17 +7763,19 @@ class QuantStrategy:
                     self._exit_trade(order_manager, price, "pool_gate_reverse")
                     return
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
-                    logger.info(
-                        f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
-                        f"next target=${_gate.next_target:,.0f} "
-                        f"conf={_gate.confidence:.2f} "
-                        f"| {_gate.reason[:80]}")
                     # Update TP to the next pool target — let the exchange bracket
                     # order be amended by the trail engine's REST mechanism on the
                     # next trail tick that detects the TP distance change.
                     # We update local state here so the in-position monitor shows
                     # the correct target immediately.
+                    # NOTE: log is inside the guard — pool_hit_gate returns "continue"
+                    # every tick once AMD is aligned, so logging outside caused spam.
                     if pos.tp_price != _gate.next_target:
+                        logger.info(
+                            f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
+                            f"next target=${_gate.next_target:,.0f} "
+                            f"conf={_gate.confidence:.2f} "
+                            f"| {_gate.reason[:80]}")
                         pos.tp_price = _gate.next_target
                         self.current_tp_price = _gate.next_target
                         try:
