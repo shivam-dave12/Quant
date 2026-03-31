@@ -2706,8 +2706,28 @@ class _DynamicStructureTrail:
         _bi = (amd_bias  or "").lower()
         if "manipulation" in _ph or "manip" in _ph:
             # Check if AMD bias is CONTRA to position (worst case — move IS the fake)
-            _contra = (pos_side == "long"  and _bi == "bearish") or                       (pos_side == "short" and _bi == "bullish")
-            base *= 1.45 if _contra else 1.22
+            # ── CONTRA: AMD bias opposes our position.
+            #   e.g. we are LONG but AMD is BEARISH → we entered INTO the fake move.
+            #   Risk is highest at 0R (stop-hunt likely), negligible at 2R+.
+            #
+            #   contra_mult(R) = max(1.08, 1.45 − 0.30 × R)
+            #     0.00R → 1.450   full protection
+            #     0.50R → 1.300
+            #     1.00R → 1.150
+            #     1.25R → 1.080   absolute floor (never squeeze below this)
+            #
+            # ── WITH-TREND: AMD sweep confirmed our direction.
+            #   Widen modestly early (expansion needs room), taper faster.
+            #
+            #   with_mult(R) = max(1.02, 1.22 − 0.25 × R)
+            #     0.00R → 1.220
+            #     0.50R → 1.095
+            #     0.88R → 1.020   floor
+            _contra = ((pos_side == "long"  and _bi == "bearish") or
+                       (pos_side == "short" and _bi == "bullish"))
+            _manip_mult = (max(1.08, 1.45 - 0.30 * tier) if _contra
+                           else max(1.02, 1.22 - 0.25 * tier))
+            base *= _manip_mult
         elif "distribution" in _ph or "delivery" in _ph:
             base *= 0.83   # delivery underway — ride the wave, trail tighter
         elif "reaccumulation" in _ph or "redistribution" in _ph:
@@ -3107,25 +3127,131 @@ class _DynamicStructureTrail:
         else:
             new_sl = max(new_sl, price + min_dist)
 
-        # ── Liquidity pool ceiling (don't trail into unswept pools) ───
+        # ── Liquidity pool ceiling — proximity-gated, scored ────────────────────────
+        #
+        # PURPOSE: Keep the SL on the far side of any UNSWEPT liquidity pool that
+        # lies BETWEEN the current SL and the proposed new_sl.  Smart money targets
+        # those pools — our stop would be collateral damage if placed above/below one.
+        #
+        # PROXIMITY GATE (the original bug): Only apply a ceiling when the pool is
+        # actually in the path of the trail.  A pool $1,800 below new_sl is not in
+        # the path — it is irrelevant, and capping there freezes the trail.
+        #
+        # Gate condition (long example):
+        #   The pool must be within [new_sl − proximity_window, new_sl + half_window].
+        #   proximity_window = 2.0 × ATR  →  pool must be ≤ 2 ATR below proposed new_sl.
+        #   A pool 8 ATR away from new_sl does NOT constrain where we place the stop.
+        #
+        # SCORING: When multiple pools pass the gate, rank by:
+        #   1. Significance (higher sig = stronger stop-hunt magnet)
+        #   2. Proximity to new_sl (closer = more constraining)
+        # Apply only the single most constraining (highest-scored) ceiling.
+        #
+        # HARD MINIMUM: ceiling must be > current_sl + 0.02×ATR so the cap itself
+        # does not produce an improvement smaller than the tick.
         if ict_engine is not None:
             try:
-                lb = 0.30 * atr
-                for pool in ict_engine.liquidity_pools:
-                    if getattr(pool, "swept", False):
-                        continue
-                    if pos_side == "long" and getattr(pool, "level_type", "") == "SSL":
-                        ceil = pool.price - lb
-                        if current_sl < ceil < new_sl:
-                            new_sl = ceil
-                    elif pos_side == "short" and getattr(pool, "level_type", "") == "BSL":
-                        fl = pool.price + lb
-                        if current_sl > fl > new_sl:
-                            new_sl = fl
-            except Exception:
-                pass
+                # Proximity window: how far from new_sl can a pool be and still
+                # count as "in the path"?  2.0 ATR is generous — anything beyond
+                # that is not structurally relevant to this trail step.
+                _prox_window  = 2.0  * atr   # below new_sl (long) / above (short)
+                _prox_leading = 0.60 * atr   # pool may be slightly above new_sl
+                _pool_buf     = 0.28 * atr   # how far inside the pool to sit
 
-        # ── Ratchet: SL may only improve ─────────────────────────────
+                # Hard minimum: the capped SL must beat current_sl by at least this
+                # much, otherwise the cap would just re-trigger MIN_MOVE and block.
+                _cap_min_improvement = 0.04 * atr
+
+                _best_ceil   = None   # (ceil_price, score, pool_price, pool_sig)
+                _best_floor  = None
+
+                for _pool in ict_engine.liquidity_pools:
+                    if getattr(_pool, "swept", False):
+                        continue
+                    _pp  = float(_pool.price)
+                    _sig = float(getattr(_pool, "significance", 1.0))
+
+                    if pos_side == "long" and getattr(_pool, "level_type", "") == "SSL":
+                        # SSL is below price.  We don't want SL to advance past SSL
+                        # because a sweep of the SSL would dip price below the pool,
+                        # potentially tagging our SL.
+                        # Pool must be in the band: new_sl - prox_window < pool < new_sl + leading
+                        if not (new_sl - _prox_window < _pp < new_sl + _prox_leading):
+                            continue
+                        _ceil = _pp - _pool_buf
+                        # Ceiling must be an actual improvement over current_sl
+                        if _ceil <= current_sl + _cap_min_improvement:
+                            continue
+                        # Score: prefer pools closer to new_sl (more constraining)
+                        # and with higher significance (stronger liquidity magnet)
+                        _dist_score = 1.0 - abs(new_sl - _pp) / max(_prox_window, 1e-10)
+                        _score = _sig * (0.60 + 0.40 * _dist_score)
+                        if _best_ceil is None or _score > _best_ceil[1]:
+                            _best_ceil = (_ceil, _score, _pp, _sig)
+
+                    elif pos_side == "short" and getattr(_pool, "level_type", "") == "BSL":
+                        # BSL is above price.  Mirror logic for short.
+                        if not (new_sl - _prox_leading < _pp < new_sl + _prox_window):
+                            continue
+                        _floor = _pp + _pool_buf
+                        if _floor >= current_sl - _cap_min_improvement:
+                            continue
+                        _dist_score = 1.0 - abs(new_sl - _pp) / max(_prox_window, 1e-10)
+                        _score = _sig * (0.60 + 0.40 * _dist_score)
+                        if _best_floor is None or _score > _best_floor[1]:
+                            _best_floor = (_floor, _score, _pp, _sig)
+
+                if _best_ceil is not None:
+                    _ceil_price, _ceil_score, _pool_price, _pool_sig = _best_ceil
+                    if _ceil_price < new_sl:
+                        logger.debug(
+                            "Trail POOL-CEIL long: capping $%.1f→$%.1f "
+                            "(SSL @ $%.1f sig=%.2f score=%.2f prox=%.1fATR)",
+                            new_sl, _ceil_price, _pool_price, _pool_sig, _ceil_score,
+                            abs(new_sl - _pool_price) / max(atr, 1e-10))
+                        new_sl = _ceil_price
+
+                if _best_floor is not None:
+                    _floor_price, _floor_score, _pool_price, _pool_sig = _best_floor
+                    if _floor_price > new_sl:
+                        logger.debug(
+                            "Trail POOL-FLOOR short: capping $%.1f→$%.1f "
+                            "(BSL @ $%.1f sig=%.2f score=%.2f prox=%.1fATR)",
+                            new_sl, _floor_price, _pool_price, _pool_sig, _floor_score,
+                            abs(new_sl - _pool_price) / max(atr, 1e-10))
+                        new_sl = _floor_price
+
+            except Exception as _pool_e:
+                logger.debug("Trail pool-ceiling error (non-fatal): %s", _pool_e)
+
+        # ── BE floor sovereign override ───────────────────────────────────────────
+        #
+        # Capital protection is unconditional.  A pool ceiling or any other guard
+        # may have dragged new_sl below the BE floor.  Re-assert it here.
+        #
+        # Condition: be_floor is active (tier ≥ 0.30R) AND the current guard pass
+        # dropped new_sl below be_floor AND be_floor itself is a valid improvement
+        # (be_floor > current_sl for long, be_floor < current_sl for short) AND
+        # be_floor respects min_dist (never place SL inside breathing-room band).
+        if be_floor is not None:
+            if pos_side == "long":
+                _be_candidate = min(be_floor, price - min_dist)
+                if _be_candidate > new_sl and _be_candidate > current_sl:
+                    logger.debug(
+                        "Trail BE-OVERRIDE long: restoring $%.1f→$%.1f "
+                        "(pool cap had suppressed to $%.1f, tier=%.2fR)",
+                        new_sl, _be_candidate, new_sl, tier)
+                    new_sl = _be_candidate
+            else:
+                _be_candidate = max(be_floor, price + min_dist)
+                if _be_candidate < new_sl and _be_candidate < current_sl:
+                    logger.debug(
+                        "Trail BE-OVERRIDE short: restoring $%.1f→$%.1f "
+                        "(pool cap had suppressed to $%.1f, tier=%.2fR)",
+                        new_sl, _be_candidate, new_sl, tier)
+                    new_sl = _be_candidate
+
+        # ── Ratchet: SL may only improve ───────────────────────────────
         if pos_side == "long":
             if new_sl <= current_sl:
                 if hold_reason is not None:
@@ -3141,14 +3267,56 @@ class _DynamicStructureTrail:
                         f" tier={tier:.2f}R mult={mult:.2f}")
                 return None
 
-        # ── Minimum meaningful move: 0.06×ATR ────────────────────────
-        min_mv = 0.06 * atr
-        improvement = abs(new_sl - current_sl)
-        if improvement < min_mv:
-            if hold_reason is not None:
-                hold_reason.append(f"MIN_MOVE {improvement:.1f}<{min_mv:.1f}")
-            return None
+        # ── Minimum meaningful move ────────────────────────────────────────────────
+        #
+        # PURPOSE: Filter out noise updates that are too small to be worth the
+        # exchange round-trip (slippage + fee recalculation overhead).
+        #
+        # DYNAMIC SCALING: min_mv is not fixed — it scales with both ATR and tier.
+        #   At low tier (0.10–0.30R): wider gate — don't over-twitch the stop early.
+        #   At high tier (2R+): tighter gate — small steps are fine, we want precision.
+        #
+        #   min_mv(R) = ATR × max(0.03, 0.10 × e^(−0.55×R))
+        #     0.10R: 0.095×ATR   At $255 ATR → $24.2
+        #     0.30R: 0.086×ATR                → $21.9
+        #     0.50R: 0.077×ATR                → $19.6
+        #     1.00R: 0.058×ATR                → $14.8
+        #     1.50R: 0.044×ATR                → $11.2
+        #     2.00R: 0.033×ATR                →  $8.4
+        #     3.00R: 0.030×ATR (floor)         →  $7.7
+        #
+        # BE-TRANSIT EXEMPTION: The very first move that crosses the break-even line
+        # is exempt from MIN_MOVE.  This is a once-per-trade capital-protection event
+        # and must not be gated by noise filters.  Subsequent BE-region moves are
+        # subject to the normal (tighter) gate.
+        #
+        # Detection: crossing BE is (current_sl < be_price ≤ new_sl) for long,
+        #            or (current_sl > be_price ≥ new_sl) for short.
+        import math as _math
+        _min_mv = atr * max(0.030, 0.10 * _math.exp(-0.55 * tier))
+        _improvement = abs(new_sl - current_sl)
 
+        # BE transit: first time crossing the break-even price
+        _be_transit = False
+        if be_floor is not None:
+            # be_price is the raw entry + commission floor (be_floor == be_price here)
+            _be_price_raw = be_floor   # set in Layer 1 above
+            if pos_side == "long":
+                _be_transit = (current_sl < _be_price_raw <= new_sl)
+            else:
+                _be_transit = (current_sl > _be_price_raw >= new_sl)
+
+        if not _be_transit and _improvement < _min_mv:
+            if hold_reason is not None:
+                hold_reason.append(
+                    f"MIN_MOVE {_improvement:.1f}<{_min_mv:.1f}"
+                    f" (tier={tier:.2f}R, ATR={atr:.1f})")
+            return None
+        if _be_transit and _improvement < _min_mv:
+            logger.debug(
+                "Trail MIN_MOVE bypassed: BE-transit $%.1f→$%.1f "
+                "(improv=%.1f < gate=%.1f, tier=%.2fR)",
+                current_sl, new_sl, _improvement, _min_mv, tier)
         # ── Tick rounding ─────────────────────────────────────────────
         ts      = tick_size if tick_size > 0 else 0.1
         rounded = round(round(new_sl / ts) * ts, 10)
