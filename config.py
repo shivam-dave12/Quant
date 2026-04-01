@@ -43,8 +43,8 @@ REMAINDER_MIN_QTY        = 0.001
 
 # ── Risk management ───────────────────────────────────────────────────────────
 RISK_PER_TRADE          = 0.60
-MAX_DAILY_LOSS          = 400
-MAX_DAILY_LOSS_PCT      = 5.0
+MAX_DAILY_LOSS          = 10000
+MAX_DAILY_LOSS_PCT      = 100.0
 MAX_DRAWDOWN_PCT        = 100.0
 MAX_CONSECUTIVE_LOSSES  = 100
 MAX_DAILY_TRADES        = 1000
