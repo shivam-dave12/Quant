@@ -353,8 +353,14 @@ class ConvictionFilter:
             allows.append(f"TOTAL={score:.3f} ✅")
 
         if allowed:
-            self._session_state.entries_taken += 1
-            self._session_state.last_entry_time = now
+            # NOTE: entries_taken and last_entry_time are intentionally NOT set
+            # here. They are set only in mark_entry_placed(), which is called by
+            # quant_strategy._enter_trade() after PositionPhase.ACTIVE is confirmed.
+            # Setting them here caused a 900s lockout after every evaluation that
+            # passed conviction but failed to execute (e.g. insufficient margin,
+            # TP gate rejection, exchange error) — the trade never happened but
+            # the timer was armed. This was the root cause of score=0.000 /
+            # MIN_INTERVAL blocks immediately after a failed entry attempt.
             logger.info(
                 f"✅ CONVICTION PASSED ({score:.3f}) | "
                 f"{' | '.join(allows)}")
@@ -372,6 +378,52 @@ class ConvictionFilter:
             rr_ratio       = rr,
             pool_tf        = pool_tf,
             pool_sig       = pool_sig,
+        )
+
+    def mark_entry_placed(self, now: float) -> None:
+        """
+        Called by quant_strategy._enter_trade() the moment PositionPhase.ACTIVE
+        is confirmed (order filled, position live).  This is the ONLY place that
+        arms the MIN_ENTRY_INTERVAL cooldown and increments entries_taken.
+
+        Decoupled from evaluate() so that conviction passes that fail to execute
+        (insufficient margin, TP gate, exchange error, fill timeout) do NOT
+        consume the session quota or start the cooldown timer.
+        """
+        self._session_state.entries_taken  += 1
+        self._session_state.last_entry_time = now
+        logger.info(
+            f"ConvictionFilter: entry placed — "
+            f"entries_taken={self._session_state.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
+            f"| next entry allowed in {MIN_ENTRY_INTERVAL_SEC}s"
+        )
+
+    def on_session_change(self, new_session: str) -> None:
+        """
+        Called by quant_strategy when the killzone/session changes
+        (e.g. OFF_HOURS → NEW_YORK, NEW_YORK → LONDON).
+
+        Resets entries_taken and consecutive_losses for the new session window
+        while preserving the WIN/LOSS record for the day's analytics.
+
+        The 900s MIN_ENTRY_INTERVAL cooldown is also cleared — it is
+        intra-session pacing, not an inter-session barrier.
+        """
+        old_sess = self._session_state.session_id
+        if new_session == old_sess:
+            return  # no change
+        logger.info(
+            f"ConvictionFilter: session boundary {old_sess!r} → {new_session!r} "
+            f"| resetting entries_taken={self._session_state.entries_taken} "
+            f"and consecutive_losses={self._session_state.consecutive_losses}"
+        )
+        # Preserve cumulative W/L but reset session-level pacing counters
+        wins   = self._session_state.wins
+        losses = self._session_state.losses
+        self._session_state = SessionState(
+            session_id   = new_session,
+            wins         = wins,
+            losses       = losses,
         )
 
     def record_trade_result(self, win: bool) -> None:
@@ -433,30 +485,40 @@ class ConvictionFilter:
     def _check_session_limits(self, now: float, session: str) -> Optional[str]:
         st = self._session_state
 
-        if (st.last_entry_time > 0
-                and (now - st.last_entry_time) < MIN_ENTRY_INTERVAL_SEC):
-            wait = int(MIN_ENTRY_INTERVAL_SEC - (now - st.last_entry_time))
-            return f"MIN_INTERVAL: {wait}s until next entry allowed"
+        # ── Pacing: minimum interval between consecutive entries ───────────────
+        if st.last_entry_time > 0:
+            elapsed = now - st.last_entry_time
+            if elapsed < MIN_ENTRY_INTERVAL_SEC:
+                wait = int(MIN_ENTRY_INTERVAL_SEC - elapsed)
+                return f"MIN_INTERVAL: {wait}s until next entry allowed"
 
+        # ── Consecutive loss circuit breaker ───────────────────────────────────
         if st.consecutive_losses >= MAX_SESSION_LOSSES:
             return (
-                f"SESSION_INVALIDATED: {st.consecutive_losses} consecutive losses. "
-                f"Review direction before next entry."
+                f"SESSION_INVALIDATED: {st.consecutive_losses} consecutive losses "
+                f"in session '{st.session_id}'. Review direction before next entry."
             )
 
+        # ── Per-session entry cap ──────────────────────────────────────────────
         if st.entries_taken >= MAX_ENTRIES_PER_SESSION:
             return (
                 f"MAX_ENTRIES_HIT: {st.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
-                f"entries taken this session."
+                f"entries taken this session. New session resets this counter."
             )
 
         return None
 
-    def reset_session(self) -> None:
+    def reset_session(self, reason: str = "manual") -> None:
+        """Full session reset — clears all pacing state. W/L counters preserved."""
+        wins   = self._session_state.wins
+        losses = self._session_state.losses
         logger.info(
-            f"ConvictionFilter: session reset "
-            f"(was W/L={self._session_state.wins}/{self._session_state.losses})")
-        self._session_state = SessionState()
+            f"ConvictionFilter: full session reset ({reason}) "
+            f"| was W/L={wins}/{losses} "
+            f"entries={self._session_state.entries_taken} "
+            f"consec_losses={self._session_state.consecutive_losses}"
+        )
+        self._session_state = SessionState(wins=wins, losses=losses)
 
     # ─────────────────────────────────────────────────────────────────────────
     # FACTOR SCORING METHODS

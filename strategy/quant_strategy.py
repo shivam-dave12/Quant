@@ -4610,6 +4610,9 @@ class QuantStrategy:
         # Key format: (pool_price_float, sweep_timestamp_int_ms)
         # Entries are pruned when older than 60s to prevent unbounded growth.
         self._notified_sweeps: set = set()
+        # Track previous killzone so on_session_change() fires exactly once per
+        # London/NY/Asia/OFF_HOURS boundary — resets conviction session quota.
+        self._last_conviction_kz: str = ""
 
         self._log_init()
 
@@ -6113,6 +6116,20 @@ class QuantStrategy:
                     ict_ctx.kill_zone = sess.get("session", "")
                 except Exception:
                     pass
+                # ── CONVICTION GATE: session boundary reset ────────────────────
+                # When the killzone changes (OFF_HOURS→NEW_YORK, NEW_YORK→LONDON
+                # etc.) reset entries_taken and consecutive_losses so each new
+                # institutional session gets a fresh quota.  MIN_ENTRY_INTERVAL
+                # cooldown is also cleared — it is intra-session pacing only.
+                _new_kz = ict_ctx.kill_zone or str(getattr(self._ict, '_killzone', '') or '')
+                if (self._conviction is not None
+                        and _new_kz
+                        and _new_kz != self._last_conviction_kz):
+                    self._last_conviction_kz = _new_kz
+                    try:
+                        self._conviction.on_session_change(_new_kz)
+                    except Exception as _kz_e:
+                        logger.debug(f"ConvictionFilter.on_session_change error: {_kz_e}")
             except Exception as e:
                 logger.debug(f"ICT context build error: {e}")
 
@@ -6343,7 +6360,7 @@ class QuantStrategy:
 
                 _conv_result = self._conviction.evaluate(
                     trade_side   = signal.side,
-                    sweep_pool   = _conv_pool if _conv_pool is not None else object(),
+                    sweep_pool   = _conv_pool,   # None is handled by _extract_pool_info
                     entry_price  = signal.entry_price,
                     sl_price     = signal.sl_price,
                     tp_price     = signal.tp_price,
@@ -8279,6 +8296,16 @@ class QuantStrategy:
         # Moving it here prevents aborted entries (TP-gate, fee-gate, exchange
         # error) from consuming the daily trade cap with no actual order sent.
         self._risk_gate.record_trade_start()
+        # CONVICTION GATE: arm MIN_ENTRY_INTERVAL pacing timer and increment
+        # entries_taken ONLY after the order is confirmed filled and the position
+        # is ACTIVE.  Calling this here (not in evaluate()) ensures that signals
+        # which pass conviction but fail to execute (margin too low, TP gate,
+        # exchange error) do NOT lock out the next signal for 900 seconds.
+        if self._conviction is not None:
+            try:
+                self._conviction.mark_entry_placed(time.time())
+            except Exception as _cv_mp_e:
+                logger.debug(f"ConvictionFilter.mark_entry_placed error: {_cv_mp_e}")
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_opened()
 
