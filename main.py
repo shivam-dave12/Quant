@@ -242,37 +242,6 @@ class QuantBot:
             )
             self.order_manager = self.execution_router  # alias for controller
 
-            # ── ISSUE-2 FIX: Apply plain-limit TP/SL patch to all OMs ────────
-            # Replaces trigger/conditional stop orders with resting limit orders
-            # placed directly in the book at the exact SL/TP price.
-            # Maker rebate from placement; zero trigger-activation latency.
-            # Applied to EVERY configured OrderManager so it persists across
-            # runtime exchange switches (/setexchange).
-            try:
-                from execution.order_manager_limit_patch import patch_order_manager as _patch_om
-            except ImportError:
-                try:
-                    from order_manager_limit_patch import patch_order_manager as _patch_om
-                except ImportError:
-                    _patch_om = None
-                    logger.warning(
-                        "⚠️  order_manager_limit_patch not found — "
-                        "TP/SL will use original trigger orders")
-
-            if _patch_om is not None:
-                _patched = []
-                for _exch_key, _om_inst in self.execution_router._managers.items():
-                    try:
-                        _patch_om(_om_inst)
-                        _patched.append(_exch_key)
-                    except Exception as _pe:
-                        logger.warning(
-                            f"⚠️  patch_order_manager failed for {_exch_key}: {_pe}")
-                if _patched:
-                    logger.info(
-                        f"✅ Plain-limit TP/SL patch applied to: "
-                        f"{', '.join(_patched)}")
-
             # ── Build data managers ───────────────────────────────────────────
             exec_exch = config.EXECUTION_EXCHANGE.lower()
 

@@ -6236,6 +6236,9 @@ class QuantStrategy:
                     cvd_trend    = _cvd_ps,
                     liq_snapshot = liq_snapshot,   # fresh — liq_map.update() already ran
                 )
+                # Store for conviction gate's CISD factor (issue-2 fix)
+                if _ps_decision is not None:
+                    self._dir_engine._last_ps_decision = _ps_decision
                 if _ps_decision is not None and _ps_decision.action in ("reverse", "continue"):
                     # Inject verdict into ICTContext so entry_engine can weight it
                     ict_ctx.direction_hint            = _ps_decision.action
@@ -6323,10 +6326,24 @@ class QuantStrategy:
                 if self._ict is not None:
                     _sess_str = str(getattr(self._ict, '_killzone', '') or '')
 
+                # Resolve sweep_pool: prefer signal.swept_pool (actual swept pool),
+                # fall back to primary_target (pool being approached).
+                _conv_pool = None
+                if hasattr(signal, 'swept_pool') and signal.swept_pool is not None:
+                    _conv_pool = signal.swept_pool
+                elif hasattr(signal, 'target_pool') and signal.target_pool is not None:
+                    _conv_pool = signal.target_pool
+                elif liq_snapshot and liq_snapshot.primary_target is not None:
+                    _conv_pool = liq_snapshot.primary_target
+
+                # Entry type for approach vs reversal detection
+                _entry_type_str = (signal.entry_type.value
+                                   if hasattr(signal, 'entry_type') and signal.entry_type is not None
+                                   else "")
+
                 _conv_result = self._conviction.evaluate(
                     trade_side   = signal.side,
-                    sweep_pool   = signal.swept_pool if hasattr(signal, 'swept_pool') and signal.swept_pool is not None
-                                   else (liq_snapshot.primary_target if liq_snapshot and liq_snapshot.primary_target else object()),
+                    sweep_pool   = _conv_pool if _conv_pool is not None else object(),
                     entry_price  = signal.entry_price,
                     sl_price     = signal.sl_price,
                     tp_price     = signal.tp_price,
@@ -6338,6 +6355,7 @@ class QuantStrategy:
                     ps_decision  = _ps_dec_for_conv,
                     candles_5m   = candles_by_tf.get("5m"),
                     session      = _sess_str,
+                    entry_type   = _entry_type_str,
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])

@@ -1,73 +1,53 @@
 """
-conviction_filter.py — Institutional Entry Conviction Gate v1.0
+conviction_filter.py — Institutional Entry Conviction Gate v2.0
 ================================================================
-ISSUE-4 FIX: Win rate improvement to ≥70% via mandatory multi-factor
-convergence before any entry is allowed.
+COMPLETE REWRITE — v1.0 had fundamental calculation errors that caused
+score=0.000 on every evaluation, blocking 100% of trades.
 
-ROOT CAUSE ANALYSIS — why win rates below 70% happen in an ICT/SMC system:
+ROOT CAUSE ANALYSIS OF v1.0 FAILURES:
+  1. POOL_TF_BLOCKED (primary): Gate read the pool's NATIVE timeframe (often 1m)
+     but ignored htf_count. A 1m pool with HTFx2 confluence IS institutionally
+     equivalent to a 15m pool — that is literally what htf_count measures.
+     Fix: effective_rank = max(native_rank, htf_count_rank).
 
-  1. PREMATURE ENTRIES: Entering on sweep detection alone, before displacement
-     and CISD confirm the reversal. The "sweep" might be incomplete — price
-     could continue sweeping more pools above/below.
+  2. AMD_BLOCKED ACCUMULATION (secondary): Bot is frequently in ACCUMULATION
+     phase (consolidation between moves). Hard-blocking ALL ACCUMULATION was
+     blocking 100% of setup windows. ICT allows entries in accumulation when
+     bias is directional — it's the RANDOM/NEUTRAL accumulation that is low
+     probability, not accumulation with a bullish/bearish lean.
+     Fix: ACCUMULATION + aligned bias -> 0.40 score (not hard block).
 
-  2. WRONG POOL TARGETING: Entering the reversal from a LOW-SIGNIFICANCE pool.
-     5m equal lows are swept and bounced ~40% of the time. 1H swing lows are
-     swept and bounced ~72% of the time. 4H swing lows: ~81%.
+  3. CISD score always 0.0: _last_ps_decision did not exist on DirectionEngine.
+     quant_strategy.py now stores it after evaluate_sweep; conviction gate
+     reads it correctly via ps_decision parameter.
 
-  3. DEALING RANGE VIOLATIONS: Entering LONG when price is in PREMIUM (above
-     50% of dealing range). ICT rule: ONLY longs in discount, ONLY shorts in
-     premium. Every violation of this drops win rate ~15–20%.
+  4. OTE score wrong for approach signals: PRE_SWEEP_APPROACH fires BEFORE
+     price reaches the pool — OTE calculation assumed post-sweep retrace.
+     Fix: entry-type aware scoring via entry_type parameter.
 
-  4. COUNTER-SESSION ENTRIES: Taking reversal longs during London distribution
-     phase or Asia consolidation. ICT specifically says these sessions have
-     directional delivery — fighting them is low probability.
+  5. MIN_RR = 2.0 blocked all entry-engine signals: entry engine produces
+     1.4-1.6 R:R signals (validated, high-quality). Gate required 2.0+.
+     Fix: MIN_RR = 1.40 (matching entry engine's own minimum).
 
-  5. NO DISPLACEMENT CONFIRMATION: Entering before a strong displacement candle
-     closes AWAY from the swept level. Without displacement, the sweep might be
-     engineered to trap early reversals before continuing in the sweep direction.
+  6. REQUIRED_CONVICTION_SCORE = 0.75 unreachable with all factors at 0.0.
+     Fix: threshold = 0.55 (still selective, achievable with real signals).
 
-  6. MISSING OTE: Entering at the sweep level directly rather than waiting for
-     the 50–78.6% Fibonacci retrace. OTE is WHERE smart money re-enters. At
-     the swept level, you compete with trapped longs/shorts and liquidity noise.
+  7. Session ASIA hard block over-strict for directional setups.
+     Fix: ASIA is a strong penalty (0.10) not a hard block.
 
-SOLUTION — 7-FACTOR CONVICTION SCORE:
-  Each factor is binary (pass/fail) with a weight. Entry requires:
-    • Conviction score ≥ REQUIRED_SCORE (0.75 by default)
-    • MANDATORY GATES that must ALL pass regardless of score:
-      - Pool significance ≥ 1h level (no 5m-only sweeps)
-      - Dealing range position is valid (discount for long, premium for short)
-      - AMD phase is not ACCUMULATION (must be MANIPULATION or DISTRIBUTION)
-
-  Factor                         Weight    ICT basis
-  ─────────────────────────────────────────────────────────────────────────
-  1. Pool significance tier        0.25    Higher TF pool = higher probability
-  2. Dealing range valid            GATE    ICT rule: premium/discount gate
-  3. Displacement confirmed         0.20    Closed strong candle = institutional footprint
-  4. CISD (CHoCH/BOS post-sweep)    0.20    Change in state of delivery = green light
-  5. OTE zone retracement           0.15    50–78.6% fib = institutional re-entry
-  6. Session alignment              0.10    London/NY kill zone = delivery expected
-  7. AMD phase alignment            0.10    MANIPULATION/DISTRIBUTION = directional
-  ─────────────────────────────────────────────────────────────────────────
+FACTOR WEIGHTS (revised):
+  1. Pool significance tier         0.25  (HTF-effective rank, not just native TF)
+  2. Dealing range valid            GATE  (premium/discount — still enforced)
+  3. Displacement confirmed         0.25  (ICT footprint — primary evidence)
+  4. CISD (CHoCH/BOS post-sweep)   0.20  (structural state change)
+  5. OTE zone retracement           0.15  (entry quality — partial for approach)
+  6. Session alignment              0.10  (kill zone bonus)
+  7. AMD phase alignment            0.05  (reduced — phase can lag)
   TOTAL                             1.00
 
-  MANDATORY GATES: #2 (dealing range) + pool_sig >= POOL_MIN_TF_RANK
-
-ADDITIONAL QUALITY FILTERS (applied after conviction gate):
-  • Minimum time since last trade: 15 min (avoid revenge trading)
-  • Maximum trades per session: 3 (quality over quantity)
-  • Required R:R >= 2.0 (only take trades where next pool is ≥ 2× SL distance)
-  • No entry if two consecutive losses in the same session (session invalidated)
-
-WIN RATE TARGET METHODOLOGY:
-  At the default thresholds, back-testing on BTC perp 2023–2024 shows:
-    Baseline (no filter):      ~45% win rate, 8–12 entries/day
-    Pool sig filter only:      ~55% win rate, 5–8 entries/day
-    + Dealing range gate:      ~62% win rate, 4–6 entries/day
-    + Displacement + CISD:     ~71% win rate, 2–4 entries/day
-    + OTE + Session + AMD:     ~76% win rate, 1–3 entries/day
-  
-  The 70% target is hit at: displacement + CISD + dealing range + pool sig ≥ 1h.
-  The 76% is achieved with all 7 factors. Volume of trades drops — quality rises.
+MANDATORY GATES (early return on fail):
+  - Dealing range: longs below 0.58 P/D only, shorts above 0.42 P/D only
+  - R:R: minimum 1.40 (matching entry engine)
 """
 
 from __future__ import annotations
@@ -85,54 +65,44 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Minimum conviction score to allow entry (0.0–1.0)
-REQUIRED_CONVICTION_SCORE = 0.75
+REQUIRED_CONVICTION_SCORE = 0.55
 
-# Pool timeframe minimum for mandatory gate (must be AT LEAST this TF)
-# 3 = 15m, 4 = 1h, 5 = 4h. Set to 3 (15m minimum — filters pure 5m/2m sweeps)
-POOL_MIN_TF_RANK = 3   # 15m or higher
+# Pool minimum EFFECTIVE TF rank (after HTF-confluence boost)
+# 1=1m, 2=5m, 3=15m. Set to 2: pools with htf_count>=1 clear this.
+POOL_MIN_TF_RANK = 2
 
-# TF ranks for reference
 _TF_RANK: Dict[str, int] = {
-    "1m": 1, "2m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6,
+    "1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3,
+    "30m": 3, "1h": 4, "4h": 5, "1d": 6,
 }
 
-# Displacement: minimum candle body size (as fraction of ATR) to confirm
-DISPLACEMENT_MIN_BODY_ATR = 0.6   # 60% of ATR — strong institutional candle
+DISPLACEMENT_MIN_BODY_ATR = 0.55
 
-# OTE Fibonacci levels (50%–78.6% retrace from sweep to pre-sweep origin)
 OTE_FIB_LOW  = 0.500
 OTE_FIB_HIGH = 0.786
 
-# Minimum R:R required to allow entry
-MIN_RR = 2.0
+MIN_RR = 1.40  # matches entry engine minimum
 
-# Session scoring: which sessions allow entries and with what priority
 _SESSION_SCORE: Dict[str, float] = {
-    "LONDON":    1.00,   # Full score — London open = primary manipulation kill zone
-    "NY":        1.00,   # Full score — NY open = primary delivery kill zone
-    "LONDON_NY": 0.80,   # NY after London close: still valid but less structured
-    "ASIA":      0.00,   # BLOCK — Asia = accumulation, no directional delivery
-    "":          0.50,   # Unknown session: partial credit
+    "LONDON":    1.00,
+    "NY":        1.00,
+    "NEW_YORK":  1.00,
+    "LONDON_NY": 0.80,
+    "ASIA":      0.10,   # Penalty, not hard block
+    "":          0.50,
 }
 
-# AMD phase scoring
 _AMD_PHASE_SCORE: Dict[str, float] = {
-    "MANIPULATION":   1.00,   # Best — Judas swing → clean reversal expected
-    "DISTRIBUTION":   0.85,   # Good — real move underway, continuation trades
-    "REACCUMULATION": 0.70,   # OK — mid-trend pause, likely resume
-    "REDISTRIBUTION": 0.70,
-    "ACCUMULATION":   0.00,   # BLOCK — no direction yet
-    "":               0.40,   # Unknown
+    "MANIPULATION":   1.00,
+    "DISTRIBUTION":   0.85,
+    "REACCUMULATION": 0.75,
+    "REDISTRIBUTION": 0.75,
+    "ACCUMULATION":   0.40,   # v2.0 fix: not 0.0
+    "":               0.45,
 }
 
-# Maximum consecutive session losses before blocking further entries
-MAX_SESSION_LOSSES = 2
-
-# Minimum time between entries (seconds)
-MIN_ENTRY_INTERVAL_SEC = 900   # 15 minutes
-
-# Maximum entries per session
+MAX_SESSION_LOSSES    = 2
+MIN_ENTRY_INTERVAL_SEC = 900
 MAX_ENTRIES_PER_SESSION = 3
 
 
@@ -142,21 +112,19 @@ MAX_ENTRIES_PER_SESSION = 3
 
 @dataclass
 class ConvictionFactors:
-    """Per-factor results for a conviction assessment."""
-    pool_sig_score:     float = 0.0   # Factor 1: pool significance tier [0–1]
-    dealing_range_ok:   bool  = False # Gate: premium/discount valid
-    displacement_score: float = 0.0   # Factor 3: displacement strength [0–1]
-    cisd_score:         float = 0.0   # Factor 4: CHoCH/BOS post-sweep [0–1]
-    ote_score:          float = 0.0   # Factor 5: OTE retracement [0–1]
-    session_score:      float = 0.0   # Factor 6: session alignment [0–1]
-    amd_score:          float = 0.0   # Factor 7: AMD phase [0–1]
+    pool_sig_score:     float = 0.0
+    dealing_range_ok:   bool  = False
+    displacement_score: float = 0.0
+    cisd_score:         float = 0.0
+    ote_score:          float = 0.0
+    session_score:      float = 0.0
+    amd_score:          float = 0.0
 
 
 @dataclass
 class ConvictionResult:
-    """Output of the conviction gate."""
     allowed:        bool
-    score:          float              # 0.0–1.0
+    score:          float
     factors:        ConvictionFactors  = field(default_factory=ConvictionFactors)
     reject_reasons: List[str]          = field(default_factory=list)
     allow_reasons:  List[str]          = field(default_factory=list)
@@ -167,13 +135,12 @@ class ConvictionResult:
 
 @dataclass
 class SessionState:
-    """Tracks per-session performance for dynamic quality control."""
-    session_id:       str = ""
-    entries_taken:    int = 0
-    consecutive_losses: int = 0
-    last_entry_time:  float = 0.0
-    wins:             int = 0
-    losses:           int = 0
+    session_id:         str   = ""
+    entries_taken:      int   = 0
+    consecutive_losses: int   = 0
+    last_entry_time:    float = 0.0
+    wins:               int   = 0
+    losses:             int   = 0
 
     def record_outcome(self, win: bool) -> None:
         if win:
@@ -190,125 +157,97 @@ class SessionState:
 
 class ConvictionFilter:
     """
-    Institutional Entry Conviction Gate.
+    Institutional Entry Conviction Gate v2.0
 
-    Called BEFORE any entry order is placed. Returns ConvictionResult.allowed
-    which must be True for the entry to proceed.
-
-    WIRING IN quant_strategy.py / entry_engine.py:
-    ────────────────────────────────────────────────
-    In QuantStrategy.__init__():
-        from conviction_filter import ConvictionFilter
-        self._conviction = ConvictionFilter()
-
-    In _evaluate_entry() BEFORE placing any order:
-        conviction = self._conviction.evaluate(
-            trade_side      = "long",   # "long" | "short"
-            sweep_pool      = swept_pool,            # PoolTarget
-            entry_price     = planned_entry,
-            sl_price        = planned_sl,
-            tp_price        = planned_tp,
-            price           = current_price,
-            atr             = atr,
-            now             = time.time(),
-            ict_engine      = self._ict,
-            liq_snapshot    = liq_snapshot,
-            ps_decision     = ps_decision,           # PostSweepDecision
-            candles_5m      = candles_5m,
-            session         = session_str,
-        )
-        if not conviction.allowed:
-            logger.info(f"ENTRY BLOCKED: {' | '.join(conviction.reject_reasons)}")
-            return   # Do NOT enter
-
-    After trade closes, record outcome:
-        self._conviction.record_trade_result(win=True)  # or False
+    Evaluates 7 ICT factors with corrected calculations.
+    Mandatory gates: dealing range + R:R.
+    Score >= 0.55 allows entry.
     """
 
     def __init__(self) -> None:
         self._session_state = SessionState()
-        self._last_session_key = ""
 
     def evaluate(
         self,
-        trade_side:   str,          # "long" | "short"
-        sweep_pool,                 # PoolTarget or LiquidityPool
+        trade_side:   str,
+        sweep_pool,
         entry_price:  float,
         sl_price:     float,
         tp_price:     float,
         price:        float,
         atr:          float,
-        now:          float,        # epoch seconds
+        now:          float,
         ict_engine              = None,
         liq_snapshot            = None,
-        ps_decision             = None,    # PostSweepDecision from direction_engine
-        candles_5m: Optional[List[Dict]] = None,
-        session:    str             = "",
+        ps_decision             = None,
+        candles_5m: Optional[List] = None,
+        session:    str            = "",
+        entry_type: str            = "",
     ) -> ConvictionResult:
-        """
-        Evaluate whether this entry meets conviction requirements.
 
-        Returns ConvictionResult with allowed=True/False and full factor breakdown.
-        """
         factors  = ConvictionFactors()
         rejects: List[str] = []
         allows:  List[str] = []
 
-        # ── Preliminary: session state quality control ─────────────────────────
+        # ── Session quality control ────────────────────────────────────────
         session_block = self._check_session_limits(now, session)
         if session_block:
             return ConvictionResult(
                 allowed=False, score=0.0,
                 reject_reasons=[session_block], factors=factors)
 
-        # ── Pool info ──────────────────────────────────────────────────────────
-        pool_price = float(getattr(
-            getattr(sweep_pool, 'pool', sweep_pool), 'price', 0.0))
-        pool_tf    = str(getattr(
-            getattr(sweep_pool, 'pool', sweep_pool), 'timeframe', '5m'))
+        # ── Pool info ──────────────────────────────────────────────────────
+        pool_price, pool_tf, pool_sig, pool_htf_count = \
+            self._extract_pool_info(sweep_pool, atr)
 
-        if hasattr(sweep_pool, 'adjusted_sig'):
-            pool_sig = sweep_pool.adjusted_sig()
-        else:
-            pool_sig = float(getattr(
-                getattr(sweep_pool, 'pool', sweep_pool), 'significance', 1.0))
+        # ── EFFECTIVE TF RANK (v2.0 core fix) ─────────────────────────────
+        # htf_count measures how many higher TFs confirmed this pool level.
+        # A 1m pool with HTFx2 means two higher-TF structures converge there —
+        # institutionally equivalent to a 15m pool. This IS the ICT principle
+        # of multi-timeframe confluence.
+        native_rank = _TF_RANK.get(pool_tf, 2)
+        if   pool_htf_count >= 3: effective_rank = max(native_rank, 4)  # 1h equivalent
+        elif pool_htf_count >= 2: effective_rank = max(native_rank, 3)  # 15m equivalent
+        elif pool_htf_count >= 1: effective_rank = max(native_rank, 2)  # 5m equivalent
+        else:                     effective_rank = native_rank
 
-        pool_tf_rank = _TF_RANK.get(pool_tf, 2)
-
-        # ── MANDATORY GATE 1: Pool significance / timeframe ───────────────────
-        if pool_tf_rank < POOL_MIN_TF_RANK:
+        # ── MANDATORY GATE 1: Pool effective timeframe ─────────────────────
+        if effective_rank < POOL_MIN_TF_RANK:
             rejects.append(
-                f"POOL_TF_BLOCKED: {pool_tf} (rank {pool_tf_rank} < "
-                f"required {POOL_MIN_TF_RANK}). Minimum: 15m pool."
+                f"POOL_TF_BLOCKED: {pool_tf}(htfx{pool_htf_count}) "
+                f"effective_rank={effective_rank} < required={POOL_MIN_TF_RANK}. "
+                f"Need 5m+ effective rank (native 5m+, or 1m with HTFx1+)."
             )
             return ConvictionResult(
                 allowed=False, score=0.0,
                 reject_reasons=rejects, factors=factors,
                 pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── FACTOR 1: Pool significance score ─────────────────────────────────
-        factors.pool_sig_score = min(pool_sig / 8.0, 1.0)
-        if pool_sig >= 5.0:
-            allows.append(f"POOL_SIG={pool_sig:.1f} (strong {pool_tf})")
-        elif pool_sig >= 3.0:
-            allows.append(f"POOL_SIG={pool_sig:.1f} (moderate {pool_tf})")
+        # ── FACTOR 1: Pool significance score (weight 0.25) ───────────────
+        _rank_bonus = min(effective_rank / 4.0, 1.0)
+        _sig_score  = min(pool_sig / 8.0, 1.0)
+        factors.pool_sig_score = _rank_bonus * 0.40 + _sig_score * 0.60
+        if effective_rank >= 3 and pool_sig >= 5.0:
+            allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f} STRONG")
+        else:
+            allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f}")
 
-        # ── MANDATORY GATE 2: Dealing range valid ──────────────────────────────
+        # ── MANDATORY GATE 2: Dealing range ───────────────────────────────
         dr_pd = self._get_dealing_range_pd(price, ict_engine, liq_snapshot)
-        if trade_side == "long" and dr_pd > 0.55:
+        if trade_side == "long" and dr_pd > 0.58:
             rejects.append(
-                f"DEALING_RANGE_BLOCKED: price in PREMIUM (P/D={dr_pd:.2f}>0.55). "
-                f"ICT rule: longs only in DISCOUNT."
+                f"DEALING_RANGE_BLOCKED: LONG in PREMIUM (P/D={dr_pd:.2f}>0.58). "
+                f"ICT rule: longs only below equilibrium."
             )
             factors.dealing_range_ok = False
             return ConvictionResult(
                 allowed=False, score=0.0,
                 reject_reasons=rejects, factors=factors,
                 pool_tf=pool_tf, pool_sig=pool_sig)
-        elif trade_side == "short" and dr_pd < 0.45:
+        elif trade_side == "short" and dr_pd < 0.42:
             rejects.append(
-                f"DEALING_RANGE_BLOCKED: price in DISCOUNT (P/D={dr_pd:.2f}<0.45). "
-                f"ICT rule: shorts only in PREMIUM."
+                f"DEALING_RANGE_BLOCKED: SHORT in DISCOUNT (P/D={dr_pd:.2f}<0.42). "
+                f"ICT rule: shorts only above equilibrium."
             )
             factors.dealing_range_ok = False
             return ConvictionResult(
@@ -317,76 +256,87 @@ class ConvictionFilter:
                 pool_tf=pool_tf, pool_sig=pool_sig)
         else:
             factors.dealing_range_ok = True
-            allows.append(f"DEALING_RANGE_OK: P/D={dr_pd:.2f} ({'discount' if trade_side == 'long' else 'premium'})")
+            _dr_label = (
+                "DEEP-DISC" if dr_pd < 0.25 else
+                "DISCOUNT"  if dr_pd < 0.42 else
+                "EQ"        if dr_pd < 0.58 else
+                "PREMIUM"   if dr_pd < 0.75 else "DEEP-PREM"
+            )
+            allows.append(f"DR={_dr_label}({dr_pd:.2f})")
 
-        # ── MANDATORY GATE 3: R:R check ───────────────────────────────────────
+        # ── MANDATORY GATE 3: R:R ──────────────────────────────────────────
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
         if rr < MIN_RR:
             rejects.append(
-                f"RR_BLOCKED: R:R={rr:.2f} < {MIN_RR}. Next pool must be "
-                f"at least {MIN_RR}× the SL distance."
+                f"RR_BLOCKED: R:R={rr:.2f} < {MIN_RR:.2f}. "
+                f"Minimum {MIN_RR:.2f}R required."
             )
             return ConvictionResult(
                 allowed=False, score=0.0,
                 reject_reasons=rejects, factors=factors,
                 rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
-        allows.append(f"RR={rr:.1f}R")
+        allows.append(f"RR={rr:.2f}R")
 
-        # ── FACTOR 3: Displacement confirmation ───────────────────────────────
+        # Determine if this is an approach (pre-sweep) type signal
+        is_approach = ("approach" in entry_type.lower() or
+                       "pre_sweep" in entry_type.lower() or
+                       "proximity" in entry_type.lower())
+
+        # ── FACTOR 3: Displacement (weight 0.25) ──────────────────────────
         factors.displacement_score = self._score_displacement(
-            trade_side, price, pool_price, atr, candles_5m, ict_engine)
-        if factors.displacement_score >= 0.6:
-            allows.append(f"DISPLACEMENT={factors.displacement_score:.2f}")
-        elif factors.displacement_score < 0.3:
-            rejects.append(
-                f"DISPLACEMENT_WEAK={factors.displacement_score:.2f} "
-                f"(min 0.30 for scoring)")
+            trade_side, price, pool_price, atr, candles_5m, ict_engine,
+            is_approach=is_approach)
+        if factors.displacement_score >= 0.70:
+            allows.append(f"DISP={factors.displacement_score:.2f} ✅")
+        elif factors.displacement_score >= 0.40:
+            allows.append(f"DISP={factors.displacement_score:.2f}")
+        else:
+            rejects.append(f"DISP_WEAK={factors.displacement_score:.2f}")
 
-        # ── FACTOR 4: CISD (Change in State of Delivery) ─────────────────────
-        factors.cisd_score = self._score_cisd(trade_side, ps_decision, ict_engine)
-        if factors.cisd_score >= 0.7:
+        # ── FACTOR 4: CISD (weight 0.20) ──────────────────────────────────
+        factors.cisd_score = self._score_cisd(
+            trade_side, ps_decision, ict_engine, is_approach=is_approach)
+        if factors.cisd_score >= 0.70:
+            allows.append(f"CISD={factors.cisd_score:.2f} ✅")
+        elif factors.cisd_score >= 0.35:
             allows.append(f"CISD={factors.cisd_score:.2f}")
 
-        # ── FACTOR 5: OTE zone ────────────────────────────────────────────────
-        factors.ote_score = self._score_ote(
-            trade_side, entry_price, pool_price, price)
-        if factors.ote_score >= 0.7:
-            allows.append(f"OTE={factors.ote_score:.2f}")
+        # ── FACTOR 5: OTE zone (weight 0.15) ──────────────────────────────
+        if is_approach:
+            # Not yet at pool — give partial credit for approaching OTE zone
+            factors.ote_score = 0.55
+        else:
+            factors.ote_score = self._score_ote(
+                trade_side, entry_price, pool_price, price)
+        if factors.ote_score >= 0.70:
+            allows.append(f"OTE={factors.ote_score:.2f} ✅")
 
-        # ── FACTOR 6: Session alignment ───────────────────────────────────────
+        # ── FACTOR 6: Session (weight 0.10) ───────────────────────────────
         sess_key = self._resolve_session(session, ict_engine)
-        factors.session_score = _SESSION_SCORE.get(sess_key, 0.5)
-        if sess_key == "ASIA" and _SESSION_SCORE["ASIA"] == 0.0:
-            rejects.append("SESSION_BLOCKED: ASIA (accumulation — no directional delivery)")
-            return ConvictionResult(
-                allowed=False, score=0.0,
-                reject_reasons=rejects, factors=factors,
-                pool_tf=pool_tf, pool_sig=pool_sig)
-        if factors.session_score >= 0.8:
+        factors.session_score = _SESSION_SCORE.get(sess_key, 0.50)
+        if factors.session_score >= 0.80:
             allows.append(f"SESSION={sess_key}")
+        elif factors.session_score < 0.20:
+            rejects.append(f"SESSION_WEAK={sess_key}({factors.session_score:.2f})")
 
-        # ── FACTOR 7: AMD phase ───────────────────────────────────────────────
+        # ── FACTOR 7: AMD phase (weight 0.05) ─────────────────────────────
         factors.amd_score = self._score_amd(trade_side, ict_engine)
-        if factors.amd_score == 0.0:
-            rejects.append("AMD_BLOCKED: ACCUMULATION phase — no directional delivery")
-            return ConvictionResult(
-                allowed=False, score=0.0,
-                reject_reasons=rejects, factors=factors,
-                pool_tf=pool_tf, pool_sig=pool_sig)
-        if factors.amd_score >= 0.85:
-            allows.append(f"AMD={factors.amd_score:.2f}")
+        if factors.amd_score >= 0.80:
+            allows.append(f"AMD={factors.amd_score:.2f} ✅")
+        elif factors.amd_score < 0.20:
+            rejects.append(f"AMD_WEAK={factors.amd_score:.2f}")
 
-        # ── COMPUTE CONVICTION SCORE ───────────────────────────────────────────
+        # ── COMPUTE CONVICTION SCORE ───────────────────────────────────────
         score = (
             factors.pool_sig_score     * 0.25 +
-            factors.displacement_score * 0.20 +
+            factors.displacement_score * 0.25 +
             factors.cisd_score         * 0.20 +
             factors.ote_score          * 0.15 +
             factors.session_score      * 0.10 +
-            factors.amd_score          * 0.10
+            factors.amd_score          * 0.05
         )
 
-        # ── FINAL DECISION ─────────────────────────────────────────────────────
+        # ── FINAL DECISION ─────────────────────────────────────────────────
         if score < REQUIRED_CONVICTION_SCORE:
             rejects.append(
                 f"SCORE_TOO_LOW: {score:.3f} < {REQUIRED_CONVICTION_SCORE} "
@@ -400,20 +350,18 @@ class ConvictionFilter:
             allowed = False
         else:
             allowed = True
-            allows.append(f"TOTAL_SCORE={score:.3f} ✅")
+            allows.append(f"TOTAL={score:.3f} ✅")
 
         if allowed:
             self._session_state.entries_taken += 1
             self._session_state.last_entry_time = now
             logger.info(
                 f"✅ CONVICTION PASSED ({score:.3f}) | "
-                f"{' | '.join(allows)}"
-            )
+                f"{' | '.join(allows)}")
         else:
             logger.info(
                 f"❌ CONVICTION BLOCKED ({score:.3f}) | "
-                f"REJECT: {' | '.join(rejects)}"
-            )
+                f"REJECT: {' | '.join(rejects)}")
 
         return ConvictionResult(
             allowed        = allowed,
@@ -427,37 +375,75 @@ class ConvictionFilter:
         )
 
     def record_trade_result(self, win: bool) -> None:
-        """Call after each trade closes to update session quality control."""
         self._session_state.record_outcome(win)
-        outcome = "WIN" if win else "LOSS"
         logger.info(
-            f"ConvictionFilter: trade {outcome} | "
-            f"session W/L={self._session_state.wins}/{self._session_state.losses} "
-            f"consecutive_losses={self._session_state.consecutive_losses}"
+            f"ConvictionFilter: {'WIN' if win else 'LOSS'} | "
+            f"W/L={self._session_state.wins}/{self._session_state.losses} "
+            f"consec_losses={self._session_state.consecutive_losses}"
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FACTOR SCORING METHODS
+    # POOL INFO EXTRACTION
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_pool_info(sweep_pool, atr: float) -> Tuple[float, str, float, int]:
+        """
+        Extract (price, timeframe, significance, htf_count) from any pool object.
+        Handles PoolTarget, SweepResult, LiquidityPool, bare objects.
+        """
+        if sweep_pool is None:
+            return 0.0, "5m", 1.0, 0
+
+        # Unwrap PoolTarget/SweepResult -> inner pool
+        inner = getattr(sweep_pool, 'pool', sweep_pool)
+
+        price   = float(getattr(inner, 'price', 0.0) or 0.0)
+        tf      = str(getattr(inner, 'timeframe', '5m') or '5m')
+        htf_cnt = int(getattr(inner, 'htf_count', 0) or 0)
+
+        # Significance: try multiple attribute names
+        sig = 0.0
+        for attr in ('significance', 'adjusted_sig', 'sig'):
+            _v = getattr(sweep_pool, attr, None)
+            if _v is None:
+                _v = getattr(inner, attr, None)
+            if _v is not None:
+                try:
+                    sig = float(_v() if callable(_v) else _v)
+                    if sig > 0:
+                        break
+                except Exception:
+                    pass
+        if sig <= 0.0:
+            tc  = int(getattr(inner, 'touches', 0) or 0)
+            sig = max(1.0, 2.0 + tc * 0.5)
+
+        # Proximity boost for PoolTarget objects
+        dist_atr = float(getattr(sweep_pool, 'distance_atr', 99.0) or 99.0)
+        if dist_atr < 3.0:
+            sig *= max(0.5, 1.0 + (3.0 - dist_atr) / 6.0)
+
+        return price, tf, round(sig, 2), htf_cnt
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SESSION QUALITY CONTROL
     # ─────────────────────────────────────────────────────────────────────────
 
     def _check_session_limits(self, now: float, session: str) -> Optional[str]:
-        """Return block reason string if session limits are hit, else None."""
         st = self._session_state
 
-        # Time interval check
         if (st.last_entry_time > 0
                 and (now - st.last_entry_time) < MIN_ENTRY_INTERVAL_SEC):
             wait = int(MIN_ENTRY_INTERVAL_SEC - (now - st.last_entry_time))
             return f"MIN_INTERVAL: {wait}s until next entry allowed"
 
-        # Consecutive loss guard
         if st.consecutive_losses >= MAX_SESSION_LOSSES:
             return (
                 f"SESSION_INVALIDATED: {st.consecutive_losses} consecutive losses. "
                 f"Review direction before next entry."
             )
 
-        # Max entries per session
         if st.entries_taken >= MAX_ENTRIES_PER_SESSION:
             return (
                 f"MAX_ENTRIES_HIT: {st.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
@@ -467,19 +453,23 @@ class ConvictionFilter:
         return None
 
     def reset_session(self) -> None:
-        """Call at the start of each new session (London/NY open)."""
         logger.info(
             f"ConvictionFilter: session reset "
-            f"(was W/L={self._session_state.wins}/{self._session_state.losses})"
-        )
+            f"(was W/L={self._session_state.wins}/{self._session_state.losses})")
         self._session_state = SessionState()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FACTOR SCORING METHODS
+    # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _get_dealing_range_pd(price: float, ict_engine, liq_snapshot) -> float:
-        """Get dealing range P/D position [0=discount, 1=premium]."""
+        """Get dealing range P/D position [0=full discount, 1=full premium]."""
         dr = getattr(ict_engine, '_dealing_range', None) if ict_engine else None
         if dr is not None:
-            return float(getattr(dr, 'current_pd', 0.5))
+            pd = getattr(dr, 'current_pd', None)
+            if pd is not None:
+                return float(pd)
 
         if liq_snapshot is not None:
             bsl_pools = getattr(liq_snapshot, 'bsl_pools', [])
@@ -492,11 +482,10 @@ class ConvictionFilter:
                 rng = max(bsl - ssl, 1e-9)
                 return (price - ssl) / rng
 
-        return 0.5   # unknown — neutral (neither blocked nor passed)
+        return 0.50  # neutral — passes gate for both directions
 
     @staticmethod
     def _compute_rr(trade_side: str, entry: float, sl: float, tp: float) -> float:
-        """Compute R:R = distance to TP / distance to SL."""
         sl_dist = abs(entry - sl)
         tp_dist = abs(tp - entry)
         if sl_dist < 1e-10:
@@ -505,116 +494,136 @@ class ConvictionFilter:
 
     @staticmethod
     def _score_displacement(
-        trade_side: str,
-        price: float,
-        pool_price: float,
-        atr: float,
-        candles_5m: Optional[List],
+        trade_side:  str,
+        price:       float,
+        pool_price:  float,
+        atr:         float,
+        candles_5m:  Optional[List],
         ict_engine,
+        is_approach: bool = False,
     ) -> float:
-        """
-        Score displacement strength post-sweep [0–1].
+        """Score displacement strength [0-1]."""
+        if is_approach:
+            # Pre-sweep: check ICT engine pool displacement_confirmed flag
+            if ict_engine is not None:
+                try:
+                    for pool in ict_engine.liquidity_pools:
+                        if abs(getattr(pool, 'price', 0) - pool_price) < atr * 0.5:
+                            if getattr(pool, 'displacement_confirmed', False):
+                                ds = float(getattr(pool, 'displacement_score', 0.5) or 0.5)
+                                return min(ds * 0.80, 0.80)
+                except Exception:
+                    pass
+            return 0.45  # baseline credit for approaching pool
 
-        Displacement = strong closed candle body moving AWAY from swept pool.
-        Long (SSL swept): candle must close UP with large body.
-        Short (BSL swept): candle must close DOWN with large body.
-        """
-        if not candles_5m or len(candles_5m) < 3:
-            # Fallback: use displacement_score from ict_engine if available
+        # Reversal: scan last 3 closed 5m candles for displacement body
+        if candles_5m and len(candles_5m) >= 4:
+            closed = candles_5m[-4:-1]
+            scores = []
+            for c in closed:
+                try:
+                    o, cl = float(c['o']), float(c['c'])
+                    h, lo = float(c['h']), float(c['l'])
+                    body  = abs(cl - o)
+                    rng   = max(h - lo, 1e-10)
+                    bf    = body / rng
+                    ba    = body / max(atr, 1e-10)
+
+                    if trade_side == "long" and cl > o:
+                        scores.append(min(ba / DISPLACEMENT_MIN_BODY_ATR, 1.0) * bf)
+                    elif trade_side == "short" and cl < o:
+                        scores.append(min(ba / DISPLACEMENT_MIN_BODY_ATR, 1.0) * bf)
+                    else:
+                        scores.append(0.0)
+                except Exception:
+                    continue
+
+            if scores:
+                return min(max(scores), 1.0)
+
+        # Fallback: ICT engine pool displacement score
+        if ict_engine is not None:
             try:
-                if ict_engine:
-                    pools = list(getattr(ict_engine, 'liquidity_pools', []))
-                    for p in pools:
-                        if abs(getattr(p, 'price', 0) - pool_price) < atr * 0.3:
-                            ds = float(getattr(p, 'displacement_score', 0.0) or 0.0)
+                for p in ict_engine.liquidity_pools:
+                    if abs(getattr(p, 'price', 0) - pool_price) < atr * 0.4:
+                        ds = float(getattr(p, 'displacement_score', 0.0) or 0.0)
+                        if ds > 0:
                             return min(ds, 1.0)
             except Exception:
                 pass
-            return 0.3   # partial credit for unknown
 
-        # Use last 2 CLOSED candles (exclude live candle [-1])
-        closed = candles_5m[-3:-1]
-        if not closed:
-            return 0.3
-
-        scores = []
-        for c in closed:
-            try:
-                o, cl = float(c['o']), float(c['c'])
-                h, lo = float(c['h']), float(c['l'])
-                body  = abs(cl - o)
-                wick  = (h - lo) - body
-                # Body fraction of range
-                rng   = max(h - lo, 1e-10)
-                bf    = body / rng
-                # Body size relative to ATR
-                ba    = body / atr
-
-                # Direction check
-                if trade_side == "long" and cl > o:   # bullish candle
-                    score = min(ba / DISPLACEMENT_MIN_BODY_ATR, 1.0) * bf
-                elif trade_side == "short" and cl < o: # bearish candle
-                    score = min(ba / DISPLACEMENT_MIN_BODY_ATR, 1.0) * bf
-                else:
-                    score = 0.0   # wrong direction candle
-
-                scores.append(score)
-            except Exception:
-                continue
-
-        return min(max(scores, default=0.0), 1.0)
+        return 0.30  # minimal partial credit
 
     @staticmethod
-    def _score_cisd(trade_side: str, ps_decision, ict_engine) -> float:
+    def _score_cisd(
+        trade_side:  str,
+        ps_decision,
+        ict_engine,
+        is_approach: bool = False,
+    ) -> float:
         """
-        Score CISD (Change in State of Delivery) confirmation [0–1].
+        Score CISD (Change in State of Delivery) [0-1].
 
-        CISD = CHoCH or BOS in the reversal direction on 5m/15m post-sweep.
-        High score = direction_engine has confirmed the reversal.
+        v2.0 FIX: ps_decision is now properly provided from quant_strategy
+        (stored as dir_engine._last_ps_decision after evaluate_sweep).
         """
+        if is_approach:
+            # Pre-sweep: check BOS/CHoCH from ICT for structural pre-alignment
+            if ict_engine is not None:
+                try:
+                    for tf in ("15m", "5m", "1m"):
+                        st = getattr(ict_engine, '_tf', {}).get(tf)
+                        if st is None:
+                            continue
+                        bos = str(getattr(st, 'bos_direction', '') or '').lower()
+                        if trade_side == "long" and bos == "bullish":
+                            return 0.55
+                        if trade_side == "short" and bos == "bearish":
+                            return 0.55
+                except Exception:
+                    pass
+            return 0.40  # neutral credit — pre-sweep
+
+        # Post-sweep: use DirectionEngine's PostSweepDecision
         if ps_decision is not None:
-            # PostSweepDecision from direction_engine.evaluate_sweep()
             cisd_active = getattr(ps_decision, 'cisd_active', False)
-            ps_conf     = float(getattr(ps_decision, 'confidence', 0.0))
-            action      = str(getattr(ps_decision, 'action', ''))
-            direction   = str(getattr(ps_decision, 'direction', ''))
+            ps_conf     = float(getattr(ps_decision, 'confidence', 0.0) or 0.0)
+            action      = str(getattr(ps_decision, 'action', '') or '')
+            direction   = str(getattr(ps_decision, 'direction', '') or '').lower()
 
-            # Check direction alignment
-            direction_ok = (
-                (trade_side == "long"  and direction == "long")  or
-                (trade_side == "short" and direction == "short")
+            dir_ok = (
+                (trade_side == "long"  and direction in ("long", "bullish")) or
+                (trade_side == "short" and direction in ("short", "bearish")) or
+                direction == ""
             )
 
-            if cisd_active and direction_ok and action == "reverse":
-                return 0.85 + min(ps_conf * 0.15, 0.15)   # 0.85–1.0
+            if cisd_active and dir_ok and action == "reverse":
+                return min(0.85 + ps_conf * 0.15, 1.0)
+            if dir_ok and action == "reverse":
+                return min(0.65 + ps_conf * 0.20, 0.85)
+            if dir_ok and action in ("wait", "continue"):
+                return 0.35
+            if not dir_ok and action == "reverse":
+                return 0.10
+            return 0.25
 
-            if direction_ok and action == "reverse":
-                return 0.60 + min(ps_conf * 0.25, 0.25)   # 0.60–0.85
-
-            if direction_ok and action == "wait":
-                return 0.30   # direction engine sees potential but needs more time
-
-            return 0.10   # wrong direction or no signal
-
-        # Fallback: check ICT engine structure directly
+        # Fallback: ICT engine BOS/CHoCH direct
         if ict_engine is not None:
             try:
                 for tf in ("15m", "5m"):
-                    st = ict_engine._tf.get(tf) if hasattr(ict_engine, '_tf') else None
+                    st = getattr(ict_engine, '_tf', {}).get(tf)
                     if st is None:
                         continue
-                    choch = str(getattr(st, 'choch_direction', '')).lower()
-                    bos   = str(getattr(st, 'bos_direction',   '')).lower()
-                    if trade_side == "long":
-                        if choch == "bullish" or bos == "bullish":
-                            return 0.70
-                    else:
-                        if choch == "bearish" or bos == "bearish":
-                            return 0.70
+                    choch = str(getattr(st, 'choch_direction', '') or '').lower()
+                    bos   = str(getattr(st, 'bos_direction', '') or '').lower()
+                    if trade_side == "long" and (choch == "bullish" or bos == "bullish"):
+                        return 0.60
+                    if trade_side == "short" and (choch == "bearish" or bos == "bearish"):
+                        return 0.60
             except Exception:
                 pass
 
-        return 0.0   # no CISD evidence
+        return 0.15  # no CISD evidence
 
     @staticmethod
     def _score_ote(
@@ -624,89 +633,94 @@ class ConvictionFilter:
         price:       float,
     ) -> float:
         """
-        Score OTE (Optimal Trade Entry) zone alignment [0–1].
-
-        OTE = 50–78.6% Fibonacci retrace from pool_price back toward origin.
-
-        For a LONG after SSL sweep:
-          Pool was swept DOWN to pool_price, then price delivered UP.
-          OTE is the 50–78.6% retrace FROM the high (pre-sweep origin)
-          BACK TOWARD the swept SSL level.
-          Entry IN the OTE zone = 1.0; outside = partial or 0.0.
-
-        We approximate origin as current price (proxy for post-sweep high).
-        This works when evaluate() is called during the retrace back into OTE.
+        Score OTE (Optimal Trade Entry) zone [0-1].
+        OTE = 50-78.6% Fibonacci retrace from sweep extreme.
+        Peaks at 61.8% (golden ratio).
         """
-        if pool_price <= 0 or entry_price <= 0:
-            return 0.5   # unknown — partial credit
+        if pool_price <= 0 or entry_price <= 0 or price <= 0:
+            return 0.50
 
         if trade_side == "long":
-            # Swept DOWN (SSL). Origin ≈ current price (post-sweep delivery high).
-            # OTE is 50–78.6% retrace from price back to pool.
             total_move = abs(price - pool_price)
             if total_move < 1e-3:
-                return 0.5
-            retrace_dist = abs(price - entry_price)
-            fib = retrace_dist / total_move
+                return 0.50
+            fib = abs(price - entry_price) / total_move
         else:
-            # Swept UP (BSL). OTE is 50–78.6% retrace back down.
             total_move = abs(pool_price - price)
             if total_move < 1e-3:
-                return 0.5
-            retrace_dist = abs(entry_price - price)
-            fib = retrace_dist / total_move
+                return 0.50
+            fib = abs(entry_price - price) / total_move
 
         if OTE_FIB_LOW <= fib <= OTE_FIB_HIGH:
-            # Inside OTE: score peaks at 61.8% Fibonacci (golden ratio)
-            # Distance from 0.618 → normalized score
             dist_from_618 = abs(fib - 0.618)
-            return max(0.0, 1.0 - dist_from_618 * 5.0)   # 1.0 at 0.618, ~0.7 at extremes
+            return max(0.65, 1.0 - dist_from_618 * 5.0)
         elif fib < OTE_FIB_LOW:
-            # Not retraced enough — too early
-            return max(0.0, fib / OTE_FIB_LOW * 0.4)   # partial 0–0.4
+            return max(0.30, fib / OTE_FIB_LOW * 0.65)
         else:
-            # Over-retraced — approaching pool again (low confidence)
-            return max(0.0, 0.3 - (fib - OTE_FIB_HIGH) * 3.0)
+            return max(0.10, 0.40 - (fib - OTE_FIB_HIGH) * 3.0)
 
     @staticmethod
     def _score_amd(trade_side: str, ict_engine) -> float:
-        """Score AMD phase alignment with trade direction [0–1]."""
+        """
+        Score AMD phase alignment [0-1].
+
+        v2.0 FIX: ACCUMULATION with aligned bias now scores 0.40, not 0.0.
+        Neutral accumulation scores 0.30 (not a block — just lower probability).
+        """
         if ict_engine is None:
-            return 0.4   # unknown — partial credit
+            return 0.45
+
         try:
-            amd   = getattr(ict_engine, '_amd', None)
+            amd = getattr(ict_engine, '_amd', None)
             if amd is None:
-                return 0.4
-            phase = str(getattr(amd, 'phase', '')).upper()
-            bias  = str(getattr(amd, 'bias',  '')).lower()
-            conf  = float(getattr(amd, 'confidence', 0.5))
+                return 0.45
 
-            base = _AMD_PHASE_SCORE.get(phase, 0.4)
-            if base == 0.0:
-                return 0.0   # ACCUMULATION — hard block
+            phase = str(getattr(amd, 'phase', '') or '').upper()
+            bias  = str(getattr(amd, 'bias',  '') or '').lower()
+            conf  = float(getattr(amd, 'confidence', 0.5) or 0.5)
 
-            # Bias alignment bonus
-            if trade_side == "long"  and bias == "bullish": base *= min(1.0 + conf * 0.2, 1.0)
-            if trade_side == "short" and bias == "bearish": base *= min(1.0 + conf * 0.2, 1.0)
-            # Bias disagreement penalty
-            if trade_side == "long"  and bias == "bearish": base *= 0.60
-            if trade_side == "short" and bias == "bullish": base *= 0.60
+            base = _AMD_PHASE_SCORE.get(phase, 0.40)
+
+            long_ok  = (trade_side == "long"  and "bull" in bias)
+            short_ok = (trade_side == "short" and "bear" in bias)
+            neutral  = bias in ("neutral", "")
+            contra   = not (long_ok or short_ok or neutral)
+
+            if long_ok or short_ok:
+                base = min(base * (1.0 + conf * 0.20), 1.0)
+            elif contra:
+                base *= 0.55
+
+            # ACCUMULATION-specific floors
+            if phase == "ACCUMULATION":
+                if long_ok or short_ok:
+                    base = max(base, 0.40)
+                elif neutral:
+                    base = max(base, 0.30)
+                elif contra:
+                    base = 0.10
 
             return min(base, 1.0)
+
         except Exception:
-            return 0.4
+            return 0.40
 
     @staticmethod
     def _resolve_session(session_hint: str, ict_engine) -> str:
-        """Resolve session string for scoring."""
         if session_hint:
             su = session_hint.upper()
-            if 'LONDON' in su: return 'LONDON'
-            if 'NY'     in su: return 'NY'
-            if 'ASIA'   in su: return 'ASIA'
+            if 'NEW_YORK' in su or ('NY' in su and 'LONDON' not in su):
+                return 'NY'
+            if 'LONDON' in su:
+                return 'LONDON'
+            if 'ASIA' in su:
+                return 'ASIA'
         if ict_engine is not None:
-            kz = str(getattr(ict_engine, '_killzone', '')).upper()
-            if 'LONDON' in kz: return 'LONDON'
-            if 'NY'     in kz: return 'NY'
-            if 'ASIA'   in kz: return 'ASIA'
+            kz = str(getattr(ict_engine, '_killzone', '') or '').upper()
+            if 'NEW_YORK' in kz or ('NY' in kz and 'LONDON' not in kz):
+                return 'NY'
+            if 'LONDON' in kz:
+                return 'LONDON'
+            if 'ASIA' in kz:
+                return 'ASIA'
         return ''
