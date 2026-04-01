@@ -85,6 +85,14 @@ class RiskManager:
         self._IST = timezone(timedelta(hours=5, minutes=30))
         self._last_reset_date = datetime.now(self._IST).date()
 
+        # Deferred daily-reset state.
+        # When the calendar day rolls over while a position is open,
+        # _pending_reset is set True and the actual counter clearing is
+        # delayed until set_position_open(False) is called (i.e. the trade
+        # closes).  The closing trade is then recorded in the NEW day's books.
+        self._position_is_open: bool = False
+        self._pending_reset:    bool = False
+
         # Shared API (CoinSwitchAPI, DeltaAPI, or ExecutionRouter)
         if shared_api is not None:
             self.api = shared_api
@@ -451,6 +459,16 @@ class RiskManager:
             exit_price  = float(exit_price)
             quantity    = float(quantity)
 
+            # If a midnight reset was deferred because a position was open,
+            # apply it NOW — before recording this trade — so the closing
+            # trade is counted in the new day, not the previous one.
+            if self._pending_reset:
+                logger.info(
+                    "🔄 Applying deferred daily reset inside record_trade "
+                    "(position closed — booking trade in the new day)."
+                )
+                self._apply_daily_reset()
+
             if pnl_override is not None:
                 pnl = float(pnl_override)
             else:
@@ -509,17 +527,14 @@ class RiskManager:
     # DAILY RESET
     # =========================================================================
 
-    def _reset_daily_if_needed(self):
-        """Reset all daily counters when a new IST calendar day begins."""
-        today = datetime.now(self._IST).date()
-
-        if not hasattr(self, '_last_reset_date'):
-            self._last_reset_date = today
-            return
-
-        if today <= self._last_reset_date:
-            return
-
+    def _apply_daily_reset(self) -> None:
+        """
+        Perform the actual counter reset.  Called under self._lock.
+        Separated from _reset_daily_if_needed so it can be triggered both
+        immediately (no open position) and deferred (position was open at
+        midnight — fired from set_position_open / record_trade instead).
+        """
+        today          = datetime.now(self._IST).date()
         prev_day       = self._last_reset_date
         prev_cons_loss = self.consecutive_losses
         prev_daily_pnl = self.daily_pnl
@@ -529,6 +544,7 @@ class RiskManager:
         self.daily_pnl          = 0.0
         self.consecutive_losses = 0
         self._last_reset_date   = today
+        self._pending_reset     = False
 
         logger.info(
             f"🔄 Daily reset: {prev_day} → {today} | "
@@ -536,6 +552,67 @@ class RiskManager:
             f"prev consecutive_losses={prev_cons_loss} (reset to 0) | "
             f"prev daily_trades={prev_n_trades}"
         )
+
+    def _reset_daily_if_needed(self) -> None:
+        """
+        Check whether the IST calendar day has rolled over and act:
+
+        • No open position → apply reset immediately (normal path).
+        • Position open    → defer: set _pending_reset = True and log once.
+                             The reset will fire inside record_trade() /
+                             set_position_open(False) when the trade closes,
+                             so the closing trade is booked in the NEW day.
+
+        Must be called under self._lock.
+        """
+        today = datetime.now(self._IST).date()
+
+        if not hasattr(self, '_last_reset_date'):
+            self._last_reset_date = today
+            return
+
+        if today <= self._last_reset_date and not self._pending_reset:
+            return
+
+        # Day has changed (or a deferred reset is waiting).
+        if self._position_is_open:
+            # Defer — mark pending once so we don't spam the log every tick.
+            if not self._pending_reset:
+                logger.info(
+                    f"⏳ Daily reset deferred (position open at midnight) — "
+                    f"will apply when the open trade closes and be counted "
+                    f"in {today}."
+                )
+                self._pending_reset = True
+            return
+
+        # No open position — reset immediately.
+        self._apply_daily_reset()
+
+    # =========================================================================
+    # POSITION STATE NOTIFIER
+    # =========================================================================
+
+    def set_position_open(self, is_open: bool) -> None:
+        """
+        Call this whenever a position is opened or closed so the risk manager
+        can handle the deferred midnight reset correctly.
+
+        • set_position_open(True)  — called when an entry is filled.
+        • set_position_open(False) — called when the position is fully flat.
+
+        If a midnight reset was pending (position was open when the calendar
+        day changed), it is applied here the moment the position closes so
+        that record_trade() — which is called immediately after — books the
+        closing trade into the new day.
+        """
+        with self._lock:
+            self._position_is_open = is_open
+            if not is_open and self._pending_reset:
+                logger.info(
+                    "🔄 Applying deferred daily reset — position now closed."
+                )
+                self._apply_daily_reset()
 
     # =========================================================================
     # STATISTICS

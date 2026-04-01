@@ -1344,6 +1344,187 @@ def format_post_sweep_verdict(
 
 
 # ======================================================================
+# ISSUE-4: CONVICTION GATE BLOCK ALERT
+# Sent when the 7-factor conviction gate rejects an entry signal.
+# Shows score, mandatory gate failures, and which factors passed/failed.
+# Throttled in quant_strategy to once per 60s per side.
+# ======================================================================
+
+def format_conviction_block_alert(
+    side:           str,
+    score:          float,
+    reject_reasons: Optional[List[str]] = None,
+    allow_reasons:  Optional[List[str]] = None,
+    factors         = None,      # ConvictionFactors dataclass instance
+    entry_price:    float = 0.0,
+    sl_price:       float = 0.0,
+    tp_price:       float = 0.0,
+    rr_ratio:       float = 0.0,
+) -> str:
+    """
+    Conviction gate block alert (Issue-4 fix).
+
+    Displays:
+      • Entry side + proposed prices
+      • Overall conviction score vs required threshold
+      • Score bar
+      • Each reject reason (mandatory gate failures highlighted)
+      • Each passing factor
+      • Per-factor scores when ConvictionFactors dataclass is provided
+    """
+    reject_reasons = reject_reasons or []
+    allow_reasons  = allow_reasons  or []
+    side_icon      = "🟢" if side.lower() == "long" else "🔴"
+    required       = 0.75   # REQUIRED_CONVICTION_SCORE from conviction_filter
+
+    score_pct      = min(1.0, score / required)
+    bar_filled     = min(10, int(score_pct * 10))
+    score_bar      = "█" * bar_filled + "░" * (10 - bar_filled)
+    status_icon    = "✅" if score >= required else "❌"
+
+    lines = [
+        f"🚫 <b>CONVICTION GATE BLOCKED</b>  {side_icon} {side.upper()}",
+        "",
+        f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required",
+        f"  [{score_bar}]",
+    ]
+
+    if entry_price:
+        lines.append(
+            f"  Entry: {_fmt_price(entry_price)}  "
+            f"SL: {_fmt_price(sl_price)}  "
+            f"TP: {_fmt_price(tp_price)}  "
+            f"R:R: {rr_ratio:.1f}R"
+        )
+
+    # Per-factor breakdown when ConvictionFactors is available
+    if factors is not None:
+        lines.append("")
+        lines.append("<b>📊 FACTOR BREAKDOWN</b>")
+        factor_rows = [
+            ("Pool sig",      getattr(factors, 'pool_sig_score',     0.0), 0.25),
+            ("Displacement",  getattr(factors, 'displacement_score', 0.0), 0.20),
+            ("CISD",          getattr(factors, 'cisd_score',         0.0), 0.20),
+            ("OTE zone",      getattr(factors, 'ote_score',          0.0), 0.15),
+            ("Session",       getattr(factors, 'session_score',      0.0), 0.10),
+            ("AMD phase",     getattr(factors, 'amd_score',          0.0), 0.10),
+        ]
+        for fname, fval, fwt in factor_rows:
+            fb = min(5, int(fval * 5))
+            fbar = "█" * fb + "░" * (5 - fb)
+            contrib = fval * fwt
+            ficon   = "✅" if fval >= 0.6 else ("⚠️" if fval >= 0.3 else "❌")
+            lines.append(
+                f"  {ficon} {fname:<14} [{fbar}] {fval:.2f}  "
+                f"(×{fwt:.2f}={contrib:.3f})"
+            )
+        dr_ok = getattr(factors, 'dealing_range_ok', None)
+        if dr_ok is not None:
+            dr_icon = "✅" if dr_ok else "❌"
+            lines.append(f"  {dr_icon} Dealing Range   GATE: {'PASS' if dr_ok else 'FAIL'}")
+
+    # Reject reasons — mandatory gate failures are most important
+    if reject_reasons:
+        lines.append("")
+        lines.append("<b>🚫 REJECT REASONS</b>")
+        for r in reject_reasons[:6]:
+            # Mandatory gate failures are prefixed POOL_TF_BLOCKED, DEALING_RANGE_BLOCKED etc.
+            is_gate = any(k in r for k in (
+                "BLOCKED", "GATE", "INVALIDATED", "SESSION_BLOCKED",
+                "AMD_BLOCKED", "MIN_INTERVAL", "MAX_ENTRIES",
+            ))
+            icon = "🔴" if is_gate else "⚠️"
+            lines.append(f"  {icon} {_esc(r[:120])}")
+
+    # Passing factors for context
+    if allow_reasons:
+        lines.append("")
+        lines.append("<b>✅ PASSED</b>")
+        for a in allow_reasons[:4]:
+            lines.append(f"  ✅ {_esc(a[:80])}")
+
+    return "\n".join(lines)
+
+
+# ======================================================================
+# ISSUE-3: LIQUIDITY TRAIL SL UPDATE ALERT
+# Sent when LiquidityTrailEngine advances the SL to a new pool anchor.
+# Shows the anchor pool details, buffer, phase, and session context.
+# Throttled in quant_strategy to once per 120s.
+# ======================================================================
+
+def format_liquidity_trail_update(
+    side:          str,
+    new_sl:        float,
+    anchor_price:  float,
+    anchor_tf:     str,
+    anchor_sig:    float,
+    phase:         str,          # "SWEPT_POOL" | "UNSWEPT_POOL"
+    is_swept:      bool,
+    entry_price:   float,
+    current_price: float,
+    atr:           float,
+    session:       str = "",
+) -> str:
+    """
+    Liquidity-only trail SL update alert (Issue-3 fix).
+
+    Displays:
+      • New SL price and pool anchor details
+      • Phase (swept/unswept pool anchor)
+      • Distance metrics and session context
+      • Profit locked in R-multiples
+    """
+    side_icon    = "🟢" if side.lower() == "long" else "🔴"
+    phase_icons  = {"SWEPT_POOL": "🏦", "UNSWEPT_POOL": "🎯", "HOLD": "⏸"}
+    phase_icon   = phase_icons.get(phase, "📍")
+
+    anchor_status = "✅ SWEPT (confirmed S/R)" if is_swept else "⚡ UNSWEPT (stop cluster)"
+
+    # Profit locked = distance from entry to new SL (in initial SL units)
+    if atr > 1e-10:
+        if side.lower() == "long":
+            profit_r = (new_sl - entry_price) / atr
+        else:
+            profit_r = (entry_price - new_sl) / atr
+    else:
+        profit_r = 0.0
+
+    dist_to_sl_atr  = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
+    dist_anchor_atr = abs(anchor_price - new_sl)   / atr if atr > 1e-10 else 0.0
+
+    session_icons = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
+    sess_icon     = session_icons.get(session.upper(), "🌐")
+
+    lines = [
+        f"{side_icon} <b>LIQUIDITY TRAIL UPDATE</b>  {phase_icon} {phase.replace('_', ' ')}",
+        "",
+        f"  {side_icon} SL moved to: <b>{_fmt_price(new_sl)}</b>",
+        f"  📍 Anchor pool: {_fmt_price(anchor_price)} ({anchor_tf})  "
+        f"sig={anchor_sig:.1f}",
+        f"  {anchor_status}",
+        "",
+        f"  Entry:  {_fmt_price(entry_price)}",
+        f"  Price:  {_fmt_price(current_price)}",
+        f"  SL gap: {dist_to_sl_atr:.2f} ATR from price",
+        f"  Locked: {profit_r:+.2f} ATR from entry",
+        "",
+        f"  {sess_icon} Session: {session or 'unknown'}",
+    ]
+
+    if phase == "SWEPT_POOL":
+        lines.append(
+            "  <i>SL anchored to confirmed institutional support/resistance</i>"
+        )
+    else:
+        lines.append(
+            "  <i>SL anchored to unswept stop cluster — structural barrier</i>"
+        )
+
+    return "\n".join(lines)
+
+
+# ======================================================================
 # LOGGING HANDLER — forward WARNING+ to Telegram
 # ======================================================================
 

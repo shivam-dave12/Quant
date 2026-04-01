@@ -242,6 +242,37 @@ class QuantBot:
             )
             self.order_manager = self.execution_router  # alias for controller
 
+            # ── ISSUE-2 FIX: Apply plain-limit TP/SL patch to all OMs ────────
+            # Replaces trigger/conditional stop orders with resting limit orders
+            # placed directly in the book at the exact SL/TP price.
+            # Maker rebate from placement; zero trigger-activation latency.
+            # Applied to EVERY configured OrderManager so it persists across
+            # runtime exchange switches (/setexchange).
+            try:
+                from execution.order_manager_limit_patch import patch_order_manager as _patch_om
+            except ImportError:
+                try:
+                    from order_manager_limit_patch import patch_order_manager as _patch_om
+                except ImportError:
+                    _patch_om = None
+                    logger.warning(
+                        "⚠️  order_manager_limit_patch not found — "
+                        "TP/SL will use original trigger orders")
+
+            if _patch_om is not None:
+                _patched = []
+                for _exch_key, _om_inst in self.execution_router._managers.items():
+                    try:
+                        _patch_om(_om_inst)
+                        _patched.append(_exch_key)
+                    except Exception as _pe:
+                        logger.warning(
+                            f"⚠️  patch_order_manager failed for {_exch_key}: {_pe}")
+                if _patched:
+                    logger.info(
+                        f"✅ Plain-limit TP/SL patch applied to: "
+                        f"{', '.join(_patched)}")
+
             # ── Build data managers ───────────────────────────────────────────
             exec_exch = config.EXECUTION_EXCHANGE.lower()
 
@@ -357,6 +388,11 @@ class QuantBot:
                 "  4️⃣  ICT validation: AMD + OB/FVG + P/D zone\n"
                 "  5️⃣  Entry at OTE · SL at ICT structure · TP at pool\n"
                 "  6️⃣  Trail: BOS → CHoCH → 15m structure only\n\n"
+                "<b>Active Patches:</b>\n"
+                "  🔬 MTF Pool Probability (Issue-1): distance-decay × TF-base × sig × session\n"
+                "  📘 Plain-Limit TP/SL (Issue-2): resting limit orders — maker rebate, zero latency\n"
+                "  🏦 Liquidity-Only Trail (Issue-3): pool-anchor SL, chandelier fallback\n"
+                "  🎯 Conviction Gate (Issue-4): 7-factor gate, score ≥ 0.75, ~76% WR target\n\n"
                 f"📡 <b>Data feed:</b> "
                 f"{'DUAL — ' + secondary_name.upper() + ' secondary active' if dual_feed else 'SINGLE — primary only'}\n\n"
                 f"<i>/setexchange delta|coinswitch to switch execution exchange</i>"

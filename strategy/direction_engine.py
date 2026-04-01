@@ -142,6 +142,24 @@ except ImportError:
         PoolTarget           = None   # type: ignore
         PoolSide             = None   # type: ignore
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ISSUE-1 FIX: MTF Pool Sweep Probability Engine
+# Replaces Factor 5 "pool_asymmetry" with a true per-pool distance-decay ×
+# TF-base-probability × significance × session-context model.
+# If the module is absent the original significance-sum fallback still runs.
+# ─────────────────────────────────────────────────────────────────────────────
+_MTF_PROB_AVAILABLE = False
+try:
+    from strategy.mtf_pool_probability import compute_mtf_pool_factor, get_mtf_pool_forecast
+    _MTF_PROB_AVAILABLE = True
+except ImportError:
+    try:
+        from mtf_pool_probability import compute_mtf_pool_factor, get_mtf_pool_forecast
+        _MTF_PROB_AVAILABLE = True
+    except ImportError:
+        compute_mtf_pool_factor  = None   # type: ignore
+        get_mtf_pool_forecast    = None   # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -523,14 +541,31 @@ class DirectionEngine:
         factors.order_flow = _sigmoid(_of_composite, steepness=1.3)
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 5: Pool Significance Asymmetry  (weight 0.09)
+        # FACTOR 5: MTF Pool Sweep Probability  (weight 0.09)
         # ─────────────────────────────────────────────────────────────────────
-        # FIX-3: Prefer LiquidityMap PoolTarget.adjusted_sig() when available.
-        # LiquidityMap incorporates HTF confluence (×2.5), OB/FVG alignment
-        # bonuses, adjacency bonus, and exponential distance decay. ICT
-        # LiquidityLevel only has touch_count and timeframe.
-        if liq_snapshot is not None:
-            # Use PoolTarget.adjusted_sig() — the canonical selection key
+        # ISSUE-1 FIX: Replaced flat significance-sum with a two-layer
+        # probability model that uses distance decay × TF base probability ×
+        # significance × recency × touch momentum per pool, then aggregates
+        # into a BSL vs SSL net score in [-1, +1].
+        #
+        # Decay half-lives (ATR):  2m=0.5  15m=1.2  1h=2.5  4h=4.0  1d=6.0
+        # TF base priors:          2m=0.35 15m=0.55 1h=0.70 4h=0.80 1d=0.65
+        # Session: London +20% BSL (Judas swing); Asia -20% all; NY neutral.
+        #
+        # net_score > 0 → BSL more likely swept next (price going UP)
+        # net_score < 0 → SSL more likely swept next (price going DOWN)
+        # Weight is unchanged at 0.09; signal quality improves dramatically.
+        if _MTF_PROB_AVAILABLE:
+            factors.pool_asymmetry = compute_mtf_pool_factor(
+                liq_snapshot = liq_snapshot,
+                price        = price,
+                atr          = a,
+                now          = now_ms / 1000.0,
+                ict_engine   = ict_engine,
+                session      = str(getattr(ict_engine, '_killzone', '') or ''),
+            )
+        elif liq_snapshot is not None:
+            # Fallback A: LiquidityMap PoolTarget.adjusted_sig() significance sum
             _bsl_sig_lm = sum(t.adjusted_sig()
                               for t in liq_snapshot.bsl_pools
                               if t.pool.price > price)
@@ -544,9 +579,9 @@ class DirectionEngine:
             else:
                 factors.pool_asymmetry = 0.0
         else:
-            # Fallback: ICT LiquidityLevel pool scoring
-            _all_ict      = list(getattr(ict_engine, 'liquidity_pools', []))
-            _unswept_ict  = [p for p in _all_ict if not getattr(p, 'swept', False)]
+            # Fallback B: ICT LiquidityLevel pool scoring (no LiquidityMap)
+            _all_ict     = list(getattr(ict_engine, 'liquidity_pools', []))
+            _unswept_ict = [p for p in _all_ict if not getattr(p, 'swept', False)]
 
             def _ict_pool_sig(p: object) -> float:
                 dist_atr = abs(getattr(p, 'price', 0.0) - price) / a

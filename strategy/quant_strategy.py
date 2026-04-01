@@ -100,6 +100,37 @@ except ImportError:
         HuntPrediction   = None   # type: ignore
         DirectionBias    = None   # type: ignore
 
+# ── ISSUE-4 FIX: Conviction Gate ─────────────────────────────────────────────
+# 7-factor mandatory gate before any entry. Mandatory gates: pool TF ≥ 15m,
+# dealing range valid, AMD not ACCUMULATION, session not ASIA.
+# Required conviction score ≥ 0.75 for all weighted factors.
+_CONVICTION_FILTER_AVAILABLE = False
+try:
+    from strategy.conviction_filter import ConvictionFilter, ConvictionResult
+    _CONVICTION_FILTER_AVAILABLE = True
+except ImportError:
+    try:
+        from conviction_filter import ConvictionFilter, ConvictionResult
+        _CONVICTION_FILTER_AVAILABLE = True
+    except ImportError:
+        ConvictionFilter = None   # type: ignore
+        ConvictionResult = None   # type: ignore
+
+# ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────────────
+# SL anchors to swept/unswept pool structure instead of fixed ATR ratchets.
+# Significance-based buffer; session-aware (London tighter, Asia disabled).
+_LIQ_TRAIL_AVAILABLE = False
+try:
+    from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+    _LIQ_TRAIL_AVAILABLE = True
+except ImportError:
+    try:
+        from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+        _LIQ_TRAIL_AVAILABLE = True
+    except ImportError:
+        LiquidityTrailEngine  = None   # type: ignore
+        LiquidityTrailResult  = None   # type: ignore
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG ACCESSOR
@@ -4546,6 +4577,21 @@ class QuantStrategy:
         self._liq_map = LiquidityMap() if _LIQ_MAP_AVAILABLE else None
         self._entry_engine = EntryEngine() if _ENTRY_ENGINE_AVAILABLE else None
         self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
+
+        # ── ISSUE-4 FIX: Conviction Gate ─────────────────────────────────────
+        # Evaluates 7 ICT factors before any entry order is placed.
+        # Mandatory hard blocks: pool TF, dealing range, AMD phase, session.
+        # Weighted score must reach 0.75; tracks session-level quality state.
+        self._conviction: Optional[object] = (
+            ConvictionFilter() if _CONVICTION_FILTER_AVAILABLE else None
+        )
+
+        # ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────
+        # SL anchors to swept/unswept pool structure; significance-based buffer.
+        # Takes priority over chandelier trail. Chandelier runs as fallback only.
+        self._liq_trail: Optional[object] = (
+            LiquidityTrailEngine() if _LIQ_TRAIL_AVAILABLE else None
+        )
         self._flow_streak_dir_v2 = ""
         self._flow_streak_count_v2 = 0
         # BUG-FIX-3: These attrs are read by main.py heartbeat via getattr().
@@ -4594,8 +4640,23 @@ class QuantStrategy:
         )
         logger.info(f"   DirectionEngine: {dir_status}")
         # Trail
+        # Trail
         trail_status = "InstitutionalLiquidityTrail v7.0 (pool anchor -> dyn buffer -> HTF floor -> BOS gate; chandelier fallback)"
         logger.info(f"   Trail: {trail_status}")
+        # Conviction gate (Issue-4)
+        conv_status = (
+            "ACTIVE (7-factor gate: pool-TF ≥ 15m, DR-valid, displacement, CISD, OTE, session, AMD | score ≥ 0.75)"
+            if self._conviction is not None
+            else "UNAVAILABLE (conviction_filter.py not found — entries ungated)"
+        )
+        logger.info(f"   ConvictionGate: {conv_status}")
+        # Liquidity trail (Issue-3)
+        liq_trail_status = (
+            "ACTIVE (swept-pool anchor → unswept-pool anchor → chandelier fallback | Asia disabled)"
+            if self._liq_trail is not None
+            else "UNAVAILABLE (liquidity_trail.py not found — chandelier trail only)"
+        )
+        logger.info(f"   LiquidityTrail: {liq_trail_status}")
         logger.info("=" * 72)
 
     def get_position(self) -> Optional[Dict]:
@@ -6244,6 +6305,67 @@ class QuantStrategy:
                 f"@ ${signal.entry_price:,.1f} | "
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
+
+            # ── ISSUE-4 FIX: Conviction Gate ─────────────────────────────────
+            # Evaluate 7 ICT factors (mandatory gates + weighted score ≥ 0.75).
+            # Retrieve the PostSweepDecision from the active DirectionEngine
+            # state so the CISD factor can read confirmation directly.
+            if self._conviction is not None:
+                _ps_dec_for_conv = None
+                if self._dir_engine is not None:
+                    try:
+                        _ps_dec_for_conv = getattr(
+                            self._dir_engine, '_last_ps_decision', None)
+                    except Exception:
+                        pass
+
+                _sess_str = ""
+                if self._ict is not None:
+                    _sess_str = str(getattr(self._ict, '_killzone', '') or '')
+
+                _conv_result = self._conviction.evaluate(
+                    trade_side   = signal.side,
+                    sweep_pool   = signal.swept_pool if hasattr(signal, 'swept_pool') and signal.swept_pool is not None
+                                   else (liq_snapshot.primary_target if liq_snapshot and liq_snapshot.primary_target else object()),
+                    entry_price  = signal.entry_price,
+                    sl_price     = signal.sl_price,
+                    tp_price     = signal.tp_price,
+                    price        = price,
+                    atr          = atr,
+                    now          = now,
+                    ict_engine   = self._ict,
+                    liq_snapshot = liq_snapshot,
+                    ps_decision  = _ps_dec_for_conv,
+                    candles_5m   = candles_by_tf.get("5m"),
+                    session      = _sess_str,
+                )
+                if not _conv_result.allowed:
+                    reject_str = " | ".join(_conv_result.reject_reasons[:3])
+                    logger.info(
+                        f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
+                        f"score={_conv_result.score:.3f} | {reject_str}")
+                    self._entry_engine.consume_signal()
+                    # Telegram alert for conviction block (throttled 60s per side)
+                    _conv_tg_key = f"_conv_tg_last_{signal.side}"
+                    if now - getattr(self, _conv_tg_key, 0.0) >= 60.0:
+                        setattr(self, _conv_tg_key, now)
+                        try:
+                            from telegram.notifier import format_conviction_block_alert
+                            from telegram.notifier import send_telegram_message as _stm
+                            _stm(format_conviction_block_alert(
+                                side          = signal.side,
+                                score         = _conv_result.score,
+                                reject_reasons= _conv_result.reject_reasons,
+                                allow_reasons = _conv_result.allow_reasons,
+                                factors       = _conv_result.factors,
+                                entry_price   = signal.entry_price,
+                                sl_price      = signal.sl_price,
+                                tp_price      = signal.tp_price,
+                                rr_ratio      = _conv_result.rr_ratio,
+                            ))
+                        except Exception as _cv_tg_e:
+                            logger.debug(f"ConvictionGate Telegram error: {_cv_tg_e}")
+                    return
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
             _min_sig.atr = atr
@@ -8927,6 +9049,85 @@ class QuantStrategy:
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
+        # ══════════════════════════════════════════════════════════════════
+        # ISSUE-3 FIX: Liquidity-Only Trail — RUNS FIRST
+        # Anchors SL to swept/unswept pool structure rather than fixed ATR
+        # ratchets. Significance-based buffer. Session-aware.
+        # Returns new_sl=None → fall through to chandelier trail below.
+        # ══════════════════════════════════════════════════════════════════
+        if self._liq_trail is not None and self._liq_map is not None:
+            try:
+                _trail_snap = self._liq_map.get_snapshot(price, atr)
+                _liq_hold_reasons: list = []
+                _liq_result = self._liq_trail.compute(
+                    pos_side        = pos.side,
+                    price           = price,
+                    entry_price     = pos.entry_price,
+                    current_sl      = pos.sl_price,
+                    atr             = atr,
+                    initial_sl_dist = pos.initial_sl_dist,
+                    peak_profit     = pos.peak_profit,
+                    liq_snapshot    = _trail_snap,
+                    ict_engine      = self._ict,
+                    now             = now,
+                    hold_reason     = _liq_hold_reasons,
+                )
+                if _liq_result.new_sl is not None:
+                    _new_liq_sl = _liq_result.new_sl
+                    logger.info(
+                        f"🏦 LiqTrail [{_liq_result.phase}] "
+                        f"anchor=${_liq_result.anchor.price:.0f} "
+                        f"({_liq_result.anchor.timeframe} sig={_liq_result.anchor.sig:.1f}) "
+                        f"→ SL ${_new_liq_sl:.1f} | {_liq_result.reason}")
+                    # Replace SL with new pool-anchored limit order
+                    _lt_side = "sell" if pos.side == "long" else "buy"
+                    _lt_result = order_manager.replace_stop_loss(
+                        existing_sl_order_id = pos.sl_order_id,
+                        side                 = _lt_side,
+                        quantity             = pos.quantity,
+                        new_trigger_price    = _new_liq_sl,
+                    )
+                    if _lt_result and not _lt_result.get("error"):
+                        pos.sl_price = _new_liq_sl
+                        if hasattr(_lt_result, 'get'):
+                            _new_oid = _lt_result.get("order_id")
+                            if _new_oid:
+                                pos.sl_order_id = _new_oid
+                        # Send Telegram trail update (throttled 120s)
+                        _trail_tg_key = "_liq_trail_tg_last"
+                        if now - getattr(self, _trail_tg_key, 0.0) >= 120.0:
+                            setattr(self, _trail_tg_key, now)
+                            try:
+                                from telegram.notifier import format_liquidity_trail_update
+                                from telegram.notifier import send_telegram_message as _stm
+                                _stm(format_liquidity_trail_update(
+                                    side         = pos.side,
+                                    new_sl       = _new_liq_sl,
+                                    anchor_price = _liq_result.anchor.price,
+                                    anchor_tf    = _liq_result.anchor.timeframe,
+                                    anchor_sig   = _liq_result.anchor.sig,
+                                    phase        = _liq_result.phase,
+                                    is_swept     = _liq_result.anchor.is_swept,
+                                    entry_price  = pos.entry_price,
+                                    current_price= price,
+                                    atr          = atr,
+                                    session      = self._liq_trail._detect_session(self._ict),
+                                ))
+                            except Exception as _lt_tg_e:
+                                logger.debug(f"LiqTrail Telegram error: {_lt_tg_e}")
+                        return True
+                    else:
+                        err = (_lt_result or {}).get("error", "unknown")
+                        logger.warning(
+                            f"LiqTrail: SL replace failed ({err}) — "
+                            f"falling through to chandelier")
+                else:
+                    logger.debug(
+                        f"LiqTrail: HOLD | "
+                        f"{' | '.join(_liq_hold_reasons[:3])}")
+            except Exception as _lt_e:
+                logger.debug(f"LiqTrail compute error (non-fatal): {_lt_e}")
+
         # ── Feature 5: Displacement detection from last closed 5m candle ──────
         # A displacement candle = institutional momentum bar: body ≥ DISP_MIN_ATR × ATR
         # aligned with trade direction.  When confirmed, the Displacement+CVD gate
@@ -8960,6 +9161,7 @@ class QuantStrategy:
 
         # ══════════════════════════════════════════════════════════════════
         # RATCHET REMOVED — v2.0 Chandelier trail handles all trailing.
+        # (Runs only when LiquidityTrail could not find a structural anchor.)
         # ══════════════════════════════════════════════════════════════════
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
@@ -9580,6 +9782,15 @@ class QuantStrategy:
         if is_win:
             self._winning_trades += 1
         self._risk_gate.record_trade_result(pnl)
+
+        # ── ISSUE-4 FIX: Conviction Gate — session quality tracking ──────────
+        # Record win/loss so the consecutive-loss session guard can block
+        # further entries after MAX_SESSION_LOSSES in the same session.
+        if self._conviction is not None:
+            try:
+                self._conviction.record_trade_result(win=is_win)
+            except Exception as _cv_rec_e:
+                logger.debug(f"ConvictionFilter.record_trade_result error: {_cv_rec_e}")
 
         # Full trade record for /trades command
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
