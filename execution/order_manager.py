@@ -379,39 +379,21 @@ class _DeltaAdapter:
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
 
-        # Compute limit offsets for bracket SL and TP children so Delta creates
-        # stop-limit legs instead of stop-market legs (maker fee rebate + edit-in-place).
-        # Delta supports bracket_stop_loss_limit_price / bracket_take_profit_limit_price
-        # as optional params — exchange silently ignores them if unsupported.
-        tick         = float(getattr(config, 'TICK_SIZE', 0.1))
-        sl_ticks     = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
-        tp_ticks     = int(getattr(config, 'TP_LIMIT_OFFSET_TICKS', sl_ticks))
-        sl_offset    = sl_ticks * tick
-        tp_offset    = tp_ticks * tick
-
-        # For a BUY entry: SL exits with SELL (limit below trigger);
-        #                  TP exits with SELL (limit below trigger).
-        # For a SELL entry: SL exits with BUY (limit above trigger);
-        #                   TP exits with BUY (limit above trigger).
-        if side.lower() == "buy":
-            bracket_sl_limit = round(float(sl_price) - sl_offset, 1)
-            bracket_tp_limit = round(float(tp_price) - tp_offset, 1)
-        else:
-            bracket_sl_limit = round(float(sl_price) + sl_offset, 1)
-            bracket_tp_limit = round(float(tp_price) + tp_offset, 1)
-
+        # Delta's place_order() does NOT accept bracket_stop_loss_limit_price /
+        # bracket_take_profit_limit_price — passing them causes TypeError.
+        # The bracket API always creates stop-MARKET children natively.
+        # OrderManager.place_bracket_limit_entry() upgrades those children to
+        # stop-LIMIT immediately after the entry fills (see "child upgrade" block).
         resp = self.api.place_order(
-            symbol                          = self.symbol,
-            side                            = side.lower(),
-            order_type                      = "limit",
-            size                            = contracts,
-            limit_price                     = float(limit_price),
-            bracket_stop_loss_price         = float(sl_price),
-            bracket_stop_loss_limit_price   = bracket_sl_limit,   # stop-limit child
-            bracket_take_profit_price       = float(tp_price),
-            bracket_take_profit_limit_price = bracket_tp_limit,   # stop-limit child
-            post_only                       = False,
-            time_in_force                   = "gtc",
+            symbol                  = self.symbol,
+            side                    = side.lower(),
+            order_type              = "limit",
+            size                    = contracts,
+            limit_price             = float(limit_price),
+            bracket_stop_loss_price = float(sl_price),
+            bracket_take_profit_price = float(tp_price),
+            post_only               = False,
+            time_in_force           = "gtc",
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -1104,6 +1086,38 @@ class OrderManager:
                                     logger.info(
                                         f"Bracket child bg-resolve: SL={_s[:8]}\u2026 TP={_t[:8]}\u2026 "
                                         f"(attempt {attempt})")
+
+                                    # Upgrade stop-market children to stop-limit.
+                                    _exit_side = "sell" if side.lower() in ("buy", "long") else "buy"
+
+                                    if _s and _st > 0:
+                                        _sl_cancel = _captured_om.cancel_order(_s)
+                                        if _sl_cancel not in (CancelResult.ALREADY_FILLED,
+                                                              CancelResult.PARTIAL_FILL):
+                                            _new_sl = _captured_om.place_stop_loss(
+                                                side=_exit_side, quantity=quantity,
+                                                trigger_price=_st, use_limit=True,
+                                            )
+                                            if _new_sl and not _new_sl.get("_error"):
+                                                _s = _new_sl["order_id"]
+                                                logger.info(
+                                                    f"✅ Bg-resolve SL upgraded to stop-limit: "
+                                                    f"{_s} stop=${_st:.2f}")
+
+                                    if _t and _tt > 0:
+                                        _tp_cancel = _captured_om.cancel_order(_t)
+                                        if _tp_cancel not in (CancelResult.ALREADY_FILLED,
+                                                              CancelResult.PARTIAL_FILL):
+                                            _new_tp = _captured_om.place_take_profit(
+                                                side=_exit_side, quantity=quantity,
+                                                trigger_price=_tt,
+                                            )
+                                            if _new_tp and not _new_tp.get("_error"):
+                                                _t = _new_tp["order_id"]
+                                                logger.info(
+                                                    f"✅ Bg-resolve TP upgraded to stop-limit: "
+                                                    f"{_t} stop=${_tt:.2f}")
+
                                     if not hasattr(_captured_om, "_pending_bracket_children"):
                                         _captured_om._pending_bracket_children = {}
                                     _captured_om._pending_bracket_children[_captured_order_id] = {
@@ -1128,6 +1142,60 @@ class OrderManager:
                     logger.info(f"  Bracket SL order: {sl_oid} @ ${sl_trig:.2f}")
                 if tp_oid:
                     logger.info(f"  Bracket TP order: {tp_oid} @ ${tp_trig:.2f}")
+
+                # ── Bracket child upgrade: stop-market → stop-limit ───────────
+                # Delta's bracket API places SL/TP children as stop-MARKET.
+                # We cancel each child and immediately replace it with a
+                # stop-LIMIT order so that every resting order is a limit order
+                # (maker fee rebate + atomic edit-in-place for trailing).
+                exit_side = "sell" if side.lower() in ("buy", "long") else "buy"
+
+                if sl_oid and sl_trig > 0:
+                    sl_cancel = self.cancel_order(sl_oid)
+                    if sl_cancel not in (CancelResult.ALREADY_FILLED,
+                                         CancelResult.PARTIAL_FILL):
+                        new_sl = self.place_stop_loss(
+                            side=exit_side, quantity=quantity,
+                            trigger_price=sl_trig, use_limit=True,
+                        )
+                        if new_sl and not new_sl.get("_error"):
+                            sl_oid = new_sl["order_id"]
+                            data["bracket_sl_order_id"] = sl_oid
+                            logger.info(
+                                f"✅ Bracket SL upgraded to stop-limit: "
+                                f"{sl_oid} stop=${sl_trig:.2f}")
+                        else:
+                            logger.warning(
+                                f"⚠️ Bracket SL upgrade failed — "
+                                f"reconcile will re-place SL")
+                    else:
+                        logger.warning(
+                            f"⚠️ Bracket SL {sl_oid[:8]}… already filled "
+                            f"before upgrade — skipping replace")
+
+                if tp_oid and tp_trig > 0:
+                    tp_cancel = self.cancel_order(tp_oid)
+                    if tp_cancel not in (CancelResult.ALREADY_FILLED,
+                                         CancelResult.PARTIAL_FILL):
+                        new_tp = self.place_take_profit(
+                            side=exit_side, quantity=quantity,
+                            trigger_price=tp_trig,
+                        )
+                        if new_tp and not new_tp.get("_error"):
+                            tp_oid = new_tp["order_id"]
+                            data["bracket_tp_order_id"] = tp_oid
+                            logger.info(
+                                f"✅ Bracket TP upgraded to stop-limit: "
+                                f"{tp_oid} stop=${tp_trig:.2f}")
+                        else:
+                            logger.warning(
+                                f"⚠️ Bracket TP upgrade failed — "
+                                f"reconcile will re-place TP")
+                    else:
+                        logger.warning(
+                            f"⚠️ Bracket TP {tp_oid[:8]}… already filled "
+                            f"before upgrade — position may have closed")
+
                 return data
 
             if status == "CANCELLED":
@@ -1143,73 +1211,66 @@ class OrderManager:
                         trigger_price: float,
                         use_limit: bool = True) -> Optional[Dict]:
         """
-        Place a standalone stop-loss order.
+        Place a standalone stop-loss as a stop-LIMIT order (always).
 
-        use_limit=True (default for trailing SLs): stop-limit order.
-          order_type=limit_order + stop_order_type=stop_loss_order + stop_price + limit_price
-          Advantages: atomic edit-in-place (PUT /v2/orders with stop_price+limit_price),
-          maker fee rebate (−0.02% vs +0.05% taker = 7bps saved per trail).
-          Limit offset configured via SL_LIMIT_OFFSET_TICKS (default 20 ticks = $2.00).
+        order_type=limit_order + stop_order_type=stop_loss_order + stop_price + limit_price.
 
-        use_limit=False: stop-market order (used only for emergency/non-trailing SLs).
-          Guaranteed fill but taker fee and no edit-in-place for stop_price.
+        stop-market is never used — every SL must be a limit order:
+          • Maker fee rebate (−0.02% vs +0.05% taker = 7bps per trail).
+          • Atomic edit-in-place (PUT /v2/orders with stop_price + limit_price together).
+          • Consistent with bracket-child upgrade and TP-limit behaviour.
 
-        Bracket entry SL is always stop-market (placed by place_bracket_limit_entry).
-        Trailing SLs start as stop-limit on first cancel+replace of the bracket child.
+        Limit offset (SL_LIMIT_OFFSET_TICKS × TICK_SIZE, default $2.00) gives a fill
+        buffer beyond the trigger so the order executes even on fast moves:
+          SHORT SL (BUY to close):  limit = stop + offset  (max price we'll pay)
+          LONG  SL (SELL to close): limit = stop − offset  (min price we'll accept)
+
+        The use_limit parameter is kept for API compatibility but ignored — limit is
+        always used.  Callers that previously passed use_limit=False will now place
+        stop-limit orders, which is the correct behaviour.
         """
+        if not use_limit:
+            logger.warning(
+                "place_stop_loss called with use_limit=False — "
+                "stop-market is disabled; placing stop-LIMIT instead."
+            )
         try:
-            api_side = self._normalize_side(side)
-            tick  = float(getattr(config, 'TICK_SIZE', 0.1))
+            api_side     = self._normalize_side(side)
+            tick         = float(getattr(config, 'TICK_SIZE', 0.1))
             offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
             limit_offset = offset_ticks * tick
 
-            # Initialise limit_price to None; only assigned when use_limit=True.
-            # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
-            # limit_price before the if/else block, causing UnboundLocalError in
-            # _record_order when use_limit=False because the dict literal
-            # `"limit_price": limit_price if use_limit else None` was evaluated
-            # even on the False branch (Python evaluates the whole expression
-            # before checking the condition in some older CPython versions).
-            # Initialising to None is safe and makes the intent explicit.
-            limit_price: Optional[float] = None
-
-            # Limit price: gives execution buffer past the stop trigger.
-            # SHORT SL (buy to close): limit = stop + offset (max price we'll pay)
-            # LONG  SL (sell to close): limit = stop - offset (min price we'll accept)
-            if use_limit:
-                if api_side == "BUY":
-                    limit_price = round(trigger_price + limit_offset, 1)
-                else:
-                    limit_price = round(trigger_price - limit_offset, 1)
-                logger.info(
-                    f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
-                    f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
-                data = self._place_with_retry(
-                    side=api_side, order_type="limit_order",
-                    quantity=quantity, trigger_price=trigger_price,
-                    price=limit_price,
-                    reduce_only=True, stop_order_type="stop_loss_order")
+            # Limit price: execution buffer past the stop trigger.
+            # SHORT SL (buy to close):  limit = stop + offset (max price we'll pay)
+            # LONG  SL (sell to close): limit = stop − offset (min price we'll accept)
+            if api_side == "BUY":
+                limit_price = round(trigger_price + limit_offset, 1)
             else:
-                # Stop-market: guaranteed fill, taker fee (for non-trailing / emergency)
-                logger.info(f"SL-MARKET {side} qty={quantity} trigger=${trigger_price:,.2f}")
-                data = self._place_with_retry(
-                    side=api_side, order_type="market_order",
-                    quantity=quantity, trigger_price=trigger_price,
-                    reduce_only=True, stop_order_type="stop_loss_order")
+                limit_price = round(trigger_price - limit_offset, 1)
+
+            logger.info(
+                f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
+                f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
+            data = self._place_with_retry(
+                side=api_side, order_type="limit_order",
+                quantity=quantity, trigger_price=trigger_price,
+                price=limit_price,
+                reduce_only=True, stop_order_type="stop_loss_order")
 
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id": data["order_id"], "side": side,
-                    "type": "STOP_LOSS_LIMIT" if use_limit else "STOP_LOSS",
-                    "quantity": quantity, "trigger_price": trigger_price,
-                    "limit_price": limit_price if use_limit else None,
-                    "status": data.get("status", "UNKNOWN"),
-                    "timestamp": datetime.now().isoformat(),
+                    "order_id":      data["order_id"],
+                    "side":          side,
+                    "type":          "STOP_LOSS_LIMIT",
+                    "quantity":      quantity,
+                    "trigger_price": trigger_price,
+                    "limit_price":   limit_price,
+                    "status":        data.get("status", "UNKNOWN"),
+                    "timestamp":     datetime.now().isoformat(),
                 })
                 logger.info(
-                    f"✅ SL{'_LIMIT' if use_limit else ''}: {data['order_id']} "
-                    f"@ stop=${trigger_price:,.2f}"
-                    + (f" limit=${limit_price:,.2f}" if use_limit else ""))
+                    f"✅ SL_LIMIT: {data['order_id']} "
+                    f"stop=${trigger_price:,.2f} limit=${limit_price:,.2f}")
             return data
         except Exception as e:
             logger.error(f"place_stop_loss error: {e}", exc_info=True)
