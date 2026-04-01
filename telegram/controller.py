@@ -1121,11 +1121,15 @@ class TelegramBotController:
                 pass
         choch_active = choch_tf is not None and choch_lvl > 0.0
 
-        # Break-even threshold (mirrors _update_trailing_sl)
-        import config as _cfg_mod
-        _comm = float(getattr(_cfg_mod, 'COMMISSION_RATE', 0.00055))
-        _fee_buf  = entry * _comm * 2.0 + 0.10 * atr
-        _be_price = (entry + _fee_buf if side == "LONG" else entry - _fee_buf)
+        # Break-even threshold — use same _calc_be_price() as the trail engine.
+        # Importing from quant_strategy ensures display always matches execution.
+        try:
+            from strategy.quant_strategy import _calc_be_price as _cbp
+        except ImportError:
+            from quant_strategy import _calc_be_price as _cbp
+        # pos object not available here (controller only has flat scalars);
+        # exact fee falls back to commission-rate estimate (acceptable for display).
+        _be_price = _cbp(side.lower(), entry, atr, pos=None)
         be_locked = ((side == "LONG"  and sl >= _be_price) or
                      (side == "SHORT" and sl <= _be_price and sl > 0))
 

@@ -650,16 +650,54 @@ class DirectionEngine:
             elif _bos_d == 'bearish': factors.micro_bos = -0.80
 
         # ─────────────────────────────────────────────────────────────────────
-        # FACTOR 10: Volume Asymmetry  (weight 0.01)
+        # FACTOR 10: Volume Expansion Asymmetry  (weight 0.01)
         # ─────────────────────────────────────────────────────────────────────
+        # BUG-5 FIX: the original implementation read ICTEngine._tick_flow and
+        # ._cvd_trend — private attributes set only by set_order_flow_data().
+        # This was:
+        #   (a) Redundant with Factor 4 (order_flow), which already combines
+        #       tick_flow and cvd_trend with a higher 0.13 weight.
+        #   (b) Fragile: if ICTEngine renames those attrs, Factor 10 silently
+        #       returns 0.0 with no warning and no test failure.
+        #
+        # Replacement: signed volume-expansion ratio.
+        #   • Compute the 2-bar trailing average volume vs the 20-bar baseline.
+        #   • Sign the ratio by the net candle body of the same 2 bars so that
+        #     expanding volume INTO a bullish displacement scores positive (→ BSL)
+        #     and expanding volume INTO a bearish displacement scores negative (→ SSL).
+        #   • Uses the same _c5 list already bound above (candles_5m or []).
+        #   • Requires ≥ 22 closed bars; falls back to 0.0 otherwise.
+        #   • Clipped to [-1, +1] before the sigmoid so extreme outlier volumes
+        #     (news candles) don't dominate the 0.01-weight factor.
         factors.volume = 0.0
         try:
-            _tf_raw  = getattr(ict_engine, '_tick_flow', None)
-            _cvd_raw = getattr(ict_engine, '_cvd_trend', None)
-            if _tf_raw is not None and _cvd_raw is not None:
-                factors.volume = _sigmoid(
-                    float(_tf_raw) * 0.4 + float(_cvd_raw) * 0.6,
-                    steepness=0.8)
+            # Need at minimum: 20 baseline bars + 2 recent closed bars +
+            # 1 live bar to exclude.  _c5[-1] is the live bar — never use it.
+            if len(_c5) >= 23 and a > 1e-10:
+                _vols_raw = [float(c.get('v', 0)) for c in _c5[-23:]]
+                # Split into 20-bar baseline and 2 most-recent CLOSED bars.
+                # Index layout (after slicing 23 bars):
+                #   [0..19]  = 20 baseline bars (oldest → newest)
+                #   [20, 21] = 2 most-recent CLOSED bars
+                #   [22]     = live bar (excluded)
+                _baseline_vols = _vols_raw[:20]
+                _recent_vols   = _vols_raw[20:22]
+                _avg_baseline  = sum(_baseline_vols) / 20.0
+                if _avg_baseline > 1e-10:
+                    _avg_recent = sum(_recent_vols) / max(len(_recent_vols), 1)
+                    # Expansion ratio centred at 0: ratio 1.0 → 0.0, 2.0 → +1.0
+                    _raw_expansion = (_avg_recent / _avg_baseline) - 1.0
+                    _raw_expansion = max(-1.0, min(1.0, _raw_expansion))
+
+                    # Direction from net closed-bar body of the same 2 bars.
+                    _recent_candles = _c5[-3:-1]   # 2 closed bars (live excluded)
+                    _net_body = sum(
+                        float(c.get('c', 0)) - float(c.get('o', 0))
+                        for c in _recent_candles
+                    )
+                    # Sign the expansion: positive expansion in bull direction → +
+                    _signed = math.copysign(_raw_expansion, _net_body)
+                    factors.volume = _sigmoid(_signed, steepness=1.5)
         except Exception:
             pass
 

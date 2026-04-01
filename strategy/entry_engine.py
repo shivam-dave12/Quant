@@ -1936,13 +1936,35 @@ class EntryEngine:
         # ── Accumulate DYNAMIC evidence with decay ────────────────────
         # Static baseline is already locked in ps.static_*_base.
         # Only dynamic deltas feed the decay accumulator.
-        _decay = 0.92  # per-tick decay for the weaker side
-        if rev_delta > 0:
+        #
+        # THREE-CASE BRANCHING (fixes double-decay on mixed-signal ticks):
+        #
+        # The original two separate `if` blocks fired BOTH on a mixed-signal
+        # tick (rev_delta > 0 AND cont_delta > 0), causing the reversal side
+        # to be decayed by ×0.92 on the same tick it was just boosted.
+        # This is the same bug documented in direction_engine.py as FIX-7.
+        #
+        # Correct logic:
+        #   BOTH > 0  → add both, decay both symmetrically
+        #               (mixed signal: evidence grows on both sides, both decay)
+        #   only rev  → add rev, decay cont only
+        #   only cont → add cont, decay rev only
+        #   neither   → no decay; let accumulated evidence persist until
+        #               the next directional tick provides signal
+        _decay = 0.92
+        if rev_delta > 0 and cont_delta > 0:
+            # Mixed signal tick — both sides active, symmetric decay
             ps.rev_evidence  += rev_delta
-            ps.cont_evidence *= _decay
-        if cont_delta > 0:
             ps.cont_evidence += cont_delta
             ps.rev_evidence  *= _decay
+            ps.cont_evidence *= _decay
+        elif rev_delta > 0:
+            ps.rev_evidence  += rev_delta
+            ps.cont_evidence *= _decay
+        elif cont_delta > 0:
+            ps.cont_evidence += cont_delta
+            ps.rev_evidence  *= _decay
+        # Both zero → no decay: stale evidence persists unchanged
 
         ps.peak_rev  = max(ps.peak_rev,  ps.static_rev_base  + ps.rev_evidence)
         ps.peak_cont = max(ps.peak_cont, ps.static_cont_base + ps.cont_evidence)

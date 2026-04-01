@@ -358,6 +358,73 @@ def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
     return round(round(price / tick) * tick, 10) if tick > 0 else price
 
+
+def _calc_be_price(pos_side: str, entry_price: float, atr: float,
+                   pos=None) -> float:
+    """
+    Single source of truth for break-even price across the entire engine.
+
+    WHY ONE FUNCTION:
+      Five different inline expressions previously spread across quant_strategy
+      and controller computed a slightly different break-even price:
+        - 0.10 ATR buffer  (display / heartbeat paths)
+        - 0.12 ATR buffer  (_DynamicStructureTrail)
+        - 0.15 ATR buffer  (counter-BOS path in _update_trailing_sl)
+        - 0.30 ATR only, no fee  (legacy compute_trail_sl gating)
+      None of them used the exact paid commission captured from Delta's
+      paid_commission field (stored on PositionState.entry_fee_paid since v8.1).
+
+    FORMULA:
+      fee_per_btc  = exact_entry_fee / qty   if exact fee available (v8.1+)
+                   = entry_price × COMMISSION_RATE × 2   otherwise
+      slippage_buf = 0.12 × ATR   (half-spread estimate; tighter than old 0.15,
+                                   wider than old 0.10 — a calibrated middle ground)
+      be_price     = entry_price ± (fee_per_btc + slippage_buf)
+
+    EXACT FEE:
+      Delta's paid_commission is the actual taker/maker fee in USD for the entry
+      leg.  We store it on pos.entry_fee_paid at fill.  When present it replaces
+      the commission-rate estimate, giving a trade-level accurate BE.
+
+    ARGS:
+      pos_side     : 'long' | 'short'
+      entry_price  : position entry price
+      atr          : current ATR (5m)
+      pos          : PositionState (optional) — used for exact fee + quantity
+
+    RETURNS:
+      Break-even price as float.  For long: entry_price + buf.
+      For short: entry_price - buf.
+    """
+    import config as _cfg_be
+    # ── Fee per BTC ──────────────────────────────────────────────────────────
+    _exact_fee = 0.0
+    _qty       = 0.0
+    if pos is not None:
+        _exact_fee = float(getattr(pos, 'entry_fee_paid', 0.0) or 0.0)
+        _qty       = float(getattr(pos, 'quantity',       0.0) or 0.0)
+
+    if _exact_fee > 1e-6 and _qty > 1e-10:
+        # Exact round-trip cost: entry paid_commission (exact) + estimated exit
+        # fee (same rate applied symmetrically — we don't have the exit fee yet).
+        _entry_fee_per_btc = _exact_fee / _qty
+        # Estimate exit fee at the same rate as entry (conservative)
+        _exit_fee_rate = _entry_fee_per_btc / max(entry_price, 1.0)
+        _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_fee_rate
+    else:
+        # Fallback: bilateral commission-rate estimate
+        _rate        = float(getattr(_cfg_be, 'COMMISSION_RATE', 0.00055))
+        _fee_per_btc = entry_price * _rate * 2.0
+
+    # ── Slippage allowance ───────────────────────────────────────────────────
+    # 0.12 ATR: tighter than the old 0.15 used in counter-BOS (that was overly
+    # conservative) and wider than the 0.10 used in display (that was too tight).
+    # At $255 ATR this is $30.6 — covers a normal half-spread on BTC perps.
+    _slippage_buf = 0.12 * atr
+
+    _buf = _fee_per_btc + _slippage_buf
+    return (entry_price + _buf if pos_side == "long" else entry_price - _buf)
+
 def _sigmoid(z: float, steepness: float = 1.0) -> float:
     return max(-1.0, min(1.0, z * steepness / (1.0 + abs(z * steepness) * 0.5)))
 
@@ -2187,8 +2254,9 @@ class InstitutionalLevels:
         # ═══ BREAK-EVEN UNLOCKED FLAG ════════════════════════════════════
         # Defined here — before zone freeze — to fix the v4.9 forward-reference
         # NameError that silently crashed every trail tick.
-        _be_price = (entry_price + 0.3 * atr if pos_side == "long"
-                     else entry_price - 0.3 * atr)
+        # NOTE: this function is legacy dead-code (replaced by _DynamicStructureTrail).
+        # Kept in-sync with _calc_be_price for correctness if ever re-enabled.
+        _be_price = _calc_be_price(pos_side, entry_price, atr, pos=None)
         _be_is_unlocked = (
             (pos_side == "long"  and current_sl >= _be_price) or
             (pos_side == "short" and current_sl <= _be_price)
@@ -3036,13 +3104,12 @@ class _DynamicStructureTrail:
         # ══════════════════════════════════════════════════════════════
         # LAYER 1: BREAK-EVEN FLOOR (capital protection, 0.30R+)
         # ══════════════════════════════════════════════════════════════
-        try:
-            from config import COMMISSION_RATE as _cr
-        except Exception:
-            _cr = 0.00055
-        be_buf   = entry_price * _cr * 2.0 + 0.12 * atr
-        be_price = (entry_price + be_buf if pos_side == "long"
-                    else entry_price - be_buf)
+        # BE floor: single source of truth via _calc_be_price().
+        # 'pos' is not available here (static method), so exact fee falls back
+        # to commission-rate estimate — acceptable because the DST is called from
+        # _update_trailing_sl which also has the pos object and will do the exact
+        # override in the BE-OVERRIDE block below.
+        be_price = _calc_be_price(pos_side, entry_price, atr, pos=None)
         be_floor = be_price if tier >= 0.30 else None
 
         # ══════════════════════════════════════════════════════════════
@@ -4093,9 +4160,13 @@ class QuantStrategy:
             self._pending_hunt_signal = None
             # Clear any open DirectionEngine post-sweep state so evidence from
             # before the reconnect doesn't bleed into the first new setup.
-            if self._dir_engine is not None and hasattr(self._dir_engine, '_ps_state'):
+            # BUG-4 FIX: use the public clear_sweep() API instead of directly
+            # nulling the private _ps_state attribute.  Direct mutation bypasses
+            # any invariants (e.g. _ps_state_quality reset) that clear_sweep()
+            # maintains, and silently breaks if DirectionEngine renames the attr.
+            if self._dir_engine is not None:
                 try:
-                    self._dir_engine._ps_state = None
+                    self._dir_engine.clear_sweep()
                 except Exception:
                     pass
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
@@ -5024,9 +5095,7 @@ class QuantStrategy:
             choch_active = choch_tf is not None and choch_lvl > 0.0
 
             # ── Break-even lock ───────────────────────────────────────────
-            _fee_buf  = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.10 * atr
-            _be_price = (pos.entry_price + _fee_buf if pos.side == "long"
-                         else pos.entry_price - _fee_buf)
+            _be_price = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
             be_locked = ((pos.side == "long"  and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
@@ -5313,14 +5382,22 @@ class QuantStrategy:
             try:
                 _tf_de  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_de = self._cvd.get_trend_signal() if self._cvd else 0.0
+                # FIX-8: pass previous tick's snapshot (before this tick's
+                # liq_map.update() runs — see direction_engine FIX-8 guide).
+                # _last_snapshot is set by get_snapshot() at the end of the
+                # previous tick; it is None on the very first tick, which the
+                # direction_engine handles gracefully (falls back to ICT pools).
+                _prev_liq_snap = (getattr(self._liq_map, '_last_snapshot', None)
+                                  if self._liq_map is not None else None)
                 _hunt: HuntPrediction = self._dir_engine.predict_hunt(
-                    price      = price,
-                    atr        = atr,
-                    now_ms     = now_ms,
-                    ict_engine = self._ict,
-                    tick_flow  = _tf_de,
-                    cvd_trend  = _cvd_de,
-                    candles_5m = candles_by_tf.get("5m", []),
+                    price        = price,
+                    atr          = atr,
+                    now_ms       = now_ms,
+                    ict_engine   = self._ict,
+                    tick_flow    = _tf_de,
+                    cvd_trend    = _cvd_de,
+                    candles_5m   = candles_by_tf.get("5m", []),
+                    liq_snapshot = _prev_liq_snap,
                 )
                 # Bridge HuntPrediction dataclass → legacy dict shape that the
                 # rest of the codebase already consumes via _last_hunt_pred.
@@ -5406,6 +5483,13 @@ class QuantStrategy:
                 candles_by_tf.get("1m", []))
         except Exception:
             pass
+        # BUG-1 FIX: Persist directional tick_flow/cvd_trend for use in
+        # generate_periodic_report().  _flow_conviction is a non-negative
+        # magnitude scalar — passing it to evaluate_sweep() as tick_flow
+        # (which expects a signed [-1,+1] direction) corrupts the post-sweep
+        # reversal score displayed in the periodic heartbeat report.
+        self._last_tick_flow = tick_flow
+        self._last_cvd_trend  = cvd_trend
 
         if tick_flow > 0.4:
             if self._flow_streak_dir_v2 == "long":
@@ -5579,12 +5663,13 @@ class QuantStrategy:
                 _tf_ps  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_ps = self._cvd.get_trend_signal() if self._cvd else 0.0
                 _ps_decision = self._dir_engine.evaluate_sweep(
-                    price      = price,
-                    atr        = atr,
-                    now        = now,
-                    ict_engine = self._ict,
-                    tick_flow  = _tf_ps,
-                    cvd_trend  = _cvd_ps,
+                    price        = price,
+                    atr          = atr,
+                    now          = now,
+                    ict_engine   = self._ict,
+                    tick_flow    = _tf_ps,
+                    cvd_trend    = _cvd_ps,
+                    liq_snapshot = liq_snapshot,   # fresh — liq_map.update() already ran
                 )
                 if _ps_decision is not None and _ps_decision.action in ("reverse", "continue"):
                     # Inject verdict into ICTContext so entry_engine can weight it
@@ -7565,9 +7650,11 @@ class QuantStrategy:
         # The sweep that triggered this entry has been acted on. Reset the
         # accumulative PostSweepState so evaluate_sweep() doesn't keep firing
         # after the position is live (pool-hit gate takes over from here).
-        if self._dir_engine is not None and hasattr(self._dir_engine, '_ps_state'):
+        # BUG-4 FIX: use the public clear_sweep() API — see on_stream_restart
+        # for the full rationale on why direct _ps_state mutation is wrong.
+        if self._dir_engine is not None:
             try:
-                self._dir_engine._ps_state = None
+                self._dir_engine.clear_sweep()
             except Exception:
                 pass
 
@@ -7789,6 +7876,15 @@ class QuantStrategy:
             try:
                 _tf_ph  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_ph = self._cvd.get_trend_signal() if self._cvd else 0.0
+                # FIX-5: pass liq_snapshot so pool_hit_gate can auto-resolve
+                # next_pool from the nearest qualifying opposing pool.
+                _gate_liq_snap = None
+                try:
+                    if self._liq_map is not None:
+                        _gate_liq_snap = self._liq_map.get_snapshot(
+                            price, self._atr_5m.atr if self._atr_5m else 1.0)
+                except Exception:
+                    pass
                 _gate = self._dir_engine.pool_hit_gate(
                     pos_side   = pos.side,
                     pos_entry  = pos.entry_price,
@@ -7799,69 +7895,215 @@ class QuantStrategy:
                     ict_engine = self._ict,
                     tick_flow  = _tf_ph,
                     cvd_trend  = _cvd_ph,
+                    liq_snapshot = _gate_liq_snap,
                 )
                 if _gate is not None and _gate.action == "reverse":
-                    logger.info(
-                        f"🚧 DIR_ENGINE POOL-GATE: REVERSE "
-                        f"conf={_gate.confidence:.2f} "
-                        f"| {_gate.reason[:100]}")
-                    try:
-                        from telegram.notifier import format_pool_gate_alert
-                        send_telegram_message(format_pool_gate_alert(
-                            action        = "reverse",
-                            confidence    = _gate.confidence,
-                            reason        = _gate.reason,
-                            pos_side      = pos.side,
-                            pos_entry     = pos.entry_price,
-                            current_price = price,
-                            pos_sl        = pos.sl_price,
-                            pos_tp        = pos.tp_price,
-                            atr           = self._atr_5m.atr if self._atr_5m else 0.0,
-                        ))
-                    except Exception:
-                        send_telegram_message(
-                            f"🚧 <b>POOL-GATE: REVERSE TRIGGERED</b>\n"
-                            f"Structure invalidated — gate recommends reversal\n"
-                            f"Confidence: {_gate.confidence:.2f}\n"
-                            f"{_gate.reason[:200]}")
-                    self._exit_trade(order_manager, price, "pool_gate_reverse")
-                    return
-                elif _gate is not None and _gate.action == "continue" and _gate.next_target:
-                    # Update TP to the next pool target — let the exchange bracket
-                    # order be amended by the trail engine's REST mechanism on the
-                    # next trail tick that detects the TP distance change.
-                    # We update local state here so the in-position monitor shows
-                    # the correct target immediately.
-                    # NOTE: log is inside the guard — pool_hit_gate returns "continue"
-                    # every tick once AMD is aligned, so logging outside caused spam.
-                    if pos.tp_price != _gate.next_target:
-                        logger.info(
-                            f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
-                            f"next target=${_gate.next_target:,.0f} "
-                            f"conf={_gate.confidence:.2f} "
-                            f"| {_gate.reason[:80]}")
-                        pos.tp_price = _gate.next_target
-                        self.current_tp_price = _gate.next_target
+                    # BUG-3 FIX: pool_hit_gate "reverse" must NEVER close the
+                    # position.  The gate fires every tick once AMD flips contra
+                    # — exiting on each tick would fire multiple exits and leave
+                    # the bot flat at a suboptimal price.  Instead: migrate SL
+                    # to breakeven (capital protection) and send a Telegram
+                    # awareness alert.  The existing SL/TP bracket remains live
+                    # and manages the exit when the market decides.
+                    logger.warning(
+                        f"⚠️ POOL-GATE: REVERSE signal — no exit taken, "
+                        f"migrating SL to BE if not already there. "
+                        f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
+
+                    _be_tick  = _round_to_tick(
+                        _calc_be_price(pos.side, pos.entry_price,
+                                       self._atr_5m.atr if self._atr_5m else 1.0,
+                                       pos=pos))
+                    _be_needed = (
+                        (pos.side == "long"  and pos.sl_price < _be_tick) or
+                        (pos.side == "short" and pos.sl_price > _be_tick)
+                    )
+                    if _be_needed and pos.sl_order_id and not pos.be_ratchet_applied:
+                        try:
+                            _es = "sell" if pos.side == "long" else "buy"
+                            _be_result = order_manager.replace_stop_loss(
+                                existing_sl_order_id = pos.sl_order_id,
+                                side                 = _es,
+                                quantity             = pos.quantity,
+                                new_trigger_price    = _be_tick,
+                            )
+                            if _be_result is None:
+                                # replace_stop_loss returning None means SL already
+                                # fired — treat as a fill event and bail out.
+                                self._record_exchange_exit(None)
+                                return
+                            if isinstance(_be_result, dict) and "error" not in _be_result:
+                                with self._lock:
+                                    pos.sl_price           = _be_tick
+                                    pos.sl_order_id        = (_be_result.get("order_id")
+                                                              or pos.sl_order_id)
+                                    pos.be_ratchet_applied = True
+                                    self.current_sl_price  = _be_tick
+                                logger.info(
+                                    f"🔒 POOL-GATE REVERSE → SL migrated to BE "
+                                    f"${_be_tick:,.2f} (no exit; bracket manages)")
+                                send_telegram_message(
+                                    f"⚠️ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
+                                    f"Pool hit with contra AMD flow — <b>no exit taken</b>\n"
+                                    f"SL migrated to breakeven: <b>${_be_tick:,.2f}</b>\n"
+                                    f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
+                            else:
+                                logger.debug(
+                                    f"Pool-gate BE migration rejected by exchange: "
+                                    f"{_be_result}")
+                        except Exception as _be_e:
+                            logger.debug(
+                                f"Pool-gate BE migration error (non-fatal): {_be_e}")
+                    else:
+                        # SL is already at or beyond BE, or no sl_order_id yet.
+                        # Send awareness-only alert so operator can see the signal.
                         try:
                             from telegram.notifier import format_pool_gate_alert
                             send_telegram_message(format_pool_gate_alert(
-                                action        = "continue",
+                                action        = "hold",
                                 confidence    = _gate.confidence,
-                                reason        = _gate.reason,
+                                reason        = f"[REVERSE signal — no exit] {_gate.reason}",
                                 pos_side      = pos.side,
                                 pos_entry     = pos.entry_price,
                                 current_price = price,
                                 pos_sl        = pos.sl_price,
                                 pos_tp        = pos.tp_price,
-                                next_target   = _gate.next_target,
                                 atr           = self._atr_5m.atr if self._atr_5m else 0.0,
                             ))
                         except Exception:
                             send_telegram_message(
-                                f"🚧 <b>POOL-GATE: TP EXTENDED</b>\n"
-                                f"New target: ${_gate.next_target:,.0f}\n"
-                                f"Confidence: {_gate.confidence:.2f}\n"
-                                f"{_gate.reason[:200]}")
+                                f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
+                                f"SL already at/beyond BE — bracket manages\n"
+                                f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
+                    # NOTE: no early return — trail engine must still run this tick.
+                elif _gate is not None and _gate.action == "continue" and _gate.next_target:
+                    # BUG-2 FIX: "continue" was updating local state only.
+                    # The exchange bracket TP order remained at the original
+                    # price, so the extension never reached the exchange.
+                    # When price hit the old TP, the bracket fired — the bot
+                    # exited at the first pool instead of riding to next_target.
+                    #
+                    # Fix: cancel the existing TP order and place a new one at
+                    # next_target (cancel-and-replace — order_manager has no
+                    # replace_take_profit method).  Local state is updated only
+                    # after the exchange confirms the new order.
+                    # Guard is strictly inside the changed-price check so this
+                    # block never fires twice for the same target (pool_hit_gate
+                    # returns "continue" every tick once AMD is aligned).
+                    _new_tp = _round_to_tick(_gate.next_target)
+                    if pos.tp_price != _new_tp:
+                        # Sanity-check: new TP must be beyond current price in
+                        # the correct direction, otherwise skip silently.
+                        _tp_direction_valid = (
+                            (pos.side == "long"  and _new_tp > price) or
+                            (pos.side == "short" and _new_tp < price)
+                        )
+                        if not _tp_direction_valid:
+                            logger.debug(
+                                f"Pool-gate CONTINUE: next_target "
+                                f"${_new_tp:,.2f} is behind current price "
+                                f"${price:,.2f} for {pos.side} — skipping TP amend")
+                        else:
+                            logger.info(
+                                f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
+                                f"TP ${pos.tp_price:,.2f} → ${_new_tp:,.2f} "
+                                f"conf={_gate.confidence:.2f} "
+                                f"| {_gate.reason[:80]}")
+
+                            _tp_amended = False
+                            if pos.tp_order_id:
+                                # Cancel the existing TP limit/stop order then
+                                # immediately re-place at the extended price.
+                                # We treat cancel failure as non-fatal — if the
+                                # cancel returns a filled/partial result the
+                                # position is already closed and _sync_position
+                                # will reconcile on the next heartbeat.
+                                try:
+                                    _cancel_result = order_manager.cancel_order(
+                                        pos.tp_order_id)
+                                    # cancel_order returning None or a filled
+                                    # status means the TP fired concurrently.
+                                    if _cancel_result is None:
+                                        logger.warning(
+                                            "Pool-gate TP cancel returned None "
+                                            "— TP may have fired concurrently; "
+                                            "skipping amend, reconcile will clean up")
+                                    else:
+                                        _exit_side = (
+                                            "sell" if pos.side == "long" else "buy")
+                                        _new_tp_data = order_manager.place_take_profit(
+                                            side          = _exit_side,
+                                            quantity      = pos.quantity,
+                                            trigger_price = _new_tp,
+                                        )
+                                        if _new_tp_data and isinstance(_new_tp_data, dict) \
+                                                and "error" not in _new_tp_data:
+                                            with self._lock:
+                                                pos.tp_price          = _new_tp
+                                                pos.tp_order_id       = (
+                                                    _new_tp_data.get("order_id")
+                                                    or pos.tp_order_id)
+                                                self.current_tp_price = _new_tp
+                                            _tp_amended = True
+                                            logger.info(
+                                                f"✅ Exchange TP amended → "
+                                                f"${_new_tp:,.2f} "
+                                                f"order={pos.tp_order_id}")
+                                        else:
+                                            # place_take_profit failed.  The old
+                                            # TP is already cancelled — place an
+                                            # emergency market-close to avoid an
+                                            # unprotected position, then bail.
+                                            logger.error(
+                                                f"Pool-gate TP re-place FAILED "
+                                                f"after cancel: {_new_tp_data}. "
+                                                f"Issuing emergency market close.")
+                                            _es = ("sell" if pos.side == "long"
+                                                   else "buy")
+                                            order_manager.place_market_order(
+                                                side       = _es,
+                                                quantity   = pos.quantity,
+                                                reduce_only= True,
+                                            )
+                                            self._record_exchange_exit(None)
+                                            return
+                                except Exception as _tpa_e:
+                                    logger.debug(
+                                        f"Pool-gate TP amend error (non-fatal): "
+                                        f"{_tpa_e}")
+
+                            if not _tp_amended:
+                                # No tp_order_id on record (bracket already
+                                # managed natively by the exchange, e.g. Bybit
+                                # bracket mode) — update local state only so
+                                # the in-position monitor is consistent.
+                                with self._lock:
+                                    pos.tp_price          = _new_tp
+                                    self.current_tp_price = _new_tp
+                                logger.debug(
+                                    "Pool-gate CONTINUE: no tp_order_id — "
+                                    "local state updated, exchange manages TP natively")
+
+                            try:
+                                from telegram.notifier import format_pool_gate_alert
+                                send_telegram_message(format_pool_gate_alert(
+                                    action        = "continue",
+                                    confidence    = _gate.confidence,
+                                    reason        = _gate.reason,
+                                    pos_side      = pos.side,
+                                    pos_entry     = pos.entry_price,
+                                    current_price = price,
+                                    pos_sl        = pos.sl_price,
+                                    pos_tp        = _new_tp,
+                                    next_target   = _new_tp,
+                                    atr           = self._atr_5m.atr if self._atr_5m else 0.0,
+                                ))
+                            except Exception:
+                                send_telegram_message(
+                                    f"🚧 <b>POOL-GATE: TP EXTENDED</b>\n"
+                                    f"New target: ${_new_tp:,.2f}\n"
+                                    f"Confidence: {_gate.confidence:.2f}\n"
+                                    f"{_gate.reason[:200]}")
                 # action="hold" → do nothing, let existing SL/TP manage
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
@@ -8193,9 +8435,8 @@ class QuantStrategy:
         # ══════════════════════════════════════════════════════════════════
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
-        _fee_buf = pos.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.15 * atr
-        _be_floor = (pos.entry_price + _fee_buf if pos.side == "long"
-                     else pos.entry_price - _fee_buf)
+        # BE floor — use exact entry fee when available (v8.1+)
+        _be_floor = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
 
         # ══════════════════════════════════════════════════════════════════
         # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
@@ -9272,9 +9513,7 @@ class QuantStrategy:
             if init_sl > 1e-10:
                 raw_pts = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
                 locked_r = max(0, raw_pts / init_sl) if raw_pts > 0 else 0.0
-            _fee_buf = p.entry_price * QCfg.COMMISSION_RATE() * 2.0 + 0.10 * atr
-            _be_price = (p.entry_price + _fee_buf if p.side == "long"
-                         else p.entry_price - _fee_buf)
+            _be_price = _calc_be_price(p.side, p.entry_price, atr, pos=p)
             be_moved = ((p.side == "long" and p.sl_price >= _be_price) or
                         (p.side == "short" and p.sl_price <= _be_price))
 
@@ -9334,13 +9573,25 @@ class QuantStrategy:
                 pass
             try:
                 if self._dir_engine.in_post_sweep:
+                    _hb_liq_snap = None
+                    try:
+                        if self._liq_map is not None:
+                            _hb_liq_snap = self._liq_map.get_snapshot(price, atr)
+                    except Exception:
+                        pass
+                    # BUG-1 FIX: Use _last_tick_flow/_last_cvd_trend (signed
+                    # direction signals, set in _evaluate_entry each tick).
+                    # _flow_conviction is a non-negative magnitude — passing it
+                    # here as tick_flow made all heartbeat reversal scores
+                    # appear weakly-bullish regardless of true market direction.
                     _ps_eval = self._dir_engine.evaluate_sweep(
-                        price      = price,
-                        atr        = atr,
-                        now        = time.time(),
-                        ict_engine = self._ict,
-                        tick_flow  = getattr(self, '_flow_conviction', 0.0),
-                        cvd_trend  = 0.0,
+                        price        = price,
+                        atr          = atr,
+                        now          = time.time(),
+                        ict_engine   = self._ict,
+                        tick_flow    = getattr(self, '_last_tick_flow', 0.0),
+                        cvd_trend    = getattr(self, '_last_cvd_trend',  0.0),
+                        liq_snapshot = _hb_liq_snap,
                     )
                     if _ps_eval is not None:
                         direction_ps_analysis = _ps_eval
