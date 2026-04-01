@@ -406,6 +406,19 @@ class QCfg:
     def TRAIL_DISP_CVD_MIN_R() -> float:
         """Gate is only active above this R-multiple (below = BE move allowed freely)."""
         return float(_cfg("QUANT_TRAIL_DISP_CVD_MIN_R", 0.30))
+    # ── v6.2: Liquidity-tier smart-money trailing ──────────────────────────────
+    @staticmethod
+    def TRAIL_SMART_LIQUIDITY_ENABLED() -> bool:
+        return bool(_cfg("QUANT_TRAIL_SMART_LIQUIDITY_ENABLED", True))
+    @staticmethod
+    def TRAIL_SMART_POST_SWEEP_SEC() -> float:
+        return float(_cfg("QUANT_TRAIL_SMART_POST_SWEEP_SEC", 180.0))
+    @staticmethod
+    def TRAIL_SMART_T3_MAX_ATR() -> float:
+        return float(_cfg("QUANT_TRAIL_SMART_T3_MAX_ATR", 10.0))
+    @staticmethod
+    def TRAIL_SMART_STALE_POOL_ATR() -> float:
+        return float(_cfg("QUANT_TRAIL_SMART_STALE_POOL_ATR", 0.45))
 
 def _round_to_tick(price: float) -> float:
     tick = QCfg.TICK_SIZE()
@@ -2236,366 +2249,11 @@ class InstitutionalLevels:
                          ict_engine=None,
                          now_ms: int = 0,
                          hold_reason: Optional[List[str]] = None) -> Optional[float]:
-        """
-        Institutional trailing SL — v4.9 (ICT-anchored, zone-aware).
-
-        v4.9 ADDITIONS on top of v4.8's 7-bug rewrite:
-
-        NEW 1: ICT ZONE FREEZE
-               If price is testing an active Order Block or sitting inside an FVG,
-               the trail is COMPLETELY FROZEN. These are institutional zones where
-               smart money placed orders. A test of an OB is not a reversal —
-               it is the setup completing. Freezing the trail here eliminates the
-               "SL hit during pullback, then TP fires without us" pattern.
-
-        NEW 2: ICT OB ANCHOR (additional SL candidate)
-               If an active OB exists between current_sl and price, compute SL =
-               OB.low - ICT_OB_SL_BUFFER_ATR × ATR (for long). This is the most
-               institutionally valid SL level — that is literally WHERE the orders
-               are sitting. The structure holds or it doesn't. OB anchor > chandelier.
-
-        NEW 3: LIQUIDITY POOL CEILING
-               After all candidates are built, cap the trail SL so it cannot advance
-               PAST an unswept liquidity pool (EQL for long, EQH for short) in the
-               direction of price. Smart money sweeps those pools — trailing SL right
-               at the pool means the sweep takes us out before the reversal.
-               Keep SL safely BEYOND the pool level by ICT_LIQ_POOL_BUFFER_ATR × ATR.
-
-        Returns None if no improvement qualifies, if in ICT zone freeze, or if
-        the pullback classifier says to hold.
-        """
-        if candles_5m is None:
-            candles_5m = []
-
-        # v4.8 BUG 1 FIX: Use ORIGINAL SL distance, not current
-        # After trail moves SL from $73,320 to $73,600, using current SL
-        # makes init_dist=$200→$80, inflating tier from 0.6 to 1.5 instantly.
-        init_dist = initial_sl_dist if initial_sl_dist > 1e-10 else (
-            abs(entry_price - current_sl) if abs(entry_price - current_sl) > 1e-10 else atr)
-
-        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-
-        # v4.8 BUG 2 FIX: Phase is determined by PEAK profit, not current.
-        # During a healthy pullback from +2R to +1R, tier drops and Phase 2
-        # demotes to Phase 1, losing chandelier exactly when needed.
-        # Phase RATCHETS UP — once earned, never lost.
-        tier_profit = max(profit, peak_profit)
-        tier = tier_profit / init_dist if init_dist > 1e-10 else 0.0
-
-        if atr < 1e-10:
-            if hold_reason is not None:
-                hold_reason.append("ATR=0")
-            return None
-
-        # ═══ PHASE 0: HANDS OFF ═══════════════════════════════════════════
-        if tier < QCfg.TRAIL_BE_R():
-            if hold_reason is not None:
-                hold_reason.append(f"PHASE0 tier={tier:.2f}R < BE_R={QCfg.TRAIL_BE_R():.1f}R")
-            return None
-
-        # ═══ DETERMINE PHASE AND MIN DISTANCE ═════════════════════════════
-        if tier >= QCfg.TRAIL_AGGRESSIVE_R():
-            phase = 3
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P3() * atr
-        elif tier >= QCfg.TRAIL_LOCK_R():
-            phase = 2
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P2() * atr
-        else:
-            phase = 1
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
-
-        # ═══ BREAK-EVEN UNLOCKED FLAG ════════════════════════════════════
-        # Defined here — before zone freeze — to fix the v4.9 forward-reference
-        # NameError that silently crashed every trail tick.
-        # NOTE: this function is legacy dead-code (replaced by _DynamicStructureTrail).
-        # Kept in-sync with _calc_be_price for correctness if ever re-enabled.
-        _be_price = _calc_be_price(pos_side, entry_price, atr, pos=None)
-        _be_is_unlocked = (
-            (pos_side == "long"  and current_sl >= _be_price) or
-            (pos_side == "short" and current_sl <= _be_price)
+        """DEPRECATED. Trailing SL is exclusively handled by `_DynamicStructureTrail.compute()`."""
+        raise RuntimeError(
+            "InstitutionalLevels.compute_trail_sl is fully deprecated and must not be used. "
+            "Trailing SL is exclusively handled by _DynamicStructureTrail.compute()."
         )
-
-        # ═══ v5.0: FVG ZONE FREEZE (time-limited + SL-proximity-gated) ════
-        # OB zone freeze removed — it permanently blocked trailing whenever
-        # overlapping OBs covered the entire trade range.
-        # FVG freeze kept with two hard guards:
-        #   GUARD 1 — TIME: release unconditionally after 10 minutes
-        #   GUARD 2 — SL PROXIMITY: only freeze when SL is within 1.5×ATR
-        #             of the FVG boundary (SL must have trailed to the zone)
-        _FVG_MAX_FREEZE_SEC = 600.0
-        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
-            if hold_seconds < _FVG_MAX_FREEZE_SEC:
-                try:
-                    _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                    _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
-                    _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
-                             else ict_engine.fvgs_bear)
-                    for _fvg in _fvgs:
-                        if not _fvg.is_active(_ict_now_ms):
-                            continue
-                        _fvg_lo = _fvg.bottom - _freeze_atr * 0.5
-                        _fvg_hi = _fvg.top    + _freeze_atr * 0.5
-                        if not (_fvg_lo <= price <= _fvg_hi):
-                            continue
-                        if pos_side == "long":
-                            _sl_near_fvg = current_sl >= _fvg.bottom - 1.5 * atr
-                        else:
-                            _sl_near_fvg = current_sl <= _fvg.top + 1.5 * atr
-                        if not _sl_near_fvg:
-                            logger.debug(
-                                f"Trail: FVG freeze SKIPPED — SL ${current_sl:,.0f} "
-                                f"not near FVG ${_fvg.bottom:.0f}–${_fvg.top:.0f}")
-                            continue
-                        if hold_reason is not None:
-                            hold_reason.append(
-                                f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
-                        return None
-                except Exception as _ict_e:
-                    logger.debug(f"Trail ICT FVG zone check error (non-fatal): {_ict_e}")
-
-                # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
-        # NOTE: _be_price and _be_is_unlocked defined above in phase block.
-        if QCfg.TRAIL_PULLBACK_FREEZE():
-            is_pb, rev_count, pb_detail = InstitutionalLevels._classify_pullback_vs_reversal(
-                pos_side, price, entry_price, atr,
-                candles_1m, candles_5m, orderbook, entry_vol, peak_price_abs)
-            if is_pb and _be_is_unlocked:
-                # BE locked — full pullback freeze engaged
-                logger.debug(
-                    f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} "
-                    f"reversal) BE locked — FROZEN [{pb_detail}]")
-                if hold_reason is not None:
-                    hold_reason.append(f"PULLBACK({rev_count}sig) [{pb_detail}]")
-                return None
-            elif is_pb and not _be_is_unlocked:
-                # BE not yet locked — allow BE move, but log the pullback status
-                logger.debug(
-                    f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} rev) "
-                    f"— BE not locked, allowing BE move [{pb_detail}]")
-
-        # ═══ BUILD CANDIDATE SL LEVELS ════════════════════════════════════
-        # v4.9 INSTITUTIONAL PRIORITY — structure first, chandelier last resort:
-        #   1. Profit floor      — fee-adjusted breakeven (all phases)
-        #   2. ICT OB anchor     — WHERE institutional orders are (all phases)
-        #   3. 5m swing low/high — market's confirmed structure (all phases)
-        #   4. 1m micro-swing    — tighter confirmed structure (Phase 2+)
-        #   5. Chandelier        — Phase 3 ONLY when no structure found
-        #   6. HVN               — volume-based support (Phase 3 only)
-        #   7. OB wall           — orderbook depth support (Phase 3 only)
-        #
-        # Chandelier was previously Phase 2+, causing stops on normal OB pullbacks.
-        # Structure must lead. Chandelier is the fallback for featureless markets.
-        candidates: List[float] = []
-
-        # ── 1. Profit floor (all phases) ─────────────────────────────────
-        rt_fee_per_btc   = entry_price * QCfg.COMMISSION_RATE() * 2.0
-        profit_floor_buf = rt_fee_per_btc + 0.3 * atr
-        profit_floor = (entry_price + profit_floor_buf if pos_side == "long"
-                        else entry_price - profit_floor_buf)
-        candidates.append(profit_floor)
-
-        # ── 2. ICT OB anchor (all phases) ────────────────────────────────
-        # Highest-conviction structural level: SL just below an active bullish OB
-        # (for long). That is literally WHERE smart money placed its buy orders.
-        # The market bounces off OBs by design; SL below it survives OB tests.
-        if QCfg.ICT_OB_SL_ANCHOR() and ict_engine is not None:
-            try:
-                _now_ms_ob = now_ms if now_ms > 0 else int(time.time() * 1000)
-                _ob_buf    = QCfg.ICT_OB_SL_BUFFER_ATR() * atr
-                _obs = (ict_engine.order_blocks_bull if pos_side == "long"
-                        else ict_engine.order_blocks_bear)
-                for _ob in sorted([o for o in _obs if o.is_active(_now_ms_ob)],
-                                   key=lambda x: abs(x.midpoint - price)):
-                    if pos_side == "long":
-                        if current_sl < _ob.low - _ob_buf < price - min_dist:
-                            candidates.append(_ob.low - _ob_buf)
-                            logger.debug(
-                                f"Trail: OB anchor ${_ob.low - _ob_buf:,.1f} "
-                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
-                            break
-                    else:
-                        if price + min_dist < _ob.high + _ob_buf < current_sl:
-                            candidates.append(_ob.high + _ob_buf)
-                            logger.debug(
-                                f"Trail: OB anchor ${_ob.high + _ob_buf:,.1f} "
-                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
-                            break
-            except Exception as _e:
-                logger.debug(f"Trail OB anchor error: {_e}")
-
-        # ── 3. 1m confirmed swing structure (all phases) — PRIMARY ─────────
-        # v5.0: 1m closed swing lows/highs are the primary trail driver.
-        # 15m ICT structure sets the SL/TP at entry. During the trade, 1m
-        # structure captures the freshest institutional footprints every minute.
-        if len(candles_1m) >= 6:
-            closed_1m_p = candles_1m[:-1]
-            sh_1m_p, sl_1m_p = InstitutionalLevels.find_swing_extremes(
-                closed_1m_p, min(10, len(closed_1m_p) - 2))
-            swing_buf_1m = max(0.10 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.40)
-
-            if pos_side == "long" and sl_1m_p:
-                valid = [l for l in sl_1m_p
-                         if current_sl + 0.05 * atr < l < price - min_dist]
-                if valid:
-                    best_sw = max(valid)
-                    candidates.append(best_sw - swing_buf_1m)
-                    logger.debug(
-                        f"Trail: 1m swing low ${best_sw:,.1f} → SL ${best_sw-swing_buf_1m:,.1f}")
-            elif pos_side == "short" and sh_1m_p:
-                valid = [h for h in sh_1m_p
-                         if price + min_dist < h < current_sl - 0.05 * atr]
-                if valid:
-                    best_sw = min(valid)
-                    candidates.append(best_sw + swing_buf_1m)
-                    logger.debug(
-                        f"Trail: 1m swing high ${best_sw:,.1f} → SL ${best_sw+swing_buf_1m:,.1f}")
-
-        # ── 4. 1m tighter micro-swing (Phase 2+) ─────────────────────────
-        if phase >= 2 and len(candles_1m) >= 8:
-            closed_1m    = candles_1m[:-1]
-            sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
-                closed_1m, min(QCfg.TRAIL_SWING_BARS(), len(closed_1m) - 2))
-            micro_buf = max(0.08 * atr, swing_buf_1m * 0.60)
-
-            if pos_side == "long" and sl_1m:
-                valid = [l for l in sl_1m if current_sl < l < price - min_dist]
-                if valid:
-                    best_m = max(valid)
-                    candidates.append(best_m - micro_buf)
-                    logger.debug(
-                        f"Trail: 1m micro ${best_m:,.1f} → SL ${best_m-micro_buf:,.1f}")
-            elif pos_side == "short" and sh_1m:
-                valid = [h for h in sh_1m if price + min_dist < h < current_sl]
-                if valid:
-                    best_m = min(valid)
-                    candidates.append(best_m + micro_buf)
-
-        # ── 5. Chandelier exit (Phase 3 ONLY — last resort) ──────────────
-        # Used ONLY when no structural candidate exists (featureless market, tight
-        # consolidation with no confirmed swings). NOT the primary driver.
-        # Previously was Phase 2+, which caused the main reported problem.
-        if phase >= 3 and peak_price_abs > 1e-10:
-            if trade_mode in ("trend", "momentum"):
-                n_chandelier = QCfg.TREND_CHANDELIER_N()
-            else:
-                # v5.0: fixed N — no hold-time taper (max-hold timer removed)
-                n_chandelier = QCfg.TRAIL_CHANDELIER_N_START()
-
-            if pos_side == "long":
-                chand = peak_price_abs - n_chandelier * atr
-                if current_sl < chand < price - min_dist:
-                    candidates.append(chand)
-            else:
-                chand = peak_price_abs + n_chandelier * atr
-                if price + min_dist < chand < current_sl:
-                    candidates.append(chand)
-
-        # ── 6. HVN snap (Phase 3 only) ──────────────────────────────────
-        if phase >= 3 and len(candles_1m) >= 30:
-            profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
-            for hvn in InstitutionalLevels.find_hvn_levels(
-                    profile, QCfg.TRAIL_HVN_SNAP_THRESH()):
-                if pos_side == "long" and current_sl < hvn < price - min_dist:
-                    candidates.append(hvn - 0.15 * atr)
-                elif pos_side == "short" and price + min_dist < hvn < current_sl:
-                    candidates.append(hvn + 0.15 * atr)
-
-        # ── 7. OB wall snap (Phase 3 only) ──────────────────────────────
-        if phase >= 3:
-            wall_side = "bid" if pos_side == "long" else "ask"
-            walls = InstitutionalLevels.find_orderbook_walls(
-                orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-            if walls:
-                if pos_side == "long":
-                    vw = [(p, q) for p, q in walls if current_sl < p < price - min_dist]
-                    if vw:
-                        candidates.append(max(vw, key=lambda x: x[1])[0] - 0.10 * atr)
-                else:
-                    vw = [(p, q) for p, q in walls if price + min_dist < p < current_sl]
-                    if vw:
-                        candidates.append(min(vw, key=lambda x: x[1])[0] + 0.10 * atr)
-
-        if not candidates:
-            if hold_reason is not None:
-                hold_reason.append("NO_CANDIDATES")
-            return None
-
-        # ═══ SELECT BEST CANDIDATE ════════════════════════════════════════
-        if pos_side == "long":
-            new_sl = max(candidates)
-        else:
-            new_sl = min(candidates)
-
-        # ── Vol-decay tightening (Phase 3 only) ──────────────────────
-        if phase >= 3 and len(candles_1m) >= 10 and entry_vol > 1e-10:
-            recent_vol = sum(float(c['v']) for c in candles_1m[-5:]) / 5.0
-            vol_ratio  = recent_vol / entry_vol
-            decay_mult = QCfg.TRAIL_VOL_DECAY_MULT()
-            if vol_ratio < decay_mult:
-                tighten = 0.35 * atr * (1.0 - vol_ratio / decay_mult)
-                if pos_side == "long":
-                    new_sl = min(new_sl + tighten, price - min_dist)
-                else:
-                    new_sl = max(new_sl - tighten, price + min_dist)
-
-        # ── v4.9: LIQUIDITY POOL CEILING CAP ─────────────────────────
-        # Keep the trailing SL on the FAR SIDE of any unswept liquidity pool
-        # between current_sl and price. Smart money sweeps those pools — if our
-        # SL is right at or past the pool, the sweep hunts us before reversal.
-        # Cap the SL at: pool.price - ICT_LIQ_POOL_BUFFER (long) or pool.price + buffer (short).
-        if QCfg.ICT_LIQ_CEILING_ENABLED() and ict_engine is not None:
-            try:
-                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                _liq_buf    = QCfg.ICT_LIQ_POOL_BUFFER_ATR() * atr
-                for _pool in ict_engine.liquidity_pools:
-                    if _pool.swept:
-                        continue
-                    if pos_side == "long" and _pool.pool_type == "EQL":
-                        # EQL below price: SL must stay BELOW the pool minus buffer
-                        # i.e., don't trail SL ABOVE the pool level
-                        _ceiling = _pool.price - _liq_buf
-                        if current_sl < _ceiling < new_sl:
-                            # SL candidate crossed above pool — cap it
-                            logger.debug(
-                                f"Trail: LIQ CEILING — capping SL at ${_ceiling:,.1f} "
-                                f"(EQL pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
-                            new_sl = _ceiling
-                    elif pos_side == "short" and _pool.pool_type == "EQH":
-                        # EQH above price: SL must stay ABOVE the pool plus buffer
-                        _floor = _pool.price + _liq_buf
-                        if current_sl > _floor > new_sl:
-                            logger.debug(
-                                f"Trail: LIQ FLOOR — capping SL at ${_floor:,.1f} "
-                                f"(EQH pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
-                            new_sl = _floor
-            except Exception as _liq_e:
-                logger.debug(f"Trail liq ceiling error (non-fatal): {_liq_e}")
-
-        # ═══ MINIMUM DISTANCE ENFORCEMENT (absolute guard) ════════════════
-        if pos_side == "long":
-            max_allowed = price - min_dist
-            if new_sl > max_allowed:
-                new_sl = max_allowed
-        else:
-            min_allowed = price + min_dist
-            if new_sl < min_allowed:
-                new_sl = min_allowed
-
-        # ═══ RATCHET: SL may only improve ════════════════════════════════
-        min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
-        if pos_side == "long":
-            if new_sl <= current_sl + min_move:
-                if hold_reason is not None:
-                    hold_reason.append(f"RATCHET new={new_sl:.1f} <= sl+min_move={current_sl+min_move:.1f}")
-                return None
-        else:
-            if new_sl >= current_sl - min_move:
-                if hold_reason is not None:
-                    hold_reason.append(f"RATCHET new={new_sl:.1f} >= sl-min_move={current_sl-min_move:.1f}")
-                return None
-
-        return new_sl
 
 # ═══════════════════════════════════════════════════════════════
 # ICT STRUCTURE TRAIL — inline, no external dependency
@@ -3221,6 +2879,153 @@ class _DynamicStructureTrail:
 
         return adj
 
+    @staticmethod
+    def _pool_buffer_atr(
+        amd_phase: str,
+        pos_side: str,
+        hold_seconds: float,
+        displacement_confirmed: bool,
+        cvd_trend: float,
+        tick_flow: float,
+        session_name: str,
+    ) -> float:
+        """Dynamic pool buffer (ATR units) driven by AMD/flow/session context."""
+        _ph = (amd_phase or "").lower()
+        _sess = (session_name or "").upper()
+        if "manip" in _ph:
+            buf = 0.46
+        elif ("distribution" in _ph or "delivery" in _ph or
+              "reaccumulation" in _ph or "redistribution" in _ph):
+            buf = 0.14
+        else:
+            buf = 0.22
+
+        if hold_seconds <= QCfg.TRAIL_SMART_POST_SWEEP_SEC():
+            buf = max(buf, 0.45)
+        if displacement_confirmed:
+            buf *= 0.70
+        _flow_agree = ((pos_side == "long" and cvd_trend > 0 and tick_flow > 0) or
+                       (pos_side == "short" and cvd_trend < 0 and tick_flow < 0))
+        if _flow_agree:
+            buf *= 0.80
+        if _sess in ("LONDON", "NEW_YORK"):
+            buf *= 0.90
+        elif _sess == "ASIA":
+            buf *= 1.12
+        return max(0.10, min(0.55, buf))
+
+    @staticmethod
+    def _in_pd_zone(pos_side: str, price: float, ict_engine, now_ms: int) -> bool:
+        """Freeze trail when price is inside active FVG/OB for the position side."""
+        if ict_engine is None:
+            return False
+        try:
+            _now = now_ms if now_ms > 0 else int(time.time() * 1000)
+            _obs = (ict_engine.order_blocks_bull if pos_side == "long"
+                    else ict_engine.order_blocks_bear)
+            for _ob in _obs:
+                if _ob.is_active(_now) and _ob.low <= price <= _ob.high:
+                    return True
+            _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
+                     else ict_engine.fvgs_bear)
+            for _fvg in _fvgs:
+                if _fvg.is_active(_now) and _fvg.bottom <= price <= _fvg.top:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _liquidity_tier_candidate(
+        pos_side: str,
+        price: float,
+        current_sl: float,
+        atr: float,
+        ict_engine,
+        amd_phase: str,
+        hold_seconds: float,
+        displacement_confirmed: bool,
+        cvd_trend: float,
+        tick_flow: float,
+        bos_count: int,
+        session_name: str,
+    ):
+        """Return (candidate_sl, label) from Tier-1/2/3 liquidity hierarchy."""
+        if ict_engine is None or atr < 1e-10:
+            return None, ""
+        try:
+            pools = [p for p in ict_engine.liquidity_pools if not getattr(p, "swept", False)]
+        except Exception:
+            pools = []
+        if not pools:
+            return None, ""
+
+        def _behind(p) -> bool:
+            if pos_side == "long":
+                return getattr(p, "level_type", "") == "SSL" and float(p.price) < price
+            return getattr(p, "level_type", "") == "BSL" and float(p.price) > price
+
+        pools = [p for p in pools if _behind(p)]
+        if not pools:
+            return None, ""
+
+        _tier1 = [p for p in pools if getattr(p, "timeframe", "5m") in ("1m", "5m")]
+        _tier2 = [p for p in pools if getattr(p, "timeframe", "5m") in ("15m", "1h")]
+        _tier3 = [p for p in pools if getattr(p, "timeframe", "5m") in ("4h", "1d")]
+
+        if pos_side == "long":
+            t1 = max(_tier1, key=lambda p: p.price) if _tier1 else None
+            t2 = max(_tier2, key=lambda p: p.price) if _tier2 else None
+            t3 = max(_tier3, key=lambda p: p.price) if _tier3 else None
+        else:
+            t1 = min(_tier1, key=lambda p: p.price) if _tier1 else None
+            t2 = min(_tier2, key=lambda p: p.price) if _tier2 else None
+            t3 = min(_tier3, key=lambda p: p.price) if _tier3 else None
+
+        if t1 is None:
+            return None, ""
+
+        _buf_atr = _DynamicStructureTrail._pool_buffer_atr(
+            amd_phase=amd_phase, pos_side=pos_side, hold_seconds=hold_seconds,
+            displacement_confirmed=displacement_confirmed, cvd_trend=cvd_trend,
+            tick_flow=tick_flow, session_name=session_name,
+        )
+        _buf = _buf_atr * atr
+        candidate = (float(t1.price) - _buf) if pos_side == "long" else (float(t1.price) + _buf)
+        label = f"LIQ_T1@{getattr(t1,'timeframe','5m')}:${float(t1.price):.0f}"
+
+        # Tier-2 structural safety floor/ceiling (prevent over-tightening)
+        if t2 is not None:
+            _t2_buf = max(_buf_atr, 0.28) * atr
+            _guard = (float(t2.price) - _t2_buf) if pos_side == "long" else (float(t2.price) + _t2_buf)
+            if pos_side == "long":
+                candidate = min(candidate, _guard)
+            else:
+                candidate = max(candidate, _guard)
+            label += f"|T2@{getattr(t2,'timeframe','15m')}:${float(t2.price):.0f}"
+
+        # Tier-3 optional backstop only when displacement confirms delivery
+        if t3 is not None and displacement_confirmed:
+            _dist_atr = abs(price - float(t3.price)) / max(atr, 1e-10)
+            if _dist_atr <= QCfg.TRAIL_SMART_T3_MAX_ATR():
+                _t3_buf = max(_buf_atr, 0.50) * atr
+                _backstop = (float(t3.price) - _t3_buf) if pos_side == "long" else (float(t3.price) + _t3_buf)
+                if pos_side == "long":
+                    candidate = min(candidate, _backstop)
+                else:
+                    candidate = max(candidate, _backstop)
+                label += f"|T3@{getattr(t3,'timeframe','4h')}:${float(t3.price):.0f}"
+
+        # Movement rule #1: must be new/higher-significance near pool vs stale SL
+        _stale = abs(candidate - current_sl) / max(atr, 1e-10) >= QCfg.TRAIL_SMART_STALE_POOL_ATR()
+        if not _stale:
+            return None, ""
+        # Movement rule #2: institutional confirmation (BOS 5m/15m proxy or displacement)
+        if not (displacement_confirmed or bos_count > 0):
+            return None, ""
+        # Movement rule #3 (Tier-2 guard) already enforced above by candidate cap
+        return candidate, label
+
     # ── Main compute ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -3310,6 +3115,18 @@ class _DynamicStructureTrail:
                     _amd_bias  = getattr(_amd, "bias",  "") or ""
             except Exception:
                 pass
+        _session_name = ""
+        if ict_engine is not None:
+            try:
+                _session_name = str(getattr(ict_engine, "_session", "") or "")
+            except Exception:
+                _session_name = ""
+
+        if (QCfg.TRAIL_SMART_LIQUIDITY_ENABLED()
+                and _DynamicStructureTrail._in_pd_zone(pos_side, price, ict_engine, now_ms)):
+            if hold_reason is not None:
+                hold_reason.append("PD_ZONE_FREEZE")
+            return None
 
         # ══════════════════════════════════════════════════════════════
         # LAYER 1: BREAK-EVEN FLOOR (capital protection, 0.30R+)
@@ -3359,6 +3176,15 @@ class _DynamicStructureTrail:
             amd_phase   = _amd_phase,
             amd_bias    = _amd_bias,
         )
+        if QCfg.TRAIL_SMART_LIQUIDITY_ENABLED():
+            _liq_sl, _liq_lbl = _DynamicStructureTrail._liquidity_tier_candidate(
+                pos_side=pos_side, price=price, current_sl=current_sl, atr=atr,
+                ict_engine=ict_engine, amd_phase=_amd_phase, hold_seconds=hold_seconds,
+                displacement_confirmed=displacement_confirmed, cvd_trend=cvd_trend,
+                tick_flow=tick_flow, bos_count=bos_count, session_name=_session_name,
+            )
+            if _liq_sl is not None:
+                structural_candidates.append((_liq_sl, _liq_lbl))
 
         # ══════════════════════════════════════════════════════════════
         # COMBINE: take most protective candidate
@@ -8122,76 +7948,34 @@ class QuantStrategy:
                     # to breakeven (capital protection) and send a Telegram
                     # awareness alert.  The existing SL/TP bracket remains live
                     # and manages the exit when the market decides.
+                    #
+                    # v6.2 CHANGE: SL migration is abolished. Only the unified
+                    # trailing system (_DynamicStructureTrail) is allowed to
+                    # update stop-loss orders.
                     logger.warning(
                         f"⚠️ POOL-GATE: REVERSE signal — no exit taken, "
-                        f"migrating SL to BE if not already there. "
+                        f"no manual SL migration (trail engine owns SL). "
                         f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
 
-                    _be_tick  = _round_to_tick(
-                        _calc_be_price(pos.side, pos.entry_price,
-                                       self._atr_5m.atr if self._atr_5m else 1.0,
-                                       pos=pos))
-                    _be_needed = (
-                        (pos.side == "long"  and pos.sl_price < _be_tick) or
-                        (pos.side == "short" and pos.sl_price > _be_tick)
-                    )
-                    if _be_needed and pos.sl_order_id and not pos.be_ratchet_applied:
-                        try:
-                            _es = "sell" if pos.side == "long" else "buy"
-                            _be_result = order_manager.replace_stop_loss(
-                                existing_sl_order_id = pos.sl_order_id,
-                                side                 = _es,
-                                quantity             = pos.quantity,
-                                new_trigger_price    = _be_tick,
-                            )
-                            if _be_result is None:
-                                # replace_stop_loss returning None means SL already
-                                # fired — treat as a fill event and bail out.
-                                self._record_exchange_exit(None)
-                                return
-                            if isinstance(_be_result, dict) and "error" not in _be_result:
-                                with self._lock:
-                                    pos.sl_price           = _be_tick
-                                    pos.sl_order_id        = (_be_result.get("order_id")
-                                                              or pos.sl_order_id)
-                                    pos.be_ratchet_applied = True
-                                    self.current_sl_price  = _be_tick
-                                logger.info(
-                                    f"🔒 POOL-GATE REVERSE → SL migrated to BE "
-                                    f"${_be_tick:,.2f} (no exit; bracket manages)")
-                                send_telegram_message(
-                                    f"⚠️ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
-                                    f"Pool hit with contra AMD flow — <b>no exit taken</b>\n"
-                                    f"SL migrated to breakeven: <b>${_be_tick:,.2f}</b>\n"
-                                    f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
-                            else:
-                                logger.debug(
-                                    f"Pool-gate BE migration rejected by exchange: "
-                                    f"{_be_result}")
-                        except Exception as _be_e:
-                            logger.debug(
-                                f"Pool-gate BE migration error (non-fatal): {_be_e}")
-                    else:
-                        # SL is already at or beyond BE, or no sl_order_id yet.
-                        # Send awareness-only alert so operator can see the signal.
-                        try:
-                            from telegram.notifier import format_pool_gate_alert
-                            send_telegram_message(format_pool_gate_alert(
-                                action        = "hold",
-                                confidence    = _gate.confidence,
-                                reason        = f"[REVERSE signal — no exit] {_gate.reason}",
-                                pos_side      = pos.side,
-                                pos_entry     = pos.entry_price,
-                                current_price = price,
-                                pos_sl        = pos.sl_price,
-                                pos_tp        = pos.tp_price,
-                                atr           = self._atr_5m.atr if self._atr_5m else 0.0,
-                            ))
-                        except Exception:
-                            send_telegram_message(
-                                f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
-                                f"SL already at/beyond BE — bracket manages\n"
-                                f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
+                    # Send awareness-only alert so operator can see the signal.
+                    try:
+                        from telegram.notifier import format_pool_gate_alert
+                        send_telegram_message(format_pool_gate_alert(
+                            action        = "hold",
+                            confidence    = _gate.confidence,
+                            reason        = f"[REVERSE signal — no exit] {_gate.reason}",
+                            pos_side      = pos.side,
+                            pos_entry     = pos.entry_price,
+                            current_price = price,
+                            pos_sl        = pos.sl_price,
+                            pos_tp        = pos.tp_price,
+                            atr           = self._atr_5m.atr if self._atr_5m else 0.0,
+                        ))
+                    except Exception:
+                        send_telegram_message(
+                            f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
+                            f"Trail engine owns SL — no manual migration\n"
+                            f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                     # NOTE: no early return — trail engine must still run this tick.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
                     # BUG-2 FIX: "continue" was updating local state only.
@@ -8677,57 +8461,6 @@ class QuantStrategy:
         init_dist_r = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
         mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
         _be_floor = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
-
-        # ══════════════════════════════════════════════════════════════════
-        # v5.1: COUNTER-TREND BOS STRUCTURAL INVALIDATION
-        # ══════════════════════════════════════════════════════════════════
-        if self._ict is not None and not pos.be_ratchet_applied:
-            try:
-                _tf_5m = self._ict._tf.get("5m")
-                if _tf_5m is not None:
-                    _counter_bos = False
-                    if (pos.side == "long" and _tf_5m.bos_direction == "bearish"
-                            and _tf_5m.bos_level < pos.entry_price):
-                        _counter_bos = True
-                    elif (pos.side == "short" and _tf_5m.bos_direction == "bullish"
-                            and _tf_5m.bos_level > pos.entry_price):
-                        _counter_bos = True
-                    if _counter_bos:
-                        _sl_worse = ((pos.side == "long" and pos.sl_price < _be_floor) or
-                                     (pos.side == "short" and pos.sl_price > _be_floor))
-                        if _sl_worse and profit > 0:
-                            _be_tick = _round_to_tick(_be_floor)
-                            if pos.side == "long" and _be_tick >= price:
-                                _be_tick = _round_to_tick(price - 0.5 * atr)
-                            elif pos.side == "short" and _be_tick <= price:
-                                _be_tick = _round_to_tick(price + 0.5 * atr)
-                            _is_better = ((pos.side == "long" and _be_tick > pos.sl_price) or
-                                          (pos.side == "short" and _be_tick < pos.sl_price))
-                            if _is_better:
-                                logger.warning(
-                                    f"🚨 COUNTER-BOS: 5m {_tf_5m.bos_direction} "
-                                    f"@ ${_tf_5m.bos_level:,.0f} → BE ${_be_tick:,.1f}")
-                                es = "sell" if pos.side == "long" else "buy"
-                                result = order_manager.replace_stop_loss(
-                                    existing_sl_order_id=pos.sl_order_id,
-                                    side=es, quantity=pos.quantity,
-                                    new_trigger_price=_be_tick)
-                                if result is None:
-                                    self._record_exchange_exit(None); return True
-                                if isinstance(result, dict) and "error" not in result:
-                                    with self._lock:
-                                        pos.sl_price = _be_tick
-                                        pos.sl_order_id = result.get("order_id") or pos.sl_order_id
-                                        pos.trail_active = True
-                                        pos.be_ratchet_applied = True
-                                        self.current_sl_price = _be_tick
-                                    send_telegram_message(
-                                        f"🚨 <b>COUNTER-BOS → BE</b>\n"
-                                        f"5m BOS {_tf_5m.bos_direction} @ ${_tf_5m.bos_level:,.0f}\n"
-                                        f"SL → ${_be_tick:,.2f}")
-                                return False
-            except Exception as _bos_e:
-                logger.debug(f"Counter-BOS check error (non-fatal): {_bos_e}")
 
         # ══════════════════════════════════════════════════════════════════
         # v6.0+: DYNAMIC TRAIL ENGINE — institutional v2.0
