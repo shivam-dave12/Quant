@@ -1047,11 +1047,47 @@ class EntryEngine:
             confirmations += 1
         if best_approach.pool.ob_aligned:  confirmations += 1
         if best_approach.pool.fvg_aligned: confirmations += 1
+
+        # Bug-3 fix: amd_agrees is computed for logging/future use but SUPPRESSED
+        # during the MANIPULATION phase.
+        #
+        # Root cause: in MANIPULATION, ict.amd_bias reflects the post-Judas DELIVERY
+        # direction, not the current price direction.  The Judas swing runs AGAINST
+        # delivery, so approach_side="long" + amd_bias="bullish" evaluates True while
+        # price is actively sliding downward into the SSL — a premature approach entry
+        # into the fake move before the sweep even completes.  Counting amd_agrees as
+        # a confirmation here lowers the bar for exactly the wrong trades.
+        #
+        # The condition is still computed so it appears in ict_validation logs and can
+        # be used by future callers without further refactoring.  During MANIPULATION
+        # it does NOT increment confirmations unless independently corroborated by the
+        # DirectionEngine direction_hint (Bug-1 fix below).
+        _amd_phase_upper = (ict.amd_phase or '').upper()
         amd_agrees = (
             (approach_side == "long"  and ict.amd_bias == "bullish") or
             (approach_side == "short" and ict.amd_bias == "bearish")
         )
-        if amd_agrees: confirmations += 1
+        if amd_agrees and _amd_phase_upper != 'MANIPULATION':
+            confirmations += 1
+
+        # Bug-1 fix: DirectionEngine direction_hint as an independent confirmation source.
+        #
+        # Root cause: DirectionEngine.evaluate_sweep() produces a high-confidence
+        # direction_hint / direction_hint_side verdict injected into ICTContext every
+        # tick.  _check_proximity_approach read ict.amd_bias for confirmations but
+        # never consulted direction_hint — the entire DirectionEngine post-sweep
+        # pipeline was invisible to proximity entries.
+        #
+        # Fix: direction_hint_side == approach_side AND confidence >= 0.40 adds one
+        # independent confirmation.  Additive (not replacing amd_agrees), it applies
+        # equally in all AMD phases — including MANIPULATION where amd_agrees is
+        # suppressed — so a high-confidence DirectionEngine verdict can still unlock
+        # a proximity entry when the AMD gate is quiet.
+        _dir_hint_side = (getattr(ict, 'direction_hint_side', '') or '').lower()
+        _dir_hint_conf = float(getattr(ict, 'direction_hint_confidence', 0.0) or 0.0)
+        if _dir_hint_side == approach_side and _dir_hint_conf >= 0.40:
+            confirmations += 1
+
         if ict.session_quality == "prime": confirmations += 1
 
         if confirmations < 1:
@@ -1932,6 +1968,42 @@ class EntryEngine:
             rev_delta  += 4.0; rev_reasons.append(f"SUSTAINED rev flow ({ps.rev_flow_ticks} ticks)")
         if ps.cont_flow_ticks >= 5:
             cont_delta += 4.0; cont_reasons.append(f"SUSTAINED cont flow ({ps.cont_flow_ticks} ticks)")
+
+        # Bug-2 fix: Cross-sweep structural decay.
+        #
+        # Root cause: when price swept an opposing pool during an active post-sweep
+        # evaluation (e.g. evaluating SSL sweep for LONG while BSL was subsequently
+        # swept), the accumulated reversal evidence was never invalidated.  The model
+        # continued building reversal conviction on stale evidence from a structurally
+        # changed market — a setup that should have been abandoned was allowed to fire.
+        #
+        # Detection: scan ict.ict_sweeps for any event whose pool_type differs from
+        # the pool currently being evaluated, whose sweep_ts is AFTER ps.entered_at,
+        # and whose age is < 90s (still structurally relevant).
+        #
+        # Remedy: ps.rev_evidence *= 0.55 (hard structural decay, not a soft penalty —
+        # a cross-sweep is a direct contradiction of the reversal thesis) and a
+        # cont_delta += 10.0 bonus (the cross-sweep IS continuation evidence).
+        # The ×0.55 multiplier is intentionally aggressive: accumulated evidence from
+        # many prior ticks must survive this decay to still produce a reversal signal,
+        # which requires genuinely overwhelming multi-factor confluence.
+        _current_pool_type = sweep.pool.side.value  # "BSL" or "SSL"
+        _entered_at_ms = int(ps.entered_at * 1000)
+        for _ict_ev in (getattr(ict, 'ict_sweeps', None) or []):
+            if (_ict_ev.pool_type != _current_pool_type
+                    and _ict_ev.sweep_ts > _entered_at_ms
+                    and now * 1000 - _ict_ev.sweep_ts < 90_000):
+                _pre_decay = ps.rev_evidence
+                ps.rev_evidence *= 0.55
+                cont_delta += 10.0
+                cont_reasons.append(
+                    f"CROSS-SWEEP {_ict_ev.pool_type} @${_ict_ev.pool_price:,.0f}")
+                logger.info(
+                    f"POST_SWEEP: ⚠️  CROSS-SWEEP DECAY — {_ict_ev.pool_type} swept "
+                    f"${_ict_ev.pool_price:,.1f} while evaluating {_current_pool_type} "
+                    f"reversal: rev_evidence {_pre_decay:.1f} → {ps.rev_evidence:.1f} "
+                    f"(×0.55), cont_delta+10")
+                break  # one cross-sweep is sufficient structural invalidation
 
         # ── Accumulate DYNAMIC evidence with decay ────────────────────
         # Static baseline is already locked in ps.static_*_base.

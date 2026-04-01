@@ -378,16 +378,40 @@ class _DeltaAdapter:
         self.limiter.wait()
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
+
+        # Compute limit offsets for bracket SL and TP children so Delta creates
+        # stop-limit legs instead of stop-market legs (maker fee rebate + edit-in-place).
+        # Delta supports bracket_stop_loss_limit_price / bracket_take_profit_limit_price
+        # as optional params — exchange silently ignores them if unsupported.
+        tick         = float(getattr(config, 'TICK_SIZE', 0.1))
+        sl_ticks     = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
+        tp_ticks     = int(getattr(config, 'TP_LIMIT_OFFSET_TICKS', sl_ticks))
+        sl_offset    = sl_ticks * tick
+        tp_offset    = tp_ticks * tick
+
+        # For a BUY entry: SL exits with SELL (limit below trigger);
+        #                  TP exits with SELL (limit below trigger).
+        # For a SELL entry: SL exits with BUY (limit above trigger);
+        #                   TP exits with BUY (limit above trigger).
+        if side.lower() == "buy":
+            bracket_sl_limit = round(float(sl_price) - sl_offset, 1)
+            bracket_tp_limit = round(float(tp_price) - tp_offset, 1)
+        else:
+            bracket_sl_limit = round(float(sl_price) + sl_offset, 1)
+            bracket_tp_limit = round(float(tp_price) + tp_offset, 1)
+
         resp = self.api.place_order(
-            symbol                    = self.symbol,
-            side                      = side.lower(),
-            order_type                = "limit",
-            size                      = contracts,
-            limit_price               = float(limit_price),
-            bracket_stop_loss_price   = float(sl_price),
-            bracket_take_profit_price = float(tp_price),
-            post_only                 = False,
-            time_in_force             = "gtc",
+            symbol                          = self.symbol,
+            side                            = side.lower(),
+            order_type                      = "limit",
+            size                            = contracts,
+            limit_price                     = float(limit_price),
+            bracket_stop_loss_price         = float(sl_price),
+            bracket_stop_loss_limit_price   = bracket_sl_limit,   # stop-limit child
+            bracket_take_profit_price       = float(tp_price),
+            bracket_take_profit_limit_price = bracket_tp_limit,   # stop-limit child
+            post_only                       = False,
+            time_in_force                   = "gtc",
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -1021,10 +1045,12 @@ class OrderManager:
                 _SL_TYPES = {
                     "STOP_MARKET", "STOP_MARKET_ORDER", "STOP",
                     "STOP_LOSS_MARKET", "STOP_LOSS_ORDER",
+                    "STOP_LOSS_LIMIT",          # stop-limit SL child
                 }
                 _TP_TYPES = {
                     "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET_ORDER",
                     "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
+                    "TAKE_PROFIT_LIMIT",         # stop-limit TP child
                 }
 
                 def _parse_children(open_ords):
@@ -1191,23 +1217,56 @@ class OrderManager:
 
     def place_take_profit(self, side: str, quantity: float,
                           trigger_price: float) -> Optional[Dict]:
+        """
+        Place a standalone take-profit as a stop-LIMIT order (never market).
+
+        order_type=limit_order + stop_order_type=take_profit_order + stop_price + limit_price.
+
+        Limit-price offset gives a fill buffer past the trigger so the order
+        executes even if price overshoots by a few ticks:
+          SHORT TP (BUY to close):  limit = trigger + TP_LIMIT_OFFSET_TICKS × TICK_SIZE
+          LONG  TP (SELL to close): limit = trigger − TP_LIMIT_OFFSET_TICKS × TICK_SIZE
+
+        TP_LIMIT_OFFSET_TICKS defaults to SL_LIMIT_OFFSET_TICKS (20) when not set.
+        Edit-in-place (replace_take_profit) also passes new_limit_price so the
+        stop-limit stays intact after every trail amendment.
+        """
         try:
-            api_side = self._normalize_side(side)
-            logger.info(f"TP {side} qty={quantity} trigger=${trigger_price:,.2f}")
-            # API doc: standalone TP orders use order_type=market_order +
-            # stop_order_type=take_profit_order.
+            api_side     = self._normalize_side(side)
+            tick         = float(getattr(config, 'TICK_SIZE', 0.1))
+            offset_ticks = int(getattr(config, 'TP_LIMIT_OFFSET_TICKS',
+                                       getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20)))
+            limit_offset = offset_ticks * tick
+
+            # SHORT TP → BUY side: max price we'll pay = trigger + offset
+            # LONG  TP → SELL side: min price we'll accept = trigger - offset
+            if api_side == "BUY":
+                limit_price = round(trigger_price + limit_offset, 1)
+            else:
+                limit_price = round(trigger_price - limit_offset, 1)
+
+            logger.info(
+                f"TP-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
+                f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
             data = self._place_with_retry(
-                side=api_side, order_type="market_order",
+                side=api_side, order_type="limit_order",
                 quantity=quantity, trigger_price=trigger_price,
+                price=limit_price,
                 reduce_only=True, stop_order_type="take_profit_order")
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id": data["order_id"], "side": side, "type": "TAKE_PROFIT",
-                    "quantity": quantity, "trigger_price": trigger_price,
-                    "status": data.get("status", "UNKNOWN"),
-                    "timestamp": datetime.now().isoformat(),
+                    "order_id":      data["order_id"],
+                    "side":          side,
+                    "type":          "TAKE_PROFIT_LIMIT",
+                    "quantity":      quantity,
+                    "trigger_price": trigger_price,
+                    "limit_price":   limit_price,
+                    "status":        data.get("status", "UNKNOWN"),
+                    "timestamp":     datetime.now().isoformat(),
                 })
-                logger.info(f"✅ TP: {data['order_id']} @ ${trigger_price:,.2f}")
+                logger.info(
+                    f"✅ TP_LIMIT: {data['order_id']} "
+                    f"stop=${trigger_price:,.2f} limit=${limit_price:,.2f}")
             return data
         except Exception as e:
             logger.error(f"place_take_profit error: {e}", exc_info=True)
@@ -1315,18 +1374,38 @@ class OrderManager:
     def replace_take_profit(self, existing_tp_order_id: Optional[str],
                             side: str, quantity: float,
                             new_trigger_price: float) -> Optional[Dict]:
-        """Same edit-in-place → cancel+replace strategy as replace_stop_loss."""
+        """
+        Same edit-in-place → cancel+replace strategy as replace_stop_loss.
+
+        Always amends as stop-LIMIT (never market): both new_stop_price AND
+        new_limit_price are sent to edit_order so the TP order keeps its
+        limit_order order_type after every trail/amendment.
+        """
         try:
+            # Pre-compute limit price for this side (same formula as place_take_profit)
+            tick         = float(getattr(config, 'TICK_SIZE', 0.1))
+            offset_ticks = int(getattr(config, 'TP_LIMIT_OFFSET_TICKS',
+                                       getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20)))
+            limit_offset = offset_ticks * tick
+            api_side     = self._normalize_side(side)
+            if api_side == "BUY":
+                new_limit_price = round(new_trigger_price + limit_offset, 1)
+            else:
+                new_limit_price = round(new_trigger_price - limit_offset, 1)
+
             # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
+            # Always send new_limit_price alongside new_stop_price so the order
+            # remains a stop-limit order, not a stop-market, after the edit.
             if existing_tp_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
                     order_id=existing_tp_order_id,
                     new_stop_price=new_trigger_price,
+                    new_limit_price=new_limit_price,
                 )
                 if edited and not edited.get("_error"):
                     logger.info(
                         f"✅ TP edited in-place {existing_tp_order_id[:10]}… "
-                        f"→ ${new_trigger_price:,.2f}"
+                        f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}"
                     )
                     edited["order_id"] = edited.get("order_id", existing_tp_order_id)
                     return edited
@@ -1355,8 +1434,9 @@ class OrderManager:
             new_tp = self.place_take_profit(side=side, quantity=quantity,
                                             trigger_price=new_trigger_price)
             if new_tp:
-                logger.info(f"✅ TP replaced → {new_tp['order_id']} "
-                            f"@ ${new_trigger_price:,.2f}")
+                logger.info(
+                    f"✅ TP replaced (stop-limit) → {new_tp['order_id']} "
+                    f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}")
                 return new_tp
             return {"error": "PLACE_FAILED"}
         except Exception as e:
@@ -1457,9 +1537,15 @@ class OrderManager:
                 return None
             # Delta bracket child stop_order_type remap (defense-in-depth in case
             # api.py normalisation was bypassed or a different adapter is used).
-            _STOP_OTYPE_REMAP = {
+            # Two remap tables — one for market-type conditional orders, one for
+            # limit-type conditional orders (stop-limit SL/TP).
+            _STOP_OTYPE_REMAP_MARKET = {
                 "STOP_LOSS_ORDER":   "STOP_MARKET",
                 "TAKE_PROFIT_ORDER": "TAKE_PROFIT_MARKET",
+            }
+            _STOP_OTYPE_REMAP_LIMIT = {
+                "STOP_LOSS_ORDER":   "STOP_LOSS_LIMIT",
+                "TAKE_PROFIT_ORDER": "TAKE_PROFIT_LIMIT",
             }
             result = []
             for o in raw:
@@ -1468,10 +1554,13 @@ class OrderManager:
                 otype = str(o.get("order_type") or o.get("type") or "").upper()
                 # If otype resolved to plain MARKET, check if the underlying raw
                 # dict has stop_order_type that reclassifies it as SL/TP.
-                if otype == "MARKET":
-                    _raw_inner = o.get("_raw") or o.get("raw") or {}
-                    _sot = str(_raw_inner.get("stop_order_type", "")).upper()
-                    otype = _STOP_OTYPE_REMAP.get(_sot, otype)
+                # Also handle LIMIT + stop_order_type → STOP_LOSS_LIMIT / TAKE_PROFIT_LIMIT.
+                _raw_inner = o.get("_raw") or o.get("raw") or {}
+                _sot = str(_raw_inner.get("stop_order_type", "")).upper()
+                if otype in ("MARKET", "MARKET_ORDER"):
+                    otype = _STOP_OTYPE_REMAP_MARKET.get(_sot, otype)
+                elif otype in ("LIMIT", "LIMIT_ORDER") and _sot in _STOP_OTYPE_REMAP_LIMIT:
+                    otype = _STOP_OTYPE_REMAP_LIMIT[_sot]
                 side  = str(o.get("side") or "").upper()
                 try: qty  = float(o.get("quantity") or o.get("size") or 0)
                 except (ValueError, TypeError): qty = 0.0
@@ -1499,10 +1588,14 @@ class OrderManager:
         orders = self.get_open_orders(symbol=sym)
         if orders is None:
             return {}
-        CONDITIONAL_TYPES = {"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
-                              "TAKE_PROFIT", "STOP_LOSS_MARKET",
-                              "STOP_MARKET_ORDER", "STOP_LOSS_ORDER",
-                              "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER"}
+        CONDITIONAL_TYPES = {
+            "STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
+            "TAKE_PROFIT", "STOP_LOSS_MARKET",
+            "STOP_MARKET_ORDER", "STOP_LOSS_ORDER",
+            "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER",
+            # stop-limit variants (new order type names for limit SL/TP)
+            "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT",
+        }
         targets = [o for o in orders if o["type"] in CONDITIONAL_TYPES]
         if not targets:
             return {}
