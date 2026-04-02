@@ -885,19 +885,6 @@ class DeltaAPI:
         stop_order_type: Optional[str]    = None,
         # isomorphic_slippage_check is passed through if provided (advanced)
         isomorphic_slippage_check: Optional[bool] = None,
-        # ── Bracket LIMIT-order legs (CreateBracketOrderRequest nested schema) ─
-        # Use when SL/TP bracket children must be LIMIT orders, not market.
-        # Nested-object form required by the Create endpoint:
-        #   stop_loss_order   = {"order_type": "limit_order",
-        #                        "stop_price":  "56000", "limit_price": "55000"}
-        #   take_profit_order = {"order_type": "limit_order",
-        #                        "stop_price":  "65000", "limit_price": "64000"}
-        # MUTUALLY EXCLUSIVE with flat bracket_stop_loss_price /
-        # bracket_take_profit_price params.
-        stop_loss_order:             Optional[Dict] = None,
-        take_profit_order:           Optional[Dict] = None,
-        # "mark_price" | "last_traded_price" | "spot_price"
-        bracket_stop_trigger_method: Optional[str]  = None,
     ) -> Dict:
         """
         POST /v2/orders — place a new order.
@@ -974,15 +961,6 @@ class DeltaAPI:
             body["stop_order_type"] = stop_order_type
         if isomorphic_slippage_check is not None:
             body["isomorphic_slippage_check"] = isomorphic_slippage_check
-        # ── Bracket limit-order legs (nested objects, CreateBracketOrderRequest) ─
-        # Include stop_loss_order / take_profit_order dicts directly in the body.
-        # These override the flat bracket_stop_loss_price fields when present.
-        if stop_loss_order is not None:
-            body["stop_loss_order"] = stop_loss_order
-        if take_profit_order is not None:
-            body["take_profit_order"] = take_profit_order
-        if bracket_stop_trigger_method is not None:
-            body["bracket_stop_trigger_method"] = bracket_stop_trigger_method
 
         resp = self._post("/v2/orders", body=body)
 
