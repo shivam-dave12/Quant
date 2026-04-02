@@ -4641,6 +4641,9 @@ class QuantStrategy:
                     "Place post_trade_agent.py in strategy/ to enable."
                 )
 
+        # ── Unified entry gate state ──────────────────────────────────────
+        self._last_unified_gate_key = None
+        self._last_unified_gate_ts  = 0.0
         self._log_init()
 
     def _log_init(self):
@@ -5845,6 +5848,188 @@ class QuantStrategy:
         return fallback_side
 
 
+    # ─── UNIFIED ENTRY GATE — Institutional Coherence Check ─────────────────
+    def _unified_entry_gate(self, signal, ict_ctx, flow_state,
+                             liq_snapshot, price, atr, now):
+        """
+        Institutional Unified Entry Gate.
+
+        This is NOT a parameter filter — it is a STRUCTURAL COHERENCE check.
+        Every engine must agree on direction before capital is deployed.
+
+        The conviction filter checks individual factor scores (displacement,
+        CISD, OTE, etc.).  This gate checks INTER-ENGINE AGREEMENT — whether
+        the direction engine, ICT engine, HTF structure, and order flow all
+        point the same way.
+
+        WHY THIS MATTERS:
+          In the production log, the entry engine said "REVERSAL LONG" while
+          AMD said "ACCUMULATION bias=bullish" (no delivery expected) and
+          the direction engine said "NEUTRAL conf=0.22" (no conviction).
+          These are CONTRADICTORY signals.  The conviction filter scored
+          the individual factors and passed (0.75+), but the engines were
+          not aligned.  Result: SL hit.
+
+          An institutional desk would NEVER enter when their macro analyst
+          says accumulation, their flow desk says neutral, but their
+          structure analyst says long.  All desks must agree.
+
+        Returns: (allowed: bool, reason: str)
+        """
+        rejections = []
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 1: AMD Phase Coherence
+        # ══════════════════════════════════════════════════════════════════
+        # The AMD cycle determines WHEN institutional delivery happens.
+        # ACCUMULATION: smart money building positions — NO delivery
+        # MANIPULATION: the sweep — this IS the setup moment
+        # DISTRIBUTION: delivery — the move we want to capture
+        #
+        # Entering during ACCUMULATION is like trying to trade during
+        # the consolidation before an earnings release.  Nothing happens.
+
+        amd_phase = (ict_ctx.amd_phase or "").upper()
+        amd_bias  = (ict_ctx.amd_bias  or "").lower()
+        amd_conf  = ict_ctx.amd_confidence
+
+        if amd_phase == "ACCUMULATION":
+            rejections.append(
+                f"AMD=ACCUMULATION — smart money accumulating, "
+                f"no delivery expected. Wait for MANIPULATION sweep.")
+
+        # During MANIPULATION: bias must AGREE with trade direction.
+        # A bullish MANIPULATION means SSL will be swept (short-side fake-out).
+        # The delivery is LONG.  Going SHORT during bullish MANIPULATION
+        # is trading the wrong side of the AMD cycle.
+        if amd_phase == "MANIPULATION" and amd_conf >= 0.50:
+            bias_contra = (
+                (signal.side == "long"  and "bear" in amd_bias) or
+                (signal.side == "short" and "bull" in amd_bias)
+            )
+            if bias_contra:
+                rejections.append(
+                    f"AMD_CONTRA: MANIP bias={amd_bias} conf={amd_conf:.2f} "
+                    f"vs {signal.side} — wrong side of AMD cycle")
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 2: Direction Engine Agreement
+        # ══════════════════════════════════════════════════════════════════
+        # The DirectionEngine predicts which pool will be swept next and
+        # where price will deliver after.  If it says "bearish delivery"
+        # with > 40% confidence and we want to go LONG — that's a conflict.
+        #
+        # We don't require the direction engine to agree perfectly.
+        # But if it actively DISAGREES with high confidence, we block.
+
+        if self._dir_engine is not None:
+            try:
+                # Check hunt prediction (pre-sweep directional call)
+                _hunt = getattr(self._dir_engine, '_last_hunt_prediction', None)
+                if _hunt is None:
+                    # Try the cached dict version
+                    _hunt_dict = getattr(self._ict, '_last_hunt_pred', None) if self._ict else None
+                    if _hunt_dict and isinstance(_hunt_dict, dict):
+                        _del_dir   = _hunt_dict.get('delivery_direction', '')
+                        _hunt_conf = float(_hunt_dict.get('confidence', 0.0))
+                        if _hunt_conf >= 0.45:
+                            agrees = (
+                                (signal.side == "long"  and _del_dir == "bullish") or
+                                (signal.side == "short" and _del_dir == "bearish") or
+                                _del_dir in ("", "neutral", None)
+                            )
+                            if not agrees:
+                                rejections.append(
+                                    f"DIR_ENGINE: delivery={_del_dir} "
+                                    f"conf={_hunt_conf:.2f} vs {signal.side}")
+                elif hasattr(_hunt, 'delivery_direction'):
+                    _del_dir   = getattr(_hunt, 'delivery_direction', '')
+                    _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
+                    if _hunt_conf >= 0.45:
+                        agrees = (
+                            (signal.side == "long"  and _del_dir == "bullish") or
+                            (signal.side == "short" and _del_dir == "bearish") or
+                            _del_dir in ("", "neutral", None)
+                        )
+                        if not agrees:
+                            rejections.append(
+                                f"DIR_ENGINE: delivery={_del_dir} "
+                                f"conf={_hunt_conf:.2f} vs {signal.side}")
+            except Exception:
+                pass
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 3: HTF Structure Alignment
+        # ══════════════════════════════════════════════════════════════════
+        # The 15m and 4H market structure must not BOTH oppose the trade.
+        # If both say bearish (lower highs, lower lows, bearish BOS) —
+        # going LONG is fighting the institutional order flow.
+        #
+        # One TF opposing is acceptable (short-term counter-trend within
+        # a longer trend).  Both opposing = structural veto.
+
+        if self._ict is not None and getattr(self._ict, '_initialized', False):
+            try:
+                tf_data = getattr(self._ict, '_tf', {})
+                tf_15m  = tf_data.get("15m")
+                tf_4h   = tf_data.get("4h")
+                if tf_15m and tf_4h:
+                    t15 = str(getattr(tf_15m, 'trend', 'ranging') or 'ranging').lower()
+                    t4h = str(getattr(tf_4h,  'trend', 'ranging') or 'ranging').lower()
+
+                    both_bearish = (t15 == "bearish" and t4h == "bearish")
+                    both_bullish = (t15 == "bullish" and t4h == "bullish")
+
+                    if signal.side == "long" and both_bearish:
+                        rejections.append(
+                            f"HTF_BEARISH: 15m={t15} 4H={t4h} — "
+                            f"both bearish, cannot go LONG")
+                    elif signal.side == "short" and both_bullish:
+                        rejections.append(
+                            f"HTF_BULLISH: 15m={t15} 4H={t4h} — "
+                            f"both bullish, cannot go SHORT")
+            except Exception:
+                pass
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 4: Order Flow Conviction
+        # ══════════════════════════════════════════════════════════════════
+        # Tick flow + CVD must show at least weak agreement.
+        # We don't require strong flow (that's the conviction filter's job).
+        # But BOTH being flat/opposing = no institutional participation.
+
+        tf  = flow_state.tick_flow if flow_state else 0.0
+        cvd = flow_state.cvd_trend if flow_state else 0.0
+
+        flow_opposes = (
+            (signal.side == "long"  and tf < -0.35 and cvd < -0.20) or
+            (signal.side == "short" and tf >  0.35 and cvd >  0.20)
+        )
+        if flow_opposes:
+            rejections.append(
+                f"FLOW_OPPOSING: tick={tf:+.2f} cvd={cvd:+.2f} "
+                f"both against {signal.side}")
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 5: Kill Zone Filter
+        # ══════════════════════════════════════════════════════════════════
+        session = str(getattr(ict_ctx, 'kill_zone', '') or '')
+        if not session and self._ict:
+            session = str(getattr(self._ict, '_killzone', '') or '')
+        if session.upper() == "ASIA":
+            rejections.append("ASIA_SESSION — no institutional flow")
+
+        # ══════════════════════════════════════════════════════════════════
+        # GATE 6: Minimum R:R
+        # ══════════════════════════════════════════════════════════════════
+        if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 2.0:
+            rejections.append(f"RR={signal.rr_ratio:.1f} < 2.0")
+
+        # ── DECISION ───────────────────────────────────────────────────────
+        if rejections:
+            return False, " | ".join(rejections[:3])
+        return True, "UNIFIED_GATE_PASS"
+
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         """
         v9.0 -- Liquidity-First Entry Engine.
@@ -6366,6 +6551,25 @@ class QuantStrategy:
             allowed, reason = self._risk_gate.can_trade(total_bal)
             if not allowed:
                 logger.info(f"Signal blocked by risk manager: {reason}")
+                self._entry_engine.consume_signal()
+                return
+
+            # ── UNIFIED ENTRY GATE — institutional coherence check ────────────
+            # All engines must agree on direction before capital is deployed.
+            # This runs BEFORE the conviction filter because it checks
+            # inter-engine agreement, not individual factor quality.
+            gate_ok, gate_reason = self._unified_entry_gate(
+                signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
+            if not gate_ok:
+                # Deduplicate logging (same key = same block reason)
+                _gate_key = (signal.side, gate_reason[:50])
+                if _gate_key != getattr(self, '_last_unified_gate_key', None):
+                    self._last_unified_gate_key = _gate_key
+                    logger.info(
+                        f"🚫 UNIFIED GATE [{signal.side.upper()}] | {gate_reason}")
+                else:
+                    logger.debug(
+                        f"🚫 UNIFIED GATE [{signal.side.upper()}] | {gate_reason}")
                 self._entry_engine.consume_signal()
                 return
 
@@ -8693,133 +8897,37 @@ class QuantStrategy:
                                 f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                     # NOTE: no early return — trail engine must still run this tick.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
-                    # BUG-2 FIX: "continue" was updating local state only.
-                    # The exchange bracket TP order remained at the original
-                    # price, so the extension never reached the exchange.
-                    # When price hit the old TP, the bracket fired — the bot
-                    # exited at the first pool instead of riding to next_target.
+                    # ════════════════════════════════════════════════════════════
+                    # TP IMMUTABILITY POLICY
+                    # ════════════════════════════════════════════════════════════
+                    # The Take Profit is set at entry and NEVER amended.
                     #
-                    # Fix: cancel the existing TP order and place a new one at
-                    # next_target (cancel-and-replace — order_manager has no
-                    # replace_take_profit method).  Local state is updated only
-                    # after the exchange confirms the new order.
-                    # Guard is strictly inside the changed-price check so this
-                    # block never fires twice for the same target (pool_hit_gate
-                    # returns "continue" every tick once AMD is aligned).
-                    _new_tp = _round_to_tick(_gate.next_target)
-                    if pos.tp_price != _new_tp:
-                        # Sanity-check: new TP must be beyond current price in
-                        # the correct direction, otherwise skip silently.
-                        _tp_direction_valid = (
-                            (pos.side == "long"  and _new_tp > price) or
-                            (pos.side == "short" and _new_tp < price)
-                        )
-                        if not _tp_direction_valid:
-                            logger.debug(
-                                f"Pool-gate CONTINUE: next_target "
-                                f"${_new_tp:,.2f} is behind current price "
-                                f"${price:,.2f} for {pos.side} — skipping TP amend")
-                        else:
-                            logger.info(
-                                f"🚧 DIR_ENGINE POOL-GATE: CONTINUE → "
-                                f"TP ${pos.tp_price:,.2f} → ${_new_tp:,.2f} "
-                                f"conf={_gate.confidence:.2f} "
-                                f"| {_gate.reason[:80]}")
-
-                            _tp_amended = False
-                            if pos.tp_order_id:
-                                # Cancel the existing TP limit/stop order then
-                                # immediately re-place at the extended price.
-                                # We treat cancel failure as non-fatal — if the
-                                # cancel returns a filled/partial result the
-                                # position is already closed and _sync_position
-                                # will reconcile on the next heartbeat.
-                                try:
-                                    _cancel_result = order_manager.cancel_order(
-                                        pos.tp_order_id)
-                                    # cancel_order returning None or a filled
-                                    # status means the TP fired concurrently.
-                                    if _cancel_result is None:
-                                        logger.warning(
-                                            "Pool-gate TP cancel returned None "
-                                            "— TP may have fired concurrently; "
-                                            "skipping amend, reconcile will clean up")
-                                    else:
-                                        _exit_side = (
-                                            "sell" if pos.side == "long" else "buy")
-                                        _new_tp_data = order_manager.place_take_profit(
-                                            side          = _exit_side,
-                                            quantity      = pos.quantity,
-                                            trigger_price = _new_tp,
-                                        )
-                                        if _new_tp_data and isinstance(_new_tp_data, dict) \
-                                                and "error" not in _new_tp_data:
-                                            with self._lock:
-                                                pos.tp_price          = _new_tp
-                                                pos.tp_order_id       = (
-                                                    _new_tp_data.get("order_id")
-                                                    or pos.tp_order_id)
-                                                self.current_tp_price = _new_tp
-                                            _tp_amended = True
-                                            logger.info(
-                                                f"✅ Exchange TP amended → "
-                                                f"${_new_tp:,.2f} "
-                                                f"order={pos.tp_order_id}")
-                                        else:
-                                            # place_take_profit failed.  The old
-                                            # TP is already cancelled — place an
-                                            # emergency market-close to avoid an
-                                            # unprotected position, then bail.
-                                            logger.error(
-                                                f"Pool-gate TP re-place FAILED "
-                                                f"after cancel: {_new_tp_data}. "
-                                                f"Issuing emergency market close.")
-                                            _es = ("sell" if pos.side == "long"
-                                                   else "buy")
-                                            order_manager.place_market_order(
-                                                side       = _es,
-                                                quantity   = pos.quantity,
-                                                reduce_only= True,
-                                            )
-                                            self._record_exchange_exit(None)
-                                            return
-                                except Exception as _tpa_e:
-                                    logger.debug(
-                                        f"Pool-gate TP amend error (non-fatal): "
-                                        f"{_tpa_e}")
-
-                            if not _tp_amended:
-                                # No tp_order_id on record (bracket already
-                                # managed natively by the exchange, e.g. Bybit
-                                # bracket mode) — update local state only so
-                                # the in-position monitor is consistent.
-                                with self._lock:
-                                    pos.tp_price          = _new_tp
-                                    self.current_tp_price = _new_tp
-                                logger.debug(
-                                    "Pool-gate CONTINUE: no tp_order_id — "
-                                    "local state updated, exchange manages TP natively")
-
-                            try:
-                                from telegram.notifier import format_pool_gate_alert
-                                send_telegram_message(format_pool_gate_alert(
-                                    action        = "continue",
-                                    confidence    = _gate.confidence,
-                                    reason        = _gate.reason,
-                                    pos_side      = pos.side,
-                                    pos_entry     = pos.entry_price,
-                                    current_price = price,
-                                    pos_sl        = pos.sl_price,
-                                    pos_tp        = _new_tp,
-                                    next_target   = _new_tp,
-                                    atr           = self._atr_5m.atr if self._atr_5m else 0.0,
-                                ))
-                            except Exception:
-                                send_telegram_message(
-                                    f"🚧 <b>POOL-GATE: TP EXTENDED</b>\n"
-                                    f"New target: ${_new_tp:,.2f}\n"
-                                    f"Confidence: {_gate.confidence:.2f}\n"
-                                    f"{_gate.reason[:200]}")
+                    # WHY:
+                    #   In production, 23/24 trades exited via SL.  Only 1 hit TP.
+                    #   Extending TP further when the first target isn't reached
+                    #   guarantees the trade dies to a trailing SL instead.
+                    #
+                    #   The original TP was set at the opposing liquidity pool —
+                    #   the structural delivery target.  If the market doesn't
+                    #   reach it, the SL trail manages the exit with whatever
+                    #   profit was captured.
+                    #
+                    #   If you believe TP should be further, that's a NEW THESIS.
+                    #   Open a new position after the current one closes.
+                    #
+                    # WHAT WE DO INSTEAD:
+                    #   Log the suggestion for post-trade analysis.
+                    #   The trail engine may tighten SL on the next tick,
+                    #   which naturally locks available profit.
+                    #
+                    _next = _gate.next_target
+                    logger.info(
+                        f"📝 POOL-GATE CONTINUE: next target ${_next:,.0f} — "
+                        f"TP stays at ${pos.tp_price:,.0f} (immutability policy) | "
+                        f"conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
+                    # DO NOT call replace_take_profit.
+                    # DO NOT modify pos.tp_price.
+                    # The existing SL/TP bracket manages the exit.
                 # action="hold" → do nothing, let existing SL/TP manage
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")

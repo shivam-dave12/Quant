@@ -181,10 +181,10 @@ _PS_OTE_FIB_HIGH           = 0.786   # OTE zone upper bound (78.6% retrace)
 _PS_CONTINUATION_SL_BUFFER = 0.40    # ATR buffer BEYOND swept pool for continuation SL
 _PS_REVERSAL_SL_BUFFER     = 0.35    # ATR buffer beyond sweep wick for reversal SL
 
-_PS_SCORE_THRESHOLD_EARLY  = 55.0    # early phase: overwhelming evidence required
-_PS_SCORE_THRESHOLD_NORMAL = 45.0    # standard phase
-_PS_SCORE_THRESHOLD_MATURE = 35.0    # mature phase: accept weaker setups
-_PS_SCORE_GAP_MIN          = 8.0     # minimum gap between rev/cont scores
+_PS_SCORE_THRESHOLD_EARLY  = 80.0    # early phase: overwhelming evidence required (was 55.0)
+_PS_SCORE_THRESHOLD_NORMAL = 65.0    # standard phase (was 45.0)
+_PS_SCORE_THRESHOLD_MATURE = 55.0    # mature phase: still need good evidence (was 35.0)
+_PS_SCORE_GAP_MIN          = 15.0   # minimum gap between rev/cont scores (was 8.0)
 
 _PS_DISP_SCORE_MULT        = 1.30    # during displacement phase, need 1.3× score
 _PS_MATURE_SCORE_MULT      = 0.75    # during mature phase, accept 0.75× score
@@ -943,17 +943,33 @@ class EntryEngine:
         now:   float,
     ) -> bool:
         """
-        BUG-FIX-3: BSL and SSL selection now use t.adjusted_sig() for both sides
-        so the cross-side comparison is consistent (was: BSL by distance, SSL by sig).
-        HTF escalation applied if the approaching pool's TP fails R:R.
+        DISABLED — Pre-sweep approach entries removed. (ANALYSIS.md §5)
 
-        BUG-FIX-DIRECTIONAL (v3.2): Evaluate sides independently based on flow.
-          Old: BSL and SSL competed by adjusted_sig(). BSL pools in declining
-          markets accumulate higher significance (untouched), so LONG always won
-          even when price was sliding >10%. Now flow direction gates which side
-          is evaluated. When flow is neutral, both sides are checked but the
-          side matching EWMA direction is preferred.
+        Production data shows approach entries have <35% WR because:
+          1. The pool may not be swept at all (no setup confirmed)
+          2. You're entering in the direction the market is about to reverse
+          3. There's no displacement, no CISD, no structural confirmation
+          4. The R:R is computed against an unsettled target
+
+        Institutional traders NEVER enter before the sweep.
+        They wait for: sweep → displacement → CISD → OTE retrace → ENTER.
+
+        Returns False unconditionally.
+        To re-enable with strict filters, restore _check_proximity_approach_ORIG
+        and raise thresholds to: sig>=10, confirms>=3, R:R>=2.5, TF>=15m.
         """
+        return False
+
+    def _check_proximity_approach_ORIG(
+        self,
+        snap:  LiquidityMapSnapshot,
+        flow:  OrderFlowState,
+        ict:   ICTContext,
+        price: float,
+        atr:   float,
+        now:   float,
+    ) -> bool:
+        """Original approach logic — preserved for reference, never called."""
         if now - self._last_entry_at < _ENTRY_COOLDOWN_SEC:
             return False
 

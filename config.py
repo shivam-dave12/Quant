@@ -44,10 +44,10 @@ REMAINDER_MIN_QTY        = 0.001
 # ── Risk management ───────────────────────────────────────────────────────────
 RISK_PER_TRADE          = 0.60
 MAX_DAILY_LOSS          = 10000
-MAX_DAILY_LOSS_PCT      = 100.0
+MAX_DAILY_LOSS_PCT      = 3.0      # was 100.0 — institutional day circuit breaker (ANALYSIS.md §12)
 MAX_DRAWDOWN_PCT        = 1000.0
-MAX_CONSECUTIVE_LOSSES  = 100
-MAX_DAILY_TRADES        = 1000
+MAX_CONSECUTIVE_LOSSES  = 2        # was 100 — 2 losses = thesis wrong, stop (config_overrides.py)
+MAX_DAILY_TRADES        = 10       # was 1000 — institutional max per day (config_overrides.py)
 ONE_POSITION_AT_A_TIME  = True
 MIN_TIME_BETWEEN_TRADES = 3
 TRADE_COOLDOWN_SECONDS  = 100
@@ -113,7 +113,7 @@ HEALTH_CHECK_INTERVAL_SEC          = 12.0
 PRICE_STALE_SECONDS                = 90.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
-ENTRY_EVALUATION_INTERVAL_SECONDS  = 1
+ENTRY_EVALUATION_INTERVAL_SECONDS  = 2   # was 1 — don't process every 250ms tick (config_overrides.py)
 ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS
 
 # ── Logging / Reporting ───────────────────────────────────────────────────────
@@ -143,14 +143,14 @@ RATE_LIMIT_ORDERS        = 15
 # Bracket entry SL is always stop-market (guaranteed crash protection).
 SL_LIMIT_OFFSET_TICKS    = 20   # ticks of limit buffer on trailing stop-limit
 SL_BUFFER_TICKS              = 5
-MIN_SL_DISTANCE_PCT          = 0.001  # legacy pct floor; actual SL uses 1.0×ATR minimum
+MIN_SL_DISTANCE_PCT          = 0.004  # was 0.001 — BTC@$66K: 0.004=$264 min SL dist (config_overrides.py)
 MAX_SL_DISTANCE_PCT          = 0.035
 SL_MIN_IMPROVEMENT_PCT       = 0.001
 SL_RATCHET_ONLY              = True
 SL_ATR_PERIOD                = 14
 SL_ATR_BUFFER_MULT           = 0.75
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
-SL_MIN_IMPROVEMENT_ATR_MULT  = 0.08
+SL_MIN_IMPROVEMENT_ATR_MULT  = 0.20   # was 0.08 — prevents micro SL updates (config_overrides.py)
 TRAILING_SL_CHECK_INTERVAL   = 10
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
@@ -179,9 +179,10 @@ QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.30   # BE lock at 0.30R (was 0.40)
-QUANT_TRAIL_LOCK_R             = 0.80
-QUANT_TRAIL_AGGRESSIVE_R       = 1.80   # Aggressive at 1.80R (was 2.00)
+QUANT_TRAIL_BE_R               = 1.00   # was 0.30 — BE lock at 1.0R (config_overrides.py)
+QUANT_TRAIL_LOCK_R             = 2.00   # was 0.80 — structural trail starts at 2.0R (config_overrides.py)
+QUANT_TRAIL_AGGRESSIVE_R       = 3.50   # was 1.80 — aggressive trail at 3.5R (config_overrides.py)
+QUANT_TRAIL_LIQ_MIN_BREATHING_ATR = 1.00  # minimum ATR gap between SL and price (config_overrides.py)
 QUANT_TRAIL_MIN_DIST_ATR_P1    = 2.00   # Phase 1: 2.0 ATR min (was 1.50 — death zone)
 QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.50   # Phase 2: 1.5 ATR (was 1.10)
 QUANT_TRAIL_MIN_DIST_ATR_P3    = 1.00   # Phase 3: 1.0 ATR (was 0.70)
@@ -209,8 +210,8 @@ QUANT_ATR_PCTILE_WINDOW        = 100
 QUANT_ATR_MIN_PCTILE           = 0.00
 QUANT_ATR_MAX_PCTILE           = 0.97
 QUANT_MAX_HOLD_SEC             = 2400
-QUANT_COOLDOWN_SEC             = 180
-QUANT_LOSS_LOCKOUT_SEC         = 300
+QUANT_COOLDOWN_SEC             = 300    # was 180 — 5 min between trades (config_overrides.py)
+QUANT_LOSS_LOCKOUT_SEC         = 5400   # was 300 — 90 min lockout after consec losses (config_overrides.py)
 QUANT_POS_SYNC_SEC             = 30
 QUANT_W_VWAP_DEV               = 0.30
 QUANT_W_CVD_DIV                = 0.25
@@ -339,33 +340,39 @@ QUANT_MIN_CONFIRMING         = 4     # minimum confirming signals (of 5 quant + 
 # ── Conviction Filter ─────────────────────────────────────────────────────────
 # All numeric thresholds consumed by conviction_filter.py.
 # conviction_filter.py imports these via `from config import CONVICTION_*`.
+#
+# INSTITUTIONAL CALIBRATION v3.0 — calibrated for 65-75% WR, 3-6 trades/session.
+# Source: config_overrides.py + ANALYSIS.md root cause analysis.
 # ─────────────────────────────────────────────────────────────────────────────
 # Score gate: weighted sum of 6 factors must reach this to allow entry.
-CONVICTION_MIN_SCORE               = 0.55
+# 0.82 = only highest-conviction setups (ANALYSIS.md §11.2). Was 0.55.
+CONVICTION_MIN_SCORE               = 0.82
 
 # Pool effective timeframe rank floor (1m=1, 5m=2, 15m=3, 1h=4, 4h=5, 1d=6).
-# HTF-confluence count boosts the native rank before this check.
-CONVICTION_POOL_MIN_TF_RANK        = 2
+# 1m/5m pools are noise — they form and dissolve every few minutes. Was 2.
+CONVICTION_POOL_MIN_TF_RANK        = 3
 
 # Displacement: minimum candle body / ATR ratio to count as meaningful.
-CONVICTION_DISPLACEMENT_BODY_ATR   = 0.55
+# Proves institutional intent. Weak displacement = noise sweep. Was 0.55.
+CONVICTION_DISPLACEMENT_BODY_ATR   = 0.70
 
 # OTE (Optimal Trade Entry) Fibonacci retracement band.
 CONVICTION_OTE_FIB_LOW             = 0.500   # 50% retrace
-CONVICTION_OTE_FIB_HIGH            = 0.786   # 78.6% retrace
+CONVICTION_OTE_FIB_HIGH            = 0.786   # 78.6% retrace (golden pocket)
 
 # Hard R:R floor enforced as mandatory gate (early-return, no score computed).
-# Intentionally lower than QUANT_REVERSION_MIN_RR — conviction gate fires first.
 CONVICTION_MIN_RR                  = 2.0
 
-# Per-session consecutive-loss circuit breaker.
-CONVICTION_MAX_SESSION_LOSSES      = MAX_DAILY_LOSS
+# Per-session consecutive-loss circuit breaker. Was MAX_DAILY_LOSS (effectively unlimited).
+CONVICTION_MAX_SESSION_LOSSES      = 2
 
-# Minimum seconds between consecutive entries within the same session.
-CONVICTION_MIN_ENTRY_INTERVAL_SEC  = TRADE_COOLDOWN_SECONDS
+# Minimum seconds between consecutive entries. Was TRADE_COOLDOWN_SECONDS (100s).
+# 300s = 5 minutes. Institutional pace: one trade per 15-30 min is normal.
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 300
 
-# Maximum entries allowed before session boundary resets the counter.
-CONVICTION_MAX_ENTRIES_PER_SESSION = MAX_DAILY_TRADES
+# Maximum entries per kill zone session (London/NY/Asia).
+# Was MAX_DAILY_TRADES (effectively unlimited). 5 = institutional norm.
+CONVICTION_MAX_ENTRIES_PER_SESSION = 5
 
 # ── Legacy aliases (strategy code reads these) ────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE   # used by CoinSwitch order_manager path
