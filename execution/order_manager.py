@@ -40,8 +40,11 @@ FIX LOG (v10.2):
     market orders.  This eliminates the entire post-fill "bracket child
     upgrade" step along with the NOT_FOUND race condition it could trigger.
     _DeltaAdapter.place_bracket_limit_entry accepts sl_limit_price and
-    tp_limit_price and passes them as bracket_stop_loss_limit_price /
-    bracket_take_profit_limit_price.  OrderManager computes these from
+    tp_limit_price.  The adapter builds nested stop_loss_order /
+    take_profit_order objects per the CreateBracketOrderRequest schema
+    (order_type="limit_order", stop_price=trigger, limit_price=worst-fill)
+    rather than the flat bracket_stop_loss_limit_price kwargs used by
+    EditBracketOrderRequest.  OrderManager computes these prices from
     sl_price / tp_price using the same tick-snap logic as place_stop_loss
     and place_take_profit.
 
@@ -385,39 +388,62 @@ class _DeltaAdapter:
                                   sl_limit_price: Optional[float] = None,
                                   tp_limit_price: Optional[float] = None) -> Optional[Dict]:
         """
-        Place a bracket limit-entry order on Delta.
+        Place a bracket limit-entry order on Delta Exchange.
 
-        When sl_limit_price / tp_limit_price are supplied the bracket children
-        are created as LIMIT orders (stop_price = trigger, limit_price = worst
-        acceptable fill).  When omitted the API falls back to its default
-        (market children).  Callers should always supply both limit prices so
-        SL and TP are resting limit orders, not market orders.
+        Uses the CreateBracketOrderRequest nested-object schema:
+          stop_loss_order  : { order_type, stop_price, limit_price }
+          take_profit_order: { order_type, stop_price, limit_price }
+
+        When sl_limit_price / tp_limit_price are supplied the legs are sent as
+        "limit_order" (stop triggers, then fills at worst=limit_price).
+        When omitted the legs fall back to "market_order".
+
+        NOTE: CreateBracketOrderRequest uses NESTED objects (stop_loss_order /
+        take_profit_order), NOT the flat bracket_stop_loss_price kwargs that
+        EditBracketOrderRequest uses.  Mixing the two schemas is the source of
+        "unexpected keyword argument" errors.
         """
         self.limiter.wait()
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
 
-        kwargs: Dict = dict(
-            symbol        = self.symbol,
-            side          = side.lower(),
-            order_type    = "limit",
-            size          = contracts,
-            limit_price   = float(limit_price),
-            post_only     = False,
-            time_in_force = "gtc",
-        )
-
-        # Build bracket legs — always limit_order when limit prices are given.
-        kwargs["bracket_stop_loss_price"] = float(sl_price)
-        kwargs["bracket_take_profit_price"] = float(tp_price)
-
+        # ── Build bracket leg objects (nested, per CreateBracketOrderRequest) ──
         if sl_limit_price is not None:
-            kwargs["bracket_stop_loss_limit_price"] = float(sl_limit_price)
+            sl_order = {
+                "order_type": "limit_order",
+                "stop_price": str(sl_price),
+                "limit_price": str(sl_limit_price),
+            }
+        else:
+            sl_order = {
+                "order_type": "market_order",
+                "stop_price": str(sl_price),
+            }
 
         if tp_limit_price is not None:
-            kwargs["bracket_take_profit_limit_price"] = float(tp_limit_price)
+            tp_order = {
+                "order_type": "limit_order",
+                "stop_price": str(tp_price),
+                "limit_price": str(tp_limit_price),
+            }
+        else:
+            tp_order = {
+                "order_type": "market_order",
+                "stop_price": str(tp_price),
+            }
 
-        resp = self.api.place_order(**kwargs)
+        resp = self.api.place_order(
+            symbol                       = self.symbol,
+            side                         = side.lower(),
+            order_type                   = "limit_order",
+            size                         = contracts,
+            limit_price                  = float(limit_price),
+            post_only                    = False,
+            time_in_force                = "gtc",
+            stop_loss_order              = sl_order,
+            take_profit_order            = tp_order,
+            bracket_stop_trigger_method  = "last_traded_price",
+        )
         oid = self.extract_order_id(resp)
         if not oid:
             sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
