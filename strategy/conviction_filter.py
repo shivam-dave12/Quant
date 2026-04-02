@@ -1,53 +1,36 @@
 """
-conviction_filter.py — Institutional Entry Conviction Gate v2.0
+conviction_filter.py — Institutional Entry Conviction Gate v2.1
 ================================================================
-COMPLETE REWRITE — v1.0 had fundamental calculation errors that caused
-score=0.000 on every evaluation, blocking 100% of trades.
+v2.1 FIX LOG:
+  BUG-SCORE-ZERO: evaluate() returned early from _check_session_limits()
+    BEFORE running any factor scoring. Every cooldown-blocked entry showed
+    score=0.000 with all factor bars at zero in the Telegram display — making
+    it impossible to see whether the setup was actually good or bad.
 
-ROOT CAUSE ANALYSIS OF v1.0 FAILURES:
-  1. POOL_TF_BLOCKED (primary): Gate read the pool's NATIVE timeframe (often 1m)
-     but ignored htf_count. A 1m pool with HTFx2 confluence IS institutionally
-     equivalent to a 15m pool — that is literally what htf_count measures.
-     Fix: effective_rank = max(native_rank, htf_count_rank).
+  FIX: Factor scoring now ALWAYS runs first, producing a real conviction score.
+    Session limit check runs AFTER scoring, as a separate gate.  The result
+    carries the real score (e.g. 0.552) but allowed=False with a clear
+    MIN_INTERVAL reason.  Telegram displays real factor bars even during
+    cooldown.
 
-  2. AMD_BLOCKED ACCUMULATION (secondary): Bot is frequently in ACCUMULATION
-     phase (consolidation between moves). Hard-blocking ALL ACCUMULATION was
-     blocking 100% of setup windows. ICT allows entries in accumulation when
-     bias is directional — it's the RANDOM/NEUTRAL accumulation that is low
-     probability, not accumulation with a bullish/bearish lean.
-     Fix: ACCUMULATION + aligned bias -> 0.40 score (not hard block).
+  This also fixes the misleading "Dealing Range GATE: FAIL" label that
+  appeared in the conviction block alert during MIN_INTERVAL blocks —
+  the dealing range gate had never been evaluated.
 
-  3. CISD score always 0.0: _last_ps_decision did not exist on DirectionEngine.
-     quant_strategy.py now stores it after evaluate_sweep; conviction gate
-     reads it correctly via ps_decision parameter.
-
-  4. OTE score wrong for approach signals: PRE_SWEEP_APPROACH fires BEFORE
-     price reaches the pool — OTE calculation assumed post-sweep retrace.
-     Fix: entry-type aware scoring via entry_type parameter.
-
-  5. MIN_RR = 2.0 blocked all entry-engine signals: entry engine produces
-     1.4-1.6 R:R signals (validated, high-quality). Gate required 2.0+.
-     Fix: MIN_RR = 1.40 (matching entry engine's own minimum).
-
-  6. REQUIRED_CONVICTION_SCORE = 0.75 unreachable with all factors at 0.0.
-     Fix: threshold = 0.55 (still selective, achievable with real signals).
-
-  7. Session ASIA hard block over-strict for directional setups.
-     Fix: ASIA is a strong penalty (0.10) not a hard block.
-
-FACTOR WEIGHTS (revised):
-  1. Pool significance tier         0.25  (HTF-effective rank, not just native TF)
-  2. Dealing range valid            GATE  (premium/discount — still enforced)
-  3. Displacement confirmed         0.25  (ICT footprint — primary evidence)
-  4. CISD (CHoCH/BOS post-sweep)   0.20  (structural state change)
-  5. OTE zone retracement           0.15  (entry quality — partial for approach)
-  6. Session alignment              0.10  (kill zone bonus)
-  7. AMD phase alignment            0.05  (reduced — phase can lag)
+FACTOR WEIGHTS (unchanged from v2.0):
+  1. Pool significance tier         0.25
+  2. Dealing range valid            GATE  (mandatory early-return still applies)
+  3. Displacement confirmed         0.25
+  4. CISD (CHoCH/BOS post-sweep)   0.20
+  5. OTE zone retracement           0.15
+  6. Session alignment              0.10
+  7. AMD phase alignment            0.05
   TOTAL                             1.00
 
-MANDATORY GATES (early return on fail):
+MANDATORY GATES (still enforced — early return on fail):
   - Dealing range: longs below 0.58 P/D only, shorts above 0.42 P/D only
   - R:R: minimum 1.40 (matching entry engine)
+  NOTE: Session limits are NOT mandatory gates — they run after scoring.
 """
 
 from __future__ import annotations
@@ -68,7 +51,6 @@ logger = logging.getLogger(__name__)
 REQUIRED_CONVICTION_SCORE = 0.55
 
 # Pool minimum EFFECTIVE TF rank (after HTF-confluence boost)
-# 1=1m, 2=5m, 3=15m. Set to 2: pools with htf_count>=1 clear this.
 POOL_MIN_TF_RANK = 2
 
 _TF_RANK: Dict[str, int] = {
@@ -131,6 +113,8 @@ class ConvictionResult:
     rr_ratio:       float              = 0.0
     pool_tf:        str                = ""
     pool_sig:       float              = 0.0
+    # v2.1: True when the only block is a session-timing gate (score is real)
+    blocked_by_timing: bool            = False
 
 
 @dataclass
@@ -157,11 +141,12 @@ class SessionState:
 
 class ConvictionFilter:
     """
-    Institutional Entry Conviction Gate v2.0
+    Institutional Entry Conviction Gate v2.1
 
     Evaluates 7 ICT factors with corrected calculations.
-    Mandatory gates: dealing range + R:R.
-    Score >= 0.55 allows entry.
+    Mandatory gates (early return): dealing range + R:R.
+    Session timing limits run AFTER scoring (score is always real).
+    Score >= 0.55 AND no session limit block → entry allowed.
     """
 
     def __init__(self) -> None:
@@ -184,34 +169,37 @@ class ConvictionFilter:
         session:    str            = "",
         entry_type: str            = "",
     ) -> ConvictionResult:
+        """
+        Evaluate conviction for a potential entry.
 
+        v2.1 change: factor scoring runs UNCONDITIONALLY before session-limit
+        checks.  This means blocked-by-cooldown results carry a real score and
+        real factor values — not zeros.  The Telegram display is truthful.
+
+        Return is always a ConvictionResult with:
+          .allowed        — True only if score passes AND no session limit hit
+          .score          — real conviction score (0-1), always computed
+          .blocked_by_timing — True when the only block is MIN_INTERVAL / session cap
+          .factors        — real per-factor scores (never all-zero except on gate failure)
+          .reject_reasons — human-readable reasons for any block
+        """
         factors  = ConvictionFactors()
         rejects: List[str] = []
         allows:  List[str] = []
-
-        # ── Session quality control ────────────────────────────────────────
-        session_block = self._check_session_limits(now, session)
-        if session_block:
-            return ConvictionResult(
-                allowed=False, score=0.0,
-                reject_reasons=[session_block], factors=factors)
 
         # ── Pool info ──────────────────────────────────────────────────────
         pool_price, pool_tf, pool_sig, pool_htf_count = \
             self._extract_pool_info(sweep_pool, atr)
 
-        # ── EFFECTIVE TF RANK (v2.0 core fix) ─────────────────────────────
-        # htf_count measures how many higher TFs confirmed this pool level.
-        # A 1m pool with HTFx2 means two higher-TF structures converge there —
-        # institutionally equivalent to a 15m pool. This IS the ICT principle
-        # of multi-timeframe confluence.
+        # ── EFFECTIVE TF RANK ──────────────────────────────────────────────
         native_rank = _TF_RANK.get(pool_tf, 2)
-        if   pool_htf_count >= 3: effective_rank = max(native_rank, 4)  # 1h equivalent
-        elif pool_htf_count >= 2: effective_rank = max(native_rank, 3)  # 15m equivalent
-        elif pool_htf_count >= 1: effective_rank = max(native_rank, 2)  # 5m equivalent
+        if   pool_htf_count >= 3: effective_rank = max(native_rank, 4)
+        elif pool_htf_count >= 2: effective_rank = max(native_rank, 3)
+        elif pool_htf_count >= 1: effective_rank = max(native_rank, 2)
         else:                     effective_rank = native_rank
 
         # ── MANDATORY GATE 1: Pool effective timeframe ─────────────────────
+        # This is a hard structural filter — return early with zero score.
         if effective_rank < POOL_MIN_TF_RANK:
             rejects.append(
                 f"POOL_TF_BLOCKED: {pool_tf}(htfx{pool_htf_count}) "
@@ -233,6 +221,7 @@ class ConvictionFilter:
             allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f}")
 
         # ── MANDATORY GATE 2: Dealing range ───────────────────────────────
+        # Hard structural filter — return early with zero score.
         dr_pd = self._get_dealing_range_pd(price, ict_engine, liq_snapshot)
         if trade_side == "long" and dr_pd > 0.58:
             rejects.append(
@@ -265,6 +254,7 @@ class ConvictionFilter:
             allows.append(f"DR={_dr_label}({dr_pd:.2f})")
 
         # ── MANDATORY GATE 3: R:R ──────────────────────────────────────────
+        # Hard structural filter — return early with zero score.
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
         if rr < MIN_RR:
             rejects.append(
@@ -277,7 +267,6 @@ class ConvictionFilter:
                 rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
         allows.append(f"RR={rr:.2f}R")
 
-        # Determine if this is an approach (pre-sweep) type signal
         is_approach = ("approach" in entry_type.lower() or
                        "pre_sweep" in entry_type.lower() or
                        "proximity" in entry_type.lower())
@@ -303,7 +292,6 @@ class ConvictionFilter:
 
         # ── FACTOR 5: OTE zone (weight 0.15) ──────────────────────────────
         if is_approach:
-            # Not yet at pool — give partial credit for approaching OTE zone
             factors.ote_score = 0.55
         else:
             factors.ote_score = self._score_ote(
@@ -335,9 +323,11 @@ class ConvictionFilter:
             factors.session_score      * 0.10 +
             factors.amd_score          * 0.05
         )
+        score = round(score, 4)
 
-        # ── FINAL DECISION ─────────────────────────────────────────────────
-        if score < REQUIRED_CONVICTION_SCORE:
+        # ── SCORE GATE ─────────────────────────────────────────────────────
+        score_passed = score >= REQUIRED_CONVICTION_SCORE
+        if not score_passed:
             rejects.append(
                 f"SCORE_TOO_LOW: {score:.3f} < {REQUIRED_CONVICTION_SCORE} "
                 f"[pool={factors.pool_sig_score:.2f} "
@@ -347,20 +337,41 @@ class ConvictionFilter:
                 f"sess={factors.session_score:.2f} "
                 f"amd={factors.amd_score:.2f}]"
             )
-            allowed = False
         else:
-            allowed = True
             allows.append(f"TOTAL={score:.3f} ✅")
 
+        # ── SESSION TIMING GATE (runs AFTER scoring — v2.1 fix) ───────────
+        # Checked LAST so the score is always computed and displayed correctly.
+        # A timing block sets blocked_by_timing=True so the caller can log
+        # the real score in Telegram rather than 0.000.
+        timing_block = self._check_session_limits(now, session)
+        if timing_block:
+            # Score was computed — still block the entry but carry real score
+            rejects_with_timing = [timing_block] + rejects
+            if score_passed:
+                # Signal quality is good; timing is the only blocker
+                log_score_str = f"{score:.3f} (GOOD — blocked by timing only)"
+            else:
+                log_score_str = f"{score:.3f}"
+            logger.info(
+                f"🚫 CONVICTION GATE BLOCKED ({log_score_str}) | "
+                f"TIMING: {timing_block}"
+            )
+            return ConvictionResult(
+                allowed        = False,
+                score          = score,
+                factors        = factors,
+                reject_reasons = rejects_with_timing,
+                allow_reasons  = allows,
+                rr_ratio       = rr,
+                pool_tf        = pool_tf,
+                pool_sig       = pool_sig,
+                blocked_by_timing = True,
+            )
+
+        # ── FINAL DECISION ─────────────────────────────────────────────────
+        allowed = score_passed
         if allowed:
-            # NOTE: entries_taken and last_entry_time are intentionally NOT set
-            # here. They are set only in mark_entry_placed(), which is called by
-            # quant_strategy._enter_trade() after PositionPhase.ACTIVE is confirmed.
-            # Setting them here caused a 900s lockout after every evaluation that
-            # passed conviction but failed to execute (e.g. insufficient margin,
-            # TP gate rejection, exchange error) — the trade never happened but
-            # the timer was armed. This was the root cause of score=0.000 /
-            # MIN_INTERVAL blocks immediately after a failed entry attempt.
             logger.info(
                 f"✅ CONVICTION PASSED ({score:.3f}) | "
                 f"{' | '.join(allows)}")
@@ -371,7 +382,7 @@ class ConvictionFilter:
 
         return ConvictionResult(
             allowed        = allowed,
-            score          = round(score, 4),
+            score          = score,
             factors        = factors,
             reject_reasons = rejects,
             allow_reasons  = allows,
@@ -383,12 +394,8 @@ class ConvictionFilter:
     def mark_entry_placed(self, now: float) -> None:
         """
         Called by quant_strategy._enter_trade() the moment PositionPhase.ACTIVE
-        is confirmed (order filled, position live).  This is the ONLY place that
+        is confirmed (order filled, position live). This is the ONLY place that
         arms the MIN_ENTRY_INTERVAL cooldown and increments entries_taken.
-
-        Decoupled from evaluate() so that conviction passes that fail to execute
-        (insufficient margin, TP gate, exchange error, fill timeout) do NOT
-        consume the session quota or start the cooldown timer.
         """
         self._session_state.entries_taken  += 1
         self._session_state.last_entry_time = now
@@ -400,24 +407,18 @@ class ConvictionFilter:
 
     def on_session_change(self, new_session: str) -> None:
         """
-        Called by quant_strategy when the killzone/session changes
-        (e.g. OFF_HOURS → NEW_YORK, NEW_YORK → LONDON).
-
-        Resets entries_taken and consecutive_losses for the new session window
-        while preserving the WIN/LOSS record for the day's analytics.
-
-        The 900s MIN_ENTRY_INTERVAL cooldown is also cleared — it is
-        intra-session pacing, not an inter-session barrier.
+        Called by quant_strategy when the killzone/session changes.
+        Resets entries_taken and consecutive_losses for the new session.
+        The 900s MIN_ENTRY_INTERVAL cooldown is also cleared.
         """
         old_sess = self._session_state.session_id
         if new_session == old_sess:
-            return  # no change
+            return
         logger.info(
             f"ConvictionFilter: session boundary {old_sess!r} → {new_session!r} "
             f"| resetting entries_taken={self._session_state.entries_taken} "
             f"and consecutive_losses={self._session_state.consecutive_losses}"
         )
-        # Preserve cumulative W/L but reset session-level pacing counters
         wins   = self._session_state.wins
         losses = self._session_state.losses
         self._session_state = SessionState(
@@ -434,6 +435,27 @@ class ConvictionFilter:
             f"consec_losses={self._session_state.consecutive_losses}"
         )
 
+    def get_session_state_summary(self) -> Dict:
+        """Return current session state for display/logging."""
+        st = self._session_state
+        elapsed_since_entry = 0
+        cooldown_remaining  = 0
+        if st.last_entry_time > 0:
+            elapsed_since_entry = time.time() - st.last_entry_time
+            cooldown_remaining  = max(0, MIN_ENTRY_INTERVAL_SEC - elapsed_since_entry)
+        return {
+            "session_id":          st.session_id,
+            "entries_taken":       st.entries_taken,
+            "max_entries":         MAX_ENTRIES_PER_SESSION,
+            "consecutive_losses":  st.consecutive_losses,
+            "max_losses":          MAX_SESSION_LOSSES,
+            "wins":                st.wins,
+            "losses":              st.losses,
+            "last_entry_time":     st.last_entry_time,
+            "cooldown_remaining_s": int(cooldown_remaining),
+            "cooldown_active":     cooldown_remaining > 0,
+        }
+
     # ─────────────────────────────────────────────────────────────────────────
     # POOL INFO EXTRACTION
     # ─────────────────────────────────────────────────────────────────────────
@@ -442,19 +464,16 @@ class ConvictionFilter:
     def _extract_pool_info(sweep_pool, atr: float) -> Tuple[float, str, float, int]:
         """
         Extract (price, timeframe, significance, htf_count) from any pool object.
-        Handles PoolTarget, SweepResult, LiquidityPool, bare objects.
         """
         if sweep_pool is None:
             return 0.0, "5m", 1.0, 0
 
-        # Unwrap PoolTarget/SweepResult -> inner pool
         inner = getattr(sweep_pool, 'pool', sweep_pool)
 
         price   = float(getattr(inner, 'price', 0.0) or 0.0)
         tf      = str(getattr(inner, 'timeframe', '5m') or '5m')
         htf_cnt = int(getattr(inner, 'htf_count', 0) or 0)
 
-        # Significance: try multiple attribute names
         sig = 0.0
         for attr in ('significance', 'adjusted_sig', 'sig'):
             _v = getattr(sweep_pool, attr, None)
@@ -471,7 +490,6 @@ class ConvictionFilter:
             tc  = int(getattr(inner, 'touches', 0) or 0)
             sig = max(1.0, 2.0 + tc * 0.5)
 
-        # Proximity boost for PoolTarget objects
         dist_atr = float(getattr(sweep_pool, 'distance_atr', 99.0) or 99.0)
         if dist_atr < 3.0:
             sig *= max(0.5, 1.0 + (3.0 - dist_atr) / 6.0)
@@ -483,23 +501,29 @@ class ConvictionFilter:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _check_session_limits(self, now: float, session: str) -> Optional[str]:
+        """
+        Check timing/pacing gates.  Returns a reason string if blocked, else None.
+
+        v2.1: Called AFTER all factor scoring so the returned ConvictionResult
+        always carries a real score even when this gate fires.
+        """
         st = self._session_state
 
-        # ── Pacing: minimum interval between consecutive entries ───────────────
+        # ── Pacing: minimum interval between consecutive entries ──────────────
         if st.last_entry_time > 0:
             elapsed = now - st.last_entry_time
             if elapsed < MIN_ENTRY_INTERVAL_SEC:
                 wait = int(MIN_ENTRY_INTERVAL_SEC - elapsed)
                 return f"MIN_INTERVAL: {wait}s until next entry allowed"
 
-        # ── Consecutive loss circuit breaker ───────────────────────────────────
+        # ── Consecutive loss circuit breaker ──────────────────────────────────
         if st.consecutive_losses >= MAX_SESSION_LOSSES:
             return (
                 f"SESSION_INVALIDATED: {st.consecutive_losses} consecutive losses "
                 f"in session '{st.session_id}'. Review direction before next entry."
             )
 
-        # ── Per-session entry cap ──────────────────────────────────────────────
+        # ── Per-session entry cap ─────────────────────────────────────────────
         if st.entries_taken >= MAX_ENTRIES_PER_SESSION:
             return (
                 f"MAX_ENTRIES_HIT: {st.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
@@ -566,7 +590,6 @@ class ConvictionFilter:
     ) -> float:
         """Score displacement strength [0-1]."""
         if is_approach:
-            # Pre-sweep: check ICT engine pool displacement_confirmed flag
             if ict_engine is not None:
                 try:
                     for pool in ict_engine.liquidity_pools:
@@ -576,9 +599,8 @@ class ConvictionFilter:
                                 return min(ds * 0.80, 0.80)
                 except Exception:
                     pass
-            return 0.45  # baseline credit for approaching pool
+            return 0.45
 
-        # Reversal: scan last 3 closed 5m candles for displacement body
         if candles_5m and len(candles_5m) >= 4:
             closed = candles_5m[-4:-1]
             scores = []
@@ -603,7 +625,6 @@ class ConvictionFilter:
             if scores:
                 return min(max(scores), 1.0)
 
-        # Fallback: ICT engine pool displacement score
         if ict_engine is not None:
             try:
                 for p in ict_engine.liquidity_pools:
@@ -614,7 +635,7 @@ class ConvictionFilter:
             except Exception:
                 pass
 
-        return 0.30  # minimal partial credit
+        return 0.30
 
     @staticmethod
     def _score_cisd(
@@ -623,14 +644,8 @@ class ConvictionFilter:
         ict_engine,
         is_approach: bool = False,
     ) -> float:
-        """
-        Score CISD (Change in State of Delivery) [0-1].
-
-        v2.0 FIX: ps_decision is now properly provided from quant_strategy
-        (stored as dir_engine._last_ps_decision after evaluate_sweep).
-        """
+        """Score CISD (Change in State of Delivery) [0-1]."""
         if is_approach:
-            # Pre-sweep: check BOS/CHoCH from ICT for structural pre-alignment
             if ict_engine is not None:
                 try:
                     for tf in ("15m", "5m", "1m"):
@@ -644,9 +659,8 @@ class ConvictionFilter:
                             return 0.55
                 except Exception:
                     pass
-            return 0.40  # neutral credit — pre-sweep
+            return 0.40
 
-        # Post-sweep: use DirectionEngine's PostSweepDecision
         if ps_decision is not None:
             cisd_active = getattr(ps_decision, 'cisd_active', False)
             ps_conf     = float(getattr(ps_decision, 'confidence', 0.0) or 0.0)
@@ -669,7 +683,6 @@ class ConvictionFilter:
                 return 0.10
             return 0.25
 
-        # Fallback: ICT engine BOS/CHoCH direct
         if ict_engine is not None:
             try:
                 for tf in ("15m", "5m"):
@@ -685,7 +698,7 @@ class ConvictionFilter:
             except Exception:
                 pass
 
-        return 0.15  # no CISD evidence
+        return 0.15
 
     @staticmethod
     def _score_ote(
@@ -694,11 +707,7 @@ class ConvictionFilter:
         pool_price:  float,
         price:       float,
     ) -> float:
-        """
-        Score OTE (Optimal Trade Entry) zone [0-1].
-        OTE = 50-78.6% Fibonacci retrace from sweep extreme.
-        Peaks at 61.8% (golden ratio).
-        """
+        """Score OTE (Optimal Trade Entry) zone [0-1]."""
         if pool_price <= 0 or entry_price <= 0 or price <= 0:
             return 0.50
 
@@ -723,12 +732,7 @@ class ConvictionFilter:
 
     @staticmethod
     def _score_amd(trade_side: str, ict_engine) -> float:
-        """
-        Score AMD phase alignment [0-1].
-
-        v2.0 FIX: ACCUMULATION with aligned bias now scores 0.40, not 0.0.
-        Neutral accumulation scores 0.30 (not a block — just lower probability).
-        """
+        """Score AMD phase alignment [0-1]."""
         if ict_engine is None:
             return 0.45
 
@@ -753,7 +757,6 @@ class ConvictionFilter:
             elif contra:
                 base *= 0.55
 
-            # ACCUMULATION-specific floors
             if phase == "ACCUMULATION":
                 if long_ok or short_ok:
                     base = max(base, 0.40)

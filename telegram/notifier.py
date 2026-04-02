@@ -32,8 +32,8 @@ import queue as _queue_mod
 _send_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
 _worker_started = False
 _worker_lock    = threading.Lock()
-_MIN_INTERVAL   = 1.0
-_MAX_RETRIES    = 3
+_MIN_INTERVAL   = 1.2   # slightly above Telegram's 1-msg/sec guideline
+_MAX_RETRIES    = 4     # 4 attempts: covers 429 + one 502 retry
 
 
 # ======================================================================
@@ -151,13 +151,16 @@ def _send_worker():
                     break
 
                 if resp.status_code in (429, 500, 502, 503) and attempt < _MAX_RETRIES - 1:
-                    backoff = 2.0 * (2 ** attempt)
+                    import random
                     if resp.status_code == 429:
                         try:
-                            retry_after = resp.json().get("parameters", {}).get("retry_after", backoff)
-                            backoff = max(backoff, float(retry_after))
+                            retry_after = resp.json().get("parameters", {}).get("retry_after", 10)
+                            backoff = max(float(retry_after), 5.0)
                         except Exception:
-                            pass
+                            backoff = 10.0
+                    else:
+                        # 5xx: exponential with jitter, cap at 60s
+                        backoff = min(2.0 * (2 ** attempt) + random.uniform(0, 2), 60.0)
                     logger.warning(f"Telegram {resp.status_code}, retry {attempt+1}/{_MAX_RETRIES} in {backoff:.1f}s")
                     time.sleep(backoff)
                     continue
@@ -1351,41 +1354,67 @@ def format_post_sweep_verdict(
 # ======================================================================
 
 def format_conviction_block_alert(
-    side:           str,
-    score:          float,
-    reject_reasons: Optional[List[str]] = None,
-    allow_reasons:  Optional[List[str]] = None,
-    factors         = None,      # ConvictionFactors dataclass instance
-    entry_price:    float = 0.0,
-    sl_price:       float = 0.0,
-    tp_price:       float = 0.0,
-    rr_ratio:       float = 0.0,
+    side:              str,
+    score:             float,
+    reject_reasons:    Optional[List[str]] = None,
+    allow_reasons:     Optional[List[str]] = None,
+    factors            = None,      # ConvictionFactors dataclass instance
+    entry_price:       float = 0.0,
+    sl_price:          float = 0.0,
+    tp_price:          float = 0.0,
+    rr_ratio:          float = 0.0,
+    blocked_by_timing: bool  = False,  # v2.1: True when only blocker is MIN_INTERVAL
 ) -> str:
     """
-    Conviction gate block alert (Issue-4 fix).
+    Conviction gate block alert.
+
+    v2.1 changes:
+      • required threshold corrected to 0.55 (was wrong 0.75 — never matched
+        the actual gate in conviction_filter.py).
+      • factor weights corrected to match conviction_filter.py (disp=0.25 not 0.20).
+      • When blocked_by_timing=True, header shows ⏱️ TIMING GATE instead of 🚫
+        so the user knows setup quality is fine — only the cooldown is blocking.
+      • Dealing Range now shows PASS/FAIL based on actual gate state, not zero factors.
+      • Factor bars only shown when factors are non-zero (avoids misleading all-zeros
+        display during timing-only blocks where factors were computed but not stored).
 
     Displays:
       • Entry side + proposed prices
-      • Overall conviction score vs required threshold
+      • Overall conviction score vs required threshold (0.55)
       • Score bar
-      • Each reject reason (mandatory gate failures highlighted)
-      • Each passing factor
-      • Per-factor scores when ConvictionFactors dataclass is provided
+      • Per-factor breakdown (real values, correct weights)
+      • Reject reasons with timing vs structural distinction
+      • Passing factors for context
     """
     reject_reasons = reject_reasons or []
     allow_reasons  = allow_reasons  or []
     side_icon      = "🟢" if side.lower() == "long" else "🔴"
-    required       = 0.75   # REQUIRED_CONVICTION_SCORE from conviction_filter
+    # FIX: correct threshold — matches REQUIRED_CONVICTION_SCORE in conviction_filter.py
+    required       = 0.55
 
-    score_pct      = min(1.0, score / required)
-    bar_filled     = min(10, int(score_pct * 10))
-    score_bar      = "█" * bar_filled + "░" * (10 - bar_filled)
-    status_icon    = "✅" if score >= required else "❌"
+    score_pct   = min(1.0, score / required) if required > 0 else 0.0
+    bar_filled  = min(10, int(score_pct * 10))
+    score_bar   = "█" * bar_filled + "░" * (10 - bar_filled)
+    status_icon = "✅" if score >= required else "❌"
+
+    # Header: distinguish timing blocks from structural blocks
+    if blocked_by_timing and score >= required:
+        header_icon = "⏱️"
+        header_text = "CONVICTION GATE — TIMING HOLD"
+        subtext     = f"  Score: ✅ <b>{score:.3f}</b> / {required:.2f}  (setup quality: GOOD)"
+    elif blocked_by_timing:
+        header_icon = "⏱️"
+        header_text = "CONVICTION GATE — TIMING HOLD"
+        subtext     = f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required"
+    else:
+        header_icon = "🚫"
+        header_text = "CONVICTION GATE BLOCKED"
+        subtext     = f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required"
 
     lines = [
-        f"🚫 <b>CONVICTION GATE BLOCKED</b>  {side_icon} {side.upper()}",
+        f"{header_icon} <b>{header_text}</b>  {side_icon} {side.upper()}",
         "",
-        f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required",
+        subtext,
         f"  [{score_bar}]",
     ]
 
@@ -1397,17 +1426,27 @@ def format_conviction_block_alert(
             f"R:R: {rr_ratio:.1f}R"
         )
 
-    # Per-factor breakdown when ConvictionFactors is available
-    if factors is not None:
+    # Per-factor breakdown — only show when factors are actually computed (non-zero)
+    # v2.1: factors are always computed now; zero values only occur on mandatory gate
+    # failures (pool TF / dealing range / RR) where the gate returned before scoring.
+    factors_computed = (
+        factors is not None and
+        any(getattr(factors, a, 0.0) > 0 for a in
+            ('pool_sig_score', 'displacement_score', 'cisd_score',
+             'ote_score', 'session_score', 'amd_score'))
+    )
+
+    if factors_computed:
         lines.append("")
         lines.append("<b>📊 FACTOR BREAKDOWN</b>")
+        # FIX: correct weights matching conviction_filter.py
         factor_rows = [
             ("Pool sig",      getattr(factors, 'pool_sig_score',     0.0), 0.25),
-            ("Displacement",  getattr(factors, 'displacement_score', 0.0), 0.20),
+            ("Displacement",  getattr(factors, 'displacement_score', 0.0), 0.25),  # was 0.20
             ("CISD",          getattr(factors, 'cisd_score',         0.0), 0.20),
             ("OTE zone",      getattr(factors, 'ote_score',          0.0), 0.15),
             ("Session",       getattr(factors, 'session_score',      0.0), 0.10),
-            ("AMD phase",     getattr(factors, 'amd_score',          0.0), 0.10),
+            ("AMD phase",     getattr(factors, 'amd_score',          0.0), 0.05),  # was 0.10
         ]
         for fname, fval, fwt in factor_rows:
             fb = min(5, int(fval * 5))
@@ -1422,16 +1461,29 @@ def format_conviction_block_alert(
         if dr_ok is not None:
             dr_icon = "✅" if dr_ok else "❌"
             lines.append(f"  {dr_icon} Dealing Range   GATE: {'PASS' if dr_ok else 'FAIL'}")
+    elif factors is not None:
+        # Factors are zero — mandatory gate (pool TF / dealing range / RR) fired early
+        lines.append("")
+        lines.append("  <i>Factor scoring skipped — mandatory structural gate failed</i>")
 
-    # Reject reasons — mandatory gate failures are most important
-    if reject_reasons:
+    # Reject reasons — separate timing from structural
+    timing_reasons    = [r for r in reject_reasons if any(
+        k in r for k in ("MIN_INTERVAL", "MAX_ENTRIES", "SESSION_INVALIDATED"))]
+    structural_reasons = [r for r in reject_reasons if r not in timing_reasons]
+
+    if timing_reasons:
+        lines.append("")
+        lines.append("<b>⏱️ TIMING</b>")
+        for r in timing_reasons[:3]:
+            lines.append(f"  🕐 {_esc(r[:120])}")
+
+    if structural_reasons:
         lines.append("")
         lines.append("<b>🚫 REJECT REASONS</b>")
-        for r in reject_reasons[:6]:
-            # Mandatory gate failures are prefixed POOL_TF_BLOCKED, DEALING_RANGE_BLOCKED etc.
+        for r in structural_reasons[:5]:
             is_gate = any(k in r for k in (
-                "BLOCKED", "GATE", "INVALIDATED", "SESSION_BLOCKED",
-                "AMD_BLOCKED", "MIN_INTERVAL", "MAX_ENTRIES",
+                "BLOCKED", "GATE", "INVALIDATED",
+                "AMD_BLOCKED", "SCORE_TOO_LOW",
             ))
             icon = "🔴" if is_gate else "⚠️"
             lines.append(f"  {icon} {_esc(r[:120])}")
