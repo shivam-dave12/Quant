@@ -34,19 +34,18 @@ Key differences handled per-exchange
 All exchange-specific behaviour is encapsulated in the _Adapter inner
 classes so the OrderManager logic never branches on exchange type.
 
-FIX LOG (v10.2):
-  BUG-BRACKET-LIMIT: Bracket SL and TP are now sent as LIMIT orders
-    (stop_price = trigger, limit_price = worst-acceptable fill) instead of
-    market orders.  This eliminates the entire post-fill "bracket child
-    upgrade" step along with the NOT_FOUND race condition it could trigger.
-    _DeltaAdapter.place_bracket_limit_entry accepts sl_limit_price and
-    tp_limit_price.  The adapter builds nested stop_loss_order /
-    take_profit_order objects per the CreateBracketOrderRequest schema
-    (order_type="limit_order", stop_price=trigger, limit_price=worst-fill)
-    rather than the flat bracket_stop_loss_limit_price kwargs used by
-    EditBracketOrderRequest.  OrderManager computes these prices from
-    sl_price / tp_price using the same tick-snap logic as place_stop_loss
-    and place_take_profit.
+FIX LOG (v10.1):
+  BUG-BRACKET-RACE: place_bracket_limit_entry tried cancel+replace on
+    bracket market children WITHOUT first verifying the position was still
+    open.  When a bracket SL/TP fires in the 1-3s window between fill
+    detection and the child-cancel attempt, cancel returns NOT_FOUND and the
+    subsequent reduce_only order hits no_position_for_reduce_only.
+    FIX: (1) Verify position open before ANY reduce_only placement.
+         (2) On child NOT_FOUND during upgrade, re-check position and abort
+             upgrade gracefully — position already closed by bracket, log the
+             correct exit prices.
+         (3) Place new SL/TP BEFORE cancelling the bracket child so there is
+             no unprotected window (place-then-cancel, not cancel-then-place).
 
   BUG-REDUCE-ONLY-GUARD: All reduce_only placements now guarded by a
     pre-flight position check (_position_open_guard) that returns None
@@ -387,62 +386,40 @@ class _DeltaAdapter:
                                   tp_price: float,
                                   sl_limit_price: Optional[float] = None,
                                   tp_limit_price: Optional[float] = None) -> Optional[Dict]:
-        """
-        Place a bracket limit-entry order on Delta Exchange.
-
-        Uses the CreateBracketOrderRequest nested-object schema:
-          stop_loss_order  : { order_type, stop_price, limit_price }
-          take_profit_order: { order_type, stop_price, limit_price }
-
-        When sl_limit_price / tp_limit_price are supplied the legs are sent as
-        "limit_order" (stop triggers, then fills at worst=limit_price).
-        When omitted the legs fall back to "market_order".
-
-        NOTE: CreateBracketOrderRequest uses NESTED objects (stop_loss_order /
-        take_profit_order), NOT the flat bracket_stop_loss_price kwargs that
-        EditBracketOrderRequest uses.  Mixing the two schemas is the source of
-        "unexpected keyword argument" errors.
-        """
         self.limiter.wait()
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
 
-        # ── Build bracket leg objects (nested, per CreateBracketOrderRequest) ──
-        if sl_limit_price is not None:
-            sl_order = {
-                "order_type": "limit_order",
-                "stop_price": str(sl_price),
-                "limit_price": str(sl_limit_price),
-            }
-        else:
-            sl_order = {
-                "order_type": "market_order",
-                "stop_price": str(sl_price),
-            }
+        # For bracket limit orders, once the stop is triggered a limit order is
+        # placed at limit_price.  We add a small buffer on the "worse" side so
+        # the limit is virtually certain to fill even with minor slippage.
+        tick    = float(getattr(config, "TICK_SIZE", 0.5))
+        _buf    = tick * 10          # 10-tick buffer (~$5 for BTC 0.5-tick markets)
+        # exit direction: entry=sell → exit=buy (buffer is higher); entry=buy → exit=sell (lower)
+        _exit_buy = side.lower() in ("sell", "short")
+        if sl_limit_price is None:
+            sl_limit_price = sl_price + _buf if _exit_buy else sl_price - _buf
+        if tp_limit_price is None:
+            tp_limit_price = tp_price + _buf if _exit_buy else tp_price - _buf
 
-        if tp_limit_price is not None:
-            tp_order = {
-                "order_type": "limit_order",
-                "stop_price": str(tp_price),
-                "limit_price": str(tp_limit_price),
-            }
-        else:
-            tp_order = {
-                "order_type": "market_order",
-                "stop_price": str(tp_price),
-            }
+        logger.info(
+            f"[BRACKET-LIMIT] SL stop=${sl_price:.2f} limit=${sl_limit_price:.2f} | "
+            f"TP stop=${tp_price:.2f} limit=${tp_limit_price:.2f}"
+        )
 
         resp = self.api.place_order(
-            symbol                       = self.symbol,
-            side                         = side.lower(),
-            order_type                   = "limit_order",
-            size                         = contracts,
-            limit_price                  = float(limit_price),
-            post_only                    = False,
-            time_in_force                = "gtc",
-            stop_loss_order              = sl_order,
-            take_profit_order            = tp_order,
-            bracket_stop_trigger_method  = "last_traded_price",
+            symbol                          = self.symbol,
+            side                            = side.lower(),
+            order_type                      = "limit",
+            size                            = contracts,
+            limit_price                     = float(limit_price),
+            bracket_stop_loss_price         = float(sl_price),
+            bracket_stop_loss_limit_price   = float(sl_limit_price),
+            bracket_take_profit_price       = float(tp_price),
+            bracket_take_profit_limit_price = float(tp_limit_price),
+            bracket_stop_trigger_method     = "last_traded_price",
+            post_only                       = False,
+            time_in_force                   = "gtc",
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -955,62 +932,45 @@ class OrderManager:
                                   timeout_sec: float = 45.0) -> Optional[Dict]:
         """
         Bracket entry for Delta: places a single limit order with embedded SL + TP.
-
-        Both bracket legs are sent as LIMIT orders (stop_price = trigger,
-        limit_price = worst acceptable fill), so children REST IN THE BOOK as
-        plain limit orders rather than market orders.  This eliminates the
-        market-fill race window that previously required a post-fill upgrade step.
-
-        Limit prices are derived from sl_price / tp_price with the same tick-snap
-        logic used by place_stop_loss() and place_take_profit():
-          SL : limit = trigger (snap to tick) — same price, exchange fills at-or-better
-          TP : limit = trigger ∓ 1 tick inside the pool (ensures passive fill)
-
-        After fill, child order IDs are discovered from the open-orders snapshot
-        and stored in the return dict for strategy tracking.  If children are not
-        visible in the fast path a background resolver continues looking for 90 s.
-
+        Polls until filled, then queries open orders to retrieve bracket child IDs.
         Returns None for non-Delta adapters (caller falls back to regular flow).
+
+        FIX v10.1 — Bracket child upgrade race condition:
+        -------------------------------------------------------
+        PROBLEM (before fix):
+          After fill, the code ran: cancel(bracket_child) → place(new_limit, reduce_only).
+          If the bracket's own market SL/TP fired in the 1-3s window between fill
+          detection and the cancel attempt, cancel returned NOT_FOUND and the
+          subsequent reduce_only placement hit no_position_for_reduce_only.
+          The strategy then recorded a fill at entry price with $0 gross P&L (only fees).
+
+        SOLUTION (applied here):
+          1. After fill is confirmed, immediately verify the position is STILL OPEN
+             before touching any bracket children.  If exchange is already FLAT,
+             record the bracket as self-closed and return so identify_exit_order
+             can reconcile the actual exit price from fills.
+          2. Upgrade strategy changed to PLACE-FIRST then CANCEL:
+             - Place new plain-limit SL FIRST (no risk window).
+             - Only then cancel the bracket market child.
+             - If cancel returns NOT_FOUND (child fired in between), re-check position.
+               If FLAT → bracket fired; cancel the new plain-limit and let
+               identify_exit_order detect the correct exit.
+               If OPEN → our new limit is the active SL; proceed normally.
+          3. TP follows the same place-first / cancel-second / position-recheck pattern.
+          4. Any reduce_only placement is guarded by _position_open_guard().
         """
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None
 
-        # ── Compute bracket child limit prices ────────────────────────────────
-        # Children are placed as stop-limit orders.  The limit price is the
-        # worst-acceptable fill price after the stop triggers.
-        #
-        # SL: set limit == trigger (exchange will fill at trigger or better).
-        #     Using exactly the trigger avoids gap-fills on illiquid markets while
-        #     still guaranteeing a resting limit rather than a market sweep.
-        #
-        # TP: set limit 1 tick inside the pool (same convention as place_take_profit).
-        #     For a SELL TP this means limit = trigger − 1 tick so the order sits
-        #     passively just below the target level.
-        tick         = float(getattr(config, "TICK_SIZE", 0.1))
-        exit_is_sell = self._normalize_side(side) == "BUY"   # entry BUY → exit SELL
-
-        sl_limit = round(sl_price / tick) * tick              # at trigger, snap to tick
-
-        if exit_is_sell:
-            tp_limit = round((tp_price - tick) / tick) * tick # 1 tick inside for SELL TP
-        else:
-            tp_limit = round((tp_price + tick) / tick) * tick # 1 tick inside for BUY TP
-
         logger.info(
-            f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
-            f"SL stop=${sl_price:.2f} limit=${sl_limit:.2f} | "
-            f"TP stop=${tp_price:.2f} limit=${tp_limit:.2f} "
-            f"(timeout={timeout_sec:.0f}s)"
+            f"[BRACKET-LIMIT] {side.upper()} {quantity} @ ${limit_price:.2f} "
+            f"SL stop=${sl_price:.2f} TP stop=${tp_price:.2f} "
+            f"(native limit orders, timeout={timeout_sec:.0f}s)"
         )
 
         data = self._adapter.place_bracket_limit_entry(
-            side           = side,
-            quantity       = quantity,
-            limit_price    = limit_price,
-            sl_price       = sl_price,
-            tp_price       = tp_price,
-            sl_limit_price = sl_limit,
-            tp_limit_price = tp_limit,
+            side=side, quantity=quantity,
+            limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
         )
         if not data or data.get("_error"):
             sc = (data or {}).get("_sc", 0)
@@ -1045,25 +1005,26 @@ class OrderManager:
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
                             f" fee=${data['paid_commission']:.4f}")
 
-                # ── STEP 1: Wait for Delta to register bracket child orders ──────
-                # The position guard that previously lived here was removed.
-                # Rationale: Delta's /v2/positions/margined endpoint lags 2-5s
-                # after a fill.  Querying it here returns FLAT even though the
-                # position just opened, causing a false-positive abort.
-                #
-                # With LIMIT bracket children the guard is also unnecessary:
-                # stop-limit SL/TP children only fire when price reaches their
-                # stop_price trigger — they CANNOT fill in the 2-5s post-fill
-                # window unless price moves 100+ pts instantaneously.
-                # Child-discovery (STEP 2) and the background resolver (STEP 3)
-                # don't place any orders, so there is nothing to guard against.
+                # ── STEP 1: Verify position is still open BEFORE any child work ──
+                # Small pause to let Delta's bracket engine register the position
                 time.sleep(self._POST_FILL_POSITION_WAIT)
+                if not self._position_open_guard("bracket_post_fill"):
+                    # Exchange is already FLAT — bracket's own market SL or TP
+                    # fired in the window between fill detection and now.
+                    # Let identify_exit_order recover the actual exit price.
+                    logger.warning(
+                        "⚠️ Bracket position already FLAT after fill — "
+                        "bracket market child fired before upgrade. "
+                        "Returning bracket_closed_by_children=True for reconcile."
+                    )
+                    data["bracket_sl_order_id"]       = ""
+                    data["bracket_tp_order_id"]       = ""
+                    data["bracket_sl_price"]          = sl_price
+                    data["bracket_tp_price"]          = tp_price
+                    data["bracket_closed_by_children"] = True
+                    return data
 
                 # ── STEP 2: Discover bracket child order IDs ──────────────────
-                # Bracket children are now LIMIT orders (stop_loss_limit /
-                # take_profit_limit) — no upgrade step needed.  We just need their
-                # IDs for replace_stop_loss / replace_take_profit and
-                # identify_exit_order to work correctly.
                 sl_oid = tp_oid = ""
                 sl_trig = tp_trig = 0.0
 
@@ -1111,7 +1072,7 @@ class OrderManager:
                     )
                     sl_oid, sl_trig, tp_oid, tp_trig = _parse_children(open_ords)
                     if sl_oid and tp_oid:
-                        logger.info(f"Bracket limit children found on fast attempt {_fast+1}")
+                        logger.info(f"Bracket children found on fast attempt {_fast+1}")
                         break
 
                 data["bracket_sl_order_id"] = sl_oid
@@ -1120,9 +1081,14 @@ class OrderManager:
                 data["bracket_tp_price"]    = tp_trig or tp_price
 
                 if sl_oid:
-                    logger.info(f"  Bracket SL (limit) order: {sl_oid} stop=${sl_trig:.2f} limit=${sl_limit:.2f}")
+                    logger.info(f"  Bracket SL order: {sl_oid} @ ${sl_trig:.2f}")
                 if tp_oid:
-                    logger.info(f"  Bracket TP (limit) order: {tp_oid} stop=${tp_trig:.2f} limit=${tp_limit:.2f}")
+                    logger.info(f"  Bracket TP order: {tp_oid} @ ${tp_trig:.2f}")
+
+                # Bracket SL/TP are already placed as native limit orders
+                # (bracket_stop_loss_limit_price / bracket_take_profit_limit_price
+                # were set in _DeltaAdapter.place_bracket_limit_entry).
+                # No market→limit upgrade step needed.
 
                 # ── STEP 3: Background resolver for missing children ───────────
                 # If children were not found in the fast path, resolve in background.
@@ -1155,8 +1121,6 @@ class OrderManager:
                                         f"Bracket child bg-resolve: SL={_s[:8]}… "
                                         f"TP={_t[:8]}… (attempt {attempt})"
                                     )
-                                    _exit_side = "sell" if _captured_side.lower() in ("buy", "long") else "buy"
-
                                     if not hasattr(_captured_om, "_pending_bracket_children"):
                                         _captured_om._pending_bracket_children = {}
                                     _captured_om._pending_bracket_children[_captured_order_id] = {

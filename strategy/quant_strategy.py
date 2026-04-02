@@ -9288,6 +9288,13 @@ class QuantStrategy:
                 logger.debug(f"Counter-BOS check error (non-fatal): {_bos_e}")
 
         # ══════════════════════════════════════════════════════════════════
+        # LIQUIDITY-ONLY MODE: skip chandelier when LiqTrail is wired in.
+        # _DynamicStructureTrail runs only when liquidity_trail.py is absent.
+        # ══════════════════════════════════════════════════════════════════
+        if self._liq_trail is not None:
+            return False   # LiqTrail is the sole trailing engine; chandelier disabled
+
+        # ══════════════════════════════════════════════════════════════════
         # v6.0+: DYNAMIC TRAIL ENGINE — institutional v2.0
         # Reads: AMD phase, ATR percentile, OBs/Breaker Blocks, FVGs,
         # 4H/1H/15m/5m/1m swing cascade, liquidity pools, CVD, displacement.
