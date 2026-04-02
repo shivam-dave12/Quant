@@ -5945,13 +5945,28 @@ class QuantStrategy:
                     "scenario":           "",   # filled by get_hunt_scenario if needed
                     "confidence_factors": {},   # DirectionEngine uses HuntFactors dataclass
                 }, now_ms)
-                logger.info(
-                    f"🧭 DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
-                    f"conf={_hunt.confidence:.2f} "
-                    f"delivery={_hunt.delivery_direction} "
-                    f"raw={_hunt.raw_score:+.3f} "
-                    f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
-                    f"| {_hunt.reason[:100]}")
+                # Throttle DIR_ENGINE log: only emit at INFO when prediction
+                # changes or at most once per 30s (same NEUTRAL repeated every tick
+                # is pure noise — moved routine ticks to debug).
+                _de_log_key = (_hunt.predicted, round(_hunt.confidence, 1))
+                _de_last_key = getattr(self, "_dir_engine_last_log_key", None)
+                _de_last_ts  = getattr(self, "_dir_engine_last_log_ts", 0.0)
+                if _de_log_key != _de_last_key or (now - _de_last_ts) >= 30.0:
+                    self._dir_engine_last_log_key = _de_log_key
+                    self._dir_engine_last_log_ts  = now
+                    logger.info(
+                        f"🧭 DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"conf={_hunt.confidence:.2f} "
+                        f"delivery={_hunt.delivery_direction} "
+                        f"raw={_hunt.raw_score:+.3f} "
+                        f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
+                        f"| {_hunt.reason[:100]}")
+                else:
+                    logger.debug(
+                        f"🧭 DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"conf={_hunt.confidence:.2f} raw={_hunt.raw_score:+.3f} "
+                        f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
+                        f"| {_hunt.reason[:100]}")
                 # Send Telegram only when a high-confidence directional call is made
                 # (>=0.55 = "strong" threshold from direction_engine constants).
                 # Throttle to once per 5 minutes per direction to avoid spam on
@@ -6376,9 +6391,18 @@ class QuantStrategy:
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])
-                    logger.info(
-                        f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
-                        f"score={_conv_result.score:.3f} | {reject_str}")
+                    # Deduplicate: only log at INFO when score or reason changes
+                    _conv_key = (signal.side, round(_conv_result.score, 2), reject_str[:60])
+                    _conv_last = getattr(self, "_last_conv_block_key", None)
+                    if _conv_key != _conv_last:
+                        self._last_conv_block_key = _conv_key
+                        logger.info(
+                            f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
+                            f"score={_conv_result.score:.3f} | {reject_str}")
+                    else:
+                        logger.debug(
+                            f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
+                            f"score={_conv_result.score:.3f} | {reject_str}")
                     self._entry_engine.consume_signal()
                     # Telegram alert for conviction block (throttled 60s per side)
                     _conv_tg_key = f"_conv_tg_last_{signal.side}"

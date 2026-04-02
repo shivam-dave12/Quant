@@ -1211,61 +1211,72 @@ class OrderManager:
                         trigger_price: float,
                         use_limit: bool = True) -> Optional[Dict]:
         """
-        ISSUE-2 FIX: Place a plain REDUCE-ONLY LIMIT ORDER at the SL price.
+        BUG-SL-FIX: Place SL as a CONDITIONAL STOP-LIMIT order.
 
-        Previously sent:
-          order_type=limit_order, stop_order_type=stop_loss_order,
-          stop_price=trigger_price, limit_price=trigger ± offset
+        The previous "ISSUE-2 FIX" used a plain reduce-only limit SELL at the
+        SL price. For LONG positions this is catastrophic: a limit SELL at
+        $66,220 when the best bid is $66,367 is a MARKETABLE order that fills
+        IMMEDIATELY at current market price — not when $66,220 is actually hit.
 
-        Now sends:
-          order_type=limit_order, price=trigger_price, reduce_only=True
-          NO stop_price, NO stop_order_type — order rests in the book immediately.
+        Root cause of the ghost SL trigger:
+          LONG @ $66,377  SL limit-SELL placed at $66,220 (below bid $66,367)
+          → Exchange sees a marketable limit order → fills at $66,367 instantly
+          → Position closed at near-entry price, not at the intended SL level
 
-        Advantages over trigger/conditional orders:
-          • Maker rebate from the moment the order rests in the book.
-          • Zero activation latency — no trigger → activation → fill cycle.
-          • No conditional order overhead on Delta Exchange.
-          • For BTC/USDT perp (24/7, deep liquidity) gap-fill risk is minimal
-            and identical to a stop-limit that fails to fill through a gap anyway.
+        Fix: Use stop_order_type=stop_loss_order so the order is DORMANT until
+        the stop_price is touched. This is the correct exchange mechanism for SL.
 
-        `trigger_price` retains its parameter name for zero-refactor caller
-        compatibility — it is now the exact limit price resting in the book.
-        `use_limit` is kept for API compatibility; always ignored (always limit).
+        Order sent to Delta:
+          order_type      = "limit_order"
+          stop_order_type = "stop_loss_order"    ← conditional, not resting
+          stop_price      = trigger_price         ← activation trigger
+          limit_price     = trigger ± 2 ticks     ← execution limit after trigger
+          reduce_only     = True
         """
         try:
-            api_side    = self._normalize_side(side)
-            tick        = float(getattr(config, 'TICK_SIZE', 0.1))
-            limit_price = round(trigger_price / tick) * tick
+            api_side = self._normalize_side(side)
+            tick     = float(getattr(config, 'TICK_SIZE', 0.1))
+            stop_px  = round(trigger_price / tick) * tick
+
+            # 2-tick buffer inside trigger so the limit executes on normal moves.
+            # SELL SL (long): limit below stop → won't rest above bid, fills on drop
+            # BUY  SL (short): limit above stop → fills on rise
+            if api_side == "SELL":
+                limit_px = round((stop_px - 2 * tick) / tick) * tick
+            else:
+                limit_px = round((stop_px + 2 * tick) / tick) * tick
 
             logger.info(
-                f"SL-LIMIT (plain) {side} qty={quantity} "
-                f"limit=${limit_price:,.2f} [no trigger, resting in book]")
+                f"SL stop-limit {side} qty={quantity} "
+                f"trigger=${stop_px:,.2f} limit=${limit_px:,.2f}")
 
-            # Plain limit order — NO stop_order_type, NO trigger_price field.
             data = self._place_with_retry(
-                side        = api_side,
-                order_type  = "limit_order",
-                quantity    = quantity,
-                price       = limit_price,
-                reduce_only = True,
+                side            = api_side,
+                order_type      = "limit_order",
+                quantity        = quantity,
+                price           = limit_px,
+                stop_price      = stop_px,
+                stop_order_type = "stop_loss_order",
+                reduce_only     = True,
             )
 
             if data:
                 self._record_order(data["order_id"], {
                     "order_id":    data["order_id"],
                     "side":        side,
-                    "type":        "STOP_LOSS_LIMIT_PLAIN",
+                    "type":        "STOP_LOSS_LIMIT",
                     "quantity":    quantity,
-                    "limit_price": limit_price,
+                    "stop_price":  stop_px,
+                    "limit_price": limit_px,
                     "status":      data.get("status", "UNKNOWN"),
                     "timestamp":   datetime.now().isoformat(),
                 })
                 logger.info(
-                    f"✅ SL (plain limit): {data['order_id']} "
-                    f"@ ${limit_price:,.2f}")
+                    f"✅ SL (stop-limit): {data['order_id']} "
+                    f"trigger=${stop_px:,.2f} limit=${limit_px:,.2f}")
             return data
         except Exception as e:
-            logger.error(f"place_stop_loss (plain limit) error: {e}", exc_info=True)
+            logger.error(f"place_stop_loss error: {e}", exc_info=True)
             return None
 
     def place_take_profit(self, side: str, quantity: float,
@@ -1360,12 +1371,17 @@ class OrderManager:
             new_limit   = round(new_trigger_price / tick) * tick
 
             # ── Path 1: Edit-in-place (Delta) ────────────────────────────────
-            # Plain limit: only price changes — no stop_price to update.
+            # Stop-limit SL: must update both stop_price (trigger) and limit_price.
+            tick       = float(getattr(config, 'TICK_SIZE', 0.1))
+            new_stop   = round(new_trigger_price / tick) * tick
+            # Determine limit offset direction from side
+            _api_side  = self._normalize_side(side)
+            new_limit  = round((new_stop - 2 * tick) / tick) * tick if _api_side == "SELL"                          else round((new_stop + 2 * tick) / tick) * tick
             if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
                     order_id        = existing_sl_order_id,
+                    new_stop_price  = new_stop,
                     new_limit_price = new_limit,
-                    # Deliberately omitting new_stop_price — plain limit has none.
                 )
                 if edited and not edited.get("_error"):
                     logger.info(

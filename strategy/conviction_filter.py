@@ -376,7 +376,9 @@ class ConvictionFilter:
                 f"✅ CONVICTION PASSED ({score:.3f}) | "
                 f"{' | '.join(allows)}")
         else:
-            logger.info(
+            # Logged at DEBUG — quant_strategy logs the gate block at INFO level
+            # to avoid double-logging the same rejection every tick.
+            logger.debug(
                 f"❌ CONVICTION BLOCKED ({score:.3f}) | "
                 f"REJECT: {' | '.join(rejects)}")
 

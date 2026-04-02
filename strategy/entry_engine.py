@@ -767,7 +767,7 @@ class EntryEngine:
                 continue
             reward = abs(tp - price)
             if reward / risk >= min_rr:
-                logger.info(
+                logger.debug(
                     f"HTF TP escalation: [{target.pool.timeframe}] "
                     f"${target.pool.price:,.1f} ({target.distance_atr:.1f}ATR "
                     f"htf_count={target.pool.htf_count}) -> TP=${tp:,.1f} "
@@ -1135,8 +1135,12 @@ class EntryEngine:
                     f"confirms={confirmations} R:R={rr:.1f}"),
             ict_validation=self._ict_summary(ict, approach_side),
         )
-        logger.info(f"PROXIMITY SIGNAL: {approach_side.upper()} -> "
-                    f"${best_approach.pool.price:,.1f} | {self._signal.reason}")
+        # Only log when the target pool changes to avoid per-tick spam
+        _prox_key = (approach_side, round(best_approach.pool.price, 0))
+        if getattr(self, "_last_prox_log_key", None) != _prox_key:
+            self._last_prox_log_key = _prox_key
+            logger.info(f"PROXIMITY SIGNAL: {approach_side.upper()} -> "
+                        f"${best_approach.pool.price:,.1f} | {self._signal.reason}")
         self._proximity_confirms = 0
         self._proximity_target   = None
         return True
@@ -1445,8 +1449,14 @@ class EntryEngine:
                     f"{_htf_note}"),
             ict_validation=self._ict_summary(ict, tr.direction),
         )
-        logger.info(f"SIGNAL: {self._signal.entry_type.value} "
-                    f"{self._signal.side.upper()} | {self._signal.reason}")
+        # Log only when target pool or direction changes — not every tick
+        _sig_key = (self._signal.side, round(getattr(
+            getattr(self._signal, 'target_pool', None), 'pool', type('_',(),{'price':0})()).price if
+            hasattr(self._signal, 'target_pool') and self._signal.target_pool else 0, 0))
+        if getattr(self, "_last_ready_sig_key", None) != _sig_key:
+            self._last_ready_sig_key = _sig_key
+            logger.info(f"SIGNAL: {self._signal.entry_type.value} "
+                        f"{self._signal.side.upper()} | {self._signal.reason}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # POST-SWEEP PIPELINE v3.3 — Industry-Grade Multi-Phase Evaluation
