@@ -79,7 +79,7 @@ QUANT_LOSS_LOCKOUT_SEC = 5400   # 90 minutes
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Minimum R:R for any entry type.
-MIN_RISK_REWARD_RATIO = 2.0
+MIN_RISK_REWARD_RATIO = 1.50
 
 # Evaluation interval — don't process every 250ms tick.
 ENTRY_EVALUATION_INTERVAL_SECONDS = 2
