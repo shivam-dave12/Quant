@@ -63,7 +63,7 @@ MAX_ORDER_RETRIES                = 2
 MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
-LIMIT_ORDER_FILL_TIMEOUT_SEC     = 45.0  # 45s for reversion fill; expired = cancel + cooldown
+LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0  # 60 for reversion fill; expired = cancel + cooldown
 REQUEST_TIMEOUT                  = 30
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
@@ -335,6 +335,37 @@ QUANT_HTF_BOTH_VETO          = 0.20  # threshold when both TFs align against tra
 # Quant signal quality gates (Gate C)
 QUANT_MIN_RAW_COMPOSITE      = 0.35  # pre-ICT-boost composite floor
 QUANT_MIN_CONFIRMING         = 4     # minimum confirming signals (of 5 quant + ICT)
+
+# ── Conviction Filter ─────────────────────────────────────────────────────────
+# All numeric thresholds consumed by conviction_filter.py.
+# conviction_filter.py imports these via `from config import CONVICTION_*`.
+# ─────────────────────────────────────────────────────────────────────────────
+# Score gate: weighted sum of 6 factors must reach this to allow entry.
+CONVICTION_MIN_SCORE               = 0.55
+
+# Pool effective timeframe rank floor (1m=1, 5m=2, 15m=3, 1h=4, 4h=5, 1d=6).
+# HTF-confluence count boosts the native rank before this check.
+CONVICTION_POOL_MIN_TF_RANK        = 2
+
+# Displacement: minimum candle body / ATR ratio to count as meaningful.
+CONVICTION_DISPLACEMENT_BODY_ATR   = 0.55
+
+# OTE (Optimal Trade Entry) Fibonacci retracement band.
+CONVICTION_OTE_FIB_LOW             = 0.500   # 50% retrace
+CONVICTION_OTE_FIB_HIGH            = 0.786   # 78.6% retrace
+
+# Hard R:R floor enforced as mandatory gate (early-return, no score computed).
+# Intentionally lower than QUANT_REVERSION_MIN_RR — conviction gate fires first.
+CONVICTION_MIN_RR                  = 2.0
+
+# Per-session consecutive-loss circuit breaker.
+CONVICTION_MAX_SESSION_LOSSES      = MAX_DAILY_LOSS
+
+# Minimum seconds between consecutive entries within the same session.
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = TRADE_COOLDOWN_SECONDS
+
+# Maximum entries allowed before session boundary resets the counter.
+CONVICTION_MAX_ENTRIES_PER_SESSION = MAX_DAILY_TRADES
 
 # ── Legacy aliases (strategy code reads these) ────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE   # used by CoinSwitch order_manager path

@@ -45,47 +45,45 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS  (all numeric thresholds sourced from central config.py)
 # ─────────────────────────────────────────────────────────────────────────────
+from config import (
+    CONVICTION_MIN_SCORE               as REQUIRED_CONVICTION_SCORE,
+    CONVICTION_POOL_MIN_TF_RANK        as POOL_MIN_TF_RANK,
+    CONVICTION_DISPLACEMENT_BODY_ATR   as DISPLACEMENT_MIN_BODY_ATR,
+    CONVICTION_OTE_FIB_LOW             as OTE_FIB_LOW,
+    CONVICTION_OTE_FIB_HIGH            as OTE_FIB_HIGH,
+    CONVICTION_MIN_RR                  as MIN_RR,
+    CONVICTION_MAX_SESSION_LOSSES      as MAX_SESSION_LOSSES,
+    CONVICTION_MIN_ENTRY_INTERVAL_SEC  as MIN_ENTRY_INTERVAL_SEC,
+    CONVICTION_MAX_ENTRIES_PER_SESSION as MAX_ENTRIES_PER_SESSION,
+)
 
-REQUIRED_CONVICTION_SCORE = 0.55
-
-# Pool minimum EFFECTIVE TF rank (after HTF-confluence boost)
-POOL_MIN_TF_RANK = 2
-
+# ── Timeframe rank lookup (logic — not a tunable threshold) ──────────────────
 _TF_RANK: Dict[str, int] = {
     "1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3,
     "30m": 3, "1h": 4, "4h": 5, "1d": 6,
 }
 
-DISPLACEMENT_MIN_BODY_ATR = 0.55
-
-OTE_FIB_LOW  = 0.500
-OTE_FIB_HIGH = 0.786
-
-MIN_RR = 1.40  # matches entry engine minimum
-
+# ── Session quality multipliers (logic — not a tunable threshold) ─────────────
 _SESSION_SCORE: Dict[str, float] = {
     "LONDON":    1.00,
     "NY":        1.00,
     "NEW_YORK":  1.00,
     "LONDON_NY": 0.80,
-    "ASIA":      0.10,   # Penalty, not hard block
+    "ASIA":      0.10,   # penalty, not hard block
     "":          0.50,
 }
 
+# ── AMD phase base scores (logic — not a tunable threshold) ───────────────────
 _AMD_PHASE_SCORE: Dict[str, float] = {
     "MANIPULATION":   1.00,
     "DISTRIBUTION":   0.85,
     "REACCUMULATION": 0.75,
     "REDISTRIBUTION": 0.75,
-    "ACCUMULATION":   0.40,   # v2.0 fix: not 0.0
+    "ACCUMULATION":   0.40,
     "":               0.45,
 }
-
-MAX_SESSION_LOSSES    = 2
-MIN_ENTRY_INTERVAL_SEC = 900
-MAX_ENTRIES_PER_SESSION = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
