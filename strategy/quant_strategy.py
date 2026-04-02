@@ -4347,6 +4347,10 @@ class PositionState:
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
     entry_htf_15m: float = 0.0
     entry_htf_4h:  float = 0.0
+    # PostTradeAgent MAE tracking: exact Maximum Adverse Excursion in points.
+    # Updated every trail tick so set_exit_context() can use the true value
+    # rather than the SL-distance approximation.
+    peak_adverse:  float = 0.0
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -4614,6 +4618,26 @@ class QuantStrategy:
         # London/NY/Asia/OFF_HOURS boundary — resets conviction session quota.
         self._last_conviction_kz: str = ""
 
+        # ── Post-Trade Analysis Agent (v2.0) ──────────────────────────────────
+        # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
+        # R-multiples), entry quality (OTE/AMD/ICT/session), structural causation
+        # (WICK_SWEEP/BOS_BREAK/AMD_FLIP/POOL_REACHED/…), Bayesian adaptive
+        # parameters, and Information Coefficient (IC) signal tracking.
+        # Non-fatal: bot operates normally if the file is missing.
+        try:
+            from strategy.post_trade_agent import PostTradeAgent
+            self._post_trade_agent = PostTradeAgent()
+        except ImportError:
+            try:
+                from post_trade_agent import PostTradeAgent
+                self._post_trade_agent = PostTradeAgent()
+            except ImportError:
+                self._post_trade_agent = None
+                logger.warning(
+                    "PostTradeAgent not found — post-trade analysis disabled. "
+                    "Place post_trade_agent.py in strategy/ to enable."
+                )
+
         self._log_init()
 
     def _log_init(self):
@@ -4660,6 +4684,13 @@ class QuantStrategy:
             else "UNAVAILABLE (liquidity_trail.py not found — chandelier trail only)"
         )
         logger.info(f"   LiquidityTrail: {liq_trail_status}")
+        # Post-trade agent
+        pta_status = (
+            "ACTIVE (5-dim: geometry/entry/causation/Bayesian/IC | Telegram debrief)"
+            if self._post_trade_agent is not None
+            else "UNAVAILABLE (post_trade_agent.py not found)"
+        )
+        logger.info(f"   PostTradeAgent: {pta_status}")
         logger.info("=" * 72)
 
     def get_position(self) -> Optional[Dict]:
@@ -9079,6 +9110,13 @@ class QuantStrategy:
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
         if profit > pos.peak_profit: pos.peak_profit = profit
 
+        # ── PostTradeAgent: track Maximum Adverse Excursion (MAE) ─────────────
+        # adverse = how far price has moved against the position (in points)
+        # peak_adverse accumulates the worst-case intra-trade drawdown.
+        _adverse = max(0.0, -profit)
+        if _adverse > pos.peak_adverse:
+            pos.peak_adverse = _adverse
+
         # Track absolute peak price (used by chandelier)
         if pos.side == "long":
             if price > pos.peak_price_abs:
@@ -9759,6 +9797,24 @@ class QuantStrategy:
         )
 
         # ─── Step 3: Record PnL and trade history ─────────────────────────────
+
+        # ── PostTradeAgent: capture exit context before trade_record exists ────
+        # Must run BEFORE _record_pnl() because trade_record doesn't carry
+        # fill_price, peak_adverse, or ict/liq context — those are on pos/engine.
+        if self._post_trade_agent is not None:
+            try:
+                _liq_snap_pt = getattr(self._liq_map, '_last_snapshot', None)
+                self._post_trade_agent.set_exit_context(
+                    exit_type    = exit_type,
+                    fill_price   = fill_price,
+                    pos          = pos,
+                    atr          = self._atr_5m.atr,
+                    ict_engine   = self._ict,
+                    liq_snapshot = _liq_snap_pt,
+                )
+            except Exception as _pt_e:
+                logger.debug(f"PostTradeAgent.set_exit_context error: {_pt_e}")
+
         self._record_pnl(pnl, exit_reason=exit_reason, exit_price=fill_price,
                          fee_breakdown=fee_breakdown)
 
@@ -9937,6 +9993,46 @@ class QuantStrategy:
         # Keep last 200 trades in memory — in-place trim avoids allocating a new list
         if len(self._trade_history) > 200:
             del self._trade_history[:-200]
+
+        # ── PostTradeAgent: full 5-dimension analysis + Telegram debrief ───────
+        # Runs after _trade_history.append() so trade_record is available.
+        # The Telegram debrief is a separate message from the raw exit summary
+        # already sent in _record_exchange_exit — it is purely analytical.
+        if self._post_trade_agent is not None and self._trade_history:
+            try:
+                _liq_snap_pt2 = getattr(self._liq_map, '_last_snapshot', None)
+                self._post_trade_agent.on_trade_closed(
+                    trade_record = self._trade_history[-1],
+                    pos          = pos,
+                    atr          = self._atr_5m.atr if self._atr_5m else 1.0,
+                    ict_engine   = self._ict,
+                    liq_snapshot = _liq_snap_pt2,
+                )
+                # Send institutional trade debrief to Telegram
+                if self._post_trade_agent.records:
+                    try:
+                        from strategy.post_trade_agent import format_trade_analysis_alert
+                        _last_rec = self._post_trade_agent.records[-1]
+                        _wr       = self._post_trade_agent._stats_overall.bayes.mean
+                        send_telegram_message(format_trade_analysis_alert(
+                            _last_rec, _wr,
+                            agent=self._post_trade_agent,
+                        ))
+                    except ImportError:
+                        try:
+                            from post_trade_agent import format_trade_analysis_alert
+                            _last_rec = self._post_trade_agent.records[-1]
+                            _wr       = self._post_trade_agent._stats_overall.bayes.mean
+                            send_telegram_message(format_trade_analysis_alert(
+                                _last_rec, _wr,
+                                agent=self._post_trade_agent,
+                            ))
+                        except Exception as _pt_tg2:
+                            logger.debug(f"PostTrade Telegram (fallback) error: {_pt_tg2}")
+                    except Exception as _pt_tg:
+                        logger.debug(f"PostTrade Telegram error: {_pt_tg}")
+            except Exception as _pt_e2:
+                logger.debug(f"PostTradeAgent.on_trade_closed error: {_pt_e2}")
 
         # v6.0: Compute margin-based P&L % and update the record
         _margin_pnl_pct_final = 0.0

@@ -175,6 +175,7 @@ class TelegramBotController:
                 {"command": "sl",          "description": "Current SL/TP levels + distances"},
                 {"command": "trades",      "description": "Recent trade history"},
                 {"command": "stats",       "description": "Signal attribution analysis"},
+                {"command": "learn",       "description": "Post-trade analysis · Bayesian adaptive parameters · IC"},
                 {"command": "balance",     "description": "Wallet balance"},
                 {"command": "equity",      "description": "Balance + unrealised PnL"},
                 {"command": "risk",        "description": "Risk gate status + limits"},
@@ -213,6 +214,7 @@ class TelegramBotController:
             "pause", "resume", "balance", "trail", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
             "pnl", "market", "risk", "equity", "sl", "tp",
+            "learn",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -254,6 +256,7 @@ class TelegramBotController:
             elif cmd == "/risk":                return self._cmd_risk()
             elif cmd == "/equity":              return self._cmd_equity()
             elif cmd in ("/sl", "/tp"):         return self._cmd_sl_tp()
+            elif cmd == "/learn":               return self._cmd_learn()
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
@@ -283,6 +286,7 @@ class TelegramBotController:
             "  /position — Full pos + trail state\n"
             "  /trades — Recent history\n"
             "  /stats — Win rate / attribution\n"
+            "  /learn — Post-trade analysis · Bayesian adaptive params\n"
             "  /balance — Wallet balance\n"
             "  /risk — Risk gate status\n\n"
             "⚙️ <b>CONTROL</b>\n"
@@ -1407,6 +1411,67 @@ class TelegramBotController:
             f"  Total Fees: ${total_fees:.4f} ({n_exact} exact, {n_est} est.)",
         ]
         return "\n".join(l for l in lines if l is not None)
+
+    # ================================================================
+    # /learn  — Post-trade analysis & adaptive parameter engine
+    # ================================================================
+
+    def _cmd_learn(self) -> str:
+        """
+        Institutional post-trade analysis report.
+
+        Shows (all Bayesian-estimated; min 5 real samples per dimension):
+          • Overall WR with Wilson CI, G-Ratio, avg R-multiple, IC score
+          • Per ICT Tier WR + avg PnL + geometry (G-ratio, entry efficiency)
+          • Per AMD Phase WR + SL efficiency + entry efficiency + avg R
+          • Per Session WR + avg PnL (London / NY / Asia / Kill-zone)
+          • SL Causation breakdown (WICK_SWEEP / BOS_BREAK / AMD_FLIP / …)
+          • TP Causation breakdown (POOL_REACHED / STRUCTURAL / TRAIL_LOCK / …)
+          • Adaptive parameter adjustments (mult × drift%) with evidence trail
+          • Recent insights (INFO / WARN / ACTION) from the adaptive engine
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = getattr(bot_instance, "strategy", None)
+        if strat is None:
+            return "Strategy not ready."
+
+        agent = getattr(strat, "_post_trade_agent", None)
+        if agent is None:
+            return (
+                "⚠️ PostTradeAgent not loaded.\n"
+                "Place <code>post_trade_agent.py</code> in <code>strategy/</code> "
+                "and restart the bot."
+            )
+
+        if not agent.records:
+            n_hist = len(getattr(strat, "_trade_history", []))
+            return (
+                f"📊 PostTradeAgent active but no analysis yet.\n"
+                f"Trade history has {n_hist} record(s) — agent runs after each close.\n"
+                f"Minimum {5} real trades needed for Bayesian recommendations."
+            )
+
+        try:
+            report = agent.get_dimension_report()
+            # Telegram has a 4096-char hard limit per message; split if needed
+            if len(report) <= 4000:
+                self.send_message(report)
+            else:
+                # Send in two parts
+                split_at = report.rfind("\n", 0, 4000)
+                if split_at == -1:
+                    split_at = 4000
+                self.send_message(report[:split_at])
+                self.send_message(
+                    "<b>…continued</b>\n" + report[split_at:]
+                )
+            return None   # message already sent via send_message()
+        except Exception as e:
+            logger.error(f"_cmd_learn error: {e}", exc_info=True)
+            return f"❌ Learn report error: {e}"
 
     # ================================================================
     # /huntstatus
