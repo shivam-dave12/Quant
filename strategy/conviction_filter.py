@@ -218,38 +218,19 @@ class ConvictionFilter:
         else:
             allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f}")
 
-        # ── MANDATORY GATE 2: Dealing range ───────────────────────────────
-        # Hard structural filter — return early with zero score.
+        # ── DEALING RANGE CONTEXT (informational — not a gate) ────────────
+        # ISSUE-2: DR hard gate removed. DR position is logged for analysis
+        # but never blocks a trade. AMD + HTF structure are the structural
+        # arbiters; DR is a lagging byproduct of those signals.
         dr_pd = self._get_dealing_range_pd(price, ict_engine, liq_snapshot)
-        if trade_side == "long" and dr_pd > 0.58:
-            rejects.append(
-                f"DEALING_RANGE_BLOCKED: LONG in PREMIUM (P/D={dr_pd:.2f}>0.58). "
-                f"ICT rule: longs only below equilibrium."
-            )
-            factors.dealing_range_ok = False
-            return ConvictionResult(
-                allowed=False, score=0.0,
-                reject_reasons=rejects, factors=factors,
-                pool_tf=pool_tf, pool_sig=pool_sig)
-        elif trade_side == "short" and dr_pd < 0.42:
-            rejects.append(
-                f"DEALING_RANGE_BLOCKED: SHORT in DISCOUNT (P/D={dr_pd:.2f}<0.42). "
-                f"ICT rule: shorts only above equilibrium."
-            )
-            factors.dealing_range_ok = False
-            return ConvictionResult(
-                allowed=False, score=0.0,
-                reject_reasons=rejects, factors=factors,
-                pool_tf=pool_tf, pool_sig=pool_sig)
-        else:
-            factors.dealing_range_ok = True
-            _dr_label = (
-                "DEEP-DISC" if dr_pd < 0.25 else
-                "DISCOUNT"  if dr_pd < 0.42 else
-                "EQ"        if dr_pd < 0.58 else
-                "PREMIUM"   if dr_pd < 0.75 else "DEEP-PREM"
-            )
-            allows.append(f"DR={_dr_label}({dr_pd:.2f})")
+        factors.dealing_range_ok = True
+        _dr_label = (
+            "DEEP-DISC" if dr_pd < 0.25 else
+            "DISCOUNT"  if dr_pd < 0.42 else
+            "EQ"        if dr_pd < 0.58 else
+            "PREMIUM"   if dr_pd < 0.75 else "DEEP-PREM"
+        )
+        allows.append(f"DR={_dr_label}({dr_pd:.2f})")
 
         # ── MANDATORY GATE 3: R:R ──────────────────────────────────────────
         # Hard structural filter — return early with zero score.

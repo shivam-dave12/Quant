@@ -1835,7 +1835,10 @@ class InstitutionalLevels:
         # v5.0: 15m structural swings only.
         # This function is Step 2 in _compute_sl_tp (fallback if no ICT OB).
         # Lookback: 40 candles = 10 hours (vs old 12 = 3 hours).
-        buf_mult  = QCfg.SL_BUFFER_ATR_MULT() * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
+        # ISSUE-1 FIX: apply PostTradeAgent Bayesian SL buffer adjustment
+        _pta_sl_mult = (self._post_trade_agent.params.sl_buffer_atr.current_mult
+                        if self._post_trade_agent is not None else 1.0)
+        buf_mult  = QCfg.SL_BUFFER_ATR_MULT() * _pta_sl_mult * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
         buffer    = buf_mult * atr
         min_dist  = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
         max_dist  = price * QCfg.MAX_SL_PCT()
@@ -6670,7 +6673,10 @@ class QuantStrategy:
         # High confidence reduces requirement by 1 (never below 1)
         if _hunt_scenario_conf >= 0.70:
             _cn_base = max(1, _cn_base - 1)
-        _cn = _cn_base
+        # ISSUE-1 FIX: scale confirm ticks by PostTradeAgent Bayesian recommendation
+        _pta_tick_mult = (self._post_trade_agent.params.entry_confirm_ticks.current_mult
+                          if self._post_trade_agent is not None else 1.0)
+        _cn = max(1, round(_cn_base * _pta_tick_mult))
 
         if side == "long":
             self._confirm_hunt_long += 1
@@ -7122,25 +7128,9 @@ class QuantStrategy:
                 if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5:
                     return
 
-            # P/D zone gate (only for standard path — sweep path is already gated)
-            # B7 FIX: skip entirely in a trending regime.  The PD zone logic is
-            # designed for mean-reversion (short from premium, long from discount).
-            # In TRENDING_DOWN, price IS in the lower half of the 4H range — that
-            # is the delivery zone, not a reason to block the SHORT.  Applying the
-            # gate unconditionally blocked the trade precisely where it should fire.
-            if self._ict is not None and self._ict._initialized and not self._regime.is_trending():
-                _tf4h = self._ict._tf.get("4h")
-                _pd4h = _tf4h.premium_discount if _tf4h is not None else 0.5
-                if side == "long" and sig.in_premium and not sig.in_discount:
-                    if now - self._last_pd_gate_log.get("long", 0) >= 60.0:
-                        self._last_pd_gate_log["long"] = now
-                        logger.debug(f"📊 PD gate: LONG blocked — 4H premium (pd={_pd4h:.2f})")
-                    self._confirm_long = self._confirm_short = 0; return
-                if side == "short" and sig.in_discount and not sig.in_premium:
-                    if now - self._last_pd_gate_log.get("short", 0) >= 60.0:
-                        self._last_pd_gate_log["short"] = now
-                        logger.debug(f"📊 PD gate: SHORT blocked — 4H discount (pd={_pd4h:.2f})")
-                    self._confirm_long = self._confirm_short = 0; return
+            # ISSUE-2: P/D zone gate removed entirely. DR position is a lagging
+            # derivative of AMD+HTF structure — double-gating on it after conviction
+            # filter already passed systematically blocks shorts in bull delivery.
 
             # Composite threshold gate (VWAP direction)
             if side == "long" and c >= thr:
@@ -10121,7 +10111,18 @@ class QuantStrategy:
         step = QCfg.LOT_STEP()
 
         # ── Tier multiplier ───────────────────────────────────────────────────
-        tier_mult = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
+        _tier_base = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
+        # ISSUE-1 FIX: scale base tier by PostTradeAgent Bayesian sizing recommendation
+        _pta = self._post_trade_agent
+        if _pta is not None:
+            _tier_adj = {
+                "S": _pta.params.tier_s_sizing.current_mult,
+                "A": _pta.params.tier_a_sizing.current_mult,
+                "B": _pta.params.tier_b_sizing.current_mult,
+            }.get(ict_tier, 1.0)
+        else:
+            _tier_adj = 1.0
+        tier_mult = _tier_base * _tier_adj
 
         # ── Composite score modifier ──────────────────────────────────────────
         comp_mod = 0.0

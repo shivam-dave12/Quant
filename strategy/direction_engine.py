@@ -347,16 +347,16 @@ class DirectionEngine:
     """
 
     _FACTOR_WEIGHTS = {
-        "amd":            0.22,
-        "htf_structure":  0.18,
-        "dealing_range":  0.15,
-        "order_flow":     0.13,
-        "pool_asymmetry": 0.09,
-        "ob_fvg_pull":    0.08,
-        "displacement":   0.07,
-        "session":        0.04,
+        "amd":            0.26,
+        "htf_structure":  0.21,
+        "dealing_range":  0.00,   # ISSUE-2: DR removed as scoring factor; retained for logging only
+        "order_flow":     0.15,
+        "pool_asymmetry": 0.11,
+        "ob_fvg_pull":    0.09,
+        "displacement":   0.08,
+        "session":        0.05,
         "micro_bos":      0.03,
-        "volume":         0.01,
+        "volume":         0.02,
     }
     assert abs(sum(_FACTOR_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
@@ -450,8 +450,7 @@ class DirectionEngine:
                 dr_pd = (price - ssl_price) / rng
 
         if bsl_price <= 0 or ssl_price <= 0:
-            return self._null_prediction(now_ms, reason="no_dealing_range",
-                                         dr_pd=dr_pd)
+            dr_pd = 0.5  # ISSUE-2: no structural bias assumed; continue scoring on remaining factors
 
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 1: AMD Phase + Bias  (weight 0.22)
@@ -532,7 +531,7 @@ class DirectionEngine:
         # dr_pd = 0.0 (deep discount) → heading UP to BSL → +1.0
         # dr_pd = 0.5 (equilibrium)   → neutral → 0.0
         # dr_pd = 1.0 (deep premium)  → heading DOWN to SSL → -1.0
-        factors.dealing_range = max(-1.0, min(1.0, 1.0 - 2.0 * dr_pd))
+        factors.dealing_range = 0.0  # ISSUE-2: DR removed from score; dr_pd retained for logging
 
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 4: Order Flow Vector  (weight 0.13)
@@ -665,8 +664,7 @@ class DirectionEngine:
             elif 'NY' in kz:
                 dominant = (
                     factors.amd            * self._FACTOR_WEIGHTS['amd'] +
-                    factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure'] +
-                    factors.dealing_range  * self._FACTOR_WEIGHTS['dealing_range']
+                    factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure']
                 )
                 factors.session = _sigmoid(dominant * 2.5, steepness=1.0)
             elif 'ASIA' in kz:
@@ -788,19 +786,6 @@ class DirectionEngine:
         confidence = abs(score)
         bsl_score  = max(0.0,  score)
         ssl_score  = max(0.0, -score)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # DEALING RANGE GATE: Cap confidence if in wrong zone
-        # ─────────────────────────────────────────────────────────────────────
-        # Applied AFTER the HTF override recompute so the penalty survives it.
-        # BSL hunt from deep premium: smart money already sold, unlikely to go higher.
-        # SSL hunt from deep discount: smart money already bought, unlikely to go lower.
-        if score > 0 and dr_pd > 0.75:
-            _zone_penalty = (dr_pd - 0.75) / 0.25
-            confidence = max(0.0, confidence - _zone_penalty * 0.30)
-        elif score < 0 and dr_pd < 0.25:
-            _zone_penalty = (0.25 - dr_pd) / 0.25
-            confidence = max(0.0, confidence - _zone_penalty * 0.30)
 
         # ─────────────────────────────────────────────────────────────────────
         # BUILD RESULT
