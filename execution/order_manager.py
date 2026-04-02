@@ -377,48 +377,23 @@ class _DeltaAdapter:
     def place_bracket_limit_entry(self, side: str, quantity: float,
                                   limit_price: float,
                                   sl_price: float,
-                                  tp_price: float,
-                                  sl_limit_price: Optional[float] = None,
-                                  tp_limit_price: Optional[float] = None) -> Optional[Dict]:
-        """
-        Bracket limit entry: one API call places the entry + stop-limit SL + take-profit-limit TP.
-
-        Per Delta API docs (POST /orders):
-          bracket_stop_loss_price        — SL trigger (stop_price)
-          bracket_stop_loss_limit_price  — SL limit price (converts to stop-limit, earns maker fee)
-          bracket_take_profit_price      — TP trigger
-          bracket_take_profit_limit_price— TP limit price (converts to take-profit-limit)
-          bracket_stop_trigger_method    — "last_traded_price"
-
-        When bracket_*_limit_price fields are supplied, Delta creates the bracket
-        children as limit_order + stop_order_type orders (stop-limit SL / TP-limit),
-        not the default stop-market / take-profit-market orders.  This eliminates
-        the cancel-and-replace "upgrade" step entirely.
-        """
+                                  tp_price: float) -> Optional[Dict]:
+        # Bracket limit order: entry + SL + TP in a single Delta API call.
+        # Avoids bad_schema from separate stop/take-profit order placement.
         self.limiter.wait()
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
-
-        kwargs: Dict = dict(
-            symbol                     = self.symbol,
-            side                       = side.lower(),
-            order_type                 = "limit_order",
-            size                       = contracts,
-            limit_price                = float(limit_price),
-            bracket_stop_loss_price    = float(sl_price),
-            bracket_take_profit_price  = float(tp_price),
-            bracket_stop_trigger_method = "last_traded_price",
-            post_only                  = False,
-            time_in_force              = "gtc",
+        resp = self.api.place_order(
+            symbol                    = self.symbol,
+            side                      = side.lower(),
+            order_type                = "limit_order",
+            size                      = contracts,
+            limit_price               = float(limit_price),
+            bracket_stop_loss_price   = float(sl_price),
+            bracket_take_profit_price = float(tp_price),
+            post_only                 = False,
+            time_in_force             = "gtc",
         )
-        # Attach limit prices when provided — converts bracket children to
-        # stop-limit SL and take-profit-limit TP (both earn maker fee rebate).
-        if sl_limit_price is not None:
-            kwargs["bracket_stop_loss_limit_price"]  = float(sl_limit_price)
-        if tp_limit_price is not None:
-            kwargs["bracket_take_profit_limit_price"] = float(tp_limit_price)
-
-        resp = self.api.place_order(**kwargs)
         oid = self.extract_order_id(resp)
         if not oid:
             sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
@@ -985,64 +960,42 @@ class OrderManager:
         """
         Bracket entry for Delta Exchange.
 
-        Places a single limit_order entry with embedded stop-limit SL and
-        take-profit-limit TP in ONE API call (POST /orders with bracket_* fields).
+        Execution flow
+        --------------
+        1. POST /orders — limit entry with bracket_stop_loss_price + bracket_take_profit_price.
+           Delta auto-creates two conditional children on fill:
+             • stop-market  SL  (stop_order_type = stop_loss_order)
+             • take-profit-market TP  (stop_order_type = take_profit_order)
 
-        Per the official Delta API docs:
-          bracket_stop_loss_price         -> SL trigger
-          bracket_stop_loss_limit_price   -> SL limit price  (makes it stop-limit, not stop-market)
-          bracket_take_profit_price       -> TP trigger
-          bracket_take_profit_limit_price -> TP limit price  (makes it take-profit-limit)
-          bracket_stop_trigger_method     -> "last_traded_price"
+        2. Immediately after fill, UPGRADE both children:
+             • SL  → stop-limit      via place_stop_loss(use_limit=True)
+               Atomic edit-in-place (PUT /v2/orders stop_price + limit_price),
+               maker fee rebate (−0.02 % vs +0.05 % taker = 7 bps/trail saved).
+             • TP  → take-profit-limit  via place_take_profit(use_limit=True)
+               limit_order + take_profit_order + stop_price + limit_price.
+               Protected trigger (no premature fill on gap moves) + maker fee.
+               1-tick inside pool for queue priority ahead of resting liquidity.
 
-        Bracket children returned by Delta:
-          order_type = "limit_order" + stop_order_type = "stop_loss_order"    -> normalised STOP_LIMIT
-          order_type = "limit_order" + stop_order_type = "take_profit_order"  -> normalised TAKE_PROFIT_LIMIT
+        Both upgraded children support atomic edit-in-place for the trailing engine.
+        No plain limit orders are used — all exit orders carry explicit triggers.
 
-        No cancel-and-replace "upgrade" step required — both children are already
-        limit orders earning maker fee rebate and supporting atomic edit-in-place.
-
-        Return dict keys on success:
-          fill_price, fill_type, order_id, bracket_order=True,
-          bracket_sl_order_id, bracket_tp_order_id,
-          bracket_sl_price, bracket_tp_price
+        Return dict keys on success
+        ---------------------------
+        fill_price, fill_type, order_id, bracket_order=True,
+        bracket_sl_order_id, bracket_tp_order_id,
+        bracket_sl_price, bracket_tp_price
         """
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
-            return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
-
-        tick         = float(getattr(config, 'TICK_SIZE', 0.5))
-        offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
-        limit_offset = offset_ticks * tick
-        _exit_side   = "sell" if side.lower() in ("buy", "long") else "buy"
-
-        # ── SL limit price (stop-limit — buffer below/above trigger) ─────────
-        # LONG  SL (sell to close): limit = stop - offset  (min price we'll accept)
-        # SHORT SL (buy to close):  limit = stop + offset  (max price we'll pay)
-        if _exit_side == "sell":
-            sl_limit_px = round(sl_price - limit_offset, 1)
-        else:
-            sl_limit_px = round(sl_price + limit_offset, 1)
-
-        # ── TP limit price (take-profit-limit — 1 tick inside pool) ──────────
-        # LONG  TP (sell): limit = trigger - 1 tick  (queue priority before pool)
-        # SHORT TP (buy):  limit = trigger + 1 tick
-        if _exit_side == "sell":
-            tp_limit_px = round(tp_price - tick, 1)
-        else:
-            tp_limit_px = round(tp_price + tick, 1)
+            return None   # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
         logger.info(
             f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
-            f"SL=${sl_price:.2f}(lim=${sl_limit_px:.2f}) "
-            f"TP=${tp_price:.2f}(lim=${tp_limit_px:.2f}) "
-            f"(timeout={timeout_sec:.0f}s)"
+            f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
 
         data = self._adapter.place_bracket_limit_entry(
             side=side, quantity=quantity,
-            limit_price=limit_price,
-            sl_price=sl_price,       tp_price=tp_price,
-            sl_limit_price=sl_limit_px, tp_limit_price=tp_limit_px,
+            limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
         )
         if not data or data.get("_error"):
             sc  = (data or {}).get("_sc", 0)
@@ -1079,24 +1032,25 @@ class OrderManager:
                     f" fee=${data['paid_commission']:.4f}"
                 )
 
-                # ── Locate bracket child orders (SL + TP) ────────────────────
-                # Delta creates children asynchronously after fill.
-                # Children are limit_order + stop_order_type (stop-limit SL and
-                # take-profit-limit TP) — no upgrade step needed.
+                # ── Identify bracket child orders ─────────────────────────────
+                # Delta creates stop-market SL + take-profit-market TP asynchronously.
+                # We detect them, then upgrade to stop-limit SL + TP-limit TP.
                 sl_oid = tp_oid = ""
                 sl_trig = tp_trig = 0.0
 
-                # Normalised type strings (set by get_open_orders remapping):
-                #   limit_order + stop_loss_order   -> STOP_LIMIT
-                #   limit_order + take_profit_order -> TAKE_PROFIT_LIMIT
-                # Also handle legacy market children in case API falls back.
-                _SL_TYPES = {
-                    "STOP_LIMIT", "STOP_MARKET", "STOP_MARKET_ORDER", "STOP",
+                # Child type tokens after get_open_orders normalisation:
+                #   stop-market  SL  → STOP_MARKET | STOP_LOSS_ORDER | STOP_LOSS_MARKET
+                #   TP-market    TP  → TAKE_PROFIT_MARKET | TAKE_PROFIT_ORDER
+                # After upgrade:
+                #   stop-limit   SL  → recorded as STOP_LOSS_LIMIT
+                #   TP-limit     TP  → recorded as TAKE_PROFIT_LIMIT
+                _SL_RAW_TYPES = {
+                    "STOP_MARKET", "STOP_MARKET_ORDER", "STOP",
                     "STOP_LOSS_MARKET", "STOP_LOSS_ORDER",
                 }
-                _TP_TYPES = {
-                    "TAKE_PROFIT_LIMIT", "TAKE_PROFIT_MARKET",
-                    "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
+                _TP_RAW_TYPES = {
+                    "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET_ORDER",
+                    "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
                 }
 
                 def _parse_children(open_ords):
@@ -1104,35 +1058,105 @@ class OrderManager:
                     _sl_o = _tp_o = ""
                     _sl_t = _tp_t = 0.0
                     for o in (open_ords or []):
-                        # Normalised type from get_open_orders
-                        ot = str(o.get("type") or "").upper().replace(" ", "_").replace("-", "_")
-                        # Raw stop_order_type fallback (for unremapped entries)
-                        _raw_inner = o.get("raw") or {}
-                        raw_sot = str(_raw_inner.get("stop_order_type", "")).upper()
-
+                        raw_inner = o.get("raw") or {}
+                        ot  = str(
+                            o.get("type") or
+                            raw_inner.get("order_type") or
+                            raw_inner.get("stop_order_type") or ""
+                        ).upper().replace(" ", "_").replace("-", "_")
                         trig = float(
                             o.get("trigger_price") or
-                            _raw_inner.get("stop_price") or 0
+                            raw_inner.get("stop_price") or 0
                         )
                         oid = o.get("order_id", "")
-
-                        is_sl = (
-                            ot in _SL_TYPES or
-                            raw_sot == "STOP_LOSS_ORDER" or
-                            ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot)
-                        )
-                        is_tp = (
-                            ot in _TP_TYPES or
-                            raw_sot == "TAKE_PROFIT_ORDER" or
-                            ("PROFIT" in ot and ("TAKE" in ot or ot.startswith("TAKE")))
-                        )
+                        is_sl = (ot in _SL_RAW_TYPES or
+                                 ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
+                        is_tp = (ot in _TP_RAW_TYPES or
+                                 ("PROFIT" in ot or (ot.startswith("TAKE") and "PROFIT" in ot)))
                         if is_sl and not _sl_o and oid:
                             _sl_o = oid; _sl_t = trig
                         elif is_tp and not _tp_o and oid:
                             _tp_o = oid; _tp_t = trig
                     return _sl_o, _sl_t, _tp_o, _tp_t
 
-                # Fast path: 2 attempts x 1.5s = 3s max — covers >95% of cases
+                _exit_side = "sell" if side.lower() in ("buy", "long") else "buy"
+                _tick      = float(getattr(config, "TICK_SIZE", 0.5))
+
+                # ── Upgrade helpers ──────────────────────────────────────────
+
+                def _upgrade_sl(sl_order_id: str, sl_trigger: float,
+                                qty: float) -> str:
+                    """
+                    Cancel bracket stop-market SL → place stop-limit SL.
+
+                    Stop-limit advantages
+                    • Atomic edit-in-place (PUT /v2/orders stop_price+limit_price).
+                    • Maker fee rebate vs taker (−0.02 % vs +0.05 %).
+
+                    Returns new order_id on success.
+                    Returns "" if SL fired mid-upgrade (caller aborts — position closed).
+                    Returns sl_order_id unchanged on failure (old SL stays live).
+                    """
+                    try:
+                        res = self.cancel_order(sl_order_id)
+                        if res in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
+                            logger.info("Bracket SL fired during upgrade — position closed")
+                            return ""
+                        if res in (CancelResult.SUCCESS, CancelResult.NOT_FOUND):
+                            new_sl = self.place_stop_loss(
+                                side=_exit_side, quantity=qty,
+                                trigger_price=sl_trigger, use_limit=True,
+                            )
+                            if new_sl:
+                                logger.info(
+                                    f"\u2705 Bracket SL upgraded to stop-limit: "
+                                    f"{new_sl['order_id']} stop=${sl_trigger:,.2f}"
+                                )
+                                return new_sl["order_id"]
+                        logger.warning("\u26a0\ufe0f Bracket SL upgrade failed — reconcile will re-place")
+                    except Exception as exc:
+                        logger.warning(f"\u26a0\ufe0f Bracket SL upgrade error: {exc}")
+                    return sl_order_id   # keep original on failure; still live
+
+                def _upgrade_tp(tp_order_id: str, tp_trigger: float,
+                                qty: float) -> Tuple[str, float]:
+                    """
+                    Cancel bracket take-profit-market TP → place take-profit-limit TP.
+
+                    Take-profit-limit advantages over bracket default (take-profit-market)
+                    • Protected trigger — no premature fill on gap moves through pool.
+                    • Limit set 1 tick inside the pool → queue priority ahead of
+                      resting liquidity, better average fill price.
+                    • Earns maker fee rebate (−0.02 % vs +0.05 % taker).
+                    • Supports atomic edit-in-place for TP moves.
+
+                    Returns (new_order_id, effective_limit_price) on success.
+                    Returns ("", tp_trigger) if TP fired mid-upgrade (position closed).
+                    Returns (tp_order_id, tp_trigger) unchanged on failure.
+                    """
+                    try:
+                        res = self.cancel_order(tp_order_id)
+                        if res in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
+                            logger.info("Bracket TP fired during upgrade — position closed")
+                            return "", tp_trigger
+                        if res in (CancelResult.SUCCESS, CancelResult.NOT_FOUND):
+                            new_tp = self.place_take_profit(
+                                side=_exit_side, quantity=qty,
+                                trigger_price=tp_trigger, use_limit=True,
+                            )
+                            if new_tp:
+                                # Infer effective limit price (1 tick inside pool)
+                                lp = (round(tp_trigger - _tick, 1)
+                                      if _exit_side == "sell"
+                                      else round(tp_trigger + _tick, 1))
+                                return new_tp["order_id"], lp
+                        logger.warning("\u26a0\ufe0f Bracket TP upgrade failed — reconcile will re-place")
+                    except Exception as exc:
+                        logger.warning(f"\u26a0\ufe0f Bracket TP upgrade error: {exc}")
+                    return tp_order_id, tp_trigger   # keep original on failure
+
+                # ── Fast-path child resolution (2 × 1.5 s = 3 s) ────────────
+                # Covers >95 % of cases synchronously before returning.
                 for _fast in range(2):
                     time.sleep(1.5)
                     open_ords = self.get_open_orders()
@@ -1147,12 +1171,26 @@ class OrderManager:
                     sl_oid, sl_trig, tp_oid, tp_trig = _parse_children(open_ords)
                     if sl_oid and tp_oid:
                         logger.info(f"Bracket children found on fast attempt {_fast + 1}")
+
+                        # Upgrade SL: stop-market → stop-limit
+                        upgraded_sl = _upgrade_sl(sl_oid, sl_trig, quantity)
+                        if upgraded_sl == "":
+                            return None   # SL fired mid-upgrade; position closed
+                        sl_oid = upgraded_sl
+
+                        # Upgrade TP: take-profit-market → take-profit-limit
+                        upgraded_tp_id, upgraded_tp_px = _upgrade_tp(tp_oid, tp_trig, quantity)
+                        if upgraded_tp_id == "":
+                            return None   # TP fired mid-upgrade; position closed
+                        tp_oid  = upgraded_tp_id
+                        tp_trig = upgraded_tp_px
                         break
 
-                # Slow path: background thread if children still missing after fast attempts
+                # ── Slow-path: background resolver if children still missing ──
                 if not (sl_oid and tp_oid):
                     _captured_order_id = order_id
                     _captured_om       = self
+                    _captured_qty      = quantity
 
                     def _bg_child_resolve():
                         bg_deadline = time.time() + 90.0
@@ -1169,20 +1207,24 @@ class OrderManager:
                                         f"SL={_s[:8]}\u2026 TP={_t[:8]}\u2026 "
                                         f"(attempt {attempt})"
                                     )
-                                    if not hasattr(_captured_om,
-                                                   "_pending_bracket_children"):
+                                    _us = _upgrade_sl(_s, _st, _captured_qty)
+                                    if _us:
+                                        _s = _us
+                                    _ut_id, _ut_px = _upgrade_tp(_t, _tt, _captured_qty)
+                                    if _ut_id:
+                                        _t  = _ut_id
+                                        _tt = _ut_px
+                                    if not hasattr(_captured_om, "_pending_bracket_children"):
                                         _captured_om._pending_bracket_children = {}
-                                    _captured_om._pending_bracket_children[
-                                        _captured_order_id
-                                    ] = {
+                                    _captured_om._pending_bracket_children[_captured_order_id] = {
                                         "sl_order_id": _s, "sl_price": _st,
                                         "tp_order_id": _t, "tp_price": _tt,
                                     }
                                     return
-                            except Exception as _e:
-                                logger.debug(f"Bracket child bg-resolve error: {_e}")
+                            except Exception as exc:
+                                logger.debug(f"Bracket child bg-resolve error: {exc}")
                         logger.warning(
-                            f"Bracket child bg-resolve: children not found within 90s "
+                            f"Bracket child bg-resolve: children not found within 90 s "
                             f"for order {_captured_order_id[:8]}\u2026 "
                             f"\u2014 reconcile will recover SL/TP"
                         )
@@ -1287,24 +1329,66 @@ class OrderManager:
             return None
 
     def place_take_profit(self, side: str, quantity: float,
-                          trigger_price: float) -> Optional[Dict]:
+                          trigger_price: float,
+                          use_limit: bool = True) -> Optional[Dict]:
+        """
+        Place a standalone take-profit order.
+
+        use_limit=True (default):  take-profit-limit order.
+          order_type=limit_order + stop_order_type=take_profit_order + stop_price + limit_price
+          Limit price is set 1 tick inside the pool (LONG exit: trigger − 1 tick,
+          SHORT exit: trigger + 1 tick) for queue priority ahead of resting liquidity.
+          Advantages: earns maker fee rebate; supports atomic edit-in-place via
+          PUT /v2/orders; protected by trigger (no premature fill on gap moves).
+
+        use_limit=False: take-profit-market (legacy, taker fee, guaranteed fill).
+        """
         try:
             api_side = self._normalize_side(side)
-            logger.info(f"TP {side} qty={quantity} trigger=${trigger_price:,.2f}")
-            # API doc: standalone TP orders use order_type=market_order +
-            # stop_order_type=take_profit_order.
-            data = self._place_with_retry(
-                side=api_side, order_type="market_order",
-                quantity=quantity, trigger_price=trigger_price,
-                reduce_only=True, stop_order_type="take_profit_order")
+            tick     = float(getattr(config, 'TICK_SIZE', 0.5))
+
+            if use_limit:
+                # 1-tick inside pool: SELL exit → limit = trigger − tick
+                #                     BUY  exit → limit = trigger + tick
+                if api_side == "SELL":
+                    limit_price = round(trigger_price - tick, 1)
+                else:
+                    limit_price = round(trigger_price + tick, 1)
+                logger.info(
+                    f"TP-LIMIT {side} qty={quantity} "
+                    f"stop=${trigger_price:,.2f} limit=${limit_price:,.2f} "
+                    f"[1-tick inside pool]"
+                )
+                data = self._place_with_retry(
+                    side=api_side, order_type="limit_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    price=limit_price,
+                    reduce_only=True, stop_order_type="take_profit_order",
+                )
+            else:
+                logger.info(f"TP-MARKET {side} qty={quantity} trigger=${trigger_price:,.2f}")
+                data = self._place_with_retry(
+                    side=api_side, order_type="market_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    reduce_only=True, stop_order_type="take_profit_order",
+                )
+
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id": data["order_id"], "side": side, "type": "TAKE_PROFIT",
-                    "quantity": quantity, "trigger_price": trigger_price,
-                    "status": data.get("status", "UNKNOWN"),
-                    "timestamp": datetime.now().isoformat(),
+                    "order_id":      data["order_id"],
+                    "side":          side,
+                    "type":          "TAKE_PROFIT_LIMIT" if use_limit else "TAKE_PROFIT",
+                    "quantity":      quantity,
+                    "trigger_price": trigger_price,
+                    "limit_price":   limit_price if use_limit else None,
+                    "status":        data.get("status", "UNKNOWN"),
+                    "timestamp":     datetime.now().isoformat(),
                 })
-                logger.info(f"✅ TP: {data['order_id']} @ ${trigger_price:,.2f}")
+                logger.info(
+                    f"✅ TP{'_LIMIT' if use_limit else ''}: {data['order_id']} "
+                    f"@ stop=${trigger_price:,.2f}"
+                    + (f" limit=${limit_price:,.2f}" if use_limit else "")
+                )
             return data
         except Exception as e:
             logger.error(f"place_take_profit error: {e}", exc_info=True)
@@ -1450,7 +1534,8 @@ class OrderManager:
                     self._remove_active_order(existing_tp_order_id)
 
             new_tp = self.place_take_profit(side=side, quantity=quantity,
-                                            trigger_price=new_trigger_price)
+                                            trigger_price=new_trigger_price,
+                                            use_limit=True)
             if new_tp:
                 logger.info(f"✅ TP replaced → {new_tp['order_id']} "
                             f"@ ${new_trigger_price:,.2f}")
@@ -1552,11 +1637,9 @@ class OrderManager:
                 logger.warning("get_open_orders: 404 — endpoint unsupported, suppressing future calls")
                 self._open_orders_404 = True
                 return None
-            # Bracket children placed as limit_order have:
-            #   order_type = "limit_order"
-            #   stop_order_type = "stop_loss_order" | "take_profit_order"
-            # Regular stop orders have order_type = "market_order" + stop_order_type.
-            # Both cases must be remapped so _parse_children / cancel sweeps work.
+            # Bracket children after upgrade have stop_order_type in their raw dict.
+            # Remap to normalised type tokens that _parse_children and cancel sweeps
+            # can match: stop_loss_order → STOP_LIMIT, take_profit_order → TAKE_PROFIT_LIMIT.
             _STOP_OTYPE_REMAP = {
                 "STOP_LOSS_ORDER":   "STOP_LIMIT",
                 "TAKE_PROFIT_ORDER": "TAKE_PROFIT_LIMIT",
@@ -1566,11 +1649,9 @@ class OrderManager:
                 if not isinstance(o, dict): continue
                 oid   = str(o.get("order_id") or o.get("id") or "")
                 otype = str(o.get("order_type") or o.get("type") or "").upper()
-                # If otype resolved to plain MARKET or LIMIT, check if the underlying raw
+                # If otype resolved to plain MARKET, check if the underlying raw
                 # dict has stop_order_type that reclassifies it as SL/TP.
-                # This covers both legacy stop-market bracket children (MARKET) and
-                # the new stop-limit / take-profit-limit bracket children (LIMIT_ORDER).
-                if otype in ("MARKET", "LIMIT_ORDER", "LIMIT", "LIMIT ORDER"):
+                if otype == "MARKET":
                     _raw_inner = o.get("_raw") or o.get("raw") or {}
                     _sot = str(_raw_inner.get("stop_order_type", "")).upper()
                     otype = _STOP_OTYPE_REMAP.get(_sot, otype)
@@ -1602,11 +1683,11 @@ class OrderManager:
         if orders is None:
             return {}
         CONDITIONAL_TYPES = {
-            # Legacy stop-market / take-profit-market bracket children
+            # Default bracket children (stop-market / take-profit-market)
             "STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT",
-            "STOP_LOSS_MARKET", "STOP_MARKET_ORDER",
-            "STOP_LOSS_ORDER", "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER",
-            # New stop-limit / take-profit-limit bracket children (normalised names)
+            "STOP_LOSS_MARKET", "STOP_MARKET_ORDER", "STOP_LOSS_ORDER",
+            "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER",
+            # Upgraded bracket children (stop-limit / take-profit-limit)
             "STOP_LIMIT", "TAKE_PROFIT_LIMIT",
         }
         targets = [o for o in orders if o["type"] in CONDITIONAL_TYPES]
