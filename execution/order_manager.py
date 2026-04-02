@@ -1045,24 +1045,19 @@ class OrderManager:
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
                             f" fee=${data['paid_commission']:.4f}")
 
-                # ── STEP 1: Verify position is still open ─────────────────────
-                # Small pause to let Delta's bracket engine register the position.
+                # ── STEP 1: Wait for Delta to register bracket child orders ──────
+                # The position guard that previously lived here was removed.
+                # Rationale: Delta's /v2/positions/margined endpoint lags 2-5s
+                # after a fill.  Querying it here returns FLAT even though the
+                # position just opened, causing a false-positive abort.
+                #
+                # With LIMIT bracket children the guard is also unnecessary:
+                # stop-limit SL/TP children only fire when price reaches their
+                # stop_price trigger — they CANNOT fill in the 2-5s post-fill
+                # window unless price moves 100+ pts instantaneously.
+                # Child-discovery (STEP 2) and the background resolver (STEP 3)
+                # don't place any orders, so there is nothing to guard against.
                 time.sleep(self._POST_FILL_POSITION_WAIT)
-                if not self._position_open_guard("bracket_post_fill"):
-                    # Exchange is already FLAT — a bracket child fired in the
-                    # narrow window between fill detection and now.
-                    # let identify_exit_order recover the actual exit price.
-                    logger.warning(
-                        "⚠️ Bracket position already FLAT after fill — "
-                        "bracket child fired before child-discovery. "
-                        "Returning bracket_closed_by_children=True for reconcile."
-                    )
-                    data["bracket_sl_order_id"]        = ""
-                    data["bracket_tp_order_id"]        = ""
-                    data["bracket_sl_price"]           = sl_price
-                    data["bracket_tp_price"]           = tp_price
-                    data["bracket_closed_by_children"] = True
-                    return data
 
                 # ── STEP 2: Discover bracket child order IDs ──────────────────
                 # Bracket children are now LIMIT orders (stop_loss_limit /
