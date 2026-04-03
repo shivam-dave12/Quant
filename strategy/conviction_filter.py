@@ -74,7 +74,7 @@ try:
     )
 except ImportError:
     # Fallback defaults if config not available
-    _CFG_MIN_SCORE = 0.82
+    _CFG_MIN_SCORE = 0.72
     _CFG_MIN_TF_RANK = 3
     _CFG_DISP_BODY_ATR = 0.70
     _CFG_OTE_LOW = 0.500
@@ -99,8 +99,8 @@ MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
 # ── Dealing range — institutional zones ───────────────────────────────────────
 # Longs ONLY in discount.  Shorts ONLY in premium.  No exceptions.
 # This is the single most important structural filter for win rate.
-DR_LONG_MAX_PD = 0.40    # LONG only below 40% of dealing range (discount) — was 0.45
-DR_SHORT_MIN_PD = 0.60   # SHORT only above 60% of dealing range (premium) — was 0.55
+DR_LONG_MAX_PD = 0.45    # LONG only below 45% of dealing range (discount)
+DR_SHORT_MIN_PD = 0.55   # SHORT only above 55% of dealing range (premium)
 
 # ── Timeframe rank lookup ─────────────────────────────────────────────────────
 _TF_RANK: Dict[str, int] = {

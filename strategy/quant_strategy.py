@@ -1,27 +1,16 @@
 """
-QUANT STRATEGY v5.0 — ICT-COMMANDER / QUANT-SCOUT ARCHITECTURE
-==============================================================
+QUANT STRATEGY v10.0 — INSTITUTIONAL LIQUIDITY-FIRST
+=====================================================
 Architecture:
-  ICT Engine  = Commander  — defines what to trade, where SL/TP go, when structure is valid
-  Quant Engine = Scout     — provides order-flow timing signals to execute within ICT setups
+  LiquidityMap → EntryEngine → ConvictionFilter → UnifiedGate → Execution
+  ICT Engine = structural context (AMD, OB, FVG, BOS, sweep detection)
+  DirectionEngine = hunt prediction + post-sweep evaluation
+  Quant Scout = order-flow timing (VWAP, CVD, tick flow, OB imbalance)
 
-Entry tiers (via ICTEntryGate):
-  Tier-S: ICT Sweep-and-Go in OTE zone (AMD sweep + displacement + 61.8%-78.6% retrace)
-    → SL at sweep wick extreme (0.5-0.8×ATR), TP at AMD delivery target (opposing pool)
-    → Confirm ticks: 1-2 | Expected edge: 58-66% WR, 1:2.5-4.0 R:R
-  Tier-A: ICT structural alignment (DISTRIBUTION/REACCUMULATION context)
-    → 2 confirm ticks | Expected edge: 52-58% WR, 1:2.0-3.5 R:R
-  Tier-B: Standard quant + ICT confluence
-    → 3 confirm ticks | Expected edge: 48-54% WR, 1:1.8-2.5 R:R
-
-Quant signals used as entry helpers (NOT primary gates):
-  VWAP deviation, CVD, tick flow, orderbook imbalance, volume exhaustion
-  → For Tier-S/A: soft veto only (tick flow not strongly opposing)
-  → For Tier-B:   hard requirements (overextended, n_confirming≥3, composite≥threshold)
-
-SL: ICTSLEngine 4-tier (sweep wick → disp OB → 15m ICT OB → 15m swing)
-TP: ICTTPEngine delivery target (opposing pool → structural → VWAP)
-Trail: _DynamicStructureTrail — BOS/CHoCH/OB/FVG/swing inline engine (no external deps)
+Entry: Only via EntryEngine (sweep reversal, continuation, displacement)
+SL/TP: EntryEngine provides primary levels; ICT OB → 15m swing → ATR fallback
+Trail: LiquidityTrailEngine (primary) → _DynamicStructureTrail (fallback)
+Exit: SL/TP bracket on exchange. Trail moves SL only.
 """
 
 from __future__ import annotations
@@ -47,13 +36,8 @@ try:
 except ImportError:
     ExecutionCostEngine = None   # fee_engine.py not yet present — graceful fallback
 
-_HUNT_AVAILABLE = False  # LiquidityHunter removed; v9 uses LiquidityMap + EntryEngine
 
 # ── ICT Institutional Trade Engine — fully inlined; external module removed ─
-# All ICTEntryGate / ICTSweepDetector / ICTSLEngine / ICTTPEngine / ICTTrailEngine
-# logic is embedded directly in this file.  ict_trade_engine.py is no longer
-# needed and the import attempt has been removed to eliminate the startup warning.
-_ICT_TRADE_ENGINE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -1354,330 +1338,6 @@ class RegimeClassifier:
 # ═══════════════════════════════════════════════════════════════
 # BREAKOUT DETECTOR — Adaptive multi-evidence scoring (v4.7)
 # ═══════════════════════════════════════════════════════════════
-class BreakoutDetector:
-    """
-    Institutional breakout detection with adaptive evidence weighting.
-
-    Key insight: A real breakout has MULTIPLE confirming signals simultaneously.
-    A fake spike has only one (the candle body). So we weigh evidence, not count
-    candles. One explosive candle with volume confirmation = real. Without = noise.
-
-    Scoring (5 factors, direction-aware):
-      F1: Candle body magnitude (uses last CLOSED candle only — no wick noise)
-          body > 1.5×ATR = 3pts | > 1.0×ATR = 2pts | > 0.5×ATR = 1pt
-      F2: Volume confirmation (breakout candle volume vs recent average)
-          vol > 2.0× avg = 2pts | > 1.5× avg = 1pt
-      F3: ATR expansion (current vs baseline)
-          expansion > 1.5× = 1pt
-      F4: Price displacement from VWAP (institutional anchor)
-          |price - VWAP| > 2.0×ATR = 2pts | > 1.5×ATR = 1pt
-      F5: Follow-through (current price holds above breakout candle midpoint)
-          Holds above 50% of breakout candle body = 1pt
-
-    Min score: 4 (one explosive candle + volume = 4, passes without waiting)
-
-    After breakout fires → tracks state for retest entry:
-      - Records breakout extreme + midpoint
-      - Tracks pullback low/high for retest entry trigger
-    """
-    def __init__(self):
-        self._breakout_active = False
-        self._breakout_dir = ""
-        self._breakout_until = 0.0
-        self._last_check = 0.0
-        self._CHECK_INTERVAL = 5.0
-
-        # Retest tracking state
-        self._bo_extreme = 0.0
-        self._bo_midpoint = 0.0
-        self._retest_low = 0.0
-        self._retest_high = 0.0
-        self._retest_started = False
-        self._retest_ready = False
-        self._retest_invalidated = False   # v4.7: once pullback too deep, stays dead
-        self._retest_timeout = 0.0
-        self._bo_atr = 0.0
-
-        # v4.7 FLAW 4 FIX: Directional cooldown after expiry
-        self._last_expired_dir = ""        # direction of last expired breakout
-        self._last_expired_time = 0.0      # when it expired
-
-    def reset_state(self):
-        self._breakout_active = False
-        self._breakout_dir = ""
-        self._breakout_until = 0.0
-        self._retest_started = False
-        self._retest_ready = False
-        self._retest_invalidated = False
-        self._last_expired_dir = ""
-        self._last_expired_time = 0.0
-
-    def update(self, candles_5m: List[Dict], atr_engine: 'ATREngine',
-               price: float, now: float, vwap_price: float = 0.0) -> None:
-        """Check for breakout conditions. Called from _evaluate_entry."""
-        if now - self._last_check < self._CHECK_INTERVAL:
-            return
-        self._last_check = now
-
-        # If block expired, clear it and record direction for cooldown
-        if self._breakout_active and now > self._breakout_until:
-            self._last_expired_dir = self._breakout_dir  # v4.7: remember direction
-            self._last_expired_time = now
-            self._breakout_active = False
-            self._breakout_dir = ""
-            self._retest_started = False
-            self._retest_ready = False
-            self._retest_invalidated = False
-            logger.info("🔓 Breakout block expired — reversion entries re-enabled")
-
-        if len(candles_5m) < 10:
-            return
-
-        atr = atr_engine.atr
-        if atr < 1e-10:
-            return
-
-        # ── Update retest tracking for active breakout ────────────────────
-        if self._breakout_active:
-            self._track_retest(price, atr, now)
-            return  # don't re-detect while active
-
-        # v4.7 FLAW 4 FIX: Cooldown before detecting OPPOSITE direction
-        # After breakout UP expires and price pulls back, the correction candle
-        # looks like a breakout DOWN — but it's just mean reversion. Block opposite
-        # direction detection for 10 minutes after expiry.
-        opposite_cooldown = 600.0  # 10 minutes
-
-        score_up = 0
-        score_down = 0
-        details = {}
-
-        # ── Factor 1: Candle body magnitude (CLOSED candle only) ──────────
-        last = candles_5m[-1]
-        body = float(last['c']) - float(last['o'])
-        body_abs = abs(body)
-        body_atr = body_abs / atr
-        is_bullish = body > 0
-
-        # FIX 12: Removed dead no-op `(score_up if is_bullish else score_down)`.
-        # Pure expression that evaluated and discarded the result — did nothing.
-        if body_atr >= 1.5:
-            if is_bullish: score_up   += 3
-            else:          score_down += 3
-            details['candle'] = f'{body_atr:.1f}ATR(3)'
-        elif body_atr >= 1.0:
-            if is_bullish: score_up += 2
-            else: score_down += 2
-            details['candle'] = f'{body_atr:.1f}ATR(2)'
-        elif body_atr >= 0.5:
-            if is_bullish: score_up += 1
-            else: score_down += 1
-            details['candle'] = f'{body_atr:.1f}ATR(1)'
-
-        # ── Factor 2: Volume confirmation ─────────────────────────────────
-        vols = [float(c.get('v', 0)) for c in candles_5m[-8:]]
-        if len(vols) >= 6:
-            avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
-            last_vol = vols[-1]
-            if avg_vol > 1e-10:
-                vol_ratio = last_vol / avg_vol
-                if vol_ratio >= 2.0:
-                    score_up += 2; score_down += 2
-                    details['vol'] = f'{vol_ratio:.1f}x(2)'
-                elif vol_ratio >= 1.5:
-                    score_up += 1; score_down += 1
-                    details['vol'] = f'{vol_ratio:.1f}x(1)'
-
-        # ── Factor 3: ATR expansion ───────────────────────────────────────
-        hist = list(atr_engine._atr_hist)
-        if len(hist) >= 10:
-            baseline = sum(hist[-10:-1]) / 9.0
-            if baseline > 1e-10:
-                expansion = hist[-1] / baseline
-                if expansion >= 1.5:
-                    score_up += 1; score_down += 1
-                    details['atr_exp'] = f'{expansion:.1f}x(1)'
-
-        # ── Factor 4: VWAP displacement ───────────────────────────────────
-        if vwap_price > 1e-10:
-            vwap_disp = (price - vwap_price) / atr
-            vwap_abs = abs(vwap_disp)
-            if vwap_abs >= 2.0:
-                if vwap_disp > 0: score_up += 2
-                else: score_down += 2
-                details['vwap'] = f'{vwap_disp:+.1f}ATR(2)'
-            elif vwap_abs >= 1.5:
-                if vwap_disp > 0: score_up += 1
-                else: score_down += 1
-                details['vwap'] = f'{vwap_disp:+.1f}ATR(1)'
-
-        # ── Factor 5: Follow-through ──────────────────────────────────────
-        # Current price holds above/below breakout candle midpoint
-        mid = (float(last['o']) + float(last['c'])) / 2.0
-        if is_bullish and price > mid:
-            score_up += 1
-            details['hold'] = 'above_mid(1)'
-        elif not is_bullish and body_abs > 1e-10 and price < mid:
-            score_down += 1
-            details['hold'] = 'below_mid(1)'
-
-        # ── Evaluate ─────────────────────────────────────────────────────
-        min_score = int(_cfg("QUANT_BO_MIN_SCORE", 4))
-        block_sec = float(_cfg("QUANT_BO_BLOCK_SEC", 900))
-        retest_timeout = float(_cfg("QUANT_BO_RETEST_TIMEOUT", 900))
-
-        def _fire(direction, score, extreme, midpt):
-            self._breakout_active = True
-            self._breakout_dir = direction
-            self._breakout_until = now + block_sec
-            self._bo_extreme = extreme
-            self._bo_midpoint = midpt
-            self._bo_atr = atr
-            self._retest_low = extreme if direction == "up" else 1e18
-            self._retest_high = extreme if direction == "down" else 0.0
-            self._retest_started = False
-            self._retest_ready = False
-            self._retest_invalidated = False   # v4.7: fresh breakout
-            self._retest_timeout = now + retest_timeout
-            detail_str = " | ".join(f"{k}={v}" for k, v in details.items())
-            logger.info(
-                f"🚀 BREAKOUT {direction.upper()} (score={score}/{min_score}) | "
-                f"{detail_str} | Block {block_sec/60:.0f}min | "
-                f"Waiting for retest entry")
-
-        # v4.7 FLAW 4: Apply directional cooldown
-        def _cooled_down(direction):
-            """Returns False if this direction is in cooldown from a recent expiry."""
-            if not self._last_expired_dir:
-                return True
-            # Opposite direction of recently expired breakout — apply cooldown
-            opposite = {"up": "down", "down": "up"}
-            if direction == opposite.get(self._last_expired_dir):
-                if now - self._last_expired_time < opposite_cooldown:
-                    return False
-            return True
-
-        if score_up >= min_score and score_up > score_down and _cooled_down("up"):
-            extreme = float(last['h'])
-            mid = (float(last['o']) + float(last['c'])) / 2.0
-            _fire("up", score_up, extreme, mid)
-
-        elif score_down >= min_score and score_down > score_up and _cooled_down("down"):
-            extreme = float(last['l'])
-            mid = (float(last['o']) + float(last['c'])) / 2.0
-            _fire("down", score_down, extreme, mid)
-
-    def _track_retest(self, price: float, atr: float, now: float):
-        """Track pullback/retest state after breakout is detected.
-
-        v4.7 FIXES:
-          - FLAW 2: Only logs on state transitions, not every tick
-          - FLAW 3: Once retrace > pullback_max, permanently invalidated
-                    (was re-arming on next tick because retrace >= pullback_min)
-        """
-        if now > self._retest_timeout:
-            return
-
-        # v4.7 FLAW 3: Once invalidated, stays dead. No re-arming.
-        if self._retest_invalidated:
-            return
-
-        pullback_min = 0.3 * self._bo_atr
-        # v5.1: Use max(breakout ATR, current ATR) for pullback_max.
-        # During crash volatility, ATR expands 2-3× but bo_atr was captured
-        # pre-crash. Using stale bo_atr causes retests to invalidate at
-        # 154pts vs max 138pts — missed by 16pts (actual retrace from logs).
-        # max() widens the threshold with expanding vol, never shrinks it.
-        _effective_atr = max(self._bo_atr, atr) if atr > 1e-10 else self._bo_atr
-        pullback_max = 2.5 * _effective_atr
-
-        if self._breakout_dir == "up":
-            if price < self._retest_low:
-                self._retest_low = price
-            retrace = self._bo_extreme - price
-
-            # Invalidate if retrace too deep — BEFORE checking start/ready
-            if retrace > pullback_max:
-                if not self._retest_invalidated:
-                    self._retest_invalidated = True
-                    logger.info(f"❌ Retest invalidated: retrace {retrace:.0f} > max {pullback_max:.0f}")
-                return
-
-            # State transition: pullback started
-            if retrace >= pullback_min and not self._retest_started:
-                self._retest_started = True
-                logger.info(f"📐 Retest pullback started: retrace {retrace:.0f} "
-                           f"from ${self._bo_extreme:,.2f}")
-
-            # State transition: pullback complete (bounce from low)
-            if self._retest_started and not self._retest_ready:
-                bounce = price - self._retest_low
-                if bounce > 0.2 * self._bo_atr:
-                    self._retest_ready = True
-                    logger.info(f"✅ Retest ready: low ${self._retest_low:,.2f} "
-                               f"→ bounce ${price:,.2f} (+{bounce:.0f})")
-
-        else:  # breakout down
-            if price > self._retest_high:
-                self._retest_high = price
-            retrace = price - self._bo_extreme
-
-            if retrace > pullback_max:
-                if not self._retest_invalidated:
-                    self._retest_invalidated = True
-                    logger.info(f"❌ Retest invalidated: retrace {retrace:.0f} > max {pullback_max:.0f}")
-                return
-
-            if retrace >= pullback_min and not self._retest_started:
-                self._retest_started = True
-                logger.info(f"📐 Retest pullback started: retrace {retrace:.0f} "
-                           f"from ${self._bo_extreme:,.2f}")
-
-            if self._retest_started and not self._retest_ready:
-                bounce = self._retest_high - price
-                if bounce > 0.2 * self._bo_atr:
-                    self._retest_ready = True
-                    logger.info(f"✅ Retest ready: high ${self._retest_high:,.2f} "
-                               f"→ bounce ${price:,.2f} (+{bounce:.0f})")
-
-    @property
-    def is_active(self) -> bool:
-        return self._breakout_active
-
-    @property
-    def direction(self) -> str:
-        return self._breakout_dir
-
-    @property
-    def retest_ready(self) -> bool:
-        return self._retest_ready
-
-    @property
-    def retest_sl(self) -> float:
-        """SL for retest entry — below pullback low (long) / above pullback high (short)."""
-        buf = self._bo_atr * 0.3 if self._bo_atr > 0 else 5.0
-        if self._breakout_dir == "up":
-            return self._retest_low - buf
-        else:
-            return self._retest_high + buf
-
-    def blocks_reversion(self, side: str) -> bool:
-        if not self._breakout_active:
-            return False
-        if self._breakout_dir == "up" and side == "short":
-            return True
-        if self._breakout_dir == "down" and side == "long":
-            return True
-        return False
-
-    def allows_momentum_entry(self, side: str) -> bool:
-        if not self._breakout_active:
-            return False
-        if self._breakout_dir == "up" and side == "long":
-            return True
-        if self._breakout_dir == "down" and side == "short":
-            return True
-        return False
 class InstitutionalLevels:
     """
     Computes SL/TP/Trail levels using:
@@ -1790,110 +1450,6 @@ class InstitutionalLevels:
             if l < float(recent[i-1]['l']) and l < float(recent[i+1]['l']):
                 lows.append(l)
         return highs, lows
-
-    @staticmethod
-    def _swing_cluster_score(level: float, all_swings: List[float], atr: float) -> float:
-        """
-        Score a structural level by how many other swing extremes cluster near it.
-        Clustered swings = contested zone = stronger barrier = better SL anchor.
-
-        Returns score in [1.0, 2.0]:
-          1.0 = isolated swing (weakest)
-          2.0 = four or more nearby swings (institutional zone)
-        """
-        if not all_swings or atr < 1e-10:
-            return 1.0
-        radius = QCfg.SL_SWING_DENSITY_WINDOW() * atr
-        nearby = sum(1 for s in all_swings if abs(s - level) <= radius and abs(s - level) > 1e-10)
-        return 1.0 + min(nearby / 4.0, 1.0)
-
-    @staticmethod
-    def compute_sl(price: float, side: str, atr: float,
-                   candles_5m: List[Dict], candles_1m: List[Dict],
-                   orderbook: Dict, vwap: float, vwap_std: float,
-                   atr_pctile: float = 0.5,
-                   candles_15m: Optional[List[Dict]] = None) -> float:
-        """
-        Initial SL placement — v5.0 (15m structural swings only).
-
-        NOTE: This function is called from _compute_sl_tp as Step 2 (fallback)
-        when no ICT 15m OB is found. Step 1 (primary) queries get_ob_sl_level
-        directly. This function provides the 15m swing structural level.
-
-        Uses 15m swing extremes ONLY. 5m/1m swings, VWAP, HVN, OB walls all
-        removed — they are not 15m ICT structure.
-
-        Lookback: min(40, len-2) candles = up to 10 hours of 15m structure.
-        Institutional swing levels persist for hours, not 3 candles.
-
-        Called only by _compute_sl_tp. htf_only ICT OB SL takes priority.
-        ATR fallback fires in _compute_sl_tp if this returns None implicitly
-        (via the caller's Step 3).
-
-        Signature kept unchanged for backward compatibility.
-        """
-        # v5.0: 15m structural swings only.
-        # This function is Step 2 in _compute_sl_tp (fallback if no ICT OB).
-        # Lookback: 40 candles = 10 hours (vs old 12 = 3 hours).
-        # ISSUE-1 FIX: apply PostTradeAgent Bayesian SL buffer adjustment
-        _pta_sl_mult = (self._post_trade_agent.params.sl_buffer_atr.current_mult
-                        if self._post_trade_agent is not None else 1.0)
-        buf_mult  = QCfg.SL_BUFFER_ATR_MULT() * _pta_sl_mult * (1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
-        buffer    = buf_mult * atr
-        min_dist  = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
-        max_dist  = price * QCfg.MAX_SL_PCT()
-
-        # 15m swings — wide lookback for institutional structure
-        sh_15m, sl_15m = [], []
-        if candles_15m and len(candles_15m) >= 3:
-            _lb = min(40, len(candles_15m) - 2)   # 10 hours of 15m candles
-            sh_15m, sl_15m = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
-
-        scored: List[Tuple[float, float, str]] = []
-
-        def add(level: float, score: float, label: str = "") -> None:
-            dist = abs(price - level)
-            if dist > max_dist:
-                return
-            if side == "long" and level >= price:
-                return
-            if side == "short" and level <= price:
-                return
-            # 15m swings bypass min_dist — structure IS the validity criterion
-            scored.append((level, score, label))
-
-        if side == "long":
-            all_lows = sl_15m
-            for lvl in sl_15m:
-                if lvl < price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_lows, atr)
-                    add(lvl - buffer * 0.80, 8.0 * cs, f"15m_low@{lvl:.0f}")
-        else:
-            all_highs = sh_15m
-            for lvl in sh_15m:
-                if lvl > price:
-                    cs = InstitutionalLevels._swing_cluster_score(lvl, all_highs, atr)
-                    add(lvl + buffer * 0.80, 8.0 * cs, f"15m_high@{lvl:.0f}")
-
-        if scored:
-            if side == "long":
-                scored.sort(key=lambda x: (-x[1], price - x[0]))
-            else:
-                scored.sort(key=lambda x: (-x[1], x[0] - price))
-            sl = scored[0][0]
-            logger.info(
-                f"📌 15m Swing SL: ${sl:,.2f} [{scored[0][2]}] score={scored[0][1]:.1f} "
-                f"dist={abs(price-sl):.1f}pts/{abs(price-sl)/max(atr,1e-10):.2f}ATR "
-                f"| {len(scored)} 15m candidates (lb={min(40, len(candles_15m)-2) if candles_15m else 0})")
-            dist = abs(price - sl)
-            if dist > max_dist:
-                sl = (price - max_dist) if side == "long" else (price + max_dist)
-            return sl
-
-        # No 15m structure — return None signal to caller (ATR fallback in _compute_sl_tp)
-        # We return the ATR fallback here so the function signature is unchanged
-        _atr_dist = max(min_dist, min(max_dist, 1.5 * atr))
-        return (price - _atr_dist if side == "long" else price + _atr_dist)
 
     @staticmethod
     def compute_tp(price: float, side: str, atr: float, sl_price: float,
@@ -2105,572 +1661,6 @@ class InstitutionalLevels:
             return None
 
         return tp
-    @staticmethod
-    def compute_tp_trend(price: float, side: str, atr: float, sl_price: float,
-                         candles_5m: List[Dict], orderbook: Dict,
-                         swing_lookback: int = 12,
-                         candles_15m: Optional[List[Dict]] = None) -> float:
-        """
-        Trend/momentum TP placement — v5.0 (15m ICT structure).
-
-        Uses 15m swing extremes as structural targets. 5m swings and OB walls removed.
-        In a trending market the 15m swing above/below price is the next institutional
-        delivery target — the level where the prior move stalled.
-        ATR channel is always included as a fallback.
-        """
-        sl_dist = abs(price - sl_price)
-        if sl_dist < 1e-10:
-            return price + atr if side == "long" else price - atr
-
-        min_tp_dist = sl_dist * QCfg.TREND_MIN_RR()
-        max_tp_dist = sl_dist * QCfg.TREND_MAX_RR()
-
-        atr_tp_dist = atr * QCfg.TREND_TP_ATR_MULT()
-        atr_tp_dist = max(atr_tp_dist, min_tp_dist)
-        atr_tp_dist = min(atr_tp_dist, max_tp_dist)
-        atr_tp      = (price + atr_tp_dist) if side == "long" else (price - atr_tp_dist)
-
-        # ── 15m swing target — institutional level ahead of price ────────────
-        swing_tp: Optional[float] = None
-        _c15 = candles_15m if (candles_15m and len(candles_15m) >= 3) else []
-        if _c15:
-            _lb  = min(40, len(_c15) - 2)
-            sh15, sl15 = InstitutionalLevels.find_swing_extremes(_c15, _lb)
-            if side == "long" and sh15:
-                valid = [h for h in sh15 if price + min_tp_dist < h <= price + max_tp_dist]
-                if valid:
-                    swing_tp = min(valid) - 0.08 * atr
-            elif side == "short" and sl15:
-                valid = [l for l in sl15 if price - max_tp_dist <= l < price - min_tp_dist]
-                if valid:
-                    swing_tp = max(valid) + 0.08 * atr
-
-        candidates: List[float] = []
-        if swing_tp is not None and abs(swing_tp - price) >= sl_dist * 1.5:
-            candidates.append(swing_tp)
-        candidates.append(atr_tp)
-
-        if side == "long":
-            valid_c = [c for c in candidates if price + min_tp_dist < c <= price + max_tp_dist]
-            return max(valid_c) if valid_c else atr_tp
-        else:
-            valid_c = [c for c in candidates if price - max_tp_dist <= c < price - min_tp_dist]
-            return min(valid_c) if valid_c else atr_tp
-
-    @staticmethod
-    def _classify_pullback_vs_reversal(
-            pos_side: str, price: float, entry_price: float, atr: float,
-            candles_1m: List[Dict], candles_5m: List[Dict],
-            orderbook: Dict, entry_vol: float,
-            peak_price_abs: float) -> Tuple[bool, int, str]:
-        """
-        Institutional pullback-vs-reversal classifier — v4.5.
-
-        Evaluates 6 independent signals. Returns:
-          (is_pullback: bool, reversal_count: int, detail: str)
-
-        A pullback is a healthy retracement within the trend/reversion move.
-        A reversal is a structural shift where the trade thesis is invalidated.
-
-        The 6 signals (each scores 0 or 1 toward reversal):
-
-        1. VOLUME PROFILE: Is pullback volume expanding relative to impulse?
-           Healthy pullback = declining volume. Reversal = expanding.
-
-        2. RETRACE DEPTH: How deep is the pullback relative to ATR?
-           Shallow (< PB_DEPTH_ATR) = pullback. Deep = reversal warning.
-
-        3. CANDLE CHARACTER: Are retrace candles large-bodied vs impulse?
-           Small-bodied retrace = pullback. Large opposing candles = reversal.
-
-        4. ORDERBOOK SHIFT: Has bid/ask imbalance flipped against the trade?
-           Still favoring trade direction = pullback. Flipped = reversal.
-
-        5. SWING STRUCTURE (5m): Has price broken the last confirmed 5m swing?
-           Swing holding = pullback. Swing broken = reversal.
-
-        6. MOMENTUM STALLING: Is price making lower highs (long) or higher lows (short)
-           over the last 5+ candles? Momentum continuation = pullback. Stalling = reversal.
-        """
-        reversal_signals = 0
-        details = []
-
-        if atr < 1e-10 or len(candles_1m) < 10:
-            return True, 0, "insufficient data"
-
-        recent = candles_1m[-10:]
-        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-        retrace_from_peak = abs(peak_price_abs - price) if peak_price_abs > 1e-10 else 0.0
-
-        # ── Signal 1: Volume profile ─────────────────────────────────
-        # Compare last 3 candles vol (retrace) vs previous 5 candles (impulse)
-        if len(candles_1m) >= 10:
-            retrace_vol = sum(float(c['v']) for c in candles_1m[-3:]) / 3.0
-            impulse_vol = sum(float(c['v']) for c in candles_1m[-8:-3]) / 5.0
-            if impulse_vol > 1e-10:
-                vol_ratio = retrace_vol / impulse_vol
-                if vol_ratio > QCfg.TRAIL_PB_VOL_RATIO():
-                    reversal_signals += 1
-                    details.append(f"vol_expand({vol_ratio:.2f})")
-                else:
-                    details.append(f"vol_decline({vol_ratio:.2f})")
-
-        # ── Signal 2: Retrace depth ──────────────────────────────────
-        if retrace_from_peak > QCfg.TRAIL_PB_DEPTH_ATR() * atr:
-            reversal_signals += 1
-            details.append(f"deep_retrace({retrace_from_peak/atr:.1f}ATR)")
-        else:
-            details.append(f"shallow({retrace_from_peak/atr:.1f}ATR)")
-
-        # ── Signal 3: Candle character ───────────────────────────────
-        # Large opposing candles = reversal signal
-        if len(candles_1m) >= 8:
-            impulse_bodies = [abs(float(c['c']) - float(c['o'])) for c in candles_1m[-8:-3]]
-            retrace_bodies = [abs(float(c['c']) - float(c['o'])) for c in candles_1m[-3:]]
-            avg_impulse = sum(impulse_bodies) / max(len(impulse_bodies), 1)
-            avg_retrace = sum(retrace_bodies) / max(len(retrace_bodies), 1)
-            if avg_impulse > 1e-10 and avg_retrace / avg_impulse > 0.80:
-                reversal_signals += 1
-                details.append("large_retrace_candles")
-
-        # ── Signal 4: Orderbook shift ────────────────────────────────
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
-        if bids and asks:
-            def _ob_qty(lvl):
-                if isinstance(lvl,(list,tuple)) and len(lvl)>=2: return float(lvl[1])
-                if isinstance(lvl,dict): return float(lvl.get("size") or lvl.get("quantity") or 0)
-                return 0.0
-            bid_depth = sum(_ob_qty(b) for b in bids[:5]) if len(bids) >= 5 else 0
-            ask_depth = sum(_ob_qty(a) for a in asks[:5]) if len(asks) >= 5 else 0
-            total = bid_depth + ask_depth
-            if total > 1e-10:
-                imbalance = (bid_depth - ask_depth) / total
-                # For long: negative imbalance (more asks) = reversal
-                # For short: positive imbalance (more bids) = reversal
-                if pos_side == "long" and imbalance < -0.15:
-                    reversal_signals += 1
-                    details.append(f"ob_shift({imbalance:+.2f})")
-                elif pos_side == "short" and imbalance > 0.15:
-                    reversal_signals += 1
-                    details.append(f"ob_shift({imbalance:+.2f})")
-
-        # ── Signal 5: 5m swing structure break ───────────────────────
-        if candles_5m and len(candles_5m) >= 5:
-            sh_5m, sl_5m = InstitutionalLevels.find_swing_extremes(
-                candles_5m[:-1], min(8, len(candles_5m) - 2))
-            if pos_side == "long" and sl_5m:
-                # Last 5m swing low below entry — if price breaks below it
-                relevant = [l for l in sl_5m if l > entry_price - 0.5 * atr]
-                if relevant and price < min(relevant):
-                    reversal_signals += 1
-                    details.append("5m_swing_broken")
-            elif pos_side == "short" and sh_5m:
-                relevant = [h for h in sh_5m if h < entry_price + 0.5 * atr]
-                if relevant and price > max(relevant):
-                    reversal_signals += 1
-                    details.append("5m_swing_broken")
-
-        # ── Signal 6: Momentum stalling ──────────────────────────────
-        # Last 5 candle highs declining (long) or lows rising (short)
-        if len(candles_1m) >= 6:
-            last5 = candles_1m[-5:]
-            if pos_side == "long":
-                highs = [float(c['h']) for c in last5]
-                declining = all(highs[i] <= highs[i-1] for i in range(1, len(highs)))
-                if declining:
-                    reversal_signals += 1
-                    details.append("momentum_stalling")
-            else:
-                lows = [float(c['l']) for c in last5]
-                rising = all(lows[i] >= lows[i-1] for i in range(1, len(lows)))
-                if rising:
-                    reversal_signals += 1
-                    details.append("momentum_stalling")
-
-        is_pullback = reversal_signals < QCfg.TRAIL_REV_MIN_SIGNALS()
-        return is_pullback, reversal_signals, "|".join(details)
-
-    @staticmethod
-    def compute_trail_sl(pos_side: str, price: float, entry_price: float,
-                         current_sl: float, atr: float,
-                         candles_1m: List[Dict], orderbook: Dict,
-                         peak_profit: float, entry_vol: float,
-                         hold_seconds: float = 0.0,
-                         peak_price_abs: float = 0.0,
-                         trade_mode: str = "reversion",
-                         candles_5m: Optional[List[Dict]] = None,
-                         initial_sl_dist: float = 0.0,
-                         ict_engine=None,
-                         now_ms: int = 0,
-                         hold_reason: Optional[List[str]] = None) -> Optional[float]:
-        """
-        Institutional trailing SL — v4.9 (ICT-anchored, zone-aware).
-
-        v4.9 ADDITIONS on top of v4.8's 7-bug rewrite:
-
-        NEW 1: ICT ZONE FREEZE
-               If price is testing an active Order Block or sitting inside an FVG,
-               the trail is COMPLETELY FROZEN. These are institutional zones where
-               smart money placed orders. A test of an OB is not a reversal —
-               it is the setup completing. Freezing the trail here eliminates the
-               "SL hit during pullback, then TP fires without us" pattern.
-
-        NEW 2: ICT OB ANCHOR (additional SL candidate)
-               If an active OB exists between current_sl and price, compute SL =
-               OB.low - ICT_OB_SL_BUFFER_ATR × ATR (for long). This is the most
-               institutionally valid SL level — that is literally WHERE the orders
-               are sitting. The structure holds or it doesn't. OB anchor > chandelier.
-
-        NEW 3: LIQUIDITY POOL CEILING
-               After all candidates are built, cap the trail SL so it cannot advance
-               PAST an unswept liquidity pool (EQL for long, EQH for short) in the
-               direction of price. Smart money sweeps those pools — trailing SL right
-               at the pool means the sweep takes us out before the reversal.
-               Keep SL safely BEYOND the pool level by ICT_LIQ_POOL_BUFFER_ATR × ATR.
-
-        Returns None if no improvement qualifies, if in ICT zone freeze, or if
-        the pullback classifier says to hold.
-        """
-        if candles_5m is None:
-            candles_5m = []
-
-        # v4.8 BUG 1 FIX: Use ORIGINAL SL distance, not current
-        # After trail moves SL from $73,320 to $73,600, using current SL
-        # makes init_dist=$200→$80, inflating tier from 0.6 to 1.5 instantly.
-        init_dist = initial_sl_dist if initial_sl_dist > 1e-10 else (
-            abs(entry_price - current_sl) if abs(entry_price - current_sl) > 1e-10 else atr)
-
-        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-
-        # v4.8 BUG 2 FIX: Phase is determined by PEAK profit, not current.
-        # During a healthy pullback from +2R to +1R, tier drops and Phase 2
-        # demotes to Phase 1, losing chandelier exactly when needed.
-        # Phase RATCHETS UP — once earned, never lost.
-        tier_profit = max(profit, peak_profit)
-        tier = tier_profit / init_dist if init_dist > 1e-10 else 0.0
-
-        if atr < 1e-10:
-            if hold_reason is not None:
-                hold_reason.append("ATR=0")
-            return None
-
-        # ═══ PHASE 0: HANDS OFF ═══════════════════════════════════════════
-        if tier < QCfg.TRAIL_BE_R():
-            if hold_reason is not None:
-                hold_reason.append(f"PHASE0 tier={tier:.2f}R < BE_R={QCfg.TRAIL_BE_R():.1f}R")
-            return None
-
-        # ═══ DETERMINE PHASE AND MIN DISTANCE ═════════════════════════════
-        if tier >= QCfg.TRAIL_AGGRESSIVE_R():
-            phase = 3
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P3() * atr
-        elif tier >= QCfg.TRAIL_LOCK_R():
-            phase = 2
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P2() * atr
-        else:
-            phase = 1
-            min_dist = QCfg.TRAIL_MIN_DIST_ATR_P1() * atr
-
-        # ═══ BREAK-EVEN UNLOCKED FLAG ════════════════════════════════════
-        # Defined here — before zone freeze — to fix the v4.9 forward-reference
-        # NameError that silently crashed every trail tick.
-        # NOTE: this function is legacy dead-code (replaced by _DynamicStructureTrail).
-        # Kept in-sync with _calc_be_price for correctness if ever re-enabled.
-        _be_price = _calc_be_price(pos_side, entry_price, atr, pos=None)
-        _be_is_unlocked = (
-            (pos_side == "long"  and current_sl >= _be_price) or
-            (pos_side == "short" and current_sl <= _be_price)
-        )
-
-        # ═══ v5.0: FVG ZONE FREEZE (time-limited + SL-proximity-gated) ════
-        # OB zone freeze removed — it permanently blocked trailing whenever
-        # overlapping OBs covered the entire trade range.
-        # FVG freeze kept with two hard guards:
-        #   GUARD 1 — TIME: release unconditionally after 10 minutes
-        #   GUARD 2 — SL PROXIMITY: only freeze when SL is within 1.5×ATR
-        #             of the FVG boundary (SL must have trailed to the zone)
-        _FVG_MAX_FREEZE_SEC = 600.0
-        if QCfg.ICT_ZONE_FREEZE_ENABLED() and ict_engine is not None and _be_is_unlocked:
-            if hold_seconds < _FVG_MAX_FREEZE_SEC:
-                try:
-                    _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                    _freeze_atr  = QCfg.ICT_ZONE_FREEZE_ATR() * atr
-                    _fvgs = (ict_engine.fvgs_bull if pos_side == "long"
-                             else ict_engine.fvgs_bear)
-                    for _fvg in _fvgs:
-                        if not _fvg.is_active(_ict_now_ms):
-                            continue
-                        _fvg_lo = _fvg.bottom - _freeze_atr * 0.5
-                        _fvg_hi = _fvg.top    + _freeze_atr * 0.5
-                        if not (_fvg_lo <= price <= _fvg_hi):
-                            continue
-                        if pos_side == "long":
-                            _sl_near_fvg = current_sl >= _fvg.bottom - 1.5 * atr
-                        else:
-                            _sl_near_fvg = current_sl <= _fvg.top + 1.5 * atr
-                        if not _sl_near_fvg:
-                            logger.debug(
-                                f"Trail: FVG freeze SKIPPED — SL ${current_sl:,.0f} "
-                                f"not near FVG ${_fvg.bottom:.0f}–${_fvg.top:.0f}")
-                            continue
-                        if hold_reason is not None:
-                            hold_reason.append(
-                                f"ICT_FVG_FREEZE FVG=${_fvg.bottom:.0f}-${_fvg.top:.0f}")
-                        return None
-                except Exception as _ict_e:
-                    logger.debug(f"Trail ICT FVG zone check error (non-fatal): {_ict_e}")
-
-                # ═══ PULLBACK DETECTION (Phases 1-3) ══════════════════════════════
-        # NOTE: _be_price and _be_is_unlocked defined above in phase block.
-        if QCfg.TRAIL_PULLBACK_FREEZE():
-            is_pb, rev_count, pb_detail = InstitutionalLevels._classify_pullback_vs_reversal(
-                pos_side, price, entry_price, atr,
-                candles_1m, candles_5m, orderbook, entry_vol, peak_price_abs)
-            if is_pb and _be_is_unlocked:
-                # BE locked — full pullback freeze engaged
-                logger.debug(
-                    f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} "
-                    f"reversal) BE locked — FROZEN [{pb_detail}]")
-                if hold_reason is not None:
-                    hold_reason.append(f"PULLBACK({rev_count}sig) [{pb_detail}]")
-                return None
-            elif is_pb and not _be_is_unlocked:
-                # BE not yet locked — allow BE move, but log the pullback status
-                logger.debug(
-                    f"Trail: PULLBACK ({rev_count}/{QCfg.TRAIL_REV_MIN_SIGNALS()} rev) "
-                    f"— BE not locked, allowing BE move [{pb_detail}]")
-
-        # ═══ BUILD CANDIDATE SL LEVELS ════════════════════════════════════
-        # v4.9 INSTITUTIONAL PRIORITY — structure first, chandelier last resort:
-        #   1. Profit floor      — fee-adjusted breakeven (all phases)
-        #   2. ICT OB anchor     — WHERE institutional orders are (all phases)
-        #   3. 5m swing low/high — market's confirmed structure (all phases)
-        #   4. 1m micro-swing    — tighter confirmed structure (Phase 2+)
-        #   5. Chandelier        — Phase 3 ONLY when no structure found
-        #   6. HVN               — volume-based support (Phase 3 only)
-        #   7. OB wall           — orderbook depth support (Phase 3 only)
-        #
-        # Chandelier was previously Phase 2+, causing stops on normal OB pullbacks.
-        # Structure must lead. Chandelier is the fallback for featureless markets.
-        candidates: List[float] = []
-
-        # ── 1. Profit floor (all phases) ─────────────────────────────────
-        rt_fee_per_btc   = entry_price * QCfg.COMMISSION_RATE() * 2.0
-        profit_floor_buf = rt_fee_per_btc + 0.3 * atr
-        profit_floor = (entry_price + profit_floor_buf if pos_side == "long"
-                        else entry_price - profit_floor_buf)
-        candidates.append(profit_floor)
-
-        # ── 2. ICT OB anchor (all phases) ────────────────────────────────
-        # Highest-conviction structural level: SL just below an active bullish OB
-        # (for long). That is literally WHERE smart money placed its buy orders.
-        # The market bounces off OBs by design; SL below it survives OB tests.
-        if QCfg.ICT_OB_SL_ANCHOR() and ict_engine is not None:
-            try:
-                _now_ms_ob = now_ms if now_ms > 0 else int(time.time() * 1000)
-                _ob_buf    = QCfg.ICT_OB_SL_BUFFER_ATR() * atr
-                _obs = (ict_engine.order_blocks_bull if pos_side == "long"
-                        else ict_engine.order_blocks_bear)
-                for _ob in sorted([o for o in _obs if o.is_active(_now_ms_ob)],
-                                   key=lambda x: abs(x.midpoint - price)):
-                    if pos_side == "long":
-                        if current_sl < _ob.low - _ob_buf < price - min_dist:
-                            candidates.append(_ob.low - _ob_buf)
-                            logger.debug(
-                                f"Trail: OB anchor ${_ob.low - _ob_buf:,.1f} "
-                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
-                            break
-                    else:
-                        if price + min_dist < _ob.high + _ob_buf < current_sl:
-                            candidates.append(_ob.high + _ob_buf)
-                            logger.debug(
-                                f"Trail: OB anchor ${_ob.high + _ob_buf:,.1f} "
-                                f"(OB ${_ob.low:,.1f}–${_ob.high:,.1f} str={_ob.strength:.0f})")
-                            break
-            except Exception as _e:
-                logger.debug(f"Trail OB anchor error: {_e}")
-
-        # ── 3. 1m confirmed swing structure (all phases) — PRIMARY ─────────
-        # v5.0: 1m closed swing lows/highs are the primary trail driver.
-        # 15m ICT structure sets the SL/TP at entry. During the trade, 1m
-        # structure captures the freshest institutional footprints every minute.
-        if len(candles_1m) >= 6:
-            closed_1m_p = candles_1m[:-1]
-            sh_1m_p, sl_1m_p = InstitutionalLevels.find_swing_extremes(
-                closed_1m_p, min(10, len(closed_1m_p) - 2))
-            swing_buf_1m = max(0.10 * atr, QCfg.SL_BUFFER_ATR_MULT() * atr * 0.40)
-
-            if pos_side == "long" and sl_1m_p:
-                valid = [l for l in sl_1m_p
-                         if current_sl + 0.05 * atr < l < price - min_dist]
-                if valid:
-                    best_sw = max(valid)
-                    candidates.append(best_sw - swing_buf_1m)
-                    logger.debug(
-                        f"Trail: 1m swing low ${best_sw:,.1f} → SL ${best_sw-swing_buf_1m:,.1f}")
-            elif pos_side == "short" and sh_1m_p:
-                valid = [h for h in sh_1m_p
-                         if price + min_dist < h < current_sl - 0.05 * atr]
-                if valid:
-                    best_sw = min(valid)
-                    candidates.append(best_sw + swing_buf_1m)
-                    logger.debug(
-                        f"Trail: 1m swing high ${best_sw:,.1f} → SL ${best_sw+swing_buf_1m:,.1f}")
-
-        # ── 4. 1m tighter micro-swing (Phase 2+) ─────────────────────────
-        if phase >= 2 and len(candles_1m) >= 8:
-            closed_1m    = candles_1m[:-1]
-            sh_1m, sl_1m = InstitutionalLevels.find_swing_extremes(
-                closed_1m, min(QCfg.TRAIL_SWING_BARS(), len(closed_1m) - 2))
-            micro_buf = max(0.08 * atr, swing_buf_1m * 0.60)
-
-            if pos_side == "long" and sl_1m:
-                valid = [l for l in sl_1m if current_sl < l < price - min_dist]
-                if valid:
-                    best_m = max(valid)
-                    candidates.append(best_m - micro_buf)
-                    logger.debug(
-                        f"Trail: 1m micro ${best_m:,.1f} → SL ${best_m-micro_buf:,.1f}")
-            elif pos_side == "short" and sh_1m:
-                valid = [h for h in sh_1m if price + min_dist < h < current_sl]
-                if valid:
-                    best_m = min(valid)
-                    candidates.append(best_m + micro_buf)
-
-        # ── 5. Chandelier exit (Phase 3 ONLY — last resort) ──────────────
-        # Used ONLY when no structural candidate exists (featureless market, tight
-        # consolidation with no confirmed swings). NOT the primary driver.
-        # Previously was Phase 2+, which caused the main reported problem.
-        if phase >= 3 and peak_price_abs > 1e-10:
-            if trade_mode in ("trend", "momentum"):
-                n_chandelier = QCfg.TREND_CHANDELIER_N()
-            else:
-                # v5.0: fixed N — no hold-time taper (max-hold timer removed)
-                n_chandelier = QCfg.TRAIL_CHANDELIER_N_START()
-
-            if pos_side == "long":
-                chand = peak_price_abs - n_chandelier * atr
-                if current_sl < chand < price - min_dist:
-                    candidates.append(chand)
-            else:
-                chand = peak_price_abs + n_chandelier * atr
-                if price + min_dist < chand < current_sl:
-                    candidates.append(chand)
-
-        # ── 6. HVN snap (Phase 3 only) ──────────────────────────────────
-        if phase >= 3 and len(candles_1m) >= 30:
-            profile = InstitutionalLevels.build_volume_profile(
-                candles_1m[-150:], QCfg.VP_BUCKET_COUNT())
-            for hvn in InstitutionalLevels.find_hvn_levels(
-                    profile, QCfg.TRAIL_HVN_SNAP_THRESH()):
-                if pos_side == "long" and current_sl < hvn < price - min_dist:
-                    candidates.append(hvn - 0.15 * atr)
-                elif pos_side == "short" and price + min_dist < hvn < current_sl:
-                    candidates.append(hvn + 0.15 * atr)
-
-        # ── 7. OB wall snap (Phase 3 only) ──────────────────────────────
-        if phase >= 3:
-            wall_side = "bid" if pos_side == "long" else "ask"
-            walls = InstitutionalLevels.find_orderbook_walls(
-                orderbook, wall_side, QCfg.OB_WALL_DEPTH(), QCfg.OB_WALL_MULT())
-            if walls:
-                if pos_side == "long":
-                    vw = [(p, q) for p, q in walls if current_sl < p < price - min_dist]
-                    if vw:
-                        candidates.append(max(vw, key=lambda x: x[1])[0] - 0.10 * atr)
-                else:
-                    vw = [(p, q) for p, q in walls if price + min_dist < p < current_sl]
-                    if vw:
-                        candidates.append(min(vw, key=lambda x: x[1])[0] + 0.10 * atr)
-
-        if not candidates:
-            if hold_reason is not None:
-                hold_reason.append("NO_CANDIDATES")
-            return None
-
-        # ═══ SELECT BEST CANDIDATE ════════════════════════════════════════
-        if pos_side == "long":
-            new_sl = max(candidates)
-        else:
-            new_sl = min(candidates)
-
-        # ── Vol-decay tightening (Phase 3 only) ──────────────────────
-        if phase >= 3 and len(candles_1m) >= 10 and entry_vol > 1e-10:
-            recent_vol = sum(float(c['v']) for c in candles_1m[-5:]) / 5.0
-            vol_ratio  = recent_vol / entry_vol
-            decay_mult = QCfg.TRAIL_VOL_DECAY_MULT()
-            if vol_ratio < decay_mult:
-                tighten = 0.35 * atr * (1.0 - vol_ratio / decay_mult)
-                if pos_side == "long":
-                    new_sl = min(new_sl + tighten, price - min_dist)
-                else:
-                    new_sl = max(new_sl - tighten, price + min_dist)
-
-        # ── v4.9: LIQUIDITY POOL CEILING CAP ─────────────────────────
-        # Keep the trailing SL on the FAR SIDE of any unswept liquidity pool
-        # between current_sl and price. Smart money sweeps those pools — if our
-        # SL is right at or past the pool, the sweep hunts us before reversal.
-        # Cap the SL at: pool.price - ICT_LIQ_POOL_BUFFER (long) or pool.price + buffer (short).
-        if QCfg.ICT_LIQ_CEILING_ENABLED() and ict_engine is not None:
-            try:
-                _ict_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
-                _liq_buf    = QCfg.ICT_LIQ_POOL_BUFFER_ATR() * atr
-                for _pool in ict_engine.liquidity_pools:
-                    if _pool.swept:
-                        continue
-                    if pos_side == "long" and _pool.pool_type == "EQL":
-                        # EQL below price: SL must stay BELOW the pool minus buffer
-                        # i.e., don't trail SL ABOVE the pool level
-                        _ceiling = _pool.price - _liq_buf
-                        if current_sl < _ceiling < new_sl:
-                            # SL candidate crossed above pool — cap it
-                            logger.debug(
-                                f"Trail: LIQ CEILING — capping SL at ${_ceiling:,.1f} "
-                                f"(EQL pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
-                            new_sl = _ceiling
-                    elif pos_side == "short" and _pool.pool_type == "EQH":
-                        # EQH above price: SL must stay ABOVE the pool plus buffer
-                        _floor = _pool.price + _liq_buf
-                        if current_sl > _floor > new_sl:
-                            logger.debug(
-                                f"Trail: LIQ FLOOR — capping SL at ${_floor:,.1f} "
-                                f"(EQH pool @ ${_pool.price:,.1f}, SL was ${new_sl:,.1f})")
-                            new_sl = _floor
-            except Exception as _liq_e:
-                logger.debug(f"Trail liq ceiling error (non-fatal): {_liq_e}")
-
-        # ═══ MINIMUM DISTANCE ENFORCEMENT (absolute guard) ════════════════
-        if pos_side == "long":
-            max_allowed = price - min_dist
-            if new_sl > max_allowed:
-                new_sl = max_allowed
-        else:
-            min_allowed = price + min_dist
-            if new_sl < min_allowed:
-                new_sl = min_allowed
-
-        # ═══ RATCHET: SL may only improve ════════════════════════════════
-        min_move = QCfg.TRAIL_MIN_MOVE_ATR() * atr
-        if pos_side == "long":
-            if new_sl <= current_sl + min_move:
-                if hold_reason is not None:
-                    hold_reason.append(f"RATCHET new={new_sl:.1f} <= sl+min_move={current_sl+min_move:.1f}")
-                return None
-        else:
-            if new_sl >= current_sl - min_move:
-                if hold_reason is not None:
-                    hold_reason.append(f"RATCHET new={new_sl:.1f} >= sl-min_move={current_sl-min_move:.1f}")
-                return None
-
-        return new_sl
-
-# ═══════════════════════════════════════════════════════════════
-# ICT STRUCTURE TRAIL — inline, no external dependency
-# Pure ICT logic: BOS, CHoCH, OBs, FVGs, swing structure only.
-# No AMD phase logic, no external file, always available.
-# ═══════════════════════════════════════════════════════════════
-
 def _ict_find_swings_inline(candles: list, lookback: int):
     """Find swing highs and lows from a candle list."""
     if len(candles) < 3 or lookback < 1:
@@ -4489,7 +3479,6 @@ class QuantStrategy:
         self._htf = HTFTrendFilter()
         self._adx = ADXEngine()
         self._regime = RegimeClassifier()
-        self._breakout = BreakoutDetector()  # v4.6: fast breakout detection
         # v4.8: ICT/SMC structural confluence engine
         self._ict = ICTEngine() if _ICT_AVAILABLE else None
         # DirectionEngine — owns hunt prediction, post-sweep eval, pool-hit gate.
@@ -4498,16 +3487,7 @@ class QuantStrategy:
         self._dir_engine: Optional[object] = (
             DirectionEngine() if _DIRECTION_ENGINE_AVAILABLE else None)
         # v5.0: ICT Sweep-and-Go institutional engine
-        self._sweep_detector: Optional[object] = (
-            ICTSweepDetector() if _ICT_TRADE_ENGINE_AVAILABLE else None)
-        self._active_sweep_setup: Optional[object] = None  # ICTSweepSetup | None
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
-        self._pending_hunt_signal = None   # hunt signal for _compute_sl_tp (Tier-L path)
-        self._confirm_trend_long = 0; self._confirm_trend_short = 0
-        self._confirm_flow_long = 0; self._confirm_flow_short = 0
-        self._last_flow_entry_time = 0.0
-        self._flow_tick_streak = 0       # consecutive extreme tick flow readings
-        self._flow_tick_direction = ""   # "long" | "short" | ""
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
@@ -4518,9 +3498,7 @@ class QuantStrategy:
         # They are only reset when: (a) a hunt entry fires, (b) the hunt signal
         # is None / expired (checked in the routing block each tick), or
         # (c) _enter_trade() resets all state after a confirmed fill.
-        self._confirm_hunt_long = 0; self._confirm_hunt_short = 0
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
-        self._last_momentum_attempt = 0.0   # cooldown after any retest attempt (pass or fail)
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
@@ -4559,26 +3537,13 @@ class QuantStrategy:
         self._last_data_warn       = 0.0
         self._last_atr_warn        = 0.0
         self._last_price_warn      = 0.0
-        self._last_bo_block_log    = 0.0
-        self._last_ict_gate_log    = 0.0
         self._last_trail_block_log = 0.0
         # v6.0: Structure-event-driven trail variables
         self._last_trail_check_price    = 0.0   # price at last trail computation
         self._last_trail_rest_time      = 0.0   # timestamp of last successful trail REST move
         self._last_structure_fingerprint = None  # structural state fingerprint for change detection
         self._last_maxhold_check   = 0.0
-        # Bug-3 fix: path-specific ICT gate block timers.
-        # The original single shared pair (_ict_gate_start_time / _ict_gate_alerted)
-        # was used by reversion, momentum, and trend paths simultaneously.
-        # When the reversion path passed and reset the timer, the momentum path's
-        # accumulated block time was silently lost, preventing the 15-min Telegram
-        # alert from ever firing when the bot was stuck for hours.
-        self._ict_gate_start_time_rev   = 0.0   # reversion path
-        self._ict_gate_alerted_rev      = False
-        self._ict_gate_start_time_mom   = 0.0   # momentum retest path
-        self._ict_gate_alerted_mom      = False
-        self._ict_gate_start_time_trend = 0.0   # trend pullback path
-        self._ict_gate_alerted_trend    = False
+
 
         # -- v9.0: New liquidity-first engines --
         self._liq_map = LiquidityMap() if _LIQ_MAP_AVAILABLE else None
@@ -4648,54 +3613,21 @@ class QuantStrategy:
 
     def _log_init(self):
         logger.info("=" * 72)
-        logger.info("⚡ QuantStrategy v9.0 — LIQUIDITY-FIRST")
+        logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-        # Entry engine
-        entry_status = "ACTIVE (LiquidityMap → FlowDetector → EntryEngine)" if _ENTRY_ENGINE_AVAILABLE else "LEGACY (entry_engine.py not found)"
-        logger.info(f"   Entry Engine: {entry_status}")
-        # Liquidity map
-        liq_status = "ACTIVE (multi-TF pool scanner, pool priority, sweep detection)" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE (liquidity_map.py not found)"
+        entry_status = "ACTIVE (LiquidityMap → EntryEngine → ConvictionFilter)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
+        logger.info(f"   Entry: {entry_status}")
+        liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   LiquidityMap: {liq_status}")
-        # ICT engine
-        ict_status = "DISABLED (ict_engine.py not found)"
-        if self._ict:
-            ict_status = (
-                f"ENABLED | ZoneFreeze={QCfg.ICT_ZONE_FREEZE_ENABLED()} "
-                f"OBanchor={QCfg.ICT_OB_SL_ANCHOR()} "
-                f"LiqCeiling={QCfg.ICT_LIQ_CEILING_ENABLED()}"
-            )
+        ict_status = "ENABLED" if self._ict else "DISABLED"
         logger.info(f"   ICT Engine: {ict_status}")
-        # Direction engine
-        dir_status = (
-            "ACTIVE (10-factor hunt prediction | post-sweep eval | pool-hit gate)"
-            if self._dir_engine is not None
-            else "UNAVAILABLE (direction_engine.py not found)"
-        )
+        dir_status = "ACTIVE" if self._dir_engine else "UNAVAILABLE"
         logger.info(f"   DirectionEngine: {dir_status}")
-        # Trail
-        # Trail
-        trail_status = "InstitutionalLiquidityTrail v7.0 (pool anchor -> dyn buffer -> HTF floor -> BOS gate; chandelier fallback)"
-        logger.info(f"   Trail: {trail_status}")
-        # Conviction gate (Issue-4)
-        conv_status = (
-            "ACTIVE (7-factor gate: pool-TF ≥ 15m, DR-valid, displacement, CISD, OTE, session, AMD | score ≥ 0.75)"
-            if self._conviction is not None
-            else "UNAVAILABLE (conviction_filter.py not found — entries ungated)"
-        )
+        conv_status = "ACTIVE" if self._conviction else "UNAVAILABLE"
         logger.info(f"   ConvictionGate: {conv_status}")
-        # Liquidity trail (Issue-3)
-        liq_trail_status = (
-            "ACTIVE (swept-pool anchor → unswept-pool anchor → chandelier fallback | Asia disabled)"
-            if self._liq_trail is not None
-            else "UNAVAILABLE (liquidity_trail.py not found — chandelier trail only)"
-        )
-        logger.info(f"   LiquidityTrail: {liq_trail_status}")
-        # Post-trade agent
-        pta_status = (
-            "ACTIVE (5-dim: geometry/entry/causation/Bayesian/IC | Telegram debrief)"
-            if self._post_trade_agent is not None
-            else "UNAVAILABLE (post_trade_agent.py not found)"
-        )
+        liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
+        logger.info(f"   LiquidityTrail: {liq_trail}")
+        pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
         logger.info(f"   PostTradeAgent: {pta_status}")
         logger.info("=" * 72)
 
@@ -4719,18 +3651,7 @@ class QuantStrategy:
             self._atr_1m.soft_reset()   # preserves ATR value; re-seeds from next batch
             self._atr_5m.soft_reset()   # same — avoids 75-min silence after reconnect
             self._adx.reset_state()
-            self._breakout.reset_state()
             if self._ict: self._ict.reset_state()
-            if self._sweep_detector is not None:
-                self._sweep_detector.invalidate()
-            self._active_sweep_setup = None
-            self._pending_hunt_signal = None
-            # Clear any open DirectionEngine post-sweep state so evidence from
-            # before the reconnect doesn't bleed into the first new setup.
-            # BUG-4 FIX: use the public clear_sweep() API instead of directly
-            # nulling the private _ps_state attribute.  Direct mutation bypasses
-            # any invariants (e.g. _ps_state_quality reset) that clear_sweep()
-            # maintains, and silently breaks if DirectionEngine renames the attr.
             if self._dir_engine is not None:
                 try:
                     self._dir_engine.clear_sweep()
@@ -4777,41 +3698,6 @@ class QuantStrategy:
             return True, ratio
         except Exception:
             return True, 0.0
-
-    def _get_quant_helpers(self, sig, side: str) -> Optional['QuantHelperSignals']:
-        """
-        Build a QuantHelperSignals snapshot from the current SignalBreakdown.
-
-        This packages the quant signals that ICTEntryGate uses as SOFT HELPERS
-        (not hard gates) when evaluating ICT sweep entries. For standard Tier-B
-        entries, these signals become required gates within ICTEntryGate itself.
-
-        Returns None if _ICT_TRADE_ENGINE_AVAILABLE is False.
-        """
-        if not _ICT_TRADE_ENGINE_AVAILABLE:
-            return None
-        try:
-            # BUG-HTF-VETO-DIRECTION FIX: sig.htf_veto is computed at signal time
-            # for self._vwap.reversion_side(price) — the VWAP direction.  When
-            # side is a sweep direction (opposite of VWAP), passing sig.htf_veto
-            # gives the wrong direction's veto to ICTEntryGate. Recompute for
-            # the actual entry side so the gate sees the correct structural opposition.
-            _htf_veto_for_side = self._htf.vetoes_trade(side)
-            return QuantHelperSignals(
-                tick_flow    = self._tick_eng.get_signal(),
-                cvd_trend    = self._cvd.get_trend_signal(),
-                vwap_dev     = sig.deviation_atr,
-                n_confirming = sig.n_confirming,
-                composite    = sig.composite,
-                regime_ok    = sig.regime_ok,
-                htf_veto     = _htf_veto_for_side,
-                adx          = sig.adx,
-                overextended = sig.overextended,
-                htf_15m      = self._htf.trend_15m,
-                htf_4h       = self._htf.trend_4h,
-            )
-        except Exception:
-            return None
 
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
         # ── Bug 1 fix: locked section is non-blocking — only state reads/writes.
@@ -5114,8 +4000,6 @@ class QuantStrategy:
         regime = self._regime.update(
             self._adx, self._atr_5m, self._htf,
             vwap_dev_atr=self._vwap.deviation_atr if hasattr(self._vwap, 'deviation_atr') else 0.0,
-            breakout_active=self._breakout.is_active if hasattr(self, '_breakout') else False,
-            breakout_dir=self._breakout.direction if hasattr(self, '_breakout') and self._breakout.is_active else "",
         )
 
         # ── Regime-adaptive weights (v7.0) ────────────────────────────────────
@@ -5214,6 +4098,7 @@ class QuantStrategy:
     def _log_thinking(self, sig, price, now):
         if now - self._last_think_log < self._think_interval: return
         self._last_think_log = now
+
         def bar(v, w=12):
             h=w//2; f=min(int(abs(v)*h+0.5),h)
             return (" "*h+"█"*f+"░"*(h-f)) if v>=0 else ("░"*(h-f)+"█"*f+" "*h)
@@ -5222,633 +4107,111 @@ class QuantStrategy:
             return f"  {l:<6} {bar(v)} {a} {v:+.3f}"
 
         c   = sig.composite
-        thr = QCfg.COMPOSITE_ENTRY_MIN()
         regime_lbl = sig.market_regime
-
-        # ── Determine the active routing path (B2/B8 fix) ────────────────────
-        # _log_thinking previously computed only the reversion all-pass check,
-        # then displayed "👀 Watching" regardless of which path was actually
-        # active.  In TRENDING regime the bot routes to _evaluate_trend_entry —
-        # the reversion composite gate shown was never the actual blocker.
-        _has_sweep_entry = (
-            _ICT_TRADE_ENGINE_AVAILABLE and
-            QCfg.ICT_SWEEP_ENTRY_ENABLED() and
-            self._active_sweep_setup is not None and
-            self._active_sweep_setup.status == "OTE_READY"
-        )
-        if _has_sweep_entry:
-            _routing_path = "sweep"
-        elif self._breakout.is_active and self._breakout.retest_ready:
-            _routing_path = "momentum"
-        elif self._regime.is_trending():
-            _routing_path = "trend"
-        else:
-            _routing_path = "reversion"
-
-        # ── Sweep setup display ───────────────────────────────────────────
-        _sweep_line = ""
-        if self._active_sweep_setup is not None:
-            ss = self._active_sweep_setup
-            _sweep_line = (
-                f"🏛️ SWEEP {ss.side.upper()} [{ss.status}] "
-                f"OTE=[${ss.ote_entry_zone_low:.0f}–${ss.ote_entry_zone_high:.0f}] "
-                f"SL=${ss.sl_sweep_candle:.0f} "
-                f"AMD_conf={ss.amd_confidence:.2f} "
-                f"q={ss.quality_score():.2f}")
-
-        # ── Quant helper signals (display only — not gate logic here) ─────
-        # Bug-5/7 fix: the Composite gate line used QCfg.COMPOSITE_ENTRY_MIN()
-        # (0.350) as its displayed threshold, but the actual Tier-B gate in
-        # ICTEntryGate uses TIER_B_COMPOSITE_MIN (0.30). Logs showed entries
-        # "blocked at ±0.350" while the real block was at 0.30 — diagnostic
-        # confusion.  Use the real gate constant here for the display tick mark.
-        _tierb_thr = (ICTEntryGate.TIER_B_COMPOSITE_MIN
-                      if _ICT_TRADE_ENGINE_AVAILABLE else thr)
-        gates = [
-            f"{'✅' if sig.overextended else '⚪'} Overextended ({sig.deviation_atr:+.1f} ATR)  [quant-scout: VWAP deviation]",
-            f"{'✅' if sig.regime_ok else '❌'} Regime ({sig.atr_pct:.0%})  [ATR percentile gate]",
-            f"⚪ HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f}) [info only — not a gate]",
-            f"{'✅' if sig.n_confirming>=3 else '⚪'} Quant Confluence ({sig.n_confirming}/5) [scout: n_conf]",
-            f"{'✅' if abs(c)>=_tierb_thr else '⚪'} Composite ({c:+.3f} vs ±{_tierb_thr:.3f}) [scout: order-flow]",
-        ]
-
-        # ── ICT tier gate display (B1 + B6 fix) ──────────────────────────
-        if self._ict is not None:
-            if self._ict._initialized:
-                _ict_scores_valid = (sig.ict_ob + sig.ict_fvg + sig.ict_sweep + sig.ict_session) > 0.0
-                if _ict_scores_valid:
-                    # G FIX: sig.ict_* may hold scores computed for the OPPOSITE
-                    # direction (e.g. AMD bearish → ict_side=SHORT, but we are
-                    # evaluating a LONG reversion).  If we pass those scores to
-                    # ICTEntryGate.evaluate("long", sig, ...) the gate reads SHORT
-                    # confluence as LONG support — potentially passing a tier check
-                    # that should fail, or showing a misleading BLOCKED reason.
-                    #
-                    # Fix: when ict_direction opposes reversion_side, re-compute
-                    # ICT confluence for reversion_side locally for this display call.
-                    # We patch sig.ict_* temporarily (single-threaded tick call),
-                    # evaluate the gate, then restore the originals.  sig.composite
-                    # and sig.ict_boost_signed are NOT touched — they reflect the
-                    # directional boost correctly applied in _evaluate_entry.
-                    _disp_rev_side = sig.reversion_side or "long"
-                    _ict_dir_vs_vwap = sig.ict_direction  # +1=long, -1=short, 0=unset
-                    _ict_opposes_disp = (
-                        (_ict_dir_vs_vwap < 0 and _disp_rev_side == "long") or
-                        (_ict_dir_vs_vwap > 0 and _disp_rev_side == "short")
-                    )
-
-                    # Save originals for restore; also initialise display values to
-                    # originals so the no-recompute path falls through unchanged.
-                    _orig_ict_ob    = sig.ict_ob
-                    _orig_ict_fvg   = sig.ict_fvg
-                    _orig_ict_sweep = sig.ict_sweep
-                    _orig_ict_sess  = sig.ict_session
-                    _orig_ict_total = sig.ict_total
-                    _orig_ict_det   = sig.ict_details
-                    _disp_note      = ""
-
-                    # H FIX: Track display scores separately so we can show the
-                    # re-computed values in the label AFTER restoring originals.
-                    # Without this, ict_gate_lbl used sig.ict_total (restored SHORT)
-                    # while the tier label came from LONG evaluation — displaying
-                    # "Σ=0.52 [disp re-comp for LONG]" where 0.52 was the SHORT score.
-                    _disp_ict_total = _orig_ict_total
-                    _disp_ict_ob    = _orig_ict_ob
-                    _disp_ict_fvg   = _orig_ict_fvg
-                    _disp_ict_sweep = _orig_ict_sweep
-                    _disp_ict_sess  = _orig_ict_sess
-
-                    # STACK/RISK DISPLAY FIX: Stack and RevRisk display lines read
-                    # from sig.ict_mtf_ob_count / sig.ict_fvg_stack_count which were
-                    # set from the PRIMARY (ICT-side) confluence call. When ICT and
-                    # VWAP directions conflict and _rc is computed for the VWAP side,
-                    # the gate display shows re-computed FVG=0.67 while the Stack
-                    # still shows 0FVG from the original side — contradictory.
-                    # Fix: track display versions of all advanced fields and update
-                    # them from _rc when re-computing, without touching sig fields
-                    # that should remain from the authoritative primary computation.
-                    _disp_mtf_ob        = sig.ict_mtf_ob_count
-                    _disp_fvg_stack     = sig.ict_fvg_stack_count
-                    _disp_rev_risk      = sig.ict_htf_reversal_risk
-                    _disp_rev_zone_near = sig.ict_htf_rev_zone_near
-                    _disp_chain_score   = sig.ict_chain_score
-                    _disp_ssl_atr       = sig.ict_nearest_ssl_atr
-                    _disp_bsl_atr       = sig.ict_nearest_bsl_atr
-
-                    if _ict_opposes_disp:
-                        try:
-                            _now_ms_d = int(now * 1000) if now < 1e12 else int(now)
-                            _rc = self._ict.get_confluence(
-                                _disp_rev_side, price, _now_ms_d, atr=sig.atr)
-                            # Patch sig so the ICTEntryGate evaluation reads
-                            # correctly-directed scores
-                            sig.ict_ob      = _rc.ob_score
-                            sig.ict_fvg     = _rc.fvg_score
-                            sig.ict_sweep   = _rc.sweep_score
-                            sig.ict_session = _rc.session_score
-                            sig.ict_total   = _rc.total
-                            sig.ict_details = _rc.details
-                            # H FIX: save re-computed values for display — these
-                            # will survive the restore below
-                            _disp_ict_total = _rc.total
-                            _disp_ict_ob    = _rc.ob_score
-                            _disp_ict_fvg   = _rc.fvg_score
-                            _disp_ict_sweep = _rc.sweep_score
-                            _disp_ict_sess  = _rc.session_score
-                            _disp_note = f" [disp re-comp for {_disp_rev_side.upper()}]"
-                            # STACK/RISK DISPLAY: update display vars from _rc
-                            # so Stack, RevRisk, and RevZone reflect the same side
-                            # as the FVG/OB scores shown in the gate line
-                            _disp_mtf_ob        = _rc.mtf_ob_count
-                            _disp_fvg_stack     = _rc.fvg_stack_count
-                            _disp_rev_risk      = _rc.htf_reversal_risk
-                            _disp_rev_zone_near = (
-                                getattr(_rc, 'judas_swing_active', False) or
-                                _rc.htf_reversal_risk > (0.90 if sig.adx < 25.0 else 0.55)
-                            )
-                            _disp_chain_score   = sig.ict_chain_score  # chain = AMD side, unchanged
-                            _disp_ssl_atr       = _rc.nearest_ssl_dist_atr
-                            _disp_bsl_atr       = _rc.nearest_bsl_dist_atr
-                        except Exception:
-                            pass  # fall through: display original scores with a warning
-
-                    _tier_display = "B"
-                    _tier_reason_d = ""
-                    if _ICT_TRADE_ENGINE_AVAILABLE:
-                        try:
-                            _qh_d = self._get_quant_helpers(sig, _disp_rev_side)
-                            _td, _, _tdr = ICTEntryGate.evaluate(
-                                _disp_rev_side, sig,
-                                self._active_sweep_setup, price, _qh_d,
-                                mode="reversion", market_regime=sig.market_regime,
-                                ict_engine=self._ict)
-                            _tier_display  = _td
-                            _tier_reason_d = _tdr
-                        except Exception:
-                            _tier_display  = "?"
-                            _tier_reason_d = ""
-
-                    # Restore originals — must happen before any further sig use
-                    sig.ict_ob      = _orig_ict_ob
-                    sig.ict_fvg     = _orig_ict_fvg
-                    sig.ict_sweep   = _orig_ict_sweep
-                    sig.ict_session = _orig_ict_sess
-                    sig.ict_total   = _orig_ict_total
-                    sig.ict_details = _orig_ict_det
-
-                    _tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
-                                   "BLOCKED": "⛔", "?": "❓"}
-
-                    # B1 FIX: show the signed ICT direction (from _evaluate_entry)
-                    # so the arrow reflects the composite contribution direction.
-                    _ict_dir_arrow = ("▲LONG"  if sig.ict_direction > 0
-                                      else ("▼SHORT" if sig.ict_direction < 0
-                                            else "─UNSET"))
-                    _boost_str = f"{sig.ict_boost_signed:+.3f}" if sig.ict_direction != 0 else "n/a"
-
-                    # B6 FIX + H FIX: use _disp_ict_* which holds either the
-                    # re-computed entry-side scores (when recompute succeeded) or
-                    # the original scores (when recompute was skipped / failed).
-                    # This ensures Σ and sub-scores always match the tier label
-                    # direction — previously the restored SHORT total was shown
-                    # next to a LONG tier label after re-computation.
-                    _ob_norm  = min(_disp_ict_ob  / 2.0, 1.0)
-                    _fvg_norm = min(_disp_ict_fvg / 1.5, 1.0)
-
-                    ict_gate_lbl = (
-                        f"{_tier_icons.get(_tier_display,'❓')} ICT [{_tier_display}]{_disp_note} "
-                        f"Σ={_disp_ict_total:.2f} ({_ict_dir_arrow} boost={_boost_str}) "
-                        f"[OB={_ob_norm:.2f}({_disp_ict_ob:.1f}raw) "
-                        f"FVG={_fvg_norm:.2f}({_disp_ict_fvg:.1f}raw) "
-                        f"Swp={_disp_ict_sweep:.1f} KZ={_disp_ict_sess:.1f}]"
-                    )
-                    if _tier_reason_d:
-                        ict_gate_lbl += f"\n    {_tier_reason_d}"
-                else:
-                    ict_gate_lbl = "📋 ICT (ACTIVE position — not updated)"
-                gates.append(ict_gate_lbl)
-            else:
-                gates.append("⏳ ICT (initializing...)")
-
-        # ── AMD phase + MTF ───────────────────────────────────────────────
-        if self._ict is not None and self._ict._initialized:
-            amd_icon = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
-                        "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
-                        "ACCUMULATION": "💤"}.get(sig.amd_phase, "❓")
-            bias_icon = "🟢" if sig.amd_bias == "bullish" else (
-                        "🔴" if sig.amd_bias == "bearish" else "⚪")
-            # AMD line — include delivery target and Judas flag if active
-            _amd_line = (
-                f"{amd_icon} AMD: {sig.amd_phase} {bias_icon}{sig.amd_bias} "
-                f"conf={sig.amd_conf:.2f} | {sig.mtf_details}")
-            if sig.ict_delivery_target > 0:
-                _dt_dist_atr = (abs(sig.ict_delivery_target - price) / sig.atr
-                                if sig.atr > 0 else 0.0)
-                _amd_line += (
-                    f" | 🎯TARGET=${sig.ict_delivery_target:,.0f}"
-                    f"({_dt_dist_atr:.1f}ATR,conf={sig.ict_delivery_conf:.2f})")
-            if sig.ict_judas_active:
-                _amd_line += " | ⚡JUDAS_ACTIVE"
-            gates.append(_amd_line)
-
-            # PD matrix — premium/discount across all TFs
-            pd_icon = "💰DISC" if sig.in_discount else (
-                      "💎PREM" if sig.in_premium  else "〰️EQ")
-            _pd_line = f"🗺️ MTF: {'✅ALIGNED' if sig.mtf_aligned else '❌SPLIT'} {pd_icon}"
-            if sig.ict_pd_matrix:
-                _pd_line += f"  PD:[{sig.ict_pd_matrix}]"
-            gates.append(_pd_line)
-
-            # Advanced structural context line (session quality, chain, reversal risk)
-            _adv_parts = []
-            if sig.ict_session_entry_q:
-                _eq_icon = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🟠",
-                            "AVOID": "🔴"}.get(sig.ict_session_entry_q, "⚪")
-                _adv_parts.append(f"Session:{_eq_icon}{sig.ict_session_entry_q}")
-            # Use _disp_* variables which reflect the re-computed side when applicable.
-            # This ensures Stack, RevRisk and SSL/BSL distances match the same side
-            # as the FVG/OB scores in the gate line (no more "FVG=0.67 but Stack:0FVG").
-            # Bug-4 fix: use locals() instead of dir().  dir() includes class/instance
-            # attrs and has implementation-defined semantics for locals — locals() is
-            # the correct stdlib idiom to probe whether a name was assigned in the
-            # current frame.  The _disp_* vars are set unconditionally inside the
-            # _ict_scores_valid block above, so they are always present here when
-            # that block ran; the fallback path is only hit when ICT is uninitialized.
-            _d_chain   = locals().get('_disp_chain_score',   sig.ict_chain_score)
-            _d_ob      = locals().get('_disp_mtf_ob',        sig.ict_mtf_ob_count)
-            _d_fvg     = locals().get('_disp_fvg_stack',     sig.ict_fvg_stack_count)
-            _d_rr      = locals().get('_disp_rev_risk',      sig.ict_htf_reversal_risk)
-            _d_rz      = locals().get('_disp_rev_zone_near', sig.ict_htf_rev_zone_near)
-            _d_ssl     = locals().get('_disp_ssl_atr',       sig.ict_nearest_ssl_atr)
-            _d_bsl     = locals().get('_disp_bsl_atr',       sig.ict_nearest_bsl_atr)
-            if _d_chain > 0:
-                _adv_parts.append(f"Chain={_d_chain:.2f}")
-            if _d_ob > 0 or _d_fvg > 0:
-                _adv_parts.append(f"Stack:{_d_ob}OB+{_d_fvg}FVG")
-            if _d_rr > 0.40:
-                _adv_parts.append(f"⚠️RevRisk={_d_rr:.2f}")
-            if _d_rz:
-                _adv_parts.append("🚧HTF_REV_ZONE<1ATR")
-            if _d_ssl > 0:
-                _adv_parts.append(f"SSL↓{_d_ssl:.1f}ATR")
-            if _d_bsl > 0:
-                _adv_parts.append(f"BSL↑{_d_bsl:.1f}ATR")
-            if _adv_parts:
-                gates.append(f"🔬 ICT: {' | '.join(_adv_parts)}")
-
-        gates.append(f"📊 {regime_lbl} | ADX={sig.adx:.1f} | TrendΣ={sig.trend_score:+.3f}")
-
-        # ── B2/B8 FIX: routing-aware all-pass and status label ────────────
-        # Previously the all-pass check and "👀 Watching" label always showed
-        # reversion gates regardless of which path (_evaluate_trend_entry,
-        # _evaluate_momentum_entry, etc.) was actually active.  Now we surface
-        # the real blocker for the path currently being evaluated.
-        _ict_init = self._ict is not None and self._ict._initialized
-        ap       = False
-        _status  = "👀 Watching"
-
-        if _routing_path == "trend":
-            t_side   = self._regime.trend_side() or "?"
-            cvd_bias = self._cvd.get_trend_signal()
-            tf_sig   = self._tick_eng.get_signal()
-            _cvd_ok  = (cvd_bias >= QCfg.TREND_CVD_MIN()
-                        if t_side == "long"
-                        else cvd_bias <= -QCfg.TREND_CVD_MIN())
-            _tick_ok = (tf_sig > -0.30 if t_side == "long" else tf_sig < 0.30)
-            _ts_ok   = (abs(sig.trend_score) >= QCfg.TREND_COMPOSITE_MIN() and
-                        (sig.trend_score > 0 if t_side == "long"
-                         else sig.trend_score < 0))
-            _ict_ok_t = (not _ict_init) or (sig.ict_total >= 0.40)
-            gates.append(f"🔀 ACTIVE PATH: TREND [{t_side.upper()}]")
-            gates.append(
-                f"  {'✅' if _cvd_ok  else '❌'} CVD trend "
-                f"({cvd_bias:+.3f} vs ±{QCfg.TREND_CVD_MIN():.2f})")
-            gates.append(
-                f"  {'✅' if _tick_ok else '❌'} Tick flow "
-                f"({tf_sig:+.3f} vs ±0.30)")
-            gates.append(
-                f"  {'✅' if _ts_ok   else '❌'} Trend score "
-                f"({sig.trend_score:+.3f} vs ±{QCfg.TREND_COMPOSITE_MIN():.2f})")
-            ap = _cvd_ok and _tick_ok and _ts_ok and _ict_ok_t
-            _status = ("🎯 ENTRY READY" if ap
-                       else f"⏳ TREND WAIT [{t_side.upper()}] — EMA pullback")
-
-        elif _routing_path == "momentum":
-            gates.append(
-                f"🔀 ACTIVE PATH: MOMENTUM RETEST [{self._breakout.direction}]")
-            ap      = True   # momentum path manages its own confirm counter
-            _status = f"⏳ MOMENTUM RETEST ({self._breakout.direction})"
-
-        elif _routing_path == "sweep":
-            gates.append(
-                f"🔀 ACTIVE PATH: SWEEP OTE [{self._active_sweep_setup.side.upper()}]")
-            ap      = True
-            _status = (f"🏛️ SWEEP OTE "
-                       f"[{self._active_sweep_setup.side.upper()}] "
-                       f"q={self._active_sweep_setup.quality_score():.2f}")
-
-        else:
-            # Reversion path
-            # E FIX: also detect ICT/VWAP direction mismatch so the display is
-            # explicit about the conflict instead of silently confusing.
-            _ict_dir_disp = sig.ict_direction   # +1=long, -1=short, 0=unset
-            _ict_rev_side = sig.reversion_side or "long"
-            _ict_vs_vwap_conflict = (
-                (_ict_dir_disp < 0 and _ict_rev_side == "long") or
-                (_ict_dir_disp > 0 and _ict_rev_side == "short")
-            )
-            if _ict_vs_vwap_conflict:
-                _conflict_lbl = (
-                    "▼SHORT" if _ict_dir_disp < 0 else "▲LONG")
-                gates.append(
-                    f"⚠️  ICT ({_conflict_lbl}) vs VWAP "
-                    f"({_ict_rev_side.upper()}) — opposite directions; "
-                    f"ICT scores re-computed for {_ict_rev_side.upper()}")
-
-            _ap_reason = ""
-            if _ict_init and _ICT_TRADE_ENGINE_AVAILABLE:
-                try:
-                    _qh_ap = self._get_quant_helpers(sig, _ict_rev_side)
-                    # D FIX: capture reason so we can surface it in _status
-                    # instead of the generic "👀 Watching" that obscures ICT blocks.
-                    _ap_tier, _, _ap_reason = ICTEntryGate.evaluate(
-                        _ict_rev_side, sig,
-                        self._active_sweep_setup, price, _qh_ap,
-                        mode="reversion", market_regime=sig.market_regime,
-                        ict_engine=self._ict)
-                    ap = _ap_tier in ("S", "A", "B")
-                    # FIX Bug-3: ICTEntryGate passed but breakout would block in
-                    # _evaluate_entry — display must reflect the same gate.
-                    # Without this, "🎯 ENTRY READY" appeared even when the next
-                    # line logged "🚫 Breakout blocks SHORT/LONG reversion".
-                    if ap and self._breakout.blocks_reversion(_ict_rev_side):
-                        ap = False
-                        _bo_dir = self._breakout.direction.upper()
-                        _ap_reason = f"BREAKOUT_BLOCK_{_bo_dir}"
-
-                    # DISPLAY-SYNC FIX: mirror the HTF_REV_ZONE pre-gate that fires
-                    # first in _evaluate_reversion_entry(). Without this, the status
-                    # box shows "MANIP_no_confirmed_sweep" while the actual first block
-                    # executed is HTF_REV_ZONE — misleading to read in the logs.
-                    # Note: _is_ote_sweep check matches the condition in _evaluate_entry.
-                    _disp_is_ote = (
-                        _ICT_TRADE_ENGINE_AVAILABLE and
-                        self._active_sweep_setup is not None and
-                        self._active_sweep_setup.status == "OTE_READY"
-                    )
-                    if (not ap and
-                            sig.ict_htf_rev_zone_near and
-                            not _disp_is_ote and
-                            sig.ict_htf_reversal_risk > (0.90 if sig.adx < 25.0 else 0.55)):
-                        _ap_reason = (
-                            f"HTF_REV_ZONE(risk={sig.ict_htf_reversal_risk:.2f},"
-                            f"zone<1ATR)")
-                except Exception:
-                    ap = False
-            else:
-                # FIX: Use the minimum ADX-adaptive floor (0.12) for display consistency.
-                # HTF veto removed from gate — informational only.
-                _ict_ok = (not _ict_init) or (sig.ict_total >= 0.12)
-                ap = (sig.overextended and sig.regime_ok and
-                      sig.n_confirming >= 3 and abs(c) >= thr and _ict_ok)
-                # FIX Bug-3 (non-ICT path): same breakout gate
-                if ap and self._breakout.blocks_reversion(_ict_rev_side):
-                    ap = False
-                    _ap_reason = f"BREAKOUT_BLOCK_{self._breakout.direction.upper()}"
-
-            # D FIX: surface the real block reason — "👀 Watching" implied
-            # passive state; when ICT hard-blocks the status must say so.
-            if ap:
-                _status = "🎯 ENTRY READY"
-            elif _ap_reason and _ap_reason not in ("no_ict", ""):
-                _status = f"⛔ ICT BLOCKED — {_ap_reason}"
-            else:
-                _status = "👀 Watching"
-
-        cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
+        atr = sig.atr if sig.atr > 1e-10 else 1.0
         _in_pos = self._pos.is_active()
 
         if _in_pos:
-            # ════════════════════════════════════════════════════════════════
-            # IN-POSITION MONITOR — shows ONLY what is actually managing the
-            # position: _DynamicStructureTrail (BOS/CHoCH/phase/R-multiples).
-            # Old quant-scout gates (VWAP/CVD/composite/n_confirming) are NOT
-            # shown here because they play zero role once we are in a trade.
-            # ════════════════════════════════════════════════════════════════
-            # BUG-FIX: _log_thinking has no `atr` parameter; pull it from the
-            # signal object so every downstream reference is defined.
-            atr       = sig.atr if sig.atr > 1e-10 else 1.0
-            pos       = self._pos
+            pos = self._pos
             profit_pts = ((price - pos.entry_price) if pos.side == "long"
                           else (pos.entry_price - price))
-            init_dist  = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
-            cur_r      = profit_pts / init_dist if init_dist > 1e-10 else 0.0
-            peak_r     = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
-            mfe_r      = max(cur_r, peak_r)
+            init_dist = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+            cur_r = profit_pts / init_dist if init_dist > 1e-10 else 0.0
+            peak_r = pos.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r = max(cur_r, peak_r)
 
-            # ── BOS count and CHoCH from the live ICT engine ─────────────
             _now_ms_disp = int(now * 1000) if now > 0 else int(time.time() * 1000)
-            bos_cnt   = 0
-            choch_tf  = None
-            choch_lvl = 0.0
+            bos_cnt = 0
+            choch_tf = None; choch_lvl = 0.0
             if self._ict is not None:
                 try:
-                    bos_cnt = _DynamicStructureTrail._bos_count(
-                        self._ict, pos.side, _now_ms_disp)
-                    choch_tf, choch_lvl = _DynamicStructureTrail._choch(
-                        self._ict, pos.side)
-                except Exception:
-                    pass
+                    bos_cnt = _DynamicStructureTrail._bos_count(self._ict, pos.side, _now_ms_disp)
+                    choch_tf, choch_lvl = _DynamicStructureTrail._choch(self._ict, pos.side)
+                except Exception: pass
             choch_active = choch_tf is not None and choch_lvl > 0.0
 
-            # ── Break-even lock ───────────────────────────────────────────
             _be_price = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
-            be_locked = ((pos.side == "long"  and pos.sl_price >= _be_price) or
+            be_locked = ((pos.side == "long" and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
-            # ── Trail phase (v6.0: derived from tier, not old _phase method) ─
-            # The _DynamicStructureTrail uses continuous tier-based logic, not discrete
-            # phases. Map tier to meaningful labels for display.
-            if mfe_r >= 2.0:
-                trail_phase = 3
-            elif mfe_r >= 1.0:
-                trail_phase = 2
-            elif mfe_r >= 0.40:
-                trail_phase = 1
-            elif mfe_r >= 0.10:
-                trail_phase = 0  # chandelier active but early
-            else:
-                trail_phase = -1  # below activation threshold
+            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
+            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURE ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE FLOOR ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — CHANDELIER ({mfe_r:.2f}R)"
+            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
 
-            # v6.0: Dynamic phase labels reflecting actual trail state
-            if trail_phase == 3:
-                phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE STRUCTURE TRAIL (R={mfe_r:.2f}R, tight to 1m/5m)"
-            elif trail_phase == 2:
-                if choch_active:
-                    phase_lbl = f"🟠 PHASE 2 — CHoCH TIGHTEN  (CHoCH@${choch_lvl:.0f} [{choch_tf}])"
-                elif bos_cnt >= 2:
-                    phase_lbl = f"🟠 PHASE 2 — BOS SWING TRAIL (bos={bos_cnt})"
-                else:
-                    phase_lbl = f"🟠 PHASE 2 — STRUCTURE + CHANDELIER (R={mfe_r:.2f}R)"
-            elif trail_phase == 1:
-                phase_lbl = f"🟡 PHASE 1 — BE FLOOR + CHANDELIER (bos={bos_cnt}, R={mfe_r:.2f}R)"
-            elif trail_phase == 0:
-                phase_lbl = f"⬜ PHASE 0 — CHANDELIER ENVELOPE ACTIVE (R={mfe_r:.2f}R, wide trail)"
-            else:
-                phase_lbl = f"⬜ PHASE 0 — HANDS OFF (R={mfe_r:.2f}R < 0.10R activation)"
-
-            # ── Margin % P&L ───────────────────────────────────────────────
-            _margin_pnl_pct_disp = 0.0
-            _margin_used_disp = 0.0
+            _margin_pnl_pct = 0.0
             try:
                 if pos.entry_price > 0 and pos.quantity > 0:
-                    _notional_d = pos.entry_price * pos.quantity
-                    _lev_d = QCfg.LEVERAGE()
-                    _margin_used_disp = _notional_d / _lev_d if _lev_d > 0 else _notional_d
-                    if _margin_used_disp > 1e-10:
-                        _unrealised_d = profit_pts * pos.quantity
-                        _margin_pnl_pct_disp = (_unrealised_d / _margin_used_disp) * 100.0
-            except Exception:
-                pass
+                    _notional = pos.entry_price * pos.quantity
+                    _margin = _notional / QCfg.LEVERAGE() if QCfg.LEVERAGE() > 0 else _notional
+                    if _margin > 1e-10:
+                        _margin_pnl_pct = (profit_pts * pos.quantity / _margin) * 100.0
+            except Exception: pass
 
-            # ── Ratchet milestone reached ─────────────────────────────────
-            _last_ratchet_r = getattr(pos, 'last_ratchet_r', 0.0)
-            _ratchet_milestones = [2.50, 2.00, 1.50, 1.00, 0.50]
-            _next_ratchet = next(
-                (m for m in _ratchet_milestones if mfe_r < m), None)
-            _next_ratchet_str = (f"{_next_ratchet:.2f}R" if _next_ratchet
-                                 else "all milestones hit")
-
-            # ── Progress bar ──────────────────────────────────────────────
-            _bar_filled = min(int(mfe_r * 4), 16)
-            _prog_bar   = "█" * _bar_filled + "░" * (16 - _bar_filled)
-
-            # ── SL / TP distances ─────────────────────────────────────────
             sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
             tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
+            _bar_filled = min(int(mfe_r * 4), 16)
+            _prog_bar = "█" * _bar_filled + "░" * (16 - _bar_filled)
 
-            # ── AMD and dealing range at a glance ─────────────────────────
             _amd_brief = ""
-            _dr_brief  = ""
             if self._ict is not None and self._ict._initialized:
                 try:
-                    _amd_brief = (
-                        f"{self._ict._amd.phase}  bias={self._ict._amd.bias}"
-                        f"  conf={self._ict._amd.confidence:.2f}")
-                except Exception:
-                    pass
-                try:
-                    _dr = getattr(self._ict, '_dealing_range', None)
-                    if _dr:
-                        _pd = getattr(_dr, 'current_pd', 0.5)
-                        _pd_lbl = ("DEEP DISC" if _pd < 0.25 else
-                                   "DISCOUNT"  if _pd < 0.40 else
-                                   "EQ"        if _pd < 0.60 else
-                                   "PREMIUM"   if _pd < 0.75 else "DEEP PREM")
-                        _dr_brief = f"{_pd_lbl} ({_pd:.0%})  range=[${_dr.low:,.0f}–${_dr.high:,.0f}]"
-                except Exception:
-                    pass
+                    _amd_brief = (f"{self._ict._amd.phase}  bias={self._ict._amd.bias}"
+                                  f"  conf={self._ict._amd.confidence:.2f}")
+                except Exception: pass
 
-            # ── Pool TP target (stored from entry signal) ─────────────────
-            _pool_tp_str = ""
-            _es = getattr(self, '_last_entry_signal', None)
-            if _es is not None:
-                try:
-                    _pt = _es.target_pool
-                    if _pt and hasattr(_pt, 'pool'):
-                        _pool_tp_str = (
-                            f"{_pt.pool.side.value} @ ${_pt.pool.price:,.0f}"
-                            f"  sig={_pt.significance:.2f}")
-                except Exception:
-                    pass
-
-            lines = [
-                f"┌─── 📊 IN-POSITION MONITOR [{pos.side.upper()}] ────────────────────────",
-                f"  Price  ${price:,.2f}  │  ATR={atr:.1f}  │  Hold={now - pos.entry_time:.0f}s",
-                f"  Entry  ${pos.entry_price:,.2f}  SL ${pos.sl_price:,.2f}  TP ${pos.tp_price:,.2f}",
-                f"  SL dist: {sl_dist_atr:.1f}ATR  │  TP dist: {tp_dist_atr:.1f}ATR",
-            ]
-            if _pool_tp_str:
-                lines.append(f"  Pool TP: {_pool_tp_str}")
-            lines += [
-                f"  {'─'*60}",
-                f"  R-PROGRESS:  current={cur_r:+.2f}R  peak(MFE)={mfe_r:.2f}R",
-                f"  [{_prog_bar}] {mfe_r:.2f}R  │  next ratchet @ {_next_ratchet_str}",
-                f"  MARGIN PnL: {_margin_pnl_pct_disp:+.1f}% on ${_margin_used_disp:.2f} margin",
-                f"  {'─'*60}",
-                f"  TRAIL ENGINE: {phase_lbl}",
-                f"  BOS confirmed: {bos_cnt}  │  CHoCH: "
+            lines_out = [
+                f"┌─── 📊 IN-POSITION [{pos.side.upper()}] ────────────────────────",
+                f"  Price ${price:,.2f} │ ATR={atr:.1f} │ Hold={now - pos.entry_time:.0f}s",
+                f"  Entry ${pos.entry_price:,.2f}  SL ${pos.sl_price:,.2f}  TP ${pos.tp_price:,.2f}",
+                f"  SL dist: {sl_dist_atr:.1f}ATR │ TP dist: {tp_dist_atr:.1f}ATR",
+                f"  ─" * 30,
+                f"  R-PROGRESS: current={cur_r:+.2f}R  peak={mfe_r:.2f}R",
+                f"  [{_prog_bar}] {mfe_r:.2f}R │ Margin PnL: {_margin_pnl_pct:+.1f}%",
+                f"  ─" * 30,
+                f"  TRAIL: {phase_lbl}",
+                f"  BOS: {bos_cnt} │ CHoCH: "
                 + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none"),
-                f"  Break-even:  "
-                + ("✅ LOCKED — risk-free trade" if be_locked
-                   else f"❌ not yet  (SL needs to reach ${_be_price:,.2f})"),
+                f"  BE: " + ("✅ LOCKED" if be_locked else f"❌ needs ${_be_price:,.2f}"),
             ]
             if _amd_brief:
-                lines.append(f"  AMD: {_amd_brief}")
-            if _dr_brief:
-                lines.append(f"  Zone: {_dr_brief}")
-            lines.append(f"└{'─'*66}")
-            logger.info("\n" + "\n".join(lines))
-
+                lines_out.append(f"  AMD: {_amd_brief}")
+            lines_out.append(f"└{'─'*60}")
+            logger.info("\n" + "\n".join(lines_out))
         else:
-            # ── SCANNING / IDLE — show quant-scout gate table (unchanged) ──
-            _ict_side_lbl = getattr(sig, '_ict_evaluated_side', sig.reversion_side) or "?"
-            _header = (
-                f"┌─── 🧠 v9 ICT-COMMANDER  ${price:,.2f}  VWAP=${sig.vwap_price:,.2f}"
-                f"  ATR={sig.atr:.1f}  ICT-side={_ict_side_lbl.upper()} ────")
-            lines = [_header]
-            if _sweep_line:
-                lines.append(f"  {_sweep_line}")
-            lines += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
-                      fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
-                      fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
-                      f"  Σ={c:+.4f} | VWAP-side: {sig.reversion_side.upper()}",
-                      f"  ── GATES (⚪=quant-scout, ❌=hard-block) ──"]
+            # SCANNING display
+            engine_state = "SCANNING"
+            if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+                engine_state = self._entry_engine.state
+
+            gates = [
+                f"{'✅' if sig.overextended else '⚪'} Overextended ({sig.deviation_atr:+.1f}ATR)",
+                f"{'✅' if sig.regime_ok else '❌'} ATR Regime ({sig.atr_pct:.0%})",
+                f"⚪ HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
+                f"📊 {regime_lbl} │ ADX={sig.adx:.1f}",
+            ]
+            if self._ict is not None and self._ict._initialized:
+                amd_phase = getattr(self._ict._amd, 'phase', '?') if self._ict._amd else '?'
+                amd_bias = getattr(self._ict._amd, 'bias', '?') if self._ict._amd else '?'
+                gates.append(f"🏛️ AMD: {amd_phase} ({amd_bias})")
+
+            cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
+            header = (f"┌─── 🧠 v10 LIQUIDITY-FIRST  ${price:,.2f}  "
+                      f"VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} ────")
+            lines_out = [header]
+            lines_out += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
+                          fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
+                          fmt("VEX", sig.vol_exhaust), f"  {'─'*42}",
+                          f"  Σ={c:+.4f} │ State: {engine_state}",
+                          f"  ── GATES ──"]
             for g in gates:
-                lines.append(f"  {g}")
-            lines.append(f"  {_status}")
-            lines.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
-            lines.append(f"└{'─'*66}")
-            logger.info("\n" + "\n".join(lines))
+                lines_out.append(f"  {g}")
+            lines_out.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
+            lines_out.append(f"└{'─'*60}")
+            logger.info("\n" + "\n".join(lines_out))
 
 
-    @staticmethod
-    def _resolve_ict_side_from_structure(ict_engine, fallback_side: str,
-                                          now_ms: int) -> str:
-        """
-        B3 FIX: Derive ICT direction from the dominant active OB structure when
-        AMD is neutral.  Previously this fell back to sig.reversion_side (VWAP),
-        causing the ICT boost to work against the OB score it was computed from.
-
-        Logic:
-          - Sum quality of active bull OBs  vs  active bear OBs.
-          - If one side dominates by > 0.1 quality points, use that side.
-          - Otherwise fall through to fallback_side (VWAP or composite sign).
-
-        The 0.1 threshold prevents noise from a single low-quality OB overriding
-        VWAP when structure is genuinely ambiguous.
-        """
-        try:
-            bull_quality = sum(
-                ob.strength / 100.0
-                for ob in ict_engine.order_blocks_bull
-                if ob.is_active(now_ms)
-            )
-            bear_quality = sum(
-                ob.strength / 100.0
-                for ob in ict_engine.order_blocks_bear
-                if ob.is_active(now_ms)
-            )
-            if bull_quality > bear_quality + 0.1:
-                return "long"
-            if bear_quality > bull_quality + 0.1:
-                return "short"
-        except Exception:
-            pass
-        return fallback_side
-
-
-    # ─── UNIFIED ENTRY GATE — Institutional Coherence Check ─────────────────
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
@@ -6756,1079 +5119,17 @@ class QuantStrategy:
             logger.info(f"[THINK] {' | '.join(parts)}")
 
 
-    def _evaluate_entry_legacy(self, *args, **kwargs):
-        """Removed — v9 LiquidityMap + EntryEngine is always used."""
-        logger.warning("_evaluate_entry_legacy called but has been removed; ensure EntryEngine and LiquidityMap are available")
-
-    
-    def _evaluate_hunt_entry(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        sig,
-        price:       float,
-        now:         float,
-        hunt_signal,          # hunt signal (side/sl/tp/rr/pool prices)
-    ) -> None:
-        """
-        v5.2 — Liquidity Hunt Entry.
-
-        Triggered when a BSL or SSL sweep signal is confirmed by the ICT engine
-        and the trade to the opposing pool meets the minimum R:R gate.
-
-        Entry rules:
-          • ATR regime must be valid (not extreme volatility)
-          • HTF structure must not strongly oppose the hunt direction
-          • Scenario-adaptive confirm ticks (1-3 based on post-sweep prediction)
-
-        SL/TP sourced from the hunt_signal object (pre-computed by EntryEngine):
-          SL  = behind swept pool wick + 0.5×ATR buffer
-          TP  = opposing pool level − 0.1×ATR buffer
-        """
-        side = hunt_signal.side   # "long" | "short"
-        price = data_manager.get_last_price()
-
-        # ── Scenario prediction (drives confirm count + timing) ──────────
-        # Before ANY gate, query ICT for post-hunt scenario. This determines
-        # whether we enter immediately (CONTINUATION), at OTE (REVERSAL), or
-        # after pullback confirmation (PULLBACK_CONT).
-        _hunt_scenario     = "REVERSAL"    # ICT default is OTE after sweep
-        _hunt_scenario_conf = 0.0
-        _hunt_timing        = "WAIT_OTE"
-        _hunt_opposing_pool = hunt_signal.target_pool_price
-        _hunt_swept_pool    = hunt_signal.swept_pool_price
-
-        if self._ict is not None and hasattr(self._ict, 'get_hunt_scenario'):
-            try:
-                _atr_h   = getattr(self, '_atr_val', None) or 1.0
-                _now_ms_h = int(now * 1000) if now < 1e12 else int(now)
-                _sc = self._ict.get_hunt_scenario(price, _atr_h, _now_ms_h)
-                _hunt_scenario      = _sc.get("scenario", "REVERSAL")
-                _hunt_scenario_conf = _sc.get("confidence", 0.0)
-                _hunt_timing        = _sc.get("entry_timing", "WAIT_OTE")
-                logger.info(
-                    f"🎣 HUNT SCENARIO: {_hunt_scenario} "
-                    f"(conf={_hunt_scenario_conf:.2f}) timing={_hunt_timing} | "
-                    f"{_sc.get('details','')}"
-                )
-            except Exception as _e:
-                logger.debug(f"Hunt scenario error: {_e}")
-
-        # Also check if we have an updated opposing pool from the Direction/ICT engine.
-        # DirectionEngine is the authoritative source; ICT injected cache is the fallback.
-        if self._ict is not None:
-            try:
-                _hunt_obj_oe = (self._dir_engine.last_hunt
-                                if self._dir_engine is not None else None)
-                if _hunt_obj_oe is not None:
-                    _hp = {
-                        "opposing_pool": getattr(_hunt_obj_oe, 'opposing_pool_price', None),
-                    }
-                else:
-                    _hp = getattr(self._ict, '_last_hunt_pred', {}) or {}
-                if _hp.get('opposing_pool') is not None:
-                    _hunt_opposing_pool = _hp['opposing_pool']
-                    # Update the hunt signal TP to match the engine's target.
-                    # BUG-4 FIX: dataclasses.replace() preserves created_at and any future fields.
-                    if ((side == "long"  and _hunt_opposing_pool > price) or
-                            (side == "short" and _hunt_opposing_pool < price)):
-                        hunt_signal = dataclasses.replace(
-                            hunt_signal,
-                            tp_price          = _hunt_opposing_pool,
-                            target_pool_price = _hunt_opposing_pool,
-                        )
-            except Exception:
-                pass
-
-        # Gate 1: ATR regime
-        if not sig.regime_ok:
-            logger.debug("🎣 Hunt gate: ATR regime invalid — skipping")
-            return
-
-        # Gate 2: HTF must not be strongly opposed (informational threshold only)
-        if self._htf.vetoes_trade(side):
-            # HTF veto in hunt is soft — only block when score is extreme
-            _htf_block = (
-                (side == "long"  and self._htf.trend_15m < -0.50) or
-                (side == "short" and self._htf.trend_15m > +0.50)
-            )
-            if _htf_block:
-                logger.info(
-                    f"🎣 Hunt gate: HTF strongly opposes {side.upper()} "
-                    f"(15m={self._htf.trend_15m:+.2f}) — skipping sweep entry")
-                return
-
-        # Gate 3: Scenario-adaptive confirm ticks
-        #
-        # The number of confirm ticks is determined by the post-hunt scenario:
-        #   CONTINUATION  (price blasting through, no retrace expected): 1 tick
-        #   REVERSAL      (classic ICT sweep-and-go, OTE retrace):        2 ticks
-        #   PULLBACK_CONT (retrace first, then continue):                  3 ticks
-        #   UNCERTAIN     (no strong prediction):                          2 ticks
-        #
-        # High scenario confidence reduces the count by 1 (floor 1).
-        # Uses dedicated _confirm_hunt_long / _confirm_hunt_short counters
-        # (Bug-C fix) so that ICT OTE routing — which resets _confirm_long /
-        # _confirm_short on every tick it fires — cannot interrupt hunt
-        # confirmation progress.
-        _cn_base = {"CONTINUATION": 1, "REVERSAL": 2,
-                    "PULLBACK_CONT": 3, "UNCERTAIN": 2}.get(_hunt_scenario, 2)
-        # High confidence reduces requirement by 1 (never below 1)
-        if _hunt_scenario_conf >= 0.70:
-            _cn_base = max(1, _cn_base - 1)
-        # ISSUE-1 FIX: scale confirm ticks by PostTradeAgent Bayesian recommendation
-        _pta_tick_mult = (self._post_trade_agent.params.entry_confirm_ticks.current_mult
-                          if self._post_trade_agent is not None else 1.0)
-        _cn = max(1, round(_cn_base * _pta_tick_mult))
-
-        if side == "long":
-            self._confirm_hunt_long += 1
-            self._confirm_hunt_short = 0
-            if self._confirm_hunt_long < _cn:
-                logger.debug(
-                    f"🎣 Hunt confirm {self._confirm_hunt_long}/{_cn} "
-                    f"({_hunt_scenario} conf={_hunt_scenario_conf:.2f})")
-                return
-        else:
-            self._confirm_hunt_short += 1
-            self._confirm_hunt_long = 0
-            if self._confirm_hunt_short < _cn:
-                logger.debug(
-                    f"🎣 Hunt confirm {self._confirm_hunt_short}/{_cn} "
-                    f"({_hunt_scenario} conf={_hunt_scenario_conf:.2f})")
-                return
-
-        # ── CONFIRMED — store signal and launch entry ────────────────────
-        self._confirm_hunt_long = self._confirm_hunt_short = 0
-        self._pending_hunt_signal = hunt_signal
-
-
-        swept_label = (
-            f"SSL@${hunt_signal.swept_pool_price:,.0f}"
-            if side == "long"
-            else f"BSL@${hunt_signal.swept_pool_price:,.0f}"
-        )
-        # Determine ICT tier from scenario confidence
-        # CONTINUATION + high conf = Tier-S equivalent (immediate, tight SL)
-        # REVERSAL = Tier-A (OTE is the entry, institutional sweep confirmed)
-        # PULLBACK_CONT = Tier-B equivalent (need pullback confirmation)
-        _hunt_ict_tier = "A"
-        if _hunt_scenario == "CONTINUATION" and _hunt_scenario_conf >= 0.65:
-            _hunt_ict_tier = "S"
-        elif _hunt_scenario == "PULLBACK_CONT":
-            _hunt_ict_tier = "B"
-
-        logger.info(
-            f"🎣 HUNT ENTRY {side.upper()} confirmed  "
-            f"swept={swept_label}  "
-            f"target=${hunt_signal.target_pool_price:,.0f}  "
-            f"SL=${hunt_signal.sl_price:,.1f}  "
-            f"TP=${hunt_signal.tp_price:,.1f}  "
-            f"R:R=1:{hunt_signal.rr:.2f}  "
-            f"pred_score={hunt_signal.prediction_score:+.3f}  "
-            f"scenario={_hunt_scenario}(conf={_hunt_scenario_conf:.2f})  "
-            f"tier={_hunt_ict_tier}"
-        )
-        self._launch_entry_async(
-            data_manager, order_manager, risk_manager,
-            side, sig, mode="hunt", ict_tier=_hunt_ict_tier
-        )
-
-    def _evaluate_reversion_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
-        """
-        v5.0 — ICT-Commander / Quant-Scout Entry Evaluation.
-
-        PATH SPLIT:
-          ICT SWEEP PATH (Tier-S/A): ICT structure defines the trade.
-            • Entry side = sweep_setup.side (NOT VWAP reversion side)
-            • VWAP overextension NOT required (price is at OTE, not VWAP extreme)
-            • n_confirming NOT required (ICT sweep is the signal)
-            • HTF is informational only — sweep geometry defines direction
-            • Quant signals used as soft confirmation only:
-              - Tick flow not STRONGLY opposing (−0.30 threshold)
-              - ATR regime not extreme
-            • Confirm counter uses SWEEP SIDE, not VWAP side
-
-          STANDARD QUANT PATH (Tier-B): Order flow + ICT confluence.
-            • Gates: overextended, regime_ok, n_confirming ≥ 3, composite ≥ 0.30
-            • HTF: informational only — NOT a gate (removed by design)
-            • P/D zone gate active (long not in 4H premium, short not in discount)
-            • ICT floor: regime-adaptive (0.12 RANGING / 0.20 TRANSITIONING / 0.35 TRENDING)
-            • Confirm counter uses VWAP reversion side
-        """
-        c    = sig.composite
-        thr  = QCfg.COMPOSITE_ENTRY_MIN()
-
-        # ── BUG-A FIX: Override `side` to sweep_setup.side for sweep entries ─
-        # The docstring stated "overridden for sweep path" but this override was
-        # never implemented.  Consequence: every sweep OTE_READY entry used the
-        # VWAP reversion side (often the OPPOSITE of the sweep direction), causing
-        # three cascading failures:
-        #
-        #   1. allows_reversion() vetoed the sweep: a LONG sweep with price above
-        #      VWAP gives side="short"; TRENDING_UP then blocked it outright.
-        #
-        #   2. _ict_opposes_side triggered and zeroed sig.ict_total for the LONG
-        #      sweep's confluence scores, because ICT direction (+1 LONG) opposed
-        #      the VWAP side ("short").  Gate then saw ict_total=0.0.
-        #
-        #   3. ICTEntryGate.evaluate("short", ..., sweep_setup.side="long") failed
-        #      Tier-S (sweep_setup.side != side) and hit MANIP hard-block.
-        #
-        # Fix: detect OTE_READY sweep setup and switch `side` to sweep direction
-        # BEFORE any gate evaluation. Regime and breakout veto are skipped for
-        # sweep entries — they are DIRECTIONAL institutional setups, not fades.
-        _is_ote_sweep = (
-            _ICT_TRADE_ENGINE_AVAILABLE and
-            self._active_sweep_setup is not None and
-            self._active_sweep_setup.status == "OTE_READY"
-        )
-        if _is_ote_sweep:
-            side = self._active_sweep_setup.side  # "long" | "short"
-        else:
-            side = sig.reversion_side   # VWAP-based direction for standard reversion path
-
-        # ── Hard veto: trending against reversion trade ──────────────────
-        # Skipped for sweep entries — institutional sweep setups are valid IN
-        # any regime; the AMD phase + ICT gate is the structural filter here.
-        if not _is_ote_sweep and not self._regime.allows_reversion(side):
-            self._confirm_long = self._confirm_short = 0; return
-
-        # ── v6.0 MTF DIRECTIONAL OVERRIDE ─────────────────────────────────
-        # INSTITUTIONAL PRINCIPLE: don't fade 3+ aligned timeframes.
-        # When 1D, 1H, 15M are all bullish and you're trying to SHORT, you're
-        # fighting the entire institutional order flow. The composite may say
-        # SHORT because VWAP deviation = -1.0 (distance, not selling), but
-        # selling into 3+ bullish TFs is how retail gets destroyed.
-        #
-        # Skipped for sweep entries — sweeps are institutional setups that
-        # can be counter-trend by design (sweep of SSL in a downtrend).
-        if not _is_ote_sweep:
-            try:
-                _trend_scores = []
-                if hasattr(sig, 'trend_1d'): _trend_scores.append(sig.trend_1d)
-                if hasattr(sig, 'trend_4h'): _trend_scores.append(sig.trend_4h)
-                if hasattr(sig, 'trend_1h'): _trend_scores.append(sig.trend_1h)
-                if hasattr(sig, 'trend_15m'): _trend_scores.append(sig.trend_15m)
-                # Fallback: use HTF filter if individual trend scores not available
-                if not _trend_scores and hasattr(self, '_htf'):
-                    _h4 = self._htf.trend_4h
-                    _h15 = self._htf.trend_15m
-                    if side == "short" and _h4 > 0.3 and _h15 > 0.3:
-                        self._confirm_long = self._confirm_short = 0; return
-                    if side == "long" and _h4 < -0.3 and _h15 < -0.3:
-                        self._confirm_long = self._confirm_short = 0; return
-                elif _trend_scores:
-                    _bull_count = sum(1 for s in _trend_scores if s > 0.3)
-                    _bear_count = sum(1 for s in _trend_scores if s < -0.3)
-                    if side == "short" and _bull_count >= 3:
-                        self._confirm_long = self._confirm_short = 0; return
-                    if side == "long" and _bear_count >= 3:
-                        self._confirm_long = self._confirm_short = 0; return
-            except Exception:
-                pass
-
-        # ── Breakout veto: never fade a detected breakout ─────────────────
-        # Skipped for sweep entries — a LONG sweep entry WITH the breakout
-        # direction is not a fade; blocks_reversion only protects counter-trend.
-        if not _is_ote_sweep and self._breakout.blocks_reversion(side):
-            self._confirm_long = self._confirm_short = 0
-            if now - self._last_bo_block_log >= 60.0:
-                self._last_bo_block_log = now
-                logger.info(f"🚫 Breakout blocks {side.upper()} reversion ({self._breakout.direction})")
-            return
-
-        # ── Build quant helper signals for ICTEntryGate ───────────────────
-        quant_helpers = self._get_quant_helpers(sig, side)
-
-        # ── C FIX: Re-compute ICT confluence for the entry side when it was ──
-        # evaluated for the OPPOSITE direction in _evaluate_entry.
-        #
-        # _evaluate_entry computes ICT confluence for `ict_side` (driven by AMD
-        # bias or dominant OB structure).  When AMD is bearish and VWAP says LONG,
-        # ict_side="short" and sig.ict_total=0.53 is SHORT confluence strength.
-        # Passing that into ICTEntryGate.evaluate("long",...) is structurally wrong:
-        #   • SHORT strength 0.65 looks like strong LONG ICT support to the gate
-        #   • Gate can pass a LONG with zero real ICT backing
-        #   • Conversely, a high SHORT score blocks LONG for wrong reasons
-        #
-        # For sweep entries, `side` is now sweep_setup.side. If ict_direction
-        # (AMD bias) disagrees with the sweep side (shouldn't happen — sweep
-        # detector requires AMD bias to match sweep direction), still recompute
-        # so the gate always receives correctly-directed scores.
-        #
-        # Bug-2 fix: the original code added a signed boost in _evaluate_entry()
-        # using the AMD/ICT side (e.g. LONG) and then did NOT reverse it when
-        # evaluating the VWAP reversion side (e.g. SHORT). The ICT LONG boost
-        # (+0.086 to +0.108) was persistently making sig.composite LESS negative,
-        # so SHORT entries consistently fell short of the ±0.350 composite gate.
-        # Fix: when the ICT side opposes `side`, un-apply the original boost and
-        # apply a correctly-directed one for the actual entry side being evaluated.
-        _ict_dir = sig.ict_direction   # +1.0=long, -1.0=short, 0.0=unset (B1 field)
-        _ict_opposes_side = (
-            (_ict_dir < 0 and side == "long") or
-            (_ict_dir > 0 and side == "short")
-        )
-        if (_ict_opposes_side and
-                self._ict is not None and self._ict._initialized):
-            try:
-                _now_ms_rg = int(now * 1000) if now < 1e12 else int(now)
-                _recomp    = self._ict.get_confluence(side, price, _now_ms_rg,
-                                                       atr=sig.atr)
-                sig.ict_ob      = _recomp.ob_score
-                sig.ict_fvg     = _recomp.fvg_score
-                sig.ict_sweep   = _recomp.sweep_score
-                sig.ict_session = _recomp.session_score
-                sig.ict_total   = _recomp.total
-                sig.ict_details = _recomp.details
-                # ADVANCED FIELD PROPAGATION FIX: original code updated only the
-                # 6 basic scores. All 12 advanced fields remained from the primary
-                # (ICT-side) computation, so gate decisions used correct totals
-                # but display fields (Stack, RevRisk, RevZone) reflected the wrong
-                # side. Propagate the full recomputed result now.
-                sig.ict_mtf_ob_count      = _recomp.mtf_ob_count
-                sig.ict_fvg_stack_count   = _recomp.fvg_stack_count
-                sig.ict_htf_reversal_risk = _recomp.htf_reversal_risk
-                sig.ict_pd_grade          = _recomp.pd_grade
-                sig.ict_pd_matrix         = _recomp.pd_matrix
-                sig.ict_judas_active      = _recomp.judas_swing_active
-                sig.ict_nearest_bsl_atr   = _recomp.nearest_bsl_dist_atr
-                sig.ict_nearest_ssl_atr   = _recomp.nearest_ssl_dist_atr
-                if _recomp.delivery_target:
-                    sig.ict_delivery_target = _recomp.delivery_target
-                    sig.ict_delivery_conf   = _recomp.delivery_confidence
-                # HTF reversal zone: recompute for the new side
-                if sig.atr > 0:
-                    try:
-                        _rz = self._ict.get_htf_reversal_zones(price, sig.atr, _now_ms_rg)
-                        sig.ict_htf_rev_zone_near = any(
-                            z["dist_atr"] < 1.0 and z["direction"] != side
-                            for z in _rz)
-                    except Exception:
-                        pass
-                # Bug-2 fix: un-apply the original opposite-direction boost and
-                # substitute a correctly-directed one for `side`.  Without this the
-                # original LONG boost (e.g. +0.097) stays embedded in sig.composite
-                # even when evaluating a SHORT entry, making the composite 0.19 less
-                # negative than the raw order-flow signals warrant and systematically
-                # blocking SHORT entries that would otherwise clear the ±0.350 gate.
-                # FIX 7c: use stored raw composite (pre-boost) instead of
-                # un-applying the boost from the clamped value. The clamped
-                # composite makes un-apply give wrong results for SHORT entries
-                # (composite 0.05–0.15 less negative → systematically below ±0.30 gate).
-                _new_dir     = 1.0 if side == "long" else -1.0
-                _new_boost   = _recomp.total * 0.15 * _new_dir
-                _old_boost   = sig.ict_boost_signed  # snapshot before overwrite
-                _raw_comp    = getattr(sig, '_raw_composite', sig.composite - sig.ict_boost_signed)
-                sig.composite        = max(-1.0, min(1.0, _raw_comp + _new_boost))
-                sig.ict_boost_signed = _new_boost
-                sig.ict_direction    = _new_dir
-                _prev_dir_lbl = "SHORT" if _ict_dir < 0 else "LONG"
-                logger.debug(
-                    f"🔄 ICT re-computed for {side.upper()} "
-                    f"(was {_prev_dir_lbl}): "
-                    f"Σ={_recomp.total:.2f} "
-                    f"[OB={_recomp.ob_score:.2f} "
-                    f"FVG={_recomp.fvg_score:.2f}] "
-                    f"boost_corrected: {_old_boost:+.3f} → {_new_boost:+.3f} "
-                    f"composite_now={sig.composite:+.4f}")
-            except Exception as _rce:
-                logger.debug(f"ICT side-recompute error (non-fatal): {_rce}")
-                # Zero out so gate cannot mistake opposite-side scores as support
-                sig.ict_total = 0.0
-
-        # ── ICT Tier-Based Gate ───────────────────────────────────────────
-        _effective_cn = QCfg.CONFIRM_TICKS()   # default; overridden by tier
-        _tier         = "BLOCKED"
-        _tier_reason  = "no_ict"
-        _is_sweep_path = False
-
-        # ── v8.0: Advanced ICT pre-gates (applied before ICTEntryGate) ───
-        # HTF reversal zone proximity: if a high-conviction opposing HTF OB+FVG
-        # zone is within 1 ATR, price is likely to stall or reverse there.
-        # Only block Tier-B entries — sweep setups (Tier-S/A) have their own
-        # structural invalidation via the OTE zone.
-        #
-        # ADX-ADAPTIVE THRESHOLD: In ranging markets (ADX < 25), opposing OBs
-        # within 1 ATR are NORMAL — they are the range boundaries that price
-        # bounces between.  RevRisk 0.70-0.85 is typical ranging structure,
-        # not a genuine reversal threat.  Only extreme risk (>0.90) blocks.
-        # In trending markets (ADX >= 25), price is leaving these zones behind
-        # so even moderate risk (>0.55) is meaningful.
-        _adx_val = getattr(sig, 'adx', 25.0)
-        _rev_zone_threshold = 0.90 if _adx_val < 25.0 else 0.55
-        if (sig.ict_htf_rev_zone_near and
-                not _is_ote_sweep and
-                sig.ict_htf_reversal_risk > _rev_zone_threshold):
-            if now - self._last_ict_gate_log >= 30.0:
-                self._last_ict_gate_log = now
-                logger.info(
-                    f"⛔ HTF_REV_ZONE [{side.upper()}]: "
-                    f"opposing reversal zone <1ATR (risk={sig.ict_htf_reversal_risk:.2f})")
-            self._confirm_long = self._confirm_short = 0
-            return
-
-        if (self._ict is not None and self._ict._initialized and
-                _ICT_TRADE_ENGINE_AVAILABLE):
-            try:
-                _tier, _cn_override, _tier_reason = ICTEntryGate.evaluate(
-                    side, sig, self._active_sweep_setup, price, quant_helpers,
-                    mode="reversion", market_regime=sig.market_regime,
-                    ict_engine=self._ict)
-
-                if _tier == "BLOCKED":
-                    if self._ict_gate_start_time_rev == 0.0:
-                        self._ict_gate_start_time_rev = now
-                    if now - self._last_ict_gate_log >= 30.0:
-                        self._last_ict_gate_log = now
-                        logger.info(
-                            f"⛔ ICTEntryGate BLOCKED [{side.upper()}]: {_tier_reason}")
-                    if not self._ict_gate_alerted_rev and (now - self._ict_gate_start_time_rev) >= 900.0:
-                        self._ict_gate_alerted_rev = True
-                        send_telegram_message(
-                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                            f"No ICT confluence for ≥15 min.\n"
-                            f"Side: {side.upper()} | Reason: {_tier_reason}\n"
-                            f"HTF: 15m={self._htf.trend_15m:+.2f}  "
-                            f"4H={self._htf.trend_4h:+.2f}  "
-                            f"(info-only — HTF is not a gate)\n"
-                            f"<i>Bot alive — waiting for institutional setup.</i>")
-                    self._confirm_long = self._confirm_short = 0
-                    return
-
-                self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
-                _effective_cn  = _cn_override
-
-                # ── Tier-L: Liquidity-Hunt Driven entry ──────────────────
-                # Tier-L fires when predict_next_hunt() is very confident even
-                # without a formal ICTSweepSetup. Route via the hunt path for
-                # proper SL/TP using the opposing liquidity pool as target.
-                if _tier == "L":
-                    logger.info(
-                        f"🎣 TIER-L LIQUIDITY HUNT [{side.upper()}]: "
-                        f"{_tier_reason}")
-                    # Build a minimal hunt signal from ICT engine data
-                    if self._ict is not None:
-                        try:
-                            # Read from DirectionEngine (authoritative) and fall back
-                            # to ICT injected cache if DirectionEngine unavailable.
-                            _hunt_obj = (self._dir_engine.last_hunt
-                                         if self._dir_engine is not None else None)
-                            if _hunt_obj is not None:
-                                _hp_l    = {
-                                    "opposing_pool": getattr(_hunt_obj, 'opposing_pool_price', None),
-                                    "swept_pool":    getattr(_hunt_obj, 'swept_pool_price', None),
-                                }
-                            else:
-                                _hp_l = getattr(self._ict, '_last_hunt_pred', {}) or {}
-                            _opp_l   = _hp_l.get('opposing_pool')
-                            _swept_l = _hp_l.get('swept_pool')
-                            _atr_l   = getattr(self, '_atr_val', None) or 1.0
-                            _now_l   = int(now * 1000) if now < 1e12 else int(now)
-                            if _opp_l is not None and _swept_l is not None:
-                                # ict_trade_engine is no longer a separate module;
-                                # ICTSLEngine / ICTTPEngine are inlined into quant_strategy.
-                                # The Tier-L path without a formal sweep setup falls through
-                                # to Tier-A entry which uses the existing SL/TP pipeline.
-                                pass
-                        except Exception as _le:
-                            logger.debug(f"Tier-L build error: {_le}")
-                    # Fallback if we can't build the hunt signal: treat as Tier-A
-                    _tier = "A"
-
-                _is_sweep_path = (_tier in ("S", "A") and
-                                  self._active_sweep_setup is not None and
-                                  self._active_sweep_setup.status == "OTE_READY")
-
-                logger.debug(
-                    f"✅ Tier-{_tier} [{side.upper()}]: {_tier_reason} | "
-                    f"cn={_cn_override} sweep_path={_is_sweep_path}")
-
-            except Exception as _ieg_e:
-                logger.debug(f"ICTEntryGate error (non-fatal): {_ieg_e}")
-                # Fall through to legacy path below
-
-        elif self._ict is not None and self._ict._initialized:
-            # ── Legacy ICT gate (no ict_trade_engine) ────────────────────
-            _ict_min_base = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-            _ict_min_ob   = float(getattr(config, 'ICT_OB_MIN_SCORE_FOR_ENTRY', 0.35))
-            _ict_min = _ict_min_ob if sig.ict_ob >= 0.55 else _ict_min_base
-            if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time_rev == 0.0:
-                    self._ict_gate_start_time_rev = now
-                if now - self._last_ict_gate_log >= 30.0:
-                    self._last_ict_gate_log = now
-                    logger.info(
-                        f"⛔ ICT gate [{side.upper()} REVERSION]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f} [{sig.ict_details}]")
-                if not self._ict_gate_alerted_rev and (now - self._ict_gate_start_time_rev) >= 900.0:
-                    self._ict_gate_alerted_rev = True
-                    send_telegram_message(
-                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"{sig.ict_details}")
-                self._confirm_long = self._confirm_short = 0
-                return
-            self._ict_gate_start_time_rev = 0.0; self._ict_gate_alerted_rev = False
-
-        # ══════════════════════════════════════════════════════════════════
-        # PATH SPLIT: ICT SWEEP vs STANDARD QUANT
-        # ══════════════════════════════════════════════════════════════════
-
-        if _is_sweep_path:
-            # ── ICT SWEEP PATH (Tier-S / Tier-A) ─────────────────────────
-            # ICT structure is the commander.
-            # Quant helpers are already embedded in ICTEntryGate.evaluate().
-            # Entry side = SWEEP SETUP SIDE (not VWAP reversion side).
-            entry_side = self._active_sweep_setup.side
-
-            # ATR regime is the only hard quant gate here
-            # (already checked in ICTEntryGate, but double-check)
-            if not sig.regime_ok:
-                self._confirm_long = self._confirm_short = 0; return
-
-            # Confirm counter uses SWEEP SIDE
-            if entry_side == "long":
-                self._confirm_long += 1; self._confirm_short = 0
-                if self._confirm_long >= _effective_cn:
-                    self._confirm_long = self._confirm_short = 0
-                    logger.info(
-                        f"🏛️ ICT SWEEP LONG Tier-{_tier} confirmed "
-                        f"(cn={_effective_cn} AMD={sig.amd_phase} "
-                        f"OTE=[${self._active_sweep_setup.ote_entry_zone_low:.0f}–"
-                        f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
-                    self._launch_entry_async(
-                        data_manager, order_manager, risk_manager,
-                        "long", sig, mode="reversion", ict_tier=_tier)
-            else:
-                self._confirm_short += 1; self._confirm_long = 0
-                if self._confirm_short >= _effective_cn:
-                    self._confirm_long = self._confirm_short = 0
-                    logger.info(
-                        f"🏛️ ICT SWEEP SHORT Tier-{_tier} confirmed "
-                        f"(cn={_effective_cn} AMD={sig.amd_phase} "
-                        f"OTE=[${self._active_sweep_setup.ote_entry_zone_low:.0f}–"
-                        f"${self._active_sweep_setup.ote_entry_zone_high:.0f}])")
-                    self._launch_entry_async(
-                        data_manager, order_manager, risk_manager,
-                        "short", sig, mode="reversion", ict_tier=_tier)
-
-        else:
-            # ── STANDARD QUANT PATH (Tier-B or no ICT) ───────────────────
-            # All legacy quant gates required.
-            # Entry side = VWAP reversion side.
-
-            # Full gate stack: overextended + regime + confluence
-            # HTF veto REMOVED — direction is encoded by ICT structure + order flow.
-            # Keeping HTF here would block VWAP reversion longs when 15m is bearish —
-            # exactly the setup the strategy is designed to take.
-            if not (sig.overextended and sig.regime_ok and
-                    sig.n_confirming >= 3):
-                self._confirm_long = self._confirm_short = 0; return
-
-            # Opposite-side cooldown after recent exit
-            if self._last_exit_side and self._last_exit_side != side:
-                if now - self._last_exit_time < QCfg.COOLDOWN_SEC() * 1.5:
-                    return
-
-            # ISSUE-2: P/D zone gate removed entirely. DR position is a lagging
-            # derivative of AMD+HTF structure — double-gating on it after conviction
-            # filter already passed systematically blocks shorts in bull delivery.
-
-            # Composite threshold gate (VWAP direction)
-            if side == "long" and c >= thr:
-                self._confirm_long += 1; self._confirm_short = 0
-            elif side == "short" and c <= -thr:
-                self._confirm_short += 1; self._confirm_long = 0
-            else:
-                self._confirm_long = self._confirm_short = 0; return
-
-            cn = _effective_cn
-            if self._confirm_long >= cn:
-                self._confirm_long = self._confirm_short = 0
-                self._launch_entry_async(
-                    data_manager, order_manager, risk_manager,
-                    "long", sig, mode="reversion", ict_tier=_tier)
-            elif self._confirm_short >= cn:
-                self._confirm_long = self._confirm_short = 0
-                self._launch_entry_async(
-                    data_manager, order_manager, risk_manager,
-                    "short", sig, mode="reversion", ict_tier=_tier)
-
-    def _evaluate_trend_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
-        """
-        Trend-following pullback entry — active only in TRENDING_UP / TRENDING_DOWN.
-
-        Entry logic (institutional pullback-to-EMA):
-          1. Market must be in an established trend (RegimeClassifier confirms)
-          2. Price has pulled back into the EMA(8) zone (not chasing the breakout)
-          3. Pullback depth: TREND_PULLBACK_ATR_MIN ≤ dist(price, ema8) ≤ TREND_PULLBACK_ATR_MAX
-             — too shallow = not a real pullback; too deep = trend may be reversing
-          4. CVD trend bias not strongly opposed (prevents buying into distribution)
-          5. Tick flow in trend direction (live order flow confirming the move)
-          6. Composite trend score ≥ TREND_COMPOSITE_MIN
-          7. TREND_CONFIRM_TICKS consecutive confirming evaluations (slightly more
-             patient than reversion to avoid catching the start of a pullback)
-
-        TP: ATR-channel extension (not VWAP — VWAP is behind price in a trend).
-        SL: Behind the pullback swing low/high using existing multi-TF compute_sl.
-        Trail: Tight chandelier (TREND_CHANDELIER_N) — trends reverse sharply.
-        """
-        trend_side = self._regime.trend_side()
-        if trend_side is None: return
-
-        # CVD directional filter: don't buy if order flow is strongly opposed
-        # B5 FIX: each early return now emits a debug log so the real gate
-        # blocker is visible instead of the display showing stale reversion info.
-        cvd_bias = self._cvd.get_trend_signal()
-        if trend_side == "long" and cvd_bias < QCfg.TREND_CVD_MIN():
-            logger.debug(
-                f"⛔ TREND gate [CVD opposing]: {cvd_bias:+.3f} < {QCfg.TREND_CVD_MIN():.2f}")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-        if trend_side == "short" and cvd_bias > -QCfg.TREND_CVD_MIN():
-            logger.debug(
-                f"⛔ TREND gate [CVD opposing]: {cvd_bias:+.3f} > {-QCfg.TREND_CVD_MIN():.2f}")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-
-        # Tick flow must broadly agree with trend direction
-        tf = self._tick_eng.get_signal()
-        if trend_side == "long" and tf < -0.30:
-            logger.debug(f"⛔ TREND gate [tick opposing]: {tf:+.3f} < -0.30")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-        if trend_side == "short" and tf > 0.30:
-            logger.debug(f"⛔ TREND gate [tick opposing]: {tf:+.3f} > +0.30")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-
-        # Composite trend score gate
-        if abs(sig.trend_score) < QCfg.TREND_COMPOSITE_MIN():
-            logger.debug(
-                f"⛔ TREND gate [trend_score weak]: "
-                f"|{sig.trend_score:+.3f}| < {QCfg.TREND_COMPOSITE_MIN():.2f}")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-        if trend_side == "long" and sig.trend_score <= 0:
-            logger.debug(
-                f"⛔ TREND gate [trend_score wrong sign]: "
-                f"LONG but score={sig.trend_score:+.3f}")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-        if trend_side == "short" and sig.trend_score >= 0:
-            logger.debug(
-                f"⛔ TREND gate [trend_score wrong sign]: "
-                f"SHORT but score={sig.trend_score:+.3f}")
-            self._confirm_trend_long = self._confirm_trend_short = 0; return
-
-        # ── ICT gate for trend entries ───────────────────────────────────────
-        _t  = "B"   # Bug-4 fix: declare before conditional block so confirm-
-        _cn = QCfg.TREND_CONFIRM_TICKS()  # counter below can reference directly
-        _tr = ""
-        if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
-            try:
-                _qh = self._get_quant_helpers(sig, trend_side)
-                _t, _cn, _tr = ICTEntryGate.evaluate(
-                    trend_side, sig, None, price, _qh,
-                    mode="trend", market_regime=sig.market_regime,
-                    ict_engine=self._ict)
-                if _t == "BLOCKED":
-                    if self._ict_gate_start_time_trend == 0.0:
-                        self._ict_gate_start_time_trend = now
-                    if now - self._last_ict_gate_log >= 30.0:
-                        self._last_ict_gate_log = now
-                        logger.info(
-                            f"⛔ ICT gate [TREND {trend_side.upper()}]: {_tr}")
-                    if not self._ict_gate_alerted_trend and (now - self._ict_gate_start_time_trend) >= 900.0:
-                        self._ict_gate_alerted_trend = True
-                        send_telegram_message(
-                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                            f"TREND {trend_side.upper()}: {_tr}\n"
-                            f"<i>Bot alive — waiting for structure.</i>")
-                    self._confirm_trend_long = self._confirm_trend_short = 0
-                    return
-                self._ict_gate_start_time_trend = 0.0; self._ict_gate_alerted_trend = False
-            except Exception as _tge:
-                logger.debug(f"Trend ICTEntryGate error (non-fatal): {_tge}")
-        elif self._ict is not None and self._ict._initialized:
-            # Legacy flat threshold gate
-            _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-            if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time_trend == 0.0:
-                    self._ict_gate_start_time_trend = now
-                if now - self._last_ict_gate_log >= 30.0:
-                    self._last_ict_gate_log = now
-                    logger.info(
-                        f"⛔ ICT gate [TREND {trend_side.upper()}]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
-                if not self._ict_gate_alerted_trend and (now - self._ict_gate_start_time_trend) >= 900.0:
-                    self._ict_gate_alerted_trend = True
-                    send_telegram_message(
-                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"{sig.ict_details}")
-                self._confirm_trend_long = self._confirm_trend_short = 0
-                return
-            self._ict_gate_start_time_trend = 0.0; self._ict_gate_alerted_trend = False
-
-        # Pullback-to-EMA depth check
-        try: candles_5m = data_manager.get_candles("5m", limit=30)
-        except Exception: return
-        if len(candles_5m) < 10: return
-        closes = [float(c['c']) for c in candles_5m]
-        period = QCfg.EMA_FAST()
-        k = 2.0 / (period + 1)
-        ema = sum(closes[:period]) / period
-        for v in closes[period:]: ema = v * k + ema * (1.0 - k)
-        atr = self._atr_5m.atr
-        ema_dist = (ema - price) if trend_side == "long" else (price - ema)
-        pb_min = QCfg.TREND_PULLBACK_ATR_MIN() * atr
-        pb_max = QCfg.TREND_PULLBACK_ATR_MAX() * atr
-        if not (pb_min <= ema_dist <= pb_max):
-            logger.debug(
-                f"⛔ TREND gate [EMA pullback out of window]: "
-                f"dist={ema_dist/atr:+.2f}ATR "
-                f"window=[{pb_min/atr:.2f}–{pb_max/atr:.2f}ATR] "
-                f"ema={ema:.2f} price={price:.2f}")
-            return
-
-        # Confirmation counter
-        if trend_side == "long":
-            self._confirm_trend_long += 1; self._confirm_trend_short = 0
-        else:
-            self._confirm_trend_short += 1; self._confirm_trend_long = 0
-
-        cn = QCfg.TREND_CONFIRM_TICKS()
-        if trend_side == "long" and self._confirm_trend_long >= cn:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            # Bug-4 fix: _t is initialised to "B" before the gate block above
-            _trend_tier = _t
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "long", sig, mode="trend", ict_tier=_trend_tier)
-        elif trend_side == "short" and self._confirm_trend_short >= cn:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            _trend_tier = _t   # Bug-4 fix: always defined, see above
-            self._launch_entry_async(data_manager, order_manager, risk_manager, "short", sig, mode="trend", ict_tier=_trend_tier)
-
-    def _evaluate_flow_entry(self, data_manager, order_manager, risk_manager,
-                              sig, price, now, flow_side: str):
-        """
-        v5.1 — ICT Displacement Entry (institutional order flow + structure).
-
-        ICT MODEL: Sweep → Displacement → Distribution.
-
-        Institutions sweep liquidity (BSL/SSL), displace price with aggressive
-        volume (the displacement candle creates OBs and FVGs), then distribute
-        in the displacement direction. This IS the delivery — not a reaction.
-
-        PRIMARY signal: Recent ICT liquidity sweep with displacement confirmed.
-        CONFIRMATION: Order flow (tick + CVD) shows institutional aggression.
-        STRUCTURAL: 5m BOS confirms the break.
-
-        The sweet spot is WHERE sweep + displacement + order flow converge:
-          BSL swept + disp + bearish BOS + tick < -0.55 + CVD bearish → SHORT
-          SSL swept + disp + bullish BOS + tick > +0.55 + CVD bullish → LONG
-
-        SL: Behind the sweep candle (where liquidity was taken — institutional
-            orders sit behind that level; if price reclaims it, thesis is dead).
-        TP: Nearest opposing liquidity pool (where the next stops are — that's
-            where price is being delivered).
-        """
-        # ── Gate 1: Recent ICT sweep with displacement ────────────────────
-        # The sweep must be fresh (<5min) and displacement-confirmed.
-        # This is the institutional footprint — not a wick, but a close
-        # through the level with body > ATR (displacement).
-        _sweep_confirmed = False
-        _sweep_pool = None
-        _sweep_age_max_ms = 300_000  # 5 minutes
-
-        if self._ict is not None and getattr(self._ict, '_initialized', False):
-            try:
-                _now_ms = int(now * 1000) if now < 1e12 else int(now)
-                for pool in self._ict.liquidity_pools:
-                    if not pool.swept or not pool.displacement_confirmed:
-                        continue
-                    _age = _now_ms - pool.sweep_timestamp
-                    if _age > _sweep_age_max_ms or _age < 0:
-                        continue
-                    # BSL swept + displacement = bearish (smart money sold through buy stops)
-                    if pool.level_type == "BSL" and flow_side == "short":
-                        _sweep_confirmed = True
-                        _sweep_pool = pool
-                        break
-                    # SSL swept + displacement = bullish (smart money bought through sell stops)
-                    elif pool.level_type == "SSL" and flow_side == "long":
-                        _sweep_confirmed = True
-                        _sweep_pool = pool
-                        break
-            except Exception:
-                pass
-
-        if not _sweep_confirmed:
-            # No fresh displacement sweep — fall back to structural-only flow.
-            # Still require 5m BOS + extreme order flow, but with wider
-            # confirmation (5 ticks instead of 2) since there's no sweep anchor.
-            _FLOW_CONFIRM_NO_SWEEP = 5
-            if flow_side == "long":
-                self._confirm_flow_long += 1
-                self._confirm_flow_short = 0
-                if self._confirm_flow_long < _FLOW_CONFIRM_NO_SWEEP:
-                    return
-            else:
-                self._confirm_flow_short += 1
-                self._confirm_flow_long = 0
-                if self._confirm_flow_short < _FLOW_CONFIRM_NO_SWEEP:
-                    return
-
-            self._confirm_flow_long = self._confirm_flow_short = 0
-            self._last_flow_entry_time = now
-
-            logger.info(
-                f"⚡ FLOW DISPLACEMENT (no sweep anchor) — {flow_side.upper()} | "
-                f"tick={self._tick_eng.get_signal():+.2f} "
-                f"streak={self._flow_tick_streak} | "
-                f"CVD_trend={self._cvd.get_trend_signal():+.2f} | "
-                f"BOS=5m confirmed")
-
-            # Invalidate conflicting sweep setups
-            if (self._active_sweep_setup is not None and
-                    self._active_sweep_setup.side != flow_side):
-                if self._sweep_detector is not None:
-                    self._sweep_detector.invalidate()
-                self._active_sweep_setup = None
-
-            self._launch_entry_async(
-                data_manager, order_manager, risk_manager,
-                flow_side, sig, mode="flow", ict_tier="B")
-            return
-
-        # ── Gate 2: AMD phase alignment ───────────────────────────────────
-        # AMD should be MANIPULATION (Judas swing in progress) or early
-        # DISTRIBUTION (delivery has started). ACCUMULATION = no edge.
-        _amd = self._ict.get_amd_state()
-        _amd_ok = _amd.phase in ("MANIPULATION", "DISTRIBUTION",
-                                   "REDISTRIBUTION", "REACCUMULATION")
-        _bias_matches = (
-            (flow_side == "short" and _amd.bias == "bearish") or
-            (flow_side == "long" and _amd.bias == "bullish") or
-            _amd.bias == "neutral"  # neutral doesn't oppose
-        )
-
-        if not (_amd_ok or _bias_matches):
-            # AMD actively opposes — only proceed if sweep is very strong
-            if not (_sweep_pool and _sweep_pool.displacement_confirmed and
-                    _sweep_pool.wick_rejection):
-                self._confirm_flow_long = self._confirm_flow_short = 0
-                return
-
-        # ── Gate 3: Fast confirmation (sweep-backed = 2 ticks) ────────────
-        _FLOW_CONFIRM_SWEEP = 2
-        if flow_side == "long":
-            self._confirm_flow_long += 1
-            self._confirm_flow_short = 0
-            if self._confirm_flow_long < _FLOW_CONFIRM_SWEEP:
-                return
-        else:
-            self._confirm_flow_short += 1
-            self._confirm_flow_long = 0
-            if self._confirm_flow_short < _FLOW_CONFIRM_SWEEP:
-                return
-
-        # ── CONFIRMED: sweep + displacement + flow + BOS ──────────────────
-        self._confirm_flow_long = self._confirm_flow_short = 0
-        self._last_flow_entry_time = now
-
-        # Invalidate conflicting sweep setups
-        if (self._active_sweep_setup is not None and
-                self._active_sweep_setup.side != flow_side):
-            logger.info(
-                f"🔄 Displacement {flow_side.upper()} invalidates "
-                f"{self._active_sweep_setup.side.upper()} sweep setup")
-            if self._sweep_detector is not None:
-                self._sweep_detector.invalidate()
-            self._active_sweep_setup = None
-
-        _sweep_label = (f"{_sweep_pool.level_type}@${_sweep_pool.price:,.0f}"
-                        if _sweep_pool else "none")
-        logger.info(
-            f"⚡ ICT DISPLACEMENT ENTRY — {flow_side.upper()} | "
-            f"sweep={_sweep_label} disp=True | "
-            f"AMD={_amd.phase}({_amd.bias},conf={_amd.confidence:.2f}) | "
-            f"tick={self._tick_eng.get_signal():+.2f} "
-            f"streak={self._flow_tick_streak} | "
-            f"CVD_trend={self._cvd.get_trend_signal():+.2f}")
-
-        # Tier-A when sweep-backed (institutional footprint confirmed)
-        # Tier-B when structure-only (BOS + flow but no sweep anchor)
-        _tier = "A" if _sweep_confirmed else "B"
-
-        self._launch_entry_async(
-            data_manager, order_manager, risk_manager,
-            flow_side, sig, mode="flow", ict_tier=_tier)
-
-    def _evaluate_momentum_entry(self, data_manager, order_manager, risk_manager, sig, price, now):
-        """
-        v4.7: Break-and-retest entry — institutional momentum entry.
-
-        Instead of chasing the breakout (gets caught at the top) or waiting
-        for a 5m pullback to EMA (never comes), this uses the RETEST pattern:
-
-        1. Breakout detector fires → records extreme + midpoint
-        2. WAIT for micro-pullback (0.3-1.0 × ATR retrace from extreme)
-        3. WAIT for bounce from pullback (price moves 0.2 × ATR off the low)
-        4. ENTER on the bounce with tight SL below the pullback low
-
-        Why this works:
-          - You buy the pullback, not the top
-          - SL is tight (below retest low) → small risk
-          - Confirmation is built in (bounce = buyers still there)
-          - If breakout was fake, the pullback low breaks → no entry
-
-        Timeout: If no retest within 15 min, breakout was too impulsive.
-        The opportunity is gone — move on.
-        """
-        bo_dir = self._breakout.direction
-        if not bo_dir:
-            return
-
-        side = "long" if bo_dir == "up" else "short"
-
-        # ── Phase 1: Retest not ready yet — just wait ─────────────────────
-        if not self._breakout.retest_ready:
-            # Reset confirmation counters while waiting
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            return
-
-        # ── Retest attempt cooldown ───────────────────────────────────────
-        # Without this, after each _enter_trade call (whether it places an order
-        # OR is rejected by TP gate), the confirm counters reset to 0 and the
-        # momentum path re-fires every 2 seconds indefinitely.
-        # Allow a new attempt only after QUANT_RETEST_RETRY_SEC seconds.
-        retry_sec = float(_cfg("QUANT_RETEST_RETRY_SEC", 30.0))
-        if now - self._last_momentum_attempt < retry_sec:
-            return
-
-        # ── Phase 2: Retest ready — apply entry gates ─────────────────────
-
-        # Gate 1: Tick flow must agree with breakout direction
-        tf = self._tick_eng.get_signal()
-        if side == "long" and tf < -0.15:
-            return
-        if side == "short" and tf > 0.15:
-            return
-
-        # Gate 2: Don't chase exhaustion (>4×ATR from VWAP)
-        atr = self._atr_5m.atr
-        if atr > 1e-10 and self._vwap.vwap > 0:
-            dev_atr = abs(price - self._vwap.vwap) / atr
-            if dev_atr > 4.0:
-                return
-
-        # Gate 3: Price must still be above breakout midpoint (long) /
-        #         below breakout midpoint (short) — breakout structure intact
-        if side == "long" and price < self._breakout._bo_midpoint:
-            return
-        if side == "short" and price > self._breakout._bo_midpoint:
-            return
-
-        # ── Gate 4: ICT structural confluence ───────────────────────────────
-        # Momentum retest requires institutional structure in the retest zone.
-        # A bounce without OBs/FVGs is noise — use ICTEntryGate for full check.
-        _t_mo     = "B"   # Bug-4 fix: declare before conditional block so
-        _tr_mo    = ""    # locals() check below always finds them, not dir()
-        _cn_mo    = QCfg.CONFIRM_TICKS()
-        if _ICT_TRADE_ENGINE_AVAILABLE and self._ict is not None and self._ict._initialized:
-            try:
-                _qh_mo = self._get_quant_helpers(sig, side)
-                _t_mo, _cn_mo, _tr_mo = ICTEntryGate.evaluate(
-                    side, sig, self._active_sweep_setup, price, _qh_mo,
-                    mode="momentum", market_regime=sig.market_regime,
-                    ict_engine=self._ict)
-                if _t_mo == "BLOCKED":
-                    if self._ict_gate_start_time_mom == 0.0:
-                        self._ict_gate_start_time_mom = now
-                    if now - self._last_ict_gate_log >= 30.0:
-                        self._last_ict_gate_log = now
-                        logger.info(
-                            f"⛔ ICT gate [MOMENTUM {side.upper()}]: {_tr_mo}")
-                    if not self._ict_gate_alerted_mom and (now - self._ict_gate_start_time_mom) >= 900.0:
-                        self._ict_gate_alerted_mom = True
-                        send_telegram_message(
-                            f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                            f"MOMENTUM {side.upper()}: {_tr_mo}")
-                    self._confirm_trend_long = self._confirm_trend_short = 0
-                    return
-                self._ict_gate_start_time_mom = 0.0; self._ict_gate_alerted_mom = False
-            except Exception as _mge:
-                logger.debug(f"Momentum ICTEntryGate error (non-fatal): {_mge}")
-        elif self._ict is not None and self._ict._initialized:
-            _ict_min = float(getattr(config, 'ICT_MIN_SCORE_FOR_ENTRY', 0.45))
-            if sig.ict_total < _ict_min:
-                if self._ict_gate_start_time_mom == 0.0:
-                    self._ict_gate_start_time_mom = now
-                if now - self._last_ict_gate_log >= 30.0:
-                    self._last_ict_gate_log = now
-                    logger.info(
-                        f"⛔ ICT gate [MOMENTUM {side.upper()}]: "
-                        f"score={sig.ict_total:.2f} < min={_ict_min:.2f}")
-                if not self._ict_gate_alerted_mom and (now - self._ict_gate_start_time_mom) >= 900.0:
-                    self._ict_gate_alerted_mom = True
-                    send_telegram_message(
-                        f"⛔ <b>ICT GATE — 15 MIN BLOCK</b>\n"
-                        f"Score: {sig.ict_total:.2f} (min={_ict_min:.2f})\n"
-                        f"{sig.ict_details}")
-                self._confirm_trend_long = self._confirm_trend_short = 0
-                return
-            self._ict_gate_start_time_mom = 0.0; self._ict_gate_alerted_mom = False
-
-        # ── Phase 3: Confirmation counter ─────────────────────────────────
-        if side == "long":
-            self._confirm_trend_long += 1
-            self._confirm_trend_short = 0
-        else:
-            self._confirm_trend_short += 1
-            self._confirm_trend_long = 0
-
-        cn = QCfg.CONFIRM_TICKS()
-        if side == "long" and self._confirm_trend_long >= cn:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._last_momentum_attempt = now
-            retest_sl = self._breakout.retest_sl
-            # Bug-4 fix: _t_mo is initialised to "B" before the ICT gate block
-            # above, so it is always defined here — no dir()/locals() probe needed.
-            _mo_tier = _t_mo
-            logger.info(
-                f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
-                f"retest_low=${self._breakout._retest_low:,.2f} | "
-                f"SL=${retest_sl:,.2f}")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum", ict_tier=_mo_tier)
-        elif side == "short" and self._confirm_trend_short >= cn:
-            self._confirm_trend_long = self._confirm_trend_short = 0
-            self._last_momentum_attempt = now
-            retest_sl = self._breakout.retest_sl
-            _mo_tier = _t_mo   # Bug-4 fix: always defined, see initialisation above
-            logger.info(
-                f"🚀 RETEST ENTRY — {side.upper()} (breakout {bo_dir}) | "
-                f"retest_high=${self._breakout._retest_high:,.2f} | "
-                f"SL=${retest_sl:,.2f}")
-            self._launch_entry_async(data_manager, order_manager, risk_manager, side, sig, mode="momentum", ict_tier=_mo_tier)
-
     def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
                        signal_confidence=0.5, use_maker_entry=False):
         """
-        Institutional SL/TP — v5.0 ICT Sweep Engine primary path.
-
-        v5.0 HIERARCHY:
-          PATH-A (Sweep Engine available + sweep setup active):
-            SL → ICTSLEngine (sweep-wick → disp-OB → 15m-OB → 15m-swing)
-            TP → ICTTPEngine (AMD delivery → opposing pool → structural → VWAP)
-            Hard R:R gate: reversion ≥1.8R, trend ≥2.5R — reject if not met.
-
-          PATH-B (Legacy — no sweep engine or no active setup):
-            SL → existing ICT OB → 15m swing → ATR fallback
-            TP → existing ICT structural tiered selection
-            Fee-normalized TP floor gate (PATCH 4).
-
-        Both paths share the fee-engine gate at the end for consistency.
-
-        Args:
-            signal_confidence: composite score [0,1] for fee gate tuning
-            use_maker_entry:   limit-entry flag for fee gate
+        Institutional SL/TP computation — ICT OB → 15m swing → ATR fallback.
+        
+        Primary path: EntryEngine provides force_sl/force_tp (used in _enter_trade).
+        This method is the FALLBACK when force levels are invalid.
+        
+        Hierarchy: ICT 15m OB → 15m swing structure → ATR fallback.
+        TP: Liquidity pool → ICT structural → VWAP tiered selection.
+        Fee-normalized TP floor gate applied at the end.
         """
         try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+5)
         except Exception: candles_5m = []
@@ -7845,112 +5146,15 @@ class QuantStrategy:
         # ══════════════════════════════════════════════════════════════════════
         # v5.0 PATH-A — ICT SWEEP ENGINE (highest conviction, best R:R)
         # ══════════════════════════════════════════════════════════════════════
-        # Use ICTSLEngine + ICTTPEngine when:
-        #   • ict_trade_engine.py is available, AND
-        #   • An active sweep setup (OTE_READY) is present
-        #
-        # Both return values are validated. If ICTTPEngine returns None
-        # (no target meets the R:R gate), PATH-A is rejected — do NOT lower
-        # the bar. Fall through to PATH-B for the legacy path.
         sl_price    = None
         tp_price    = None
         _sl_source  = "none"
-        _used_path  = "B"   # "A" | "B" | "C" — for logging
+        _sl_source  = "none"
 
         now_ms_slatp = int(time.time() * 1000)
 
         # ══════════════════════════════════════════════════════════════════════
-        # PATH-C — LIQUIDITY HUNT (pre-computed SL/TP from Tier-L EntryEngine path)
-        # ══════════════════════════════════════════════════════════════════════
-        # When mode=="hunt", _pending_hunt_signal holds SL/TP from the hunter.
-        # These levels are structurally superior: SL behind swept pool wick,
-        # TP at opposing liquidity pool — exactly where price is being delivered.
-        # Skip PATH-A and PATH-B entirely; apply the fee gate at the end.
-        if mode == "hunt" and self._pending_hunt_signal is not None:
-            _hs = self._pending_hunt_signal
-            _hs_sl  = _round_to_tick(_hs.sl_price)
-            _hs_tp  = _round_to_tick(_hs.tp_price)
-            # Direction sanity
-            _sl_ok = (side == "long"  and _hs_sl < price) or (side == "short" and _hs_sl > price)
-            _tp_ok = (side == "long"  and _hs_tp > price) or (side == "short" and _hs_tp < price)
-            if _sl_ok and _tp_ok:
-                # BUG-2 FIX: _evaluate_hunt_entry may mutate tp_price (ICT opposing-pool
-                # update) AFTER the original hunt signal R:R was validated.
-                # The mutated TP could place the ratio below _MIN_RR (e.g. 0.9R).
-                # Re-validate here using the ACTUAL prices PATH-C will use.
-                _sl_dist = abs(price - _hs_sl)
-                _tp_dist = abs(price - _hs_tp)
-                _path_c_rr = _tp_dist / _sl_dist if _sl_dist > 1e-10 else 0.0
-                _min_rr_c  = QCfg.REVERSION_MIN_RR() if mode not in ("trend", "momentum") \
-                             else QCfg.TREND_MIN_RR()
-                if _path_c_rr < _min_rr_c:
-                    logger.info(
-                        f"⛔ PATH-C R:R gate: {_path_c_rr:.2f} < {_min_rr_c:.1f} "
-                        f"(SL={_sl_dist:.0f}pts TP={_tp_dist:.0f}pts) "
-                        f"— hunt signal R:R degraded after ICT TP update, rejecting"
-                    )
-                    # Clear the stale hunt signal so it is not re-evaluated
-                    self._pending_hunt_signal = None
-                    # Fall through to PATH-A / PATH-B
-                else:
-                    sl_price   = _hs_sl
-                    tp_price   = _hs_tp
-                    _sl_source = "hunt_swept_pool"
-                    _used_path = "C"
-                    logger.info(
-                        f"🎣 PATH-C (HUNT): SL=${sl_price:,.1f}  TP=${tp_price:,.1f}  "
-                        f"R:R=1:{_path_c_rr:.2f}  "
-                        f"swept=${_hs.swept_pool_price:,.0f}  target=${_hs.target_pool_price:,.0f}"
-                    )
-                    # Apply only the fee-gate at the end — skip all structural SL/TP logic
-
-        if (sl_price is None and  # PATH-C not active
-                _ICT_TRADE_ENGINE_AVAILABLE and
-                QCfg.ICT_SWEEP_ENTRY_ENABLED() and
-                self._active_sweep_setup is not None and
-                self._active_sweep_setup.status == "OTE_READY" and
-                self._active_sweep_setup.side == side):
-
-            try:
-                sl_price, _sl_source = ICTSLEngine.compute(
-                    side, price, atr,
-                    sweep_setup  = self._active_sweep_setup,
-                    ict_engine   = self._ict,
-                    candles_15m  = candles_15m,
-                    atr_pctile   = atr_pctile,
-                    mode         = mode,
-                    market_regime = self._regime.regime.value if hasattr(self._regime, 'regime') else "RANGING",
-                )
-                tp_price = ICTTPEngine.compute(
-                    side, price, atr, sl_price,
-                    sweep_setup  = self._active_sweep_setup,
-                    ict_engine   = self._ict,
-                    candles_15m  = candles_15m,
-                    vwap         = vwap,
-                    mode         = mode,
-                    now_ms       = now_ms_slatp,
-                )
-                if tp_price is None:
-                    # Hard R:R gate rejected — no valid target → PATH-B
-                    logger.info(
-                        f"⛔ PATH-A R:R gate: no valid TP target for "
-                        f"{side.upper()} sweep setup — falling through to PATH-B")
-                    sl_price   = None
-                    _sl_source = "none"
-                else:
-                    _used_path = "A"
-                    logger.info(
-                        f"🏛️ PATH-A ACTIVE: sweep SL=${sl_price:,.2f}({_sl_source}) "
-                        f"TP=${tp_price:,.2f} "
-                        f"R:R=1:{abs(tp_price-price)/max(abs(price-sl_price),1):.2f} "
-                        f"AMD={getattr(self._active_sweep_setup,'amd_confidence',0):.2f}"
-                    )
-            except Exception as _pa_e:
-                logger.warning(f"PATH-A sweep engine error (falling to PATH-B): {_pa_e}")
-                sl_price = None; tp_price = None; _sl_source = "none"
-
-        # ══════════════════════════════════════════════════════════════════════
-        # v5.0 PATH-B — LEGACY ICT HIERARCHY (v6.0: regime-adaptive + liq guard)
+        # SL/TP COMPUTATION — ICT OB → 15m swing → ATR fallback
         # ══════════════════════════════════════════════════════════════════════
         if sl_price is None:
             # v6.0: regime-adaptive min_dist for PATH-B
@@ -8037,7 +5241,6 @@ class QuantStrategy:
                     f"({_atr_sl_dist:.0f}pts / {_atr_sl_dist/atr:.2f}ATR) — no 15m structure found")
 
             # ── v6.0: PATH-B LIQUIDITY PROXIMITY GUARD ─────────────────────────
-            # Same logic as ICTSLEngine — if SL sits near a BSL/SSL cluster,
             # move it behind the pool so the sweep doesn't take us out.
             if sl_price is not None and self._ict is not None:
                 try:
@@ -8095,13 +5298,7 @@ class QuantStrategy:
         # TP COMPUTATION (PATH-B only — PATH-A already computed tp_price)
         # ══════════════════════════════════════════════════════════════════════
         if tp_price is None:
-            if mode in ("trend", "momentum"):
-                tp_price = InstitutionalLevels.compute_tp_trend(
-                    price, side, atr, sl_price, candles_5m, orderbook,
-                    swing_lookback=QCfg.SL_SWING_LOOKBACK(),
-                    candles_15m=candles_15m)
-            else:
-                tp_price = InstitutionalLevels.compute_tp(
+            tp_price = InstitutionalLevels.compute_tp(
                     price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
                     candles_5m=candles_5m,
                     ict_engine=self._ict,
@@ -8128,18 +5325,7 @@ class QuantStrategy:
         if side == "long"  and (sl_price >= price or tp_price <= price): return None, None
         if side == "short" and (sl_price <= price or tp_price >= price): return None, None
 
-        # ── PATH-A: additional R:R sanity check ───────────────────────────────
-        if _used_path == "A":
-            rr_actual = abs(tp_price - price) / max(abs(price - sl_price), 1e-10)
-            min_rr    = (QCfg.ICT_TP_MIN_RR_TREND()     if mode in ("trend", "momentum")
-                         else QCfg.ICT_TP_MIN_RR_REVERSION())
-            if rr_actual < min_rr:
-                logger.info(
-                    f"⛔ PATH-A R:R final check: {rr_actual:.2f} < {min_rr:.1f} "
-                    f"— rejecting sweep setup entry")
-                return None, None
-
-        # ── Fee-normalized TP floor gate (PATCH 4) ───────────────────────────
+        # ── Fee-normalized TP floor gate ─────────────────────────────────────
         if self._fee_engine is not None and self._fee_engine.is_warmed_up():
             tp_distance = abs(tp_price - price)
             sl_distance = abs(sl_price - price)
@@ -8537,7 +5723,6 @@ class QuantStrategy:
         self.current_sl_price       = sl_price
         self.current_tp_price       = tp_price
         self._confirm_long          = self._confirm_short = 0
-        self._confirm_hunt_long     = self._confirm_hunt_short = 0
         # Reset duplicate guards for the new position
         self._exit_completed        = False
         self._pnl_recorded_for     = 0.0
@@ -8558,20 +5743,7 @@ class QuantStrategy:
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_opened()
 
-        # ── v5.0: Invalidate sweep detector — setup consumed ─────────────────────
-        if self._sweep_detector is not None:
-            self._sweep_detector.invalidate()
-        _sweep_was_active = self._active_sweep_setup is not None
-        self._active_sweep_setup = None
-        # ── v5.2: Clear hunt signal — consumed by fill ────────────────────────
-        _hunt_was_active = self._pending_hunt_signal is not None
-        self._pending_hunt_signal = None
-        # ── DirectionEngine: clear post-sweep evidence — trade now open ──────
-        # The sweep that triggered this entry has been acted on. Reset the
-        # accumulative PostSweepState so evaluate_sweep() doesn't keep firing
-        # after the position is live (pool-hit gate takes over from here).
-        # BUG-4 FIX: use the public clear_sweep() API — see on_stream_restart
-        # for the full rationale on why direct _ps_state mutation is wrong.
+        # ── Clear post-sweep evidence — trade now open ────────────────────────
         if self._dir_engine is not None:
             try:
                 self._dir_engine.clear_sweep()
@@ -8590,9 +5762,9 @@ class QuantStrategy:
             "pre_sweep_approach": "⚡ PRE-SWEEP APPROACH",
             "sweep_continuation": "📈 SWEEP CONTINUATION",
         }
-        if _sweep_was_active:
+        if False:
             _et_label = "🏛️ SWEEP-AND-GO REVERSAL"
-        elif locals().get('_hunt_was_active', False) or mode == "hunt":
+        elif locals().get('False', False) or mode == "hunt":
             _et_label = "🎣 LIQUIDITY HUNT"
         else:
             _et_label = _et_labels.get(mode, mode.upper())
@@ -9008,83 +6180,6 @@ class QuantStrategy:
 
                     threading.Thread(target=_bg_trail, daemon=True,
                                      name="trail-sl").start()
-
-    def _check_thesis(self, pos, price, sig, atr) -> Tuple[bool, str]:
-        """
-        v4.6: Check if the original trade thesis is still valid.
-        Returns (thesis_valid, reason_string).
-
-        A trade thesis is valid when:
-          1. Price is still between SL and TP (not breached either)
-          2. Composite signal has not flipped against the trade
-          3. Not deeply underwater (< THESIS_MAX_DRAWDOWN_PCT of SL distance)
-          4. For reversion: price hasn't passed VWAP (reversion hasn't completed)
-
-        If ANY check fails → thesis broken → force exit.
-        If ALL pass → thesis valid → grant extension.
-        """
-        reasons = []
-
-        # 1. Price between SL and TP
-        if pos.side == "long":
-            if price <= pos.sl_price:
-                return False, "price at/below SL"
-            if price >= pos.tp_price:
-                return False, "price at/above TP"
-        else:
-            if price >= pos.sl_price:
-                return False, "price at/above SL"
-            if price <= pos.tp_price:
-                return False, "price at/below TP"
-
-        # 2. Composite signal still agrees (or at least neutral)
-        # For LONG: composite should not be deeply negative
-        # For SHORT: composite should not be deeply positive
-        comp = sig.composite
-        if pos.side == "long" and comp < -0.15:
-            return False, f"composite flipped bearish ({comp:+.3f})"
-        if pos.side == "short" and comp > 0.15:
-            return False, f"composite flipped bullish ({comp:+.3f})"
-        reasons.append(f"Σ={comp:+.3f}")
-
-        # 3. Not deeply underwater
-        drawdown = (pos.entry_price - price) if pos.side == "long" else (price - pos.entry_price)
-        # v4.6 BUG FIX #2: Use ORIGINAL SL distance, not current (may be tightened by trail)
-        # When trail moves SL from $71,200 to $72,900, using current SL makes DD look like 100%+
-        sl_dist = pos.initial_sl_dist if pos.initial_sl_dist > 0 else abs(pos.entry_price - pos.sl_price)
-        if sl_dist > 0:
-            dd_pct = drawdown / sl_dist
-            max_dd = QCfg.THESIS_MAX_DRAWDOWN_PCT()
-            if dd_pct > max_dd:
-                return False, f"drawdown {dd_pct:.0%} > {max_dd:.0%} of SL"
-            reasons.append(f"DD={dd_pct:.0%}")
-        
-        # 4. Reversion: check if price has blown through VWAP significantly
-        # v4.6 NOTE: Do NOT exit just because price crossed VWAP.
-        # TP is often BEYOND VWAP (e.g., VWAP + 1.5×SL_dist). Exiting at VWAP
-        # would kill winning trades that are on their way to TP.
-        # Only flag this for information, not for thesis break.
-        vwap = self._vwap.vwap
-        if pos.trade_mode == "reversion" and vwap > 0 and atr > 1e-10:
-            vwap_dist_atr = abs(price - vwap) / atr
-            if pos.side == "long":
-                if price > vwap:
-                    reasons.append(f"past VWAP ✅ (+{vwap_dist_atr:.1f}ATR)")
-                else:
-                    reasons.append(f"VWAP={vwap_dist_atr:.1f}ATR away")
-            else:
-                if price < vwap:
-                    reasons.append(f"past VWAP ✅ (+{vwap_dist_atr:.1f}ATR)")
-                else:
-                    reasons.append(f"VWAP={vwap_dist_atr:.1f}ATR away")
-
-        # 5. Bonus: if signals are strong in our direction, thesis is robust
-        if pos.side == "long" and comp > 0.2:
-            reasons.append("signals STRONG ✅")
-        elif pos.side == "short" and comp < -0.2:
-            reasons.append("signals STRONG ✅")
-
-        return True, " | ".join(reasons)
 
     def _detect_structure_change(self, data_manager, price: float,
                                   pos: 'PositionState', now: float) -> bool:
