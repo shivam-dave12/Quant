@@ -4429,18 +4429,19 @@ class QuantStrategy:
         # ══════════════════════════════════════════════════════════════════
         # GATE 5: Kill Zone / Session Filter
         # ══════════════════════════════════════════════════════════════════
-        # Belt-and-suspenders second line of defence for ASIA and WEEKEND.
-        # The primary block is in ConvictionFilter.evaluate() Gate 4 and in
-        # the early-exit guard at the top of _evaluate_entry().  This gate
-        # ensures no entry passes even if those upstream guards are bypassed
-        # by a code path that does not call ConvictionFilter (e.g. a future
-        # legacy fallback or unit-test harness).
+        # ASIA is the only session-level veto.  It is a pure accumulation /
+        # range period with no institutional delivery — entries here have a
+        # structurally poor risk profile regardless of other factors.
+        #
+        # WEEKEND is NOT blocked.  Crypto is 24/7.  The session score for
+        # WEEKEND (0.65 in ConvictionFilter) reflects the absence of a named
+        # kill zone but does not constitute a veto.  A high-quality sweep +
+        # displacement + CISD setup on a Saturday is a valid trade.
         session = str(getattr(ict_ctx, 'kill_zone', '') or '')
         if not session and self._ict:
             session = str(getattr(self._ict, '_killzone', '') or '')
-        if session.upper() in ("ASIA", "WEEKEND"):
-            rejections.append(
-                f"{session.upper()}_SESSION — no institutional flow, hard blocked")
+        if session.upper() == "ASIA":
+            rejections.append("ASIA_SESSION — accumulation range, no delivery expected")
 
         # ══════════════════════════════════════════════════════════════════
         # GATE 6: Minimum R:R
@@ -4457,39 +4458,14 @@ class QuantStrategy:
         """
         v9.0 — Liquidity-First Entry Engine.
         Single decision flow.  Falls back to legacy if new engine unavailable.
-        """
-        # ── Weekend / off-hours guard ────────────────────────────────────────
-        # Checked BEFORE any candle fetching, engine updates, or ICT analysis.
-        # The ICT engine's _session attribute is set during the PREVIOUS tick's
-        # update, so this check is at most ~30s stale — acceptable for a
-        # session-level gate.
-        #
-        # Controlled by the TRADE_WEEKEND flag (default False).  Set it to True
-        # in config.py only if you intentionally want weekend entries (e.g. for
-        # a crypto-only book where Sunday liquidity is acceptable).
-        #
-        # Why this matters:
-        #   Without this guard the engine runs the full stack (candle fetch,
-        #   ATR / VWAP / CVD / ICT updates, liquidity-map build, direction
-        #   engine prediction) every 30 seconds all weekend, producing
-        #   legitimate-looking logs while every entry path is structurally
-        #   blocked.  The result is wasted CPU, misleading Telegram alerts,
-        #   and confusion about why "the bot is running but not trading".
-        _trade_weekend: bool = getattr(
-            self, '_cfg_trade_weekend',
-            getattr(self, 'TRADE_WEEKEND', False))
-        if not _trade_weekend and self._ict is not None:
-            _sess_last = str(getattr(self._ict, '_session', '') or '').upper()
-            if 'WEEKEND' in _sess_last:
-                _now_ts = time.time()
-                _last_wk_log: float = getattr(self, '_last_weekend_log_ts', 0.0)
-                if _now_ts - _last_wk_log >= 300.0:
-                    self._last_weekend_log_ts = _now_ts
-                    logger.info(
-                        "⏸  WEEKEND: skipping entry evaluation — "
-                        "no institutional flow (set TRADE_WEEKEND=True to override)")
-                return
 
+        Session note: this method runs regardless of session label (WEEKEND,
+        OFF_HOURS, etc.).  Crypto markets are 24/7.  Session-awareness is
+        handled by the factor scoring inside ConvictionFilter (WEEKEND scores
+        0.65, ASIA is hard-blocked) and DirectionEngine Factor 8.  There is
+        no early exit for weekends — a valid liquidity hunt at 3am Saturday
+        is as real as one on Tuesday during the London open.
+        """
         if not _ENTRY_ENGINE_AVAILABLE or self._entry_engine is None or self._liq_map is None:
             logger.error("EntryEngine or LiquidityMap unavailable — no entry evaluation")
             return

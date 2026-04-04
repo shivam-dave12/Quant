@@ -676,39 +676,32 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 8: Session Timing  (weight 0.04)
         # ─────────────────────────────────────────────────────────────────────
-        # London KZ: Judas-swing bias — often sweeps UP then delivers DOWN
-        #            → slight BSL-sweep bias (price hunts BSL first)
-        # NY KZ:     Amplify the existing directional composite
-        # Asia KZ:   Range consolidation — neutral
-        # Weekend / Off-hours: No institutional participation — neutral (0.0).
-        #            Do NOT amplify or suppress other factors; just contribute
-        #            nothing.  The ConvictionFilter and _evaluate_entry have
-        #            separate hard-blocks for WEEKEND that stop entries entirely.
+        # London KZ: Judas-swing bias — tends to run buy stops first → +BSL bias
+        # NY KZ:     Amplifies the dominant directional composite already scored
+        # Asia KZ:   Range / accumulation — no directional bias → 0.0
+        # Weekend:   No named kill zone — no session-specific bias added → 0.0
+        #            The core factors (AMD, HTF structure, dealing range, flow)
+        #            still score normally.  Only the 0.04-weight session bonus
+        #            is absent.  Crypto liquidity hunts are valid 24/7.
+        # Off-hours: Same as weekend — neutral, no session bonus.
         #
-        # Source priority: _session (full window) > _killzone (KZ-only).
-        # Previously the code fell back to _killzone when _session was
-        # "WEEKEND", causing _sess to become blank and factors.session = 0.0
-        # silently — the correct behaviour but for the wrong reason, obscuring
-        # the real cause in logs.  Now it is explicit.
+        # Source priority: _session (full window) > _killzone (KZ-only string).
         factors.session = 0.0
         try:
             _sess = str(getattr(ict_engine, '_session', '') or '').upper()
             if not _sess:
                 _sess = str(getattr(ict_engine, '_killzone', '') or '').upper()
 
-            if 'WEEKEND' in _sess or 'OFF_HOURS' in _sess:
-                pass   # factors.session remains 0.0 — no institutional flow
-            elif 'LONDON' in _sess:
-                factors.session = +0.35   # London Judas-swing: tends to run buy stops first
-            elif 'NY' in _sess:
-                # NY amplifies the dominant directional signal already scored
+            if 'LONDON' in _sess and 'NY' not in _sess:
+                factors.session = +0.35   # London Judas-swing: tends to hunt BSL first
+            elif 'NY' in _sess or 'NEW_YORK' in _sess:
+                # NY open amplifies whichever direction AMD + HTF already favour
                 dominant = (
-                    factors.amd            * self._FACTOR_WEIGHTS['amd'] +
-                    factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure']
+                    factors.amd           * self._FACTOR_WEIGHTS['amd'] +
+                    factors.htf_structure * self._FACTOR_WEIGHTS['htf_structure']
                 )
                 factors.session = _sigmoid(dominant * 2.5, steepness=1.0)
-            elif 'ASIA' in _sess:
-                factors.session = 0.0   # Accumulation / range = directionless
+            # ASIA / WEEKEND / OFF_HOURS / blank → factors.session stays 0.0
         except Exception:
             pass
 

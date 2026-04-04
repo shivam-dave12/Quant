@@ -109,17 +109,24 @@ _TF_RANK: Dict[str, int] = {
 }
 
 # ── Session quality ───────────────────────────────────────────────────────────
-# WEEKEND and ASIA are hard-blocked in the mandatory gates below.
-# The score values here are only reached for non-blocked sessions.
+# ASIA is the only hard-blocked session (no institutional delivery, no named
+# kill zone, pure accumulation / range).
+#
+# WEEKEND is NOT hard-blocked.  Crypto markets run 24/7.  Liquidity hunts,
+# AMD cycles, HTF structure, displacement, and CISD are all equally valid on
+# a Saturday.  What changes is the ABSENCE of a named institutional kill zone
+# (London open / NY open).  We model that as a moderate score reduction rather
+# than a veto — the conviction gate's displacement + CISD + pool-TF weights
+# already handle the lower-quality setups naturally.
 _SESSION_SCORE: Dict[str, float] = {
-    "LONDON":    1.00,   # London open = institutional manipulation → reversal
-    "NY":        1.00,   # NY open = institutional delivery
+    "LONDON":    1.00,   # London open — institutional manipulation → reversal
+    "NY":        1.00,   # NY open — institutional delivery
     "NEW_YORK":  1.00,
     "LONDON_NY": 0.85,   # Overlap — high volume but chaotic
-    "ASIA":      0.00,   # HARD BLOCK (see mandatory gates) — no institutional flow
-    "WEEKEND":   0.00,   # HARD BLOCK (see mandatory gates) — no institutional flow
-    "OFF_HOURS": 0.20,   # Between sessions — significant penalty, not hard-blocked
-    "":          0.40,   # Unknown session — penalize
+    "WEEKEND":   0.65,   # No named KZ, but crypto liquidity hunts are valid 24/7
+    "OFF_HOURS": 0.55,   # Between sessions on a weekday — lower but not blocked
+    "ASIA":      0.00,   # HARD BLOCK — accumulation / range, no delivery
+    "":          0.40,   # Unknown — penalise (data issue, not a legitimate session)
 }
 
 # ── AMD phase scores ──────────────────────────────────────────────────────────
@@ -281,15 +288,17 @@ class ConvictionFilter:
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── GATE 4: Session — HARD BLOCK Asia and Weekend ─────────────────
-        # Both ASIA and WEEKEND are structurally low-liquidity periods with no
-        # institutional delivery.  Hard-blocking prevents the engine from burning
-        # cycles and producing misleading "almost-passed" rejection logs during
-        # periods where no entry is ever valid.
+        # ── GATE 4: Session — HARD BLOCK Asia only ────────────────────────
+        # ASIA is blocked because it is a pure accumulation / range period —
+        # no institutional delivery, no kill zone, no displacement expected.
+        #
+        # WEEKEND is NOT blocked.  Crypto runs 24/7.  Liquidity sweeps,
+        # AMD cycles, and structural setups are equally valid on a Saturday.
+        # The session_score for WEEKEND (0.65) reflects the absence of a named
+        # kill zone but does not prevent a high-quality setup from passing.
         sess_key = self._resolve_session(session, ict_engine)
-        if sess_key in ("ASIA", "WEEKEND"):
-            rejects.append(
-                f"SESSION: {sess_key} — no institutional flow, hard blocked")
+        if sess_key == "ASIA":
+            rejects.append("SESSION: ASIA — accumulation range, no delivery expected")
             return ConvictionResult(
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
