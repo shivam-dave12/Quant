@@ -561,7 +561,8 @@ class DirectionEngine:
                 atr          = a,
                 now          = now_ms / 1000.0,
                 ict_engine   = ict_engine,
-                session      = str(getattr(ict_engine, '_killzone', '') or ''),
+                # MOD-6 FIX: pass canonical _session (full window) not _killzone (KZ-only)
+                session      = str(getattr(ict_engine, '_session', '') or ''),
             )
         elif liq_snapshot is not None:
             # Fallback A: LiquidityMap PoolTarget.adjusted_sig() significance sum
@@ -658,16 +659,20 @@ class DirectionEngine:
         # Asia KZ:   Range consolidation — neutral
         factors.session = 0.0
         try:
-            kz = getattr(ict_engine, '_killzone', '').upper()
-            if 'LONDON' in kz:
+            # MOD-6 FIX: prefer _session (full-window) over _killzone (KZ-only)
+            _sess = str(getattr(ict_engine, '_session', '') or '').upper()
+            if not _sess or _sess in ('OFF_HOURS', 'WEEKEND'):
+                # Fall back to killzone string when session is off/unknown
+                _sess = str(getattr(ict_engine, '_killzone', '') or '').upper()
+            if 'LONDON' in _sess:
                 factors.session = +0.35   # London tends to run buy stops first
-            elif 'NY' in kz:
+            elif 'NY' in _sess:
                 dominant = (
                     factors.amd            * self._FACTOR_WEIGHTS['amd'] +
                     factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure']
                 )
                 factors.session = _sigmoid(dominant * 2.5, steepness=1.0)
-            elif 'ASIA' in kz:
+            elif 'ASIA' in _sess:
                 factors.session = 0.0   # accumulation = directionless
         except Exception:
             pass
@@ -1393,10 +1398,13 @@ class DirectionEngine:
                 s_rev += min(_STATIC_REV_POOL_MAX, _tc * 1.5)
 
         # ── Session Kill Zone Context ─────────────────────────────────────
-        _kz = getattr(ict_engine, '_killzone', '').lower()
-        if   'asia'   in _kz: s_rev += 7.0   # Asia sweeps are often manipulations
-        elif 'london' in _kz: s_rev += 4.0   # London Judas swing = moderate rev bias
-        elif 'ny'     in _kz: s_rev += 2.0   # NY open often reverses Asia range
+        # MOD-6 FIX: read _session (full window) before _killzone (KZ-only)
+        _sess_raw = str(getattr(ict_engine, '_session', '') or '').lower()
+        if not _sess_raw or _sess_raw in ('off_hours', 'weekend'):
+            _sess_raw = str(getattr(ict_engine, '_killzone', '') or '').lower()
+        if   'asia'   in _sess_raw: s_rev += 7.0   # Asia sweeps are often manipulations
+        elif 'london' in _sess_raw: s_rev += 4.0   # London Judas swing = moderate rev bias
+        elif 'ny'     in _sess_raw: s_rev += 2.0   # NY open often reverses Asia range
 
         return round(s_rev, 2), round(s_cont, 2)
 

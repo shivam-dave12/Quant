@@ -433,17 +433,34 @@ class MTFPoolProbability:
 
     @staticmethod
     def _detect_session(session_hint: str, ict_engine) -> str:
-        """Resolve session string from hint or ICT engine killzone."""
+        """
+        Resolve session string from hint or ICT engine.
+
+        MOD-6 FIX: Previously fell back only to ict._killzone, which is empty
+        outside kill-zone hours even while the session is active. Now checks
+        ict._session (canonical, full-window string) first so probability
+        weights apply for the entire London/NY/Asia session, not just KZ windows.
+        """
+        # Priority 1: session_hint from caller
         if session_hint:
             su = session_hint.upper()
             if 'LONDON' in su:
                 return 'LONDON'
-            if 'NY' in su or 'NEW YORK' in su:
+            if 'NY' in su or 'NEW YORK' in su or 'NEW_YORK' in su:
                 return 'NY'
             if 'ASIA' in su:
                 return 'ASIA'
+        # Priority 2: canonical _session from ICT engine (full-window)
         if ict_engine is not None:
-            kz = str(getattr(ict_engine, '_killzone', '')).upper()
+            _sess = str(getattr(ict_engine, '_session', '') or '').upper()
+            if _sess in ('LONDON', 'LONDON_NY'):
+                return 'LONDON'
+            if _sess in ('NY', 'NEW_YORK'):
+                return 'NY'
+            if _sess == 'ASIA':
+                return 'ASIA'
+            # Priority 3: _killzone string (KZ-window only, last resort)
+            kz = str(getattr(ict_engine, '_killzone', '') or '').upper()
             if 'LONDON' in kz:
                 return 'LONDON'
             if 'NY' in kz:

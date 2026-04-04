@@ -710,9 +710,28 @@ class LiquidityTrailEngine:
 
     @staticmethod
     def _detect_session(ict_engine) -> str:
-        """Detect trading session from ICT engine killzone."""
+        """
+        Detect trading session from ICT engine.
+
+        MOD-6/CRIT-3 FIX: Previously read only _killzone, which is empty
+        outside kill-zone hours even when the session is active. A trade
+        taken at 04:30 NY during London session (before the 07:00 KZ opens)
+        would get sess_mult=1.0 (neutral) instead of the tighter London mult.
+
+        Fix: prefer ict._session (canonical, full-session-window string set
+        by _update_session via the now DST-correct zoneinfo path) over _killzone.
+        """
         if ict_engine is None:
             return ""
+        # Priority 1: canonical session (active the whole session window)
+        _sess = str(getattr(ict_engine, '_session', '') or '').upper()
+        if _sess in ('LONDON', 'NY', 'NEW_YORK', 'ASIA', 'LONDON_NY', 'OFF_HOURS', 'WEEKEND'):
+            if _sess in ('NEW_YORK',):
+                return 'NY'
+            if _sess in ('OFF_HOURS', 'WEEKEND'):
+                return ''
+            return _sess
+        # Priority 2: killzone string (fallback when _session not available)
         kz = str(getattr(ict_engine, '_killzone', '') or '').upper()
         if 'LONDON' in kz:
             return 'LONDON'

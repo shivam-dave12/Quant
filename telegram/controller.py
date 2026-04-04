@@ -1627,22 +1627,26 @@ class TelegramBotController:
             "  TP:        Opposing liquidity pool sweep price",
             "  Trail:     ICT structure (BOS→CHoCH→15m)",
             "",
-            "<b>Position Sizing</b>",
-            f"  Margin/trade: <b>{getattr(cfg,'QUANT_MARGIN_PCT',0.20):.0%}</b> of balance",
-            f"  Risk/trade:   {getattr(cfg,'RISK_PER_TRADE',0.60):.2f}% of balance",
-            f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',4.0):.2f} USDT",
-            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',1.0)} BTC",
+            "<b>Position Sizing  (risk-based)</b>",
+            # CRIT-1/CRIT-7 FIX: display RISK_PER_TRADE (now the actual sizing lever).
+            # Old display showed QUANT_MARGIN_PCT (deprecated) and a wrong 0.60 fallback.
+            f"  Risk/trade:   <b>{getattr(cfg,'RISK_PER_TRADE',0.006)*100:.2f}%</b> of balance",
+            f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',1.0):.2f} USDT",
+            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',0.5)} BTC",
             "",
             "<b>Entry</b>",
             f"  Confirm ticks: {getattr(cfg,'QUANT_CONFIRM_TICKS',2)}",
-            f"  Cooldown:      {getattr(cfg,'QUANT_COOLDOWN_SEC',180)}s",
+            # SIG-1 FIX: default 300 (was 180)
+            f"  Cooldown:      {getattr(cfg,'QUANT_COOLDOWN_SEC',300)}s",
             f"  Max hold:      {getattr(cfg,'QUANT_MAX_HOLD_SEC',2400)}s",
             "",
             "<b>Risk</b>",
-            f"  Min R:R:          {getattr(cfg,'MIN_RISK_REWARD_RATIO',0.8)}",
-            f"  Max daily trades: {getattr(cfg,'MAX_DAILY_TRADES',8)}",
-            f"  Max daily loss:   {getattr(cfg,'MAX_DAILY_LOSS_PCT',5.0):.1f}%",
-            f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',3)}",
+            # SIG-1 FIX: corrected defaults throughout
+            f"  Min R:R:          {getattr(cfg,'MIN_RISK_REWARD_RATIO',2.0)}",
+            f"  Max daily trades: {getattr(cfg,'MAX_DAILY_TRADES',10)}",
+            f"  Max daily loss:   {getattr(cfg,'MAX_DAILY_LOSS_PCT',3.0):.1f}%",
+            f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',2)}",
+            f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
             "<b>Trail</b>",
             f"  Enabled:    {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
@@ -1828,7 +1832,7 @@ class TelegramBotController:
                 "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
                 "<b>Adjustable:</b>\n"
                 "  leverage          int   (e.g. 20)\n"
-                "  margin            float (0.05–1.0, e.g. 0.20)\n"
+                "  risk              float (0.001–0.020, e.g. 0.006 = 0.6%)\n"
                 "  cooldown          int   seconds\n"
                 "  max_daily_trades  int\n"
                 "  max_daily_loss    float %\n"
@@ -1844,7 +1848,9 @@ class TelegramBotController:
 
         allowed = {
             "leverage":         ("LEVERAGE",             int),
-            "margin":           ("QUANT_MARGIN_PCT",     float),
+            # CRIT-1 FIX: RISK_PER_TRADE is now the position-sizing lever.
+            # QUANT_MARGIN_PCT is retired — _compute_quantity no longer reads it.
+            "risk":             ("RISK_PER_TRADE",       float),
             "cooldown":         ("QUANT_COOLDOWN_SEC",   int),
             "max_daily_trades": ("MAX_DAILY_TRADES",     int),
             "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
@@ -1892,26 +1898,27 @@ class TelegramBotController:
                         return f"❌ Exchange API error: {e}\nConfig reverted to {old_val}x."
             return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (exchange not updated — bot not running)"
 
-        # ── Margin PCT validation ─────────────────────────────────────────
-        if key == "margin":
-            if not (0.05 <= new_val <= 1.0):
+        # ── Risk per trade validation ─────────────────────────────────────
+        if key == "risk":
+            if not (0.001 <= new_val <= 0.020):
                 return (
-                    f"❌ Margin must be 0.05–1.0 (5%–100%).\n"
-                    f"You entered: {new_val}\n"
-                    f"Example: /set margin 0.30 (= 30% of balance per trade)"
+                    f"❌ Risk/trade must be 0.001–0.020 (0.1%–2.0%).\n"
+                    f"You entered: {new_val} ({new_val*100:.2f}%)\n"
+                    f"Example: /set risk 0.006  (= 0.6% of balance risked per trade)\n"
+                    f"Industry standard: 0.5%–1.0% per trade."
                 )
             if bot_running and bot_instance and bot_instance.strategy:
                 pos = bot_instance.strategy.get_position()
                 if pos:
                     return (
-                        f"❌ Cannot change margin while position is open.\n"
-                        f"Close position first, then /set margin {new_val}."
+                        f"❌ Cannot change risk/trade while position is open.\n"
+                        f"Close position first, then /set risk {new_val}."
                     )
             setattr(cfg, attr_name, new_val)
             logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
             return (
-                f"✅ <b>MARGIN</b>: {old_val:.0%} → <b>{new_val:.0%}</b>\n"
-                f"Next trade will use {new_val:.0%} of available balance as margin."
+                f"✅ <b>RISK/TRADE</b>: {old_val*100:.2f}% → <b>{new_val*100:.2f}%</b>\n"
+                f"Next trade will risk {new_val*100:.2f}% of available balance at SL."
             )
 
         setattr(cfg, attr_name, new_val)

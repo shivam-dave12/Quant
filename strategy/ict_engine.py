@@ -2286,11 +2286,31 @@ class ICTEngine:
     def _update_session(self, now_ms: int) -> None:
         """Unified session and kill zone detection in NY time to prevent DST desync."""
         try:
-            dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
-            uh  = dt.hour + dt.minute / 60.0
-            dst = 3 <= dt.month <= 10
-            ny  = (uh + (-4.0 if dst else -5.0)) % 24.0
-            wd  = dt.weekday()
+            # CRIT-3 FIX: Use zoneinfo for exact DST-aware NY conversion.
+            # Previous `3 <= month <= 10` misclassified ~2 weeks/year during
+            # US DST transitions (2nd Sunday March, 1st Sunday November).
+            try:
+                from zoneinfo import ZoneInfo
+                import datetime as _dtm
+                _ny_dt = _dtm.datetime.fromtimestamp(now_ms / 1000.0,
+                                                     tz=ZoneInfo("America/New_York"))
+                ny = _ny_dt.hour + _ny_dt.minute / 60.0
+                wd = _ny_dt.weekday()
+            except Exception:
+                # Fallback: accurate calendar-based DST computation
+                dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+                uh  = dt.hour + dt.minute / 60.0
+                _m, _d, _y = dt.month, dt.day, dt.year
+                def _nth_sunday(yr, mo, n):
+                    import calendar as _cal
+                    first_wd = _cal.monthrange(yr, mo)[0]
+                    return 1 + ((6 - first_wd) % 7) + (n - 1) * 7
+                _ds  = _nth_sunday(_y, 3, 2)   # 2nd Sunday March
+                _de  = _nth_sunday(_y, 11, 1)  # 1st Sunday November
+                _in_dst = ((_m == 3 and _d >= _ds) or (4 <= _m <= 10) or
+                           (_m == 11 and _d < _de))
+                ny  = (uh + (-4.0 if _in_dst else -5.0)) % 24.0
+                wd  = dt.weekday()
 
             self._killzone = ""
             self._session  = "OFF_HOURS"

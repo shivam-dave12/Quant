@@ -80,17 +80,31 @@ _CISD_MAX_WAIT_SEC   = 360
 _ENTRY_COOLDOWN_SEC  = 30.0
 
 # SL / TP
-_MIN_RR_RATIO       = 1.4
+# SIG-2 FIX: floor raised from 1.4 → 2.0 to match the conviction gate's
+# CONVICTION_MIN_RR hard gate. A 1.4 floor allowed the entry engine to
+# present setups that the conviction filter would unconditionally reject,
+# wasting evaluation cycles and creating misleading log output.
+_MIN_RR_RATIO       = 2.0
 _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
 _CONT_SL_BUFFER_ATR = 0.40
 
 # Post-Sweep phases (seconds after sweep)
-_PS_PHASE_DISPLACEMENT = 45.0
-_PS_PHASE_CISD         = 120.0
-_PS_PHASE_OTE          = 240.0
-_PS_PHASE_MATURE       = 360.0
+# MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
+# tune phase windows for different market conditions (trending vs ranging)
+# without a code deploy. Fallbacks preserve original production values.
+try:
+    import config as _ecfg
+    _PS_PHASE_DISPLACEMENT = float(getattr(_ecfg, 'PS_PHASE_DISPLACEMENT_SEC', 45.0))
+    _PS_PHASE_CISD         = float(getattr(_ecfg, 'PS_PHASE_CISD_SEC',         120.0))
+    _PS_PHASE_OTE          = float(getattr(_ecfg, 'PS_PHASE_OTE_SEC',          240.0))
+    _PS_PHASE_MATURE       = float(getattr(_ecfg, 'PS_PHASE_MATURE_SEC',       360.0))
+except Exception:
+    _PS_PHASE_DISPLACEMENT = 45.0
+    _PS_PHASE_CISD         = 120.0
+    _PS_PHASE_OTE          = 240.0
+    _PS_PHASE_MATURE       = 360.0
 
 # Post-Sweep evidence thresholds
 _PS_THRESHOLD_EARLY  = 80.0
