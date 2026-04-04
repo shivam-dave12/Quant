@@ -1292,6 +1292,31 @@ class DirectionEngine:
         s_cont = 0.0
 
         if ict_engine is None:
+            # Bug #15 fix: previously returned (0, 0) when ict_engine is None,
+            # meaning dynamic factors had to cross the FULL threshold alone (~62-80 pts).
+            # This silently degraded detection quality without any log warning.
+            # Instead, derive a minimal baseline from data already in ps:
+            #   • Sweep quality → reversal prior (higher quality = more institutional)
+            #   • Session hint embedded in ps → session-weight contribution
+            #   • Pool type → dealing range proxy (BSL swept → bearish reversal likely)
+            # This keeps the static baseline proportional even without ICT engine.
+            _sweep_quality = float(getattr(ps.sweep if hasattr(ps, 'sweep') else ps,
+                                           'quality', 0.35) or 0.35)
+            _pool_type     = str(getattr(ps, 'swept_pool_type', '') or '')
+
+            # Sweep quality → reversal base (mirrors the ICT path quality scoring)
+            if   _sweep_quality >= 0.70: s_rev += 12.0
+            elif _sweep_quality >= 0.50: s_rev +=  7.0
+            elif _sweep_quality >= 0.35: s_rev +=  3.0
+
+            # Pool type structural prior (BSL swept → bearish reversal; SSL swept → bullish)
+            # Mapped identically to the ICT MANIPULATION phase aligned case (22 pts × 0.5 conf).
+            if _pool_type in ('BSL', 'SSL'):
+                s_rev += 8.0   # conservative: no AMD confidence to scale with
+
+            logger.debug(
+                "POST_SWEEP _score_sweep_static: ict_engine=None — "
+                "using sweep-quality fallback (s_rev=%.1f s_cont=%.1f)", s_rev, s_cont)
             return s_rev, s_cont
 
         amd = getattr(ict_engine, '_amd', None)

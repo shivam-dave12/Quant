@@ -2518,6 +2518,7 @@ class _DynamicStructureTrail:
         tick_flow:       float  = 0.0,
         displacement_confirmed: bool  = False,
         liq_snapshot            = None,   # v7.0: live LiquidityMapSnapshot
+        pos                     = None,   # Bug #4: PositionState for exact BE fee
     ):
         """
         Institutional Liquidity-First Trail Engine v7.0
@@ -2577,7 +2578,7 @@ class _DynamicStructureTrail:
                 pass
 
         # ── Break-even floor (unconditional at 0.30R) ──────────────────────────
-        be_price = _calc_be_price(pos_side, entry_price, atr, pos=None)
+        be_price = _calc_be_price(pos_side, entry_price, atr, pos=pos)
         be_floor = be_price if tier >= 0.30 else None
 
         # ── Volatility regime + min breathing room ─────────────────────────────
@@ -3832,7 +3833,20 @@ class QuantStrategy:
                 threading.Thread(target=_bg_sync_active, daemon=True,
                                  name="pos-sync-active").start()
 
-            self._manage_active(data_manager, order_manager, now)
+            # Bug #6 fix: _manage_active reads and modifies self._pos (trail SL,
+            # peak_profit, be_ratchet_applied) concurrently with the background
+            # sync thread that also writes to self._pos via _sync_position.
+            # While self._lock guards individual field mutations, _update_trailing_sl
+            # performs multi-step read-then-modify sequences that release the lock
+            # between steps (e.g. peak_profit update → replace_stop_loss REST call).
+            # A sync result arriving in that window can produce stale peak/SL values.
+            #
+            # Solution: skip one trail-management tick while a sync is in flight.
+            # The trail engine is stateful and will catch up on the next tick; the
+            # ~30-second sync interval means at most one skipped trail evaluation.
+            # This is always safe: the existing SL remains on the exchange unchanged.
+            if not self._pos_sync_in_progress:
+                self._manage_active(data_manager, order_manager, now)
 
         elif phase == PositionPhase.EXITING:
             if need_exit_sync and not self._exit_sync_in_progress:
@@ -3874,15 +3888,26 @@ class QuantStrategy:
             # or the entry aborts (→FLAT via finally in _launch_entry_async).
             # Safety watchdog: force FLAT if background thread dies silently.
             _entry_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 120.0))
-            if (now - self._entering_since) > (_entry_timeout + 30.0):
+            # Bug #12 fix: the old guard was (_entry_timeout + 30.0).  With the
+            # default of 120s this fires at 150s — matching the log message.  But
+            # if LIMIT_ORDER_FILL_TIMEOUT_SEC is set to 45s (used in the compact
+            # exchange path) the watchdog fires at 75s — well before the fill
+            # timeout can even expire, creating a race where the watchdog resets
+            # ENTERING while the fill poll is still active.  The buffer is now
+            # proportional: max(30s, 25% of the fill timeout).  At 45s → buffer=30s
+            # (watchdog at 75s, poll done at 45s + margin); at 120s → buffer=30s
+            # (unchanged); at 300s → buffer=75s (watchdog at 375s).
+            _watchdog_buffer  = max(30.0, _entry_timeout * 0.25)
+            if (now - self._entering_since) > (_entry_timeout + _watchdog_buffer):
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
+                        _total_wait = int(_entry_timeout + _watchdog_buffer)
                         logger.warning(
-                            "⚠️ ENTERING watchdog: >150s without fill confirmation "
+                            f"⚠️ ENTERING watchdog: >{_total_wait}s without fill confirmation "
                             "— forcing FLAT (check exchange for orphaned position)")
                         send_telegram_message(
-                            "⚠️ <b>ENTERING TIMEOUT</b>\n"
-                            "Bracket order fill not confirmed after 150s.\n"
+                            f"⚠️ <b>ENTERING TIMEOUT</b>\n"
+                            f"Bracket order fill not confirmed after {_total_wait}s.\n"
                             "State reset to FLAT.\n"
                             "<b>Check exchange for open position!</b>")
                         self._pos.phase = PositionPhase.FLAT
@@ -3900,7 +3925,8 @@ class QuantStrategy:
 
     def _launch_entry_async(self, data_manager, order_manager, risk_manager,
                              side: str, sig, mode: str,
-                             ict_tier: str = "") -> None:
+                             ict_tier: str = "",
+                             prefetched_bal_info: dict = None) -> None:
         """
         Non-blocking entry: sets ENTERING phase immediately, then runs
         _enter_trade in a daemon thread so the main on_tick loop is never
@@ -3908,6 +3934,13 @@ class QuantStrategy:
 
         ict_tier: "S" | "A" | "B" | "" — passed through to _enter_trade so
         confidence-weighted position sizing can scale size by conviction tier.
+
+        prefetched_bal_info: Bug #5 fix — the balance dict already fetched in
+        _evaluate_entry (REST call #1) is forwarded here so _enter_trade does
+        not make a second identical REST call in the same tick. Between the two
+        calls the balance cannot change (no position is open), but the redundancy
+        added ~50 ms latency and could produce divergent values on stale exchange
+        endpoints.
 
         The try/finally guarantees any abort path inside _enter_trade
         (TP gate rejection, SL failure, partial-fill abort, etc.) resets phase
@@ -3918,11 +3951,13 @@ class QuantStrategy:
             self._entering_since = time.time()
 
         _dm, _om, _rm = data_manager, order_manager, risk_manager
+        _bal           = prefetched_bal_info
 
         def _bg():
             try:
                 self._enter_trade(_dm, _om, _rm, side, sig, mode=mode,
-                                  ict_tier=ict_tier)
+                                  ict_tier=ict_tier,
+                                  prefetched_bal_info=_bal)
             except Exception as _e:
                 logger.error(
                     f"_enter_trade background thread error ({mode}/{side}): {_e}",
@@ -5127,6 +5162,7 @@ class QuantStrategy:
                 side=signal.side, sig=_min_sig,
                 mode=signal.entry_type.value.lower(),
                 ict_tier=_tier,
+                prefetched_bal_info=bal_info,   # Bug #5: reuse fetched balance
             )
             self._entry_engine.consume_signal()
             self._entry_engine.on_entry_placed()
@@ -5438,7 +5474,7 @@ class QuantStrategy:
         return sl_price, tp_price
 
     def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion",
-                     ict_tier: str = ""):
+                     ict_tier: str = "", prefetched_bal_info: dict = None):
         """
         Position entry — v7.0 (confidence-weighted sizing via ict_tier).
 
@@ -5449,6 +5485,11 @@ class QuantStrategy:
           "":     0.50× base margin  (minimal exposure — no ICT gate)
 
         Additionally modulated by composite score (±10%) and AMD confidence (±8%).
+
+        prefetched_bal_info: Bug #5 — when supplied, the REST balance call is
+        skipped. _evaluate_entry already fetched the balance in the same tick;
+        making a second call adds latency with no benefit (balance cannot change
+        between the two calls — no position is open at this point).
         """
         price = data_manager.get_last_price()
         if price < 1.0: return
@@ -5456,7 +5497,13 @@ class QuantStrategy:
         if atr < 1e-10: return
 
         # ── Risk gate ─────────────────────────────────────────────────────────────
-        bal_info = risk_manager.get_available_balance()
+        # Bug #5 fix: reuse prefetched balance when available; only call the REST
+        # endpoint as a fallback (e.g. when _enter_trade is invoked outside of the
+        # normal _evaluate_entry → _launch_entry_async path).
+        if prefetched_bal_info is not None:
+            bal_info = prefetched_bal_info
+        else:
+            bal_info = risk_manager.get_available_balance()
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
@@ -5484,12 +5531,16 @@ class QuantStrategy:
                     if isinstance(lvl,(list,tuple)): return float(lvl[0])
                     if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
                     return 0.0
+                # Bug #3 fix: LIMIT_ORDER_OFFSET_TICKS was only applied in the
+                # fallback path (empty book). With a live book the offset was
+                # silently ignored, defeating its purpose of improving maker-fill
+                # probability by placing the order slightly inside the spread.
                 if side == "long":
-                    limit_px  = round(_best_px(bids[0]), 1)
-                    mt_reason = f"limit_long@bid={limit_px:.1f}"
+                    limit_px  = round(_best_px(bids[0]) - offset, 1)
+                    mt_reason = f"limit_long@bid-{offset:.1f}={limit_px:.1f}"
                 else:
-                    limit_px  = round(_best_px(asks[0]), 1)
-                    mt_reason = f"limit_short@ask={limit_px:.1f}"
+                    limit_px  = round(_best_px(asks[0]) + offset, 1)
+                    mt_reason = f"limit_short@ask+{offset:.1f}={limit_px:.1f}"
             else:
                 raise ValueError("empty book")
         except Exception:
@@ -5976,18 +6027,42 @@ class QuantStrategy:
         pos = self._pos; price = data_manager.get_last_price()
         if price < 1.0: return
 
-        # ── Compute signals FIRST (needed for thesis check) ──────────────────
-        sig = self._compute_signals(data_manager)
+        # ── Conditionally compute signals — only when trade mode consumes them ──
+        # Bug #7/#19 fix: _compute_signals() runs all five signal engines (VWAP,
+        # CVD, ADX, OB, tick) on every active tick, but in the dominant trade mode
+        # "reversion" (all liquidity-first entries) the result is used only for
+        # _log_thinking() — pure overhead.  The WeightScheduler and its dynamic
+        # regime weights are also dead code in the v10 liquidity-first path
+        # (_evaluate_entry routes through pool-based logic, never calls
+        # _compute_signals).
+        #
+        # Gate: only compute when trade_mode is "trend" (regime-flip exit check)
+        # or "flow" (sustained counter-flow exit check).  In "reversion" mode we
+        # still call _log_thinking with the last cached signal so the thinking log
+        # continues to appear — it just isn't recomputed every tick.
+        _needs_signals = pos.trade_mode in ("trend", "flow")
+        sig = None
+        if _needs_signals:
+            sig = self._compute_signals(data_manager)
+            if sig is not None:
+                self._last_sig = sig   # keep cache fresh for display/heartbeat
+        else:
+            # In reversion mode: use the cached last signal for logging only.
+            sig = getattr(self, '_last_sig', None)
+
         if sig is not None:
             self._log_thinking(sig, price, now)
 
-            if pos.trade_mode == "trend":
-                regime_flipped = not self._regime.is_trending() or (
-                    (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
-                    (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
-                if regime_flipped:
-                    logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
-                    self._exit_trade(order_manager, price, "regime_flip"); return
+            # These exit checks are only valid on a freshly computed signal;
+            # the cached reversion-mode signal is stale and must not drive exits.
+            if _needs_signals:
+                if pos.trade_mode == "trend":
+                    regime_flipped = not self._regime.is_trending() or (
+                        (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
+                        (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
+                    if regime_flipped:
+                        logger.info(f"🔄 Regime flip → exit {pos.side.upper()} [{pos.trade_mode}]")
+                        self._exit_trade(order_manager, price, "regime_flip"); return
 
             # v6.0: Momentum trades exit via SL, TP, or trailing SL ONLY.
             # BREAKOUT_EXPIRED exit REMOVED — it was closing positions right before
@@ -5997,7 +6072,8 @@ class QuantStrategy:
 
             # v5.1: Flow trades exit when order flow structurally reverses.
             # Not on a single tick flip — on sustained counter-flow + BOS reversal.
-            if pos.trade_mode == "flow":
+            # Guard: only run when signals were freshly computed (not cached).
+            if _needs_signals and pos.trade_mode == "flow":
                 # BUG-FIX: compute profit here; it was used below without being defined
                 _flow_profit = ((price - pos.entry_price) if pos.side == "long"
                                 else (pos.entry_price - price))
@@ -6449,6 +6525,7 @@ class QuantStrategy:
                     ict_engine      = self._ict,
                     now             = now,
                     hold_reason     = _liq_hold_reasons,
+                    pos             = pos,   # Bug #14: exact entry fee for BE lock
                 )
                 if _liq_result.new_sl is not None:
                     _new_liq_sl = _liq_result.new_sl
@@ -6685,6 +6762,7 @@ class QuantStrategy:
             tick_flow                = _tick_flow_now,
             displacement_confirmed   = _displacement_confirmed,
             liq_snapshot             = _trail_liq_snap,   # v7.0 primary anchor
+            pos                      = pos,               # Bug #4: exact BE fee
         )
 
         if new_sl is None:
@@ -7223,7 +7301,10 @@ class QuantStrategy:
         # further entries after MAX_SESSION_LOSSES in the same session.
         if self._conviction is not None:
             try:
-                self._conviction.record_trade_result(win=is_win)
+                # Bug #1 fix: previously called record_trade_result(win=is_win)
+                # with no pnl argument, permanently pinning session_pnl=0.0 and
+                # making the drawdown circuit breaker impossible to trigger.
+                self._conviction.record_trade_result(win=is_win, pnl=pnl)
             except Exception as _cv_rec_e:
                 logger.debug(f"ConvictionFilter.record_trade_result error: {_cv_rec_e}")
 
@@ -7366,6 +7447,18 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
+        # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
+        # _anchor_lock_until across the lifetime of the instance (one instance
+        # per QuantStrategy, reused for every position).  If position A closed
+        # while anchored to a 15m SSL at $66,800 and position B opens within
+        # the 90-second lock window, the engine would reuse A's stale anchor —
+        # structurally irrelevant and potentially in the wrong direction for B.
+        # reset() clears both fields atomically; it is intentionally idempotent.
+        if hasattr(self, '_liq_trail') and self._liq_trail is not None:
+            try:
+                self._liq_trail.reset()
+            except Exception as _ltr_e:
+                logger.debug(f"LiquidityTrailEngine.reset() error (non-fatal): {_ltr_e}")
         # CRITICAL: do NOT reset _pnl_recorded_for or _exit_completed here.
         # These guards must persist until a new position opens (in _enter_trade).
         # Resetting them here was the v7.0 root cause of double-counting:

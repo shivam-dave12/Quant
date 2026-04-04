@@ -306,7 +306,21 @@ def _detect_equal_levels(
     cluster_radius_atr: float,
 ) -> List[Tuple[float, int]]:
     """
-    Cluster swing extremes within cluster_radius x ATR.
+    Cluster swing extremes within cluster_radius × ATR of the cluster CENTROID.
+
+    Bug #20 fix: the original implementation compared each new price against
+    the LAST price added to the current cluster (single-linkage). With a chain
+    like [100.0, 100.15, 100.30] and radius=0.20×ATR, the first two merge
+    correctly, then 100.30 is compared against 100.15 (not 100.0), and since
+    0.15 ≤ 0.20 it merges — producing a cluster that spans 0.30×ATR (50% over
+    budget). At BTC ATR=$67 and radius=0.20 this means swings $20 apart merged
+    as "equal highs", inflating touch count and creating a single pool where two
+    distinct stop clusters actually exist.
+
+    Fix: track the running centroid. A new price only joins the cluster if its
+    distance from the current centroid is ≤ radius. The centroid is updated
+    incrementally after each admission — O(n) and numerically stable.
+
     Returns [(centroid_price, touch_count), ...] sorted ascending.
     """
     if not swings or atr < 1e-10:
@@ -314,20 +328,30 @@ def _detect_equal_levels(
 
     radius        = atr * cluster_radius_atr
     sorted_swings = sorted(swings, key=lambda s: s[1])
-    clusters:      List[Tuple[float, int]] = []
-    cluster_prices: List[float]            = []
+    clusters:     List[Tuple[float, int]] = []
+
+    # Running cluster represented as (sum_of_prices, count) for O(1) centroid.
+    cluster_sum:   float = 0.0
+    cluster_count: int   = 0
 
     for _, price in sorted_swings:
-        if not cluster_prices:
-            cluster_prices = [price]
-        elif abs(price - cluster_prices[-1]) <= radius:
-            cluster_prices.append(price)
+        if cluster_count == 0:
+            cluster_sum   = price
+            cluster_count = 1
         else:
-            clusters.append((sum(cluster_prices) / len(cluster_prices), len(cluster_prices)))
-            cluster_prices = [price]
+            centroid = cluster_sum / cluster_count
+            if abs(price - centroid) <= radius:
+                # Price is within radius of the centroid — admit to cluster.
+                cluster_sum   += price
+                cluster_count += 1
+            else:
+                # Price is outside — flush the current cluster and start a new one.
+                clusters.append((cluster_sum / cluster_count, cluster_count))
+                cluster_sum   = price
+                cluster_count = 1
 
-    if cluster_prices:
-        clusters.append((sum(cluster_prices) / len(cluster_prices), len(cluster_prices)))
+    if cluster_count > 0:
+        clusters.append((cluster_sum / cluster_count, cluster_count))
 
     return clusters
 
@@ -785,30 +809,51 @@ class LiquidityMap:
 
     def _promote_htf_confluence(self, atr: float) -> None:
         """
-        FIX-7: Set pool.htf_count = number of distinct OTHER timeframes that
-        have a pool within 0.7 x ATR of this pool (widened from 0.5 ATR).
+        Set pool.htf_count = number of distinct OTHER timeframes that have a
+        pool within 0.7×ATR of this pool (same side only).
 
-        A 5m pool clustering with a 4h level gets htf_count >= 1, which
-        triggers _HTF_CONFLUENCE_MULT (x2.5) in significance() when htf_count >= 2.
+        Bug #16 fix: the original implementation was O(n²) — it iterated every
+        pool against every other pool, producing up to 32,400 comparisons per
+        call at maximum pool density (180 pools across 6 TFs).  This ran inside
+        update() which is called every tick (~4×/second), visibly bloating tick
+        latency under high pool density.
+
+        Fix: sort all pools by (side, price) once — O(n log n) — then use a
+        sliding window per side to find neighbours within the radius.  Each pool
+        is compared only against its actual spatial neighbours, giving O(n) work
+        per side after sorting.  Total complexity: O(n log n).
+
         Counter is fully recomputed each call — no stale state accumulates.
         """
-        radius = atr * 0.7   # FIX-7: was 0.5
+        radius = atr * 0.7
 
-        # Collect all active pools with their timeframe tag
-        all_pools: List[LiquidityPool] = []
+        # Collect all active pools with their timeframe, grouped by side.
+        bsl_pools: List[LiquidityPool] = []
+        ssl_pools: List[LiquidityPool] = []
         for reg in self._registries.values():
-            all_pools.extend(reg.bsl_pools + reg.ssl_pools)
+            bsl_pools.extend(reg.bsl_pools)
+            ssl_pools.extend(reg.ssl_pools)
 
-        for pool in all_pools:
-            tf_set: set = set()
-            for other in all_pools:
-                if other is pool:
-                    continue
-                if other.side != pool.side:
-                    continue
-                if abs(other.price - pool.price) <= radius:
-                    tf_set.add(other.timeframe)
-            pool.htf_count = len(tf_set)
+        def _apply_sliding_window(pools: List[LiquidityPool]) -> None:
+            if not pools:
+                return
+            # Sort by price ascending — enables O(n) sliding window.
+            pools.sort(key=lambda p: p.price)
+            n = len(pools)
+            left = 0
+            for right in range(n):
+                # Advance left pointer to maintain window: all pools within radius.
+                while pools[right].price - pools[left].price > radius:
+                    left += 1
+                # Count distinct OTHER timeframes within [left, right].
+                tf_set: set = set()
+                for k in range(left, right + 1):
+                    if pools[k] is not pools[right]:
+                        tf_set.add(pools[k].timeframe)
+                pools[right].htf_count = len(tf_set)
+
+        _apply_sliding_window(bsl_pools)
+        _apply_sliding_window(ssl_pools)
 
     def _align_with_ict(self, ict_engine, price: float, atr: float) -> None:
         """

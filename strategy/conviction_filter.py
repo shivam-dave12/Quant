@@ -263,22 +263,31 @@ class ConvictionFilter:
                 factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
 
         # ── GATE 2: Dealing range — institutional zones ────────────────────
-        dr_pd = self._get_dealing_range_pd(price, ict_engine, liq_snapshot)
-        if trade_side == "long" and dr_pd > DR_LONG_MAX_PD:
-            rejects.append(
-                f"DEALING_RANGE: LONG in premium/EQ (PD={dr_pd:.2f} > {DR_LONG_MAX_PD}). "
-                f"Institutions buy in discount only.")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
-        if trade_side == "short" and dr_pd < DR_SHORT_MIN_PD:
-            rejects.append(
-                f"DEALING_RANGE: SHORT in discount/EQ (PD={dr_pd:.2f} < {DR_SHORT_MIN_PD}). "
-                f"Institutions sell in premium only.")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
-        factors.dealing_range_ok = True
+        # Bug #13 fix: _get_dealing_range_pd now returns (pd, data_available).
+        # When data_available=False the 0.50 value is a pure sentinel — applying
+        # the discount/premium gate would block BOTH directions simultaneously,
+        # so we skip the gate and log a warning instead.
+        dr_pd, dr_data_available = self._get_dealing_range_pd(
+            price, ict_engine, liq_snapshot)
+        if not dr_data_available:
+            logger.debug(
+                "DEALING_RANGE: no structural data yet — gate skipped (0.50 sentinel)")
+        else:
+            if trade_side == "long" and dr_pd > DR_LONG_MAX_PD:
+                rejects.append(
+                    f"DEALING_RANGE: LONG in premium/EQ (PD={dr_pd:.2f} > {DR_LONG_MAX_PD}). "
+                    f"Institutions buy in discount only.")
+                return ConvictionResult(
+                    allowed=False, score=0.0, reject_reasons=rejects,
+                    factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
+            if trade_side == "short" and dr_pd < DR_SHORT_MIN_PD:
+                rejects.append(
+                    f"DEALING_RANGE: SHORT in discount/EQ (PD={dr_pd:.2f} < {DR_SHORT_MIN_PD}). "
+                    f"Institutions sell in premium only.")
+                return ConvictionResult(
+                    allowed=False, score=0.0, reject_reasons=rejects,
+                    factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
+        factors.dealing_range_ok = dr_data_available
 
         # ── GATE 3: R:R minimum ───────────────────────────────────────────
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
@@ -495,10 +504,27 @@ class ConvictionFilter:
                 f"ENTRY_CAP: {st.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
                 f"entries exhausted this session.")
 
-        # Cumulative drawdown circuit breaker (session PnL as % of margin)
-        # This is a safety net — if we're down 4% in a session, stop.
-        # Note: session_pnl is in absolute terms, not percentage.
-        # The quant_strategy caller should convert to % if needed.
+        # Bug #2 fix: Cumulative session drawdown circuit breaker.
+        # session_pnl is in absolute USD terms.  We normalise it to a notional
+        # $10 000 account so the 4% gate is exchange-agnostic.  Operators who
+        # want a margin-relative gate should override SESSION_DRAWDOWN_NOTIONAL
+        # in config.  This guard prevents a single bad session from compounding
+        # beyond the daily VaR limit regardless of the consecutive-loss pattern.
+        try:
+            import config as _cfg
+            _notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
+            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 4.0))
+        except Exception:
+            _notional   = 10_000.0
+            _max_dd_pct = 4.0
+
+        if _notional > 0 and st.session_pnl < 0:
+            _dd_pct = abs(st.session_pnl) / _notional * 100.0
+            if _dd_pct >= _max_dd_pct:
+                return (
+                    f"DRAWDOWN_CIRCUIT_BREAKER: session PnL=${st.session_pnl:.2f} "
+                    f"({_dd_pct:.1f}% of ${_notional:,.0f} notional >= {_max_dd_pct:.1f}% cap). "
+                    f"Trading halted for this session.")
 
         return None
 
@@ -531,23 +557,49 @@ class ConvictionFilter:
         return price, tf, round(sig, 2), htf_cnt
 
     @staticmethod
-    def _get_dealing_range_pd(price: float, ict_engine, liq_snapshot) -> float:
-        """Get dealing range Premium/Discount position [0=full discount, 1=full premium]."""
+    def _get_dealing_range_pd(
+        price: float, ict_engine, liq_snapshot,
+    ) -> Tuple[float, bool]:
+        """
+        Get dealing range Premium/Discount position [0=full discount, 1=full premium].
+
+        Returns (pd, data_available) where data_available=False means the 0.50
+        value is a pure fallback (no structural data) and the caller MUST skip
+        GATE 2 rather than hard-blocking both directions simultaneously.
+
+        Bug #13 fix: the previous version returned bare 0.50 when data was absent,
+        causing GATE 2 to block ALL entries at startup (0.50 > 0.45 → LONG blocked;
+        0.50 < 0.55 → SHORT blocked).  The equilibrium fallback is only meaningful
+        when there is genuine structural data placing price at equilibrium.
+        """
+        # Priority 1: ICT engine dealing range (computed from multi-TF candles)
         if ict_engine is not None:
             dr = getattr(ict_engine, '_dealing_range', None)
             if dr is not None:
                 pd = getattr(dr, 'current_pd', None)
                 if pd is not None:
-                    return float(pd)
+                    return float(pd), True
+
+        # Priority 2: pool-based calculation from liquidity snapshot
         if liq_snapshot is not None:
             bsl_pools = getattr(liq_snapshot, 'bsl_pools', [])
             ssl_pools = getattr(liq_snapshot, 'ssl_pools', [])
             bsl_above = [t.pool.price for t in bsl_pools if t.pool.price > price]
             ssl_below = [t.pool.price for t in ssl_pools if t.pool.price < price]
             if bsl_above and ssl_below:
-                rng = max(min(bsl_above) - max(ssl_below), 1e-9)
-                return (price - max(ssl_below)) / rng
-        return 0.50
+                # Use the nearest BSL and SSL as dealing range boundaries.
+                # Guard against thin-pool scenarios where the calculated range
+                # would be less than 1 ATR — in that case the pool spread is too
+                # narrow to produce a meaningful P/D reading.
+                nearest_bsl = min(bsl_above)
+                nearest_ssl = max(ssl_below)
+                rng = nearest_bsl - nearest_ssl
+                if rng > 1e-9:
+                    return (price - nearest_ssl) / rng, True
+
+        # No structural data available — return sentinel 0.50 with data_available=False.
+        # Caller MUST skip GATE 2 in this state.
+        return 0.50, False
 
     @staticmethod
     def _get_amd_phase(ict_engine) -> str:

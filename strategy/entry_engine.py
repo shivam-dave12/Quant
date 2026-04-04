@@ -389,9 +389,25 @@ class EntryEngine:
         return sig
 
     def on_entry_placed(self) -> None:
+        """
+        Called by quant_strategy when a trade order is confirmed sent.
+
+        Bug #17 fix: _momentum_entries_1h was previously incremented when the
+        momentum SIGNAL was generated, not when the entry was actually placed.
+        A signal blocked by the conviction gate still consumed a budget slot,
+        so two blocked signals exhausted the 3-per-hour cap even with zero
+        fills.  The counter now increments here — strictly after consume_signal()
+        has been called and the order submitted — giving an accurate count of
+        attempted (not generated) entries.
+        """
         self._state = EngineState.ENTERING
         self._state_entered = time.time()
         self._last_entry_at = time.time()
+        # Increment momentum budget for the active signal type (if momentum).
+        if (self._signal is not None and
+                getattr(self._signal, 'entry_type', None) ==
+                EntryType.DISPLACEMENT_MOMENTUM):
+            self._momentum_entries_1h += 1
         self._signal = None
 
     def on_entry_failed(self) -> None:
@@ -637,7 +653,11 @@ class EntryEngine:
             target = min(reachable, key=lambda t: t.distance_atr)
 
         self._last_momentum_candle_ts = int(disp_candle.get('t', 0) or 0)
-        self._momentum_entries_1h += 1
+        # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
+        # It is incremented in on_entry_placed() ONLY if the signal is consumed
+        # and the order actually submitted.  Incrementing here would charge the
+        # hourly budget for signals that are subsequently blocked by the
+        # conviction gate, unfairly exhausting the momentum allowance. (Bug #17)
 
         self._signal = EntrySignal(
             side=disp_dir, entry_type=EntryType.DISPLACEMENT_MOMENTUM,
@@ -744,8 +764,16 @@ class EntryEngine:
 
         if decision.action == "reverse":
             self._handle_reversal(ps.sweep, decision, snap, flow, ict, price, atr, now)
+            # Bug #18 fix: _handle_reversal sets self._post_sweep = None and
+            # calls self._reset(now).  Without an explicit return here the method
+            # falls through to the next tick, creating a window where
+            # self._state == POST_SWEEP but self._post_sweep is None.  Any new
+            # sweep arriving in that window is silently dropped by the state guard.
+            return
         elif decision.action == "continue":
             self._handle_continuation(ps.sweep, decision, snap, flow, ict, price, atr, now)
+            # Same one-tick window fix as above.
+            return
 
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep

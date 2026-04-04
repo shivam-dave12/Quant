@@ -230,6 +230,24 @@ class LiquidityTrailEngine:
         self._anchor_lock_until: float = 0.0
         self._last_phase: str = "HANDS_OFF"
 
+    def reset(self) -> None:
+        """
+        Reset all inter-position state.
+
+        Bug #23 fix: _locked_anchor and _anchor_lock_until were never cleared
+        between positions. If position A closed while anchored to a 15m SSL at
+        $66,800 and position B opened within 90 seconds, the engine would re-use
+        the stale anchor from A, potentially placing SL at a structurally
+        irrelevant level for B's direction and range.
+
+        Call this from _finalise_exit() immediately after the old PositionState
+        is replaced, BEFORE the new entry evaluation begins.
+        """
+        self._locked_anchor    = None
+        self._anchor_lock_until = 0.0
+        self._last_phase        = "HANDS_OFF"
+        logger.debug("LiquidityTrailEngine: state reset for new position")
+
     def compute(
         self,
         pos_side:        str,
@@ -243,6 +261,7 @@ class LiquidityTrailEngine:
         ict_engine               = None,
         now:             float  = 0.0,
         hold_reason:     Optional[List[str]] = None,
+        pos                      = None,   # Bug #14: PositionState for exact fee
     ) -> LiquidityTrailResult:
         """
         Compute the next SL based on institutional phase-based logic.
@@ -291,7 +310,7 @@ class LiquidityTrailEngine:
             self._last_phase = "BE_LOCK"
             return self._try_be_lock(
                 pos_side, price, entry_price, current_sl, atr, init_dist,
-                r_multiple, hold_reason)
+                r_multiple, hold_reason, pos=pos)
 
         # ══════════════════════════════════════════════════════════════════
         # PHASE 2 — STRUCTURAL TRAIL (2.0R to 3.5R)
@@ -332,15 +351,43 @@ class LiquidityTrailEngine:
         self, pos_side: str, price: float, entry_price: float,
         current_sl: float, atr: float, init_dist: float,
         r_multiple: float, hold_reason: Optional[List[str]],
+        pos=None,
     ) -> LiquidityTrailResult:
         """
         Move SL to breakeven + round-trip fees + slippage buffer.
         Only one move in this phase — once BE is locked, hold.
+
+        Bug #14 fix: previously used a hardcoded 0.055% taker fee, silently
+        ignoring config.COMMISSION_RATE and Delta's maker rebate.  Now:
+          1. If pos.entry_fee_paid is available (Delta v8.1+ exact fill), derive
+             the per-unit fee from it — this captures the actual maker/taker rate.
+          2. Otherwise fall back to config.COMMISSION_RATE (bilateral estimate).
+        This matches the behaviour of the centralised _calc_be_price() in
+        quant_strategy.py, which was specifically written to fix this pattern.
         """
-        # Compute BE price: entry + (commission round-trip) + (slippage buffer)
-        commission_rt = entry_price * 0.00055 * 2   # round-trip taker
-        slippage_buf = 0.12 * atr                    # half-spread estimate
-        total_buffer = commission_rt + slippage_buf
+        # ── Fee per unit (exact or estimated) ─────────────────────────────
+        _exact_fee = 0.0
+        _qty       = 0.0
+        if pos is not None:
+            _exact_fee = float(getattr(pos, 'entry_fee_paid', 0.0) or 0.0)
+            _qty       = float(getattr(pos, 'quantity',       0.0) or 0.0)
+
+        if _exact_fee > 1e-6 and _qty > 1e-10:
+            # Exact entry fee from exchange fill; estimate exit at same rate.
+            _entry_fee_per_unit = _exact_fee / _qty
+            _exit_fee_rate      = _entry_fee_per_unit / max(entry_price, 1.0)
+            commission_rt       = _entry_fee_per_unit + entry_price * _exit_fee_rate
+        else:
+            # Config-driven bilateral estimate (respects COMMISSION_RATE overrides).
+            try:
+                import config as _cfg
+                _rate = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+            except Exception:
+                _rate = 0.00055
+            commission_rt = entry_price * _rate * 2.0
+
+        slippage_buf  = 0.12 * atr
+        total_buffer  = commission_rt + slippage_buf
 
         if pos_side == "long":
             be_price = entry_price + total_buffer
