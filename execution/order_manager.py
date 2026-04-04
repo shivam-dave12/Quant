@@ -33,23 +33,6 @@ Key differences handled per-exchange
 
 All exchange-specific behaviour is encapsulated in the _Adapter inner
 classes so the OrderManager logic never branches on exchange type.
-
-FIX LOG (v10.1):
-  BUG-BRACKET-RACE: place_bracket_limit_entry tried cancel+replace on
-    bracket market children WITHOUT first verifying the position was still
-    open.  When a bracket SL/TP fires in the 1-3s window between fill
-    detection and the child-cancel attempt, cancel returns NOT_FOUND and the
-    subsequent reduce_only order hits no_position_for_reduce_only.
-    FIX: (1) Verify position open before ANY reduce_only placement.
-         (2) On child NOT_FOUND during upgrade, re-check position and abort
-             upgrade gracefully — position already closed by bracket, log the
-             correct exit prices.
-         (3) Place new SL/TP BEFORE cancelling the bracket child so there is
-             no unprotected window (place-then-cancel, not cancel-then-place).
-
-  BUG-REDUCE-ONLY-GUARD: All reduce_only placements now guarded by a
-    pre-flight position check (_position_open_guard) that returns None
-    if the exchange reports FLAT, preventing no_position_for_reduce_only.
 """
 
 from __future__ import annotations
@@ -119,6 +102,8 @@ class _RateLimiter:
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 
+# Also keep a module-level alias for legacy imports (quant_strategy does
+# `from execution.order_manager import GlobalRateLimiter`)
 class GlobalRateLimiter:
     """Legacy shim — routes to the active exchange limiter."""
     _active = _CS_LIMITER
@@ -316,6 +301,7 @@ class _DeltaAdapter:
             return None
         result = resp.get("result")
         if isinstance(result, dict):
+            # Delta returns id as integer in result.id
             oid = result.get("id") or result.get("order_id")
             return str(int(oid)) if oid else None
         return None
@@ -360,17 +346,20 @@ class _DeltaAdapter:
                     reduce_only: bool = False,
                     stop_order_type: Optional[str] = None) -> Optional[Dict]:
         self.limiter.wait()
+        # symbol is the primary key; Delta API resolves product_id internally
+        # Convert BTC quantity → integer contracts
+        # Delta India inverse perpetual: 1 contract = DELTA_CONTRACT_VALUE_BTC BTC
         _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
         resp = self.api.place_order(
             symbol          = self.symbol,
             side            = side.lower(),
             order_type      = order_type,
-            size            = contracts,
+            size            = contracts,       # Delta: integer contracts
             limit_price     = float(price) if price else None,
             stop_price      = float(trigger_price) if trigger_price else None,
             reduce_only     = reduce_only,
-            stop_order_type = stop_order_type,
+            stop_order_type = stop_order_type,  # "stop_loss_order" | "take_profit_order"
         )
         oid = self.extract_order_id(resp)
         if not oid:
@@ -384,6 +373,8 @@ class _DeltaAdapter:
                                   limit_price: float,
                                   sl_price: float,
                                   tp_price: float) -> Optional[Dict]:
+        # Bracket limit order: entry + SL + TP in a single Delta API call.
+        # Avoids bad_schema from separate stop/take-profit order placement.
         self.limiter.wait()
         _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
         contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
@@ -408,16 +399,28 @@ class _DeltaAdapter:
 
     def cancel_order(self, order_id: str) -> Dict:
         self.limiter.wait()
+        # Pass product_id so api.cancel_order() can include it in the DELETE body.
+        # Delta requires product_id in the body; without it the request returns 404.
         pid = self._get_product_id()
         return self.api.cancel_order(order_id=order_id, product_id=pid) or {}
 
-    def edit_order(self, order_id: str, new_stop_price: float = None,
+    def edit_order(self, order_id: str, new_stop_price: float,
                    new_limit_price: Optional[float] = None) -> Optional[Dict]:
+        """
+        Atomically modify a stop order's trigger price (and limit price for stop-limits).
+
+        PUT /v2/orders — id and product_id in body (confirmed from API doc).
+
+        For stop-limit trailing SLs, always pass new_limit_price alongside new_stop_price.
+        The API EditOrderRequest schema supports both fields — one round-trip, atomic.
+
+        Returns a result dict on success, or {"_error": True, "_sc": sc} on failure.
+        """
         self.limiter.wait()
         resp = self.api.edit_order(
             order_id    = order_id,
             stop_price  = new_stop_price,
-            limit_price = new_limit_price,
+            limit_price = new_limit_price,   # None for stop-market, float for stop-limit
         )
         if resp and resp.get("success"):
             result = resp.get("result", {}) or {}
@@ -444,12 +447,28 @@ class _DeltaAdapter:
         return raw if isinstance(raw, list) else []
 
     def query_order_exact(self, order_id: str) -> Optional[Dict]:
+        """
+        GET /v2/orders/{order_id} — fetch a single order by its ID.
+
+        Per Delta API docs, the response always contains:
+          state           — "open" | "pending" | "closed" | "cancelled"
+          paid_commission — string; the actual USD commission charged on this order
+          stop_order_type — "stop_loss_order" | "take_profit_order" (for conditional orders)
+          commission      — same as paid_commission (alias field present in docs)
+
+        "closed" state means the order filled completely.
+        "paid_commission" is the exact fee charged — not an estimate.
+
+        Costs one _DELTA_LIMITER slot (0.25 s).
+        Returns the full raw Delta order object dict, or None on any error.
+        """
         self.limiter.wait()
         try:
             resp = self.api.get_order(order_id=order_id)
             if not isinstance(resp, dict) or not resp.get("success"):
                 return None
             result = resp.get("result") or {}
+            # api.py wraps the response; _raw is the original Delta dict
             raw = result.get("_raw") or result
             return raw if isinstance(raw, dict) else None
         except Exception as e:
@@ -457,12 +476,33 @@ class _DeltaAdapter:
             return None
 
     def get_fills_recent(self, page_size: int = 5) -> Optional[list]:
+        """
+        GET /v2/fills — most recent fill records for this symbol.
+
+        Used solely to retrieve the exact per-contract execution price for a
+        known order_id, because GET /v2/orders/{id} does not guarantee
+        returning average_fill_price for all order types per the official schema.
+
+        Fill object fields used here (per Delta API docs):
+          order_id   — string; matches the integer order id we placed
+          price      — string; exact per-contract execution price
+          commission — string; fee for this individual fill event
+          size       — integer; contracts filled in this event
+
+        For multi-fill orders (rare for market SL/TP), VWAP across fills for
+        the same order_id is computed by the caller.
+
+        page_size hard-capped at 5 — exit fills are always the most recent
+        events; fetching more wastes one rate-limit slot for no benefit.
+        Returns list of raw fill dicts, or None on any error.
+        """
         self.limiter.wait()
         try:
             resp = self.api.get_fills(symbol=self.symbol, page_size=min(page_size, 5))
             if not isinstance(resp, dict) or not resp.get("success"):
                 return None
             raw = resp.get("result", []) or []
+            # Some Delta paginated responses: {"result": [...], "meta": {...}}
             if isinstance(raw, dict):
                 raw = raw.get("result", []) or []
             return raw if isinstance(raw, list) else []
@@ -472,6 +512,7 @@ class _DeltaAdapter:
 
     def get_positions(self, symbol: str) -> Optional[Dict]:
         self.limiter.wait()
+        # Delta get_positions uses product_symbol parameter
         resp = self.api.get_positions(product_symbol=self.symbol)
         if isinstance(resp, dict) and resp.get("success"):
             return resp.get("result", {})
@@ -483,11 +524,14 @@ class _DeltaAdapter:
 
     def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
         self.limiter.wait()
+        # Pass symbol — Delta API resolves product_id internally via _symbol_to_product_id
         return self.api.set_leverage(symbol=self.symbol, leverage=leverage)
 
     def normalise_position(self, raw) -> Optional[Dict]:
         """Turn Delta position response into a canonical dict."""
+        # raw may be a list (from get_positions result) or a single dict
         if isinstance(raw, dict):
+            # Some Delta endpoints wrap in {result: [...]}
             inner = raw.get("result", raw)
             positions = inner if isinstance(inner, list) else [inner]
         elif isinstance(raw, list):
@@ -500,6 +544,7 @@ class _DeltaAdapter:
             if not isinstance(pos, dict): continue
             sym = str(pos.get("product_symbol",
                      pos.get("symbol", ""))).upper()
+            # Match BTCUSD against BTCUSD or any ticker containing it
             if delta_sym not in sym and sym not in delta_sym: continue
             size = 0.0
             for f in ("size", "quantity", "net_size"):
@@ -513,6 +558,7 @@ class _DeltaAdapter:
             if size > 0:
                 rs = str(pos.get("direction",
                          pos.get("side", ""))).upper()
+                # Delta uses "buy"/"sell" in direction field
                 side = "LONG" if rs in ("LONG", "BUY") else \
                        "SHORT" if rs in ("SHORT", "SELL") else None
             entry = 0.0
@@ -540,14 +586,10 @@ class OrderManager:
     Inject a CoinSwitchAPI or DeltaAPI; this class handles the rest.
     """
 
-    _MAX_RETRIES       = 2
-    _RETRY_BASE_SLEEP  = 1.0
-    _MAX_401_RETRIES   = 2
-    _401_RETRY_DELAY   = 1.0
-
-    # How long (seconds) to wait for a position to appear after fill
-    # before declaring the bracket closed itself.
-    _POST_FILL_POSITION_WAIT = 2.0
+    _MAX_RETRIES       = 2     # was 3 — 3 attempts × 30s timeout = 90s minimum block
+    _RETRY_BASE_SLEEP  = 1.0   # was 3.0 — base sleep for exponential backoff
+    _MAX_401_RETRIES   = 2     # was 3 — auth errors rarely fix themselves
+    _401_RETRY_DELAY   = 1.0   # was 2.0
 
     def __init__(self, api, exchange_name: str = "coinswitch") -> None:
         exch = exchange_name.lower()
@@ -556,16 +598,32 @@ class OrderManager:
         else:
             self._adapter = _CoinSwitchAdapter(api)
 
-        self.api            = api
+        self.api            = api         # kept for legacy access
         self._exchange_name = exch
         self._orders_lock   = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
+        # BUG-1 FIX: plain list grew forever — swap to deque so memory is bounded.
+        # 1 000 entries covers well over a year of daily trading; oldest records
+        # are evicted automatically once the cap is reached.
         self.order_history: deque = deque(maxlen=1_000)
         self._rate_window_start = time.time()
         self._rate_window_count = 0
         self._open_orders_404   = False
 
+        # Expose for callers that do order_manager.CancelResult
         self.CancelResult = CancelResult
+
+        # NOTE: GlobalRateLimiter is NOT set here.
+        # When the ExecutionRouter is used (the normal code path), the router
+        # owns both OMs and calls _sync_global_limiter() after construction,
+        # pointing GlobalRateLimiter at whichever exchange is currently active.
+        # Calling set_active() here caused a race: the last OM constructed
+        # (always delta, since it's created second) won, so GlobalRateLimiter
+        # always pointed at the delta limiter even when CoinSwitch was the active
+        # exchange — silently applying the wrong rate-limit interval to all calls.
+        # The single-OM legacy path (no router) can call GlobalRateLimiter.set_active()
+        # explicitly after construction if needed.
+
         logger.info(f"✅ OrderManager initialised (exchange={exch})")
 
     @property
@@ -593,29 +651,43 @@ class OrderManager:
         return True
 
     def _place_with_retry(self, **kwargs) -> Optional[Dict]:
-        """Place order with exponential-backoff retry on transient errors."""
+        """Place order with exponential-backoff retry on transient errors.
+
+        Retry matrix:
+          429 → notify limiter, exponential backoff, continue
+          5xx → exponential backoff, continue
+          401 → track consecutive 401s, sleep, continue; abort after MAX_401_RETRIES
+          other → non-retryable, return None immediately
+
+        consecutive_401s resets on any non-401 attempt so the counter
+        tracks CONSECUTIVE 401s, not total 401s across the entire loop.
+        """
         consecutive_401s = 0
         max_attempts     = self._MAX_RETRIES + self._MAX_401_RETRIES
         for attempt in range(max_attempts):
             result = self._adapter.place_order(**kwargs)
 
+            # ── Success ───────────────────────────────────────────────
             if result and not result.get("_error"):
                 return result
 
             sc  = (result or {}).get("_sc", 0)
             raw = (result or {}).get("_raw", {})
 
+            # ── 429 Too Many Requests ─────────────────────────────────
             if sc == 429:
-                consecutive_401s = 0
+                consecutive_401s = 0   # reset; 429 breaks the 401 chain
                 self._adapter.limiter.notify_429()
                 time.sleep(self._RETRY_BASE_SLEEP * (2 ** min(attempt, 4)))
                 continue
 
+            # ── Transient server error ────────────────────────────────
             if sc in (500, 502, 503):
-                consecutive_401s = 0
+                consecutive_401s = 0   # reset; server error breaks 401 chain
                 time.sleep(self._RETRY_BASE_SLEEP * (2 ** min(attempt, 3)))
                 continue
 
+            # ── Auth error ────────────────────────────────────────────
             if sc == 401:
                 consecutive_401s += 1
                 if consecutive_401s <= self._MAX_401_RETRIES:
@@ -631,6 +703,7 @@ class OrderManager:
                 )
                 return None
 
+            # ── Non-retryable ─────────────────────────────────────────
             logger.error(f"place_order non-retryable failure: sc={sc} raw={raw}")
             return None
 
@@ -646,37 +719,11 @@ class OrderManager:
         with self._orders_lock:
             self.active_orders.pop(order_id, None)
 
-    def _position_open_guard(self, context: str = "") -> bool:
-        """
-        Return True if a position is currently open on the exchange.
-        Return False (FLAT) — caller must NOT place reduce_only orders.
-
-        Costs one API slot.  Used before any reduce_only placement to prevent
-        no_position_for_reduce_only errors when a bracket child fires while
-        we are still in the child-upgrade sequence.
-        """
-        try:
-            pos = self.get_open_position()
-            if pos is None:
-                logger.warning(
-                    f"_position_open_guard[{context}]: position query failed — "
-                    f"assuming OPEN to err on the safe side")
-                return True  # conservative: assume open if query fails
-            has_position = (pos.get("side") is not None and
-                            float(pos.get("size", 0)) > 0)
-            if not has_position:
-                logger.warning(
-                    f"_position_open_guard[{context}]: exchange reports FLAT — "
-                    f"skipping reduce_only order")
-            return has_position
-        except Exception as e:
-            logger.error(f"_position_open_guard error: {e}")
-            return True  # conservative
-
     # ── Position query ────────────────────────────────────────────────────────
 
     def get_open_position(self) -> Optional[Dict]:
         try:
+            # Adapter.get_positions uses self.symbol (exchange-correct)
             raw = self._adapter.get_positions(self._adapter.symbol)
             if raw is None:
                 return None
@@ -698,7 +745,7 @@ class OrderManager:
                                 self._adapter.extract_status(data)
                     return data
                 if attempt < retry_count - 1:
-                    time.sleep(1.0)
+                    time.sleep(1.0)   # was 2*(attempt+1) — reduced to limit blocking
             except Exception as e:
                 logger.error(f"get_order_status error attempt {attempt+1}: {e}")
                 if attempt < retry_count - 1:
@@ -736,6 +783,9 @@ class OrderManager:
                 filled_qty = req_qty
             fill_pct = (filled_qty / req_qty * 100) if req_qty > 0 else 0.0
 
+            # Extract exact paid_commission from Delta order response.
+            # data is the normalised dict from get_order_status; _raw holds the
+            # original Delta response which contains paid_commission (string).
             _raw = data.get("_raw") or data
             paid_commission = 0.0
             for _fee_key in ("paid_commission", "commission"):
@@ -775,9 +825,6 @@ class OrderManager:
         try:
             if not self._check_window_rate_limit():
                 return None
-            # Guard: never place reduce_only against a flat position
-            if reduce_only and not self._position_open_guard("market_order"):
-                return None
             api_side = self._normalize_side(side)
             logger.info(f"MARKET {side} qty={quantity} reduce_only={reduce_only}")
             data = self._place_with_retry(
@@ -801,9 +848,6 @@ class OrderManager:
                           price: float, reduce_only: bool = False) -> Optional[Dict]:
         try:
             if not self._check_window_rate_limit():
-                return None
-            # Guard: never place reduce_only against a flat position
-            if reduce_only and not self._position_open_guard("limit_order"):
                 return None
             api_side = self._normalize_side(side)
             logger.info(f"LIMIT {side} qty={quantity} @ ${price:,.2f}")
@@ -883,6 +927,7 @@ class OrderManager:
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 return data
 
+        # Timeout
         cancel_result = self.cancel_order(order_id)
         if cancel_result == CancelResult.ALREADY_FILLED:
             details = self.get_fill_details(order_id)
@@ -912,32 +957,13 @@ class OrderManager:
         Polls until filled, then queries open orders to retrieve bracket child IDs.
         Returns None for non-Delta adapters (caller falls back to regular flow).
 
-        FIX v10.1 — Bracket child upgrade race condition:
-        -------------------------------------------------------
-        PROBLEM (before fix):
-          After fill, the code ran: cancel(bracket_child) → place(new_limit, reduce_only).
-          If the bracket's own market SL/TP fired in the 1-3s window between fill
-          detection and the cancel attempt, cancel returned NOT_FOUND and the
-          subsequent reduce_only placement hit no_position_for_reduce_only.
-          The strategy then recorded a fill at entry price with $0 gross P&L (only fees).
-
-        SOLUTION (applied here):
-          1. After fill is confirmed, immediately verify the position is STILL OPEN
-             before touching any bracket children.  If exchange is already FLAT,
-             record the bracket as self-closed and return so identify_exit_order
-             can reconcile the actual exit price from fills.
-          2. Upgrade strategy changed to PLACE-FIRST then CANCEL:
-             - Place new plain-limit SL FIRST (no risk window).
-             - Only then cancel the bracket market child.
-             - If cancel returns NOT_FOUND (child fired in between), re-check position.
-               If FLAT → bracket fired; cancel the new plain-limit and let
-               identify_exit_order detect the correct exit.
-               If OPEN → our new limit is the active SL; proceed normally.
-          3. TP follows the same place-first / cancel-second / position-recheck pattern.
-          4. Any reduce_only placement is guarded by _position_open_guard().
+        Return dict keys on success:
+          fill_price, fill_type, order_id, bracket_order=True,
+          bracket_sl_order_id, bracket_tp_order_id,
+          bracket_sl_price, bracket_tp_price
         """
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
-            return None
+            return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
         logger.info(
             f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
@@ -974,46 +1000,35 @@ class OrderManager:
 
             if status == "FILLED":
                 fill_px = float(details.get("fill_price") or limit_price)
-                data["fill_type"]       = "maker"
-                data["fill_price"]      = fill_px
-                data["bracket_order"]   = True
+                data["fill_type"]    = "maker"
+                data["fill_price"]   = fill_px
+                data["bracket_order"] = True
+                # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
                             f" fee=${data['paid_commission']:.4f}")
 
-                # ── STEP 1: Verify position is still open BEFORE any child work ──
-                # Small pause to let Delta's bracket engine register the position
-                time.sleep(self._POST_FILL_POSITION_WAIT)
-                if not self._position_open_guard("bracket_post_fill"):
-                    # Exchange is already FLAT — bracket's own market SL or TP
-                    # fired in the window between fill detection and now.
-                    # Let identify_exit_order recover the actual exit price.
-                    logger.warning(
-                        "⚠️ Bracket position already FLAT after fill — "
-                        "bracket market child fired before upgrade. "
-                        "Returning bracket_closed_by_children=True for reconcile."
-                    )
-                    data["bracket_sl_order_id"]       = ""
-                    data["bracket_tp_order_id"]       = ""
-                    data["bracket_sl_price"]          = sl_price
-                    data["bracket_tp_price"]          = tp_price
-                    data["bracket_closed_by_children"] = True
-                    return data
-
-                # ── STEP 2: Discover bracket child order IDs ──────────────────
+                # Query open orders to retrieve bracket SL/TP child order IDs.
+                # Delta creates children asynchronously after fill.
+                # Bug 4 fix: was a 6-attempt blocking loop (up to 24s of sleep
+                # while holding the strategy lock). Now: 2 fast attempts (3s
+                # total) return immediately to the caller. If children are still
+                # missing, a background thread polls for up to 90s and writes
+                # the IDs into _pending_bracket_children so the reconcile loop
+                # picks them up on the next pass.
                 sl_oid = tp_oid = ""
                 sl_trig = tp_trig = 0.0
-
                 _SL_TYPES = {
                     "STOP_MARKET", "STOP_MARKET_ORDER", "STOP",
-                    "STOP_LOSS_MARKET", "STOP_LOSS_ORDER", "STOP_LOSS_LIMIT",
+                    "STOP_LOSS_MARKET", "STOP_LOSS_ORDER",
                 }
                 _TP_TYPES = {
                     "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET_ORDER",
-                    "TAKE_PROFIT", "TAKE_PROFIT_ORDER", "TAKE_PROFIT_LIMIT",
+                    "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
                 }
 
                 def _parse_children(open_ords):
+                    """Return (sl_oid, sl_trig, tp_oid, tp_trig) from an open-orders list."""
                     _sl_o = _tp_o = ""
                     _sl_t = _tp_t = 0.0
                     for o in (open_ords or []):
@@ -1026,181 +1041,43 @@ class OrderManager:
                         trig = float(o.get("trigger_price") or
                                      (o.get("raw") or {}).get("stop_price") or 0)
                         oid  = o.get("order_id", "")
-                        is_sl = (ot in _SL_TYPES or
-                                 ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
-                        is_tp = (ot in _TP_TYPES or
-                                 ("PROFIT" in ot or "TAKE_PROFIT" in ot))
+                        is_sl = (ot in _SL_TYPES or ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
+                        is_tp = (ot in _TP_TYPES or ("PROFIT" in ot or "TAKE_PROFIT" in ot))
                         if is_sl and not _sl_o and oid:
                             _sl_o = oid; _sl_t = trig
                         elif is_tp and not _tp_o and oid:
                             _tp_o = oid; _tp_t = trig
                     return _sl_o, _sl_t, _tp_o, _tp_t
 
-                # Fast path: 2 attempts × 1.5 s
+                # Fast path: 2 attempts x 1.5s = 3s max — covers >95% of cases
                 for _fast in range(2):
                     time.sleep(1.5)
                     open_ords = self.get_open_orders()
-                    raw_types = [(o.get("order_id", "?")[:8], o.get("type", "?"))
-                                 for o in (open_ords or [])]
-                    logger.info(
-                        f"Bracket child query (fast {_fast+1}/2) — "
-                        f"open orders: {raw_types}"
-                    )
+                    raw_types = [(o.get("order_id","?")[:8], o.get("type","?")) for o in (open_ords or [])]
+                    logger.info(f"Bracket child query (fast {_fast+1}/2) — open orders: {raw_types}")
                     sl_oid, sl_trig, tp_oid, tp_trig = _parse_children(open_ords)
                     if sl_oid and tp_oid:
                         logger.info(f"Bracket children found on fast attempt {_fast+1}")
                         break
 
-                data["bracket_sl_order_id"] = sl_oid
-                data["bracket_tp_order_id"] = tp_oid
-                data["bracket_sl_price"]    = sl_trig or sl_price
-                data["bracket_tp_price"]    = tp_trig or tp_price
-
-                if sl_oid:
-                    logger.info(f"  Bracket SL order: {sl_oid} @ ${sl_trig:.2f}")
-                if tp_oid:
-                    logger.info(f"  Bracket TP order: {tp_oid} @ ${tp_trig:.2f}")
-
-                # ── STEP 3: Upgrade bracket market children → plain limits ─────
-                # Strategy: PLACE-FIRST then CANCEL (eliminates unprotected window).
-                # If cancel returns NOT_FOUND (bracket child fired between place and
-                # cancel), re-check position: FLAT → bracket won; cancel our new
-                # limit and return bracket_closed_by_children. OPEN → new limit is
-                # the active guard; proceed.
-                exit_side = "sell" if side.lower() in ("buy", "long") else "buy"
-
-                # ── SL upgrade ────────────────────────────────────────────────
-                if sl_oid and sl_trig > 0:
-                    # Place new plain-limit SL first
-                    new_sl = self.place_stop_loss(
-                        side=exit_side, quantity=quantity,
-                        trigger_price=sl_trig, use_limit=True,
-                    )
-                    if new_sl and not new_sl.get("_error"):
-                        new_sl_id = new_sl["order_id"]
-                        logger.info(
-                            f"✅ Bracket SL upgraded to stop-limit: "
-                            f"{new_sl_id} stop=${sl_trig:.2f}"
-                        )
-                        # Now cancel the original bracket market child
-                        sl_cancel = self.cancel_order(sl_oid)
-                        if sl_cancel == CancelResult.NOT_FOUND:
-                            # Bracket SL fired while we placed the new one
-                            logger.warning(
-                                f"⚠️ Bracket SL {sl_oid[:8]}… fired during upgrade — "
-                                f"re-checking position"
-                            )
-                            if not self._position_open_guard("sl_upgrade_recheck"):
-                                # Position closed by bracket SL — cancel our new limit
-                                self.cancel_order(new_sl_id)
-                                data["bracket_closed_by_children"] = True
-                                logger.warning(
-                                    "Position FLAT after bracket SL fired — "
-                                    "new SL cancelled, returning for reconcile"
-                                )
-                                return data
-                            # Position still open — bracket SL must have expired/cancelled
-                            # Our new plain-limit SL is now the active guard
-                            data["bracket_sl_order_id"] = new_sl_id
-                        elif sl_cancel in (CancelResult.SUCCESS, CancelResult.ALREADY_FILLED):
-                            data["bracket_sl_order_id"] = new_sl_id
-                        else:
-                            logger.warning(
-                                f"⚠️ Bracket SL cancel result {sl_cancel.value} — "
-                                f"keeping new plain-limit {new_sl_id[:8]}…"
-                            )
-                            data["bracket_sl_order_id"] = new_sl_id
-                    else:
-                        logger.warning(
-                            f"⚠️ Bracket SL upgrade failed — original market child "
-                            f"{sl_oid[:8]}… remains as guard"
-                        )
-
-                # ── TP upgrade ────────────────────────────────────────────────
-                if tp_oid and tp_trig > 0:
-                    # Guard: position must still be open before reduce_only TP
-                    if not self._position_open_guard("tp_upgrade"):
-                        logger.warning(
-                            "⚠️ Position FLAT before TP upgrade — "
-                            "skipping TP placement, bracket closed itself"
-                        )
-                        data["bracket_closed_by_children"] = True
-                        return data
-
-                    # Place new plain-limit TP first
-                    new_tp = self.place_take_profit(
-                        side=exit_side, quantity=quantity,
-                        trigger_price=tp_trig,
-                    )
-                    if new_tp and not new_tp.get("_error"):
-                        new_tp_id = new_tp["order_id"]
-                        logger.info(
-                            f"✅ Bracket TP upgraded to stop-limit: "
-                            f"{new_tp_id} stop=${tp_trig:.2f}"
-                        )
-                        # Cancel original bracket market TP
-                        tp_cancel = self.cancel_order(tp_oid)
-                        if tp_cancel == CancelResult.NOT_FOUND:
-                            logger.warning(
-                                f"⚠️ Bracket TP {tp_oid[:8]}… fired during upgrade — "
-                                f"re-checking position"
-                            )
-                            if not self._position_open_guard("tp_upgrade_recheck"):
-                                self.cancel_order(new_tp_id)
-                                data["bracket_closed_by_children"] = True
-                                logger.warning(
-                                    "Position FLAT after bracket TP fired — "
-                                    "new TP cancelled, returning for reconcile"
-                                )
-                                return data
-                            data["bracket_tp_order_id"] = new_tp_id
-                        elif tp_cancel in (CancelResult.SUCCESS, CancelResult.ALREADY_FILLED):
-                            data["bracket_tp_order_id"] = new_tp_id
-                        else:
-                            logger.warning(
-                                f"⚠️ Bracket TP cancel result {tp_cancel.value} — "
-                                f"keeping new plain-limit {new_tp_id[:8]}…"
-                            )
-                            data["bracket_tp_order_id"] = new_tp_id
-                    else:
-                        logger.warning(
-                            f"⚠️ Bracket TP upgrade failed — original market child "
-                            f"{tp_oid[:8]}… remains as guard"
-                        )
-
-                # ── STEP 4: Background resolver for missing children ───────────
-                # If children were not found in the fast path, resolve in background.
+                # Slow path: background thread resolves within 90s if still missing
                 if not (sl_oid and tp_oid):
                     _captured_order_id = order_id
                     _captured_om       = self
-                    _captured_side     = side
-                    _captured_qty      = quantity
-                    _captured_sl_price = sl_price
-                    _captured_tp_price = tp_price
 
                     def _bg_child_resolve():
-                        deadline_bg = time.time() + 90.0
-                        attempt     = 0
-                        while time.time() < deadline_bg:
+                        deadline = time.time() + 90.0
+                        attempt  = 0
+                        while time.time() < deadline:
                             time.sleep(3.0 + min(attempt, 5) * 2.0)
                             attempt += 1
                             try:
-                                # Check position first — if already flat, stop
-                                if not _captured_om._position_open_guard("bg_resolve"):
-                                    logger.info(
-                                        "Bracket bg-resolve: position flat — "
-                                        "bracket already closed itself, stopping"
-                                    )
-                                    return
                                 ords = _captured_om.get_open_orders()
                                 _s, _st, _t, _tt = _parse_children(ords)
                                 if _s and _t:
                                     logger.info(
-                                        f"Bracket child bg-resolve: SL={_s[:8]}… "
-                                        f"TP={_t[:8]}… (attempt {attempt})"
-                                    )
-                                    _exit_side = "sell" if _captured_side.lower() in ("buy", "long") else "buy"
-
+                                        f"Bracket child bg-resolve: SL={_s[:8]}\u2026 TP={_t[:8]}\u2026 "
+                                        f"(attempt {attempt})")
                                     if not hasattr(_captured_om, "_pending_bracket_children"):
                                         _captured_om._pending_bracket_children = {}
                                     _captured_om._pending_bracket_children[_captured_order_id] = {
@@ -1212,18 +1089,26 @@ class OrderManager:
                                 logger.debug(f"Bracket child bg-resolve error: {_e}")
                         logger.warning(
                             f"Bracket child bg-resolve: children not found within 90s "
-                            f"for order {_captured_order_id[:8]}… — reconcile will recover"
-                        )
+                            f"for order {_captured_order_id[:8]}\u2026 — reconcile will recover SL/TP")
 
                     import threading as _threading
                     _threading.Thread(target=_bg_child_resolve, daemon=True).start()
 
+                data["bracket_sl_order_id"] = sl_oid
+                data["bracket_tp_order_id"] = tp_oid
+                data["bracket_sl_price"]    = sl_trig
+                data["bracket_tp_price"]    = tp_trig
+                if sl_oid:
+                    logger.info(f"  Bracket SL order: {sl_oid} @ ${sl_trig:.2f}")
+                if tp_oid:
+                    logger.info(f"  Bracket TP order: {tp_oid} @ ${tp_trig:.2f}")
                 return data
 
             if status == "CANCELLED":
                 logger.info(f"Bracket order {order_id[:8]}… cancelled by exchange")
                 break
 
+        # Timeout — cancel and signal caller to retry after cooldown
         self.cancel_order(order_id)
         logger.info(f"Bracket order timeout after {timeout_sec:.0f}s — cancelled")
         return None
@@ -1232,95 +1117,100 @@ class OrderManager:
                         trigger_price: float,
                         use_limit: bool = True) -> Optional[Dict]:
         """
-        Place a plain REDUCE-ONLY LIMIT ORDER at the SL price.
-        Guarded by _position_open_guard — never fires against a flat position.
+        Place a standalone stop-loss order.
+
+        use_limit=True (default for trailing SLs): stop-limit order.
+          order_type=limit_order + stop_order_type=stop_loss_order + stop_price + limit_price
+          Advantages: atomic edit-in-place (PUT /v2/orders with stop_price+limit_price),
+          maker fee rebate (−0.02% vs +0.05% taker = 7bps saved per trail).
+          Limit offset configured via SL_LIMIT_OFFSET_TICKS (default 20 ticks = $2.00).
+
+        use_limit=False: stop-market order (used only for emergency/non-trailing SLs).
+          Guaranteed fill but taker fee and no edit-in-place for stop_price.
+
+        Bracket entry SL is always stop-market (placed by place_bracket_limit_entry).
+        Trailing SLs start as stop-limit on first cancel+replace of the bracket child.
         """
         try:
-            # Guard before any reduce_only placement
-            if not self._position_open_guard("place_stop_loss"):
-                return None
+            api_side = self._normalize_side(side)
+            tick  = float(getattr(config, 'TICK_SIZE', 0.1))
+            offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
+            limit_offset = offset_ticks * tick
 
-            api_side    = self._normalize_side(side)
-            tick        = float(getattr(config, 'TICK_SIZE', 0.1))
-            limit_price = round(trigger_price / tick) * tick
+            # Initialise limit_price to None; only assigned when use_limit=True.
+            # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
+            # limit_price before the if/else block, causing UnboundLocalError in
+            # _record_order when use_limit=False because the dict literal
+            # `"limit_price": limit_price if use_limit else None` was evaluated
+            # even on the False branch (Python evaluates the whole expression
+            # before checking the condition in some older CPython versions).
+            # Initialising to None is safe and makes the intent explicit.
+            limit_price: Optional[float] = None
 
-            logger.info(
-                f"SL-LIMIT (plain) {side} qty={quantity} "
-                f"limit=${limit_price:,.2f} [no trigger, resting in book]")
-
-            data = self._place_with_retry(
-                side        = api_side,
-                order_type  = "limit_order",
-                quantity    = quantity,
-                price       = limit_price,
-                reduce_only = True,
-            )
+            # Limit price: gives execution buffer past the stop trigger.
+            # SHORT SL (buy to close): limit = stop + offset (max price we'll pay)
+            # LONG  SL (sell to close): limit = stop - offset (min price we'll accept)
+            if use_limit:
+                if api_side == "BUY":
+                    limit_price = round(trigger_price + limit_offset, 1)
+                else:
+                    limit_price = round(trigger_price - limit_offset, 1)
+                logger.info(
+                    f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
+                    f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
+                data = self._place_with_retry(
+                    side=api_side, order_type="limit_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    price=limit_price,
+                    reduce_only=True, stop_order_type="stop_loss_order")
+            else:
+                # Stop-market: guaranteed fill, taker fee (for non-trailing / emergency)
+                logger.info(f"SL-MARKET {side} qty={quantity} trigger=${trigger_price:,.2f}")
+                data = self._place_with_retry(
+                    side=api_side, order_type="market_order",
+                    quantity=quantity, trigger_price=trigger_price,
+                    reduce_only=True, stop_order_type="stop_loss_order")
 
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id":    data["order_id"],
-                    "side":        side,
-                    "type":        "STOP_LOSS_LIMIT_PLAIN",
-                    "quantity":    quantity,
-                    "limit_price": limit_price,
-                    "status":      data.get("status", "UNKNOWN"),
-                    "timestamp":   datetime.now().isoformat(),
+                    "order_id": data["order_id"], "side": side,
+                    "type": "STOP_LOSS_LIMIT" if use_limit else "STOP_LOSS",
+                    "quantity": quantity, "trigger_price": trigger_price,
+                    "limit_price": limit_price if use_limit else None,
+                    "status": data.get("status", "UNKNOWN"),
+                    "timestamp": datetime.now().isoformat(),
                 })
                 logger.info(
-                    f"✅ SL (plain limit): {data['order_id']} "
-                    f"@ ${limit_price:,.2f}")
+                    f"✅ SL{'_LIMIT' if use_limit else ''}: {data['order_id']} "
+                    f"@ stop=${trigger_price:,.2f}"
+                    + (f" limit=${limit_price:,.2f}" if use_limit else ""))
             return data
         except Exception as e:
-            logger.error(f"place_stop_loss (plain limit) error: {e}", exc_info=True)
+            logger.error(f"place_stop_loss error: {e}", exc_info=True)
             return None
 
     def place_take_profit(self, side: str, quantity: float,
                           trigger_price: float) -> Optional[Dict]:
-        """
-        Place a plain REDUCE-ONLY LIMIT ORDER at the TP price (1 tick inside pool).
-        Guarded by _position_open_guard — never fires against a flat position.
-        """
         try:
-            # Guard before any reduce_only placement
-            if not self._position_open_guard("place_take_profit"):
-                return None
-
             api_side = self._normalize_side(side)
-            tick     = float(getattr(config, 'TICK_SIZE', 0.1))
-
-            if api_side == "SELL":
-                limit_price = round((trigger_price - tick) / tick) * tick
-            else:
-                limit_price = round((trigger_price + tick) / tick) * tick
-
-            logger.info(
-                f"TP-LIMIT (plain) {side} qty={quantity} "
-                f"limit=${limit_price:,.2f} [no trigger, 1-tick inside pool]")
-
+            logger.info(f"TP {side} qty={quantity} trigger=${trigger_price:,.2f}")
+            # API doc: standalone TP orders use order_type=market_order +
+            # stop_order_type=take_profit_order.
             data = self._place_with_retry(
-                side        = api_side,
-                order_type  = "limit_order",
-                quantity    = quantity,
-                price       = limit_price,
-                reduce_only = True,
-            )
-
+                side=api_side, order_type="market_order",
+                quantity=quantity, trigger_price=trigger_price,
+                reduce_only=True, stop_order_type="take_profit_order")
             if data:
                 self._record_order(data["order_id"], {
-                    "order_id":    data["order_id"],
-                    "side":        side,
-                    "type":        "TAKE_PROFIT_LIMIT_PLAIN",
-                    "quantity":    quantity,
-                    "limit_price": limit_price,
-                    "status":      data.get("status", "UNKNOWN"),
-                    "timestamp":   datetime.now().isoformat(),
+                    "order_id": data["order_id"], "side": side, "type": "TAKE_PROFIT",
+                    "quantity": quantity, "trigger_price": trigger_price,
+                    "status": data.get("status", "UNKNOWN"),
+                    "timestamp": datetime.now().isoformat(),
                 })
-                logger.info(
-                    f"✅ TP (plain limit): {data['order_id']} "
-                    f"@ ${limit_price:,.2f}")
+                logger.info(f"✅ TP: {data['order_id']} @ ${trigger_price:,.2f}")
             return data
         except Exception as e:
-            logger.error(f"place_take_profit (plain limit) error: {e}", exc_info=True)
+            logger.error(f"place_take_profit error: {e}", exc_info=True)
             return None
 
     # ── Order replacement ─────────────────────────────────────────────────────
@@ -1329,38 +1219,64 @@ class OrderManager:
                           side: str, quantity: float,
                           new_trigger_price: float) -> Optional[Dict]:
         """
-        Update trailing SL to new_trigger_price using a plain limit.
-        Edit-in-place preferred; cancel+replace as fallback.
-        """
-        try:
-            tick        = float(getattr(config, 'TICK_SIZE', 0.1))
-            new_limit   = round(new_trigger_price / tick) * tick
+        Update trailing SL to new_trigger_price.
 
-            # ── Path 1: Edit-in-place (Delta) ────────────────────────────────
+        Strategy:
+          1. EDIT-IN-PLACE (Delta) — PUT /v2/orders with id+product_id in body.
+             Sends both stop_price AND limit_price together (stop-limit).
+             Atomic: no cancel+replace cycle, zero unprotected window.
+             404 = order gone (SL fired) → return None, caller records exit.
+             bad_schema (with product_id fix) = should not occur — fall through.
+
+          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit failures.
+             Places a stop-limit order (limit offset = SL_LIMIT_OFFSET_TICKS × TICK_SIZE).
+             NOT_FOUND on cancel → abort (old SL still live) to prevent orphan accumulation.
+        """
+        tick  = float(getattr(config, 'TICK_SIZE', 0.1))
+        offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
+        limit_offset = offset_ticks * tick
+        api_side = self._normalize_side(side)
+
+        # Compute limit_price for the stop-limit (same logic as place_stop_loss)
+        if api_side == "BUY":
+            new_limit_price = round(new_trigger_price + limit_offset, 1)
+        else:
+            new_limit_price = round(new_trigger_price - limit_offset, 1)
+
+        try:
+            # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
+            # Sends stop_price + limit_price atomically — no cancel+replace needed.
+            # Confirmed from API doc: EditOrderRequest supports both fields.
             if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
-                    order_id        = existing_sl_order_id,
-                    new_limit_price = new_limit,
+                    order_id=existing_sl_order_id,
+                    new_stop_price=new_trigger_price,
+                    new_limit_price=new_limit_price,
                 )
                 if edited and not edited.get("_error"):
                     logger.info(
-                        f"✅ SL (plain limit) edited in-place "
-                        f"{existing_sl_order_id[:10]}… → ${new_limit:,.2f}")
+                        f"✅ SL edited in-place {existing_sl_order_id[:10]}… "
+                        f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}"
+                    )
                     edited["order_id"] = edited.get("order_id", existing_sl_order_id)
                     return edited
 
                 sc  = (edited or {}).get("_sc", 0)
                 err = (edited or {}).get("_err_msg", "")
                 if sc == 404 or "not_found" in str(err).lower():
+                    # SL order gone — it fired. Caller handles exit reconciliation.
                     logger.info(
                         f"SL {existing_sl_order_id[:10]}… gone (404) "
-                        f"— SL likely fired, letting reconcile detect exit")
+                        f"— SL likely fired, letting reconcile detect exit"
+                    )
                     return None
-                logger.warning(
-                    f"SL plain-limit edit failed sc={sc} err={err} "
-                    f"— falling back to cancel+replace")
+                else:
+                    logger.warning(
+                        f"SL edit failed sc={sc} err={err} "
+                        f"— falling back to cancel+replace"
+                    )
 
-            # ── Path 2: Cancel + Replace fallback ────────────────────────────
+            # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
             if existing_sl_order_id:
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
@@ -1372,67 +1288,56 @@ class OrderManager:
                         return None
                     if result == CancelResult.FAILED:
                         return {"error": "CANCEL_FAILED"}
+                    # NOT_FOUND: old SL still live on exchange — do NOT place a new one.
+                    # Placing a new SL would accumulate orphaned stop orders (root cause
+                    # of the 5-SL bug seen in screenshot). Retry on next trail tick.
                     if result == CancelResult.NOT_FOUND:
                         logger.warning(
-                            f"⚠️ SL cancel NOT_FOUND for {existing_sl_order_id} "
-                            f"— aborting replace. Retry next tick.")
+                            f"⚠️ SL cancel returned NOT_FOUND for {existing_sl_order_id} — "
+                            f"aborting replace (old SL may still be live). Retry next tick.")
                         return {"error": "CANCEL_NOT_FOUND"}
                     self._remove_active_order(existing_sl_order_id)
 
-            new_sl = self.place_stop_loss(
-                side          = side,
-                quantity      = quantity,
-                trigger_price = new_trigger_price,
-            )
+            # Place stop-limit replacement (use_limit=True is default)
+            new_sl = self.place_stop_loss(side=side, quantity=quantity,
+                                          trigger_price=new_trigger_price,
+                                          use_limit=True)
             if new_sl:
                 logger.info(
-                    f"✅ SL (plain limit) replaced → {new_sl['order_id']} "
-                    f"@ ${new_limit:,.2f}")
+                    f"✅ SL replaced (stop-limit) → {new_sl['order_id']} "
+                    f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}")
                 return new_sl
             return {"error": "PLACE_FAILED"}
-
         except Exception as e:
-            logger.error(f"replace_stop_loss (plain limit) error: {e}", exc_info=True)
+            logger.error(f"replace_stop_loss error: {e}", exc_info=True)
             return {"error": str(e)}
 
     def replace_take_profit(self, existing_tp_order_id: Optional[str],
                             side: str, quantity: float,
                             new_trigger_price: float) -> Optional[Dict]:
-        """
-        Update TP to new_trigger_price using a plain limit order.
-        Edit-in-place preferred; cancel+replace as fallback.
-        """
+        """Same edit-in-place → cancel+replace strategy as replace_stop_loss."""
         try:
-            tick     = float(getattr(config, 'TICK_SIZE', 0.1))
-            api_side = self._normalize_side(side)
-
-            if api_side == "SELL":
-                new_limit = round((new_trigger_price - tick) / tick) * tick
-            else:
-                new_limit = round((new_trigger_price + tick) / tick) * tick
-
-            # ── Path 1: Edit-in-place (Delta) ────────────────────────────────
+            # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
             if existing_tp_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
-                    order_id        = existing_tp_order_id,
-                    new_limit_price = new_limit,
+                    order_id=existing_tp_order_id,
+                    new_stop_price=new_trigger_price,
                 )
                 if edited and not edited.get("_error"):
                     logger.info(
-                        f"✅ TP (plain limit) edited in-place "
-                        f"{existing_tp_order_id[:10]}… → ${new_limit:,.2f}")
+                        f"✅ TP edited in-place {existing_tp_order_id[:10]}… "
+                        f"→ ${new_trigger_price:,.2f}"
+                    )
                     edited["order_id"] = edited.get("order_id", existing_tp_order_id)
                     return edited
 
                 sc  = (edited or {}).get("_sc", 0)
                 err = (edited or {}).get("_err_msg", "")
-                if sc == 404 or "not_found" in str(err).lower():
-                    logger.info(
-                        f"TP {existing_tp_order_id[:10]}… gone (404) — already filled")
-                    return None
-                logger.warning(
-                    f"TP plain-limit edit failed sc={sc} err={err} "
-                    f"— falling back to cancel+replace")
+                if sc != 404 and "not_found" not in str(err).lower():
+                    logger.warning(
+                        f"TP edit failed sc={sc} err={err} "
+                        f"— falling back to cancel+replace"
+                    )
 
             # ── Path 2: Cancel + Replace fallback ────────────────────────────
             if existing_tp_order_id:
@@ -1447,20 +1352,15 @@ class OrderManager:
                         return {"error": "CANCEL_FAILED"}
                     self._remove_active_order(existing_tp_order_id)
 
-            new_tp = self.place_take_profit(
-                side          = side,
-                quantity      = quantity,
-                trigger_price = new_trigger_price,
-            )
+            new_tp = self.place_take_profit(side=side, quantity=quantity,
+                                            trigger_price=new_trigger_price)
             if new_tp:
-                logger.info(
-                    f"✅ TP (plain limit) replaced → {new_tp['order_id']} "
-                    f"@ ${new_limit:,.2f}")
+                logger.info(f"✅ TP replaced → {new_tp['order_id']} "
+                            f"@ ${new_trigger_price:,.2f}")
                 return new_tp
             return {"error": "PLACE_FAILED"}
-
         except Exception as e:
-            logger.error(f"replace_take_profit (plain limit) error: {e}", exc_info=True)
+            logger.error(f"replace_take_profit error: {e}", exc_info=True)
             return {"error": str(e)}
 
     # ── Cancel ────────────────────────────────────────────────────────────────
@@ -1472,6 +1372,10 @@ class OrderManager:
             if not isinstance(resp, dict):
                 return CancelResult.FAILED
 
+            # Determine if the cancel API call itself succeeded.
+            # CoinSwitch: success = no "error" key in response body.
+            # Delta:       success = resp["success"] == True.
+            # Both can return {} on success (empty body = 200 OK).
             has_error   = bool(resp.get("error"))
             has_success = resp.get("success", None)
             sc          = resp.get("status_code", 0)
@@ -1481,6 +1385,7 @@ class OrderManager:
             elif has_success is False:
                 api_succeeded = False
             else:
+                # No "success" key (CoinSwitch style) — no error = success
                 api_succeeded = not has_error and sc not in (400, 401, 403, 404, 422)
 
             if sc == 404:
@@ -1488,14 +1393,20 @@ class OrderManager:
                 return CancelResult.NOT_FOUND
 
             if api_succeeded:
+                # Cancel was accepted — verify final state for correctness.
+                # Exchanges may have already filled the order before cancel landed.
                 current = self.get_order_status_safe(order_id)
                 if current == "FILLED":
                     return CancelResult.ALREADY_FILLED
                 if current == "PARTIAL_FILL":
                     return CancelResult.PARTIAL_FILL
+                # PENDING after a successful cancel request means the exchange
+                # accepted but hasn't settled yet (eventual consistency) — treat
+                # as SUCCESS; the position will be confirmed on next poll.
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
 
+            # Cancel API call failed — check if the order was already done
             current = self.get_order_status_safe(order_id)
             if current == "FILLED":
                 return CancelResult.ALREADY_FILLED
@@ -1505,6 +1416,7 @@ class OrderManager:
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
             if current == "UNKNOWN":
+                # Order gone from exchange (404 on status query)
                 self._remove_active_order(order_id)
                 return CancelResult.NOT_FOUND
 
@@ -1537,30 +1449,29 @@ class OrderManager:
             raw  = self._adapter.get_open_orders(sym)
             if raw is None:
                 return None
+            # Detect 404 dict response (adapter returned error dict instead of raising)
             if isinstance(raw, dict) and (raw.get("status_code") == 404
                                           or "404" in str(raw.get("error", ""))):
                 logger.warning("get_open_orders: 404 — endpoint unsupported, suppressing future calls")
                 self._open_orders_404 = True
                 return None
-            _STOP_OTYPE_REMAP_MARKET = {
+            # Delta bracket child stop_order_type remap (defense-in-depth in case
+            # api.py normalisation was bypassed or a different adapter is used).
+            _STOP_OTYPE_REMAP = {
                 "STOP_LOSS_ORDER":   "STOP_MARKET",
                 "TAKE_PROFIT_ORDER": "TAKE_PROFIT_MARKET",
-            }
-            _STOP_OTYPE_REMAP_LIMIT = {
-                "STOP_LOSS_ORDER":   "STOP_LOSS_LIMIT",
-                "TAKE_PROFIT_ORDER": "TAKE_PROFIT_LIMIT",
             }
             result = []
             for o in raw:
                 if not isinstance(o, dict): continue
                 oid   = str(o.get("order_id") or o.get("id") or "")
                 otype = str(o.get("order_type") or o.get("type") or "").upper()
-                _raw_inner = o.get("_raw") or o.get("raw") or {}
-                _sot = str(_raw_inner.get("stop_order_type", "")).upper()
-                if otype in ("MARKET", "MARKET_ORDER"):
-                    otype = _STOP_OTYPE_REMAP_MARKET.get(_sot, otype)
-                elif otype in ("LIMIT", "LIMIT_ORDER") and _sot in _STOP_OTYPE_REMAP_LIMIT:
-                    otype = _STOP_OTYPE_REMAP_LIMIT[_sot]
+                # If otype resolved to plain MARKET, check if the underlying raw
+                # dict has stop_order_type that reclassifies it as SL/TP.
+                if otype == "MARKET":
+                    _raw_inner = o.get("_raw") or o.get("raw") or {}
+                    _sot = str(_raw_inner.get("stop_order_type", "")).upper()
+                    otype = _STOP_OTYPE_REMAP.get(_sot, otype)
                 side  = str(o.get("side") or "").upper()
                 try: qty  = float(o.get("quantity") or o.get("size") or 0)
                 except (ValueError, TypeError): qty = 0.0
@@ -1577,7 +1488,7 @@ class OrderManager:
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "Not Found" in err_str:
-                logger.warning("get_open_orders: 404 Not Found — suppressing future calls")
+                logger.warning("get_open_orders: 404 Not Found — endpoint unsupported, suppressing future calls")
                 self._open_orders_404 = True
             else:
                 logger.error(f"get_open_orders error: {e}", exc_info=True)
@@ -1588,13 +1499,10 @@ class OrderManager:
         orders = self.get_open_orders(symbol=sym)
         if orders is None:
             return {}
-        CONDITIONAL_TYPES = {
-            "STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
-            "TAKE_PROFIT", "STOP_LOSS_MARKET",
-            "STOP_MARKET_ORDER", "STOP_LOSS_ORDER",
-            "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER",
-            "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT",
-        }
+        CONDITIONAL_TYPES = {"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET",
+                              "TAKE_PROFIT", "STOP_LOSS_MARKET",
+                              "STOP_MARKET_ORDER", "STOP_LOSS_ORDER",
+                              "TAKE_PROFIT_MARKET_ORDER", "TAKE_PROFIT_ORDER"}
         targets = [o for o in orders if o["type"] in CONDITIONAL_TYPES]
         if not targets:
             return {}
@@ -1619,6 +1527,42 @@ class OrderManager:
         """
         Determine exactly which exit order fired by querying both order IDs
         directly via GET /v2/orders/{id}.
+
+        Design principle — NO scanning, NO guessing, NO estimates:
+          We already know both sl_order_id and tp_order_id from order placement.
+          Delta GET /v2/orders/{id} returns definitive state and paid_commission.
+          We query both IDs, check state:"closed", extract exact fee. Done.
+          This is O(2) API calls regardless of account order history length.
+
+        API calls per invocation (rate: 0.25 s per call on _DELTA_LIMITER):
+          1. GET /v2/orders/{sl_order_id}  → state, paid_commission
+          2. GET /v2/orders/{tp_order_id}  → state, paid_commission
+          3. GET /v2/fills (page_size=5)   → fill price for the closed order
+          Total worst-case: 3 × 0.25 s = 0.75 s, called ONCE per trade exit.
+
+        Delta API response fields (per official docs):
+          state:"closed"   — order executed completely (filled)
+          state:"cancelled"— order cancelled (did not fire)
+          paid_commission  — EXACT USD commission charged, always present
+          stop_order_type  — "stop_loss_order" | "take_profit_order"
+
+        Fill price resolution (all exact exchange data, no estimation):
+          1. GET /v2/fills: VWAP across fills for the order_id
+          2. average_fill_price from the order _raw (present for closed orders)
+          3. stop_price from the order _raw (trigger price = fill reference
+             for last-traded-price triggered stop orders)
+
+        Returns:
+          {
+            "confirmed":  bool,  — True = exchange confirmed
+            "exit_type":  str,   — "tp" | "sl" | "trail_sl"
+            "fill_price": float, — exact execution price
+            "order_id":   str,   — the fired order id
+            "fee_paid":   float, — paid_commission from Delta (exact USD)
+          }
+
+        CoinSwitch: query_order_exact not available → confirmed=False always.
+        All exceptions caught at DEBUG — exit flow is never disrupted.
         """
         _UNCONFIRMED: Dict = {
             "confirmed":  False,
@@ -1628,6 +1572,7 @@ class OrderManager:
             "fee_paid":   0.0,
         }
 
+        # Only _DeltaAdapter exposes query_order_exact / get_fills_recent
         if not hasattr(self._adapter, "query_order_exact"):
             return _UNCONFIRMED
 
@@ -1636,6 +1581,8 @@ class OrderManager:
         if not known_sl and not known_tp:
             return _UNCONFIRMED
 
+        # ── Step 1: Query both orders directly ────────────────────────────────
+        # GET /v2/orders/{id} — one call per order, returns state + paid_commission.
         sl_raw: Optional[Dict] = None
         tp_raw: Optional[Dict] = None
 
@@ -1651,6 +1598,8 @@ class OrderManager:
             except Exception as e:
                 logger.debug(f"identify_exit_order: TP order query error: {e}")
 
+        # ── Step 2: Determine which order closed ──────────────────────────────
+        # state:"closed" means filled. Only one can be closed at exit.
         sl_closed = (isinstance(sl_raw, dict) and
                      str(sl_raw.get("state", "")).lower() == "closed")
         tp_closed = (isinstance(tp_raw, dict) and
@@ -1665,6 +1614,7 @@ class OrderManager:
             )
             return _UNCONFIRMED
 
+        # Select the fired order (prefer SL in the impossibly rare both-closed case)
         if sl_closed:
             fired_raw = sl_raw
             fired_id  = str(fired_raw.get("id", known_sl) or known_sl)
@@ -1674,13 +1624,19 @@ class OrderManager:
             fired_id  = str(fired_raw.get("id", known_tp) or known_tp)
             exit_type = "tp"
 
+        # Exact fee — paid_commission per Delta API response schema.
+        # Both "paid_commission" and "commission" are present per docs; prefer paid_commission.
         fee_paid = float(
             fired_raw.get("paid_commission",
             fired_raw.get("commission", 0)) or 0
         )
 
+        # ── Step 3: Get exact fill price ──────────────────────────────────────
+        # Three sources, all exact exchange data — no estimation, no strategy state.
         fill_price = 0.0
 
+        # Source A: GET /v2/fills — per-fill execution price, match by order_id.
+        # VWAP across fills for multi-fill orders: sum(price×size)/sum(size).
         try:
             fills = self._adapter.get_fills_recent(page_size=5)
             _num = 0.0
@@ -1698,11 +1654,16 @@ class OrderManager:
         except Exception as e:
             logger.debug(f"identify_exit_order: fills price lookup error: {e}")
 
+        # Source B: average_fill_price from the order object.
+        # Present in Delta closed-order responses even if not in the official schema.
         if fill_price <= 0:
             afp = float(fired_raw.get("average_fill_price", 0) or 0)
             if afp > 0:
                 fill_price = afp
 
+        # Source C: stop_price — the trigger level the stop order was set at.
+        # For LTP-triggered stop orders the fill is at (or within slippage of)
+        # stop_price. Exact from exchange, not from strategy state.
         if fill_price <= 0:
             sp = float(fired_raw.get("stop_price", 0) or 0)
             if sp > 0:
@@ -1767,6 +1728,7 @@ class OrderManager:
         urgency = 0.65 * momentum_urgency + 0.35 * ext_urgency
         return round(min(1.0, max(0.0, urgency)), 3)
 
+    # Guaranteed delivery wrapper (unchanged from v3)
     def place_order_guaranteed(self, order_fn_name: str,
                                max_wait_seconds: float = 600.0,
                                retry_interval_base: float = 15.0,
