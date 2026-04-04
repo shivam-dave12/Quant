@@ -109,12 +109,16 @@ _TF_RANK: Dict[str, int] = {
 }
 
 # ── Session quality ───────────────────────────────────────────────────────────
+# WEEKEND and ASIA are hard-blocked in the mandatory gates below.
+# The score values here are only reached for non-blocked sessions.
 _SESSION_SCORE: Dict[str, float] = {
     "LONDON":    1.00,   # London open = institutional manipulation → reversal
     "NY":        1.00,   # NY open = institutional delivery
     "NEW_YORK":  1.00,
     "LONDON_NY": 0.85,   # Overlap — high volume but chaotic
-    "ASIA":      0.00,   # HARD BLOCK (see mandatory gates)
+    "ASIA":      0.00,   # HARD BLOCK (see mandatory gates) — no institutional flow
+    "WEEKEND":   0.00,   # HARD BLOCK (see mandatory gates) — no institutional flow
+    "OFF_HOURS": 0.20,   # Between sessions — significant penalty, not hard-blocked
     "":          0.40,   # Unknown session — penalize
 }
 
@@ -277,10 +281,15 @@ class ConvictionFilter:
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── GATE 4: Session — HARD BLOCK Asia ─────────────────────────────
+        # ── GATE 4: Session — HARD BLOCK Asia and Weekend ─────────────────
+        # Both ASIA and WEEKEND are structurally low-liquidity periods with no
+        # institutional delivery.  Hard-blocking prevents the engine from burning
+        # cycles and producing misleading "almost-passed" rejection logs during
+        # periods where no entry is ever valid.
         sess_key = self._resolve_session(session, ict_engine)
-        if sess_key == "ASIA":
-            rejects.append("SESSION: ASIA — no institutional flow, hard blocked")
+        if sess_key in ("ASIA", "WEEKEND"):
+            rejects.append(
+                f"SESSION: {sess_key} — no institutional flow, hard blocked")
             return ConvictionResult(
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
@@ -745,12 +754,37 @@ class ConvictionFilter:
 
     @staticmethod
     def _resolve_session(session_hint: str, ict_engine) -> str:
-        for src in (session_hint, str(getattr(ict_engine, '_killzone', '') or '') if ict_engine else ''):
-            su = src.upper()
-            if 'NEW_YORK' in su or ('NY' in su and 'LONDON' not in su):
-                return 'NY'
-            if 'LONDON' in su:
-                return 'LONDON'
-            if 'ASIA' in su:
-                return 'ASIA'
+        """
+        Resolve a canonical session key from the hint string and ICT engine state.
+
+        Priority order:
+          1. session_hint  — caller-supplied, most specific
+          2. ict_engine._session  — full session window label (preferred over KZ)
+          3. ict_engine._killzone — kill-zone-only label, last resort
+
+        WEEKEND is checked FIRST in every source so it is never masked by a
+        partial string match against NY / LONDON / ASIA.  Previously the method
+        checked NY before WEEKEND, so "WEEKEND" fell through to return '' and
+        the hard-block gate never fired.
+        """
+        sources = [session_hint]
+        if ict_engine is not None:
+            # _session carries the full session-window label, e.g. "WEEKEND",
+            # "NEW_YORK", "LONDON".  Always prefer it over _killzone.
+            sources.append(str(getattr(ict_engine, '_session',  '') or ''))
+            # _killzone is kill-zone-specific (e.g. "LONDON_OPEN").  Use only
+            # when _session is blank.
+            sources.append(str(getattr(ict_engine, '_killzone', '') or ''))
+
+        for src in sources:
+            su = src.upper().strip()
+            if not su:
+                continue
+            # WEEKEND checked unconditionally first — do not reorder.
+            if 'WEEKEND'   in su:                                  return 'WEEKEND'
+            if 'OFF_HOURS' in su or su == 'OFF':                   return 'OFF_HOURS'
+            if 'NEW_YORK'  in su or ('NY' in su
+                                      and 'LONDON' not in su):     return 'NY'
+            if 'LONDON'    in su:                                   return 'LONDON'
+            if 'ASIA'      in su:                                   return 'ASIA'
         return ''

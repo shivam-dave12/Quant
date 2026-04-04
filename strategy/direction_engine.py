@@ -346,17 +346,27 @@ class DirectionEngine:
     v2.0 Sync Fixes: FIX-1 through FIX-8 (see module docstring).
     """
 
+    # Factor weights — restored to the design specification in the module docstring.
+    #
+    # History of the deviation that caused Bug #2:
+    #   dealing_range was set to 0.00 (labelled ISSUE-2) and its 0.15 weight
+    #   was silently absorbed into amd (0.22→0.26) and htf_structure (0.18→0.21).
+    #   However factors.dealing_range was also hardcoded to 0.0, so those extra
+    #   weights contributed nothing — the composite permanently lost 0.15 signal
+    #   mass, making AMD vs order_flow the only meaningful contributors.  Their
+    #   opposing signs during REDISTRIBUTION-bearish + LONG-flow conditions caused
+    #   the composite to cancel near zero and never breach the 0.18 threshold.
     _FACTOR_WEIGHTS = {
-        "amd":            0.26,
-        "htf_structure":  0.21,
-        "dealing_range":  0.00,   # ISSUE-2: DR removed as scoring factor; retained for logging only
-        "order_flow":     0.15,
-        "pool_asymmetry": 0.11,
-        "ob_fvg_pull":    0.09,
-        "displacement":   0.08,
-        "session":        0.05,
-        "micro_bos":      0.03,
-        "volume":         0.02,
+        "amd":            0.22,   # AMD phase + bias
+        "htf_structure":  0.18,   # 4H + 1H + 15m structural cascade
+        "dealing_range":  0.15,   # Premium / discount position — RESTORED from 0.00
+        "order_flow":     0.13,   # Tick flow + CVD directional pressure
+        "pool_asymmetry": 0.09,   # MTF pool significance asymmetry
+        "ob_fvg_pull":    0.08,   # Unfilled OB / FVG delivery highways
+        "displacement":   0.07,   # Recent closed-candle momentum
+        "session":        0.04,   # Kill-zone behavioural tendencies
+        "micro_bos":      0.03,   # 5m BOS direction
+        "volume":         0.01,   # Net buy / sell volume asymmetry
     }
     assert abs(sum(_FACTOR_WEIGHTS.values()) - 1.0) < 1e-9, "Weights must sum to 1.0"
 
@@ -528,10 +538,23 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 3: Dealing Range P/D Position  (weight 0.15)
         # ─────────────────────────────────────────────────────────────────────
-        # dr_pd = 0.0 (deep discount) → heading UP to BSL → +1.0
-        # dr_pd = 0.5 (equilibrium)   → neutral → 0.0
-        # dr_pd = 1.0 (deep premium)  → heading DOWN to SSL → -1.0
-        factors.dealing_range = 0.0  # ISSUE-2: DR removed from score; dr_pd retained for logging
+        # dr_pd = 0.0 (deep discount) → price heading UP toward BSL → +1.0
+        # dr_pd = 0.5 (equilibrium)   → no structural bias           →  0.0
+        # dr_pd = 1.0 (deep premium)  → price heading DOWN to SSL    → -1.0
+        #
+        # Sigmoid centred at 0.5 with a ×4 pre-scale: values within ±0.10 of
+        # equilibrium produce a near-zero score (the "no-man's-land" zone).
+        # Values approaching structural extremes saturate at ±1.  This matches
+        # the ICT principle — only trade from premium / discount zones, never
+        # from mid-range equilibrium where both sides have equal claims.
+        #
+        # Guard: if neither BSL nor SSL levels were found, the dr_pd default is
+        # 0.5 (equilibrium) and we emit 0.0 rather than a spurious directional
+        # bias — "no data" must not be interpreted as "buy from discount".
+        if bsl_price > 0 and ssl_price > 0:
+            factors.dealing_range = _sigmoid((0.5 - dr_pd) * 4.0, steepness=1.0)
+        else:
+            factors.dealing_range = 0.0   # No structural levels found — neutral
 
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 4: Order Flow Vector  (weight 0.13)
@@ -653,27 +676,39 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         # FACTOR 8: Session Timing  (weight 0.04)
         # ─────────────────────────────────────────────────────────────────────
-        # London KZ: Judas swing bias (often sweeps UP then delivers DOWN)
-        #            → slight BSL sweep bias (price hunts BSL first)
+        # London KZ: Judas-swing bias — often sweeps UP then delivers DOWN
+        #            → slight BSL-sweep bias (price hunts BSL first)
         # NY KZ:     Amplify the existing directional composite
         # Asia KZ:   Range consolidation — neutral
+        # Weekend / Off-hours: No institutional participation — neutral (0.0).
+        #            Do NOT amplify or suppress other factors; just contribute
+        #            nothing.  The ConvictionFilter and _evaluate_entry have
+        #            separate hard-blocks for WEEKEND that stop entries entirely.
+        #
+        # Source priority: _session (full window) > _killzone (KZ-only).
+        # Previously the code fell back to _killzone when _session was
+        # "WEEKEND", causing _sess to become blank and factors.session = 0.0
+        # silently — the correct behaviour but for the wrong reason, obscuring
+        # the real cause in logs.  Now it is explicit.
         factors.session = 0.0
         try:
-            # MOD-6 FIX: prefer _session (full-window) over _killzone (KZ-only)
             _sess = str(getattr(ict_engine, '_session', '') or '').upper()
-            if not _sess or _sess in ('OFF_HOURS', 'WEEKEND'):
-                # Fall back to killzone string when session is off/unknown
+            if not _sess:
                 _sess = str(getattr(ict_engine, '_killzone', '') or '').upper()
-            if 'LONDON' in _sess:
-                factors.session = +0.35   # London tends to run buy stops first
+
+            if 'WEEKEND' in _sess or 'OFF_HOURS' in _sess:
+                pass   # factors.session remains 0.0 — no institutional flow
+            elif 'LONDON' in _sess:
+                factors.session = +0.35   # London Judas-swing: tends to run buy stops first
             elif 'NY' in _sess:
+                # NY amplifies the dominant directional signal already scored
                 dominant = (
                     factors.amd            * self._FACTOR_WEIGHTS['amd'] +
                     factors.htf_structure  * self._FACTOR_WEIGHTS['htf_structure']
                 )
                 factors.session = _sigmoid(dominant * 2.5, steepness=1.0)
             elif 'ASIA' in _sess:
-                factors.session = 0.0   # accumulation = directionless
+                factors.session = 0.0   # Accumulation / range = directionless
         except Exception:
             pass
 
@@ -796,9 +831,23 @@ class DirectionEngine:
         # BUILD RESULT
         # ─────────────────────────────────────────────────────────────────────
         if confidence < _HUNT_MIN_CONFIDENCE:
+            # Log the ACTUAL composite score before it is discarded.
+            # Previously this branch returned a null prediction with confidence=0.0
+            # and the caller's log printed "conf=0.00", making it impossible to see
+            # how far below threshold the engine actually was.  The real composite
+            # (here: `confidence` = abs(score)) is now visible in every NEUTRAL line.
+            logger.debug(
+                f"DirectionEngine: NEUTRAL | "
+                f"composite={confidence:.3f} (threshold={_HUNT_MIN_CONFIDENCE}) "
+                f"raw={score:+.3f} | "
+                f"AMD={factors.amd:+.2f} "
+                f"HTF={factors.htf_structure:+.2f} "
+                f"DR={factors.dealing_range:+.2f} "
+                f"flow={factors.order_flow:+.2f} "
+                f"pool={factors.pool_asymmetry:+.2f}")
             result = self._null_prediction(
                 now_ms,
-                reason=f"low_confidence({confidence:.3f}<{_HUNT_MIN_CONFIDENCE})",
+                reason=f"low_confidence(composite={confidence:.3f}<{_HUNT_MIN_CONFIDENCE})",
                 dr_pd=dr_pd, bsl_score=bsl_score, ssl_score=ssl_score,
                 score=score, factors=factors)
             self._last_hunt    = result
