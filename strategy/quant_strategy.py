@@ -3699,24 +3699,63 @@ class QuantStrategy:
         return QCfg.TRAIL_ENABLED()
 
     def _spread_atr_gate(self, data_manager) -> tuple:
-        """v4.3 Solution 5: Reject entries when spread cost is too large relative to ATR.
-        During low-liquidity hours, spread widens 3-5x making the cost-to-move ratio untenable."""
-        if self._fee_engine is None:
-            return True, 0.0
+        """
+        Reject entries when the live bid-ask spread is too large relative to ATR.
+
+        BUG FIX: Previously called self._fee_engine._spread.median_bps() which
+        returns a hardcoded FEE_SPREAD_DEFAULT_BPS=2.0 sentinel whenever fewer
+        than 5 samples have been collected. On startup the tracker is empty, so
+        every tick returned 2.0 bps (13× the real BTC spread of ~0.15 bps),
+        blocking all entries with ratio=0.468 > 0.30 indefinitely.
+
+        Fix: compute the live spread directly from the current orderbook at
+        evaluation time. The fee engine's rolling tracker continues updating
+        independently for round-trip cost estimation — it is not used here.
+
+        Also adds a 60s log throttle to suppress repeated identical messages.
+        """
         try:
-            spread_bps = self._fee_engine._spread.median_bps()
-            atr = self._atr_5m.atr
+            atr   = self._atr_5m.atr
             price = data_manager.get_last_price()
             if atr < 1e-10 or price < 1.0:
                 return True, 0.0
-            spread_price = spread_bps / 10_000.0 * price
-            ratio = spread_price / atr
+
+            # ── Live bid/ask from current orderbook ───────────────────────────
+            ob    = data_manager.get_orderbook()
+            bids  = (ob or {}).get("bids", [])
+            asks  = (ob or {}).get("asks", [])
+            if not bids or not asks:
+                return True, 0.0
+
+            def _get_px(lvl) -> float:
+                if isinstance(lvl, (list, tuple)): return float(lvl[0])
+                if isinstance(lvl, dict):           return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                return 0.0
+
+            bid = _get_px(bids[0])
+            ask = _get_px(asks[0])
+            if bid <= 0.0 or ask <= bid:
+                return True, 0.0
+
+            mid        = (bid + ask) / 2.0
+            spread_bps = (ask - bid) / mid * 10_000.0
+            spread_usd = ask - bid
+
+            # ── Ratio: spread-dollars / ATR-dollars ───────────────────────────
+            ratio     = (spread_bps / 10_000.0 * price) / atr
             max_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO", 0.30))
+
             if ratio > max_ratio:
-                logger.info(
-                    f"⛔ Spread/ATR gate: {ratio:.3f} > {max_ratio} "
-                    f"(spread={spread_bps:.1f}bps, ATR=${atr:.1f}) — too expensive")
+                # Throttle: log at most once per 60 s to avoid tick-level spam
+                _now = time.time()
+                if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
+                    self._last_spread_gate_warn = _now
+                    logger.info(
+                        f"⛔ Spread/ATR gate: {ratio:.3f} > {max_ratio} "
+                        f"(spread={spread_bps:.2f}bps / ${spread_usd:.2f}, "
+                        f"ATR=${atr:.1f}) — too expensive")
                 return False, ratio
+
             return True, ratio
         except Exception:
             return True, 0.0
@@ -4971,9 +5010,14 @@ class QuantStrategy:
                     except Exception:
                         pass
 
+                # MOD-6 FIX: Pass ict._session (canonical "LONDON"/"NY"/"ASIA"),
+                # not ict._killzone ("LONDON_KZ" / "" outside KZ window).
+                # _killzone is empty between kill-zones even when the session is
+                # active, causing the conviction gate to misread the session as ''
+                # and apply a 0.40 penalty instead of the full 1.00 session score.
                 _sess_str = ""
                 if self._ict is not None:
-                    _sess_str = str(getattr(self._ict, '_killzone', '') or '')
+                    _sess_str = str(getattr(self._ict, '_session', '') or '')
 
                 # Resolve sweep_pool: prefer signal.swept_pool (actual swept pool),
                 # fall back to primary_target (pool being approached).

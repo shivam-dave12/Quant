@@ -107,8 +107,12 @@ class SpreadTracker:
         Uses the true median (average of two middle elements for even-length arrays)
         rather than the upper-median, which biased spread estimates upward and caused
         the fee floor to be slightly too aggressive on even sample counts.
+
+        Warmup default: 0.20 bps — realistic for BTC inverse perp (actual ~0.15 bps).
+        The old default of 2.0 bps was 13× too wide, causing fee-floor over-rejection
+        during the first ~5 seconds of each session.
         """
-        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
+        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 0.20))
         if len(self._hist) < 5:
             return default
         arr = sorted(self._hist)
@@ -124,7 +128,7 @@ class SpreadTracker:
 
     def percentile_bps(self, pct: float) -> float:
         """pct in [0, 1]"""
-        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
+        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 0.20))
         with self._lock:
             if len(self._hist) < 10:
                 return default
@@ -518,18 +522,16 @@ class ExecutionCostEngine:
         """
         True once the engine has enough spread samples for reliable cost estimates.
 
-        Before warmup: median_bps() returns the hardcoded default (2.0 bps).
-        That default can produce fee floors that reject valid setups if the
-        actual spread is tighter.  Gate the TP floor check on warmup.
+        Before warmup: median_bps() returns FEE_SPREAD_DEFAULT_BPS (0.20 bps) —
+        a realistic BTC inverse perp spread. The old default of 2.0 bps was 13×
+        too wide and caused the fee floor to over-reject valid setups in the
+        first ~5 seconds of each session.
 
         Warmup threshold: 5 spread samples (~5-10 seconds of live data).
 
-        Note: slippage EWMA is tracked separately in diagnostic_snapshot via
-        'slip_warmed'.  We do NOT require the slippage EWMA here because
-        expected_bps() has its own safe default (0.0 bps) when unwarmed,
-        which only underestimates round-trip cost — it never over-gates entries.
-        Requiring slip_warmed here would have blocked ALL entries for several
-        minutes after a stream restart until a fill was recorded.
+        Note: the _spread_atr_gate in quant_strategy.py does NOT use median_bps()
+        — it computes the live bid-ask directly from the current orderbook so it
+        is unaffected by the warmup sentinel entirely.
         """
         return self._spread.sample_count >= 5
 
