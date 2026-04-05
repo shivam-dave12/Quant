@@ -257,16 +257,21 @@ class ConvictionFilter:
         # MANDATORY HARD GATES — any failure = immediate rejection
         # ══════════════════════════════════════════════════════════════════
 
-        # ── GATE 1: Pool effective timeframe ───────────────────────────────
+        # ── GATE 1: Pool timeframe — data-driven (no hard block) ────────────
+        # Pool TF rank feeds directly into _rank_bonus in Factor 1 scoring:
+        #   rank 1 (1m) → _rank_bonus = 0.25   (very low contribution)
+        #   rank 2 (5m) → _rank_bonus = 0.50   (moderate)
+        #   rank 3 (15m)→ _rank_bonus = 0.75   (good)
+        #   rank 4 (1h+)→ _rank_bonus = 1.00   (excellent)
+        # Low-rank pools score poorly and almost never clear REQUIRED_SCORE.
+        # No early return — the score gates the trade.
         if effective_rank < POOL_MIN_TF_RANK:
             rejects.append(
-                f"POOL_TF: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
-                f"< required={POOL_MIN_TF_RANK}")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
+                f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
+                f"— will score low (not hard-blocked; data-driven)")
+            # Falls through to factor scoring.
 
-        # ── GATE 2: Dealing range — fully data-driven score factor (no hard block) ──
+# ── GATE 2: Dealing range — fully data-driven score factor (no hard block) ──
         # The dealing range P/D position is incorporated as a SCORE FACTOR in the
         # conviction model, not as a hard veto. This is correct ICT methodology:
         #
@@ -288,15 +293,30 @@ class ConvictionFilter:
             f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) {entry_type} — data-driven scoring only")
         factors.dealing_range_ok = dr_data_available
 
-        # ── GATE 3: R:R minimum ───────────────────────────────────────────
+        # ── GATE 3: R:R — data-driven score modifier (no hard block) ─────────
+        # R:R below minimum does NOT veto — it reduces the pool_sig_score.
+        # Rationale: a setup can have genuinely poor R:R due to tight structure
+        # but still be valid. A 1.5 R:R setup with exceptional CISD + OTE is
+        # better than a 3:1 R:R with no confirmation. Let the composite score decide.
+        #
+        # R:R score modifier applied to pool_sig_score:
+        #   R:R >= 3.0  → +0.10 bonus
+        #   R:R 2.0-3.0 → no modifier
+        #   R:R 1.5-2.0 → -0.10 penalty
+        #   R:R 1.0-1.5 → -0.20 penalty
+        #   R:R < 1.0   → -0.35 penalty (near-guarantee of loss)
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
-        if rr < MIN_RR:
-            rejects.append(f"RR: {rr:.2f} < {MIN_RR:.1f} minimum")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+        _rr_mod = (0.10 if rr >= 3.0 else
+                   0.00 if rr >= 2.0 else
+                  -0.10 if rr >= 1.5 else
+                  -0.20 if rr >= 1.0 else
+                  -0.35)
+        if rr < 1.0:
+            rejects.append(f"RR_VERY_LOW: {rr:.2f} — heavy score penalty applied")
+        elif rr < MIN_RR:
+            rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — score penalty applied")
 
-        # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
+# ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
         # All sessions are scored, none are hard-blocked.  ASIA receives a
         # very low session_score (0.10) which makes it nearly impossible to
         # clear the overall score threshold without exceptional displacement
@@ -327,11 +347,14 @@ class ConvictionFilter:
         # FACTOR SCORING — weighted conviction model
         # ══════════════════════════════════════════════════════════════════
 
-        # ── Factor 1: Pool significance (weight 0.20) ─────────────────────
+        # ── Factor 1: Pool significance + R:R modifier (weight 0.20) ─────────
+        # R:R modifier (_rr_mod from Gate 3) and TF rank both shape this score
+        # continuously — no threshold cut-off, fully data-driven.
         _rank_bonus = min(effective_rank / 4.0, 1.0)
         _sig_score = min(pool_sig / 8.0, 1.0)
-        factors.pool_sig_score = _rank_bonus * 0.40 + _sig_score * 0.60
-        allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f}")
+        factors.pool_sig_score = max(0.05, min(1.0,
+            _rank_bonus * 0.40 + _sig_score * 0.60 + _rr_mod))
+        allows.append(f"POOL={pool_tf}(htfx{pool_htf_count}) sig={pool_sig:.1f} RR={rr:.1f}({_rr_mod:+.2f})")
 
         # ── Factor 2: Displacement (weight 0.25) ──────────────────────────
         factors.displacement_score = self._score_displacement(

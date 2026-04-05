@@ -4300,61 +4300,27 @@ class QuantStrategy:
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
-        Institutional Unified Entry Gate.
+        Institutional Unified Entry Gate — ADVISORY ONLY (fully data-driven).
 
-        This is NOT a parameter filter — it is a STRUCTURAL COHERENCE check.
-        Every engine must agree on direction before capital is deployed.
+        This gate logs structural coherence notes for diagnostics but does NOT
+        block any trade. All actual gating is handled by the conviction_filter
+        score. The architecture is:
 
-        The conviction filter checks individual factor scores (displacement,
-        CISD, OTE, etc.).  This gate checks INTER-ENGINE AGREEMENT — whether
-        the direction engine, ICT engine, HTF structure, and order flow all
-        point the same way.
+          ConvictionFilter → SCORE gates the trade (single source of truth)
+          UnifiedGate     → LOGS advisory signals for post-trade attribution
 
-        WHY THIS MATTERS:
-          In the production log, the entry engine said "REVERSAL LONG" while
-          AMD said "ACCUMULATION bias=bullish" (no delivery expected) and
-          the direction engine said "NEUTRAL conf=0.22" (no conviction).
-          These are CONTRADICTORY signals.  The conviction filter scored
-          the individual factors and passed (0.75+), but the engines were
-          not aligned.  Result: SL hit.
-
-          An institutional desk would NEVER enter when their macro analyst
-          says accumulation, their flow desk says neutral, but their
-          structure analyst says long.  All desks must agree.
-
-        Returns: (allowed: bool, reason: str)
+        Philosophy: no binary veto on session, AMD phase, flow direction, or HTF
+        structure. The data-driven score in conviction_filter already weights all
+        of these factors. A double-gate creates false precision (two separate
+        thresholds on the same signal) and blocks valid setups.
         """
-        rejections = []
+        advisories = []   # informational only — never blocks
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 1: AMD Phase Coherence
-        # ══════════════════════════════════════════════════════════════════
-        # The AMD cycle determines WHEN institutional delivery happens.
-        # ACCUMULATION: smart money building positions — NO delivery
-        # MANIPULATION: the sweep — this IS the setup moment
-        # DISTRIBUTION: delivery — the move we want to capture
-        #
-        # Entering during ACCUMULATION is like trying to trade during
-        # the consolidation before an earnings release.  Nothing happens.
-
+        # ── AMD Phase context ───────────────────────────────────────────────
         amd_phase = (ict_ctx.amd_phase or "").upper()
         amd_bias  = (ict_ctx.amd_bias  or "").lower()
         amd_conf  = ict_ctx.amd_confidence
 
-        # BUG-A1 FIX: AMD=ACCUMULATION hard block is EXEMPT for SWEEP_REVERSAL entries.
-        #
-        # ICT AMD cycle: ACCUMULATION -> MANIPULATION -> DISTRIBUTION.
-        # The sweep IS the event that transitions AMD phase. The ICT AMD engine uses
-        # Wilder-smoothing (2-5 bar lag), so AMD still reports ACCUMULATION for
-        # several bars AFTER the sweep fires. Blocking all SWEEP_REVERSAL entries
-        # during ACCUMULATION therefore vetos the bot's primary setup at its prime window.
-        #
-        # Keep the hard block for CONTINUATION and MOMENTUM entries which genuinely
-        # require an active delivery phase.
-        #
-        # Additionally, when DirectionEngine's post-sweep accumulative model has
-        # confirmed "reverse" with >= 0.40 confidence, that verdict supersedes
-        # the stale pre-sweep AMD reading entirely.
         _is_sweep_rev = (hasattr(signal, 'entry_type')
                          and signal.entry_type is not None
                          and 'REVERSAL' in str(signal.entry_type).upper())
@@ -4362,92 +4328,34 @@ class QuantStrategy:
                         and ict_ctx.direction_hint_confidence >= 0.40)
 
         if amd_phase == "ACCUMULATION":
-            if _is_sweep_rev:
-                # Sweep reversal during ACCUMULATION: AMD phase lag expected.
-                # The conviction_filter penalises the AMD score; no gate veto here.
-                pass
-            elif _has_ps_hint:
-                # Post-sweep model confirmed reversal: direction hint supersedes AMD phase.
-                pass
+            if _is_sweep_rev or _has_ps_hint:
+                advisories.append(f"AMD=ACCUM sweep-reversal (phase lag expected, scoring handles it)")
             else:
-                # DATA-DRIVEN: AMD=ACCUMULATION is NOT hard-blocked.
-                # The conviction_filter scores ACCUMULATION near 0.00 in _score_amd().
-                # This makes it very hard to clear the conviction threshold without
-                # exceptional displacement+CISD+OTE, but possible.
-                logger.debug(
-                    "UNIFIED_GATE: AMD=ACCUMULATION non-reversal entry — "
-                    "conviction_filter will apply near-zero amd_score penalty")
+                advisories.append(f"AMD=ACCUM non-reversal — low amd_score will penalise conviction")
 
-        # During MANIPULATION: bias must AGREE with trade direction.
-        # A bullish MANIPULATION means SSL will be swept (short-side fake-out).
-        # The delivery is LONG.  Going SHORT during bullish MANIPULATION
-        # is trading the wrong side of the AMD cycle.
-        #
-        # BUG-A2 FIX: Threshold raised 0.50 -> 0.65. AMD bias at moderate confidence
-        # (0.50-0.65) conflicts with valid post-sweep setups because AMD updates lag
-        # the actual sweep by 2-5 bars. Only block when AMD confidence is genuinely
-        # high (>= 0.65 = strong institutional conviction against our direction).
-        # Also: post-sweep direction hint overrides contra-AMD at moderate confidence.
         if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
             bias_contra = (
                 (signal.side == "long"  and "bear" in amd_bias) or
                 (signal.side == "short" and "bull" in amd_bias)
             )
-            # Strong post-sweep evidence overrides moderate contra-AMD
-            if bias_contra and _has_ps_hint:
-                bias_contra = False
-            if bias_contra:
-                rejections.append(
-                    f"AMD_CONTRA: MANIP bias={amd_bias} conf={amd_conf:.2f} "
-                    f"vs {signal.side} — wrong side of AMD cycle")
+            if bias_contra and not _has_ps_hint:
+                advisories.append(
+                    f"AMD_ADVISORY: MANIP bias={amd_bias} conf={amd_conf:.2f} "
+                    f"vs {signal.side} — contra-AMD, conviction will penalise")
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 2: Direction Engine Agreement
-        # ══════════════════════════════════════════════════════════════════
-        # The DirectionEngine predicts which pool will be swept next and
-        # where price will deliver after.  If it says "bearish delivery"
-        # with > 40% confidence and we want to go LONG — that's a conflict.
-        #
-        # We don't require the direction engine to agree perfectly.
-        # But if it actively DISAGREES with high confidence, we block.
+        # ── AMD lag override for fresh sweeps ───────────────────────────────
+        # (Already applied to ict_ctx.amd_phase in _evaluate_entry; repeated
+        #  here for gate logging completeness only)
 
-        # BUG-B1 FIX: Direction engine gate threshold raised 0.45 -> 0.60.
-        # The _last_hunt is a PRE-SWEEP prediction (which pool will be swept next).
-        # After the sweep fires, the relevant verdict is ict_ctx.direction_hint
-        # (the post-sweep accumulative model from DirectionEngine.evaluate_sweep()).
-        # The old code checked stale pre-sweep data with a low confidence threshold
-        # (0.45) and blocked valid post-sweep entries.
-        #
-        # Priority: if post-sweep direction_hint agrees with signal side, skip the
-        # pre-sweep hunt check entirely — the more specific evidence wins.
+        # ── Direction Engine context ─────────────────────────────────────────
         if self._dir_engine is not None:
             try:
-                # If post-sweep model has confirmed our direction, skip pre-sweep gate
                 _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
                 if not _ps_agrees:
-                    # Check hunt prediction (pre-sweep directional call)
                     _hunt = getattr(self._dir_engine, '_last_hunt', None)
-                    if _hunt is None:
-                        # Try the cached dict version
-                        _hunt_dict = getattr(self._ict, '_last_hunt_pred', None) if self._ict else None
-                        if _hunt_dict and isinstance(_hunt_dict, dict):
-                            _del_dir   = _hunt_dict.get('delivery_direction', '')
-                            _hunt_conf = float(_hunt_dict.get('confidence', 0.0))
-                            # BUG-B1 FIX: threshold raised from 0.45 to 0.60
-                            if _hunt_conf >= 0.60:
-                                agrees = (
-                                    (signal.side == "long"  and _del_dir == "bullish") or
-                                    (signal.side == "short" and _del_dir == "bearish") or
-                                    _del_dir in ("", "neutral", None)
-                                )
-                                if not agrees:
-                                    rejections.append(
-                                        f"DIR_ENGINE: delivery={_del_dir} "
-                                        f"conf={_hunt_conf:.2f} vs {signal.side}")
-                    elif hasattr(_hunt, 'delivery_direction'):
+                    if _hunt is not None and hasattr(_hunt, 'delivery_direction'):
                         _del_dir   = getattr(_hunt, 'delivery_direction', '')
                         _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
-                        # BUG-B1 FIX: threshold raised from 0.45 to 0.60
                         if _hunt_conf >= 0.60:
                             agrees = (
                                 (signal.side == "long"  and _del_dir == "bullish") or
@@ -4455,22 +4363,14 @@ class QuantStrategy:
                                 _del_dir in ("", "neutral", None)
                             )
                             if not agrees:
-                                rejections.append(
-                                    f"DIR_ENGINE: delivery={_del_dir} "
-                                    f"conf={_hunt_conf:.2f} vs {signal.side}")
+                                advisories.append(
+                                    f"DIR_ADVISORY: hunt delivery={_del_dir} "
+                                    f"conf={_hunt_conf:.2f} vs {signal.side} "
+                                    f"(not blocking — conviction_filter weights flow)")
             except Exception:
                 pass
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 3: HTF Structure Alignment
-        # ══════════════════════════════════════════════════════════════════
-        # The 15m and 4H market structure must not BOTH oppose the trade.
-        # If both say bearish (lower highs, lower lows, bearish BOS) —
-        # going LONG is fighting the institutional order flow.
-        #
-        # One TF opposing is acceptable (short-term counter-trend within
-        # a longer trend).  Both opposing = structural veto.
-
+        # ── HTF Structure context ────────────────────────────────────────────
         if self._ict is not None and getattr(self._ict, '_initialized', False):
             try:
                 tf_data = getattr(self._ict, '_tf', {})
@@ -4479,76 +4379,55 @@ class QuantStrategy:
                 if tf_15m and tf_4h:
                     t15 = str(getattr(tf_15m, 'trend', 'ranging') or 'ranging').lower()
                     t4h = str(getattr(tf_4h,  'trend', 'ranging') or 'ranging').lower()
-
                     both_bearish = (t15 == "bearish" and t4h == "bearish")
                     both_bullish = (t15 == "bullish" and t4h == "bullish")
-
                     if signal.side == "long" and both_bearish:
-                        rejections.append(
-                            f"HTF_BEARISH: 15m={t15} 4H={t4h} — "
-                            f"both bearish, cannot go LONG")
+                        advisories.append(
+                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bearish vs LONG "
+                            f"(not blocking — conviction_filter scores HTF via structure)")
                     elif signal.side == "short" and both_bullish:
-                        rejections.append(
-                            f"HTF_BULLISH: 15m={t15} 4H={t4h} — "
-                            f"both bullish, cannot go SHORT")
+                        advisories.append(
+                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bullish vs SHORT "
+                            f"(not blocking — conviction_filter scores HTF via structure)")
             except Exception:
                 pass
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 4: Order Flow Conviction
-        # ══════════════════════════════════════════════════════════════════
-        # Tick flow + CVD must show at least weak agreement.
-        # We don't require strong flow (that's the conviction filter's job).
-        # But BOTH being flat/opposing = no institutional participation.
-
+        # ── Order Flow context ───────────────────────────────────────────────
         tf  = flow_state.tick_flow if flow_state else 0.0
         cvd = flow_state.cvd_trend if flow_state else 0.0
-
         flow_opposes = (
             (signal.side == "long"  and tf < -0.35 and cvd < -0.20) or
             (signal.side == "short" and tf >  0.35 and cvd >  0.20)
         )
-        # DATA-DRIVEN: Flow is now a soft advisory only. Strong opposing flow
-        # is noted in allows/rejects log for visibility but does NOT block the
-        # entry. The conviction_filter scores order flow (CVD + tick) as weighted
-        # factors and the overall score gates the trade.
         if flow_opposes:
-            logger.debug(
+            advisories.append(
                 f"FLOW_ADVISORY: tick={tf:+.2f} cvd={cvd:+.2f} "
-                f"both soft-opposing {signal.side} (not blocking — scored in conviction)")
+                f"vs {signal.side} (scored in conviction_filter, not blocking)")
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 5: Kill Zone / Session Filter
-        # ══════════════════════════════════════════════════════════════════
-        # ASIA is the only session-level veto.  It is a pure accumulation /
-        # range period with no institutional delivery — entries here have a
-        # structurally poor risk profile regardless of other factors.
-        #
-        # WEEKEND is NOT blocked.  Crypto is 24/7.  The session score for
-        # WEEKEND (0.65 in ConvictionFilter) reflects the absence of a named
-        # kill zone but does not constitute a veto.  A high-quality sweep +
-        # displacement + CISD setup on a Saturday is a valid trade.
+        # ── Session context ──────────────────────────────────────────────────
         session = str(getattr(ict_ctx, 'kill_zone', '') or '')
         if not session and self._ict:
             session = str(getattr(self._ict, '_killzone', '') or '')
-        # DATA-DRIVEN: ASIA session is NOT hard-blocked here.
-        # ConvictionFilter scores ASIA at 0.10 (session_score factor × 0.10 weight)
-        # which reduces overall conviction score substantially. The score gates the trade.
         if session.upper() == "ASIA":
-            logger.debug(
-                "UNIFIED_GATE: ASIA session — conviction_filter will apply "
-                "session_score=0.10 penalty (not hard-blocked here)")
+            advisories.append(
+                "SESSION_ADVISORY: ASIA — conviction_filter applies session_score=0.10 "
+                "(not blocking here)")
 
-        # ══════════════════════════════════════════════════════════════════
-        # GATE 6: Minimum R:R
-        # ══════════════════════════════════════════════════════════════════
+        # ── R:R context ──────────────────────────────────────────────────────
         if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 2.0:
-            rejections.append(f"RR={signal.rr_ratio:.1f} < 2.0")
+            advisories.append(
+                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 2.0 — "
+                f"conviction_filter applies R:R penalty to pool_sig_score")
 
-        # ── DECISION ───────────────────────────────────────────────────────
-        if rejections:
-            return False, " | ".join(rejections[:3])
+        # ── Log all advisories at DEBUG (not INFO — avoids log spam) ─────────
+        if advisories:
+            logger.debug(
+                f"UNIFIED_GATE [{signal.side.upper()}] advisories (not blocking): "
+                f"{' | '.join(advisories[:4])}")
+
+        # ALWAYS PASS — conviction_filter score is the sole gate
         return True, "UNIFIED_GATE_PASS"
+
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         """
