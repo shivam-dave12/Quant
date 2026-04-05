@@ -252,6 +252,7 @@ class ConvictionFilter:
 
         is_approach = any(k in entry_type.lower()
                           for k in ("approach", "pre_sweep", "proximity"))
+        _is_reversal_type = "reversal" in entry_type.lower()
 
         # ══════════════════════════════════════════════════════════════════
         # MANDATORY HARD GATES — any failure = immediate rejection
