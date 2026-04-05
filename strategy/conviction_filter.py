@@ -390,10 +390,13 @@ class ConvictionFilter:
         # Good DR alignment adds up to +0.15; poor alignment subtracts up to 0.15.
         # For reversals: the zone logic is INVERTED (premium SSL sweep → LONG is correct).
         # This replaces the old hard DR gate with a continuous score contribution.
-        factors.ote_score = self._score_ote(
+        _raw_ote_score = self._score_ote(
             trade_side, entry_price, pool_price, price,
             sweep_wick_price=sweep_wick_price,
         )
+        factors.ote_score = _raw_ote_score
+        _dr_mod_applied   = 0.0
+        _dr_inverted      = False
         if dr_data_available:
             if trade_side == "long":
                 # Discount zone good for longs; premium zone bad
@@ -402,8 +405,17 @@ class ConvictionFilter:
                 # Premium zone good for shorts; discount zone bad
                 _dr_mod = 0.15 * (2.0 * max(0.0, dr_pd - 0.50))
             if _is_reversal_type:
-                _dr_mod = -_dr_mod   # reversal entries work the OPPOSITE zone
-            factors.ote_score = max(0.05, min(1.0, factors.ote_score + _dr_mod))
+                _dr_mod    = -_dr_mod   # reversal entries work the OPPOSITE zone
+                _dr_inverted = True
+            _dr_mod_applied   = _dr_mod
+            factors.ote_score = max(0.05, min(1.0, _raw_ote_score + _dr_mod))
+        # DR reversal audit trail: makes it auditable why a reversal in premium
+        # is scored the way it is — previously invisible in logs.
+        logger.debug(
+            f"ConvictionFilter OTE/DR: side={trade_side} type={entry_type!r} "
+            f"raw_ote={_raw_ote_score:.3f} dr_pd={dr_pd:.3f}({_pd_label}) "
+            f"dr_mod={_dr_mod_applied:+.3f} inverted={_dr_inverted} "
+            f"final_ote={factors.ote_score:.3f}")
         if factors.ote_score >= 0.70:
             allows.append(f"OTE={factors.ote_score:.2f}✅ DR={_pd_label}({dr_pd:.2f})")
         else:

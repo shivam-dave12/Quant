@@ -351,6 +351,27 @@ class EntryEngine:
         self._gate_blocked_until: float = 0.0
         self._gate_block_key: tuple = ()
 
+        # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
+        # After a verdict fires, _handle_reversal/_handle_continuation previously
+        # cleared _post_sweep but did NOT record the sweep as processed.  On the
+        # next SCANNING tick _collect_sweeps() found the same sweep (still within
+        # the 60s window) and re-entered POST_SWEEP — looping every ~5s for up to
+        # 60s per sweep.
+        #
+        # Key schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
+        #   pool_price   — rounded to dollar to absorb tick-level float noise
+        #   pool_side    — "BSL" or "SSL" — different sides at same price are distinct
+        #   detected_at  — rounded to second; ensures a NEW sweep at the same level
+        #                  (detected_at differs) is never suppressed by a stale entry
+        #
+        # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
+        # window PLUS the 45s gate-block cooldown with 15s margin.
+        #
+        # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
+        # must survive a state reset so the same sweep cannot sneak back in.
+        # force_reset() clears it fully when the operator demands a hard reset.
+        self._processed_sweeps: Dict[tuple, float] = {}
+
         # FIX-SPAM: Momentum signal gate-block (independent of post-sweep gate).
         # Momentum signals have no conviction cooldown of their own — when the
         # conviction gate rejects a momentum signal, the engine immediately
@@ -481,6 +502,15 @@ class EntryEngine:
         When the block key CHANGES (different side or different gate reason prefix)
         the gate is immediately lifted — a new signal from a different pool or with a
         different reason is evaluated fresh. Only identical signals are suppressed.
+
+        BUG-3 FIX (GATE-ORPHAN): After the BUG-2 (STATE-DANGLE) fix, state
+        transitions to SCANNING before quant_strategy calls mark_gate_blocked().
+        The _gate_blocked_until field is only consulted in POST_SWEEP state, so it
+        becomes a no-op in SCANNING. The processed-sweep registry is the correct
+        suppression layer — extend the registered sweep's expiry here so it cannot
+        re-enter within the gate-block cooldown window. self._signal is still set
+        at the time this is called (quant_strategy calls mark_gate_blocked() BEFORE
+        consume_signal()) so sweep_result is available for the key lookup.
         """
         new_key = (side, reason_prefix[:40])
         # If the block key changes, reset immediately (different signal context)
@@ -491,6 +521,18 @@ class EntryEngine:
             # Same block reason — extend the cooldown from NOW
             self._gate_blocked_until = max(
                 self._gate_blocked_until, time.time() + cooldown_sec)
+
+        # BUG-3 FIX: Extend processed-sweep registry expiry for the sweep that
+        # generated this blocked signal.  This is the correct suppression point
+        # after the state-dangle fix — _gate_blocked_until only works in POST_SWEEP.
+        if (self._signal is not None
+                and hasattr(self._signal, 'sweep_result')
+                and self._signal.sweep_result is not None):
+            key = self._sweep_key(self._signal.sweep_result)
+            self._processed_sweeps[key] = max(
+                self._processed_sweeps.get(key, 0.0),
+                time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
+            )
 
     def mark_momentum_blocked(
         self,
@@ -537,6 +579,11 @@ class EntryEngine:
         self._flow_ewma_last_update = 0.0
         self._momentum_entries_1h = 0
         self._last_momentum_candle_ts = 0
+        # BUG-5 FIX: Hard operator reset — clear processed-sweep registry fully.
+        # Normal _reset() intentionally keeps entries so a cooldown survives a
+        # state transition. force_reset() is called explicitly by the operator
+        # and must guarantee a completely clean slate.
+        self._processed_sweeps.clear()
 
     @property
     def state(self) -> str:
@@ -555,6 +602,12 @@ class EntryEngine:
         self._signal = None
         self._tracking = None
         self._post_sweep = None
+        # BUG-2 / BUG-1: Purge EXPIRED processed-sweep entries only.
+        # Active entries (expiry > now) must survive the state reset so the same
+        # sweep cannot sneak back in during its 120s hold window.  force_reset()
+        # clears the registry fully when an operator hard-reset is required.
+        self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items()
+                                   if v > now}
 
     # ── Internal: flow EWMA (continuous-time) ─────────────────────────
 
@@ -610,10 +663,16 @@ class EntryEngine:
         fetching means check_sweeps() may fire 15-30s after the actual sweep candle
         closed. With a 10s window the sweep is ALREADY stale before entry_engine.update()
         even runs. 60s gives a full 5m bar worth of tolerance.
+
+        BUG-1 FIX (SWEEP-LOOP): Both LiquidityMap and ICT-bridge sweeps are now
+        filtered against _processed_sweeps before being returned.  A sweep that has
+        already driven a verdict (regardless of whether the resulting signal was
+        consumed or blocked) will not be re-presented until its 120s hold expires.
         """
         sweeps = [s for s in snap.recent_sweeps
                   if s.detected_at > now - 60.0
-                  and s.quality >= _MIN_SWEEP_QUALITY]
+                  and s.quality >= _MIN_SWEEP_QUALITY
+                  and not self._is_processed(s, now)]
 
         if (not sweeps
                 and self._state not in (EngineState.POST_SWEEP,
@@ -631,6 +690,14 @@ class EntryEngine:
                 quality = min(1.0, 0.35 + 0.35 * ev.disp_score
                               + (0.15 if ev.wick_reject else 0.0))
                 if quality < _MIN_SWEEP_QUALITY:
+                    continue
+
+                # BUG-4 FIX: ICT-bridge synthetic sweeps were not checked against
+                # _processed_sweeps.  A bridge sweep for an already-processed pool
+                # bypassed the registry entirely and could re-enter POST_SWEEP.
+                _bridge_key = (round(ev.pool_price, 0), side.value,
+                               round(ev.sweep_ts / 1000.0, 0))
+                if self._processed_sweeps.get(_bridge_key, 0.0) > now:
                     continue
 
                 pool = type('SynthPool', (), {
@@ -653,6 +720,26 @@ class EntryEngine:
                     f"${ev.pool_price:,.1f} quality={quality:.2f}")
 
         return sweeps
+
+    @staticmethod
+    def _sweep_key(sweep: SweepResult) -> tuple:
+        """
+        Canonical key for the processed-sweeps registry.
+        Schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
+          pool_price  — dollar-rounded to absorb tick-level float noise
+          pool_side   — "BSL"/"SSL" — same price, different sides are distinct
+          detected_at — second-rounded; a genuinely NEW sweep at the same level
+                        (with a different detected_at) is never suppressed
+        """
+        return (
+            round(sweep.pool.price, 0),
+            sweep.pool.side.value,
+            round(sweep.detected_at, 0),
+        )
+
+    def _is_processed(self, sweep: SweepResult, now: float) -> bool:
+        """Return True if sweep is within its processed-sweep hold window."""
+        return self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now
 
     def _find_ict_event(self, sweep, ict_ctx, atr) -> Optional[ICTSweepEvent]:
         for ev in (getattr(ict_ctx, 'ict_sweeps', None) or []):
@@ -818,6 +905,17 @@ class EntryEngine:
         tf = getattr(sweep.pool, 'timeframe', '5m')
         if sweep.quality < tf_quality.get(tf, 0.45):
             return
+
+        # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
+        # registry THE MOMENT we commit to evaluating it.  This is the earliest
+        # possible registration point — before any evidence accumulation — so that
+        # _collect_sweeps() cannot find and re-present the same sweep on any
+        # subsequent tick, regardless of how the evaluation resolves (verdict, gate
+        # block, timeout, or early rejection inside _handle_reversal/continuation).
+        # Expiry = now + 120s:  outlasts the 60s detection window + 45s gate-block
+        # cooldown + 15s margin.
+        _reg_key = self._sweep_key(sweep)
+        self._processed_sweeps[_reg_key] = now + 120.0
 
         self._post_sweep = _PostSweepState(
             sweep=sweep, entered_at=now,
@@ -1229,7 +1327,15 @@ class EntryEngine:
         )
         logger.info(f"🎯 SIGNAL: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
+        # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
+        # Previously only _post_sweep was cleared here; the engine remained in
+        # POST_SWEEP for one more tick before _do_post_sweep() noticed ps is None
+        # and transitioned. That one-tick gap was a second re-entry vector.
+        # We cannot call _reset(now) here because it would null self._signal.
+        # Instead, manually perform the non-destructive parts of _reset():
         self._post_sweep = None
+        self._state = EngineState.SCANNING
+        self._state_entered = now
 
     def _handle_continuation(self, sweep, decision, snap, flow, ict,
                               price, atr, now) -> None:
@@ -1277,7 +1383,11 @@ class EntryEngine:
             ict_validation=self._ict_summary(ict, side),
         )
         logger.info(f"🎯 SIGNAL: CONTINUATION {side.upper()} R:R={rr:.1f}")
+        # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
+        # Transition to SCANNING immediately without nulling self._signal.
         self._post_sweep = None
+        self._state = EngineState.SCANNING
+        self._state_entered = now
 
     # ── Helpers ───────────────────────────────────────────────────────
 

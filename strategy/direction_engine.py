@@ -166,7 +166,17 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Hunt prediction
-_HUNT_MIN_CONFIDENCE    = 0.18   # below this = NEUTRAL (insufficient signal)
+# THRESHOLD-FLAP FIX: Replace the single _HUNT_MIN_CONFIDENCE threshold with a
+# Schmitt-trigger two-threshold design.
+#   _HUNT_ON_THRESHOLD:  score must EXCEED this to commit (or flip) a direction.
+#   _HUNT_OFF_THRESHOLD: score must DROP BELOW this to revert to NEUTRAL.
+#   Band [_HUNT_OFF_THRESHOLD, _HUNT_ON_THRESHOLD): hold the last committed
+#   direction at its committed confidence — no flip, no NEUTRAL.
+# Effect: scores oscillating around 0.18 (e.g. 0.168 ↔ 0.175 ↔ 0.156) no longer
+# cause BSL_HUNT ↔ NEUTRAL flips every few seconds; only a drop below 0.11
+# genuinely reverts to NEUTRAL.  True NEUTRAL (score 0.109 < OFF) is preserved.
+_HUNT_ON_THRESHOLD  = 0.18   # must EXCEED to commit a direction (was _HUNT_MIN_CONFIDENCE)
+_HUNT_OFF_THRESHOLD = 0.11   # must DROP BELOW to revert committed → NEUTRAL
 _HUNT_STRONG_CONFIDENCE = 0.55   # above this = high-conviction directional call
 _HUNT_CACHE_SEC         = 5      # refresh prediction at most every 5 seconds
 
@@ -377,6 +387,13 @@ class DirectionEngine:
         self._ps_state:          Optional[PostSweepState] = None
         self._ps_state_quality:  float = 0.0
         self._last_ps_analysis:  Dict  = {}
+
+        # THRESHOLD-FLAP FIX: Schmitt-trigger hysteresis state.
+        # Persists the last committed direction so the band [OFF, ON) holds it.
+        # None = currently NEUTRAL (no committed direction).
+        self._committed_direction:  Optional[str] = None   # "BSL" | "SSL" | None
+        self._committed_confidence: float         = 0.0
+        self._committed_score:      float         = 0.0
 
     # =========================================================================
     # 1. HUNT PREDICTION ENGINE
@@ -823,15 +840,59 @@ class DirectionEngine:
         # ─────────────────────────────────────────────────────────────────────
         # BUILD RESULT
         # ─────────────────────────────────────────────────────────────────────
-        if confidence < _HUNT_MIN_CONFIDENCE:
-            # Log the ACTUAL composite score before it is discarded.
-            # Previously this branch returned a null prediction with confidence=0.0
-            # and the caller's log printed "conf=0.00", making it impossible to see
-            # how far below threshold the engine actually was.  The real composite
-            # (here: `confidence` = abs(score)) is now visible in every NEUTRAL line.
+        # ─────────────────────────────────────────────────────────────────────
+        # SCHMITT-TRIGGER HYSTERESIS  (THRESHOLD-FLAP FIX)
+        # ─────────────────────────────────────────────────────────────────────
+        # Three zones:
+        #   confidence >= ON  (0.18): commit/update the direction.
+        #   confidence <  OFF (0.11): revert to NEUTRAL regardless of last state.
+        #   Band [OFF, ON)          : hold the last committed direction at its
+        #                             last committed confidence — no flip, no NEUTRAL.
+        #
+        # This eliminates the BSL_HUNT ↔ NEUTRAL oscillation observed when the
+        # composite score hovers at ~0.168–0.175, which was straddling the old
+        # single 0.18 threshold every few seconds.
+        if confidence >= _HUNT_ON_THRESHOLD:
+            # New or updated committed direction.
+            self._committed_direction  = "BSL" if score > 0 else "SSL"
+            self._committed_confidence = confidence
+            self._committed_score      = score
+        elif confidence < _HUNT_OFF_THRESHOLD:
+            # Score fell below the OFF threshold — genuine NEUTRAL.
+            if self._committed_direction is not None:
+                logger.debug(
+                    f"DirectionEngine: NEUTRAL (hysteresis OFF triggered: "
+                    f"composite={confidence:.3f} < {_HUNT_OFF_THRESHOLD}) | "
+                    f"prev={self._committed_direction} conf={self._committed_confidence:.3f}")
+            self._committed_direction  = None
+            self._committed_confidence = 0.0
+            self._committed_score      = 0.0
+        else:
+            # Band [OFF, ON): hold the last committed state.
+            if self._committed_direction is None:
+                # No prior committed state — treat as NEUTRAL.
+                logger.debug(
+                    f"DirectionEngine: NEUTRAL (hysteresis band, no prior state: "
+                    f"composite={confidence:.3f} in [{_HUNT_OFF_THRESHOLD},{_HUNT_ON_THRESHOLD}))")
+            else:
+                # Hold: restore committed confidence/score for result building.
+                logger.debug(
+                    f"DirectionEngine: HOLD {self._committed_direction} "
+                    f"(hysteresis band: live={confidence:.3f} in "
+                    f"[{_HUNT_OFF_THRESHOLD},{_HUNT_ON_THRESHOLD}), "
+                    f"held conf={self._committed_confidence:.3f})")
+                confidence = self._committed_confidence
+                score      = self._committed_score
+                # Recompute bsl/ssl from held score
+                bsl_score = max(0.0,  score)
+                ssl_score = max(0.0, -score)
+
+        if self._committed_direction is None:
+            # NEUTRAL — log actual composite so operators can see how far below ON we are.
             logger.debug(
                 f"DirectionEngine: NEUTRAL | "
-                f"composite={confidence:.3f} (threshold={_HUNT_MIN_CONFIDENCE}) "
+                f"composite={abs(self._committed_score) if self._committed_score else confidence:.3f} "
+                f"(ON={_HUNT_ON_THRESHOLD} OFF={_HUNT_OFF_THRESHOLD}) "
                 f"raw={score:+.3f} | "
                 f"AMD={factors.amd:+.2f} "
                 f"HTF={factors.htf_structure:+.2f} "
@@ -840,14 +901,14 @@ class DirectionEngine:
                 f"pool={factors.pool_asymmetry:+.2f}")
             result = self._null_prediction(
                 now_ms,
-                reason=f"low_confidence(composite={confidence:.3f}<{_HUNT_MIN_CONFIDENCE})",
+                reason=f"low_confidence(composite={confidence:.3f}<{_HUNT_ON_THRESHOLD})",
                 dr_pd=dr_pd, bsl_score=bsl_score, ssl_score=ssl_score,
                 score=score, factors=factors)
             self._last_hunt    = result
             self._last_hunt_ms = now_ms
             return result
 
-        if score > 0:
+        if self._committed_direction == "BSL":
             predicted          = "BSL"
             delivery_direction = "bearish"
             # FIX-3: Use LiquidityMap pool prices when available

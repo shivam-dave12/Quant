@@ -5030,6 +5030,11 @@ class QuantStrategy:
                         and hasattr(self._entry_engine, 'mark_gate_blocked')):
                     self._entry_engine.mark_gate_blocked(
                         signal.side, gate_reason[:40], cooldown_sec=45.0)
+                    # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
+                    # so mark_gate_blocked can still read signal.sweep_result to extend
+                    # the processed-sweep registry entry (the correct suppression layer
+                    # now that state transitions to SCANNING before this call).
+                    self._entry_engine.consume_signal()
                 else:
                     self._entry_engine.consume_signal()
                 return
@@ -5145,6 +5150,9 @@ class QuantStrategy:
                     elif hasattr(self._entry_engine, 'mark_gate_blocked'):
                         self._entry_engine.mark_gate_blocked(
                             signal.side, reject_str[:40], cooldown_sec=45.0)
+                        # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
+                        # (same ordering rationale as the unified gate path above).
+                        self._entry_engine.consume_signal()
                     else:
                         self._entry_engine.consume_signal()
                     # Telegram alert for conviction block (throttled 60s per side)
