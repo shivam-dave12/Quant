@@ -129,7 +129,7 @@ _SESSION_SCORE: Dict[str, float] = {
     "LONDON_NY": 0.85,   # Overlap — high volume but chaotic
     "WEEKEND":   0.65,   # No named KZ, but crypto liquidity hunts are valid 24/7
     "OFF_HOURS": 0.55,   # Between sessions on a weekday — lower but not blocked
-    "ASIA":      0.00,   # HARD BLOCK — accumulation / range, no delivery
+    "ASIA":      0.10,   # Very low score — penalises but does not veto
     "":          0.40,   # Unknown — penalise (data issue, not a legitimate session)
 }
 
@@ -266,58 +266,26 @@ class ConvictionFilter:
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── GATE 2: Dealing range — institutional zones ────────────────────
-        # Bug #13 fix: _get_dealing_range_pd now returns (pd, data_available).
-        # When data_available=False the 0.50 value is a pure sentinel — applying
-        # the discount/premium gate would block BOTH directions simultaneously,
-        # so we skip the gate and log a warning instead.
+        # ── GATE 2: Dealing range — fully data-driven score factor (no hard block) ──
+        # The dealing range P/D position is incorporated as a SCORE FACTOR in the
+        # conviction model, not as a hard veto. This is correct ICT methodology:
         #
-        # BUG-A2 FIX: SWEEP_REVERSAL and DISPLACEMENT_MOMENTUM entries are EXEMPT
-        # from the dealing range gate.
+        #   For APPROACH entries:  discount = good zone to buy (score bonus)
+        #   For REVERSAL entries:  premium SSL sweep = false move down, LONG is correct
+        #                          (dealing range gate is irrelevant / inverted)
+        #   For CONTINUATION:      scoring reflects the directional bias naturally
         #
-        # ICT dealing range logic for reversal entries (opposite of approach):
-        #   SSL swept below (sell-stops triggered) in a PREMIUM zone → FALSE move down
-        #   → Smart money swept stops → Delivery is LONG back into premium.
-        #   A LONG entry in PREMIUM after an SSL sweep IS institutionally correct.
-        #
-        #   BSL swept above (buy-stops triggered) in a DISCOUNT zone → FALSE move up
-        #   → Smart money swept stops → Delivery is SHORT back into discount.
-        #   A SHORT entry in DISCOUNT after a BSL sweep IS institutionally correct.
-        #
-        # The dealing range gate applies ONLY to approach entries (don't anticipate
-        # the sweep by buying into premium / selling into discount). Since approach
-        # entries are already hard-blocked by Gate 6, the only entries that could
-        # be blocked here are reversals — which is the opposite of correct ICT.
-        _is_reversal_type = any(k in entry_type.lower()
-                                for k in ("reversal", "momentum", "continuation"))
+        # None of this needs a hard block. A poor dealing-range position reduces
+        # the score; an exceptional setup in the wrong zone can still pass.
         dr_pd, dr_data_available = self._get_dealing_range_pd(
             price, ict_engine, liq_snapshot)
         if not dr_data_available:
             logger.debug(
-                "DEALING_RANGE: no structural data yet — gate skipped (0.50 sentinel)")
-        elif _is_reversal_type:
-            # Sweep reversals + momentum: PD check is intentionally skipped.
-            # Log the zone for informational purposes only.
-            _pd_label = ("PREMIUM" if dr_pd > 0.60 else
-                         "DISCOUNT" if dr_pd < 0.40 else "EQ")
-            logger.debug(
-                f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) — exempt for {entry_type} "
-                f"(reversal entries operate in the swept zone, PD gate does not apply)")
-        else:
-            if trade_side == "long" and dr_pd > DR_LONG_MAX_PD:
-                rejects.append(
-                    f"DEALING_RANGE: LONG in premium/EQ (PD={dr_pd:.2f} > {DR_LONG_MAX_PD}). "
-                    f"Institutions buy in discount only.")
-                return ConvictionResult(
-                    allowed=False, score=0.0, reject_reasons=rejects,
-                    factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
-            if trade_side == "short" and dr_pd < DR_SHORT_MIN_PD:
-                rejects.append(
-                    f"DEALING_RANGE: SHORT in discount/EQ (PD={dr_pd:.2f} < {DR_SHORT_MIN_PD}). "
-                    f"Institutions sell in premium only.")
-                return ConvictionResult(
-                    allowed=False, score=0.0, reject_reasons=rejects,
-                    factors=factors, pool_tf=pool_tf, pool_sig=pool_sig)
+                "DEALING_RANGE: no structural data yet — scoring with neutral 0.50")
+        _pd_label = ("PREMIUM" if dr_pd > 0.60 else
+                     "DISCOUNT" if dr_pd < 0.40 else "EQ")
+        logger.debug(
+            f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) {entry_type} — data-driven scoring only")
         factors.dealing_range_ok = dr_data_available
 
         # ── GATE 3: R:R minimum ───────────────────────────────────────────
@@ -328,68 +296,32 @@ class ConvictionFilter:
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── GATE 4: Session — HARD BLOCK Asia only ────────────────────────
-        # ASIA is blocked because it is a pure accumulation / range period —
-        # no institutional delivery, no kill zone, no displacement expected.
-        #
-        # WEEKEND is NOT blocked.  Crypto runs 24/7.  Liquidity sweeps,
-        # AMD cycles, and structural setups are equally valid on a Saturday.
-        # The session_score for WEEKEND (0.65) reflects the absence of a named
-        # kill zone but does not prevent a high-quality setup from passing.
+        # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
+        # All sessions are scored, none are hard-blocked.  ASIA receives a
+        # very low session_score (0.10) which makes it nearly impossible to
+        # clear the overall score threshold without exceptional displacement
+        # + CISD + OTE, but a genuinely exceptional setup is still allowed.
+        # This is fully data-driven: the score gates the trade, not the label.
         sess_key = self._resolve_session(session, ict_engine)
-        if sess_key == "ASIA":
-            rejects.append("SESSION: ASIA — accumulation range, no delivery expected")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+        # (ASIA falls through with session_score=0.10 → almost never passes)
 
-        # ── GATE 5: AMD phase — HARD BLOCK Accumulation (with reversal exemption) ──
-        # BUG-A3 FIX: AMD=ACCUMULATION hard block must NOT apply to SWEEP_REVERSAL
-        # entries. Here is why:
-        #
-        # ICT AMD cycle: ACCUMULATION → MANIPULATION → DISTRIBUTION
-        #
-        # The sweep IS the transition event from ACCUMULATION to MANIPULATION.
-        # When price sweeps a liquidity pool OUT OF an ACCUMULATION phase, the
-        # AMD engine is still reporting ACCUMULATION because Wilder-smoothed
-        # evidence takes 2-5 bars to detect the phase shift. The ACTUAL market
-        # state at that moment is mid-sweep = MANIPULATION.
-        #
-        # Blocking SWEEP_REVERSAL when AMD=ACCUMULATION means:
-        #   1. Sweep occurs (AM→MANIPULATION beginning)
-        #   2. Entry engine generates SWEEP_REVERSAL signal (correct)
-        #   3. AMD still says ACCUMULATION (lag)
-        #   4. Gate blocks entry (wrong — the AMD lag IS the entry opportunity)
-        #
-        # Keep the block for DISPLACEMENT_MOMENTUM and CONTINUATION entries
-        # where ACCUMULATION means genuine no-delivery (not a transitional lag).
+        # ── GATE 5: AMD phase — fully data-driven (NO hard block) ──────────
+        # AMD=ACCUMULATION receives an amd_score near 0.00 in _score_amd(),
+        # making it nearly impossible to clear the overall conviction threshold.
+        # No phase is ever unconditionally vetoed — the score gates the trade.
+        # Exceptional displacement + CISD + OTE can still clear the bar even
+        # during ACCUMULATION (e.g. AMD phase lag during a live sweep).
         amd_phase = self._get_amd_phase(ict_engine)
-        if amd_phase == "ACCUMULATION":
-            if not _is_reversal_type:
-                rejects.append(
-                    "AMD: ACCUMULATION — no delivery expected, hard blocked. "
-                    "Wait for MANIPULATION sweep.")
-                return ConvictionResult(
-                    allowed=False, score=0.0, reject_reasons=rejects,
-                    factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
-            else:
-                # SWEEP_REVERSAL during ACCUMULATION: likely AMD phase lag.
-                # Penalise heavily in scoring (amd_score near 0) but do NOT hard-block.
-                logger.debug(
-                    "AMD: ACCUMULATION during sweep reversal — phase lag likely. "
-                    "Allowing with heavy AMD score penalty (not hard-blocked).")
-
-        # ── GATE 6: Approach entries — HARD BLOCK ─────────────────────────
-        # PRE_SWEEP_APPROACH entries are inherently low-probability.
-        # The pool hasn't been swept, there's no displacement, no CISD.
-        # Institutional traders NEVER enter before the sweep.
+        # No hard block. amd_phase is passed to _score_amd() below.
+        
+        # ── Gate 6: Approach entries — data-driven (no hard block) ─────────────
+        # Approach entries score very low on displacement (0.20) and CISD (0.10)
+        # because no sweep/wick/structural confirmation exists yet. The resulting
+        # score (typically <0.45) almost never clears REQUIRED_SCORE=0.65.
+        # No unconditional block — the score alone gates the trade.
         if is_approach:
-            rejects.append(
-                "APPROACH_BLOCKED: Pre-sweep approach entries disabled. "
-                "Wait for confirmed sweep + displacement + CISD.")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+            rejects.append("APPROACH: pre-sweep — expect very low displacement/CISD scores")
+            # Falls through to factor scoring (no early return).
 
         # ══════════════════════════════════════════════════════════════════
         # FACTOR SCORING — weighted conviction model
@@ -416,11 +348,27 @@ class ConvictionFilter:
         elif factors.cisd_score >= 0.35:
             allows.append(f"CISD={factors.cisd_score:.2f}")
 
-        # ── Factor 4: OTE zone (weight 0.15) ──────────────────────────────
+        # ── Factor 4: OTE zone + Dealing Range alignment (weight 0.15) ─────────
+        # OTE score is now modulated by dealing range position (fully data-driven).
+        # Good DR alignment adds up to +0.15; poor alignment subtracts up to 0.15.
+        # For reversals: the zone logic is INVERTED (premium SSL sweep → LONG is correct).
+        # This replaces the old hard DR gate with a continuous score contribution.
         factors.ote_score = self._score_ote(
             trade_side, entry_price, pool_price, price)
+        if dr_data_available:
+            if trade_side == "long":
+                # Discount zone good for longs; premium zone bad
+                _dr_mod = 0.15 * (1.0 - 2.0 * max(0.0, dr_pd - 0.50))
+            else:
+                # Premium zone good for shorts; discount zone bad
+                _dr_mod = 0.15 * (2.0 * max(0.0, dr_pd - 0.50))
+            if _is_reversal_type:
+                _dr_mod = -_dr_mod   # reversal entries work the OPPOSITE zone
+            factors.ote_score = max(0.05, min(1.0, factors.ote_score + _dr_mod))
         if factors.ote_score >= 0.70:
-            allows.append(f"OTE={factors.ote_score:.2f}✅")
+            allows.append(f"OTE={factors.ote_score:.2f}✅ DR={_pd_label}({dr_pd:.2f})")
+        else:
+            allows.append(f"OTE={factors.ote_score:.2f} DR={_pd_label}({dr_pd:.2f})")
 
         # ── Factor 5: Session quality (weight 0.10) ───────────────────────
         factors.session_score = _SESSION_SCORE.get(sess_key, 0.40)

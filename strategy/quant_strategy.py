@@ -4370,9 +4370,13 @@ class QuantStrategy:
                 # Post-sweep model confirmed reversal: direction hint supersedes AMD phase.
                 pass
             else:
-                rejections.append(
-                    f"AMD=ACCUMULATION — smart money accumulating, "
-                    f"no delivery expected. Wait for MANIPULATION sweep.")
+                # DATA-DRIVEN: AMD=ACCUMULATION is NOT hard-blocked.
+                # The conviction_filter scores ACCUMULATION near 0.00 in _score_amd().
+                # This makes it very hard to clear the conviction threshold without
+                # exceptional displacement+CISD+OTE, but possible.
+                logger.debug(
+                    "UNIFIED_GATE: AMD=ACCUMULATION non-reversal entry — "
+                    "conviction_filter will apply near-zero amd_score penalty")
 
         # During MANIPULATION: bias must AGREE with trade direction.
         # A bullish MANIPULATION means SSL will be swept (short-side fake-out).
@@ -4504,10 +4508,14 @@ class QuantStrategy:
             (signal.side == "long"  and tf < -0.35 and cvd < -0.20) or
             (signal.side == "short" and tf >  0.35 and cvd >  0.20)
         )
+        # DATA-DRIVEN: Flow is now a soft advisory only. Strong opposing flow
+        # is noted in allows/rejects log for visibility but does NOT block the
+        # entry. The conviction_filter scores order flow (CVD + tick) as weighted
+        # factors and the overall score gates the trade.
         if flow_opposes:
-            rejections.append(
-                f"FLOW_OPPOSING: tick={tf:+.2f} cvd={cvd:+.2f} "
-                f"both against {signal.side}")
+            logger.debug(
+                f"FLOW_ADVISORY: tick={tf:+.2f} cvd={cvd:+.2f} "
+                f"both soft-opposing {signal.side} (not blocking — scored in conviction)")
 
         # ══════════════════════════════════════════════════════════════════
         # GATE 5: Kill Zone / Session Filter
@@ -4523,8 +4531,13 @@ class QuantStrategy:
         session = str(getattr(ict_ctx, 'kill_zone', '') or '')
         if not session and self._ict:
             session = str(getattr(self._ict, '_killzone', '') or '')
+        # DATA-DRIVEN: ASIA session is NOT hard-blocked here.
+        # ConvictionFilter scores ASIA at 0.10 (session_score factor × 0.10 weight)
+        # which reduces overall conviction score substantially. The score gates the trade.
         if session.upper() == "ASIA":
-            rejections.append("ASIA_SESSION — accumulation range, no delivery expected")
+            logger.debug(
+                "UNIFIED_GATE: ASIA session — conviction_filter will apply "
+                "session_score=0.10 penalty (not hard-blocked here)")
 
         # ══════════════════════════════════════════════════════════════════
         # GATE 6: Minimum R:R
@@ -5295,8 +5308,15 @@ class QuantStrategy:
                 parts.append(f"Bias={ict_ctx.amd_bias[:4]}")
 
             # Pool distances
-            parts.append(f"BSL={liq_snapshot.nearest_bsl_atr:.1f}ATR")
-            parts.append(f"SSL={liq_snapshot.nearest_ssl_atr:.1f}ATR")
+            # Compute nearest pool distances directly (more reliable than snapshot property)
+            _nearest_bsl = liq_snapshot.nearest_bsl_atr
+            _nearest_ssl = liq_snapshot.nearest_ssl_atr
+            if _nearest_bsl <= 0 and liq_snapshot.bsl_pools:
+                _nearest_bsl = min((pt.distance_atr for pt in liq_snapshot.bsl_pools), default=0)
+            if _nearest_ssl <= 0 and liq_snapshot.ssl_pools:
+                _nearest_ssl = min((pt.distance_atr for pt in liq_snapshot.ssl_pools), default=0)
+            parts.append(f"BSL={_nearest_bsl:.1f}ATR")
+            parts.append(f"SSL={_nearest_ssl:.1f}ATR")
 
             # Structure
             _s15 = ""
