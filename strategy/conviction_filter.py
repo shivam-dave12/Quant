@@ -226,6 +226,7 @@ class ConvictionFilter:
         candles_5m: Optional[List] = None,
         session:    str            = "",
         entry_type: str            = "",
+        sweep_wick_price: float    = 0.0,
     ) -> ConvictionResult:
         """
         Evaluate conviction for a potential entry.
@@ -234,6 +235,10 @@ class ConvictionFilter:
           1. Hard mandatory gates (any fail = immediate rejection)
           2. Factor scoring (always runs, produces real score)
           3. Session timing gates (checked last so score is always populated)
+
+        sweep_wick_price (FIX-OTE-REVERSAL): The wick extreme of the sweep candle.
+          For reversal entries this is the correct Fibonacci anchor for OTE scoring.
+          Callers should pass sweep_result.wick_extreme when available.
         """
         factors  = ConvictionFactors()
         rejects: List[str] = []
@@ -242,6 +247,14 @@ class ConvictionFilter:
         # ── Extract pool info ──────────────────────────────────────────────
         pool_price, pool_tf, pool_sig, pool_htf_count = \
             self._extract_pool_info(sweep_pool, atr)
+
+        # FIX-OTE-REVERSAL: try to get sweep wick from sweep_pool if not passed
+        if sweep_wick_price <= 0 and sweep_pool is not None:
+            sweep_wick_price = float(
+                getattr(sweep_pool, 'sweep_wick', 0.0)
+                or getattr(sweep_pool, 'wick_extreme', 0.0)
+                or 0.0
+            )
 
         # ── Effective TF rank ──────────────────────────────────────────────
         native_rank = _TF_RANK.get(pool_tf, 2)
@@ -378,7 +391,9 @@ class ConvictionFilter:
         # For reversals: the zone logic is INVERTED (premium SSL sweep → LONG is correct).
         # This replaces the old hard DR gate with a continuous score contribution.
         factors.ote_score = self._score_ote(
-            trade_side, entry_price, pool_price, price)
+            trade_side, entry_price, pool_price, price,
+            sweep_wick_price=sweep_wick_price,
+        )
         if dr_data_available:
             if trade_side == "long":
                 # Discount zone good for longs; premium zone bad
@@ -760,17 +775,40 @@ class ConvictionFilter:
     @staticmethod
     def _score_ote(
         trade_side: str, entry_price: float, pool_price: float, price: float,
+        sweep_wick_price: float = 0.0,
     ) -> float:
         """
         Score OTE (Optimal Trade Entry) zone [0-1].
 
         OTE = 50% to 78.6% Fibonacci retracement of the displacement move.
         The golden pocket (61.8% - 78.6%) is where institutions fill.
+
+        FIX-OTE-REVERSAL: For reversal entries, the correct Fibonacci reference
+        is the SWEEP WICK → POST-REVERSAL HIGH/LOW, NOT pool_price → current_price.
+
+        Original bug: pool_price ≈ sweep price ≈ entry price for reversal entries
+        (price hasn't retraced after the reversal), so total_move ≈ $6 and fib ≈ 0,
+        giving ote_score = 0.10 regardless of setup quality.
+
+        Fix: when sweep_wick_price is provided (reversal entries always have it),
+        use it as the anchor of the displacement leg instead of pool_price. This
+        correctly measures how much the market has retraced from the wick extreme,
+        which is the actual OTE question for a reversal trade.
         """
         if pool_price <= 0 or entry_price <= 0 or price <= 0:
             return 0.40
 
-        total_move = abs(price - pool_price)
+        # FIX-OTE-REVERSAL: use sweep wick as reference when available
+        anchor_price = pool_price
+        if sweep_wick_price > 0:
+            # For SSL sweeps (long reversal): wick is BELOW pool price
+            # For BSL sweeps (short reversal): wick is ABOVE pool price
+            if trade_side == "long" and sweep_wick_price < pool_price:
+                anchor_price = sweep_wick_price
+            elif trade_side == "short" and sweep_wick_price > pool_price:
+                anchor_price = sweep_wick_price
+
+        total_move = abs(price - anchor_price)
         if total_move < 1e-3:
             return 0.40
 

@@ -255,6 +255,9 @@ class EntrySignal:
     reason:         str   = ""
     ict_validation: str   = ""
     created_at:     float = field(default_factory=time.time)
+    # FIX-SL-FLIP: candle timestamp that produced this signal — passed back to
+    # mark_momentum_blocked() so the frozen SL can be keyed to the right candle.
+    displacement_candle_ts: int = 0
 
 
 @dataclass
@@ -333,7 +336,7 @@ class EntryEngine:
         self._proximity_target   = None
         self._proximity_side     = ""
 
-        # BUG-B2 FIX: Gate-block cooldown
+        # BUG-B2 FIX: Gate-block cooldown (POST_SWEEP signals)
         # When unified_entry_gate or conviction_filter blocks a signal from the
         # active POST_SWEEP state, the post_sweep evidence model remains alive and
         # will regenerate the identical signal on the next tick (250ms later).
@@ -347,6 +350,27 @@ class EntryEngine:
         #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
         self._gate_blocked_until: float = 0.0
         self._gate_block_key: tuple = ()
+
+        # FIX-SPAM: Momentum signal gate-block (independent of post-sweep gate).
+        # Momentum signals have no conviction cooldown of their own — when the
+        # conviction gate rejects a momentum signal, the engine immediately
+        # regenerates the identical signal on the next 250ms tick, producing
+        # hundreds of log lines per minute for the same setup.
+        #
+        # _momentum_blocked_until: suppress momentum signal generation until this
+        #   epoch time.  Lifted early if price moves > _MOMENTUM_BLOCK_ATR_MOVE ATR
+        #   from the entry price at block time (genuine structural change).
+        # _momentum_block_entry_price: entry price when block was set (for ATR check).
+        # _momentum_block_candle_ts: candle timestamp at block time.  A new candle
+        #   (different ts) always lifts the block immediately.
+        # _momentum_block_sl: the SL at the time of blocking — frozen so the signal
+        #   does not flip between two SL values on alternating ticks (FIX-SL-FLIP).
+        self._momentum_blocked_until:     float = 0.0
+        self._momentum_block_entry_price: float = 0.0
+        self._momentum_block_candle_ts:   int   = 0
+        self._momentum_block_sl:          Optional[float] = None
+        _MOMENTUM_BLOCK_SEC      = 30.0   # default cooldown when gate blocks
+        _MOMENTUM_BLOCK_ATR_MOVE = 0.25   # ATR distance that lifts block early
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -467,6 +491,42 @@ class EntryEngine:
             # Same block reason — extend the cooldown from NOW
             self._gate_blocked_until = max(
                 self._gate_blocked_until, time.time() + cooldown_sec)
+
+    def mark_momentum_blocked(
+        self,
+        entry_price: float,
+        candle_ts: int,
+        locked_sl: float,
+        cooldown_sec: float = 30.0,
+    ) -> None:
+        """
+        FIX-SPAM + FIX-SL-FLIP: Called by quant_strategy when the conviction gate
+        blocks a DISPLACEMENT_MOMENTUM signal.
+
+        Two problems solved in one call:
+
+        1. SPAM (FIX-SPAM): Without this, the scanning state regenerates the same
+           momentum signal every 250ms because _last_entry_at is only updated on
+           on_entry_placed() (which never fires when the conviction gate blocks).
+           A 30s cooldown matches _ENTRY_COOLDOWN_SEC and aligns with the typical
+           time for market structure to change enough to warrant re-evaluation.
+
+        2. SL FLIP (FIX-SL-FLIP): _compute_sl() picks between an ICT OB-based SL
+           and an ATR fallback depending on whether ict.nearest_ob_price is non-zero
+           that tick. The OB presence flickers tick-to-tick (it's fetched live),
+           causing the SL to alternate between two values ($66,851 vs $66,855 in the
+           logs). locked_sl freezes the SL computed at signal-generation time and
+           reuses it for any subsequent signal within the cooldown window, ensuring
+           the conviction gate always scores the SAME R:R.
+
+        The block is lifted early if:
+          - A new (different) candle is found (candle_ts changed)
+          - Price moves more than 0.25 ATR from entry_price (structural shift)
+        """
+        self._momentum_blocked_until     = time.time() + cooldown_sec
+        self._momentum_block_entry_price = entry_price
+        self._momentum_block_candle_ts   = candle_ts
+        self._momentum_block_sl          = locked_sl
 
     def on_position_closed(self) -> None:
         self._reset(time.time())
@@ -621,6 +681,17 @@ class EntryEngine:
         if self._momentum_entries_1h >= _MOMENTUM_MAX_PER_HOUR:
             return False
 
+        # FIX-SPAM: Respect momentum gate-block cooldown.
+        # Lift early if price has moved significantly (new market structure) or
+        # a different candle is now the best displacement candidate.
+        if now < self._momentum_blocked_until:
+            moved = (abs(price - self._momentum_block_entry_price) / max(atr, 1e-10)
+                     if atr > 0 else 0.0)
+            if moved < 0.25:
+                return False
+            # Price moved enough — clear the block so we can re-evaluate
+            self._momentum_blocked_until = 0.0
+
         # Find displacement candle
         disp_candle = None
         disp_tf = ""
@@ -671,13 +742,26 @@ class EntryEngine:
 
         amd_mult = self._amd_modifier(ict, disp_dir)
 
+        # FIX-SL-FLIP: If this is the same candle that was previously blocked,
+        # reuse the frozen SL to prevent tick-to-tick SL oscillation caused by
+        # ict.nearest_ob_price flickering in/out between ticks.
+        disp_candle_ts = int(disp_candle.get('t', 0) or 0)
+        _reuse_frozen_sl = (
+            self._momentum_block_sl is not None
+            and disp_candle_ts == self._momentum_block_candle_ts
+            and disp_candle_ts > 0
+        )
+
         # SL
         ch, cl_val = float(disp_candle['h']), float(disp_candle['l'])
         buf = atr * _MOMENTUM_SL_BUFFER_ATR
-        sl = cl_val - buf if disp_dir == "long" else ch + buf
-        ict_sl = self._compute_sl(ict, disp_dir, price, atr)
-        if ict_sl is not None:
-            sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
+        if _reuse_frozen_sl:
+            sl = self._momentum_block_sl
+        else:
+            sl = cl_val - buf if disp_dir == "long" else ch + buf
+            ict_sl = self._compute_sl(ict, disp_dir, price, atr)
+            if ict_sl is not None:
+                sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
 
         risk = abs(price - sl)
         if risk < 1e-10:
@@ -705,7 +789,7 @@ class EntryEngine:
                 return False
             target = min(reachable, key=lambda t: t.distance_atr)
 
-        self._last_momentum_candle_ts = int(disp_candle.get('t', 0) or 0)
+        self._last_momentum_candle_ts = disp_candle_ts
         # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
         # It is incremented in on_entry_placed() ONLY if the signal is consumed
         # and the order actually submitted.  Incrementing here would charge the
@@ -719,6 +803,7 @@ class EntryEngine:
             conviction=abs(flow.conviction) * amd_mult,
             reason=f"DISPLACEMENT {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}",
             ict_validation=self._ict_summary(ict, disp_dir),
+            displacement_candle_ts=disp_candle_ts,
         )
         logger.info(f"MOMENTUM SIGNAL: {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}")
         return True

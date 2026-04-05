@@ -5077,21 +5077,31 @@ class QuantStrategy:
                                    if hasattr(signal, 'entry_type') and signal.entry_type is not None
                                    else "")
 
+                # FIX-OTE-REVERSAL: pass the sweep wick extreme so the conviction
+                # filter can use it as the correct Fibonacci anchor for OTE scoring.
+                # Without this, reversal entries always score OTE≈0.10 because
+                # pool_price ≈ current price (no retrace has occurred yet post-sweep).
+                _sweep_wick = 0.0
+                if hasattr(signal, 'sweep_result') and signal.sweep_result is not None:
+                    _sweep_wick = float(
+                        getattr(signal.sweep_result, 'wick_extreme', 0.0) or 0.0)
+
                 _conv_result = self._conviction.evaluate(
-                    trade_side   = signal.side,
-                    sweep_pool   = _conv_pool,   # None is handled by _extract_pool_info
-                    entry_price  = signal.entry_price,
-                    sl_price     = signal.sl_price,
-                    tp_price     = signal.tp_price,
-                    price        = price,
-                    atr          = atr,
-                    now          = now,
-                    ict_engine   = self._ict,
-                    liq_snapshot = liq_snapshot,
-                    ps_decision  = _ps_dec_for_conv,
-                    candles_5m   = candles_by_tf.get("5m"),
-                    session      = _sess_str,
-                    entry_type   = _entry_type_str,
+                    trade_side       = signal.side,
+                    sweep_pool       = _conv_pool,   # None is handled by _extract_pool_info
+                    entry_price      = signal.entry_price,
+                    sl_price         = signal.sl_price,
+                    tp_price         = signal.tp_price,
+                    price            = price,
+                    atr              = atr,
+                    now              = now,
+                    ict_engine       = self._ict,
+                    liq_snapshot     = liq_snapshot,
+                    ps_decision      = _ps_dec_for_conv,
+                    candles_5m       = candles_by_tf.get("5m"),
+                    session          = _sess_str,
+                    entry_type       = _entry_type_str,
+                    sweep_wick_price = _sweep_wick,
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])
@@ -5107,9 +5117,32 @@ class QuantStrategy:
                         logger.debug(
                             f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
-                    # BUG-B2 FIX: Use mark_gate_blocked() instead of consume_signal()
-                    # to prevent the 4 Hz signal regeneration busy-loop.
-                    if hasattr(self._entry_engine, 'mark_gate_blocked'):
+                    # BUG-B2 / FIX-SPAM / FIX-SL-FLIP:
+                    # Route the gate-block notification to the correct suppressor
+                    # based on signal type.
+                    #
+                    # DISPLACEMENT_MOMENTUM → mark_momentum_blocked():
+                    #   Freezes the SL at signal.sl_price so it doesn't oscillate
+                    #   between the ICT-OB path and the ATR-fallback path on
+                    #   alternating ticks. Also suppresses spam for 30s (configurable).
+                    #
+                    # POST_SWEEP (REVERSAL / CONTINUATION) → mark_gate_blocked():
+                    #   Existing 45s cooldown for the evidence-accumulation model.
+                    #   Not used for momentum because momentum has no evidence state
+                    #   to accumulate — the cooldown logic is different.
+                    _is_momentum = (
+                        hasattr(signal, 'entry_type')
+                        and signal.entry_type is not None
+                        and 'MOMENTUM' in str(signal.entry_type).upper()
+                    )
+                    if _is_momentum and hasattr(self._entry_engine, 'mark_momentum_blocked'):
+                        self._entry_engine.mark_momentum_blocked(
+                            entry_price = signal.entry_price,
+                            candle_ts   = getattr(signal, 'displacement_candle_ts', 0),
+                            locked_sl   = signal.sl_price,
+                            cooldown_sec= 30.0,
+                        )
+                    elif hasattr(self._entry_engine, 'mark_gate_blocked'):
                         self._entry_engine.mark_gate_blocked(
                             signal.side, reject_str[:40], cooldown_sec=45.0)
                     else:
