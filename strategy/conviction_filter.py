@@ -73,9 +73,13 @@ try:
         CONVICTION_MAX_ENTRIES_PER_SESSION as _CFG_MAX_ENTRIES,
     )
 except ImportError:
-    # Fallback defaults if config not available
-    _CFG_MIN_SCORE = 0.72
-    _CFG_MIN_TF_RANK = 3
+    # BUG-C1 FIX: Calibrated crypto-specific defaults.
+    # 0.72 → 0.65: more realistic for crypto 24/7 (especially weekends/off-hours
+    #               where session score 0.55-0.65 caps the ceiling)
+    # POOL_MIN_TF_RANK 3 → 2: allow 5m pools that have HTF confluence (effective
+    #               rank promoted to 3+ via htf_count); pure 1m pools still blocked
+    _CFG_MIN_SCORE = 0.65
+    _CFG_MIN_TF_RANK = 2
     _CFG_DISP_BODY_ATR = 0.70
     _CFG_OTE_LOW = 0.500
     _CFG_OTE_HIGH = 0.786
@@ -267,11 +271,38 @@ class ConvictionFilter:
         # When data_available=False the 0.50 value is a pure sentinel — applying
         # the discount/premium gate would block BOTH directions simultaneously,
         # so we skip the gate and log a warning instead.
+        #
+        # BUG-A2 FIX: SWEEP_REVERSAL and DISPLACEMENT_MOMENTUM entries are EXEMPT
+        # from the dealing range gate.
+        #
+        # ICT dealing range logic for reversal entries (opposite of approach):
+        #   SSL swept below (sell-stops triggered) in a PREMIUM zone → FALSE move down
+        #   → Smart money swept stops → Delivery is LONG back into premium.
+        #   A LONG entry in PREMIUM after an SSL sweep IS institutionally correct.
+        #
+        #   BSL swept above (buy-stops triggered) in a DISCOUNT zone → FALSE move up
+        #   → Smart money swept stops → Delivery is SHORT back into discount.
+        #   A SHORT entry in DISCOUNT after a BSL sweep IS institutionally correct.
+        #
+        # The dealing range gate applies ONLY to approach entries (don't anticipate
+        # the sweep by buying into premium / selling into discount). Since approach
+        # entries are already hard-blocked by Gate 6, the only entries that could
+        # be blocked here are reversals — which is the opposite of correct ICT.
+        _is_reversal_type = any(k in entry_type.lower()
+                                for k in ("reversal", "momentum", "continuation"))
         dr_pd, dr_data_available = self._get_dealing_range_pd(
             price, ict_engine, liq_snapshot)
         if not dr_data_available:
             logger.debug(
                 "DEALING_RANGE: no structural data yet — gate skipped (0.50 sentinel)")
+        elif _is_reversal_type:
+            # Sweep reversals + momentum: PD check is intentionally skipped.
+            # Log the zone for informational purposes only.
+            _pd_label = ("PREMIUM" if dr_pd > 0.60 else
+                         "DISCOUNT" if dr_pd < 0.40 else "EQ")
+            logger.debug(
+                f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) — exempt for {entry_type} "
+                f"(reversal entries operate in the swept zone, PD gate does not apply)")
         else:
             if trade_side == "long" and dr_pd > DR_LONG_MAX_PD:
                 rejects.append(
@@ -312,15 +343,41 @@ class ConvictionFilter:
                 allowed=False, score=0.0, reject_reasons=rejects,
                 factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
 
-        # ── GATE 5: AMD phase — HARD BLOCK Accumulation ───────────────────
+        # ── GATE 5: AMD phase — HARD BLOCK Accumulation (with reversal exemption) ──
+        # BUG-A3 FIX: AMD=ACCUMULATION hard block must NOT apply to SWEEP_REVERSAL
+        # entries. Here is why:
+        #
+        # ICT AMD cycle: ACCUMULATION → MANIPULATION → DISTRIBUTION
+        #
+        # The sweep IS the transition event from ACCUMULATION to MANIPULATION.
+        # When price sweeps a liquidity pool OUT OF an ACCUMULATION phase, the
+        # AMD engine is still reporting ACCUMULATION because Wilder-smoothed
+        # evidence takes 2-5 bars to detect the phase shift. The ACTUAL market
+        # state at that moment is mid-sweep = MANIPULATION.
+        #
+        # Blocking SWEEP_REVERSAL when AMD=ACCUMULATION means:
+        #   1. Sweep occurs (AM→MANIPULATION beginning)
+        #   2. Entry engine generates SWEEP_REVERSAL signal (correct)
+        #   3. AMD still says ACCUMULATION (lag)
+        #   4. Gate blocks entry (wrong — the AMD lag IS the entry opportunity)
+        #
+        # Keep the block for DISPLACEMENT_MOMENTUM and CONTINUATION entries
+        # where ACCUMULATION means genuine no-delivery (not a transitional lag).
         amd_phase = self._get_amd_phase(ict_engine)
         if amd_phase == "ACCUMULATION":
-            rejects.append(
-                "AMD: ACCUMULATION — no delivery expected, hard blocked. "
-                "Wait for MANIPULATION sweep.")
-            return ConvictionResult(
-                allowed=False, score=0.0, reject_reasons=rejects,
-                factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+            if not _is_reversal_type:
+                rejects.append(
+                    "AMD: ACCUMULATION — no delivery expected, hard blocked. "
+                    "Wait for MANIPULATION sweep.")
+                return ConvictionResult(
+                    allowed=False, score=0.0, reject_reasons=rejects,
+                    factors=factors, rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+            else:
+                # SWEEP_REVERSAL during ACCUMULATION: likely AMD phase lag.
+                # Penalise heavily in scoring (amd_score near 0) but do NOT hard-block.
+                logger.debug(
+                    "AMD: ACCUMULATION during sweep reversal — phase lag likely. "
+                    "Allowing with heavy AMD score penalty (not hard-blocked).")
 
         # ── GATE 6: Approach entries — HARD BLOCK ─────────────────────────
         # PRE_SWEEP_APPROACH entries are inherently low-probability.

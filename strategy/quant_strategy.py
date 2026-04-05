@@ -4341,20 +4341,57 @@ class QuantStrategy:
         amd_bias  = (ict_ctx.amd_bias  or "").lower()
         amd_conf  = ict_ctx.amd_confidence
 
+        # BUG-A1 FIX: AMD=ACCUMULATION hard block is EXEMPT for SWEEP_REVERSAL entries.
+        #
+        # ICT AMD cycle: ACCUMULATION -> MANIPULATION -> DISTRIBUTION.
+        # The sweep IS the event that transitions AMD phase. The ICT AMD engine uses
+        # Wilder-smoothing (2-5 bar lag), so AMD still reports ACCUMULATION for
+        # several bars AFTER the sweep fires. Blocking all SWEEP_REVERSAL entries
+        # during ACCUMULATION therefore vetos the bot's primary setup at its prime window.
+        #
+        # Keep the hard block for CONTINUATION and MOMENTUM entries which genuinely
+        # require an active delivery phase.
+        #
+        # Additionally, when DirectionEngine's post-sweep accumulative model has
+        # confirmed "reverse" with >= 0.40 confidence, that verdict supersedes
+        # the stale pre-sweep AMD reading entirely.
+        _is_sweep_rev = (hasattr(signal, 'entry_type')
+                         and signal.entry_type is not None
+                         and 'REVERSAL' in str(signal.entry_type).upper())
+        _has_ps_hint = (ict_ctx.direction_hint == "reverse"
+                        and ict_ctx.direction_hint_confidence >= 0.40)
+
         if amd_phase == "ACCUMULATION":
-            rejections.append(
-                f"AMD=ACCUMULATION — smart money accumulating, "
-                f"no delivery expected. Wait for MANIPULATION sweep.")
+            if _is_sweep_rev:
+                # Sweep reversal during ACCUMULATION: AMD phase lag expected.
+                # The conviction_filter penalises the AMD score; no gate veto here.
+                pass
+            elif _has_ps_hint:
+                # Post-sweep model confirmed reversal: direction hint supersedes AMD phase.
+                pass
+            else:
+                rejections.append(
+                    f"AMD=ACCUMULATION — smart money accumulating, "
+                    f"no delivery expected. Wait for MANIPULATION sweep.")
 
         # During MANIPULATION: bias must AGREE with trade direction.
         # A bullish MANIPULATION means SSL will be swept (short-side fake-out).
         # The delivery is LONG.  Going SHORT during bullish MANIPULATION
         # is trading the wrong side of the AMD cycle.
-        if amd_phase == "MANIPULATION" and amd_conf >= 0.50:
+        #
+        # BUG-A2 FIX: Threshold raised 0.50 -> 0.65. AMD bias at moderate confidence
+        # (0.50-0.65) conflicts with valid post-sweep setups because AMD updates lag
+        # the actual sweep by 2-5 bars. Only block when AMD confidence is genuinely
+        # high (>= 0.65 = strong institutional conviction against our direction).
+        # Also: post-sweep direction hint overrides contra-AMD at moderate confidence.
+        if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
             bias_contra = (
                 (signal.side == "long"  and "bear" in amd_bias) or
                 (signal.side == "short" and "bull" in amd_bias)
             )
+            # Strong post-sweep evidence overrides moderate contra-AMD
+            if bias_contra and _has_ps_hint:
+                bias_contra = False
             if bias_contra:
                 rejections.append(
                     f"AMD_CONTRA: MANIP bias={amd_bias} conf={amd_conf:.2f} "
@@ -4370,20 +4407,44 @@ class QuantStrategy:
         # We don't require the direction engine to agree perfectly.
         # But if it actively DISAGREES with high confidence, we block.
 
+        # BUG-B1 FIX: Direction engine gate threshold raised 0.45 -> 0.60.
+        # The _last_hunt is a PRE-SWEEP prediction (which pool will be swept next).
+        # After the sweep fires, the relevant verdict is ict_ctx.direction_hint
+        # (the post-sweep accumulative model from DirectionEngine.evaluate_sweep()).
+        # The old code checked stale pre-sweep data with a low confidence threshold
+        # (0.45) and blocked valid post-sweep entries.
+        #
+        # Priority: if post-sweep direction_hint agrees with signal side, skip the
+        # pre-sweep hunt check entirely — the more specific evidence wins.
         if self._dir_engine is not None:
             try:
-                # Check hunt prediction (pre-sweep directional call).
-                # Attribute is _last_hunt on DirectionEngine (set in predict_hunt()).
-                # Previously fetched as _last_hunt_prediction which does not exist,
-                # causing _hunt=None on every call and silently skipping Gate 2.
-                _hunt = getattr(self._dir_engine, '_last_hunt', None)
-                if _hunt is None:
-                    # Try the cached dict version
-                    _hunt_dict = getattr(self._ict, '_last_hunt_pred', None) if self._ict else None
-                    if _hunt_dict and isinstance(_hunt_dict, dict):
-                        _del_dir   = _hunt_dict.get('delivery_direction', '')
-                        _hunt_conf = float(_hunt_dict.get('confidence', 0.0))
-                        if _hunt_conf >= 0.45:
+                # If post-sweep model has confirmed our direction, skip pre-sweep gate
+                _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
+                if not _ps_agrees:
+                    # Check hunt prediction (pre-sweep directional call)
+                    _hunt = getattr(self._dir_engine, '_last_hunt', None)
+                    if _hunt is None:
+                        # Try the cached dict version
+                        _hunt_dict = getattr(self._ict, '_last_hunt_pred', None) if self._ict else None
+                        if _hunt_dict and isinstance(_hunt_dict, dict):
+                            _del_dir   = _hunt_dict.get('delivery_direction', '')
+                            _hunt_conf = float(_hunt_dict.get('confidence', 0.0))
+                            # BUG-B1 FIX: threshold raised from 0.45 to 0.60
+                            if _hunt_conf >= 0.60:
+                                agrees = (
+                                    (signal.side == "long"  and _del_dir == "bullish") or
+                                    (signal.side == "short" and _del_dir == "bearish") or
+                                    _del_dir in ("", "neutral", None)
+                                )
+                                if not agrees:
+                                    rejections.append(
+                                        f"DIR_ENGINE: delivery={_del_dir} "
+                                        f"conf={_hunt_conf:.2f} vs {signal.side}")
+                    elif hasattr(_hunt, 'delivery_direction'):
+                        _del_dir   = getattr(_hunt, 'delivery_direction', '')
+                        _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
+                        # BUG-B1 FIX: threshold raised from 0.45 to 0.60
+                        if _hunt_conf >= 0.60:
                             agrees = (
                                 (signal.side == "long"  and _del_dir == "bullish") or
                                 (signal.side == "short" and _del_dir == "bearish") or
@@ -4393,19 +4454,6 @@ class QuantStrategy:
                                 rejections.append(
                                     f"DIR_ENGINE: delivery={_del_dir} "
                                     f"conf={_hunt_conf:.2f} vs {signal.side}")
-                elif hasattr(_hunt, 'delivery_direction'):
-                    _del_dir   = getattr(_hunt, 'delivery_direction', '')
-                    _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
-                    if _hunt_conf >= 0.45:
-                        agrees = (
-                            (signal.side == "long"  and _del_dir == "bullish") or
-                            (signal.side == "short" and _del_dir == "bearish") or
-                            _del_dir in ("", "neutral", None)
-                        )
-                        if not agrees:
-                            rejections.append(
-                                f"DIR_ENGINE: delivery={_del_dir} "
-                                f"conf={_hunt_conf:.2f} vs {signal.side}")
             except Exception:
                 pass
 
@@ -4772,6 +4820,26 @@ class QuantStrategy:
                 ict_ctx.amd_phase = getattr(amd, 'phase', "")
                 ict_ctx.amd_bias = getattr(amd, 'bias', "")
                 ict_ctx.amd_confidence = getattr(amd, 'confidence', 0.0)
+
+                # BUG-C2 FIX: AMD phase lag override for fresh sweeps.
+                # When AMD reports ACCUMULATION but a liquidity sweep occurred in
+                # the last 2 bars (10m at 5m TF), the Wilder-smoothing lag is causing
+                # the phase misread. Override to MANIPULATION so gate 1 logic is
+                # correct. Confidence set to 0.50 (moderate — sweep confirmed but
+                # full MANIPULATION evidence not yet accumulated).
+                _fresh_sweep_ms = now_ms - 600_000  # 10 minutes = 2 bars at 5m
+                if (ict_ctx.amd_phase == "ACCUMULATION"
+                        and hasattr(self._ict, 'liquidity_pools')):
+                    _has_fresh_sweep = any(
+                        p.swept and p.sweep_timestamp > _fresh_sweep_ms
+                        for p in self._ict.liquidity_pools
+                    )
+                    if _has_fresh_sweep:
+                        logger.debug(
+                            "AMD_LAG_OVERRIDE: Fresh sweep detected while AMD=ACCUMULATION "
+                            "— overriding to MANIPULATION (Wilder-smoothing lag)")
+                        ict_ctx.amd_phase = "MANIPULATION"
+                        ict_ctx.amd_confidence = max(ict_ctx.amd_confidence, 0.50)
                 mb = self._ict.get_market_bias()
                 ict_ctx.in_premium = getattr(mb, 'in_premium', False)
                 ict_ctx.in_discount = getattr(mb, 'in_discount', False)
@@ -4847,9 +4915,33 @@ class QuantStrategy:
                 for pool in self._ict.liquidity_pools:
                     if pool.swept and pool.sweep_timestamp > _sweep_age_limit:
                         c5 = candles_by_tf.get("5m", [])
+                        # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
+                        # The old code blindly used c5[-2] (last closed bar), but the sweep
+                        # may have occurred in c5[-3], c5[-4], etc. Using the wrong bar gives
+                        # wick_extreme from an unrelated candle, placing SL on the wrong side
+                        # of entry (confirmed by log: SL=$67,410 > entry=$67,279 for LONG).
+                        #
+                        # Search backward through the last 5 closed bars (exclude c5[-1]
+                        # which is the forming bar). For SSL sweep: find bar whose LOW
+                        # breached pool.price. For BSL sweep: find bar whose HIGH breached.
                         _ch = float(c5[-2]['h']) if len(c5) >= 2 else price
                         _cl = float(c5[-2]['l']) if len(c5) >= 2 else price
                         _cc = float(c5[-2]['c']) if len(c5) >= 2 else price
+                        if len(c5) >= 3:
+                            _lookback = c5[max(-6, -len(c5)):-1]  # up to 5 closed bars
+                            for _cand in reversed(_lookback):
+                                try:
+                                    _ch_cand = float(_cand['h'])
+                                    _cl_cand = float(_cand['l'])
+                                    _cc_cand = float(_cand['c'])
+                                    if pool.level_type == "SSL" and _cl_cand < pool.price:
+                                        _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
+                                        break
+                                    elif pool.level_type == "BSL" and _ch_cand > pool.price:
+                                        _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
+                                        break
+                                except (KeyError, TypeError, ValueError):
+                                    continue
                         ict_ctx.ict_sweeps.append(ICTSweepEvent(
                             pool_price=pool.price,
                             pool_type=pool.level_type,
@@ -4920,13 +5012,9 @@ class QuantStrategy:
                                             now              = now,
                                             quality          = _new_quality,
                                         )
-                                # Prune stale entries — keep only sweeps from the
-                                # last 60s so the set does not grow unboundedly.
-                                # NOTE: pool.sweep_timestamp is stored as int ms
-                                # (see ict_engine.py: sweep_timestamp: int = 0,
-                                # set via _candle_ts() which returns now_ms).
-                                # The comparison k[1] > (now_ms - 60_000) is
-                                # correct — both sides are milliseconds.
+                                # BUG-D1 FIX: Prune _notified_sweeps unconditionally
+                                # per-pool-visit (not just inside _should_forward path)
+                                # so the set stays bounded even when no new sweeps arrive.
                                 _cutoff_ms = now_ms - 60_000
                                 self._notified_sweeps = {
                                     k for k in self._notified_sweeps
@@ -5041,7 +5129,17 @@ class QuantStrategy:
                 else:
                     logger.debug(
                         f"🚫 UNIFIED GATE [{signal.side.upper()}] | {gate_reason}")
-                self._entry_engine.consume_signal()
+                # BUG-B2 FIX: Do NOT consume_signal() on gate blocks.
+                # consume_signal() clears _signal but leaves POST_SWEEP state alive,
+                # causing the identical signal to regenerate every 250ms (4 Hz busy-loop).
+                # mark_gate_blocked() suppresses signal generation for 45s while
+                # evidence continues accumulating, then re-evaluates with fresh structure.
+                if (hasattr(self, '_entry_engine') and self._entry_engine is not None
+                        and hasattr(self._entry_engine, 'mark_gate_blocked')):
+                    self._entry_engine.mark_gate_blocked(
+                        signal.side, gate_reason[:40], cooldown_sec=45.0)
+                else:
+                    self._entry_engine.consume_signal()
                 return
 
             logger.info(
@@ -5117,7 +5215,13 @@ class QuantStrategy:
                         logger.debug(
                             f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
-                    self._entry_engine.consume_signal()
+                    # BUG-B2 FIX: Use mark_gate_blocked() instead of consume_signal()
+                    # to prevent the 4 Hz signal regeneration busy-loop.
+                    if hasattr(self._entry_engine, 'mark_gate_blocked'):
+                        self._entry_engine.mark_gate_blocked(
+                            signal.side, reject_str[:40], cooldown_sec=45.0)
+                    else:
+                        self._entry_engine.consume_signal()
                     # Telegram alert for conviction block (throttled 60s per side)
                     _conv_tg_key = f"_conv_tg_last_{signal.side}"
                     if now - getattr(self, _conv_tg_key, 0.0) >= 60.0:

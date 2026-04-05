@@ -333,6 +333,21 @@ class EntryEngine:
         self._proximity_target   = None
         self._proximity_side     = ""
 
+        # BUG-B2 FIX: Gate-block cooldown
+        # When unified_entry_gate or conviction_filter blocks a signal from the
+        # active POST_SWEEP state, the post_sweep evidence model remains alive and
+        # will regenerate the identical signal on the next tick (250ms later).
+        # Without this guard, the bot enters a busy-loop: generate → block → consume
+        # → generate → block, cycling at 4 Hz and exhausting every pool evaluation
+        # before any structural evidence can accumulate.
+        #
+        # _gate_blocked_until: epoch timestamp after which signal generation is
+        #   allowed again. Set by mark_gate_blocked() called from quant_strategy.
+        # _gate_block_key: (side, reason_prefix) dedup so a DIFFERENT gate reason
+        #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
+        self._gate_blocked_until: float = 0.0
+        self._gate_block_key: tuple = ()
+
     # ── Public API ────────────────────────────────────────────────────
 
     def update(
@@ -424,6 +439,35 @@ class EntryEngine:
         if self._state not in (EngineState.SCANNING, EngineState.IN_POSITION):
             self._reset(time.time())
 
+    def mark_gate_blocked(self, side: str, reason_prefix: str,
+                           cooldown_sec: float = 45.0) -> None:
+        """
+        BUG-B2 FIX: Called by quant_strategy when unified_entry_gate OR
+        conviction_filter blocks a signal from an active POST_SWEEP state.
+
+        Suppresses signal generation for `cooldown_sec` seconds so the evaluation
+        pipeline does not busy-loop at 4 Hz generating and immediately discarding
+        the identical signal.
+
+        cooldown_sec:
+          45s — shorter than the evidence decay period (92% decay / tick) so that
+          genuine structural changes (new CISD, BOS, OTE) can fire a fresh signal.
+          Long enough to prevent tick-level noise from re-triggering a blocked setup.
+
+        When the block key CHANGES (different side or different gate reason prefix)
+        the gate is immediately lifted — a new signal from a different pool or with a
+        different reason is evaluated fresh. Only identical signals are suppressed.
+        """
+        new_key = (side, reason_prefix[:40])
+        # If the block key changes, reset immediately (different signal context)
+        if new_key != self._gate_block_key:
+            self._gate_block_key = new_key
+            self._gate_blocked_until = time.time() + cooldown_sec
+        else:
+            # Same block reason — extend the cooldown from NOW
+            self._gate_blocked_until = max(
+                self._gate_blocked_until, time.time() + cooldown_sec)
+
     def on_position_closed(self) -> None:
         self._reset(time.time())
 
@@ -497,9 +541,18 @@ class EntryEngine:
     # ── Internal: collect sweeps from both systems ────────────────────
 
     def _collect_sweeps(self, snap, ict_ctx, now, atr) -> List[SweepResult]:
-        """Merge LiquidityMap sweeps + ICT engine sweeps into one list."""
+        """Merge LiquidityMap sweeps + ICT engine sweeps into one list.
+
+        BUG-A4 FIX: Window extended from 10s to 60s.
+        LiquidityMap.check_sweeps() fires on CLOSED 5m candles, meaning a sweep
+        detected at bar close will have detected_at ≈ close_time. The entry engine
+        runs every ~250ms. In practice, ICT engine update latency + multi-TF candle
+        fetching means check_sweeps() may fire 15-30s after the actual sweep candle
+        closed. With a 10s window the sweep is ALREADY stale before entry_engine.update()
+        even runs. 60s gives a full 5m bar worth of tolerance.
+        """
         sweeps = [s for s in snap.recent_sweeps
-                  if s.detected_at > now - 10.0
+                  if s.detected_at > now - 60.0
                   and s.quality >= _MIN_SWEEP_QUALITY]
 
         if (not sweeps
@@ -712,6 +765,14 @@ class EntryEngine:
             self._reset(now)
             return
 
+        # BUG-B2 FIX: Respect gate-block cooldown.
+        # If a gate (unified or conviction) blocked the last signal from this
+        # post-sweep state, suppress signal generation until the cooldown expires.
+        # Evidence accumulation and logging continue normally — only the final
+        # signal SET is gated. This prevents the 4 Hz busy-loop where the same
+        # signal is generated and immediately discarded hundreds of times.
+        _gate_suppressed = (now < self._gate_blocked_until)
+
         ps.tick_count += 1
         ps.highest_since = max(ps.highest_since, price)
         ps.lowest_since = min(ps.lowest_since, price)
@@ -761,6 +822,16 @@ class EntryEngine:
 
         # Evaluate evidence
         decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+
+        # BUG-B2 FIX: If gate-blocked, allow evidence to accumulate but do not
+        # present a new signal yet. Log remaining cooldown at debug level.
+        if _gate_suppressed:
+            remaining = self._gate_blocked_until - now
+            logger.debug(
+                f"POST_SWEEP: gate-block cooldown {remaining:.0f}s remaining — "
+                f"evidence accumulating (rev={self._last_sweep_analysis.get('rev_score',0):.0f} "
+                f"cont={self._last_sweep_analysis.get('cont_score',0):.0f})")
+            return
 
         if decision.action == "reverse":
             self._handle_reversal(ps.sweep, decision, snap, flow, ict, price, atr, now)
