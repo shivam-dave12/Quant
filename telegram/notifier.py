@@ -60,11 +60,11 @@ except ImportError:
     try:
         from conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
     except ImportError:
-        _REQUIRED_CONVICTION_SCORE = 0.65   # matches conviction_filter.py default
+        _REQUIRED_CONVICTION_SCORE = 0.45   # matches conviction_filter.py / config.py
 
 # ── DirectionEngine confidence thresholds (mirrored from direction_engine.py)
-_HUNT_ON_THRESHOLD  = 0.18   # must exceed to commit a direction
-_HUNT_OFF_THRESHOLD = 0.11   # must drop below to revert to NEUTRAL
+_HUNT_ON_THRESHOLD  = 0.10   # must exceed to commit a direction
+_HUNT_OFF_THRESHOLD = 0.05   # must drop below to revert to NEUTRAL
 
 
 # ======================================================================
@@ -398,21 +398,21 @@ def _build_gate_diagnostic(
         "PREMIUM"       if dealing_range_pd < 0.75 else
         "DEEP PREMIUM"
     )
-    long_ok  = dealing_range_pd < 0.45
-    short_ok = dealing_range_pd > 0.55
+    long_ok  = dealing_range_pd < 0.65
+    short_ok = dealing_range_pd > 0.35
 
-    if long_ok and short_ok:   # should not happen, but handle gracefully
+    if long_ok and short_ok:
         g3_icon = "✅"
         g3_note = "both sides valid"
     elif long_ok:
         g3_icon = "✅"
-        g3_note = "LONG valid (discount) | SHORT needs >55%"
+        g3_note = "LONG valid (discount)"
     elif short_ok:
         g3_icon = "✅"
-        g3_note = "SHORT valid (premium) | LONG needs <45%"
+        g3_note = "SHORT valid (premium)"
     else:
         g3_icon = "⚠️"
-        g3_note = "equilibrium zone — OTE score reduced for both sides"
+        g3_note = "equilibrium zone — OTE score reduced"
 
     lines.append(
         f"  {g3_icon} Dealing Range     {pd_label} ({pd_pct:.0f}%)  "
@@ -424,11 +424,11 @@ def _build_gate_diagnostic(
         "LONDON":    1.00,
         "NY":        1.00,
         "NEW_YORK":  1.00,
-        "LONDON_NY": 0.85,
-        "WEEKEND":   0.65,
-        "OFF_HOURS": 0.55,
-        "ASIA":      0.10,
-        "":          0.40,
+        "LONDON_NY": 0.95,
+        "WEEKEND":   0.80,
+        "OFF_HOURS": 0.75,
+        "ASIA":      0.60,
+        "":          0.60,
     }
     sess_key   = (session or "").upper().replace(" ", "_")
     sess_score = _SESSION_SCORE_MAP.get(sess_key, 0.40)
@@ -452,10 +452,10 @@ def _build_gate_diagnostic(
     flow_abs = abs(flow_conviction)
     if flow_abs >= 0.30:
         g5_icon = "✅"
-        g5_note = f"{flow_direction.upper() or '?'} ({flow_conviction:+.3f})"
+        g5_note = f"{_esc(flow_direction.upper() or '?')} ({flow_conviction:+.3f})"
     elif flow_abs >= 0.10:
         g5_icon = "⚠️"
-        g5_note = f"weak {flow_direction or 'neutral'} ({flow_conviction:+.3f})"
+        g5_note = f"weak {_esc(flow_direction or 'neutral')} ({flow_conviction:+.3f})"
     else:
         g5_icon = "❌"
         g5_note = "NEUTRAL — no directional order-flow"
@@ -496,11 +496,11 @@ def _build_gate_diagnostic(
         if dh_conf < _HUNT_ON_THRESHOLD:
             blockers.append(f"DirectionEngine conf={dh_conf:.1%}<{_HUNT_ON_THRESHOLD:.0%}")
     if amd_score < 0.30:
-        blockers.append(f"AMD={amd_phase}(score={amd_score:.2f})")
+        blockers.append(f"AMD={_esc(amd_phase)}(score={amd_score:.2f})")
     if not (long_ok or short_ok):
-        blockers.append(f"DR={pd_label}({pd_pct:.0f}%)")
+        blockers.append(f"DR={_esc(pd_label)}({pd_pct:.0f}%)")
     if sess_score < 0.55:
-        blockers.append(f"Session={session}(score={sess_score:.2f})")
+        blockers.append(f"Session={_esc(session)}(score={sess_score:.2f})")
     if flow_abs < 0.10:
         blockers.append("Flow=NEUTRAL")
 
@@ -732,8 +732,8 @@ def format_periodic_report(
 
         lines.append("")
         lines.append(
-            f"{ps_ai} <b>POST-SWEEP VERDICT</b>: {ps_action.upper()}  "
-            f"{ps_di} {ps_dir.upper() or '—'}"
+            f"{ps_ai} <b>POST-SWEEP VERDICT</b>: {_esc(ps_action.upper())}  "
+            f"{ps_di} {_esc(ps_dir.upper() or '—')}"
         )
         lines.append(f"  conf={ps_conf:.0%}  phase={_esc(ps_phase)}")
         lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {ps_winner}")
@@ -977,8 +977,8 @@ def format_post_sweep_verdict(
     )
 
     lines: List[str] = [
-        f"{action_icon} <b>POST-SWEEP: {action.upper()}</b>  "
-        f"{dir_icon} {direction.upper() or '—'}",
+        f"{action_icon} <b>POST-SWEEP: {_esc(action.upper())}</b>  "
+        f"{dir_icon} {_esc(direction.upper() or '—')}",
         f"  [{_score_bar(confidence)}] {confidence:.0%}  "
         f"|  {phase_icon} Phase: <b>{_esc(phase)}</b>",
     ]
@@ -1054,7 +1054,7 @@ def format_pool_gate_alert(
     cur_r = profit / risk if risk > 0 else 0.0
 
     lines: List[str] = [
-        f"{action_icon} <b>POOL-GATE: {action.upper()}</b>  {side_icon} {pos_side.upper()}",
+        f"{action_icon} <b>POOL-GATE: {_esc(action.upper())}</b>  {side_icon} {_esc(pos_side.upper())}",
         f"  [{_score_bar(confidence)}] {confidence:.0%}",
         "",
         "<b>📊 POSITION</b>",
@@ -1284,10 +1284,10 @@ def format_liquidity_trail_update(
     _ = dist_anchor_atr  # kept for future use; suppress unused warning
 
     lines: List[str] = [
-        f"{side_icon} <b>LIQUIDITY TRAIL UPDATE</b>  {phase_icon} {phase.replace('_', ' ')}",
+        f"{side_icon} <b>LIQUIDITY TRAIL UPDATE</b>  {phase_icon} {_esc(phase.replace('_', ' '))}",
         "",
         f"  {side_icon} SL moved to: <b>{_fmt_price(new_sl)}</b>",
-        f"  📍 Anchor pool: {_fmt_price(anchor_price)} ({anchor_tf})  sig={anchor_sig:.1f}",
+        f"  📍 Anchor pool: {_fmt_price(anchor_price)} ({_esc(anchor_tf)})  sig={anchor_sig:.1f}",
         f"  {anchor_status}",
         "",
         f"  Entry:  {_fmt_price(entry_price)}",
@@ -1295,7 +1295,7 @@ def format_liquidity_trail_update(
         f"  SL gap: {dist_to_sl_atr:.2f} ATR from price",
         f"  Locked: {profit_r:+.2f} ATR from entry",
         "",
-        f"  {sess_icon} Session: {session or 'unknown'}",
+        f"  {sess_icon} Session: {_esc(session or 'unknown')}",
     ]
 
     if phase == "SWEPT_POOL":

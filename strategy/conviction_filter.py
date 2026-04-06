@@ -311,22 +311,20 @@ class ConvictionFilter:
         # but still be valid. A 1.5 R:R setup with exceptional CISD + OTE is
         # better than a 3:1 R:R with no confirmation. Let the composite score decide.
         #
-        # R:R score modifier applied to pool_sig_score:
-        #   R:R >= 3.0  → +0.10 bonus
-        #   R:R 2.0-3.0 → no modifier
-        #   R:R 1.5-2.0 → -0.10 penalty
-        #   R:R 1.0-1.5 → -0.20 penalty
-        #   R:R < 1.0   → -0.35 penalty (near-guarantee of loss)
+        # R:R score modifier applied to pool_sig_score (aligned with MIN_RR=1.2):
+        #   R:R >= 2.5  → +0.10 bonus
+        #   R:R >= MIN_RR → no modifier
+        #   R:R 0.8-MIN_RR → -0.10 penalty
+        #   R:R < 0.8   → -0.20 penalty
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
-        _rr_mod = (0.10 if rr >= 3.0 else
-                   0.00 if rr >= 2.0 else
-                  -0.10 if rr >= 1.5 else
-                  -0.20 if rr >= 1.0 else
-                  -0.35)
-        if rr < 1.0:
-            rejects.append(f"RR_VERY_LOW: {rr:.2f} — heavy score penalty applied")
+        _rr_mod = (0.10 if rr >= 2.5 else
+                   0.00 if rr >= MIN_RR else
+                  -0.10 if rr >= 0.8 else
+                  -0.20)
+        if rr < 0.8:
+            rejects.append(f"RR_VERY_LOW: {rr:.2f} — score penalty applied")
         elif rr < MIN_RR:
-            rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — score penalty applied")
+            rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — minor score penalty")
 
 # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
         # All sessions are scored, none are hard-blocked.  ASIA receives a

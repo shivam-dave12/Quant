@@ -4410,13 +4410,13 @@ class QuantStrategy:
             session = str(getattr(self._ict, '_killzone', '') or '')
         if session.upper() == "ASIA":
             advisories.append(
-                "SESSION_ADVISORY: ASIA — conviction_filter applies session_score=0.10 "
+                "SESSION_ADVISORY: ASIA — conviction_filter applies session_score=0.60 "
                 "(not blocking here)")
 
         # ── R:R context ──────────────────────────────────────────────────────
-        if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 2.0:
+        if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 1.2:
             advisories.append(
-                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 2.0 — "
+                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 — "
                 f"conviction_filter applies R:R penalty to pool_sig_score")
 
         # ── Log all advisories at DEBUG (not INFO — avoids log spam) ─────────
@@ -5005,39 +5005,9 @@ class QuantStrategy:
                 self._entry_engine.consume_signal()
                 return
 
-            # ── UNIFIED ENTRY GATE — institutional coherence check ────────────
-            # All engines must agree on direction before capital is deployed.
-            # This runs BEFORE the conviction filter because it checks
-            # inter-engine agreement, not individual factor quality.
-            gate_ok, gate_reason = self._unified_entry_gate(
+            # ── UNIFIED ENTRY GATE — advisory logging only (no blocking) ───
+            self._unified_entry_gate(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
-            if not gate_ok:
-                # Deduplicate logging (same key = same block reason)
-                _gate_key = (signal.side, gate_reason[:50])
-                if _gate_key != getattr(self, '_last_unified_gate_key', None):
-                    self._last_unified_gate_key = _gate_key
-                    logger.info(
-                        f"🚫 UNIFIED GATE [{signal.side.upper()}] | {gate_reason}")
-                else:
-                    logger.debug(
-                        f"🚫 UNIFIED GATE [{signal.side.upper()}] | {gate_reason}")
-                # BUG-B2 FIX: Do NOT consume_signal() on gate blocks.
-                # consume_signal() clears _signal but leaves POST_SWEEP state alive,
-                # causing the identical signal to regenerate every 250ms (4 Hz busy-loop).
-                # mark_gate_blocked() suppresses signal generation for 45s while
-                # evidence continues accumulating, then re-evaluates with fresh structure.
-                if (hasattr(self, '_entry_engine') and self._entry_engine is not None
-                        and hasattr(self._entry_engine, 'mark_gate_blocked')):
-                    self._entry_engine.mark_gate_blocked(
-                        signal.side, gate_reason[:40], cooldown_sec=10.0)
-                    # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
-                    # so mark_gate_blocked can still read signal.sweep_result to extend
-                    # the processed-sweep registry entry (the correct suppression layer
-                    # now that state transitions to SCANNING before this call).
-                    self._entry_engine.consume_signal()
-                else:
-                    self._entry_engine.consume_signal()
-                return
 
             logger.info(
                 f"SIGNAL: {signal.entry_type.value} {signal.side.upper()} "
@@ -5537,10 +5507,7 @@ class QuantStrategy:
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
-        allowed, reason = self._risk_gate.can_trade(total_bal)
-        if not allowed:
-            logger.info(f"Entry blocked: {reason}")
-            return
+        # NOTE: risk gate already checked in _evaluate_entry — no duplicate check here
 
         # ── Map composite score → signal_confidence [0, 1] (PATCH 5a) ───────────
         # NOTE: moved BEFORE _compute_sl_tp so signal_confidence is available.
@@ -5656,7 +5623,8 @@ class QuantStrategy:
         # comes from risk_manager.calculate_position_size (dollar-risk / SL-dist).
         # The tier/composite/AMD multiplier is applied on top of that base.
         qty = self._compute_quantity(
-            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price
+            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
+            prefetched_bal_info=bal_info
         )
         if qty is None or qty < QCfg.MIN_QTY(): return
         logger.info(
@@ -7504,7 +7472,8 @@ class QuantStrategy:
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,
                            ict_tier: str = "",
-                           sl_price: Optional[float] = None) -> Optional[float]:
+                           sl_price: Optional[float] = None,
+                           prefetched_bal_info: dict = None) -> Optional[float]:
         """
         Risk-calibrated position sizing — v9.0 (CRIT-1 fix).
 
@@ -7576,8 +7545,8 @@ class QuantStrategy:
 
         total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
 
-        # ── Available balance (single REST call — SIG-8 fix) ──────────────────
-        bal = risk_manager.get_available_balance()
+        # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────
+        bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()
         if bal is None:
             logger.warning("_compute_quantity: get_available_balance returned None")
             return None

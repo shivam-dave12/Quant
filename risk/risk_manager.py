@@ -299,21 +299,11 @@ class RiskManager:
                 )
                 return None
 
-            # ── Step 5: Pool-based R:R validation ─────────────────────
-            # When a pool TP price is given, ensure the trade meets the
-            # minimum R:R against the actual pool target, not a proxy.
+            # ── Step 5: Pool-based R:R logging (advisory — no longer blocks) ─
             if pool_tp_price is not None:
                 tp_distance = abs(pool_tp_price - entry_price)
                 actual_rr   = tp_distance / price_distance if price_distance > 0 else 0.0
-                min_rr      = float(getattr(config, "MIN_RISK_REWARD_RATIO", 0.8))
-                if actual_rr < min_rr:
-                    logger.warning(
-                        f"Pool R:R too low: {actual_rr:.2f} "
-                        f"(pool_tp=${pool_tp_price:,.2f} vs entry=${entry_price:,.2f} "
-                        f"SL_dist={price_distance:.2f}) — min={min_rr}"
-                    )
-                    return None
-                logger.debug(f"Pool R:R validated: {actual_rr:.2f}:1 "
+                logger.debug(f"Pool R:R: {actual_rr:.2f}:1 "
                              f"(pool_tp=${pool_tp_price:,.2f})")
 
             # ── Logging ───────────────────────────────────────────────

@@ -308,7 +308,7 @@ CONVICTION_OTE_FIB_LOW             = 0.382
 CONVICTION_OTE_FIB_HIGH            = 0.886
 CONVICTION_MIN_RR                  = 1.2     # match risk management R:R
 CONVICTION_MAX_SESSION_LOSSES      = 5       # allow more losses per session
-CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 30      # 30s between entries
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 10      # 10s pacing (on_tick cooldown is primary)
 CONVICTION_MAX_ENTRIES_PER_SESSION = 20      # allow many entries per session
 
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
