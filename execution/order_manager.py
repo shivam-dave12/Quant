@@ -1442,8 +1442,17 @@ class OrderManager:
     # ── Open orders + conditional sweep ──────────────────────────────────────
 
     def get_open_orders(self, symbol: str = None) -> Optional[list]:
+        # Reset 404 latch after 5 minutes — transient 404s should not permanently
+        # disable open order queries for the entire session
         if self._open_orders_404:
-            return None
+            if not hasattr(self, '_open_orders_404_time'):
+                self._open_orders_404_time = 0
+            import time as _t
+            if _t.time() - self._open_orders_404_time > 300:
+                self._open_orders_404 = False
+                logger.info("get_open_orders: 404 latch reset after 5 min cooldown")
+            else:
+                return None
         try:
             sym  = symbol or getattr(config, "SYMBOL", "BTCUSDT")
             raw  = self._adapter.get_open_orders(sym)
@@ -1452,8 +1461,9 @@ class OrderManager:
             # Detect 404 dict response (adapter returned error dict instead of raising)
             if isinstance(raw, dict) and (raw.get("status_code") == 404
                                           or "404" in str(raw.get("error", ""))):
-                logger.warning("get_open_orders: 404 — endpoint unsupported, suppressing future calls")
+                logger.warning("get_open_orders: 404 — suppressing calls for 5 min")
                 self._open_orders_404 = True
+                import time as _t; self._open_orders_404_time = _t.time()
                 return None
             # Delta bracket child stop_order_type remap (defense-in-depth in case
             # api.py normalisation was bypassed or a different adapter is used).
@@ -1488,8 +1498,9 @@ class OrderManager:
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "Not Found" in err_str:
-                logger.warning("get_open_orders: 404 Not Found — endpoint unsupported, suppressing future calls")
+                logger.warning("get_open_orders: 404 Not Found — suppressing calls for 5 min")
                 self._open_orders_404 = True
+                import time as _t; self._open_orders_404_time = _t.time()
             else:
                 logger.error(f"get_open_orders error: {e}", exc_info=True)
             return None
