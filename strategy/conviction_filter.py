@@ -100,11 +100,9 @@ MAX_SESSION_LOSSES = _CFG_MAX_SESS_LOSSES
 MIN_ENTRY_INTERVAL_SEC = _CFG_INTERVAL_SEC
 MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
 
-# ── Dealing range — institutional zones ───────────────────────────────────────
-# Longs ONLY in discount.  Shorts ONLY in premium.  No exceptions.
-# This is the single most important structural filter for win rate.
-DR_LONG_MAX_PD = 0.45    # LONG only below 45% of dealing range (discount)
-DR_SHORT_MIN_PD = 0.55   # SHORT only above 55% of dealing range (premium)
+# ── Dealing range — scoring zones (no hard block) ────────────────────────────
+DR_LONG_MAX_PD = 0.65    # Longs preferred in discount but allowed wider
+DR_SHORT_MIN_PD = 0.35   # Shorts preferred in premium but allowed wider
 
 # ── Timeframe rank lookup ─────────────────────────────────────────────────────
 _TF_RANK: Dict[str, int] = {
@@ -123,26 +121,26 @@ _TF_RANK: Dict[str, int] = {
 # than a veto — the conviction gate's displacement + CISD + pool-TF weights
 # already handle the lower-quality setups naturally.
 _SESSION_SCORE: Dict[str, float] = {
-    "LONDON":    1.00,   # London open — institutional manipulation → reversal
-    "NY":        1.00,   # NY open — institutional delivery
+    "LONDON":    1.00,
+    "NY":        1.00,
     "NEW_YORK":  1.00,
-    "LONDON_NY": 0.85,   # Overlap — high volume but chaotic
-    "WEEKEND":   0.65,   # No named KZ, but crypto liquidity hunts are valid 24/7
-    "OFF_HOURS": 0.55,   # Between sessions on a weekday — lower but not blocked
-    "ASIA":      0.10,   # Very low score — penalises but does not veto
-    "":          0.40,   # Unknown — penalise (data issue, not a legitimate session)
+    "LONDON_NY": 0.95,
+    "WEEKEND":   0.80,   # crypto is 24/7 — weekends are valid
+    "OFF_HOURS": 0.75,   # off-hours still have liquidity hunts
+    "ASIA":      0.60,   # Asia session — lower but NOT blocked
+    "":          0.60,   # unknown session — don't penalize heavily
 }
 
 # ── AMD phase scores ──────────────────────────────────────────────────────────
 # ACCUMULATION = 0.00 (HARD BLOCK — no delivery expected)
 # MANIPULATION = highest (sweep happening — this IS the setup)
 _AMD_PHASE_SCORE: Dict[str, float] = {
-    "MANIPULATION":   1.00,   # The sweep — this is where entries happen
+    "MANIPULATION":   1.00,   # The sweep — prime entry zone
     "DISTRIBUTION":   0.90,   # Delivery phase — good for continuation
-    "REDISTRIBUTION": 0.75,   # Mid-trend pause — decent
-    "REACCUMULATION": 0.70,   # Mid-trend pause — decent
-    "ACCUMULATION":   0.00,   # HARD BLOCK — no institutional delivery
-    "":               0.30,   # Unknown — heavy penalty
+    "REDISTRIBUTION": 0.80,   # Mid-trend pause
+    "REACCUMULATION": 0.75,   # Mid-trend pause
+    "ACCUMULATION":   0.40,   # Lower score but NOT blocked — AMD lags sweeps
+    "":               0.50,   # Unknown — moderate score
 }
 
 
@@ -569,10 +567,10 @@ class ConvictionFilter:
         try:
             import config as _cfg
             _notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
-            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 4.0))
+            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 10.0))
         except Exception:
             _notional   = 10_000.0
-            _max_dd_pct = 4.0
+            _max_dd_pct = 10.0
 
         if _notional > 0 and st.session_pnl < 0:
             _dd_pct = abs(st.session_pnl) / _notional * 100.0

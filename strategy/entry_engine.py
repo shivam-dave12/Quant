@@ -70,21 +70,17 @@ _FLOW_EWMA_ADAPTIVE_CAP  = 0.40
 # Pool targeting
 _MAX_TARGET_ATR        = 8.0
 _MIN_TARGET_ATR        = 0.25
-_MIN_POOL_SIGNIFICANCE = 2.0
+_MIN_POOL_SIGNIFICANCE = 1.0   # allow lower significance pools
 
 # Sweep quality
-_MIN_SWEEP_QUALITY = 0.35
+_MIN_SWEEP_QUALITY = 0.15    # lower sweep quality threshold
 
 # Timing
 _CISD_MAX_WAIT_SEC   = 360
-_ENTRY_COOLDOWN_SEC  = 30.0
+_ENTRY_COOLDOWN_SEC  = 10.0   # faster re-entry
 
 # SL / TP
-# SIG-2 FIX: floor raised from 1.4 → 2.0 to match the conviction gate's
-# CONVICTION_MIN_RR hard gate. A 1.4 floor allowed the entry engine to
-# present setups that the conviction filter would unconditionally reject,
-# wasting evaluation cycles and creating misleading log output.
-_MIN_RR_RATIO       = 2.0
+_MIN_RR_RATIO       = 1.2    # match config MIN_RISK_REWARD_RATIO
 _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
@@ -106,17 +102,17 @@ except Exception:
     _PS_PHASE_OTE          = 240.0
     _PS_PHASE_MATURE       = 360.0
 
-# Post-Sweep evidence thresholds
-_PS_THRESHOLD_EARLY  = 80.0
-_PS_THRESHOLD_NORMAL = 65.0
-_PS_THRESHOLD_MATURE = 55.0
-_PS_GAP_MIN          = 15.0
-_PS_DISP_MULT        = 1.30
-_PS_MATURE_MULT      = 0.75
+# Post-Sweep evidence thresholds (lowered to allow entries)
+_PS_THRESHOLD_EARLY  = 45.0
+_PS_THRESHOLD_NORMAL = 35.0
+_PS_THRESHOLD_MATURE = 25.0
+_PS_GAP_MIN          = 8.0
+_PS_DISP_MULT        = 1.10
+_PS_MATURE_MULT      = 0.65
 
 # Displacement requirements
-_PS_DISP_MIN_ATR    = 0.5
-_PS_DISP_STRONG_ATR = 1.2
+_PS_DISP_MIN_ATR    = 0.25   # lower displacement requirement
+_PS_DISP_STRONG_ATR = 0.8    # easier strong displacement
 _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
 
@@ -126,9 +122,9 @@ _MOMENTUM_MIN_VOL_RATIO    = 1.3
 _MOMENTUM_MIN_ATR_MOVE     = 0.6
 _MOMENTUM_LOOKBACK_CANDLES = 3
 _MOMENTUM_SL_BUFFER_ATR    = 0.15
-_MOMENTUM_MIN_RR           = 1.3
-_MOMENTUM_COOLDOWN_SEC     = 60.0
-_MOMENTUM_MAX_PER_HOUR     = 3
+_MOMENTUM_MIN_RR           = 1.0    # allow tighter momentum entries
+_MOMENTUM_COOLDOWN_SEC     = 15.0   # faster momentum cooldown
+_MOMENTUM_MAX_PER_HOUR     = 10     # allow more momentum entries
 
 # HTF TP escalation
 _HTF_TP_TIMEFRAMES   = ('1h', '4h', '1d')

@@ -1658,14 +1658,17 @@ class InstitutionalLevels:
                     break
 
         if tp is None:
-            # Every structural candidate failed minimum R:R.
-            # DO NOT return a naked R-floor — that is not a trade, it is gambling.
-            _best = max((abs(c[0]-price)/max(sl_dist,1e-10) for c in scored), default=0.0)
+            # Fallback: use ATR-based TP at minimum R:R distance
+            _fallback_dist = sl_dist * max(_min_rr_gate, 1.5)
+            _fallback_dist = min(_fallback_dist, max_tp_dist)
+            if side == "long":
+                tp = price + _fallback_dist
+            else:
+                tp = price - _fallback_dist
             logger.info(
-                f"⛔ TP: NO VALID TARGET for {side.upper()} "
-                f"— {len(scored)} candidates, best R:R={_best:.2f} < {_min_rr_gate:.1f} required. "
-                f"Trade rejected — no liquidity zone in reach.")
-            return None
+                f"TP ATR FALLBACK: ${tp:,.2f} ({_fallback_dist:.0f}pts) "
+                f"R:R=1:{_fallback_dist/max(sl_dist,1):.1f} — "
+                f"no structural target found, using minimum R:R distance")
 
         return tp
 def _ict_find_swings_inline(candles: list, lookback: int):
@@ -3178,13 +3181,10 @@ class HTFTrendFilter:
 
     def vetoes_trade(self, side: str) -> bool:
         """
-        Per-timeframe HTF veto.
-
-        LONG  veto: 15m < -HTF_15M_VETO OR (15m < -HTF_BOTH AND 4h < -HTF_BOTH)
-        SHORT veto: 15m > +HTF_15M_VETO OR (15m > +HTF_BOTH AND 4h > +HTF_BOTH)
-
-        Thresholds unchanged — only the inputs are now structure-stable.
+        HTF veto — DISABLED. Always returns False.
+        HTF context is advisory only; conviction filter scores HTF via structure.
         """
+        return False
         if not QCfg.HTF_ENABLED():
             return False
         t15       = self._trend_15m
@@ -5029,7 +5029,7 @@ class QuantStrategy:
                 if (hasattr(self, '_entry_engine') and self._entry_engine is not None
                         and hasattr(self._entry_engine, 'mark_gate_blocked')):
                     self._entry_engine.mark_gate_blocked(
-                        signal.side, gate_reason[:40], cooldown_sec=45.0)
+                        signal.side, gate_reason[:40], cooldown_sec=10.0)
                     # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
                     # so mark_gate_blocked can still read signal.sweep_result to extend
                     # the processed-sweep registry entry (the correct suppression layer
@@ -5149,7 +5149,7 @@ class QuantStrategy:
                         )
                     elif hasattr(self._entry_engine, 'mark_gate_blocked'):
                         self._entry_engine.mark_gate_blocked(
-                            signal.side, reject_str[:40], cooldown_sec=45.0)
+                            signal.side, reject_str[:40], cooldown_sec=10.0)
                         # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
                         # (same ordering rationale as the unified gate path above).
                         self._entry_engine.consume_signal()
@@ -5482,7 +5482,7 @@ class QuantStrategy:
         if side == "long"  and (sl_price >= price or tp_price <= price): return None, None
         if side == "short" and (sl_price <= price or tp_price >= price): return None, None
 
-        # ── Fee-normalized TP floor gate ─────────────────────────────────────
+        # ── Fee TP advisory (no longer blocks trades) ────────────────────────
         if self._fee_engine is not None and self._fee_engine.is_warmed_up():
             tp_distance = abs(tp_price - price)
             sl_distance = abs(sl_price - price)
@@ -5495,25 +5495,11 @@ class QuantStrategy:
                     signal_confidence = signal_confidence,
                 )
                 if tp_distance < min_tp:
-                    snap = self._fee_engine.diagnostic_snapshot()
-                    actual_rr = tp_distance / sl_distance if sl_distance > 1e-10 else 0.0
-                    min_rr    = min_tp / sl_distance if sl_distance > 1e-10 else 0.0
-                    logger.info(
-                        f"⛔ TP gate: tp=${tp_price:,.1f}({tp_distance:.0f}pts/{tp_distance/atr:.1f}ATR) "
-                        f"R:R={actual_rr:.2f} < required={min_rr:.2f} "
-                        f"[fee_floor=${min_tp:.0f} pctile={atr_pctile:.2f} "
-                        f"spread={snap['spread_median_bps']:.1f}bps "
-                        f"rt={snap['rt_cost_taker_bps']:.1f}bps]"
-                    )
-                    return None, None
-                logger.debug(
-                    f"✅ TP gate passed: tp_dist=${tp_distance:.2f} ≥ min=${min_tp:.2f} "
-                    f"R:R={tp_distance/sl_distance:.2f} (pctile={atr_pctile:.2f})"
-                )
+                    logger.debug(
+                        f"Fee advisory: TP dist {tp_distance:.0f} < fee floor {min_tp:.0f} "
+                        f"(not blocking — trade proceeds)")
             except Exception as e:
-                logger.debug(f"Fee gate error (non-fatal): {e}")
-        elif self._fee_engine is not None and not self._fee_engine.is_warmed_up():
-            logger.debug("Fee gate skipped — engine not yet warmed up (< 5 spread samples)")
+                logger.debug(f"Fee check error (non-fatal): {e}")
 
         return sl_price, tp_price
 
@@ -5642,7 +5628,7 @@ class QuantStrategy:
                 use_maker_entry=use_maker,
             )
         else:
-            # Force levels active — still validate with fee engine if available
+            # Force levels active — fee engine check is advisory only (no block)
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
                     _tp_dist = abs(tp_price - price)
@@ -5652,8 +5638,7 @@ class QuantStrategy:
                         use_maker_entry=use_maker,
                         signal_confidence=signal_confidence)
                     if _tp_dist < _min_tp:
-                        logger.info(f"⛔ Force TP fee gate: {_tp_dist:.0f} < {_min_tp:.0f}")
-                        sl_price = None
+                        logger.debug(f"Fee advisory: TP dist {_tp_dist:.0f} < fee floor {_min_tp:.0f} (not blocking)")
                 except Exception:
                     pass
         if sl_price is None:

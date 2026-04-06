@@ -175,22 +175,22 @@ except ImportError:
 # Effect: scores oscillating around 0.18 (e.g. 0.168 ↔ 0.175 ↔ 0.156) no longer
 # cause BSL_HUNT ↔ NEUTRAL flips every few seconds; only a drop below 0.11
 # genuinely reverts to NEUTRAL.  True NEUTRAL (score 0.109 < OFF) is preserved.
-_HUNT_ON_THRESHOLD  = 0.18   # must EXCEED to commit a direction (was _HUNT_MIN_CONFIDENCE)
-_HUNT_OFF_THRESHOLD = 0.11   # must DROP BELOW to revert committed → NEUTRAL
-_HUNT_STRONG_CONFIDENCE = 0.55   # above this = high-conviction directional call
+_HUNT_ON_THRESHOLD  = 0.10   # lowered to commit direction faster
+_HUNT_OFF_THRESHOLD = 0.05   # lowered to stay committed longer
+_HUNT_STRONG_CONFIDENCE = 0.35   # lowered for more directional calls
 _HUNT_CACHE_SEC         = 5      # refresh prediction at most every 5 seconds
 
 # Post-sweep evidence thresholds
 # FIX-2: Recalibrated so direction_engine fires ~5-10s before entry_engine's
 # window closes. entry_engine effective thresholds: EARLY=71.5, NORMAL=45, MATURE=26.25.
 # direction_engine effective thresholds:            EARLY=80.6, NORMAL=50, MATURE=27.0.
-_PS_REV_THRESHOLD_EARLY  = 62.0   # × 1.30 phase mult = 80.6 effective  [was 65]
-_PS_REV_THRESHOLD_NORMAL = 50.0   # standard phase                       [was 52]
-_PS_REV_THRESHOLD_MATURE = 36.0   # relaxed, mature phase                [was 38]
+_PS_REV_THRESHOLD_EARLY  = 35.0   # lowered for faster decisions
+_PS_REV_THRESHOLD_NORMAL = 28.0   # lowered
+_PS_REV_THRESHOLD_MATURE = 20.0   # lowered
 _PS_CONT_THRESHOLD_RATIO = 0.90   # continuation needs 90% of reversal threshold
 _PS_GAP_MIN              = 10.0   # minimum score separation between rev and cont
-_PS_TIMEOUT_SEC          = 360.0  # 6 minutes — then abandon evaluation
-_PS_EVAL_DELAY_SEC       = 8.0    # initial delay before first evaluation tick
+_PS_TIMEOUT_SEC          = 600.0  # 10 minutes — more time for evaluation
+_PS_EVAL_DELAY_SEC       = 3.0    # faster first evaluation
 
 # Phase timeline boundaries (seconds after sweep)
 _PS_PHASE_DISPLACEMENT_SEC = 45.0    # 0 –  45s: expect price to reject hard
