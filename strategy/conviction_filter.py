@@ -16,31 +16,27 @@ WHY REWRITE:
     - Approach entries scored with generous 0.55 OTE fallback
     - Pool TF minimum too low (5m pools = noise)
 
-INSTITUTIONAL CONVICTION MODEL v3.0:
+INSTITUTIONAL CONVICTION MODEL v3.1:
 
-  MANDATORY HARD GATES (any failure = immediate rejection, no score):
-    1. Pool TF effective rank >= 3 (15m+ or 5m with HTFx2+)
-    2. Dealing range: LONG only in discount (PD < 0.45), SHORT only in premium (PD > 0.55)
-    3. R:R >= 2.0 minimum
-    4. NOT in Asia session
-    5. NOT in ACCUMULATION AMD phase (no delivery expected)
+  NO HARD GATES — all factors are data-driven score contributions.
+  Poor values reduce the score; exceptional setups can still pass.
 
   WEIGHTED FACTORS (scored 0-1, weighted sum must pass threshold):
     1. Pool significance quality        0.20
     2. Displacement strength             0.25  ← most important: proves institutional intent
     3. CISD confirmation                 0.25  ← CHoCH/BOS = structural confirmation
-    4. OTE zone precision                0.15
+    4. OTE zone + Dealing Range          0.15
     5. Session quality                   0.10
     6. AMD phase alignment               0.05
     TOTAL                                1.00
 
-  REQUIRED SCORE: 0.72 (calibrated for 65-75% WR)
+  REQUIRED SCORE: from config (CONVICTION_MIN_SCORE, default 0.45)
 
-  SESSION LIMITS:
-    - Max 5 entries per session (London/NY/Asia)
-    - 300s minimum between entries (institutional pace)
-    - 2 consecutive losses = session circuit breaker
-    - 4% cumulative drawdown = day circuit breaker
+  SESSION LIMITS (from config):
+    - Max entries per session: CONVICTION_MAX_ENTRIES_PER_SESSION
+    - Min interval: CONVICTION_MIN_ENTRY_INTERVAL_SEC
+    - Max consecutive losses: CONVICTION_MAX_SESSION_LOSSES
+    - Cumulative drawdown circuit breaker: SESSION_DRAWDOWN_CAP_PCT
 
   FEEDBACK LOOP:
     PostTradeAgent insights dynamically adjust AMD threshold and SL buffer.
@@ -132,8 +128,8 @@ _SESSION_SCORE: Dict[str, float] = {
 }
 
 # ── AMD phase scores ──────────────────────────────────────────────────────────
-# ACCUMULATION = 0.00 (HARD BLOCK — no delivery expected)
-# MANIPULATION = highest (sweep happening — this IS the setup)
+# All phases scored, none hard-blocked. ACCUMULATION = 0.40 (low but allowed
+# because AMD phase detection lags actual sweeps).
 _AMD_PHASE_SCORE: Dict[str, float] = {
     "MANIPULATION":   1.00,   # The sweep — prime entry zone
     "DISTRIBUTION":   0.90,   # Delivery phase — good for continuation
@@ -225,6 +221,7 @@ class ConvictionFilter:
         session:    str            = "",
         entry_type: str            = "",
         sweep_wick_price: float    = 0.0,
+        measured_displacement_atr: float = 0.0,
     ) -> ConvictionResult:
         """
         Evaluate conviction for a potential entry.
@@ -327,13 +324,9 @@ class ConvictionFilter:
             rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — minor score penalty")
 
 # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
-        # All sessions are scored, none are hard-blocked.  ASIA receives a
-        # very low session_score (0.10) which makes it nearly impossible to
-        # clear the overall score threshold without exceptional displacement
-        # + CISD + OTE, but a genuinely exceptional setup is still allowed.
-        # This is fully data-driven: the score gates the trade, not the label.
+        # All sessions are scored, none are hard-blocked.
+        # ASIA: 0.60, OFF_HOURS: 0.75, WEEKEND: 0.80, LONDON/NY: 1.00.
         sess_key = self._resolve_session(session, ict_engine)
-        # (ASIA falls through with session_score=0.10 → almost never passes)
 
         # ── GATE 5: AMD phase — fully data-driven (NO hard block) ──────────
         # AMD=ACCUMULATION receives an amd_score near 0.00 in _score_amd(),
@@ -368,7 +361,8 @@ class ConvictionFilter:
 
         # ── Factor 2: Displacement (weight 0.25) ──────────────────────────
         factors.displacement_score = self._score_displacement(
-            trade_side, price, pool_price, atr, candles_5m, ict_engine)
+            trade_side, price, pool_price, atr, candles_5m, ict_engine,
+            measured_displacement_atr=measured_displacement_atr)
         if factors.displacement_score >= 0.70:
             allows.append(f"DISP={factors.displacement_score:.2f}✅")
         else:
@@ -384,7 +378,9 @@ class ConvictionFilter:
         # ── Factor 4: OTE zone + Dealing Range alignment (weight 0.15) ─────────
         # OTE score is now modulated by dealing range position (fully data-driven).
         # Good DR alignment adds up to +0.15; poor alignment subtracts up to 0.15.
-        # For reversals: the zone logic is INVERTED (premium SSL sweep → LONG is correct).
+        # Reversals have the SAME DR bias as directional trades:
+        #   BSL sweep → short reversal → premium is GOOD (shorting from premium)
+        #   SSL sweep → long reversal  → discount is GOOD (buying from discount)
         # This replaces the old hard DR gate with a continuous score contribution.
         _raw_ote_score = self._score_ote(
             trade_side, entry_price, pool_price, price,
@@ -392,7 +388,6 @@ class ConvictionFilter:
         )
         factors.ote_score = _raw_ote_score
         _dr_mod_applied   = 0.0
-        _dr_inverted      = False
         if dr_data_available:
             if trade_side == "long":
                 # Discount zone good for longs; premium zone bad
@@ -400,17 +395,14 @@ class ConvictionFilter:
             else:
                 # Premium zone good for shorts; discount zone bad
                 _dr_mod = 0.15 * (2.0 * max(0.0, dr_pd - 0.50))
-            if _is_reversal_type:
-                _dr_mod    = -_dr_mod   # reversal entries work the OPPOSITE zone
-                _dr_inverted = True
+            # No inversion for reversals — BSL sweep→short in premium and
+            # SSL sweep→long in discount are both correct ICT directional bias.
             _dr_mod_applied   = _dr_mod
             factors.ote_score = max(0.05, min(1.0, _raw_ote_score + _dr_mod))
-        # DR reversal audit trail: makes it auditable why a reversal in premium
-        # is scored the way it is — previously invisible in logs.
         logger.debug(
             f"ConvictionFilter OTE/DR: side={trade_side} type={entry_type!r} "
             f"raw_ote={_raw_ote_score:.3f} dr_pd={dr_pd:.3f}({_pd_label}) "
-            f"dr_mod={_dr_mod_applied:+.3f} inverted={_dr_inverted} "
+            f"dr_mod={_dr_mod_applied:+.3f} "
             f"final_ote={factors.ote_score:.3f}")
         if factors.ote_score >= 0.70:
             allows.append(f"OTE={factors.ote_score:.2f}✅ DR={_pd_label}({dr_pd:.2f})")
@@ -676,6 +668,7 @@ class ConvictionFilter:
     def _score_displacement(
         trade_side: str, price: float, pool_price: float,
         atr: float, candles_5m: Optional[List], ict_engine,
+        measured_displacement_atr: float = 0.0,
     ) -> float:
         """
         Score displacement strength [0-1].
@@ -683,7 +676,19 @@ class ConvictionFilter:
         Displacement = strong directional candle away from sweep level.
         This is THE proof of institutional intent — smart money entering aggressively.
         Without displacement, the sweep might just be noise.
+
+        measured_displacement_atr: when the entry_engine has already measured
+        the actual displacement in ATR multiples, trust that measurement
+        instead of re-measuring from raw candles (which can undercount when
+        the move spans multiple candles).
         """
+        # FIX-DISP-FLOW: use entry_engine's measured displacement when available
+        if measured_displacement_atr > 0:
+            # Map ATR multiples to score: 0.4ATR→0.50, 0.7ATR→0.75, 1.0ATR→0.90, 1.5ATR+→1.0
+            raw = min(measured_displacement_atr / DISPLACEMENT_MIN_BODY_ATR, 1.0)
+            # Boost: measured displacement already confirmed directional alignment
+            return min(1.0, raw * 0.90 + 0.10)
+
         # Check recent 5m candles for displacement bodies
         if candles_5m and len(candles_5m) >= 4:
             closed = candles_5m[-4:-1]   # last 3 closed candles

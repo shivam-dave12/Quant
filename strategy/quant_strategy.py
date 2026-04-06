@@ -5017,14 +5017,37 @@ class QuantStrategy:
 
             # ── ISSUE-4 FIX: Conviction Gate ─────────────────────────────────
             # Evaluate 7 ICT factors (mandatory gates + weighted score ≥ 0.75).
-            # Retrieve the PostSweepDecision from the active DirectionEngine
-            # state so the CISD factor can read confirmation directly.
+            # Retrieve the PostSweepDecision — try dir_engine first, fall back
+            # to entry_engine's _last_sweep_analysis (which has CISD, displacement,
+            # etc. from the actual sweep evaluation that produced this signal).
             if self._conviction is not None:
                 _ps_dec_for_conv = None
                 if self._dir_engine is not None:
                     try:
                         _ps_dec_for_conv = getattr(
                             self._dir_engine, '_last_ps_decision', None)
+                    except Exception:
+                        pass
+                # FIX-CISD-FLOW: dir_engine may not have entered post_sweep
+                # (it detects sweeps independently). Fall back to entry_engine's
+                # sweep analysis which actually produced this signal.
+                if _ps_dec_for_conv is None and self._entry_engine is not None:
+                    try:
+                        _sa = getattr(self._entry_engine, '_last_sweep_analysis', None)
+                        if _sa and _sa.get('rev_score', 0) > 0:
+                            from strategy.direction_engine import PostSweepDecision as _DirPSD
+                            _ps_dec_for_conv = _DirPSD(
+                                action="reverse" if _sa['rev_score'] > _sa.get('cont_score', 0) else "continue",
+                                direction=signal.side,
+                                confidence=min(1.0, max(_sa['rev_score'], _sa.get('cont_score', 0)) / 90.0),
+                                phase=_sa.get('phase', ''),
+                                cisd_active=bool(_sa.get('cisd', False)),
+                                ote_active=bool(_sa.get('ote', False)),
+                                displacement_atr=float(_sa.get('displacement_atr', 0.0)),
+                                rev_score=float(_sa.get('rev_score', 0)),
+                                cont_score=float(_sa.get('cont_score', 0)),
+                                reason=signal.reason,
+                            )
                     except Exception:
                         pass
 
@@ -5061,6 +5084,15 @@ class QuantStrategy:
                     _sweep_wick = float(
                         getattr(signal.sweep_result, 'wick_extreme', 0.0) or 0.0)
 
+                # FIX-DISP-FLOW: get measured displacement from entry_engine
+                _measured_disp_atr = 0.0
+                if _ps_dec_for_conv is not None:
+                    _measured_disp_atr = float(getattr(_ps_dec_for_conv, 'displacement_atr', 0.0) or 0.0)
+                if _measured_disp_atr <= 0 and self._entry_engine is not None:
+                    _sa = getattr(self._entry_engine, '_last_sweep_analysis', None)
+                    if _sa:
+                        _measured_disp_atr = float(_sa.get('displacement_atr', 0.0) or 0.0)
+
                 _conv_result = self._conviction.evaluate(
                     trade_side       = signal.side,
                     sweep_pool       = _conv_pool,   # None is handled by _extract_pool_info
@@ -5077,6 +5109,7 @@ class QuantStrategy:
                     session          = _sess_str,
                     entry_type       = _entry_type_str,
                     sweep_wick_price = _sweep_wick,
+                    measured_displacement_atr = _measured_disp_atr,
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])
