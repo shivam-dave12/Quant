@@ -256,8 +256,8 @@ class RiskManager:
 
             sl_pct = price_distance / entry_price
 
-            if sl_pct < 0.001:
-                logger.error(f"SL too tight: {sl_pct*100:.3f}% (min 0.1%)")
+            if sl_pct < 0.0005:
+                logger.error(f"SL too tight: {sl_pct*100:.3f}% (min 0.05%)")
                 return None
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
@@ -413,19 +413,19 @@ class RiskManager:
             # ── Consecutive losses ────────────────────────────────────────────
             if self.consecutive_losses >= self.max_consecutive_losses:
                 hours_since_last = (now - self.last_trade_time) / 3600
-                AUTO_RESET_HOURS = 4.0
+                AUTO_RESET_HOURS = 0.5  # 30 min auto-reset (was 4 hours)
                 if self.last_trade_time > 0 and hours_since_last >= AUTO_RESET_HOURS:
                     logger.warning(
-                        f"⚠️ Consecutive losses auto-reset: {self.consecutive_losses} losses "
+                        f"Consecutive losses auto-reset: {self.consecutive_losses} losses "
                         f"but {hours_since_last:.1f}h elapsed (> {AUTO_RESET_HOURS}h). "
                         f"Market context reset — allowing new evaluation."
                     )
                     self.consecutive_losses = 0
                 else:
-                    remaining_h = max(0.0, AUTO_RESET_HOURS - hours_since_last)
+                    remaining_m = max(0.0, (AUTO_RESET_HOURS - hours_since_last) * 60)
                     return False, (
                         f"Max consecutive losses ({self.consecutive_losses}) — "
-                        f"auto-reset in {remaining_h:.1f}h or at day boundary"
+                        f"auto-reset in {remaining_m:.0f}m or at day boundary"
                     )
 
             return True, "OK"
