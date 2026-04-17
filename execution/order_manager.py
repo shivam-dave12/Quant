@@ -869,8 +869,15 @@ class OrderManager:
 
     def place_limit_entry(self, side: str, quantity: float,
                           limit_price: float, timeout_sec: float = 25.0,
-                          fallback_to_market: bool = True) -> Optional[Dict]:
-        """Maker limit entry with adaptive polling and market fallback."""
+                          fallback_to_market: bool = True,
+                          on_order_placed=None) -> Optional[Dict]:
+        """
+        Maker limit entry with adaptive polling and market fallback.
+
+        on_order_placed: optional callback(order_id: str) invoked the moment
+          the REST call returns a valid order_id. Used by the strategy
+          watchdog to switch from Stage-A to Stage-B timing. Never raises.
+        """
         logger.info(f"🎯 Maker entry: {side} {quantity} @ ${limit_price:.2f} "
                     f"(timeout={timeout_sec:.0f}s)")
 
@@ -882,12 +889,22 @@ class OrderManager:
                 if mdata:
                     mdata["fill_type"] = "taker"
                     mdata["fill_price"] = 0.0
+                    if on_order_placed is not None:
+                        try: on_order_placed(mdata.get("order_id", ""))
+                        except Exception: pass
                 return mdata
             return None
 
         order_id = data.get("order_id", "")
         if not order_id:
             return None
+
+        # BUG 2 FIX: notify caller the order is now on the exchange
+        if on_order_placed is not None:
+            try:
+                on_order_placed(order_id)
+            except Exception as _cb_e:
+                logger.warning(f"on_order_placed callback error (non-fatal): {_cb_e}")
 
         deadline   = time.time() + timeout_sec
         poll_count = 0
@@ -951,7 +968,8 @@ class OrderManager:
                                   limit_price: float,
                                   sl_price: float,
                                   tp_price: float,
-                                  timeout_sec: float = 45.0) -> Optional[Dict]:
+                                  timeout_sec: float = 45.0,
+                                  on_order_placed=None) -> Optional[Dict]:
         """
         Bracket entry for Delta: places a single limit order with embedded SL + TP.
         Polls until filled, then queries open orders to retrieve bracket child IDs.
@@ -961,6 +979,11 @@ class OrderManager:
           fill_price, fill_type, order_id, bracket_order=True,
           bracket_sl_order_id, bracket_tp_order_id,
           bracket_sl_price, bracket_tp_price
+
+        on_order_placed: optional callback(order_id: str) invoked the moment
+          the REST call returns a valid order_id — BEFORE the fill-poll loop
+          begins.  Used by the strategy watchdog to switch from Stage-A
+          (pre-order) to Stage-B (post-order) timing. Never raises.
         """
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
@@ -984,6 +1007,13 @@ class OrderManager:
         if not order_id:
             return None
         logger.info(f"✅ Bracket order placed: {order_id} @ ${limit_price:.2f}")
+
+        # BUG 2 FIX: notify the caller that the order is now on the exchange
+        if on_order_placed is not None:
+            try:
+                on_order_placed(order_id)
+            except Exception as _cb_e:
+                logger.warning(f"on_order_placed callback error (non-fatal): {_cb_e}")
 
         deadline   = time.time() + timeout_sec
         poll_count = 0

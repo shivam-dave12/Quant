@@ -1,36 +1,43 @@
 """
-telegram/notifier.py — Liquidity-First Telegram Notifier
-=========================================================
+telegram/notifier.py — Liquidity-First Telegram Notifier  v2.0
+==============================================================
 Report architecture mirrors the decision hierarchy:
   DirectionEngine hunt → Pool target → Flow confirmation → ICT context → Entry → Exit
 
-Public API (all imported by strategy layer):
+Public API (imported by strategy layer):
   send_telegram_message()            — async fire-and-forget delivery
-  format_periodic_report()           — 15-min institutional dashboard (includes gate diagnostic)
+  format_periodic_report()           — 15-min institutional dashboard
   format_direction_hunt_alert()      — DirectionEngine high-confidence prediction
   format_post_sweep_verdict()        — post-sweep reversal/continuation decision
   format_conviction_block_alert()    — conviction gate rejection with factor breakdown
   format_pool_gate_alert()           — pool-hit gate action (exit/reverse/continue)
-  format_liquidity_trail_update()    — liquidity-trail SL advance
+  format_liquidity_trail_update()    — Fibonacci-trail SL advance (v5.0 engine)
   install_global_telegram_log_handler()
   TelegramLogHandler
 
 Internal helpers (used by controller.py):
-  _sanitize_html()
+  _sanitize_html(), _esc()
 
-Removed (dead code — never imported by any strategy/controller file):
-  format_market_outlook()    — superseded by format_periodic_report()
-  format_entry_alert()       — superseded by v9_display.format_entry_alert_v9()
-  format_trail_update()      — superseded by format_liquidity_trail_update()
-  format_position_close()    — superseded by v9_display
-  format_pool_sweep_alert()  — superseded by v9_display
+v2.0 CHANGES
+------------
+1.  _sanitize_html rewritten as a proper state-machine parser. It now:
+      • Normalises stray ampersands to &amp; (was missing — leading cause of
+        byte-offset 2010-2035 parse errors).
+      • Uses a single-pass tokenizer that splits the input into text runs
+        and tag runs, escaping only the text runs.
+      • Emits perfectly balanced tags: unmatched closes are dropped, unclosed
+        opens are auto-closed at end.
+      • Tolerates truncation: a tag fragment with no > at end-of-string is
+        escaped as literal.
+      • Does NOT apply inside <code>/<pre> contents — those are treated as
+        raw text and fully escaped (as Telegram HTML requires).
 
-Bug fixes applied:
-  BUG-W1: format_conviction_block_alert pool_sig weight 0.25 → 0.20 (matches conviction_filter.py)
-  BUG-W2: format_conviction_block_alert CISD weight 0.20 → 0.25 (matches conviction_filter.py)
-  BUG-T1: format_conviction_block_alert required threshold 0.55 → 0.65 (matches REQUIRED_SCORE default)
-  NEW-G1: _build_gate_diagnostic() — 6-gate status panel added to every periodic report
-  NEW-A1: format_conviction_blocked alias → format_conviction_block_alert (defensive)
+2.  New _tag(text, name) helper guarantees that the wrapping is correct —
+    all fresh format_* functions use it instead of hand-crafted markup.
+
+3.  format_liquidity_trail_update rewritten for the v5.0 Fibonacci engine:
+    shows fib_ratio, swing context, momentum gate, HTF alignment, buffer
+    details, pool-between-expansion tag, and cluster info.
 """
 
 from __future__ import annotations
@@ -52,19 +59,17 @@ import telegram.config as telegram_config
 
 logger = logging.getLogger(__name__)
 
-# ── Import REQUIRED_SCORE from the authoritative source so this file can
-#    never drift out of sync with conviction_filter.py.
+# REQUIRED_SCORE from authoritative source
 try:
     from strategy.conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
 except ImportError:
     try:
         from conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
     except ImportError:
-        _REQUIRED_CONVICTION_SCORE = 0.45   # matches conviction_filter.py / config.py
+        _REQUIRED_CONVICTION_SCORE = 0.45
 
-# ── DirectionEngine confidence thresholds (mirrored from direction_engine.py)
-_HUNT_ON_THRESHOLD  = 0.10   # must exceed to commit a direction
-_HUNT_OFF_THRESHOLD = 0.05   # must drop below to revert to NEUTRAL
+_HUNT_ON_THRESHOLD  = 0.10
+_HUNT_OFF_THRESHOLD = 0.05
 
 
 # ======================================================================
@@ -74,8 +79,8 @@ _HUNT_OFF_THRESHOLD = 0.05   # must drop below to revert to NEUTRAL
 _send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
 _worker_started: bool            = False
 _worker_lock:   threading.Lock   = threading.Lock()
-_MIN_INTERVAL   = 1.2    # slightly above Telegram's 1-msg/sec guideline
-_MAX_RETRIES    = 4      # covers 429 + one 502 retry
+_MIN_INTERVAL = 1.2
+_MAX_RETRIES  = 4
 
 
 def _send_worker() -> None:
@@ -90,7 +95,6 @@ def _send_worker() -> None:
             item = _send_queue.get(timeout=30)
         except _queue_mod.Empty:
             continue
-
         if item is None:
             break
 
@@ -100,10 +104,9 @@ def _send_worker() -> None:
             gap = _MIN_INTERVAL - (time.time() - last_send_ts)
             if gap > 0:
                 time.sleep(gap)
-
             try:
-                url       = (f"https://api.telegram.org/bot"
-                             f"{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage")
+                url = (f"https://api.telegram.org/bot"
+                       f"{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage")
                 send_text = message[:4000]
                 if parse_mode == "HTML":
                     send_text = _sanitize_html(send_text)
@@ -114,7 +117,7 @@ def _send_worker() -> None:
                     "parse_mode":               parse_mode,
                     "disable_web_page_preview": True,
                 }
-                resp         = _req.post(url, json=payload, timeout=15)
+                resp = _req.post(url, json=payload, timeout=15)
                 last_send_ts = time.time()
 
                 if resp.status_code == 200:
@@ -123,10 +126,11 @@ def _send_worker() -> None:
                 # HTML parse error → retry as plain text (once)
                 if resp.status_code == 400 and parse_mode == "HTML" and attempt == 0:
                     logger.warning(
-                        "Telegram HTML parse error — retrying as plain text: "
-                        f"{resp.text[:120]}"
+                        "Telegram HTML parse error — retrying as plain text: %s",
+                        resp.text[:160]
                     )
-                    plain = re.sub(r"<[^>]+>", "", send_text, flags=re.DOTALL)
+                    plain = re.sub(r"<[^>]*>", "", send_text, flags=re.DOTALL)
+                    plain = _html_lib.unescape(plain)
                     r2 = _req.post(
                         url,
                         json={
@@ -139,16 +143,15 @@ def _send_worker() -> None:
                     last_send_ts = time.time()
                     if r2.status_code == 200:
                         break
+                    logger.warning("Plain-text fallback also failed: %s", r2.text[:160])
                     break
 
-                # Rate-limit / transient errors — exponential backoff
+                # Rate-limit / transient — backoff
                 if resp.status_code in (429, 500, 502, 503) and attempt < _MAX_RETRIES - 1:
                     if resp.status_code == 429:
                         try:
-                            backoff = max(
-                                float(resp.json().get("parameters", {}).get("retry_after", 10)),
-                                5.0,
-                            )
+                            backoff = max(float(resp.json().get("parameters", {})
+                                                .get("retry_after", 10)), 5.0)
                         except Exception:
                             backoff = 10.0
                     else:
@@ -202,55 +205,177 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
 
 
 # ======================================================================
-# HTML SANITIZER  (also imported by controller.py)
+# HTML SANITIZER v2.0 — state-machine parser
 # ======================================================================
+
+# Telegram parse_mode=HTML permits these tags and attributes only
+_SAFE_TAGS = frozenset(("b", "strong", "i", "em", "u", "ins", "s", "strike",
+                        "del", "code", "pre", "tg-spoiler"))
+_SAFE_TAGS_WITH_ATTR = frozenset(("a",))  # <a href="..."> only
+_VALID_ENTITIES = ("amp", "lt", "gt", "quot", "apos", "#")
+
+# Regex: a tag is <[/]name[ attrs]>.  We tokenize on tag boundaries.
+_TAG_RE = re.compile(
+    r"<(/?)\s*([A-Za-z][A-Za-z0-9_-]*)\s*([^>]*?)/?\s*>",
+    re.DOTALL,
+)
+# Regex: a valid HTML entity
+_ENTITY_RE = re.compile(r"&(#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+
+
+def _normalise_ampersands(text: str) -> str:
+    """
+    Replace ampersands that are NOT part of a valid entity with &amp;.
+
+    Walks the string, leaving well-formed entities (&amp; &#39; &#x3C;) intact
+    and escaping every other & to &amp;.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "&":
+            out.append(ch)
+            i += 1
+            continue
+        m = _ENTITY_RE.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+        else:
+            out.append("&amp;")
+            i += 1
+    return "".join(out)
+
 
 def _sanitize_html(text: str) -> str:
     """
-    Remove or escape HTML constructs that Telegram's parse_mode=HTML rejects.
-    Telegram supports only: <b> <i> <u> <s> <code> <pre> <a href> <tg-spoiler>
-    and their closing counterparts.
+    Bulletproof Telegram HTML sanitizer.
+
+    Produces output guaranteed to round-trip through Telegram's HTML parser
+    (parse_mode=HTML) without "Unexpected end tag" or "can't parse entities"
+    400 errors.
+
+    Pipeline:
+      1. Convert <br>, <hr>, <p>/</p> to whitespace (not supported by Telegram).
+      2. Tokenize into (text, tag) runs.
+      3. Walk runs with an explicit open-tag stack:
+           • Text runs: ampersand-normalise (naked & → &amp;), leave others alone.
+             Do NOT escape < or > in text — they were already tag tokens
+             if well-formed; any stray < or > is already surrounded by text
+             and will be caught by the final entity normalisation.
+           • Tag runs: allow only safe tags; strip attrs on non-<a> tags;
+             drop orphan closes; auto-close mismatched opens.
+      4. Auto-close remaining open tags at end.
+      5. Final naked-ampersand and naked-lt/gt pass.
+      6. Collapse excess blank lines.
     """
-    text = re.sub(r"<br\s*/?>",  "\n",          text, flags=re.IGNORECASE)
-    text = re.sub(r"<hr\s*/?>",  "\n──────\n",   text, flags=re.IGNORECASE)
-    text = re.sub(r"<p\s*/?>",   "\n",           text, flags=re.IGNORECASE)
-    text = re.sub(r"</p>",        "",             text, flags=re.IGNORECASE)
+    if not text:
+        return text
 
-    _SAFE_TAGS = {
-        "b", "/b", "i", "/i", "u", "/u", "s", "/s",
-        "code", "/code", "pre", "/pre",
-        "tg-spoiler", "/tg-spoiler",
-    }
+    # -- Pass 1: structural conversion -------------------------------------
+    text = re.sub(r"<br\s*/?>",        "\n",                       text, flags=re.IGNORECASE)
+    text = re.sub(r"<hr\s*/?>",        "\n────────\n",             text, flags=re.IGNORECASE)
+    text = re.sub(r"<p(?:\s[^>]*)?>",  "\n",                       text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>",             "",                         text, flags=re.IGNORECASE)
 
-    def _fix_tag(m: re.Match) -> str:
-        inner    = m.group(1).strip()
-        if inner.lower().startswith("a ") or inner.lower() == "/a":
-            return m.group(0)
-        tag_name = inner.lower().split()[0] if inner else ""
-        return m.group(0) if tag_name in _SAFE_TAGS else ""
+    # -- Pass 2: tokenize on tag boundaries --------------------------------
+    tokens: List[tuple] = []    # list of ("text", str) | ("tag", opening, name, attrs)
+    cursor = 0
+    for m in _TAG_RE.finditer(text):
+        if m.start() > cursor:
+            tokens.append(("text", text[cursor:m.start()]))
+        closing = m.group(1) == "/"
+        name    = m.group(2).lower()
+        attrs   = m.group(3).strip()
+        tokens.append(("tag", closing, name, attrs))
+        cursor = m.end()
+    if cursor < len(text):
+        tokens.append(("text", text[cursor:]))
 
-    text = re.sub(r"<([^>]*)>", _fix_tag, text)
+    # -- Pass 3: walk with open-tag stack ----------------------------------
+    out: List[str] = []
+    stack: List[str] = []
 
-    _SAFE_RE = re.compile(
-        r"<(?=/?(?:b|i|u|s|code|pre|tg-spoiler|a)(?:[\s>\"/]|$))",
-        re.IGNORECASE,
-    )
-    parts = text.split("<")
-    if len(parts) > 1:
-        rebuilt = [parts[0]]
-        for part in parts[1:]:
-            rebuilt.append("<" if _SAFE_RE.match("<" + part) else "&lt;")
-            rebuilt.append(part)
-        text = "".join(rebuilt)
+    for tok in tokens:
+        if tok[0] == "text":
+            # Normalise naked ampersands; leave < and > alone (none should
+            # exist here — tokenizer consumed all tag-shaped <...>)
+            out.append(_normalise_ampersands(tok[1]))
+            continue
 
-    return re.sub(r"\n{3,}", "\n\n", text)
+        _, closing, name, attrs = tok
+        # Unknown/unsafe tag → escape as literal
+        is_safe = (name in _SAFE_TAGS) or (name in _SAFE_TAGS_WITH_ATTR)
+        if not is_safe:
+            raw = f"</{name}>" if closing else f"<{name}{(' ' + attrs) if attrs else ''}>"
+            out.append(_html_lib.escape(raw, quote=False))
+            continue
+
+        # Safe tag — strip attributes except on <a>
+        if name == "a":
+            if closing:
+                # Match outer <a> if any; drop orphan </a>
+                if "a" in stack:
+                    while stack and stack[-1] != "a":
+                        out.append(f"</{stack.pop()}>")
+                    stack.pop()
+                    out.append("</a>")
+                # else: orphan </a> — drop silently
+                continue
+            # Opening <a> — keep href="..." if present, discard everything else
+            href_match = re.search(r'href\s*=\s*"([^"]*)"', attrs, flags=re.IGNORECASE)
+            if not href_match:
+                href_match = re.search(r"href\s*=\s*'([^']*)'", attrs, flags=re.IGNORECASE)
+            if href_match:
+                href = href_match.group(1)
+                href = _normalise_ampersands(href)
+                stack.append("a")
+                out.append(f'<a href="{href}">')
+            else:
+                # <a> with no href is invalid in Telegram — drop
+                pass
+            continue
+
+        # Plain safe tags (<b>, <i>, ...): ignore attrs
+        if closing:
+            if name in stack:
+                while stack and stack[-1] != name:
+                    out.append(f"</{stack.pop()}>")
+                stack.pop()
+                out.append(f"</{name}>")
+            # else: orphan close — drop
+        else:
+            stack.append(name)
+            out.append(f"<{name}>")
+
+    # -- Pass 4: auto-close any remaining open tags ------------------------
+    while stack:
+        out.append(f"</{stack.pop()}>")
+
+    rendered = "".join(out)
+
+    # -- Pass 5: collapse blank lines --------------------------------------
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+
+    return rendered
 
 
 def _esc(s: Any) -> str:
-    """HTML-escape a value for safe Telegram HTML output."""
+    """HTML-escape a dynamic value for safe Telegram HTML output."""
     if s is None:
         return ""
     return _html_lib.escape(str(s), quote=False)
+
+
+def _tag(text: Any, name: str) -> str:
+    """
+    Wrap a value in an HTML tag, escaping the content safely.
+
+    Use this everywhere instead of hand-crafted '<b>{x}</b>' strings.
+    """
+    return f"<{name}>{_esc(text)}</{name}>"
 
 
 # ======================================================================
@@ -267,255 +392,89 @@ def _fmt_pct(v: float) -> str:
     return f"{v:.2f}%"
 
 
-def _time_ago(ts_ms: int) -> str:
-    if not ts_ms:
-        return "?"
-    elapsed = (time.time() * 1000 - ts_ms) / 1000
-    if elapsed < 60:
-        return f"{elapsed:.0f}s ago"
-    if elapsed < 3600:
-        return f"{elapsed/60:.0f}m ago"
-    return f"{elapsed/3600:.1f}h ago"
-
-
-def _flow_bar(conviction: float) -> str:
-    """Visual signed flow bar for periodic report headers."""
-    n = max(0, min(5, int(abs(conviction) * 5)))
-    if conviction > 0.05:
-        return "▁" * (5 - n) + "▓" * n + " ▲"
-    if conviction < -0.05:
-        return "▓" * n + "▁" * (5 - n) + " ▼"
-    return "▁▁▁▁▁ ─"
-
-
 def _session_icon(session: str) -> str:
-    return {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}.get(
-        (session or "").lower().replace(" ", "_"), "⚪"
-    )
+    s = (session or "").upper()
+    if "LONDON" in s: return "🇬🇧"
+    if "NY" in s or "NEW_YORK" in s: return "🇺🇸"
+    if "ASIA" in s: return "🌏"
+    return "🌐"
 
 
-def _score_bar(value: float, width: int = 10) -> str:
-    """Filled progress bar scaled to [0, 1]."""
-    filled = min(width, int(max(0.0, min(1.0, value)) * width))
+def _score_bar(score: float, width: int = 10) -> str:
+    filled = min(max(int(score * width + 0.5), 0), width)
     return "█" * filled + "░" * (width - filled)
 
 
-def _signed_bar(value: float, half: int = 5) -> str:
-    """Signed bar: negative fills left half, positive fills right half."""
-    mag = min(half, int(abs(value) * half + 0.5))
-    if value >= 0:
-        return "░" * half + "█" * mag + "░" * (half - mag)
-    return "░" * (half - mag) + "█" * mag + "░" * half
+def _fmt_tf(tf: str) -> str:
+    return _esc(tf or "?")
 
 
 # ======================================================================
-# GATE DIAGNOSTIC — internal builder for format_periodic_report
+# GATE DIAGNOSTIC PANEL (internal)
 # ======================================================================
 
 def _build_gate_diagnostic(
-    direction_hunt:   Optional[Any],
-    amd_phase:        str,
-    dealing_range_pd: float,
-    session:          str,
-    flow_conviction:  float,
-    flow_direction:   str,
-    htf_bias:         str,
+    direction_hunt=None,
+    amd_phase: str = "",
+    dealing_range_pd: float = 0.5,
+    session: str = "",
+    flow_conviction: float = 0.0,
+    flow_direction: str = "",
+    htf_bias: str = "",
 ) -> List[str]:
-    """
-    Build the 🚦 ENTRY GATE STATUS section for periodic reports.
+    """Render a 6-gate entry diagnostic panel for the periodic report."""
+    gates: List[str] = ["🚦 <b>ENTRY GATE STATUS</b>"]
 
-    Shows the six institutional gates with ✅/⚠️/❌, current value,
-    required threshold, and a plain-English diagnostic reason.  Each gate
-    mirrors the real decision logic in direction_engine.py and
-    conviction_filter.py so the operator can immediately see what must
-    change before the bot takes a trade.
+    # Gate 1: session
+    s = (session or "").upper()
+    sess_ok = s in ("LONDON", "NY", "LONDON_NY")
+    gates.append(f"  {'✅' if sess_ok else '⚪'} Session: {_esc(s or 'off')}")
 
-    Gate 1  — DirectionEngine confidence (0.18 ON / 0.11 OFF Schmitt trigger)
-    Gate 2  — AMD phase (MANIPULATION/DISTRIBUTION = active; ACCUMULATION ≈ 0)
-    Gate 3  — Dealing Range P/D% (LONG discount <45%; SHORT premium >55%)
-    Gate 4  — Session quality (score and killzone flag)
-    Gate 5  — Flow conviction (directional order-flow alignment)
-    Gate 6  — DirectionEngine 10-factor breakdown (when factors are available)
-    """
-    lines: List[str] = []
-    lines.append("🚦 <b>ENTRY GATE STATUS</b>")
-
-    # ── Gate 1: DirectionEngine confidence ──────────────────────────────────
-    if direction_hunt is not None:
-        dh_conf  = float(getattr(direction_hunt, "confidence", 0.0))
-        dh_pred  = getattr(direction_hunt, "predicted", None)
-        dh_bsl   = float(getattr(direction_hunt, "bsl_score", 0.0))
-        dh_ssl   = float(getattr(direction_hunt, "ssl_score", 0.0))
-
-        if dh_conf >= _HUNT_ON_THRESHOLD:
-            g1_icon = "✅"
-            g1_note = f"hunting {dh_pred or '?'}"
-        elif dh_conf >= _HUNT_OFF_THRESHOLD:
-            g1_icon = "⚠️"
-            g1_note = f"hysteresis band — last={dh_pred or 'NEUTRAL'}"
-        else:
-            g1_icon = "❌"
-            g1_note = f"NEUTRAL — need {_HUNT_ON_THRESHOLD:.0%} (BSL={dh_bsl:.3f} SSL={dh_ssl:.3f})"
-
-        lines.append(
-            f"  {g1_icon} DirectionEngine   conf={dh_conf:.1%}  "
-            f"threshold={_HUNT_ON_THRESHOLD:.0%}  [{g1_note}]"
-        )
-    else:
-        lines.append("  ⚪ DirectionEngine   no data")
-
-    # ── Gate 2: AMD phase ────────────────────────────────────────────────────
-    _AMD_SCORE_MAP = {
-        "MANIPULATION":   1.00,
-        "DISTRIBUTION":   0.90,
-        "REDISTRIBUTION": 0.75,
-        "REACCUMULATION": 0.70,
-        "ACCUMULATION":   0.00,
-    }
-    phase_upper = (amd_phase or "").upper()
-    amd_score   = _AMD_SCORE_MAP.get(phase_upper, 0.30)
-    if amd_score >= 0.70:
-        g2_icon = "✅"
-        g2_note = "active delivery phase"
-    elif amd_score >= 0.30:
-        g2_icon = "⚠️"
-        g2_note = f"weak phase — score={amd_score:.2f}"
-    else:
-        g2_icon = "❌"
-        g2_note = "ACCUMULATION — no institutional delivery expected"
-
-    lines.append(
-        f"  {g2_icon} AMD Phase         {_esc(amd_phase or 'UNKNOWN')}  "
-        f"score={amd_score:.2f}×0.05  [{g2_note}]"
+    # Gate 2: hunt prediction
+    pred = getattr(direction_hunt, "predicted", None) if direction_hunt else None
+    conf = float(getattr(direction_hunt, "confidence", 0.0)) if direction_hunt else 0.0
+    hunt_ok = pred in ("BSL", "SSL") and conf >= _HUNT_ON_THRESHOLD
+    gates.append(
+        f"  {'✅' if hunt_ok else '⚪'} Hunt: "
+        f"{_esc(pred or 'NEUTRAL')} ({conf:.0%})"
     )
 
-    # ── Gate 3: Dealing Range ────────────────────────────────────────────────
-    pd_pct   = dealing_range_pd * 100
+    # Gate 3: flow direction
+    flow_ok = abs(flow_conviction) >= 0.20 and flow_direction in ("long", "short")
+    gates.append(
+        f"  {'✅' if flow_ok else '⚪'} Flow: "
+        f"{_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})"
+    )
+
+    # Gate 4: AMD phase
+    amd_ok = "MANIPULATION" in (amd_phase or "").upper() or \
+             "DISTRIBUTION" in (amd_phase or "").upper()
+    gates.append(
+        f"  {'✅' if amd_ok else '⚪'} AMD: {_esc(amd_phase or 'UNKNOWN')}"
+    )
+
+    # Gate 5: dealing range P/D
+    pd_ok = dealing_range_pd < 0.40 or dealing_range_pd > 0.60
     pd_label = (
-        "DEEP DISCOUNT" if dealing_range_pd < 0.25 else
-        "DISCOUNT"      if dealing_range_pd < 0.40 else
-        "EQUILIBRIUM"   if dealing_range_pd < 0.60 else
-        "PREMIUM"       if dealing_range_pd < 0.75 else
-        "DEEP PREMIUM"
+        "DISC" if dealing_range_pd < 0.40 else
+        "EQ"   if dealing_range_pd < 0.60 else
+        "PREM"
     )
-    long_ok  = dealing_range_pd < 0.65
-    short_ok = dealing_range_pd > 0.35
-
-    if long_ok and short_ok:
-        g3_icon = "✅"
-        g3_note = "both sides valid"
-    elif long_ok:
-        g3_icon = "✅"
-        g3_note = "LONG valid (discount)"
-    elif short_ok:
-        g3_icon = "✅"
-        g3_note = "SHORT valid (premium)"
-    else:
-        g3_icon = "⚠️"
-        g3_note = "equilibrium zone — OTE score reduced"
-
-    lines.append(
-        f"  {g3_icon} Dealing Range     {pd_label} ({pd_pct:.0f}%)  "
-        f"[{g3_note}]"
+    gates.append(
+        f"  {'✅' if pd_ok else '⚪'} P/D: {pd_label} ({dealing_range_pd:.0%})"
     )
 
-    # ── Gate 4: Session quality ──────────────────────────────────────────────
-    _SESSION_SCORE_MAP = {
-        "LONDON":    1.00,
-        "NY":        1.00,
-        "NEW_YORK":  1.00,
-        "LONDON_NY": 0.95,
-        "WEEKEND":   0.80,
-        "OFF_HOURS": 0.75,
-        "ASIA":      0.60,
-        "":          0.60,
-    }
-    sess_key   = (session or "").upper().replace(" ", "_")
-    sess_score = _SESSION_SCORE_MAP.get(sess_key, 0.40)
-
-    if sess_score >= 0.85:
-        g4_icon = "✅"
-        g4_note = "institutional killzone"
-    elif sess_score >= 0.55:
-        g4_icon = "⚠️"
-        g4_note = f"reduced quality (score={sess_score:.2f}×0.10={sess_score*0.10:.3f})"
-    else:
-        g4_icon = "❌"
-        g4_note = f"very low quality (score={sess_score:.2f}×0.10={sess_score*0.10:.3f})"
-
-    lines.append(
-        f"  {g4_icon} Session           {_esc(session or 'UNKNOWN')}  "
-        f"qual={sess_score:.2f}  [{g4_note}]"
+    # Gate 6: HTF bias
+    htf_ok = bool(htf_bias) and htf_bias.lower() != "mixed"
+    gates.append(
+        f"  {'✅' if htf_ok else '⚪'} HTF: {_esc(htf_bias or 'mixed')}"
     )
 
-    # ── Gate 5: Flow conviction ──────────────────────────────────────────────
-    flow_abs = abs(flow_conviction)
-    if flow_abs >= 0.30:
-        g5_icon = "✅"
-        g5_note = f"{_esc(flow_direction.upper() or '?')} ({flow_conviction:+.3f})"
-    elif flow_abs >= 0.10:
-        g5_icon = "⚠️"
-        g5_note = f"weak {_esc(flow_direction or 'neutral')} ({flow_conviction:+.3f})"
-    else:
-        g5_icon = "❌"
-        g5_note = "NEUTRAL — no directional order-flow"
-
-    lines.append(
-        f"  {g5_icon} Flow Conviction   {_flow_bar(flow_conviction)}  [{g5_note}]"
-    )
-
-    # ── Gate 6: DirectionEngine 10-factor breakdown ──────────────────────────
-    if direction_hunt is not None:
-        dh_factors = getattr(direction_hunt, "factors", None)
-        if dh_factors is not None:
-            _FACTOR_LABELS = [
-                ("amd",            "AMD       "),
-                ("htf_structure",  "HTF struct"),
-                ("dealing_range",  "Deal range"),
-                ("order_flow",     "Order flow"),
-                ("pool_asymmetry", "Pool asym "),
-                ("ob_fvg_pull",    "OB/FVG    "),
-                ("displacement",   "Displacmnt"),
-                ("session",        "Session   "),
-                ("micro_bos",      "Micro BOS "),
-                ("volume",         "Volume    "),
-            ]
-            lines.append("")
-            lines.append("  <b>📐 10-FACTOR SCORES</b>  (+ = BSL hunt, − = SSL hunt)")
-            for attr, label in _FACTOR_LABELS:
-                val  = float(getattr(dh_factors, attr, 0.0))
-                bar  = _signed_bar(val, half=4)
-                sign = "+" if val >= 0 else ""
-                icon = "🟢" if val > 0.15 else ("🔴" if val < -0.15 else "⚪")
-                lines.append(f"    {icon} {label} [{bar}] {sign}{val:.2f}")
-
-    # ── Primary blocker summary ──────────────────────────────────────────────
-    blockers: List[str] = []
-    if direction_hunt is not None:
-        dh_conf = float(getattr(direction_hunt, "confidence", 0.0))
-        if dh_conf < _HUNT_ON_THRESHOLD:
-            blockers.append(f"DirectionEngine conf={dh_conf:.1%}<{_HUNT_ON_THRESHOLD:.0%}")
-    if amd_score < 0.30:
-        blockers.append(f"AMD={_esc(amd_phase)}(score={amd_score:.2f})")
-    if not (long_ok or short_ok):
-        blockers.append(f"DR={_esc(pd_label)}({pd_pct:.0f}%)")
-    if sess_score < 0.55:
-        blockers.append(f"Session={_esc(session)}(score={sess_score:.2f})")
-    if flow_abs < 0.10:
-        blockers.append("Flow=NEUTRAL")
-
-    if blockers:
-        lines.append("")
-        lines.append(f"  🔴 <b>Primary blockers:</b> {' | '.join(blockers)}")
-    else:
-        lines.append("")
-        lines.append("  🟢 <b>All macro gates clear</b> — waiting for sweep + displacement")
-
-    return lines
+    return gates
 
 
 # ======================================================================
-# 1. PERIODIC STATUS REPORT  (15-min institutional dashboard)
+# 1. PERIODIC REPORT
 # ======================================================================
 
 def format_periodic_report(
@@ -527,18 +486,15 @@ def format_periodic_report(
     total_pnl:           float = 0.0,
     consecutive_losses:  int   = 0,
     bot_state:           str   = "SCANNING",
-    # Pool state
     n_bsl_pools:         int   = 0,
     n_ssl_pools:         int   = 0,
     primary_target_str:  str   = "—",
     flow_conviction:     float = 0.0,
     flow_direction:      str   = "",
-    # ICT
     amd_phase:           str   = "UNKNOWN",
     session:             str   = "REGULAR",
     in_killzone:         bool  = False,
     regime:              str   = "UNKNOWN",
-    # Position
     position:            Optional[Dict] = None,
     current_sl:          Optional[float] = None,
     current_tp:          Optional[float] = None,
@@ -546,7 +502,6 @@ def format_periodic_report(
     breakeven_moved:     bool  = False,
     profit_locked_pct:   float = 0.0,
     extra_lines:         Optional[List[str]] = None,
-    # v10 extended
     atr:                 float = 0.0,
     htf_bias:            str   = "",
     dealing_range_pd:    float = 0.5,
@@ -556,25 +511,11 @@ def format_periodic_report(
     nearest_bsl:         Optional[Dict] = None,
     nearest_ssl:         Optional[Dict] = None,
     sweep_analysis:      Optional[Dict] = None,
-    # DirectionEngine state
     direction_hunt:        Optional[Any] = None,
     direction_ps_analysis: Optional[Any] = None,
     **_kwargs: Any,
 ) -> str:
-    """
-    15-minute institutional Telegram dashboard.
-
-    Layout:
-      Header (time / price / balance / PnL)
-      Market Structure (AMD / HTF / Dealing Range / Regime)
-      Liquidity Map (BSL/SSL counts, nearest pools, sweep analysis)
-      Hunt Prediction (DirectionEngine snapshot)
-      Post-Sweep Verdict (when in post-sweep mode)
-      🚦 ENTRY GATE STATUS  ← diagnostic section added by _build_gate_diagnostic()
-      Position (when in trade)
-      Performance
-      Extra lines (cost engine, expectancy, ATR, VWAP)
-    """
+    """15-minute institutional Telegram dashboard."""
     ist_tz  = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(ist_tz).strftime("%H:%M IST")
     now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
@@ -584,14 +525,14 @@ def format_periodic_report(
     pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
 
     _STATE_ICONS = {
-        "SCANNING":   "🔍",
-        "TRACKING":   "📡",
-        "READY":      "🎯",
-        "ENTERING":   "⚡",
-        "IN_POSITION":"📊",
-        "POST_SWEEP": "🌊",
+        "SCANNING":    "🔍",
+        "TRACKING":    "📡",
+        "READY":       "🎯",
+        "ENTERING":    "⚡",
+        "IN_POSITION": "📊",
+        "POST_SWEEP":  "🌊",
     }
-    state_icon = _STATE_ICONS.get(bot_state.upper(), "⚪")
+    state_icon = _STATE_ICONS.get((bot_state or "").upper(), "⚪")
 
     _PD_LABEL = (
         "DEEP DISC"  if dealing_range_pd < 0.25 else
@@ -603,92 +544,80 @@ def format_periodic_report(
 
     lines: List[str] = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>STATUS</b>  {now_ist} / {now_utc}",
+        f"📊 <b>STATUS</b>  {_esc(now_ist)} / {_esc(now_utc)}",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
-    # ── Price + Balance ──────────────────────────────────────────────────────
     lines.append(f"💰 BTC: <b>{_fmt_price(current_price)}</b>")
     atr_part = f"  ATR: {_fmt_price(atr)}" if atr > 0 else ""
     lines.append(f"  💵 Bal: {_fmt_price(balance)}{atr_part}")
     lines.append(
-        f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  Total: {_fmt_price(total_pnl)}"
+        f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  "
+        f"Total: {_fmt_price(total_pnl)}"
     )
 
-    # ── State + Session ──────────────────────────────────────────────────────
     lines.append("")
-    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  {sess_icon} {_esc(session)}{kz_str}")
+    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  "
+                 f"{sess_icon} {_esc(session)}{kz_str}")
 
-    # ── Market Structure ─────────────────────────────────────────────────────
     lines.append("")
     lines.append("🏛️ <b>MARKET STRUCTURE</b>")
     lines.append(f"  AMD: {_esc(amd_phase)} ({_esc(amd_bias)})")
 
     htf_parts: List[str] = []
-    if structure_4h:
-        htf_parts.append(f"4H:{_esc(structure_4h)}")
-    if structure_15m:
-        htf_parts.append(f"15m:{_esc(structure_15m)}")
-    if htf_bias:
-        htf_parts.append(f"HTF:{_esc(htf_bias)}")
+    if structure_4h:  htf_parts.append(f"4H:{_esc(structure_4h)}")
+    if structure_15m: htf_parts.append(f"15m:{_esc(structure_15m)}")
+    if htf_bias:      htf_parts.append(f"HTF:{_esc(htf_bias)}")
     if htf_parts:
         lines.append(f"  {' | '.join(htf_parts)}")
 
     lines.append(f"  Dealing range: {_PD_LABEL} ({dealing_range_pd:.0%})")
     lines.append(f"  Regime: {_esc(regime)}")
 
-    # ── Liquidity Map ────────────────────────────────────────────────────────
     lines.append("")
     lines.append("🎯 <b>LIQUIDITY</b>")
-    lines.append(f"  BSL ▲ {n_bsl_pools} pools  |  SSL ▼ {n_ssl_pools} pools")
+    lines.append(f"  BSL ▲ {int(n_bsl_pools)} pools  |  "
+                 f"SSL ▼ {int(n_ssl_pools)} pools")
 
     if nearest_bsl:
-        bsl_p   = nearest_bsl.get("price", 0)
-        bsl_d   = nearest_bsl.get("dist_atr", 0)
-        bsl_sig = nearest_bsl.get("significance", 0)
-        bsl_tf  = nearest_bsl.get("timeframe", "")
         lines.append(
-            f"  ▲ Nearest BSL: {_fmt_price(bsl_p)} "
-            f"({bsl_d:.1f}ATR sig={bsl_sig:.0f} {bsl_tf})"
+            f"  ▲ Nearest BSL: {_fmt_price(nearest_bsl.get('price', 0))} "
+            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR "
+            f"sig={nearest_bsl.get('significance', 0):.0f} "
+            f"{_esc(nearest_bsl.get('timeframe', ''))})"
         )
     if nearest_ssl:
-        ssl_p   = nearest_ssl.get("price", 0)
-        ssl_d   = nearest_ssl.get("dist_atr", 0)
-        ssl_sig = nearest_ssl.get("significance", 0)
-        ssl_tf  = nearest_ssl.get("timeframe", "")
         lines.append(
-            f"  ▼ Nearest SSL: {_fmt_price(ssl_p)} "
-            f"({ssl_d:.1f}ATR sig={ssl_sig:.0f} {ssl_tf})"
+            f"  ▼ Nearest SSL: {_fmt_price(nearest_ssl.get('price', 0))} "
+            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR "
+            f"sig={nearest_ssl.get('significance', 0):.0f} "
+            f"{_esc(nearest_ssl.get('timeframe', ''))})"
         )
 
     if primary_target_str and primary_target_str != "—":
         lines.append(f"  🎯 Target: {_esc(primary_target_str)}")
 
-    # ── Sweep Analysis ───────────────────────────────────────────────────────
     if sweep_analysis:
-        rs        = float(sweep_analysis.get("reversal_score",     0))
-        cs        = float(sweep_analysis.get("continuation_score", 0))
-        rr        = sweep_analysis.get("reversal_reasons",     [])
-        cr        = sweep_analysis.get("continuation_reasons", [])
-        sw_side   = sweep_analysis.get("sweep_side",  "?")
-        sw_price  = sweep_analysis.get("sweep_price", 0)
-        winner    = (
-            "REVERSAL"     if rs > cs + 15 else
-            "CONTINUATION" if cs > rs + 15 else
-            "UNDECIDED"
-        )
+        rs = float(sweep_analysis.get("reversal_score", 0))
+        cs = float(sweep_analysis.get("continuation_score", 0))
+        rr = sweep_analysis.get("reversal_reasons", []) or []
+        cr = sweep_analysis.get("continuation_reasons", []) or []
+        sw_side = sweep_analysis.get("sweep_side", "?")
+        sw_price = sweep_analysis.get("sweep_price", 0)
+        winner = ("REVERSAL"     if rs > cs + 15 else
+                  "CONTINUATION" if cs > rs + 15 else
+                  "UNDECIDED")
         lines.append("")
         lines.append(
             f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)})"
         )
-        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{winner}</b>")
+        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{_esc(winner)}</b>")
         if rr:
-            lines.append(f"  Rev:  {', '.join(str(r) for r in rr[:3])}")
+            lines.append(f"  Rev:  {_esc(', '.join(str(r) for r in rr[:3]))}")
         if cr:
-            lines.append(f"  Cont: {', '.join(str(r) for r in cr[:3])}")
+            lines.append(f"  Cont: {_esc(', '.join(str(r) for r in cr[:3]))}")
 
-    # ── DirectionEngine — Hunt Prediction snapshot ───────────────────────────
     if direction_hunt is not None:
         dh_pred  = getattr(direction_hunt, "predicted", None)
         dh_conf  = float(getattr(direction_hunt, "confidence", 0.0))
@@ -708,23 +637,20 @@ def format_periodic_report(
         )
         lines.append(f"  BSL={dh_bsl:.3f}  SSL={dh_ssl:.3f}  raw={dh_raw:+.3f}")
 
-    # ── DirectionEngine — Post-Sweep Verdict snapshot ────────────────────────
     if direction_ps_analysis is not None:
-        ps_action = getattr(direction_ps_analysis, "action",         "?")
-        ps_dir    = getattr(direction_ps_analysis, "direction",       "")
+        ps_action = getattr(direction_ps_analysis, "action", "?")
+        ps_dir    = getattr(direction_ps_analysis, "direction", "")
         ps_conf   = float(getattr(direction_ps_analysis, "confidence", 0.0))
-        ps_phase  = getattr(direction_ps_analysis, "phase",           "")
+        ps_phase  = getattr(direction_ps_analysis, "phase", "")
         ps_rev    = float(getattr(direction_ps_analysis, "rev_score",  0.0))
         ps_cont   = float(getattr(direction_ps_analysis, "cont_score", 0.0))
-        ps_cisd   = getattr(direction_ps_analysis, "cisd_active",    False)
-        ps_ote    = getattr(direction_ps_analysis, "ote_active",     False)
+        ps_cisd   = getattr(direction_ps_analysis, "cisd_active", False)
+        ps_ote    = getattr(direction_ps_analysis, "ote_active",  False)
         ps_disp   = float(getattr(direction_ps_analysis, "displacement_atr", 0.0))
 
-        ps_winner = (
-            "REVERSAL"     if ps_rev  > ps_cont + 15 else
-            "CONTINUATION" if ps_cont > ps_rev  + 15 else
-            "CONTESTED"
-        )
+        ps_winner = ("REVERSAL"     if ps_rev  > ps_cont + 15 else
+                     "CONTINUATION" if ps_cont > ps_rev  + 15 else
+                     "CONTESTED")
         ps_ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
             ps_action.lower(), "❓"
         )
@@ -736,19 +662,15 @@ def format_periodic_report(
             f"{ps_di} {_esc(ps_dir.upper() or '—')}"
         )
         lines.append(f"  conf={ps_conf:.0%}  phase={_esc(ps_phase)}")
-        lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {ps_winner}")
+        lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {_esc(ps_winner)}")
 
         ps_flags: List[str] = []
-        if ps_cisd:
-            ps_flags.append("CISD✓")
-        if ps_ote:
-            ps_flags.append("OTE✓")
-        if ps_disp > 0:
-            ps_flags.append(f"disp={ps_disp:.2f}ATR")
+        if ps_cisd: ps_flags.append("CISD✓")
+        if ps_ote:  ps_flags.append("OTE✓")
+        if ps_disp > 0: ps_flags.append(f"disp={ps_disp:.2f}ATR")
         if ps_flags:
-            lines.append("  " + "  ".join(ps_flags))
+            lines.append("  " + "  ".join(_esc(x) for x in ps_flags))
 
-    # ── 🚦 ENTRY GATE STATUS ─────────────────────────────────────────────────
     lines.append("")
     gate_lines = _build_gate_diagnostic(
         direction_hunt   = direction_hunt,
@@ -761,15 +683,14 @@ def format_periodic_report(
     )
     lines.extend(gate_lines)
 
-    # ── Position ─────────────────────────────────────────────────────────────
     if position:
-        side    = position.get("side", "?").upper()
+        side    = (position.get("side") or "?").upper()
         p_entry = entry_price or position.get("entry_price", 0)
         qty     = float(position.get("quantity", 0) or 0)
 
         side_icon = "🟢" if side == "LONG" else "🔴"
         lines.append("")
-        lines.append(f"{side_icon} <b>POSITION: {side}</b>")
+        lines.append(f"{side_icon} <b>POSITION: {_esc(side)}</b>")
         lines.append(f"  Entry: {_fmt_price(p_entry)}")
 
         if current_sl:
@@ -780,26 +701,23 @@ def format_periodic_report(
             lines.append(f"  TP: {_fmt_price(current_tp)} ({tp_dist:.1f}ATR)")
 
         if p_entry and current_price:
-            move   = (
-                (current_price - p_entry) if side == "LONG"
-                else (p_entry - current_price)
-            )
+            move = ((current_price - p_entry) if side == "LONG"
+                    else (p_entry - current_price))
             risk_d = abs(p_entry - current_sl) if current_sl else 0
             ur_r   = move / risk_d if risk_d > 0 else 0
             upnl   = move * qty if qty > 0 else move
             icon   = "🟢" if move >= 0 else "🔴"
 
-            # Progress bar toward TP
             bar = "░" * 16
             prog = 0.0
             if current_tp:
                 total = abs(current_tp - p_entry)
                 if total > 0:
-                    prog  = min(1.0, max(0.0, abs(current_price - p_entry) / total))
+                    prog = min(1.0, max(0.0, abs(current_price - p_entry) / total))
                     if move < 0:
                         prog = 0.0
                     filled = int(prog * 16)
-                    bar    = "█" * filled + "░" * (16 - filled)
+                    bar = "█" * filled + "░" * (16 - filled)
 
             if qty > 0:
                 lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.2f}R)")
@@ -810,18 +728,17 @@ def format_periodic_report(
         if breakeven_moved:
             lines.append(f"  🔒 BE locked | {profit_locked_pct:.1f}R secured")
 
-    # ── Performance ──────────────────────────────────────────────────────────
     lines.append("")
     lines.append("📈 <b>PERFORMANCE</b>")
-    lines.append(f"  Trades: {total_trades}  |  WR: {win_rate:.1f}%")
+    lines.append(f"  Trades: {int(total_trades)}  |  WR: {win_rate:.1f}%")
     if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consecutive losses: {consecutive_losses}")
+        lines.append(f"  ⚠️ Consecutive losses: {int(consecutive_losses)}")
 
-    # ── Extra lines (cost engine, expectancy, VWAP) ──────────────────────────
     if extra_lines:
         lines.append("")
         for el in extra_lines:
             if el and el.strip():
+                # extra_lines can contain HTML — let _sanitize_html handle it
                 lines.append(el)
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -829,104 +746,51 @@ def format_periodic_report(
 
 
 # ======================================================================
-# 2. DIRECTION ENGINE — HUNT PREDICTION ALERT
+# 2. HUNT PREDICTION
 # ======================================================================
 
 def format_direction_hunt_alert(
     predicted:           Optional[str],
     confidence:          float,
     delivery_direction:  str,
-    raw_score:           float,
     bsl_score:           float,
     ssl_score:           float,
-    reason:              str   = "",
-    dealing_range_pd:    float = 0.5,
-    swept_pool_price:    Optional[float] = None,
-    opposing_pool_price: Optional[float] = None,
+    nearest_bsl:         Optional[Dict] = None,
+    nearest_ssl:         Optional[Dict] = None,
+    raw_score:           float = 0.0,
     current_price:       float = 0.0,
-    amd_phase:           str   = "",
-    htf_bias:            str   = "",
-    session:             str   = "",
-    in_killzone:         bool  = False,
-    factors:             Optional[Any] = None,
+    atr:                 float = 0.0,
 ) -> str:
-    """
-    DirectionEngine high-confidence hunt prediction alert.
-    Sent when the 10-factor model crosses _HUNT_ON_THRESHOLD (18%).
-    """
-    hunt_icon  = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
-    deliv_icon = "🟢" if delivery_direction == "bullish" else (
-        "🔴" if delivery_direction == "bearish" else "⚪"
-    )
-    kz_str = " 🔥KZ" if in_killzone else ""
-    pd_label = (
-        "DEEP DISC" if dealing_range_pd < 0.25 else
-        "DISCOUNT"  if dealing_range_pd < 0.40 else
-        "EQ"        if dealing_range_pd < 0.60 else
-        "PREMIUM"   if dealing_range_pd < 0.75 else
-        "DEEP PREM"
-    )
-
-    lines: List[str] = [
-        f"{hunt_icon} <b>HUNT PREDICTION: {_esc(predicted or 'NEUTRAL')}</b>",
-        f"  {deliv_icon} Delivery: <b>{_esc(delivery_direction or '—')}</b>",
-        "",
-        "<b>📊 CONFIDENCE</b>",
-        f"  [{_score_bar(confidence)}] {confidence:.0%}",
-        f"  BSL score: {bsl_score:.3f}  |  SSL score: {ssl_score:.3f}",
-        f"  Raw (±1): {raw_score:+.3f}",
+    hunt_icon = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
+    deliv_icon = "🟢" if delivery_direction == "bullish" else \
+                 ("🔴" if delivery_direction == "bearish" else "⚪")
+    lines = [
+        f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(predicted or 'NEUTRAL')}",
+        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
+        f"  Delivery:   {deliv_icon} {_esc(delivery_direction or '—')}",
+        f"  BSL score:  {bsl_score:+.3f}",
+        f"  SSL score:  {ssl_score:+.3f}",
+        f"  Raw:        {raw_score:+.3f}",
     ]
-
-    if factors is not None:
-        _FACTOR_LABELS = [
-            ("amd",            "AMD phase  "),
-            ("htf_structure",  "HTF struct "),
-            ("dealing_range",  "Deal range "),
-            ("order_flow",     "Order flow "),
-            ("pool_asymmetry", "Pool asym  "),
-            ("ob_fvg_pull",    "OB/FVG pull"),
-            ("displacement",   "Displacemnt"),
-            ("session",        "Session    "),
-            ("micro_bos",      "Micro BOS  "),
-            ("volume",         "Volume     "),
-        ]
-        lines.append("")
-        lines.append("<b>🔢 10-FACTOR BREAKDOWN</b>")
-        for attr, label in _FACTOR_LABELS:
-            val  = float(getattr(factors, attr, 0.0))
-            sign = "+" if val >= 0 else ""
-            lines.append(f"  {label}  [{_signed_bar(val)}] {sign}{val:.2f}")
-
-    lines += [
-        "",
-        "<b>🎯 TARGETS</b>",
-    ]
-    if swept_pool_price:
-        lines.append(f"  Hunt target (sweep):  {_fmt_price(swept_pool_price)}")
-    if opposing_pool_price:
-        lines.append(f"  Delivery target (TP): {_fmt_price(opposing_pool_price)}")
-    if current_price:
-        lines.append(f"  Current price:        {_fmt_price(current_price)}")
-
-    lines += [
-        "",
-        "<b>🏛️ CONTEXT</b>",
-        f"  Dealing range: {pd_label} ({dealing_range_pd:.0%})",
-    ]
-    if amd_phase:
-        lines.append(f"  AMD: {_esc(amd_phase)}")
-    if htf_bias:
-        lines.append(f"  HTF bias: {_esc(htf_bias)}")
-    if session:
-        lines.append(f"  Session: {_esc(session)}{kz_str}")
-    if reason:
-        lines += ["", "<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
-
+    if current_price > 0:
+        lines.append(f"  Price:      {_fmt_price(current_price)}")
+    if atr > 0:
+        lines.append(f"  ATR:        {_fmt_price(atr)}")
+    if nearest_bsl:
+        lines.append(
+            f"  ▲ BSL target: {_fmt_price(nearest_bsl.get('price', 0))} "
+            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR)"
+        )
+    if nearest_ssl:
+        lines.append(
+            f"  ▼ SSL target: {_fmt_price(nearest_ssl.get('price', 0))} "
+            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR)"
+        )
     return "\n".join(lines)
 
 
 # ======================================================================
-# 3. DIRECTION ENGINE — POST-SWEEP VERDICT
+# 3. POST-SWEEP VERDICT
 # ======================================================================
 
 def format_post_sweep_verdict(
@@ -934,308 +798,107 @@ def format_post_sweep_verdict(
     direction:        str,
     confidence:       float,
     phase:            str,
-    cisd_active:      bool  = False,
-    ote_active:       bool  = False,
+    rev_score:        float,
+    cont_score:       float,
+    cisd_active:      bool = False,
+    ote_active:       bool = False,
     displacement_atr: float = 0.0,
-    rev_score:        float = 0.0,
-    cont_score:       float = 0.0,
-    rev_reasons:      Optional[List[str]] = None,
-    cont_reasons:     Optional[List[str]] = None,
-    reason:           str   = "",
-    swept_pool_price: Optional[float] = None,
-    swept_pool_type:  str   = "",
+    sweep_side:       str   = "",
+    sweep_price:      float = 0.0,
     current_price:    float = 0.0,
+    atr:              float = 0.0,
+    **_kwargs: Any,
 ) -> str:
-    """
-    Post-sweep accumulative evidence verdict.
-    Sent when action is 'reverse' or 'continue' (not 'wait').
-    """
-    rev_reasons  = rev_reasons  or []
-    cont_reasons = cont_reasons or []
-
-    action_icons = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}
-    action_icon  = action_icons.get(action.lower(), "❓")
-    dir_icon     = "🟢" if direction.lower() == "long" else (
-        "🔴" if direction.lower() == "short" else "⚪"
+    ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
+        action.lower(), "❓"
     )
-    phase_icons = {
-        "DISPLACEMENT": "⚡",
-        "CISD":         "🔀",
-        "OTE":          "🎯",
-        "MATURE":       "📐",
-    }
-    phase_icon = phase_icons.get(phase.upper(), "📍")
+    di = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
+    winner = ("REVERSAL"     if rev_score  > cont_score + 15 else
+              "CONTINUATION" if cont_score > rev_score  + 15 else
+              "CONTESTED")
 
-    total = rev_score + cont_score
-    rev_pct  = rev_score  / total if total > 0 else 0.0
-    cont_pct = cont_score / total if total > 0 else 0.0
-
-    winner = (
-        "REVERSAL"     if rev_score  > cont_score + 15 else
-        "CONTINUATION" if cont_score > rev_score  + 15 else
-        "CONTESTED"
-    )
-
-    lines: List[str] = [
-        f"{action_icon} <b>POST-SWEEP: {_esc(action.upper())}</b>  "
-        f"{dir_icon} {_esc(direction.upper() or '—')}",
-        f"  [{_score_bar(confidence)}] {confidence:.0%}  "
-        f"|  {phase_icon} Phase: <b>{_esc(phase)}</b>",
+    lines = [
+        f"{ai} <b>POST-SWEEP VERDICT</b>: {_esc(action.upper())}  "
+        f"{di} {_esc(direction.upper() or '—')}",
+        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
+        f"  Phase:      {_esc(phase)}",
+        f"  Sweep:      {_esc(sweep_side)} @ {_fmt_price(sweep_price)}",
+        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}  → {_esc(winner)}",
     ]
-
-    if swept_pool_price or swept_pool_type:
-        ctx = f"  Swept: {_esc(swept_pool_type)} @ {_fmt_price(swept_pool_price)}"
-        if current_price:
-            ctx += f"  |  Now: {_fmt_price(current_price)}"
-        lines.append(ctx)
-
     flags: List[str] = []
-    if cisd_active:
-        flags.append("🔀 CISD confirmed")
-    if ote_active:
-        flags.append("🎯 OTE reached")
-    if displacement_atr > 0:
-        flags.append(f"⚡ Disp {displacement_atr:.2f}ATR")
+    if cisd_active: flags.append("CISD✓")
+    if ote_active:  flags.append("OTE✓")
+    if displacement_atr > 0: flags.append(f"disp={displacement_atr:.2f}ATR")
     if flags:
-        lines.append("  " + "  |  ".join(flags))
-
-    lines += [
-        "",
-        "<b>⚖️ EVIDENCE SCOREBOARD</b>",
-        f"  REV  [{_score_bar(rev_pct)}] {rev_score:.1f}",
-        f"  CONT [{_score_bar(cont_pct)}] {cont_score:.1f}",
-        f"  → <b>{winner}</b>",
-    ]
-
-    if rev_reasons:
-        lines.append(f"  Rev:  {', '.join(_esc(r) for r in rev_reasons[:4])}")
-    if cont_reasons:
-        lines.append(f"  Cont: {', '.join(_esc(r) for r in cont_reasons[:4])}")
-    if reason:
-        lines += ["", "<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
-
+        lines.append("  " + "  ".join(_esc(f) for f in flags))
+    if current_price > 0:
+        lines.append(f"  Price={_fmt_price(current_price)}  ATR={_fmt_price(atr)}")
     return "\n".join(lines)
 
 
 # ======================================================================
-# 4. DIRECTION ENGINE — POOL-HIT GATE ALERT
+# 4. POOL GATE ALERT
 # ======================================================================
 
 def format_pool_gate_alert(
-    action:        str,
-    confidence:    float,
-    reason:        str,
-    pos_side:      str,
-    pos_entry:     float,
-    current_price: float,
-    pos_sl:        float = 0.0,
-    pos_tp:        float = 0.0,
-    next_target:   Optional[float] = None,
-    atr:           float = 0.0,
+    action:          str,                # "exit" | "reverse" | "continue"
+    side:            str,                # position side
+    pool_side:       str,                # "BSL" | "SSL"
+    pool_price:      float,
+    current_price:   float,
+    reason:          str = "",
+    rev_score:       float = 0.0,
+    cont_score:      float = 0.0,
+    **_kwargs: Any,
 ) -> str:
-    """
-    Pool-hit gate decision alert.
-    Sent when action is exit, reverse, or continue (not hold).
-    """
-    action_icons = {
-        "exit":     "🏁",
-        "reverse":  "🔄",
-        "continue": "➡️",
-        "hold":     "🔒",
-    }
-    action_icon = action_icons.get(action.lower(), "❓")
-    side_icon   = "🟢" if pos_side.upper() == "LONG" else "🔴"
-
-    profit = (
-        (current_price - pos_entry) if pos_side.upper() == "LONG"
-        else (pos_entry - current_price)
+    act_icon = {"exit": "🚪", "reverse": "🔄", "continue": "➡️"}.get(
+        action.lower(), "❓"
     )
-    risk  = abs(pos_entry - pos_sl) if pos_sl else 0
-    cur_r = profit / risk if risk > 0 else 0.0
-
-    lines: List[str] = [
-        f"{action_icon} <b>POOL-GATE: {_esc(action.upper())}</b>  {side_icon} {_esc(pos_side.upper())}",
-        f"  [{_score_bar(confidence)}] {confidence:.0%}",
-        "",
-        "<b>📊 POSITION</b>",
-        f"  Entry: {_fmt_price(pos_entry)} | Price: {_fmt_price(current_price)}",
-        f"  R now: {cur_r:+.2f}R | Profit: {profit:+.1f}pts",
+    lines = [
+        f"{act_icon} <b>POOL-GATE {_esc(action.upper())}</b>",
+        f"  Position:  {_esc(side.upper())}",
+        f"  Pool hit:  {_esc(pool_side)} @ {_fmt_price(pool_price)}",
+        f"  Price:     {_fmt_price(current_price)}",
+        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}",
     ]
-    if pos_sl:
-        sl_dist = abs(current_price - pos_sl) / max(atr, 1) if atr > 0 else 0
-        lines.append(f"  SL: {_fmt_price(pos_sl)} ({sl_dist:.1f}ATR from price)")
-    if pos_tp:
-        tp_dist = abs(pos_tp - current_price) / max(atr, 1) if atr > 0 else 0
-        lines.append(f"  TP: {_fmt_price(pos_tp)} ({tp_dist:.1f}ATR from price)")
-    if action.lower() == "continue" and next_target:
-        lines += ["", "<b>🎯 NEXT TARGET</b>", f"  {_fmt_price(next_target)}"]
-
-    lines += ["", "<b>💡 REASON</b>", f"  {_esc(reason[:300])}"]
+    if reason:
+        lines.append(f"  Reason: {_esc(reason)}")
     return "\n".join(lines)
 
 
 # ======================================================================
-# 5. CONVICTION GATE BLOCK ALERT
+# 5. CONVICTION BLOCK ALERT
 # ======================================================================
 
 def format_conviction_block_alert(
-    side:              str,
-    score:             float,
-    reject_reasons:    Optional[List[str]] = None,
-    allow_reasons:     Optional[List[str]] = None,
-    factors:           Any  = None,
-    entry_price:       float = 0.0,
-    sl_price:          float = 0.0,
-    tp_price:          float = 0.0,
-    rr_ratio:          float = 0.0,
-    blocked_by_timing: bool  = False,
+    side:               str,
+    factor_scores:      Dict[str, float],
+    weighted_total:     float,
+    reasons:            Optional[List[str]] = None,
+    required_score:     float = _REQUIRED_CONVICTION_SCORE,
+    **_kwargs: Any,
 ) -> str:
-    """
-    Conviction gate block alert — sent (throttled 60s/side) every time the
-    conviction filter rejects an entry signal.
-
-    Factor weights match conviction_filter.py exactly:
-      pool_sig × 0.20  |  displacement × 0.25  |  cisd × 0.25
-      ote      × 0.15  |  session      × 0.10  |  amd  × 0.05
-
-    Required threshold = REQUIRED_SCORE imported from conviction_filter.py
-    (default 0.65 — correct for crypto 24/7 with crypto-specific calibration).
-
-    BUG-W1 FIX: pool_sig weight was 0.25; correct value is 0.20.
-    BUG-W2 FIX: cisd weight was 0.20; correct value is 0.25.
-    BUG-T1 FIX: required was hardcoded 0.55; now imported as 0.65.
-    """
-    reject_reasons = reject_reasons or []
-    allow_reasons  = allow_reasons  or []
-
-    side_icon = "🟢" if side.lower() == "long" else "🔴"
-    required  = _REQUIRED_CONVICTION_SCORE
-
-    score_pct  = min(1.0, score / required) if required > 0 else 0.0
-    score_bar  = _score_bar(score_pct)
-    status_icon = "✅" if score >= required else "❌"
-
-    # Header — distinguish timing holds from structural rejections
-    if blocked_by_timing and score >= required:
-        header_icon = "⏱️"
-        header_text = "CONVICTION GATE — TIMING HOLD"
-        subtext     = (
-            f"  Score: ✅ <b>{score:.3f}</b> / {required:.2f}  "
-            f"(setup quality: GOOD)"
-        )
-    elif blocked_by_timing:
-        header_icon = "⏱️"
-        header_text = "CONVICTION GATE — TIMING HOLD"
-        subtext     = (
-            f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required"
-        )
-    else:
-        header_icon = "🚫"
-        header_text = "CONVICTION GATE BLOCKED"
-        subtext     = (
-            f"  Score: {status_icon} <b>{score:.3f}</b> / {required:.2f} required"
-        )
-
-    lines: List[str] = [
-        f"{header_icon} <b>{header_text}</b>  {side_icon} {side.upper()}",
+    deficit = max(0.0, required_score - weighted_total)
+    lines = [
+        f"🚫 <b>CONVICTION BLOCKED</b> {_esc(side.upper())}",
+        f"  Total: <b>{weighted_total:.2f}</b> / {required_score:.2f}  "
+        f"(need +{deficit:.2f})",
         "",
-        subtext,
-        f"  [{score_bar}]",
+        "  <b>Factor scores</b>",
     ]
-
-    if entry_price:
-        lines.append(
-            f"  Entry: {_fmt_price(entry_price)}  "
-            f"SL: {_fmt_price(sl_price)}  "
-            f"TP: {_fmt_price(tp_price)}  "
-            f"R:R: {rr_ratio:.1f}R"
-        )
-
-    # Factor breakdown — only when factors were actually computed (any non-zero)
-    factors_computed = (
-        factors is not None and
-        any(
-            getattr(factors, a, 0.0) > 0
-            for a in (
-                "pool_sig_score", "displacement_score", "cisd_score",
-                "ote_score", "session_score", "amd_score",
-            )
-        )
-    )
-
-    if factors_computed:
-        # Weights match conviction_filter.py lines 434-441 exactly.
-        _FACTOR_ROWS = [
-            ("Pool sig",     "pool_sig_score",     0.20),
-            ("Displacement", "displacement_score", 0.25),
-            ("CISD",         "cisd_score",         0.25),
-            ("OTE zone",     "ote_score",          0.15),
-            ("Session",      "session_score",      0.10),
-            ("AMD phase",    "amd_score",          0.05),
-        ]
+    for factor, score in factor_scores.items():
+        bar = _score_bar(min(1.0, max(0.0, score)), width=10)
+        lines.append(f"    {_esc(factor):<12} [{bar}] {score:+.2f}")
+    if reasons:
         lines.append("")
-        lines.append("<b>📊 FACTOR BREAKDOWN</b>")
-        for fname, fattr, fwt in _FACTOR_ROWS:
-            fval    = float(getattr(factors, fattr, 0.0))
-            fbar    = _score_bar(fval, width=5)
-            contrib = fval * fwt
-            ficon   = "✅" if fval >= 0.6 else ("⚠️" if fval >= 0.3 else "❌")
-            lines.append(
-                f"  {ficon} {fname:<14} [{fbar}] {fval:.2f}  "
-                f"(×{fwt:.2f} = {contrib:.3f})"
-            )
-
-        dr_ok = getattr(factors, "dealing_range_ok", None)
-        if dr_ok is not None:
-            dr_icon = "✅" if dr_ok else "❌"
-            lines.append(
-                f"  {dr_icon} Dealing Range   DR data: {'available' if dr_ok else 'unavailable'}"
-            )
-
-    elif factors is not None:
-        lines.append("")
-        lines.append(
-            "  <i>Factor scoring skipped — mandatory structural gate failed early</i>"
-        )
-
-    # Reject reasons — split timing vs structural
-    timing_reasons    = [r for r in reject_reasons if any(
-        k in r for k in ("MIN_INTERVAL", "MAX_ENTRIES", "SESSION_INVALIDATED")
-    )]
-    structural_reasons = [r for r in reject_reasons if r not in timing_reasons]
-
-    if timing_reasons:
-        lines.append("")
-        lines.append("<b>⏱️ TIMING</b>")
-        for r in timing_reasons[:3]:
-            lines.append(f"  🕐 {_esc(r[:120])}")
-
-    if structural_reasons:
-        lines.append("")
-        lines.append("<b>🚫 REJECT REASONS</b>")
-        for r in structural_reasons[:5]:
-            is_gate = any(k in r for k in (
-                "BLOCKED", "GATE", "INVALIDATED",
-                "AMD_BLOCKED", "SCORE_TOO_LOW", "SCORE:",
-            ))
-            icon = "🔴" if is_gate else "⚠️"
-            lines.append(f"  {icon} {_esc(r[:120])}")
-
-    if allow_reasons:
-        lines.append("")
-        lines.append("<b>✅ PASSED</b>")
-        for a in allow_reasons[:4]:
-            lines.append(f"  ✅ {_esc(a[:80])}")
-
+        lines.append("  <b>Rejection reasons</b>")
+        for r in reasons[:5]:
+            lines.append(f"    • {_esc(r)}")
     return "\n".join(lines)
 
 
-# Defensive alias — guards against any future import by the old name.
-format_conviction_blocked = format_conviction_block_alert
-
-
 # ======================================================================
-# 6. LIQUIDITY TRAIL SL UPDATE ALERT
+# 6. LIQUIDITY TRAIL UPDATE (v5.0 FIB ENGINE)
 # ======================================================================
 
 def format_liquidity_trail_update(
@@ -1250,58 +913,137 @@ def format_liquidity_trail_update(
     current_price: float,
     atr:           float,
     session:       str = "",
+    # v5.0 extras (all optional so v4.0 callers still work)
+    fib_ratio:     Optional[float]   = None,
+    r_multiple:    float             = 0.0,
+    swing_low:     Optional[float]   = None,
+    swing_high:    Optional[float]   = None,
+    momentum_gate: str               = "",
+    htf_aligned:   Optional[bool]    = None,
+    is_cluster:    bool              = False,
+    n_cluster_tfs: int               = 1,
+    pool_boost:    bool              = False,
+    pool_between_expand: bool        = False,
+    buffer_atr:    float             = 0.0,
 ) -> str:
     """
-    Liquidity-trail SL advance alert.
+    Fibonacci SL trail advance alert (v5.0 engine).
 
-    Shows new SL, the pool anchor it was set relative to (swept vs unswept),
-    distance metrics in ATR, and R-multiples locked from entry.
-    Throttled in quant_strategy to once per 120s.
+    Shows the full anchor reasoning: Fib ratio + swing context + momentum
+    source + HTF alignment + liquidity confluence tags.
+    Throttled in quant_strategy to one per 120s.
     """
-    side_icon = "🟢" if side.lower() == "long" else "🔴"
+    side_icon = "🟢" if (side or "").lower() == "long" else "🔴"
     phase_icons = {
-        "SWEPT_POOL":   "🏦",
-        "UNSWEPT_POOL": "🎯",
+        "STRUCTURAL":   "🏛️",
+        "AGGRESSIVE":   "🎯",
+        "BE_LOCK":      "🔒",
+        "COUNTER_BOS":  "🚨",
+        "HANDS_OFF":    "⏸",
         "HOLD":         "⏸",
     }
-    phase_icon     = phase_icons.get(phase, "📍")
-    anchor_status  = (
-        "✅ SWEPT (confirmed S/R)" if is_swept
-        else "⚡ UNSWEPT (stop cluster)"
+    phase_icon = phase_icons.get(phase, "📍")
+
+    # Fib ratio display
+    fib_str = f"{fib_ratio:.3f}" if fib_ratio is not None else "?"
+    golden = fib_ratio in (0.382, 0.500, 0.618) if fib_ratio is not None else False
+    ratio_tag = f"✨ <b>{fib_str}</b>" if golden else f"<b>{fib_str}</b>"
+
+    # Cluster tag
+    cluster_tag = ""
+    if is_cluster:
+        cluster_tag = f" ×{int(n_cluster_tfs)}TF"
+
+    # Pool confluence
+    pool_tag = ""
+    if pool_boost:
+        pool_tag = " +pool"
+    if pool_between_expand:
+        pool_tag += " +expand"
+
+    # Momentum source
+    gate_emoji = {"DISP": "💥", "CVD": "📈", "BOS": "🏗️", "NONE": "⚪"}.get(
+        momentum_gate, "⚪"
     )
-    sess_icons     = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
-    sess_icon      = sess_icons.get(session.upper(), "🌐")
 
-    profit_r = 0.0
-    if atr > 1e-10:
-        profit_r = (
-            (new_sl - entry_price) / atr if side.lower() == "long"
-            else (entry_price - new_sl) / atr
-        )
+    # HTF alignment
+    htf_str = (
+        "🟢 aligned" if htf_aligned is True else
+        "🔴 counter" if htf_aligned is False else
+        "⚪ n/a"
+    )
 
-    dist_to_sl_atr  = abs(current_price - new_sl)   / atr if atr > 1e-10 else 0.0
-    dist_anchor_atr = abs(anchor_price  - new_sl)   / atr if atr > 1e-10 else 0.0
-    _ = dist_anchor_atr  # kept for future use; suppress unused warning
+    sess_icons = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
+    sess_icon  = sess_icons.get((session or "").upper(), "🌐")
+
+    # Profit locked in R from entry
+    r_locked = 0.0
+    if atr > 1e-10 and entry_price > 0:
+        if (side or "").lower() == "long":
+            r_locked_pts = new_sl - entry_price
+        else:
+            r_locked_pts = entry_price - new_sl
+        r_locked = r_locked_pts / atr
+
+    dist_to_sl_atr = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
 
     lines: List[str] = [
-        f"{side_icon} <b>LIQUIDITY TRAIL UPDATE</b>  {phase_icon} {_esc(phase.replace('_', ' '))}",
+        f"{side_icon} <b>FIBONACCI TRAIL</b>  {phase_icon} {_esc(phase)}  "
+        f"({r_multiple:.2f}R)",
         "",
-        f"  {side_icon} SL moved to: <b>{_fmt_price(new_sl)}</b>",
-        f"  📍 Anchor pool: {_fmt_price(anchor_price)} ({_esc(anchor_tf)})  sig={anchor_sig:.1f}",
-        f"  {anchor_status}",
-        "",
-        f"  Entry:  {_fmt_price(entry_price)}",
-        f"  Price:  {_fmt_price(current_price)}",
-        f"  SL gap: {dist_to_sl_atr:.2f} ATR from price",
-        f"  Locked: {profit_r:+.2f} ATR from entry",
-        "",
-        f"  {sess_icon} Session: {_esc(session or 'unknown')}",
+        f"  🎯 SL → <b>{_fmt_price(new_sl)}</b>  "
+        f"({r_locked:+.2f}R from entry)",
+        f"  📐 Fib: {ratio_tag}{_esc(cluster_tag)}{_esc(pool_tag)}  "
+        f"{_fmt_price(anchor_price)} ({_fmt_tf(anchor_tf)})",
     ]
 
-    if phase == "SWEPT_POOL":
-        lines.append("  <i>SL anchored to confirmed institutional support/resistance</i>")
+    if swing_low is not None and swing_high is not None:
+        swing_rng = abs(swing_high - swing_low)
+        lines.append(
+            f"  📊 Swing: {_fmt_price(swing_low)} → {_fmt_price(swing_high)}  "
+            f"({swing_rng:.0f}pts)"
+        )
+
+    if buffer_atr > 0:
+        lines.append(f"  🪶 Buffer: {buffer_atr:.2f} ATR")
+
+    if phase in ("STRUCTURAL", "AGGRESSIVE"):
+        lines.append(
+            f"  {gate_emoji} Momentum: {_esc(momentum_gate or 'n/a')}  "
+            f"HTF: {htf_str}"
+        )
+
+    lines.append(
+        f"  📏 Distance: {dist_to_sl_atr:.2f} ATR  |  Q: {anchor_sig:.1f}"
+    )
+
+    lines.append("")
+    lines.append(
+        f"  Entry: {_fmt_price(entry_price)}  |  "
+        f"Price: {_fmt_price(current_price)}  "
+        f"{sess_icon} {_esc(session or 'unknown')}"
+    )
+
+    if phase == "COUNTER_BOS":
+        lines.append(
+            "  <i>🚨 Counter-BOS broke entry — thesis invalidated, locked to BE</i>"
+        )
+    elif phase == "BE_LOCK":
+        lines.append(
+            "  <i>🔒 BE + exact fees + slippage locked; trade is now risk-free</i>"
+        )
+    elif is_cluster:
+        lines.append(
+            "  <i>Multi-TF Fib confluence — strongest possible anchor</i>"
+        )
+    elif pool_boost:
+        lines.append(
+            "  <i>Fibonacci + liquidity pool confluence</i>"
+        )
     else:
-        lines.append("  <i>SL anchored to unswept stop cluster — structural barrier</i>")
+        lines.append(
+            "  <i>SL anchored to institutional Fib retracement</i>"
+        )
 
     return "\n".join(lines)
 

@@ -238,6 +238,22 @@ class RiskManager:
                 logger.error(f"No available balance: {available}")
                 return None
 
+            # ── BUG 3 FIX: commission reserve ─────────────────────────
+            # Delta rejects `insufficient_commission` when balance minus
+            # margin leaves less than the maker+taker round-trip fee.
+            # Reserve: 2× taker rate (worst case) × 1.15 safety margin.
+            _taker_rate = float(getattr(config, "COMMISSION_RATE", 0.00055))
+            _max_notional = available * float(config.LEVERAGE)
+            _fee_budget   = _max_notional * _taker_rate * 2.0 * 1.15
+            available_after_fees = max(0.0, available - _fee_budget)
+            if available_after_fees < config.MIN_MARGIN_PER_TRADE:
+                logger.error(
+                    f"Balance after fee reserve ${available_after_fees:.2f} < "
+                    f"MIN_MARGIN ${config.MIN_MARGIN_PER_TRADE:.2f} "
+                    f"(raw=${available:.2f} fee_reserve=${_fee_budget:.2f})"
+                )
+                return None
+
             # ── SL distance ───────────────────────────────────────────
             if side == "LONG":
                 price_distance = entry_price - stop_loss
@@ -262,20 +278,20 @@ class RiskManager:
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
 
-            # ── Step 1: Dollar risk budget ────────────────────────────
-            dollar_risk     = available * (config.RISK_PER_TRADE / 100)
+            # ── Step 1: Dollar risk budget (based on fee-adjusted balance) ─
+            dollar_risk     = available_after_fees * (config.RISK_PER_TRADE / 100)
             dollar_risk     = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
-            max_dollar_risk = available * (min(config.RISK_PER_TRADE * 3, 5.0) / 100)
+            max_dollar_risk = available_after_fees * (min(config.RISK_PER_TRADE * 3, 5.0) / 100)
             dollar_risk     = min(dollar_risk, max_dollar_risk)
 
             # ── Step 2: Risk-based notional + qty ─────────────────────
             notional      = dollar_risk / sl_pct
             position_size = notional / entry_price
 
-            # ── Step 3: Margin cap ────────────────────────────────────
+            # ── Step 3: Margin cap (uses fee-adjusted balance) ────────
             margin_required = position_size * entry_price / config.LEVERAGE
             max_margin = min(
-                available * (config.BALANCE_USAGE_PERCENTAGE / 100),
+                available_after_fees * (config.BALANCE_USAGE_PERCENTAGE / 100),
                 config.MAX_MARGIN_PER_TRADE
             )
             max_margin = max(max_margin, config.MIN_MARGIN_PER_TRADE)

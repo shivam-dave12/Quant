@@ -261,7 +261,7 @@ class TelegramBotController:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
             logger.error(f"Command error [{cmd}]: {e}", exc_info=True)
-            return f"❌ Error in {cmd}: {e}"
+            return f"❌ Error in {_esc(cmd)}: {_esc(e)}"
 
     # ================================================================
     # /help
@@ -270,35 +270,37 @@ class TelegramBotController:
     def _cmd_help(self) -> str:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏛️ <b>LIQUIDITY-FIRST BOT</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🏛️ <b>LIQUIDITY-FIRST BOT  v5.0</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Fibonacci trailing · Liquidity-pool entries · ICT structure</i>\n\n"
             "📊 <b>QUICK VIEW</b>\n"
-            "  /pnl — PnL snapshot (1 tap)\n"
-            "  /market — Price + bias + session\n"
-            "  /sl — SL/TP levels + distance\n"
-            "  /equity — Balance + unrealised\n\n"
-            "🧠 <b>ANALYSIS</b>\n"
-            "  /thinking — 5-layer decision stack\n"
-            "  /pools — BSL/SSL pool map\n"
-            "  /flow — Order flow (CVD, OB, tick)\n"
-            "  /structures — ICT OB/FVG/AMD\n\n"
-            "📈 <b>POSITION</b>\n"
-            "  /position — Full pos + trail state\n"
-            "  /trades — Recent history\n"
-            "  /stats — Win rate / attribution\n"
-            "  /learn — Post-trade analysis · Bayesian adaptive params\n"
-            "  /balance — Wallet balance\n"
-            "  /risk — Risk gate status\n\n"
+            "  /pnl — Snapshot: uPnL, realised, last trades\n"
+            "  /market — Price, ATR, AMD, MTF, flow, pools\n"
+            "  /sl — SL/TP distances, BE status, R-multiple\n"
+            "  /equity — Balance + unrealised + session return\n"
+            "  /risk — Gate status, daily limits, cooldown\n\n"
+            "🧠 <b>DECISION ANALYSIS</b>\n"
+            "  /thinking — 5-layer liquidity-first decision stack\n"
+            "  /pools — BSL/SSL pool map with priority scores\n"
+            "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
+            "  /structures — ICT OB/FVG/AMD secondary layer\n"
+            "  /huntstatus — Liquidity-hunt engine prediction\n\n"
+            "📈 <b>POSITION &amp; HISTORY</b>\n"
+            "  /position — Pos + Fibonacci trail state\n"
+            "  /trades — Last 10 trades with R, MFE, fees\n"
+            "  /stats — Win rate attribution by tier/reason\n"
+            "  /learn — Post-trade Bayesian adaptive params\n"
+            "  /balance — Wallet balance detail\n\n"
             "⚙️ <b>CONTROL</b>\n"
-            "  /start / /stop — Start/stop bot\n"
-            "  /pause / /resume — Pause/resume\n"
-            "  /trail [on|off|auto] — Trail mode\n"
-            "  /config — Show config\n"
-            "  /set &lt;key&gt; &lt;val&gt; — Adjust live\n"
-            "  /setexchange &lt;delta|cs&gt;\n\n"
+            "  /start · /stop — Start/stop bot\n"
+            "  /pause · /resume — Pause trading (keep monitoring)\n"
+            "  /trail [on|off|auto] — Trail mode override\n"
+            "  /config — Show active config values\n"
+            "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
+            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
             "🚨 <b>EMERGENCY</b>\n"
-            "  /killswitch — Close + cancel all\n"
-            "  /resetrisk [full] — Clear lockout\n"
+            "  /killswitch — Close positions + cancel all\n"
+            "  /resetrisk [full] — Clear risk lockout\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -1137,18 +1139,25 @@ class TelegramBotController:
         be_locked = ((side == "LONG"  and sl >= _be_price) or
                      (side == "SHORT" and sl <= _be_price and sl > 0))
 
-        # Trail phase
-        try:
-            trail_phase = _DynamicStructureTrail._phase(bos_cnt, be_locked, False, mfe_r)
-        except Exception:
-            trail_phase = 0
-        _phase_labels = {
-            0: "⬜ P0 — HANDS OFF  (BOS not yet confirmed)",
-            1: "🟡 P1 — BOS SWING TRAIL  (SL behind 5m swing)",
-            2: "🟠 P2 — CHoCH TIGHTEN  (SL pulled to CHoCH)",
-            3: "🟢 P3 — 15m STRUCTURE TRAIL  (tight to OB/swing)",
-        }
-        trail_phase_lbl = _phase_labels.get(trail_phase, f"Phase {trail_phase}")
+        # Trail phase — v5.0 Fibonacci engine phase labels (R-multiple driven).
+        # These MUST match the phase strings emitted by LiquidityTrailEngine:
+        #   PHASE_0_MAX_R=1.0  PHASE_1_MAX_R=2.0  PHASE_2_MAX_R=3.5  P3=3.5+
+        if mfe_r >= 3.5:
+            trail_phase_lbl = (
+                "🟢 AGGRESSIVE  (Phase 3, 3.5R+) — all-TF Fib, HTF-gated, tight buffers"
+            )
+        elif mfe_r >= 2.0:
+            trail_phase_lbl = (
+                "🟠 STRUCTURAL  (Phase 2, 2.0–3.5R) — 1H/15m Fib, wider buffers"
+            )
+        elif mfe_r >= 1.0:
+            trail_phase_lbl = (
+                "🟡 BE_LOCK  (Phase 1, 1.0–2.0R) — SL at BE + exact fees"
+            )
+        else:
+            trail_phase_lbl = (
+                "⬜ HANDS OFF  (Phase 0, <1.0R) — initial structural SL trusted"
+            )
 
         # Ratchet next milestone
         _ratchet_milestones = [0.50, 1.00, 1.50, 2.00, 2.50]
@@ -1252,7 +1261,10 @@ class TelegramBotController:
         if not strat or not rm:
             return "Components not ready."
 
-        history = getattr(strat, '_trade_history', [])
+        # BUG 1 FIX: _trade_history is a deque(maxlen=200), which does not
+        # support slice indexing.  Convert to list before slicing so that
+        # `history[-10:]` works the same as on a list.
+        history = list(getattr(strat, '_trade_history', []))
         lines   = ["<b>📋 Trade History</b>\n"]
 
         if history:
@@ -1354,7 +1366,8 @@ class TelegramBotController:
         if not strat:
             return "Strategy not ready."
 
-        history = getattr(strat, '_trade_history', [])
+        # BUG 1 FIX: _trade_history is a deque — convert for any slice operations
+        history = list(getattr(strat, '_trade_history', []))
         if len(history) < 3:
             return f"📊 Not enough trades yet ({len(history)} recorded — need ≥3)."
 
@@ -1561,15 +1574,34 @@ class TelegramBotController:
             dpnl     = getattr(rm, 'daily_pnl', 0.0)
             init_bal = getattr(rm, 'initial_balance', 0.0)
             dpct     = (dpnl / init_bal * 100.0 if init_bal > 1e-10 else 0.0)
+
+            # Commission reserve preview — helps diagnose Bug 3 before it bites
+            import config as _cfg
+            _lev   = int(getattr(_cfg, 'LEVERAGE', 30))
+            _rate  = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+            _max_notional = avail * _lev
+            _fee_reserve  = _max_notional * _rate * 2.0 * 1.15
+            _avail_after  = max(0.0, avail - _fee_reserve)
+            pnl_icon = "🟢" if dpnl >= 0 else "🔴"
+
             return (
-                f"<b>Wallet Balance</b>\n"
-                f"Available: <b>${avail:,.2f}</b> USDT\n"
-                f"Locked:    ${locked:,.2f} USDT\n"
-                f"Total:     ${total:,.2f} USDT\n\n"
-                f"Today's PnL: ${dpnl:+,.2f} ({dpct:+.2f}%)"
+                f"💰 <b>Wallet Balance</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Available:  <b>{_esc(f'${avail:,.2f}')}</b> USDT\n"
+                f"Locked:     {_esc(f'${locked:,.2f}')} USDT\n"
+                f"Total:      {_esc(f'${total:,.2f}')} USDT\n"
+                f"\n"
+                f"<b>Sizing Headroom</b>  (leverage {_lev}x)\n"
+                f"  Max notional:     {_esc(f'${_max_notional:,.0f}')}\n"
+                f"  Commission reserve: {_esc(f'${_fee_reserve:.2f}')}  "
+                f"<i>(2× taker × 1.15 safety)</i>\n"
+                f"  Sizeable balance: <b>{_esc(f'${_avail_after:,.2f}')}</b>\n"
+                f"\n"
+                f"{pnl_icon} Today's PnL: <b>{_esc(f'${dpnl:+,.2f}')}</b>  "
+                f"({dpct:+.2f}%)"
             )
         except Exception as e:
-            return f"Balance error: {e}"
+            return f"Balance error: {_esc(e)}"
 
     # ================================================================
     # /pause / /resume / /trail
@@ -1580,14 +1612,24 @@ class TelegramBotController:
         if not bot_instance: return "Bot not running."
         bot_instance.trading_enabled      = False
         bot_instance.trading_pause_reason = "Paused via Telegram"
-        return "⏸️ Trading PAUSED. Pool monitoring continues. Use /resume to re-enable."
+        return (
+            "⏸️ <b>Trading PAUSED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• No new entries will be taken\n"
+            "• Existing position (if any) is still managed (trail + SL/TP)\n"
+            "• Pool monitoring continues\n"
+            "• Send <code>/resume</code> to re-enable entries"
+        )
 
     def _cmd_resume(self) -> str:
         global bot_instance
         if not bot_instance: return "Bot not running."
         bot_instance.trading_enabled      = True
         bot_instance.trading_pause_reason = ""
-        return "▶️ Trading RESUMED."
+        return (
+            "▶️ <b>Trading RESUMED</b>\n"
+            "Entries re-enabled. Bot will evaluate signals on next tick."
+        )
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
@@ -1597,15 +1639,28 @@ class TelegramBotController:
         arg = (args or "").strip().lower()
         if arg in ("on", "enable", "1", "true", "yes"):
             strat.set_trail_override(True)
-            return "🔒 Trailing SL: FORCED ON (ICT structure only)"
+            return (
+                "🔒 <b>Trailing SL: FORCED ON</b>\n"
+                "Engine: Fibonacci v5.0 (sole trail)\n"
+                "Will advance SL per phase logic regardless of config flag."
+            )
         elif arg in ("off", "disable", "0", "false", "no"):
             strat.set_trail_override(False)
-            return "🔓 Trailing SL: FORCED OFF"
+            return (
+                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
+                "SL will remain at initial structural level.\n"
+                "Exit will be via TP fill, SL hit, or max-hold timeout."
+            )
         else:
             strat.set_trail_override(None)
             enabled = strat.get_trail_enabled()
-            return (f"🔄 Trailing SL: AUTO  "
-                    f"(config default = {'ON' if enabled else 'OFF'})")
+            default_txt = "ON" if enabled else "OFF"
+            return (
+                f"🔄 <b>Trailing SL: AUTO</b>\n"
+                f"Using config default: <b>{default_txt}</b>\n"
+                f"Engine: Fibonacci v5.0 (bar-close gated, momentum-confirmed)\n"
+                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
+            )
 
     # ================================================================
     # /config
@@ -1648,11 +1703,15 @@ class TelegramBotController:
             f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',2)}",
             f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
-            "<b>Trail</b>",
-            f"  Enabled:    {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
-            f"  BE (0→1):   {getattr(cfg,'QUANT_TRAIL_BE_R',0.3)}R",
-            f"  BOS (1→2):  {getattr(cfg,'QUANT_TRAIL_LOCK_R',0.8)}R",
-            f"  CHoCH(2→3): {getattr(cfg,'QUANT_TRAIL_AGGRESSIVE_R',1.5)}R",
+            "<b>Trail  (v5.0 Fibonacci — sole engine)</b>",
+            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
+            f"  Phase 0 (&lt;1.0R): HANDS OFF — structural SL trusted",
+            f"  Phase 1 (1.0–2.0R): BE_LOCK — entry + exact fees + slippage",
+            f"  Phase 2 (2.0–3.5R): FIB STRUCTURAL — 1H/15m swings",
+            f"  Phase 3 (3.5R+):    FIB AGGRESSIVE — all TFs, HTF-gated",
+            f"  Close confirm:  P2=2 closes, P3=1 close + displacement",
+            f"  Counter-BOS:    sovereign override → BE at any R",
+            f"  Commission RT:  {getattr(cfg,'COMMISSION_RATE',0.00055)*100:.3f}% taker (×2)",
         ]
         return "\n".join(lines)
 
@@ -1941,28 +2000,32 @@ class TelegramBotController:
 
         price   = dm.get_last_price()
         pos     = strat.get_position()
-        history = getattr(strat, '_trade_history', [])
+        # BUG 1 FIX: _trade_history is a deque — convert to list for slicing
+        history = list(getattr(strat, '_trade_history', []))
         total_t = getattr(strat, '_total_trades', 0)
         wins    = getattr(strat, '_winning_trades', 0)
+        losses  = total_t - wins
         wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
         total_pnl = getattr(strat, '_total_pnl', 0.0)
 
         pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+        lines = [
+            f"{pnl_icon} <b>PnL @ {_esc(f'${price:,.2f}')}</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
 
-        lines = [f"{pnl_icon} <b>PnL @ ${price:,.2f}</b>"]
-
-        # Unrealised PnL if in position
+        # ── Unrealised ──────────────────────────────────────────────
         if pos:
             p = strat._pos
-            side = p.side.upper()
-            entry = p.entry_price
+            side   = p.side.upper()
+            entry  = p.entry_price
             upnl_pts = (price - entry) if side == "LONG" else (entry - price)
-            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(entry - p.sl_price)
-            cur_r = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
-            mfe_r = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 \
+                        else abs(entry - p.sl_price)
+            cur_r  = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r  = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
             hold_m = (time.time() - p.entry_time) / 60.0
 
-            # v6.0: Margin-based unrealised PnL %
             _u_margin_pct = 0.0
             _u_margin_used = 0.0
             try:
@@ -1977,34 +2040,62 @@ class TelegramBotController:
                 pass
 
             u_icon = "🟢" if upnl_pts >= 0 else "🔴"
+            lines.append(f"{u_icon} <b>OPEN {_esc(side)}</b> @ {_esc(f'${entry:,.2f}')}")
             lines.append(
-                f"\n{u_icon} <b>{side}</b> @ ${entry:,.2f}"
-                f"\n  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)"
-                f"\n  Margin: <b>{_u_margin_pct:+.1f}%</b> on ${_u_margin_used:.2f}"
-                f"\n  MFE: {mfe_r:.2f}R | Hold: {hold_m:.0f}m"
-                f"\n  SL: ${p.sl_price:,.2f} | TP: ${p.tp_price:,.2f}"
+                f"  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)  "
+                f"MFE: {mfe_r:.2f}R"
+            )
+            lines.append(
+                f"  Margin: <b>{_u_margin_pct:+.1f}%</b> on "
+                f"{_esc(f'${_u_margin_used:.2f}')}"
+            )
+            lines.append(
+                f"  SL: {_esc(f'${p.sl_price:,.2f}')}  "
+                f"TP: {_esc(f'${p.tp_price:,.2f}')}  "
+                f"Hold: {hold_m:.0f}m"
+            )
+            lines.append("")
+
+        # ── Realised ────────────────────────────────────────────────
+        _margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history
+                        if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        _total_margin_pct = sum(_margin_pcts)
+        _margin_disp = f"  ({_total_margin_pct:+.1f}% margin)" if _margin_pcts else ""
+
+        lines.append(f"<b>Realised</b>:  {_esc(f'${total_pnl:+.4f}')}{_margin_disp}")
+        lines.append(
+            f"Trades: {total_t} | W:{wins} L:{losses} | WR: <b>{wr:.0f}%</b>"
+        )
+
+        # ── Expectancy ──────────────────────────────────────────────
+        if total_t >= 3:
+            win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
+            loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+            avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+            avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+            expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
+            exp_icon = "🟢" if expectancy > 0 else "🔴"
+            lines.append(
+                f"{exp_icon} Expectancy: <b>{_esc(f'${expectancy:+.2f}')}</b>/trade  "
+                f"(avgW {_esc(f'${avg_win:+.2f}')} avgL {_esc(f'${avg_loss:+.2f}')})"
             )
 
-        # Realised PnL
-        # v6.0: Show total margin % from trade history
-        _r_margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
-        _r_total_margin_pct = sum(_r_margin_pcts)
-        _margin_disp = f"  ({_r_total_margin_pct:+.1f}% margin)" if _r_margin_pcts else ""
-        lines.append(f"\n<b>Realised</b>: ${total_pnl:+.4f}{_margin_disp}")
-        lines.append(f"Trades: {total_t} | W:{wins} L:{total_t - wins} | WR: {wr:.0f}%")
-
-        # Last 3 trades
+        # ── Recent 3 trades ─────────────────────────────────────────
         if history:
-            lines.append("\n<b>Recent:</b>")
+            lines.append("")
+            lines.append("<b>Recent</b>:")
             for t in reversed(history[-3:]):
-                pnl = t.get('pnl', 0.0)
-                side = t.get('side', '?').upper()
+                pnl    = t.get('pnl', 0.0)
+                side   = (t.get('side') or '?').upper()
                 reason = t.get('reason', '?')
-                m_pct = t.get('margin_pnl_pct', 0.0)
-                icon = "✅" if t.get('is_win') else "❌"
-                m_tag = f" ({m_pct:+.1f}%)" if abs(m_pct) > 0.01 else ""
-                lines.append(f"  {icon} {side} ${pnl:+.4f}{m_tag} [{reason[:10]}]")
-
+                m_pct  = t.get('margin_pnl_pct', 0.0)
+                icon   = "✅" if t.get('is_win') else "❌"
+                m_tag  = f" ({m_pct:+.1f}%)" if abs(m_pct) > 0.01 else ""
+                lines.append(
+                    f"  {icon} {_esc(side)} "
+                    f"{_esc(f'${pnl:+.4f}')}{m_tag} "
+                    f"[{_esc(reason[:12])}]"
+                )
         return "\n".join(lines)
 
     # ================================================================
