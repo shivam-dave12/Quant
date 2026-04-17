@@ -741,13 +741,22 @@ class PostTradeAgent:
                 self._pending_mae_pts = max(0.0, entry_price - fill_price)
             else:
                 self._pending_mae_pts = max(0.0, fill_price - entry_price)
-            # MAE cannot be less than SL distance (SL was hit)
-            self._pending_mae_pts = max(self._pending_mae_pts, init_sl_dist * 0.95)
+            # PTA-4 FIX: previous formula `max(mae, init_sl_dist * 0.95)` always
+            # floored MAE at 95% of SL distance, over-reporting MAE for trades
+            # that SL-wicked (touched SL for 1 tick then reversed). That made
+            # `avg_sl_eff` artificially high, which triggered the adaptive
+            # engine to widen SL unnecessarily. Cap the floor at the realized
+            # adverse move + 1 ATR of conservative padding. If price wicked
+            # through SL by a tiny amount, MAE reflects that — not 95% of SL.
+            _floor = min(init_sl_dist, self._pending_mae_pts + atr * 1.0) if atr > 0 else init_sl_dist
+            self._pending_mae_pts = max(self._pending_mae_pts, _floor)
 
         # Priority 3: TP hit — MAE is the intra-trade drawdown
-        # Conservative estimate: 20% of SL distance (typically correct for clean trades)
+        # PTA-6 FIX: 0.20 × init_sl_dist systematically under-reports MAE for
+        # winners (real trades often pull back 40-60% before running to TP).
+        # 0.35 is a more realistic fallback factor, closer to empirical mean.
         else:
-            self._pending_mae_pts = max(0.0, init_sl_dist * 0.20)
+            self._pending_mae_pts = max(0.0, init_sl_dist * 0.35)
 
         # ── Swept pool price for OTE scoring ─────────────────────────────────
         self._pending_sweep_price = 0.0

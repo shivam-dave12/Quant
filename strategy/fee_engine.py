@@ -291,15 +291,19 @@ class ProfitFloorModel:
         if price <= 0:
             return float("inf")     # genuine bad data — hard-block always correct
         if atr <= 0:
-            # Bug-20 fix: returning inf here caused valid ICT entries to be
-            # silently rejected during ATR warmup (first ~14 candles after boot).
-            # The bot would confirm a signal through all structural gates, hit the
-            # fee floor check, get inf back, and silently drop the trade with no
-            # log entry. Strategy-level gates (min_qty, SL distance) still apply;
-            # bypassing the fee floor during warmup is safe — it re-activates the
-            # moment ATR > 0.
-            logger.debug("ProfitFloor: ATR=0 (engine warming up) — fee floor bypassed")
-            return 0.0
+            # FE-4 FIX: during ATR warmup (first ~14 candles after boot), return
+            # a conservative floor of 2 × rt_cost_price rather than 0.0. A zero
+            # floor allowed post-warmup TP recomputation to suddenly reject a
+            # setup that had just passed (same-tick decision race). 2× the
+            # round-trip cost is a safe, always-achievable minimum — a setup
+            # that cannot clear 2× fees is not worth taking even during warmup.
+            # Strategy-level gates (min_qty, SL distance) still apply.
+            _rt_price_warmup = total_rt_cost_bps / 10_000.0 * price
+            _warmup_floor    = 2.0 * _rt_price_warmup
+            logger.debug(
+                f"ProfitFloor: ATR=0 (engine warming up) — using conservative "
+                f"2×rt_cost floor = ${_warmup_floor:.2f}")
+            return _warmup_floor
 
         mult = self.compute_multiplier(
             atr_percentile, spread_bps, atr, price, signal_confidence
@@ -409,16 +413,14 @@ class MakerTakerDecision:
             # ── 3. Estimate fill probability ──────────────────────────────
             urgency_fill_prob = 1.0 - signal_urgency
 
+            # FE-5 FIX: remove the isinstance(list|tuple) filter — it rejected
+            # dict-format orderbook levels (Delta API) and silently produced
+            # relevant_depth=0. The _ob_qty helper already returns 0.0 for
+            # unrecognised shapes, so the sum is safe without the filter.
             if side == "long":
-                relevant_depth = sum(
-                    _ob_qty(b) for b in bids[:depth_levels]
-                    if isinstance(b, (list, tuple)) and len(b) >= 2
-                )
+                relevant_depth = sum(_ob_qty(b) for b in bids[:depth_levels])
             else:
-                relevant_depth = sum(
-                    _ob_qty(a) for a in asks[:depth_levels]
-                    if isinstance(a, (list, tuple)) and len(a) >= 2
-                )
+                relevant_depth = sum(_ob_qty(a) for a in asks[:depth_levels])
 
             if relevant_depth > 0:
                 size_fraction  = quantity / relevant_depth

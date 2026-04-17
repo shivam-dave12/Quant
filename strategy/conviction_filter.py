@@ -385,6 +385,7 @@ class ConvictionFilter:
         _raw_ote_score = self._score_ote(
             trade_side, entry_price, pool_price, price,
             sweep_wick_price=sweep_wick_price,
+            atr=atr,
         )
         factors.ote_score = _raw_ote_score
         _dr_mod_applied   = 0.0
@@ -689,8 +690,10 @@ class ConvictionFilter:
             # Boost: measured displacement already confirmed directional alignment
             return min(1.0, raw * 0.90 + 0.10)
 
-        # Check recent 5m candles for displacement bodies
-        if candles_5m and len(candles_5m) >= 4:
+        # CF-2 FIX: guard `>= 5` ensures the slice [-4:-1] always pulls
+        # 3 CLOSED candles. With `>= 4`, a short candles_5m deque could
+        # include a stale seed candle or the live forming bar.
+        if candles_5m and len(candles_5m) >= 5:
             closed = candles_5m[-4:-1]   # last 3 closed candles
             best_score = 0.0
             for c in closed:
@@ -789,6 +792,7 @@ class ConvictionFilter:
     def _score_ote(
         trade_side: str, entry_price: float, pool_price: float, price: float,
         sweep_wick_price: float = 0.0,
+        atr: float = 0.0,
     ) -> float:
         """
         Score OTE (Optimal Trade Entry) zone [0-1].
@@ -807,6 +811,12 @@ class ConvictionFilter:
         use it as the anchor of the displacement leg instead of pool_price. This
         correctly measures how much the market has retraced from the wick extreme,
         which is the actual OTE question for a reversal trade.
+
+        CF-5 FIX: divide-guard uses ATR-scaled threshold instead of 1e-3 points.
+        For BTC at $76k, 1e-3 is 0.001 points — effectively no guard. When the
+        displacement leg is truly meaningless (< 5% of ATR), return the neutral
+        fallback instead of dividing by near-zero and producing a bogus fib
+        (which then falls through all OTE zones to the penalty branch).
         """
         if pool_price <= 0 or entry_price <= 0 or price <= 0:
             return 0.40
@@ -822,7 +832,10 @@ class ConvictionFilter:
                 anchor_price = sweep_wick_price
 
         total_move = abs(price - anchor_price)
-        if total_move < 1e-3:
+        # CF-5 FIX: divide-guard scaled to ATR. If the displacement leg is less
+        # than 5% of ATR, the retracement metric is meaningless — return neutral.
+        _min_leg = max(atr * 0.05, 1e-3) if atr > 0 else 1e-3
+        if total_move < _min_leg:
             return 0.40
 
         if trade_side == "long":

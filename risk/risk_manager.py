@@ -279,9 +279,18 @@ class RiskManager:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
 
             # ── Step 1: Dollar risk budget (based on fee-adjusted balance) ─
-            dollar_risk     = available_after_fees * (config.RISK_PER_TRADE / 100)
+            # CFG-1 fix: RISK_PER_TRADE is now a FRACTION (0.006 = 0.6%) per
+            # config.py convention, aligned with quant_strategy._compute_quantity.
+            # Previously this divided by 100 treating the value as a percent,
+            # while quant_strategy used the raw value as a fraction — so the
+            # same 0.60 gave 0.6% here but 60% there, producing 100× over-sizing
+            # with the "required margin > available — scaling down" warnings.
+            # Now both consumers read the same fraction; the max-risk cap is
+            # also expressed as a fraction (5% absolute ceiling).
+            dollar_risk     = available_after_fees * config.RISK_PER_TRADE
             dollar_risk     = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
-            max_dollar_risk = available_after_fees * (min(config.RISK_PER_TRADE * 3, 5.0) / 100)
+            _max_risk_frac  = min(config.RISK_PER_TRADE * 3.0, 0.05)
+            max_dollar_risk = available_after_fees * _max_risk_frac
             dollar_risk     = min(dollar_risk, max_dollar_risk)
 
             # ── Step 2: Risk-based notional + qty ─────────────────────

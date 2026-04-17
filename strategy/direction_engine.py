@@ -424,9 +424,14 @@ class DirectionEngine:
           score < 0: SSL hunt more likely (price heading down to run sell stops)
           abs(score) < _HUNT_MIN_CONFIDENCE: uncertain → None
         """
+        # DE-2 FIX: Don't serve a cached NEUTRAL prediction — the inputs may
+        # have changed (new sweep, new DR, new flow). A cached NEUTRAL prevents
+        # the engine from ever committing a direction within the cache window.
+        # Only cache when we have an actual committed direction (predicted set).
         age_ms = now_ms - self._last_hunt_ms
         if (not force_refresh
                 and self._last_hunt is not None
+                and self._last_hunt.predicted is not None
                 and age_ms < _HUNT_CACHE_SEC * 1000):
             return self._last_hunt
 
@@ -910,7 +915,13 @@ class DirectionEngine:
 
         if self._committed_direction == "BSL":
             predicted          = "BSL"
-            delivery_direction = "bearish"
+            # DE-1 FIX (CRITICAL): BSL pools sit ABOVE current price.
+            # A BSL HUNT = price hunts stops ABOVE = price is going UP to hunt them.
+            # Therefore delivery_direction is BULLISH, not bearish.
+            # Previous value "bearish" inverted the entire downstream signal:
+            # 210/210 committed directions in the log had the wrong label, which
+            # notifier.py and telegram displays propagated unchanged.
+            delivery_direction = "bullish"
             # FIX-3: Use LiquidityMap pool prices when available
             swept_pool    = bsl_price
             opposing_pool = ssl_price
@@ -931,7 +942,10 @@ class DirectionEngine:
             )
         else:
             predicted          = "SSL"
-            delivery_direction = "bullish"
+            # DE-1 FIX (CRITICAL): SSL pools sit BELOW current price.
+            # An SSL HUNT = price hunts stops BELOW = price is going DOWN to hunt them.
+            # Therefore delivery_direction is BEARISH, not bullish.
+            delivery_direction = "bearish"
             swept_pool    = ssl_price
             opposing_pool = bsl_price
             if liq_snapshot is not None and liq_snapshot.ssl_pools:

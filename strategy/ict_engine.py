@@ -561,7 +561,12 @@ class ICTEngine:
         self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=250)
         # Liquidity pools: 6 TFs × many swing points, need room for HTF pools
         self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=200)
-        self._registered_sweeps: Deque[Tuple] = deque(maxlen=500)
+        # ICT-3 FIX: maxlen 500 → 2000. During extended warmup processing
+        # (1000+ historical candles), 500 registered sweeps can evict within
+        # the same session, allowing a re-registered stale sweep to corrupt
+        # _select_best_sweep with a stale timestamp. 2000 gives ample headroom
+        # for warmup + normal session load.
+        self._registered_sweeps: Deque[Tuple] = deque(maxlen=2000)
         # Advanced PD array types — doubled to accommodate HTF structures
         self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=60)
         self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=60)
@@ -936,7 +941,12 @@ class ICTEngine:
 
         highs: List[Tuple[int, float]] = []
         lows:  List[Tuple[int, float]] = []
-        for i in range(2, len(recent) - 2):
+        # ICT-1 FIX: the previous `range(2, len(recent) - 2)` allowed i to reach
+        # len(recent) - 3, whose forward neighbour i+2 is len(recent) - 1 — the
+        # LIVE forming candle. A confirmed fractal must only use fully closed
+        # bars on both sides. Shrinking the upper bound excludes the live candle
+        # from any fractal check.
+        for i in range(2, len(recent) - 3):
             h = float(recent[i]['h'])
             l = float(recent[i]['l'])
             # All four neighbours must be strictly greater/less.
@@ -1069,15 +1079,20 @@ class ICTEngine:
         A low-quality minor SSL swept 5 minutes ago would override a
         high-conviction BSL swept 40 minutes ago that still has active delivery.
 
-        Selection criteria (within 1.5× distribution window):
-          freshness    × 0.40  — recent sweeps are more likely still in delivery
-          displacement × 0.35  — institutional confirmation of directional intent
-          wick_rejection × 0.15 — price rejected the swept level (conviction close)
-          touch_count  × 0.10  — more touches = deeper stop cluster = stronger magnet
+        Selection criteria (within AMD_DISTRIB_WINDOW_MS = 90 min):
+          freshness    × 0.60  — recent sweeps far more likely to be the regime driver
+          displacement × 0.25  — institutional confirmation of directional intent
+          wick_rejection × 0.10 — price rejected the swept level (conviction close)
+          touch_count  × 0.05  — more touches = deeper stop cluster = stronger magnet
+
+        ICT-8 FIX: window narrowed from 135min (1.5× distrib) to 90min. A
+        90-minute-old high-quality sweep should not override a 5-minute-old
+        low-quality sweep that represents the CURRENT regime. Freshness weight
+        raised from 0.40 to 0.60 to further favour recent sweeps.
 
         Falls back to most-recent if all candidates are outside the window.
         """
-        window_ms = self.AMD_DISTRIB_WINDOW_MS * 1.5
+        window_ms = self.AMD_DISTRIB_WINDOW_MS   # 90 min — was 1.5× = 135 min
         candidates = [p for p in swept
                       if (now_ms - p.sweep_timestamp) < window_ms]
         if not candidates:
@@ -1087,18 +1102,15 @@ class ICTEngine:
         def _sweep_quality(p: 'LiquidityLevel') -> float:
             age_ms    = now_ms - p.sweep_timestamp
             freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
-            q = freshness * 0.40
+            q = freshness * 0.60   # ICT-8: raised from 0.40
             # v3.0: Use continuous displacement_score instead of binary flag.
-            # A sweep with disp_score=0.35 gets 0.35×0.35=0.12 quality credit,
-            # not zero. This prevents high-wick sweeps from being completely
-            # ignored when they still carry meaningful institutional signal.
             _disp_score = getattr(p, 'displacement_score', 0.0)
             if _disp_score > 0:
-                q += _disp_score * 0.35
+                q += _disp_score * 0.25   # lowered from 0.35 to rebalance
             elif p.displacement_confirmed:
-                q += 0.35  # backward compat
-            if p.wick_rejection:         q += 0.15
-            q += min(0.10, getattr(p, 'touch_count', 1) * 0.03)
+                q += 0.25
+            if p.wick_rejection:         q += 0.10
+            q += min(0.05, getattr(p, 'touch_count', 1) * 0.015)
             return q
 
         return max(candidates, key=_sweep_quality)
@@ -1712,6 +1724,41 @@ class ICTEngine:
             if _key not in _kept_index:
                 kept.append(fresh)
                 _kept_index[_key] = True  # prevent double-add within the same fresh batch
+
+        # ICT-5 FIX: dedupe the final kept list at `tol` distance before
+        # committing to the deque. Without this, cluster drift across many
+        # update cycles can produce two pools at similar prices (both kept
+        # because their rounded keys differ by 1 dollar but they are within
+        # `tol` = $300). That inflates touch counts in downstream scoring.
+        # Algorithm: sort by price, keep first of each `tol`-tight cluster,
+        # transferring touch_count from dropped duplicates to the survivor.
+        if len(kept) > 1:
+            _deduped: List[LiquidityLevel] = []
+            # Process BSL and SSL separately — a BSL and SSL at the same price
+            # are distinct (different sides).
+            for _side in ("BSL", "SSL"):
+                _side_pools = sorted(
+                    [p for p in kept if p.level_type == _side],
+                    key=lambda p: p.price,
+                )
+                _last: Optional[LiquidityLevel] = None
+                for p in _side_pools:
+                    if _last is not None and abs(p.price - _last.price) <= tol:
+                        # Duplicate — merge touch_count into the survivor
+                        _last.touch_count = max(_last.touch_count, p.touch_count)
+                        # Prefer higher-TF label
+                        _TF_R2 = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
+                        if _TF_R2.get(p.timeframe, 1) > _TF_R2.get(_last.timeframe, 1):
+                            _last.timeframe = p.timeframe
+                        # Preserve swept status if either was swept
+                        if getattr(p, 'swept', False) and not getattr(_last, 'swept', False):
+                            _last.swept = True
+                            _last.sweep_timestamp = getattr(p, 'sweep_timestamp',
+                                                            _last.sweep_timestamp)
+                        continue
+                    _deduped.append(p)
+                    _last = p
+            kept = _deduped
 
         # ── Step 4: Replace the deque ──────────────────────────────────
         self.liquidity_pools.clear()

@@ -900,6 +900,12 @@ class EntryEngine:
         tf_quality = {'1m': 0.65, '5m': 0.55, '15m': 0.45, '4h': 0.35}
         tf = getattr(sweep.pool, 'timeframe', '5m')
         if sweep.quality < tf_quality.get(tf, 0.45):
+            # EE-4 FIX: register the rejected sweep in _processed_sweeps so
+            # _collect_sweeps() doesn't re-present it every 250ms for the full
+            # 60s detection window. 60s hold matches the detection window
+            # exactly — expires at the same time the sweep naturally ages out.
+            _reject_key = self._sweep_key(sweep)
+            self._processed_sweeps[_reject_key] = now + 60.0
             return
 
         # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
@@ -1417,9 +1423,14 @@ class EntryEngine:
         return None, None
 
     def _find_opposing_target(self, direction, snap, price, atr):
+        # EE-3 FIX: previously capped at _MAX_TARGET_ATR (8.0 ATR), which
+        # rejected HTF pools at 10-30 ATR that are the real institutional
+        # targets. The caller uses the returned pool for TP computation
+        # and for quality scoring — both benefit from HTF reach. Callers
+        # that need a proximity filter still apply their own distance gate.
         pools = snap.bsl_pools if direction == "long" else snap.ssl_pools
         reachable = [t for t in pools
-                     if t.distance_atr <= _MAX_TARGET_ATR
+                     if t.distance_atr <= _HTF_TP_MAX_ATR
                      and t.significance >= _MIN_POOL_SIGNIFICANCE * 0.5]
         if not reachable:
             return None
@@ -1463,19 +1474,34 @@ class EntryEngine:
         return sl
 
     def _push_sl_behind_pools(self, sl, side, price, atr):
-        """Push SL behind nearby liquidity pools."""
+        """Push SL behind nearby liquidity pools.
+
+        EE-6 FIX: cap the total push distance to _SL_PUSH_MAX_ATR from the
+        starting SL so a large `snap.bsl_pools` list with one outlier pool
+        far from price cannot shift SL to an unrealistic distance.
+        """
         snap = self._last_liq_snapshot
         if snap is None:
             return sl
+        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
+        sl_origin = sl
         buf = 0.25 * atr
         if side == "long":
             for t in snap.ssl_pools:
                 if sl < t.pool.price < price:
-                    sl = min(sl, t.pool.price - buf)
+                    candidate = t.pool.price - buf
+                    # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
+                    # below the original SL.
+                    if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = min(sl, candidate)
         else:
             for t in snap.bsl_pools:
                 if price < t.pool.price < sl:
-                    sl = max(sl, t.pool.price + buf)
+                    candidate = t.pool.price + buf
+                    if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = max(sl, candidate)
         return sl
 
     @staticmethod

@@ -44,7 +44,14 @@ LOT_STEP_SIZE            = 0.001
 REMAINDER_MIN_QTY        = 0.001
 
 # ── Risk management ──────────────────────────────────────────────────────────
-RISK_PER_TRADE           = 0.60
+# RISK_PER_TRADE: FRACTION of available balance risked per trade (NOT percent).
+#   0.006 = 0.6% risk per trade.
+#   Previous value 0.60 was interpreted as percent by risk_manager (÷100 = 0.006 → 0.6%)
+#   but as FRACTION by quant_strategy._compute_quantity (× direct = 0.60 → 60%).
+#   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
+#   triggering the "required margin > available — scaling down" warnings in logs.
+#   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
+RISK_PER_TRADE           = 0.006     # 0.6% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker (relaxed)
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -246,7 +253,11 @@ QUANT_MIN_CONFIRMING           = 2        # need only 2 confirming signals
 
 # ── Fee engine ────────────────────────────────────────────────────────────────
 FEE_SPREAD_HIST_MAXLEN      = 500
-FEE_SPREAD_DEFAULT_BPS      = 2.0
+# CFG-2 fix: 0.20 matches fee_engine code-level default (line 115 comment says
+# "Warmup default: 0.20 bps — realistic for BTC inverse perp (actual ~0.15 bps).
+# The old default of 2.0 bps was 13× too wide, causing fee-floor over-rejection
+# during the first ~5 seconds of each session.")
+FEE_SPREAD_DEFAULT_BPS      = 0.20
 FEE_SLIP_ALPHA              = 0.25
 FEE_SLIP_DEFAULT_BPS        = 1.5
 FEE_SLIP_MIN_BPS            = 0.5
@@ -255,7 +266,8 @@ FEE_FLOOR_MULT_HIGH         = 1.2
 FEE_FLOOR_MAX_ATR_MULT      = 2.0
 FEE_FLOOR_INFLECT           = 0.45
 FEE_FLOOR_STEEPNESS         = 6.0
-FEE_FLOOR_ABS_MIN_MULT      = 1.4
+# CFG-3 fix: fee_engine code comment (line 239) says "was 1.4" — lowered to 1.2
+FEE_FLOOR_ABS_MIN_MULT      = 1.2
 FEE_SPREAD_ATR_WARN         = 0.06
 FEE_SPREAD_PENALTY_K        = 4.0
 FEE_CONF_NEUTRAL            = 0.5

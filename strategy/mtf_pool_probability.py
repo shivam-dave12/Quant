@@ -389,7 +389,16 @@ class MTFPoolProbability:
         next 5m candle completes.
 
         Also reads ict_engine.liquidity_pools with timeframe in {"2m","5m"}.
+
+        MTF-4 FIX: dedupe against pools already present in bsl_out/ssl_out
+        (which were populated from liq_snapshot). Without dedup, the same
+        physical pool appears twice (once from LiquidityMap, once from ICT),
+        inflating grand total and mis-reporting confidence.
         """
+        # MTF-4: precompute existing prices for O(1) proximity lookup
+        _existing_bsl = [pp.price for pp in bsl_out]
+        _existing_ssl = [pp.price for pp in ssl_out]
+        _dedupe_tol_atr = 0.20      # treat within 0.2 ATR as same pool
         try:
             _all_pools = list(getattr(ict_engine, 'liquidity_pools', []))
             for p in _all_pools:
@@ -412,7 +421,11 @@ class MTFPoolProbability:
                 prob     = c_dist * c_tf * c_touch
 
                 lt = str(getattr(p, 'level_type', '')).upper()
+                # MTF-4: skip if a pool already exists within dedupe tolerance
+                _dedupe_px = atr * _dedupe_tol_atr
                 if 'BSL' in lt and pool_price > price:
+                    if any(abs(ep - pool_price) < _dedupe_px for ep in _existing_bsl):
+                        continue
                     bsl_out.append(PoolProbability(
                         price=pool_price, side="BSL", timeframe=tf,
                         distance_atr=round(dist_atr, 3),
@@ -420,7 +433,10 @@ class MTFPoolProbability:
                         components={"distance": round(c_dist, 4),
                                     "tf_base": c_tf, "touch": round(c_touch, 4)},
                     ))
+                    _existing_bsl.append(pool_price)
                 elif 'SSL' in lt and pool_price < price:
+                    if any(abs(ep - pool_price) < _dedupe_px for ep in _existing_ssl):
+                        continue
                     ssl_out.append(PoolProbability(
                         price=pool_price, side="SSL", timeframe=tf,
                         distance_atr=round(dist_atr, 3),
@@ -428,6 +444,7 @@ class MTFPoolProbability:
                         components={"distance": round(c_dist, 4),
                                     "tf_base": c_tf, "touch": round(c_touch, 4)},
                     ))
+                    _existing_ssl.append(pool_price)
         except Exception as e:
             logger.debug(f"MTF micro-pool extraction non-fatal: {e}")
 
