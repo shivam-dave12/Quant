@@ -6911,10 +6911,16 @@ class QuantStrategy:
 
     def _reconcile_apply(self, order_manager, data):
         ex_pos=data["ex_pos"]; open_orders=data.get("open_orders")
-        ex_size_raw=float(ex_pos.get("size",0.0))
-        ex_size=abs(ex_size_raw)
-        ex_side=str(ex_pos.get("side") or "").upper()
-        phase = self._pos.phase
+
+        # FIX (CRITICAL-6): prefer the adapter's BTC-unit fields. The Delta
+        # adapter now returns size in BTC (converted from contracts) and
+        # size_signed preserving direction. CoinSwitch adapter returns
+        # size in BTC natively. Either way, we want BTC here.
+        ex_size     = abs(float(ex_pos.get("size", 0.0)))
+        ex_size_raw = float(ex_pos.get("size_signed",
+                                       ex_pos.get("size", 0.0)))
+        ex_side     = str(ex_pos.get("side") or "").upper()
+        phase       = self._pos.phase
 
         # Delta bracket child order type names (covers both bracket and standalone):
         # "stop_market_order", "stop_loss_order", "STOP_MARKET", "STOP", "STOP_LOSS_MARKET"

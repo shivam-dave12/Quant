@@ -528,10 +528,41 @@ class _DeltaAdapter:
         return self.api.set_leverage(symbol=self.symbol, leverage=leverage)
 
     def normalise_position(self, raw) -> Optional[Dict]:
-        """Turn Delta position response into a canonical dict."""
-        # raw may be a list (from get_positions result) or a single dict
+        """
+        Turn Delta position response into a canonical dict.
+
+        CRITICAL UNIT-CONSISTENCY CONTRACT:
+          The strategy's PositionState stores quantity in BTC units
+          (`pos.quantity = 0.001` means 0.001 BTC). On entry, the strategy
+          writes `pos.quantity = qty_btc` directly, and this adapter's
+          place_order converts that to `size = round(qty_btc / _cv)` integer
+          contracts before sending to Delta.
+
+          RECONCILE PATH BUG (pre-fix):
+          Delta's position endpoint returns `size` in **contracts**, not BTC.
+          The previous code read `size = abs(float(pos["size"]))` and
+          returned it verbatim. When the reconcile path adopted an exchange
+          position, it wrote `pos.quantity = size_in_contracts` — a 1000×
+          unit mismatch for DELTA_CONTRACT_VALUE_BTC=0.001. A 0.001 BTC
+          position (= 1 contract) was then tracked internally as
+          `quantity = 1.0 BTC`, causing:
+            - trailing SL to attempt placing 1.0-BTC-equivalent SL orders
+              (1000× the real size; exchange rejects)
+            - PnL estimates off by 1000× (the log showed gross=$209.50 on
+              what was really a $0.21 exposure — see third-trade incident)
+            - position size logs showing 1.0 when actual was 0.001
+
+          FIX:
+          Convert contracts → BTC at the adapter boundary. All callers
+          downstream of normalise_position see size in BTC units, matching
+          the entry-side invariant.
+
+          Invariant established by this fix:
+            Every `pos.quantity` in the strategy is in BTC units.
+            Every `size` argument to adapter.place_order is in BTC units.
+            The adapter is the sole place that translates to/from contracts.
+        """
         if isinstance(raw, dict):
-            # Some Delta endpoints wrap in {result: [...]}
             inner = raw.get("result", raw)
             positions = inner if isinstance(inner, list) else [inner]
         elif isinstance(raw, list):
@@ -540,27 +571,43 @@ class _DeltaAdapter:
             positions = []
 
         delta_sym = getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper()
+        _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
+        if _cv <= 0:
+            _cv = 0.001
+
         for pos in positions:
             if not isinstance(pos, dict): continue
             sym = str(pos.get("product_symbol",
                      pos.get("symbol", ""))).upper()
-            # Match BTCUSD against BTCUSD or any ticker containing it
             if delta_sym not in sym and sym not in delta_sym: continue
-            size = 0.0
+
+            # Read raw contract size from Delta's response.
+            size_contracts_raw = 0.0
+            signed_contracts   = 0.0
             for f in ("size", "quantity", "net_size"):
                 v = pos.get(f)
                 if v is not None:
                     try:
-                        size = abs(float(v))
-                        if size > 0: break
+                        signed_contracts = float(v)
+                        size_contracts_raw = abs(signed_contracts)
+                        if size_contracts_raw > 0: break
                     except (ValueError, TypeError): pass
+
+            # CONVERT: contracts → BTC (strategy-layer unit).
+            size_btc        = size_contracts_raw * _cv
+            signed_size_btc = signed_contracts   * _cv
+
             side = None
-            if size > 0:
+            if size_btc > 0:
                 rs = str(pos.get("direction",
                          pos.get("side", ""))).upper()
-                # Delta uses "buy"/"sell" in direction field
                 side = "LONG" if rs in ("LONG", "BUY") else \
                        "SHORT" if rs in ("SHORT", "SELL") else None
+                # Secondary resolution from sign of contracts if string side absent
+                if side is None:
+                    if   signed_contracts > 0: side = "LONG"
+                    elif signed_contracts < 0: side = "SHORT"
+
             entry = 0.0
             for f in ("entry_price", "avg_entry_price"):
                 v = pos.get(f)
@@ -572,9 +619,18 @@ class _DeltaAdapter:
             upnl = 0.0
             try: upnl = float(pos.get("unrealized_pnl", 0))
             except (ValueError, TypeError): pass
-            return {"side": side, "size": size, "entry_price": entry,
-                    "unrealized_pnl": upnl, "raw": pos}
-        return {"side": None, "size": 0.0, "entry_price": 0.0,
+
+            return {
+                "side":           side,
+                "size":           size_btc,          # BTC units (converted)
+                "size_signed":    signed_size_btc,   # signed BTC (for side-disamb.)
+                "size_contracts": size_contracts_raw,# raw contracts (for diagnostics)
+                "entry_price":    entry,
+                "unrealized_pnl": upnl,
+                "raw":            pos,
+            }
+        return {"side": None, "size": 0.0, "size_signed": 0.0,
+                "size_contracts": 0.0, "entry_price": 0.0,
                 "unrealized_pnl": 0.0}
 
 

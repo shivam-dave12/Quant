@@ -275,8 +275,6 @@ class MarketAggregator:
                 "promoting secondary to primary for candle data."
             )
             # Swap: secondary becomes primary for candle reads
-            # (microstructure tap from old secondary still flows; we just
-            # redirect get_candles / get_last_price to the new primary)
             self._primary, self._secondary = self._secondary, self._primary
             self._secondary_alive = True
             # BUG-AGG-2 FIX: after promoting secondary to primary, re-register
@@ -293,6 +291,22 @@ class MarketAggregator:
                     logger.error(
                         f"Failed to re-register strategy on new primary: {_reg_e}"
                     )
+
+            # BUG-AGG-3 FIX: the OLD primary is now the NEW secondary, but its
+            # _on_trade is the untapped original. After the swap, secondary
+            # trades no longer flow into _merged_trades. Re-install the tap
+            # on the new secondary so dual-feed CVD resumes.
+            if self._secondary is not None:
+                try:
+                    self._install_secondary_trade_tap()
+                    logger.info(
+                        "✅ Trade tap re-installed on new secondary after failover"
+                    )
+                except Exception as _tap_e:
+                    logger.error(
+                        f"Failed to re-install trade tap on new secondary: {_tap_e}"
+                    )
+
             logger.info(
                 f"✅ Swapped: new primary={type(self._primary).__name__} "
                 f"new secondary={type(self._secondary).__name__}"
@@ -364,6 +378,25 @@ class MarketAggregator:
             return p_ob
 
         def merge_side(p_levels: list, s_levels: list, ascending: bool) -> list:
+            # BUG-AGG-4 FIX (orderbook merge price granularity):
+            # The original code rounded to 2 decimals via round(lvl[0], 2).
+            # For BTC at ~$77k, 2-decimal rounding is ~$0.01 — finer than
+            # either exchange's tick size (Delta ~$0.5, CoinSwitch ~$0.1).
+            # The effect was that levels at $77098.44 and $77098.45 became
+            # DIFFERENT keys even though neither exchange quotes at that
+            # granularity — creating phantom "walls" at fractional-tick
+            # prices that don't exist in reality. Imbalance/OFI computed
+            # on this merged book reads a distorted shape of liquidity.
+            #
+            # Fix: round to the coarsest tick size (max of both, from config).
+            # Levels at $77098.4 and $77098.5 on a $0.1 tick grid remain
+            # distinct; levels at $77098.44 and $77098.45 get correctly
+            # bucketed into $77098.5. This preserves real liquidity topology.
+            _tick = float(getattr(config, 'TICK_SIZE', 0.1))
+            if _tick <= 0:
+                _tick = 0.1
+            _inv_tick = 1.0 / _tick
+
             combined: Dict[float, float] = {}
             all_levels = (
                 _norm_levels(p_levels)[:self._ob_depth] +
@@ -371,8 +404,14 @@ class MarketAggregator:
             )
             for lvl in all_levels:
                 try:
-                    px  = round(lvl[0], 2)
-                    qty = lvl[1]
+                    # Snap to tick grid: round(price / tick) * tick
+                    px_raw = float(lvl[0])
+                    qty    = float(lvl[1])
+                    if px_raw <= 0 or qty < 0:
+                        continue
+                    px = round(round(px_raw * _inv_tick) * _tick,
+                               # preserve enough decimals for any reasonable tick
+                               6)
                     combined[px] = combined.get(px, 0.0) + qty
                 except Exception:
                     continue
