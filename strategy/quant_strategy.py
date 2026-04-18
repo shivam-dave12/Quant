@@ -5145,13 +5145,42 @@ class QuantStrategy:
                                 side                 = _es,
                                 quantity             = pos.quantity,
                                 new_trigger_price    = _be_tick,
+                                old_trigger_price    = pos.sl_price,
                             )
                             if _be_result is None:
                                 # replace_stop_loss returning None means SL already
                                 # fired — treat as a fill event and bail out.
                                 self._record_exchange_exit(None)
                                 return
-                            if isinstance(_be_result, dict) and "error" not in _be_result:
+                            if isinstance(_be_result, dict) and _be_result.get("error") == "UNPROTECTED":
+                                logger.critical(
+                                    "💀 POOL-GATE BE: SL replace UNPROTECTED — "
+                                    "emergency-flattening.")
+                                try:
+                                    if hasattr(order_manager, "emergency_flatten"):
+                                        order_manager.emergency_flatten(reason="pool_gate_be_unprotected")
+                                    else:
+                                        order_manager.place_market_order(
+                                            side=_es, quantity=pos.quantity, reduce_only=True)
+                                except Exception as _ef_e:
+                                    logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
+                                with self._lock:
+                                    if self._pos.phase == PositionPhase.ACTIVE:
+                                        self._pos.phase = PositionPhase.EXITING
+                                        self._exiting_since = time.time()
+                                return
+                            if isinstance(_be_result, dict) and _be_result.get("error") == "PLACE_FAILED_RESTORED":
+                                _r_oid = _be_result.get("restore_order_id")
+                                _r_trig = float(_be_result.get("restore_trigger", 0) or 0)
+                                with self._lock:
+                                    if _r_oid: pos.sl_order_id = _r_oid
+                                    if _r_trig > 0:
+                                        pos.sl_price = _r_trig
+                                        self.current_sl_price = _r_trig
+                                logger.warning(
+                                    f"⚠️ POOL-GATE BE: SL restored at ${_r_trig:,.2f} "
+                                    f"(requested ${_be_tick:,.2f}).")
+                            elif isinstance(_be_result, dict) and "error" not in _be_result:
                                 with self._lock:
                                     pos.sl_price           = _be_tick
                                     pos.sl_order_id        = (_be_result.get("order_id")
@@ -5587,13 +5616,68 @@ class QuantStrategy:
             side                 = _lt_side,
             quantity             = pos.quantity,
             new_trigger_price    = _new_liq_sl,
+            old_trigger_price    = pos.sl_price,
         )
         if _lt_result is None:
+            # replace_stop_loss returns None ONLY when it verified the SL
+            # order is a TRUE fill (not a self-cancellation ghost). Safe
+            # to record exchange exit.
             logger.warning("🚨 SL already fired during trail dispatch")
             self._record_exchange_exit(None)
             return True
         if isinstance(_lt_result, dict) and _lt_result.get("error"):
             err = _lt_result.get("error", "unknown")
+
+            # ── FIX (third-trade bug): UNPROTECTED means SL is GONE ───────────
+            # The cancel succeeded but the replace failed AND the restore
+            # failed — position is live on the exchange with no stop-loss.
+            # This is the exact state that blew up the third trade. The only
+            # institutionally-correct response is to flatten at market and
+            # let the reconcile path record the exit.
+            if err == "UNPROTECTED":
+                logger.critical(
+                    "💀 TRAIL: SL replace returned UNPROTECTED — "
+                    "position has no stop-loss on exchange. Emergency-flattening.")
+                send_telegram_message(
+                    "🚨 <b>UNPROTECTED POSITION</b>\n"
+                    "SL could not be moved or restored.\n"
+                    "Emergency-flattening at market.")
+                try:
+                    if hasattr(order_manager, "emergency_flatten"):
+                        order_manager.emergency_flatten(reason="trail_unprotected")
+                    else:
+                        _es = "sell" if pos.side == "long" else "buy"
+                        order_manager.place_market_order(
+                            side=_es, quantity=pos.quantity, reduce_only=True)
+                except Exception as _ef_e:
+                    logger.error(
+                        f"emergency_flatten raised: {_ef_e}", exc_info=True)
+                # Transition to EXITING; reconcile will book the real exit.
+                with self._lock:
+                    if self._pos.phase == PositionPhase.ACTIVE:
+                        self._pos.phase = PositionPhase.EXITING
+                        self._exiting_since = time.time()
+                return False
+
+            # Partial success: old SL cancelled, new one at requested trigger
+            # failed, but we successfully restored an SL at a fallback trigger.
+            # The trail did not move as intended — update our tracking to the
+            # restored trigger so we don't re-fire the same failing replace
+            # every tick, but do NOT mark the trail as advanced.
+            if err == "PLACE_FAILED_RESTORED":
+                _restore_oid = _lt_result.get("restore_order_id")
+                _restore_trig = float(_lt_result.get("restore_trigger", 0) or 0)
+                logger.warning(
+                    f"⚠️ Trail: SL restored at ${_restore_trig:,.2f} (not the "
+                    f"requested ${_new_liq_sl:,.1f}). Updating tracking.")
+                with self._lock:
+                    if _restore_oid:
+                        self._pos.sl_order_id = _restore_oid
+                    if _restore_trig > 0:
+                        self._pos.sl_price = _restore_trig
+                        self.current_sl_price = _restore_trig
+                return False
+
             logger.warning(f"FibTrail: SL replace failed ({err}) — keeping current SL")
             return False
 
@@ -5784,14 +5868,19 @@ class QuantStrategy:
             # If position is flat on exchange, we know SL or TP fired even if
             # individual order state queries failed.
             _try_position_fallback = False
+            _ex_still_open = False
+            _ex_pos_snapshot = None
             if self._om is not None:
                 try:
-                    _ex_pos = self._om.get_position()
+                    _ex_pos = self._om.get_position() if hasattr(self._om, "get_position") else self._om.get_open_position()
                     if _ex_pos is not None:
+                        _ex_pos_snapshot = _ex_pos
                         _ex_qty = abs(float(_ex_pos.get("size", _ex_pos.get("quantity", 0))))
                         if _ex_qty < 1e-10:
                             _try_position_fallback = True
                             logger.info("Position is FLAT on exchange — exit occurred, reconstructing")
+                        else:
+                            _ex_still_open = True
                 except Exception as _pos_e:
                     logger.debug(f"Position fallback check error: {_pos_e}")
 
@@ -5822,7 +5911,45 @@ class QuantStrategy:
                 self._finalise_exit()
                 return
 
-            # Truly unconfirmed after all retries — record zero PnL
+            # ── FIX (third-trade bug): exchange reports position STILL OPEN ────
+            # Previously the code recorded pnl=0 / set phase=FLAT here, while
+            # the exchange had an unprotected live position. That caused the
+            # reconcile to re-adopt the live position — and the ex_side parse
+            # bug flipped it to SHORT. NEVER record a phantom flat while the
+            # exchange shows an open position. Instead:
+            #   1. Release the _exit_completed claim so a future call can retry.
+            #   2. Trigger emergency_flatten to force the exchange into a
+            #      known-flat state via a reduce-only market order.
+            #   3. Leave phase = ACTIVE so the next _sync_position / reconcile
+            #      can book the real exit once the flatten settles.
+            if _ex_still_open:
+                logger.critical(
+                    "💀 EXIT UNCONFIRMED but exchange position is STILL OPEN — "
+                    "refusing to record phantom FLAT. Triggering emergency flatten.")
+                send_telegram_message(
+                    "🚨 <b>EXIT UNCONFIRMED + EXCHANGE STILL OPEN</b>\n"
+                    "Emergency-flattening to force a known-flat state.\n"
+                    f"Entry: ${pos.entry_price:,.2f} | Side: {pos.side.upper()}")
+                try:
+                    if hasattr(self._om, "emergency_flatten"):
+                        self._om.emergency_flatten(reason="exit_unconfirmed_still_open")
+                    else:
+                        # Fallback if older OM without the helper
+                        _es = "sell" if pos.side == "long" else "buy"
+                        self._om.place_market_order(
+                            side=_es, quantity=pos.quantity, reduce_only=True)
+                except Exception as _ef_e:
+                    logger.error(f"emergency flatten raised: {_ef_e}", exc_info=True)
+
+                # Release the exit claim so the NEXT reconcile can confirm the
+                # flatten's actual exit price.
+                with self._lock:
+                    self._exit_completed = False
+                # Do NOT call _record_pnl(0) and do NOT _finalise_exit.
+                return
+
+            # Truly unconfirmed AND exchange reports flat (or unreachable) —
+            # record zero PnL as the last-resort state-convergence.
             _sl_disp = str(pos.sl_order_id or "unknown")
             _tp_disp = str(pos.tp_order_id or "unknown")
             logger.warning(
@@ -6784,7 +6911,9 @@ class QuantStrategy:
 
     def _reconcile_apply(self, order_manager, data):
         ex_pos=data["ex_pos"]; open_orders=data.get("open_orders")
-        ex_size=float(ex_pos.get("size",0.0)); ex_side=str(ex_pos.get("side") or "").upper()
+        ex_size_raw=float(ex_pos.get("size",0.0))
+        ex_size=abs(ex_size_raw)
+        ex_side=str(ex_pos.get("side") or "").upper()
         phase = self._pos.phase
 
         # Delta bracket child order type names (covers both bracket and standalone):
@@ -6801,16 +6930,51 @@ class QuantStrategy:
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
             # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
-            # Adopting it with entry_price=0 produces tier=~800 in the trail engine
-            # (profit = current_price − 0 = ~70k), fires the chandelier, and then
-            # tries to place a duplicate SL that the exchange rejects with 400.
-            # The resulting None from replace_stop_loss was misread as "SL fired" →
-            # false FLAT → re-adoption loop. Reject and wait for the next cycle.
             if ex_entry < 1.0:
                 logger.warning(
                     f"Reconcile: skipping adoption of {ex_side} size={ex_size} "
                     f"— entry_price={ex_entry:.2f} not yet settled on exchange")
                 return
+
+            # ── FIX (third-trade bug): refuse ambiguous-side adoption ─────────
+            # The original code did `"long" if ex_side=="LONG" else "short"`,
+            # which silently produced SHORT whenever ex_side was anything other
+            # than the exact literal "LONG" — including empty string, missing
+            # key, or lowercase. In the third-trade incident the exchange
+            # returned an empty side on a genuinely-LONG position and the bot
+            # adopted it as SHORT, then tracked an inverted phantom for 27m.
+            #
+            # New policy: resolve side from TWO independent sources and refuse
+            # to adopt if they disagree or both are ambiguous.
+            #   Source 1: string side field ("LONG"/"SHORT")
+            #   Source 2: sign of raw size (positive = long, negative = short)
+            iside_from_str  = None
+            if ex_side == "LONG":
+                iside_from_str = "long"
+            elif ex_side == "SHORT":
+                iside_from_str = "short"
+
+            iside_from_size = None
+            if ex_size_raw > 0:
+                iside_from_size = "long"
+            elif ex_size_raw < 0:
+                iside_from_size = "short"
+
+            if iside_from_str and iside_from_size and iside_from_str != iside_from_size:
+                logger.error(
+                    f"🚨 Reconcile: side conflict — str={ex_side} signed_size={ex_size_raw} "
+                    f"— REFUSING adoption. Will retry on next reconcile cycle.")
+                return
+
+            iside = iside_from_str or iside_from_size
+            if iside is None:
+                logger.error(
+                    f"🚨 Reconcile: ambiguous side (str={ex_side!r}, "
+                    f"size={ex_size_raw}) — REFUSING adoption of size={ex_size} "
+                    f"at entry=${ex_entry:,.2f}. Will retry on next reconcile cycle.")
+                return
+            # ─────────────────────────────────────────────────────────────────
+
             sl_oid=tp_oid=None; sl_p=tp_p=0.0
 
             if open_orders:
@@ -6819,7 +6983,21 @@ class QuantStrategy:
                     trig=float(o.get("trigger_price") or (o.get("raw") or {}).get("stop_price") or 0)
                     if _is_sl(ot): sl_oid=o["order_id"]; sl_p=trig
                     elif _is_tp(ot): tp_oid=o["order_id"]; tp_p=trig
-            iside = "long" if ex_side=="LONG" else "short"
+
+            # Sanity check: SL must be on the protective side of entry for the
+            # adopted side. A long's SL is BELOW entry; a short's SL is ABOVE.
+            # If the orphan SL contradicts the adopted side, drop the SL oid
+            # and let a fresh one be placed rather than tracking a wrong-side SL.
+            if sl_oid and sl_p > 0:
+                _sl_ok = ((iside == "long"  and sl_p < ex_entry) or
+                          (iside == "short" and sl_p > ex_entry))
+                if not _sl_ok:
+                    logger.warning(
+                        f"⚠️ Reconcile: discovered SL @ ${sl_p:,.2f} is on the "
+                        f"WRONG side of {iside} entry ${ex_entry:,.2f} — "
+                        f"ignoring (was likely a prior trade's orphan).")
+                    sl_oid = None; sl_p = 0.0
+
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
                 tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=abs(ex_entry-sl_p) if sl_p>0 else 0.0,
@@ -6829,8 +7007,20 @@ class QuantStrategy:
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
             self._pnl_recorded_for = 0.0
-            logger.warning(f"⚡ RECONCILE: adopted {ex_side} @ ${ex_entry:,.2f}")
-            send_telegram_message(f"⚡ <b>POSITION ADOPTED</b>\nSide: {ex_side} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+            logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
+            send_telegram_message(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+
+            # ── FIX: if the adopted position has NO SL, this is an unprotected
+            # state inherited from a prior failure. Trigger emergency flatten
+            # rather than track a live unprotected position.
+            if sl_oid is None:
+                logger.critical(
+                    f"💀 Adopted {iside.upper()} has NO stop-loss on exchange — "
+                    f"emergency-flattening to prevent unbounded loss.")
+                try:
+                    order_manager.emergency_flatten(reason="adopted_unprotected")
+                except Exception as _ef_e:
+                    logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
             return
         if phase==PositionPhase.ACTIVE and ex_size<QCfg.MIN_QTY():
             logger.info("📡 Reconcile: exchange FLAT → TP/SL fired")
@@ -6841,10 +7031,25 @@ class QuantStrategy:
                     ot=(o.get("type") or (o.get("raw") or {}).get("order_type") or "").upper().replace(" ","_").replace("-","_")
                     trig=float(o.get("trigger_price") or (o.get("raw") or {}).get("stop_price") or 0)
                     if not self._pos.sl_order_id and _is_sl(ot):
+                        # Side-sanity check also on recovery path
+                        _side = self._pos.side
+                        _ep = self._pos.entry_price or 0.0
+                        _ok = (_ep <= 0) or (
+                            (_side == "long"  and trig < _ep) or
+                            (_side == "short" and trig > _ep))
+                        if not _ok:
+                            logger.warning(
+                                f"Reconcile: recovered SL @ ${trig:,.2f} contradicts "
+                                f"{_side} entry ${_ep:,.2f} — ignoring")
+                            continue
                         self._pos.sl_order_id=o["order_id"]; self.current_sl_price=trig
+                        self._pos.sl_price=trig
+                        if self._pos.initial_sl_dist == 0 and _ep > 0:
+                            self._pos.initial_sl_dist = abs(_ep - trig)
                         logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}… @ ${trig:.2f}")
                     elif not self._pos.tp_order_id and _is_tp(ot):
                         self._pos.tp_order_id=o["order_id"]; self.current_tp_price=trig
+                        self._pos.tp_price=trig
                         logger.info(f"Reconcile: recovered TP order {o['order_id'][:8]}… @ ${trig:.2f}")
 
     def _sync_position(self, order_manager):

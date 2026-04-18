@@ -610,6 +610,16 @@ class OrderManager:
         self._rate_window_count = 0
         self._open_orders_404   = False
 
+        # ── FIX (third-trade bug): self-cancelled-orders tracker ──────────────
+        # When we cancel an SL ourselves (cancel+replace path), we record the
+        # order_id + timestamp here. This lets downstream code distinguish
+        # "SL was filled by the market" (exchange fired it) from
+        # "SL was cancelled by us and the replacement failed" (orphaned).
+        # A 404 on an id in this set is a GHOST, not an exit. Entries expire
+        # after _SELF_CANCEL_TTL_SEC so the dict cannot grow unbounded.
+        self._self_cancelled_orders: Dict[str, float] = {}
+        self._SELF_CANCEL_TTL_SEC = 120.0
+
         # Expose for callers that do order_manager.CancelResult
         self.CancelResult = CancelResult
 
@@ -718,6 +728,32 @@ class OrderManager:
     def _remove_active_order(self, order_id: str) -> None:
         with self._orders_lock:
             self.active_orders.pop(order_id, None)
+
+    # ── FIX (third-trade bug): self-cancellation tracker helpers ──────────────
+    def _mark_self_cancelled(self, order_id: str) -> None:
+        """Record that WE cancelled this order. Used to disambiguate 404s."""
+        if not order_id:
+            return
+        now = time.time()
+        with self._orders_lock:
+            self._self_cancelled_orders[str(order_id)] = now
+            # Prune stale entries (bounded memory guarantee)
+            _stale = [oid for oid, ts in self._self_cancelled_orders.items()
+                      if now - ts > self._SELF_CANCEL_TTL_SEC]
+            for oid in _stale:
+                self._self_cancelled_orders.pop(oid, None)
+
+    def _was_self_cancelled(self, order_id: str) -> bool:
+        if not order_id:
+            return False
+        with self._orders_lock:
+            ts = self._self_cancelled_orders.get(str(order_id))
+            if ts is None:
+                return False
+            if time.time() - ts > self._SELF_CANCEL_TTL_SEC:
+                self._self_cancelled_orders.pop(str(order_id), None)
+                return False
+            return True
 
     # ── Position query ────────────────────────────────────────────────────────
 
@@ -842,6 +878,60 @@ class OrderManager:
             return data
         except Exception as e:
             logger.error(f"place_market_order error: {e}", exc_info=True)
+            return None
+
+    def emergency_flatten(self, reason: str = "unprotected") -> Optional[Dict]:
+        """
+        Flatten any open position at market (reduce_only).
+
+        Called by the strategy when replace_stop_loss returns UNPROTECTED,
+        i.e. the position is live on the exchange with no stop-loss attached.
+        Queries exchange state directly (no trust of strategy state) and
+        sends an opposing reduce-only market order sized to the live qty.
+
+        Returns the market order dict on success, None on failure.
+        """
+        try:
+            ex_pos = self.get_open_position()
+            if ex_pos is None:
+                logger.info(f"emergency_flatten [{reason}]: no exchange position — nothing to do")
+                return None
+            ex_side = str(ex_pos.get("side") or "").upper()
+            ex_size = abs(float(ex_pos.get("size", 0) or 0))
+            min_qty = float(getattr(config, "MIN_POSITION_SIZE", 0.001))
+            if ex_size < min_qty:
+                logger.info(
+                    f"emergency_flatten [{reason}]: exchange size {ex_size} "
+                    f"below min {min_qty} — treating as flat")
+                return None
+            if ex_side not in ("LONG", "SHORT"):
+                # Best-effort inference from signed size if available
+                _signed = float(ex_pos.get("size", 0) or 0)
+                if _signed > 0:
+                    ex_side = "LONG"
+                elif _signed < 0:
+                    ex_side = "SHORT"
+                else:
+                    logger.error(
+                        f"🚨 emergency_flatten [{reason}]: cannot determine side "
+                        f"from ex_pos={ex_pos} — refusing to send blind market order")
+                    return None
+            close_side = "SELL" if ex_side == "LONG" else "BUY"
+            logger.critical(
+                f"💀 EMERGENCY FLATTEN [{reason}] — closing {ex_side} "
+                f"size={ex_size} via MARKET {close_side} reduce_only=True")
+            result = self.place_market_order(
+                side=close_side, quantity=ex_size, reduce_only=True)
+            if result:
+                logger.warning(
+                    f"✅ Emergency flatten sent: order_id={result.get('order_id')} "
+                    f"reason={reason}")
+            else:
+                logger.critical(
+                    f"💀 Emergency flatten FAILED for {reason} — MANUAL INTERVENTION REQUIRED")
+            return result
+        except Exception as e:
+            logger.error(f"emergency_flatten error: {e}", exc_info=True)
             return None
 
     def place_limit_order(self, side: str, quantity: float,
@@ -1247,20 +1337,39 @@ class OrderManager:
 
     def replace_stop_loss(self, existing_sl_order_id: Optional[str],
                           side: str, quantity: float,
-                          new_trigger_price: float) -> Optional[Dict]:
+                          new_trigger_price: float,
+                          old_trigger_price: Optional[float] = None) -> Optional[Dict]:
         """
         Update trailing SL to new_trigger_price.
 
-        Strategy:
+        Strategy (institutional invariant: NEVER leave position unprotected):
           1. EDIT-IN-PLACE (Delta) — PUT /v2/orders with id+product_id in body.
              Sends both stop_price AND limit_price together (stop-limit).
              Atomic: no cancel+replace cycle, zero unprotected window.
-             404 = order gone (SL fired) → return None, caller records exit.
-             bad_schema (with product_id fix) = should not occur — fall through.
 
-          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit failures.
-             Places a stop-limit order (limit offset = SL_LIMIT_OFFSET_TICKS × TICK_SIZE).
-             NOT_FOUND on cancel → abort (old SL still live) to prevent orphan accumulation.
+             404 handling: a 404 BY ITSELF is ambiguous — the order could have
+             fired on the exchange (true exit) OR it could have been cancelled
+             by a previous cancel+replace attempt of ours that then failed to
+             place a new SL (the GHOST case that caused the third-trade bug).
+             Disambiguate via _was_self_cancelled(): if we cancelled it, the
+             caller must NOT treat this as "exit confirmed" — it is an
+             UNPROTECTED state that must be emergency-flattened.
+
+          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit
+             failures. Places a stop-limit order.
+
+             CRITICAL INVARIANT: if the cancel succeeds but the replace fails,
+             we MUST attempt to restore an SL (at the original trigger, or at
+             the new trigger with widened buffer, or at worst a plain stop-
+             market). Returning "PLACE_FAILED" while leaving the position
+             unprotected is the catastrophic path that blew up the third trade.
+
+        Return contract:
+          dict with "order_id" on success
+          None — SL already filled (exit confirmed, caller records exit)
+          {"error": "UNPROTECTED", ...} — SL is GONE and we could not restore.
+             Caller MUST emergency-flatten the position immediately.
+          {"error": "<other>"} — SL was NOT touched; current SL still live.
         """
         tick  = float(getattr(config, 'TICK_SIZE', 0.1))
         offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
@@ -1275,8 +1384,6 @@ class OrderManager:
 
         try:
             # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
-            # Sends stop_price + limit_price atomically — no cancel+replace needed.
-            # Confirmed from API doc: EditOrderRequest supports both fields.
             if existing_sl_order_id and hasattr(self._adapter, "edit_order"):
                 edited = self._adapter.edit_order(
                     order_id=existing_sl_order_id,
@@ -1294,11 +1401,22 @@ class OrderManager:
                 sc  = (edited or {}).get("_sc", 0)
                 err = (edited or {}).get("_err_msg", "")
                 if sc == 404 or "not_found" in str(err).lower():
-                    # SL order gone — it fired. Caller handles exit reconciliation.
+                    # ── GHOST-404 disambiguation ──────────────────────────
+                    # If we ourselves cancelled this id recently, the 404 is
+                    # a ghost, not an exit — the position is UNPROTECTED.
+                    if self._was_self_cancelled(existing_sl_order_id):
+                        logger.error(
+                            f"🚨 SL {existing_sl_order_id[:10]}… 404 is a GHOST "
+                            f"(we cancelled it ourselves and replacement failed). "
+                            f"Position is UNPROTECTED.")
+                        return {"error": "UNPROTECTED",
+                                "reason": "ghost_404_self_cancelled",
+                                "sl_cancelled": True,
+                                "order_id": existing_sl_order_id}
+                    # True exit: order is gone and WE didn't cancel it.
                     logger.info(
                         f"SL {existing_sl_order_id[:10]}… gone (404) "
-                        f"— SL likely fired, letting reconcile detect exit"
-                    )
+                        f"— not in self-cancelled set → exit confirmed")
                     return None
                 else:
                     logger.warning(
@@ -1307,6 +1425,7 @@ class OrderManager:
                     )
 
             # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
+            cancelled_old = False
             if existing_sl_order_id:
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
                 if existing_status in ("FILLED", "PARTIAL_FILL"):
@@ -1318,15 +1437,16 @@ class OrderManager:
                         return None
                     if result == CancelResult.FAILED:
                         return {"error": "CANCEL_FAILED"}
-                    # NOT_FOUND: old SL still live on exchange — do NOT place a new one.
-                    # Placing a new SL would accumulate orphaned stop orders (root cause
-                    # of the 5-SL bug seen in screenshot). Retry on next trail tick.
                     if result == CancelResult.NOT_FOUND:
                         logger.warning(
                             f"⚠️ SL cancel returned NOT_FOUND for {existing_sl_order_id} — "
                             f"aborting replace (old SL may still be live). Retry next tick.")
                         return {"error": "CANCEL_NOT_FOUND"}
+                    # Cancel SUCCESS — record it so a later 404 can be identified
+                    # as a ghost instead of misread as "exit confirmed".
+                    self._mark_self_cancelled(existing_sl_order_id)
                     self._remove_active_order(existing_sl_order_id)
+                    cancelled_old = True
 
             # Place stop-limit replacement (use_limit=True is default)
             new_sl = self.place_stop_loss(side=side, quantity=quantity,
@@ -1337,6 +1457,51 @@ class OrderManager:
                     f"✅ SL replaced (stop-limit) → {new_sl['order_id']} "
                     f"stop=${new_trigger_price:,.2f} limit=${new_limit_price:,.2f}")
                 return new_sl
+
+            # ── RESTORE PATH (institutional invariant) ─────────────────────────
+            # If we cancelled the old SL and the new one failed, the position
+            # is UNPROTECTED. We MUST restore coverage before returning.
+            if cancelled_old:
+                logger.error(
+                    "🚨 SL replace failed AFTER cancel — position is UNPROTECTED. "
+                    "Attempting emergency SL restore.")
+
+                # Tier-1: replace at original trigger with plain stop-market
+                # (no limit, no immediate-execution rejection).
+                _restore_trigger = (float(old_trigger_price)
+                                    if old_trigger_price is not None
+                                    and old_trigger_price > 0
+                                    else new_trigger_price)
+                try:
+                    restored = self.place_stop_loss(
+                        side=side, quantity=quantity,
+                        trigger_price=_restore_trigger,
+                        use_limit=False,  # plain stop-market: widest acceptance
+                    )
+                    if restored:
+                        logger.warning(
+                            f"⚠️ SL RESTORED (stop-market) → {restored['order_id']} "
+                            f"@ ${_restore_trigger:,.2f}. Original replace failed.")
+                        # Signal partial success: SL exists but NOT at the
+                        # requested trigger. Strategy should not assume the
+                        # trail moved; it should re-try on next tick.
+                        restored["_restore"] = True
+                        restored["_restored_at"] = _restore_trigger
+                        return {"error": "PLACE_FAILED_RESTORED",
+                                "restore_order_id": restored["order_id"],
+                                "restore_trigger": _restore_trigger}
+                except Exception as _re:
+                    logger.error(f"SL restore attempt raised: {_re}", exc_info=True)
+
+                # Tier-2 (last resort): return UNPROTECTED so the strategy can
+                # emergency-flatten the position at market.
+                logger.critical(
+                    "💀 SL REPLACE + RESTORE BOTH FAILED. "
+                    "Position is UNPROTECTED — caller MUST flatten immediately.")
+                return {"error": "UNPROTECTED",
+                        "reason": "replace_and_restore_failed",
+                        "sl_cancelled": True}
+
             return {"error": "PLACE_FAILED"}
         except Exception as e:
             logger.error(f"replace_stop_loss error: {e}", exc_info=True)
@@ -1433,6 +1598,9 @@ class OrderManager:
                 # PENDING after a successful cancel request means the exchange
                 # accepted but hasn't settled yet (eventual consistency) — treat
                 # as SUCCESS; the position will be confirmed on next poll.
+                # Record our cancellation so a later 404 query on this id is
+                # correctly identified as a GHOST (not "exit fired").
+                self._mark_self_cancelled(order_id)
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
 
@@ -1443,6 +1611,7 @@ class OrderManager:
             if current == "PARTIAL_FILL":
                 return CancelResult.PARTIAL_FILL
             if current == "CANCELLED":
+                self._mark_self_cancelled(order_id)
                 self._remove_active_order(order_id)
                 return CancelResult.SUCCESS
             if current == "UNKNOWN":
