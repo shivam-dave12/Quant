@@ -111,6 +111,32 @@ PHASE_1_MAX_R = 2.0    # BE lock zone
 PHASE_2_MAX_R = 3.5    # Fib structural zone (1H/15m swings)
 # Phase 3 ≥ 3.5R (Fib aggressive — all TFs, HTF-gated)
 
+# ── Phase-gate normalisation ──────────────────────────────────────────────
+# PHASE_X_MAX_R thresholds above were calibrated assuming a ~1.5 ATR
+# reference stop distance.  ICT structural SLs are placed at CHoCH/swing
+# levels which can be 5–10× ATR from entry.  Using raw init_dist as the
+# R denominator then makes every threshold unreachable:
+#
+#   Example: init_dist=919pts (8.7×ATR, ATR=105.5)
+#     Phase 1 (BE)  needs R=1.0 → 919 pts profit  → price 8.7 ATR from entry
+#     Phase 2 trail needs R=2.0 → 1839 pts profit  → below the TP
+#     Phase 3 trail needs R=3.5 → 3218 pts profit  → impossible
+#
+# Fix: phase boundary comparisons use a SEPARATE metric, phase_gate_r,
+# whose denominator is capped at PHASE_GATE_DENOM_ATR × ATR.  The true
+# financial R (r_multiple = profit / init_dist) is NOT altered — it is
+# passed unchanged to all downstream logic (validate_sl, fibonacci_trail,
+# logging, Telegram, LiquidityTrailResult).
+#
+# Calibration (PHASE_GATE_DENOM_ATR = 1.5):
+#   Phase 0 → 1 unlocks after  1.5 ATR of profit
+#   Phase 1 → 2 unlocks after  3.0 ATR of profit
+#   Phase 2 → 3 unlocks after  5.25 ATR of profit
+#
+# For normal-width SLs (init_dist ≤ 1.5 ATR) min() returns init_dist
+# and phase_gate_r == r_multiple — behaviour is identical to pre-fix.
+PHASE_GATE_DENOM_ATR: float = 1.5   # reference SL width in ATR units
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FIBONACCI LEVEL CATALOGUE
@@ -383,7 +409,10 @@ class LiquidityTrailEngine:
             return self._blocked("ASIA_SESSION_DISABLED", hold_reason)
         sess_mult = SESSION_BUFFER_MULT.get(session, 1.0)
 
-        # ── R-multiple ────────────────────────────────────────────────
+        # ── R-multiple (pure — never altered) ─────────────────────────
+        # True financial R: profit / initial_risk_distance.
+        # Passed unchanged to _fibonacci_trail, _validate_sl, logging,
+        # and LiquidityTrailResult.  Do NOT use for phase comparisons.
         init_dist = max(
             initial_sl_dist if initial_sl_dist > 1e-10 else 0.0,
             abs(entry_price - current_sl),
@@ -392,6 +421,13 @@ class LiquidityTrailEngine:
         profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
         r_peak    = max(profit, peak_profit)
         r_multiple = r_peak / init_dist if init_dist > 1e-10 else 0.0
+
+        # ── Phase-gate R (ATR-normalised — phase comparisons only) ────
+        # See PHASE_GATE_DENOM_ATR constant for full rationale.
+        # For normal SLs (init_dist ≤ 1.5×ATR): _phase_denom == init_dist
+        # → phase_gate_r == r_multiple (zero behaviour change).
+        _phase_denom = min(init_dist, atr * PHASE_GATE_DENOM_ATR)
+        phase_gate_r = r_peak / _phase_denom if _phase_denom > 1e-10 else 0.0
 
         # ── Counter-BOS sovereign override ────────────────────────────
         # Fires exactly once per position.  Moves SL to BE immediately.
@@ -413,17 +449,17 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 0 — HANDS OFF
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_0_MAX_R:
+        if phase_gate_r < PHASE_0_MAX_R:
             self._last_phase = "HANDS_OFF"
             return self._hold(
-                f"PHASE_0_HANDS_OFF: R={r_multiple:.2f}<{PHASE_0_MAX_R}R — "
+                f"PHASE_0_HANDS_OFF: R={r_multiple:.2f}(gate={phase_gate_r:.2f})<{PHASE_0_MAX_R}R — "
                 f"initial structural SL is optimal",
                 hold_reason, r_multiple=r_multiple)
 
         # ══════════════════════════════════════════════════════════════
         # PHASE 1 — BREAKEVEN LOCK
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_1_MAX_R:
+        if phase_gate_r < PHASE_1_MAX_R:
             self._last_phase = "BE_LOCK"
             return self._try_be_lock(
                 pos_side, price, entry_price, current_sl, atr,
@@ -440,7 +476,7 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 2 / 3 — FIBONACCI TRAIL
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_2_MAX_R:
+        if phase_gate_r < PHASE_2_MAX_R:
             self._last_phase = "STRUCTURAL"
             return self._fibonacci_trail(
                 pos_side, price, entry_price, current_sl, atr, init_dist,

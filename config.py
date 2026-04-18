@@ -51,7 +51,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.006     # 0.6% of available balance per trade
+RISK_PER_TRADE           = 0.02     # 2% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker (relaxed)
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
