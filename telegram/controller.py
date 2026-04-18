@@ -1,29 +1,27 @@
 """
-Telegram Bot Controller v12 — Rewritten for QuantStrategy v4.8
-================================================================
-All command handlers rebuilt against the actual API:
-  - QuantStrategy   (quant_strategy.py)
-  - RiskManager     (risk_manager.py)
-  - ICTEngine       (ict_engine.py)
-  - Config          (config.py)
+telegram/controller.py — Liquidity-First Telegram Bot Controller
+=================================================================
+All command handlers reflect the liquidity-first decision architecture:
 
-Commands:
-  /start          - Start trading bot
-  /stop           - Stop trading bot
-  /status         - Full bot status + ICT structures
-  /thinking       - Live signal breakdown + what is blocking entry
-  /structures     - Full ICT structure map with prices
-  /position       - Current position details
-  /trades         - Recent trade history
-  /config         - Show current config values
-  /pause          - Pause trading (keep monitoring)
-  /resume         - Resume trading
-  /balance        - Wallet balance
-  /trail          - Toggle trailing SL on/off/auto
-  /killswitch     - Emergency: close all positions + cancel orders
-  /setexchange    - Switch execution exchange (delta|coinswitch)
-  /set <key> <val>- Live-adjust config (e.g. /set cooldown 120)
-  /help           - Show commands
+  /thinking   — 5-layer decision stack (pools → flow → ICT → entry → trail)
+  /status     — Full bot status (pool map + flow + position)
+  /pools      — Live liquidity pool map with priority scores
+  /flow       — Detailed orderflow state (CVD + OB delta + tick aggression)
+  /structures — ICT structure map (OB / FVG / AMD — secondary layer)
+  /position   — Current position with pool TP context
+  /trades     — Recent trade history
+  /stats      — Signal attribution analysis
+  /balance    — Wallet balance
+  /pause      — Pause trading (keep monitoring)
+  /resume     — Resume trading
+  /trail      — Toggle trailing SL on/off/auto
+  /config     — Show current config values
+  /killswitch — Emergency: close all positions + cancel orders
+  /setexchange — Switch execution exchange (delta|coinswitch)
+  /set <key> <val> — Live-adjust config
+  /resetrisk  — Clear consecutive-loss lockout
+  /huntstatus — Liquidity hunt engine status
+  /help       — Show commands
 """
 
 import logging
@@ -42,11 +40,24 @@ from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
 
+# ── v9 display engine (optional) ─────────────────────────────────────────────
+try:
+    from strategy.v9_display import (
+        format_thinking_telegram, format_pools_telegram,
+        format_flow_telegram, format_status_report_v9,
+        format_periodic_report_v9, HELP_TEXT as V9_HELP,
+    )
+    _V9_DISPLAY = True
+except ImportError:
+    _V9_DISPLAY = False
+
+
 def _esc(s) -> str:
     """Escape <, >, & in dynamic strings before embedding in Telegram HTML."""
     if s is None:
         return ""
     return _html.escape(str(s), quote=False)
+
 
 bot_instance = None
 bot_thread   = None
@@ -63,7 +74,7 @@ class TelegramBotController:
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
-        logger.info("TelegramBotController v12 initialized")
+        logger.info("TelegramBotController (liquidity-first) initialized")
 
     # ================================================================
     # MESSAGING
@@ -81,12 +92,8 @@ class TelegramBotController:
                     split_at = message.rfind('\n', 0, 4000)
                     if split_at == -1:
                         split_at = 4000
-                        chunks.append(message[:split_at])
-                        message = message[split_at:]
-                    else:
-                        chunks.append(message[:split_at])
-                        # Skip the newline itself so the next chunk has no leading blank line
-                        message = message[split_at + 1:]
+                    chunks.append(message[:split_at])
+                    message = message[split_at + 1:]
                 for chunk in chunks:
                     self._send_raw(chunk, parse_mode)
                     time.sleep(0.5)
@@ -100,12 +107,9 @@ class TelegramBotController:
                 return False
 
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
-        # Sanitize before every send so controller-built messages are treated
-        # identically to notifier-queue messages — strips unsupported tags and
-        # escapes bare < / > that would cause 400 "Unsupported start tag" errors.
         if parse_mode == "HTML":
             text = _sanitize_html(text)
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        url     = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
             "chat_id":                  self.chat_id,
             "text":                     text,
@@ -119,44 +123,30 @@ class TelegramBotController:
         return resp.status_code == 200
 
     def get_updates(self, timeout: int = 30) -> list:
-        # Bug-21 fix: cap the effective long-poll read timeout at 15 s (down from
-        # timeout+5=35 s).  The old value meant stop() couldn't interrupt an
-        # in-flight poll for up to 35 seconds — dangerous when shutting down with
-        # an open position.  A 15-second read window still gives reliable delivery
-        # for all Telegram use cases; the poll repeats immediately on return.
-        _read_timeout = min(timeout, 15) + 2   # 2 s margin above poll interval
+        _read_timeout = min(timeout, 15) + 2
         try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+            url    = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
             params = {
                 "offset":          self.last_update_id + 1,
-                "timeout":         min(timeout, 15),   # match read_timeout cap
+                "timeout":         min(timeout, 15),
                 "allowed_updates": ["message"],
             }
-            resp = requests.get(url, params=params,
-                                timeout=(5.0, _read_timeout))
-            # Bug-22 fix: log non-200 responses instead of silently returning [].
+            resp = requests.get(url, params=params, timeout=(5.0, _read_timeout))
             if resp.status_code != 200:
-                logger.warning("Telegram API HTTP %d — getUpdates skipped",
-                               resp.status_code)
+                logger.warning("Telegram API HTTP %d — getUpdates skipped", resp.status_code)
                 return []
             data = resp.json()
             return data.get("result", []) if data.get("ok") else []
         except requests.exceptions.Timeout:
-            # Normal for a long-poll that expires with no messages — not an error.
             return []
         except requests.exceptions.ConnectionError as e:
-            # Bug-22 fix: network blip — warn so operator can see Telegram is down.
             logger.warning("Telegram connection error (will retry): %s", e)
             return []
         except ValueError as e:
-            # Bug-22 fix: malformed JSON — log with context so it's diagnosable.
             logger.error("Telegram JSON parse error in getUpdates: %s", e)
             return []
         except Exception as e:
-            # Bug-22 fix: catch-all still returns [] but now logs the failure so
-            # prolonged Telegram outages are visible in the bot log.
-            logger.error("Telegram getUpdates unexpected error: %s", e,
-                         exc_info=True)
+            logger.error("Telegram getUpdates unexpected error: %s", e, exc_info=True)
             return []
 
     def clear_old_messages(self):
@@ -170,29 +160,38 @@ class TelegramBotController:
 
     def set_my_commands(self):
         try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
+            url      = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
             commands = [
-                {"command": "start",      "description": "Start trading bot"},
-                {"command": "stop",       "description": "Stop trading bot"},
-                {"command": "status",     "description": "Full status + ICT overview"},
-                {"command": "thinking",   "description": "Live signal breakdown"},
-                {"command": "structures", "description": "ICT structure map with prices"},
-                {"command": "position",   "description": "Current position details"},
-                {"command": "trades",     "description": "Recent trade history"},
-                {"command": "stats",      "description": "Signal attribution analysis"},
-                {"command": "balance",    "description": "Wallet balance"},
-                {"command": "pause",      "description": "Pause trading"},
-                {"command": "resume",     "description": "Resume trading"},
-                {"command": "trail",      "description": "Toggle trailing SL on/off/auto"},
-                {"command": "config",     "description": "Show config values"},
-                {"command": "killswitch", "description": "Emergency close all"},
-                {"command": "set",        "description": "Set config value live"},
-                {"command": "huntstatus", "description": "Liquidity hunt engine status"},
-                {"command": "help",       "description": "Show commands"},
+                {"command": "start",       "description": "Start trading bot"},
+                {"command": "stop",        "description": "Stop trading bot"},
+                {"command": "status",      "description": "Full status + pool map"},
+                {"command": "thinking",    "description": "5-layer liquidity-first decision stack"},
+                {"command": "position",    "description": "Current position + trail"},
+                {"command": "pnl",         "description": "Quick PnL snapshot"},
+                {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
+                {"command": "pools",       "description": "Live liquidity pool map"},
+                {"command": "flow",        "description": "CVD + OB delta + tick aggression"},
+                {"command": "structures",  "description": "ICT structure map (secondary layer)"},
+                {"command": "sl",          "description": "Current SL/TP levels + distances"},
+                {"command": "trades",      "description": "Recent trade history"},
+                {"command": "stats",       "description": "Signal attribution analysis"},
+                {"command": "learn",       "description": "Post-trade analysis · Bayesian adaptive parameters · IC"},
+                {"command": "balance",     "description": "Wallet balance"},
+                {"command": "equity",      "description": "Balance + unrealised PnL"},
+                {"command": "risk",        "description": "Risk gate status + limits"},
+                {"command": "pause",       "description": "Pause trading"},
+                {"command": "resume",      "description": "Resume trading"},
+                {"command": "trail",       "description": "Toggle trailing SL on/off/auto"},
+                {"command": "config",      "description": "Show config values"},
+                {"command": "set",         "description": "Set config value live"},
+                {"command": "setexchange", "description": "Switch execution exchange"},
+                {"command": "killswitch",  "description": "Emergency close all"},
+                {"command": "resetrisk",   "description": "Clear risk lockout"},
+                {"command": "help",        "description": "Show commands"},
             ]
             payload = {
-                "commands":     commands,
-                "scope":        {"type": "all_private_chats"},
+                "commands":      commands,
+                "scope":         {"type": "all_private_chats"},
                 "language_code": "en",
             }
             resp = requests.post(url, json=payload, timeout=10)
@@ -210,9 +209,12 @@ class TelegramBotController:
     def _normalize_command(self, text: str) -> tuple:
         t = (text or "").strip()
         bare_cmds = {
-            "start", "stop", "status", "thinking", "structures", "position",
-            "trades", "stats", "config", "pause", "resume", "balance", "trail",
-            "killswitch", "set", "help", "huntstatus",
+            "start", "stop", "status", "thinking", "pools", "flow",
+            "structures", "position", "trades", "stats", "config",
+            "pause", "resume", "balance", "trail", "killswitch",
+            "set", "help", "huntstatus", "setexchange", "resetrisk",
+            "pnl", "market", "risk", "equity", "sl", "tp",
+            "learn",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -228,78 +230,2147 @@ class TelegramBotController:
         global bot_instance, bot_thread, bot_running
         cmd, args = self._normalize_command(raw_text)
         try:
-            if cmd in ("/help", "/commands"):
-                return self._cmd_help()
-            elif cmd == "/start":
-                return self._cmd_start()
-            elif cmd == "/stop":
-                return self._cmd_stop()
-            elif cmd == "/status":
-                return self._cmd_status()
-            elif cmd == "/thinking":
-                return self._cmd_thinking()
-            elif cmd == "/structures":
-                return self._cmd_structures()
-            elif cmd == "/position":
-                return self._cmd_position()
-            elif cmd == "/trades":
-                return self._cmd_trades()
-            elif cmd == "/stats":
-                return self._cmd_stats()
-            elif cmd == "/balance":
-                return self._cmd_balance()
-            elif cmd == "/pause":
-                return self._cmd_pause()
-            elif cmd == "/resume":
-                return self._cmd_resume()
-            elif cmd == "/trail":
-                return self._cmd_trail(args)
-            elif cmd == "/config":
-                return self._cmd_config()
-            elif cmd == "/killswitch":
-                return self._cmd_killswitch()
-            elif cmd == "/resetrisk":
-                return self._cmd_resetrisk(args)
-            elif cmd == "/set":
-                return self._cmd_set(args)
-            elif cmd == "/setexchange":
-                return self._cmd_setexchange(args)
-            elif cmd == "/huntstatus":
-                return self._cmd_huntstatus()
+            if   cmd in ("/help", "/commands"): return self._cmd_help()
+            elif cmd == "/start":               return self._cmd_start()
+            elif cmd == "/stop":                return self._cmd_stop()
+            elif cmd == "/status":              return self._cmd_status()
+            elif cmd == "/thinking":            return self._cmd_thinking()
+            elif cmd == "/pools":               return self._cmd_pools()
+            elif cmd == "/flow":                return self._cmd_flow()
+            elif cmd == "/structures":          return self._cmd_structures()
+            elif cmd == "/position":            return self._cmd_position()
+            elif cmd == "/trades":              return self._cmd_trades()
+            elif cmd == "/stats":               return self._cmd_stats()
+            elif cmd == "/balance":             return self._cmd_balance()
+            elif cmd == "/pause":               return self._cmd_pause()
+            elif cmd == "/resume":              return self._cmd_resume()
+            elif cmd == "/trail":               return self._cmd_trail(args)
+            elif cmd == "/config":              return self._cmd_config()
+            elif cmd == "/killswitch":          return self._cmd_killswitch()
+            elif cmd == "/resetrisk":           return self._cmd_resetrisk(args)
+            elif cmd == "/set":                 return self._cmd_set(args)
+            elif cmd == "/setexchange":         return self._cmd_setexchange(args)
+            elif cmd == "/huntstatus":          return self._cmd_huntstatus()
+            elif cmd == "/pnl":                 return self._cmd_pnl()
+            elif cmd == "/market":              return self._cmd_market()
+            elif cmd == "/risk":                return self._cmd_risk()
+            elif cmd == "/equity":              return self._cmd_equity()
+            elif cmd in ("/sl", "/tp"):         return self._cmd_sl_tp()
+            elif cmd == "/learn":               return self._cmd_learn()
             else:
                 return f"Unknown command: {cmd}\n\n" + self._cmd_help()
         except Exception as e:
             logger.error(f"Command error [{cmd}]: {e}", exc_info=True)
-            return f"❌ Error in {cmd}: {e}"
+            return f"❌ Error in {_esc(cmd)}: {_esc(e)}"
 
     # ================================================================
-    # COMMAND IMPLEMENTATIONS
+    # /help
     # ================================================================
 
     def _cmd_help(self) -> str:
         return (
-            "<b>Quant Bot v4.8 Commands</b>\n\n"
-            "/status — Full status + ICT overview\n"
-            "/thinking — Live signal breakdown + entry gates\n"
-            "/structures — ICT structure map with prices\n"
-            "/position — Current position details\n"
-            "/trades — Recent trade history\n"
-            "/stats — Signal attribution analysis (tier/regime WR breakdown)\n"
-            "/balance — Wallet balance\n"
-            "/pause — Pause trading (keep monitoring)\n"
-            "/resume — Resume trading\n"
-            "/trail [on|off|auto] — Toggle trailing SL\n"
-            "/config — Show config values\n"
-            "/set &lt;key&gt; &lt;value&gt; — Adjust config live\n"
-            "/setexchange &lt;delta|coinswitch&gt; — Switch execution exchange at runtime\n"
-            "/killswitch — Emergency: close position + cancel orders\n"
-            "/resetrisk — Clear consecutive-loss lockout so trading resumes\n"
-            "/huntstatus — Liquidity hunt engine state + prediction score\n"
-            "/resetrisk full — Also reset daily PnL + trade counters (new session)\n"
-            "/start — Start bot\n"
-            "/stop — Stop bot\n"
-            "/help — This list"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏛️ <b>LIQUIDITY-FIRST BOT  v5.0</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Fibonacci trailing · Liquidity-pool entries · ICT structure</i>\n\n"
+            "📊 <b>QUICK VIEW</b>\n"
+            "  /pnl — Snapshot: uPnL, realised, last trades\n"
+            "  /market — Price, ATR, AMD, MTF, flow, pools\n"
+            "  /sl — SL/TP distances, BE status, R-multiple\n"
+            "  /equity — Balance + unrealised + session return\n"
+            "  /risk — Gate status, daily limits, cooldown\n\n"
+            "🧠 <b>DECISION ANALYSIS</b>\n"
+            "  /thinking — 5-layer liquidity-first decision stack\n"
+            "  /pools — BSL/SSL pool map with priority scores\n"
+            "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
+            "  /structures — ICT OB/FVG/AMD secondary layer\n"
+            "  /huntstatus — Liquidity-hunt engine prediction\n\n"
+            "📈 <b>POSITION &amp; HISTORY</b>\n"
+            "  /position — Pos + Fibonacci trail state\n"
+            "  /trades — Last 10 trades with R, MFE, fees\n"
+            "  /stats — Win rate attribution by tier/reason\n"
+            "  /learn — Post-trade Bayesian adaptive params\n"
+            "  /balance — Wallet balance detail\n\n"
+            "⚙️ <b>CONTROL</b>\n"
+            "  /start · /stop — Start/stop bot\n"
+            "  /pause · /resume — Pause trading (keep monitoring)\n"
+            "  /trail [on|off|auto] — Trail mode override\n"
+            "  /config — Show active config values\n"
+            "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
+            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
+            "🚨 <b>EMERGENCY</b>\n"
+            "  /killswitch — Close positions + cancel all\n"
+            "  /resetrisk [full] — Clear risk lockout\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
+
+    # ================================================================
+    # /thinking  ← CORE COMMAND — 5-layer liquidity-first stack
+    # ================================================================
+
+    def _cmd_thinking(self) -> str:
+        """
+        Live 5-layer liquidity-first decision stack:
+
+          LAYER 1 — Liquidity Map    BSL/SSL pools + priority scores
+          LAYER 2 — Flow Direction   CVD + OB delta + tick aggression
+                                     → is flow driving toward target pool?
+          LAYER 3 — ICT Secondary    AMD phase, OB/FVG alignment, P/D zone
+          LAYER 4 — Entry Gate       Sweep/OTE status, SL/TP levels
+          LAYER 5 — Post-trade       Trail engine state (BOS/CHoCH)
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running. Use /start"
+
+        try:
+            import config as cfg
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
+            rm    = bot_instance.risk_manager
+
+            if not strat or not dm or not rm:
+                return "Components not ready."
+
+            price   = dm.get_last_price()
+            now     = time.time()
+            now_ms  = int(now * 1000)
+            atr     = strat._atr_5m.atr
+            ict     = strat._ict
+            pos     = strat._pos
+            sig     = strat._last_sig
+
+            lines = [f"<b>🧠 LIQUIDITY-FIRST STACK @ ${price:,.2f}</b>"]
+
+            # ══════════════════════════════════════════════════════════
+            # LAYER 1 — LIQUIDITY MAP
+            # Markets move from pool to pool. Which pool are we targeting?
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━━ LAYER 1: LIQUIDITY MAP</b>")
+
+            liq_map = getattr(strat, '_liq_map', None)
+            if liq_map is not None:
+                try:
+                    snap    = liq_map.get_snapshot(price, atr)
+                    summary = liq_map.get_status_summary(price, atr)
+
+                    # BSL pools above price
+                    # BUG-FIX: snap.bsl_pools contains PoolTarget objects.
+                    # Price lives at p.pool.price, not p.price.
+                    # priority_score→p.significance, touch_count→p.pool.touches,
+                    # timeframe→p.pool.timeframe, fresh→pool status check.
+                    bsl_near = [p for p in snap.bsl_pools if p.pool.price > price][:4]
+                    ssl_near = [p for p in snap.ssl_pools if p.pool.price < price][:4]
+                    bsl_near_sorted = sorted(bsl_near, key=lambda p: p.pool.price)
+                    ssl_near_sorted = sorted(ssl_near, key=lambda p: p.pool.price, reverse=True)
+
+                    lines.append("  <b>BSL (Buy-side above)</b>")
+                    for p in bsl_near_sorted:
+                        dist_atr = (p.pool.price - price) / max(atr, 1)
+                        score    = p.significance
+                        touches  = p.pool.touches
+                        tf       = p.pool.timeframe
+                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
+                                    else "♻️")
+                        lines.append(
+                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
+                            f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
+
+                    lines.append("  <b>SSL (Sell-side below)</b>")
+                    for p in ssl_near_sorted:
+                        dist_atr = (price - p.pool.price) / max(atr, 1)
+                        score    = p.significance
+                        touches  = p.pool.touches
+                        tf       = p.pool.timeframe
+                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
+                                    else "♻️")
+                        lines.append(
+                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
+                            f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
+
+                    # Primary target
+                    # BUG-FIX C17-C19: PoolTarget has no .level_type or .price.
+                    # Correct paths: pt.pool.side.value, pt.pool.price, pt.significance.
+                    pt = snap.primary_target
+                    if pt:
+                        direction = "BSL ▲" if pt.pool.side.value == "BSL" else "SSL ▼"
+                        pt_score  = pt.significance
+                        lines.append(
+                            f"\n  🎯 <b>Primary target: {direction} @ ${pt.pool.price:,.1f}"
+                            f"  (score={pt_score:.2f})</b>")
+                    else:
+                        lines.append("\n  ─ No high-priority target pool identified")
+
+                    # Recent sweeps
+                    # BUG-FIX C20-C23: SweepResult has no sweep_timestamp, level_type,
+                    # price, or displacement_confirmed. Correct attrs: detected_at (seconds),
+                    # pool.side.value, pool.price, quality (use ≥0.5 as displacement proxy).
+                    if snap.recent_sweeps:
+                        lines.append(f"  🌊 Recent sweeps: {len(snap.recent_sweeps)}")
+                        for sw in snap.recent_sweeps[-2:]:
+                            age_m = (now - sw.detected_at) / 60.0
+                            disp  = "DISP✓" if sw.quality >= 0.5 else "weak"
+                            lines.append(
+                                f"    {sw.pool.side.value} ${sw.pool.price:,.1f}"
+                                f"  [{disp}]  {age_m:.0f}m ago")
+                except Exception as _le:
+                    lines.append(f"  LiqMap error: {_le}")
+            else:
+                lines.append("  ⏳ Liquidity map not available (v9 engine not active)")
+
+            # ══════════════════════════════════════════════════════════
+            # LAYER 2 — FLOW DIRECTION (primary gate)
+            # Is CVD divergence + OB delta + tick aggression driving
+            # toward the highest-priority pool?
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━━ LAYER 2: FLOW DIRECTION  (primary gate)</b>")
+
+            tick_flow    = strat._tick_eng.get_signal() if strat._tick_eng else 0.0
+            cvd_trend    = strat._cvd.get_trend_signal() if strat._cvd else 0.0
+            cvd_div      = 0.0
+            try:
+                cvd_div = strat._cvd.get_divergence_signal(dm.get_candles("1m", limit=60))
+            except Exception:
+                pass
+
+            ob_imbalance = 0.0
+            try:
+                ob = dm.get_orderbook()
+                if ob and ob.get("bids") and ob.get("asks"):
+                    bv = sum(float(b[1]) for b in ob["bids"][:10])
+                    av = sum(float(a[1]) for a in ob["asks"][:10])
+                    total_vol = bv + av
+                    if total_vol > 0:
+                        ob_imbalance = (bv - av) / total_vol
+            except Exception:
+                pass
+
+            streak     = getattr(strat, '_flow_streak_count_v2', 0)
+            streak_dir = getattr(strat, '_flow_streak_dir_v2', "")
+
+            def _flow_bar(v, w=8):
+                h = w // 2
+                f = min(int(abs(v) * h + 0.5), h)
+                return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
+                    else ("░" * (h - f) + "█" * f + "·" * h)
+
+            def _fl(label, val):
+                arrow = "▲" if val > 0.1 else ("▼" if val < -0.1 else "─")
+                return f"  {label:<12} {_flow_bar(val)} {arrow} {val:+.3f}"
+
+            lines.append(_fl("CVD div",    cvd_div))
+            lines.append(_fl("OB delta",   ob_imbalance))
+            lines.append(_fl("Tick aggr",  tick_flow))
+            lines.append(_fl("CVD trend",  cvd_trend))
+
+            # Flow conviction: weighted average of the three primary detectors
+            signals     = [cvd_div * 0.40, ob_imbalance * 0.35, tick_flow * 0.25]
+            conviction  = sum(signals)
+            flow_dir    = "long" if conviction > 0.20 else ("short" if conviction < -0.20 else "")
+
+            # Is flow toward the target pool?
+            # BUG-FIX C24: Reuse the pt already fetched from the earlier snapshot
+            # rather than calling get_snapshot() a third time.  PoolTarget has no
+            # .level_type attribute — the correct path is .pool.side.value.
+            # Note: pt may already be set from the Layer 1 section above; if the
+            # liq_map block raised an exception pt remains None from the init below.
+            pt = None
+            if liq_map is not None:
+                try:
+                    pt = liq_map.get_snapshot(price, atr).primary_target
+                except Exception:
+                    pass
+
+            toward_pool = False
+            if pt is not None and flow_dir:
+                if pt.pool.side.value == "BSL" and flow_dir == "long":
+                    toward_pool = True
+                elif pt.pool.side.value == "SSL" and flow_dir == "short":
+                    toward_pool = True
+
+            flow_gate_str = (
+                f"✅ TOWARD {'BSL ▲' if flow_dir == 'long' else 'SSL ▼'}  conv={conviction:+.3f}"
+                if toward_pool else
+                f"❌ NOT toward pool  conv={conviction:+.3f}  dir={flow_dir or 'neutral'}"
+            )
+            lines.append(f"\n  {flow_gate_str}")
+            if streak > 1:
+                lines.append(f"  Streak: {streak} ticks {streak_dir}")
+
+            # ══════════════════════════════════════════════════════════
+            # LAYER 3 — ICT SECONDARY VALIDATION
+            # AMD phase, OB/FVG alignment, premium/discount zone
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━━ LAYER 3: ICT SECONDARY VALIDATION</b>")
+
+            if ict and ict._initialized:
+                # AMD phase
+                try:
+                    amd       = ict._amd
+                    amd_phase = amd.phase
+                    amd_conf  = amd.confidence
+                    amd_bias  = amd.bias
+                    amd_icons = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
+                                 "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
+                                 "ACCUMULATION": "💤"}
+                    amd_icon  = amd_icons.get(amd_phase, "❓")
+                    bias_icon = ("🔴" if amd_bias == "bearish"
+                                 else ("🟢" if amd_bias == "bullish" else "⚪"))
+
+                    # Is AMD phase compatible with flow direction?
+                    amd_compat = True
+                    amd_note   = ""
+                    if flow_dir == "long" and amd_bias == "bearish" and amd_conf >= 0.75:
+                        amd_compat = False
+                        amd_note   = "  ⚠️ AMD bearish (high conf) vs long flow"
+                    elif flow_dir == "short" and amd_bias == "bullish" and amd_conf >= 0.75:
+                        amd_compat = False
+                        amd_note   = "  ⚠️ AMD bullish (high conf) vs short flow"
+
+                    lines.append(
+                        f"  {amd_icon} AMD: <b>{_esc(amd_phase)}</b>  "
+                        f"{bias_icon}{_esc(amd_bias)}  conf={amd_conf:.2f}  "
+                        f"{'✅' if amd_compat else '❌'} flow-compatible")
+                    if amd_note:
+                        lines.append(amd_note)
+                except Exception as _ae:
+                    lines.append(f"  AMD: error — {_ae}")
+
+                # OB/FVG in path toward target pool
+                try:
+                    long_c  = ict.get_confluence("long",  price, now_ms, atr)
+                    short_c = ict.get_confluence("short", price, now_ms, atr)
+                    active_c = long_c if flow_dir == "long" else (short_c if flow_dir == "short" else long_c)
+                    lines.append(
+                        f"  ICT confluence ({flow_dir or 'n/a'}): Σ={active_c.total:.2f}  "
+                        f"OB={active_c.ob_score:.2f}  FVG={active_c.fvg_score:.2f}  "
+                        f"Sweep={active_c.sweep_score:.2f}  KZ={active_c.session_score:.2f}")
+                    if active_c.details:
+                        lines.append(f"  → {_esc(active_c.details)}")
+                except Exception:
+                    pass
+
+                # Premium / discount zone + dealing range
+                mtf_in_disc  = getattr(sig, 'in_discount', False)
+                mtf_in_prem  = getattr(sig, 'in_premium',  False)
+                zone_str     = ("💰 DISCOUNT" if mtf_in_disc
+                                else ("💸 PREMIUM" if mtf_in_prem else "〰️ EQUILIBRIUM"))
+                lines.append(f"  Price zone: {zone_str}")
+
+                # Dealing range position
+                _dr = getattr(ict, '_dealing_range', None)
+                if _dr:
+                    _pd = getattr(_dr, 'current_pd', 0.5)
+                    _pd_label = ("DEEP DISC" if _pd < 0.25 else
+                                 "DISCOUNT" if _pd < 0.40 else
+                                 "EQ" if _pd < 0.60 else
+                                 "PREMIUM" if _pd < 0.75 else "DEEP PREM")
+                    lines.append(f"  Dealing range: {_pd_label} ({_pd:.0%})  "
+                                 f"[${_dr.low:,.0f}–${_dr.high:,.0f}]")
+
+                # HTF structure
+                _htf_parts = []
+                _tf = getattr(ict, '_tf', {})
+                for _tfk in ("1d", "4h", "1h", "15m", "5m"):
+                    _tfs = _tf.get(_tfk)
+                    if _tfs:
+                        _trend = getattr(_tfs, 'trend', 'ranging')
+                        _icon = "🟢" if _trend == "bullish" else ("🔴" if _trend == "bearish" else "⚪")
+                        _htf_parts.append(f"{_icon}{_tfk}:{_trend[:4]}")
+                if _htf_parts:
+                    lines.append(f"  MTF: {' | '.join(_htf_parts)}")
+            else:
+                lines.append("  ⏳ ICT engine initialising")
+
+            # ══════════════════════════════════════════════════════════
+            # LAYER 4 — ENTRY GATE
+            # Sweep/OTE status, SL at ICT structure, TP at pool
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━━ LAYER 4: ENTRY</b>")
+
+            sweep = getattr(strat, '_active_sweep_setup', None)
+            entry_engine = getattr(strat, '_entry_engine', None)
+            engine_state = getattr(entry_engine, 'state', 'SCANNING') if entry_engine else 'SCANNING'
+
+            lines.append(f"  Engine: <b>{_esc(engine_state)}</b>")
+
+            if sweep is not None:
+                age_m   = (now_ms - sweep.setup_time_ms) / 60_000
+                in_ote  = sweep.ote_entry_zone_low <= price <= sweep.ote_entry_zone_high
+                s_icon  = "🟢" if sweep.status == "OTE_READY" else "🔵"
+                lines.append(
+                    f"  {s_icon} Sweep setup: <b>{sweep.side.upper()}</b>  "
+                    f"status={_esc(sweep.status)}  quality={sweep.quality_score():.2f}  age={age_m:.0f}m")
+                lines.append(
+                    f"  Sweep: ${sweep.sweep_price:,.0f}  "
+                    f"OTE zone: [${sweep.ote_entry_zone_low:,.0f}–${sweep.ote_entry_zone_high:,.0f}]")
+                if in_ote:
+                    lines.append("  ✅ Price IN OTE zone — limit entry eligible")
+                    # SL info
+                    lines.append(f"  SL (ICT): wick ${sweep.sl_sweep_candle:,.0f}")
+                else:
+                    # BUG-FIX C31: Operator precedence in the original expression caused
+                    # both sides to use the wrong zone edge.  For a LONG setup price must
+                    # rise to the OTE LOW (discount zone entry); for SHORT, drop to HIGH.
+                    if sweep.side == "long":
+                        dist = max(0.0, sweep.ote_entry_zone_low - price)
+                    else:
+                        dist = max(0.0, price - sweep.ote_entry_zone_high)
+                    lines.append(f"  ⏳ {dist:.0f}pts to OTE")
+
+                # TP = opposing pool
+                if sweep.delivery_target:
+                    lines.append(f"  TP (pool): ${sweep.delivery_target:,.0f}")
+                else:
+                    lines.append("  TP: awaiting opposing pool identification")
+
+                # FVG / OB in OTE
+                extras = []
+                if getattr(sweep, 'has_fvg_in_ote', False): extras.append("FVG✓")
+                if getattr(sweep, 'has_ob_in_ote',  False): extras.append("OB✓")
+                if extras:
+                    lines.append(f"  ICT in OTE: {' '.join(extras)}")
+            else:
+                lines.append("  ─ No active sweep setup")
+                lines.append("  Waiting for pool sweep + displacement confirmation")
+
+            # Risk gate
+            can_ok, risk_reason = rm.can_trade()
+            lines.append(
+                f"\n  {'✅' if can_ok else '🚫'} Risk gate: "
+                + (f"OPEN" if can_ok else f"BLOCKED — {_esc(risk_reason)}"))
+
+            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
+            last_exit    = getattr(strat, '_last_exit_time', 0)
+            cd_rem       = max(0.0, cooldown_sec - (now - last_exit))
+            lines.append(
+                f"  {'✅' if cd_rem == 0 else '⏳'} Cooldown: "
+                + (f"{cd_rem:.0f}s remaining" if cd_rem > 0 else "ready"))
+
+            # ══════════════════════════════════════════════════════════
+            # LAYER 5 — TRAIL / POST-SWEEP ENGINE
+            # BOS swing → CHoCH tighten → 15m structure
+            # ══════════════════════════════════════════════════════════
+            from strategy.quant_strategy import PositionPhase
+            lines.append("\n<b>━━ LAYER 5: TRAIL / POST-SWEEP ENGINE</b>")
+
+            if pos.phase == PositionPhase.ACTIVE:
+                profit_pts  = (pos.entry_price - price if pos.side == "short"
+                               else price - pos.entry_price)
+                init_dist   = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
+                tier_r      = max(profit_pts, pos.peak_profit) / init_dist
+
+                be_r   = float(getattr(cfg, 'QUANT_TRAIL_BE_R',        0.3))
+                lock_r = float(getattr(cfg, 'QUANT_TRAIL_LOCK_R',       0.8))
+                aggr_r = float(getattr(cfg, 'QUANT_TRAIL_AGGRESSIVE_R', 1.5))
+
+                if   tier_r < be_r:   phase_lbl = f"⬜ HANDS OFF (&lt;{be_r:.1f}R) — no trail yet"
+                elif tier_r < lock_r: phase_lbl = f"🟡 BOS SWING TRAIL ({be_r:.1f}→{lock_r:.1f}R)"
+                elif tier_r < aggr_r: phase_lbl = f"🟠 CHoCH TIGHTEN ({lock_r:.1f}→{aggr_r:.1f}R)"
+                else:                 phase_lbl = f"🟢 15m STRUCTURE TRAIL (&gt;{aggr_r:.1f}R)"
+
+                lines.append(f"  {pos.side.upper()}  {phase_lbl}")
+                lines.append(
+                    f"  Entry ${pos.entry_price:,.2f}  "
+                    f"SL ${pos.sl_price:,.2f}  "
+                    f"TP ${pos.tp_price:,.2f}  ({tier_r:.2f}R)")
+
+                # SL distance in ATR
+                sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
+                tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
+                lines.append(f"  SL dist: {sl_dist_atr:.1f}ATR  |  TP dist: {tp_dist_atr:.1f}ATR")
+
+                # Progress bar
+                total_move = abs(pos.tp_price - pos.entry_price)
+                if total_move > 0:
+                    prog = min(1.0, max(0, abs(price - pos.entry_price) / total_move))
+                    if profit_pts < 0: prog = 0
+                    bar = "█" * int(prog * 16) + "░" * (16 - int(prog * 16))
+                    lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
+
+            else:
+                lines.append("  ─ No active position")
+
+                # Show sweep analysis if in POST_SWEEP
+                entry_eng = getattr(strat, '_entry_engine', None)
+                if entry_eng:
+                    _sa = getattr(entry_eng, '_last_sweep_analysis', None)
+                    if _sa and engine_state == "POST_SWEEP":
+                        rs = _sa.get('rev_score', 0)
+                        cs = _sa.get('cont_score', 0)
+                        rr = _sa.get('rev_reasons', [])
+                        cr = _sa.get('cont_reasons', [])
+                        sw_side = _sa.get('sweep_side', '?')
+                        sw_price = _sa.get('sweep_price', 0)
+                        sw_qual = _sa.get('sweep_quality', 0)
+                        gap = abs(rs - cs)
+
+                        winner = ("REVERSAL" if rs >= 45 and gap >= 10 else
+                                  ("CONTINUATION" if cs >= 40 and gap >= 10 else "WAIT"))
+                        bar_total = max(rs + cs, 1)
+                        rev_pct = int(rs / bar_total * 16)
+                        cont_pct = 16 - rev_pct
+                        score_bar = "◀" + "█" * rev_pct + "░" * cont_pct + "▶"
+
+                        lines.append(f"\n  🌊 <b>SWEEP ANALYSIS</b> ({sw_side} @ ${sw_price:,.0f} q={sw_qual:.0%})")
+                        lines.append(f"  {score_bar}")
+                        lines.append(f"  REV={rs:.0f}: {', '.join(_esc(r) for r in rr[:3])}")
+                        lines.append(f"  CONT={cs:.0f}: {', '.join(_esc(r) for r in cr[:3])}")
+                        lines.append(f"  → <b>{winner}</b> (rev{'≥' if rs>=45 else '<'}45 gap={gap:.0f})")
+                    elif toward_pool:
+                        lines.append(f"  Scanning for sweep entry toward {'BSL' if flow_dir == 'long' else 'SSL'}...")
+                    else:
+                        lines.append("  Waiting for flow to align with pool direction")
+                else:
+                    lines.append("  Entry engine not available")
+
+            # ══════════════════════════════════════════════════════════
+            # VERDICT
+            # ══════════════════════════════════════════════════════════
+            lines.append("\n<b>━━ VERDICT</b>")
+            if pos.phase == PositionPhase.ACTIVE:
+                lines.append("  📍 Position ACTIVE — managing via ICT structure trail")
+            elif toward_pool and sweep is not None and sweep.status == "OTE_READY" and can_ok and cd_rem == 0:
+                lines.append("  🎯 <b>ALL LAYERS GREEN — entry eligible at OTE</b>")
+            elif toward_pool and sweep is None:
+                lines.append("  ⏳ Flow confirmed → awaiting sweep + displacement")
+            elif not toward_pool:
+                lines.append("  👀 Watching — flow not yet toward target pool")
+            else:
+                missing = []
+                if not toward_pool:    missing.append("Flow not toward pool")
+                if sweep is None:      missing.append("No sweep setup")
+                if not can_ok:         missing.append(f"Risk: {_esc(risk_reason)}")
+                if cd_rem > 0:         missing.append(f"Cooldown {cd_rem:.0f}s")
+                lines.append("  👀 <b>Watching</b> — blocked by:")
+                for m in missing:
+                    lines.append(f"    • {m}")
+
+            self.send_message("\n".join(lines))
+            return None
+
+        except Exception as e:
+            logger.error(f"Thinking error: {e}", exc_info=True)
+            return f"❌ Thinking error: {e}"
+
+    # ================================================================
+    # /pools
+    # ================================================================
+
+    def _cmd_pools(self) -> str:
+        """Show full liquidity pool map with priority scores."""
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        try:
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
+            if not strat or not dm:
+                return "Components not ready."
+
+            price = dm.get_last_price()
+            atr   = strat._atr_5m.atr
+
+            if not hasattr(strat, '_liq_map') or strat._liq_map is None:
+                return "Liquidity map not available (v9 engine not active)."
+
+            snap    = strat._liq_map.get_snapshot(price, atr)
+            summary = strat._liq_map.get_status_summary(price, atr)
+
+            if _V9_DISPLAY:
+                msg = format_pools_telegram(
+                    price=price, atr=atr,
+                    bsl_pools=snap.bsl_pools, ssl_pools=snap.ssl_pools,
+                    primary_target=snap.primary_target,
+                    recent_sweeps=snap.recent_sweeps,
+                    tf_coverage=summary.get("tf_coverage", {}),
+                )
+                self.send_message(msg)
+                return None
+
+            # Fallback plain text pool display
+            lines = [f"<b>💧 Liquidity Pool Map @ ${price:,.2f}</b>  ATR=${atr:.1f}"]
+            pt = snap.primary_target
+            # BUG-FIX C25: PoolTarget has no .level_type or .price attributes.
+            # Correct paths: pt.pool.side.value and pt.pool.price.
+            if pt:
+                lines.append(f"\n🎯 <b>Primary target: "
+                              f"{'BSL' if pt.pool.side.value == 'BSL' else 'SSL'} "
+                              f"@ ${pt.pool.price:,.1f}</b>")
+
+            # BUG-FIX C26: PoolTarget .price → .pool.price, priority_score → .significance,
+            # touch_count → .pool.touches. Filter and sort via .pool.price.
+            lines.append("\n<b>▲ BSL pools</b>")
+            for p in sorted(
+                [p for p in snap.bsl_pools if p.pool.price > price],
+                key=lambda x: x.pool.price,
+            )[:6]:
+                d = (p.pool.price - price) / max(atr, 1)
+                s = p.significance
+                lines.append(
+                    f"  ${p.pool.price:,.1f}  {d:.1f}ATR  "
+                    f"x{p.pool.touches}  score={s:.2f}")
+
+            # BUG-FIX C27: same fixes for SSL
+            lines.append("\n<b>▼ SSL pools</b>")
+            for p in sorted(
+                [p for p in snap.ssl_pools if p.pool.price < price],
+                key=lambda x: x.pool.price,
+                reverse=True,
+            )[:6]:
+                d = (price - p.pool.price) / max(atr, 1)
+                s = p.significance
+                lines.append(
+                    f"  ${p.pool.price:,.1f}  {d:.1f}ATR  "
+                    f"x{p.pool.touches}  score={s:.2f}")
+
+            # BUG-FIX C28: SweepResult has no .displacement_confirmed, .level_type,
+            # or .price. Correct attrs: quality, pool.side.value, pool.price.
+            if snap.recent_sweeps:
+                lines.append(f"\n🌊 <b>Recent sweeps:</b> {len(snap.recent_sweeps)}")
+                for sw in snap.recent_sweeps[-3:]:
+                    disp = "DISP✓" if sw.quality >= 0.5 else "weak"
+                    lines.append(
+                        f"  {sw.pool.side.value} ${sw.pool.price:,.1f} [{disp}]")
+
+            self.send_message("\n".join(lines))
+            return None
+        except Exception as e:
+            logger.error(f"Pools error: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    # ================================================================
+    # /flow
+    # ================================================================
+
+    def _cmd_flow(self) -> str:
+        """Show detailed orderflow state (CVD + OB delta + tick aggression)."""
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        try:
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
+            if not strat or not dm:
+                return "Components not ready."
+
+            price = dm.get_last_price()
+
+            tick_flow = strat._tick_eng.get_signal() if strat._tick_eng else 0.0
+            cvd_trend = strat._cvd.get_trend_signal() if strat._cvd else 0.0
+            cvd_div   = 0.0
+            try:
+                cvd_div = strat._cvd.get_divergence_signal(dm.get_candles("1m", limit=60))
+            except Exception:
+                pass
+
+            ob_imbalance = 0.0
+            try:
+                ob = dm.get_orderbook()
+                if ob and ob.get("bids") and ob.get("asks"):
+                    bv = sum(float(b[1]) for b in ob["bids"][:10])
+                    av = sum(float(a[1]) for a in ob["asks"][:10])
+                    total_vol = bv + av
+                    if total_vol > 0:
+                        ob_imbalance = (bv - av) / total_vol
+            except Exception:
+                pass
+
+            streak     = getattr(strat, '_flow_streak_count_v2', 0)
+            streak_dir = getattr(strat, '_flow_streak_dir_v2', "")
+
+            signals    = [cvd_div * 0.40, ob_imbalance * 0.35, tick_flow * 0.25]
+            conviction = sum(signals)
+            direction  = "long ▲" if conviction > 0.20 else ("short ▼" if conviction < -0.20 else "neutral")
+
+            if _V9_DISPLAY:
+                msg = format_flow_telegram(
+                    price=price, tick_flow=tick_flow,
+                    cvd_trend=cvd_trend, cvd_divergence=cvd_div,
+                    ob_imbalance=ob_imbalance,
+                    tick_streak=streak, streak_direction=streak_dir,
+                    flow_conviction=conviction, flow_direction=direction,
+                )
+                self.send_message(msg)
+                return None
+
+            def bar(v, w=10):
+                h = w // 2
+                f = min(int(abs(v) * h + 0.5), h)
+                return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
+                    else ("░" * (h - f) + "█" * f + "·" * h)
+
+            lines = [f"<b>📊 Flow Direction @ ${price:,.2f}</b>"]
+            lines.append(f"\n  {'CVD div':<14} {bar(cvd_div)} {cvd_div:+.3f}")
+            lines.append(f"  {'OB delta':<14} {bar(ob_imbalance)} {ob_imbalance:+.3f}")
+            lines.append(f"  {'Tick aggression':<14} {bar(tick_flow)} {tick_flow:+.3f}")
+            lines.append(f"  {'CVD trend':<14} {bar(cvd_trend)} {cvd_trend:+.3f}")
+            lines.append(f"\n  Conviction: <b>{conviction:+.3f}</b>  → {direction}")
+            if streak > 1:
+                lines.append(f"  Streak: {streak} ticks {streak_dir}")
+
+            self.send_message("\n".join(lines))
+            return None
+        except Exception as e:
+            logger.error(f"Flow error: {e}", exc_info=True)
+            return f"Error: {e}"
+
+    # ================================================================
+    # /status
+    # ================================================================
+
+    def _cmd_status(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running. Use /start"
+        try:
+            strat = bot_instance.strategy
+            if not strat:
+                return "Strategy not ready."
+            report = strat.format_status_report()
+            self.send_message(report)
+            return None
+        except Exception as e:
+            logger.error(f"Status error: {e}", exc_info=True)
+            return f"❌ Status error: {e}"
+
+    # ================================================================
+    # /structures  (ICT secondary layer)
+    # ================================================================
+
+    def _cmd_structures(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        try:
+            strat = bot_instance.strategy
+            dm    = bot_instance.data_manager
+            if not strat or not dm:
+                return "Components not ready."
+
+            price  = dm.get_last_price()
+            now_ms = int(time.time() * 1000)
+            ict    = getattr(strat, '_ict', None)
+
+            if ict is None:
+                return "❌ ICT engine not available."
+            if not ict._initialized:
+                nb = len(list(ict.order_blocks_bull))
+                ns = len(list(ict.order_blocks_bear))
+                return (f"⏳ ICT engine warming up...\n"
+                        f"Detected so far: {nb}🟢 {ns}🔴 OBs\n"
+                        f"Need ≥10 candles + 5s update cycle.")
+
+            atr_eng = getattr(strat, '_atr_5m', None)
+            atr_v   = atr_eng.atr if atr_eng and atr_eng.atr > 1e-10 else price * 0.002
+            st      = ict.get_full_status(price, atr_v, now_ms)
+            c       = st["counts"]
+            sess    = st.get("session", "UNKNOWN")
+            kz      = st.get("killzone", "")
+            kz_s    = f" [{kz}]" if kz else ""
+
+            lines = [
+                f"🏛️ <b>ICT Structures (secondary) @ ${price:,.1f}</b>",
+                f"<i>AMD phase, OB/FVG alignment, P/D zone — confirms pool flow</i>",
+                f"Session: {_esc(sess)}{_esc(kz_s)}  |  ATR(5m): ${atr_v:.1f}",
+                (f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
+                 f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
+                 f"Liq: {c['liq_active']} active / {c['liq_swept']} swept"),
+                "",
+            ]
+
+            if st["bull_obs"]:
+                lines.append("<b>🟢 Bullish Order Blocks</b>")
+                for ob in st["bull_obs"][:5]:
+                    ote_lo  = ob["high"] - 0.79 * (ob["high"] - ob["low"])
+                    ote_hi  = ob["high"] - 0.50 * (ob["high"] - ob["low"])
+                    in_tag  = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+                    bos     = " BOS✓" if ob["bos"] else ""
+                    lines.append(
+                        f"  ${ob['low']:,.1f}–${ob['high']:,.1f}  "
+                        f"str={ob['strength']:.0f}  v={ob['visit_count']}  "
+                        f"age={ob['age_min']:.0f}m"
+                        f"  OTE:${ote_lo:,.0f}–${ote_hi:,.0f}{bos}{in_tag}"
+                    )
+
+            if st["bear_obs"]:
+                lines.append("\n<b>🔴 Bearish Order Blocks</b>")
+                for ob in st["bear_obs"][:5]:
+                    ote_lo  = ob["low"] + 0.50 * (ob["high"] - ob["low"])
+                    ote_hi  = ob["low"] + 0.79 * (ob["high"] - ob["low"])
+                    in_tag  = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
+                    bos     = " BOS✓" if ob["bos"] else ""
+                    lines.append(
+                        f"  ${ob['low']:,.1f}–${ob['high']:,.1f}  "
+                        f"str={ob['strength']:.0f}  v={ob['visit_count']}  "
+                        f"age={ob['age_min']:.0f}m"
+                        f"  OTE:${ote_lo:,.0f}–${ote_hi:,.0f}{bos}{in_tag}"
+                    )
+
+            all_fvgs = st["bull_fvgs"][:3] + st["bear_fvgs"][:3]
+            if all_fvgs:
+                lines.append("\n<b>Fair Value Gaps</b>")
+                for fvg in sorted(all_fvgs, key=lambda x: abs(x["dist_pts"])):
+                    icon   = "🟦" if fvg["direction"] == "bullish" else "🟥"
+                    in_tag = " ◄ IN GAP" if fvg["in_gap"] else ""
+                    lines.append(
+                        f"  {icon} ${fvg['bottom']:,.1f}–${fvg['top']:,.1f}  "
+                        f"size=${fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
+                        f"{fvg['dist_pts']:+.0f}pts/{fvg['dist_atr']:.2f}ATR{in_tag}"
+                    )
+
+            long_c  = ict.get_confluence("long",  price, now_ms, atr_v)
+            short_c = ict.get_confluence("short", price, now_ms, atr_v)
+            lines.append("\n<b>Confluence Scores (ICT secondary)</b>")
+            lines.append(
+                f"  LONG  Σ={long_c.total:.2f}  "
+                f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
+                f"Sweep={long_c.sweep_score:.2f}  KZ={long_c.session_score:.2f}")
+            if long_c.details:
+                lines.append(f"    → {_esc(long_c.details)}")
+            lines.append(
+                f"  SHORT Σ={short_c.total:.2f}  "
+                f"OB={short_c.ob_score:.2f}  FVG={short_c.fvg_score:.2f}  "
+                f"Sweep={short_c.sweep_score:.2f}  KZ={short_c.session_score:.2f}")
+            if short_c.details:
+                lines.append(f"    → {_esc(short_c.details)}")
+
+            self.send_message("\n".join(lines))
+            return None
+        except Exception as e:
+            logger.error(f"Structures error: {e}", exc_info=True)
+            return f"❌ Structures error: {e}"
+
+    # ================================================================
+    # /position
+    # ================================================================
+
+    def _cmd_position(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
+        if not strat:
+            return "Strategy not ready."
+
+        pos = strat.get_position()
+        if not pos:
+            return "📭 No active position."
+
+        p     = strat._pos
+        price = dm.get_last_price() if dm else 0.0
+        atr   = strat._atr_5m.atr
+
+        side   = p.side.upper()
+        entry  = p.entry_price
+        sl     = p.sl_price
+        tp     = p.tp_price
+        qty    = p.quantity
+        mode   = p.trade_mode
+        phase  = p.phase.name
+
+        init_sl_dist    = getattr(p, 'initial_sl_dist', 0.0)
+        sl_dist         = init_sl_dist if init_sl_dist > 1e-10 else (abs(entry - sl) if sl > 0 else 0.0)
+        current_sl_dist = abs(entry - sl) if sl > 0 else 0.0
+
+        if sl_dist > 1e-10:
+            current_r  = ((price - entry) / sl_dist if side == "LONG"
+                          else (entry - price) / sl_dist)
+            planned_rr = abs(tp - entry) / sl_dist if tp > 0 else 0.0
+        else:
+            current_r  = 0.0
+            planned_rr = 0.0
+
+        upnl      = ((price - entry) * qty if side == "LONG" else (entry - price) * qty)
+        hold_min  = (time.time() - p.entry_time) / 60.0 if p.entry_time > 0 else 0.0
+        peak_prof = getattr(p, 'peak_profit', 0.0)
+        mfe_r     = peak_prof / sl_dist if sl_dist > 1e-10 else 0.0
+        be_moved  = ((side == "LONG"  and sl >= entry) or
+                     (side == "SHORT" and sl <= entry and sl > 0))
+
+        # Pool TP context
+        pool_tp_note = ""
+        if hasattr(strat, '_liq_map') and strat._liq_map is not None:
+            try:
+                snap = strat._liq_map.get_snapshot(price, atr)
+                # BUG-FIX C29a: The pools were inverted.
+                # LONG trades ride UP to BSL (buy-side above); SHORT trades fall to SSL below.
+                # Old code gave LONG→SSL (below) and SHORT→BSL (above) — completely backwards.
+                # BUG-FIX C29b: PoolTarget has no .price — all lookups go through .pool.price.
+                if side == "LONG":
+                    opp_pools = [pp for pp in snap.bsl_pools if pp.pool.price > price]
+                else:
+                    opp_pools = [pp for pp in snap.ssl_pools if pp.pool.price < price]
+                if opp_pools:
+                    opp = sorted(opp_pools,
+                                 key=lambda pp: abs(pp.pool.price - tp))[0]
+                    pool_tp_note = (
+                        f"\nPool TP basis: ${opp.pool.price:,.1f} "
+                        f"(opposing {'BSL' if side == 'LONG' else 'SSL'})"
+                    )
+            except Exception:
+                pass
+
+        # ── ICT trail engine state ────────────────────────────────────────────────
+        from strategy.quant_strategy import _DynamicStructureTrail
+        bos_cnt   = 0
+        choch_tf  = None
+        choch_lvl = 0.0
+        ict_eng   = getattr(strat, '_ict', None)
+        if ict_eng is not None:
+            try:
+                bos_cnt             = _DynamicStructureTrail._bos_count(ict_eng, p.side)
+                choch_tf, choch_lvl = _DynamicStructureTrail._choch(ict_eng, p.side)
+            except Exception:
+                pass
+        choch_active = choch_tf is not None and choch_lvl > 0.0
+
+        # Break-even threshold — use same _calc_be_price() as the trail engine.
+        # Importing from quant_strategy ensures display always matches execution.
+        try:
+            from strategy.quant_strategy import _calc_be_price as _cbp
+        except ImportError:
+            from quant_strategy import _calc_be_price as _cbp
+        # pos object not available here (controller only has flat scalars);
+        # exact fee falls back to commission-rate estimate (acceptable for display).
+        _be_price = _cbp(side.lower(), entry, atr, pos=None)
+        be_locked = ((side == "LONG"  and sl >= _be_price) or
+                     (side == "SHORT" and sl <= _be_price and sl > 0))
+
+        # Trail phase — v5.0 Fibonacci engine phase labels (R-multiple driven).
+        # These MUST match the phase strings emitted by LiquidityTrailEngine:
+        #   PHASE_0_MAX_R=1.0  PHASE_1_MAX_R=2.0  PHASE_2_MAX_R=3.5  P3=3.5+
+        if mfe_r >= 3.5:
+            trail_phase_lbl = (
+                "🟢 AGGRESSIVE  (Phase 3, 3.5R+) — all-TF Fib, HTF-gated, tight buffers"
+            )
+        elif mfe_r >= 2.0:
+            trail_phase_lbl = (
+                "🟠 STRUCTURAL  (Phase 2, 2.0–3.5R) — 1H/15m Fib, wider buffers"
+            )
+        elif mfe_r >= 1.0:
+            trail_phase_lbl = (
+                "🟡 BE_LOCK  (Phase 1, 1.0–2.0R) — SL at BE + exact fees"
+            )
+        else:
+            trail_phase_lbl = (
+                "⬜ HANDS OFF  (Phase 0, <1.0R) — initial structural SL trusted"
+            )
+
+        # Ratchet next milestone
+        _ratchet_milestones = [0.50, 1.00, 1.50, 2.00, 2.50]
+        last_ratchet_r      = getattr(p, 'last_ratchet_r', 0.0)
+        _next_ratchet       = next((m for m in _ratchet_milestones if mfe_r < m), None)
+        _next_ratchet_str   = (f"next @ {_next_ratchet:.2f}R" if _next_ratchet
+                               else "✅ all ratchets hit")
+
+        # Progress bar (4 blocks per R, max 16 blocks = 4R)
+        _bar_filled = min(int(mfe_r * 4), 16)
+        _prog_bar   = "█" * _bar_filled + "░" * (16 - _bar_filled)
+
+        # Pool TP source from stored entry signal
+        _pool_tp_src = ""
+        _es = getattr(strat, '_last_entry_signal', None)
+        if _es is not None:
+            try:
+                _pt = _es.target_pool
+                if _pt and hasattr(_pt, 'pool'):
+                    _pool_tp_src = (
+                        f"  ← {'BSL ▲' if _pt.pool.side.value == 'BSL' else 'SSL ▼'}"
+                        f" pool  sig={_pt.significance:.2f}"
+                        f"  x{_pt.pool.touches} touches")
+            except Exception:
+                pass
+
+        # Entry signal type
+        _es_type = ""
+        if _es is not None:
+            try:
+                _es_type = f"  [{_es.entry_type.value}]"
+            except Exception:
+                pass
+
+        # AMD + dealing range context
+        _amd_line = ""
+        _dr_line  = ""
+        if ict_eng is not None and ict_eng._initialized:
+            try:
+                _amd = ict_eng._amd
+                _amd_icon = {"DISTRIBUTION":"🎯","MANIPULATION":"⚡",
+                             "REACCUMULATION":"🔄","REDISTRIBUTION":"🔄",
+                             "ACCUMULATION":"💤"}.get(_amd.phase,"❓")
+                _amd_line = (f"\nAMD:      {_amd_icon} {_amd.phase}"
+                             f"  bias={_amd.bias}  conf={_amd.confidence:.2f}")
+            except Exception:
+                pass
+            try:
+                _dr = getattr(ict_eng, '_dealing_range', None)
+                if _dr:
+                    _pd = getattr(_dr, 'current_pd', 0.5)
+                    _pd_lbl = ("DEEP DISC" if _pd < 0.25 else
+                               "DISCOUNT"  if _pd < 0.40 else
+                               "EQ"        if _pd < 0.60 else
+                               "PREMIUM"   if _pd < 0.75 else "DEEP PREM")
+                    _dr_line = (f"\nZone:     {_pd_lbl} ({_pd:.0%})"
+                                f"  range=[${_dr.low:,.0f}–${_dr.high:,.0f}]")
+            except Exception:
+                pass
+
+        _side_icon = "🟢" if side == "LONG" else "🔴"
+        _upnl_icon = "🟢" if upnl >= 0 else "🔴"
+
+        return (
+            f"{_side_icon} <b>Position: {side}{_es_type}</b>"
+            f"  Mode: {mode.upper()}  Tier: {getattr(p,'ict_entry_tier','?') or '—'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>💰 LEVELS</b>\n"
+            f"Entry:   ${entry:,.2f}\n"
+            f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
+            f"{_upnl_icon} uPnL:  ${upnl:+,.2f}  |  Qty: {qty:.4f} BTC\n"
+            f"SL:      ${sl:,.2f}  (dist: ${current_sl_dist:.0f} / {current_sl_dist/max(atr,1):.2f}ATR)\n"
+            f"TP:      ${tp:,.2f}{_pool_tp_src}{pool_tp_note}\n"
+            f"R:R planned: 1:{planned_rr:.2f}  |  Hold: {hold_min:.1f}m\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📈 R-PROGRESS</b>\n"
+            f"[{_prog_bar}] MFE={mfe_r:.2f}R  cur={current_r:+.2f}R\n"
+            f"{_next_ratchet_str}  |  last ratchet: {last_ratchet_r:.2f}R\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>🏛️ TRAIL ENGINE</b>\n"
+            f"{trail_phase_lbl}\n"
+            f"BOS confirmed: {bos_cnt}  │  CHoCH: "
+            + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none") +
+            f"\nBE lock: "
+            + ("✅ risk-free (SL ≥ entry)" if be_locked
+               else f"❌ not yet  (SL needs ${_be_price:,.2f})")
+            + _amd_line + _dr_line
+        )
+
+    # ================================================================
+    # /trades
+    # ================================================================
+
+    def _cmd_trades(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        rm    = bot_instance.risk_manager
+        if not strat or not rm:
+            return "Components not ready."
+
+        # BUG 1 FIX: _trade_history is a deque(maxlen=200), which does not
+        # support slice indexing.  Convert to list before slicing so that
+        # `history[-10:]` works the same as on a list.
+        history = list(getattr(strat, '_trade_history', []))
+        lines   = ["<b>📋 Trade History</b>\n"]
+
+        if history:
+            for t in reversed(history[-10:]):
+                side      = t.get('side', '?').upper()
+                mode      = t.get('mode', '?').upper()
+                entry     = t.get('entry', 0.0)
+                exit_p    = t.get('exit',  0.0)
+                pnl       = t.get('pnl',   0.0)
+                reason    = t.get('reason', '?')
+                hold      = t.get('hold_min', 0.0)
+                mfe_r     = t.get('mfe_r', 0.0)
+                trailed   = t.get('trailed', False)
+                is_win    = t.get('is_win', False)
+                init_sl   = t.get('init_sl_dist', 0.0)
+                ict_tier  = t.get('ict_tier', '')
+                pool_tp   = t.get('pool_tp_price', 0.0)
+                raw_pts   = ((exit_p - entry) if side == "LONG" else (entry - exit_p))
+                ach_r     = raw_pts / init_sl if init_sl > 1e-10 else 0.0
+
+                total_fees = t.get('total_fees', 0.0)
+                exact_fees = t.get('exact_fees', False)
+                margin_pct = t.get('margin_pnl_pct', 0.0)
+
+                if   reason == "tp_hit":       label = "🎯 TP (pool sweep)"
+                elif reason == "trail_sl_hit": label = "🔒 TRAIL (ICT struct)"
+                elif reason == "sl_hit":       label = "🛑 SL (ICT struct)"
+                else:                          label = f"🚪 {reason[:8]}"
+
+                result    = "✅" if is_win else "❌"
+                trail_tag = " [T]" if trailed else ""
+                tier_badge = f" [T{ict_tier}]" if ict_tier else ""
+                pool_tp_tag = f"  pool_tp=${pool_tp:,.0f}" if pool_tp else ""
+
+                fee_line = ""
+                if total_fees > 0:
+                    fee_tag  = "exact" if exact_fees else "est."
+                    fee_line = f"\n    Fees({fee_tag}): ${total_fees:.4f}"
+
+                # v6.0: margin % P&L display
+                margin_tag = f"  ({margin_pct:+.1f}% margin)" if abs(margin_pct) > 0.01 else ""
+
+                lines.append(
+                    f"{result} {side} [{mode}]{tier_badge}  "
+                    f"${entry:,.0f}→${exit_p:,.0f}  "
+                    f"PnL: <b>${pnl:+.2f}</b>{margin_tag}  R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
+                    f"    {label}{trail_tag}  hold: {hold:.0f}m{pool_tp_tag}"
+                    + fee_line
+                )
+        else:
+            lines.append("  No trades recorded yet this session.")
+
+        total_t   = getattr(strat, '_total_trades', 0)
+        wins      = getattr(strat, '_winning_trades', 0)
+        losses    = total_t - wins
+        wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = getattr(strat, '_total_pnl', 0.0)
+
+        daily_cnt = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
+        consec    = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
+        max_d     = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
+
+        win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
+        loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+        avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+        avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
+
+        total_fees_s = sum(t.get('total_fees', 0) for t in history)
+
+        # v6.0: Aggregate margin % P&L
+        margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        avg_margin_pct = sum(margin_pcts) / len(margin_pcts) if margin_pcts else 0.0
+        total_margin_pct = sum(margin_pcts)
+
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Session:   {total_t} trades  W:{wins} L:{losses}  WR: <b>{wr:.0f}%</b>",
+            f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
+            f"Margin %:  <b>{total_margin_pct:+.1f}%</b> total  (avg {avg_margin_pct:+.1f}%/trade)",
+            f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
+            f"Expectancy: ${expectancy:+.2f}/trade",
+            f"Total Fees: ${total_fees_s:.4f}" if total_fees_s > 0 else "Total Fees: —",
+            f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
+        ]
+        return "\n".join(lines)
+
+    # ================================================================
+    # /stats
+    # ================================================================
+
+    def _cmd_stats(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        if not strat:
+            return "Strategy not ready."
+
+        # BUG 1 FIX: _trade_history is a deque — convert for any slice operations
+        history = list(getattr(strat, '_trade_history', []))
+        if len(history) < 3:
+            return f"📊 Not enough trades yet ({len(history)} recorded — need ≥3)."
+
+        lines = ["<b>📊 Signal Attribution Analysis</b>\n"]
+        total = len(history)
+        wins  = sum(1 for t in history if t.get('is_win'))
+        wr_all = wins / total * 100.0
+        lines.append(f"Total trades: {total}  WR: <b>{wr_all:.0f}%</b>\n")
+
+        # By ICT tier
+        lines.append("<b>By ICT Tier</b>")
+        tier_groups: dict = {}
+        for t in history:
+            k = t.get('ict_tier', '') or 'none'
+            tier_groups.setdefault(k, []).append(t)
+        for tier in ['S', 'A', 'B', 'none']:
+            grp = tier_groups.get(tier, [])
+            if not grp: continue
+            w   = sum(1 for t in grp if t.get('is_win'))
+            wr  = w / len(grp) * 100.0
+            avg = sum(t.get('pnl', 0) for t in grp) / len(grp)
+            lines.append(f"  {'Tier-' + tier if tier != 'none' else 'No tier'}: {len(grp)} trades  WR={wr:.0f}%  avg net=${avg:+.2f}")
+
+        # By exit reason (pool-centric)
+        lines.append("\n<b>By Exit Reason</b>")
+        exit_groups: dict = {}
+        for t in history:
+            k = t.get('reason', 'unknown')
+            exit_groups.setdefault(k, []).append(t)
+        for reason, grp in sorted(exit_groups.items()):
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            lines.append(f"  {_esc(reason)}: {len(grp)} trades  WR={wr:.0f}%")
+
+        # By AMD phase
+        lines.append("\n<b>By AMD Phase</b>")
+        amd_groups: dict = {}
+        for t in history:
+            k = t.get('amd_phase', 'UNKNOWN')
+            amd_groups.setdefault(k, []).append(t)
+        for phase, grp in sorted(amd_groups.items()):
+            w  = sum(1 for t in grp if t.get('is_win'))
+            wr = w / len(grp) * 100.0
+            lines.append(f"  {_esc(phase)}: {len(grp)} trades  WR={wr:.0f}%")
+
+        # PnL summary
+        lines.append("\n<b>Realised PnL &amp; Fees</b>")
+        total_net  = sum(t.get('pnl', 0) for t in history)
+        total_fees = sum(t.get('total_fees', 0) for t in history)
+        n_exact    = sum(1 for t in history if t.get('exact_fees'))
+        n_est      = total - n_exact
+        lines += [
+            f"  Net PnL:    <b>${total_net:+.4f}</b> USDT",
+            f"  Total Fees: ${total_fees:.4f} ({n_exact} exact, {n_est} est.)",
+        ]
+        return "\n".join(l for l in lines if l is not None)
+
+    # ================================================================
+    # /learn  — Post-trade analysis & adaptive parameter engine
+    # ================================================================
+
+    def _cmd_learn(self) -> str:
+        """
+        Institutional post-trade analysis report.
+
+        Shows (all Bayesian-estimated; min 5 real samples per dimension):
+          • Overall WR with Wilson CI, G-Ratio, avg R-multiple, IC score
+          • Per ICT Tier WR + avg PnL + geometry (G-ratio, entry efficiency)
+          • Per AMD Phase WR + SL efficiency + entry efficiency + avg R
+          • Per Session WR + avg PnL (London / NY / Asia / Kill-zone)
+          • SL Causation breakdown (WICK_SWEEP / BOS_BREAK / AMD_FLIP / …)
+          • TP Causation breakdown (POOL_REACHED / STRUCTURAL / TRAIL_LOCK / …)
+          • Adaptive parameter adjustments (mult × drift%) with evidence trail
+          • Recent insights (INFO / WARN / ACTION) from the adaptive engine
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = getattr(bot_instance, "strategy", None)
+        if strat is None:
+            return "Strategy not ready."
+
+        agent = getattr(strat, "_post_trade_agent", None)
+        if agent is None:
+            return (
+                "⚠️ PostTradeAgent not loaded.\n"
+                "Place <code>post_trade_agent.py</code> in <code>strategy/</code> "
+                "and restart the bot."
+            )
+
+        if not agent.records:
+            n_hist = len(getattr(strat, "_trade_history", []))
+            return (
+                f"📊 PostTradeAgent active but no analysis yet.\n"
+                f"Trade history has {n_hist} record(s) — agent runs after each close.\n"
+                f"Minimum {5} real trades needed for Bayesian recommendations."
+            )
+
+        try:
+            report = agent.get_dimension_report()
+            # Telegram has a 4096-char hard limit per message; split if needed
+            if len(report) <= 4000:
+                self.send_message(report)
+            else:
+                # Send in two parts
+                split_at = report.rfind("\n", 0, 4000)
+                if split_at == -1:
+                    split_at = 4000
+                self.send_message(report[:split_at])
+                self.send_message(
+                    "<b>…continued</b>\n" + report[split_at:]
+                )
+            return None   # message already sent via send_message()
+        except Exception as e:
+            logger.error(f"_cmd_learn error: {e}", exc_info=True)
+            return f"❌ Learn report error: {e}"
+
+    # ================================================================
+    # /huntstatus
+    # ================================================================
+
+    def _cmd_huntstatus(self) -> str:
+        if _V9_DISPLAY:
+            return self._cmd_pools()
+
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat  = getattr(bot_instance, 'strategy', None)
+        dm     = getattr(bot_instance, 'data_manager', None)
+        if not strat or not dm:
+            return "Components not ready."
+
+        hunter = getattr(strat, '_liquidity_hunter', None)
+        if hunter is None:
+            # Fall back to pool map if no dedicated hunter
+            return self._cmd_pools()
+
+        price = dm.get_last_price()
+        atr   = strat._atr_5m.atr
+        st    = hunter.get_status_dict()
+
+        state_icons = {
+            "NO_RANGE":        "⚪",
+            "RANGING":         "🔵",
+            "STALKING":        "🟡",
+            "APPROACHING":     "🟠",
+            "SWEEP_CONFIRMED": "🟢",
+            "CISD_WAIT":       "🔍",
+            "OTE_WAIT":        "📐",
+        }
+        s_icon = state_icons.get(st["state"], "❓")
+
+        lines = [f"<b>🎣 Liquidity Hunt Engine</b>"]
+        lines.append(f"Price: ${price:,.2f}  ATR: ${atr:.1f}")
+        lines.append(f"\n<b>State:</b> {s_icon} {st['state']}")
+
+        if st["bsl"] is not None and st["ssl"] is not None:
+            bsl     = st["bsl"]
+            ssl     = st["ssl"]
+            rng     = bsl - ssl
+            rng_atr = rng / atr if atr > 1e-10 else 0
+            pd_pct  = (price - ssl) / rng * 100 if rng > 0 else 0
+            lines.append(f"SSL ${ssl:,.1f} ─ price ${price:,.2f} ({pd_pct:.0f}%) ─ BSL ${bsl:,.1f}")
+            lines.append(f"Range: {rng:.0f}pts / {rng_atr:.1f}ATR")
+        else:
+            lines.append("No active BSL/SSL range detected.")
+
+        pred = st.get("predicted_dir", "")
+        pred_str = "▲ BSL" if pred == "bsl" else ("▼ SSL" if pred == "ssl" else "─ none")
+        lines.append(f"\n<b>Prediction:</b> {pred_str}")
+        lines.append(f"  Score: {st['score_ema']:+.3f}  raw: {st['raw_score']:+.3f}")
+
+        if st.get("signal_ready"):
+            lines.append(f"\n<b>🎯 SIGNAL READY</b>")
+            lines.append(f"  Side:  <b>{(st['signal_side'] or '?').upper()}</b>")
+            lines.append(f"  SL:    ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
+            lines.append(f"  R:R:   1:{st['signal_rr']:.2f}")
+        else:
+            lines.append("\n  No pending signal.")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /balance
+    # ================================================================
+
+    def _cmd_balance(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        rm = bot_instance.risk_manager
+        if not rm:
+            return "Risk manager not ready."
+        try:
+            bal = rm.get_available_balance()
+            if not bal:
+                return "Could not fetch balance."
+            avail    = float(bal.get("available", 0))
+            total    = float(bal.get("total", avail))
+            locked   = total - avail
+            dpnl     = getattr(rm, 'daily_pnl', 0.0)
+            init_bal = getattr(rm, 'initial_balance', 0.0)
+            dpct     = (dpnl / init_bal * 100.0 if init_bal > 1e-10 else 0.0)
+
+            # Commission reserve preview — helps diagnose Bug 3 before it bites
+            import config as _cfg
+            _lev   = int(getattr(_cfg, 'LEVERAGE', 30))
+            _rate  = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+            _max_notional = avail * _lev
+            _fee_reserve  = _max_notional * _rate * 2.0 * 1.15
+            _avail_after  = max(0.0, avail - _fee_reserve)
+            pnl_icon = "🟢" if dpnl >= 0 else "🔴"
+
+            return (
+                f"💰 <b>Wallet Balance</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Available:  <b>{_esc(f'${avail:,.2f}')}</b> USDT\n"
+                f"Locked:     {_esc(f'${locked:,.2f}')} USDT\n"
+                f"Total:      {_esc(f'${total:,.2f}')} USDT\n"
+                f"\n"
+                f"<b>Sizing Headroom</b>  (leverage {_lev}x)\n"
+                f"  Max notional:     {_esc(f'${_max_notional:,.0f}')}\n"
+                f"  Commission reserve: {_esc(f'${_fee_reserve:.2f}')}  "
+                f"<i>(2× taker × 1.15 safety)</i>\n"
+                f"  Sizeable balance: <b>{_esc(f'${_avail_after:,.2f}')}</b>\n"
+                f"\n"
+                f"{pnl_icon} Today's PnL: <b>{_esc(f'${dpnl:+,.2f}')}</b>  "
+                f"({dpct:+.2f}%)"
+            )
+        except Exception as e:
+            return f"Balance error: {_esc(e)}"
+
+    # ================================================================
+    # /pause / /resume / /trail
+    # ================================================================
+
+    def _cmd_pause(self) -> str:
+        global bot_instance
+        if not bot_instance: return "Bot not running."
+        bot_instance.trading_enabled      = False
+        bot_instance.trading_pause_reason = "Paused via Telegram"
+        return (
+            "⏸️ <b>Trading PAUSED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• No new entries will be taken\n"
+            "• Existing position (if any) is still managed (trail + SL/TP)\n"
+            "• Pool monitoring continues\n"
+            "• Send <code>/resume</code> to re-enable entries"
+        )
+
+    def _cmd_resume(self) -> str:
+        global bot_instance
+        if not bot_instance: return "Bot not running."
+        bot_instance.trading_enabled      = True
+        bot_instance.trading_pause_reason = ""
+        return (
+            "▶️ <b>Trading RESUMED</b>\n"
+            "Entries re-enabled. Bot will evaluate signals on next tick."
+        )
+
+    def _cmd_trail(self, args: str) -> str:
+        global bot_instance
+        if not bot_instance: return "Bot not running."
+        strat = bot_instance.strategy
+        if not strat: return "Strategy not ready."
+        arg = (args or "").strip().lower()
+        if arg in ("on", "enable", "1", "true", "yes"):
+            strat.set_trail_override(True)
+            return (
+                "🔒 <b>Trailing SL: FORCED ON</b>\n"
+                "Engine: Fibonacci v5.0 (sole trail)\n"
+                "Will advance SL per phase logic regardless of config flag."
+            )
+        elif arg in ("off", "disable", "0", "false", "no"):
+            strat.set_trail_override(False)
+            return (
+                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
+                "SL will remain at initial structural level.\n"
+                "Exit will be via TP fill, SL hit, or max-hold timeout."
+            )
+        else:
+            strat.set_trail_override(None)
+            enabled = strat.get_trail_enabled()
+            default_txt = "ON" if enabled else "OFF"
+            return (
+                f"🔄 <b>Trailing SL: AUTO</b>\n"
+                f"Using config default: <b>{default_txt}</b>\n"
+                f"Engine: Fibonacci v5.0 (bar-close gated, momentum-confirmed)\n"
+                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
+            )
+
+    # ================================================================
+    # /config
+    # ================================================================
+
+    def _cmd_config(self) -> str:
+        import config as cfg
+        lines = [
+            "<b>Bot Configuration (liquidity-first)</b>\n",
+            f"Symbol:     {cfg.SYMBOL}",
+            f"Exchange:   {cfg.EXECUTION_EXCHANGE.upper()}",
+            f"Leverage:   {cfg.LEVERAGE}x",
+            "",
+            "<b>Architecture</b>",
+            "  Primary:   BSL/SSL pool map + flow detector",
+            "  Secondary: ICT structures (OB/FVG/AMD)",
+            "  Entry:     Limit at OTE | Market at sweep",
+            "  SL:        ICT structure (wick→OB→swing)",
+            "  TP:        Opposing liquidity pool sweep price",
+            "  Trail:     ICT structure (BOS→CHoCH→15m)",
+            "",
+            "<b>Position Sizing  (risk-based)</b>",
+            # CRIT-1/CRIT-7 FIX: display RISK_PER_TRADE (now the actual sizing lever).
+            # Old display showed QUANT_MARGIN_PCT (deprecated) and a wrong 0.60 fallback.
+            f"  Risk/trade:   <b>{getattr(cfg,'RISK_PER_TRADE',0.006)*100:.2f}%</b> of balance",
+            f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',1.0):.2f} USDT",
+            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',0.5)} BTC",
+            "",
+            "<b>Entry</b>",
+            f"  Confirm ticks: {getattr(cfg,'QUANT_CONFIRM_TICKS',2)}",
+            # SIG-1 FIX: default 300 (was 180)
+            f"  Cooldown:      {getattr(cfg,'QUANT_COOLDOWN_SEC',300)}s",
+            f"  Max hold:      {getattr(cfg,'QUANT_MAX_HOLD_SEC',2400)}s",
+            "",
+            "<b>Risk</b>",
+            # SIG-1 FIX: corrected defaults throughout
+            f"  Min R:R:          {getattr(cfg,'MIN_RISK_REWARD_RATIO',2.0)}",
+            f"  Max daily trades: {getattr(cfg,'MAX_DAILY_TRADES',10)}",
+            f"  Max daily loss:   {getattr(cfg,'MAX_DAILY_LOSS_PCT',3.0):.1f}%",
+            f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',2)}",
+            f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
+            "",
+            "<b>Trail  (v5.0 Fibonacci — sole engine)</b>",
+            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
+            f"  Phase 0 (&lt;1.0R): HANDS OFF — structural SL trusted",
+            f"  Phase 1 (1.0–2.0R): BE_LOCK — entry + exact fees + slippage",
+            f"  Phase 2 (2.0–3.5R): FIB STRUCTURAL — 1H/15m swings",
+            f"  Phase 3 (3.5R+):    FIB AGGRESSIVE — all TFs, HTF-gated",
+            f"  Close confirm:  P2=2 closes, P3=1 close + displacement",
+            f"  Counter-BOS:    sovereign override → BE at any R",
+            f"  Commission RT:  {getattr(cfg,'COMMISSION_RATE',0.00055)*100:.3f}% taker (×2)",
+        ]
+        return "\n".join(lines)
+
+    # ================================================================
+    # /killswitch
+    # ================================================================
+
+    def _cmd_killswitch(self) -> str:
+        global bot_instance
+        if not bot_instance: return "Bot not running."
+        try:
+            import config
+            bot_instance.trading_enabled = False
+            om      = bot_instance.order_manager
+            results = []
+
+            if not om:
+                return "❌ Order manager not available."
+
+            try:
+                swept = om.cancel_symbol_conditionals(symbol=config.SYMBOL)
+                results.append(f"✅ Swept {len(swept)} conditional order(s)")
+            except Exception as e:
+                results.append(f"⚠️ Cancel error: {e}")
+
+            try:
+                pos = om.get_open_position()
+                if pos and float(pos.get("size", 0)) > 0:
+                    pos_side   = str(pos.get("side", "")).upper()
+                    close_side = "SELL" if pos_side == "LONG" else "BUY"
+                    qty        = float(pos["size"])
+                    resp       = om.place_market_order(side=close_side, quantity=qty, reduce_only=True)
+                    if resp:
+                        results.append(f"✅ Closed {pos_side} ({qty} BTC)")
+                    else:
+                        results.append(f"⚠️ Close order returned None")
+                else:
+                    results.append("ℹ️ No open position on exchange")
+            except Exception as e:
+                results.append(f"⚠️ Close error: {e}")
+
+            strat = bot_instance.strategy
+            if strat:
+                try:
+                    # BUG-FIX C30: bare 'from quant_strategy import' fails when the module
+                    # is loaded as strategy.quant_strategy (ModuleNotFoundError).
+                    from strategy.quant_strategy import PositionState
+                    with strat._lock:
+                        strat._pos = PositionState()
+                        strat._confirm_long = strat._confirm_short = 0
+                    results.append("✅ Strategy reset to FLAT")
+                except Exception as e:
+                    results.append(f"⚠️ State reset: {e}")
+
+            result_str = "\n".join(f"  {r}" for r in results)
+            return (
+                f"🚨 <b>KILLSWITCH ACTIVATED</b>\n\n"
+                f"{result_str}\n\n"
+                f"Trading is PAUSED. Use /resume to re-enable."
+            )
+        except Exception as e:
+            logger.error(f"Killswitch error: {e}", exc_info=True)
+            return f"❌ Killswitch error: {e}"
+
+    # ================================================================
+    # /resetrisk
+    # ================================================================
+
+    def _cmd_resetrisk(self, args: str) -> str:
+        global bot_instance
+        if not bot_instance: return "Bot not running."
+
+        strat = getattr(bot_instance, 'strategy', None)
+        rm    = getattr(bot_instance, 'risk_manager', None)
+        if strat is None: return "❌ Strategy not initialised."
+
+        try:
+            from strategy.quant_strategy import PositionPhase
+            with strat._lock:
+                phase = strat._pos.phase
+            if phase not in (PositionPhase.FLAT, PositionPhase.ENTERING):
+                return (
+                    "❌ Cannot reset risk gate while position is open.\n"
+                    f"Current phase: {phase.name}\n"
+                    "Close the position first, then /resetrisk."
+                )
+        except Exception as e:
+            logger.warning(f"resetrisk phase check error: {e}")
+
+        reset_daily = "full" in args.lower()
+        lines = ["🔄 <b>Risk Gate Reset</b>"]
+
+        gate = getattr(strat, '_risk_gate', None)
+        if gate is not None:
+            try:
+                gate_result = gate.force_reset(reset_consec=True, reset_daily=reset_daily)
+                lines.append(f"  DailyRiskGate: {gate_result}")
+            except Exception as e:
+                lines.append(f"  DailyRiskGate error: {e}")
+        else:
+            lines.append("  ⚠️ DailyRiskGate not found on strategy")
+
+        if rm is not None:
+            try:
+                with rm._lock:
+                    prev_cl = rm.consecutive_losses
+                    prev_dp = rm.daily_pnl
+                    rm.consecutive_losses = 0
+                    if reset_daily:
+                        rm.daily_pnl    = 0.0
+                        rm.daily_trades = []
+                detail = f"consec_losses {prev_cl}→0"
+                if reset_daily:
+                    detail += f" | daily_pnl ${prev_dp:+.2f}→$0.00 | daily_trades cleared"
+                lines.append(f"  RiskManager: {detail}")
+            except Exception as e:
+                lines.append(f"  RiskManager error: {e}")
+
+        if reset_daily:
+            lines.append("\n<i>Full daily reset applied — counters treated as new session.</i>")
+        else:
+            lines.append("\n<i>Consecutive-loss lock cleared only. Daily PnL/trade count unchanged.</i>")
+        return "\n".join(lines)
+
+    # ================================================================
+    # /setexchange
+    # ================================================================
+
+    def _cmd_setexchange(self, args: str) -> str:
+        global bot_instance, bot_running
+
+        if not args:
+            active = getattr(config, "EXECUTION_EXCHANGE", "?")
+            return (
+                f"Current execution exchange: <b>{active.upper()}</b>\n\n"
+                f"Usage: /setexchange &lt;exchange&gt;\n"
+                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
+                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
+            )
+
+        target = args.strip().lower()
+
+        if not bot_running or bot_instance is None:
+            try:
+                from core.types import Exchange
+                Exchange.from_str(target)
+                config.EXECUTION_EXCHANGE = Exchange.from_str(target).value
+                return (f"✅ Execution exchange set to <b>{target.upper()}</b> "
+                        f"(bot not running — takes effect on next start)")
+            except ValueError:
+                return f"❌ Unknown exchange: <code>{target}</code>"
+
+        router = getattr(bot_instance, "execution_router", None)
+        if router is None:
+            return "❌ Execution router not available."
+
+        strategy = getattr(bot_instance, "strategy", None)
+        success, message = router.switch(target, strategy=strategy)
+
+        if success and bot_instance.order_manager:
+            try:
+                bot_instance.order_manager.set_leverage(leverage=int(config.LEVERAGE))
+            except Exception as e:
+                message += f"\n⚠️ Leverage set failed: {e}"
+
+        return message
+
+    # ================================================================
+    # /set
+    # ================================================================
+
+    def _cmd_set(self, args: str) -> str:
+        import config as cfg
+
+        if not args or len(args.split()) < 2:
+            return (
+                "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
+                "<b>Adjustable:</b>\n"
+                "  leverage          int   (e.g. 20)\n"
+                "  risk              float (0.001–0.020, e.g. 0.006 = 0.6%)\n"
+                "  cooldown          int   seconds\n"
+                "  max_daily_trades  int\n"
+                "  max_daily_loss    float %\n"
+                "  max_consec_loss   int\n"
+                "  min_rr            float\n"
+                "  trail_enabled     bool  (true/false)\n"
+                "  max_hold          int   seconds\n"
+            )
+
+        parts   = args.split(None, 1)
+        key     = parts[0].lower().strip()
+        val_str = parts[1].strip()
+
+        allowed = {
+            "leverage":         ("LEVERAGE",             int),
+            # CRIT-1 FIX: RISK_PER_TRADE is now the position-sizing lever.
+            # QUANT_MARGIN_PCT is retired — _compute_quantity no longer reads it.
+            "risk":             ("RISK_PER_TRADE",       float),
+            "cooldown":         ("QUANT_COOLDOWN_SEC",   int),
+            "max_daily_trades": ("MAX_DAILY_TRADES",     int),
+            "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",   float),
+            "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES", int),
+            "min_rr":           ("MIN_RISK_REWARD_RATIO", float),
+            "trail_enabled":    ("QUANT_TRAIL_ENABLED",  bool),
+            "max_hold":         ("QUANT_MAX_HOLD_SEC",   int),
+        }
+
+        if key not in allowed:
+            return (f"Unknown key: <code>{key}</code>\n"
+                    f"Allowed: {', '.join(sorted(allowed.keys()))}")
+
+        attr_name, val_type = allowed[key]
+        try:
+            new_val = (val_str.lower() in ("true", "1", "yes", "on")
+                       if val_type == bool else val_type(val_str))
+        except ValueError:
+            return f"Invalid value: <code>{val_str}</code> (expected {val_type.__name__})"
+
+        old_val = getattr(cfg, attr_name, "?")
+
+        if key == "leverage":
+            global bot_instance, bot_running
+            if bot_running and bot_instance and bot_instance.strategy:
+                pos = bot_instance.strategy.get_position()
+                if pos:
+                    return (
+                        f"❌ Cannot change leverage while position is open.\n"
+                        f"Close position first, then /set leverage {new_val}."
+                    )
+            setattr(cfg, attr_name, new_val)
+            if bot_running and bot_instance:
+                om = getattr(bot_instance, 'order_manager', None)
+                if om:
+                    try:
+                        resp = om.set_leverage(leverage=int(new_val))
+                        if isinstance(resp, dict) and resp.get("error"):
+                            setattr(cfg, attr_name, old_val)
+                            return f"❌ Exchange rejected: {resp['error']}\nConfig reverted to {old_val}x."
+                        return (f"✅ <b>Leverage updated</b>: {old_val}x → <b>{new_val}x</b>\n"
+                                f"Config and exchange both updated.")
+                    except Exception as e:
+                        setattr(cfg, attr_name, old_val)
+                        return f"❌ Exchange API error: {e}\nConfig reverted to {old_val}x."
+            return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (exchange not updated — bot not running)"
+
+        # ── Risk per trade validation ─────────────────────────────────────
+        if key == "risk":
+            if not (0.001 <= new_val <= 0.020):
+                return (
+                    f"❌ Risk/trade must be 0.001–0.020 (0.1%–2.0%).\n"
+                    f"You entered: {new_val} ({new_val*100:.2f}%)\n"
+                    f"Example: /set risk 0.006  (= 0.6% of balance risked per trade)\n"
+                    f"Industry standard: 0.5%–1.0% per trade."
+                )
+            if bot_running and bot_instance and bot_instance.strategy:
+                pos = bot_instance.strategy.get_position()
+                if pos:
+                    return (
+                        f"❌ Cannot change risk/trade while position is open.\n"
+                        f"Close position first, then /set risk {new_val}."
+                    )
+            setattr(cfg, attr_name, new_val)
+            logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+            return (
+                f"✅ <b>RISK/TRADE</b>: {old_val*100:.2f}% → <b>{new_val*100:.2f}%</b>\n"
+                f"Next trade will risk {new_val*100:.2f}% of available balance at SL."
+            )
+
+        setattr(cfg, attr_name, new_val)
+        logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+        return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
+
+    # ================================================================
+    # /pnl — Quick PnL snapshot (most used command)
+    # ================================================================
+
+    def _cmd_pnl(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
+        rm    = bot_instance.risk_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        price   = dm.get_last_price()
+        pos     = strat.get_position()
+        # BUG 1 FIX: _trade_history is a deque — convert to list for slicing
+        history = list(getattr(strat, '_trade_history', []))
+        total_t = getattr(strat, '_total_trades', 0)
+        wins    = getattr(strat, '_winning_trades', 0)
+        losses  = total_t - wins
+        wr      = wins / total_t * 100.0 if total_t > 0 else 0.0
+        total_pnl = getattr(strat, '_total_pnl', 0.0)
+
+        pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+        lines = [
+            f"{pnl_icon} <b>PnL @ {_esc(f'${price:,.2f}')}</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        # ── Unrealised ──────────────────────────────────────────────
+        if pos:
+            p = strat._pos
+            side   = p.side.upper()
+            entry  = p.entry_price
+            upnl_pts = (price - entry) if side == "LONG" else (entry - price)
+            init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 \
+                        else abs(entry - p.sl_price)
+            cur_r  = upnl_pts / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r  = p.peak_profit / init_dist if init_dist > 1e-10 else 0.0
+            hold_m = (time.time() - p.entry_time) / 60.0
+
+            _u_margin_pct = 0.0
+            _u_margin_used = 0.0
+            try:
+                if entry > 0 and p.quantity > 0:
+                    _u_notional = entry * p.quantity
+                    _u_lev = int(getattr(__import__('config'), 'LEVERAGE', 30))
+                    _u_margin_used = _u_notional / _u_lev if _u_lev > 0 else _u_notional
+                    if _u_margin_used > 1e-10:
+                        _u_upnl_usd = upnl_pts * p.quantity
+                        _u_margin_pct = (_u_upnl_usd / _u_margin_used) * 100.0
+            except Exception:
+                pass
+
+            u_icon = "🟢" if upnl_pts >= 0 else "🔴"
+            lines.append(f"{u_icon} <b>OPEN {_esc(side)}</b> @ {_esc(f'${entry:,.2f}')}")
+            lines.append(
+                f"  uPnL: {upnl_pts:+.1f}pts ({cur_r:+.2f}R)  "
+                f"MFE: {mfe_r:.2f}R"
+            )
+            lines.append(
+                f"  Margin: <b>{_u_margin_pct:+.1f}%</b> on "
+                f"{_esc(f'${_u_margin_used:.2f}')}"
+            )
+            lines.append(
+                f"  SL: {_esc(f'${p.sl_price:,.2f}')}  "
+                f"TP: {_esc(f'${p.tp_price:,.2f}')}  "
+                f"Hold: {hold_m:.0f}m"
+            )
+            lines.append("")
+
+        # ── Realised ────────────────────────────────────────────────
+        _margin_pcts = [t.get('margin_pnl_pct', 0.0) for t in history
+                        if abs(t.get('margin_pnl_pct', 0.0)) > 0.001]
+        _total_margin_pct = sum(_margin_pcts)
+        _margin_disp = f"  ({_total_margin_pct:+.1f}% margin)" if _margin_pcts else ""
+
+        lines.append(f"<b>Realised</b>:  {_esc(f'${total_pnl:+.4f}')}{_margin_disp}")
+        lines.append(
+            f"Trades: {total_t} | W:{wins} L:{losses} | WR: <b>{wr:.0f}%</b>"
+        )
+
+        # ── Expectancy ──────────────────────────────────────────────
+        if total_t >= 3:
+            win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
+            loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
+            avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
+            avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+            expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
+            exp_icon = "🟢" if expectancy > 0 else "🔴"
+            lines.append(
+                f"{exp_icon} Expectancy: <b>{_esc(f'${expectancy:+.2f}')}</b>/trade  "
+                f"(avgW {_esc(f'${avg_win:+.2f}')} avgL {_esc(f'${avg_loss:+.2f}')})"
+            )
+
+        # ── Recent 3 trades ─────────────────────────────────────────
+        if history:
+            lines.append("")
+            lines.append("<b>Recent</b>:")
+            for t in reversed(history[-3:]):
+                pnl    = t.get('pnl', 0.0)
+                side   = (t.get('side') or '?').upper()
+                reason = t.get('reason', '?')
+                m_pct  = t.get('margin_pnl_pct', 0.0)
+                icon   = "✅" if t.get('is_win') else "❌"
+                m_tag  = f" ({m_pct:+.1f}%)" if abs(m_pct) > 0.01 else ""
+                lines.append(
+                    f"  {icon} {_esc(side)} "
+                    f"{_esc(f'${pnl:+.4f}')}{m_tag} "
+                    f"[{_esc(reason[:12])}]"
+                )
+        return "\n".join(lines)
+
+    # ================================================================
+    # /market — Quick market snapshot
+    # ================================================================
+
+    def _cmd_market(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+        strat = bot_instance.strategy
+        dm    = bot_instance.data_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        price = dm.get_last_price()
+        atr   = strat._atr_5m.atr
+        ict   = getattr(strat, '_ict', None)
+
+        lines = [f"📊 <b>MARKET @ ${price:,.2f}</b>"]
+        lines.append(f"ATR(5m): ${atr:.1f}")
+
+        # AMD bias
+        if ict and ict._initialized:
+            try:
+                amd = ict._amd
+                bias_icon = "🔴" if amd.bias == "bearish" else ("🟢" if amd.bias == "bullish" else "⚪")
+                lines.append(f"AMD: {amd.phase} {bias_icon}{amd.bias} ({amd.confidence:.0%})")
+            except Exception:
+                pass
+
+            # MTF structure
+            _tf = getattr(ict, '_tf', {})
+            parts = []
+            for k in ("4h", "1h", "15m", "5m"):
+                s = _tf.get(k)
+                if s:
+                    t = getattr(s, 'trend', 'ranging')
+                    icon = "🟢" if t == "bullish" else ("🔴" if t == "bearish" else "⚪")
+                    parts.append(f"{icon}{k}")
+            if parts:
+                lines.append(f"MTF: {' '.join(parts)}")
+
+            # Dealing range
+            _dr = getattr(ict, '_dealing_range', None)
+            if _dr:
+                _pd = getattr(_dr, 'current_pd', 0.5)
+                _lbl = ("DEEP DISC" if _pd < 0.25 else "DISCOUNT" if _pd < 0.40
+                        else "EQ" if _pd < 0.60 else "PREMIUM" if _pd < 0.75 else "DEEP PREM")
+                lines.append(f"Zone: {_lbl} ({_pd:.0%})")
+
+            # Session
+            _sess = getattr(ict, '_session', '')
+            _kz = getattr(ict, '_killzone', '')
+            if _sess:
+                lines.append(f"Session: {_sess}" + (f" [{_kz}]" if _kz else ""))
+
+        # Nearest pools
+        liq_map = getattr(strat, '_liq_map', None)
+        if liq_map and atr > 1e-10:
+            try:
+                snap = liq_map.get_snapshot(price, atr)
+                if snap.bsl_pools:
+                    nearest_bsl = min(snap.bsl_pools, key=lambda t: t.distance_atr)
+                    lines.append(f"BSL: ${nearest_bsl.pool.price:,.0f} ({nearest_bsl.distance_atr:.1f}ATR)")
+                if snap.ssl_pools:
+                    nearest_ssl = min(snap.ssl_pools, key=lambda t: t.distance_atr)
+                    lines.append(f"SSL: ${nearest_ssl.pool.price:,.0f} ({nearest_ssl.distance_atr:.1f}ATR)")
+            except Exception:
+                pass
+
+        # Flow
+        tick_flow = 0.0
+        cvd_trend = 0.0
+        try:
+            tick_flow = strat._tick_eng.get_signal()
+            cvd_trend = strat._cvd.get_trend_signal()
+        except Exception:
+            pass
+        flow_dir = "▲ LONG" if tick_flow > 0.3 else ("▼ SHORT" if tick_flow < -0.3 else "─ neutral")
+        lines.append(f"Flow: {flow_dir} (tick={tick_flow:+.2f} cvd={cvd_trend:+.2f})")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /risk — Risk gate status
+    # ================================================================
+
+    def _cmd_risk(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        rm    = bot_instance.risk_manager
+        if not strat or not rm:
+            return "Components not ready."
+
+        import config as cfg
+        gate = getattr(strat, '_risk_gate', None)
+
+        lines = ["🛡️ <b>RISK STATUS</b>\n"]
+
+        # Risk gate
+        can_ok, reason = rm.can_trade()
+        lines.append(f"{'✅' if can_ok else '🚫'} Trade gate: {'OPEN' if can_ok else reason}")
+
+        # Daily stats
+        if gate:
+            daily  = gate.daily_trades
+            max_d  = int(getattr(cfg, 'MAX_DAILY_TRADES', 8))
+            consec = gate.consec_losses
+            max_c  = int(getattr(cfg, 'MAX_CONSECUTIVE_LOSSES', 5))
+            lines.append(f"\nDaily trades: {daily}/{max_d}")
+            lines.append(f"Consec losses: {consec}/{max_c}")
+
+        # Daily PnL
+        dpnl = getattr(rm, 'daily_pnl', 0.0)
+        max_loss = float(getattr(cfg, 'MAX_DAILY_LOSS_PCT', 5.0))
+        init_bal = getattr(rm, 'initial_balance', 0.0)
+        dpct = dpnl / init_bal * 100 if init_bal > 1e-10 else 0.0
+        lines.append(f"Daily PnL: ${dpnl:+.2f} ({dpct:+.1f}% of ${init_bal:.2f})")
+        lines.append(f"Max daily loss: {max_loss:.1f}%")
+
+        # Cooldown
+        now = time.time()
+        last_exit = getattr(strat, '_last_exit_time', 0)
+        cd = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
+        cd_rem = max(0, cd - (now - last_exit))
+        lines.append(f"\nCooldown: {'ready' if cd_rem == 0 else f'{cd_rem:.0f}s remaining'}")
+
+        # Position status
+        pos = strat.get_position()
+        lines.append(f"Position: {'ACTIVE' if pos else 'FLAT'}")
+        lines.append(f"Trading: {'ENABLED' if bot_instance.trading_enabled else 'PAUSED'}")
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # /equity — Balance + unrealised PnL
+    # ================================================================
+
+    def _cmd_equity(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        rm = bot_instance.risk_manager
+        strat = bot_instance.strategy
+        dm = bot_instance.data_manager
+        if not rm or not strat or not dm:
+            return "Components not ready."
+
+        try:
+            bal = rm.get_available_balance()
+            if not bal:
+                return "Could not fetch balance."
+
+            avail = float(bal.get("available", 0))
+            total = float(bal.get("total", avail))
+            init_bal = getattr(rm, 'initial_balance', 0.0)
+            total_pnl = getattr(strat, '_total_pnl', 0.0)
+
+            lines = ["💰 <b>EQUITY</b>\n"]
+            lines.append(f"Balance: <b>${total:,.2f}</b>")
+            lines.append(f"Available: ${avail:,.2f}")
+            lines.append(f"Starting: ${init_bal:,.2f}")
+
+            # Unrealised
+            pos = strat.get_position()
+            if pos:
+                p = strat._pos
+                price = dm.get_last_price()
+                upnl = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
+                upnl_usd = upnl * p.quantity
+                lines.append(f"\nUnrealised: ${upnl_usd:+.4f} ({upnl:+.1f}pts)")
+                lines.append(f"Equity: <b>${total + upnl_usd:,.2f}</b>")
+            else:
+                lines.append(f"\nEquity: <b>${total:,.2f}</b>")
+
+            lines.append(f"\nRealised PnL: ${total_pnl:+.4f}")
+            if init_bal > 0:
+                session_ret = (total - init_bal) / init_bal * 100
+                lines.append(f"Session return: {session_ret:+.2f}%")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Equity error: {e}"
+
+    # ================================================================
+    # /sl or /tp — Quick SL/TP view
+    # ================================================================
+
+    def _cmd_sl_tp(self) -> str:
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running."
+
+        strat = bot_instance.strategy
+        dm = bot_instance.data_manager
+        if not strat or not dm:
+            return "Components not ready."
+
+        pos = strat.get_position()
+        if not pos:
+            return "📭 No active position — no SL/TP."
+
+        p = strat._pos
+        price = dm.get_last_price()
+        atr = strat._atr_5m.atr
+        side = p.side.upper()
+
+        sl_dist = abs(price - p.sl_price)
+        tp_dist = abs(p.tp_price - price)
+        sl_atr = sl_dist / atr if atr > 1e-10 else 0
+        tp_atr = tp_dist / atr if atr > 1e-10 else 0
+
+        init_dist = p.initial_sl_dist if p.initial_sl_dist > 1e-10 else abs(p.entry_price - p.sl_price)
+        profit = (price - p.entry_price) if side == "LONG" else (p.entry_price - price)
+        cur_r = profit / init_dist if init_dist > 1e-10 else 0
+
+        # Break-even check
+        import config as _cfg
+        _cr = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+        be_buf = p.entry_price * _cr * 2.0 + 0.10 * atr
+        be_price = p.entry_price + be_buf if side == "LONG" else p.entry_price - be_buf
+        be_locked = (side == "LONG" and p.sl_price >= be_price) or \
+                    (side == "SHORT" and p.sl_price <= be_price)
+
+        side_icon = "🟢" if side == "LONG" else "🔴"
+        be_icon = "🔒" if be_locked else "❌"
+
+        lines = [
+            f"{side_icon} <b>{side} SL/TP</b>\n",
+            f"Price: ${price:,.2f} | ATR: ${atr:.1f}",
+            f"Entry: ${p.entry_price:,.2f}\n",
+            f"🛑 SL: <b>${p.sl_price:,.2f}</b>",
+            f"   {sl_dist:.1f}pts / {sl_atr:.1f}ATR from price",
+            f"\n🎯 TP: <b>${p.tp_price:,.2f}</b>",
+            f"   {tp_dist:.1f}pts / {tp_atr:.1f}ATR from price",
+            f"\nR-multiple: {cur_r:+.2f}R",
+            f"Break-even: {be_icon} {'LOCKED' if be_locked else f'needs SL at ${be_price:,.2f}'}",
+        ]
+
+        return "\n".join(lines)
+
+    # ================================================================
+    # BOT THREAD
+    # ================================================================
+
+    def _run_bot_thread(self):
+        global bot_instance, bot_running
+        try:
+            bot_running = True
+            import sys, os as _os
+            _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from main import QuantBot
+            bot_instance = QuantBot()
+            if not bot_instance.initialize():
+                self.send_message("❌ Bot init failed. Check logs.")
+                bot_running = False
+                return
+            if not bot_instance.start():
+                self.send_message("❌ Bot start failed. Check logs.")
+                bot_running = False
+                return
+            bot_instance.run()
+        except Exception as e:
+            logger.error(f"Bot crashed: {e}", exc_info=True)
+            self.send_message(f"❌ Bot crashed: {e}")
+        finally:
+            bot_running = False
+            logger.info("Bot thread finished")
 
     def _cmd_start(self) -> str:
         global bot_instance, bot_thread, bot_running
@@ -323,1529 +2394,6 @@ class TelegramBotController:
             bot_instance.stop()
         return "🛑 Bot stopped."
 
-    def _cmd_status(self) -> str:
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running. Use /start"
-        try:
-            strat = bot_instance.strategy
-            if not strat:
-                return "Strategy not ready."
-            # format_status_report() includes regime, ICT, PnL, active position
-            report = strat.format_status_report()
-            self.send_message(report)
-            return None
-        except Exception as e:
-            logger.error(f"Status error: {e}", exc_info=True)
-            return f"❌ Status error: {e}"
-
-    def _cmd_thinking(self) -> str:
-        """
-        Live signal breakdown — shows the full decision stack:
-          Market context → HTF → AMD → Sweep → ICT tier → Quant gates → Verdict
-          Plus trail state when a position is active.
-        """
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running. Use /start"
-
-        try:
-            import config as cfg
-            strat = bot_instance.strategy
-            dm    = bot_instance.data_manager
-            rm    = bot_instance.risk_manager
-
-            if not strat or not dm or not rm:
-                return "Components not ready."
-
-            price  = dm.get_last_price()
-            now    = time.time()
-            now_ms = int(now * 1000)
-            sig    = strat._last_sig
-            atr    = strat._atr_5m.atr
-            atr_pct = strat._atr_5m.get_percentile()
-            vwap   = strat._vwap.vwap
-            # dev_atr is SIGNED — use abs() for gate comparison, keep sign for display
-            dev_atr = strat._vwap.deviation_atr
-            htf_15m = strat._htf.trend_15m
-            htf_4h  = strat._htf.trend_4h
-            ict     = strat._ict
-            pos     = strat._pos
-
-            lines = [f"<b>🧠 THINKING @ ${price:,.2f}</b>"]
-
-            # ══════════════════════════════════════════════════════════
-            # 1. MARKET CONTEXT
-            # ══════════════════════════════════════════════════════════
-            regime_val = getattr(strat._regime, '_regime', None)
-            regime_str = regime_val.value if regime_val else "UNKNOWN"
-            conf       = getattr(strat._regime, '_confidence', 0.0)
-            adx_val    = strat._adx.adx
-            pdi        = strat._adx.plus_di
-            mdi        = strat._adx.minus_di
-
-            sess = ict._session  if ict else "N/A"
-            kz   = ict._killzone if ict else ""
-            kz_s = f" [{kz.upper()}]" if kz else " [off-session]"
-
-            lines.append("\n<b>━ Market Context</b>")
-            lines.append(f"  Price:  ${price:,.2f}  VWAP: ${vwap:,.2f}  Dev: {dev_atr:+.2f}ATR")
-            lines.append(f"  ATR(5m): ${atr:.1f}  ({atr_pct:.0%} pctile)")
-            lines.append(f"  Regime: <b>{_esc(regime_str)}</b>  conf={conf:.0%}"
-                         f"  ADX={adx_val:.1f}  +DI={pdi:.1f}  -DI={mdi:.1f}")
-            lines.append(f"  Session: {_esc(sess)}{_esc(kz_s)}")
-
-            # ══════════════════════════════════════════════════════════
-            # 2. HTF STRUCTURE
-            # ══════════════════════════════════════════════════════════
-            # vetoes_trade fires when:
-            #   SHORT: t15m > +0.35 (15m bullish vetoes SHORT)
-            #   LONG:  t15m < -0.35 (15m bearish vetoes LONG)
-            # The direction being VETOED is determined by t15m sign, not t4h sign.
-            veto_15m  = float(getattr(cfg, 'QUANT_HTF_15M_VETO',  0.35))
-            veto_both = float(getattr(cfg, 'QUANT_HTF_BOTH_VETO', 0.20))
-            veto_short = (htf_15m > veto_15m or
-                          (htf_15m > veto_both and htf_4h > veto_both))
-            veto_long  = (htf_15m < -veto_15m or
-                          (htf_15m < -veto_both and htf_4h < -veto_both))
-
-            if veto_short and not veto_long:
-                htf_verdict = f"❌ VETOING SHORT  (15m={htf_15m:+.2f} &gt;{veto_15m:+.2f})"
-            elif veto_long and not veto_short:
-                htf_verdict = f"❌ VETOING LONG   (15m={htf_15m:+.2f} &lt;{-veto_15m:+.2f})"
-            elif veto_short and veto_long:
-                htf_verdict = f"❌ VETOING BOTH   (15m={htf_15m:+.2f} 4h={htf_4h:+.2f})"
-            else:
-                htf_verdict = f"✅ No veto"
-
-            lines.append("\n<b>━ HTF Structure</b>")
-            lines.append(f"  4H:  {htf_4h:+.2f}  15m: {htf_15m:+.2f}")
-            lines.append(f"  {htf_verdict}")
-            lines.append(f"  Source: {'ICT swing structure' if strat._htf.ict_source else 'EMA fallback'}")
-
-            # ══════════════════════════════════════════════════════════
-            # 3. AMD PHASE  (full ICT layer — was missing entirely)
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ AMD Cycle</b>")
-            if ict and ict._initialized:
-                try:
-                    amd       = ict._amd
-                    amd_phase = amd.phase
-                    amd_conf  = amd.confidence
-                    amd_bias  = amd.bias
-                    amd_icons = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
-                                 "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
-                                 "ACCUMULATION": "💤"}
-                    amd_icon  = amd_icons.get(amd_phase, "❓")
-                    bias_icon = ("🔴" if amd_bias == "bearish"
-                                 else ("🟢" if amd_bias == "bullish" else "⚪"))
-                    lines.append(
-                        f"  {amd_icon} <b>{_esc(amd_phase)}</b>  {bias_icon}{_esc(amd_bias)}  "
-                        f"conf={amd_conf:.2f}")
-
-                    # MTF alignment
-                    mtf_aligned = getattr(sig, 'mtf_aligned', False)
-                    in_disc     = getattr(sig, 'in_discount', False)
-                    in_prem     = getattr(sig, 'in_premium',  False)
-                    zone_str    = ("💰DISCOUNT" if in_disc
-                                   else ("💸PREMIUM" if in_prem else "〰️EQUILIBRIUM"))
-                    mtf_str     = "✅ALIGNED" if mtf_aligned else "❌SPLIT"
-                    lines.append(f"  MTF: {mtf_str}  Price zone: {zone_str}")
-                    if sig.mtf_details:
-                        lines.append(f"  {_esc(sig.mtf_details)}")
-
-                    # AMD phase interpretation for entry — thresholds MUST match ICTEntryGate exactly.
-                    # Hard block threshold is 0.75 (changed from 0.55 to allow Tier-B in ranging markets).
-                    if amd_phase == "ACCUMULATION" and amd_conf >= 0.75:
-                        lines.append("  ⛔ Hard block: ACCUMULATION conf≥0.75 — no delivery in progress")
-                    elif amd_phase == "ACCUMULATION" and amd_conf >= 0.50:
-                        lines.append(f"  💤 ACCUMULATION (conf={amd_conf:.2f}) — Tier-B eligible (quant-primary)")
-                    elif amd_phase == "MANIPULATION":
-                        lines.append("  ⚡ Judas swing active — need confirmed sweep for Tier-S")
-                    elif amd_phase in ("DISTRIBUTION", "REDISTRIBUTION"):
-                        lines.append(f"  🎯 Delivery phase — Tier-A/S entry eligible (ICT gate next)")
-                    elif amd_phase == "REACCUMULATION":
-                        lines.append(f"  🔄 Re-entry phase — with-HTF Tier-A eligible")
-                except Exception as _ae:
-                    lines.append(f"  AMD: error reading — {_ae}")
-            else:
-                lines.append("  ⏳ ICT engine not initialised")
-
-            # ══════════════════════════════════════════════════════════
-            # 4. SWEEP SETUP  (was missing entirely)
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ Sweep Setup</b>")
-            sweep = getattr(strat, '_active_sweep_setup', None)
-            if sweep is not None:
-                # Age
-                age_ms  = now_ms - sweep.setup_time_ms
-                age_min = age_ms / 60_000
-                atr_v   = max(atr, 1.0)
-                buf     = 0.5 * atr_v
-
-                # Distance to OTE and reachability.
-                # SHORT: BSL swept above, price displaced down. OTE is ABOVE current price.
-                #   Price must retrace UP into OTE.
-                #   Missed: price too far DOWN (below ote_low - buf) OR too far UP past zone.
-                # LONG:  SSL swept below, price displaced up. OTE is BELOW current price.
-                #   Price must retrace DOWN into OTE.
-                #   Missed ONLY: price blew too far DOWN through zone (below ote_low - buf).
-                #   Being above ote_high just means still approaching — always reachable.
-                in_ote = sweep.ote_entry_zone_low <= price <= sweep.ote_entry_zone_high
-                if sweep.side == "short":
-                    dist_to_ote   = sweep.ote_entry_zone_low - price   # + = price below OTE (approaching)
-                    ote_reachable = ((sweep.ote_entry_zone_low - buf)
-                                     <= price
-                                     <= (sweep.ote_entry_zone_high + buf))
-                else:
-                    dist_to_ote   = price - sweep.ote_entry_zone_high  # + = price above OTE (approaching)
-                    ote_reachable = price >= (sweep.ote_entry_zone_low - buf)
-
-                # Delivery target display — ternary outside format spec (f-string
-                # cannot contain conditional expressions in the format specifier)
-                delivery_str = (f"${sweep.delivery_target:,.0f}"
-                                if sweep.delivery_target else "N/A")
-
-                status_icon = "🟢" if sweep.status == "OTE_READY" else "🔵"
-                lines.append(
-                    f"  {status_icon} <b>{sweep.side.upper()}</b>  status={_esc(sweep.status)}  "
-                    f"quality={sweep.quality_score():.2f}  age={age_min:.0f}m")
-                lines.append(
-                    f"  Sweep: ${sweep.sweep_price:,.0f}  "
-                    f"OTE: [${sweep.ote_entry_zone_low:,.0f}–${sweep.ote_entry_zone_high:,.0f}]")
-                if in_ote:
-                    lines.append(f"  ✅ Price IN OTE zone — entry eligible")
-                elif ote_reachable:
-                    lines.append(
-                        f"  ⏳ {abs(dist_to_ote):.0f}pts to OTE "
-                        f"({'up' if sweep.side == 'short' else 'down'})")
-                else:
-                    lines.append(f"  ❌ OTE missed — price {abs(dist_to_ote):.0f}pts beyond zone")
-                lines.append(
-                    f"  SL: ${sweep.sl_sweep_candle:,.0f}  "
-                    f"Delivery: {delivery_str}"
-                    f"  {'FVG✓' if sweep.has_fvg_in_ote else ''}"
-                    f"{'OB✓' if sweep.has_ob_in_ote else ''}")
-            else:
-                lines.append("  ─ No active sweep setup")
-                if ict and ict._initialized:
-                    swept_pools = [p for p in ict.liquidity_pools
-                                   if p.swept and p.displacement_confirmed]
-                    if swept_pools:
-                        latest = max(swept_pools, key=lambda p: p.sweep_timestamp)
-                        age_m  = (now_ms - latest.sweep_timestamp) / 60_000
-                        lines.append(
-                            f"  Last displaced sweep: ${latest.price:,.0f}  "
-                            f"{age_m:.0f}m ago  "
-                            f"({'SSL' if latest.level_type == 'SSL' else 'BSL'})")
-
-            # ══════════════════════════════════════════════════════════
-            # 5. ICT ENTRY TIER  (was missing entirely)
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ ICT Entry Gate</b>")
-            if ict and ict._initialized:
-                try:
-                    from strategy.ict_trade_engine import ICTEntryGate, QuantHelperSignals
-                    # BUG-C FIX: Use sweep side when OTE_READY, else VWAP reversion side.
-                    # Previously always used sig.reversion_side — this is wrong for sweep
-                    # entries where side = sweep_setup.side (possibly opposite VWAP).
-                    # The gate evaluation must mirror the actual _evaluate_reversion_entry logic.
-                    _active_sweep = getattr(strat, '_active_sweep_setup', None)
-                    if (_active_sweep is not None and
-                            _active_sweep.status == "OTE_READY"):
-                        _side = _active_sweep.side
-                    else:
-                        _side = sig.reversion_side or "long"
-                    _qh   = strat._get_quant_helpers(sig, _side)
-                    _tier, _cn, _reason = ICTEntryGate.evaluate(
-                        _side, sig, sweep, price, _qh)
-                    tier_icons = {"S": "🥇", "A": "🥈", "B": "🥉",
-                                  "BLOCKED": "⛔"}
-                    lines.append(
-                        f"  {tier_icons.get(_tier,'❓')} <b>Tier-{_tier}</b>  "
-                        f"side={_side.upper()}  confirm_ticks={_cn}")
-                    lines.append(f"  {_esc(_reason)}")
-                    # HTF shown as context — not a gate condition
-                    if getattr(sig, 'htf_veto', False):
-                        lines.append(
-                            f"  ℹ️ HTF opposing (15m={htf_15m:+.2f}) — "
-                            f"informational only, direction set by ICT structure")
-                except Exception as _te:
-                    lines.append(f"  ICT gate error: {_esc(str(_te))}")
-
-                # ICT scores — normalised (consistent with terminal display)
-                ob_norm  = min(sig.ict_ob  / 2.0, 1.0)
-                fvg_norm = min(sig.ict_fvg / 1.5, 1.0)
-                lines.append(
-                    f"  ICT Σ={sig.ict_total:.2f}  "
-                    f"OB={ob_norm:.2f}(raw={sig.ict_ob:.1f})  "
-                    f"FVG={fvg_norm:.2f}(raw={sig.ict_fvg:.1f})  "
-                    f"Sweep={sig.ict_sweep:.2f}  KZ={sig.ict_session:.2f}")
-                if sig.ict_details:
-                    lines.append(f"  {_esc(sig.ict_details)}")
-            else:
-                lines.append("  ⏳ ICT engine initialising")
-
-            # ══════════════════════════════════════════════════════════
-            # 6. QUANT SIGNALS + GATES
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ Quant Signals</b>")
-
-            def bar(v, w=10):
-                h = w // 2; f_ = min(int(abs(v) * h + 0.5), h)
-                return ("·" * h + "█" * f_ + "░" * (h - f_)) if v >= 0 \
-                    else ("░" * (h - f_) + "█" * f_ + "·" * h)
-
-            def sline(label, val):
-                arrow = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
-                return f"  {label:<7} {bar(val)} {arrow} {val:+.3f}"
-
-            lines.append(sline("VWAP",  sig.vwap_dev))
-            lines.append(sline("CVD",   sig.cvd_div))
-            lines.append(sline("OB",    sig.orderbook))
-            lines.append(sline("TICK",  sig.tick_flow))
-            lines.append(sline("VEX",   sig.vol_exhaust))
-            lines.append(f"  {'─' * 32}")
-
-            c   = sig.composite
-            thr = float(getattr(cfg, 'QUANT_COMPOSITE_ENTRY_MIN', 0.30))
-            # n_confirming counts QUANT signals only (max 5 — VWAP/CVD/OB/TICK/VEX)
-            # ICT has its own gate above; /6 denominator in old code was wrong
-            lines.append(f"  Σ = {c:+.4f}  (need ±{thr:.3f})")
-            lines.append(f"  Confirming: {sig.n_confirming}/5 quant signals")
-
-            lines.append("\n<b>━ Entry Gates</b>")
-            # Overextended: gate uses ADX-adaptive threshold (0.4/0.6/0.9 ATR)
-            if adx_val < 25.0:
-                actual_thresh = 0.4
-                thresh_regime = "ranging"
-            elif adx_val < 35.0:
-                actual_thresh = 0.6
-                thresh_regime = "transitioning"
-            else:
-                actual_thresh = 0.9
-                thresh_regime = "trending"
-            g_ext  = sig.overextended
-            g_reg  = sig.regime_ok
-            g_conf = sig.n_confirming >= 3
-            g_comp = abs(c) >= thr
-
-            lines.append(
-                f"  {'✅' if g_ext  else '❌'} Overextended   "
-                f"(|dev|={abs(dev_atr):.2f}ATR  need ≥{actual_thresh:.1f}ATR [{thresh_regime}  ADX={adx_val:.1f}])")
-            lines.append(
-                f"  {'✅' if g_reg  else '❌'} ATR regime     "
-                f"({atr_pct:.0%} pctile  valid 5–97%)")
-            lines.append(
-                f"  ⚪ HTF (info)       "
-                f"(4h={htf_4h:+.2f}  15m={htf_15m:+.2f}  — directional context, not a gate)")
-            lines.append(
-                f"  {'✅' if g_conf else '❌'} Confluence     "
-                f"({sig.n_confirming}/5 quant  need ≥3)")
-            lines.append(
-                f"  {'✅' if g_comp else '❌'} Composite      "
-                f"(Σ={c:+.3f}  need ±{thr:.3f})")
-
-            # ══════════════════════════════════════════════════════════
-            # 7. RISK GATE + COOLDOWN
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ Risk & Cooldown</b>")
-            can_ok, risk_reason = rm.can_trade()
-            daily_trades = strat._risk_gate.daily_trades
-            max_dt       = int(getattr(cfg, 'QUANT_MAX_DAILY_TRADES', 8))
-            consec       = strat._risk_gate.consec_losses
-            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
-            cd_rem       = max(0.0, cooldown_sec - (now - strat._last_exit_time))
-
-            lines.append(
-                f"  {'✅' if can_ok else '🚫'} Risk gate: "
-                f"{daily_trades}/{max_dt} trades  consec_loss={consec}"
-                + (f"  → {_esc(risk_reason)}" if not can_ok else ""))
-            lines.append(
-                f"  {'✅' if cd_rem == 0 else '⏳'} Cooldown: "
-                + (f"{cd_rem:.0f}s remaining" if cd_rem > 0 else "ready"))
-
-            bo = strat._breakout
-            if bo.is_active:
-                retest = "RETEST READY ✅" if bo.retest_ready else "awaiting pullback"
-                lines.append(f"  🚀 Breakout {_esc(bo.direction.upper())} — {retest}")
-
-            # ══════════════════════════════════════════════════════════
-            # 8. ACTIVE POSITION + TRAIL STATE  (was missing entirely)
-            # ══════════════════════════════════════════════════════════
-            from strategy.quant_strategy import PositionPhase
-            if pos.phase == PositionPhase.ACTIVE:
-                lines.append("\n<b>━ Active Position + Trail</b>")
-                profit_pts   = (pos.entry_price - price if pos.side == "short"
-                                else price - pos.entry_price)
-                sl_dist_now  = abs(price - pos.sl_price)
-                tp_dist_now  = abs(price - pos.tp_price)
-                init_dist    = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
-                tier_r       = max(profit_pts, pos.peak_profit) / init_dist
-                rr_now       = tp_dist_now / max(sl_dist_now, 1e-9)
-                hold_m       = (now - pos.entry_time) / 60.0
-
-                # Trail phase
-                be_r   = float(getattr(cfg, 'QUANT_TRAIL_BE_R',        0.3))
-                lock_r = float(getattr(cfg, 'QUANT_TRAIL_LOCK_R',       0.8))
-                aggr_r = float(getattr(cfg, 'QUANT_TRAIL_AGGRESSIVE_R', 1.5))
-                if tier_r < be_r:
-                    phase_lbl = f"⬜ P0 — hands off (< {be_r:.1f}R)"
-                elif tier_r < lock_r:
-                    phase_lbl = f"🟡 P1 — structure trail (< {lock_r:.1f}R)"
-                elif tier_r < aggr_r:
-                    phase_lbl = f"🟠 P2 — locked trail (< {aggr_r:.1f}R)"
-                else:
-                    phase_lbl = f"🟢 P3 — aggressive trail"
-
-                lines.append(
-                    f"  {pos.side.upper()}  mode={_esc(pos.trade_mode)}  "
-                    f"tier={_esc(getattr(pos,'ict_entry_tier',''))}")
-                lines.append(
-                    f"  Entry:  ${pos.entry_price:,.2f}  "
-                    f"SL: ${pos.sl_price:,.2f}  TP: ${pos.tp_price:,.2f}")
-                lines.append(
-                    f"  P&L:    {profit_pts:+.1f}pts  "
-                    f"MFE: {pos.peak_profit:.1f}pts  "
-                    f"Hold: {hold_m:.0f}m")
-                lines.append(
-                    f"  R:      {tier_r:.2f}R  "
-                    f"Remaining R:R to TP: 1:{rr_now:.1f}")
-                lines.append(f"  Trail:  {phase_lbl}")
-
-                # Break-even lock status
-                be_price = (pos.entry_price + 0.25 * atr if pos.side == "long"
-                            else pos.entry_price - 0.25 * atr)
-                be_locked = ((pos.side == "long"  and pos.sl_price >= be_price) or
-                             (pos.side == "short" and pos.sl_price <= be_price))
-                if be_locked:
-                    locked_profit = abs(pos.entry_price - pos.sl_price)
-                    lines.append(
-                        f"  🔒 Break-even locked  "
-                        f"({locked_profit:.0f}pts profit protected if SL hit)")
-                else:
-                    to_be = abs(profit_pts) / init_dist if init_dist > 1e-9 else 0
-                    lines.append(
-                        f"  ⬜ BE lock at {be_r:.1f}R — currently {to_be:.2f}R "
-                        f"({profit_pts:.0f}pts / {init_dist:.0f}pts SL)")
-
-            # ══════════════════════════════════════════════════════════
-            # 9. VERDICT
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━ Verdict</b>")
-            # HTF is informational — not in all_pass
-            all_pass = g_ext and g_reg and g_conf and g_comp
-
-            if pos.phase == PositionPhase.ACTIVE:
-                lines.append(f"  📍 Position ACTIVE — entry gate not evaluated")
-            elif all_pass and can_ok and cd_rem == 0:
-                cn_long  = getattr(strat, '_confirm_long',  0)
-                cn_short = getattr(strat, '_confirm_short', 0)
-                cn_need  = int(getattr(cfg, 'QUANT_CONFIRM_TICKS', 2))
-                lines.append(
-                    f"  🎯 <b>ALL QUANT GATES PASS</b>  "
-                    f"({max(cn_long, cn_short)}/{cn_need} confirm ticks)  "
-                    f"— ICT gate is the binding decision above")
-            else:
-                missing = []
-                if not g_ext:
-                    missing.append(
-                        f"VWAP: |{abs(dev_atr):.2f}|ATR &lt; {actual_thresh:.1f}ATR ({thresh_regime})")
-                if not g_reg:
-                    missing.append(f"ATR regime ({atr_pct:.0%})")
-                if not g_conf:
-                    missing.append(f"Confluence {sig.n_confirming}/5 &lt; 3")
-                if not g_comp:
-                    missing.append(f"Composite Σ={c:+.3f} &lt; ±{thr:.3f}")
-                if not can_ok:
-                    missing.append(f"Risk: {_esc(risk_reason)}")
-                if cd_rem > 0:
-                    missing.append(f"Cooldown {cd_rem:.0f}s")
-                lines.append("  👀 <b>Watching</b>  —  blocked by:")
-                for m in missing:
-                    lines.append(f"    • {m}")
-                # HTF shown as context even when not blocking
-                if sig.htf_veto:
-                    lines.append(
-                        f"    ℹ️ HTF opposing ({htf_15m:+.2f} 15m) — informational only")
-
-            self.send_message("\n".join(lines))
-            return None
-
-        except Exception as e:
-            logger.error(f"Thinking error: {e}", exc_info=True)
-            return f"❌ Thinking error: {e}"
-
-    def _cmd_structures(self) -> str:
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-
-        try:
-            strat = bot_instance.strategy
-            dm    = bot_instance.data_manager
-            if not strat or not dm:
-                return "Components not ready."
-
-            price  = dm.get_last_price()
-            now_ms = int(time.time() * 1000)
-
-            ict = getattr(strat, '_ict', None)
-            if ict is None:
-                return "❌ ICT engine not available (ict_engine.py not loaded)."
-            if not ict._initialized:
-                nb = len(list(ict.order_blocks_bull))
-                ns = len(list(ict.order_blocks_bear))
-                return (f"⏳ ICT engine warming up...\n"
-                        f"Detected so far: {nb}🟢 {ns}🔴 OBs\n"
-                        f"Need ≥10 candles + 5s update cycle.")
-
-            atr_eng = getattr(strat, '_atr_5m', None)
-            atr_v   = atr_eng.atr if atr_eng and atr_eng.atr > 1e-10 else price * 0.002
-
-            st   = ict.get_full_status(price, atr_v, now_ms)
-            c    = st["counts"]
-            sess = st.get("session", "UNKNOWN")
-            kz   = st.get("killzone", "")
-            kz_s = f" [{kz}]" if kz else ""
-
-            lines = [
-                f"🏛️ <b>ICT Structures @ ${price:,.1f}</b>",
-                f"Session: {_esc(sess)}{_esc(kz_s)}  |  ATR(5m): ${atr_v:.1f}",
-                (f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
-                 f"FVGs: {c['fvg_bull']}🟦 {c['fvg_bear']}🟥  "
-                 f"Liq: {c['liq_active']} active / {c['liq_swept']} swept"),
-                "",
-            ]
-
-            # ── Bullish OBs ──────────────────────────────────────────────
-            if st["bull_obs"]:
-                lines.append("<b>🟢 Bullish Order Blocks</b>")
-                for ob in st["bull_obs"][:5]:
-                    ote_lo = ob["high"] - 0.79 * (ob["high"] - ob["low"])
-                    ote_hi = ob["high"] - 0.50 * (ob["high"] - ob["low"])
-                    tags   = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
-                    in_tag = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
-                    bos    = " BOS✓" if ob["bos"] else ""
-                    lines.append(
-                        f"  ${ob['low']:,.1f} – ${ob['high']:,.1f}  "
-                        f"mid=${ob['midpoint']:,.1f}  "
-                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.2f}ATR\n"
-                        f"    str={ob['strength']:.0f}  v={ob['visit_count']}  "
-                        f"age={ob['age_min']:.0f}m  "
-                        f"OTE:${ote_lo:,.0f}–${ote_hi:,.0f}"
-                        f"{bos} {tags}{in_tag}"
-                    )
-            else:
-                lines.append("🟢 No active bullish OBs")
-
-            lines.append("")
-
-            # ── Bearish OBs ──────────────────────────────────────────────
-            if st["bear_obs"]:
-                lines.append("<b>🔴 Bearish Order Blocks</b>")
-                for ob in st["bear_obs"][:5]:
-                    ote_lo = ob["low"] + 0.50 * (ob["high"] - ob["low"])
-                    ote_hi = ob["low"] + 0.79 * (ob["high"] - ob["low"])
-                    tags   = " ".join(f"[{t}]" for t in ob["tags"]) if ob["tags"] else ""
-                    in_tag = " ◄ IN OB" if ob["in_ob"] else (" ← OTE" if ob["in_ote"] else "")
-                    bos    = " BOS✓" if ob["bos"] else ""
-                    lines.append(
-                        f"  ${ob['low']:,.1f} – ${ob['high']:,.1f}  "
-                        f"mid=${ob['midpoint']:,.1f}  "
-                        f"{ob['dist_pts']:+.0f}pts/{ob['dist_atr']:.2f}ATR\n"
-                        f"    str={ob['strength']:.0f}  v={ob['visit_count']}  "
-                        f"age={ob['age_min']:.0f}m  "
-                        f"OTE:${ote_lo:,.0f}–${ote_hi:,.0f}"
-                        f"{bos} {tags}{in_tag}"
-                    )
-            else:
-                lines.append("🔴 No active bearish OBs")
-
-            lines.append("")
-
-            # ── FVGs ─────────────────────────────────────────────────────
-            all_fvgs = st["bull_fvgs"][:3] + st["bear_fvgs"][:3]
-            if all_fvgs:
-                lines.append("<b>Fair Value Gaps</b>")
-                for fvg in sorted(all_fvgs, key=lambda x: abs(x["dist_pts"])):
-                    icon   = "🟦" if fvg["direction"] == "bullish" else "🟥"
-                    in_tag = " ◄ IN GAP" if fvg["in_gap"] else ""
-                    lines.append(
-                        f"  {icon} ${fvg['bottom']:,.1f}–${fvg['top']:,.1f}  "
-                        f"size=${fvg['size']:.1f}  fill={fvg['fill_pct']:.0%}  "
-                        f"{fvg['dist_pts']:+.0f}pts/{fvg['dist_atr']:.2f}ATR  "
-                        f"age={fvg['age_min']:.0f}m{in_tag}"
-                    )
-            else:
-                lines.append("No active FVGs")
-
-            lines.append("")
-
-            # ── Liquidity ────────────────────────────────────────────────
-            nearby = [l for l in st["liq_active"] if abs(l["dist_pts"]) < 5.0 * atr_v]
-            if nearby:
-                lines.append("<b>💧 Liquidity Pools</b>")
-                eqh = sorted(
-                    [l for l in nearby if l["pool_type"] == "EQH"],
-                    key=lambda x: x["price"], reverse=True)
-                eql = sorted(
-                    [l for l in nearby if l["pool_type"] == "EQL"],
-                    key=lambda x: x["price"], reverse=True)
-                for l in eqh[:4]:
-                    lines.append(
-                        f"  EQH ▲ ${l['price']:,.1f}  x{l['touch_count']}  "
-                        f"{l['dist_pts']:+.0f}pts/{abs(l['dist_pts'])/atr_v:.2f}ATR")
-                for l in eql[:4]:
-                    lines.append(
-                        f"  EQL ▼ ${l['price']:,.1f}  x{l['touch_count']}  "
-                        f"{l['dist_pts']:+.0f}pts/{abs(l['dist_pts'])/atr_v:.2f}ATR")
-
-            if st["liq_swept"]:
-                lines.append("<b>🌊 Recent Sweeps</b>")
-                for l in st["liq_swept"][:3]:
-                    disp = "DISP✓" if l["displacement"] else "weak"
-                    wick = " WR✓" if l["wick_rejection"] else ""
-                    age  = (f"{l['sweep_age_min']:.0f}m ago"
-                            if l["sweep_age_min"] is not None else "")
-                    lines.append(
-                        f"  {l['pool_type']} ${l['price']:,.1f}  [{disp}{wick}]  {age}")
-
-            lines.append("")
-
-            # ── Swing levels ─────────────────────────────────────────────
-            sh = st["swing_highs"][:4]
-            sl = st["swing_lows"][:4]
-            if sh or sl:
-                lines.append("<b>📌 Swing Levels</b>")
-                if sh:
-                    sh_str = "  ".join(f"${h:,.0f}(+{h-price:.0f})" for h in sh)
-                    lines.append(f"  Highs ▲: {sh_str}")
-                if sl:
-                    sl_str = "  ".join(f"${l:,.0f}({l-price:.0f})" for l in sl)
-                    lines.append(f"  Lows  ▼: {sl_str}")
-
-            lines.append("")
-
-            # ── Confluence scores both sides ──────────────────────────────
-            long_c  = ict.get_confluence("long",  price, now_ms)
-            short_c = ict.get_confluence("short", price, now_ms)
-            lines.append("<b>Confluence Scores</b>")
-            lines.append(
-                f"  LONG  Σ={long_c.total:.2f}  "
-                f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
-                f"Sweep={long_c.sweep_score:.2f}  KZ={long_c.session_score:.2f}")
-            if long_c.details:
-                lines.append(f"    → {_esc(long_c.details)}")
-            lines.append(
-                f"  SHORT Σ={short_c.total:.2f}  "
-                f"OB={short_c.ob_score:.2f}  FVG={short_c.fvg_score:.2f}  "
-                f"Sweep={short_c.sweep_score:.2f}  KZ={short_c.session_score:.2f}")
-            if short_c.details:
-                lines.append(f"    → {_esc(short_c.details)}")
-
-            self.send_message("\n".join(lines))
-            return None
-
-        except Exception as e:
-            logger.error(f"Structures error: {e}", exc_info=True)
-            return f"❌ Structures error: {e}"
-
-    def _cmd_position(self) -> str:
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-
-        strat = bot_instance.strategy
-        dm    = bot_instance.data_manager
-        if not strat:
-            return "Strategy not ready."
-
-        pos = strat.get_position()
-        if not pos:
-            return "📭 No active position."
-
-        # Access PositionState directly — these fields are guaranteed
-        p     = strat._pos
-        price = dm.get_last_price() if dm else 0.0
-        atr   = strat._atr_5m.atr
-
-        side    = p.side.upper()
-        entry   = p.entry_price
-        sl      = p.sl_price
-        tp      = p.tp_price
-        qty     = p.quantity
-        mode    = p.trade_mode
-        phase   = p.phase.name
-
-        # Issue 1 FIX: R:R must use INITIAL SL distance (not current, which shrinks
-        # as trail moves up). current_sl distance understates planned R:R.
-        init_sl_dist = getattr(p, 'initial_sl_dist', 0.0)
-        sl_dist = init_sl_dist if init_sl_dist > 1e-10 else (abs(entry - sl) if sl > 0 else 0.0)
-        current_sl_dist = abs(entry - sl) if sl > 0 else 0.0
-
-        if sl_dist > 1e-10:
-            current_r = ((price - entry) / sl_dist if side == "LONG"
-                         else (entry - price) / sl_dist)
-            planned_rr = abs(tp - entry) / sl_dist if tp > 0 else 0.0
-        else:
-            current_r  = 0.0
-            planned_rr = 0.0
-
-        upnl = ((price - entry) * qty if side == "LONG"
-                else (entry - price) * qty)
-
-        hold_min     = (time.time() - p.entry_time) / 60.0 if p.entry_time > 0 else 0.0
-        trail_state  = "✅ active" if p.trail_active else "⏳ waiting"
-        peak_profit  = getattr(p, 'peak_profit', 0.0)
-        init_sl_dist = getattr(p, 'initial_sl_dist', sl_dist)
-        mfe_r        = peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        be_moved     = ((side == "LONG"  and sl >= entry) or
-                        (side == "SHORT" and sl <= entry and sl > 0))
-
-        # Entry signal context
-        sig_lines = []
-        if p.entry_signal:
-            es = p.entry_signal
-            sig_lines.append(
-                f"\n<b>Entry signal:</b>  Σ={es.composite:+.3f}  "
-                f"regime={es.market_regime}  ADX={es.adx:.1f}")
-            if es.ict_total > 0.01:
-                sig_lines.append(
-                    f"ICT: {es.ict_total:.2f} [{_esc(es.ict_details)}]")
-
-        return (
-            f"<b>Active Position — {side}</b>\n"
-            f"Mode: {mode.upper()}  |  Phase: {phase}\n\n"
-            f"Entry:   ${entry:,.2f}\n"
-            f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
-            f"uPnL:    ${upnl:+,.2f}\n"
-            f"Qty:     {qty:.4f} BTC\n\n"
-            f"SL:      ${sl:,.2f}  "
-            f"(init dist: ${sl_dist:.0f} / {sl_dist/max(atr,1):.2f}ATR  "
-            f"current dist: ${current_sl_dist:.0f})\n"
-            f"TP:      ${tp:,.2f}\n"
-            f"Planned R:R: 1:{planned_rr:.2f}\n"
-            f"MFE: {mfe_r:.2f}R\n\n"
-            f"Hold:  {hold_min:.1f}m\n"
-            f"Trail: {trail_state}\n"
-            f"BE:    {'Yes ✅' if be_moved else 'No'}"
-            + "".join(sig_lines)
-        )
-
-    def _cmd_trades(self) -> str:
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-
-        strat = bot_instance.strategy
-        rm    = bot_instance.risk_manager
-        if not strat or not rm:
-            return "Components not ready."
-
-        # ── Source: strategy._trade_history (ground truth, set at close) ──
-        history = getattr(strat, '_trade_history', [])
-
-        lines = ["<b>📋 Trade History</b>\n"]
-
-        if history:
-            # Show last 10 trades, newest first
-            for t in reversed(history[-10:]):
-                side    = t.get('side', '?').upper()
-                mode    = t.get('mode', '?').upper()
-                entry   = t.get('entry', 0.0)
-                exit_p  = t.get('exit',  0.0)
-                pnl     = t.get('pnl',   0.0)
-                reason  = t.get('reason', '?')
-                hold    = t.get('hold_min', 0.0)
-                mfe_r   = t.get('mfe_r', 0.0)
-                trailed = t.get('trailed', False)
-                is_win  = t.get('is_win', False)
-                init_sl = t.get('init_sl_dist', 0.0)
-                raw_pts = ((exit_p - entry) if side == "LONG" else (entry - exit_p))
-                ach_r   = raw_pts / init_sl if init_sl > 1e-10 else 0.0
-                # Attribution fields (v7.0)
-                ict_tier   = t.get('ict_tier', '')
-                composite  = t.get('composite', 0.0)
-                ict_total  = t.get('ict_total', 0.0)
-                amd_phase  = t.get('amd_phase', '')
-                adx_val    = t.get('adx', 0.0)
-                tier_badge = f" [T{ict_tier}]" if ict_tier else ""
-                # Fee breakdown fields (exact from Delta /v2/fills, else estimated)
-                gross_pnl  = t.get('gross_pnl',  pnl)
-                entry_fee  = t.get('entry_fee',  0.0)
-                exit_fee   = t.get('exit_fee',   0.0)
-                total_fees = t.get('total_fees', 0.0)
-                exact_fees = t.get('exact_fees', False)
-
-                # Determine label
-                if reason == "tp_hit":
-                    label = "🎯 TP"
-                elif reason == "trail_sl_hit":
-                    label = "🔒 TRAIL"
-                elif reason == "sl_hit":
-                    label = "🛑 SL"
-                else:
-                    label = f"🚪 {reason[:8]}"
-
-                result    = "✅" if is_win else "❌"
-                trail_tag = " [T]" if trailed else ""
-                fee_tag   = "exact" if exact_fees else "est."
-
-                # Fee line: show gross→net breakdown when fee data is present
-                if total_fees > 0:
-                    fee_line = (
-                        f"\n    Fees({fee_tag}): entry=${entry_fee:.4f} "
-                        f"exit=${exit_fee:.4f} "
-                        f"total=${total_fees:.4f} | "
-                        f"Gross=${gross_pnl:+.4f}"
-                    )
-                else:
-                    fee_line = ""
-
-                lines.append(
-                    f"{result} {side} [{mode}]{tier_badge}  "
-                    f"${entry:,.0f}→${exit_p:,.0f}  "
-                    f"PnL: <b>${pnl:+.2f}</b>  "
-                    f"R: {ach_r:+.2f}  MFE: {mfe_r:.1f}R\n"
-                    f"    {label}{trail_tag}  hold: {hold:.0f}m"
-                    + (f"  Σ={composite:+.3f} ICT={ict_total:.2f}"
-                       f"  {_esc(amd_phase[:5])}  ADX={adx_val:.0f}" if composite else "")
-                    + fee_line
-                )
-        else:
-            lines.append("  No trades recorded yet this session.")
-
-        # ── Summary stats from strategy (ground truth) ──────────────────
-        total_t   = getattr(strat, '_total_trades', 0)
-        wins      = getattr(strat, '_winning_trades', 0)
-        losses    = total_t - wins
-        wr        = wins / total_t * 100.0 if total_t > 0 else 0.0
-        total_pnl = getattr(strat, '_total_pnl', 0.0)
-
-        # Daily stats from risk gate (authoritative daily counters)
-        daily_cnt = strat._risk_gate.daily_trades if hasattr(strat, '_risk_gate') else 0
-        consec    = strat._risk_gate.consec_losses if hasattr(strat, '_risk_gate') else 0
-        max_d     = getattr(__import__('config'), 'MAX_DAILY_TRADES', 8)
-
-        # Avg win / avg loss from history
-        win_pnls  = [t['pnl'] for t in history if t.get('is_win')]
-        loss_pnls = [t['pnl'] for t in history if not t.get('is_win')]
-        avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
-        avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
-        expectancy = (wr/100 * avg_win) + ((1 - wr/100) * avg_loss)
-
-        # Total fees paid — sum exact where available, estimated where not
-        fees_exact   = [t['total_fees'] for t in history if t.get('exact_fees') and t.get('total_fees', 0) > 0]
-        fees_est     = [t['total_fees'] for t in history if not t.get('exact_fees') and t.get('total_fees', 0) > 0]
-        total_fees_s = sum(fees_exact) + sum(fees_est)
-        n_exact      = len(fees_exact)
-        n_est        = len(fees_est)
-        if total_fees_s > 0:
-            fee_src_tag = f"({n_exact} exact, {n_est} est.)"
-            fee_summary = f"Total Fees:  ${total_fees_s:.4f} {fee_src_tag}"
-        else:
-            fee_summary = "Total Fees:  —"
-
-        lines += [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"Session:   {total_t} trades  W:{wins} L:{losses}  WR: <b>{wr:.0f}%</b>",
-            f"Total PnL: <b>${total_pnl:+.2f}</b> USDT",
-            f"Avg Win:   ${avg_win:+.2f}  Avg Loss: ${avg_loss:+.2f}",
-            f"Expectancy: ${expectancy:+.2f}/trade",
-            fee_summary,
-            f"Today:     {daily_cnt}/{max_d} trades  consec_loss={consec}",
-        ]
-        return "\n".join(lines)
-
-    def _cmd_stats(self) -> str:
-        """
-        Signal attribution analysis — which signal combinations produce wins.
-        Shows win-rate breakdown by ICT tier, regime, AMD phase and composite score.
-        Includes realised PnL and fees breakdown where available.
-        Requires ≥5 trades to produce meaningful stats.
-        """
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-
-        strat = bot_instance.strategy
-        if not strat:
-            return "Strategy not ready."
-
-        history = getattr(strat, '_trade_history', [])
-        if len(history) < 3:
-            return f"📊 Not enough trades yet ({len(history)} recorded — need ≥3)."
-
-        lines = ["<b>📊 Signal Attribution Analysis</b>\n"]
-
-        total  = len(history)
-        wins   = sum(1 for t in history if t.get('is_win'))
-        wr_all = wins / total * 100.0
-
-        lines.append(f"Total trades: {total}  WR: <b>{wr_all:.0f}%</b>\n")
-
-        # ── By ICT tier ──────────────────────────────────────────────────
-        lines.append("<b>By ICT Tier</b>")
-        tier_groups: dict = {}
-        for t in history:
-            k = t.get('ict_tier', '') or 'none'
-            tier_groups.setdefault(k, []).append(t)
-        for tier in ['S', 'A', 'B', 'none']:
-            grp = tier_groups.get(tier, [])
-            if not grp:
-                continue
-            w       = sum(1 for t in grp if t.get('is_win'))
-            wr      = w / len(grp) * 100.0
-            avg_pnl = sum(t.get('pnl', 0) for t in grp) / len(grp)
-            avg_fees= sum(t.get('total_fees', 0) for t in grp) / len(grp)
-            fee_tag = " (fees est.)" if not any(t.get('exact_fees') for t in grp) else ""
-            label   = f"Tier-{tier}" if tier != 'none' else "No tier"
-            lines.append(
-                f"  {label}: {len(grp)} trades  WR={wr:.0f}%  "
-                f"avg net=${avg_pnl:+.2f}  avg fees=${avg_fees:.4f}{fee_tag}"
-            )
-
-        # ── By regime ────────────────────────────────────────────────────
-        lines.append("\n<b>By Regime</b>")
-        reg_groups: dict = {}
-        for t in history:
-            k = t.get('regime', 'UNKNOWN')
-            reg_groups.setdefault(k, []).append(t)
-        for reg, grp in sorted(reg_groups.items()):
-            w  = sum(1 for t in grp if t.get('is_win'))
-            wr = w / len(grp) * 100.0
-            lines.append(f"  {_esc(reg)}: {len(grp)} trades  WR={wr:.0f}%")
-
-        # ── By AMD phase ─────────────────────────────────────────────────
-        lines.append("\n<b>By AMD Phase</b>")
-        amd_groups: dict = {}
-        for t in history:
-            k = t.get('amd_phase', 'UNKNOWN')
-            amd_groups.setdefault(k, []).append(t)
-        for phase, grp in sorted(amd_groups.items()):
-            w  = sum(1 for t in grp if t.get('is_win'))
-            wr = w / len(grp) * 100.0
-            lines.append(f"  {_esc(phase)}: {len(grp)} trades  WR={wr:.0f}%")
-
-        # ── By composite score bucket ─────────────────────────────────────
-        lines.append("\n<b>By Composite Score</b>")
-        buckets = [
-            ("≥0.70", lambda c: c >= 0.70),
-            ("0.50–0.70", lambda c: 0.50 <= c < 0.70),
-            ("0.35–0.50", lambda c: 0.35 <= c < 0.50),
-            ("<0.35", lambda c: abs(c) < 0.35),
-        ]
-        for label, fn in buckets:
-            grp = [t for t in history if fn(abs(t.get('composite', 0.0)))]
-            if not grp:
-                continue
-            w  = sum(1 for t in grp if t.get('is_win'))
-            wr = w / len(grp) * 100.0
-            lines.append(f"  {label}: {len(grp)} trades  WR={wr:.0f}%")
-
-        # ── Best and worst combos ─────────────────────────────────────────
-        if len(history) >= 10:
-            lines.append("\n<b>Top 3 win combos (tier+regime)</b>")
-            combo_groups: dict = {}
-            for t in history:
-                k = f"{t.get('ict_tier','?')}|{t.get('regime','?')[:8]}"
-                combo_groups.setdefault(k, []).append(t)
-            ranked = []
-            for combo, grp in combo_groups.items():
-                if len(grp) >= 2:
-                    w  = sum(1 for t in grp if t.get('is_win'))
-                    wr = w / len(grp) * 100.0
-                    ranked.append((wr, len(grp), combo))
-            ranked.sort(reverse=True)
-            for wr, cnt, combo in ranked[:3]:
-                tier_lbl, reg_lbl = combo.split('|')
-                lines.append(f"  Tier-{tier_lbl} + {_esc(reg_lbl)}: {cnt} trades  WR={wr:.0f}%")
-
-        # ── Realised PnL and fee summary ──────────────────────────────────
-        lines.append("\n<b>Realised PnL &amp; Fees</b>")
-        total_gross  = sum(t.get('gross_pnl', t.get('pnl', 0)) for t in history)
-        total_net    = sum(t.get('pnl', 0) for t in history)
-        total_fees   = sum(t.get('total_fees', 0) for t in history)
-        total_entry  = sum(t.get('entry_fee', 0) for t in history)
-        total_exit   = sum(t.get('exit_fee',  0) for t in history)
-        n_exact      = sum(1 for t in history if t.get('exact_fees'))
-        n_est        = total - n_exact
-        fee_note     = f"({n_exact} exact from exchange, {n_est} estimated)" if n_exact > 0 \
-                       else "(all estimated — enable Delta for exact fees)"
-
-        lines += [
-            f"  Gross PnL:   ${total_gross:+.4f} USDT",
-            f"  Total Fees:  ${total_fees:.4f} USDT  {fee_note}",
-            f"    Entry fees: ${total_entry:.4f}  Exit fees: ${total_exit:.4f}",
-            f"  Net PnL:     <b>${total_net:+.4f}</b> USDT",
-            f"  Avg fee/trade: ${(total_fees/total):.4f}" if total > 0 else "",
-        ]
-
-        return "\n".join(l for l in lines if l is not None)
-
-    def _cmd_huntstatus(self) -> str:
-        """
-        /huntstatus — display LiquidityHunter state, prediction score, and
-        last signal if one is pending.
-        """
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-
-        strat = getattr(bot_instance, 'strategy', None)
-        dm    = getattr(bot_instance, 'data_manager', None)
-        if not strat or not dm:
-            return "Components not ready."
-
-        hunter = getattr(strat, '_liquidity_hunter', None)
-        if hunter is None:
-            return (
-                "❌ LiquidityHunter not available.\n"
-                "Ensure <code>liquidity_hunter.py</code> is in the strategy/ directory."
-            )
-
-        price  = dm.get_last_price()
-        atr    = strat._atr_5m.atr
-
-        st = hunter.get_status_dict()
-
-        # State icon
-        state_icons = {
-            "NO_RANGE":        "⚪",
-            "RANGING":         "🔵",
-            "STALKING":        "🟡",
-            "APPROACHING":     "🟠",
-            "SWEEP_CONFIRMED": "🟢",
-            "CISD_WAIT":       "🔍",
-            "OTE_WAIT":        "📐",
-        }
-        s_icon = state_icons.get(st["state"], "❓")
-
-        lines = [f"<b>🎣 Liquidity Hunt Engine</b>"]
-        lines.append(f"Price: ${price:,.2f}  ATR: ${atr:.1f}")
-        lines.append("")
-        lines.append(f"<b>State:</b> {s_icon} {st['state']}")
-
-        if st["bsl"] is not None and st["ssl"] is not None:
-            bsl = st["bsl"]
-            ssl = st["ssl"]
-            rng_size = bsl - ssl
-            rng_atr  = rng_size / atr if atr > 1e-10 else 0
-            pd_pct   = (price - ssl) / rng_size * 100 if rng_size > 0 else 0
-            lines.append(
-                f"SSL ${ssl:,.1f}  ─  price ${price:,.2f} ({pd_pct:.0f}%)  ─  BSL ${bsl:,.1f}")
-            lines.append(
-                f"Range: {rng_size:.0f}pts / {rng_atr:.1f}ATR  "
-                f"(BSL x{st['bsl_touches']}  SSL x{st['ssl_touches']})")
-        else:
-            lines.append("No active BSL/SSL range detected.")
-
-        lines.append("")
-        pred_icon = "▲ BSL" if st["predicted_dir"] == "bsl" else ("▼ SSL" if st["predicted_dir"] == "ssl" else "─ none")
-        lines.append(f"<b>Prediction</b>: {pred_icon}")
-        lines.append(
-            f"  EMA score: {st['score_ema']:+.3f}  "
-            f"raw: {st['raw_score']:+.3f}")
-
-        # Component breakdown — weights imported from HUNT_WEIGHTS (single source of truth)
-        # Previously this block had a hardcoded dict with AMD missing (weight=0.00),
-        # causing AMD (the strongest signal, weight=0.25) to appear to contribute nothing.
-        comp = st.get("components", {})
-        if comp:
-            lines.append("  <b>Components</b>:")
-            try:
-                from strategy.liquidity_hunter import HUNT_WEIGHTS as _display_weights
-            except ImportError:
-                try:
-                    from liquidity_hunter import HUNT_WEIGHTS as _display_weights
-                except ImportError:
-                    # Last-resort fallback using correct ICT engine weights (not old 8-factor)
-                    _display_weights = {
-                        "amd": 0.25, "dr_pos": 0.16, "flow": 0.14,
-                        "cvd": 0.12, "pool_sig": 0.10, "ob_magnet": 0.09,
-                        "fvg_path": 0.07, "session": 0.04, "micro": 0.03,
-                    }
-            for key, val in comp.items():
-                w         = _display_weights.get(key, 0)
-                contrib   = val * w
-                arrow     = "▲" if val > 0.05 else ("▼" if val < -0.05 else "─")
-                lines.append(
-                    f"    {key:<10} {arrow} {val:+.3f}  × {w:.2f} = {contrib:+.4f}")
-
-        # Signal
-        lines.append("")
-        if st["signal_ready"]:
-            sig_type = st.get("signal_type", "SIGNAL")
-            sig_qual = st.get("signal_quality", 0)
-            cisd_flag = "✅ CISD" if st.get("cisd_confirmed") else "❌ no CISD"
-            ote_flag  = "OTE entry" if st.get("ote_entry") else "market entry"
-            lines.append(f"<b>🎯 {sig_type} READY</b>")
-            lines.append(
-                f"  Side:   <b>{(st['signal_side'] or '?').upper()}</b>")
-            lines.append(
-                f"  SL:     ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
-            lines.append(f"  R:R:    1:{st['signal_rr']:.2f}")
-            lines.append(
-                f"  Quality: {sig_qual:.2f}  {cisd_flag}  {ote_flag}")
-        else:
-            lines.append("  No pending signal.")
-
-        return "\n".join(lines)
-
-    def _cmd_balance(self) -> str:
-        global bot_instance, bot_running
-        if not bot_running or not bot_instance:
-            return "Bot not running."
-        rm = bot_instance.risk_manager
-        if not rm:
-            return "Risk manager not ready."
-        try:
-            bal = rm.get_available_balance()
-            if not bal:
-                return "Could not fetch balance."
-            avail    = float(bal.get("available", 0))
-            total    = float(bal.get("total", avail))
-            locked   = total - avail
-            dpnl     = getattr(rm, 'daily_pnl', 0.0)
-            init_bal = getattr(rm, 'initial_balance', 0.0)
-            dpct     = (dpnl / init_bal * 100.0 if init_bal > 1e-10 else 0.0)
-            return (
-                f"<b>Wallet Balance</b>\n"
-                f"Available: <b>${avail:,.2f}</b> USDT\n"
-                f"Locked:    ${locked:,.2f} USDT\n"
-                f"Total:     ${total:,.2f} USDT\n\n"
-                f"Today's PnL: ${dpnl:+,.2f} ({dpct:+.2f}%)"
-            )
-        except Exception as e:
-            return f"Balance error: {e}"
-
-    def _cmd_pause(self) -> str:
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-        bot_instance.trading_enabled      = False
-        bot_instance.trading_pause_reason = "Paused via Telegram"
-        return "⏸️ Trading PAUSED. Monitoring continues. Use /resume to re-enable."
-
-    def _cmd_resume(self) -> str:
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-        bot_instance.trading_enabled      = True
-        bot_instance.trading_pause_reason = ""
-        return "▶️ Trading RESUMED."
-
-    def _cmd_trail(self, args: str) -> str:
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-        strat = bot_instance.strategy
-        if not strat:
-            return "Strategy not ready."
-        arg = (args or "").strip().lower()
-        if arg in ("on", "enable", "1", "true", "yes"):
-            strat.set_trail_override(True)
-            return "🔒 Trailing SL: FORCED ON"
-        elif arg in ("off", "disable", "0", "false", "no"):
-            strat.set_trail_override(False)
-            return "🔓 Trailing SL: FORCED OFF"
-        else:
-            strat.set_trail_override(None)
-            enabled = strat.get_trail_enabled()
-            return (f"🔄 Trailing SL: AUTO  "
-                    f"(config default = {'ON' if enabled else 'OFF'})")
-
-    def _cmd_config(self) -> str:
-        import config as cfg
-        lines = [
-            "<b>Bot Configuration</b>\n",
-            f"Symbol:     {cfg.SYMBOL}",
-            f"Exchange:   {cfg.EXCHANGE}",
-            f"Leverage:   {cfg.LEVERAGE}x",
-            "",
-            "<b>Position Sizing</b>",
-            f"  Margin/trade: {getattr(cfg,'QUANT_MARGIN_PCT',0.20):.0%} of available balance",
-            f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',4.0):.2f} USDT",
-            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',1.0)} BTC",
-            "",
-            "<b>Entry</b>",
-            f"  VWAP ATR mult:    {getattr(cfg,'QUANT_VWAP_ENTRY_ATR_MULT',1.2)}×ATR",
-            f"  Composite min:    ±{getattr(cfg,'QUANT_COMPOSITE_ENTRY_MIN',0.30)}",
-            f"  Confirm ticks:    {getattr(cfg,'QUANT_CONFIRM_TICKS',2)}",
-            f"  Cooldown:         {getattr(cfg,'QUANT_COOLDOWN_SEC',180)}s",
-            f"  Max hold:         {getattr(cfg,'QUANT_MAX_HOLD_SEC',2400)}s",
-            "",
-            "<b>Risk</b>",
-            f"  Min SL dist:      {getattr(cfg,'MIN_SL_DISTANCE_PCT',0.003)*100:.2f}%",
-            f"  Max SL dist:      {getattr(cfg,'MAX_SL_DISTANCE_PCT',0.035)*100:.2f}%",
-            f"  SL ATR buffer:    {getattr(cfg,'QUANT_SL_BUFFER_ATR_MULT',0.4)}×ATR",
-            f"  Min R:R:          {getattr(cfg,'MIN_RISK_REWARD_RATIO',0.8)}",
-            f"  Max daily trades: {getattr(cfg,'MAX_DAILY_TRADES',8)}",
-            f"  Max daily loss:   {getattr(cfg,'MAX_DAILY_LOSS_PCT',5.0):.1f}%",
-            f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',3)}",
-            "",
-            "<b>Trail</b>",
-            f"  Enabled:    {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
-            f"  BE (0→1):   {getattr(cfg,'QUANT_TRAIL_BE_R',0.3)}R",
-            f"  Lock (1→2): {getattr(cfg,'QUANT_TRAIL_LOCK_R',0.8)}R",
-            f"  Aggr (2→3): {getattr(cfg,'QUANT_TRAIL_AGGRESSIVE_R',1.5)}R",
-        ]
-        return "\n".join(lines)
-
-    def _cmd_killswitch(self) -> str:
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-        try:
-            import config
-            bot_instance.trading_enabled = False
-            om      = bot_instance.order_manager
-            results = []
-
-            if not om:
-                return "❌ Order manager not available."
-
-            # 1. Cancel all open orders
-            try:
-                swept = om.cancel_symbol_conditionals(symbol=config.SYMBOL)
-                results.append(f"✅ Swept {len(swept)} conditional order(s)")
-            except Exception as e:
-                results.append(f"⚠️ Cancel error: {e}")
-
-            # 2. Close open position
-            try:
-                pos = om.get_open_position()
-                if pos and float(pos.get("size", 0)) > 0:
-                    pos_side   = str(pos.get("side", "")).upper()
-                    close_side = "SELL" if pos_side == "LONG" else "BUY"
-                    qty        = float(pos["size"])
-                    resp       = om.place_market_order(
-                        side=close_side, quantity=qty, reduce_only=True)
-                    if resp:
-                        results.append(f"✅ Closed {pos_side} ({qty} contracts/BTC)")
-                    else:
-                        results.append(f"⚠️ Close order returned None")
-                else:
-                    results.append("ℹ️ No open position on exchange")
-            except Exception as e:
-                results.append(f"⚠️ Close error: {e}")
-
-            # 3. Reset strategy state to FLAT
-            strat = bot_instance.strategy
-            if strat:
-                try:
-                    from quant_strategy import PositionState
-                    with strat._lock:
-                        strat._pos = PositionState()
-                        strat._confirm_long = strat._confirm_short = 0
-                        strat._confirm_trend_long = strat._confirm_trend_short = 0
-                    results.append("✅ Strategy reset to FLAT")
-                except Exception as e:
-                    results.append(f"⚠️ State reset: {e}")
-
-            result_str = "\n".join(f"  {r}" for r in results)
-            return (
-                f"🚨 <b>KILLSWITCH ACTIVATED</b>\n\n"
-                f"{result_str}\n\n"
-                f"Trading is PAUSED. Use /resume to re-enable."
-            )
-        except Exception as e:
-            logger.error(f"Killswitch error: {e}", exc_info=True)
-            return f"❌ Killswitch error: {e}"
-
-    def _cmd_resetrisk(self, args: str) -> str:
-        """
-        /resetrisk          — clear consecutive-loss lockout only
-        /resetrisk full     — also reset daily PnL and daily trade counter
-
-        Operates on both DailyRiskGate (inside QuantStrategy) and the
-        standalone RiskManager so they stay in sync.
-
-        Safety rule: blocked while a position is ACTIVE — the risk gate must
-        not be cleared while in a trade (it would mask the loss count from a
-        currently open losing position).
-        """
-        global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-
-        strat = getattr(bot_instance, 'strategy', None)
-        rm    = getattr(bot_instance, 'risk_manager', None)
-
-        if strat is None:
-            return "❌ Strategy not initialised."
-
-        # Block reset while a position is open
-        try:
-            from strategy.quant_strategy import PositionPhase
-            with strat._lock:
-                phase = strat._pos.phase
-            if phase not in (PositionPhase.FLAT, PositionPhase.ENTERING):
-                return (
-                    "❌ Cannot reset risk gate while position is open.\n"
-                    f"Current phase: {phase.name}\n"
-                    "Close the position first, then /resetrisk."
-                )
-        except Exception as e:
-            logger.warning(f"resetrisk phase check error: {e}")
-
-        reset_daily = "full" in args.lower()
-        lines = ["🔄 <b>Risk Gate Reset</b>"]
-
-        # ── 1. DailyRiskGate (inside strategy) ─────────────────────────────────
-        gate = getattr(strat, '_risk_gate', None)
-        if gate is not None:
-            try:
-                gate_result = gate.force_reset(reset_consec=True, reset_daily=reset_daily)
-                lines.append(f"  DailyRiskGate: {gate_result}")
-            except Exception as e:
-                lines.append(f"  DailyRiskGate error: {e}")
-        else:
-            lines.append("  ⚠️ DailyRiskGate not found on strategy")
-
-        # ── 2. RiskManager (standalone) ─────────────────────────────────────────
-        if rm is not None:
-            try:
-                with rm._lock:
-                    prev_cl = rm.consecutive_losses
-                    prev_dp = rm.daily_pnl
-                    rm.consecutive_losses = 0
-                    if reset_daily:
-                        rm.daily_pnl   = 0.0
-                        rm.daily_trades = []
-                detail = f"consec_losses {prev_cl}→0"
-                if reset_daily:
-                    detail += f" | daily_pnl ${prev_dp:+.2f}→$0.00 | daily_trades cleared"
-                lines.append(f"  RiskManager:   {detail}")
-            except Exception as e:
-                lines.append(f"  RiskManager error: {e}")
-        else:
-            lines.append("  ⚠️ RiskManager not attached to bot")
-
-        # ── 3. Current gate state after reset ───────────────────────────────────
-        try:
-            bal_info = rm.get_available_balance() if rm else None
-            total_bal = float((bal_info or {}).get("total", 0.0))
-            ok, reason = gate.can_trade(total_bal) if gate else (False, "no gate")
-            state_line = "✅ Gate OPEN — trading will resume on next signal" \
-                         if ok else f"⚠️ Gate still CLOSED: {reason}"
-            lines.append(f"\n{state_line}")
-        except Exception as e:
-            lines.append(f"\n  Gate state check error: {e}")
-
-        if reset_daily:
-            lines.append("\n<i>Full daily reset applied — counters treated as new session.</i>")
-        else:
-            lines.append("\n<i>Consecutive-loss lock cleared only. Daily PnL/trade count unchanged.</i>")
-
-        return "\n".join(lines)
-
-    def _cmd_setexchange(self, args: str) -> str:
-        """
-        /setexchange delta|coinswitch
-
-        Hot-switches the execution exchange at runtime.
-        Blocked if a position is currently open (must close first).
-        Verifies balance on the new exchange before switching.
-
-        The data aggregator continues to pull from BOTH exchanges regardless
-        of which exchange is active for execution — this command only affects
-        where orders are placed.
-        """
-        global bot_instance, bot_running
-
-        if not args:
-            active = getattr(config, "EXECUTION_EXCHANGE", "?")
-            return (
-                f"Current execution exchange: <b>{active.upper()}</b>\n\n"
-                f"Usage: /setexchange &lt;exchange&gt;\n"
-                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
-                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
-            )
-
-        target = args.strip().lower()
-
-        if not bot_running or bot_instance is None:
-            # Bot not running — update config only
-            try:
-                from core.types import Exchange
-                Exchange.from_str(target)   # validates
-                config.EXECUTION_EXCHANGE = Exchange.from_str(target).value
-                return (f"✅ Execution exchange set to <b>{target.upper()}</b> "
-                        f"(bot not running — takes effect on next start)")
-            except ValueError:
-                return f"❌ Unknown exchange: <code>{target}</code>"
-
-        router = getattr(bot_instance, "execution_router", None)
-        if router is None:
-            return "❌ Execution router not available — bot may not be fully initialised."
-
-        strategy = getattr(bot_instance, "strategy", None)
-        success, message = router.switch(target, strategy=strategy)
-
-        if success:
-            # Also update leverage on the new exchange
-            if bot_instance.order_manager:
-                try:
-                    bot_instance.order_manager.set_leverage(
-                        leverage=int(config.LEVERAGE)
-                    )
-                except Exception as e:
-                    message += f"\n⚠️ Leverage set failed: {e}"
-
-        return message
-
-    def _cmd_set(self, args: str) -> str:
-        """
-        Live-adjust a config parameter.
-        For LEVERAGE: also calls the exchange API to set it live and blocks
-        the change if a position is currently open (wrong leverage on open
-        position is dangerous).
-        """
-        import config as cfg
-
-        if not args or len(args.split()) < 2:
-            return (
-                "Usage: /set &lt;key&gt; &lt;value&gt;\n\n"
-                "<b>Adjustable:</b>\n"
-                "  leverage          int   (e.g. 20)\n"
-                "  margin            float (e.g. 0.15)\n"
-                "  cooldown          int   seconds\n"
-                "  max_daily_trades  int\n"
-                "  max_daily_loss    float %\n"
-                "  max_consec_loss   int\n"
-                "  min_rr            float\n"
-                "  composite_min     float (e.g. 0.30)\n"
-                "  trail_enabled     bool  (true/false)\n"
-                "  max_hold          int   seconds\n"
-                "  vwap_mult         float (e.g. 1.2)\n"
-                "  sl_buffer         float (e.g. 0.4)\n"
-            )
-
-        parts   = args.split(None, 1)
-        key     = parts[0].lower().strip()
-        val_str = parts[1].strip()
-
-        allowed = {
-            "leverage":         ("LEVERAGE",                  int),
-            "margin":           ("QUANT_MARGIN_PCT",          float),
-            "cooldown":         ("QUANT_COOLDOWN_SEC",        int),
-            "max_daily_trades": ("MAX_DAILY_TRADES",          int),
-            "max_daily_loss":   ("MAX_DAILY_LOSS_PCT",        float),
-            "max_consec_loss":  ("MAX_CONSECUTIVE_LOSSES",    int),
-            "min_rr":           ("MIN_RISK_REWARD_RATIO",     float),
-            "composite_min":    ("QUANT_COMPOSITE_ENTRY_MIN", float),
-            "trail_enabled":    ("QUANT_TRAIL_ENABLED",       bool),
-            "max_hold":         ("QUANT_MAX_HOLD_SEC",        int),
-            "vwap_mult":        ("QUANT_VWAP_ENTRY_ATR_MULT", float),
-            "sl_buffer":        ("QUANT_SL_BUFFER_ATR_MULT",  float),
-        }
-
-        if key not in allowed:
-            return (f"Unknown key: <code>{key}</code>\n"
-                    f"Allowed: {', '.join(sorted(allowed.keys()))}")
-
-        attr_name, val_type = allowed[key]
-        try:
-            new_val = (val_str.lower() in ("true", "1", "yes", "on")
-                       if val_type == bool else val_type(val_str))
-        except ValueError:
-            return f"Invalid value: <code>{val_str}</code> (expected {val_type.__name__})"
-
-        old_val = getattr(cfg, attr_name, "?")
-
-        # ── Leverage: exchange API call required ──────────────────────────────
-        if key == "leverage":
-            global bot_instance, bot_running
-
-            # Refuse if a position is open — changing leverage mid-trade is
-            # dangerous: the sizing already used the old leverage for qty calc.
-            if bot_running and bot_instance and bot_instance.strategy:
-                pos = bot_instance.strategy.get_position()
-                if pos:
-                    return (
-                        f"❌ Cannot change leverage while position is open.\n"
-                        f"Close position first, then /set leverage {new_val}."
-                    )
-
-            # Apply to config first so the bot uses it for the next sizing call
-            setattr(cfg, attr_name, new_val)
-            logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
-
-            # Call the exchange API to set it live
-            if bot_running and bot_instance:
-                om = getattr(bot_instance, 'order_manager', None)
-                if om:
-                    try:
-                        resp = om.set_leverage(leverage=int(new_val))
-                        if isinstance(resp, dict) and resp.get("error"):
-                            # Exchange rejected — revert config to avoid mismatch
-                            setattr(cfg, attr_name, old_val)
-                            return (
-                                f"❌ Exchange rejected leverage change: {resp['error']}\n"
-                                f"Config reverted to {old_val}x."
-                            )
-                        logger.info(f"Exchange leverage set to {new_val}x: {resp}")
-                        return (
-                            f"✅ <b>Leverage updated</b>: {old_val}x → <b>{new_val}x</b>\n"
-                            f"Config and exchange both updated."
-                        )
-                    except Exception as e:
-                        # Revert config so it stays in sync with exchange
-                        setattr(cfg, attr_name, old_val)
-                        logger.error(f"set_leverage API error: {e}")
-                        return (
-                            f"❌ Exchange API error: {e}\n"
-                            f"Config reverted to {old_val}x."
-                        )
-                else:
-                    return (
-                        f"⚠️ Config updated to {new_val}x but order manager "
-                        f"not available — exchange NOT updated.\n"
-                        f"Restart bot to apply leverage on exchange."
-                    )
-            else:
-                # Bot not running — config-only change is fine
-                return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (bot not running — exchange not updated)"
-
-        # ── All other keys: config-only ───────────────────────────────────────
-        setattr(cfg, attr_name, new_val)
-        logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
-        return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
-
-    # ================================================================
-    # BOT THREAD
-    # ================================================================
-
-    def _run_bot_thread(self):
-        global bot_instance, bot_running
-        try:
-            bot_running  = True
-            import sys, os as _os
-            # Ensure project root is on path so 'main' resolves correctly
-            _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-            if _root not in sys.path:
-                sys.path.insert(0, _root)
-            from main import QuantBot
-            bot_instance = QuantBot()
-            if not bot_instance.initialize():
-                self.send_message("❌ Bot init failed. Check logs.")
-                bot_running = False
-                return
-            if not bot_instance.start():
-                self.send_message("❌ Bot start failed. Check logs.")
-                bot_running = False
-                return
-            bot_instance.run()
-        except Exception as e:
-            logger.error(f"Bot crashed: {e}", exc_info=True)
-            self.send_message(f"❌ Bot crashed: {e}")
-        finally:
-            bot_running = False
-            logger.info("Bot thread finished")
-
     # ================================================================
     # MAIN LOOP
     # ================================================================
@@ -1855,18 +2403,13 @@ class TelegramBotController:
         self.clear_old_messages()
         self.set_my_commands()
         self.send_message(
-            "⚡ <b>Unified Quant Bot v5 Controller Ready</b>\n"
+            "⚡ <b>Liquidity-First Quant Bot Controller Ready</b>\n"
             "Execution: " + getattr(config, "EXECUTION_EXCHANGE", "?").upper() + "\n\n"
             + self._cmd_help())
         logger.info("Telegram controller started")
 
         while self.running:
             try:
-                # Bug-21 fix: use timeout=10 so the poll returns within ~12 s
-                # of a stop() call rather than blocking for up to 35 s.  The
-                # shorter interval has no practical effect on message delivery —
-                # Telegram updates are pushed server-side regardless of the
-                # client poll timeout.
                 updates = self.get_updates(timeout=10)
                 for upd in updates:
                     self.last_update_id = upd.get("update_id", self.last_update_id)
@@ -1904,24 +2447,17 @@ def main():
         def formatTime(self, record, datefmt=None):
             from datetime import datetime
             dt = datetime.fromtimestamp(record.created, tz=IST)
-            s  = dt.strftime("%Y-%m-%d %H:%M:%S")
-            return f"{s},{int(record.msecs):03d}"
+            return f"{dt.strftime('%Y-%m-%d %H:%M:%S')},{int(record.msecs):03d}"
 
     _fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-    _fh = logging.FileHandler("telegram_controller.log", encoding="utf-8")
+    _fh  = logging.FileHandler("telegram_controller.log", encoding="utf-8")
     _fh.setFormatter(_fmt)
-
-    _sh = logging.StreamHandler(
+    _sh  = logging.StreamHandler(
         stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
         if hasattr(sys.stdout, "buffer") else sys.stdout
     )
     _sh.setFormatter(_fmt)
-
-    logging.basicConfig(
-        level=getattr(config, "LOG_LEVEL", "INFO"),
-        handlers=[_fh, _sh],
-    )
+    logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh])
 
     def _signal_handler(signum, frame):
         logger.info(f"Signal {signum} — stopping controller")

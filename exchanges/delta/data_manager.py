@@ -297,34 +297,98 @@ class DeltaDataManager:
 
     def _process_ws_candle(self, data: Dict, candle: Candle,
                            target: deque, tf_key: str, tf_label: str) -> None:
+        """
+        Merge a WebSocket candle tick into the deque for its timeframe.
+
+        Invariants this method preserves (verified on every call):
+          I1. target is sorted by start-of-bar timestamp, strictly increasing.
+          I2. At most ONE in-progress bar is at target[-1]; its start_ts is
+              tracked in self._forming_ts[tf_key].
+          I3. A late/stale tick (start_ts < latest known bar) is DROPPED.
+              Never appends out-of-order bars — downstream indicators
+              (ATR, swing detection, ICT structure) assume monotonic order.
+          I4. On a closed tick for a bar already closed in the deque
+              (duplicate close after forming_ts was popped), the existing
+              bar is overwritten (last-write-wins on identical start_ts),
+              not duplicated.
+
+        BUG-DELTA-DM-1 fix (duplicate-append-on-repeated-close):
+          Previous logic popped forming_ts on close. A second closed tick
+          for the same bar (rare, but observed after WS reconnect) would
+          find forming_ts=None, fail the equality check, and append a
+          duplicate. Fix: compare against target[-1].timestamp as a
+          secondary check, regardless of forming_ts state.
+
+        BUG-DELTA-DM-2 fix (out-of-order ticks):
+          Previous logic had no guard against stale ticks arriving after
+          a newer bar. A T-bar tick arriving after T+1 was already in the
+          deque would be appended, violating the sort invariant. Fix:
+          explicit start_ts vs target[-1].timestamp comparison.
+        """
         if not self._warmup_complete:
             self._last_price = candle.close
             self._last_price_update_time = time.time()
             return
 
-        is_closed  = bool(data.get("x", False))
-        start_ts   = int(data.get("t", 0))
-        forming_ts = self._forming_ts.get(tf_key)
+        is_closed = bool(data.get("x", False))
+        start_ts  = int(data.get("t", 0))
 
+        # start_ts is in ms (as emitted by the WS normaliser); candle.timestamp
+        # is in seconds (set in _make_candle_cb). Compare in ms for consistency.
+        if start_ts <= 0:
+            logger.debug(f"Delta {tf_label}: tick with non-positive start_ts={start_ts} dropped")
+            return
+
+        latest_ts_ms = int(target[-1].timestamp * 1000) if target else 0
+
+        # ── I3: stale-tick guard ────────────────────────────────────────────
+        # If this tick is for a bar STRICTLY OLDER than the newest bar we've
+        # already recorded, drop it. Do NOT update last_price from a stale
+        # bar either (it would move last_price backwards in time).
+        if start_ts < latest_ts_ms:
+            logger.debug(
+                f"Delta {tf_label}: dropping stale tick start_ts={start_ts} "
+                f"< latest_ts_ms={latest_ts_ms}")
+            return
+
+        # Price update from fresh candle ticks only.
         self._last_price = candle.close
         self._last_price_update_time = time.time()
 
-        if is_closed:
-            if forming_ts == start_ts and target:
-                target[-1] = candle
+        forming_ts = self._forming_ts.get(tf_key)
+
+        # ── Same-bar update (in-place replace) ─────────────────────────────
+        # Two cases converge here:
+        #   a) forming_ts tracks this bar and target[-1] is this bar
+        #   b) forming_ts is None but target[-1] is this bar (post-close tick
+        #      after we already popped forming_ts — BUG-DELTA-DM-1 case)
+        if target and start_ts == latest_ts_ms:
+            target[-1] = candle
+            if is_closed:
+                # Closed update on an existing bar — clear forming marker.
+                self._forming_ts.pop(tf_key, None)
+                if tf_label != "1m":
+                    logger.info(f"✅ Delta {tf_label} CLOSED @ ${candle.close:.2f}")
+                else:
+                    logger.debug(f"✅ Delta 1m CLOSED @ ${candle.close:.2f}")
             else:
-                target.append(candle)
+                # Still forming — ensure forming marker is correct.
+                self._forming_ts[tf_key] = start_ts
+            self.stats.record_candle()
+            return
+
+        # ── New bar (append) ────────────────────────────────────────────────
+        # Reached iff start_ts > latest_ts_ms (strictly newer). Invariant I1
+        # preserved.
+        target.append(candle)
+        if is_closed:
             self._forming_ts.pop(tf_key, None)
             if tf_label != "1m":
                 logger.info(f"✅ Delta {tf_label} CLOSED @ ${candle.close:.2f}")
             else:
                 logger.debug(f"✅ Delta 1m CLOSED @ ${candle.close:.2f}")
         else:
-            if forming_ts == start_ts and target:
-                target[-1] = candle
-            else:
-                target.append(candle)
-                self._forming_ts[tf_key] = start_ts
+            self._forming_ts[tf_key] = start_ts
 
         self.stats.record_candle()
 
@@ -351,12 +415,19 @@ class DeltaDataManager:
                             close     = float(data["c"]),
                             volume    = float(data["v"]),
                         )
-                    except Exception:
+                    except (KeyError, TypeError, ValueError) as e:
+                        # BUG-DELTA-DM-3 fix: log malformed payloads at debug
+                        # level instead of silently discarding. Helps diagnose
+                        # upstream format drift.
+                        logger.debug(
+                            f"Delta {label}: malformed candle payload {e}: "
+                            f"{ {k: data.get(k) for k in ('t','o','h','l','c','v')} }")
                         return
                     if c.close > 0:
                         self._process_ws_candle(data, c, target, tf_key, label)
             except Exception as e:
-                logger.error(f"Delta {label} candle callback error: {e}")
+                logger.error(f"Delta {label} candle callback error: {e}",
+                             exc_info=True)
         return cb
 
     # ── WS callbacks ─────────────────────────────────────────────────────────

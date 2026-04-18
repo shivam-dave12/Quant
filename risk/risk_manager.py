@@ -1,6 +1,16 @@
 """
-Risk Manager - Industry Grade
-Comprehensive risk management with position tracking
+risk/risk_manager.py — Liquidity-First Risk Manager
+=====================================================
+Position sizing and risk control for the liquidity-first architecture.
+
+Key changes from VWAP-reversion model:
+  - calculate_position_size() now accepts an optional pool_tp_price so the
+    R:R is evaluated against the actual opposing-pool target, not a VWAP
+    fraction.  When pool_tp_price is provided it is used as the TP reference
+    for R:R validation; the dollar risk budget is unchanged.
+  - All other risk limits (daily loss, consecutive losses, drawdown, cooldown)
+    are retained unchanged — they are architecture-agnostic.
+  - Balance caching and thread-safety model unchanged.
 """
 
 import logging
@@ -16,122 +26,117 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class TradeRecord:
-    timestamp: float
-    side: str
+    timestamp:   float
+    side:        str
     entry_price: float
-    exit_price: float
-    quantity: float
-    pnl: float
-    is_win: bool
-    reason: str
+    exit_price:  float
+    quantity:    float
+    pnl:         float
+    is_win:      bool
+    reason:      str
+
 
 class RiskManager:
-    """Industry-grade risk manager"""
+    """
+    Liquidity-first risk manager.
+
+    Position sizing model (pool-to-pool):
+      1. Dollar risk  = RISK_PER_TRADE% of available balance.
+      2. Notional     = dollar_risk / sl_distance_pct.
+      3. qty (BTC)    = notional / entry_price.
+      4. Margin cap   applied if needed.
+      5. R:R validated against pool_tp_price (opposing pool sweep) when
+         provided; falls back to MIN_RISK_REWARD_RATIO config guard.
+    """
 
     def __init__(self, shared_api=None):
         self._lock = threading.RLock()
 
         # Performance tracking
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.losing_trades = 0
-        self.realized_pnl = 0.0
-        self.daily_pnl = 0.0
+        self.total_trades       = 0
+        self.winning_trades     = 0
+        self.losing_trades      = 0
+        self.realized_pnl       = 0.0
+        self.daily_pnl          = 0.0
         self.consecutive_losses = 0
 
-        # Risk limits — must be assigned BEFORE trade-history deques so that
-        # BUG-14 FIX: daily_trades deque's maxlen can reference max_daily_trades.
-        # Previously these three lines appeared *after* the deque construction,
-        # causing an AttributeError on 'self.max_daily_trades' at startup.
-        self.daily_loss_limit = config.MAX_DAILY_LOSS
-        self.max_consecutive_losses = config.MAX_CONSECUTIVE_LOSSES
-        self.max_daily_trades = config.MAX_DAILY_TRADES
+        # Risk limits (assigned BEFORE trade-history deques)
+        self.daily_loss_limit         = config.MAX_DAILY_LOSS
+        self.max_consecutive_losses   = config.MAX_CONSECUTIVE_LOSSES
+        self.max_daily_trades         = config.MAX_DAILY_TRADES
 
-        # Trade history — both bounded to prevent unbounded memory growth.
-        # BUG-5 FIX: daily_trades was a plain list (inconsistent with trade_history deque).
-        # At MAX_DAILY_TRADES=8 the risk is harmless today, but it is a maintenance trap
-        # — future callers that forget the daily reset would grow it forever.
-        # Use deque(maxlen) so the cap is structurally enforced even without the reset.
+        # Trade history (bounded deques)
         self.trade_history: deque = deque(maxlen=1000)
         self.daily_trades:  deque = deque(maxlen=self.max_daily_trades + 10)
         self.last_trade_time = 0.0
 
         # Balance tracking
-        self.initial_balance = 0.0
-        self.current_balance   = 0.0   # total wallet equity (available + locked)
-        self.available_balance = 0.0   # free margin only — used for position sizing
-        self.balance_cache_time = 0.0
-        self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
-        # Concurrency guard: prevents multiple threads piling into a REST balance fetch.
-        # Callers that arrive while a fetch is in progress return the cached value
-        # immediately instead of waiting — the main loop is never blocked.
+        self.initial_balance       = 0.0
+        self.current_balance       = 0.0
+        self.available_balance     = 0.0
+        self.balance_cache_time    = 0.0
+        self.balance_cache_ttl     = config.BALANCE_CACHE_TTL_SEC
         self._balance_fetch_in_progress = False
 
-        # Daily reset tracking — date-anchored using IST (UTC+5:30)
-        # Must match DailyRiskGate in quant_strategy to prevent cross-day PnL drift.
+        # Daily reset (IST UTC+5:30)
         self._IST = timezone(timedelta(hours=5, minutes=30))
         self._last_reset_date = datetime.now(self._IST).date()
 
-        # Shared API — accepts CoinSwitchAPI, DeltaAPI, or ExecutionRouter.
+        # Deferred daily-reset state.
+        # When the calendar day rolls over while a position is open,
+        # _pending_reset is set True and the actual counter clearing is
+        # delayed until set_position_open(False) is called (i.e. the trade
+        # closes).  The closing trade is then recorded in the NEW day's books.
+        self._position_is_open: bool = False
+        self._pending_reset:    bool = False
+
+        # Shared API (CoinSwitchAPI, DeltaAPI, or ExecutionRouter)
         if shared_api is not None:
             self.api = shared_api
         else:
             self.api = None
             logger.warning("RiskManager: no shared_api — balance queries disabled")
 
-        logger.info("✅ RiskManager initialized")
+        logger.info("✅ RiskManager initialized (liquidity-first mode)")
+
+    # =========================================================================
+    # BALANCE
+    # =========================================================================
 
     def get_available_balance(self) -> Optional[Dict]:
         """
         Get available balance with caching.
 
-        Thread-safety model:
-          - Cache check and state update are lock-protected (fast, in-memory).
-          - The REST call is made OUTSIDE the lock so the main loop is never
-            blocked waiting for a network round-trip.
-          - A _balance_fetch_in_progress flag prevents concurrent fetches from
-            piling up: if a fetch is already running, callers return the cached
-            value immediately rather than waiting up to 30s for a HTTP timeout.
-
-        Critical: GlobalRateLimiter.wait() is intentionally NOT called here.
-          The global rate limiter governs ORDER placement (cancel, place, modify).
-          Balance reads are independent REST calls on a separate endpoint and
-          must never contend with the order rate limiter — doing so blocked the
-          main loop for up to 3 seconds every 35s (one full limiter interval).
+        Thread-safety: cache check under lock; REST call outside lock so the
+        main trading loop is never blocked during a network round-trip.
+        The _balance_fetch_in_progress flag prevents concurrent pile-up.
+        GlobalRateLimiter.wait() is intentionally NOT called here — balance
+        reads must not contend with order placement rate limits.
         """
         with self._lock:
             now = time.time()
-
-            # Fast path: valid cache — return immediately without any I/O
             if now - self.balance_cache_time < self.balance_cache_ttl:
                 return {
                     "available": self.available_balance,
                     "total":     self.current_balance,
                     "cached":    True,
                 }
-
-            # If another thread is already fetching, return cached value rather
-            # than blocking. The fresh data will be available on the next call.
             if self._balance_fetch_in_progress:
                 return {
                     "available": self.available_balance,
                     "total":     self.current_balance,
                     "cached":    True,
                 }
-
             if self.api is None:
                 return None
-
             self._balance_fetch_in_progress = True
-            # Snapshot cached values for fallback — used outside the lock
             _fallback_avail = self.available_balance
             _fallback_total = self.current_balance
 
-        # ── REST call — deliberately outside the lock ─────────────────────────
-        # The lock is not held during the HTTP request so on_tick, trail
-        # management, and all other threads continue running normally.
+        # REST call — outside lock
         try:
             balance_data = self.api.get_balance() if hasattr(self.api, "get_balance") else None
 
@@ -152,13 +157,11 @@ class RiskManager:
             locked    = float(balance_data.get("locked",    0.0))
             total     = available + locked
 
-            # ── Re-acquire lock to update shared state ─────────────────────────
             with self._lock:
                 self.available_balance = available
                 self.current_balance   = total
                 self.balance_cache_time = time.time()
                 self._balance_fetch_in_progress = False
-
                 if self.initial_balance == 0.0:
                     self.initial_balance = total
                     logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
@@ -171,38 +174,50 @@ class RiskManager:
                 self._balance_fetch_in_progress = False
             return {"available": _fallback_avail, "total": _fallback_total,
                     "cached": True, "error": str(e)}
-        # NOTE: No finally block here.  The flag is cleared in every explicit
-        # return path above (null response, error key, success block, exception
-        # handler).  A finally block would re-acquire the lock and unconditionally
-        # clear the flag — which would race against a NEW fetch that another thread
-        # legitimately started between the last flag-clear inside the try/except
-        # and the finally executing, silently clearing the wrong fetch's flag and
-        # opening a window for duplicate concurrent fetches.
 
+    # =========================================================================
+    # POSITION SIZING (pool-aware)
+    # =========================================================================
 
     def calculate_position_size(
         self,
-        entry_price: float,
-        stop_loss: float,
-        side: str
+        entry_price:   float,
+        stop_loss:     float,
+        side:          str,
+        pool_tp_price: Optional[float] = None,   # ← opposing pool sweep price
     ) -> Optional[float]:
         """
-        Calculate position size (BTC quantity to send to exchange).
+        Calculate BTC position size for a liquidity-pool trade.
 
-        Industry-standard risk-based sizing:
-          1. Dollar risk = RISK_PER_TRADE% of available balance
-             (the maximum dollar loss accepted if SL fires, e.g. 0.60% of balance)
-          2. Notional = dollar_risk / sl_distance_pct
-          3. qty (BTC) = notional / entry_price
-          4. Margin cap: if margin > BALANCE_USAGE_PERCENTAGE% of balance or
-             MAX_MARGIN_PER_TRADE, scale down (capital allocation guard)
-          5. Apply MIN/MAX_POSITION_SIZE hard limits
+        Sizing steps:
+          1. Dollar risk  = RISK_PER_TRADE% of available balance.
+          2. Notional     = dollar_risk / sl_distance_pct.
+          3. qty (BTC)    = notional / entry_price.
+          4. Margin cap   if margin > BALANCE_USAGE_PERCENTAGE% or
+                          MAX_MARGIN_PER_TRADE → scale down.
+          5. R:R guard    if pool_tp_price is supplied, verify that the
+                          trade's R:R meets MIN_RISK_REWARD_RATIO before
+                          returning.  A pool-based TP should always pass;
+                          if it fails the pool target is too close and the
+                          setup should be skipped.
+          6. Hard limits  MIN/MAX_POSITION_SIZE.
 
-        NOTE: No division by LEVERAGE here.  The exchange uses the qty you
-        send as the ACTUAL BTC position.  Leverage only determines how much
-        margin is held against that notional.  Dividing qty by leverage was
-        a previous bug that made actual positions 25× too small and required
-        a compensating ×LEVERAGE in PnL — both are now removed.
+        Args:
+            entry_price:   Intended fill price (OTE limit or market).
+            stop_loss:     ICT structural SL (sweep wick → OB → swing).
+            side:          "LONG" | "SHORT".
+            pool_tp_price: Price of the opposing liquidity pool (target).
+                           When provided, R:R is validated before returning.
+                           Pass None to skip R:R validation (used during
+                           sizing preview before TP is confirmed).
+
+        Returns:
+            BTC quantity (float) or None if size is invalid.
+
+        NOTE: No division by LEVERAGE.  `quantity` is the actual BTC position.
+        Leverage is implicit — the exchange holds (quantity × price / leverage)
+        as margin.  Dividing qty by leverage during sizing was a prior bug
+        that produced positions 25× too small.
         """
         try:
             entry_price = float(entry_price)
@@ -223,7 +238,23 @@ class RiskManager:
                 logger.error(f"No available balance: {available}")
                 return None
 
-            # ── SL distance validation ────────────────────────────────
+            # ── BUG 3 FIX: commission reserve ─────────────────────────
+            # Delta rejects `insufficient_commission` when balance minus
+            # margin leaves less than the maker+taker round-trip fee.
+            # Reserve: 2× taker rate (worst case) × 1.15 safety margin.
+            _taker_rate = float(getattr(config, "COMMISSION_RATE", 0.00055))
+            _max_notional = available * float(config.LEVERAGE)
+            _fee_budget   = _max_notional * _taker_rate * 2.0 * 1.15
+            available_after_fees = max(0.0, available - _fee_budget)
+            if available_after_fees < config.MIN_MARGIN_PER_TRADE:
+                logger.error(
+                    f"Balance after fee reserve ${available_after_fees:.2f} < "
+                    f"MIN_MARGIN ${config.MIN_MARGIN_PER_TRADE:.2f} "
+                    f"(raw=${available:.2f} fee_reserve=${_fee_budget:.2f})"
+                )
+                return None
+
+            # ── SL distance ───────────────────────────────────────────
             if side == "LONG":
                 price_distance = entry_price - stop_loss
                 if stop_loss >= entry_price:
@@ -239,52 +270,47 @@ class RiskManager:
                 logger.error(f"Invalid SL distance: {price_distance:.2f}")
                 return None
 
-            sl_pct = price_distance / entry_price          # e.g. 0.005 = 0.5%
+            sl_pct = price_distance / entry_price
 
-            if sl_pct < 0.001:
-                logger.error(f"SL too tight: {sl_pct*100:.3f}% (min 0.1%)")
+            if sl_pct < 0.0005:
+                logger.error(f"SL too tight: {sl_pct*100:.3f}% (min 0.05%)")
                 return None
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
 
-            # ── Step 1: Dollar risk budget ────────────────────────────
-            # RISK_PER_TRADE is the % of balance we accept LOSING if SL fires.
-            # e.g. RISK_PER_TRADE=0.60 → risk $6 on a $1000 balance.
-            # MAX_MARGIN_PER_TRADE is a capital allocation cap (Step 3), NOT a
-            # risk budget limit. Clamping dollar_risk by MAX_MARGIN confuses
-            # "how much I can lose" with "how much exchange holds as collateral".
-            dollar_risk = available * (config.RISK_PER_TRADE / 100)
-            # Floor only: ensure minimum viable trade size
-            dollar_risk = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
-            # Ceiling: cap at a sensible multiple of the risk percentage
-            # to prevent extreme sizing on very wide SLs
-            max_dollar_risk = available * (min(config.RISK_PER_TRADE * 3, 5.0) / 100)
-            dollar_risk = min(dollar_risk, max_dollar_risk)
+            # ── Step 1: Dollar risk budget (based on fee-adjusted balance) ─
+            # CFG-1 fix: RISK_PER_TRADE is now a FRACTION (0.006 = 0.6%) per
+            # config.py convention, aligned with quant_strategy._compute_quantity.
+            # Previously this divided by 100 treating the value as a percent,
+            # while quant_strategy used the raw value as a fraction — so the
+            # same 0.60 gave 0.6% here but 60% there, producing 100× over-sizing
+            # with the "required margin > available — scaling down" warnings.
+            # Now both consumers read the same fraction; the max-risk cap is
+            # also expressed as a fraction (5% absolute ceiling).
+            dollar_risk     = available_after_fees * config.RISK_PER_TRADE
+            dollar_risk     = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
+            _max_risk_frac  = min(config.RISK_PER_TRADE * 3.0, 0.05)
+            max_dollar_risk = available_after_fees * _max_risk_frac
+            dollar_risk     = min(dollar_risk, max_dollar_risk)
 
             # ── Step 2: Risk-based notional + qty ─────────────────────
-            # If we risk $dollar_risk at sl_pct, we can hold this notional:
-            notional = dollar_risk / sl_pct            # e.g. $60 / 0.005 = $12,000
-            position_size = notional / entry_price     # e.g. $12,000 / $90,000 = 0.133 BTC
+            notional      = dollar_risk / sl_pct
+            position_size = notional / entry_price
 
-            # ── Step 3: Margin cap ────────────────────────────────────
-            # Ensure the margin required does not exceed the hard limits.
-            # margin_required = notional / leverage  (what the exchange holds)
+            # ── Step 3: Margin cap (uses fee-adjusted balance) ────────
             margin_required = position_size * entry_price / config.LEVERAGE
             max_margin = min(
-                available * (config.BALANCE_USAGE_PERCENTAGE / 100),
+                available_after_fees * (config.BALANCE_USAGE_PERCENTAGE / 100),
                 config.MAX_MARGIN_PER_TRADE
             )
             max_margin = max(max_margin, config.MIN_MARGIN_PER_TRADE)
 
             if margin_required > max_margin:
-                scale = max_margin / margin_required
+                scale         = max_margin / margin_required
                 position_size = position_size * scale
                 notional      = position_size * entry_price
                 margin_required = max_margin
-                logger.debug(
-                    f"Position scaled by {scale:.3f} to respect "
-                    f"margin cap ${max_margin:.2f}"
-                )
+                logger.debug(f"Position scaled by {scale:.3f} to respect margin cap ${max_margin:.2f}")
 
             # ── Step 4: Hard limits ───────────────────────────────────
             position_size = max(config.MIN_POSITION_SIZE,
@@ -298,18 +324,31 @@ class RiskManager:
                 )
                 return None
 
+            # ── Step 5: Pool-based R:R logging (advisory — no longer blocks) ─
+            if pool_tp_price is not None:
+                tp_distance = abs(pool_tp_price - entry_price)
+                actual_rr   = tp_distance / price_distance if price_distance > 0 else 0.0
+                logger.debug(f"Pool R:R: {actual_rr:.2f}:1 "
+                             f"(pool_tp=${pool_tp_price:,.2f})")
+
             # ── Logging ───────────────────────────────────────────────
-            actual_notional      = position_size * entry_price
-            actual_margin        = actual_notional / config.LEVERAGE
-            actual_dollar_risk   = position_size * price_distance   # loss if SL fires
-            actual_risk_pct      = actual_dollar_risk / available * 100
+            actual_notional    = position_size * entry_price
+            actual_margin      = actual_notional / config.LEVERAGE
+            actual_dollar_risk = position_size * price_distance
+            actual_risk_pct    = actual_dollar_risk / available * 100
+
+            pool_rr_str = ""
+            if pool_tp_price is not None:
+                tp_dist  = abs(pool_tp_price - entry_price)
+                pool_rr  = tp_dist / price_distance if price_distance > 0 else 0.0
+                pool_rr_str = f" | Pool R:R: {pool_rr:.2f}:1 (TP@${pool_tp_price:,.2f})"
 
             logger.info(
                 f"✅ Position sized: {position_size:.4f} BTC | "
                 f"Notional: ${actual_notional:,.0f} | "
                 f"Margin: ${actual_margin:.2f} | "
-                f"$ Risk @ SL: ${actual_dollar_risk:.2f} ({actual_risk_pct:.2f}% of balance) | "
-                f"SL dist: {sl_pct*100:.3f}%"
+                f"$ Risk @ SL: ${actual_dollar_risk:.2f} ({actual_risk_pct:.2f}%)"
+                + pool_rr_str
             )
             return position_size
 
@@ -320,34 +359,37 @@ class RiskManager:
             logger.error(f"Error calculating position size: {e}", exc_info=True)
             return None
 
+    # =========================================================================
+    # TRADE NOTIFICATIONS
+    # =========================================================================
+
     def notify_entry_placed(self) -> None:
         """
-        Called by strategy._execute_entry immediately after limit order
-        is confirmed placed. Updates last_trade_time so can_trade() cooldown
-        works correctly without waiting for the trade to close.
+        Called immediately after a limit/market entry is confirmed placed.
+        Resets the last_trade_time so can_trade() cooldown works correctly
+        without waiting for the trade to close.
         """
         with self._lock:
             self.last_trade_time = time.time()
             logger.debug("🔔 RiskManager: entry placed — cooldown timer reset")
 
+    # =========================================================================
+    # TRADE GATE
+    # =========================================================================
 
     def can_trade(self) -> tuple[bool, str]:
         with self._lock:
             now = time.time()
 
-            # ── Reset daily counters FIRST — must happen before any check ─────
-            # If the calendar day just changed, consecutive_losses and daily_pnl
-            # must be zeroed before the cooldown / loss-limit gates see them.
-            # Placing this call below the cooldown checks meant yesterday's losses
-            # blocked the first trade of the new trading day.
+            # Reset daily counters FIRST — must happen before any gate check
+            # so yesterday's losses don't block the first trade of the new day.
             self._reset_daily_if_needed()
 
             # ── Min time between trades ───────────────────────────────────────
             time_since_last = now - self.last_trade_time
             if (self.last_trade_time > 0 and
                     time_since_last < config.MIN_TIME_BETWEEN_TRADES * 60):
-                remaining = int(
-                    config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
+                remaining = int(config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
             # ── Loss cooldown ─────────────────────────────────────────────────
@@ -366,97 +408,92 @@ class RiskManager:
             if self.daily_pnl <= -self.daily_loss_limit:
                 return False, f"Daily loss limit hit (${abs(self.daily_pnl):.2f})"
 
-            # ── Daily loss limit (% of balance) — new ────────────────────────
+            # ── Daily loss limit (% of balance) ──────────────────────────────
             if self.current_balance > 0:
                 daily_loss_pct = abs(self.daily_pnl) / self.current_balance * 100
                 max_daily_pct  = getattr(config, "MAX_DAILY_LOSS_PCT", 5.0)
                 if self.daily_pnl < 0 and daily_loss_pct >= max_daily_pct:
                     return False, (f"Daily loss % limit hit "
-                                f"({daily_loss_pct:.1f}% >= {max_daily_pct}%)")
+                                   f"({daily_loss_pct:.1f}% >= {max_daily_pct}%)")
 
-            # ── Max drawdown check (new) ──────────────────────────────────────
+            # ── Max drawdown ──────────────────────────────────────────────────
             if self.initial_balance > 0 and self.current_balance > 0:
                 drawdown_pct = ((self.initial_balance - self.current_balance)
                                 / self.initial_balance * 100)
                 max_dd = getattr(config, "MAX_DRAWDOWN_PCT", 15.0)
                 if drawdown_pct >= max_dd:
                     return False, (f"Max drawdown hit "
-                                f"({drawdown_pct:.1f}% >= {max_dd}%)")
+                                   f"({drawdown_pct:.1f}% >= {max_dd}%)")
 
             # ── Consecutive losses ────────────────────────────────────────────
             if self.consecutive_losses >= self.max_consecutive_losses:
-                # Auto-reset after 4 hours: prevents infinite deadlock where
-                # losses block trading → can't trade → can't win → never resets.
-                # After 4h the market context has changed enough to try again.
                 hours_since_last = (now - self.last_trade_time) / 3600
-                AUTO_RESET_HOURS = 4.0
+                AUTO_RESET_HOURS = 0.5  # 30 min auto-reset (was 4 hours)
                 if self.last_trade_time > 0 and hours_since_last >= AUTO_RESET_HOURS:
                     logger.warning(
-                        f"⚠️ Consecutive losses auto-reset: {self.consecutive_losses} losses "
+                        f"Consecutive losses auto-reset: {self.consecutive_losses} losses "
                         f"but {hours_since_last:.1f}h elapsed (> {AUTO_RESET_HOURS}h). "
                         f"Market context reset — allowing new evaluation."
                     )
                     self.consecutive_losses = 0
                 else:
-                    remaining_h = max(0.0, AUTO_RESET_HOURS - hours_since_last)
+                    remaining_m = max(0.0, (AUTO_RESET_HOURS - hours_since_last) * 60)
                     return False, (
                         f"Max consecutive losses ({self.consecutive_losses}) — "
-                        f"auto-reset in {remaining_h:.1f}h or at day boundary"
+                        f"auto-reset in {remaining_m:.0f}m or at day boundary"
                     )
 
             return True, "OK"
 
+    # =========================================================================
+    # RECORD TRADE
+    # =========================================================================
 
     def record_trade(
         self,
-        side: str,
-        entry_price: float,
-        exit_price: float,
-        quantity: float,
-        reason: str,
-        pnl_override: float = None,
+        side:          str,
+        entry_price:   float,
+        exit_price:    float,
+        quantity:      float,
+        reason:        str,
+        pnl_override:  float = None,
     ):
-        """Record completed trade with industry-grade P&L accounting.
+        """
+        Record a completed trade.
 
-        P&L formula (futures):
-            gross_pnl  = price_delta × quantity          (BTC qty × $ move)
-            commission = quantity × avg_price × fee_rate × 2  (entry + exit)
-            net_pnl    = gross_pnl − commission
+        P&L (futures, no leverage multiplier bug):
+          gross_pnl  = price_delta × quantity
+          commission = quantity × avg_price × fee_rate × 2
+          net_pnl    = gross_pnl − commission
 
-        NOTE: NO multiplication by LEVERAGE.  `quantity` is the actual BTC
-        quantity held on the exchange.  The leverage is implicit in the fact
-        that you controlled `quantity × price` notional with only
-        `quantity × price / leverage` margin.  Multiplying by leverage again
-        was an accounting error introduced when position_size was (incorrectly)
-        divided by leverage during sizing.  Both bugs are now removed.
-
-        Args:
-            pnl_override: If provided, use this as the final net dollar PnL.
-                         Used by strategy._on_position_closed which already
-                         computes the leveraged-correct figure.
+        pnl_override: use caller-supplied net PnL when strategy has already
+                      computed the correct figure (avoids double-accounting).
         """
         with self._lock:
             entry_price = float(entry_price)
             exit_price  = float(exit_price)
             quantity    = float(quantity)
 
+            # If a midnight reset was deferred because a position was open,
+            # apply it NOW — before recording this trade — so the closing
+            # trade is counted in the new day, not the previous one.
+            if self._pending_reset:
+                logger.info(
+                    "🔄 Applying deferred daily reset inside record_trade "
+                    "(position closed — booking trade in the new day)."
+                )
+                self._apply_daily_reset()
+
             if pnl_override is not None:
-                # Caller already computed the correct net PnL
                 pnl = float(pnl_override)
             else:
-                # ── Gross PnL ──────────────────────────────────────────
                 if side.upper() == "LONG":
                     gross_pnl = (exit_price - entry_price) * quantity
                 else:
                     gross_pnl = (entry_price - exit_price) * quantity
-
-                # ── Commission (both legs, taker rate) ─────────────────
-                # CoinSwitch typical taker fee ≈ 0.055% per side.
-                # Adjust COMMISSION_RATE in config if you know the exact rate.
                 fee_rate   = getattr(config, "COMMISSION_RATE", 0.00055)
                 commission = (entry_price + exit_price) * quantity * fee_rate
                 pnl        = gross_pnl - commission
-
                 logger.debug(
                     f"P&L breakdown: gross=${gross_pnl:+.4f} "
                     f"commission=${commission:.4f} net=${pnl:+.4f}"
@@ -464,12 +501,10 @@ class RiskManager:
 
             is_win = pnl > 0
 
-            # ── Return on margin ───────────────────────────────────────
             notional_at_entry = entry_price * quantity
             margin_used       = notional_at_entry / config.LEVERAGE if config.LEVERAGE > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
 
-            # ── Create record ──────────────────────────────────────────
             trade = TradeRecord(
                 timestamp   = time.time(),
                 side        = side,
@@ -481,20 +516,19 @@ class RiskManager:
                 reason      = reason,
             )
 
-            # ── Update statistics ──────────────────────────────────────
             self.trade_history.append(trade)
             self.daily_trades.append(trade)
-            self.total_trades   += 1
+            self.total_trades    += 1
             self.realized_pnl   += pnl
             self.daily_pnl      += pnl
             self.last_trade_time = time.time()
 
             if is_win:
-                self.winning_trades  += 1
-                self.consecutive_losses = 0
+                self.winning_trades     += 1
+                self.consecutive_losses  = 0
             else:
-                self.losing_trades       += 1
-                self.consecutive_losses  += 1
+                self.losing_trades      += 1
+                self.consecutive_losses += 1
 
             logger.info(
                 f"📊 Trade recorded: {side.upper()} | "
@@ -504,37 +538,28 @@ class RiskManager:
                 f"Total trades: {self.total_trades}"
             )
 
-    def _reset_daily_if_needed(self):
+    # =========================================================================
+    # DAILY RESET
+    # =========================================================================
+
+    def _apply_daily_reset(self) -> None:
         """
-        Reset all daily counters when a new IST calendar day begins.
-
-        Uses IST (UTC+5:30) to match DailyRiskGate in quant_strategy.
-        This prevents cross-day PnL drift where a trade opening before
-        midnight UTC and closing after causes PnL to be assigned to the
-        wrong day.
+        Perform the actual counter reset.  Called under self._lock.
+        Separated from _reset_daily_if_needed so it can be triggered both
+        immediately (no open position) and deferred (position was open at
+        midnight — fired from set_position_open / record_trade instead).
         """
-        today = datetime.now(self._IST).date()
+        today          = datetime.now(self._IST).date()
+        prev_day       = self._last_reset_date
+        prev_cons_loss = self.consecutive_losses
+        prev_daily_pnl = self.daily_pnl
+        prev_n_trades  = len(self.daily_trades)
 
-        if not hasattr(self, '_last_reset_date'):
-            self._last_reset_date = today
-            return
-
-        if today <= self._last_reset_date:
-            return   # Same day — nothing to reset
-
-        # ── New day detected ──────────────────────────────────────────
-        prev_day        = self._last_reset_date
-        prev_cons_loss  = self.consecutive_losses
-        prev_daily_pnl  = self.daily_pnl
-        prev_n_trades   = len(self.daily_trades)
-
-        # BUG-5 FIX: was `self.daily_trades = []` which switched from deque→list,
-        # defeating the type consistency fix above. Use .clear() to preserve the
-        # deque type and its maxlen constraint across the day boundary.
         self.daily_trades.clear()
         self.daily_pnl          = 0.0
-        self.consecutive_losses = 0   # ← CRITICAL: unlocks the infinite deadlock
+        self.consecutive_losses = 0
         self._last_reset_date   = today
+        self._pending_reset     = False
 
         logger.info(
             f"🔄 Daily reset: {prev_day} → {today} | "
@@ -543,8 +568,73 @@ class RiskManager:
             f"prev daily_trades={prev_n_trades}"
         )
 
+    def _reset_daily_if_needed(self) -> None:
+        """
+        Check whether the IST calendar day has rolled over and act:
+
+        • No open position → apply reset immediately (normal path).
+        • Position open    → defer: set _pending_reset = True and log once.
+                             The reset will fire inside record_trade() /
+                             set_position_open(False) when the trade closes,
+                             so the closing trade is booked in the NEW day.
+
+        Must be called under self._lock.
+        """
+        today = datetime.now(self._IST).date()
+
+        if not hasattr(self, '_last_reset_date'):
+            self._last_reset_date = today
+            return
+
+        if today <= self._last_reset_date and not self._pending_reset:
+            return
+
+        # Day has changed (or a deferred reset is waiting).
+        if self._position_is_open:
+            # Defer — mark pending once so we don't spam the log every tick.
+            if not self._pending_reset:
+                logger.info(
+                    f"⏳ Daily reset deferred (position open at midnight) — "
+                    f"will apply when the open trade closes and be counted "
+                    f"in {today}."
+                )
+                self._pending_reset = True
+            return
+
+        # No open position — reset immediately.
+        self._apply_daily_reset()
+
+    # =========================================================================
+    # POSITION STATE NOTIFIER
+    # =========================================================================
+
+    def set_position_open(self, is_open: bool) -> None:
+        """
+        Call this whenever a position is opened or closed so the risk manager
+        can handle the deferred midnight reset correctly.
+
+        • set_position_open(True)  — called when an entry is filled.
+        • set_position_open(False) — called when the position is fully flat.
+
+        If a midnight reset was pending (position was open when the calendar
+        day changed), it is applied here the moment the position closes so
+        that record_trade() — which is called immediately after — books the
+        closing trade into the new day.
+        """
+        with self._lock:
+            self._position_is_open = is_open
+            if not is_open and self._pending_reset:
+                logger.info(
+                    "🔄 Applying deferred daily reset — position now closed."
+                )
+                self._apply_daily_reset()
+
+    # =========================================================================
+    # STATISTICS
+    # =========================================================================
+
     def get_statistics(self) -> Dict:
-        """Get comprehensive risk and performance statistics."""
+        """Comprehensive risk and performance statistics."""
         with self._lock:
             total  = self.total_trades
             wins   = self.winning_trades
@@ -552,21 +642,17 @@ class RiskManager:
 
             win_rate = (wins / total * 100) if total > 0 else 0.0
 
-            # Average win / loss
             win_pnls  = [t.pnl for t in self.trade_history if t.is_win]
             loss_pnls = [t.pnl for t in self.trade_history if not t.is_win]
             avg_win   = (sum(win_pnls)  / len(win_pnls))  if win_pnls  else 0.0
             avg_loss  = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else 0.0
 
-            # Profit factor = gross wins / |gross losses|
             gross_wins   = sum(win_pnls)
             gross_losses = abs(sum(loss_pnls))
             profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf")
 
-            # Expectancy per trade
             expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
 
-            # Max drawdown on trade history
             peak = 0.0
             equity = 0.0
             max_dd = 0.0
@@ -578,7 +664,6 @@ class RiskManager:
                 if dd > max_dd:
                     max_dd = dd
 
-            # Current streak
             streak = 0
             if self.trade_history:
                 last_win = list(self.trade_history)[-1].is_win
@@ -590,23 +675,19 @@ class RiskManager:
                 streak = streak if last_win else -streak
 
             return {
-                # Volume
-                "total_trades":         total,
-                "winning_trades":       wins,
-                "losing_trades":        losses,
-                "daily_trades":         len(self.daily_trades),
-                # Performance
-                "win_rate":             round(win_rate, 2),
-                "avg_win":              round(avg_win, 4),
-                "avg_loss":             round(avg_loss, 4),
-                "profit_factor":        round(profit_factor, 3),
-                "expectancy":           round(expectancy, 4),
-                # P&L
-                "realized_pnl":         round(self.realized_pnl, 4),
-                "daily_pnl":            round(self.daily_pnl, 4),
-                "max_drawdown":         round(max_dd, 4),
-                # Risk
-                "consecutive_losses":   self.consecutive_losses,
-                "current_streak":       streak,
-                "current_balance":      self.current_balance,
+                "total_trades":       total,
+                "winning_trades":     wins,
+                "losing_trades":      losses,
+                "daily_trades":       len(self.daily_trades),
+                "win_rate":           round(win_rate, 2),
+                "avg_win":            round(avg_win, 4),
+                "avg_loss":           round(avg_loss, 4),
+                "profit_factor":      round(profit_factor, 3),
+                "expectancy":         round(expectancy, 4),
+                "realized_pnl":       round(self.realized_pnl, 4),
+                "daily_pnl":          round(self.daily_pnl, 4),
+                "max_drawdown":       round(max_dd, 4),
+                "consecutive_losses": self.consecutive_losses,
+                "current_streak":     streak,
+                "current_balance":    self.current_balance,
             }

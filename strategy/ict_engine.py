@@ -62,13 +62,16 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL HELPER — used by predict_next_hunt()
+# MODULE-LEVEL HELPER — used by _predict_next_hunt() (private/deprecated path)
+# Direction logic has moved to direction_engine.DirectionEngine which carries
+# its own _sigmoid.  This stays to avoid breaking the private fallback.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fast_sigmoid(z: float, steepness: float = 1.0) -> float:
     """Fast symmetric sigmoid mapping ℝ → (-1, 1). No math.exp needed."""
     sz = z * steepness
     return max(-1.0, min(1.0, sz / (1.0 + abs(sz) * 0.5)))
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,9 +289,10 @@ class LiquidityLevel:
     level_type:  str   # "BSL" | "SSL"
     touch_count: int
     swept:       bool = False
-    sweep_timestamp:        int  = 0
-    displacement_confirmed: bool = False
-    wick_rejection:         bool = False
+    sweep_timestamp:        int   = 0
+    displacement_confirmed: bool  = False
+    displacement_score:     float = 0.0    # v3.0: continuous 0.0-1.0 score
+    wick_rejection:         bool  = False
     timeframe: str = "5m"   # source TF: "5m"|"15m"|"1h"|"4h"|"1d"
 
     @property
@@ -309,9 +313,12 @@ class TFStructure:
     bos_level:     float = 0.0
     bos_direction: str   = ""
     bos_timestamp: int   = 0     # epoch ms of the CLOSED candle that confirmed the BOS
-    choch_level:   float = 0.0
-    choch_timestamp: int = 0     # epoch ms of CHoCH confirmation candle
-    choch_bar_index: int = -1    # candle index within lb-slice; -1 = none
+    choch_level:     float = 0.0
+    choch_timestamp: int  = 0     # epoch ms of CHoCH confirmation candle
+    choch_bar_index: int  = -1    # candle index within lb-slice; -1 = none
+    choch_direction: str  = ""    # "bullish"|"bearish"|"" — direction of the CHoCH break
+                                  # bearish trend CHoCH = "bullish" (close above LH)
+                                  # bullish trend CHoCH = "bearish" (close below HL)
     range_high:    float = 0.0
     range_low:     float = 0.0
     equilibrium:   float = 0.0
@@ -488,7 +495,7 @@ class ICTConfluence:
     # ── Unified Hunt Prediction (populated in get_confluence) ─────────────
     # These fields let all downstream consumers (ICTEntryGate, ICTSLEngine,
     # ICTTPEngine, ICTTrailEngine) use the hunt prediction without re-computing.
-    hunt_prediction:   Dict  = None    # full dict from predict_next_hunt()
+    hunt_prediction:   Dict  = None    # full dict from DirectionEngine.predict_hunt()
     hunt_aligns_trade: bool  = False   # True if hunt direction matches this trade
 
     def __post_init__(self):
@@ -533,8 +540,11 @@ class ICTEngine:
     # HTF OB threshold for htf_only filtering
     HTF_STRENGTH_THRESHOLD = 70.0
 
-    # Kill zone hours (NY time = UTC + offset)
-    KZ_ASIA_START   = 20; KZ_ASIA_END   = 24
+    # Kill zone hours (NY time = UTC + offset).
+    # KZ_ASIA_END wraps across midnight: Asia KZ is ny >= 20 OR ny < 1.
+    # Default of 24 was a latent bug — if _load_config ever fails to set the
+    # instance attribute, ny < 24 is always True, making every hour ASIA_KZ.
+    KZ_ASIA_START   = 20; KZ_ASIA_END   = 1
     KZ_LONDON_START = 2;  KZ_LONDON_END  = 5
     KZ_NY_START     = 7;  KZ_NY_END     = 10
 
@@ -551,7 +561,12 @@ class ICTEngine:
         self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=250)
         # Liquidity pools: 6 TFs × many swing points, need room for HTF pools
         self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=200)
-        self._registered_sweeps: Deque[Tuple] = deque(maxlen=500)
+        # ICT-3 FIX: maxlen 500 → 2000. During extended warmup processing
+        # (1000+ historical candles), 500 registered sweeps can evict within
+        # the same session, allowing a re-registered stale sweep to corrupt
+        # _select_best_sweep with a stale timestamp. 2000 gives ample headroom
+        # for warmup + normal session load.
+        self._registered_sweeps: Deque[Tuple] = deque(maxlen=2000)
         # Advanced PD array types — doubled to accommodate HTF structures
         self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=60)
         self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=60)
@@ -586,7 +601,8 @@ class ICTEngine:
         self._killzone = ""
 
         # ── Order-flow data (set externally each tick via set_order_flow_data) ──
-        # These feed directly into predict_next_hunt() for real-time scoring.
+        # These are injected via set_order_flow_data() and also forwarded to
+        # DirectionEngine by quant_strategy Step 3b for hunt prediction.
         # Range: [-1, +1]  positive = net buying pressure
         self._tick_flow:  float = 0.0   # TickFlowEngine signal
         self._cvd_trend:  float = 0.0   # CVD slope signal
@@ -905,27 +921,37 @@ class ICTEngine:
         """
         Swing → trend + BOS/CHoCH + premium/discount for one timeframe.
 
-        Lookback: up to 60 candles (= 15h on 15m, 10 days on 4h).
-        Swing detection: fractal with left=2, right=2.
-        Only confirmed swings (candle[i+2] already closed) used.
+        ARCHITECTURE:
+          - Full lookback (60 bars) for BOS/CHoCH/swing LEVEL detection
+          - TREND uses only last 20 bars of confirmed swings to reflect
+            the CURRENT regime, not the historical average.
+            (20 × 15m = 5h window; 20 × 5m = 100min window)
+          - Strict fractal: ALL 4 neighbours must be strictly < (>).
+            Equal neighbours disqualify the bar — no doji/flat false swings.
+          - BOS uses the last CLOSED candle, not the forming live candle.
+          - CHoCH sets choch_direction for downstream trail engine.
         """
         out = TFStructure(timeframe=tf)
         if len(candles) < 8:
             return out
 
+        # ── Full-range swing detection (for BOS/CHoCH levels + P/D range) ──
         lb = min(60, len(candles))
         recent = candles[-lb:]
 
-        # ── Fractal swing detection ───────────────────────────────────
         highs: List[Tuple[int, float]] = []
         lows:  List[Tuple[int, float]] = []
-        for i in range(2, len(recent) - 2):
+        # ICT-1 FIX: the previous `range(2, len(recent) - 2)` allowed i to reach
+        # len(recent) - 3, whose forward neighbour i+2 is len(recent) - 1 — the
+        # LIVE forming candle. A confirmed fractal must only use fully closed
+        # bars on both sides. Shrinking the upper bound excludes the live candle
+        # from any fractal check.
+        for i in range(2, len(recent) - 3):
             h = float(recent[i]['h'])
             l = float(recent[i]['l'])
-            # BUG-SWING-1 FIX: all four neighbours must be strict >.
-            # The old hybrid (>= on three, + tiny epsilon on one) lets
-            # two identical adjacent highs both qualify, inflating swing
-            # counts 2-5× in flat/choppy markets → wrong trend labels.
+            # All four neighbours must be strictly greater/less.
+            # Equal neighbours (flat) disqualify — prevents double-counting
+            # of identical candles in choppy ranges.
             if (h > float(recent[i-1]['h']) and h > float(recent[i-2]['h']) and
                     h > float(recent[i+1]['h']) and h > float(recent[i+2]['h'])):
                 highs.append((i, h))
@@ -933,23 +959,38 @@ class ICTEngine:
                     l < float(recent[i+1]['l']) and l < float(recent[i+2]['l'])):
                 lows.append((i, l))
 
-        # ── Trend from swing sequence ─────────────────────────────────
-        sh = [s[1] for s in highs[-4:]]
-        sl = [s[1] for s in lows[-4:]]
+        # ── Trend: use only the RECENT 20-bar swing window ───────────────
+        # Using 60 bars for trend includes historical regimes (rallies/drops
+        # from hours ago) that no longer represent current structure.
+        # 20-bar window isolates the active swing sequence.
+        trend_lb = min(20, len(candles))
+        recent_t = candles[-trend_lb:]
+        t_highs: List[float] = []
+        t_lows:  List[float] = []
+        for i in range(2, len(recent_t) - 2):
+            h = float(recent_t[i]['h'])
+            l = float(recent_t[i]['l'])
+            if (h > float(recent_t[i-1]['h']) and h > float(recent_t[i-2]['h']) and
+                    h > float(recent_t[i+1]['h']) and h > float(recent_t[i+2]['h'])):
+                t_highs.append(h)
+            if (l < float(recent_t[i-1]['l']) and l < float(recent_t[i-2]['l']) and
+                    l < float(recent_t[i+1]['l']) and l < float(recent_t[i+2]['l'])):
+                t_lows.append(l)
 
         trend = "ranging"
-        if len(sh) >= 2 and len(sl) >= 2:
-            hh = sh[-1] > sh[-2]
-            hl = sl[-1] > sl[-2]
-            lh = sh[-1] < sh[-2]
-            ll = sl[-1] < sl[-2]
+        if len(t_highs) >= 2 and len(t_lows) >= 2:
+            hh = t_highs[-1] > t_highs[-2]
+            hl = t_lows[-1]  > t_lows[-2]
+            lh = t_highs[-1] < t_highs[-2]
+            ll = t_lows[-1]  < t_lows[-2]
             if hh and hl:
                 trend = "bullish"
             elif lh and ll:
                 trend = "bearish"
+            # Mixed (HH+LL or LH+HL) = ranging — no label issued
         out.trend = trend
 
-        # ── Last/prev swing levels ────────────────────────────────────
+        # ── Last/prev swing levels (from full 60-bar window) ─────────────
         if highs:
             out.last_sh = highs[-1][1]
             out.prev_sh = highs[-2][1] if len(highs) >= 2 else 0.0
@@ -957,15 +998,13 @@ class ICTEngine:
             out.last_sl_ = lows[-1][1]
             out.prev_sl_ = lows[-2][1] if len(lows) >= 2 else 0.0
 
-        # ── BOS (Break of Structure) ──────────────────────────────────
-        # Use the last CLOSED candle (recent[-2]), not the still-forming
-        # candle (recent[-1]).  Using recent[-1] causes premature BOS
-        # signals on every tick of the live candle whose close hasn't
-        # been confirmed yet.
-        last_close = float(recent[-2]['c'])
-        # bos_timestamp: the open-time of the candle whose CLOSE triggered BOS.
-        # This lets _update_amd compare "did this BOS happen AFTER the sweep?"
+        # ── BOS (Break of Structure) ──────────────────────────────────────
+        # RULE: close of the last CLOSED candle (index -2) beyond the last
+        # confirmed swing extreme. The forming candle (-1) is excluded because
+        # its close updates every tick and triggers spurious intra-bar BOS.
+        last_close     = float(recent[-2]['c'])
         last_closed_ts = int(recent[-2].get('t', 0))
+
         if out.last_sh > 0 and last_close > out.last_sh:
             out.bos_level     = out.last_sh
             out.bos_direction = "bullish"
@@ -975,24 +1014,35 @@ class ICTEngine:
             out.bos_direction = "bearish"
             out.bos_timestamp = last_closed_ts
 
-        # ── CHoCH (Change of Character) ───────────────────────────────
-        # ICT definition: first confirmed CLOSE beyond the opposing swing extreme.
-        #   Bearish trend CHoCH = close ABOVE the last lower-high (bullish break)
-        #   Bullish trend CHoCH = close BELOW the last higher-low (bearish break)
-        # Previous code checked swing-point shifts (higher-low / lower-high),
-        # which are leading indicators, not confirmed structural breaks.
+        # ── CHoCH (Change of Character) ───────────────────────────────────
+        # ICT: first confirmed close BEYOND the opposing swing extreme.
+        # The DIRECTION of the CHoCH is the direction OF THE BREAK (not the
+        # prior trend). This is the field the trail engine reads.
+        #
+        #   Bearish trend CHoCH = close above the last Lower-High
+        #     → break is BULLISH (price moving up through a lower-high)
+        #     → choch_direction = "bullish"
+        #
+        #   Bullish trend CHoCH = close below the last Higher-Low
+        #     → break is BEARISH (price moving down through a higher-low)
+        #     → choch_direction = "bearish"
+        #
+        # We use the FULL 60-bar highs/lows for CHoCH level accuracy
+        # (the lower-high may be 30+ bars ago on 15m).
         if trend == "bearish" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
-            # Downtrend has lower-highs; CHoCH = close above the last lower-high
+            # Lower-High confirmed; CHoCH = close above it
             if last_close > highs[-1][1]:
                 out.choch_level     = highs[-1][1]
                 out.choch_bar_index = highs[-1][0]
                 out.choch_timestamp = last_closed_ts
+                out.choch_direction = "bullish"   # the break direction
         elif trend == "bullish" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
-            # Uptrend has higher-lows; CHoCH = close below the last higher-low
+            # Higher-Low confirmed; CHoCH = close below it
             if last_close < lows[-1][1]:
                 out.choch_level     = lows[-1][1]
                 out.choch_bar_index = lows[-1][0]
                 out.choch_timestamp = last_closed_ts
+                out.choch_direction = "bearish"   # the break direction
 
         # ── Premium / Discount ────────────────────────────────────────
         # ICT P/D uses the range between the last confirmed swing high and
@@ -1029,15 +1079,20 @@ class ICTEngine:
         A low-quality minor SSL swept 5 minutes ago would override a
         high-conviction BSL swept 40 minutes ago that still has active delivery.
 
-        Selection criteria (within 1.5× distribution window):
-          freshness    × 0.40  — recent sweeps are more likely still in delivery
-          displacement × 0.35  — institutional confirmation of directional intent
-          wick_rejection × 0.15 — price rejected the swept level (conviction close)
-          touch_count  × 0.10  — more touches = deeper stop cluster = stronger magnet
+        Selection criteria (within AMD_DISTRIB_WINDOW_MS = 90 min):
+          freshness    × 0.60  — recent sweeps far more likely to be the regime driver
+          displacement × 0.25  — institutional confirmation of directional intent
+          wick_rejection × 0.10 — price rejected the swept level (conviction close)
+          touch_count  × 0.05  — more touches = deeper stop cluster = stronger magnet
+
+        ICT-8 FIX: window narrowed from 135min (1.5× distrib) to 90min. A
+        90-minute-old high-quality sweep should not override a 5-minute-old
+        low-quality sweep that represents the CURRENT regime. Freshness weight
+        raised from 0.40 to 0.60 to further favour recent sweeps.
 
         Falls back to most-recent if all candidates are outside the window.
         """
-        window_ms = self.AMD_DISTRIB_WINDOW_MS * 1.5
+        window_ms = self.AMD_DISTRIB_WINDOW_MS   # 90 min — was 1.5× = 135 min
         candidates = [p for p in swept
                       if (now_ms - p.sweep_timestamp) < window_ms]
         if not candidates:
@@ -1047,10 +1102,15 @@ class ICTEngine:
         def _sweep_quality(p: 'LiquidityLevel') -> float:
             age_ms    = now_ms - p.sweep_timestamp
             freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
-            q = freshness * 0.40
-            if p.displacement_confirmed: q += 0.35
-            if p.wick_rejection:         q += 0.15
-            q += min(0.10, getattr(p, 'touch_count', 1) * 0.03)
+            q = freshness * 0.60   # ICT-8: raised from 0.40
+            # v3.0: Use continuous displacement_score instead of binary flag.
+            _disp_score = getattr(p, 'displacement_score', 0.0)
+            if _disp_score > 0:
+                q += _disp_score * 0.25   # lowered from 0.35 to rebalance
+            elif p.displacement_confirmed:
+                q += 0.25
+            if p.wick_rejection:         q += 0.10
+            q += min(0.05, getattr(p, 'touch_count', 1) * 0.015)
             return q
 
         return max(candidates, key=_sweep_quality)
@@ -1109,7 +1169,12 @@ class ICTEngine:
 
         # ── Confidence from sweep quality ────────────────────────────
         conf = 0.50
-        if latest.displacement_confirmed: conf += 0.20
+        # v3.0: graduated displacement confidence using continuous score
+        _disp_sc = getattr(latest, 'displacement_score', 0.0)
+        if _disp_sc > 0:
+            conf += _disp_sc * 0.25   # max +0.25 at score=1.0
+        elif latest.displacement_confirmed:
+            conf += 0.20              # backward compat
         if latest.wick_rejection:         conf += 0.10
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
@@ -1226,6 +1291,70 @@ class ICTEngine:
             ssl = [p for p in unswept if p.level_type == "SSL" and p.price < price]
             if ssl:
                 target = max(ssl, key=_pool_score).price
+
+        # ── Reconcile bias with HTF MARKET STRUCTURE ─────────────────────
+        # CRITICAL FIX: The sweep-derived bias is WRONG when the sweep is a
+        # CONTINUATION sweep (liquidity consumed during a trend) rather than
+        # a MANIPULATION sweep (Judas swing that reverses).
+        #
+        # EXAMPLE FROM LIVE BUG:
+        #   Price drops from $66,600 → $65,300 (clearly bearish distribution)
+        #   SSL @ $65,916 swept on the way down (continuation — not reversal)
+        #   SSL @ $66,067 swept with displacement (continuation during drop)
+        #   Code says: SSL swept → bullish bias (WRONG — price is distributing DOWN)
+        #
+        # ICT INSTITUTIONAL RULE:
+        #   HTF structure (4H/1H) determines the MACRO bias.
+        #   Sweeps DURING an established HTF trend are CONTINUATION sweeps
+        #   (stops consumed along the delivery path), NOT manipulation sweeps.
+        #   Only sweeps at the END of a trend (reversal structure) flip bias.
+        #
+        # IMPLEMENTATION:
+        #   1. Read 4H and 1H structure from ICT engine
+        #   2. If HTF is directionally aligned (both bearish or both bullish),
+        #      OVERRIDE sweep-derived bias to match HTF — NO confidence gate.
+        #   3. If HTF is mixed/ranging, keep sweep-derived bias (no override)
+        #   4. If only 15m is available, require it to be strong to override
+        st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
+        st_1h  = self._tf.get("1h",  TFStructure(timeframe="1h"))
+        st_4h  = self._tf.get("4h",  TFStructure(timeframe="4h"))
+
+        if phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION", "MANIPULATION"):
+            # Start with sweep-derived bias
+            if sweep_type == "BSL":
+                bias = "bearish"   # ran buy stops above → deliver DOWN
+            else:
+                bias = "bullish"   # ran sell stops below → deliver UP
+
+            # ── HTF OVERRIDE (no confidence gate — structure > sweep) ─────
+            # 4H is the dominant timeframe for institutional bias.
+            # If 4H is clearly directional, it overrides sweep-derived bias.
+            _4h_bearish = st_4h.trend == "bearish"
+            _4h_bullish = st_4h.trend == "bullish"
+            _1h_bearish = st_1h.trend == "bearish"
+            _1h_bullish = st_1h.trend == "bullish"
+            _15m_bearish = st_15m.trend == "bearish"
+            _15m_bullish = st_15m.trend == "bullish"
+
+            # Count bearish/bullish aligned timeframes
+            _bear_count = sum([_4h_bearish, _1h_bearish, _15m_bearish])
+            _bull_count = sum([_4h_bullish, _1h_bullish, _15m_bullish])
+
+            # Strong HTF consensus (2+ timeframes agree) overrides sweep
+            if _bear_count >= 2 and bias == "bullish":
+                bias = "bearish"
+                details += f" | HTF OVERRIDE→bearish ({_bear_count}/3 TFs bearish)"
+            elif _bull_count >= 2 and bias == "bearish":
+                bias = "bullish"
+                details += f" | HTF OVERRIDE→bullish ({_bull_count}/3 TFs bullish)"
+
+            # Single strong 4H override (4H is institutional anchor)
+            elif _4h_bearish and bias == "bullish":
+                bias = "bearish"
+                details += " | 4H OVERRIDE→bearish"
+            elif _4h_bullish and bias == "bearish":
+                bias = "bullish"
+                details += " | 4H OVERRIDE→bullish"
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,
@@ -1596,6 +1725,41 @@ class ICTEngine:
                 kept.append(fresh)
                 _kept_index[_key] = True  # prevent double-add within the same fresh batch
 
+        # ICT-5 FIX: dedupe the final kept list at `tol` distance before
+        # committing to the deque. Without this, cluster drift across many
+        # update cycles can produce two pools at similar prices (both kept
+        # because their rounded keys differ by 1 dollar but they are within
+        # `tol` = $300). That inflates touch counts in downstream scoring.
+        # Algorithm: sort by price, keep first of each `tol`-tight cluster,
+        # transferring touch_count from dropped duplicates to the survivor.
+        if len(kept) > 1:
+            _deduped: List[LiquidityLevel] = []
+            # Process BSL and SSL separately — a BSL and SSL at the same price
+            # are distinct (different sides).
+            for _side in ("BSL", "SSL"):
+                _side_pools = sorted(
+                    [p for p in kept if p.level_type == _side],
+                    key=lambda p: p.price,
+                )
+                _last: Optional[LiquidityLevel] = None
+                for p in _side_pools:
+                    if _last is not None and abs(p.price - _last.price) <= tol:
+                        # Duplicate — merge touch_count into the survivor
+                        _last.touch_count = max(_last.touch_count, p.touch_count)
+                        # Prefer higher-TF label
+                        _TF_R2 = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
+                        if _TF_R2.get(p.timeframe, 1) > _TF_R2.get(_last.timeframe, 1):
+                            _last.timeframe = p.timeframe
+                        # Preserve swept status if either was swept
+                        if getattr(p, 'swept', False) and not getattr(_last, 'swept', False):
+                            _last.swept = True
+                            _last.sweep_timestamp = getattr(p, 'sweep_timestamp',
+                                                            _last.sweep_timestamp)
+                        continue
+                    _deduped.append(p)
+                    _last = p
+            kept = _deduped
+
         # ── Step 4: Replace the deque ──────────────────────────────────
         self.liquidity_pools.clear()
         for p in kept:
@@ -1672,22 +1836,19 @@ class ICTEngine:
             all_c += list(candles_1h[-5:])
         all_c.sort(key=lambda c: int(c.get("t", 0)))
 
-        # BUG-SWEEP-DEDUP-FALLBACK FIX: the dedup key is (pool_price, candle_ts).
-        # When c['t'] is absent the original code used now_ms (wall-clock), which
-        # changes every millisecond.  Every call generates a new unique key → the
-        # same pool gets swept multiple times, corrupt AMD state, and the
-        # sweep-count keeps growing unboundedly.
-        # Fix: when 't' is missing, bucket now_ms into the nearest 5-minute
-        # open time (floor to 300_000ms boundary) so candles without a timestamp
-        # still produce stable, reproducible keys.
-        _5M_MS = 300_000   # 5 minutes in milliseconds
+        # BUG-SWEEP-DEDUP FIX: dedup key is (pool_price_rounded, candle_ts).
+        # When c['t'] is absent, use now_ms directly (wall-clock millisecond).
+        # The old approach bucketed to 5-min boundaries, which meant two DIFFERENT
+        # pools swept in the same 5-min window collided on the same bucket key,
+        # causing one sweep to be silently dropped.
+        # Using now_ms means each call to update() within the same sweep session
+        # gets a unique key — which is correct, since we only call update() when
+        # new candle data arrives (not every tick).
+        # The _registered_sweeps deque with maxlen=500 prevents unbounded growth.
 
         def _candle_ts(c: dict) -> int:
             raw = c.get('t', 0)
-            if raw:
-                return int(raw)
-            # Stable fallback: floor now_ms to nearest 5-minute boundary
-            return (now_ms // _5M_MS) * _5M_MS
+            return int(raw) if raw else now_ms
 
         for pool in list(self.liquidity_pools):
             if pool.swept:
@@ -1702,25 +1863,31 @@ class ICTEngine:
                     continue
 
                 if pool.level_type == "BSL" and h > pool.price and cl < pool.price:
-                    disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
+                    disp_score = (body / rng) if rng > 0 else 0.0
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
+                    pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     logger.info(
-                        f"🔱 ICT BSL SWEPT @ ${pool.price:.0f} disp={disp} → BEARISH BIAS")
+                        f"🔱 ICT BSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) → BEARISH BIAS")
                     break
 
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
-                    disp = rng > 0 and body / rng >= self.SWEEP_DISP_MIN
+                    disp_score = (body / rng) if rng > 0 else 0.0
+                    disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
+                    pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     logger.info(
-                        f"🔱 ICT SSL SWEPT @ ${pool.price:.0f} disp={disp} → BULLISH BIAS")
+                        f"🔱 ICT SSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) → BULLISH BIAS")
                     break
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1937,33 +2104,76 @@ class ICTEngine:
 
     def _update_dealing_range(self, price: float) -> None:
         """
-        Compute the current Dealing Range: range between nearest significant SSL (below)
-        and BSL (above) that are UNSWEPT.
+        Compute the current Dealing Range: range between nearest significant SSL
+        below price and BSL above price that are UNSWEPT.
 
-        This is the range smart money is currently 'dealing' within.
-        The equilibrium of this range is the institutional reference level.
+        BUG-8 FIX: When swept pools at $68K+ are used as DR anchors, the 'low'
+        (SSL) ends up ABOVE current price ($66.7K), producing current_pd < 0
+        (−370% to −409%). This happens because:
+          1. Multiple SSL/BSL pools were swept during the stop-hunt
+          2. The remaining 'best_ssl' (highest sig) is actually above current price
+          3. The formula (price - ssl) / range becomes negative
+
+        VALIDATION LAYER:
+          After selecting best_ssl and best_bsl, verify:
+          - best_ssl.price < price (SSL must be BELOW current price)
+          - best_bsl.price > price (BSL must be ABOVE current price)
+          - range must be at least 0.5 × 15m ATR (not a degenerate range)
+
+        If validation fails, FALL BACK to the current 15m confirmed swing range
+        (last confirmed swing low → last confirmed swing high). This always
+        produces a valid DR because _analyze_structure only sets range_high/low
+        from confirmed fractal swings, never from active sweeps.
+
+        DR from 15m structure is labeled with ssl_source_tf = bsl_source_tf = "15m_struct".
         """
-        unswept = [p for p in self.liquidity_pools if not p.swept]
+        unswept   = [p for p in self.liquidity_pools if not p.swept]
         ssl_below = [p for p in unswept if p.level_type == "SSL" and p.price < price]
         bsl_above = [p for p in unswept if p.level_type == "BSL" and p.price > price]
 
-        if not ssl_below or not bsl_above:
-            self._dealing_range = None
-            return
-
         TF_WEIGHT = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
-        # Prefer significant pools (high touch_count + high TF)
         def sig(p):
             return p.touch_count * TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1)
 
-        best_ssl = max(ssl_below, key=sig)
-        best_bsl = max(bsl_above, key=sig)
+        # ── Attempt pool-anchored DR ──────────────────────────────────────
+        low = high = None
+        ssl_tf = bsl_tf = "pool"
+        if ssl_below and bsl_above:
+            best_ssl = max(ssl_below, key=sig)
+            best_bsl = max(bsl_above, key=sig)
+            _low  = best_ssl.price
+            _high = best_bsl.price
+            # VALIDATION: price must be inside the range
+            if _low < price < _high and (_high - _low) > 1e-3:
+                low    = _low
+                high   = _high
+                ssl_tf = getattr(best_ssl, 'timeframe', '5m')
+                bsl_tf = getattr(best_bsl, 'timeframe', '5m')
 
-        low  = best_ssl.price
-        high = best_bsl.price
-        rng  = max(high - low, 1e-9)
-        eq   = (low + high) / 2.0
-        pd   = (price - low) / rng
+        # ── Fallback: use 15m confirmed swing structure ───────────────────
+        if low is None:
+            st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
+            # last_sl_ and last_sh are from confirmed fractal swings in full 60-bar window
+            _low  = st_15m.range_low
+            _high = st_15m.range_high
+            if _low > 1e-3 and _high > _low and _low < price < _high:
+                low    = _low
+                high   = _high
+                ssl_tf = bsl_tf = "15m_struct"
+            else:
+                # Final fallback: use recent 15m absolute high/low if swing range invalid
+                st_1h = self._tf.get("1h", TFStructure(timeframe="1h"))
+                if st_1h.range_low > 1e-3 and st_1h.range_low < price < st_1h.range_high:
+                    low    = st_1h.range_low
+                    high   = st_1h.range_high
+                    ssl_tf = bsl_tf = "1h_struct"
+                else:
+                    self._dealing_range = None
+                    return
+
+        rng = max(high - low, 1e-9)
+        eq  = (low + high) / 2.0
+        pd  = (price - low) / rng       # always in [0, 1] by construction
 
         if   pd < 0.25: q = "DEEP_DISC"
         elif pd < 0.50: q = "DISC"
@@ -1973,8 +2183,8 @@ class ICTEngine:
         self._dealing_range = DealingRange(
             low=low, high=high, equilibrium=eq, current_pd=pd,
             quadrant=q,
-            ssl_source_tf=getattr(best_ssl, 'timeframe', '5m'),
-            bsl_source_tf=getattr(best_bsl, 'timeframe', '5m'),
+            ssl_source_tf=ssl_tf,
+            bsl_source_tf=bsl_tf,
             range_size=rng)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2123,11 +2333,31 @@ class ICTEngine:
     def _update_session(self, now_ms: int) -> None:
         """Unified session and kill zone detection in NY time to prevent DST desync."""
         try:
-            dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
-            uh  = dt.hour + dt.minute / 60.0
-            dst = 3 <= dt.month <= 10
-            ny  = (uh + (-4.0 if dst else -5.0)) % 24.0
-            wd  = dt.weekday()
+            # CRIT-3 FIX: Use zoneinfo for exact DST-aware NY conversion.
+            # Previous `3 <= month <= 10` misclassified ~2 weeks/year during
+            # US DST transitions (2nd Sunday March, 1st Sunday November).
+            try:
+                from zoneinfo import ZoneInfo
+                import datetime as _dtm
+                _ny_dt = _dtm.datetime.fromtimestamp(now_ms / 1000.0,
+                                                     tz=ZoneInfo("America/New_York"))
+                ny = _ny_dt.hour + _ny_dt.minute / 60.0
+                wd = _ny_dt.weekday()
+            except Exception:
+                # Fallback: accurate calendar-based DST computation
+                dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+                uh  = dt.hour + dt.minute / 60.0
+                _m, _d, _y = dt.month, dt.day, dt.year
+                def _nth_sunday(yr, mo, n):
+                    import calendar as _cal
+                    first_wd = _cal.monthrange(yr, mo)[0]
+                    return 1 + ((6 - first_wd) % 7) + (n - 1) * 7
+                _ds  = _nth_sunday(_y, 3, 2)   # 2nd Sunday March
+                _de  = _nth_sunday(_y, 11, 1)  # 1st Sunday November
+                _in_dst = ((_m == 3 and _d >= _ds) or (4 <= _m <= 10) or
+                           (_m == 11 and _d < _de))
+                ny  = (uh + (-4.0 if _in_dst else -5.0)) % 24.0
+                wd  = dt.weekday()
 
             self._killzone = ""
             self._session  = "OFF_HOURS"
@@ -2178,9 +2408,10 @@ class ICTEngine:
         """
         Inject live order-flow data from external engines.
 
-        Called by quant_strategy.py each tick BEFORE predict_next_hunt() /
-        get_confluence() so that the liquidity prediction reflects the most
-        current order-flow state.
+        Called by quant_strategy.py each tick BEFORE get_confluence() so that
+        the liquidity score reflects the most current order-flow state.
+        Hunt prediction is now delegated to DirectionEngine — see
+        inject_hunt_prediction() below.
 
         tick_flow:  TickFlowEngine signal in [-1, +1].
                     Positive = net buying pressure (price heading to BSL).
@@ -2192,12 +2423,34 @@ class ICTEngine:
         self._tick_flow  = max(-1.0, min(1.0, float(tick_flow)))
         self._cvd_trend  = max(-1.0, min(1.0, float(cvd_trend)))
 
+    def inject_hunt_prediction(self, pred_dict: Dict, now_ms: int) -> None:
+        """
+        Accept a hunt prediction computed externally by DirectionEngine.
+
+        Called by quant_strategy.py immediately after DirectionEngine.predict_hunt()
+        so that get_confluence(), get_status(), and get_full_status() continue to
+        consume hunt data without modification.  ICTEngine no longer owns the
+        prediction logic — it owns the structural context that DirectionEngine reads.
+
+        pred_dict keys (mirrors old predict_next_hunt return shape):
+          predicted, confidence, delivery_direction, raw_score,
+          bsl_score, ssl_score, dealing_range_pd, swept_pool,
+          opposing_pool, reason, scenario
+        """
+        self._last_hunt_pred = pred_dict or {}
+        self._last_hunt_ms   = now_ms
+
     # ─────────────────────────────────────────────────────────────────────
-    # PUBLIC: LIQUIDITY HUNT PREDICTION (CORE DECISION ENGINE)
+    # DEPRECATED: predict_next_hunt() — kept as private fallback only.
+    # Hunt prediction has been moved to direction_engine.DirectionEngine.
+    # ICTEngine exposes inject_hunt_prediction() so callers (get_confluence,
+    # get_status, Tier-L) remain unchanged.  Do NOT promote this back to
+    # public — it would create a split-brain where two engines produce
+    # conflicting hunt signals with different factor weights.
     # ─────────────────────────────────────────────────────────────────────
 
-    def predict_next_hunt(self, price: float, atr: float, now_ms: int,
-                          candles_5m: Optional[List[Dict]] = None) -> Dict:
+    def _predict_next_hunt(self, price: float, atr: float, now_ms: int,
+                           candles_5m: Optional[List[Dict]] = None) -> Dict:
         """
         9-factor prediction of which liquidity pool gets hunted FIRST.
 
@@ -2379,17 +2632,19 @@ class ICTEngine:
         components["disp_bias"] = f_disp
 
         # ── Factor 8: Session timing (0.03) ───────────────────────────────
-        # London open (08:00-09:00 UTC): slight BSL sweep bias (Judas swing up)
-        # NY delivery (13:30-15:30 UTC): amplify existing direction
+        # Uses self._session / self._killzone already computed by _update_session()
+        # (called in update()).  This avoids the previous DST bug (hardcoded UTC
+        # minutes 480-540 / 810-930 were only correct for EDT, wrong by 1h in EST)
+        # and guarantees this factor stays in sync with the session display.
+        #
+        # London KZ: slight BSL sweep bias (Judas swing up during London open).
+        # NY KZ:     amplify whichever direction the primary factors already favour.
         f_sess = 0.0
         try:
-            from datetime import datetime, timezone as _tz
-            _dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=_tz.utc)
-            _hm  = _dt.hour * 60 + _dt.minute
-            if 480 <= _hm <= 540:      # London KZ 08:00-09:00 UTC
-                f_sess = +0.20         # London BSL sweep Judas bias
-            elif 810 <= _hm <= 930:    # NY 13:30-15:30 UTC
-                # Amplify existing EMA direction
+            if self._killzone == "LONDON_KZ":
+                f_sess = +0.20          # London BSL sweep / Judas swing bias
+            elif self._killzone == "NY_KZ":
+                # Amplify the existing composite of primary factors
                 _existing = sum(
                     components[k] * _WEIGHTS[k]
                     for k in ("amd", "dr_pos", "flow", "cvd")
@@ -3013,13 +3268,15 @@ class ICTEngine:
         # ── 4. Liquidity + Hunt Prediction  (UNIFIED — core decision driver) ──
         #
         # Liquidity is NOT a peripheral metric — it IS the ICT setup.
-        # The 9-factor predict_next_hunt() runs inside this block and its
-        # confidence feeds the confluence score at the same weight as structure.
+        # DirectionEngine.predict_hunt() runs in quant_strategy Step 3b and its
+        # result is injected via inject_hunt_prediction() before get_confluence()
+        # is called.  The confidence feeds the confluence score at the same weight
+        # as structure.
         #
         # Two sub-components:
         #   A. Sweep freshness     (max 0.10) — same as before, slightly tighter
-        #   B. Hunt prediction     (max 0.20) — NEW: aligning with predicted
-        #                                        delivery direction gives a big bonus
+        #   B. Hunt prediction     (max 0.20) — aligning with predicted delivery
+        #                                        direction gives a big bonus;
         #                                        opposing prediction gives a penalty
         # Combined cap: 0.30  (was 0.15) — liquidity now equals structure weight.
 
@@ -3058,18 +3315,13 @@ class ICTEngine:
             details.append(f"Stacked {len(pools_ahead)} pools ahead")
 
         # Sub-component B: hunt prediction alignment
-        hunt_pred  = None
+        # Prediction is injected externally by DirectionEngine via
+        # inject_hunt_prediction() before get_confluence() is called.
+        # No self-computation here — ICTEngine owns context, not the decision.
+        hunt_pred  = self._last_hunt_pred or {}
         hunt_score = 0.0
-        _hunt_cache_stale = (now_ms - self._last_hunt_ms) > 10_000  # 10 s
-        if _hunt_cache_stale or not self._last_hunt_pred:
-            try:
-                hunt_pred = self.predict_next_hunt(price, atr, now_ms)
-            except Exception:
-                hunt_pred = {}
-        else:
-            hunt_pred = self._last_hunt_pred
 
-        if hunt_pred and hunt_pred.get("predicted"):
+        if hunt_pred.get("predicted"):
             hunt_conf = hunt_pred["confidence"]
             hunt_dir  = hunt_pred.get("delivery_direction", "")
             hunt_aligns = ((side == "long"  and hunt_dir == "bullish") or
@@ -3089,9 +3341,9 @@ class ICTEngine:
         out.sweep_score     = liq   # legacy: sweep-only component
         # Attach hunt prediction to the confluence object so callers
         # (ICTEntryGate, ICTSLEngine, ICTTPEngine) can use it directly.
-        out.hunt_prediction   = hunt_pred or {}
+        out.hunt_prediction   = hunt_pred
         out.hunt_aligns_trade = bool(
-            hunt_pred and
+            hunt_pred.get("predicted") and
             hunt_pred.get("delivery_direction") ==
             ("bullish" if side == "long" else "bearish"))
 

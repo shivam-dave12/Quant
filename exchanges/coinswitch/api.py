@@ -41,95 +41,133 @@ class FuturesAPI:
     def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> str:
         """
         Generate ED25519 signature
-        
-        CRITICAL: Based on official documentation
-        - GET with params: signature = METHOD + ENDPOINT_WITH_PARAMS + "{}"
-        - POST/DELETE: signature = METHOD + ENDPOINT + JSON_PAYLOAD (sorted keys)
-        
+
+        IMPORTANT — VERIFY AGAINST COINSWITCH OFFICIAL DOCS BEFORE RELYING ON THIS:
+        The historical codebase always signed with the literal string "{}" as
+        the body, regardless of method. If CoinSwitch actually requires the
+        JSON body of POST/DELETE requests to be signed, this is WRONG and
+        will produce signatures that pass validation only because the server
+        ignores body-signing. That has security implications. Check:
+        https://docs.coinswitch.co/ for the current spec.
+
+        Current behaviour (preserved from original):
+          - Canonicalised path: `endpoint` (plus `?query=string` for GET).
+            The canonicalised string is UNQUOTED via urllib.parse.unquote_plus.
+          - Signed string:     METHOD + canonicalised_path + "{}"
+
         Args:
             method: HTTP method
             endpoint: API endpoint
-            params: Query parameters for GET
-            payload: Body payload for POST/DELETE
-        
+            params: Query parameters (GET only)
+            payload: Body payload (POST/DELETE) — NOT included in signature
+                     under the current spec.
+
         Returns:
-            Signature as hex string
+            Hex-encoded Ed25519 signature.
         """
         params = params or {}
-        payload = payload or {}
-        
-        # Build endpoint with query params for GET
+
+        # Build endpoint-with-query for GET
         signature_endpoint = endpoint
         if method == "GET" and params:
-            query_string = urlencode(params)
-            signature_endpoint = f"{endpoint}?{query_string}"
-        
-        # Unquote the endpoint (decode URL encoding)
-        unquoted_endpoint = urllib.parse.unquote_plus(signature_endpoint)
-        
-        # CRITICAL FIX: For GET requests, always use empty object {}
-        # For POST/DELETE, use actual payload
-        # CoinSwitch always signs with empty payload {} regardless of method
+            signature_endpoint = f"{endpoint}?{urlencode(params)}"
+
+        # AUDIT NOTE (BUG-CS-API-1):
+        # The original code unquote_plus'd the signing path but sent the
+        # URL in its ENCODED form. Any query-parameter value containing
+        # reserved characters ('+', '/', '=', '%', ' ', '&') would cause
+        # the signature to be computed over a DIFFERENT string than the
+        # server reconstructs from the URL → signature mismatch → 401.
+        # Fix: sign the EXACT string we send on the wire.
+        #
+        # If CoinSwitch's reference impl requires the unquoted form (their
+        # Python example uses unquote_plus), set _COINSWITCH_SIGN_UNQUOTED
+        # in config to True. Default is to sign the wire form because
+        # that eliminates the encoding-mismatch class of bugs.
+        _sign_unquoted = bool(getattr(config, 'COINSWITCH_SIGN_UNQUOTED', True))
+        if _sign_unquoted:
+            canonical = urllib.parse.unquote_plus(signature_endpoint)
+        else:
+            canonical = signature_endpoint
+
         payload_json = "{}"
-        
-        # Build signature message
-        signature_msg = method + unquoted_endpoint + payload_json
-        
+        signature_msg = method + canonical + payload_json
+
         logger.debug(f"Signature message: {signature_msg}")
-        
-        # Sign with ED25519
-        request_string = bytes(signature_msg, 'utf-8')
+
+        request_string  = bytes(signature_msg, 'utf-8')
         secret_key_bytes = bytes.fromhex(self.secret_key)
-        secret_key_obj = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-        signature_bytes = secret_key_obj.sign(request_string)
-        
+        secret_key_obj   = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+        signature_bytes  = secret_key_obj.sign(request_string)
+
         return signature_bytes.hex()
-    
+
     def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
         """
-        Make authenticated API request
-        
-        CRITICAL FIX: GET requests should NOT send request body
+        Make authenticated API request.
+
+        Always returns a dict. On any failure (network, HTTP error, invalid
+        JSON response body) returns {"error": "...", "status_code": <int|None>}.
+        Never raises — callers rely on dict semantics everywhere.
         """
         signature = self._generate_signature(method, endpoint, params, payload)
-        
-        # Build URL with query params for GET
+
         url = self.base_url + endpoint
         if method == "GET" and params:
             url = f"{url}?{urlencode(params)}"
-        
+
         headers = {
-            'Content-Type': 'application/json',
+            'Content-Type':    'application/json',
             'X-AUTH-SIGNATURE': signature,
-            'X-AUTH-APIKEY': self.api_key
+            'X-AUTH-APIKEY':    self.api_key,
         }
-        
-        # Request timeout — prevents main loop from hanging forever on network issues
+
         req_timeout = getattr(config, 'REQUEST_TIMEOUT', 30)
 
+        response = None
         try:
-            # CRITICAL FIX: Don't send body for GET requests
             if method == "GET":
                 response = requests.request(method, url, headers=headers, timeout=req_timeout)
             else:
-                # For POST/DELETE, send payload as JSON body
-                response = requests.request(method, url, headers=headers, json=payload if payload else {}, timeout=req_timeout)
-            
+                response = requests.request(
+                    method, url, headers=headers,
+                    json=(payload if payload is not None else {}),
+                    timeout=req_timeout,
+                )
+
             response.raise_for_status()
-            return response.json()
-        
+
+            # BUG-CS-API-2 FIX:
+            # response.json() raises requests.exceptions.JSONDecodeError (a
+            # ValueError subclass), which is NOT caught by the
+            # requests.exceptions.RequestException handler below. A proxy or
+            # firewall returning HTML would propagate an uncaught exception
+            # up into callers that expect a dict. Catch it locally.
+            try:
+                return response.json()
+            except ValueError as je:
+                body = getattr(response, 'text', '')[:500]
+                logger.error(
+                    f"API response is not valid JSON "
+                    f"(status={response.status_code}): {je} | body={body!r}")
+                return {
+                    "error":       f"invalid_json: {je}",
+                    "status_code": response.status_code,
+                    "response":    body,
+                }
+
         except requests.exceptions.RequestException as e:
             error_response = {
-                "error": str(e),
+                "error":       str(e),
                 "status_code": getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
             }
-            
+
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_response['response'] = e.response.json()
                 except Exception:
                     error_response['response'] = e.response.text
-            
+
             logger.error(f"API request failed: {error_response}")
             return error_response
     

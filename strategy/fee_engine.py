@@ -107,8 +107,12 @@ class SpreadTracker:
         Uses the true median (average of two middle elements for even-length arrays)
         rather than the upper-median, which biased spread estimates upward and caused
         the fee floor to be slightly too aggressive on even sample counts.
+
+        Warmup default: 0.20 bps — realistic for BTC inverse perp (actual ~0.15 bps).
+        The old default of 2.0 bps was 13× too wide, causing fee-floor over-rejection
+        during the first ~5 seconds of each session.
         """
-        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
+        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 0.20))
         if len(self._hist) < 5:
             return default
         arr = sorted(self._hist)
@@ -124,7 +128,7 @@ class SpreadTracker:
 
     def percentile_bps(self, pct: float) -> float:
         """pct in [0, 1]"""
-        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 2.0))
+        default = float(_cfg("FEE_SPREAD_DEFAULT_BPS", 0.20))
         with self._lock:
             if len(self._hist) < 10:
                 return default
@@ -287,15 +291,19 @@ class ProfitFloorModel:
         if price <= 0:
             return float("inf")     # genuine bad data — hard-block always correct
         if atr <= 0:
-            # Bug-20 fix: returning inf here caused valid ICT entries to be
-            # silently rejected during ATR warmup (first ~14 candles after boot).
-            # The bot would confirm a signal through all structural gates, hit the
-            # fee floor check, get inf back, and silently drop the trade with no
-            # log entry. Strategy-level gates (min_qty, SL distance) still apply;
-            # bypassing the fee floor during warmup is safe — it re-activates the
-            # moment ATR > 0.
-            logger.debug("ProfitFloor: ATR=0 (engine warming up) — fee floor bypassed")
-            return 0.0
+            # FE-4 FIX: during ATR warmup (first ~14 candles after boot), return
+            # a conservative floor of 2 × rt_cost_price rather than 0.0. A zero
+            # floor allowed post-warmup TP recomputation to suddenly reject a
+            # setup that had just passed (same-tick decision race). 2× the
+            # round-trip cost is a safe, always-achievable minimum — a setup
+            # that cannot clear 2× fees is not worth taking even during warmup.
+            # Strategy-level gates (min_qty, SL distance) still apply.
+            _rt_price_warmup = total_rt_cost_bps / 10_000.0 * price
+            _warmup_floor    = 2.0 * _rt_price_warmup
+            logger.debug(
+                f"ProfitFloor: ATR=0 (engine warming up) — using conservative "
+                f"2×rt_cost floor = ${_warmup_floor:.2f}")
+            return _warmup_floor
 
         mult = self.compute_multiplier(
             atr_percentile, spread_bps, atr, price, signal_confidence
@@ -405,16 +413,14 @@ class MakerTakerDecision:
             # ── 3. Estimate fill probability ──────────────────────────────
             urgency_fill_prob = 1.0 - signal_urgency
 
+            # FE-5 FIX: remove the isinstance(list|tuple) filter — it rejected
+            # dict-format orderbook levels (Delta API) and silently produced
+            # relevant_depth=0. The _ob_qty helper already returns 0.0 for
+            # unrecognised shapes, so the sum is safe without the filter.
             if side == "long":
-                relevant_depth = sum(
-                    _ob_qty(b) for b in bids[:depth_levels]
-                    if isinstance(b, (list, tuple)) and len(b) >= 2
-                )
+                relevant_depth = sum(_ob_qty(b) for b in bids[:depth_levels])
             else:
-                relevant_depth = sum(
-                    _ob_qty(a) for a in asks[:depth_levels]
-                    if isinstance(a, (list, tuple)) and len(a) >= 2
-                )
+                relevant_depth = sum(_ob_qty(a) for a in asks[:depth_levels])
 
             if relevant_depth > 0:
                 size_fraction  = quantity / relevant_depth
@@ -518,18 +524,16 @@ class ExecutionCostEngine:
         """
         True once the engine has enough spread samples for reliable cost estimates.
 
-        Before warmup: median_bps() returns the hardcoded default (2.0 bps).
-        That default can produce fee floors that reject valid setups if the
-        actual spread is tighter.  Gate the TP floor check on warmup.
+        Before warmup: median_bps() returns FEE_SPREAD_DEFAULT_BPS (0.20 bps) —
+        a realistic BTC inverse perp spread. The old default of 2.0 bps was 13×
+        too wide and caused the fee floor to over-reject valid setups in the
+        first ~5 seconds of each session.
 
         Warmup threshold: 5 spread samples (~5-10 seconds of live data).
 
-        Note: slippage EWMA is tracked separately in diagnostic_snapshot via
-        'slip_warmed'.  We do NOT require the slippage EWMA here because
-        expected_bps() has its own safe default (0.0 bps) when unwarmed,
-        which only underestimates round-trip cost — it never over-gates entries.
-        Requiring slip_warmed here would have blocked ALL entries for several
-        minutes after a stream restart until a fill was recorded.
+        Note: the _spread_atr_gate in quant_strategy.py does NOT use median_bps()
+        — it computes the live bid-ask directly from the current orderbook so it
+        is unaffected by the warmup sentinel entirely.
         """
         return self._spread.sample_count >= 5
 

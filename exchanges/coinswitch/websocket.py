@@ -172,46 +172,70 @@ class CoinSwitchWebSocket:
                 logger.error(f"Candle handler error: {e}")
 
     def _resubscribe_all(self) -> None:
-        """Re-register all subscriptions and restore callbacks after reconnect."""
-        with self._subs_lock:
-            logger.info("CoinSwitch WS: resubscribing all streams...")
+        """
+        Re-register all subscriptions after a reconnect.
 
-            with self._lock:
-                self._ob_callbacks.clear()
-                self._tr_callbacks.clear()
-                self._can_callbacks.clear()
+        BUG-CS-WS-1 FIX — lock ordering:
+          Previously this method acquired (_subs_lock → _lock) while the
+          public subscribe_* methods acquire (_lock → _subs_lock). That is
+          a classic AB-BA deadlock. Fix: ALL paths that touch both locks
+          must use the same order. We standardise on (_lock → _subs_lock)
+          everywhere; _resubscribe_all now follows that order.
 
-            for sub in self._subs["orderbook"]:
-                cb = sub.get("callback")
-                if cb:
-                    with self._lock:
-                        self._ob_callbacks.append(cb)
-                self.sio.emit(self._EV_ORDERBOOK,
-                              {"event": "subscribe", "pair": sub["pair"]},
-                              namespace=self.NAMESPACE)
+        BUG-CS-WS-2 FIX — don't wipe callbacks:
+          The old code cleared _ob_callbacks / _tr_callbacks / _can_callbacks
+          completely before re-adding only those recorded in _subs. That
+          briefly exposed an empty-callback state to in-flight handlers,
+          and silently dropped any subscription recorded outside _subs.
+          New behaviour: re-emit the subscription requests; leave the
+          callback registry untouched. The callbacks themselves survive
+          reconnect because they live in the Python object — only the
+          server-side subscription needs to be re-established.
+        """
+        # Snapshot subs atomically so we emit without holding the lock
+        # (socket.io emit can block; holding locks around it is dangerous).
+        with self._lock:
+            with self._subs_lock:
+                ob_subs  = list(self._subs["orderbook"])
+                cd_subs  = list(self._subs["candlestick"])
+                tr_subs  = list(self._subs["trades"])
 
-            for sub in self._subs["candlestick"]:
-                cb  = sub.get("callback")
-                ikey = str(sub.get("interval", ""))
-                if cb and ikey:
-                    with self._lock:
-                        self._can_callbacks.setdefault(ikey, [])
-                        if cb not in self._can_callbacks[ikey]:
-                            self._can_callbacks[ikey].append(cb)
-                self.sio.emit(self._EV_CANDLESTICK,
-                              {"event": "subscribe", "pair": sub["pair"]},
-                              namespace=self.NAMESPACE)
+        logger.info(
+            f"CoinSwitch WS: resubscribing "
+            f"{len(ob_subs)} OB, {len(cd_subs)} candles, {len(tr_subs)} trades"
+        )
 
-            for sub in self._subs["trades"]:
-                cb = sub.get("callback")
-                if cb:
-                    with self._lock:
-                        self._tr_callbacks.append(cb)
-                self.sio.emit(self._EV_TRADES,
-                              {"event": "subscribe", "pair": sub["pair"]},
-                              namespace=self.NAMESPACE)
+        for sub in ob_subs:
+            try:
+                self.sio.emit(
+                    self._EV_ORDERBOOK,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe OB {sub.get('pair')}: {e}")
 
-            logger.info("CoinSwitch WS: resubscription complete")
+        for sub in cd_subs:
+            try:
+                self.sio.emit(
+                    self._EV_CANDLESTICK,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe candle {sub.get('pair')}: {e}")
+
+        for sub in tr_subs:
+            try:
+                self.sio.emit(
+                    self._EV_TRADES,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe trades {sub.get('pair')}: {e}")
+
+        logger.info("CoinSwitch WS: resubscription requests sent")
 
     # ── Public interface ──────────────────────────────────────────────────────
 

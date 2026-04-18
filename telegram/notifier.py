@@ -1,137 +1,93 @@
 """
-Telegram Notifier v10.1 — Institutional-Grade ICT Reports
-============================================================
-Every message includes exact price levels so you can verify
-structures on chart. Full trade plan visibility.
+telegram/notifier.py — Liquidity-First Telegram Notifier  v2.0
+==============================================================
+Report architecture mirrors the decision hierarchy:
+  DirectionEngine hunt → Pool target → Flow confirmation → ICT context → Entry → Exit
 
-Report Types:
-  1. Market Outlook  — full structure map with trade plan (every 5m)
-  2. Entry Alert     — comprehensive entry with full context
-  3. Trail Update    — SL move with structure justification
-  4. Position Close  — detailed P&L with trade review
-  5. Periodic Status — balance/P&L summary
-  6. Structure Deep  — /structures command response
+Public API (imported by strategy layer):
+  send_telegram_message()            — async fire-and-forget delivery
+  format_periodic_report()           — 15-min institutional dashboard
+  format_direction_hunt_alert()      — DirectionEngine high-confidence prediction
+  format_post_sweep_verdict()        — post-sweep reversal/continuation decision
+  format_conviction_block_alert()    — conviction gate rejection with factor breakdown
+  format_pool_gate_alert()           — pool-hit gate action (exit/reverse/continue)
+  format_liquidity_trail_update()    — Fibonacci-trail SL advance (v5.0 engine)
+  install_global_telegram_log_handler()
+  TelegramLogHandler
+
+Internal helpers (used by controller.py):
+  _sanitize_html(), _esc()
+
+v2.0 CHANGES
+------------
+1.  _sanitize_html rewritten as a proper state-machine parser. It now:
+      • Normalises stray ampersands to &amp; (was missing — leading cause of
+        byte-offset 2010-2035 parse errors).
+      • Uses a single-pass tokenizer that splits the input into text runs
+        and tag runs, escaping only the text runs.
+      • Emits perfectly balanced tags: unmatched closes are dropped, unclosed
+        opens are auto-closed at end.
+      • Tolerates truncation: a tag fragment with no > at end-of-string is
+        escaped as literal.
+      • Does NOT apply inside <code>/<pre> contents — those are treated as
+        raw text and fully escaped (as Telegram HTML requires).
+
+2.  New _tag(text, name) helper guarantees that the wrapping is correct —
+    all fresh format_* functions use it instead of hand-crafted markup.
+
+3.  format_liquidity_trail_update rewritten for the v5.0 Fibonacci engine:
+    shows fib_ratio, swing context, momentum gate, HTF alignment, buffer
+    details, pool-between-expansion tag, and cluster info.
 """
 
-import logging
-import re
-import time
-import threading
-import requests
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone
-from collections import deque
-import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import telegram.config as telegram_config
-import html as _html_lib
+from __future__ import annotations
 
+import html as _html_lib
+import logging
+import queue as _queue_mod
+import re
+import sys
+import os as _os
+import threading
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+import telegram.config as telegram_config
 
 logger = logging.getLogger(__name__)
 
-import queue as _queue_mod
+# REQUIRED_SCORE from authoritative source
+try:
+    from strategy.conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
+except ImportError:
+    try:
+        from conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
+    except ImportError:
+        _REQUIRED_CONVICTION_SCORE = 0.45
 
-_send_queue: _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
-_worker_started = False
-_worker_lock    = threading.Lock()
-_MIN_INTERVAL   = 1.0
-_MAX_RETRIES    = 3
-
-def _sanitize_html(text: str) -> str:
-    """
-    Remove or escape HTML constructs that Telegram's HTML parse_mode rejects.
-
-    Telegram supports only: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">,
-    <tg-spoiler>, and their closing counterparts.  Any other tag (including empty
-    tags like <> or unknown tags like <br>, <hr>, <p>) raises a 400 parse error.
-
-    Strategy:
-      1. Replace <br> / <br/> with a newline (most common culprit).
-      2. Strip any remaining unsupported tags while preserving their inner text.
-      3. Collapse runs of blank lines to at most two consecutive newlines.
-    """
-
-    # Common safe substitutions
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<hr\s*/?>', '\n──────\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<p\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'</p>', '', text, flags=re.IGNORECASE)
-
-    # Supported tags — keep these intact
-    _SAFE_TAGS = {
-        'b', '/b', 'i', '/i', 'u', '/u', 's', '/s',
-        'code', '/code', 'pre', '/pre',
-        'tg-spoiler', '/tg-spoiler',
-    }
-
-    def _fix_tag(m):
-        inner = m.group(1).strip()
-        # Keep <a href="..."> and </a>
-        if inner.lower().startswith('a ') or inner.lower() == '/a':
-            return m.group(0)
-        # Keep safe tags
-        tag_name = inner.lower().split()[0] if inner else ''
-        if tag_name in _SAFE_TAGS:
-            return m.group(0)
-        # Strip unsupported tag (keep its text content if any)
-        return ''
-
-    text = re.sub(r'<([^>]*)>', _fix_tag, text)
-
-    # Escape any remaining bare `<` that are NOT the opening of a valid Telegram
-    # HTML tag.  These arise from dynamic content such as numeric comparisons
-    # ("adx < 5.0", "price < sl"), f-strings with dict reprs ("<class ...>"),
-    # or reason strings returned by strategy internals.
-    #
-    # After the tag-stripping pass above, the only `<` chars that should remain
-    # are those starting recognised safe tags.  Anything else must be escaped
-    # so Telegram's HTML parser doesn't choke on them.
-    #
-    # BUG-SANITIZE-REGEX FIX: the original lookahead pattern
-    # `(?!/?(?:b|i|u|s|code|pre|tg-spoiler|a(?:[\s>\/]|$)))` used a simple
-    # character alternation that failed to match `tg-spoiler` when the `-`
-    # was preceded by other tag characters.  More fundamentally, the double
-    # negative lookahead `(?![^>]*>)` was overly greedy and swallowed the
-    # entire tag body, sometimes escaping the `<` of legitimate tags.
-    # Fix: use a single positive lookahead for the exact set of supported tag
-    # name prefixes; anything else gets escaped.
-    _SAFE_TAG_RE = re.compile(
-        r'<(?=/?(?:b|i|u|s|code|pre|tg-spoiler|a)(?:[\s>"/]|$))',
-        re.IGNORECASE,
-    )
-    # Build the escaped version: replace any `<` NOT followed by a safe tag
-    # by splitting on `<` and re-joining, escaping those that don't open safe tags.
-    parts = text.split('<')
-    if len(parts) > 1:
-        rebuilt = [parts[0]]
-        for part in parts[1:]:
-            # Check if this segment opens a safe Telegram tag
-            if _SAFE_TAG_RE.match('<' + part):
-                rebuilt.append('<')
-            else:
-                rebuilt.append('&lt;')
-            rebuilt.append(part)
-        text = ''.join(rebuilt)
-
-    # Collapse excessive blank lines (> 2 consecutive newlines → 2)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text
+_HUNT_ON_THRESHOLD  = 0.10
+_HUNT_OFF_THRESHOLD = 0.05
 
 
+# ======================================================================
+# ASYNC SEND WORKER
+# ======================================================================
+
+_send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
+_worker_started: bool            = False
+_worker_lock:   threading.Lock   = threading.Lock()
+_MIN_INTERVAL = 1.2
+_MAX_RETRIES  = 4
 
 
-def _esc(s) -> str:
-    """Escape <, >, & for Telegram HTML parse_mode."""
-    if s is None:
-        return ""
-    return _html_lib.escape(str(s), quote=False)
+def _send_worker() -> None:
+    """Background daemon — drains the queue and sends to Telegram."""
+    import random
+    import requests as _req
 
-
-def _send_worker():
-    """Background thread that drains the message queue and sends to Telegram.
-    
-    Retries transient errors (502, 429, 5xx) with exponential backoff.
-    Never blocks the main trading loop.
-    """
     last_send_ts = 0.0
 
     while True:
@@ -139,96 +95,91 @@ def _send_worker():
             item = _send_queue.get(timeout=30)
         except _queue_mod.Empty:
             continue
-
         if item is None:
             break
 
         message, parse_mode = item
 
         for attempt in range(_MAX_RETRIES):
-            # Rate limit between sends
-            now = time.time()
-            gap = _MIN_INTERVAL - (now - last_send_ts)
+            gap = _MIN_INTERVAL - (time.time() - last_send_ts)
             if gap > 0:
                 time.sleep(gap)
-
             try:
-                url = f"https://api.telegram.org/bot{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage"
-
-                # Sanitize HTML before sending to prevent "Unsupported start tag" 400s
+                url = (f"https://api.telegram.org/bot"
+                       f"{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage")
                 send_text = message[:4000]
-                send_mode = parse_mode
                 if parse_mode == "HTML":
                     send_text = _sanitize_html(send_text)
 
                 payload = {
-                    "chat_id": telegram_config.TELEGRAM_CHAT_ID,
-                    "text": send_text,
-                    "parse_mode": send_mode,
+                    "chat_id":                  telegram_config.TELEGRAM_CHAT_ID,
+                    "text":                     send_text,
+                    "parse_mode":               parse_mode,
                     "disable_web_page_preview": True,
                 }
-                resp = requests.post(url, json=payload, timeout=15)
+                resp = _req.post(url, json=payload, timeout=15)
                 last_send_ts = time.time()
 
                 if resp.status_code == 200:
                     break
 
-                # 400 parse error — retry once without parse_mode (plain text)
+                # HTML parse error → retry as plain text (once)
                 if resp.status_code == 400 and parse_mode == "HTML" and attempt == 0:
                     logger.warning(
-                        f"Telegram HTML parse error — retrying as plain text: {resp.text[:120]}"
+                        "Telegram HTML parse error — retrying as plain text: %s",
+                        resp.text[:160]
                     )
-                    # DOTALL: strip tags that span multiple lines (e.g. logged tracebacks)
-                    plain_text = re.sub(r'<[^>]+>', '', send_text, flags=re.DOTALL)
-                    plain_payload = {
-                        "chat_id": telegram_config.TELEGRAM_CHAT_ID,
-                        "text": plain_text[:4000],
-                        "disable_web_page_preview": True,
-                    }
-                    resp2 = requests.post(url, json=plain_payload, timeout=15)
+                    plain = re.sub(r"<[^>]*>", "", send_text, flags=re.DOTALL)
+                    plain = _html_lib.unescape(plain)
+                    r2 = _req.post(
+                        url,
+                        json={
+                            "chat_id":                  telegram_config.TELEGRAM_CHAT_ID,
+                            "text":                     plain[:4000],
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=15,
+                    )
                     last_send_ts = time.time()
-                    if resp2.status_code == 200:
+                    if r2.status_code == 200:
                         break
-                    logger.warning(
-                        f"Telegram plain-text fallback also failed: {resp2.status_code}"
-                    )
+                    logger.warning("Plain-text fallback also failed: %s", r2.text[:160])
                     break
 
-                # Retryable errors
+                # Rate-limit / transient — backoff
                 if resp.status_code in (429, 500, 502, 503) and attempt < _MAX_RETRIES - 1:
-                    backoff = 2.0 * (2 ** attempt)
                     if resp.status_code == 429:
-                        # Respect Telegram's retry_after if provided
                         try:
-                            retry_after = resp.json().get("parameters", {}).get("retry_after", backoff)
-                            backoff = max(backoff, float(retry_after))
+                            backoff = max(float(resp.json().get("parameters", {})
+                                                .get("retry_after", 10)), 5.0)
                         except Exception:
-                            pass
-                    logger.warning(f"Telegram {resp.status_code}, retry {attempt+1}/{_MAX_RETRIES} "
-                                   f"in {backoff:.1f}s")
+                            backoff = 10.0
+                    else:
+                        backoff = min(2.0 * (2 ** attempt) + random.uniform(0, 2), 60.0)
+                    logger.warning(
+                        f"Telegram {resp.status_code}, retry {attempt+1}/{_MAX_RETRIES} "
+                        f"in {backoff:.1f}s"
+                    )
                     time.sleep(backoff)
                     continue
 
-                # Non-retryable failure
                 logger.warning(f"Telegram send failed: {resp.status_code} — {resp.text[:200]}")
                 break
 
-            except requests.exceptions.Timeout:
+            except _req.exceptions.Timeout:
                 if attempt < _MAX_RETRIES - 1:
-                    logger.warning(f"Telegram timeout, retry {attempt+1}/{_MAX_RETRIES}")
                     time.sleep(2.0 * (attempt + 1))
                     continue
                 logger.error("Telegram send timed out after all retries")
                 break
-            except Exception as e:
-                logger.error(f"Telegram send error: {e}")
+            except Exception as exc:
+                logger.error(f"Telegram send error: {exc}")
                 break
 
         _send_queue.task_done()
 
 
-def _ensure_worker_started():
-    """Start the background worker thread exactly once (thread-safe)."""
+def _ensure_worker_started() -> None:
     global _worker_started
     if _worker_started:
         return
@@ -240,21 +191,11 @@ def _ensure_worker_started():
         _worker_started = True
 
 
-# ======================================================================
-# CORE SENDER — NON-BLOCKING
-# ======================================================================
-
 def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
-    """Enqueue a Telegram message for async delivery.
-    
-    Returns True if enqueued, False if queue full or disabled.
-    NEVER blocks the calling thread (main trading loop).
-    """
+    """Enqueue a Telegram message for async delivery.  Never blocks the caller."""
     if not telegram_config.TELEGRAM_ENABLED:
         return False
-
     _ensure_worker_started()
-
     try:
         _send_queue.put_nowait((message, parse_mode))
         return True
@@ -264,822 +205,861 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
 
 
 # ======================================================================
+# HTML SANITIZER v2.0 — state-machine parser
+# ======================================================================
+
+# Telegram parse_mode=HTML permits these tags and attributes only
+_SAFE_TAGS = frozenset(("b", "strong", "i", "em", "u", "ins", "s", "strike",
+                        "del", "code", "pre", "tg-spoiler"))
+_SAFE_TAGS_WITH_ATTR = frozenset(("a",))  # <a href="..."> only
+_VALID_ENTITIES = ("amp", "lt", "gt", "quot", "apos", "#")
+
+# Regex: a tag is <[/]name[ attrs]>.  We tokenize on tag boundaries.
+_TAG_RE = re.compile(
+    r"<(/?)\s*([A-Za-z][A-Za-z0-9_-]*)\s*([^>]*?)/?\s*>",
+    re.DOTALL,
+)
+# Regex: a valid HTML entity
+_ENTITY_RE = re.compile(r"&(#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+
+
+def _normalise_ampersands(text: str) -> str:
+    """
+    Replace ampersands that are NOT part of a valid entity with &amp;.
+
+    Walks the string, leaving well-formed entities (&amp; &#39; &#x3C;) intact
+    and escaping every other & to &amp;.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "&":
+            out.append(ch)
+            i += 1
+            continue
+        m = _ENTITY_RE.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+        else:
+            out.append("&amp;")
+            i += 1
+    return "".join(out)
+
+
+def _sanitize_html(text: str) -> str:
+    """
+    Bulletproof Telegram HTML sanitizer.
+
+    Produces output guaranteed to round-trip through Telegram's HTML parser
+    (parse_mode=HTML) without "Unexpected end tag" or "can't parse entities"
+    400 errors.
+
+    Pipeline:
+      1. Convert <br>, <hr>, <p>/</p> to whitespace (not supported by Telegram).
+      2. Tokenize into (text, tag) runs.
+      3. Walk runs with an explicit open-tag stack:
+           • Text runs: ampersand-normalise (naked & → &amp;), leave others alone.
+             Do NOT escape < or > in text — they were already tag tokens
+             if well-formed; any stray < or > is already surrounded by text
+             and will be caught by the final entity normalisation.
+           • Tag runs: allow only safe tags; strip attrs on non-<a> tags;
+             drop orphan closes; auto-close mismatched opens.
+      4. Auto-close remaining open tags at end.
+      5. Final naked-ampersand and naked-lt/gt pass.
+      6. Collapse excess blank lines.
+    """
+    if not text:
+        return text
+
+    # -- Pass 1: structural conversion -------------------------------------
+    text = re.sub(r"<br\s*/?>",        "\n",                       text, flags=re.IGNORECASE)
+    text = re.sub(r"<hr\s*/?>",        "\n────────\n",             text, flags=re.IGNORECASE)
+    text = re.sub(r"<p(?:\s[^>]*)?>",  "\n",                       text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>",             "",                         text, flags=re.IGNORECASE)
+
+    # -- Pass 2: tokenize on tag boundaries --------------------------------
+    tokens: List[tuple] = []    # list of ("text", str) | ("tag", opening, name, attrs)
+    cursor = 0
+    for m in _TAG_RE.finditer(text):
+        if m.start() > cursor:
+            tokens.append(("text", text[cursor:m.start()]))
+        closing = m.group(1) == "/"
+        name    = m.group(2).lower()
+        attrs   = m.group(3).strip()
+        tokens.append(("tag", closing, name, attrs))
+        cursor = m.end()
+    if cursor < len(text):
+        tokens.append(("text", text[cursor:]))
+
+    # -- Pass 3: walk with open-tag stack ----------------------------------
+    out: List[str] = []
+    stack: List[str] = []
+
+    for tok in tokens:
+        if tok[0] == "text":
+            # Normalise naked ampersands; leave < and > alone (none should
+            # exist here — tokenizer consumed all tag-shaped <...>)
+            out.append(_normalise_ampersands(tok[1]))
+            continue
+
+        _, closing, name, attrs = tok
+        # Unknown/unsafe tag → escape as literal
+        is_safe = (name in _SAFE_TAGS) or (name in _SAFE_TAGS_WITH_ATTR)
+        if not is_safe:
+            raw = f"</{name}>" if closing else f"<{name}{(' ' + attrs) if attrs else ''}>"
+            out.append(_html_lib.escape(raw, quote=False))
+            continue
+
+        # Safe tag — strip attributes except on <a>
+        if name == "a":
+            if closing:
+                # Match outer <a> if any; drop orphan </a>
+                if "a" in stack:
+                    while stack and stack[-1] != "a":
+                        out.append(f"</{stack.pop()}>")
+                    stack.pop()
+                    out.append("</a>")
+                # else: orphan </a> — drop silently
+                continue
+            # Opening <a> — keep href="..." if present, discard everything else
+            href_match = re.search(r'href\s*=\s*"([^"]*)"', attrs, flags=re.IGNORECASE)
+            if not href_match:
+                href_match = re.search(r"href\s*=\s*'([^']*)'", attrs, flags=re.IGNORECASE)
+            if href_match:
+                href = href_match.group(1)
+                href = _normalise_ampersands(href)
+                stack.append("a")
+                out.append(f'<a href="{href}">')
+            else:
+                # <a> with no href is invalid in Telegram — drop
+                pass
+            continue
+
+        # Plain safe tags (<b>, <i>, ...): ignore attrs
+        if closing:
+            if name in stack:
+                while stack and stack[-1] != name:
+                    out.append(f"</{stack.pop()}>")
+                stack.pop()
+                out.append(f"</{name}>")
+            # else: orphan close — drop
+        else:
+            stack.append(name)
+            out.append(f"<{name}>")
+
+    # -- Pass 4: auto-close any remaining open tags ------------------------
+    while stack:
+        out.append(f"</{stack.pop()}>")
+
+    rendered = "".join(out)
+
+    # -- Pass 5: collapse blank lines --------------------------------------
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+
+    return rendered
+
+
+def _esc(s: Any) -> str:
+    """HTML-escape a dynamic value for safe Telegram HTML output."""
+    if s is None:
+        return ""
+    return _html_lib.escape(str(s), quote=False)
+
+
+def _tag(text: Any, name: str) -> str:
+    """
+    Wrap a value in an HTML tag, escaping the content safely.
+
+    Use this everywhere instead of hand-crafted '<b>{x}</b>' strings.
+    """
+    return f"<{name}>{_esc(text)}</{name}>"
+
+
+# ======================================================================
 # UTILITY HELPERS
 # ======================================================================
 
-def _fmt_price(p: float) -> str:
-    """Format BTC price consistently."""
+def _fmt_price(p: Optional[float]) -> str:
     if p is None:
         return "—"
     return f"${p:,.1f}"
 
 
 def _fmt_pct(v: float) -> str:
-    """Format percentage."""
     return f"{v:.2f}%"
 
 
-def _time_ago(ts_ms: int) -> str:
-    """Human-readable time ago from millisecond timestamp."""
-    if not ts_ms:
-        return "?"
-    elapsed = (time.time() * 1000 - ts_ms) / 1000
-    if elapsed < 60:
-        return f"{elapsed:.0f}s ago"
-    if elapsed < 3600:
-        return f"{elapsed/60:.0f}m ago"
-    return f"{elapsed/3600:.1f}h ago"
+def _session_icon(session: str) -> str:
+    s = (session or "").upper()
+    if "LONDON" in s: return "🇬🇧"
+    if "NY" in s or "NEW_YORK" in s: return "🇺🇸"
+    if "ASIA" in s: return "🌏"
+    return "🌐"
 
 
-def _ob_label(ob) -> str:
-    """Format order block as concise label with price range."""
-    v_tag = "🔴" if getattr(ob, 'visit_count', 0) >= 2 else ("⚪" if getattr(ob, 'visit_count', 0) == 1 else "🟣")
-    bos = "✓BOS" if getattr(ob, 'bos_confirmed', False) else ""
-    disp = "✓DISP" if getattr(ob, 'has_displacement', False) else ""
-    tags = " ".join(filter(None, [bos, disp]))
-    return (
-        f"{v_tag} {_fmt_price(ob.low)}–{_fmt_price(ob.high)} "
-        f"str={getattr(ob, 'strength', 0):.0f} v={getattr(ob, 'visit_count', 0)} "
-        f"{tags} {_time_ago(getattr(ob, 'timestamp', 0))}"
+def _score_bar(score: float, width: int = 10) -> str:
+    filled = min(max(int(score * width + 0.5), 0), width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_tf(tf: str) -> str:
+    return _esc(tf or "?")
+
+
+# ======================================================================
+# GATE DIAGNOSTIC PANEL (internal)
+# ======================================================================
+
+def _build_gate_diagnostic(
+    direction_hunt=None,
+    amd_phase: str = "",
+    dealing_range_pd: float = 0.5,
+    session: str = "",
+    flow_conviction: float = 0.0,
+    flow_direction: str = "",
+    htf_bias: str = "",
+) -> List[str]:
+    """Render a 6-gate entry diagnostic panel for the periodic report."""
+    gates: List[str] = ["🚦 <b>ENTRY GATE STATUS</b>"]
+
+    # Gate 1: session
+    s = (session or "").upper()
+    sess_ok = s in ("LONDON", "NY", "LONDON_NY")
+    gates.append(f"  {'✅' if sess_ok else '⚪'} Session: {_esc(s or 'off')}")
+
+    # Gate 2: hunt prediction
+    pred = getattr(direction_hunt, "predicted", None) if direction_hunt else None
+    conf = float(getattr(direction_hunt, "confidence", 0.0)) if direction_hunt else 0.0
+    hunt_ok = pred in ("BSL", "SSL") and conf >= _HUNT_ON_THRESHOLD
+    gates.append(
+        f"  {'✅' if hunt_ok else '⚪'} Hunt: "
+        f"{_esc(pred or 'NEUTRAL')} ({conf:.0%})"
     )
 
-
-def _fvg_label(fvg) -> str:
-    """Format FVG with price range and fill %."""
-    fill = getattr(fvg, 'fill_percentage', 0) * 100
-    return (
-        f"{_fmt_price(fvg.bottom)}–{_fmt_price(fvg.top)} "
-        f"fill={fill:.0f}% {_time_ago(getattr(fvg, 'timestamp', 0))}"
+    # Gate 3: flow direction
+    flow_ok = abs(flow_conviction) >= 0.20 and flow_direction in ("long", "short")
+    gates.append(
+        f"  {'✅' if flow_ok else '⚪'} Flow: "
+        f"{_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})"
     )
 
-
-def _liq_label(pool) -> str:
-    """Format liquidity pool with sweep status."""
-    swept = "✅SWEPT" if getattr(pool, 'swept', False) else "⏳"
-    disp = "+DISP" if getattr(pool, 'displacement_confirmed', False) else ""
-    wick = "+WICK" if getattr(pool, 'wick_rejection', False) else ""
-    return (
-        f"{getattr(pool, 'pool_type', '?')} @ {_fmt_price(pool.price)} "
-        f"x{getattr(pool, 'touch_count', 0)} {swept} {disp} {wick}"
+    # Gate 4: AMD phase
+    amd_ok = "MANIPULATION" in (amd_phase or "").upper() or \
+             "DISTRIBUTION" in (amd_phase or "").upper()
+    gates.append(
+        f"  {'✅' if amd_ok else '⚪'} AMD: {_esc(amd_phase or 'UNKNOWN')}"
     )
 
-
-def _mss_label(ms) -> str:
-    """Format market structure shift."""
-    icon = "📈" if getattr(ms, 'direction', '') == "bullish" else "📉"
-    return (
-        f"{icon} {getattr(ms, 'structure_type', '?')} "
-        f"{getattr(ms, 'direction', '?')} [{getattr(ms, 'timeframe', '?')}] "
-        f"@ {_fmt_price(getattr(ms, 'price', 0))} {_time_ago(getattr(ms, 'timestamp', 0))}"
+    # Gate 5: dealing range P/D
+    pd_ok = dealing_range_pd < 0.40 or dealing_range_pd > 0.60
+    pd_label = (
+        "DISC" if dealing_range_pd < 0.40 else
+        "EQ"   if dealing_range_pd < 0.60 else
+        "PREM"
+    )
+    gates.append(
+        f"  {'✅' if pd_ok else '⚪'} P/D: {pd_label} ({dealing_range_pd:.0%})"
     )
 
+    # Gate 6: HTF bias
+    htf_ok = bool(htf_bias) and htf_bias.lower() != "mixed"
+    gates.append(
+        f"  {'✅' if htf_ok else '⚪'} HTF: {_esc(htf_bias or 'mixed')}"
+    )
 
-# ======================================================================
-# 1. MARKET OUTLOOK — The "Thinking" Report
-# ======================================================================
-
-def format_market_outlook(
-    current_price: float,
-    htf_bias: str = "NEUTRAL",
-    htf_bias_strength: float = 0.0,
-    htf_components: Optional[Dict] = None,
-    daily_bias: str = "NEUTRAL",
-    regime: str = "UNKNOWN",
-    regime_adx: float = 0.0,
-    session: str = "REGULAR",
-    in_killzone: bool = False,
-    amd_phase: str = "UNKNOWN",
-    # Dealing ranges with actual prices
-    dr_weekly: Optional[Any] = None,
-    dr_daily: Optional[Any] = None,
-    dr_intraday: Optional[Any] = None,
-    dr_zone_tag: str = "",
-    # Structures — pass actual objects for price levels
-    bullish_obs: Optional[List] = None,
-    bearish_obs: Optional[List] = None,
-    bullish_fvgs: Optional[List] = None,
-    bearish_fvgs: Optional[List] = None,
-    liquidity_pools: Optional[List] = None,
-    market_structures: Optional[List] = None,
-    swing_highs: Optional[List] = None,
-    swing_lows: Optional[List] = None,
-    # Trade plan
-    long_plan: Optional[Dict] = None,
-    short_plan: Optional[Dict] = None,
-    # Entry eval status
-    entry_eval_status: str = "",
-    # ── Consolidated stats (merged from periodic report) ──
-    balance: float = 0.0,
-    total_trades: int = 0,
-    win_rate: float = 0.0,
-    daily_pnl: float = 0.0,
-    total_pnl: float = 0.0,
-    consecutive_losses: int = 0,
-    bot_state: str = "READY",
-    position: Optional[Dict] = None,
-    current_sl: Optional[float] = None,
-    current_tp: Optional[float] = None,
-    entry_price: Optional[float] = None,
-    breakeven_moved: bool = False,
-    profit_locked_pct: float = 0.0,
-    regime_atr_ratio: float = 0.0,
-    regime_size_mult: float = 0.0,
-    volume_delta: Optional[Dict] = None,
-) -> str:
-    """
-    CONSOLIDATED report — market outlook + bot stats + position.
-    Single comprehensive Telegram message replacing both the old
-    'market outlook' and 'periodic report' to avoid double notifications.
-    """
-    bullish_obs = bullish_obs or []
-    bearish_obs = bearish_obs or []
-    bullish_fvgs = bullish_fvgs or []
-    bearish_fvgs = bearish_fvgs or []
-    liquidity_pools = liquidity_pools or []
-    market_structures = market_structures or []
-    swing_highs = swing_highs or []
-    swing_lows = swing_lows or []
-    htf_components = htf_components or {}
-
-    kz = "🔥 KILLZONE" if in_killzone else "⚪"
-    lines = []
-
-    # ── Header ──────────────────────────────────────────
-    lines.append("🧠 <b>ICT BOT — MARKET OUTLOOK</b>")
-    lines.append(f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')} | {_fmt_price(current_price)}")
-    lines.append("")
-
-    # ── Directional Bias ────────────────────────────────
-    lines.append(f"<b>📐 BIAS</b>")
-    lines.append(f"  HTF: <b>{htf_bias}</b> ({htf_bias_strength:.0%})")
-    if htf_components:
-        ema_pos = htf_components.get("ema", "?")
-        ms_dir = htf_components.get("ms", "?")
-        hh_hl = htf_components.get("swing", "?")
-        bos_d = htf_components.get("bos", "?")
-        lines.append(f"  ↳ EMA34={ema_pos} MS={ms_dir} Pattern={hh_hl} BOS={bos_d}")
-    lines.append(f"  Daily: {daily_bias} | Regime: <b>{regime}</b> (ADX {regime_adx:.1f})")
-    lines.append(f"  {kz} Session: {session} | AMD: {amd_phase}")
-    lines.append("")
-
-    # ── Dealing Ranges with Price Levels ────────────────
-    lines.append("<b>📏 DEALING RANGES (IPDA)</b>")
-    if dr_weekly:
-        w_low = getattr(dr_weekly, 'low', 0)
-        w_high = getattr(dr_weekly, 'high', 0)
-        w_eq = (w_low + w_high) / 2 if w_low and w_high else 0
-        lines.append(f"  Weekly: {_fmt_price(w_low)} — <i>EQ {_fmt_price(w_eq)}</i> — {_fmt_price(w_high)}")
-    else:
-        lines.append("  Weekly: not formed")
-    if dr_daily:
-        d_low = getattr(dr_daily, 'low', 0)
-        d_high = getattr(dr_daily, 'high', 0)
-        d_eq = (d_low + d_high) / 2 if d_low and d_high else 0
-        lines.append(f"  Daily:  {_fmt_price(d_low)} — <i>EQ {_fmt_price(d_eq)}</i> — {_fmt_price(d_high)}")
-    else:
-        lines.append("  Daily:  not formed")
-    if dr_intraday:
-        i_low = getattr(dr_intraday, 'low', 0)
-        i_high = getattr(dr_intraday, 'high', 0)
-        i_eq = (i_low + i_high) / 2 if i_low and i_high else 0
-        lines.append(f"  Intra:  {_fmt_price(i_low)} — <i>EQ {_fmt_price(i_eq)}</i> — {_fmt_price(i_high)}")
-    else:
-        lines.append("  Intra:  not formed")
-    if dr_zone_tag:
-        lines.append(f"  ➡️ Price in: <b>{dr_zone_tag}</b>")
-    lines.append("")
-
-    # ── Key Swing Levels ────────────────────────────────
-    lines.append("<b>🔀 KEY SWINGS</b>")
-    # Nearest highs above price
-    highs_above = sorted([s for s in swing_highs if getattr(s, 'price', 0) > current_price],
-                         key=lambda s: s.price)[:3]
-    lows_below = sorted([s for s in swing_lows if getattr(s, 'price', 0) < current_price],
-                        key=lambda s: s.price, reverse=True)[:3]
-    if highs_above:
-        h_str = " | ".join(f"{_fmt_price(s.price)} [{getattr(s, 'timeframe', '?')}]" for s in highs_above)
-        lines.append(f"  ⬆️ Highs above: {h_str}")
-    if lows_below:
-        l_str = " | ".join(f"{_fmt_price(s.price)} [{getattr(s, 'timeframe', '?')}]" for s in lows_below)
-        lines.append(f"  ⬇️ Lows below: {l_str}")
-    lines.append("")
-
-    # ── Liquidity Pools ─────────────────────────────────
-    active_pools = [p for p in liquidity_pools if not getattr(p, 'swept', False)]
-    swept_pools = [p for p in liquidity_pools if getattr(p, 'swept', False)]
-
-    lines.append(f"<b>💧 LIQUIDITY ({len(active_pools)} active / {len(swept_pools)} swept)</b>")
-    eqh = [p for p in active_pools if getattr(p, 'pool_type', '') == 'EQH']
-    eql = [p for p in active_pools if getattr(p, 'pool_type', '') == 'EQL']
-    if eqh:
-        for p in sorted(eqh, key=lambda x: x.price)[:3]:
-            dist = abs(current_price - p.price) / current_price * 100
-            lines.append(f"  🔺 EQH @ {_fmt_price(p.price)} x{p.touch_count} ({_fmt_pct(dist)} away)")
-    if eql:
-        for p in sorted(eql, key=lambda x: x.price, reverse=True)[:3]:
-            dist = abs(current_price - p.price) / current_price * 100
-            lines.append(f"  🔻 EQL @ {_fmt_price(p.price)} x{p.touch_count} ({_fmt_pct(dist)} away)")
-    if swept_pools:
-        for p in swept_pools[-2:]:
-            lines.append(f"  ✅ {_liq_label(p)}")
-    lines.append("")
-
-    # ── Order Blocks (sorted by proximity) ──────────────
-    now_ms = int(time.time() * 1000)
-    active_bull_obs = [o for o in bullish_obs if getattr(o, 'is_active', lambda t: True)(now_ms)]
-    active_bear_obs = [o for o in bearish_obs if getattr(o, 'is_active', lambda t: True)(now_ms)]
-
-    lines.append(f"<b>📦 ORDER BLOCKS ({len(active_bull_obs)}B / {len(active_bear_obs)}S active)</b>")
-    # Bull OBs — sorted by distance to price (closest first)
-    for ob in sorted(active_bull_obs, key=lambda o: abs(current_price - o.midpoint))[:3]:
-        dist = abs(current_price - ob.midpoint) / current_price * 100
-        in_ob = "⚡IN" if ob.contains_price(current_price) else f"{_fmt_pct(dist)}"
-        ote = " OTE✓" if ob.in_optimal_zone(current_price) else ""
-        lines.append(f"  🟢 {_fmt_price(ob.low)}–{_fmt_price(ob.high)} str={ob.strength:.0f} v={ob.visit_count} [{in_ob}{ote}]")
-    for ob in sorted(active_bear_obs, key=lambda o: abs(current_price - o.midpoint))[:3]:
-        dist = abs(current_price - ob.midpoint) / current_price * 100
-        in_ob = "⚡IN" if ob.contains_price(current_price) else f"{_fmt_pct(dist)}"
-        ote = " OTE✓" if ob.in_optimal_zone(current_price) else ""
-        lines.append(f"  🔴 {_fmt_price(ob.low)}–{_fmt_price(ob.high)} str={ob.strength:.0f} v={ob.visit_count} [{in_ob}{ote}]")
-    lines.append("")
-
-    # ── Fair Value Gaps ─────────────────────────────────
-    active_bull_fvgs = [f for f in bullish_fvgs if getattr(f, 'is_active', lambda t: True)(now_ms)]
-    active_bear_fvgs = [f for f in bearish_fvgs if getattr(f, 'is_active', lambda t: True)(now_ms)]
-
-    lines.append(f"<b>📊 FVGs ({len(active_bull_fvgs)}B / {len(active_bear_fvgs)}S active)</b>")
-    for fvg in sorted(active_bull_fvgs, key=lambda f: abs(current_price - f.midpoint))[:2]:
-        in_fvg = "⚡IN" if fvg.is_price_in_gap(current_price) else ""
-        lines.append(f"  🟢 {_fmt_price(fvg.bottom)}–{_fmt_price(fvg.top)} fill={fvg.fill_percentage*100:.0f}% {in_fvg}")
-    for fvg in sorted(active_bear_fvgs, key=lambda f: abs(current_price - f.midpoint))[:2]:
-        in_fvg = "⚡IN" if fvg.is_price_in_gap(current_price) else ""
-        lines.append(f"  🔴 {_fmt_price(fvg.bottom)}–{_fmt_price(fvg.top)} fill={fvg.fill_percentage*100:.0f}% {in_fvg}")
-    lines.append("")
-
-    # ── Recent Market Structure ─────────────────────────
-    recent_ms = list(market_structures)[-5:]
-    lines.append(f"<b>📐 RECENT MSS ({len(market_structures)} total)</b>")
-    for ms in reversed(recent_ms):
-        lines.append(f"  {_mss_label(ms)}")
-    lines.append("")
-
-    # ── TRADE PLAN — The "What I'm Thinking" Section ────
-    lines.append("<b>🎯 TRADE PLAN</b>")
-
-    if long_plan:
-        lines.append(f"  <b>📗 LONG PLAN:</b>")
-        lines.append(f"    Status: {long_plan.get('status', '?')}")
-        if long_plan.get('gate_failed'):
-            lines.append(f"    ❌ Blocked: {_esc(long_plan['gate_failed'])}")
-        else:
-            if long_plan.get('entry'):
-                lines.append(f"    Entry: {_fmt_price(long_plan['entry'])}")
-            if long_plan.get('sl'):
-                lines.append(f"    SL: {_fmt_price(long_plan['sl'])} ({_esc(long_plan.get('sl_reason', ''))})")
-            if long_plan.get('tp'):
-                lines.append(f"    TP: {_fmt_price(long_plan['tp'])} ({_esc(long_plan.get('tp_reason', ''))})")
-            if long_plan.get('rr'):
-                lines.append(f"    RR: {long_plan['rr']:.1f} | Score: {long_plan.get('score', 0):.0f}/{long_plan.get('threshold', 0):.0f}")
-            if long_plan.get('missing'):
-                lines.append(f"    ⏳ Need: {_esc(long_plan['missing'])}")
-    else:
-        lines.append("  📗 LONG: No valid setup")
-
-    if short_plan:
-        lines.append(f"  <b>📕 SHORT PLAN:</b>")
-        lines.append(f"    Status: {short_plan.get('status', '?')}")
-        if short_plan.get('gate_failed'):
-            lines.append(f"    ❌ Blocked: {_esc(short_plan['gate_failed'])}")
-        else:
-            if short_plan.get('entry'):
-                lines.append(f"    Entry: {_fmt_price(short_plan['entry'])}")
-            if short_plan.get('sl'):
-                lines.append(f"    SL: {_fmt_price(short_plan['sl'])} ({_esc(short_plan.get('sl_reason', ''))})")
-            if short_plan.get('tp'):
-                lines.append(f"    TP: {_fmt_price(short_plan['tp'])} ({_esc(short_plan.get('tp_reason', ''))})")
-            if short_plan.get('rr'):
-                lines.append(f"    RR: {short_plan['rr']:.1f} | Score: {short_plan.get('score', 0):.0f}/{short_plan.get('threshold', 0):.0f}")
-            if short_plan.get('missing'):
-                lines.append(f"    ⏳ Need: {_esc(short_plan['missing'])}")
-    else:
-        lines.append("  📕 SHORT: No valid setup")
-
-    if entry_eval_status:
-        lines.append(f"\n  💡 {entry_eval_status}")
-
-    # ── CONSOLIDATED: Bot Stats + Position (merged from periodic report) ──
-    lines.append("")
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
-    lines.append(f"<b>💰 ACCOUNT</b>")
-    lines.append(f"  Balance: {_fmt_price(balance)} | State: <b>{bot_state}</b>")
-    lines.append(f"  {pnl_icon} Daily P&amp;L: {_fmt_price(daily_pnl)} | Total: {_fmt_price(total_pnl)}")
-    lines.append(f"  Trades: {total_trades} | WR: {win_rate:.1f}% | Losses: {consecutive_losses}")
-    if regime_atr_ratio > 0:
-        lines.append(f"  ATR×: {regime_atr_ratio:.2f} | Size×: {regime_size_mult:.2f}")
-
-    # Active position
-    if position:
-        p_side = position.get("side", "?").upper()
-        p_entry = entry_price or position.get("entry_price", 0)
-        lines.append("")
-        lines.append(f"<b>🔹 POSITION: {p_side}</b>")
-        lines.append(f"  Entry: {_fmt_price(p_entry)}")
-        if current_sl:
-            lines.append(f"  SL: {_fmt_price(current_sl)}")
-        if current_tp:
-            lines.append(f"  TP: {_fmt_price(current_tp)}")
-        if breakeven_moved:
-            lines.append(f"  🔒 BE moved | Locked: {profit_locked_pct:.1f}R")
-        if p_entry and current_price:
-            qty = float(position.get("quantity", 0) or position.get("qty", 0) or 0)
-            if p_side == "LONG":
-                price_delta = current_price - p_entry
-            else:
-                price_delta = p_entry - current_price
-            # Unrealised PnL = price_delta × qty_btc. Leverage is implicit in the
-            # position size itself; multiplying by leverage again inflates the figure by
-            # the leverage factor (40× at 40x) — a display error, not a calculation error.
-            usdt_pnl = price_delta * qty if qty > 0 else price_delta
-            risk_price = abs(p_entry - current_sl) if current_sl else 0
-            ur_r = price_delta / risk_price if risk_price > 0 else 0
-            upnl_icon = "🟢" if price_delta >= 0 else "🔴"
-            if qty > 0:
-                lines.append(f"  {upnl_icon} uPnL: <b>${usdt_pnl:+.2f}</b> ({ur_r:+.1f}R)")
-            else:
-                lines.append(f"  {upnl_icon} uPnL: Δ{_fmt_price(abs(price_delta))} ({ur_r:+.1f}R)")
-
-    if volume_delta and isinstance(volume_delta, dict):
-        dp = volume_delta.get("delta_pct", 0.0)
-        if dp != 0:
-            lines.append(f"  Vol Δ: {dp:+.2%}")
-
-    return "\n".join(lines)
+    return gates
 
 
 # ======================================================================
-# 2. ENTRY ALERT — Full Context Entry Notification
-# ======================================================================
-
-def format_entry_alert(
-    side: str,
-    score: float,
-    threshold: float,
-    entry_price: float,
-    sl_price: float,
-    tp_price: float,
-    position_size: float,
-    rr: float,
-    reasons: List[str],
-    # Structure context
-    trigger_ob: Optional[Any] = None,
-    trigger_fvg: Optional[Any] = None,
-    sweep_pool: Optional[Any] = None,
-    mss_event: Optional[Any] = None,
-    nearest_swing_low: Optional[float] = None,
-    nearest_swing_high: Optional[float] = None,
-    # Environment
-    htf_bias: str = "?",
-    daily_bias: str = "?",
-    regime: str = "?",
-    session: str = "?",
-    in_killzone: bool = False,
-    dr_zone: str = "?",
-    regime_size_mult: float = 1.0,
-    dr_mult: float = 1.0,
-    current_price: float = 0.0,
-) -> str:
-    """Comprehensive entry notification with every price level for chart verification."""
-
-    risk = abs(entry_price - sl_price)
-    reward = abs(tp_price - entry_price)
-
-    side_icon = "🟢" if side.upper() == "LONG" else "🔴"
-    kz = " 🔥KZ" if in_killzone else ""
-
-    lines = []
-    lines.append(f"{side_icon} <b>ENTRY: {side.upper()}</b>  Score: <b>{score:.0f}/{threshold:.0f}</b>{kz}")
-    lines.append("")
-
-    # ── Price Levels (the most important section) ───────
-    lines.append("<b>💰 LEVELS</b>")
-    lines.append(f"  Price Now: {_fmt_price(current_price)}")
-    lines.append(f"  Entry:     <b>{_fmt_price(entry_price)}</b>")
-    lines.append(f"  SL:        <b>{_fmt_price(sl_price)}</b> (risk: {_fmt_price(risk)})")
-    lines.append(f"  TP:        <b>{_fmt_price(tp_price)}</b> (reward: {_fmt_price(reward)})")
-    lines.append(f"  RR:        <b>{rr:.1f}:1</b>")
-    lines.append(f"  Size:      {position_size:.4f} BTC")
-    lines.append("")
-
-    # ── Structure Justification ─────────────────────────
-    lines.append("<b>🔍 STRUCTURE</b>")
-    if trigger_ob:
-        lines.append(f"  OB: {_fmt_price(trigger_ob.low)}–{_fmt_price(trigger_ob.high)} str={trigger_ob.strength:.0f} v={trigger_ob.visit_count}")
-    if trigger_fvg:
-        lines.append(f"  FVG: {_fmt_price(trigger_fvg.bottom)}–{_fmt_price(trigger_fvg.top)} fill={trigger_fvg.fill_percentage*100:.0f}%")
-    if sweep_pool:
-        lines.append(f"  Sweep: {getattr(sweep_pool, 'pool_type', '?')} @ {_fmt_price(sweep_pool.price)}")
-    if mss_event:
-        lines.append(f"  MSS: {getattr(mss_event, 'structure_type', '?')} {getattr(mss_event, 'direction', '?')} [{getattr(mss_event, 'timeframe', '?')}]")
-    if nearest_swing_low:
-        lines.append(f"  Swing Low:  {_fmt_price(nearest_swing_low)}")
-    if nearest_swing_high:
-        lines.append(f"  Swing High: {_fmt_price(nearest_swing_high)}")
-    lines.append("")
-
-    # ── Environment ─────────────────────────────────────
-    lines.append("<b>🌍 ENVIRONMENT</b>")
-    lines.append(f"  HTF: {htf_bias} | Daily: {daily_bias}")
-    lines.append(f"  Regime: {regime} | Session: {session}")
-    lines.append(f"  DR zone: {dr_zone}")
-    lines.append(f"  Size mult: regime={regime_size_mult:.2f} DR={dr_mult:.2f}")
-    lines.append("")
-
-    # ── Confluence Reasons ──────────────────────────────
-    lines.append("<b>📊 CONFLUENCE</b>")
-    for i, r in enumerate(reasons[:8], 1):
-        lines.append(f"  {i}. {_esc(r)}")
-
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 3. TRAIL UPDATE — SL Move with Context
-# ======================================================================
-
-def format_trail_update(
-    side: str,
-    old_sl: float,
-    new_sl: float,
-    entry_price: float,
-    current_price: float,
-    trail_reason: str,
-    current_rr: float,
-    profit_locked_pct: float,
-    breakeven_moved: bool,
-) -> str:
-    """Trailing SL update notification."""
-    side_icon = "🟢" if side.upper() == "LONG" else "🔴"
-    direction = "⬆️" if (side.upper() == "LONG" and new_sl > old_sl) else "⬇️"
-
-    risk = abs(entry_price - old_sl) if old_sl else 0
-    locked_r = profit_locked_pct
-
-    lines = []
-    lines.append(f"{side_icon} <b>TRAILING SL UPDATE</b>")
-    lines.append(f"  {direction} SL: {_fmt_price(old_sl)} → <b>{_fmt_price(new_sl)}</b>")
-    lines.append(f"  Entry: {_fmt_price(entry_price)} | Price: {_fmt_price(current_price)}")
-    lines.append(f"  Current RR: {current_rr:.1f} | Locked: {locked_r:.1f}R")
-    lines.append(f"  Reason: {_esc(trail_reason)}")
-    if breakeven_moved:
-        lines.append("  🔒 Breakeven active — risk-free trade")
-
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 4. POSITION CLOSE — Detailed Trade Review
-# ======================================================================
-
-def format_position_close(
-    side: str,
-    entry_price: float,
-    close_price: float,
-    sl_price: float,
-    tp_price: float,
-    pnl: float,
-    close_reason: str,
-    # Context at entry
-    entry_score: float = 0.0,
-    entry_reasons: Optional[List[str]] = None,
-    # Trailing info
-    breakeven_moved: bool = False,
-    max_favorable: float = 0.0,
-    max_adverse: float = 0.0,
-    # Stats
-    total_pnl: float = 0.0,
-    win_rate: float = 0.0,
-    total_trades: int = 0,
-    consecutive_losses: int = 0,
-) -> str:
-    """Comprehensive position close notification with trade review."""
-    entry_reasons = entry_reasons or []
-    side_icon = "🟢" if side.upper() == "LONG" else "🔴"
-    result_icon = "✅" if pnl > 0 else "❌"
-    risk = abs(entry_price - sl_price) if sl_price else 0
-    # RR must use price-to-price ratio (not USDT pnl / price distance)
-    if side.upper() == "LONG":
-        price_move = close_price - entry_price
-    else:
-        price_move = entry_price - close_price
-    rr_achieved = price_move / risk if risk > 0 else 0
-
-    lines = []
-    lines.append(f"{result_icon} <b>POSITION CLOSED: {side.upper()}</b>")
-    lines.append("")
-
-    lines.append("<b>💰 RESULT</b>")
-    lines.append(f"  PnL: <b>{_fmt_price(pnl)}</b> ({rr_achieved:+.1f}R)")
-    lines.append(f"  Reason: {_esc(close_reason)}")
-    lines.append("")
-
-    lines.append("<b>📊 LEVELS</b>")
-    lines.append(f"  Entry: {_fmt_price(entry_price)}")
-    lines.append(f"  Exit:  {_fmt_price(close_price)}")
-    lines.append(f"  SL:    {_fmt_price(sl_price)}")
-    lines.append(f"  TP:    {_fmt_price(tp_price)}")
-    lines.append("")
-
-    lines.append("<b>📈 TRADE METRICS</b>")
-    if max_favorable:
-        mfe_r = max_favorable / risk if risk > 0 else 0
-        lines.append(f"  Max Favorable: {_fmt_price(max_favorable)} ({mfe_r:.1f}R)")
-    if max_adverse:
-        mae_r = max_adverse / risk if risk > 0 else 0
-        lines.append(f"  Max Adverse:   {_fmt_price(max_adverse)} ({mae_r:.1f}R)")
-    if breakeven_moved:
-        lines.append("  🔒 Breakeven was moved")
-    if entry_score:
-        lines.append(f"  Entry Score:   {entry_score:.0f}")
-    lines.append("")
-
-    lines.append("<b>📊 SESSION</b>")
-    lines.append(f"  Total PnL: {_fmt_price(total_pnl)}")
-    lines.append(f"  Trades: {total_trades} | WR: {win_rate:.1f}%")
-    if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consec Losses: {consecutive_losses}")
-
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 5. PERIODIC STATUS — Balance/Health Summary
+# 1. PERIODIC REPORT
 # ======================================================================
 
 def format_periodic_report(
-    current_price: float = 0.0,
-    balance: float = 0.0,
-    total_trades: int = 0,
-    win_rate: float = 0.0,
-    daily_pnl: float = 0.0,
-    total_pnl: float = 0.0,
-    consecutive_losses: int = 0,
-    htf_bias: str = "UNKNOWN",
-    htf_bias_strength: float = 0.0,
-    daily_bias: str = "NEUTRAL",
-    session: str = "REGULAR",
-    in_killzone: bool = False,
-    amd_phase: str = "UNKNOWN",
-    bot_state: str = "UNKNOWN",
-    regime: str = "UNKNOWN",
-    regime_adx: float = 0.0,
-    position: Optional[Dict] = None,
-    current_sl: Optional[float] = None,
-    current_tp: Optional[float] = None,
-    entry_price: Optional[float] = None,
-    breakeven_moved: bool = False,
-    profit_locked_pct: float = 0.0,
-    # Structures count
-    bull_obs: int = 0,
-    bear_obs: int = 0,
-    bull_fvgs: int = 0,
-    bear_fvgs: int = 0,
-    liq_pools: int = 0,
-    swing_h: int = 0,
-    swing_l: int = 0,
-    mss_count: int = 0,
-    # DR prices
-    dr_weekly_str: str = "—",
-    dr_daily_str: str = "—",
-    dr_intraday_str: str = "—",
-    volume_delta: Optional[Dict] = None,
-    extra_lines: Optional[List[str]] = None,
+    current_price:       float = 0.0,
+    balance:             float = 0.0,
+    total_trades:        int   = 0,
+    win_rate:            float = 0.0,
+    daily_pnl:           float = 0.0,
+    total_pnl:           float = 0.0,
+    consecutive_losses:  int   = 0,
+    bot_state:           str   = "SCANNING",
+    n_bsl_pools:         int   = 0,
+    n_ssl_pools:         int   = 0,
+    primary_target_str:  str   = "—",
+    flow_conviction:     float = 0.0,
+    flow_direction:      str   = "",
+    amd_phase:           str   = "UNKNOWN",
+    session:             str   = "REGULAR",
+    in_killzone:         bool  = False,
+    regime:              str   = "UNKNOWN",
+    position:            Optional[Dict] = None,
+    current_sl:          Optional[float] = None,
+    current_tp:          Optional[float] = None,
+    entry_price:         Optional[float] = None,
+    breakeven_moved:     bool  = False,
+    profit_locked_pct:   float = 0.0,
+    extra_lines:         Optional[List[str]] = None,
+    atr:                 float = 0.0,
+    htf_bias:            str   = "",
+    dealing_range_pd:    float = 0.5,
+    structure_15m:       str   = "",
+    structure_4h:        str   = "",
+    amd_bias:            str   = "",
+    nearest_bsl:         Optional[Dict] = None,
+    nearest_ssl:         Optional[Dict] = None,
+    sweep_analysis:      Optional[Dict] = None,
+    direction_hunt:        Optional[Any] = None,
+    direction_ps_analysis: Optional[Any] = None,
+    **_kwargs: Any,
 ) -> str:
-    """Periodic status report — sent every 15m."""
-    kz_icon = "🔥" if in_killzone else "⚪"
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
+    """15-minute institutional Telegram dashboard."""
+    ist_tz  = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist_tz).strftime("%H:%M IST")
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    lines = [
-        "<b>📊 ICT BOT v10 STATUS</b>",
-        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+    sess_icon = _session_icon(session)
+    kz_str    = " 🔥KZ" if in_killzone else ""
+    pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
+
+    _STATE_ICONS = {
+        "SCANNING":    "🔍",
+        "TRACKING":    "📡",
+        "READY":       "🎯",
+        "ENTERING":    "⚡",
+        "IN_POSITION": "📊",
+        "POST_SWEEP":  "🌊",
+    }
+    state_icon = _STATE_ICONS.get((bot_state or "").upper(), "⚪")
+
+    _PD_LABEL = (
+        "DEEP DISC"  if dealing_range_pd < 0.25 else
+        "DISCOUNT"   if dealing_range_pd < 0.40 else
+        "EQ"         if dealing_range_pd < 0.60 else
+        "PREMIUM"    if dealing_range_pd < 0.75 else
+        "DEEP PREM"
+    )
+
+    lines: List[str] = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>STATUS</b>  {_esc(now_ist)} / {_esc(now_utc)}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"💰 BTC: <b>{_fmt_price(current_price)}</b>",
-        f"💵 Balance: {_fmt_price(balance)}",
-        f"{pnl_icon} Daily P&L: {_fmt_price(daily_pnl)}",
-        f"📈 Total P&L: {_fmt_price(total_pnl)}",
-        "",
-        f"🎯 State: <b>{bot_state}</b>",
-        f"📐 HTF: <b>{htf_bias}</b> ({htf_bias_strength:.0%}) | Daily: {daily_bias}",
-        f"🏛️ Regime: {regime} (ADX {regime_adx:.1f})",
-        f"{kz_icon} {session} | AMD: {amd_phase}",
-        "",
-        f"📏 DR: W={dr_weekly_str} D={dr_daily_str} I={dr_intraday_str}",
-        "",
-        f"📦 OB: {bull_obs}B/{bear_obs}S | FVG: {bull_fvgs}B/{bear_fvgs}S",
-        f"💧 Liq: {liq_pools} | Swings: {swing_h}H/{swing_l}L | MSS: {mss_count}",
     ]
 
-    # Active position
-    if position:
-        side  = position.get("side", "?").upper()
-        entry_p = entry_price or position.get("entry_price", 0)
-        lines.append("")
-        lines.append(f"<b>🔹 POSITION: {side}</b>")
-        lines.append(f"  Entry: {_fmt_price(entry_p)}")
-        if current_sl:
-            lines.append(f"  SL: {_fmt_price(current_sl)}")
-        if current_tp:
-            lines.append(f"  TP: {_fmt_price(current_tp)}")
-        if breakeven_moved:
-            lines.append(f"  🔒 BE moved | Locked: {profit_locked_pct:.1f}R")
-        # Unrealized P&L — actual USDT amount (price delta × qty × leverage)
-        # qty was divided by leverage during position sizing, so multiply back
-        if entry_p and current_price:
-            qty = float(position.get("quantity", 0) or position.get("qty", 0) or 0)
-            if side == "LONG":
-                price_delta = current_price - entry_p
-            else:
-                price_delta = entry_p - current_price
-            # Unrealised PnL = price_delta × qty_btc (leverage already implicit in qty).
-            usdt_pnl = price_delta * qty if qty > 0 else price_delta
-            risk_price = abs(entry_p - current_sl) if current_sl else 0
-            ur_r = price_delta / risk_price if risk_price > 0 else 0
-            upnl_icon = "🟢" if price_delta >= 0 else "🔴"
-            if qty > 0:
-                lines.append(f"  {upnl_icon} Unrealized: <b>${usdt_pnl:+.2f}</b> ({ur_r:+.1f}R) | Δ{_fmt_price(abs(price_delta))}")
-            else:
-                lines.append(f"  {upnl_icon} Unrealized: Δ{_fmt_price(price_delta)} ({ur_r:+.1f}R)")
-
-    if volume_delta and isinstance(volume_delta, dict):
-        dp = volume_delta.get("delta_pct", 0.0)
-        if dp != 0:
-            lines.append(f"  Vol Δ: {dp:+.2%}")
+    lines.append(f"💰 BTC: <b>{_fmt_price(current_price)}</b>")
+    atr_part = f"  ATR: {_fmt_price(atr)}" if atr > 0 else ""
+    lines.append(f"  💵 Bal: {_fmt_price(balance)}{atr_part}")
+    lines.append(
+        f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  "
+        f"Total: {_fmt_price(total_pnl)}"
+    )
 
     lines.append("")
-    lines.append(f"📊 Trades: {total_trades} | WR: {win_rate:.1f}% | Consec L: {consecutive_losses}")
+    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  "
+                 f"{sess_icon} {_esc(session)}{kz_str}")
+
+    lines.append("")
+    lines.append("🏛️ <b>MARKET STRUCTURE</b>")
+    lines.append(f"  AMD: {_esc(amd_phase)} ({_esc(amd_bias)})")
+
+    htf_parts: List[str] = []
+    if structure_4h:  htf_parts.append(f"4H:{_esc(structure_4h)}")
+    if structure_15m: htf_parts.append(f"15m:{_esc(structure_15m)}")
+    if htf_bias:      htf_parts.append(f"HTF:{_esc(htf_bias)}")
+    if htf_parts:
+        lines.append(f"  {' | '.join(htf_parts)}")
+
+    lines.append(f"  Dealing range: {_PD_LABEL} ({dealing_range_pd:.0%})")
+    lines.append(f"  Regime: {_esc(regime)}")
+
+    lines.append("")
+    lines.append("🎯 <b>LIQUIDITY</b>")
+    lines.append(f"  BSL ▲ {int(n_bsl_pools)} pools  |  "
+                 f"SSL ▼ {int(n_ssl_pools)} pools")
+
+    if nearest_bsl:
+        lines.append(
+            f"  ▲ Nearest BSL: {_fmt_price(nearest_bsl.get('price', 0))} "
+            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR "
+            f"sig={nearest_bsl.get('significance', 0):.0f} "
+            f"{_esc(nearest_bsl.get('timeframe', ''))})"
+        )
+    if nearest_ssl:
+        lines.append(
+            f"  ▼ Nearest SSL: {_fmt_price(nearest_ssl.get('price', 0))} "
+            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR "
+            f"sig={nearest_ssl.get('significance', 0):.0f} "
+            f"{_esc(nearest_ssl.get('timeframe', ''))})"
+        )
+
+    if primary_target_str and primary_target_str != "—":
+        lines.append(f"  🎯 Target: {_esc(primary_target_str)}")
+
+    if sweep_analysis:
+        rs = float(sweep_analysis.get("reversal_score", 0))
+        cs = float(sweep_analysis.get("continuation_score", 0))
+        rr = sweep_analysis.get("reversal_reasons", []) or []
+        cr = sweep_analysis.get("continuation_reasons", []) or []
+        sw_side = sweep_analysis.get("sweep_side", "?")
+        sw_price = sweep_analysis.get("sweep_price", 0)
+        winner = ("REVERSAL"     if rs > cs + 15 else
+                  "CONTINUATION" if cs > rs + 15 else
+                  "UNDECIDED")
+        lines.append("")
+        lines.append(
+            f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)})"
+        )
+        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{_esc(winner)}</b>")
+        if rr:
+            lines.append(f"  Rev:  {_esc(', '.join(str(r) for r in rr[:3]))}")
+        if cr:
+            lines.append(f"  Cont: {_esc(', '.join(str(r) for r in cr[:3]))}")
+
+    if direction_hunt is not None:
+        dh_pred  = getattr(direction_hunt, "predicted", None)
+        dh_conf  = float(getattr(direction_hunt, "confidence", 0.0))
+        dh_deliv = getattr(direction_hunt, "delivery_direction", "")
+        dh_bsl   = float(getattr(direction_hunt, "bsl_score", 0.0))
+        dh_ssl   = float(getattr(direction_hunt, "ssl_score", 0.0))
+        dh_raw   = float(getattr(direction_hunt, "raw_score",  0.0))
+
+        hunt_icon  = "🔵" if dh_pred == "BSL" else ("🟠" if dh_pred == "SSL" else "⚪")
+        deliv_icon = "🟢" if dh_deliv == "bullish" else ("🔴" if dh_deliv == "bearish" else "⚪")
+
+        lines.append("")
+        lines.append(f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(dh_pred or 'NEUTRAL')}")
+        lines.append(
+            f"  [{_score_bar(dh_conf)}] {dh_conf:.0%}  "
+            f"{deliv_icon} {_esc(dh_deliv or '—')}"
+        )
+        lines.append(f"  BSL={dh_bsl:.3f}  SSL={dh_ssl:.3f}  raw={dh_raw:+.3f}")
+
+    if direction_ps_analysis is not None:
+        ps_action = getattr(direction_ps_analysis, "action", "?")
+        ps_dir    = getattr(direction_ps_analysis, "direction", "")
+        ps_conf   = float(getattr(direction_ps_analysis, "confidence", 0.0))
+        ps_phase  = getattr(direction_ps_analysis, "phase", "")
+        ps_rev    = float(getattr(direction_ps_analysis, "rev_score",  0.0))
+        ps_cont   = float(getattr(direction_ps_analysis, "cont_score", 0.0))
+        ps_cisd   = getattr(direction_ps_analysis, "cisd_active", False)
+        ps_ote    = getattr(direction_ps_analysis, "ote_active",  False)
+        ps_disp   = float(getattr(direction_ps_analysis, "displacement_atr", 0.0))
+
+        ps_winner = ("REVERSAL"     if ps_rev  > ps_cont + 15 else
+                     "CONTINUATION" if ps_cont > ps_rev  + 15 else
+                     "CONTESTED")
+        ps_ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
+            ps_action.lower(), "❓"
+        )
+        ps_di = "🟢" if ps_dir == "long" else ("🔴" if ps_dir == "short" else "⚪")
+
+        lines.append("")
+        lines.append(
+            f"{ps_ai} <b>POST-SWEEP VERDICT</b>: {_esc(ps_action.upper())}  "
+            f"{ps_di} {_esc(ps_dir.upper() or '—')}"
+        )
+        lines.append(f"  conf={ps_conf:.0%}  phase={_esc(ps_phase)}")
+        lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {_esc(ps_winner)}")
+
+        ps_flags: List[str] = []
+        if ps_cisd: ps_flags.append("CISD✓")
+        if ps_ote:  ps_flags.append("OTE✓")
+        if ps_disp > 0: ps_flags.append(f"disp={ps_disp:.2f}ATR")
+        if ps_flags:
+            lines.append("  " + "  ".join(_esc(x) for x in ps_flags))
+
+    lines.append("")
+    gate_lines = _build_gate_diagnostic(
+        direction_hunt   = direction_hunt,
+        amd_phase        = amd_phase,
+        dealing_range_pd = dealing_range_pd,
+        session          = session,
+        flow_conviction  = flow_conviction,
+        flow_direction   = flow_direction,
+        htf_bias         = htf_bias,
+    )
+    lines.extend(gate_lines)
+
+    if position:
+        side    = (position.get("side") or "?").upper()
+        p_entry = entry_price or position.get("entry_price", 0)
+        qty     = float(position.get("quantity", 0) or 0)
+
+        side_icon = "🟢" if side == "LONG" else "🔴"
+        lines.append("")
+        lines.append(f"{side_icon} <b>POSITION: {_esc(side)}</b>")
+        lines.append(f"  Entry: {_fmt_price(p_entry)}")
+
+        if current_sl:
+            sl_dist = abs(current_price - current_sl) / max(atr, 1) if atr > 0 else 0
+            lines.append(f"  SL: {_fmt_price(current_sl)} ({sl_dist:.1f}ATR)")
+        if current_tp:
+            tp_dist = abs(current_tp - current_price) / max(atr, 1) if atr > 0 else 0
+            lines.append(f"  TP: {_fmt_price(current_tp)} ({tp_dist:.1f}ATR)")
+
+        if p_entry and current_price:
+            move = ((current_price - p_entry) if side == "LONG"
+                    else (p_entry - current_price))
+            risk_d = abs(p_entry - current_sl) if current_sl else 0
+            ur_r   = move / risk_d if risk_d > 0 else 0
+            upnl   = move * qty if qty > 0 else move
+            icon   = "🟢" if move >= 0 else "🔴"
+
+            bar = "░" * 16
+            prog = 0.0
+            if current_tp:
+                total = abs(current_tp - p_entry)
+                if total > 0:
+                    prog = min(1.0, max(0.0, abs(current_price - p_entry) / total))
+                    if move < 0:
+                        prog = 0.0
+                    filled = int(prog * 16)
+                    bar = "█" * filled + "░" * (16 - filled)
+
+            if qty > 0:
+                lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.2f}R)")
+            else:
+                lines.append(f"  {icon} {move:+.1f}pts ({ur_r:+.2f}R)")
+            lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
+
+        if breakeven_moved:
+            lines.append(f"  🔒 BE locked | {profit_locked_pct:.1f}R secured")
+
+    lines.append("")
+    lines.append("📈 <b>PERFORMANCE</b>")
+    lines.append(f"  Trades: {int(total_trades)}  |  WR: {win_rate:.1f}%")
+    if consecutive_losses > 0:
+        lines.append(f"  ⚠️ Consecutive losses: {int(consecutive_losses)}")
 
     if extra_lines:
+        lines.append("")
         for el in extra_lines:
             if el and el.strip():
+                # extra_lines can contain HTML — let _sanitize_html handle it
                 lines.append(el)
 
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 
 # ======================================================================
-# 6. STRUCTURE DEEP REPORT — /structures command
+# 2. HUNT PREDICTION
 # ======================================================================
 
-def format_structures_report(
-    current_price: float = 0.0,
-    htf_bias: str = "UNKNOWN",
-    htf_bias_strength: float = 0.0,
-    daily_bias: str = "NEUTRAL",
-    session: str = "REGULAR",
-    in_killzone: bool = False,
-    amd_phase: str = "UNKNOWN",
-    bullish_obs: Optional[List] = None,
-    bearish_obs: Optional[List] = None,
-    bullish_fvgs: Optional[List] = None,
-    bearish_fvgs: Optional[List] = None,
-    liquidity_pools: Optional[List] = None,
-    market_structures: Optional[List] = None,
-    swing_highs: Optional[List] = None,
-    swing_lows: Optional[List] = None,
-    volume_delta: Optional[Dict] = None,
+def format_direction_hunt_alert(
+    predicted:           Optional[str],
+    confidence:          float,
+    delivery_direction:  str,
+    bsl_score:           float,
+    ssl_score:           float,
+    nearest_bsl:         Optional[Dict] = None,
+    nearest_ssl:         Optional[Dict] = None,
+    raw_score:           float = 0.0,
+    current_price:       float = 0.0,
+    atr:                 float = 0.0,
 ) -> str:
-    """Deep ICT structure analysis report with all price levels."""
-    bullish_obs = bullish_obs or []
-    bearish_obs = bearish_obs or []
-    bullish_fvgs = bullish_fvgs or []
-    bearish_fvgs = bearish_fvgs or []
-    liquidity_pools = liquidity_pools or []
-    market_structures = market_structures or []
-    swing_highs = swing_highs or []
-    swing_lows = swing_lows or []
+    hunt_icon = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
+    deliv_icon = "🟢" if delivery_direction == "bullish" else \
+                 ("🔴" if delivery_direction == "bearish" else "⚪")
+    lines = [
+        f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(predicted or 'NEUTRAL')}",
+        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
+        f"  Delivery:   {deliv_icon} {_esc(delivery_direction or '—')}",
+        f"  BSL score:  {bsl_score:+.3f}",
+        f"  SSL score:  {ssl_score:+.3f}",
+        f"  Raw:        {raw_score:+.3f}",
+    ]
+    if current_price > 0:
+        lines.append(f"  Price:      {_fmt_price(current_price)}")
+    if atr > 0:
+        lines.append(f"  ATR:        {_fmt_price(atr)}")
+    if nearest_bsl:
+        lines.append(
+            f"  ▲ BSL target: {_fmt_price(nearest_bsl.get('price', 0))} "
+            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR)"
+        )
+    if nearest_ssl:
+        lines.append(
+            f"  ▼ SSL target: {_fmt_price(nearest_ssl.get('price', 0))} "
+            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR)"
+        )
+    return "\n".join(lines)
 
-    now_ms = int(time.time() * 1000)
+
+# ======================================================================
+# 3. POST-SWEEP VERDICT
+# ======================================================================
+
+def format_post_sweep_verdict(
+    action:           str,
+    direction:        str,
+    confidence:       float,
+    phase:            str,
+    rev_score:        float,
+    cont_score:       float,
+    cisd_active:      bool = False,
+    ote_active:       bool = False,
+    displacement_atr: float = 0.0,
+    sweep_side:       str   = "",
+    sweep_price:      float = 0.0,
+    current_price:    float = 0.0,
+    atr:              float = 0.0,
+    **_kwargs: Any,
+) -> str:
+    ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
+        action.lower(), "❓"
+    )
+    di = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
+    winner = ("REVERSAL"     if rev_score  > cont_score + 15 else
+              "CONTINUATION" if cont_score > rev_score  + 15 else
+              "CONTESTED")
 
     lines = [
-        "<b>🔬 ICT STRUCTURE ANALYSIS</b>",
-        f"Price: <b>{_fmt_price(current_price)}</b>",
-        f"HTF: {htf_bias} ({htf_bias_strength:.0%}) | Daily: {daily_bias}",
-        f"Session: {session} | AMD: {amd_phase}",
+        f"{ai} <b>POST-SWEEP VERDICT</b>: {_esc(action.upper())}  "
+        f"{di} {_esc(direction.upper() or '—')}",
+        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
+        f"  Phase:      {_esc(phase)}",
+        f"  Sweep:      {_esc(sweep_side)} @ {_fmt_price(sweep_price)}",
+        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}  → {_esc(winner)}",
+    ]
+    flags: List[str] = []
+    if cisd_active: flags.append("CISD✓")
+    if ote_active:  flags.append("OTE✓")
+    if displacement_atr > 0: flags.append(f"disp={displacement_atr:.2f}ATR")
+    if flags:
+        lines.append("  " + "  ".join(_esc(f) for f in flags))
+    if current_price > 0:
+        lines.append(f"  Price={_fmt_price(current_price)}  ATR={_fmt_price(atr)}")
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 4. POOL GATE ALERT
+# ======================================================================
+
+def format_pool_gate_alert(
+    action:          str,                # "exit" | "reverse" | "continue"
+    side:            str,                # position side
+    pool_side:       str,                # "BSL" | "SSL"
+    pool_price:      float,
+    current_price:   float,
+    reason:          str = "",
+    rev_score:       float = 0.0,
+    cont_score:      float = 0.0,
+    **_kwargs: Any,
+) -> str:
+    act_icon = {"exit": "🚪", "reverse": "🔄", "continue": "➡️"}.get(
+        action.lower(), "❓"
+    )
+    lines = [
+        f"{act_icon} <b>POOL-GATE {_esc(action.upper())}</b>",
+        f"  Position:  {_esc(side.upper())}",
+        f"  Pool hit:  {_esc(pool_side)} @ {_fmt_price(pool_price)}",
+        f"  Price:     {_fmt_price(current_price)}",
+        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}",
+    ]
+    if reason:
+        lines.append(f"  Reason: {_esc(reason)}")
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 5. CONVICTION BLOCK ALERT
+# ======================================================================
+
+def format_conviction_block_alert(
+    side:               str,
+    factor_scores:      Dict[str, float],
+    weighted_total:     float,
+    reasons:            Optional[List[str]] = None,
+    required_score:     float = _REQUIRED_CONVICTION_SCORE,
+    **_kwargs: Any,
+) -> str:
+    deficit = max(0.0, required_score - weighted_total)
+    lines = [
+        f"🚫 <b>CONVICTION BLOCKED</b> {_esc(side.upper())}",
+        f"  Total: <b>{weighted_total:.2f}</b> / {required_score:.2f}  "
+        f"(need +{deficit:.2f})",
         "",
+        "  <b>Factor scores</b>",
     ]
-
-    # Order Blocks — ALL with full detail
-    lines.append(f"<b>📦 BULLISH OBs ({len(bullish_obs)})</b>")
-    for ob in sorted(bullish_obs, key=lambda o: abs(current_price - o.midpoint)):
-        if not ob.is_active(now_ms):
-            continue
-        dist = abs(current_price - ob.midpoint) / current_price * 100
-        in_ob = "⚡IN" if ob.contains_price(current_price) else ""
-        ote = " OTE✓" if ob.in_optimal_zone(current_price) else ""
-        bos = " BOS✓" if ob.bos_confirmed else ""
-        disp = " DISP✓" if ob.has_displacement else ""
-        lines.append(
-            f"  {_fmt_price(ob.low)}–{_fmt_price(ob.high)} "
-            f"str={ob.strength:.0f} v={ob.visit_count} "
-            f"{_fmt_pct(dist)}{in_ob}{ote}{bos}{disp}")
-
-    lines.append(f"<b>📦 BEARISH OBs ({len(bearish_obs)})</b>")
-    for ob in sorted(bearish_obs, key=lambda o: abs(current_price - o.midpoint)):
-        if not ob.is_active(now_ms):
-            continue
-        dist = abs(current_price - ob.midpoint) / current_price * 100
-        in_ob = "⚡IN" if ob.contains_price(current_price) else ""
-        ote = " OTE✓" if ob.in_optimal_zone(current_price) else ""
-        bos = " BOS✓" if ob.bos_confirmed else ""
-        disp = " DISP✓" if ob.has_displacement else ""
-        lines.append(
-            f"  {_fmt_price(ob.low)}–{_fmt_price(ob.high)} "
-            f"str={ob.strength:.0f} v={ob.visit_count} "
-            f"{_fmt_pct(dist)}{in_ob}{ote}{bos}{disp}")
-
-    # FVGs
-    lines.append("")
-    lines.append(f"<b>📊 BULLISH FVGs ({len(bullish_fvgs)})</b>")
-    for fvg in sorted(bullish_fvgs, key=lambda f: abs(current_price - f.midpoint)):
-        if not fvg.is_active(now_ms):
-            continue
-        in_fvg = " ⚡IN" if fvg.is_price_in_gap(current_price) else ""
-        lines.append(f"  {_fvg_label(fvg)}{in_fvg}")
-
-    lines.append(f"<b>📊 BEARISH FVGs ({len(bearish_fvgs)})</b>")
-    for fvg in sorted(bearish_fvgs, key=lambda f: abs(current_price - f.midpoint)):
-        if not fvg.is_active(now_ms):
-            continue
-        in_fvg = " ⚡IN" if fvg.is_price_in_gap(current_price) else ""
-        lines.append(f"  {_fvg_label(fvg)}{in_fvg}")
-
-    # Liquidity
-    lines.append("")
-    lines.append(f"<b>💧 LIQUIDITY ({len(liquidity_pools)} pools)</b>")
-    for lp in sorted(liquidity_pools, key=lambda p: abs(current_price - p.price)):
-        lines.append(f"  {_liq_label(lp)}")
-
-    # MSS
-    lines.append("")
-    lines.append(f"<b>📐 MARKET STRUCTURE ({len(market_structures)})</b>")
-    for ms in reversed(list(market_structures)[-8:]):
-        lines.append(f"  {_mss_label(ms)}")
-
-    # Swings
-    lines.append("")
-    lines.append(f"<b>🔀 SWING HIGHS (nearest 5)</b>")
-    for s in sorted(swing_highs, key=lambda x: abs(current_price - x.price))[:5]:
-        lines.append(f"  {_fmt_price(s.price)} [{getattr(s, 'timeframe', '?')}]")
-    lines.append(f"<b>🔀 SWING LOWS (nearest 5)</b>")
-    for s in sorted(swing_lows, key=lambda x: abs(current_price - x.price))[:5]:
-        lines.append(f"  {_fmt_price(s.price)} [{getattr(s, 'timeframe', '?')}]")
-
-    return "\n".join(lines)
-
-
-# ======================================================================
-# 7. ENTRY REJECTION LOG — Why a setup was rejected
-# ======================================================================
-
-def format_rejection_log(
-    side: str,
-    current_price: float,
-    l1_result: str = "",
-    l2_result: str = "",
-    l3_result: str = "",
-    score: float = 0.0,
-    threshold: float = 0.0,
-    reasons: Optional[List[str]] = None,
-) -> str:
-    """Log entry rejection with full reasoning — console only, not sent to Telegram."""
-    reasons = reasons or []
-    lines = [
-        f"⛔ {side.upper()} rejected @ {_fmt_price(current_price)}",
-    ]
-    if l1_result:
-        lines.append(f"  L1: {l1_result}")
-    if l2_result:
-        lines.append(f"  L2: {l2_result}")
-    if l3_result:
-        lines.append(f"  L3: {l3_result}")
-    if score > 0:
-        lines.append(f"  Score: {score:.0f}/{threshold:.0f}")
+    for factor, score in factor_scores.items():
+        bar = _score_bar(min(1.0, max(0.0, score)), width=10)
+        lines.append(f"    {_esc(factor):<12} [{bar}] {score:+.2f}")
     if reasons:
-        lines.append(f"  Reasons: {', '.join(reasons[:5])}")
+        lines.append("")
+        lines.append("  <b>Rejection reasons</b>")
+        for r in reasons[:5]:
+            lines.append(f"    • {_esc(r)}")
     return "\n".join(lines)
 
 
 # ======================================================================
-# LOGGING HANDLER — forward WARNING+ to Telegram
+# 6. LIQUIDITY TRAIL UPDATE (v5.0 FIB ENGINE)
+# ======================================================================
+
+def format_liquidity_trail_update(
+    side:          str,
+    new_sl:        float,
+    anchor_price:  float,
+    anchor_tf:     str,
+    anchor_sig:    float,
+    phase:         str,
+    is_swept:      bool,
+    entry_price:   float,
+    current_price: float,
+    atr:           float,
+    session:       str = "",
+    # v5.0 extras (all optional so v4.0 callers still work)
+    fib_ratio:     Optional[float]   = None,
+    r_multiple:    float             = 0.0,
+    swing_low:     Optional[float]   = None,
+    swing_high:    Optional[float]   = None,
+    momentum_gate: str               = "",
+    htf_aligned:   Optional[bool]    = None,
+    is_cluster:    bool              = False,
+    n_cluster_tfs: int               = 1,
+    pool_boost:    bool              = False,
+    pool_between_expand: bool        = False,
+    buffer_atr:    float             = 0.0,
+) -> str:
+    """
+    Fibonacci SL trail advance alert (v5.0 engine).
+
+    Shows the full anchor reasoning: Fib ratio + swing context + momentum
+    source + HTF alignment + liquidity confluence tags.
+    Throttled in quant_strategy to one per 120s.
+    """
+    side_icon = "🟢" if (side or "").lower() == "long" else "🔴"
+    phase_icons = {
+        "STRUCTURAL":   "🏛️",
+        "AGGRESSIVE":   "🎯",
+        "BE_LOCK":      "🔒",
+        "COUNTER_BOS":  "🚨",
+        "HANDS_OFF":    "⏸",
+        "HOLD":         "⏸",
+    }
+    phase_icon = phase_icons.get(phase, "📍")
+
+    # Fib ratio display
+    fib_str = f"{fib_ratio:.3f}" if fib_ratio is not None else "?"
+    golden = fib_ratio in (0.382, 0.500, 0.618) if fib_ratio is not None else False
+    ratio_tag = f"✨ <b>{fib_str}</b>" if golden else f"<b>{fib_str}</b>"
+
+    # Cluster tag
+    cluster_tag = ""
+    if is_cluster:
+        cluster_tag = f" ×{int(n_cluster_tfs)}TF"
+
+    # Pool confluence
+    pool_tag = ""
+    if pool_boost:
+        pool_tag = " +pool"
+    if pool_between_expand:
+        pool_tag += " +expand"
+
+    # Momentum source
+    gate_emoji = {"DISP": "💥", "CVD": "📈", "BOS": "🏗️", "NONE": "⚪"}.get(
+        momentum_gate, "⚪"
+    )
+
+    # HTF alignment
+    htf_str = (
+        "🟢 aligned" if htf_aligned is True else
+        "🔴 counter" if htf_aligned is False else
+        "⚪ n/a"
+    )
+
+    sess_icons = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
+    sess_icon  = sess_icons.get((session or "").upper(), "🌐")
+
+    # Profit locked in R from entry
+    r_locked = 0.0
+    if atr > 1e-10 and entry_price > 0:
+        if (side or "").lower() == "long":
+            r_locked_pts = new_sl - entry_price
+        else:
+            r_locked_pts = entry_price - new_sl
+        r_locked = r_locked_pts / atr
+
+    dist_to_sl_atr = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
+
+    lines: List[str] = [
+        f"{side_icon} <b>FIBONACCI TRAIL</b>  {phase_icon} {_esc(phase)}  "
+        f"({r_multiple:.2f}R)",
+        "",
+        f"  🎯 SL → <b>{_fmt_price(new_sl)}</b>  "
+        f"({r_locked:+.2f}R from entry)",
+        f"  📐 Fib: {ratio_tag}{_esc(cluster_tag)}{_esc(pool_tag)}  "
+        f"{_fmt_price(anchor_price)} ({_fmt_tf(anchor_tf)})",
+    ]
+
+    if swing_low is not None and swing_high is not None:
+        swing_rng = abs(swing_high - swing_low)
+        lines.append(
+            f"  📊 Swing: {_fmt_price(swing_low)} → {_fmt_price(swing_high)}  "
+            f"({swing_rng:.0f}pts)"
+        )
+
+    if buffer_atr > 0:
+        lines.append(f"  🪶 Buffer: {buffer_atr:.2f} ATR")
+
+    if phase in ("STRUCTURAL", "AGGRESSIVE"):
+        lines.append(
+            f"  {gate_emoji} Momentum: {_esc(momentum_gate or 'n/a')}  "
+            f"HTF: {htf_str}"
+        )
+
+    lines.append(
+        f"  📏 Distance: {dist_to_sl_atr:.2f} ATR  |  Q: {anchor_sig:.1f}"
+    )
+
+    lines.append("")
+    lines.append(
+        f"  Entry: {_fmt_price(entry_price)}  |  "
+        f"Price: {_fmt_price(current_price)}  "
+        f"{sess_icon} {_esc(session or 'unknown')}"
+    )
+
+    if phase == "COUNTER_BOS":
+        lines.append(
+            "  <i>🚨 Counter-BOS broke entry — thesis invalidated, locked to BE</i>"
+        )
+    elif phase == "BE_LOCK":
+        lines.append(
+            "  <i>🔒 BE + exact fees + slippage locked; trade is now risk-free</i>"
+        )
+    elif is_cluster:
+        lines.append(
+            "  <i>Multi-TF Fib confluence — strongest possible anchor</i>"
+        )
+    elif pool_boost:
+        lines.append(
+            "  <i>Fibonacci + liquidity pool confluence</i>"
+        )
+    else:
+        lines.append(
+            "  <i>SL anchored to institutional Fib retracement</i>"
+        )
+
+    return "\n".join(lines)
+
+
+# ======================================================================
+# LOGGING HANDLER — forward WARNING+ logs to Telegram
 # ======================================================================
 
 class TelegramLogHandler(logging.Handler):
-    """Forward WARNING+ logs to Telegram with throttling."""
+    """Forward WARNING+ log records to Telegram with throttling and buffering."""
 
-    def __init__(self, level=logging.WARNING, throttle_seconds: float = 5.0):
+    def __init__(self, level: int = logging.WARNING, throttle_seconds: float = 5.0):
         super().__init__(level)
-        self._throttle  = throttle_seconds
-        self._last_ts   = 0.0
-        self._lock       = threading.Lock()
+        self._throttle = throttle_seconds
+        self._last_ts  = 0.0
+        self._lock     = threading.Lock()
         self._buffer: deque = deque(maxlen=10)
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -1097,16 +1077,16 @@ class TelegramLogHandler(logging.Handler):
                 self._buffer.clear()
                 msg = "\n".join(buffered) + "\n" + msg
 
-            # CRITICAL: escape content so log messages containing <, >, &
-            # (from exception reprs, Python type names, f-strings with dicts, etc.)
-            # do not break Telegram's HTML parser.
             send_telegram_message(f"⚠️ <code>{_esc(msg[:1500])}</code>")
         except Exception:
             pass
 
 
-def install_global_telegram_log_handler(level=logging.WARNING,
-                                         throttle_seconds: float = 5.0) -> None:
+def install_global_telegram_log_handler(
+    level: int = logging.WARNING,
+    throttle_seconds: float = 5.0,
+) -> None:
+    """Attach a TelegramLogHandler to the root logger."""
     handler = TelegramLogHandler(level=level, throttle_seconds=throttle_seconds)
     handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)

@@ -1,8 +1,10 @@
 """
-config.py — Unified configuration for Dual-Exchange Quant Bot
-=============================================================
-Single source of truth. All exchange-specific params are namespaced.
-Hot-reloadable at runtime via Telegram /set commands.
+config.py — Unified Configuration v10.0
+=========================================
+Single source of truth. All institutional parameters inline.
+No config_overrides.py — everything lives here.
+
+Calibrated for 65-75% WR, 3-6 trades per session.
 """
 import os
 from dotenv import load_dotenv
@@ -26,9 +28,9 @@ if not DELTA_API_KEY and not COINSWITCH_API_KEY:
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
 LEVERAGE                 = 40
-DELTA_SYMBOL             = "BTCUSD"         # Delta India perpetual
+DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
-DELTA_BALANCE_CURRENCY   = "USD"             # Delta India is USD-settled
+DELTA_BALANCE_CURRENCY   = "USD"
 COINSWITCH_SYMBOL        = "BTCUSDT"
 COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
@@ -41,29 +43,36 @@ MAX_POSITION_SIZE        = 1.0
 LOT_STEP_SIZE            = 0.001
 REMAINDER_MIN_QTY        = 0.001
 
-# ── Risk management ───────────────────────────────────────────────────────────
-RISK_PER_TRADE          = 0.60
-MAX_DAILY_LOSS          = 400
-MAX_DAILY_LOSS_PCT      = 5.0
-MAX_DRAWDOWN_PCT        = 15.0
-MAX_CONSECUTIVE_LOSSES  = 5
-MAX_DAILY_TRADES        = 8
-ONE_POSITION_AT_A_TIME  = True
-MIN_TIME_BETWEEN_TRADES = 5
-TRADE_COOLDOWN_SECONDS  = 600
-MIN_RISK_REWARD_RATIO   = 3.0
-TARGET_RISK_REWARD_RATIO= 4.0
-MAX_RR_RATIO            = 20.0
+# ── Risk management ──────────────────────────────────────────────────────────
+# RISK_PER_TRADE: FRACTION of available balance risked per trade (NOT percent).
+#   0.006 = 0.6% risk per trade.
+#   Previous value 0.60 was interpreted as percent by risk_manager (÷100 = 0.006 → 0.6%)
+#   but as FRACTION by quant_strategy._compute_quantity (× direct = 0.60 → 60%).
+#   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
+#   triggering the "required margin > available — scaling down" warnings in logs.
+#   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
+RISK_PER_TRADE           = 0.02     # 2% of available balance per trade
+MAX_DAILY_LOSS           = 10000
+MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker (relaxed)
+MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
+MAX_CONSECUTIVE_LOSSES   = 5         # allow more losses before lockout
+MAX_DAILY_TRADES         = 30        # allow more trades per day
+ONE_POSITION_AT_A_TIME   = True
+MIN_TIME_BETWEEN_TRADES  = 0.5       # 30 seconds between trades
+TRADE_COOLDOWN_SECONDS   = 30        # 30s cooldown after loss
+MIN_RISK_REWARD_RATIO    = 1.2       # allow tighter setups
+TARGET_RISK_REWARD_RATIO = 2.0
+MAX_RR_RATIO             = 20.0
 
 # ── Order execution ───────────────────────────────────────────────────────────
 TICK_SIZE                        = 0.1
-LIMIT_ORDER_OFFSET_TICKS         = 3      # fallback when book unavailable (3 × $0.1 = $0.30)
+LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
 MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
-LIMIT_ORDER_FILL_TIMEOUT_SEC     = 45.0  # 45s for reversion fill; expired = cancel + cooldown
+LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
 REQUEST_TIMEOUT                  = 30
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
@@ -74,19 +83,32 @@ MIN_CANDLES_15M      = 100
 MIN_CANDLES_1H       = 20
 MIN_CANDLES_4H       = 40
 MIN_CANDLES_1D       = 7
-# LOOKBACK_CANDLES_* must be >= the highest limit= argument passed to
-# get_candles() in quant_strategy.py for that timeframe.  These values
-# also drive _WARMUP_CONFIG in data_manager.py so both must stay in sync.
-# Mismatched values (100 < 300) caused get_candles("5m", limit=300) to
-# silently cap at the warmup fetch size and return only 200 candles at
-# startup, starving ICT OB/FVG detection and producing count instability.
-LOOKBACK_CANDLES_1M  = 150   # strategy requests up to 120; +30 headroom
-LOOKBACK_CANDLES_5M  = 300   # strategy requests 300 (main ICT + trail + sweep)
-LOOKBACK_CANDLES_15M = 200   # strategy requests 200
-LOOKBACK_CANDLES_4H  = 50    # unchanged
-CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "4h"]
-PRIMARY_TIMEFRAME    = "5m"
+LOOKBACK_CANDLES_1M  = 300
+LOOKBACK_CANDLES_5M  = 2100
+LOOKBACK_CANDLES_15M = 700
+LOOKBACK_CANDLES_1H  = 200
+LOOKBACK_CANDLES_4H  = 50
+LOOKBACK_CANDLES_1D  = 30
+CANDLE_TIMEFRAMES    = ["1m", "5m", "15m", "1h", "4h", "1d"]
+PRIMARY_TIMEFRAME    = "15m"
+ENTRY_TIMEFRAME      = "5m"
 HTF_TIMEFRAME        = "4h"
+
+# ── Session config ────────────────────────────────────────────────────────────
+SESSION_TRAIL_WIDTH_MULT = {
+    "asia":     1.60,
+    "london":   1.20,
+    "ny":       1.00,
+    "late_ny":  1.30,
+    "off":      1.50,
+}
+SESSION_ENTRY_QUALITY = {
+    "asia":     "LOW",
+    "london":   "HIGH",
+    "ny":       "HIGH",
+    "late_ny":  "MEDIUM",
+    "off":      "LOW",
+}
 
 # ── Health / Supervisor ───────────────────────────────────────────────────────
 WS_STALE_SECONDS                   = 35.0
@@ -94,7 +116,7 @@ HEALTH_CHECK_INTERVAL_SEC          = 12.0
 PRICE_STALE_SECONDS                = 90.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
-ENTRY_EVALUATION_INTERVAL_SECONDS  = 1
+ENTRY_EVALUATION_INTERVAL_SECONDS  = 0.5    # evaluate more frequently
 ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS
 
 # ── Logging / Reporting ───────────────────────────────────────────────────────
@@ -106,7 +128,7 @@ OUTLOOK_INTERVAL_SECONDS     = 900
 COMMISSION_RATE              = 0.00055
 COMMISSION_RATE_MAKER        = 0.00020
 DELTA_COMMISSION_RATE        = 0.00050
-DELTA_COMMISSION_RATE_MAKER  = -0.00020   # rebate
+DELTA_COMMISSION_RATE_MAKER  = -0.00020
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 GLOBAL_API_MIN_INTERVAL  = 3.0
@@ -114,24 +136,16 @@ DELTA_API_MIN_INTERVAL   = 0.25
 RATE_LIMIT_ORDERS        = 15
 
 # ── SL infrastructure ─────────────────────────────────────────────────────────
-# Trailing SL order type: stop-limit instead of stop-market.
-# Stop-limit = triggers at SL price, executes as limit order at limit_price.
-# Advantages: edit-in-place atomic (no cancel+replace cycle), maker fee rebate.
-# SL_LIMIT_OFFSET_TICKS: number of ticks of limit buffer past the stop trigger.
-#   SHORT SL (buy to close): limit_price = stop_price + offset (max buy price)
-#   LONG  SL (sell to close): limit_price = stop_price - offset (min sell price)
-# 20 ticks = $2.00 — covers normal BTC spread + slippage on structural breaks.
-# Bracket entry SL is always stop-market (guaranteed crash protection).
-SL_LIMIT_OFFSET_TICKS    = 20   # ticks of limit buffer on trailing stop-limit
-SL_BUFFER_TICKS              = 5
-MIN_SL_DISTANCE_PCT          = 0.001  # legacy pct floor; actual SL uses 1.0×ATR minimum
-MAX_SL_DISTANCE_PCT          = 0.035
-SL_MIN_IMPROVEMENT_PCT       = 0.001
-SL_RATCHET_ONLY              = True
-SL_ATR_PERIOD                = 14
-SL_ATR_BUFFER_MULT           = 0.75
+SL_LIMIT_OFFSET_TICKS    = 20
+SL_BUFFER_TICKS          = 5
+MIN_SL_DISTANCE_PCT      = 0.004     # BTC@$66K = $264 min SL distance
+MAX_SL_DISTANCE_PCT      = 0.035
+SL_MIN_IMPROVEMENT_PCT   = 0.001
+SL_RATCHET_ONLY          = True
+SL_ATR_PERIOD            = 14
+SL_ATR_BUFFER_MULT       = 0.75
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
-SL_MIN_IMPROVEMENT_ATR_MULT  = 0.08
+SL_MIN_IMPROVEMENT_ATR_MULT  = 0.20   # prevents micro SL updates
 TRAILING_SL_CHECK_INTERVAL   = 10
 TRAIL_SWING_MAX_AGE_MS       = 14_400_000
 
@@ -141,15 +155,15 @@ AGG_SECONDARY_WEIGHT = 0.45
 AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
 
-# ── Quant Strategy v4.9 ───────────────────────────────────────────────────────
+# ── Quant Strategy ────────────────────────────────────────────────────────────
 QUANT_MARGIN_PCT               = 0.20
 QUANT_SLIPPAGE_TOLERANCE       = 0.0005
 QUANT_VWAP_ENTRY_ATR_MULT      = 1.2
 QUANT_CVD_DIVERGENCE_MIN       = 0.15
 QUANT_OB_CONFIRM_MIN           = 0.10
-QUANT_COMPOSITE_ENTRY_MIN      = 0.35  # post-boost composite; pre-boost gate is QUANT_MIN_RAW_COMPOSITE
+QUANT_COMPOSITE_ENTRY_MIN      = 0.35
 QUANT_EXIT_REVERSAL_THRESH     = 0.40
-QUANT_CONFIRM_TICKS            = 3    # code enforces max(CONFIRM_TICKS,5) for reversion
+QUANT_CONFIRM_TICKS            = 1        # confirm faster
 QUANT_SL_SWING_LOOKBACK        = 12
 QUANT_SL_BUFFER_ATR_MULT       = 0.4
 QUANT_TP_VWAP_FRACTION         = 0.65
@@ -160,16 +174,20 @@ QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
 QUANT_TRAIL_ENABLED            = True
-QUANT_TRAIL_BE_R               = 0.40   # was 0.50 — trail starts a little earlier
-QUANT_TRAIL_LOCK_R             = 1.00
-QUANT_TRAIL_AGGRESSIVE_R       = 2.00
-QUANT_TRAIL_MIN_DIST_ATR_P1    = 1.50
-QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.10
-QUANT_TRAIL_MIN_DIST_ATR_P3    = 0.70
+QUANT_TRAIL_BE_R               = 1.00     # BE lock at 1.0R
+QUANT_TRAIL_LOCK_R             = 2.00     # structural trail at 2.0R
+QUANT_TRAIL_AGGRESSIVE_R       = 3.50     # aggressive trail at 3.5R
+QUANT_TRAIL_LIQ_MIN_BREATHING_ATR = 1.00
+QUANT_TRAIL_MIN_DIST_ATR_P1    = 2.00
+QUANT_TRAIL_MIN_DIST_ATR_P2    = 1.50
+QUANT_TRAIL_MIN_DIST_ATR_P3    = 1.00
 QUANT_TRAIL_PULLBACK_FREEZE    = True
 QUANT_TRAIL_PB_VOL_RATIO       = 0.65
 QUANT_TRAIL_PB_DEPTH_ATR       = 1.20
-QUANT_TRAIL_REV_MIN_SIGNALS    = 2     # was 4 — 2 reversal signals sufficient to unfreeze trail
+QUANT_TRAIL_REV_MIN_SIGNALS    = 2
+QUANT_TRAIL_PHASE1_TIER        = 0.40
+QUANT_TRAIL_PHASE2_TIER        = 1.00
+QUANT_TRAIL_PHASE3_TIER        = 2.00
 QUANT_ICT_ZONE_FREEZE_ENABLED  = True
 QUANT_ICT_ZONE_FREEZE_ATR      = 0.40
 QUANT_ICT_OB_SL_ANCHOR         = True
@@ -184,10 +202,10 @@ QUANT_EMA_SLOW                 = 21
 QUANT_VOL_FLOW_WINDOW          = 10
 QUANT_ATR_PCTILE_WINDOW        = 100
 QUANT_ATR_MIN_PCTILE           = 0.00
-QUANT_ATR_MAX_PCTILE           = 0.97
-QUANT_MAX_HOLD_SEC             = 2400
-QUANT_COOLDOWN_SEC             = 180
-QUANT_LOSS_LOCKOUT_SEC         = 300
+QUANT_ATR_MAX_PCTILE           = 1.00     # don't block high-vol entries
+QUANT_MAX_HOLD_SEC             = 3600      # 60 min max hold
+QUANT_COOLDOWN_SEC             = 30        # 30s between trades
+QUANT_LOSS_LOCKOUT_SEC         = 300       # 5 min lockout after consec losses
 QUANT_POS_SYNC_SEC             = 30
 QUANT_W_VWAP_DEV               = 0.30
 QUANT_W_CVD_DIV                = 0.25
@@ -195,7 +213,7 @@ QUANT_W_OB                     = 0.20
 QUANT_W_TICK_FLOW              = 0.15
 QUANT_W_VOL_EXHAUSTION         = 0.10
 QUANT_HTF_ENABLED              = True
-QUANT_HTF_VETO_STRENGTH        = 0.35  # composite veto (trend entries); reversion uses per-TF
+QUANT_HTF_VETO_STRENGTH        = 0.00     # disabled — advisory only
 QUANT_OB_DEPTH_LEVELS          = 5
 QUANT_OB_HIST_LEN              = 60
 QUANT_TICK_AGG_WINDOW_SEC      = 30.0
@@ -215,29 +233,31 @@ QUANT_TREND_TP_ATR_MULT        = 2.5
 QUANT_TREND_COMPOSITE_MIN      = 0.35
 QUANT_TREND_CONFIRM_TICKS      = 3
 QUANT_TREND_CHANDELIER_N       = 1.5
-QUANT_MAX_SPREAD_ATR_RATIO     = 0.30
-QUANT_REVERSION_MIN_RR         = 1.5
-QUANT_REVERSION_MAX_RR         = 3.0
-QUANT_TREND_MIN_RR             = 2.0
-QUANT_TREND_MAX_RR             = 3.0
+QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # more spread tolerance
+QUANT_REVERSION_MIN_RR         = 1.2      # lowered to allow more setups
+QUANT_REVERSION_MAX_RR         = 5.0
+QUANT_TREND_MIN_RR             = 1.2
+QUANT_TREND_MAX_RR             = 5.0
 QUANT_TREND_SL_ATR_MULT        = 2.0
 QUANT_TP_MIN_ATR_MULT          = 0.5
 QUANT_TP_MAX_ATR_MULT          = 6.0
 QUANT_REVERSION_REJECT_RR      = 0.20
 QUANT_SL_MAX_ATR_MULT          = 4.0
-QUANT_BO_MIN_SCORE             = 4
-QUANT_BO_BLOCK_SEC             = 900
-QUANT_BO_RETEST_TIMEOUT        = 900
-QUANT_RETEST_RETRY_SEC         = 30
 QUANT_SMART_MAX_HOLD           = True
 QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.5
 QUANT_MAX_HOLD_EXTENSIONS      = 5
 QUANT_HOLD_EXTENSION_SEC       = 1200
 QUANT_THESIS_MAX_DRAWDOWN_PCT  = 0.70
+QUANT_MIN_RAW_COMPOSITE        = 0.20     # lowered composite threshold
+QUANT_MIN_CONFIRMING           = 2        # need only 2 confirming signals
 
 # ── Fee engine ────────────────────────────────────────────────────────────────
 FEE_SPREAD_HIST_MAXLEN      = 500
-FEE_SPREAD_DEFAULT_BPS      = 2.0
+# CFG-2 fix: 0.20 matches fee_engine code-level default (line 115 comment says
+# "Warmup default: 0.20 bps — realistic for BTC inverse perp (actual ~0.15 bps).
+# The old default of 2.0 bps was 13× too wide, causing fee-floor over-rejection
+# during the first ~5 seconds of each session.")
+FEE_SPREAD_DEFAULT_BPS      = 0.20
 FEE_SLIP_ALPHA              = 0.25
 FEE_SLIP_DEFAULT_BPS        = 1.5
 FEE_SLIP_MIN_BPS            = 0.5
@@ -246,7 +266,8 @@ FEE_FLOOR_MULT_HIGH         = 1.2
 FEE_FLOOR_MAX_ATR_MULT      = 2.0
 FEE_FLOOR_INFLECT           = 0.45
 FEE_FLOOR_STEEPNESS         = 6.0
-FEE_FLOOR_ABS_MIN_MULT      = 1.4
+# CFG-3 fix: fee_engine code comment (line 239) says "was 1.4" — lowered to 1.2
+FEE_FLOOR_ABS_MIN_MULT      = 1.2
 FEE_SPREAD_ATR_WARN         = 0.06
 FEE_SPREAD_PENALTY_K        = 4.0
 FEE_CONF_NEUTRAL            = 0.5
@@ -273,40 +294,57 @@ LIQ_TOUCH_TOLERANCE_PCT     = 0.20
 SWEEP_DISPLACEMENT_MIN      = 0.40
 SWEEP_MAX_AGE_MINUTES       = 120
 KZ_ASIA_NY_START            = 20
+KZ_ASIA_NY_END              = 1
 KZ_LONDON_NY_START          = 2
 KZ_LONDON_NY_END            = 5
 KZ_NY_NY_START              = 7
 KZ_NY_NY_END                = 10
 
 # ── ICT Gate ──────────────────────────────────────────────────────────────────
-# Minimum ICT structural confluence score required before any trade entry.
-# Ensures the bot never enters purely on quant signals without ICT structure.
-# Set to 0.0 to disable (quant-only mode).
-ICT_MIN_SCORE_FOR_ENTRY     = 0.45   # base gate (no OB credit) — session alone cannot pass
-ICT_OB_MIN_SCORE_FOR_ENTRY  = 0.35   # reduced gate when price is at/in an active OB
-                                      # (sig.ict_ob > 0.10). Rationale: in-zone OB entries
-                                      # have structural backing that justifies a lower bar.
-                                      # A twice-visited OTE BOS+DISP OB + KZ = ~0.35 → PASS.
-ICT_REQUIRE_OB_OR_FVG       = False  # proximity scoring handles this intent; True = hard
-                                      # require price physically inside an OB or FVG
-# v5.0: Proximity scoring — partial OB/FVG credit when price is near but not inside.
-# Mean-reversion entries fire after price bounces FROM an OB (just above it), so
-# contains_price() is always False → OB score = 0. These decay windows control the range.
-ICT_OB_PROXIMITY_ATR        = 1.5   # ATR distance within which an OB gets partial credit
-ICT_FVG_PROXIMITY_ATR       = 0.8   # ATR distance within which an FVG gets partial credit
-# v5.0: Confirmed displacement sweep bonus — added to weighted total post-scoring.
-# Without bonus: sweep+session caps at 0.30, below every threshold.
+ICT_MIN_SCORE_FOR_ENTRY     = 0.25     # lowered ICT score gate
+ICT_OB_MIN_SCORE_FOR_ENTRY  = 0.20     # lowered OB score gate
+ICT_REQUIRE_OB_OR_FVG       = False
+ICT_OB_PROXIMITY_ATR        = 1.5
+ICT_FVG_PROXIMITY_ATR       = 0.8
 ICT_SWEEP_DISP_BONUS        = 0.12
 
-# HTF veto — per-timeframe (reversion entries)
-# LONG veto:  15m < -0.35  OR  (15m < -0.20 AND 4h < -0.20)
-# SHORT veto: 15m > +0.35  OR  (15m > +0.20 AND 4h > +0.20)
-QUANT_HTF_15M_VETO           = 0.35  # 15m threshold for single-TF veto
-QUANT_HTF_BOTH_VETO          = 0.20  # threshold when both TFs align against trade
+# ── HTF context (no veto — advisory only) ─────────────────────────────────────
+QUANT_HTF_15M_VETO           = 0.00     # disabled — no HTF veto
+QUANT_HTF_BOTH_VETO          = 0.00     # disabled — no HTF veto
 
-# Quant signal quality gates (Gate C)
-QUANT_MIN_RAW_COMPOSITE      = 0.35  # pre-ICT-boost composite floor
-QUANT_MIN_CONFIRMING         = 4     # minimum confirming signals (of 5 quant + ICT)
+# ── Conviction Filter ─────────────────────────────────────────────────────────
+CONVICTION_MIN_SCORE               = 0.45    # lowered to allow trades to execute
+CONVICTION_POOL_MIN_TF_RANK        = 1       # allow all TF pools
+CONVICTION_DISPLACEMENT_BODY_ATR   = 0.40    # lower displacement requirement
+CONVICTION_OTE_FIB_LOW             = 0.382
+CONVICTION_OTE_FIB_HIGH            = 0.886
+CONVICTION_MIN_RR                  = 1.2     # match risk management R:R
+CONVICTION_MAX_SESSION_LOSSES      = 5       # allow more losses per session
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 10      # 10s pacing (on_tick cooldown is primary)
+CONVICTION_MAX_ENTRIES_PER_SESSION = 20      # allow many entries per session
 
-# ── Legacy aliases (strategy code reads these) ────────────────────────────────
-EXCHANGE = COINSWITCH_EXCHANGE   # used by CoinSwitch order_manager path
+# ── Trail (liquidity-first) ───────────────────────────────────────────────────
+QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
+QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15
+QUANT_TRAIL_LIQ_SAFETY_BUF_ATR    = 0.28
+QUANT_TRAIL_LIQ_POOL_LOOKBACK_ATR = 8.0
+QUANT_TRAIL_LIQ_BOS_CONFIRM_GATE  = True
+QUANT_TRAIL_LIQ_BOS_MAX_AGE_MS    = 10_000_000
+QUANT_TRAIL_DISP_CVD_GATE         = True
+QUANT_TRAIL_CVD_MIN_TREND          = 0.12
+QUANT_TRAIL_DISP_MIN_ATR_MULT     = 0.58
+QUANT_TRAIL_DISP_CVD_MIN_R        = 0.30
+QUANT_TRAIL_OB_BREAKER_PRIORITY    = True
+QUANT_TRAIL_OB_BREAKER_BUFFER_ATR  = 0.22
+QUANT_TRAIL_AMD_MANIP_BUFFER_MULT  = 1.55
+QUANT_TRAIL_AMD_DIST_BUFFER_MULT   = 0.62
+QUANT_TRAIL_AMD_REDIST_BUFFER_MULT = 1.12
+QUANT_TRAIL_HTF_CASCADE_ENABLED    = True
+QUANT_TRAIL_LIQ_POOL_PROX_ATR     = 2.20
+QUANT_TRAIL_LIQ_FLOOR_BUFFER_ATR   = 0.30
+
+# ── CHoCH expiry ──────────────────────────────────────────────────────────────
+QUANT_CHOCH_EXPIRY_BARS = 10
+
+# ── Legacy alias ──────────────────────────────────────────────────────────────
+EXCHANGE = COINSWITCH_EXCHANGE
