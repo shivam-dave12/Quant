@@ -389,6 +389,15 @@ class EntryEngine:
         _MOMENTUM_BLOCK_SEC      = 30.0   # default cooldown when gate blocks
         _MOMENTUM_BLOCK_ATR_MOVE = 0.25   # ATR distance that lifts block early
 
+        # ── Diagnostic: sweep-rejection counters ──────────────────────────
+        # Populated by _collect_sweeps() on every tick. Read by the strategy's
+        # THINK log to surface WHY the engine is not transitioning out of
+        # SCANNING (silent rejection is the observability bug that made the
+        # 4-hour "no trades" session impossible to diagnose from logs alone).
+        # {"stale": int, "low_quality": int, "processed": int}
+        self._last_liq_skip:    Optional[Dict[str, int]] = None
+        self._last_bridge_skip: Optional[Dict[str, int]] = None
+
     # ── Public API ────────────────────────────────────────────────────
 
     def update(
@@ -590,6 +599,30 @@ class EntryEngine:
         """Compat stub — no TRACKING state in sweep-only mode."""
         return None
 
+    @property
+    def scan_skip_info(self) -> Optional[Dict[str, Dict[str, int]]]:
+        """
+        Last-tick sweep-rejection counters from _collect_sweeps().
+
+        Returns:
+          None if both paths produced sweeps (nothing to report), else a dict:
+            {
+              "liq":    {"stale": n, "low_quality": n, "processed": n},   # or absent
+              "bridge": {"stale": n, "low_quality": n, "processed": n,
+                         "ict_sweeps": n},                                # or absent
+            }
+
+        Used by quant_strategy's THINK log to surface WHY SCANNING isn't
+        advancing. Silent rejection previously made "no trades" impossible
+        to distinguish from "broken pipeline".
+        """
+        out = {}
+        if self._last_liq_skip:
+            out["liq"] = dict(self._last_liq_skip)
+        if self._last_bridge_skip:
+            out["bridge"] = dict(self._last_bridge_skip)
+        return out if out else None
+
     # ── Internal: reset ───────────────────────────────────────────────
 
     def _reset(self, now: float) -> None:
@@ -665,10 +698,26 @@ class EntryEngine:
         already driven a verdict (regardless of whether the resulting signal was
         consumed or blocked) will not be re-presented until its 120s hold expires.
         """
-        sweeps = [s for s in snap.recent_sweeps
-                  if s.detected_at > now - 60.0
-                  and s.quality >= _MIN_SWEEP_QUALITY
-                  and not self._is_processed(s, now)]
+        # ── Sweep collection diagnostics ──────────────────────────────────
+        # Track every reason a sweep is rejected so upstream logs show why
+        # SCANNING isn't transitioning. Silent rejection makes "no trades"
+        # indistinguishable from "broken pipeline".
+        _skipped_stale       = 0
+        _skipped_low_quality = 0
+        _skipped_processed   = 0
+
+        sweeps = []
+        for s in (snap.recent_sweeps or []):
+            if s.detected_at <= now - 60.0:
+                _skipped_stale += 1
+                continue
+            if s.quality < _MIN_SWEEP_QUALITY:
+                _skipped_low_quality += 1
+                continue
+            if self._is_processed(s, now):
+                _skipped_processed += 1
+                continue
+            sweeps.append(s)
 
         if (not sweeps
                 and self._state not in (EngineState.POST_SWEEP,
@@ -676,9 +725,38 @@ class EntryEngine:
                                         EngineState.ENTERING)
                 and hasattr(ict_ctx, 'ict_sweeps') and ict_ctx.ict_sweeps):
 
-            age_limit = int(now * 1000) - 30_000
+            # ── FIX (entry-engine-bridge-stale): widen ICT-bridge age window
+            # ────────────────────────────────────────────────────────────
+            # Original window was 30s. ICT sweeps are detected at the close
+            # of 5m bars; the entry engine runs every 250ms. With a 30s
+            # window the bridge only covers the first 10% of each 5m bar's
+            # duration — most ticks see a stale sweep and silently drop it.
+            # This is consistent with the LiquidityMap path above (60s) and
+            # with the _notified_sweeps prune window in quant_strategy
+            # (60s cutoff for the direction-engine dedup set).
+            #
+            # Additional grace: if the sweep happened IN THE CURRENT 5m
+            # bar (bar start <= sweep_ts < bar close), extend the window
+            # to (bar_close + 60s) so a sweep at bar-open still reaches
+            # the entry engine for the full 5min + grace. The processed
+            # sweeps registry (_sweep_key keyed on detected_at rounded to
+            # seconds, 120s hold after enter_post_sweep) handles dedup —
+            # widening the detection window does not reintroduce sweep-
+            # loop reprocessing.
+            _base_age_limit = int(now * 1000) - 60_000
+            # Beginning of the current 5-minute bar (UTC-based)
+            _cur_5m_start_ms = int(now // 300.0) * 300_000
+            # Accept a sweep if EITHER it's within 60s of now OR it was
+            # detected in the current or previous 5m bar (+60s grace).
+            _bar_age_limit = _cur_5m_start_ms - 300_000  # start of previous 5m bar
+
+            _bridge_stale = 0
+            _bridge_low_q = 0
+            _bridge_proc  = 0
+
             for ev in ict_ctx.ict_sweeps:
-                if ev.sweep_ts < age_limit:
+                if ev.sweep_ts < _base_age_limit and ev.sweep_ts < _bar_age_limit:
+                    _bridge_stale += 1
                     continue
                 side = PoolSide.BSL if ev.pool_type == "BSL" else PoolSide.SSL
                 direction = "short" if ev.pool_type == "BSL" else "long"
@@ -686,14 +764,17 @@ class EntryEngine:
                 quality = min(1.0, 0.35 + 0.35 * ev.disp_score
                               + (0.15 if ev.wick_reject else 0.0))
                 if quality < _MIN_SWEEP_QUALITY:
+                    _bridge_low_q += 1
                     continue
 
-                # BUG-4 FIX: ICT-bridge synthetic sweeps were not checked against
-                # _processed_sweeps.  A bridge sweep for an already-processed pool
-                # bypassed the registry entirely and could re-enter POST_SWEEP.
+                # Still check _processed_sweeps — widened window MUST not
+                # reintroduce sweep-loop reprocessing. The registry key is
+                # seconds-rounded, so legitimate re-sweeps at the same price
+                # with a different detected_at are still admitted.
                 _bridge_key = (round(ev.pool_price, 0), side.value,
                                round(ev.sweep_ts / 1000.0, 0))
                 if self._processed_sweeps.get(_bridge_key, 0.0) > now:
+                    _bridge_proc += 1
                     continue
 
                 pool = type('SynthPool', (), {
@@ -713,7 +794,31 @@ class EntryEngine:
                 ))
                 logger.info(
                     f"🔗 ICT SWEEP BRIDGED: {ev.pool_type} "
-                    f"${ev.pool_price:,.1f} quality={quality:.2f}")
+                    f"${ev.pool_price:,.1f} quality={quality:.2f} "
+                    f"age={int((now*1000 - ev.sweep_ts)/1000)}s")
+
+            # Expose bridge rejections via state-level counters (read by the
+            # diagnostic THINK log in quant_strategy — also picked up by the
+            # mark_gate_blocked telemetry).
+            if _bridge_stale or _bridge_low_q or _bridge_proc:
+                self._last_bridge_skip = {
+                    "stale":       _bridge_stale,
+                    "low_quality": _bridge_low_q,
+                    "processed":   _bridge_proc,
+                    "ict_sweeps":  len(ict_ctx.ict_sweeps),
+                }
+            else:
+                self._last_bridge_skip = None
+
+        # Expose LiquidityMap-path rejections too.
+        if _skipped_stale or _skipped_low_quality or _skipped_processed:
+            self._last_liq_skip = {
+                "stale":       _skipped_stale,
+                "low_quality": _skipped_low_quality,
+                "processed":   _skipped_processed,
+            }
+        else:
+            self._last_liq_skip = None
 
         return sweeps
 

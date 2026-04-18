@@ -3737,117 +3737,145 @@ class QuantStrategy:
                 and hasattr(self._ict, 'liquidity_pools')
                 and _ENTRY_ENGINE_AVAILABLE):
             try:
-                _sweep_age_limit = now_ms - 30_000  # sweeps from last 30s
+                # ── FIX (ict-bridge-stale): widen window from 30s to 60s ──
+                # The original 30s window meant only ~10% of each 5m bar had
+                # sweep visibility (sweeps are detected at 5m bar close).
+                # A genuine ICT sweep would flip ict_engine's state but never
+                # reach the entry_engine because the bridge window had
+                # already closed. Observed in production log: 12 ICT sweeps
+                # fired over 4 hours, ZERO reached the entry engine.
+                #
+                # New window: 60s base, extended to include any sweep from
+                # the current or previous 5m bar (plus 60s grace). This
+                # matches the 60s window used by:
+                #   - entry_engine._collect_sweeps() LiquidityMap path
+                #   - quant_strategy._notified_sweeps prune window
+                # Dedup is unaffected: _notified_sweeps and
+                # entry_engine._processed_sweeps both key on (price, ts) at
+                # sub-second resolution, so widening the detection window
+                # cannot reintroduce sweep-loop reprocessing.
+                _base_age_limit_ms = now_ms - 60_000
+                # Start of the current 5m bar (Unix-epoch ms, floor-aligned)
+                _cur_5m_start_ms   = (now_ms // 300_000) * 300_000
+                # Accept a sweep if EITHER within 60s OR from the current/
+                # previous 5m bar (ensures a bar-open sweep stays visible
+                # for the full bar duration).
+                _bar_age_limit_ms  = _cur_5m_start_ms - 300_000  # prev bar start
+
                 for pool in self._ict.liquidity_pools:
-                    if pool.swept and pool.sweep_timestamp > _sweep_age_limit:
-                        c5 = candles_by_tf.get("5m", [])
-                        # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
-                        # The old code blindly used c5[-2] (last closed bar), but the sweep
-                        # may have occurred in c5[-3], c5[-4], etc. Using the wrong bar gives
-                        # wick_extreme from an unrelated candle, placing SL on the wrong side
-                        # of entry (confirmed by log: SL=$67,410 > entry=$67,279 for LONG).
-                        #
-                        # Search backward through the last 5 closed bars (exclude c5[-1]
-                        # which is the forming bar). For SSL sweep: find bar whose LOW
-                        # breached pool.price. For BSL sweep: find bar whose HIGH breached.
-                        _ch = float(c5[-2]['h']) if len(c5) >= 2 else price
-                        _cl = float(c5[-2]['l']) if len(c5) >= 2 else price
-                        _cc = float(c5[-2]['c']) if len(c5) >= 2 else price
-                        if len(c5) >= 3:
-                            _lookback = c5[max(-6, -len(c5)):-1]  # up to 5 closed bars
-                            for _cand in reversed(_lookback):
-                                try:
-                                    _ch_cand = float(_cand['h'])
-                                    _cl_cand = float(_cand['l'])
-                                    _cc_cand = float(_cand['c'])
-                                    if pool.level_type == "SSL" and _cl_cand < pool.price:
-                                        _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
-                                        break
-                                    elif pool.level_type == "BSL" and _ch_cand > pool.price:
-                                        _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
-                                        break
-                                except (KeyError, TypeError, ValueError):
-                                    continue
-                        ict_ctx.ict_sweeps.append(ICTSweepEvent(
-                            pool_price=pool.price,
-                            pool_type=pool.level_type,
-                            sweep_ts=pool.sweep_timestamp,
-                            displacement=pool.displacement_confirmed,
-                            disp_score=pool.displacement_score,
-                            wick_reject=pool.wick_rejection,
-                            candle_high=_ch,
-                            candle_low=_cl,
-                            candle_close=_cc,
-                        ))
-                        # Notify DirectionEngine so it can open a PostSweepState
-                        # and begin the accumulative Bayesian evidence model.
-                        # DEDUPLICATION: the bridge loop runs every 250ms and
-                        # visits all swept pools within the last 30s window.
-                        # Without this guard, on_sweep() is called ~120 times
-                        # for a single pool, resetting PostSweepState every tick
-                        # and making accumulated evidence impossible to build.
-                        if self._dir_engine is not None:
+                    if not pool.swept:
+                        continue
+                    if (pool.sweep_timestamp < _base_age_limit_ms
+                            and pool.sweep_timestamp < _bar_age_limit_ms):
+                        continue
+                    c5 = candles_by_tf.get("5m", [])
+                    # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
+                    # The old code blindly used c5[-2] (last closed bar), but the sweep
+                    # may have occurred in c5[-3], c5[-4], etc. Using the wrong bar gives
+                    # wick_extreme from an unrelated candle, placing SL on the wrong side
+                    # of entry (confirmed by log: SL=$67,410 > entry=$67,279 for LONG).
+                    #
+                    # Search backward through the last 5 closed bars (exclude c5[-1]
+                    # which is the forming bar). For SSL sweep: find bar whose LOW
+                    # breached pool.price. For BSL sweep: find bar whose HIGH breached.
+                    _ch = float(c5[-2]['h']) if len(c5) >= 2 else price
+                    _cl = float(c5[-2]['l']) if len(c5) >= 2 else price
+                    _cc = float(c5[-2]['c']) if len(c5) >= 2 else price
+                    if len(c5) >= 3:
+                        _lookback = c5[max(-6, -len(c5)):-1]  # up to 5 closed bars
+                        for _cand in reversed(_lookback):
                             try:
-                                _sweep_key = (pool.price, pool.sweep_timestamp)
-                                if _sweep_key not in self._notified_sweeps:
-                                    self._notified_sweeps.add(_sweep_key)
+                                _ch_cand = float(_cand['h'])
+                                _cl_cand = float(_cand['l'])
+                                _cc_cand = float(_cand['c'])
+                                if pool.level_type == "SSL" and _cl_cand < pool.price:
+                                    _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
+                                    break
+                                elif pool.level_type == "BSL" and _ch_cand > pool.price:
+                                    _ch, _cl, _cc = _ch_cand, _cl_cand, _cc_cand
+                                    break
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                    ict_ctx.ict_sweeps.append(ICTSweepEvent(
+                        pool_price=pool.price,
+                        pool_type=pool.level_type,
+                        sweep_ts=pool.sweep_timestamp,
+                        displacement=pool.displacement_confirmed,
+                        disp_score=pool.displacement_score,
+                        wick_reject=pool.wick_rejection,
+                        candle_high=_ch,
+                        candle_low=_cl,
+                        candle_close=_cc,
+                    ))
+                    # Notify DirectionEngine so it can open a PostSweepState
+                    # and begin the accumulative Bayesian evidence model.
+                    # DEDUPLICATION: the bridge loop runs every 250ms and
+                    # visits all swept pools within the 60s detection window.
+                    # Without this guard, on_sweep() is called ~240 times
+                    # for a single pool, resetting PostSweepState every tick
+                    # and making accumulated evidence impossible to build.
+                    if self._dir_engine is not None:
+                        try:
+                            _sweep_key = (pool.price, pool.sweep_timestamp)
+                            if _sweep_key not in self._notified_sweeps:
+                                self._notified_sweeps.add(_sweep_key)
 
-                                    # Bug-4 fix: cross-pool quality gate.
-                                    #
-                                    # Root cause: the bridge loop called on_sweep() for
-                                    # every freshly-swept ICT pool, unconditionally.  A
-                                    # lower-quality cross-pool sweep reset DirectionEngine's
-                                    # PostSweepState, destroying accumulated evidence from
-                                    # a higher-conviction earlier sweep.  e.g. a weak BSL
-                                    # touch-and-go could silently erase 60s of evidence
-                                    # built on a clean SSL displacement.
-                                    #
-                                    # Fix: if an active PostSweepState exists and the new
-                                    # pool is of the OPPOSITE type, only forward the sweep
-                                    # when its quality exceeds the active state's quality
-                                    # by a 20% premium.  Lower-quality cross-pool sweeps
-                                    # are skipped — the existing evaluation continues
-                                    # uninterrupted.  Same-type sweeps (structural
-                                    # continuation of the same pool side) always forward.
-                                    _new_quality = float(
-                                        getattr(pool, 'displacement_score', 0.5) or 0.5)
-                                    _ps_active  = getattr(self._dir_engine, '_ps_state', None)
-                                    _should_forward = True
-                                    if _ps_active is not None:
-                                        _active_type    = getattr(_ps_active, 'swept_pool_type', '')
-                                        _active_quality = getattr(
-                                            self._dir_engine, '_ps_state_quality', 0.0)
-                                        if _active_type and pool.level_type != _active_type:
-                                            _quality_threshold = _active_quality * 1.20
-                                            if _new_quality <= _quality_threshold:
-                                                logger.debug(
-                                                    f"ICT sweep bridge: cross-pool "
-                                                    f"{pool.level_type} @${pool.price:,.1f} "
-                                                    f"quality={_new_quality:.2f} <= active "
-                                                    f"{_active_type} threshold="
-                                                    f"{_quality_threshold:.2f} — skipped, "
-                                                    f"preserving existing PostSweepState")
-                                                _should_forward = False
+                                # Bug-4 fix: cross-pool quality gate.
+                                #
+                                # Root cause: the bridge loop called on_sweep() for
+                                # every freshly-swept ICT pool, unconditionally.  A
+                                # lower-quality cross-pool sweep reset DirectionEngine's
+                                # PostSweepState, destroying accumulated evidence from
+                                # a higher-conviction earlier sweep.  e.g. a weak BSL
+                                # touch-and-go could silently erase 60s of evidence
+                                # built on a clean SSL displacement.
+                                #
+                                # Fix: if an active PostSweepState exists and the new
+                                # pool is of the OPPOSITE type, only forward the sweep
+                                # when its quality exceeds the active state's quality
+                                # by a 20% premium.  Lower-quality cross-pool sweeps
+                                # are skipped — the existing evaluation continues
+                                # uninterrupted.  Same-type sweeps (structural
+                                # continuation of the same pool side) always forward.
+                                _new_quality = float(
+                                    getattr(pool, 'displacement_score', 0.5) or 0.5)
+                                _ps_active  = getattr(self._dir_engine, '_ps_state', None)
+                                _should_forward = True
+                                if _ps_active is not None:
+                                    _active_type    = getattr(_ps_active, 'swept_pool_type', '')
+                                    _active_quality = getattr(
+                                        self._dir_engine, '_ps_state_quality', 0.0)
+                                    if _active_type and pool.level_type != _active_type:
+                                        _quality_threshold = _active_quality * 1.20
+                                        if _new_quality <= _quality_threshold:
+                                            logger.debug(
+                                                f"ICT sweep bridge: cross-pool "
+                                                f"{pool.level_type} @${pool.price:,.1f} "
+                                                f"quality={_new_quality:.2f} <= active "
+                                                f"{_active_type} threshold="
+                                                f"{_quality_threshold:.2f} — skipped, "
+                                                f"preserving existing PostSweepState")
+                                            _should_forward = False
 
-                                    if _should_forward:
-                                        self._dir_engine.on_sweep(
-                                            swept_pool_price = pool.price,
-                                            pool_type        = pool.level_type,
-                                            price            = price,
-                                            atr              = atr,
-                                            now              = now,
-                                            quality          = _new_quality,
-                                        )
-                                # BUG-D1 FIX: Prune _notified_sweeps unconditionally
-                                # per-pool-visit (not just inside _should_forward path)
-                                # so the set stays bounded even when no new sweeps arrive.
-                                _cutoff_ms = now_ms - 60_000
-                                self._notified_sweeps = {
-                                    k for k in self._notified_sweeps
-                                    if k[1] > _cutoff_ms
-                                }
-                            except Exception:
-                                pass
+                                if _should_forward:
+                                    self._dir_engine.on_sweep(
+                                        swept_pool_price = pool.price,
+                                        pool_type        = pool.level_type,
+                                        price            = price,
+                                        atr              = atr,
+                                        now              = now,
+                                        quality          = _new_quality,
+                                    )
+                            # BUG-D1 FIX: Prune _notified_sweeps unconditionally
+                            # per-pool-visit (not just inside _should_forward path)
+                            # so the set stays bounded even when no new sweeps arrive.
+                            _cutoff_ms = now_ms - 60_000
+                            self._notified_sweeps = {
+                                k for k in self._notified_sweeps
+                                if k[1] > _cutoff_ms
+                            }
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")
 
@@ -4210,6 +4238,34 @@ class QuantStrategy:
                     rs = _sa.get('rev_score', 0)
                     cs = _sa.get('cont_score', 0)
                     parts.append(f"SweepScore=R{rs:.0f}/C{cs:.0f}")
+
+            # ── Scan-skip diagnostics (observability fix) ──────────────────
+            # When the engine is in SCANNING and not transitioning, surface
+            # WHY. Silent rejection previously made "no trades" impossible
+            # to diagnose — see 4-hour log with 12 ICT sweeps fired and
+            # zero reaching the entry engine.
+            if state == "SCANNING":
+                try:
+                    _skip = getattr(
+                        self._entry_engine, 'scan_skip_info', None)
+                    if callable(_skip):
+                        _skip = _skip()
+                    if _skip:
+                        _bits = []
+                        _liq = _skip.get("liq")
+                        if _liq:
+                            _liq_bits = [f"{k}={v}" for k, v in _liq.items() if v]
+                            if _liq_bits:
+                                _bits.append("liq:" + ",".join(_liq_bits))
+                        _br = _skip.get("bridge")
+                        if _br:
+                            _br_bits = [f"{k}={v}" for k, v in _br.items() if v]
+                            if _br_bits:
+                                _bits.append("bridge:" + ",".join(_br_bits))
+                        if _bits:
+                            parts.append(f"SkipSweep=[{' '.join(_bits)}]")
+                except Exception:
+                    pass
 
             logger.info(f"[THINK] {' | '.join(parts)}")
 
