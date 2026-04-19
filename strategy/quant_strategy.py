@@ -2026,7 +2026,18 @@ class HTFTrendFilter:
         # the trend long since resumed; applying it indefinitely softens an
         # established HTF score with stale information.
         if tf_struct.choch_level > 0 and tf_struct.choch_bar_index > 0:  # BUG FIX: was >= 0; index 0 is the oldest bar in window (stale), only -1 is the "no bar" sentinel
-            bars_ago = max(0, (n_candles - 1) - tf_struct.choch_bar_index)
+            # FIX-A (CRITICAL): choch_bar_index is an index within the 60-bar
+            # structural slice (candles[-lb:]), NOT an absolute index into the
+            # full n_candles feed.  Using (n_candles-1) as the reference point
+            # produces bars_ago ≈ 140-200 for a CHoCH that actually happened
+            # 4 bars ago, making every CHoCH appear permanently stale and
+            # silently disabling the ±0.15 score component entirely.
+            #
+            # Correct reference point: the last bar of the slice = lb - 1.
+            # With choch_bar_index=55 and lb=60: bars_ago = 59-55 = 4  ✓
+            # With old formula n_candles=200:     bars_ago = 199-55 = 144 ✗
+            lb = min(60, max(n_candles, 1))
+            bars_ago = max(0, (lb - 1) - tf_struct.choch_bar_index)
             if bars_ago <= QCfg.CHOCH_EXPIRY_BARS():
                 if trend == "bullish":
                     score -= 0.15

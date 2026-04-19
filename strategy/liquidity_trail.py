@@ -560,8 +560,16 @@ class LiquidityTrailEngine:
         hold_reason: Optional[List[str]], pos=None, fee_engine=None,
     ) -> LiquidityTrailResult:
         """Move SL to breakeven + exact fees + slippage buffer."""
-        be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
-        be_price = round(be_price, 1)
+        # FIX-C: Capture the unrounded BE price ONCE.  The original code called
+        # _be_price() a second time at the log line to recover the pre-round
+        # value for the fee-component calculation.  Because _be_price() reads
+        # pos.entry_fee_paid for one branch and fee_engine.effective_roundtrip
+        # for another, the two calls can return slightly different values
+        # (floating-point re-evaluation, rounding of bps, etc.).  Result: the
+        # logged fee component does not correspond to the SL price that was
+        # actually placed.  One call, one truth.
+        be_price_raw = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
+        be_price     = round(be_price_raw, 1)
 
         # Already locked?
         already = ((pos_side == "long"  and current_sl >= be_price) or
@@ -591,10 +599,9 @@ class LiquidityTrailEngine:
                 f"BE_MICRO_MOVE: {abs(be_price-current_sl)/atr:.3f}ATR<{MIN_IMPROVEMENT_ATR}ATR",
                 hold_reason, r_multiple=r_multiple)
 
-        be_price_for_log = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
-        # Re-derive fee-only component for logging: strip the slippage buffer from
-        # the total BE offset.  be_price_for_log is a PRICE not a commission amount.
-        fee_component = max(0.0, abs(be_price_for_log - entry_price) - 0.12 * atr)
+        # fee_component: strip the slippage buffer from the total BE offset.
+        # Uses be_price_raw (unrounded) so the decomposition is exact.
+        fee_component = max(0.0, abs(be_price_raw - entry_price) - 0.12 * atr)
         reason = (
             f"[BE_LOCK] R={r_multiple:.2f}R → BE=${be_price:,.1f} "
             f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"

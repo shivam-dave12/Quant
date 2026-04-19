@@ -967,7 +967,15 @@ class ICTEngine:
         recent_t = candles[-trend_lb:]
         t_highs: List[float] = []
         t_lows:  List[float] = []
-        for i in range(2, len(recent_t) - 2):
+        # FIX-B: The full 60-bar BOS/CHoCH loop uses `range(2, len(recent) - 3)`
+        # (ICT-1 FIX) to exclude the live forming candle from all fractal checks.
+        # This 20-bar trend window still used the old `- 2` upper bound, allowing
+        # `i + 2` to reach `recent_t[-1]` — the currently forming candle.  That
+        # candle's wick updates every tick, causing the trend label to flip
+        # intrabar and immediately revert on the next closed bar.  Fix: mirror
+        # the ICT-1 FIX here.  With trend_lb=20, range(2, 17) still yields 15
+        # valid fractal candidates — more than sufficient for trend detection.
+        for i in range(2, len(recent_t) - 3):
             h = float(recent_t[i]['h'])
             l = float(recent_t[i]['l'])
             if (h > float(recent_t[i-1]['h']) and h > float(recent_t[i-2]['h']) and

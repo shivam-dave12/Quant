@@ -84,6 +84,24 @@ except ImportError:
     _CFG_INTERVAL_SEC = 300
     _CFG_MAX_ENTRIES = 5
 
+# FIX-G: SESSION_DRAWDOWN_NOTIONAL and SESSION_MAX_DRAWDOWN_PCT were
+# re-imported inside _check_session_limits on every call — a hot path
+# invoked for every signal evaluation.  Python's import machinery is not
+# free: even with the module cached in sys.modules, getattr + float()
+# + exception-handling overhead on every call is redundant for constants
+# that are fixed at startup.  Hoist them here alongside the other config
+# constants so the hot path reads a plain module-level float.
+try:
+    import config as _cfg_root
+    _SESSION_DRAWDOWN_NOTIONAL: float = float(
+        getattr(_cfg_root, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
+    _SESSION_MAX_DRAWDOWN_PCT: float  = float(
+        getattr(_cfg_root, 'SESSION_MAX_DRAWDOWN_PCT',  10.0))
+    del _cfg_root
+except Exception:
+    _SESSION_DRAWDOWN_NOTIONAL = 10_000.0
+    _SESSION_MAX_DRAWDOWN_PCT  = 10.0
+
 # ── Internal constants ────────────────────────────────────────────────────────
 
 REQUIRED_SCORE = _CFG_MIN_SCORE
@@ -555,13 +573,12 @@ class ConvictionFilter:
         # want a margin-relative gate should override SESSION_DRAWDOWN_NOTIONAL
         # in config.  This guard prevents a single bad session from compounding
         # beyond the daily VaR limit regardless of the consecutive-loss pattern.
-        try:
-            import config as _cfg
-            _notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
-            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 10.0))
-        except Exception:
-            _notional   = 10_000.0
-            _max_dd_pct = 10.0
+        #
+        # FIX-G: constants are now hoisted to module level (_SESSION_DRAWDOWN_NOTIONAL,
+        # _SESSION_MAX_DRAWDOWN_PCT).  The previous `import config as _cfg` inside
+        # this method was redundant on every call and has been removed.
+        _notional   = _SESSION_DRAWDOWN_NOTIONAL
+        _max_dd_pct = _SESSION_MAX_DRAWDOWN_PCT
 
         if _notional > 0 and st.session_pnl < 0:
             _dd_pct = abs(st.session_pnl) / _notional * 100.0

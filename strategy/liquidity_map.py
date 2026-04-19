@@ -400,24 +400,44 @@ class _TimeframeRegistry:
         self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now)
         self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now)
 
-        # Prune CONSUMED and age-expired pools
+        # FIX-H: Prune CONSUMED, SWEPT, and age-expired pools from the active
+        # registries.  Previously only CONSUMED was excluded, leaving SWEPT pools
+        # in _bsl/_ssl indefinitely.  A SWEPT pool:
+        #   • cannot be re-matched by _merge_pools (guard at line 443 skips it)
+        #   • cannot be re-swept by check_sweeps (same guard)
+        #   • IS included in the _MAX_POOLS_PER_TF significance sort
+        # In a ranging market, a highly significant swept pool (HTF-aligned,
+        # many touches) retains full significance for up to 50% of max_age
+        # (e.g. 3.5 days for a 15m pool) and can crowd out freshly detected
+        # ACTIVE pools from other levels at the cap.
+        # Swept pools are already recorded in _swept_bsl/_swept_ssl for history
+        # and adjacency scoring — keeping them in the active registry is pure
+        # overhead with a silent accuracy cost.
         max_age = _POOL_MAX_AGE.get(self.tf, 7200)
         self._bsl = [p for p in self._bsl
                      if now - p.created_at < max_age
-                     and p.status != PoolStatus.CONSUMED]
+                     and p.status not in (PoolStatus.CONSUMED, PoolStatus.SWEPT)]
         self._ssl = [p for p in self._ssl
                      if now - p.created_at < max_age
-                     and p.status != PoolStatus.CONSUMED]
+                     and p.status not in (PoolStatus.CONSUMED, PoolStatus.SWEPT)]
 
         # Cap per-side by significance
         self._bsl = sorted(self._bsl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
         self._ssl = sorted(self._ssl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
 
-        # Prune swept history by age
+        # Prune swept history by age and CONSUMED status.
+        # FIX-H: Also exclude CONSUMED pools — once check_consumed promotes a
+        # pool to CONSUMED it is no longer relevant to adjacency scoring or
+        # post-sweep evaluation.  Clearing them promptly keeps the history
+        # compact and ensures _SWEPT_HISTORY_MAX slots are not wasted on dead pools.
         self._swept_bsl = [p for p in self._swept_bsl
-                           if now - p.swept_at < _SWEPT_HISTORY_AGE][-_SWEPT_HISTORY_MAX:]
+                           if p.status != PoolStatus.CONSUMED
+                           and now - p.swept_at < _SWEPT_HISTORY_AGE
+                           ][-_SWEPT_HISTORY_MAX:]
         self._swept_ssl = [p for p in self._swept_ssl
-                           if now - p.swept_at < _SWEPT_HISTORY_AGE][-_SWEPT_HISTORY_MAX:]
+                           if p.status != PoolStatus.CONSUMED
+                           and now - p.swept_at < _SWEPT_HISTORY_AGE
+                           ][-_SWEPT_HISTORY_MAX:]
 
     def _merge_pools(
         self,
@@ -543,13 +563,18 @@ class _TimeframeRegistry:
     def check_consumed(self, price: float, atr: float) -> None:
         """
         Promote SWEPT -> CONSUMED once price moves > 0.5 ATR beyond the swept level.
-        A consumed pool is no longer actionable — it's pruned from the active registry.
+        Consumed pools are excluded from the swept history on the next prune cycle.
+
+        FIX-H: Previously iterated self._bsl / self._ssl, but after Fix H those
+        lists no longer contain SWEPT pools (they are pruned to the swept history
+        immediately).  Redirect to self._swept_bsl / self._swept_ssl where the
+        SWEPT pool objects actually live.
         """
         threshold = atr * _CONSUMED_THRESHOLD_ATR
-        for pool in self._bsl:
+        for pool in self._swept_bsl:
             if pool.status == PoolStatus.SWEPT and price > pool.price + threshold:
                 pool.status = PoolStatus.CONSUMED
-        for pool in self._ssl:
+        for pool in self._swept_ssl:
             if pool.status == PoolStatus.SWEPT and price < pool.price - threshold:
                 pool.status = PoolStatus.CONSUMED
 
