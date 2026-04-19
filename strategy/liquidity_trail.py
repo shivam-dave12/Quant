@@ -248,13 +248,13 @@ PHASE3_CLOSES_REQUIRED = 1      # aggressive — 1 close plus displacement body
 #   (c) BOS on 5m/15m aligned with trade within BOS_MAX_AGE_MS
 DISP_MIN_BODY_ATR = 0.58
 CVD_MIN_TREND     = 0.12
-BOS_MAX_AGE_MS    = 10_000_000   # 10 minutes
+BOS_MAX_AGE_MS    = 600_000      # 10 minutes  (was 10_000_000 = 167 min — BUG FIX)
 
 # Liquidity-aware buffer expansion factor when a pool sits between price and SL
 POOL_BETWEEN_BUFFER_MULT = 1.35
 
 # Counter-BOS sovereign override: 5m BOS against trade that breaks entry
-COUNTER_BOS_MAX_AGE_MS = 3_000_000   # 3 minutes
+COUNTER_BOS_MAX_AGE_MS = 180_000     # 3 minutes  (was 3_000_000 = 50 min — BUG FIX)
 
 # Session buffer multipliers
 SESSION_BUFFER_MULT: Dict[str, float] = {
@@ -591,9 +591,10 @@ class LiquidityTrailEngine:
                 f"BE_MICRO_MOVE: {abs(be_price-current_sl)/atr:.3f}ATR<{MIN_IMPROVEMENT_ATR}ATR",
                 hold_reason, r_multiple=r_multiple)
 
-        commission_rt = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
-        # Re-derive fee-only component for logging
-        fee_component = abs(commission_rt - entry_price) - 0.12 * atr
+        be_price_for_log = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
+        # Re-derive fee-only component for logging: strip the slippage buffer from
+        # the total BE offset.  be_price_for_log is a PRICE not a commission amount.
+        fee_component = max(0.0, abs(be_price_for_log - entry_price) - 0.12 * atr)
         reason = (
             f"[BE_LOCK] R={r_multiple:.2f}R → BE=${be_price:,.1f} "
             f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"

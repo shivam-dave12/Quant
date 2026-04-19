@@ -766,7 +766,7 @@ class CVDEngine:
             recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD Δ in recent half
             # FIX: max(0, n-w)-1 can be -1 when n==w, wrapping to last element.
             _start_idx  = max(0, n - w)
-            _start_val  = arr[_start_idx] if _start_idx > 0 else 0.0
+            _start_val  = arr[_start_idx]   # BUG FIX: always use actual value; old code gave 0.0 when _start_idx==0, inflating earlier_cvd by arr[0]
             earlier_cvd = arr[midpoint - 1] - _start_val  # earlier half
             cvd_slope   = recent_cvd - earlier_cvd
             closes      = [float(c['c']) for c in candles[-w:]] if len(candles) >= w else []
@@ -2025,7 +2025,7 @@ class HTFTrendFilter:
         # CHOCH_EXPIRY_BARS bars).  A CHoCH from 50+ candles ago indicates
         # the trend long since resumed; applying it indefinitely softens an
         # established HTF score with stale information.
-        if tf_struct.choch_level > 0 and tf_struct.choch_bar_index >= 0:
+        if tf_struct.choch_level > 0 and tf_struct.choch_bar_index > 0:  # BUG FIX: was >= 0; index 0 is the oldest bar in window (stale), only -1 is the "no bar" sentinel
             bars_ago = max(0, (n_candles - 1) - tf_struct.choch_bar_index)
             if bars_ago <= QCfg.CHOCH_EXPIRY_BARS():
                 if trend == "bullish":
@@ -6375,6 +6375,17 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
+        # BUG FIX — "no trades after 2":
+        # DirectionEngine._ps_state was never cleared on position close.
+        # After exit, in_post_sweep remained True → evaluate_sweep() kept firing
+        # on every tick, setting a stale direction_hint that biased entry scoring
+        # toward the old sweep's direction, and spamming Telegram with repeated
+        # post-sweep verdicts.  Clear it here so the next trade starts fresh.
+        if hasattr(self, '_dir_engine') and self._dir_engine is not None:
+            try:
+                self._dir_engine.clear_sweep()
+            except Exception as _dce:
+                logger.debug(f"DirectionEngine.clear_sweep() on exit error (non-fatal): {_dce}")
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed

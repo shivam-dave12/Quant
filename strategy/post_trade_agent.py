@@ -116,7 +116,7 @@ _BETA_PRIOR_ALPHA = 2.0
 _BETA_PRIOR_BETA  = 2.0
 
 # OTE zone Fibonacci levels  (aligns with entry_engine + conviction_filter)
-_OTE_FIB_LOW  = 0.50
+_OTE_FIB_LOW  = 0.618   # BUG FIX: was 0.50; ICT OTE zone is 61.8%–78.6%, not 50%–78.6%
 _OTE_FIB_HIGH = 0.786
 _OTE_IDEAL    = 0.618   # optimal institutional entry point
 
