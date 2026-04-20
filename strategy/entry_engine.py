@@ -527,17 +527,12 @@ class EntryEngine:
             self._gate_blocked_until = max(
                 self._gate_blocked_until, time.time() + cooldown_sec)
 
-        # BUG-3 FIX: Extend processed-sweep registry expiry for the sweep that
-        # generated this blocked signal.  This is the correct suppression point
-        # after the state-dangle fix — _gate_blocked_until only works in POST_SWEEP.
-        if (self._signal is not None
-                and hasattr(self._signal, 'sweep_result')
-                and self._signal.sweep_result is not None):
-            key = self._sweep_key(self._signal.sweep_result)
-            self._processed_sweeps[key] = max(
-                self._processed_sweeps.get(key, 0.0),
-                time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
-            )
+        # BUG-3 NOTE: Previously extended _processed_sweeps here, which caused
+        # valid re-sweeps at the same level (genuine second test) to be silently
+        # blocked for up to 50s after a conviction-gate rejection.
+        # The _gate_blocked_until field is the correct suppressor for POST_SWEEP
+        # signals. We do NOT extend the sweep registry on gate-block — a fresh
+        # evidence state on the next bar should be evaluated without prejudice.
 
     def mark_momentum_blocked(
         self,
@@ -929,40 +924,95 @@ class EntryEngine:
             return False
 
         amd_mult = self._amd_modifier(ict, disp_dir)
-
-        # FIX-SL-FLIP: If this is the same candle that was previously blocked,
-        # reuse the frozen SL to prevent tick-to-tick SL oscillation caused by
-        # ict.nearest_ob_price flickering in/out between ticks.
         disp_candle_ts = int(disp_candle.get('t', 0) or 0)
+
+        # FIX-SL-FLIP: reuse frozen SL when same candle was previously blocked
         _reuse_frozen_sl = (
             self._momentum_block_sl is not None
             and disp_candle_ts == self._momentum_block_candle_ts
             and disp_candle_ts > 0
         )
 
-        # SL
-        ch, cl_val = float(disp_candle['h']), float(disp_candle['l'])
-        buf = atr * _MOMENTUM_SL_BUFFER_ATR
+        # ── Structural SL/TP via sl_tp_engine ────────────────────────────
+        try:
+            try:
+                from strategy.sl_tp_engine import compute_entry_sl, compute_entry_tp
+            except ImportError:
+                from sl_tp_engine import compute_entry_sl, compute_entry_tp
+            _have_sle = True
+        except ImportError:
+            _have_sle = False
+
+        import config as _mecfg
+        _min_rr_m = float(getattr(_mecfg, 'MIN_RISK_REWARD_RATIO', 2.0))
+        _max_rr_m = float(getattr(_mecfg, 'QUANT_REVERSION_MAX_RR', 4.0))
+        _now_ms_m = int(now * 1000)
+
         if _reuse_frozen_sl:
-            sl = self._momentum_block_sl
+            sl     = self._momentum_block_sl
+            risk   = abs(price - sl)
+            if risk < 1e-10:
+                return False
+            if _have_sle:
+                _tp_r = compute_entry_tp(
+                    disp_dir, price, sl, atr,
+                    ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                    liq_snapshot = snap,
+                    min_rr       = _min_rr_m,
+                    max_rr       = _max_rr_m,
+                    now_ms       = _now_ms_m,
+                )
+                if _tp_r is None:
+                    return False
+                tp, rr, target = _tp_r.price, _tp_r.rr, None
+            else:
+                tp, target = self._find_tp(snap, disp_dir, price, atr, sl, _MOMENTUM_MIN_RR)
+                if tp is None:
+                    return False
+                rr = abs(tp - price) / risk
+        elif _have_sle:
+            _sl_r = compute_entry_sl(
+                disp_dir, price, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                candles_15m  = candles_5m,
+                candles_5m   = candles_1m,
+                now_ms       = _now_ms_m,
+            )
+            if _sl_r is None:
+                return False
+            sl   = _sl_r.price
+            risk = abs(price - sl)
+            if risk < 1e-10:
+                return False
+            _tp_r = compute_entry_tp(
+                disp_dir, price, sl, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                min_rr       = _min_rr_m,
+                max_rr       = _max_rr_m,
+                now_ms       = _now_ms_m,
+            )
+            if _tp_r is None:
+                logger.debug(f"MOMENTUM {disp_dir.upper()}: no structural TP at RR={_min_rr_m:.1f}")
+                return False
+            tp, rr, target = _tp_r.price, _tp_r.rr, None
         else:
+            # Legacy fallback — candle-based SL when sl_tp_engine not deployed
+            ch, cl_val = float(disp_candle['h']), float(disp_candle['l'])
+            buf = atr * _MOMENTUM_SL_BUFFER_ATR
             sl = cl_val - buf if disp_dir == "long" else ch + buf
             ict_sl = self._compute_sl(ict, disp_dir, price, atr)
             if ict_sl is not None:
                 sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
+            risk = abs(price - sl)
+            if risk < 1e-10:
+                return False
+            tp, target = self._find_tp(snap, disp_dir, price, atr, sl, _MOMENTUM_MIN_RR)
+            if tp is None:
+                tp = price + risk * 2.0 if disp_dir == "long" else price - risk * 2.0
+            rr = abs(tp - price) / risk
 
-        risk = abs(price - sl)
-        if risk < 1e-10:
-            return False
-
-        # TP (pool → HTF escalation → 2R fallback)
-        tp, target = self._find_tp(snap, disp_dir, price, atr, sl,
-                                    _MOMENTUM_MIN_RR * (2.0 - amd_mult))
-        if tp is None:
-            tp = price + risk * 2.0 if disp_dir == "long" else price - risk * 2.0
-
-        reward = abs(tp - price)
-        rr = reward / risk
         adj_rr = _MOMENTUM_MIN_RR * (2.0 - amd_mult)
         if rr < adj_rr:
             return False
@@ -973,9 +1023,10 @@ class EntryEngine:
         if target is None:
             pools = snap.bsl_pools if disp_dir == "long" else snap.ssl_pools
             reachable = [t for t in pools if t.distance_atr <= _HTF_TP_MAX_ATR]
-            if not reachable:
-                return False
-            target = min(reachable, key=lambda t: t.distance_atr)
+            if reachable:
+                target = min(reachable, key=lambda t: t.distance_atr)
+            else:
+                target = None  # allowed — structural TP was found via sl_tp_engine
 
         self._last_momentum_candle_ts = disp_candle_ts
         # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
@@ -1014,15 +1065,13 @@ class EntryEngine:
             return
 
         # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
-        # registry THE MOMENT we commit to evaluating it.  This is the earliest
-        # possible registration point — before any evidence accumulation — so that
-        # _collect_sweeps() cannot find and re-present the same sweep on any
-        # subsequent tick, regardless of how the evaluation resolves (verdict, gate
-        # block, timeout, or early rejection inside _handle_reversal/continuation).
-        # Expiry = now + 120s:  outlasts the 60s detection window + 45s gate-block
-        # cooldown + 15s margin.
+        # registry THE MOMENT we commit to evaluating it.  60s matches the
+        # detection window exactly — stale sweeps naturally age out at the same
+        # time, so no gap is created where the same sweep could re-enter.
+        # (Reduced from 120s: the 120s hold was blocking new valid sweeps at the
+        # same level after genuine structural re-tests within the same session.)
         _reg_key = self._sweep_key(sweep)
-        self._processed_sweeps[_reg_key] = now + 120.0
+        self._processed_sweeps[_reg_key] = now + 60.0
 
         self._post_sweep = _PostSweepState(
             sweep=sweep, entered_at=now,
@@ -1381,35 +1430,75 @@ class EntryEngine:
         side = decision.direction
         ps = self._post_sweep
 
-        # SL: sweep wick + buffer
-        if side == "long":
-            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR
+        # ── SL/TP via structural engine ───────────────────────────────────
+        # No ATR-only levels. No 2R fallback. Real structure or reject.
+        try:
+            try:
+                from strategy.sl_tp_engine import compute_entry_sl, compute_entry_tp
+            except ImportError:
+                from sl_tp_engine import compute_entry_sl, compute_entry_tp
+            _have_sle = True
+        except ImportError:
+            _have_sle = False
+
+        if _have_sle:
+            import config as _ecfg
+            _min_rr = float(getattr(_ecfg, 'MIN_RISK_REWARD_RATIO', 2.0))
+            _max_rr = float(getattr(_ecfg, 'QUANT_REVERSION_MAX_RR', 4.0))
+            _now_ms = int(now * 1000)
+
+            _sl_res = compute_entry_sl(
+                side, price, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                sweep_result = sweep,
+                now_ms       = _now_ms,
+            )
+            if _sl_res is None:
+                logger.info(f"REVERSAL {side.upper()}: no structural SL — rejected")
+                self._post_sweep = None
+                self._reset(now)
+                return
+            sl = _sl_res.price
+
+            _tp_res = compute_entry_tp(
+                side, price, sl, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                min_rr       = _min_rr,
+                max_rr       = _max_rr,
+                now_ms       = _now_ms,
+            )
+            if _tp_res is None:
+                logger.info(f"REVERSAL {side.upper()}: no structural TP at RR={_min_rr:.1f} — rejected")
+                self._post_sweep = None
+                self._reset(now)
+                return
+            tp     = _tp_res.price
+            rr     = _tp_res.rr
+            target = None  # filled below from snap
         else:
-            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR
+            # Legacy path — only used if sl_tp_engine.py not yet deployed
+            if side == "long":
+                sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR
+            else:
+                sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR
+            sl   = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+            if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
+                self._post_sweep = None; self._reset(now); return
+            tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+            cisd_ok = ps is not None and ps.cisd_detected
+            if tp is None and cisd_ok:
+                tp = price + risk * 2.0 if side == "long" else price - risk * 2.0
+            if tp is None:
+                self._post_sweep = None; self._reset(now); return
+            rr = abs(tp - price) / risk
 
-        # Liquidity push
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
-
-        risk = abs(price - sl)
-        if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
-            self._post_sweep = None
-            self._reset(now)
-            return
-
-        self._last_sweep_reversal_dir = side
+        self._last_sweep_reversal_dir  = side
         self._last_sweep_reversal_time = now
+        risk = abs(price - sl)
 
-        # TP: pool → HTF → 2R (only if CISD)
-        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
-        cisd_ok = ps is not None and ps.cisd_detected
-        if tp is None and cisd_ok:
-            tp = price + risk * 2.0 if side == "long" else price - risk * 2.0
-        if tp is None:
-            self._post_sweep = None
-            self._reset(now)
-            return
-
-        rr = abs(tp - price) / risk
         if rr < _MIN_RR_RATIO:
             self._post_sweep = None
             self._reset(now)

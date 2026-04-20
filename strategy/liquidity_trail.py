@@ -106,9 +106,9 @@ logger = logging.getLogger(__name__)
 # PHASE THRESHOLDS (R-multiple boundaries)
 # ═══════════════════════════════════════════════════════════════════════════
 
-PHASE_0_MAX_R = 1.0    # below this → hands off (structural SL trusted)
-PHASE_1_MAX_R = 2.0    # BE lock zone
-PHASE_2_MAX_R = 3.5    # Fib structural zone (1H/15m swings)
+PHASE_0_MAX_R = 0.50   # below → hands off — SL starts moving at 0.5R, not 1.0R
+PHASE_1_MAX_R = 1.00   # BE lock at 1.0R (was 2.0R — gave back full profit at 0.65R peak)
+PHASE_2_MAX_R = 2.50   # Fib structural zone (was 3.5R)
 # Phase 3 ≥ 3.5R (Fib aggressive — all TFs, HTF-gated)
 
 # ── Phase-gate normalisation ──────────────────────────────────────────────

@@ -43,14 +43,22 @@ logger = logging.getLogger(__name__)
 
 # -- v9.0: Liquidity-First Entry Engine ------------------------------------
 try:
-    from strategy.liquidity_map import LiquidityMap
+    from strategy.pool_engine import PoolEvolutionEngine as LiquidityMap
     _LIQ_MAP_AVAILABLE = True
 except ImportError:
     try:
-        from liquidity_map import LiquidityMap
+        from pool_engine import PoolEvolutionEngine as LiquidityMap
         _LIQ_MAP_AVAILABLE = True
     except ImportError:
-        _LIQ_MAP_AVAILABLE = False
+        try:
+            from strategy.liquidity_map import LiquidityMap  # fallback
+            _LIQ_MAP_AVAILABLE = True
+        except ImportError:
+            try:
+                from liquidity_map import LiquidityMap
+                _LIQ_MAP_AVAILABLE = True
+            except ImportError:
+                _LIQ_MAP_AVAILABLE = False
 
 try:
     from strategy.entry_engine import (
@@ -90,30 +98,79 @@ except ImportError:
 # Required conviction score ≥ 0.75 for all weighted factors.
 _CONVICTION_FILTER_AVAILABLE = False
 try:
-    from strategy.conviction_filter import ConvictionFilter, ConvictionResult
+    from strategy.pool_engine import RollingWindowConvictionFilter as ConvictionFilter
+    try:
+        from strategy.conviction_filter import ConvictionResult
+    except ImportError:
+        from conviction_filter import ConvictionResult
     _CONVICTION_FILTER_AVAILABLE = True
 except ImportError:
     try:
-        from conviction_filter import ConvictionFilter, ConvictionResult
+        from pool_engine import RollingWindowConvictionFilter as ConvictionFilter
+        try:
+            from strategy.conviction_filter import ConvictionResult
+        except ImportError:
+            from conviction_filter import ConvictionResult
         _CONVICTION_FILTER_AVAILABLE = True
     except ImportError:
-        ConvictionFilter = None   # type: ignore
-        ConvictionResult = None   # type: ignore
+        try:
+            from strategy.conviction_filter import ConvictionFilter, ConvictionResult
+            _CONVICTION_FILTER_AVAILABLE = True
+        except ImportError:
+            try:
+                from conviction_filter import ConvictionFilter, ConvictionResult
+                _CONVICTION_FILTER_AVAILABLE = True
+            except ImportError:
+                ConvictionFilter = None   # type: ignore
+                ConvictionResult = None   # type: ignore
 
 # ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────────────
 # SL anchors to swept/unswept pool structure instead of fixed ATR ratchets.
 # Significance-based buffer; session-aware (London tighter, Asia disabled).
 _LIQ_TRAIL_AVAILABLE = False
 try:
-    from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+    from strategy.sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
+    # StructuralTrailEngine result fields: new_sl, anchor_price, anchor_label,
+    # reason, phase, r_multiple, blocked. Wrap to expose .anchor for compat.
+    class LiquidityTrailResult:
+        def __init__(self, r):
+            self.new_sl       = r.new_sl
+            self.reason       = r.reason
+            self.phase        = r.phase
+            self.r_multiple   = r.r_multiple
+            self.trail_blocked= r.blocked
+            self.block_reason = ""
+            # compat: callers that read result.anchor.price / result.anchor.sig
+            class _A:
+                price = r.anchor_price or 0.0
+                sig   = 0.0
+                quality = 0.0
+                timeframe = ""
+            self.anchor = _A()
     _LIQ_TRAIL_AVAILABLE = True
 except ImportError:
     try:
-        from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+        from sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
+        class LiquidityTrailResult:
+            def __init__(self, r):
+                self.new_sl=r.new_sl; self.reason=r.reason; self.phase=r.phase
+                self.r_multiple=r.r_multiple; self.trail_blocked=r.blocked
+                self.block_reason=""
+                class _A:
+                    price=r.anchor_price or 0.0; sig=0.0; quality=0.0; timeframe=""
+                self.anchor=_A()
         _LIQ_TRAIL_AVAILABLE = True
     except ImportError:
-        LiquidityTrailEngine  = None   # type: ignore
-        LiquidityTrailResult  = None   # type: ignore
+        try:
+            from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+            _LIQ_TRAIL_AVAILABLE = True
+        except ImportError:
+            try:
+                from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
+                _LIQ_TRAIL_AVAILABLE = True
+            except ImportError:
+                LiquidityTrailEngine  = None   # type: ignore
+                LiquidityTrailResult  = None   # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1658,17 +1715,10 @@ class InstitutionalLevels:
                     break
 
         if tp is None:
-            # Fallback: use ATR-based TP at minimum R:R distance
-            _fallback_dist = sl_dist * max(_min_rr_gate, 1.5)
-            _fallback_dist = min(_fallback_dist, max_tp_dist)
-            if side == "long":
-                tp = price + _fallback_dist
-            else:
-                tp = price - _fallback_dist
             logger.info(
-                f"TP ATR FALLBACK: ${tp:,.2f} ({_fallback_dist:.0f}pts) "
-                f"R:R=1:{_fallback_dist/max(sl_dist,1):.1f} — "
-                f"no structural target found, using minimum R:R distance")
+                f"compute_tp [{side.upper()}]: no structural target satisfies "
+                f"min_rr={_min_rr_gate:.1f} — trade rejected")
+            return None
 
         return tp
 def _ict_find_swings_inline(candles: list, lookback: int):
@@ -4389,17 +4439,12 @@ class QuantStrategy:
                             f"📐 15m Swing SL: ${sl_price:,.2f} "
                             f"({sl_dist:.0f}pts / {sl_dist/atr:.2f}ATR)")
 
-            # ── Step 3: ATR fallback ───────────────────────────────────────────
+            # ── Step 3: Reject — no structural SL found ──────────────────────
             if sl_price is None:
-                _min_dist   = _path_b_min_dist
-                _max_dist   = price * QCfg.MAX_SL_PCT()
-                _atr_sl_dist = max(_min_dist, min(_max_dist, 1.5 * atr))
-                sl_price   = _round_to_tick(
-                    price - _atr_sl_dist if side == "long" else price + _atr_sl_dist)
-                _sl_source = "ATR_fallback"
                 logger.warning(
-                    f"⚠️ SL ATR fallback: ${sl_price:,.2f} "
-                    f"({_atr_sl_dist:.0f}pts / {_atr_sl_dist/atr:.2f}ATR) — no 15m structure found")
+                    f"_compute_sl_tp [{side.upper()}]: no structural SL "
+                    f"(ICT OB + 15m swing both failed) — trade rejected")
+                return None, None
 
             # ── v6.0: PATH-B LIQUIDITY PROXIMITY GUARD ─────────────────────────
             # move it behind the pool so the sweep doesn't take us out.
@@ -5608,7 +5653,7 @@ class QuantStrategy:
 
         _liq_hold_reasons: list = []
         try:
-            _liq_result = self._liq_trail.compute(
+            _raw_trail_result = self._liq_trail.compute(
                 pos_side        = pos.side,
                 price           = price,
                 entry_price     = pos.entry_price,
@@ -5628,6 +5673,20 @@ class QuantStrategy:
                 candles_15m     = _trail_candles_15m,
                 candles_1h      = _trail_candles_1h,
             )
+            # Normalise result: StructuralTrailEngine returns TrailResult;
+            # LiquidityTrailEngine returns LiquidityTrailResult.  Both have
+            # .new_sl / .phase / .r_multiple / .reason.  StructuralTrailEngine
+            # has .anchor_price instead of .anchor.price — add compat shim.
+            if hasattr(_raw_trail_result, 'anchor_price'):
+                class _AnchorShim:
+                    price     = _raw_trail_result.anchor_price or 0.0
+                    sig       = 0.0
+                    quality   = 0.0
+                    timeframe = ""
+                _raw_trail_result.anchor       = _AnchorShim()
+                _raw_trail_result.trail_blocked= _raw_trail_result.blocked
+                _raw_trail_result.block_reason = ""
+            _liq_result = _raw_trail_result
         except Exception as _lt_e:
             logger.exception("Trail: compute error — HOLD")
             return False
