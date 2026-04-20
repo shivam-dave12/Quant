@@ -43,22 +43,14 @@ logger = logging.getLogger(__name__)
 
 # -- v9.0: Liquidity-First Entry Engine ------------------------------------
 try:
-    from strategy.pool_engine import PoolEvolutionEngine as LiquidityMap
+    from strategy.liquidity_map import LiquidityMap
     _LIQ_MAP_AVAILABLE = True
 except ImportError:
     try:
-        from pool_engine import PoolEvolutionEngine as LiquidityMap
+        from liquidity_map import LiquidityMap
         _LIQ_MAP_AVAILABLE = True
     except ImportError:
-        try:
-            from strategy.liquidity_map import LiquidityMap  # fallback
-            _LIQ_MAP_AVAILABLE = True
-        except ImportError:
-            try:
-                from liquidity_map import LiquidityMap
-                _LIQ_MAP_AVAILABLE = True
-            except ImportError:
-                _LIQ_MAP_AVAILABLE = False
+        _LIQ_MAP_AVAILABLE = False
 
 try:
     from strategy.entry_engine import (
@@ -98,58 +90,30 @@ except ImportError:
 # Required conviction score ≥ 0.75 for all weighted factors.
 _CONVICTION_FILTER_AVAILABLE = False
 try:
-    from strategy.pool_engine import RollingWindowConvictionFilter as ConvictionFilter
-    try:
-        from strategy.conviction_filter import ConvictionResult
-    except ImportError:
-        from conviction_filter import ConvictionResult
+    from strategy.conviction_filter import ConvictionFilter, ConvictionResult
     _CONVICTION_FILTER_AVAILABLE = True
 except ImportError:
     try:
-        from pool_engine import RollingWindowConvictionFilter as ConvictionFilter
-        try:
-            from strategy.conviction_filter import ConvictionResult
-        except ImportError:
-            from conviction_filter import ConvictionResult
+        from conviction_filter import ConvictionFilter, ConvictionResult
         _CONVICTION_FILTER_AVAILABLE = True
     except ImportError:
-        try:
-            from strategy.conviction_filter import ConvictionFilter, ConvictionResult
-            _CONVICTION_FILTER_AVAILABLE = True
-        except ImportError:
-            try:
-                from conviction_filter import ConvictionFilter, ConvictionResult
-                _CONVICTION_FILTER_AVAILABLE = True
-            except ImportError:
-                ConvictionFilter = None   # type: ignore
-                ConvictionResult = None   # type: ignore
+        ConvictionFilter = None   # type: ignore
+        ConvictionResult = None   # type: ignore
 
 # ── ISSUE-3 FIX: Liquidity-Only Trailing SL ──────────────────────────────────
 # SL anchors to swept/unswept pool structure instead of fixed ATR ratchets.
 # Significance-based buffer; session-aware (London tighter, Asia disabled).
 _LIQ_TRAIL_AVAILABLE = False
 try:
-    from strategy.sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
-    # StructuralTrailEngine result fields: new_sl, anchor_price, anchor_label,
-    # reason, phase, r_multiple, blocked. Wrap to expose .anchor for compat.
-    from strategy.liquidity_trail import LiquidityTrailResult
+    from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
     _LIQ_TRAIL_AVAILABLE = True
 except ImportError:
     try:
-        from sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
-        from liquidity_trail import LiquidityTrailResult
+        from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
         _LIQ_TRAIL_AVAILABLE = True
     except ImportError:
-        try:
-            from strategy.liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
-            _LIQ_TRAIL_AVAILABLE = True
-        except ImportError:
-            try:
-                from liquidity_trail import LiquidityTrailEngine, LiquidityTrailResult
-                _LIQ_TRAIL_AVAILABLE = True
-            except ImportError:
-                LiquidityTrailEngine  = None   # type: ignore
-                LiquidityTrailResult  = None   # type: ignore
+        LiquidityTrailEngine  = None   # type: ignore
+        LiquidityTrailResult  = None   # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -802,7 +766,7 @@ class CVDEngine:
             recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD Δ in recent half
             # FIX: max(0, n-w)-1 can be -1 when n==w, wrapping to last element.
             _start_idx  = max(0, n - w)
-            _start_val  = arr[_start_idx]   # BUG FIX: always use actual value; old code gave 0.0 when _start_idx==0, inflating earlier_cvd by arr[0]
+            _start_val  = arr[_start_idx] if _start_idx > 0 else 0.0
             earlier_cvd = arr[midpoint - 1] - _start_val  # earlier half
             cvd_slope   = recent_cvd - earlier_cvd
             closes      = [float(c['c']) for c in candles[-w:]] if len(candles) >= w else []
@@ -1694,10 +1658,17 @@ class InstitutionalLevels:
                     break
 
         if tp is None:
+            # Fallback: use ATR-based TP at minimum R:R distance
+            _fallback_dist = sl_dist * max(_min_rr_gate, 1.5)
+            _fallback_dist = min(_fallback_dist, max_tp_dist)
+            if side == "long":
+                tp = price + _fallback_dist
+            else:
+                tp = price - _fallback_dist
             logger.info(
-                f"compute_tp [{side.upper()}]: no structural target satisfies "
-                f"min_rr={_min_rr_gate:.1f} — trade rejected")
-            return None
+                f"TP ATR FALLBACK: ${tp:,.2f} ({_fallback_dist:.0f}pts) "
+                f"R:R=1:{_fallback_dist/max(sl_dist,1):.1f} — "
+                f"no structural target found, using minimum R:R distance")
 
         return tp
 def _ict_find_swings_inline(candles: list, lookback: int):
@@ -2054,19 +2025,8 @@ class HTFTrendFilter:
         # CHOCH_EXPIRY_BARS bars).  A CHoCH from 50+ candles ago indicates
         # the trend long since resumed; applying it indefinitely softens an
         # established HTF score with stale information.
-        if tf_struct.choch_level > 0 and tf_struct.choch_bar_index > 0:  # BUG FIX: was >= 0; index 0 is the oldest bar in window (stale), only -1 is the "no bar" sentinel
-            # FIX-A (CRITICAL): choch_bar_index is an index within the 60-bar
-            # structural slice (candles[-lb:]), NOT an absolute index into the
-            # full n_candles feed.  Using (n_candles-1) as the reference point
-            # produces bars_ago ≈ 140-200 for a CHoCH that actually happened
-            # 4 bars ago, making every CHoCH appear permanently stale and
-            # silently disabling the ±0.15 score component entirely.
-            #
-            # Correct reference point: the last bar of the slice = lb - 1.
-            # With choch_bar_index=55 and lb=60: bars_ago = 59-55 = 4  ✓
-            # With old formula n_candles=200:     bars_ago = 199-55 = 144 ✗
-            lb = min(60, max(n_candles, 1))
-            bars_ago = max(0, (lb - 1) - tf_struct.choch_bar_index)
+        if tf_struct.choch_level > 0 and tf_struct.choch_bar_index >= 0:
+            bars_ago = max(0, (n_candles - 1) - tf_struct.choch_bar_index)
             if bars_ago <= QCfg.CHOCH_EXPIRY_BARS():
                 if trend == "bullish":
                     score -= 0.15
@@ -2389,13 +2349,6 @@ class DailyRiskGate:
 
     def record_trade_result(self, pnl):
         with self._lock:
-            # BUG-2 FIX: reset day boundary BEFORE accumulating the result.
-            # Without this, a trade that opens just before IST midnight and
-            # closes just after will increment _consec_losses on the new
-            # day's clean slate — can_trade() then arms the lockout against
-            # a fresh day that had zero losses.  _reset_if_new_day() is
-            # idempotent so calling it here is always safe.
-            self._reset_if_new_day()
             self._daily_pnl += pnl
             if pnl < 0: self._consec_losses += 1
             else: self._consec_losses = 0
@@ -2490,6 +2443,17 @@ class QuantStrategy:
         self._pos_sync_in_progress  = False   # ACTIVE sync thread running
         self._exit_sync_in_progress = False   # EXITING sync thread running
         self._trail_in_progress     = False   # trail REST call running in background
+        # Watchdog timestamps: epoch time when the corresponding flag was set True.
+        # A flag that remains True for > _FLAG_STALE_SEC with no active thread
+        # indicates a daemon thread died without executing its finally block
+        # (process signal, executor saturation, CPython GIL contention under load).
+        # The watchdog in on_tick force-clears stale flags and logs a WARNING so
+        # the anomaly is visible in monitoring without crashing the strategy loop.
+        _FLAG_STALE_SEC = 90.0          # class constant; any flag True > 90s is stale
+        self._pos_sync_started_at:  float = 0.0
+        self._exit_sync_started_at: float = 0.0
+        self._trail_started_at:     float = 0.0
+        self._reconcile_started_at: float = 0.0
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
 
@@ -2593,15 +2557,6 @@ class QuantStrategy:
         # ── Unified entry gate state ──────────────────────────────────────
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
-        # BUG FIX — pool_hit_gate debounce timer.
-        # pool_hit_gate runs every 500ms tick while in position; on every call it
-        # may update DirectionEngine._ps_state and in_post_sweep, wiping accumulated
-        # Bayesian evidence before it can reach the conviction threshold.  After the
-        # position closes, clear_sweep() cannot fully undo state that was overwritten
-        # on the previous tick, leaving in_post_sweep=True and blocking fresh sweeps.
-        # Fix: evaluate at most once every 2 s (structure events occur at bar cadence,
-        # not tick cadence; 2 s is more than sufficient resolution).
-        self._last_pool_gate_ts: float = 0.0
         self._log_init()
 
     def _log_init(self):
@@ -2768,10 +2723,52 @@ class QuantStrategy:
             # Spawn reconcile background thread if due (non-blocking)
             if not self._reconcile_pending and now - self._last_reconcile_time >= self._RECONCILE_SEC:
                 self._last_reconcile_time = now; self._reconcile_pending = True
+                self._reconcile_started_at = now
                 threading.Thread(
                     target=self._reconcile_query_thread,
                     args=(order_manager,), daemon=True,
                 ).start()
+
+            # ── Stale-flag watchdog ───────────────────────────────────────────
+            # Background daemon threads clear their concurrency-guard booleans in
+            # a finally block.  Under normal conditions (exception, timeout, REST
+            # error) the finally always fires.  The one unhandled case is a daemon
+            # thread dying without scheduling Python cleanup — e.g. a hard SIGKILL
+            # during a REST call, or a GIL-starved thread that never gets a turn
+            # while the main thread is under heavy compute load.  If any flag stays
+            # True beyond _FLAG_STALE_SEC with no corresponding thread still alive,
+            # the next sync/trail/reconcile is permanently suppressed — the strategy
+            # keeps running but stops managing the position (no trail, no sync).
+            #
+            # Mitigation: if a flag has been True for > _FLAG_STALE_SEC, force-clear
+            # it and emit a WARNING so the anomaly is visible in monitoring.
+            # 90s is 3× the Delta REST timeout (30s) — ample time for any legitimate
+            # operation to complete before the watchdog fires.
+            _FLAG_STALE_SEC = 90.0
+            if self._pos_sync_in_progress and (now - self._pos_sync_started_at) > _FLAG_STALE_SEC:
+                logger.warning(
+                    f"⚠️  STALE FLAG: _pos_sync_in_progress True for "
+                    f"{now - self._pos_sync_started_at:.0f}s — force-clearing "
+                    f"(background thread likely died without finally)")
+                self._pos_sync_in_progress = False
+
+            if self._exit_sync_in_progress and (now - self._exit_sync_started_at) > _FLAG_STALE_SEC:
+                logger.warning(
+                    f"⚠️  STALE FLAG: _exit_sync_in_progress True for "
+                    f"{now - self._exit_sync_started_at:.0f}s — force-clearing")
+                self._exit_sync_in_progress = False
+
+            if self._trail_in_progress and (now - self._trail_started_at) > _FLAG_STALE_SEC:
+                logger.warning(
+                    f"⚠️  STALE FLAG: _trail_in_progress True for "
+                    f"{now - self._trail_started_at:.0f}s — force-clearing")
+                self._trail_in_progress = False
+
+            if self._reconcile_pending and (now - self._reconcile_started_at) > _FLAG_STALE_SEC:
+                logger.warning(
+                    f"⚠️  STALE FLAG: _reconcile_pending True for "
+                    f"{now - self._reconcile_started_at:.0f}s — force-clearing")
+                self._reconcile_pending = False
 
             # Snapshot all decision-relevant state while locked
             phase             = self._pos.phase
@@ -2789,6 +2786,7 @@ class QuantStrategy:
                 # Running it in the main thread blocks on_tick, trail management, and the
                 # heartbeat for up to 30s every 30s (100% duty cycle = permanently frozen).
                 self._pos_sync_in_progress = True
+                self._pos_sync_started_at  = now
                 with self._lock:
                     self._last_pos_sync = now   # stamp immediately so we don't re-trigger
 
@@ -2821,6 +2819,7 @@ class QuantStrategy:
         elif phase == PositionPhase.EXITING:
             if need_exit_sync and not self._exit_sync_in_progress:
                 self._exit_sync_in_progress = True
+                self._exit_sync_started_at  = now
                 with self._lock:
                     self._last_exit_sync = now
 
@@ -3209,11 +3208,11 @@ class QuantStrategy:
             be_locked = ((pos.side == "long" and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
-            if mfe_r >= 2.50: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
-            elif mfe_r >= 1.00: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURAL ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.50: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE LOCK ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.20: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — WATCHING ({mfe_r:.2f}R)"
-            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.50R)"
+            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
+            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURE ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE FLOOR ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — CHANDELIER ({mfe_r:.2f}R)"
+            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
 
             _margin_pnl_pct = 0.0
             try:
@@ -3771,17 +3770,9 @@ class QuantStrategy:
                 # etc.) reset entries_taken and consecutive_losses so each new
                 # institutional session gets a fresh quota.  MIN_ENTRY_INTERVAL
                 # cooldown is also cleared — it is intra-session pacing only.
-                # BUG-1 FIX: normalize empty _session to 'OFF_HOURS' so
-                # on_session_change() fires at bot startup AND on every
-                # named→unnamed transition (e.g. NY closes → weekend).
-                # The old guard `and _new_kz` short-circuited when ICT
-                # _session was '' — the ConvictionFilter session was never
-                # reset, entries_taken accumulated permanently, and
-                # MAX_ENTRIES_PER_SESSION (5) locked the bot out for the
-                # entire run after the first 5 trades.
-                _raw_kz = str(getattr(self._ict, '_session', '') or '')
-                _new_kz = _raw_kz if _raw_kz else 'OFF_HOURS'
+                _new_kz = ict_ctx.kill_zone or str(getattr(self._ict, '_killzone', '') or '')
                 if (self._conviction is not None
+                        and _new_kz
                         and _new_kz != self._last_conviction_kz):
                     self._last_conviction_kz = _new_kz
                     try:
@@ -4442,12 +4433,17 @@ class QuantStrategy:
                             f"📐 15m Swing SL: ${sl_price:,.2f} "
                             f"({sl_dist:.0f}pts / {sl_dist/atr:.2f}ATR)")
 
-            # ── Step 3: Reject — no structural SL found ──────────────────────
+            # ── Step 3: ATR fallback ───────────────────────────────────────────
             if sl_price is None:
+                _min_dist   = _path_b_min_dist
+                _max_dist   = price * QCfg.MAX_SL_PCT()
+                _atr_sl_dist = max(_min_dist, min(_max_dist, 1.5 * atr))
+                sl_price   = _round_to_tick(
+                    price - _atr_sl_dist if side == "long" else price + _atr_sl_dist)
+                _sl_source = "ATR_fallback"
                 logger.warning(
-                    f"_compute_sl_tp [{side.upper()}]: no structural SL "
-                    f"(ICT OB + 15m swing both failed) — trade rejected")
-                return None, None
+                    f"⚠️ SL ATR fallback: ${sl_price:,.2f} "
+                    f"({_atr_sl_dist:.0f}pts / {_atr_sl_dist/atr:.2f}ATR) — no 15m structure found")
 
             # ── v6.0: PATH-B LIQUIDITY PROXIMITY GUARD ─────────────────────────
             # move it behind the pool so the sweep doesn't take us out.
@@ -5206,24 +5202,7 @@ class QuantStrategy:
         # action="reverse"  → close and open opposite
         # action="continue" → update TP to next pool, tighten SL
         # action="hold"     → nothing, let existing SL/TP manage
-        # ── BUG FIX: pool_hit_gate 2-second debounce ──────────────────────────
-        # Root cause of "bot stops taking trades after 1–2 trades":
-        #   pool_hit_gate() was called on every 500ms on_tick while in position.
-        #   Each call can update DirectionEngine._ps_state and in_post_sweep.
-        #   With ~120 calls/minute, accumulated Bayesian evidence is overwritten
-        #   before it reaches decision threshold, and the post-sweep pipeline
-        #   never fires. After position close, clear_sweep() cannot fully undo
-        #   state mutated on the immediately-prior tick — in_post_sweep stays True,
-        #   blocking fresh sweep detection for the next trade.
-        #   Fix: evaluate pool_hit_gate at most once every 2 s. Structure events
-        #   (BOS, CHoCH, pool approach) occur at bar cadence (5 m), so 2 s
-        #   resolution is finer than necessary and adds zero meaningful latency.
-        _pg_now = now
-        _pg_debounce_interval = 2.0
-        if (self._dir_engine is not None
-                and not pos.is_flat()
-                and (_pg_now - self._last_pool_gate_ts) >= _pg_debounce_interval):
-            self._last_pool_gate_ts = _pg_now
+        if self._dir_engine is not None and not pos.is_flat():
             try:
                 _tf_ph  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_ph = self._cvd.get_trend_signal() if self._cvd else 0.0
@@ -5446,6 +5425,7 @@ class QuantStrategy:
                         if self._trail_in_progress:
                             return
                         self._trail_in_progress = True
+                        self._trail_started_at  = now
 
                     _snap_om  = order_manager
                     _snap_dm  = data_manager
@@ -5673,7 +5653,7 @@ class QuantStrategy:
 
         _liq_hold_reasons: list = []
         try:
-            _raw_trail_result = self._liq_trail.compute(
+            _liq_result = self._liq_trail.compute(
                 pos_side        = pos.side,
                 price           = price,
                 entry_price     = pos.entry_price,
@@ -5693,12 +5673,6 @@ class QuantStrategy:
                 candles_15m     = _trail_candles_15m,
                 candles_1h      = _trail_candles_1h,
             )
-            # Wrap result: StructuralTrailEngine returns TrailResult;
-            # LiquidityTrailResult wraps it with .anchor / .trail_blocked compat.
-            if hasattr(_raw_trail_result, 'anchor_price'):
-                _liq_result = LiquidityTrailResult(_raw_trail_result)
-            else:
-                _liq_result = _raw_trail_result
         except Exception as _lt_e:
             logger.exception("Trail: compute error — HOLD")
             return False
@@ -6457,17 +6431,6 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
-        # BUG FIX — "no trades after 2":
-        # DirectionEngine._ps_state was never cleared on position close.
-        # After exit, in_post_sweep remained True → evaluate_sweep() kept firing
-        # on every tick, setting a stale direction_hint that biased entry scoring
-        # toward the old sweep's direction, and spamming Telegram with repeated
-        # post-sweep verdicts.  Clear it here so the next trade starts fresh.
-        if hasattr(self, '_dir_engine') and self._dir_engine is not None:
-            try:
-                self._dir_engine.clear_sweep()
-            except Exception as _dce:
-                logger.debug(f"DirectionEngine.clear_sweep() on exit error (non-fatal): {_dce}")
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed
@@ -6491,8 +6454,6 @@ class QuantStrategy:
         self._last_structure_fingerprint = None
         self._last_trail_check_price = 0.0
         self._last_trail_rest_time = 0.0
-        # Reset pool-gate debounce so the next trade's first evaluation is immediate
-        self._last_pool_gate_ts = 0.0
         logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,

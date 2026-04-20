@@ -94,7 +94,6 @@ PRIMARY_TIMEFRAME    = "15m"
 ENTRY_TIMEFRAME      = "5m"
 HTF_TIMEFRAME        = "4h"
 
-
 # ── Session config ────────────────────────────────────────────────────────────
 SESSION_TRAIL_WIDTH_MULT = {
     "asia":     1.60,

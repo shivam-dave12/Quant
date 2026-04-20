@@ -967,15 +967,7 @@ class ICTEngine:
         recent_t = candles[-trend_lb:]
         t_highs: List[float] = []
         t_lows:  List[float] = []
-        # FIX-B: The full 60-bar BOS/CHoCH loop uses `range(2, len(recent) - 3)`
-        # (ICT-1 FIX) to exclude the live forming candle from all fractal checks.
-        # This 20-bar trend window still used the old `- 2` upper bound, allowing
-        # `i + 2` to reach `recent_t[-1]` — the currently forming candle.  That
-        # candle's wick updates every tick, causing the trend label to flip
-        # intrabar and immediately revert on the next closed bar.  Fix: mirror
-        # the ICT-1 FIX here.  With trend_lb=20, range(2, 17) still yields 15
-        # valid fractal candidates — more than sufficient for trend detection.
-        for i in range(2, len(recent_t) - 3):
+        for i in range(2, len(recent_t) - 2):
             h = float(recent_t[i]['h'])
             l = float(recent_t[i]['l'])
             if (h > float(recent_t[i-1]['h']) and h > float(recent_t[i-2]['h']) and
@@ -4378,7 +4370,7 @@ class ICTEngine:
                     "delivery_target": None,
                     "session_bias_notes": "Weekend — no institutional activity"}
 
-        if sess == "ASIA":
+        if sess == "ASIA" or (uh >= 23.0 or uh < 7.0):
             eq = "LOW"
             if killz == "ASIA_KZ": eq = "MEDIUM"
             notes = ("Asia: accumulation phase. Watch for equal highs/lows being "
@@ -4390,7 +4382,7 @@ class ICTEngine:
                     "delivery_target": amd.delivery_target,
                     "session_bias_notes": notes}
 
-        if sess == "LONDON":
+        if sess == "LONDON" or (7.0 <= uh < 13.5):
             eq = "HIGH" if killz == "LONDON_KZ" else "MEDIUM"
             judas_dir = ""
             notes = ("London: manipulation phase. Expect a Judas swing — a false "

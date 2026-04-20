@@ -84,24 +84,6 @@ except ImportError:
     _CFG_INTERVAL_SEC = 300
     _CFG_MAX_ENTRIES = 5
 
-# FIX-G: SESSION_DRAWDOWN_NOTIONAL and SESSION_MAX_DRAWDOWN_PCT were
-# re-imported inside _check_session_limits on every call — a hot path
-# invoked for every signal evaluation.  Python's import machinery is not
-# free: even with the module cached in sys.modules, getattr + float()
-# + exception-handling overhead on every call is redundant for constants
-# that are fixed at startup.  Hoist them here alongside the other config
-# constants so the hot path reads a plain module-level float.
-try:
-    import config as _cfg_root
-    _SESSION_DRAWDOWN_NOTIONAL: float = float(
-        getattr(_cfg_root, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
-    _SESSION_MAX_DRAWDOWN_PCT: float  = float(
-        getattr(_cfg_root, 'SESSION_MAX_DRAWDOWN_PCT',  10.0))
-    del _cfg_root
-except Exception:
-    _SESSION_DRAWDOWN_NOTIONAL = 10_000.0
-    _SESSION_MAX_DRAWDOWN_PCT  = 10.0
-
 # ── Internal constants ────────────────────────────────────────────────────────
 
 REQUIRED_SCORE = _CFG_MIN_SCORE
@@ -548,38 +530,6 @@ class ConvictionFilter:
         """Check timing/pacing gates.  Returns reason string if blocked."""
         st = self._session_state
 
-        # ── OFF_HOURS auto-reset ───────────────────────────────────────────────
-        # On 24/7 crypto markets the ICT engine's _session field stays '' during
-        # weekends and off-hours.  quant_strategy normalises '' → 'OFF_HOURS'
-        # before calling on_session_change(), so st.session_id is 'OFF_HOURS'
-        # for the entire off-hours block.  on_session_change() only fires when
-        # the session KEY changes, so entries_taken and consecutive_losses
-        # accumulate permanently across the whole off-hours window — typically
-        # 12–16 hours on weekdays or 48+ hours on weekends — exhausting
-        # MAX_ENTRIES_PER_SESSION (5) and locking the bot out for the entire run.
-        #
-        # Fix: if the session is unnamed/off-hours AND 4 hours have elapsed since
-        # the last entry, silently reset the intra-session counters.  4 hours is
-        # conservative: London open → NY close spans 8 hours, so a 4-hour auto-
-        # reset at most doubles the allowed entries within a continuous named
-        # session (benign) while reliably clearing the off-hours permanent lockout.
-        _OFF_HOURS_AUTO_RESET_SEC = 4 * 3600   # 4 hours
-        _is_unnamed = st.session_id in ('', 'OFF_HOURS')
-        if (_is_unnamed
-                and st.entries_taken > 0
-                and st.last_entry_time > 0
-                and (now - st.last_entry_time) >= _OFF_HOURS_AUTO_RESET_SEC):
-            logger.info(
-                "ConvictionFilter: off-hours auto-reset after %.1fh — "
-                "resetting entries_taken=%d consecutive_losses=%d",
-                (now - st.last_entry_time) / 3600.0,
-                st.entries_taken,
-                st.consecutive_losses,
-            )
-            st.entries_taken      = 0
-            st.consecutive_losses = 0
-            st.last_entry_time    = 0.0
-
         # Pacing interval
         if st.last_entry_time > 0:
             elapsed = now - st.last_entry_time
@@ -605,12 +555,13 @@ class ConvictionFilter:
         # want a margin-relative gate should override SESSION_DRAWDOWN_NOTIONAL
         # in config.  This guard prevents a single bad session from compounding
         # beyond the daily VaR limit regardless of the consecutive-loss pattern.
-        #
-        # FIX-G: constants are now hoisted to module level (_SESSION_DRAWDOWN_NOTIONAL,
-        # _SESSION_MAX_DRAWDOWN_PCT).  The previous `import config as _cfg` inside
-        # this method was redundant on every call and has been removed.
-        _notional   = _SESSION_DRAWDOWN_NOTIONAL
-        _max_dd_pct = _SESSION_MAX_DRAWDOWN_PCT
+        try:
+            import config as _cfg
+            _notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
+            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 10.0))
+        except Exception:
+            _notional   = 10_000.0
+            _max_dd_pct = 10.0
 
         if _notional > 0 and st.session_pnl < 0:
             _dd_pct = abs(st.session_pnl) / _notional * 100.0
