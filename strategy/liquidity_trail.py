@@ -525,9 +525,10 @@ class LiquidityTrailEngine:
             qty       = float(getattr(pos, 'quantity',       0.0) or 0.0)
 
         if exact_fee > 1e-6 and qty > 1e-10:
-            entry_fee_per_unit = exact_fee / qty
-            exit_rate          = entry_fee_per_unit / max(entry_price, 1.0)
-            commission_rt      = entry_fee_per_unit + entry_price * exit_rate
+            # Round-trip commission per BTC: double the exact entry fee and
+            # divide by qty. No rate derivation, no exit-rate inference —
+            # the exit leg mirrors the entry rate on the same exchange.
+            commission_rt = (exact_fee * 2.0) / qty
         elif fee_engine is not None:
             try:
                 bps = fee_engine.effective_roundtrip_cost_bps(use_maker_entry=True)

@@ -4378,7 +4378,7 @@ class ICTEngine:
                     "delivery_target": None,
                     "session_bias_notes": "Weekend — no institutional activity"}
 
-        if sess == "ASIA" or (uh >= 23.0 or uh < 7.0):
+        if sess == "ASIA":
             eq = "LOW"
             if killz == "ASIA_KZ": eq = "MEDIUM"
             notes = ("Asia: accumulation phase. Watch for equal highs/lows being "
@@ -4390,7 +4390,7 @@ class ICTEngine:
                     "delivery_target": amd.delivery_target,
                     "session_bias_notes": notes}
 
-        if sess == "LONDON" or (7.0 <= uh < 13.5):
+        if sess == "LONDON":
             eq = "HIGH" if killz == "LONDON_KZ" else "MEDIUM"
             judas_dir = ""
             notes = ("London: manipulation phase. Expect a Judas swing — a false "

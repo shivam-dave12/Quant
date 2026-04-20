@@ -3726,7 +3726,7 @@ class QuantStrategy:
                 # etc.) reset entries_taken and consecutive_losses so each new
                 # institutional session gets a fresh quota.  MIN_ENTRY_INTERVAL
                 # cooldown is also cleared — it is intra-session pacing only.
-                _new_kz = ict_ctx.kill_zone or str(getattr(self._ict, '_killzone', '') or '')
+                _new_kz = str(getattr(self._ict, '_session', '') or '')
                 if (self._conviction is not None
                         and _new_kz
                         and _new_kz != self._last_conviction_kz):
