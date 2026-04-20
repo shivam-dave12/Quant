@@ -548,6 +548,38 @@ class ConvictionFilter:
         """Check timing/pacing gates.  Returns reason string if blocked."""
         st = self._session_state
 
+        # ── OFF_HOURS auto-reset ───────────────────────────────────────────────
+        # On 24/7 crypto markets the ICT engine's _session field stays '' during
+        # weekends and off-hours.  quant_strategy normalises '' → 'OFF_HOURS'
+        # before calling on_session_change(), so st.session_id is 'OFF_HOURS'
+        # for the entire off-hours block.  on_session_change() only fires when
+        # the session KEY changes, so entries_taken and consecutive_losses
+        # accumulate permanently across the whole off-hours window — typically
+        # 12–16 hours on weekdays or 48+ hours on weekends — exhausting
+        # MAX_ENTRIES_PER_SESSION (5) and locking the bot out for the entire run.
+        #
+        # Fix: if the session is unnamed/off-hours AND 4 hours have elapsed since
+        # the last entry, silently reset the intra-session counters.  4 hours is
+        # conservative: London open → NY close spans 8 hours, so a 4-hour auto-
+        # reset at most doubles the allowed entries within a continuous named
+        # session (benign) while reliably clearing the off-hours permanent lockout.
+        _OFF_HOURS_AUTO_RESET_SEC = 4 * 3600   # 4 hours
+        _is_unnamed = st.session_id in ('', 'OFF_HOURS')
+        if (_is_unnamed
+                and st.entries_taken > 0
+                and st.last_entry_time > 0
+                and (now - st.last_entry_time) >= _OFF_HOURS_AUTO_RESET_SEC):
+            logger.info(
+                "ConvictionFilter: off-hours auto-reset after %.1fh — "
+                "resetting entries_taken=%d consecutive_losses=%d",
+                (now - st.last_entry_time) / 3600.0,
+                st.entries_taken,
+                st.consecutive_losses,
+            )
+            st.entries_taken      = 0
+            st.consecutive_losses = 0
+            st.last_entry_time    = 0.0
+
         # Pacing interval
         if st.last_entry_time > 0:
             elapsed = now - st.last_entry_time

@@ -320,6 +320,11 @@ class EntryEngine:
         # Sweep tracking
         self._last_sweep_reversal_dir  = ""
         self._last_sweep_reversal_time = 0.0
+        # BUG-3 FIX: epoch timestamp when the current position opened.
+        # Used by on_position_closed() to distinguish pre-trade sweeps
+        # (stale context, safe to purge) from post-open sweeps (live dedup
+        # guard, must survive the position close).
+        self._trade_open_time: float = 0.0
 
         # Momentum tracking
         self._momentum_entries_1h     = 0
@@ -482,6 +487,9 @@ class EntryEngine:
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION
         self._state_entered = time.time()
+        # BUG-3 FIX: stamp the open time so on_position_closed() can identify
+        # sweep registry entries that predate this position (stale context).
+        self._trade_open_time = time.time()
 
     def on_entry_cancelled(self) -> None:
         self._post_sweep = None
@@ -571,7 +579,28 @@ class EntryEngine:
         self._momentum_block_sl          = locked_sl
 
     def on_position_closed(self) -> None:
-        self._reset(time.time())
+        now = time.time()
+        # BUG-3 FIX: Purge sweep registry entries seeded BEFORE this position
+        # opened.  Pre-trade sweeps are stale context — they served their dedup
+        # purpose by preventing loop re-entry during the live trade.  After the
+        # trade closes they must not block a legitimate re-sweep at the same
+        # level on the next SCANNING tick.
+        #
+        # Identity test: a sweep entry's value = (seed_time + 120s).  Entries
+        # seeded before _trade_open_time have expiry < (_trade_open_time + 120s).
+        # Entries seeded DURING the hold (concurrent sweeps) have expiry >=
+        # (_trade_open_time + 120s) and must survive so they cannot loop.
+        #
+        # _trade_open_time = 0.0 (untracked) falls through to standard _reset().
+        _open_time = self._trade_open_time
+        if _open_time > 0:
+            _open_expiry_ceil = _open_time + 120.0
+            self._processed_sweeps = {
+                k: v for k, v in self._processed_sweeps.items()
+                if v > _open_expiry_ceil   # seeded after position opened — keep
+            }
+        self._trade_open_time = 0.0
+        self._reset(now)
 
     def force_reset(self) -> None:
         self._reset(time.time())

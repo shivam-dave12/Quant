@@ -2389,6 +2389,13 @@ class DailyRiskGate:
 
     def record_trade_result(self, pnl):
         with self._lock:
+            # BUG-2 FIX: reset day boundary BEFORE accumulating the result.
+            # Without this, a trade that opens just before IST midnight and
+            # closes just after will increment _consec_losses on the new
+            # day's clean slate — can_trade() then arms the lockout against
+            # a fresh day that had zero losses.  _reset_if_new_day() is
+            # idempotent so calling it here is always safe.
+            self._reset_if_new_day()
             self._daily_pnl += pnl
             if pnl < 0: self._consec_losses += 1
             else: self._consec_losses = 0
@@ -3764,9 +3771,17 @@ class QuantStrategy:
                 # etc.) reset entries_taken and consecutive_losses so each new
                 # institutional session gets a fresh quota.  MIN_ENTRY_INTERVAL
                 # cooldown is also cleared — it is intra-session pacing only.
-                _new_kz = str(getattr(self._ict, '_session', '') or '')
+                # BUG-1 FIX: normalize empty _session to 'OFF_HOURS' so
+                # on_session_change() fires at bot startup AND on every
+                # named→unnamed transition (e.g. NY closes → weekend).
+                # The old guard `and _new_kz` short-circuited when ICT
+                # _session was '' — the ConvictionFilter session was never
+                # reset, entries_taken accumulated permanently, and
+                # MAX_ENTRIES_PER_SESSION (5) locked the bot out for the
+                # entire run after the first 5 trades.
+                _raw_kz = str(getattr(self._ict, '_session', '') or '')
+                _new_kz = _raw_kz if _raw_kz else 'OFF_HOURS'
                 if (self._conviction is not None
-                        and _new_kz
                         and _new_kz != self._last_conviction_kz):
                     self._last_conviction_kz = _new_kz
                     try:
