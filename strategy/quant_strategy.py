@@ -132,33 +132,12 @@ try:
     from strategy.sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
     # StructuralTrailEngine result fields: new_sl, anchor_price, anchor_label,
     # reason, phase, r_multiple, blocked. Wrap to expose .anchor for compat.
-    class LiquidityTrailResult:
-        def __init__(self, r):
-            self.new_sl       = r.new_sl
-            self.reason       = r.reason
-            self.phase        = r.phase
-            self.r_multiple   = r.r_multiple
-            self.trail_blocked= r.blocked
-            self.block_reason = ""
-            # compat: callers that read result.anchor.price / result.anchor.sig
-            class _A:
-                price = r.anchor_price or 0.0
-                sig   = 0.0
-                quality = 0.0
-                timeframe = ""
-            self.anchor = _A()
+    from strategy.liquidity_trail import LiquidityTrailResult
     _LIQ_TRAIL_AVAILABLE = True
 except ImportError:
     try:
         from sl_tp_engine import StructuralTrailEngine as LiquidityTrailEngine
-        class LiquidityTrailResult:
-            def __init__(self, r):
-                self.new_sl=r.new_sl; self.reason=r.reason; self.phase=r.phase
-                self.r_multiple=r.r_multiple; self.trail_blocked=r.blocked
-                self.block_reason=""
-                class _A:
-                    price=r.anchor_price or 0.0; sig=0.0; quality=0.0; timeframe=""
-                self.anchor=_A()
+        from liquidity_trail import LiquidityTrailResult
         _LIQ_TRAIL_AVAILABLE = True
     except ImportError:
         try:
@@ -3214,11 +3193,11 @@ class QuantStrategy:
             be_locked = ((pos.side == "long" and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
-            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
-            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURE ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE FLOOR ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — CHANDELIER ({mfe_r:.2f}R)"
-            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
+            if mfe_r >= 2.50: trail_phase = 3; phase_lbl = f"🟢 PHASE 3 — AGGRESSIVE ({mfe_r:.2f}R)"
+            elif mfe_r >= 1.00: trail_phase = 2; phase_lbl = f"🟠 PHASE 2 — STRUCTURAL ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.50: trail_phase = 1; phase_lbl = f"🟡 PHASE 1 — BE LOCK ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.20: trail_phase = 0; phase_lbl = f"⬜ PHASE 0 — WATCHING ({mfe_r:.2f}R)"
+            else: trail_phase = -1; phase_lbl = f"⬜ HANDS OFF ({mfe_r:.2f}R < 0.50R)"
 
             _margin_pnl_pct = 0.0
             try:
@@ -5673,20 +5652,12 @@ class QuantStrategy:
                 candles_15m     = _trail_candles_15m,
                 candles_1h      = _trail_candles_1h,
             )
-            # Normalise result: StructuralTrailEngine returns TrailResult;
-            # LiquidityTrailEngine returns LiquidityTrailResult.  Both have
-            # .new_sl / .phase / .r_multiple / .reason.  StructuralTrailEngine
-            # has .anchor_price instead of .anchor.price — add compat shim.
+            # Wrap result: StructuralTrailEngine returns TrailResult;
+            # LiquidityTrailResult wraps it with .anchor / .trail_blocked compat.
             if hasattr(_raw_trail_result, 'anchor_price'):
-                class _AnchorShim:
-                    price     = _raw_trail_result.anchor_price or 0.0
-                    sig       = 0.0
-                    quality   = 0.0
-                    timeframe = ""
-                _raw_trail_result.anchor       = _AnchorShim()
-                _raw_trail_result.trail_blocked= _raw_trail_result.blocked
-                _raw_trail_result.block_reason = ""
-            _liq_result = _raw_trail_result
+                _liq_result = LiquidityTrailResult(_raw_trail_result)
+            else:
+                _liq_result = _raw_trail_result
         except Exception as _lt_e:
             logger.exception("Trail: compute error — HOLD")
             return False

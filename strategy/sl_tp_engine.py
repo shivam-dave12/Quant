@@ -581,6 +581,7 @@ class StructuralTrailEngine:
         cvd_trend:       float = 0.0,
         pos                        = None,
         fee_engine                 = None,
+        hold_reason:     Optional[List[str]] = None,
     ) -> TrailResult:
         """
         Compute next SL position.
@@ -636,13 +637,13 @@ class StructuralTrailEngine:
                 f"PHASE_0_HANDS_OFF: R={r_multiple:.2f} "
                 f"(gate={phase_r:.2f})<{PHASE_0_MAX_R}R — "
                 f"structural entry SL is optimal",
-                r_multiple)
+                r_multiple, hold_reason)
 
         if phase_r < PHASE_1_MAX_R:
             self._last_phase = "BE_LOCK"
             return self._phase1_be(
                 pos_side, price, entry_price, current_sl, atr,
-                r_multiple, pos, fee_engine)
+                r_multiple, pos, fee_engine, hold_reason)
 
         session = self._detect_session(ict_engine)
         candles_by_tf = {
@@ -657,43 +658,41 @@ class StructuralTrailEngine:
             return self._phase2_structural(
                 pos_side, price, entry_price, current_sl, atr, init_dist,
                 r_multiple, liq_snapshot, ict_engine, now_, now_ms,
-                candles_by_tf, session, cvd_trend, pos, fee_engine)
+                candles_by_tf, session, cvd_trend, pos, fee_engine, hold_reason)
 
         # Phase 3 — aggressive
         self._last_phase = "AGGRESSIVE"
         return self._phase3_aggressive(
             pos_side, price, entry_price, current_sl, atr, init_dist,
             r_multiple, liq_snapshot, ict_engine, now_, now_ms,
-            candles_by_tf, session, cvd_trend, pos, fee_engine)
+            candles_by_tf, session, cvd_trend, pos, fee_engine, hold_reason)
 
     # ─────────────────────────────────────────────────────────────────────
     # PHASE 1 — BREAK-EVEN LOCK
     # ─────────────────────────────────────────────────────────────────────
 
     def _phase1_be(self, pos_side, price, entry_price, current_sl, atr,
-                   r_multiple, pos, fee_engine) -> TrailResult:
+                   r_multiple, pos, fee_engine,
+                   hold_reason: Optional[List[str]] = None) -> TrailResult:
         be = round(self._be_price(pos_side, entry_price, atr, pos, fee_engine), 1)
 
         already = ((pos_side == "long"  and current_sl >= be) or
                    (pos_side == "short" and current_sl <= be))
         if already:
             return self._hold(
-                f"BE_ALREADY_LOCKED: SL=${current_sl:,.1f} >= BE=${be:,.1f}",
-                r_multiple)
+                f"BE_ALREADY_LOCKED: SL=${current_sl:,.1f} >= BE=${be:,.1f}", r_multiple, hold_reason)
 
         is_impr = ((pos_side == "long"  and be > current_sl) or
                    (pos_side == "short" and be < current_sl))
         if not is_impr:
             return self._hold(
-                f"BE_NOT_IMPROVEMENT: BE=${be:,.1f} vs current=${current_sl:,.1f}",
-                r_multiple)
+                f"BE_NOT_IMPROVEMENT: BE=${be:,.1f} vs current=${current_sl:,.1f}", r_multiple, hold_reason)
 
         # Breathing room — must not be too close to price
         breathing = abs(price - be) / atr
         if breathing < 0.35:
             return self._hold(
-                f"BE_TOO_TIGHT: breathing={breathing:.2f}ATR<0.35",
-                r_multiple)
+                f"BE_TOO_TIGHT: breathing={breathing:.2f}ATR<0.35", r_multiple, hold_reason)
 
         # Minimum meaningful move
         if abs(be - current_sl) / atr < MIN_IMPROVE_ATR:
@@ -717,6 +716,7 @@ class StructuralTrailEngine:
         self, pos_side, price, entry_price, current_sl, atr, init_dist,
         r_multiple, liq_snapshot, ict_engine, now, now_ms,
         candles_by_tf, session, cvd_trend, pos, fee_engine,
+        hold_reason: Optional[List[str]] = None,
     ) -> TrailResult:
         """
         Primary: find the nearest unswept liquidity pool that has been
@@ -734,8 +734,7 @@ class StructuralTrailEngine:
         if momentum == "NONE":
             return self._hold(
                 f"STRUCTURAL_MOMENTUM_GATE: no displacement/CVD/BOS — "
-                f"SL holds R={r_multiple:.2f}R",
-                r_multiple)
+                f"SL holds R={r_multiple:.2f}R", r_multiple, hold_reason)
 
         candidates: List[Tuple[float, float, str, float]] = []
         # (sl_level, score, label, anchor_price)
@@ -849,8 +848,7 @@ class StructuralTrailEngine:
         if not candidates:
             return self._hold(
                 f"STRUCTURAL: no qualifying pool/OB/swing with close-confirmation "
-                f"R={r_multiple:.2f}R momentum={momentum}",
-                r_multiple)
+                f"R={r_multiple:.2f}R momentum={momentum}", r_multiple, hold_reason)
 
         # Best candidate = highest score, nearest as tiebreaker
         if pos_side == "long":
@@ -882,6 +880,7 @@ class StructuralTrailEngine:
         self, pos_side, price, entry_price, current_sl, atr, init_dist,
         r_multiple, liq_snapshot, ict_engine, now, now_ms,
         candles_by_tf, session, cvd_trend, pos, fee_engine,
+        hold_reason: Optional[List[str]] = None,
     ) -> TrailResult:
         """
         Same hierarchy as Phase 2 but with tighter buffers, 1-close
@@ -907,8 +906,7 @@ class StructuralTrailEngine:
             ict_engine, now)
         if momentum == "NONE":
             return self._hold(
-                f"AGGRESSIVE_MOMENTUM_GATE: no signal R={r_multiple:.2f}R",
-                r_multiple)
+                f"AGGRESSIVE_MOMENTUM_GATE: no signal R={r_multiple:.2f}R", r_multiple, hold_reason)
 
         candidates: List[Tuple[float, float, str, float]] = []
         breath_pts = breath * atr
@@ -989,8 +987,7 @@ class StructuralTrailEngine:
         if not candidates:
             return self._hold(
                 f"AGGRESSIVE: no qualifying anchor with close-confirmation "
-                f"R={r_multiple:.2f}R momentum={momentum}",
-                r_multiple)
+                f"R={r_multiple:.2f}R momentum={momentum}", r_multiple, hold_reason)
 
         if pos_side == "long":
             candidates.sort(key=lambda x: (-x[1], -x[0]))
@@ -1274,7 +1271,10 @@ class StructuralTrailEngine:
             reason=reason, phase=phase, r_multiple=r_multiple)
 
     @staticmethod
-    def _hold(reason: str, r_multiple: float) -> TrailResult:
+    def _hold(reason: str, r_multiple: float,
+              hold_reason: Optional[List[str]] = None) -> TrailResult:
+        if hold_reason is not None:
+            hold_reason.append(reason)
         return TrailResult(
             new_sl=None, anchor_price=None, anchor_label="",
             reason=reason, phase="HOLD", r_multiple=r_multiple)

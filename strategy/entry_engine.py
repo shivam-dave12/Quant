@@ -1536,40 +1536,90 @@ class EntryEngine:
     def _handle_continuation(self, sweep, decision, snap, flow, ict,
                               price, atr, now) -> None:
         side = decision.direction
-        target = decision.next_target
-        if target is None:
-            self._post_sweep = None
-            self._reset(now)
-            return
 
-        # SL: BEYOND the swept pool
-        if side == "long":
-            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR
+        # ── Structural SL/TP via sl_tp_engine ────────────────────────────────
+        # CRITICAL: The old logic (sl = sweep.pool.price ± buffer) placed the
+        # SL on the WRONG SIDE of entry when price had moved past the swept pool.
+        # Example: BSL swept at $75,523, price at $75,219, SL = $75,467 > entry.
+        # compute_entry_sl() finds the nearest structural level BELOW (LONG) or
+        # ABOVE (SHORT) the entry price — always on the correct side.
+        try:
+            try:
+                from strategy.sl_tp_engine import compute_entry_sl, compute_entry_tp
+            except ImportError:
+                from sl_tp_engine import compute_entry_sl, compute_entry_tp
+            _have_sle = True
+        except ImportError:
+            _have_sle = False
+
+        import config as _ccfg
+        _min_rr_c = float(getattr(_ccfg, 'MIN_RISK_REWARD_RATIO', 2.0))
+        _max_rr_c = float(getattr(_ccfg, 'QUANT_REVERSION_MAX_RR', 4.0))
+        _now_ms_c = int(now * 1000)
+
+        if _have_sle:
+            _sl_r = compute_entry_sl(
+                side, price, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                now_ms       = _now_ms_c,
+            )
+            if _sl_r is None:
+                logger.info(f"CONTINUATION {side.upper()}: no structural SL — rejected")
+                self._post_sweep = None
+                self._reset(now)
+                return
+            sl = _sl_r.price
+
+            _tp_r = compute_entry_tp(
+                side, price, sl, atr,
+                ict_engine   = ict if hasattr(ict, 'order_blocks_bull') else None,
+                liq_snapshot = snap,
+                min_rr       = _min_rr_c,
+                max_rr       = _max_rr_c,
+                now_ms       = _now_ms_c,
+            )
+            if _tp_r is None:
+                logger.info(f"CONTINUATION {side.upper()}: no structural TP at RR={_min_rr_c:.1f} — rejected")
+                self._post_sweep = None
+                self._reset(now)
+                return
+            tp, rr, target = _tp_r.price, _tp_r.rr, decision.next_target
         else:
-            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR
-
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
-
-        tp_buf = atr * 0.35
-        tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf
+            # Legacy fallback path — only when sl_tp_engine.py not deployed
+            target = decision.next_target
+            if target is None:
+                self._post_sweep = None
+                self._reset(now)
+                return
+            # Guard: SL must be on the correct side of entry
+            _raw_sl = (sweep.pool.price - atr * _CONT_SL_BUFFER_ATR if side == "long"
+                       else sweep.pool.price + atr * _CONT_SL_BUFFER_ATR)
+            _raw_sl = self._push_sl_behind_pools(_raw_sl, side, price, atr)
+            _correct = ((side == "long" and _raw_sl < price) or
+                        (side == "short" and _raw_sl > price))
+            if not _correct:
+                logger.info(f"CONTINUATION {side.upper()}: SL ${_raw_sl:,.1f} wrong side of "
+                            f"entry ${price:,.1f} — rejected")
+                self._post_sweep = None
+                self._reset(now)
+                return
+            sl = _raw_sl
+            tp_buf = atr * 0.35
+            tp = (target.pool.price - tp_buf if side == "long"
+                  else target.pool.price + tp_buf)
+            rr = abs(tp - price) / max(abs(price - sl), 1e-10)
 
         risk = abs(price - sl)
-        reward = abs(tp - price)
         if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
             self._post_sweep = None
             self._reset(now)
             return
 
-        rr = reward / risk
         if rr < _MIN_RR_RATIO:
-            tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
-            if tp2 is not None:
-                tp, target = tp2, target2
-                rr = abs(tp - price) / risk
-            else:
-                self._post_sweep = None
-                self._reset(now)
-                return
+            self._post_sweep = None
+            self._reset(now)
+            return
 
         self._signal = EntrySignal(
             side=side, entry_type=EntryType.SWEEP_CONTINUATION,
