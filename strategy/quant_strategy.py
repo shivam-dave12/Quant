@@ -2586,6 +2586,15 @@ class QuantStrategy:
         # ── Unified entry gate state ──────────────────────────────────────
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
+        # BUG FIX — pool_hit_gate debounce timer.
+        # pool_hit_gate runs every 500ms tick while in position; on every call it
+        # may update DirectionEngine._ps_state and in_post_sweep, wiping accumulated
+        # Bayesian evidence before it can reach the conviction threshold.  After the
+        # position closes, clear_sweep() cannot fully undo state that was overwritten
+        # on the previous tick, leaving in_post_sweep=True and blocking fresh sweeps.
+        # Fix: evaluate at most once every 2 s (structure events occur at bar cadence,
+        # not tick cadence; 2 s is more than sufficient resolution).
+        self._last_pool_gate_ts: float = 0.0
         self._log_init()
 
     def _log_init(self):
@@ -5182,7 +5191,24 @@ class QuantStrategy:
         # action="reverse"  → close and open opposite
         # action="continue" → update TP to next pool, tighten SL
         # action="hold"     → nothing, let existing SL/TP manage
-        if self._dir_engine is not None and not pos.is_flat():
+        # ── BUG FIX: pool_hit_gate 2-second debounce ──────────────────────────
+        # Root cause of "bot stops taking trades after 1–2 trades":
+        #   pool_hit_gate() was called on every 500ms on_tick while in position.
+        #   Each call can update DirectionEngine._ps_state and in_post_sweep.
+        #   With ~120 calls/minute, accumulated Bayesian evidence is overwritten
+        #   before it reaches decision threshold, and the post-sweep pipeline
+        #   never fires. After position close, clear_sweep() cannot fully undo
+        #   state mutated on the immediately-prior tick — in_post_sweep stays True,
+        #   blocking fresh sweep detection for the next trade.
+        #   Fix: evaluate pool_hit_gate at most once every 2 s. Structure events
+        #   (BOS, CHoCH, pool approach) occur at bar cadence (5 m), so 2 s
+        #   resolution is finer than necessary and adds zero meaningful latency.
+        _pg_now = now
+        _pg_debounce_interval = 2.0
+        if (self._dir_engine is not None
+                and not pos.is_flat()
+                and (_pg_now - self._last_pool_gate_ts) >= _pg_debounce_interval):
+            self._last_pool_gate_ts = _pg_now
             try:
                 _tf_ph  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_ph = self._cvd.get_trend_signal() if self._cvd else 0.0
@@ -6450,6 +6476,8 @@ class QuantStrategy:
         self._last_structure_fingerprint = None
         self._last_trail_check_price = 0.0
         self._last_trail_rest_time = 0.0
+        # Reset pool-gate debounce so the next trade's first evaluation is immediate
+        self._last_pool_gate_ts = 0.0
         logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,

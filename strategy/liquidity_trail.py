@@ -39,6 +39,16 @@ class LiquidityTrailResult:
 
     Build from a raw TrailResult (returned by StructuralTrailEngine.compute())
     or construct directly with keyword arguments for test compatibility.
+
+    BUG FIX (Trailing SL Telegram notification silently failing):
+    The inner _AnchorShim class only had 4 fields (price, sig, quality,
+    timeframe).  format_liquidity_trail_update accesses 7 additional fields:
+      _a.is_swept, _a.fib_ratio, _a.is_cluster, _a.n_cluster_tfs,
+      _a.pool_boost, _a.pool_between_expand, _a.buffer_atr
+    All raised AttributeError which was swallowed by:
+      except Exception as _lt_tg_e: logger.debug(...)
+    causing the entire trail Telegram block to silently fail every time.
+    Fix: _AnchorShim now mirrors all 11 fields from PoolAnchor.__slots__.
     """
     __slots__ = (
         'new_sl', 'reason', 'phase', 'r_multiple',
@@ -60,11 +70,25 @@ class LiquidityTrailResult:
             self.momentum_gate = ""
             self.htf_aligned   = None
 
+            # ── FIX: expose ALL PoolAnchor fields so format_liquidity_trail_update
+            # never raises AttributeError inside the throttled TG try/except.
+            # The 4 original fields (price, sig, quality, timeframe) are preserved;
+            # the 7 missing fields are added with safe zero/False/None defaults
+            # matching the PoolAnchor constructor defaults.
+            _ap = raw.anchor_price or 0.0
             class _AnchorShim:
-                price     = raw.anchor_price or 0.0
-                sig       = 0.0
-                quality   = 0.0
-                timeframe = ""
+                price               = _ap
+                sig                 = 0.0
+                quality             = 0.0
+                timeframe           = ""
+                # Previously missing — caused silent AttributeError in TG block
+                is_swept            = False
+                fib_ratio           = None
+                is_cluster          = False
+                n_cluster_tfs       = 1
+                pool_boost          = False
+                pool_between_expand = False
+                buffer_atr          = 0.0
             self.anchor = _AnchorShim()
         else:
             # Direct construction from kwargs (tests / legacy callers)
@@ -81,10 +105,18 @@ class LiquidityTrailResult:
 
             _ap = kwargs.get('anchor_price')
             class _AnchorShim:
-                price     = _ap or 0.0
-                sig       = 0.0
-                quality   = 0.0
-                timeframe = ""
+                price               = _ap or 0.0
+                sig                 = 0.0
+                quality             = 0.0
+                timeframe           = ""
+                # ── FIX: same completeness fix for kwargs path ──────────────
+                is_swept            = False
+                fib_ratio           = None
+                is_cluster          = False
+                n_cluster_tfs       = 1
+                pool_boost          = False
+                pool_between_expand = False
+                buffer_atr          = 0.0
             self.anchor = _AnchorShim()
 
 
