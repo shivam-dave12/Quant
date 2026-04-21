@@ -3809,13 +3809,21 @@ class QuantStrategy:
                 # entry_engine._processed_sweeps both key on (price, ts) at
                 # sub-second resolution, so widening the detection window
                 # cannot reintroduce sweep-loop reprocessing.
-                _base_age_limit_ms = now_ms - 60_000
+                # 120s base window — mirrors the entry_engine bridge path (Fix 2).
+                # The two windows must be identical: if this loop ages out a sweep
+                # before entry_engine._collect_sweeps() runs, the ICT bridge path
+                # in the entry engine sees an empty ict_ctx.ict_sweeps even when a
+                # valid, unprocessed sweep exists.
+                _base_age_limit_ms = now_ms - 120_000
                 # Start of the current 5m bar (Unix-epoch ms, floor-aligned)
                 _cur_5m_start_ms   = (now_ms // 300_000) * 300_000
                 # Accept a sweep if EITHER within 60s OR from the current/
                 # previous 5m bar (ensures a bar-open sweep stays visible
                 # for the full bar duration).
-                _bar_age_limit_ms  = _cur_5m_start_ms - 300_000  # prev bar start
+                # 2 bars back (600s) — mirrors entry_engine bridge path (Fix 3).
+                # Ensures a sweep at bar-open stays visible for the full bar
+                # duration when the 120s base window crosses a bar boundary.
+                _bar_age_limit_ms  = _cur_5m_start_ms - 600_000  # 2 bars back
 
                 for pool in self._ict.liquidity_pools:
                     if not pool.swept:
@@ -3921,10 +3929,12 @@ class QuantStrategy:
                                         now              = now,
                                         quality          = _new_quality,
                                     )
-                            # BUG-D1 FIX: Prune _notified_sweeps unconditionally
-                            # per-pool-visit (not just inside _should_forward path)
-                            # so the set stays bounded even when no new sweeps arrive.
-                            _cutoff_ms = now_ms - 60_000
+                            # Prune entries older than 120s — must match the
+                            # detection window (Fix 5/6) so a swept pool is not
+                            # pruned from _notified_sweeps while it is still
+                            # within the age window, which would re-trigger
+                            # on_sweep() and reset PostSweepState evidence.
+                            _cutoff_ms = now_ms - 120_000
                             self._notified_sweeps = {
                                 k for k in self._notified_sweeps
                                 if k[1] > _cutoff_ms
@@ -6431,6 +6441,16 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
+        # Clear _notified_sweeps so swept ICT pools that were dedup-guarded
+        # during the closed position's lifetime can re-enter the bridge and
+        # fire DirectionEngine.on_sweep() for the next trade evaluation.
+        # entry_engine.on_position_closed() (above) already cleared
+        # _processed_sweeps — this ensures the bridge-level dedup set is also
+        # clean.  Keeps them in sync: both registries must be at the same
+        # boundary (position close) or the entry engine accepts a sweep that
+        # the bridge will never forward.
+        if hasattr(self, '_notified_sweeps'):
+            self._notified_sweeps.clear()
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed

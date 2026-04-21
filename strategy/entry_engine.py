@@ -773,7 +773,10 @@ class EntryEngine:
 
         sweeps = []
         for s in (snap.recent_sweeps or []):
-            if s.detected_at <= now - 60.0:
+            # 120s window: the SL-candle sweep detected_at is already > 60s old by
+            # the time _finalise_exit() completes + SCANNING resumes (reconcile +
+            # 2-min post-close delay).  120s covers the full reconcile+scan cycle.
+            if s.detected_at <= now - 120.0:
                 _skipped_stale += 1
                 continue
             if s.quality < _MIN_SWEEP_QUALITY:
@@ -808,12 +811,20 @@ class EntryEngine:
             # seconds, 120s hold after enter_post_sweep) handles dedup —
             # widening the detection window does not reintroduce sweep-
             # loop reprocessing.
-            _base_age_limit = int(now * 1000) - 60_000
+            # 120s base window: matches the LiquidityMap path (Fix 1) so both
+            # sweep sources age out at the same rate.  A 60s mismatch caused the
+            # ICT bridge to expire sweeps 60s before the LiquidityMap path saw
+            # them — making the bridge unreachable after a post-close delay.
+            _base_age_limit = int(now * 1000) - 120_000
             # Beginning of the current 5-minute bar (UTC-based)
             _cur_5m_start_ms = int(now // 300.0) * 300_000
             # Accept a sweep if EITHER it's within 60s of now OR it was
             # detected in the current or previous 5m bar (+60s grace).
-            _bar_age_limit = _cur_5m_start_ms - 300_000  # start of previous 5m bar
+            # 2 bars back (600s): extends coverage so a sweep at bar-open is
+            # admitted for the full bar duration even when the base_age_limit
+            # (120s) crosses a bar boundary mid-evaluation.  One bar (300s) could
+            # exclude early-bar sweeps at the start of the second minute.
+            _bar_age_limit = _cur_5m_start_ms - 600_000  # 2 bars back = 10 min
 
             _bridge_stale = 0
             _bridge_low_q = 0
@@ -882,6 +893,21 @@ class EntryEngine:
                 "low_quality": _skipped_low_quality,
                 "processed":   _skipped_processed,
             }
+            # Surface stale rejections at INFO level so post-close silences are
+            # diagnosable without reading DEBUG logs.  Only log when sweeps exist
+            # but were rejected — an empty snap.recent_sweeps is not a skip event.
+            if _skipped_stale and snap.recent_sweeps:
+                _stale_ages = [
+                    now - s.detected_at
+                    for s in snap.recent_sweeps
+                    if s.detected_at <= now - 120.0
+                ]
+                _oldest_age = max(_stale_ages) if _stale_ages else 0.0
+                logger.info(
+                    f"SCAN SKIP: {_skipped_stale} sweep(s) stale "
+                    f"(oldest {_oldest_age:.0f}s ago, window=120s) — "
+                    f"low_q={_skipped_low_quality} proc={_skipped_processed}"
+                )
         else:
             self._last_liq_skip = None
 
