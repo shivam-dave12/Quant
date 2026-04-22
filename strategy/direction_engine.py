@@ -964,7 +964,6 @@ class DirectionEngine:
             delivery_direction = "bearish"
             swept_pool    = ssl_price
             opposing_pool = bsl_price
-            if liq_snapshot is not None and liq_snapshot.ssl_pools:
             # BUG-4 FIX: only resolve from non-SWEPT pools
             if liq_snapshot is not None and liq_snapshot.ssl_pools:
                 _assl = [t for t in liq_snapshot.ssl_pools if self._is_pool_target_active(t)]
