@@ -3840,7 +3840,14 @@ class QuantStrategy:
                         continue
                     if (pool.sweep_timestamp < _base_age_limit_ms
                             and pool.sweep_timestamp < _bar_age_limit_ms):
+                        _bridge_dropped_historical += 1
                         continue
+                    
+                    if _bridge_dropped_historical:
+                        logger.debug(
+                            f"ICT bridge: {_bridge_dropped_historical} historical sweep(s) filtered "
+                            f"(oldest age > {(now_ms - _base_age_limit_ms)//1000}s limit)")
+
                     c5 = candles_by_tf.get("5m", [])
                     # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
                     # The old code blindly used c5[-2] (last closed bar), but the sweep
