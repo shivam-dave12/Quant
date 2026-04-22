@@ -599,18 +599,28 @@ def format_periodic_report(
         lines.append(f"  🎯 Target: {_esc(primary_target_str)}")
 
     if sweep_analysis:
-        rs = float(sweep_analysis.get("reversal_score", 0))
-        cs = float(sweep_analysis.get("continuation_score", 0))
-        rr = sweep_analysis.get("reversal_reasons", []) or []
-        cr = sweep_analysis.get("continuation_reasons", []) or []
-        sw_side = sweep_analysis.get("sweep_side", "?")
+        # KEY-SYNC FIX: entry_engine writes both short-form ("rev_score",
+        # "cont_score") and long-form ("reversal_score", "continuation_score")
+        # keys. Read long-form with short-form fallback so this works regardless
+        # of which version of entry_engine is deployed.
+        rs = float(sweep_analysis.get("reversal_score",
+                   sweep_analysis.get("rev_score", 0)))
+        cs = float(sweep_analysis.get("continuation_score",
+                   sweep_analysis.get("cont_score", 0)))
+        rr = (sweep_analysis.get("reversal_reasons")
+              or sweep_analysis.get("rev_reasons") or [])
+        cr = (sweep_analysis.get("continuation_reasons")
+              or sweep_analysis.get("cont_reasons") or [])
+        sw_side  = sweep_analysis.get("sweep_side", "?")
         sw_price = sweep_analysis.get("sweep_price", 0)
+        sw_qual  = sweep_analysis.get("sweep_quality", 0)
         winner = ("REVERSAL"     if rs > cs + 15 else
                   "CONTINUATION" if cs > rs + 15 else
                   "UNDECIDED")
         lines.append("")
+        qual_str = f" q={sw_qual:.0%}" if sw_qual > 0 else ""
         lines.append(
-            f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)})"
+            f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)}{qual_str})"
         )
         lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{_esc(winner)}</b>")
         if rr:

@@ -397,7 +397,6 @@ class EntryEngine:
         # {"stale": int, "low_quality": int, "processed": int}
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
-        self._last_ps_cleanup:  float = 0.0   # BUG-3 FIX: periodic _processed_sweeps pruning
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -577,42 +576,7 @@ class EntryEngine:
         self._momentum_block_sl          = locked_sl
 
     def on_position_closed(self) -> None:
-        """Called by quant_strategy._finalise_exit() on any normal trade exit.
-
-        BUG-EXIT-RESET FIX: _reset() transitions state → SCANNING and clears
-        _signal / _post_sweep, but it intentionally preserves gate/momentum
-        block fields so they survive mid-trade state transitions.  After a
-        FULL position close those fields must be cleared — a pre-trade
-        conviction gate block or momentum block is no longer relevant, and
-        leaving them set causes the engine to land in SCANNING but generate
-        NO signals until the block timer naturally expires (up to 45s for
-        gate, 30s for momentum, plus the _last_momentum_candle_ts guard that
-        prevents the displacement candle from the last entry from being
-        re-evaluated until it scrolls out of the lookback window).
-
-        Fields deliberately NOT cleared here:
-          _processed_sweeps     — BUG-1/BUG-2 fix: active hold windows must
-                                  survive position close so the same sweep
-                                  cannot immediately re-enter.
-          _momentum_entries_1h  — hourly budget should not reset on close;
-                                  force_reset() handles operator-mandated clears.
-          _last_entry_at        — provides a 15s re-entry guard; force_reset()
-                                  clears for operator hard-reset.
-        """
-        now = time.time()
-        self._reset(now)
-
-        # Clear all signal-generation blockers that are irrelevant post-close.
-        self._gate_blocked_until         = 0.0
-        self._gate_block_key             = ()
-        self._momentum_blocked_until     = 0.0
-        self._momentum_block_entry_price = 0.0
-        self._momentum_block_candle_ts   = 0
-        self._momentum_block_sl          = None
-        # Clear the displacement-candle stamp so the same candle can be
-        # re-evaluated as a fresh setup for the next trade.
-        self._last_momentum_candle_ts    = 0
-
+        self._reset(time.time())
 
     def force_reset(self) -> None:
         self._reset(time.time())
@@ -738,13 +702,6 @@ class EntryEngine:
         # Track every reason a sweep is rejected so upstream logs show why
         # SCANNING isn't transitioning. Silent rejection makes "no trades"
         # indistinguishable from "broken pipeline".
-        # BUG-3 FIX: periodic pruning of _processed_sweeps between position closes.
-        # _reset() prunes on close; this handles hours-long inter-trade SCANNING.
-        _PS_CLEANUP_INTERVAL_SEC = 60.0
-        if now - self._last_ps_cleanup > _PS_CLEANUP_INTERVAL_SEC:
-            self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items() if v > now}
-            self._last_ps_cleanup = now
-
         _skipped_stale       = 0
         _skipped_low_quality = 0
         _skipped_processed   = 0
@@ -1373,11 +1330,34 @@ class EntryEngine:
         ps.peak_cont = max(ps.peak_cont, cont_total)
         gap = abs(rev_total - cont_total)
 
+        # KEY-SYNC FIX: notifier.py reads "reversal_score", "continuation_score",
+        # "reversal_reasons", "continuation_reasons", "sweep_side", "sweep_price",
+        # "sweep_quality". The original dict used different short-form keys so every
+        # .get() in notifier returned 0 / [] / "?" → permanently showed REV:0 CONT:0
+        # UNDECIDED with "? @ $0.0" regardless of actual evidence scores.
+        #
+        # quant_strategy reads the short-form keys ("rev_score", "cont_score") in
+        # several places — keep both so neither caller breaks.
         self._last_sweep_analysis = {
-            "rev_score": rev_total, "cont_score": cont_total,
-            "phase": phase, "cisd": ps.cisd_detected,
-            "displacement_atr": ps.max_displacement, "ote": ps.ote_reached,
-            "rev_reasons": rev_r, "cont_reasons": cont_r,
+            # Short-form keys — consumed by quant_strategy internal logic
+            "rev_score":   rev_total,
+            "cont_score":  cont_total,
+            "rev_reasons": rev_r,
+            "cont_reasons": cont_r,
+            # Long-form keys — consumed by notifier.py format_periodic_report()
+            "reversal_score":        rev_total,
+            "continuation_score":    cont_total,
+            "reversal_reasons":      rev_r,
+            "continuation_reasons":  cont_r,
+            # Sweep identity fields (were entirely absent — caused "? @ $0.0")
+            "sweep_side":    sweep.pool.side.value,   # "BSL" or "SSL"
+            "sweep_price":   sweep.pool.price,         # pool price that was swept
+            "sweep_quality": sweep.quality,            # sweep quality [0,1]
+            # Context fields
+            "phase":            phase,
+            "cisd":             ps.cisd_detected,
+            "displacement_atr": ps.max_displacement,
+            "ote":              ps.ote_reached,
         }
 
         threshold = base_thr * mult

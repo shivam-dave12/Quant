@@ -6835,17 +6835,26 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # ── Sweep analysis ───────────────────────────────────────────────
-        if hasattr(self, '_entry_engine') and self._entry_engine is not None:
-            try:
-                sweep_anal = getattr(self._entry_engine, '_last_sweep_analysis', None)
-            except Exception:
-                pass
-
         # ── Engine state ─────────────────────────────────────────────────
         engine_state = "SCANNING"
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             engine_state = self._entry_engine.state
+
+        # ── Sweep analysis ───────────────────────────────────────────────
+        # GATE FIX: only surface sweep_analysis when the engine is actively in
+        # POST_SWEEP. _last_sweep_analysis persists on the entry engine after the
+        # POST_SWEEP window closes and the engine resets to SCANNING. Passing the
+        # stale dict unconditionally caused every subsequent heartbeat to show
+        # "REV:0 CONT:0 UNDECIDED ? @ $0.0" for the rest of the session — not
+        # because there was no sweep analysis, but because the stale dict was
+        # rendered on every report long after the sweep event resolved.
+        if (engine_state == "POST_SWEEP"
+                and hasattr(self, '_entry_engine')
+                and self._entry_engine is not None):
+            try:
+                sweep_anal = getattr(self._entry_engine, '_last_sweep_analysis', None)
+            except Exception:
+                pass
 
         # ── Position dict ────────────────────────────────────────────────
         pos_dict = None
