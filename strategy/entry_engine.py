@@ -96,22 +96,11 @@ try:
     _PS_PHASE_CISD         = float(getattr(_ecfg, 'PS_PHASE_CISD_SEC',         120.0))
     _PS_PHASE_OTE          = float(getattr(_ecfg, 'PS_PHASE_OTE_SEC',          240.0))
     _PS_PHASE_MATURE       = float(getattr(_ecfg, 'PS_PHASE_MATURE_SEC',       360.0))
-    # BUG-1 FIX: Post-close stale-window extension.
-    # After a long position hold every sweep in snap.recent_sweeps is older than
-    # the normal 120s staleness limit and the engine enters a cold-start dead zone
-    # of unknown duration.  For POST_CLOSE_GRACE_PERIOD_SEC after on_position_closed()
-    # _collect_sweeps() uses POST_CLOSE_STALE_WINDOW_SEC instead of 120s so sweeps
-    # from the final minutes of the closed position are still reachable.
-    # Operators can widen or narrow both windows from config without a redeploy.
-    _POST_CLOSE_STALE_WINDOW_SEC = float(getattr(_ecfg, 'POST_CLOSE_STALE_WINDOW_SEC', 600.0))
-    _POST_CLOSE_GRACE_PERIOD_SEC = float(getattr(_ecfg, 'POST_CLOSE_GRACE_PERIOD_SEC', 300.0))
 except Exception:
     _PS_PHASE_DISPLACEMENT = 45.0
     _PS_PHASE_CISD         = 120.0
     _PS_PHASE_OTE          = 240.0
     _PS_PHASE_MATURE       = 360.0
-    _POST_CLOSE_STALE_WINDOW_SEC = 600.0
-    _POST_CLOSE_GRACE_PERIOD_SEC = 300.0
 
 # Post-Sweep evidence thresholds (lowered to allow entries)
 _PS_THRESHOLD_EARLY  = 45.0
@@ -306,18 +295,6 @@ class _PostSweepState:
     static_scored:      bool  = False
     static_rev_base:    float = 0.0
     static_cont_base:   float = 0.0
-    # Bug #2 fix: cross-sweep decay must fire once per unique event, not every
-    # 250ms tick for the full 90s window the event remains in ict_sweeps.
-    # Key: (round(pool_price, 0), pool_type, round(sweep_ts_sec, 0))
-    # When the cross-sweep block fires it stores the event key here.  The
-    # same key is a no-op on all subsequent ticks.
-    _cross_sweep_applied: Optional[tuple] = None
-    # Bug #4 fix: cache the AMD phase+bias that were in effect when static
-    # factors were scored.  If the phase or bias changes mid-sweep (common
-    # 10-15 min lag as AMD transitions from ACCUMULATION → MANIPULATION)
-    # static_scored is reset to False so the new phase is properly scored.
-    _static_amd_phase: str = ""
-    _static_amd_bias:  str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -386,14 +363,9 @@ class EntryEngine:
         # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
         # window PLUS the 45s gate-block cooldown with 15s margin.
         #
-        # Lifecycle:
-        #   _reset(full_clear=False) — preserves active entries so the same sweep
-        #     cannot re-enter during its 120s hold window (in-evaluation resets,
-        #     on_entry_failed, on_entry_cancelled, POST_SWEEP timeout).
-        #   _reset(full_clear=True) — clears fully at position boundaries
-        #     (on_position_closed, force_reset, stuck-state watchdog) so a new
-        #     trade evaluates fresh sweeps rather than being silenced by stale
-        #     entries from the closed position's lifecycle.
+        # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
+        # must survive a state reset so the same sweep cannot sneak back in.
+        # force_reset() clears it fully when the operator demands a hard reset.
         self._processed_sweeps: Dict[tuple, float] = {}
 
         # FIX-SPAM: Momentum signal gate-block (independent of post-sweep gate).
@@ -425,21 +397,6 @@ class EntryEngine:
         # {"stale": int, "low_quality": int, "processed": int}
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
-
-        # BUG-1 FIX: Timestamp when on_position_closed() last fired.
-        # _collect_sweeps() uses this to extend the staleness window for
-        # _POST_CLOSE_GRACE_PERIOD_SEC after a close so sweeps from the
-        # final minutes of a long hold are not immediately discarded.
-        # Set BEFORE _reset() so the field survives the full_clear.
-        self._position_closed_at: float = 0.0
-
-        # BUG-3 FIX: Last conviction block record for scan_skip_info.
-        # Sweeps can pass _collect_sweeps() but still be blocked downstream
-        # by the conviction gate.  Without this, that block is invisible in
-        # the THINK log after the first identical rejection is demoted to
-        # DEBUG.  Cleared on full_clear so stale records don't pollute the
-        # next position's diagnostics.
-        self._last_conviction_block: Optional[Dict] = None
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -485,13 +442,8 @@ class EntryEngine:
             if now - self._state_entered > stuck_limit:
                 logger.warning(
                     f"Engine SELF-RECOVERY: stuck in {self._state.name} "
-                    f"for {now - self._state_entered:.0f}s — full_clear reset")
-                # full_clear=True: the state has been stuck for 120s/4h which
-                # implies the normal on_position_closed() lifecycle event was
-                # never received.  The entire per-position gate state is suspect;
-                # a narrow reset would preserve stale cooldowns and _processed_sweeps
-                # entries that block the next valid setup.
-                self._reset(now, full_clear=True)
+                    f"for {now - self._state_entered:.0f}s")
+                self._reset(now)
 
     def get_signal(self) -> Optional[EntrySignal]:
         return self._signal
@@ -501,36 +453,27 @@ class EntryEngine:
         self._signal = None
         return sig
 
-    def on_entry_placed(
-        self,
-        entry_type: Optional["EntryType"] = None,
-    ) -> None:
+    def on_entry_placed(self) -> None:
         """
-        Called by quant_strategy AFTER consume_signal() when a trade order is
-        confirmed sent.  The caller must pass the ``entry_type`` taken from the
-        consumed signal — this method cannot read self._signal because
-        consume_signal() already nulled it.
+        Called by quant_strategy when a trade order is confirmed sent.
 
-        Bug #17 (original): counter was incremented at signal-generation time,
-        not at order-submission time, so conviction-gated signals consumed
-        budget slots with zero fills.
-
-        Bug #1 (audit): the "Bug #17 fix" was itself broken.  on_entry_placed()
-        checked self._signal IS NOT None after consume_signal() had already set
-        it to None, so _momentum_entries_1h never incremented regardless of
-        entry type — _MOMENTUM_MAX_PER_HOUR had zero effect.
-
-        Fix: accept entry_type as an explicit argument.  The call site in
-        quant_strategy must be:
-            sig = self._entry_engine.consume_signal()
-            self._entry_engine.on_entry_placed(sig.entry_type)
+        Bug #17 fix: _momentum_entries_1h was previously incremented when the
+        momentum SIGNAL was generated, not when the entry was actually placed.
+        A signal blocked by the conviction gate still consumed a budget slot,
+        so two blocked signals exhausted the 3-per-hour cap even with zero
+        fills.  The counter now increments here — strictly after consume_signal()
+        has been called and the order submitted — giving an accurate count of
+        attempted (not generated) entries.
         """
         self._state = EngineState.ENTERING
         self._state_entered = time.time()
         self._last_entry_at = time.time()
-        if entry_type == EntryType.DISPLACEMENT_MOMENTUM:
+        # Increment momentum budget for the active signal type (if momentum).
+        if (self._signal is not None and
+                getattr(self._signal, 'entry_type', None) ==
+                EntryType.DISPLACEMENT_MOMENTUM):
             self._momentum_entries_1h += 1
-        # self._signal is already None (cleared by consume_signal).
+        self._signal = None
 
     def on_entry_failed(self) -> None:
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
@@ -632,58 +575,20 @@ class EntryEngine:
         self._momentum_block_candle_ts   = candle_ts
         self._momentum_block_sl          = locked_sl
 
-    def mark_conviction_blocked(
-        self,
-        side: str,
-        score: float,
-        reason: str,
-        now: Optional[float] = None,
-    ) -> None:
-        """
-        BUG-3 FIX: Called by quant_strategy when the conviction filter blocks
-        any signal type (both DISPLACEMENT_MOMENTUM and POST_SWEEP).
-
-        Stores the block context in _last_conviction_block so scan_skip_info
-        can surface it alongside sweep rejections in the THINK log.
-
-        This closes the observability gap where a conviction block during
-        SCANNING is completely invisible after the first identical rejection is
-        demoted to DEBUG.  With this in place the THINK log shows BOTH why
-        sweeps are being discarded AND why the conviction gate is blocking —
-        making the "SCANNING but no trades" state immediately diagnosable
-        without enabling DEBUG logging or tracing through source.
-
-        Lifecycle: cleared on full_clear reset (position boundary) so stale
-        records from the previous position do not mislead diagnostics for the
-        next one.
-        """
-        self._last_conviction_block = {
-            "side":   side,
-            "score":  round(score, 3),
-            "reason": reason[:80],
-            "at":     now if now is not None else time.time(),
-        }
-
     def on_position_closed(self) -> None:
-        # BUG-1 FIX: Record the close timestamp BEFORE calling _reset() so
-        # _collect_sweeps() can extend the staleness window on the first scan(s)
-        # after a long hold.  If _reset() ran first it would wipe _state_entered
-        # to now, making the post-close elapsed check meaningless.
-        # full_clear=True clears _processed_sweeps, gate-block, momentum-block,
-        # and _last_conviction_block — all per-position state.
-        _now = time.time()
-        self._position_closed_at = _now
-        self._reset(_now, full_clear=True)
+        self._reset(time.time())
 
     def force_reset(self) -> None:
-        # full_clear=True covers: _processed_sweeps, gate-block, momentum-block.
-        # Additional fields reset here are engine-lifetime counters that survive
-        # normal position boundaries but must be zeroed on an operator hard-reset.
-        self._reset(time.time(), full_clear=True)
+        self._reset(time.time())
         self._flow_ewma = 0.0
         self._flow_ewma_last_update = 0.0
         self._momentum_entries_1h = 0
         self._last_momentum_candle_ts = 0
+        # BUG-5 FIX: Hard operator reset — clear processed-sweep registry fully.
+        # Normal _reset() intentionally keeps entries so a cooldown survives a
+        # state transition. force_reset() is called explicitly by the operator
+        # and must guarantee a completely clean slate.
+        self._processed_sweeps.clear()
 
     @property
     def state(self) -> str:
@@ -695,91 +600,43 @@ class EntryEngine:
         return None
 
     @property
-    def scan_skip_info(self) -> Optional[Dict]:
+    def scan_skip_info(self) -> Optional[Dict[str, Dict[str, int]]]:
         """
-        Last-tick sweep-rejection counters from _collect_sweeps() plus the most
-        recent conviction block (if any, within the last 300s).
+        Last-tick sweep-rejection counters from _collect_sweeps().
 
         Returns:
-          None if no rejections to report, otherwise a dict with any of:
+          None if both paths produced sweeps (nothing to report), else a dict:
             {
-              "liq":        {"stale": n, "low_quality": n, "processed": n},
-              "bridge":     {"stale": n, "low_quality": n, "processed": n,
-                             "ict_sweeps": n},
-              "conviction": {"side": str, "score": float, "reason": str,
-                             "age_s": int},
+              "liq":    {"stale": n, "low_quality": n, "processed": n},   # or absent
+              "bridge": {"stale": n, "low_quality": n, "processed": n,
+                         "ict_sweeps": n},                                # or absent
             }
 
         Used by quant_strategy's THINK log to surface WHY SCANNING isn't
-        advancing.  The conviction key closes the observability gap where a
-        downstream gate block during SCANNING is invisible after the first
-        identical rejection is demoted to DEBUG.
+        advancing. Silent rejection previously made "no trades" impossible
+        to distinguish from "broken pipeline".
         """
-        out: Dict = {}
+        out = {}
         if self._last_liq_skip:
             out["liq"] = dict(self._last_liq_skip)
         if self._last_bridge_skip:
             out["bridge"] = dict(self._last_bridge_skip)
-        # BUG-3 FIX: Include the most recent conviction block if it occurred
-        # within the last 300s.  Records older than 300s are stale (market
-        # conditions have shifted) and should not be shown as current context.
-        if self._last_conviction_block is not None:
-            _age = time.time() - self._last_conviction_block.get("at", 0.0)
-            if _age < 300.0:
-                out["conviction"] = {
-                    "side":   self._last_conviction_block["side"],
-                    "score":  self._last_conviction_block["score"],
-                    "reason": self._last_conviction_block["reason"],
-                    "age_s":  int(_age),
-                }
         return out if out else None
 
     # ── Internal: reset ───────────────────────────────────────────────
 
-    def _reset(self, now: float, full_clear: bool = False) -> None:
-        """Reset engine state.
-
-        full_clear=False  (default, in-evaluation reset)
-            Used by on_entry_failed(), on_entry_cancelled(), POST_SWEEP timeout,
-            and all mid-evaluation reject paths.  Preserves active processed-sweep
-            entries so the same sweep cannot sneak back in during its 120s hold
-            window.  Gate-block and momentum-block cooldowns are also preserved
-            because the signal that triggered the gate may still be live — clearing
-            them here would immediately regenerate the blocked signal.
-
-        full_clear=True  (position-boundary / corrupt-state reset)
-            Used by on_position_closed(), force_reset(), and the stuck-state
-            self-recovery watchdogs.  ALL per-position gate state is cleared:
-              • _processed_sweeps — a new position must re-evaluate fresh sweeps;
-                keeping stale entries from a closed trade silently starves the
-                next setup, which is the root cause of the observed 9h+ silences.
-              • _gate_blocked_until / _gate_block_key — gate cooldown was scoped
-                to the POST_SWEEP evaluation of the now-closed position.
-              • _momentum_blocked_until and all _momentum_block_* fields — the
-                frozen SL and candle-ts guard are meaningless for a new position.
-        """
+    def _reset(self, now: float) -> None:
         self._state = EngineState.SCANNING
         self._state_entered = now
         self._signal = None
         self._tracking = None
         self._post_sweep = None
-
-        if full_clear:
-            # Position boundary — wipe everything so the next trade starts clean.
-            self._processed_sweeps.clear()
-            self._gate_blocked_until       = 0.0
-            self._gate_block_key           = ()
-            self._momentum_blocked_until   = 0.0
-            self._momentum_block_entry_price = 0.0
-            self._momentum_block_candle_ts = 0
-            self._momentum_block_sl        = None
-            self._last_conviction_block    = None   # BUG-3 FIX
-        else:
-            # In-evaluation reset — purge only expired processed-sweep entries.
-            # Active entries (expiry > now) must survive so the same sweep cannot
-            # sneak back in during its 120s hold window.
-            self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items()
-                                       if v > now}
+        # BUG-2 / BUG-1: Purge EXPIRED processed-sweep entries only.
+        # Active entries (expiry > now) must survive the state reset so the same
+        # sweep cannot sneak back in during its 120s hold window.  force_reset()
+        # clears the registry fully when an operator hard-reset is required.
+        self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items()
+                                   if v > now}
 
     # ── Internal: flow EWMA (continuous-time) ─────────────────────────
 
@@ -849,32 +706,9 @@ class EntryEngine:
         _skipped_low_quality = 0
         _skipped_processed   = 0
 
-        # ── BUG-1 / FIX A: Dynamic staleness limit (hoisted out of loop) ───
-        # Normal limit is 120s — enough to cover ICT/LiquidityMap detection
-        # latency on a running bot.  Two extensions:
-        #  1. POST-CLOSE (existing): for the first _POST_CLOSE_GRACE_PERIOD_SEC
-        #     after on_position_closed() widen to _POST_CLOSE_STALE_WINDOW_SEC
-        #     so sweeps from the final minutes of the hold remain reachable.
-        #  2. COLD START (FIX A): on a fresh launch _position_closed_at is 0
-        #     and the post-close branch never triggers.  If no sweep has yet
-        #     been processed the pipeline is entirely cold — the first sweep
-        #     event usually ages out before downstream evidence (CISD /
-        #     displacement) matures.  Apply half the post-close extension
-        #     (default 300s) until the first sweep is processed OR the first
-        #     position closes (whichever flips the branch out of cold-start).
-        # _position_closed_at is set before _reset(), so it is non-zero
-        # exactly when a position boundary just occurred.
-        _stale_limit = 120.0
-        if (self._position_closed_at > 0
-                and now - self._position_closed_at < _POST_CLOSE_GRACE_PERIOD_SEC):
-            _stale_limit = _POST_CLOSE_STALE_WINDOW_SEC
-        elif self._position_closed_at == 0 and not self._processed_sweeps:
-            # Cold-start warmup: no prior close, no sweep ever processed
-            _stale_limit = max(_stale_limit, _POST_CLOSE_STALE_WINDOW_SEC / 2.0)
-
         sweeps = []
         for s in (snap.recent_sweeps or []):
-            if s.detected_at <= now - _stale_limit:
+            if s.detected_at <= now - 60.0:
                 _skipped_stale += 1
                 continue
             if s.quality < _MIN_SWEEP_QUALITY:
@@ -909,20 +743,12 @@ class EntryEngine:
             # seconds, 120s hold after enter_post_sweep) handles dedup —
             # widening the detection window does not reintroduce sweep-
             # loop reprocessing.
-            # 120s base window: matches the LiquidityMap path (Fix 1) so both
-            # sweep sources age out at the same rate.  A 60s mismatch caused the
-            # ICT bridge to expire sweeps 60s before the LiquidityMap path saw
-            # them — making the bridge unreachable after a post-close delay.
-            _base_age_limit = int(now * 1000) - 120_000
+            _base_age_limit = int(now * 1000) - 60_000
             # Beginning of the current 5-minute bar (UTC-based)
             _cur_5m_start_ms = int(now // 300.0) * 300_000
             # Accept a sweep if EITHER it's within 60s of now OR it was
             # detected in the current or previous 5m bar (+60s grace).
-            # 2 bars back (600s): extends coverage so a sweep at bar-open is
-            # admitted for the full bar duration even when the base_age_limit
-            # (120s) crosses a bar boundary mid-evaluation.  One bar (300s) could
-            # exclude early-bar sweeps at the start of the second minute.
-            _bar_age_limit = _cur_5m_start_ms - 600_000  # 2 bars back = 10 min
+            _bar_age_limit = _cur_5m_start_ms - 300_000  # start of previous 5m bar
 
             _bridge_stale = 0
             _bridge_low_q = 0
@@ -991,21 +817,6 @@ class EntryEngine:
                 "low_quality": _skipped_low_quality,
                 "processed":   _skipped_processed,
             }
-            # Surface stale rejections at INFO level so post-close silences are
-            # diagnosable without reading DEBUG logs.  Only log when sweeps exist
-            # but were rejected — an empty snap.recent_sweeps is not a skip event.
-            if _skipped_stale and snap.recent_sweeps:
-                _stale_ages = [
-                    now - s.detected_at
-                    for s in snap.recent_sweeps
-                    if s.detected_at <= now - _stale_limit
-                ]
-                _oldest_age = max(_stale_ages) if _stale_ages else 0.0
-                logger.info(
-                    f"SCAN SKIP: {_skipped_stale} sweep(s) stale "
-                    f"(oldest {_oldest_age:.0f}s ago, window={_stale_limit:.0f}s) — "
-                    f"low_q={_skipped_low_quality} proc={_skipped_processed}"
-                )
         else:
             self._last_liq_skip = None
 
@@ -1069,18 +880,6 @@ class EntryEngine:
             # Price moved enough — clear the block so we can re-evaluate
             self._momentum_blocked_until = 0.0
 
-        # ── FIX D: Session-aware momentum thresholds ─────────────────────
-        # Defaults (body 0.65 / vol 1.3 / ATR 0.6) rarely trigger in Asia
-        # where bars are slower and liquidity is thinner.  Asia overrides
-        # (body 0.55 / vol 1.10 / ATR 0.40) restore entry cadence at the
-        # cost of more whipsaw risk in Asia chop.  London / NY sessions
-        # keep the tighter defaults.
-        _kz = (getattr(ict, 'kill_zone', '') or '').lower()
-        _is_asia = 'asia' in _kz
-        _body_thr = 0.55 if _is_asia else _MOMENTUM_MIN_BODY_RATIO
-        _atr_thr  = 0.40 if _is_asia else _MOMENTUM_MIN_ATR_MOVE
-        _vol_thr  = 1.10 if _is_asia else _MOMENTUM_MIN_VOL_RATIO
-
         # Find displacement candle
         disp_candle = None
         disp_tf = ""
@@ -1107,11 +906,11 @@ class EntryEngine:
                 rng = h - lo
                 if rng < 1e-10:
                     continue
-                if body / rng < _body_thr:
+                if body / rng < _MOMENTUM_MIN_BODY_RATIO:
                     continue
-                if rng / max(atr, 1e-10) < _atr_thr:
+                if rng / max(atr, 1e-10) < _MOMENTUM_MIN_ATR_MOVE:
                     continue
-                if v / max(avg_vol, 1e-10) < _vol_thr:
+                if v / max(avg_vol, 1e-10) < _MOMENTUM_MIN_VOL_RATIO:
                     continue
 
                 candle_dir = "long" if cl > o else "short"
@@ -1358,26 +1157,7 @@ class EntryEngine:
         rev_r: List[str] = []
         cont_r: List[str] = []
 
-        # ── STATIC FACTORS (scored once, invalidated on AMD phase change) ──
-        # Bug #4 fix: AMD phase can transition mid-sweep (e.g. ACCUMULATION →
-        # MANIPULATION with a 10-15 min lag).  Previously static_scored was set
-        # True on first evaluation and never cleared, so the new phase contributed
-        # zero to the score.  Reset static_scored when phase or bias changes so
-        # the static block is re-evaluated with the current AMD context.
-        current_amd_phase = (ict.amd_phase or "").upper()
-        current_amd_bias  = (ict.amd_bias  or "").lower()
-        if (ps.static_scored
-                and (current_amd_phase != ps._static_amd_phase
-                     or current_amd_bias != ps._static_amd_bias)):
-            ps.static_scored    = False
-            ps.static_rev_base  = 0.0
-            ps.static_cont_base = 0.0
-            logger.info(
-                f"POST_SWEEP: AMD changed "
-                f"{ps._static_amd_phase}/{ps._static_amd_bias} → "
-                f"{current_amd_phase}/{current_amd_bias} "
-                f"— resetting static evidence base")
-
+        # ── STATIC FACTORS (scored once) ──────────────────────────────
         if not ps.static_scored:
             s_rev, s_cont = 0.0, 0.0
 
@@ -1436,11 +1216,9 @@ class EntryEngine:
             if "london" in kz: s_rev += 3.0
             elif "ny" in kz: s_rev += 2.0
 
-            ps.static_rev_base  = s_rev
+            ps.static_rev_base = s_rev
             ps.static_cont_base = s_cont
-            ps.static_scored    = True
-            ps._static_amd_phase = current_amd_phase
-            ps._static_amd_bias  = current_amd_bias
+            ps.static_scored = True
         else:
             opp = self._find_opposing_target(rev_dir, snap, price, atr)
 
@@ -1520,27 +1298,16 @@ class EntryEngine:
         if ps.rev_flow_ticks >= 5: rev_d += 4.0
         if ps.cont_flow_ticks >= 5: cont_d += 4.0
 
-        # Cross-sweep decay — applied ONCE per unique event.
-        # Bug #2: previously fired every 250ms tick for the full 90s window the
-        # event remained in ict_sweeps.  At 0.55 per tick that is 0.55^360 ≈
-        # 3.4e-94 within 3 seconds — one event destroyed all reversal evidence,
-        # making reversal trades after any cross-sweep structurally impossible.
+        # Cross-sweep decay
         current_type = sweep.pool.side.value
         entered_ms = int(ps.entered_at * 1000)
         for ev in (getattr(ict, 'ict_sweeps', None) or []):
             if (ev.pool_type != current_type
                     and ev.sweep_ts > entered_ms
                     and now * 1000 - ev.sweep_ts < 90_000):
-                event_key = (round(ev.pool_price, 0), ev.pool_type,
-                             round(ev.sweep_ts / 1000.0, 0))
-                if ps._cross_sweep_applied != event_key:
-                    ps._cross_sweep_applied = event_key
-                    ps.rev_evidence *= 0.55
-                    cont_d += 10.0
-                    cont_r.append(f"CROSS-SWEEP {ev.pool_type}")
-                    logger.info(
-                        f"POST_SWEEP: cross-sweep decay applied once "
-                        f"(event {ev.pool_type} @ ${ev.pool_price:,.0f})")
+                ps.rev_evidence *= 0.55
+                cont_d += 10.0
+                cont_r.append(f"CROSS-SWEEP {ev.pool_type}")
                 break
 
         # ── Accumulate with decay ─────────────────────────────────────
@@ -1623,14 +1390,8 @@ class EntryEngine:
         # Liquidity push
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
-        # Bug #9 fix: use `price` (current market) as the entry_price reference
-        # for both risk and RR.  The fill will be at or near this price; using
-        # a stale or drifted value produces phantom R:R that misleads the
-        # Telegram notification.  The entry_price stored in EntrySignal IS
-        # `price` (set below) — this ensures logged R:R == traded R:R.
-        entry_price = price
-        risk = abs(entry_price - sl)
-        if risk < 1e-10 or risk / entry_price < 0.001 or risk / entry_price > 0.035:
+        risk = abs(price - sl)
+        if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
             self._post_sweep = None
             self._reset(now)
             return
@@ -1639,16 +1400,16 @@ class EntryEngine:
         self._last_sweep_reversal_time = now
 
         # TP: pool → HTF → 2R (only if CISD)
-        tp, target = self._find_tp(snap, side, entry_price, atr, sl, _MIN_RR_RATIO)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
         cisd_ok = ps is not None and ps.cisd_detected
         if tp is None and cisd_ok:
-            tp = entry_price + risk * 2.0 if side == "long" else entry_price - risk * 2.0
+            tp = price + risk * 2.0 if side == "long" else price - risk * 2.0
         if tp is None:
             self._post_sweep = None
             self._reset(now)
             return
 
-        rr = abs(tp - entry_price) / risk
+        rr = abs(tp - price) / risk
         if rr < _MIN_RR_RATIO:
             self._post_sweep = None
             self._reset(now)
@@ -1665,7 +1426,7 @@ class EntryEngine:
 
         self._signal = EntrySignal(
             side=side, entry_type=EntryType.SWEEP_REVERSAL,
-            entry_price=entry_price, sl_price=sl, tp_price=tp, rr_ratio=rr,
+            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
             target_pool=target, sweep_result=sweep,
             conviction=decision.confidence,
             reason=f"{decision.reason}{cisd}{disp}",
@@ -1674,6 +1435,11 @@ class EntryEngine:
         logger.info(f"🎯 SIGNAL: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
         # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
+        # Previously only _post_sweep was cleared here; the engine remained in
+        # POST_SWEEP for one more tick before _do_post_sweep() noticed ps is None
+        # and transitioned. That one-tick gap was a second re-entry vector.
+        # We cannot call _reset(now) here because it would null self._signal.
+        # Instead, manually perform the non-destructive parts of _reset():
         self._post_sweep = None
         self._state = EngineState.SCANNING
         self._state_entered = now
@@ -1695,36 +1461,22 @@ class EntryEngine:
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
-        # Bug #9 fix: derive risk and RR from `price` as the prospective fill
-        # price (same value stored as entry_price in the signal).  This ensures
-        # the R:R logged in Telegram exactly matches the trade's economics.
-        entry_price = price
         tp_buf = atr * 0.35
         tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf
 
-        risk = abs(entry_price - sl)
-        reward = abs(tp - entry_price)
-        if risk < 1e-10 or risk / entry_price < 0.001 or risk / entry_price > 0.035:
+        risk = abs(price - sl)
+        reward = abs(tp - price)
+        if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
             self._post_sweep = None
             self._reset(now)
             return
 
         rr = reward / risk
         if rr < _MIN_RR_RATIO:
-            tp2, target2 = self._find_tp(snap, side, entry_price, atr, sl, _MIN_RR_RATIO)
+            tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
             if tp2 is not None:
                 tp, target = tp2, target2
-                rr = abs(tp - entry_price) / risk
-                # Bug #3 fix: re-validate after substitution.  _find_tp only
-                # guarantees abs(tp-price)/risk >= min_rr using the ENTRY PRICE
-                # passed to it, but min_rr itself equals _MIN_RR_RATIO, so the
-                # recomputed rr will always pass here — the explicit guard below
-                # protects against any future change to _find_tp's internal
-                # min_rr argument or floating-point edge cases.
-                if rr < _MIN_RR_RATIO:
-                    self._post_sweep = None
-                    self._reset(now)
-                    return
+                rr = abs(tp - price) / risk
             else:
                 self._post_sweep = None
                 self._reset(now)
@@ -1732,7 +1484,7 @@ class EntryEngine:
 
         self._signal = EntrySignal(
             side=side, entry_type=EntryType.SWEEP_CONTINUATION,
-            entry_price=entry_price, sl_price=sl, tp_price=tp, rr_ratio=rr,
+            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
             target_pool=target, sweep_result=sweep,
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
@@ -1790,13 +1542,7 @@ class EntryEngine:
         return max(reachable, key=lambda t: t.adjusted_sig())
 
     def _pool_to_tp(self, target, side, price, atr):
-        # Bug #6 fix: the previous formula `atr * min(0.50, 0.10 + 0.05 * dist)`
-        # scaled the buffer with distance.  At 8 ATR distance (common HTF pool)
-        # this produced 0.50 × ATR subtracted from TP, materially reducing
-        # realized R:R below the logged signal value.  The pool price is already
-        # the institutional target; the offset purpose is spread/slippage
-        # protection only, which is independent of how far away the pool is.
-        buf = atr * 0.12
+        buf = atr * min(0.50, 0.10 + 0.05 * target.distance_atr)
         tp = target.pool.price - buf if side == "long" else target.pool.price + buf
         if side == "long" and tp <= price: return None
         if side == "short" and tp >= price: return None
@@ -1928,19 +1674,7 @@ class ICTTrailManager:
         except ImportError:
             from liquidity_map import _find_swing_highs, _find_swing_lows
 
-        # Bug #7 fix: CHoCH buffer was 0.05 ATR ≈ $7.50 at BTC $150 ATR —
-        # inside the bid/ask spread, causing immediate SL hits on normal tick
-        # noise the moment CHoCH was detected.  New values are calibrated to
-        # sit above the typical BTC spread:
-        #   CHoCH:   0.18 ATR  (tight but above spread — structure confirmed)
-        #   2× BOS:  0.25 ATR  (moderate — multiple BOS increases confidence)
-        #   default: _SL_BUFFER_ATR = 0.35 (standard structural buffer)
-        if self._choch:
-            buf_mult = 0.18
-        elif self._bos_count >= 2:
-            buf_mult = 0.25
-        else:
-            buf_mult = _SL_BUFFER_ATR
+        buf_mult = 0.05 if self._choch else (0.10 if self._bos_count >= 2 else _SL_BUFFER_ATR)
         buf = atr * buf_mult
 
         if c15m and len(c15m) >= 12:

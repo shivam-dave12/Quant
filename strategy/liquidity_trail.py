@@ -201,15 +201,9 @@ FREEZE_LOWER = 0.382
 FREEZE_UPPER = 0.618
 
 # Anti-oscillation lock (once we choose an anchor, hold it this long)
-# Bug #11 fix: 90s was too long for BTC volatility.  During DISTRIBUTION price
-# can move 1.5 ATR in 90s, making a materially better Fib cluster (e.g. a
-# 1H+15m 0.618 appearing 30s after the initial 0.382 anchor) inaccessible for
-# another 60s.  45s retains anti-oscillation protection while responding to
-# genuine structural improvements within the same swing move.
-ANCHOR_LOCK_SEC = 45.0
-# Bug #11 fix: lowered from 1.50 to 1.25.  A 25% quality premium is sufficient
-# to distinguish a genuine multi-TF confluence upgrade from noise oscillation.
-ANCHOR_OVERRIDE_QUAL_MULT = 1.25
+ANCHOR_LOCK_SEC = 90.0
+# New anchor must be this much better than the locked one to override
+ANCHOR_OVERRIDE_QUAL_MULT = 1.50
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLOSE-CONFIRMATION COUNTER
@@ -529,73 +523,44 @@ class LiquidityTrailEngine:
         current_sl: float, atr: float, r_multiple: float,
         hold_reason: Optional[List[str]], pos=None, fee_engine=None,
     ) -> LiquidityTrailResult:
-        """
-        Phase 1 (1.0R – 2.0R): pure breakeven lock.
+        """Move SL to breakeven + exact fees + slippage buffer."""
+        be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
+        be_price = round(be_price, 1)
 
-        At 1.0R the SL moves directly to entry + exact round-trip fees +
-        slippage allowance (_be_price).  There is no intermediate ratchet.
-
-        Rationale for removing the 1.0R/1.5R ratchet introduced in Bug #5 fix:
-          The ratchet attempted to guarantee partial profit before full BE by
-          stepping to +0.25R at 1.0R and +0.50R at 1.5R.  In practice it
-          produced two failure modes:
-            (a) At 1.0R the SL moved to entry+0.25R, not BE — a reversal
-                between 1.0R and 2.0R surrendered up to 0.75R of open profit
-                back to a SL that was still in profit, but not at BE.
-            (b) The ratchet_offset was computed from
-                max(abs(entry-current_sl), 0.5*ATR) which diverges from the
-                true initial risk distance after trail moves, producing
-                inconsistent R-multiples across different position sizes.
-          Institutional practice for Phase 1 is unambiguous: at 1.0R lock the
-          floor to BE so the worst case from here is scratch, not a loss.
-
-        The four guards (already-locked, not-improvement, breathing-room,
-        micro-move) are all preserved — they prevent premature or redundant moves.
-        """
-        # Full BE target: entry + round-trip commissions + slippage allowance.
-        be_price = round(
-            self._be_price(pos_side, entry_price, atr, pos, fee_engine), 1)
-
-        # Guard 1 — SL is already at or past BE (idempotency).
-        already = (
-            (pos_side == "long"  and current_sl >= be_price) or
-            (pos_side == "short" and current_sl <= be_price)
-        )
+        # Already locked?
+        already = ((pos_side == "long"  and current_sl >= be_price) or
+                   (pos_side == "short" and current_sl <= be_price))
         if already:
             return self._hold(
                 f"BE_ALREADY_LOCKED: SL=${current_sl:,.1f} >= BE=${be_price:,.1f}",
                 hold_reason, r_multiple=r_multiple)
 
-        # Guard 2 — BE must be a genuine improvement on current SL.
-        is_impr = (
-            (pos_side == "long"  and be_price > current_sl) or
-            (pos_side == "short" and be_price < current_sl)
-        )
+        # Must be an improvement
+        is_impr = ((pos_side == "long"  and be_price > current_sl) or
+                   (pos_side == "short" and be_price < current_sl))
         if not is_impr:
             return self._hold(
                 f"BE_NOT_IMPROVEMENT: BE=${be_price:,.1f} vs SL=${current_sl:,.1f}",
                 hold_reason, r_multiple=r_multiple)
 
-        # Guard 3 — breathing room: SL must be at least 0.40 ATR from price so
-        # a single tick does not immediately hit the moved stop.
+        # Breathing room
         if abs(price - be_price) / atr < 0.40:
             return self._hold(
-                f"BE_TOO_TIGHT: breathing={abs(price - be_price) / atr:.2f}ATR<0.40ATR",
+                f"BE_TOO_TIGHT: breathing={abs(price-be_price)/atr:.2f}ATR<0.40ATR",
                 hold_reason, r_multiple=r_multiple)
 
-        # Guard 4 — micro-move filter: do not make a REST call for a move
-        # smaller than MIN_IMPROVEMENT_ATR (avoids exchange noise).
+        # Minimum improvement
         if abs(be_price - current_sl) / atr < MIN_IMPROVEMENT_ATR:
             return self._hold(
-                f"BE_MICRO_MOVE: {abs(be_price - current_sl) / atr:.3f}ATR"
-                f"<{MIN_IMPROVEMENT_ATR}ATR",
+                f"BE_MICRO_MOVE: {abs(be_price-current_sl)/atr:.3f}ATR<{MIN_IMPROVEMENT_ATR}ATR",
                 hold_reason, r_multiple=r_multiple)
 
-        commission_rt  = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
-        fee_component  = abs(commission_rt - entry_price) - 0.12 * atr
+        commission_rt = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
+        # Re-derive fee-only component for logging
+        fee_component = abs(commission_rt - entry_price) - 0.12 * atr
         reason = (
             f"[BE_LOCK] R={r_multiple:.2f}R → BE=${be_price:,.1f} "
-            f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12 * atr:.1f})"
+            f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"
         )
         logger.info(f"Trail: {reason}")
         return LiquidityTrailResult(
@@ -639,25 +604,15 @@ class LiquidityTrailEngine:
         htf_aligned = None
         effective_buf_table = buf_table
         effective_min_breathing = min_breathing
-        effective_closes_required = closes_required
         if phase_num == 3:
             htf_aligned = self._htf_aligned(ict_engine, pos_side)
             if htf_aligned is False:
-                # Against HTF trend — downgrade to Phase 2 (wider) buffers.
-                # Bug #8 fix: also reset closes_required to PHASE2_CLOSES_REQUIRED.
-                # Previously the buffer was widened but closes_required remained
-                # at PHASE3_CLOSES_REQUIRED (1), so a counter-trend aggressive
-                # trail still advanced on a single closed bar — exactly the thin
-                # confirmation that wide buffers are meant to compensate for.
-                # Counter-trend deep trails must require the same 2-close
-                # structural confirmation as Phase 2.
+                # Against HTF trend — downgrade to Phase 2 (wider) buffers
                 effective_buf_table = _FIB_BUF_PHASE2
                 effective_min_breathing = MIN_BREATHING_ATR_PHASE2
-                effective_closes_required = PHASE2_CLOSES_REQUIRED
                 logger.info(
                     f"Trail[AGGRESSIVE]: HTF NOT aligned with {pos_side} "
-                    f"— downgrading to Phase 2 buffers + closes_required="
-                    f"{PHASE2_CLOSES_REQUIRED}")
+                    f"— downgrading to Phase 2 buffers")
 
         # ── Step 2: Swing-invalidation check, per-TF grid build ────────
         all_anchors: List[PoolAnchor] = []
@@ -740,12 +695,12 @@ class LiquidityTrailEngine:
 
         # ── Step 7: Select best anchor and apply close-confirmation ────
         best = self._select_best_fib_confirmed(
-            clustered, pos_side, price, candles_by_tf, effective_closes_required,
+            clustered, pos_side, price, candles_by_tf, closes_required,
             swings_by_tf)
         if best is None:
             return self._hold(
                 f"{phase_name}: no Fib anchor with close-confirmation "
-                f"(need {effective_closes_required} closed bar(s) past level)",
+                f"(need {closes_required} closed bar(s) past level)",
                 hold_reason, r_multiple=r_multiple,
                 swing_low=primary_swing[0] if primary_swing else None,
                 swing_high=primary_swing[1] if primary_swing else None,
@@ -762,16 +717,10 @@ class LiquidityTrailEngine:
                     best = self._locked_anchor
 
         # ── Step 9: Compute SL with buffer + liquidity-aware expansion ─
-        # Bug #8 fix: when Phase 3 is downgraded to Phase 2 buffers due to HTF
-        # misalignment, the default-fallback must also use the Phase 2 default,
-        # not the Phase 3 default (_DEFAULT_BUF_P3).  effective_buf_table already
-        # points to _FIB_BUF_PHASE2 in that case; the default fallback mirrors it.
-        _default_buf = (
-            _DEFAULT_BUF_P2
-            if (phase_num == 2 or effective_buf_table is _FIB_BUF_PHASE2)
-            else _DEFAULT_BUF_P3
+        raw_buf = effective_buf_table.get(
+            best.fib_ratio or 0.0,
+            _DEFAULT_BUF_P2 if phase_num == 2 else _DEFAULT_BUF_P3
         )
-        raw_buf = effective_buf_table.get(best.fib_ratio or 0.0, _default_buf)
         buf_mult = sess_mult
 
         # Liquidity-aware: if a pool sits between proposed SL and price,
@@ -1153,31 +1102,9 @@ class LiquidityTrailEngine:
         Priority: DISP > CVD > BOS.  "DISP" is evidence of a real impulse
         (body size).  "CVD" is evidence of directional flow.  "BOS" is
         structural confirmation with some staleness tolerance.
-
-        Bug #10 fix: previously checked only candles_5m[-2] (the single last
-        closed bar).  A one-bar consolidation pause after a genuine displacement
-        candle blocked the trail for a full 5 minutes even when momentum clearly
-        existed 1-2 bars prior.  In volatile BTC moves this systematically
-        delayed SL advancement.  Now checks the last 3 closed bars and accepts
-        if ANY qualifies: candles[-4:-1] (indices -4, -3, -2 are the three most
-        recent fully-closed 5m bars, -1 is the live bar).
         """
-        # (a) Displacement candle — any of the last 3 closed 5m bars
-        if candles_5m and len(candles_5m) >= 4:
-            try:
-                # [-4:-1] = three most-recent closed bars ([-1] is the live bar)
-                for lc in candles_5m[-4:-1]:
-                    lo = float(lc.get('o', lc.get('open',  0.0)) or 0.0)
-                    lc_close = float(lc.get('c', lc.get('close', 0.0)) or 0.0)
-                    body = abs(lc_close - lo)
-                    aligned = ((pos_side == "long"  and lc_close > lo) or
-                               (pos_side == "short" and lc_close < lo))
-                    if body >= DISP_MIN_BODY_ATR * atr and aligned:
-                        return "DISP"
-            except Exception:
-                pass
-        elif candles_5m and len(candles_5m) >= 2:
-            # Fallback: only one closed bar available
+        # (a) Displacement candle on last closed 5m bar
+        if candles_5m and len(candles_5m) >= 2:
             try:
                 lc = candles_5m[-2]
                 lo = float(lc.get('o', lc.get('open',  0.0)) or 0.0)

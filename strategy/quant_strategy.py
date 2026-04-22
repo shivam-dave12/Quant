@@ -2443,17 +2443,6 @@ class QuantStrategy:
         self._pos_sync_in_progress  = False   # ACTIVE sync thread running
         self._exit_sync_in_progress = False   # EXITING sync thread running
         self._trail_in_progress     = False   # trail REST call running in background
-        # Watchdog timestamps: epoch time when the corresponding flag was set True.
-        # A flag that remains True for > _FLAG_STALE_SEC with no active thread
-        # indicates a daemon thread died without executing its finally block
-        # (process signal, executor saturation, CPython GIL contention under load).
-        # The watchdog in on_tick force-clears stale flags and logs a WARNING so
-        # the anomaly is visible in monitoring without crashing the strategy loop.
-        _FLAG_STALE_SEC = 90.0          # class constant; any flag True > 90s is stale
-        self._pos_sync_started_at:  float = 0.0
-        self._exit_sync_started_at: float = 0.0
-        self._trail_started_at:     float = 0.0
-        self._reconcile_started_at: float = 0.0
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
 
@@ -2723,52 +2712,10 @@ class QuantStrategy:
             # Spawn reconcile background thread if due (non-blocking)
             if not self._reconcile_pending and now - self._last_reconcile_time >= self._RECONCILE_SEC:
                 self._last_reconcile_time = now; self._reconcile_pending = True
-                self._reconcile_started_at = now
                 threading.Thread(
                     target=self._reconcile_query_thread,
                     args=(order_manager,), daemon=True,
                 ).start()
-
-            # ── Stale-flag watchdog ───────────────────────────────────────────
-            # Background daemon threads clear their concurrency-guard booleans in
-            # a finally block.  Under normal conditions (exception, timeout, REST
-            # error) the finally always fires.  The one unhandled case is a daemon
-            # thread dying without scheduling Python cleanup — e.g. a hard SIGKILL
-            # during a REST call, or a GIL-starved thread that never gets a turn
-            # while the main thread is under heavy compute load.  If any flag stays
-            # True beyond _FLAG_STALE_SEC with no corresponding thread still alive,
-            # the next sync/trail/reconcile is permanently suppressed — the strategy
-            # keeps running but stops managing the position (no trail, no sync).
-            #
-            # Mitigation: if a flag has been True for > _FLAG_STALE_SEC, force-clear
-            # it and emit a WARNING so the anomaly is visible in monitoring.
-            # 90s is 3× the Delta REST timeout (30s) — ample time for any legitimate
-            # operation to complete before the watchdog fires.
-            _FLAG_STALE_SEC = 90.0
-            if self._pos_sync_in_progress and (now - self._pos_sync_started_at) > _FLAG_STALE_SEC:
-                logger.warning(
-                    f"⚠️  STALE FLAG: _pos_sync_in_progress True for "
-                    f"{now - self._pos_sync_started_at:.0f}s — force-clearing "
-                    f"(background thread likely died without finally)")
-                self._pos_sync_in_progress = False
-
-            if self._exit_sync_in_progress and (now - self._exit_sync_started_at) > _FLAG_STALE_SEC:
-                logger.warning(
-                    f"⚠️  STALE FLAG: _exit_sync_in_progress True for "
-                    f"{now - self._exit_sync_started_at:.0f}s — force-clearing")
-                self._exit_sync_in_progress = False
-
-            if self._trail_in_progress and (now - self._trail_started_at) > _FLAG_STALE_SEC:
-                logger.warning(
-                    f"⚠️  STALE FLAG: _trail_in_progress True for "
-                    f"{now - self._trail_started_at:.0f}s — force-clearing")
-                self._trail_in_progress = False
-
-            if self._reconcile_pending and (now - self._reconcile_started_at) > _FLAG_STALE_SEC:
-                logger.warning(
-                    f"⚠️  STALE FLAG: _reconcile_pending True for "
-                    f"{now - self._reconcile_started_at:.0f}s — force-clearing")
-                self._reconcile_pending = False
 
             # Snapshot all decision-relevant state while locked
             phase             = self._pos.phase
@@ -2786,7 +2733,6 @@ class QuantStrategy:
                 # Running it in the main thread blocks on_tick, trail management, and the
                 # heartbeat for up to 30s every 30s (100% duty cycle = permanently frozen).
                 self._pos_sync_in_progress = True
-                self._pos_sync_started_at  = now
                 with self._lock:
                     self._last_pos_sync = now   # stamp immediately so we don't re-trigger
 
@@ -2819,7 +2765,6 @@ class QuantStrategy:
         elif phase == PositionPhase.EXITING:
             if need_exit_sync and not self._exit_sync_in_progress:
                 self._exit_sync_in_progress = True
-                self._exit_sync_started_at  = now
                 with self._lock:
                     self._last_exit_sync = now
 
@@ -2903,18 +2848,8 @@ class QuantStrategy:
                         self._last_exit_time = now
                         self._entry_order_placed_at = 0.0
                         if self._entry_engine is not None:
-                            # BUG-2 FIX: The ENTERING watchdog fires only after the
-                            # order fill-timeout — this is a position-boundary event
-                            # (the trade was never opened), not an in-evaluation reset.
-                            # on_position_closed() uses full_clear=True, wiping
-                            # _processed_sweeps, the gate-block cooldown, and the
-                            # momentum-block so the next valid setup evaluates cleanly.
-                            # on_entry_failed() (full_clear=False) would preserve stale
-                            # processed-sweep entries for up to 120s, silently blocking
-                            # the next setup after every ENTERING timeout.
-                            self._entry_engine.on_position_closed()
-                            logger.info(
-                                "🔄 Entry engine full-clear after ENTERING watchdog timeout")
+                            self._entry_engine.on_entry_failed()
+                            logger.info("🔄 Entry engine reset to SCANNING after ENTERING watchdog")
 
         elif phase == PositionPhase.FLAT:
             if cooldown_ok:
@@ -3819,35 +3754,20 @@ class QuantStrategy:
                 # entry_engine._processed_sweeps both key on (price, ts) at
                 # sub-second resolution, so widening the detection window
                 # cannot reintroduce sweep-loop reprocessing.
-                # 120s base window — mirrors the entry_engine bridge path (Fix 2).
-                # The two windows must be identical: if this loop ages out a sweep
-                # before entry_engine._collect_sweeps() runs, the ICT bridge path
-                # in the entry engine sees an empty ict_ctx.ict_sweeps even when a
-                # valid, unprocessed sweep exists.
-                _base_age_limit_ms = now_ms - 120_000
+                _base_age_limit_ms = now_ms - 60_000
                 # Start of the current 5m bar (Unix-epoch ms, floor-aligned)
                 _cur_5m_start_ms   = (now_ms // 300_000) * 300_000
                 # Accept a sweep if EITHER within 60s OR from the current/
                 # previous 5m bar (ensures a bar-open sweep stays visible
                 # for the full bar duration).
-                # 2 bars back (600s) — mirrors entry_engine bridge path (Fix 3).
-                # Ensures a sweep at bar-open stays visible for the full bar
-                # duration when the 120s base window crosses a bar boundary.
-                _bar_age_limit_ms  = _cur_5m_start_ms - 600_000  # 2 bars back
+                _bar_age_limit_ms  = _cur_5m_start_ms - 300_000  # prev bar start
 
                 for pool in self._ict.liquidity_pools:
                     if not pool.swept:
                         continue
                     if (pool.sweep_timestamp < _base_age_limit_ms
                             and pool.sweep_timestamp < _bar_age_limit_ms):
-                        _bridge_dropped_historical += 1
                         continue
-                    
-                    if _bridge_dropped_historical:
-                        logger.debug(
-                            f"ICT bridge: {_bridge_dropped_historical} historical sweep(s) filtered "
-                            f"(oldest age > {(now_ms - _base_age_limit_ms)//1000}s limit)")
-
                     c5 = candles_by_tf.get("5m", [])
                     # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
                     # The old code blindly used c5[-2] (last closed bar), but the sweep
@@ -3946,12 +3866,10 @@ class QuantStrategy:
                                         now              = now,
                                         quality          = _new_quality,
                                     )
-                            # Prune entries older than 120s — must match the
-                            # detection window (Fix 5/6) so a swept pool is not
-                            # pruned from _notified_sweeps while it is still
-                            # within the age window, which would re-trigger
-                            # on_sweep() and reset PostSweepState evidence.
-                            _cutoff_ms = now_ms - 120_000
+                            # BUG-D1 FIX: Prune _notified_sweeps unconditionally
+                            # per-pool-visit (not just inside _should_forward path)
+                            # so the set stays bounded even when no new sweeps arrive.
+                            _cutoff_ms = now_ms - 60_000
                             self._notified_sweeps = {
                                 k for k in self._notified_sweeps
                                 if k[1] > _cutoff_ms
@@ -4169,19 +4087,6 @@ class QuantStrategy:
                         logger.debug(
                             f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
-                    # BUG-3 FIX: Record the conviction block in the entry engine
-                    # so scan_skip_info surfaces it in the THINK log alongside
-                    # sweep rejections.  Must fire for ALL signal types so the
-                    # real reason SCANNING is not advancing is always visible —
-                    # even after the first identical rejection is demoted to DEBUG.
-                    if hasattr(self._entry_engine, 'mark_conviction_blocked'):
-                        self._entry_engine.mark_conviction_blocked(
-                            side=signal.side,
-                            score=_conv_result.score,
-                            reason=reject_str[:80],
-                            now=now,
-                        )
-
                     # BUG-B2 / FIX-SPAM / FIX-SL-FLIP:
                     # Route the gate-block notification to the correct suppressor
                     # based on signal type.
@@ -5465,7 +5370,6 @@ class QuantStrategy:
                         if self._trail_in_progress:
                             return
                         self._trail_in_progress = True
-                        self._trail_started_at  = now
 
                     _snap_om  = order_manager
                     _snap_dm  = data_manager
@@ -6471,16 +6375,6 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
-        # Clear _notified_sweeps so swept ICT pools that were dedup-guarded
-        # during the closed position's lifetime can re-enter the bridge and
-        # fire DirectionEngine.on_sweep() for the next trade evaluation.
-        # entry_engine.on_position_closed() (above) already cleared
-        # _processed_sweeps — this ensures the bridge-level dedup set is also
-        # clean.  Keeps them in sync: both registries must be at the same
-        # boundary (position close) or the entry engine accepts a sweep that
-        # the bridge will never forward.
-        if hasattr(self, '_notified_sweeps'):
-            self._notified_sweeps.clear()
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed
