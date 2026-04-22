@@ -786,6 +786,35 @@ class ConvictionFilter:
             except Exception:
                 pass
 
+        # ── FIX B: Tier 3 fallback — ICT has a recent aligned sweep with
+        # displacement or wick rejection but no BOS/CHoCH confirmation yet.
+        # This is weaker than structural confirmation (0.45-0.55) but stronger
+        # than nothing: the sweep itself is partial evidence of a CISD.
+        # Bounded to 0.22 so the composite still requires other factors
+        # (displacement, OTE, pool) to clear REQUIRED_SCORE=0.45.
+        # Sweep window: 300s — matches the SCANNING stale window after Fix A.
+        # ────────────────────────────────────────────────────────────────
+        if ict_engine is not None:
+            try:
+                pools = getattr(ict_engine, 'liquidity_pools', None) or []
+                now_ms = int(time.time() * 1000)
+                # trade_side="long" => post-SSL sweep reversal; side="short" => post-BSL
+                target_type = "SSL" if trade_side == "long" else "BSL"
+                for lp in pools:
+                    if not getattr(lp, 'swept', False):
+                        continue
+                    if getattr(lp, 'level_type', '') != target_type:
+                        continue
+                    ts = int(getattr(lp, 'sweep_timestamp', 0) or 0)
+                    if ts <= 0 or (now_ms - ts) > 300_000:
+                        continue
+                    disp = float(getattr(lp, 'displacement_score', 0.0) or 0.0)
+                    wick = bool(getattr(lp, 'wick_rejection', False))
+                    if disp >= 0.40 or wick:
+                        return 0.22
+            except Exception:
+                pass
+
         return 0.10   # No structural confirmation — very low
 
     @staticmethod

@@ -125,6 +125,19 @@ _HTF_CONFLUENCE_MULT    = 2.5
 # Sweep detection geometry
 _SWEEP_WICK_MIN_ATR    = 0.03
 _SWEEP_REJECT_MIN_ATR  = 0.02
+# ── FIX C: Proximity sweep detection ──────────────────────────────────
+# A strict sweep requires wick-through + close reject.  Institutional
+# accumulation can manifest as repeated failed tests that exhaust
+# liquidity without a single clean wick-through.  When price has been
+# within _SWEEP_PROXIMITY_ATR of a pool for _SWEEP_PROXIMITY_MIN_CANDLES
+# closed candles and the current bar touches it, emit a low-quality
+# synthetic sweep so the POST_SWEEP evidence pipeline at least begins.
+# TRADE-OFF: pool is marked SWEPT, so a later real wick-through cannot
+# re-emit.  Selectivity traded for recall.
+_SWEEP_PROXIMITY_ATR          = 0.30
+_SWEEP_PROXIMITY_MIN_CANDLES  = 2
+_SWEEP_PROXIMITY_QUALITY      = 0.35
+_SWEEP_PROXIMITY_CONTACT_ATR  = 0.10  # current bar must come within this of pool
 
 # FIX-3: Swept-pool history bounds
 _SWEPT_HISTORY_MAX = 500        # entries per side
@@ -535,6 +548,85 @@ class _TimeframeRegistry:
                     volume_ratio=vol_ratio, quality=quality,
                     direction="long", detected_at=now,
                 ))
+
+        # ── FIX C: Proximity sweep fallback ───────────────────────────────
+        # Only runs when the strict BSL/SSL paths produced no results this
+        # bar — strict detection is always preferred.  Requires N prior
+        # closed candles near (but not through) the pool plus a current-bar
+        # touch.  Emits a synthetic low-quality SweepResult so the POST_SWEEP
+        # pipeline (CISD / displacement) at least begins.
+        # NOTE: pool is marked SWEPT; a later real wick-through will not
+        # re-emit.  Disable by raising _SWEEP_PROXIMITY_MIN_CANDLES to a
+        # very large value, or by setting _SWEEP_PROXIMITY_QUALITY below
+        # _MIN_SWEEP_QUALITY in entry_engine.
+        _N = _SWEEP_PROXIMITY_MIN_CANDLES
+        if (not results) and len(candles) >= (_N + 2):
+            prior_closed = candles[-2 - _N:-2]
+            if len(prior_closed) == _N:
+                prox_band    = atr * _SWEEP_PROXIMITY_ATR
+                contact_band = atr * _SWEEP_PROXIMITY_CONTACT_ATR
+                # ── BSL proximity: prior highs within band BELOW pool,
+                #     current high within contact_band of pool (but didn't
+                #     exceed strict wick threshold, else strict path fired).
+                for pool in self._bsl:
+                    if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
+                        continue
+                    all_near = True
+                    for x in prior_closed:
+                        xh = float(x['h'])
+                        # High must be at or below pool price, gap within prox_band
+                        if xh > pool.price:
+                            all_near = False; break
+                        if (pool.price - xh) > prox_band:
+                            all_near = False; break
+                    if not all_near:
+                        continue
+                    # Current bar must approach pool within contact_band
+                    if (pool.price - h) > contact_band:
+                        continue
+                    # Log for diagnostics
+                    pool.status     = PoolStatus.SWEPT
+                    pool.swept_at   = now
+                    pool.sweep_wick = max(h, pool.price)
+                    self._swept_bsl.append(pool)
+                    _wick_range  = max(h - lo, 1e-10)
+                    results.append(SweepResult(
+                        pool=pool, sweep_candle_idx=len(candles) - 2,
+                        wick_extreme=max(h, pool.price),
+                        rejection_pct=max(0.0, (h - cl) / _wick_range),
+                        volume_ratio=vol / max(avg_vol, 1e-10),
+                        quality=_SWEEP_PROXIMITY_QUALITY,
+                        direction="short", detected_at=now,
+                    ))
+                # ── SSL proximity: prior lows within band ABOVE pool,
+                #     current low within contact_band of pool.
+                for pool in self._ssl:
+                    if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
+                        continue
+                    all_near = True
+                    for x in prior_closed:
+                        xl = float(x['l'])
+                        if xl < pool.price:
+                            all_near = False; break
+                        if (xl - pool.price) > prox_band:
+                            all_near = False; break
+                    if not all_near:
+                        continue
+                    if (lo - pool.price) > contact_band:
+                        continue
+                    pool.status     = PoolStatus.SWEPT
+                    pool.swept_at   = now
+                    pool.sweep_wick = min(lo, pool.price)
+                    self._swept_ssl.append(pool)
+                    _wick_range  = max(h - lo, 1e-10)
+                    results.append(SweepResult(
+                        pool=pool, sweep_candle_idx=len(candles) - 2,
+                        wick_extreme=min(lo, pool.price),
+                        rejection_pct=max(0.0, (cl - lo) / _wick_range),
+                        volume_ratio=vol / max(avg_vol, 1e-10),
+                        quality=_SWEEP_PROXIMITY_QUALITY,
+                        direction="long", detected_at=now,
+                    ))
 
         return results
 

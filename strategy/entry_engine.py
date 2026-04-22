@@ -849,24 +849,31 @@ class EntryEngine:
         _skipped_low_quality = 0
         _skipped_processed   = 0
 
+        # ── BUG-1 / FIX A: Dynamic staleness limit (hoisted out of loop) ───
+        # Normal limit is 120s — enough to cover ICT/LiquidityMap detection
+        # latency on a running bot.  Two extensions:
+        #  1. POST-CLOSE (existing): for the first _POST_CLOSE_GRACE_PERIOD_SEC
+        #     after on_position_closed() widen to _POST_CLOSE_STALE_WINDOW_SEC
+        #     so sweeps from the final minutes of the hold remain reachable.
+        #  2. COLD START (FIX A): on a fresh launch _position_closed_at is 0
+        #     and the post-close branch never triggers.  If no sweep has yet
+        #     been processed the pipeline is entirely cold — the first sweep
+        #     event usually ages out before downstream evidence (CISD /
+        #     displacement) matures.  Apply half the post-close extension
+        #     (default 300s) until the first sweep is processed OR the first
+        #     position closes (whichever flips the branch out of cold-start).
+        # _position_closed_at is set before _reset(), so it is non-zero
+        # exactly when a position boundary just occurred.
+        _stale_limit = 120.0
+        if (self._position_closed_at > 0
+                and now - self._position_closed_at < _POST_CLOSE_GRACE_PERIOD_SEC):
+            _stale_limit = _POST_CLOSE_STALE_WINDOW_SEC
+        elif self._position_closed_at == 0 and not self._processed_sweeps:
+            # Cold-start warmup: no prior close, no sweep ever processed
+            _stale_limit = max(_stale_limit, _POST_CLOSE_STALE_WINDOW_SEC / 2.0)
+
         sweeps = []
         for s in (snap.recent_sweeps or []):
-            # BUG-1 FIX: Dynamic staleness limit.
-            # Normal limit is 120s — enough to cover the ICT/LiquidityMap detection
-            # latency on a running bot.  After a long position hold EVERY sweep in
-            # snap.recent_sweeps is older than 120s and is silently discarded,
-            # leaving the engine in a cold-start dead zone until a brand-new sweep
-            # fires.  For the first _POST_CLOSE_GRACE_PERIOD_SEC (default 300s)
-            # after on_position_closed() we widen the window to
-            # _POST_CLOSE_STALE_WINDOW_SEC (default 600s / 10 min) so sweeps from
-            # the final minutes of the hold are still reachable.
-            # _position_closed_at is set before _reset(), so it is non-zero
-            # exactly when a position boundary just occurred.
-            _stale_limit = 120.0
-            if (self._position_closed_at > 0
-                    and now - self._position_closed_at < _POST_CLOSE_GRACE_PERIOD_SEC):
-                _stale_limit = _POST_CLOSE_STALE_WINDOW_SEC
-
             if s.detected_at <= now - _stale_limit:
                 _skipped_stale += 1
                 continue
@@ -991,12 +998,12 @@ class EntryEngine:
                 _stale_ages = [
                     now - s.detected_at
                     for s in snap.recent_sweeps
-                    if s.detected_at <= now - 120.0
+                    if s.detected_at <= now - _stale_limit
                 ]
                 _oldest_age = max(_stale_ages) if _stale_ages else 0.0
                 logger.info(
                     f"SCAN SKIP: {_skipped_stale} sweep(s) stale "
-                    f"(oldest {_oldest_age:.0f}s ago, window=120s) — "
+                    f"(oldest {_oldest_age:.0f}s ago, window={_stale_limit:.0f}s) — "
                     f"low_q={_skipped_low_quality} proc={_skipped_processed}"
                 )
         else:
@@ -1062,6 +1069,18 @@ class EntryEngine:
             # Price moved enough — clear the block so we can re-evaluate
             self._momentum_blocked_until = 0.0
 
+        # ── FIX D: Session-aware momentum thresholds ─────────────────────
+        # Defaults (body 0.65 / vol 1.3 / ATR 0.6) rarely trigger in Asia
+        # where bars are slower and liquidity is thinner.  Asia overrides
+        # (body 0.55 / vol 1.10 / ATR 0.40) restore entry cadence at the
+        # cost of more whipsaw risk in Asia chop.  London / NY sessions
+        # keep the tighter defaults.
+        _kz = (getattr(ict, 'kill_zone', '') or '').lower()
+        _is_asia = 'asia' in _kz
+        _body_thr = 0.55 if _is_asia else _MOMENTUM_MIN_BODY_RATIO
+        _atr_thr  = 0.40 if _is_asia else _MOMENTUM_MIN_ATR_MOVE
+        _vol_thr  = 1.10 if _is_asia else _MOMENTUM_MIN_VOL_RATIO
+
         # Find displacement candle
         disp_candle = None
         disp_tf = ""
@@ -1088,11 +1107,11 @@ class EntryEngine:
                 rng = h - lo
                 if rng < 1e-10:
                     continue
-                if body / rng < _MOMENTUM_MIN_BODY_RATIO:
+                if body / rng < _body_thr:
                     continue
-                if rng / max(atr, 1e-10) < _MOMENTUM_MIN_ATR_MOVE:
+                if rng / max(atr, 1e-10) < _atr_thr:
                     continue
-                if v / max(avg_vol, 1e-10) < _MOMENTUM_MIN_VOL_RATIO:
+                if v / max(avg_vol, 1e-10) < _vol_thr:
                     continue
 
                 candle_dir = "long" if cl > o else "short"
