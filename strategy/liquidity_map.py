@@ -46,9 +46,32 @@ FIX-9  _merge_pools updates centroid when a cluster re-matches.
 FIX-10 Proximity-adjusted significance: sig × exp(-dist_atr/10) applied
         in get_snapshot() so nearby pools dominate over distant HTF pools.
 
-FIXES IN v2.1
+FIXES IN v2.2
 ─────────────
-FIX-11 PoolTarget.adjusted_sig() method added.
+FIX-B1  _merge_pools: two-pass pool rebirth for SWEPT/CONSUMED pools.
+        PRIMARY CAUSE of "stuck after first trade" (nearest_bsl_atr=999.0).
+        Old: single-pass loop SKIPPED swept pools → new clusters at same level
+             appended fresh pools which also got swept → zombie accumulation
+             filled _MAX_POOLS_PER_TF cap → no active pools survived sort.
+        New: pass 1 matches active pools (unchanged). Pass 2 REBIRTHS the most
+             recent SWEPT/CONSUMED pool within radius instead of spawning a new
+             one. Reborn pool gets fresh created_at, zeroed sweep metadata, and
+             new status so check_sweeps() can detect it again. The new sweep
+             produces a fresh detected_at timestamp → new _sweep_key in
+             entry_engine → correctly bypasses _processed_sweeps hold from the
+             original sweep event (Bug 3 self-heals).
+
+FIX-B1b Prune step: SWEPT pools evicted from active list after 2 hours.
+        Companion to FIX-B1. Pools that haven't been reborn within 2 hours
+        are evicted to _swept_bsl/_swept_ssl (already there, just removed from
+        _bsl/_ssl). Ensures zombie slots are reclaimed even on slow sessions
+        where no new swing highs form at the swept level.
+
+FIX-B4  LiquidityMap.reset_snapshot() method added.
+        Call from quant_strategy._finalise_exit() immediately after position
+        closes. Invalidates _last_snapshot so predict_hunt() on the next tick
+        uses ICT-engine-only scoring rather than stale post-trade pool data
+        that biases hunt direction toward the dead swept level.
         The adjacency bonus is applied to PoolTarget.significance in
         get_snapshot(). All decision logic in entry_engine now uses
         t.adjusted_sig() so the bonus is visible to every selector.
@@ -133,6 +156,23 @@ _SWEPT_HISTORY_AGE = 604800.0   # 7 days
 # Consumed-pool threshold: SWEPT pool at >0.5 ATR beyond price = fully consumed
 _CONSUMED_THRESHOLD_ATR = 0.5
 
+# FIX-B1: Maximum time a SWEPT pool remains in the ACTIVE registry (_bsl/_ssl)
+# before being evicted to prevent zombie pool accumulation.
+#
+# Problem: SWEPT pools are never removed from _bsl/_ssl by the existing prune
+# step (which only removes CONSUMED and age-expired pools). Over time, repeated
+# sweeps at the same level fill _MAX_POOLS_PER_TF slots with SWEPT zombies.
+# Because the significance sort retains the highest-significance pools (SWEPT
+# pools accumulate touch bonuses before death), fresh DETECTED pools score lower
+# and are cut off at position 31+, making the map appear empty to get_snapshot().
+#
+# Fix: evict SWEPT pools from the active list after 2 hours. They remain in
+# _swept_bsl/_swept_ssl for adjacency bonus and HTF TP escalation context.
+# 2 hours is 24 × 5m bars — sufficient for price to either return and retest
+# (triggering rebirth via _merge_pools FIX-B1) or move far enough away that
+# check_consumed() has already promoted them to CONSUMED.
+_SWEPT_IN_BSL_MAX_AGE: float = 7_200.0   # 2 hours
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -163,7 +203,6 @@ class LiquidityPool:
     last_touch: float      = 0.0
     swept_at:   float      = 0.0
     sweep_wick: float      = 0.0
-    bar_of_creation: float = 0.0   # BUG-1 FIX: bar open ts (s) when pool was created
 
     ob_aligned:  bool = False   # set by _align_with_ict()
     fvg_aligned: bool = False   # set by _align_with_ict()
@@ -390,12 +429,6 @@ class _TimeframeRegistry:
         if _ts > 0:
             self._last_ts = _ts
 
-        # BUG-1 FIX: record bar open timestamp in seconds for creation-guard in check_sweeps
-        try:
-            _bar_open_s = float(candles[-2].get('t', 0) or 0) / 1000.0
-        except Exception:
-            _bar_open_s = 0.0
-
         lookback  = _SWING_LOOKBACK.get(self.tf, 3)       # FIX-1
         cluster_r = _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
 
@@ -404,26 +437,44 @@ class _TimeframeRegistry:
         ssl_clusters = _detect_equal_levels(
             _find_swing_lows(candles, lookback),  atr, cluster_r)
 
-        self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now, bar_ts_s=_bar_open_s)
-        self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now, bar_ts_s=_bar_open_s)
+        self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now)
+        self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now)
 
-        # Prune CONSUMED and age-expired pools
+        # FIX-B1: Prune CONSUMED, age-expired, AND stale SWEPT pools.
+        #
+        # Original code only pruned CONSUMED + age-expired. SWEPT pools stayed
+        # in _bsl/_ssl indefinitely, accumulating as zombies and filling the
+        # _MAX_POOLS_PER_TF cap. Fresh DETECTED pools scored lower in the
+        # significance sort and were cut off, making the map appear empty.
+        #
+        # SWEPT pools that have been in the list for > _SWEPT_IN_BSL_MAX_AGE
+        # are evicted. They remain in _swept_bsl/_swept_ssl for adjacency bonus
+        # and HTF TP escalation context — they are NOT lost from the system.
         max_age = _POOL_MAX_AGE.get(self.tf, 7200)
-        self._bsl = [p for p in self._bsl
-                     if now - p.created_at < max_age
-                     and p.status != PoolStatus.CONSUMED]
-        self._ssl = [p for p in self._ssl
-                     if now - p.created_at < max_age
-                     and p.status != PoolStatus.CONSUMED]
+        self._bsl = [
+            p for p in self._bsl
+            if p.status != PoolStatus.CONSUMED
+            and now - p.created_at < max_age
+            and not (
+                p.status == PoolStatus.SWEPT
+                and p.swept_at > 0
+                and now - p.swept_at > _SWEPT_IN_BSL_MAX_AGE
+            )
+        ]
+        self._ssl = [
+            p for p in self._ssl
+            if p.status != PoolStatus.CONSUMED
+            and now - p.created_at < max_age
+            and not (
+                p.status == PoolStatus.SWEPT
+                and p.swept_at > 0
+                and now - p.swept_at > _SWEPT_IN_BSL_MAX_AGE
+            )
+        ]
 
         # Cap per-side by significance
-        # BUG-1 FIX: sort active pools before swept/consumed so a high-sig swept pool
-        # cannot displace a newly-regenerated active pool from the cap.
-        def _pool_cap_key(p: LiquidityPool):
-            is_inactive = p.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED)
-            return (1 if is_inactive else 0, -p.significance)
-        self._bsl = sorted(self._bsl, key=_pool_cap_key)[:_MAX_POOLS_PER_TF]
-        self._ssl = sorted(self._ssl, key=_pool_cap_key)[:_MAX_POOLS_PER_TF]
+        self._bsl = sorted(self._bsl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
+        self._ssl = sorted(self._ssl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
 
         # Prune swept history by age
         self._swept_bsl = [p for p in self._swept_bsl
@@ -433,22 +484,54 @@ class _TimeframeRegistry:
 
     def _merge_pools(
         self,
-        existing:  List[LiquidityPool],
-        clusters:  List[Tuple[float, int]],
-        side:      PoolSide,
-        atr:       float,
-        now:       float,
-        bar_ts_s:  float = 0.0,   # BUG-1 FIX: bar open timestamp in seconds
+        existing: List[LiquidityPool],
+        clusters: List[Tuple[float, int]],
+        side:     PoolSide,
+        atr:      float,
+        now:      float,
     ) -> List[LiquidityPool]:
         """
         Merge newly detected clusters into the existing registry.
+
         FIX-9: Updates centroid price on re-match instead of keeping stale price.
+
+        FIX-B1: TWO-PASS pool rebirth for SWEPT/CONSUMED pools.
+        ─────────────────────────────────────────────────────────
+        Root cause of "stuck after first trade" (PRIMARY BUG):
+
+        The original single-pass loop skipped SWEPT/CONSUMED pools with a bare
+        `continue`. When a new cluster centroid fell within radius of a SWEPT
+        pool's price, no match was found and a NEW pool was appended alongside
+        the zombie. That new pool would subsequently be swept too (same price
+        level), adding another zombie. Over successive sweeps, the _MAX_POOLS_PER_TF
+        cap filled entirely with SWEPT zombie pools. The significance sort kept the
+        highest-significance ones (SWEPT pools accumulate touch bonuses before
+        death), crowding out fresh DETECTED pools which scored lower. get_snapshot()
+        saw no active tradeable pools → nearest_bsl_atr = 999.0 → engine stuck in
+        SCANNING permanently after the first trade.
+
+        Fix: two-pass architecture:
+          Pass 1 — match active (non-SWEPT, non-CONSUMED) pools. Identical to
+                    the original logic. If matched, done.
+          Pass 2 — if pass 1 found no match, attempt REBIRTH of a SWEPT/CONSUMED
+                    pool whose price is within radius of the new centroid. New stop
+                    accumulation at a previously swept level is a genuine new
+                    structural level — institutions rebuild stop clusters after
+                    liquidity is taken. The reborn pool gets a fresh created_at,
+                    zeroed sweep metadata, and a new status so check_sweeps() can
+                    detect it again on a future candle.
+
+        A reborn pool will produce a SweepResult with a new detected_at timestamp
+        when next swept, generating a new _sweep_key in entry_engine — correctly
+        bypassing the _processed_sweeps hold from the original sweep event.
         """
         radius = atr * _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
         merged = list(existing)
         used   = set()
 
         for centroid, count in clusters:
+
+            # ── Pass 1: match active pools ─────────────────────────────────
             matched = False
             for i, pool in enumerate(merged):
                 if i in used:
@@ -465,16 +548,47 @@ class _TimeframeRegistry:
                     matched = True
                     break
 
+            if matched:
+                continue
+
+            # ── Pass 2: FIX-B1 — rebirth a SWEPT/CONSUMED pool ───────────
+            # Only runs when pass 1 found no active pool at this level.
+            # Rebirth takes priority over creating a brand-new pool to avoid
+            # accumulating parallel duplicates at the same price cluster.
+            for i, pool in enumerate(merged):
+                if i in used:
+                    continue
+                if pool.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
+                    continue
+                if abs(pool.price - centroid) <= radius:
+                    # Rebirth: reset all sweep state, assign fresh creation time.
+                    # htf_count/ob_aligned/fvg_aligned are re-evaluated each tick
+                    # by _promote_htf_confluence() and _align_with_ict().
+                    prev_status = pool.status.value
+                    pool.price      = centroid
+                    pool.status     = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED
+                    pool.touches    = count
+                    pool.created_at = now
+                    pool.last_touch = now
+                    pool.swept_at   = 0.0
+                    pool.sweep_wick = 0.0
+                    used.add(i)
+                    matched = True
+                    logger.debug(
+                        f"[{self.tf}] Pool REBIRTH {pool.side.value} "
+                        f"${centroid:,.1f} (was {prev_status})"
+                    )
+                    break
+
             if not matched:
                 merged.append(LiquidityPool(
-                    price            = centroid,
-                    side             = side,
-                    timeframe        = self.tf,
-                    status           = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED,
-                    touches          = count,
-                    created_at       = now,
-                    last_touch       = now,
-                    bar_of_creation  = bar_ts_s,   # BUG-1 FIX
+                    price      = centroid,
+                    side       = side,
+                    timeframe  = self.tf,
+                    status     = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED,
+                    touches    = count,
+                    created_at = now,
+                    last_touch = now,
                 ))
 
         return merged
@@ -495,12 +609,6 @@ class _TimeframeRegistry:
         cl  = float(c['c'])
         vol = float(c.get('v', 0))
 
-        # BUG-1 FIX: bar open timestamp to guard same-bar creation→sweep loop
-        try:
-            _bar_open_s = float(candles[-2].get('t', 0) or 0) / 1000.0
-        except Exception:
-            _bar_open_s = 0.0
-
         # 20-bar average volume from closed bars (exclude forming candle)
         vol_window = candles[max(0, len(candles) - 22):-1]
         avg_vol    = (sum(float(x.get('v', 0)) for x in vol_window)
@@ -513,9 +621,6 @@ class _TimeframeRegistry:
         # ── BSL sweep: wick above pool, close back below ──────────────────
         for pool in self._bsl:
             if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
-                continue
-            # BUG-1 FIX: skip pools born on this same bar (creation→sweep loop)
-            if _bar_open_s > 0.0 and pool.bar_of_creation >= _bar_open_s:
                 continue
             if h > pool.price + min_wick and cl < pool.price - min_reject:
                 wick_above = h - pool.price
@@ -640,6 +745,56 @@ class LiquidityMap:
         }
         self._recent_sweeps: List[SweepResult]          = []
         self._last_snapshot: Optional[LiquidityMapSnapshot] = None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # reset_snapshot() — FIX-B4: invalidate stale post-trade snapshot
+    # ─────────────────────────────────────────────────────────────────────
+
+    def reset_snapshot(self) -> None:
+        """
+        FIX-B4: Invalidate the cached last snapshot immediately after a
+        position closes so the direction engine does NOT use stale swept-pool
+        references on the next tick's predict_hunt() call.
+
+        ROOT CAUSE:
+          _last_snapshot is updated by get_snapshot() which is called every tick.
+          However, quant_strategy passes self._liq_map._last_snapshot to
+          predict_hunt() BEFORE calling liq_map.update() (per FIX-8 in
+          direction_engine.py). This means the snapshot used for hunt prediction
+          is always ONE TICK stale — which is intentional for normal operation.
+
+          After a trade closes the stale snapshot contains BSL/SSL pools that
+          were valid DURING the trade. If the swept pool that triggered the trade
+          is still referenced as the primary BSL/SSL target in that snapshot (and
+          it is, because pool rebirth hasn't run yet), predict_hunt() factors in
+          a pool with distance_atr near 0 (price just swept through it) and
+          significance that is artificially high from touch bonuses. This biases
+          the hunt direction toward the DEAD level and suppresses the Factor 5
+          pool_asymmetry score for the LIVE opposing pools.
+
+          Result: direction_engine returns NEUTRAL or wrong-side hunt prediction.
+          entry_engine finds no significant opposing target for TP calculation.
+          conviction_filter's pool significance score is 0. No new entry passes.
+
+        FIX:
+          Call reset_snapshot() in quant_strategy._finalise_exit() (or wherever
+          on_position_closed() is handled) BEFORE the next tick runs:
+
+              self._liq_map.reset_snapshot()   # ← add this line
+
+          When predict_hunt() receives liq_snapshot=None it falls back to ICT
+          engine-only scoring (Factor 3 DR from ICT DealingRange, Factor 5 from
+          ICT liquidity_pools). This is conservative but correct — one tick with
+          ICT-only scoring is far better than several ticks of misdirected hunt
+          prediction from stale post-trade pool data.
+
+          On the NEXT tick after reset, get_snapshot() is called after
+          liq_map.update(), producing a fresh snapshot that correctly reflects
+          the reborn pools from FIX-B1. That fresh snapshot becomes _last_snapshot
+          for the following tick's predict_hunt() — fully accurate from tick N+2.
+        """
+        self._last_snapshot = None
+        logger.debug("LiquidityMap: snapshot reset (post-trade stale-pool guard)")
 
     # ─────────────────────────────────────────────────────────────────────
     # update() — PRIMARY ENTRY POINT called every tick from quant_strategy
@@ -829,18 +984,6 @@ class LiquidityMap:
     # ─────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────
-
-    def invalidate_snapshot(self) -> None:
-        """BUG-4 FIX: Force next predict_hunt() call to see a clean pool state.
-
-        Called by _finalise_exit() in quant_strategy immediately after a trade
-        closes.  Pools swept *during* the trade are still referenced by
-        _last_snapshot; leaving that snapshot alive means DirectionEngine.predict_hunt()
-        will continue to treat those pools as valid targets for one extra tick.
-        Clearing _last_snapshot forces get_snapshot() to rebuild from current
-        pool state on the very next update() call.
-        """
-        self._last_snapshot = None
 
     def _promote_htf_confluence(self, atr: float) -> None:
         """

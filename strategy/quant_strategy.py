@@ -6375,9 +6375,7 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
-        # BUG-4 FIX: invalidate stale snapshot so next predict_hunt() sees clean pools
-        if hasattr(self, '_liq_map') and self._liq_map is not None:
-            self._liq_map.invalidate_snapshot()
+
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed
@@ -6390,6 +6388,47 @@ class QuantStrategy:
                 self._liq_trail.reset()
             except Exception as _ltr_e:
                 logger.debug(f"LiquidityTrailEngine.reset() error (non-fatal): {_ltr_e}")
+
+        # FIX-B4: Invalidate the cached LiquidityMap snapshot immediately after
+        # the position closes so that the FIRST post-close tick's predict_hunt()
+        # call (which runs BEFORE liq_map.update() per direction_engine FIX-8)
+        # does not use a snapshot that still references the now-dead swept pool
+        # as the primary BSL/SSL target.
+        #
+        # Without this call, _last_snapshot carries the pre-close pool layout
+        # where the swept pool that triggered the trade has distance_atr ≈ 0 and
+        # artificially inflated significance (touch bonuses accumulated before
+        # death). DirectionEngine.predict_hunt() then biases the hunt score toward
+        # the dead level, suppresses the Factor 5 asymmetry for live opposing pools,
+        # and returns NEUTRAL or wrong-side — blocking the post-close entry engine
+        # from finding a qualifying signal until the snapshot naturally refreshes
+        # (which requires liq_map.update() to produce a new snapshot, which only
+        # happens on the NEXT tick's _evaluate_entry path, ~250ms later — but the
+        # damage is done because the snapshot used is always N-1).
+        #
+        # reset_snapshot() sets _last_snapshot = None. predict_hunt() then falls
+        # back to ICT-engine-only scoring for exactly ONE tick, after which the
+        # fresh snapshot from the post-close liq_map.update() is available.
+        if hasattr(self, '_liq_map') and self._liq_map is not None:
+            try:
+                self._liq_map.reset_snapshot()
+            except Exception as _rs_e:
+                logger.debug(f"LiquidityMap.reset_snapshot() error (non-fatal): {_rs_e}")
+
+        # FIX-DE-CLOSE: Clear any stale DirectionEngine post-sweep state that
+        # survived from before/during the position. If the direction engine is
+        # in its post-sweep evaluation window when a position closes (rare but
+        # possible if a sweep fires just as the trade is confirmed and the direction
+        # engine hasn't finished evaluating it), the stale PostSweepState biases
+        # the NEXT sweep's initial evidence scores toward a setup that has already
+        # resolved. clear_sweep() is idempotent (no-op if no post-sweep state is
+        # active), so it is always safe to call here.
+        if hasattr(self, '_dir_engine') and self._dir_engine is not None:
+            try:
+                self._dir_engine.clear_sweep()
+            except Exception as _cs_e:
+                logger.debug(f"DirectionEngine.clear_sweep() error (non-fatal): {_cs_e}")
+
         # CRITICAL: do NOT reset _pnl_recorded_for or _exit_completed here.
         # These guards must persist until a new position opens (in _enter_trade).
         # Resetting them here was the v7.0 root cause of double-counting:
@@ -7063,10 +7102,20 @@ class QuantStrategy:
                         f"ignoring (was likely a prior trade's orphan).")
                     sl_oid = None; sl_p = 0.0
 
+            # Compute initial_sl_dist for the adopted position.
+            # When sl_p is known: use the actual distance from entry to SL.
+            # When sl_p is zero (no SL on exchange): fall back to 1.5×ATR so the
+            # LiquidityTrailEngine has a valid R-denominator and doesn't stay
+            # permanently in PHASE_0_HANDS_OFF at 0/0 = 0R.
+            _adopt_atr = self._atr_5m.atr if (hasattr(self, '_atr_5m') and self._atr_5m and self._atr_5m.atr > 0) else 0.0
+            _adopt_sl_dist = (
+                abs(ex_entry - sl_p) if sl_p > 0
+                else (_adopt_atr * 1.5 if _adopt_atr > 0 else 0.0)
+            )
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
-                tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=abs(ex_entry-sl_p) if sl_p>0 else 0.0,
-                entry_atr=self._atr_5m.atr)
+                tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=_adopt_sl_dist,
+                entry_atr=_adopt_atr)
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
             # Reset duplicate guards for the newly adopted position
@@ -7074,6 +7123,66 @@ class QuantStrategy:
             self._pnl_recorded_for = 0.0
             logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
             send_telegram_message(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+
+            # ── FIX-ADOPT-ENGINE: Wire all per-position stateful engines at adoption.
+            # ─────────────────────────────────────────────────────────────────────────
+            # The original _reconcile_apply set pos.phase = ACTIVE and returned.
+            # It did NOT call any of the per-position engine lifecycle hooks that
+            # _enter_trade calls after a normal order fill. This created three distinct
+            # failure modes, all presenting as "bot stuck after adopted trade closes":
+            #
+            # (A) EntryEngine stays in EngineState.SCANNING (on_position_opened() never
+            #     called → never transitions to IN_POSITION). The 14400s stuck-state
+            #     watchdog inside entry_engine.update() only fires for IN_POSITION, so
+            #     a 4h+ adoption never triggers self-recovery. If _finalise_exit() ever
+            #     throws between setting pos=FLAT and calling on_position_closed(), the
+            #     engine stays in SCANNING permanently — the state is already correct but
+            #     on_position_closed() → _reset() → purge _processed_sweeps is skipped,
+            #     leaving stale sweep holds that block re-entry.
+            #
+            # (B) LiquidityTrailEngine retains _locked_anchor from the PREVIOUS trade.
+            #     If the bot took a trade (or had state) before adopting this position,
+            #     the 90s anti-oscillation lock from that prior trade may still be active.
+            #     When the adopted position closes and trail logic next runs, it reuses
+            #     the stale anchor (wrong price, wrong direction) for up to 90s.
+            #
+            # (C) LiquidityMap snapshot is stale at adoption time.
+            #     predict_hunt() is called BEFORE liq_map.update() per direction_engine
+            #     FIX-8. The snapshot in use carries whatever pool layout existed BEFORE
+            #     the adoption. If a sweep happened just before adoption (which is common
+            #     — the bot adopted because its own trade signal was fast and the position
+            #     was already on exchange), the swept pool is still in the snapshot as the
+            #     primary target. After adoption, that stale pool biases hunt predictions
+            #     for the entire position lifetime.
+            #
+            # (D) DirectionEngine may have a stale PostSweepState if a sweep was detected
+            #     in the ticks leading up to adoption. clear_sweep() is idempotent — safe
+            #     to call even when no post-sweep state is active.
+            #
+            # Fixes applied here match the exact call sequence in _enter_trade (line ~4906):
+            if hasattr(self, '_entry_engine') and self._entry_engine is not None:
+                try:
+                    self._entry_engine.on_position_opened()
+                except Exception as _ee_e:
+                    logger.debug(f"entry_engine.on_position_opened() at adopt error: {_ee_e}")
+
+            if hasattr(self, '_liq_trail') and self._liq_trail is not None:
+                try:
+                    self._liq_trail.reset()
+                except Exception as _lt_e:
+                    logger.debug(f"liq_trail.reset() at adopt error: {_lt_e}")
+
+            if hasattr(self, '_liq_map') and self._liq_map is not None:
+                try:
+                    self._liq_map.reset_snapshot()
+                except Exception as _lm_e:
+                    logger.debug(f"liq_map.reset_snapshot() at adopt error: {_lm_e}")
+
+            if hasattr(self, '_dir_engine') and self._dir_engine is not None:
+                try:
+                    self._dir_engine.clear_sweep()
+                except Exception as _de_e:
+                    logger.debug(f"dir_engine.clear_sweep() at adopt error: {_de_e}")
 
             # ── FIX: if the adopted position has NO SL, this is an unprotected
             # state inherited from a prior failure. Trigger emergency flatten
