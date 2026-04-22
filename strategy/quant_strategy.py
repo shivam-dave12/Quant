@@ -2903,8 +2903,18 @@ class QuantStrategy:
                         self._last_exit_time = now
                         self._entry_order_placed_at = 0.0
                         if self._entry_engine is not None:
-                            self._entry_engine.on_entry_failed()
-                            logger.info("🔄 Entry engine reset to SCANNING after ENTERING watchdog")
+                            # BUG-2 FIX: The ENTERING watchdog fires only after the
+                            # order fill-timeout — this is a position-boundary event
+                            # (the trade was never opened), not an in-evaluation reset.
+                            # on_position_closed() uses full_clear=True, wiping
+                            # _processed_sweeps, the gate-block cooldown, and the
+                            # momentum-block so the next valid setup evaluates cleanly.
+                            # on_entry_failed() (full_clear=False) would preserve stale
+                            # processed-sweep entries for up to 120s, silently blocking
+                            # the next setup after every ENTERING timeout.
+                            self._entry_engine.on_position_closed()
+                            logger.info(
+                                "🔄 Entry engine full-clear after ENTERING watchdog timeout")
 
         elif phase == PositionPhase.FLAT:
             if cooldown_ok:
@@ -4152,6 +4162,19 @@ class QuantStrategy:
                         logger.debug(
                             f"🚫 CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
+                    # BUG-3 FIX: Record the conviction block in the entry engine
+                    # so scan_skip_info surfaces it in the THINK log alongside
+                    # sweep rejections.  Must fire for ALL signal types so the
+                    # real reason SCANNING is not advancing is always visible —
+                    # even after the first identical rejection is demoted to DEBUG.
+                    if hasattr(self._entry_engine, 'mark_conviction_blocked'):
+                        self._entry_engine.mark_conviction_blocked(
+                            side=signal.side,
+                            score=_conv_result.score,
+                            reason=reject_str[:80],
+                            now=now,
+                        )
+
                     # BUG-B2 / FIX-SPAM / FIX-SL-FLIP:
                     # Route the gate-block notification to the correct suppressor
                     # based on signal type.

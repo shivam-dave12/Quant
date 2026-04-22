@@ -96,11 +96,22 @@ try:
     _PS_PHASE_CISD         = float(getattr(_ecfg, 'PS_PHASE_CISD_SEC',         120.0))
     _PS_PHASE_OTE          = float(getattr(_ecfg, 'PS_PHASE_OTE_SEC',          240.0))
     _PS_PHASE_MATURE       = float(getattr(_ecfg, 'PS_PHASE_MATURE_SEC',       360.0))
+    # BUG-1 FIX: Post-close stale-window extension.
+    # After a long position hold every sweep in snap.recent_sweeps is older than
+    # the normal 120s staleness limit and the engine enters a cold-start dead zone
+    # of unknown duration.  For POST_CLOSE_GRACE_PERIOD_SEC after on_position_closed()
+    # _collect_sweeps() uses POST_CLOSE_STALE_WINDOW_SEC instead of 120s so sweeps
+    # from the final minutes of the closed position are still reachable.
+    # Operators can widen or narrow both windows from config without a redeploy.
+    _POST_CLOSE_STALE_WINDOW_SEC = float(getattr(_ecfg, 'POST_CLOSE_STALE_WINDOW_SEC', 600.0))
+    _POST_CLOSE_GRACE_PERIOD_SEC = float(getattr(_ecfg, 'POST_CLOSE_GRACE_PERIOD_SEC', 300.0))
 except Exception:
     _PS_PHASE_DISPLACEMENT = 45.0
     _PS_PHASE_CISD         = 120.0
     _PS_PHASE_OTE          = 240.0
     _PS_PHASE_MATURE       = 360.0
+    _POST_CLOSE_STALE_WINDOW_SEC = 600.0
+    _POST_CLOSE_GRACE_PERIOD_SEC = 300.0
 
 # Post-Sweep evidence thresholds (lowered to allow entries)
 _PS_THRESHOLD_EARLY  = 45.0
@@ -415,6 +426,21 @@ class EntryEngine:
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
 
+        # BUG-1 FIX: Timestamp when on_position_closed() last fired.
+        # _collect_sweeps() uses this to extend the staleness window for
+        # _POST_CLOSE_GRACE_PERIOD_SEC after a close so sweeps from the
+        # final minutes of a long hold are not immediately discarded.
+        # Set BEFORE _reset() so the field survives the full_clear.
+        self._position_closed_at: float = 0.0
+
+        # BUG-3 FIX: Last conviction block record for scan_skip_info.
+        # Sweeps can pass _collect_sweeps() but still be blocked downstream
+        # by the conviction gate.  Without this, that block is invisible in
+        # the THINK log after the first identical rejection is demoted to
+        # DEBUG.  Cleared on full_clear so stale records don't pollute the
+        # next position's diagnostics.
+        self._last_conviction_block: Optional[Dict] = None
+
     # ── Public API ────────────────────────────────────────────────────
 
     def update(
@@ -606,13 +632,48 @@ class EntryEngine:
         self._momentum_block_candle_ts   = candle_ts
         self._momentum_block_sl          = locked_sl
 
+    def mark_conviction_blocked(
+        self,
+        side: str,
+        score: float,
+        reason: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """
+        BUG-3 FIX: Called by quant_strategy when the conviction filter blocks
+        any signal type (both DISPLACEMENT_MOMENTUM and POST_SWEEP).
+
+        Stores the block context in _last_conviction_block so scan_skip_info
+        can surface it alongside sweep rejections in the THINK log.
+
+        This closes the observability gap where a conviction block during
+        SCANNING is completely invisible after the first identical rejection is
+        demoted to DEBUG.  With this in place the THINK log shows BOTH why
+        sweeps are being discarded AND why the conviction gate is blocking —
+        making the "SCANNING but no trades" state immediately diagnosable
+        without enabling DEBUG logging or tracing through source.
+
+        Lifecycle: cleared on full_clear reset (position boundary) so stale
+        records from the previous position do not mislead diagnostics for the
+        next one.
+        """
+        self._last_conviction_block = {
+            "side":   side,
+            "score":  round(score, 3),
+            "reason": reason[:80],
+            "at":     now if now is not None else time.time(),
+        }
+
     def on_position_closed(self) -> None:
-        # full_clear=True: the position lifecycle is complete.  All per-position
-        # gate state (_processed_sweeps, gate-block, momentum-block) must be
-        # cleared so the engine starts the next trade evaluation with a clean
-        # slate.  Preserving these across a position boundary is the root cause
-        # of "SCANNING but no signals" silences after a trade closes.
-        self._reset(time.time(), full_clear=True)
+        # BUG-1 FIX: Record the close timestamp BEFORE calling _reset() so
+        # _collect_sweeps() can extend the staleness window on the first scan(s)
+        # after a long hold.  If _reset() ran first it would wipe _state_entered
+        # to now, making the post-close elapsed check meaningless.
+        # full_clear=True clears _processed_sweeps, gate-block, momentum-block,
+        # and _last_conviction_block — all per-position state.
+        _now = time.time()
+        self._position_closed_at = _now
+        self._reset(_now, full_clear=True)
 
     def force_reset(self) -> None:
         # full_clear=True covers: _processed_sweeps, gate-block, momentum-block.
@@ -634,27 +695,43 @@ class EntryEngine:
         return None
 
     @property
-    def scan_skip_info(self) -> Optional[Dict[str, Dict[str, int]]]:
+    def scan_skip_info(self) -> Optional[Dict]:
         """
-        Last-tick sweep-rejection counters from _collect_sweeps().
+        Last-tick sweep-rejection counters from _collect_sweeps() plus the most
+        recent conviction block (if any, within the last 300s).
 
         Returns:
-          None if both paths produced sweeps (nothing to report), else a dict:
+          None if no rejections to report, otherwise a dict with any of:
             {
-              "liq":    {"stale": n, "low_quality": n, "processed": n},   # or absent
-              "bridge": {"stale": n, "low_quality": n, "processed": n,
-                         "ict_sweeps": n},                                # or absent
+              "liq":        {"stale": n, "low_quality": n, "processed": n},
+              "bridge":     {"stale": n, "low_quality": n, "processed": n,
+                             "ict_sweeps": n},
+              "conviction": {"side": str, "score": float, "reason": str,
+                             "age_s": int},
             }
 
         Used by quant_strategy's THINK log to surface WHY SCANNING isn't
-        advancing. Silent rejection previously made "no trades" impossible
-        to distinguish from "broken pipeline".
+        advancing.  The conviction key closes the observability gap where a
+        downstream gate block during SCANNING is invisible after the first
+        identical rejection is demoted to DEBUG.
         """
-        out = {}
+        out: Dict = {}
         if self._last_liq_skip:
             out["liq"] = dict(self._last_liq_skip)
         if self._last_bridge_skip:
             out["bridge"] = dict(self._last_bridge_skip)
+        # BUG-3 FIX: Include the most recent conviction block if it occurred
+        # within the last 300s.  Records older than 300s are stale (market
+        # conditions have shifted) and should not be shown as current context.
+        if self._last_conviction_block is not None:
+            _age = time.time() - self._last_conviction_block.get("at", 0.0)
+            if _age < 300.0:
+                out["conviction"] = {
+                    "side":   self._last_conviction_block["side"],
+                    "score":  self._last_conviction_block["score"],
+                    "reason": self._last_conviction_block["reason"],
+                    "age_s":  int(_age),
+                }
         return out if out else None
 
     # ── Internal: reset ───────────────────────────────────────────────
@@ -696,6 +773,7 @@ class EntryEngine:
             self._momentum_block_entry_price = 0.0
             self._momentum_block_candle_ts = 0
             self._momentum_block_sl        = None
+            self._last_conviction_block    = None   # BUG-3 FIX
         else:
             # In-evaluation reset — purge only expired processed-sweep entries.
             # Active entries (expiry > now) must survive so the same sweep cannot
@@ -773,10 +851,23 @@ class EntryEngine:
 
         sweeps = []
         for s in (snap.recent_sweeps or []):
-            # 120s window: the SL-candle sweep detected_at is already > 60s old by
-            # the time _finalise_exit() completes + SCANNING resumes (reconcile +
-            # 2-min post-close delay).  120s covers the full reconcile+scan cycle.
-            if s.detected_at <= now - 120.0:
+            # BUG-1 FIX: Dynamic staleness limit.
+            # Normal limit is 120s — enough to cover the ICT/LiquidityMap detection
+            # latency on a running bot.  After a long position hold EVERY sweep in
+            # snap.recent_sweeps is older than 120s and is silently discarded,
+            # leaving the engine in a cold-start dead zone until a brand-new sweep
+            # fires.  For the first _POST_CLOSE_GRACE_PERIOD_SEC (default 300s)
+            # after on_position_closed() we widen the window to
+            # _POST_CLOSE_STALE_WINDOW_SEC (default 600s / 10 min) so sweeps from
+            # the final minutes of the hold are still reachable.
+            # _position_closed_at is set before _reset(), so it is non-zero
+            # exactly when a position boundary just occurred.
+            _stale_limit = 120.0
+            if (self._position_closed_at > 0
+                    and now - self._position_closed_at < _POST_CLOSE_GRACE_PERIOD_SEC):
+                _stale_limit = _POST_CLOSE_STALE_WINDOW_SEC
+
+            if s.detected_at <= now - _stale_limit:
                 _skipped_stale += 1
                 continue
             if s.quality < _MIN_SWEEP_QUALITY:
