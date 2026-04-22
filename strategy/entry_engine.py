@@ -397,6 +397,7 @@ class EntryEngine:
         # {"stale": int, "low_quality": int, "processed": int}
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
+        self._last_ps_cleanup:  float = 0.0   # BUG-3 FIX: periodic _processed_sweeps pruning
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -702,6 +703,13 @@ class EntryEngine:
         # Track every reason a sweep is rejected so upstream logs show why
         # SCANNING isn't transitioning. Silent rejection makes "no trades"
         # indistinguishable from "broken pipeline".
+        # BUG-3 FIX: periodic pruning of _processed_sweeps between position closes.
+        # _reset() prunes on close; this handles hours-long inter-trade SCANNING.
+        _PS_CLEANUP_INTERVAL_SEC = 60.0
+        if now - self._last_ps_cleanup > _PS_CLEANUP_INTERVAL_SEC:
+            self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items() if v > now}
+            self._last_ps_cleanup = now
+
         _skipped_stale       = 0
         _skipped_low_quality = 0
         _skipped_processed   = 0

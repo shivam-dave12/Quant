@@ -399,6 +399,15 @@ class DirectionEngine:
     # 1. HUNT PREDICTION ENGINE
     # =========================================================================
 
+    @staticmethod
+    def _is_pool_target_active(t) -> bool:
+        """BUG-4 FIX: Return False if the pool underlying this PoolTarget has been
+        mutated to SWEPT or CONSUMED since the snapshot was built."""
+        try:
+            return t.pool.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)
+        except Exception:
+            return True   # safe default
+
     def predict_hunt(
         self,
         price:          float,
@@ -456,8 +465,11 @@ class DirectionEngine:
             dr_pd     = getattr(dr, 'current_pd', 0.5)
         elif liq_snapshot is not None:
             # FIX-3: Use LiquidityMap snapshot for dealing range
-            _bsl_pools = [t for t in liq_snapshot.bsl_pools if t.pool.price > price]
-            _ssl_pools = [t for t in liq_snapshot.ssl_pools if t.pool.price < price]
+            # BUG-4 FIX: exclude mutated-SWEPT pools from _last_snapshot
+            _bsl_pools = [t for t in liq_snapshot.bsl_pools
+                          if t.pool.price > price and self._is_pool_target_active(t)]
+            _ssl_pools = [t for t in liq_snapshot.ssl_pools
+                          if t.pool.price < price and self._is_pool_target_active(t)]
             if _bsl_pools and _ssl_pools:
                 bsl_price = min(_bsl_pools, key=lambda t: t.distance_atr).pool.price
                 ssl_price = min(_ssl_pools, key=lambda t: t.distance_atr).pool.price
@@ -611,12 +623,15 @@ class DirectionEngine:
             )
         elif liq_snapshot is not None:
             # Fallback A: LiquidityMap PoolTarget.adjusted_sig() significance sum
+            # BUG-4 FIX: exclude mutated-SWEPT pools from _last_snapshot
             _bsl_sig_lm = sum(t.adjusted_sig()
                               for t in liq_snapshot.bsl_pools
-                              if t.pool.price > price)
+                              if t.pool.price > price
+                              and self._is_pool_target_active(t))
             _ssl_sig_lm = sum(t.adjusted_sig()
                               for t in liq_snapshot.ssl_pools
-                              if t.pool.price < price)
+                              if t.pool.price < price
+                              and self._is_pool_target_active(t))
             _total_lm = _bsl_sig_lm + _ssl_sig_lm
             if _total_lm > 1e-10:
                 factors.pool_asymmetry = _sigmoid(
@@ -925,14 +940,15 @@ class DirectionEngine:
             # FIX-3: Use LiquidityMap pool prices when available
             swept_pool    = bsl_price
             opposing_pool = ssl_price
+            # BUG-4 FIX: only resolve from non-SWEPT pools
             if liq_snapshot is not None and liq_snapshot.bsl_pools:
-                _near_bsl = min(liq_snapshot.bsl_pools,
-                                key=lambda t: t.distance_atr)
-                swept_pool = _near_bsl.pool.price
+                _absl = [t for t in liq_snapshot.bsl_pools if self._is_pool_target_active(t)]
+                if _absl:
+                    swept_pool = min(_absl, key=lambda t: t.distance_atr).pool.price
             if liq_snapshot is not None and liq_snapshot.ssl_pools:
-                _near_ssl = min(liq_snapshot.ssl_pools,
-                                key=lambda t: t.distance_atr)
-                opposing_pool = _near_ssl.pool.price
+                _assl = [t for t in liq_snapshot.ssl_pools if self._is_pool_target_active(t)]
+                if _assl:
+                    opposing_pool = min(_assl, key=lambda t: t.distance_atr).pool.price
             reason = (
                 f"BSL_HUNT (score={score:+.3f}) | "
                 f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},"
@@ -949,13 +965,15 @@ class DirectionEngine:
             swept_pool    = ssl_price
             opposing_pool = bsl_price
             if liq_snapshot is not None and liq_snapshot.ssl_pools:
-                _near_ssl = min(liq_snapshot.ssl_pools,
-                                key=lambda t: t.distance_atr)
-                swept_pool = _near_ssl.pool.price
+            # BUG-4 FIX: only resolve from non-SWEPT pools
+            if liq_snapshot is not None and liq_snapshot.ssl_pools:
+                _assl = [t for t in liq_snapshot.ssl_pools if self._is_pool_target_active(t)]
+                if _assl:
+                    swept_pool = min(_assl, key=lambda t: t.distance_atr).pool.price
             if liq_snapshot is not None and liq_snapshot.bsl_pools:
-                _near_bsl = min(liq_snapshot.bsl_pools,
-                                key=lambda t: t.distance_atr)
-                opposing_pool = _near_bsl.pool.price
+                _absl = [t for t in liq_snapshot.bsl_pools if self._is_pool_target_active(t)]
+                if _absl:
+                    opposing_pool = min(_absl, key=lambda t: t.distance_atr).pool.price
             reason = (
                 f"SSL_HUNT (score={score:+.3f}) | "
                 f"AMD={getattr(amd,'phase','?')}({getattr(amd,'bias','?')},"
@@ -1507,8 +1525,11 @@ class DirectionEngine:
         # New: scales linearly from pool.adjusted_sig() up to defined max pts.
         if liq_snapshot is not None:
             # Opposing pool: the reversal's TP target
-            _opp_pools = (liq_snapshot.ssl_pools if rev_dir == "short"
-                          else liq_snapshot.bsl_pools)
+            # BUG-4 FIX: exclude mutated-SWEPT pools from _last_snapshot
+            _opp_pools = [t for t in
+                          (liq_snapshot.ssl_pools if rev_dir == "short"
+                           else liq_snapshot.bsl_pools)
+                          if self._is_pool_target_active(t)]
             if _opp_pools:
                 _best_opp = max(_opp_pools, key=lambda t: t.adjusted_sig())
                 _opp_sig  = min(_STATIC_REV_POOL_MAX,
@@ -1516,8 +1537,11 @@ class DirectionEngine:
                 if _opp_sig > 0.5:
                     s_rev += _opp_sig
             # Continuation pool: the continuation's TP target
-            _cont_pools = (liq_snapshot.bsl_pools if cont_dir == "long"
-                           else liq_snapshot.ssl_pools)
+            # BUG-4 FIX: exclude mutated-SWEPT pools from _last_snapshot
+            _cont_pools = [t for t in
+                           (liq_snapshot.bsl_pools if cont_dir == "long"
+                            else liq_snapshot.ssl_pools)
+                           if self._is_pool_target_active(t)]
             if _cont_pools:
                 _best_cont = max(_cont_pools, key=lambda t: t.adjusted_sig())
                 _cont_sig  = min(_STATIC_CONT_POOL_MAX,
@@ -1796,10 +1820,12 @@ class DirectionEngine:
         if _next_pool_resolved is None and liq_snapshot is not None:
             _pool_list = (liq_snapshot.bsl_pools if pos_side == "long"
                           else liq_snapshot.ssl_pools)
+            # BUG-4 FIX: exclude mutated-SWEPT pools from _last_snapshot
             _qualifying = [
                 t for t in _pool_list
                 if t.distance_atr > 0.5
                 and t.significance >= 2.0
+                and self._is_pool_target_active(t)    # BUG-4 FIX
             ]
             if _qualifying:
                 _nearest = min(_qualifying, key=lambda t: t.distance_atr)

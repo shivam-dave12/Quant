@@ -6375,6 +6375,9 @@ class QuantStrategy:
     def _finalise_exit(self):
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_closed()
+        # BUG-4 FIX: invalidate stale snapshot so next predict_hunt() sees clean pools
+        if hasattr(self, '_liq_map') and self._liq_map is not None:
+            self._liq_map.invalidate_snapshot()
         # Bug #23 fix: LiquidityTrailEngine holds _locked_anchor and
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed

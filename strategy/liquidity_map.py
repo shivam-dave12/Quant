@@ -163,6 +163,7 @@ class LiquidityPool:
     last_touch: float      = 0.0
     swept_at:   float      = 0.0
     sweep_wick: float      = 0.0
+    bar_of_creation: float = 0.0   # BUG-1 FIX: bar open ts (s) when pool was created
 
     ob_aligned:  bool = False   # set by _align_with_ict()
     fvg_aligned: bool = False   # set by _align_with_ict()
@@ -389,6 +390,12 @@ class _TimeframeRegistry:
         if _ts > 0:
             self._last_ts = _ts
 
+        # BUG-1 FIX: record bar open timestamp in seconds for creation-guard in check_sweeps
+        try:
+            _bar_open_s = float(candles[-2].get('t', 0) or 0) / 1000.0
+        except Exception:
+            _bar_open_s = 0.0
+
         lookback  = _SWING_LOOKBACK.get(self.tf, 3)       # FIX-1
         cluster_r = _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
 
@@ -397,8 +404,8 @@ class _TimeframeRegistry:
         ssl_clusters = _detect_equal_levels(
             _find_swing_lows(candles, lookback),  atr, cluster_r)
 
-        self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now)
-        self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now)
+        self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now, bar_ts_s=_bar_open_s)
+        self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now, bar_ts_s=_bar_open_s)
 
         # Prune CONSUMED and age-expired pools
         max_age = _POOL_MAX_AGE.get(self.tf, 7200)
@@ -410,8 +417,13 @@ class _TimeframeRegistry:
                      and p.status != PoolStatus.CONSUMED]
 
         # Cap per-side by significance
-        self._bsl = sorted(self._bsl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
-        self._ssl = sorted(self._ssl, key=lambda p: p.significance, reverse=True)[:_MAX_POOLS_PER_TF]
+        # BUG-1 FIX: sort active pools before swept/consumed so a high-sig swept pool
+        # cannot displace a newly-regenerated active pool from the cap.
+        def _pool_cap_key(p: LiquidityPool):
+            is_inactive = p.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED)
+            return (1 if is_inactive else 0, -p.significance)
+        self._bsl = sorted(self._bsl, key=_pool_cap_key)[:_MAX_POOLS_PER_TF]
+        self._ssl = sorted(self._ssl, key=_pool_cap_key)[:_MAX_POOLS_PER_TF]
 
         # Prune swept history by age
         self._swept_bsl = [p for p in self._swept_bsl
@@ -421,11 +433,12 @@ class _TimeframeRegistry:
 
     def _merge_pools(
         self,
-        existing: List[LiquidityPool],
-        clusters: List[Tuple[float, int]],
-        side:     PoolSide,
-        atr:      float,
-        now:      float,
+        existing:  List[LiquidityPool],
+        clusters:  List[Tuple[float, int]],
+        side:      PoolSide,
+        atr:       float,
+        now:       float,
+        bar_ts_s:  float = 0.0,   # BUG-1 FIX: bar open timestamp in seconds
     ) -> List[LiquidityPool]:
         """
         Merge newly detected clusters into the existing registry.
@@ -454,13 +467,14 @@ class _TimeframeRegistry:
 
             if not matched:
                 merged.append(LiquidityPool(
-                    price      = centroid,
-                    side       = side,
-                    timeframe  = self.tf,
-                    status     = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED,
-                    touches    = count,
-                    created_at = now,
-                    last_touch = now,
+                    price            = centroid,
+                    side             = side,
+                    timeframe        = self.tf,
+                    status           = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED,
+                    touches          = count,
+                    created_at       = now,
+                    last_touch       = now,
+                    bar_of_creation  = bar_ts_s,   # BUG-1 FIX
                 ))
 
         return merged
@@ -481,6 +495,12 @@ class _TimeframeRegistry:
         cl  = float(c['c'])
         vol = float(c.get('v', 0))
 
+        # BUG-1 FIX: bar open timestamp to guard same-bar creation→sweep loop
+        try:
+            _bar_open_s = float(candles[-2].get('t', 0) or 0) / 1000.0
+        except Exception:
+            _bar_open_s = 0.0
+
         # 20-bar average volume from closed bars (exclude forming candle)
         vol_window = candles[max(0, len(candles) - 22):-1]
         avg_vol    = (sum(float(x.get('v', 0)) for x in vol_window)
@@ -493,6 +513,9 @@ class _TimeframeRegistry:
         # ── BSL sweep: wick above pool, close back below ──────────────────
         for pool in self._bsl:
             if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
+                continue
+            # BUG-1 FIX: skip pools born on this same bar (creation→sweep loop)
+            if _bar_open_s > 0.0 and pool.bar_of_creation >= _bar_open_s:
                 continue
             if h > pool.price + min_wick and cl < pool.price - min_reject:
                 wick_above = h - pool.price
