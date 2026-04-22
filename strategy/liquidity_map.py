@@ -830,6 +830,18 @@ class LiquidityMap:
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────
 
+    def invalidate_snapshot(self) -> None:
+        """BUG-4 FIX: Force next predict_hunt() call to see a clean pool state.
+
+        Called by _finalise_exit() in quant_strategy immediately after a trade
+        closes.  Pools swept *during* the trade are still referenced by
+        _last_snapshot; leaving that snapshot alive means DirectionEngine.predict_hunt()
+        will continue to treat those pools as valid targets for one extra tick.
+        Clearing _last_snapshot forces get_snapshot() to rebuild from current
+        pool state on the very next update() call.
+        """
+        self._last_snapshot = None
+
     def _promote_htf_confluence(self, atr: float) -> None:
         """
         Set pool.htf_count = number of distinct OTHER timeframes that have a

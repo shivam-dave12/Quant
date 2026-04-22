@@ -131,11 +131,11 @@ logger = logging.getLogger(__name__)
 
 _LIQ_MAP_TYPES_AVAILABLE = False
 try:
-    from strategy.liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide
+    from strategy.liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide, PoolStatus
     _LIQ_MAP_TYPES_AVAILABLE = True
 except ImportError:
     try:
-        from liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide
+        from liquidity_map import LiquidityMapSnapshot, PoolTarget, PoolSide, PoolStatus
         _LIQ_MAP_TYPES_AVAILABLE = True
     except ImportError:
         LiquidityMapSnapshot = None   # type: ignore

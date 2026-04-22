@@ -577,7 +577,42 @@ class EntryEngine:
         self._momentum_block_sl          = locked_sl
 
     def on_position_closed(self) -> None:
-        self._reset(time.time())
+        """Called by quant_strategy._finalise_exit() on any normal trade exit.
+
+        BUG-EXIT-RESET FIX: _reset() transitions state → SCANNING and clears
+        _signal / _post_sweep, but it intentionally preserves gate/momentum
+        block fields so they survive mid-trade state transitions.  After a
+        FULL position close those fields must be cleared — a pre-trade
+        conviction gate block or momentum block is no longer relevant, and
+        leaving them set causes the engine to land in SCANNING but generate
+        NO signals until the block timer naturally expires (up to 45s for
+        gate, 30s for momentum, plus the _last_momentum_candle_ts guard that
+        prevents the displacement candle from the last entry from being
+        re-evaluated until it scrolls out of the lookback window).
+
+        Fields deliberately NOT cleared here:
+          _processed_sweeps     — BUG-1/BUG-2 fix: active hold windows must
+                                  survive position close so the same sweep
+                                  cannot immediately re-enter.
+          _momentum_entries_1h  — hourly budget should not reset on close;
+                                  force_reset() handles operator-mandated clears.
+          _last_entry_at        — provides a 15s re-entry guard; force_reset()
+                                  clears for operator hard-reset.
+        """
+        now = time.time()
+        self._reset(now)
+
+        # Clear all signal-generation blockers that are irrelevant post-close.
+        self._gate_blocked_until         = 0.0
+        self._gate_block_key             = ()
+        self._momentum_blocked_until     = 0.0
+        self._momentum_block_entry_price = 0.0
+        self._momentum_block_candle_ts   = 0
+        self._momentum_block_sl          = None
+        # Clear the displacement-candle stamp so the same candle can be
+        # re-evaluated as a fresh setup for the next trade.
+        self._last_momentum_candle_ts    = 0
+
 
     def force_reset(self) -> None:
         self._reset(time.time())
