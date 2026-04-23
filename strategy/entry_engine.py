@@ -1002,15 +1002,31 @@ class EntryEngine:
 
     def _enter_post_sweep(self, sweep, snap, flow, ict, price, atr, now,
                           ict_event=None) -> None:
-        tf_quality = {'1m': 0.65, '5m': 0.55, '15m': 0.45, '4h': 0.35}
+        # FIX-TF-QUALITY: Thresholds previously had a dangerous gap vs
+        # _MIN_SWEEP_QUALITY (0.15).  Any 5m sweep with quality 0.15–0.54
+        # passed _collect_sweeps but was silently rejected here and locked out
+        # for 60s with NO log entry — the primary cause of "engine stuck in
+        # SCANNING after first trade".  Thresholds are now aligned downward to
+        # reflect the actual quality range produced by the sweep-detection
+        # pipeline (ICT bridge max = 0.85; typical non-wick sweep ≈ 0.35–0.55).
+        # Lower-TF sweeps still require more quality than higher-TF sweeps.
+        tf_quality = {'1m': 0.45, '5m': 0.35, '15m': 0.25, '4h': 0.20}
         tf = getattr(sweep.pool, 'timeframe', '5m')
-        if sweep.quality < tf_quality.get(tf, 0.45):
+        if sweep.quality < tf_quality.get(tf, 0.25):
             # EE-4 FIX: register the rejected sweep in _processed_sweeps so
             # _collect_sweeps() doesn't re-present it every 250ms for the full
             # 60s detection window. 60s hold matches the detection window
             # exactly — expires at the same time the sweep naturally ages out.
             _reject_key = self._sweep_key(sweep)
             self._processed_sweeps[_reject_key] = now + 60.0
+            # FIX-TF-QUALITY-LOG: surface the rejection so "no trades" sessions
+            # are diagnosable without a custom debug patch.
+            logger.warning(
+                f"SWEEP REJECTED (tf_quality): {sweep.pool.side.value} "
+                f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
+                f"required={tf_quality.get(tf, 0.25):.2f} tf={tf} "
+                f"→ locked 60s"
+            )
             return
 
         # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
