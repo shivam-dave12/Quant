@@ -453,8 +453,9 @@ class QCfg:
         return bool(_cfg("QUANT_TRAIL_LIQ_BOS_CONFIRM_GATE", True))
     @staticmethod
     def TRAIL_LIQ_BOS_MAX_AGE_MS() -> int:
-        """Max age (ms) for BOS event to count as valid confirmation."""
-        return int(_cfg("QUANT_TRAIL_LIQ_BOS_MAX_AGE_MS", 10_000_000))  # 10 min
+        # Bug #37 fix: default reduced 10_000_000 (10 min) → 2_000_000 (2 min).
+        # A BOS from 9 minutes ago is structural history, not live momentum.
+        return int(_cfg("QUANT_TRAIL_LIQ_BOS_MAX_AGE_MS", 2_000_000))
     @staticmethod
     def TRAIL_LIQ_MIN_BREATHING_ATR() -> float:
         """Hard minimum distance between SL and current price (ATR multiples)."""
@@ -2511,6 +2512,7 @@ class QuantStrategy:
         self._last_think_log_v2 = 0.0
         self._force_sl = None
         self._force_tp = None
+        self._risk_manager_ref = None   # Bug #10 fix: set in on_tick, used by _record_exchange_exit
         # Bug-1 fix: deduplication set for DirectionEngine.on_sweep() calls.
         # The sweep bridge loop runs every 250ms and visits every swept pool
         # whose sweep_timestamp falls within the last 30s.  Without this guard,
@@ -2684,6 +2686,9 @@ class QuantStrategy:
         now = timestamp_ms / 1000.0
         with self._lock:
             self._om = order_manager
+            # Bug #10 fix: store risk_manager reference so _record_exchange_exit
+            # can call risk_manager.record_trade without a parameter chain change.
+            self._risk_manager_ref = risk_manager
             if now - self._last_eval_time < QCfg.TICK_EVAL_SEC():
                 return
             self._last_eval_time = now
@@ -2858,11 +2863,17 @@ class QuantStrategy:
     def _launch_entry_async(self, data_manager, order_manager, risk_manager,
                              side: str, sig, mode: str,
                              ict_tier: str = "",
-                             prefetched_bal_info: dict = None) -> None:
+                             prefetched_bal_info: dict = None,
+                             entry_now: float = 0.0) -> None:
         """
         Non-blocking entry: sets ENTERING phase immediately, then runs
         _enter_trade in a daemon thread so the main on_tick loop is never
         blocked by the bracket fill-polling sleep loop (up to 45s).
+
+        entry_now: the exchange-derived timestamp (timestamp_ms / 1000.0)
+        from the calling on_tick.  Threaded into _enter_trade so that
+        mark_entry_placed() uses the same clock as _check_session_limits,
+        preventing clock-drift pacing errors (Bug #21).
 
         ict_tier: "S" | "A" | "B" | "" — passed through to _enter_trade so
         confidence-weighted position sizing can scale size by conviction tier.
@@ -2884,14 +2895,16 @@ class QuantStrategy:
             # BUG 2: reset order-placed timestamp — Stage A (pre-order) begins
             self._entry_order_placed_at = 0.0
 
-        _dm, _om, _rm = data_manager, order_manager, risk_manager
+        _dm, _om, _rm  = data_manager, order_manager, risk_manager
         _bal           = prefetched_bal_info
+        _entry_now     = entry_now   # captured for the thread closure
 
         def _bg():
             try:
                 self._enter_trade(_dm, _om, _rm, side, sig, mode=mode,
                                   ict_tier=ict_tier,
-                                  prefetched_bal_info=_bal)
+                                  prefetched_bal_info=_bal,
+                                  entry_now=_entry_now)
             except Exception as _e:
                 logger.error(
                     f"_enter_trade background thread error ({mode}/{side}): {_e}",
@@ -4072,6 +4085,9 @@ class QuantStrategy:
                     entry_type       = _entry_type_str,
                     sweep_wick_price = _sweep_wick,
                     measured_displacement_atr = _measured_disp_atr,
+                    # Bug #16 fix: pass live balance so the drawdown circuit
+                    # breaker is calibrated to the real account, not $10k.
+                    live_balance     = float((bal_info or {}).get("available", 0.0)),
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])
@@ -4497,7 +4513,8 @@ class QuantStrategy:
         return sl_price, tp_price
 
     def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion",
-                     ict_tier: str = "", prefetched_bal_info: dict = None):
+                     ict_tier: str = "", prefetched_bal_info: dict = None,
+                     entry_now: float = 0.0):
         """
         Position entry — v7.0 (confidence-weighted sizing via ict_tier).
 
@@ -4537,38 +4554,75 @@ class QuantStrategy:
         raw_composite     = abs(sig.composite) if sig.composite is not None else 0.0
         signal_confidence = min(1.0, raw_composite / 0.6)   # 0.6 composite = full confidence
 
-        # ── Always limit (maker) entry — price from live orderbook ─────────────
-        use_maker = True
+        # ── Limit price: prefer OTE signal price, fall back to live book ──
+        # Bug #4 fix: the original code always computed limit_px from the
+        # live orderbook bid/ask, ignoring signal.entry_price entirely.
+        # signal.entry_price is the OTE-precise level (50%–78.6% Fibonacci
+        # retracement) computed by EntryEngine from the sweep structure.
+        # Replacing it with the live bid/ask destroys OTE precision:
+        #   • For a LONG reversal, OTE might be $94,800 but bid is $95,100 —
+        #     placing at bid fills immediately at taker cost and misses OTE.
+        #   • The institutional advantage of the OTE level is the expected
+        #     bounce from that specific Fibonacci zone; if we don't place there
+        #     we're not in the trade at the right structural price.
+        #
+        # Staleness guard: if the signal price is > 2 ATR away from the
+        # current market (price moved significantly since the signal was
+        # generated), the OTE is no longer valid and we fall back to the
+        # live orderbook offset.  This prevents stale signals from placing
+        # orders far off-market.
+        # Bug #34 fix: use_maker was always True, making MakerTakerDecision.decide()
+        # dead code.  Now query the fee engine for a proper maker/taker decision.
+        # OTE-routed entries (signal.entry_price valid) are always limit orders and
+        # default to maker.  Non-OTE (book-offset) entries consult the fee engine
+        # based on signal urgency to decide whether to post limit or take market.
+        # Note: signal_confidence is already computed above from sig.composite.
+        use_maker = True   # default — OTE limit orders are always maker
         tick      = QCfg.TICK_SIZE()
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
 
-        try:
-            orderbook = data_manager.get_orderbook()
-            bids = (orderbook or {}).get("bids", [])
-            asks = (orderbook or {}).get("asks", [])
-            if bids and asks:
-                def _best_px(lvl):
-                    if isinstance(lvl,(list,tuple)): return float(lvl[0])
-                    if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
-                    return 0.0
-                # Bug #3 fix: LIMIT_ORDER_OFFSET_TICKS was only applied in the
-                # fallback path (empty book). With a live book the offset was
-                # silently ignored, defeating its purpose of improving maker-fill
-                # probability by placing the order slightly inside the spread.
-                if side == "long":
-                    limit_px  = round(_best_px(bids[0]) - offset, 1)
-                    mt_reason = f"limit_long@bid-{offset:.1f}={limit_px:.1f}"
+        _sig_entry = getattr(self._last_entry_signal, 'entry_price', 0.0) or 0.0
+        _stale_threshold = 2.0 * atr if atr > 1e-10 else float('inf')
+        _sig_is_valid = (
+            _sig_entry > 0
+            and abs(_sig_entry - price) <= _stale_threshold
+        )
+
+        if _sig_is_valid:
+            limit_px  = _round_to_tick(_sig_entry)
+            mt_reason = f"limit_{side}_ote={limit_px:.1f} (signal.entry_price)"
+        else:
+            # Fallback: live orderbook offset (original logic)
+            try:
+                orderbook = data_manager.get_orderbook()
+                bids = (orderbook or {}).get("bids", [])
+                asks = (orderbook or {}).get("asks", [])
+                if bids and asks:
+                    def _best_px(lvl):
+                        if isinstance(lvl,(list,tuple)): return float(lvl[0])
+                        if isinstance(lvl,dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                        return 0.0
+                    if side == "long":
+                        limit_px  = round(_best_px(bids[0]) - offset, 1)
+                        mt_reason = f"limit_long@bid-{offset:.1f}={limit_px:.1f} (book fallback)"
+                    else:
+                        limit_px  = round(_best_px(asks[0]) + offset, 1)
+                        mt_reason = f"limit_short@ask+{offset:.1f}={limit_px:.1f} (book fallback)"
                 else:
-                    limit_px  = round(_best_px(asks[0]) + offset, 1)
-                    mt_reason = f"limit_short@ask+{offset:.1f}={limit_px:.1f}"
-            else:
-                raise ValueError("empty book")
-        except Exception:
-            if side == "long":
-                limit_px = round(price - offset, 1)
-            else:
-                limit_px = round(price + offset, 1)
-            mt_reason = f"limit_{side}_offset={offset:.1f}pts (no book)"
+                    raise ValueError("empty book")
+            except Exception:
+                if side == "long":
+                    limit_px = round(price - offset, 1)
+                else:
+                    limit_px = round(price + offset, 1)
+                mt_reason = f"limit_{side}_offset={offset:.1f}pts (no book, no signal)"
+
+        if _sig_entry > 0 and not _sig_is_valid:
+            logger.warning(
+                f"_enter_trade: signal.entry_price=${_sig_entry:,.1f} is "
+                f"{abs(_sig_entry - price):.0f}pts from market (>{_stale_threshold:.0f}pts=2ATR) "
+                f"— falling back to live book. Signal may be from a prior tick."
+            )
 
         # Keep fee engine updated for diagnostics and TP gate
         if self._fee_engine is not None:
@@ -4579,7 +4633,25 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        logger.info(f"Entry routing: LIMIT | {mt_reason}")
+        # Bug #34 fix: for book-offset (non-OTE) entries, query the fee engine
+        # to decide maker vs taker.  OTE-signal entries always remain maker
+        # (they're limit orders by construction).
+        if not _sig_is_valid and self._fee_engine is not None and self._fee_engine.is_warmed_up():
+            try:
+                _urgency = 1.0 - min(1.0, signal_confidence)   # low confidence = more urgent
+                _fe_maker, _fe_lim, _fe_reason = self._fee_engine.decide_entry_type(
+                    side=side, quantity=1.0,   # qty not yet known; use 1.0 for fill-prob estimate
+                    price=price,
+                    orderbook=data_manager.get_orderbook() or {},
+                    signal_urgency=_urgency,
+                )
+                if not _fe_maker:
+                    use_maker = False
+                    logger.debug(f"FeeEngine: taker entry selected — {_fe_reason}")
+            except Exception as _fe_err:
+                logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
+
+        logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
         # SL/TP computation does not depend on position size — it uses price, ATR,
@@ -4900,7 +4972,15 @@ class QuantStrategy:
         # exchange error) do NOT lock out the next signal for 900 seconds.
         if self._conviction is not None:
             try:
-                self._conviction.mark_entry_placed(time.time())
+                # Bug #21 fix: use the exchange-derived timestamp (entry_now)
+                # rather than time.time().  _check_session_limits compares
+                # now - last_entry_time against MIN_ENTRY_INTERVAL_SEC; if
+                # mark_entry_placed uses time.time() while the evaluation path
+                # uses timestamp_ms/1000, the two clocks can diverge after
+                # network delays or during replay, causing the pacing gate to
+                # fire prematurely or miss entirely.
+                _mark_now = entry_now if entry_now > 1e6 else time.time()
+                self._conviction.mark_entry_placed(_mark_now)
             except Exception as _cv_mp_e:
                 logger.debug(f"ConvictionFilter.mark_entry_placed error: {_cv_mp_e}")
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
@@ -5366,32 +5446,40 @@ class QuantStrategy:
 
                 if _rest_ok:
                     # ── Step 3: One-in-flight guard ───────────────────────────
+                    # BUG-FIX A: the original code did `return` when in-flight,
+                    # which aborted ALL of _manage_active (pool-gate, max-hold,
+                    # everything) for the duration of the REST call (~3–30s on
+                    # exchange timeout).  Replaced with a _can_launch flag so only
+                    # the trail thread dispatch is gated; _manage_active continues
+                    # normally regardless of whether a trail thread is in flight.
+                    _can_launch = False
                     with self._lock:
-                        if self._trail_in_progress:
-                            return
-                        self._trail_in_progress = True
+                        if not self._trail_in_progress:
+                            self._trail_in_progress = True
+                            _can_launch = True
 
-                    _snap_om  = order_manager
-                    _snap_dm  = data_manager
-                    _snap_px  = price
-                    _snap_now = now
+                    if _can_launch:
+                        _snap_om  = order_manager
+                        _snap_dm  = data_manager
+                        _snap_px  = price
+                        _snap_now = now
 
-                    def _bg_trail():
-                        try:
-                            live_price = _snap_dm.get_last_price()
-                            live_now   = time.time()
-                            if live_price < 1.0:
-                                live_price = _snap_px
-                            moved = self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
-                            if moved:
-                                self._last_trail_rest_time = time.time()
-                        except Exception as _te:
-                            logger.error("Trail background error: %s", _te, exc_info=True)
-                        finally:
-                            self._trail_in_progress = False
+                        def _bg_trail():
+                            try:
+                                live_price = _snap_dm.get_last_price()
+                                live_now   = time.time()
+                                if live_price < 1.0:
+                                    live_price = _snap_px
+                                moved = self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
+                                if moved:
+                                    self._last_trail_rest_time = time.time()
+                            except Exception as _te:
+                                logger.error("Trail background error: %s", _te, exc_info=True)
+                            finally:
+                                self._trail_in_progress = False
 
-                    threading.Thread(target=_bg_trail, daemon=True,
-                                     name=f"trail-sl-{int(now*1000)%100000}").start()
+                        threading.Thread(target=_bg_trail, daemon=True,
+                                         name=f"trail-sl-{int(now*1000)%100000}").start()
 
     def _detect_structure_change(self, data_manager, price: float,
                                   pos: 'PositionState', now: float) -> bool:
@@ -5510,7 +5598,16 @@ class QuantStrategy:
             logger.warning("Trail: entry_price invalid (%.2f) — skipping", pos.entry_price)
             return False
         if not pos.sl_order_id:
-            logger.debug("Trail: sl_order_id unknown — skipping")
+            # BUG-FIX B: was logger.debug — invisible in production where INFO is the
+            # floor.  This condition means the trail is permanently blocked for the
+            # entire trade since sl_order_id is never set after entry.  Raising to
+            # WARNING makes the blockage immediately visible in logs and Telegram.
+            _warn_key = "_trail_no_sl_warned"
+            if not getattr(self, _warn_key, False):
+                setattr(self, _warn_key, True)
+                logger.warning(
+                    "Trail BLOCKED: sl_order_id not set — trailing SL disabled "
+                    "for this position.  Check SL order placement in _enter_trade.")
             return False
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
 
@@ -5559,11 +5656,34 @@ class QuantStrategy:
                 _trail_1m          = data_manager.get_candles("1m",  limit=120)
                 _trail_candles_1h  = data_manager.get_candles("1h",  limit=100)
                 _trail_candles_4h  = data_manager.get_candles("4h",  limit=50)
-                self._ict.update(_trail_5m, candles_15m, price, now_ms,
-                                 candles_1m=_trail_1m,
-                                 candles_1h=_trail_candles_1h,
-                                 candles_4h=_trail_candles_4h,
-                                 candles_1d=data_manager.get_candles("1d", limit=30))
+                # Bug #40 fix: force an ICT refresh specifically for the trail
+                # path by temporarily backing the ICT engine's last-update
+                # timestamp.  The 5s throttle was designed to prevent redundant
+                # updates on every 250ms tick, but here we NEED fresh structure
+                # because a new 5m bar may have closed between the entry-path
+                # ICT update and this trail tick.  We only force a refresh if
+                # at least TRAIL_ICT_MIN_REFRESH_SEC (2s) have elapsed since
+                # the last actual update — this prevents a full re-scan every
+                # 250ms while still ensuring the trail sees bars that closed
+                # within the last 2 seconds.
+                _trail_ict_min_refresh = float(
+                    getattr(config, 'TRAIL_ICT_MIN_REFRESH_SEC', 2.0))
+                _ict_age = now - getattr(self._ict, '_last_update', 0.0)
+                if _ict_age >= _trail_ict_min_refresh:
+                    # Temporarily set _last_update to 0 to bypass the throttle,
+                    # then immediately restore so the entry path's next call
+                    # still benefits from the throttle.
+                    _saved_ts = self._ict._last_update
+                    self._ict._last_update = 0.0
+                    try:
+                        self._ict.update(_trail_5m, candles_15m, price, now_ms,
+                                         candles_1m=_trail_1m,
+                                         candles_1h=_trail_candles_1h,
+                                         candles_4h=_trail_candles_4h,
+                                         candles_1d=data_manager.get_candles("1d", limit=30))
+                    except Exception:
+                        self._ict._last_update = _saved_ts
+                        raise
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
@@ -5621,8 +5741,25 @@ class QuantStrategy:
             logger.exception("Trail: compute error — HOLD")
             return False
 
-        # HOLD — engine decided not to move SL
+        # Bug #18b fix: check trail_blocked before treating new_sl=None as a
+        # structural HOLD.  trail_blocked=True means the engine was deliberately
+        # gated (e.g. ASIA session disabled) — this is policy, not a failure to
+        # find a valid Fib level.  Log it separately so the operator can
+        # distinguish "no valid swing" from "session blocked".
+        # Also: do NOT increment consecutive_trail_holds on a policy block,
+        # because that counter is used for "trail is stuck" detection and a
+        # blocked trail is not stuck — it is intentionally paused.
         if _liq_result.new_sl is None:
+            if getattr(_liq_result, 'trail_blocked', False):
+                _log_interval = 60.0   # less noisy for policy blocks
+                if now - self._last_trail_block_log >= _log_interval:
+                    self._last_trail_block_log = now
+                    logger.info(
+                        f"🚫 Trail POLICY_BLOCK [{_liq_result.block_reason}] "
+                        f"SL=${pos.sl_price:,.1f} — not incrementing hold counter")
+                return False
+
+            # Structural HOLD — engine searched but found no valid Fib level
             pos.consecutive_trail_holds += 1
             _log_interval = 30.0
             if now - self._last_trail_block_log >= _log_interval:
@@ -6127,6 +6264,27 @@ class QuantStrategy:
         self._record_pnl(pnl, exit_reason=exit_reason, exit_price=fill_price,
                          fee_breakdown=fee_breakdown)
 
+        # Bug #10 fix: call risk_manager.record_trade so RiskManager's own
+        # counters (consecutive_losses, daily_pnl, winning_trades, last_trade_time)
+        # are updated.  Without this call, risk_manager.can_trade() gates —
+        # including the loss cooldown, daily loss %, and max consecutive losses —
+        # always read stale zeros because record_trade was never invoked.
+        # We pass pnl_override so risk_manager does not re-compute PnL from
+        # prices (which would use the linear formula for an inverse-perp account).
+        try:
+            _rm = getattr(self, '_risk_manager_ref', None)
+            if _rm is not None:
+                _rm.record_trade(
+                    side         = pos.side,
+                    entry_price  = pos.entry_price,
+                    exit_price   = fill_price,
+                    quantity     = pos.quantity,
+                    reason       = exit_reason,
+                    pnl_override = pnl,
+                )
+        except Exception as _rm_rec_e:
+            logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")
+
         # ─── Step 4: Telegram notification ────────────────────────────────────
         hold_min     = (time.time() - pos.entry_time) / 60.0 if pos.entry_time > 0 else 0.0
         init_sl_dist = (pos.initial_sl_dist if pos.initial_sl_dist > 1e-10
@@ -6440,6 +6598,9 @@ class QuantStrategy:
         self._last_structure_fingerprint = None
         self._last_trail_check_price = 0.0
         self._last_trail_rest_time = 0.0
+        # BUG-FIX C: reset per-trade trail diagnostic flags so each new position
+        # re-emits the "sl_order_id not set" warning if the problem recurs.
+        self._trail_no_sl_warned = False
         logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,
@@ -6575,19 +6736,26 @@ class QuantStrategy:
         qty = round(qty, 8)
         qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
 
-        # ── Margin guard: notional must not exceed available-after-fees ──────
-        # Uses `available_after_fees` (not raw `available`) so the post-margin
-        # remainder is ALWAYS sufficient to cover Delta's commission deduction.
+        # ── Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE ─
+        # Bug #1 fix: the old guard compared required_margin against
+        # available_after_fees * 1.01 (≈ 101%), completely ignoring the
+        # BALANCE_USAGE_PERCENTAGE config (e.g. 60%).  A 60% balance-usage
+        # cap means the bot should never commit more than 60% of available
+        # funds as margin on any single trade — the remaining 40% stays liquid
+        # for commission, funding, and drawdown headroom.
+        _bal_usage_pct = float(_cfg("BALANCE_USAGE_PERCENTAGE", 60.0))
+        _bal_usage_frac = max(0.01, min(1.0, _bal_usage_pct / 100.0))
+        max_allowed_margin = available_after_fees * _bal_usage_frac
         required_margin = qty * price / QCfg.LEVERAGE()
-        if required_margin > available_after_fees * 1.01:
+        if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
-                f"available-after-fees ${available_after_fees:.2f} "
-                f"(raw_avail=${available:.2f}, fee_reserve=${_fee_budget:.2f}) "
+                f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
+                f"({_bal_usage_pct:.0f}% of ${available_after_fees:.2f} after fees) "
                 f"— scaling down"
             )
             max_qty = math.floor(
-                (available_after_fees * QCfg.LEVERAGE() / price) / step
+                (max_allowed_margin * QCfg.LEVERAGE() / price) / step
             ) * step
             qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), round(max_qty, 8)))
             if qty < QCfg.MIN_QTY():
@@ -7225,14 +7393,23 @@ class QuantStrategy:
                                 f"Reconcile: recovered SL @ ${trig:,.2f} contradicts "
                                 f"{_side} entry ${_ep:,.2f} — ignoring")
                             continue
-                        self._pos.sl_order_id=o["order_id"]; self.current_sl_price=trig
-                        self._pos.sl_price=trig
-                        if self._pos.initial_sl_dist == 0 and _ep > 0:
-                            self._pos.initial_sl_dist = abs(_ep - trig)
+                        # Bug #8 fix: write sl_price under self._lock so the trail
+                        # thread (which also writes sl_price under this lock) cannot
+                        # observe a torn state where sl_order_id is set but sl_price
+                        # is not yet updated (or vice versa).
+                        with self._lock:
+                            self._pos.sl_order_id  = o["order_id"]
+                            self._pos.sl_price     = trig
+                            self.current_sl_price  = trig
+                            if self._pos.initial_sl_dist == 0 and _ep > 0:
+                                self._pos.initial_sl_dist = abs(_ep - trig)
                         logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}… @ ${trig:.2f}")
                     elif not self._pos.tp_order_id and _is_tp(ot):
-                        self._pos.tp_order_id=o["order_id"]; self.current_tp_price=trig
-                        self._pos.tp_price=trig
+                        # Bug #8 fix: same atomic write for TP fields.
+                        with self._lock:
+                            self._pos.tp_order_id  = o["order_id"]
+                            self._pos.tp_price     = trig
+                            self.current_tp_price  = trig
                         logger.info(f"Reconcile: recovered TP order {o['order_id'][:8]}… @ ${trig:.2f}")
 
     def _sync_position(self, order_manager):

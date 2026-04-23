@@ -599,6 +599,15 @@ class _TimeframeRegistry:
         """
         FIX-6: Evaluate last CLOSED candle (candles[-2]) only.
         Requires >= 3 candles so [-2] is a fully closed bar.
+
+        Bug #30 fix: iterate over a snapshot copy of the pool lists rather than
+        the live list.  The original code mutated pool.status while iterating,
+        creating a race with any concurrent reader (get_snapshot, prune).
+
+        Bug #43 fix: pools that are newly swept are immediately moved to the
+        _swept_bsl/_swept_ssl tracking lists so they cannot appear in
+        get_snapshot() as active TP targets.  The 2-hour prune window applies
+        only to the swept tracking lists, not to _bsl/_ssl.
         """
         if len(candles) < 3 or atr < 1e-10:
             return []
@@ -618,8 +627,13 @@ class _TimeframeRegistry:
         min_wick    = atr * _SWEEP_WICK_MIN_ATR
         min_reject  = atr * _SWEEP_REJECT_MIN_ATR
 
+        # Bug #30 fix: snapshot copies prevent mutation-during-iteration races
+        bsl_snapshot = list(self._bsl)
+        ssl_snapshot = list(self._ssl)
+
         # ── BSL sweep: wick above pool, close back below ──────────────────
-        for pool in self._bsl:
+        newly_swept_bsl: List = []
+        for pool in bsl_snapshot:
             if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
                 continue
             if h > pool.price + min_wick and cl < pool.price - min_reject:
@@ -633,7 +647,7 @@ class _TimeframeRegistry:
                 pool.status     = PoolStatus.SWEPT
                 pool.swept_at   = now
                 pool.sweep_wick = h
-                self._swept_bsl.append(pool)
+                newly_swept_bsl.append(pool)
                 results.append(SweepResult(
                     pool=pool, sweep_candle_idx=len(candles) - 2,
                     wick_extreme=h, rejection_pct=rejection / wick_range,
@@ -642,7 +656,8 @@ class _TimeframeRegistry:
                 ))
 
         # ── SSL sweep: wick below pool, close back above ──────────────────
-        for pool in self._ssl:
+        newly_swept_ssl: List = []
+        for pool in ssl_snapshot:
             if pool.status in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
                 continue
             if lo < pool.price - min_wick and cl > pool.price + min_reject:
@@ -656,13 +671,26 @@ class _TimeframeRegistry:
                 pool.status     = PoolStatus.SWEPT
                 pool.swept_at   = now
                 pool.sweep_wick = lo
-                self._swept_ssl.append(pool)
+                newly_swept_ssl.append(pool)
                 results.append(SweepResult(
                     pool=pool, sweep_candle_idx=len(candles) - 2,
                     wick_extreme=lo, rejection_pct=rejection / wick_range,
                     volume_ratio=vol_ratio, quality=quality,
                     direction="long", detected_at=now,
                 ))
+
+        # Bug #43 fix: immediately remove newly-swept pools from the active
+        # _bsl/_ssl lists so get_snapshot() never sees them as valid TP targets.
+        # They are preserved in _swept_bsl/_swept_ssl for adjacency-bonus and
+        # HTF context scoring.
+        if newly_swept_bsl:
+            swept_set = {id(p) for p in newly_swept_bsl}
+            self._bsl = [p for p in self._bsl if id(p) not in swept_set]
+            self._swept_bsl.extend(newly_swept_bsl)
+        if newly_swept_ssl:
+            swept_set = {id(p) for p in newly_swept_ssl}
+            self._ssl = [p for p in self._ssl if id(p) not in swept_set]
+            self._swept_ssl.extend(newly_swept_ssl)
 
         return results
 

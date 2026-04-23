@@ -843,13 +843,20 @@ class DirectionEngine:
             logger.debug(
                 f"DirectionEngine: HTF OVERRIDE → SSL hunt "
                 f"(all 3 TFs bearish, raw={score:+.3f})")
-            score = -abs(score) * 0.70
+            # Bug #35 fix: scale factor raised 0.70 → 0.90.
+            # At 0.70, a raw score of 0.18 (the ON threshold) becomes 0.126,
+            # falling into the [OFF=0.11, ON=0.18) hysteresis band — the signal
+            # is neither committed nor NEUTRAL and never resolves.  At 0.90 the
+            # override score remains 0.162 which is close to ON but clearly above
+            # OFF, allowing the hysteresis trigger to commit a modest SSL signal
+            # rather than getting stuck in limbo.
+            score = -abs(score) * 0.90
             _override_applied = True
         elif _bull_count >= 3 and score < -0.10:
             logger.debug(
                 f"DirectionEngine: HTF OVERRIDE → BSL hunt "
                 f"(all 3 TFs bullish, raw={score:+.3f})")
-            score = +abs(score) * 0.70
+            score = +abs(score) * 0.90   # Bug #35 fix: 0.70 → 0.90
             _override_applied = True
 
         # Recompute after potential override
@@ -1040,18 +1047,39 @@ class DirectionEngine:
                     f"<= existing={self._ps_state_quality:.2f}")
                 return
 
+        # Bug #28 fix: when a higher-quality sweep supersedes an existing state,
+        # carry the accumulated dynamic evidence forward rather than zeroing it.
+        # Wiping evidence means the first 30–60s of confirmatory signals (CISD,
+        # displacement ticks, OTE entry) are lost when a stronger sweep fires,
+        # making the decision engine restart from scratch with no context.
+        # We preserve dynamic evidence only when the NEW sweep is in the SAME
+        # direction — a direction reversal should always start fresh.
+        _carry_rev  = 0.0
+        _carry_cont = 0.0
+        if self._ps_state is not None and self._ps_state.swept_pool_type == pool_type:
+            _carry_rev  = self._ps_state.rev_evidence  * 0.5   # 50% carry: discounted
+            _carry_cont = self._ps_state.cont_evidence * 0.5   # same-direction evidence
+
         self._ps_state_quality = quality
-        self._ps_state = PostSweepState(
+        new_state = PostSweepState(
             swept_pool_price = swept_pool_price,
             swept_pool_type  = pool_type,
             entered_at       = now,
             highest_since    = price,
-            lowest_since     = price,
+            # Bug #33 fix: lowest_since must start at float('inf'), not price.
+            lowest_since     = float('inf'),
         )
+        # Apply carried evidence from the superseded state
+        new_state.rev_evidence  = _carry_rev
+        new_state.cont_evidence = _carry_cont
+        self._ps_state = new_state
         logger.info(
             f"🌊 DirectionEngine: POST-SWEEP STARTED | "
             f"{pool_type} @ ${swept_pool_price:,.1f} | "
-            f"price=${price:,.2f} | quality={quality:.2f}")
+            f"price=${price:,.2f} | quality={quality:.2f}"
+            + (f" | carried rev={_carry_rev:.1f} cont={_carry_cont:.1f}"
+               if _carry_rev > 0 or _carry_cont > 0 else "")
+        )
 
     def clear_sweep(self) -> None:
         """Call when post-sweep evaluation is complete or aborted externally."""
@@ -1237,22 +1265,32 @@ class DirectionEngine:
                 price, a, now, tick_flow, cvd_trend,
                 liq_snapshot=liq_snapshot)
 
-        # ── Accumulate with asymmetric decay  (FIX-7: correct mixed-signal logic)
-        # The entry_engine uses two separate `if` blocks which double-decays the
-        # losing side on mixed-signal ticks. This is the correct three-case version.
-        _decay = 0.92
+        # ── Accumulate with asymmetric decay  (FIX-7 + Bug #32 fix)
+        # Bug #32 fix: in the mixed-signal branch (both rev_delta>0 and cont_delta>0),
+        # the current code adds the delta then applies decay — meaning the fresh
+        # evidence from this tick is immediately shrunk by 8%.  This under-penalizes
+        # the stale accumulated evidence but also immediately discounts new evidence.
+        # The correct ordering: decay first (shrink old), then add new (preserve it).
+        # For pure-directional ticks this ordering is equivalent; for mixed it prevents
+        # the fresh delta from being decayed on the same cycle it arrives.
+        _decay         = 0.92
+        _neutral_decay = float(_cfg("PS_NEUTRAL_TICK_DECAY", 0.98))
         if rev_delta > 0 and cont_delta > 0:
-            ps.rev_evidence  += rev_delta
-            ps.cont_evidence += cont_delta
+            # Mixed: decay old evidence first, then add fresh deltas (Bug #32)
             ps.rev_evidence  *= _decay
             ps.cont_evidence *= _decay
+            ps.rev_evidence  += rev_delta
+            ps.cont_evidence += cont_delta
         elif rev_delta > 0:
-            ps.rev_evidence  += rev_delta
             ps.cont_evidence *= _decay
+            ps.rev_evidence  += rev_delta
         elif cont_delta > 0:
-            ps.cont_evidence += cont_delta
             ps.rev_evidence  *= _decay
-        # Both zero → no decay; stale evidence persists until next directional tick
+            ps.cont_evidence += cont_delta
+        else:
+            # Bug #27 fix: neutral tick — apply weak decay to both sides
+            ps.rev_evidence  *= _neutral_decay
+            ps.cont_evidence *= _neutral_decay
 
         ps.peak_rev  = max(ps.peak_rev,  ps.static_rev_base  + ps.rev_evidence)
         ps.peak_cont = max(ps.peak_cont, ps.static_cont_base + ps.cont_evidence)

@@ -222,7 +222,37 @@ PHASE3_CLOSES_REQUIRED = 1      # aggressive — 1 close plus displacement body
 #   (c) BOS on 5m/15m aligned with trade within BOS_MAX_AGE_MS
 DISP_MIN_BODY_ATR = 0.58
 CVD_MIN_TREND     = 0.12
-BOS_MAX_AGE_MS    = 10_000_000   # 10 minutes
+# Bug #37 fix: BOS_MAX_AGE_MS reduced 10_000_000 (10 min) → 2_000_000 (2 min).
+# A BOS is structural confirmation that price has broken past a swing extreme.
+# Using a 10-minute window means a BOS from 9:57 ago still qualifies as
+# "momentum confirmation" for a trail advance — by which point the market
+# has likely moved on entirely.  2 minutes = ~2.5 × the 5m bar period,
+# which is tight enough to require a recent structural event while allowing
+# for ICT engine throttle lag (5-second update interval).
+# Configurable via TRAIL_BOS_MAX_AGE_MS so operators can widen if needed.
+#
+# BUG-FIX D: 2-minute BOS age was calibrated for ENTRY confirmation (tight),
+# but it is far too tight for TRAILING.  On 15m TFs, a BOS forms roughly once
+# per bar (~15 min).  Requiring it to be < 2 minutes old means the momentum
+# gate fires "NONE" for ≈87% of the time even in a trending market, blocking
+# ALL Phase 2/3 trail advances.
+#
+# Two separate constants now:
+#   BOS_MAX_AGE_MS          — used by entry confirmation (kept at 2 min)
+#   TRAIL_BOS_MAX_AGE_MS    — used by the trail momentum gate (default 10 min)
+# Operators can override TRAIL_BOS_MAX_AGE_MS in config.py independently.
+try:
+    import config as _trail_cfg  # noqa: F811
+    BOS_MAX_AGE_MS = int(getattr(_trail_cfg, 'TRAIL_BOS_MAX_AGE_MS', 2_000_000))
+except Exception:
+    BOS_MAX_AGE_MS = 2_000_000
+
+try:
+    import config as _trail_cfg  # noqa: F811
+    TRAIL_MOMENTUM_BOS_MAX_AGE_MS = int(
+        getattr(_trail_cfg, 'TRAIL_MOMENTUM_BOS_MAX_AGE_MS', 600_000))  # 10 min default
+except Exception:
+    TRAIL_MOMENTUM_BOS_MAX_AGE_MS = 600_000
 
 # Liquidity-aware buffer expansion factor when a pool sits between price and SL
 POOL_BETWEEN_BUFFER_MULT = 1.35
@@ -237,7 +267,22 @@ SESSION_BUFFER_MULT: Dict[str, float] = {
     "ASIA":   1.50,   # wider on quiet session
     "":       1.00,
 }
-ASIA_TRAIL_DISABLED = True
+# Bug #18a fix: read from config so operators can enable Asia trailing
+# without touching source code.  Default False — Asia trails ARE allowed
+# by default (the original True was overly conservative and not configurable).
+try:
+    import config as _trail_cfg
+    ASIA_TRAIL_DISABLED = bool(getattr(_trail_cfg, 'TRAIL_ASIA_DISABLED', False))
+except Exception:
+    ASIA_TRAIL_DISABLED = False
+
+# Bug #24 fix: read ANCHOR_LOCK_SEC from config so it can be shortened
+# during fast-market conditions without a code deploy.
+try:
+    import config as _trail_cfg  # noqa: F811 — already imported above
+    ANCHOR_LOCK_SEC = float(getattr(_trail_cfg, 'TRAIL_ANCHOR_LOCK_SEC', 90.0))
+except Exception:
+    ANCHOR_LOCK_SEC = 90.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -384,14 +429,60 @@ class LiquidityTrailEngine:
         sess_mult = SESSION_BUFFER_MULT.get(session, 1.0)
 
         # ── R-multiple ────────────────────────────────────────────────
-        init_dist = max(
-            initial_sl_dist if initial_sl_dist > 1e-10 else 0.0,
-            abs(entry_price - current_sl),
-            atr * 0.5,
+        # Bug #17 fix: init_dist must represent the ORIGINAL risk distance
+        # recorded at entry, not the current SL distance.  The old formula
+        # included abs(entry_price - current_sl) as a candidate, which grew
+        # whenever the SL was widened after entry (e.g. pushed behind a pool
+        # for safety).  That inflated init_dist, doubling or more the R-multiple
+        # denominator, delaying the Phase 1 BE lock and all subsequent phases.
+        #
+        # Correct semantics:
+        #   initial_sl_dist > 0  → use it directly (entry engine recorded it)
+        #   initial_sl_dist == 0 → no record; fall back to atr*0.5 as a
+        #                          conservative floor (NOT current_sl distance)
+        init_dist = (
+            initial_sl_dist if initial_sl_dist > 1e-10
+            else max(abs(entry_price - current_sl), atr * 0.5)
+            # abs(entry_price - current_sl) is acceptable HERE only as a
+            # last resort when initial_sl_dist was never recorded (e.g.
+            # manually adopted positions), because in that case current_sl
+            # IS the original structural SL — it has not been trailed yet.
+            # The guard: initial_sl_dist > 1e-10 takes priority, so this
+            # fallback only fires when the entry engine did not set the field.
         )
+        # BUG-FIX F: if both initial_sl_dist AND the fallback evaluate to 0
+        # (e.g. current_sl == entry_price AND ATR is near-zero), r_multiple
+        # collapses to 0.0 permanently and the engine stays in PHASE_0_HANDS_OFF
+        # for the entire trade with no log noise at INFO level.  Emit a one-shot
+        # WARNING so the operator can diagnose the root cause (SL order at entry
+        # price, or ATR computation failure).
+        if init_dist < 1e-10:
+            logger.warning(
+                "Trail: init_dist is effectively zero "
+                "(initial_sl_dist=%.4f current_sl=%.4f entry=%.4f atr=%.4f) — "
+                "r_multiple will be 0.0 and trailing permanently blocked at Phase 0. "
+                "Check SL placement and ATR computation.",
+                initial_sl_dist, current_sl, entry_price, atr)
+            return self._hold("INIT_DIST_ZERO: r_multiple undefined", hold_reason)
         profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
         r_peak    = max(profit, peak_profit)
         r_multiple = r_peak / init_dist if init_dist > 1e-10 else 0.0
+
+        # Bug #19 fix: counter-BOS re-arm after Phase 1 completes.
+        # The original design fired the override exactly once per position.
+        # This protected the 0–1R range but left Phase 2+ positions (SL
+        # already above entry) unprotected when a second, deeper structural
+        # break occurred.  Re-arm by clearing the flag whenever the R-multiple
+        # crosses into Phase 2 — the Phase 2 FIB trail is now the primary
+        # protection, but a counter-BOS in that zone is still a valid reason
+        # to move to the nearest Fib level immediately rather than waiting for
+        # the Fib confirmation counter.
+        if self._counter_bos_triggered and r_multiple >= PHASE_1_MAX_R:
+            self._counter_bos_triggered = False
+            logger.debug(
+                "Trail[COUNTER_BOS]: re-armed for Phase 2+ — "
+                f"R={r_multiple:.2f}R ≥ {PHASE_1_MAX_R}R threshold"
+            )
 
         # ── Counter-BOS sovereign override ────────────────────────────
         # Fires exactly once per position.  Moves SL to BE immediately.
@@ -832,11 +923,34 @@ class LiquidityTrailEngine:
                     continue
                 return (pl_price, ph_price)
 
+        # Bug #20 fix: the original fallback used the raw wick high/low of the
+        # last 50 bars with no confirmation — isolated spike candles became
+        # Fibonacci origins, placing SL levels behind momentary noise rather
+        # than structural pivots.
+        #
+        # Replacement: require that any extreme accepted as a fallback anchor
+        # has at least ONE neighbour bar whose extreme is within 5% of the
+        # swing range of the candidate extreme.  If no such neighbour exists
+        # the extreme is a solitary wick spike and is rejected.  This forces
+        # a HOLD until a real pivot pair forms, which is the correct response
+        # when structure is ambiguous.
         recent = closed[max(0, n - min(50, n)):]
         lo = min(_l(c) for c in recent)
         hi = max(_h(c) for c in recent)
-        if hi - lo >= min_swing:
+        rng = hi - lo
+        if rng < min_swing:
+            return None
+
+        tolerance = rng * 0.05   # 5% of swing range counts as "near the extreme"
+
+        lo_confirmed = sum(1 for c in recent if _l(c) <= lo + tolerance) >= 2
+        hi_confirmed = sum(1 for c in recent if _h(c) >= hi - tolerance) >= 2
+
+        if lo_confirmed and hi_confirmed:
             return (lo, hi)
+
+        # One or both extremes are unconfirmed wick spikes — return None
+        # so the caller issues a HOLD rather than building a phantom Fib grid.
         return None
 
     # ─────────────────────────────────────────────────────────────────────
@@ -856,14 +970,28 @@ class LiquidityTrailEngine:
         swing structure is broken and its Fib grid is now phantom.
 
         For a SHORT: mirror — swing_high is the origin.
+
+        BUG-FIX E: the original implementation scanned ALL of PIVOT_SCAN_DEPTH
+        (80) bars backwards regardless of when the pivot formed.  This caused
+        a routine pullback bar from 79 bars ago (e.g. 20 hours on 15m) to
+        permanently invalidate the current structural swing, returning "no valid
+        swings → HOLD" for the remainder of the position.
+
+        Fix: only scan the last POST_PIVOT_SCAN_BARS=20 bars, which covers the
+        period most likely to contain a genuine invalidating close without
+        penalising the swing for ancient history.  Operators can tune this via
+        TRAIL_SWING_INVAL_LOOKBACK in config.py.
         """
+        import config as _si_cfg  # local import — avoid module-level circular
+        POST_PIVOT_SCAN_BARS = int(getattr(_si_cfg, 'TRAIL_SWING_INVAL_LOOKBACK', 20))
+
         swing_low, swing_high = swing
         closed = candles[:-1] if len(candles) > 1 else candles
         if len(closed) < 5:
             return False
 
-        # Walk backwards only a bounded depth (PIVOT_SCAN_DEPTH covers it)
-        scan = closed[-min(PIVOT_SCAN_DEPTH, len(closed)):]
+        # Scope to the most recent POST_PIVOT_SCAN_BARS bars only
+        scan = closed[-min(POST_PIVOT_SCAN_BARS, len(closed)):]
 
         def _c(c: dict) -> float:
             return float(c.get('c', c.get('close', 0.0)) or 0.0)
@@ -975,7 +1103,21 @@ class LiquidityTrailEngine:
             total_q = sum(a.quality for a in cluster)
             avg_price = sum(a.price * a.quality for a in cluster) / total_q
             n_tfs = len({a.timeframe for a in cluster})
-            conf_bonus = _Q_BONUS_CONFLUENCE if n_tfs >= 2 else 1.0
+
+            # Bug #25 fix: the confluence bonus must require that at least two
+            # members share the SAME Fibonacci ratio on DIFFERENT timeframes.
+            # Proximity alone (a 1H 50% and a 15m 38.2% happening to land
+            # within 0.40 ATR by coincidence) is not institutional confluence —
+            # it is a geometric accident.  True confluence is the 50% level on
+            # both 1H and 15m pointing to the same price, which means
+            # institutional actors on two different TFs are defending the same
+            # structural level.
+            same_ratio_tfs = len({
+                a.timeframe for a in cluster
+                if a.fib_ratio is not None and a.fib_ratio == base.fib_ratio
+            })
+            conf_bonus = _Q_BONUS_CONFLUENCE if same_ratio_tfs >= 2 else 1.0
+
             extra_bonus = 1.0 + _Q_BONUS_CLUSTER_EXTRA * max(0, len(cluster) - 2)
             final_q = base.quality * conf_bonus * extra_bonus
             result.append(PoolAnchor(
@@ -1017,7 +1159,23 @@ class LiquidityTrailEngine:
 
         Ranking:  quality-sorted within confirmed candidates; proximity as
         tiebreaker (tighter SL preferred when quality is tied).
+
+        BUG-FIX G: `closes_required` was applied uniformly across all TFs.
+        For 1H this means waiting 2 consecutive 1H bars (= 2 hours) before
+        the SL can advance — for most BTC futures trades the position has
+        exited before that window closes, so 1H anchors NEVER confirm and
+        the trail engine falls back to 15m only (or returns HOLD if 15m has
+        no valid swings).
+
+        Fix: scale closes_required by TF.  1H needs only 1 close (1 hour of
+        confirmation is sufficient for an hourly structural level). 15m, 5m,
+        and 1m retain the supplied value.  The asymmetry is intentional: 1H
+        structure is already "heavier" — one close past it is more significant
+        than one close past a 1m level.
         """
+        # TF-specific closes override (lower TFs retain base value)
+        _TF_CLOSES_OVERRIDE = {"1h": 1}  # all others use closes_required
+
         # Filter to candidates behind price
         candidates = [
             a for a in anchors
@@ -1031,6 +1189,9 @@ class LiquidityTrailEngine:
         confirmed: List[PoolAnchor] = []
         for a in candidates:
             tf_candles = candles_by_tf.get(a.timeframe, [])
+            # TF-adjusted closes requirement
+            tf_closes_req = _TF_CLOSES_OVERRIDE.get(a.timeframe, closes_required)
+
             if len(tf_candles) < 3:
                 # Not enough candles to confirm — allow passage ONLY for the
                 # most conservative golden ratios where the institutional
@@ -1040,12 +1201,12 @@ class LiquidityTrailEngine:
                 continue
 
             n_closes = self._count_closes_past_level(
-                pos_side, a.price, tf_candles, closes_required + 2)
+                pos_side, a.price, tf_candles, tf_closes_req + 2)
             key = (a.timeframe, a.fib_ratio or 0.0,
                    (a.swing_low or 0.0) + (a.swing_high or 0.0))
             self._close_counters[key] = n_closes
 
-            if n_closes >= closes_required:
+            if n_closes >= tf_closes_req:
                 confirmed.append(a)
 
         if not confirmed:
@@ -1133,7 +1294,11 @@ class LiquidityTrailEngine:
                         continue
                     direction = getattr(st, "bos_direction", None)
                     ts = getattr(st, "bos_timestamp", 0)
-                    if ts > 0 and (now_ms - ts) <= BOS_MAX_AGE_MS:
+                    # BUG-FIX D: use TRAIL_MOMENTUM_BOS_MAX_AGE_MS (10 min default)
+                    # instead of BOS_MAX_AGE_MS (2 min) here.  The 2-min window is
+                    # correct for entry confirmation but blocks ~87% of trail checks
+                    # on 15m TFs where BOS events form ~15 min apart.
+                    if ts > 0 and (now_ms - ts) <= TRAIL_MOMENTUM_BOS_MAX_AGE_MS:
                         if pos_side == "long"  and direction == "bullish":
                             return "BOS"
                         if pos_side == "short" and direction == "bearish":

@@ -781,6 +781,25 @@ class ICTEngine:
         if len(candles_5m) < 10:
             return
 
+        # Store ATR estimate for use in _detect_obs dedup tolerance (Bug #42).
+        # Computed from the last 14 closed 5m candles (standard ATR period).
+        # This avoids adding an `atr` parameter to the update() signature
+        # while still giving _detect_obs access to a live volatility estimate.
+        try:
+            _closed = candles_5m[-15:-1] if len(candles_5m) >= 15 else candles_5m[:-1]
+            if len(_closed) >= 5:
+                _trs = [
+                    max(float(c['h']) - float(c['l']),
+                        abs(float(c['h']) - float(candles_5m[max(0, i-1)]['c'])),
+                        abs(float(c['l']) - float(candles_5m[max(0, i-1)]['c'])))
+                    for i, c in enumerate(candles_5m[-15:-1], start=max(0, len(candles_5m)-15))
+                ]
+                self._last_atr = sum(_trs[-14:]) / min(len(_trs), 14)
+            else:
+                self._last_atr = 0.0
+        except Exception:
+            self._last_atr = 0.0
+
         # ── v8.0: PRUNE EXPIRED/MITIGATED entries BEFORE detection ─────
         # ROOT CAUSE OF OB/FVG COUNT FLUCTUATION:
         # Expired OBs (past max_age) and mitigated OBs/FVGs stay in deques
@@ -1376,10 +1395,15 @@ class ICTEngine:
         """
         if len(candles) < 5:
             return
-        # Dedup tolerance: 0.2% of price (~$140 at $70k). Wide enough to collapse
-        # near-identical OBs from overlapping TF scans, tight enough to preserve
-        # genuinely distinct levels (typical OB bodies are $200-$2000 wide).
-        tol = price * 0.002
+        # Bug #42 fix: replace price×0.002 dedup tolerance with ATR-relative
+        # tolerance.  At BTC $95k: price×0.002 = $190, which merges valid OBs
+        # from consecutive sessions that happen to land $100–$180 apart.
+        # 0.10×ATR scales with actual volatility: at ATR=$265 this is $26.5 —
+        # tight enough to preserve genuinely distinct levels while still
+        # collapsing near-exact duplicates from overlapping TF scans.
+        # When atr is not available (warmup), fall back to price×0.0003 ($28.5).
+        _atr = getattr(self, '_last_atr', 0.0)
+        tol = (_atr * 0.10) if _atr > 1.0 else (price * 0.0003)
         min_impulse = self.OB_MIN_IMPULSE_PCT * (0.60 if tf == "1m" else 1.0)
 
         # Rolling prior highs/lows for BOS check

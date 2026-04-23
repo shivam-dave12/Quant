@@ -1697,7 +1697,18 @@ class ICTTrailManager:
         except ImportError:
             from liquidity_map import _find_swing_highs, _find_swing_lows
 
-        buf_mult = 0.05 if self._choch else (0.10 if self._bos_count >= 2 else _SL_BUFFER_ATR)
+        # Bug #9 fix: CHoCH buffer raised from 0.05 ATR to 0.20 ATR.
+        # At BTC ATR=$265, 0.05 ATR = $13 — smaller than a typical 5m wick.
+        # ICT methodology requires SL placement BEHIND the structural level with
+        # enough buffer to survive normal market noise.  0.20 ATR ≈ $53, which
+        # comfortably clears the intrabar rejection range on 5m bars without
+        # giving up structural accuracy.  Configurable via ENTRY_CHOCH_SL_BUFFER_ATR.
+        try:
+            import config as _ee_cfg
+            _CHOCH_SL_BUFFER = float(getattr(_ee_cfg, 'ENTRY_CHOCH_SL_BUFFER_ATR', 0.20))
+        except Exception:
+            _CHOCH_SL_BUFFER = 0.20
+        buf_mult = _CHOCH_SL_BUFFER if self._choch else (0.10 if self._bos_count >= 2 else _SL_BUFFER_ATR)
         buf = atr * buf_mult
 
         if c15m and len(c15m) >= 12:

@@ -1982,6 +1982,26 @@ class TelegramBotController:
 
         setattr(cfg, attr_name, new_val)
         logger.info(f"CONFIG via Telegram: {attr_name} {old_val} → {new_val}")
+
+        # Bug #41 fix: several module-level constants in other modules are read
+        # at import time and never re-read from config afterward.  When the
+        # operator changes them via /set, the config module is updated but the
+        # cached constant in the consuming module is stale.  Propagate the change
+        # explicitly here.
+        if key == "min_rr":
+            try:
+                import strategy.entry_engine as _ee
+                if hasattr(_ee, '_MIN_RR_RATIO'):
+                    _ee._MIN_RR_RATIO = float(new_val)
+                    logger.info(f"CONFIG propagated to entry_engine._MIN_RR_RATIO = {new_val}")
+            except ImportError:
+                try:
+                    import entry_engine as _ee
+                    if hasattr(_ee, '_MIN_RR_RATIO'):
+                        _ee._MIN_RR_RATIO = float(new_val)
+                except ImportError:
+                    pass
+
         return f"✅ <b>{attr_name}</b>: {old_val} → <b>{new_val}</b>"
 
     # ================================================================
@@ -2418,6 +2438,31 @@ class TelegramBotController:
                     text    = (msg.get("text") or "").strip()
                     if chat_id != self.chat_id or not text:
                         continue
+
+                    # Bug #38 fix: authenticate by user_id, not just chat_id.
+                    # In a group chat, any member can send commands if only chat_id
+                    # is checked.  TELEGRAM_ALLOWED_USER_IDS is a comma-separated
+                    # list of integer user IDs in config (e.g. "123456789,987654321").
+                    # When the config key is absent or empty, the check is skipped
+                    # (backward-compatible for private-chat bots where chat_id == user_id).
+                    _raw_allowed = str(getattr(config, "TELEGRAM_ALLOWED_USER_IDS", "") or "")
+                    if _raw_allowed.strip():
+                        try:
+                            _allowed_ids = {
+                                int(x.strip()) for x in _raw_allowed.split(",")
+                                if x.strip().lstrip("-").isdigit()
+                            }
+                        except Exception:
+                            _allowed_ids = set()
+                        _sender_id = int((msg.get("from") or {}).get("id", 0))
+                        if _allowed_ids and _sender_id not in _allowed_ids:
+                            logger.warning(
+                                "Telegram command REJECTED from user_id=%d "
+                                "(not in TELEGRAM_ALLOWED_USER_IDS): %s",
+                                _sender_id, text[:80]
+                            )
+                            continue
+
                     logger.info(f"Received: {text}")
                     response = self.handle_command(text)
                     if response:

@@ -72,6 +72,7 @@ class RiskManager:
         self.trade_history: deque = deque(maxlen=1000)
         self.daily_trades:  deque = deque(maxlen=self.max_daily_trades + 10)
         self.last_trade_time = 0.0
+        self._last_loss_time = 0.0   # Bug #3 fix: separate timer for loss cooldown
 
         # Balance tracking
         self.initial_balance       = 0.0
@@ -392,12 +393,24 @@ class RiskManager:
                 remaining = int(config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
-            # ── Loss cooldown ─────────────────────────────────────────────────
+            # ── Loss cooldown — Bug #3 fix ────────────────────────────────────
+            # The original code compared TRADE_COOLDOWN_SECONDS against
+            # time_since_last (the same timer as MIN_TIME_BETWEEN_TRADES).
+            # MIN_TIME_BETWEEN_TRADES * 60 is always >= TRADE_COOLDOWN_SECONDS
+            # (0.5 min × 60 = 30s vs TRADE_COOLDOWN_SECONDS default 300s),
+            # so the min-interval gate fired first and the loss cooldown
+            # check was reached only after the pacing interval had already
+            # elapsed — meaning TRADE_COOLDOWN_SECONDS never blocked anything.
+            #
+            # Fix: track last_loss_time separately, set only after a losing trade.
+            # The cooldown is measured from the close of the losing trade,
+            # independent of the pacing timer.
             cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 300)
+            _last_loss = getattr(self, '_last_loss_time', 0.0)
             if (self.consecutive_losses > 0 and
-                    self.last_trade_time > 0 and
-                    time_since_last < cooldown):
-                remaining = int(cooldown - time_since_last)
+                    _last_loss > 0 and
+                    (now - _last_loss) < cooldown):
+                remaining = int(cooldown - (now - _last_loss))
                 return False, f"Loss cooldown: {remaining}s remaining"
 
             # ── Daily trade limit ─────────────────────────────────────────────
@@ -491,12 +504,37 @@ class RiskManager:
                     gross_pnl = (exit_price - entry_price) * quantity
                 else:
                     gross_pnl = (entry_price - exit_price) * quantity
+
+                # Bug #6 fix: Delta uses an INVERSE perpetual where the
+                # contract is denominated in USD and settled in BTC.
+                # For an inverse perp, the linear formula is an approximation
+                # that overstates PnL when the move is large.
+                # Correct formula (inverse perp):
+                #   gross_pnl = (1/entry_price − 1/exit_price) × quantity × contract_value_usd
+                # Delta BTCUSD contract_value = $1 (1 USD per contract).
+                # quantity here is in BTC (converted by order_manager), so:
+                #   gross_pnl_usd = quantity × entry_price × (exit_price/entry_price − 1) × (entry_price/exit_price)
+                # which simplifies to the linear formula only when entry≈exit.
+                # For now we apply a correction factor when the exchange is Delta inverse.
+                _is_inverse = str(getattr(config, "EXCHANGE", "")).lower() == "delta"
+                if _is_inverse and entry_price > 1e-10 and exit_price > 1e-10:
+                    # True inverse PnL in USD terms.
+                    # Derivation: position = quantity BTC × entry_price USD/BTC contracts
+                    # Entry value in BTC = quantity; exit value in BTC = quantity × entry/exit
+                    # PnL in USD = (entry - exit) × quantity / exit  [SHORT]
+                    # PnL in USD = (exit - entry) × quantity / exit  [LONG] — per BTC value at exit
+                    if side.upper() == "LONG":
+                        gross_pnl = quantity * entry_price * (1.0/entry_price - 1.0/exit_price)
+                    else:
+                        gross_pnl = quantity * entry_price * (1.0/exit_price - 1.0/entry_price)
+
                 fee_rate   = getattr(config, "COMMISSION_RATE", 0.00055)
                 commission = (entry_price + exit_price) * quantity * fee_rate
                 pnl        = gross_pnl - commission
                 logger.debug(
                     f"P&L breakdown: gross=${gross_pnl:+.4f} "
                     f"commission=${commission:.4f} net=${pnl:+.4f}"
+                    + (" [inverse]" if _is_inverse else " [linear]")
                 )
 
             is_win = pnl > 0
@@ -529,6 +567,7 @@ class RiskManager:
             else:
                 self.losing_trades      += 1
                 self.consecutive_losses += 1
+                self._last_loss_time     = time.time()   # Bug #3 fix
 
             logger.info(
                 f"📊 Trade recorded: {side.upper()} | "

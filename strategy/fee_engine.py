@@ -355,7 +355,16 @@ class MakerTakerDecision:
 
     @property
     def MAKER_RATE(self) -> float:
-        return float(_cfg("COMMISSION_RATE_MAKER", self.TAKER_RATE * 0.40))
+        # Bug #26 fix: Delta maker orders receive a REBATE — the exchange pays
+        # YOU for providing liquidity.  The canonical Delta rate is −0.00020
+        # (negative means income, not cost).  Using TAKER_RATE * 0.40 = +0.00022
+        # treats the rebate as a positive fee, understating the cost advantage of
+        # maker entries by 2× and making the fee-saving calculation incorrect.
+        #
+        # Config convention: set COMMISSION_RATE_MAKER to a negative value for
+        # rebate exchanges (Delta), or a positive fraction for fee exchanges.
+        # Default −0.00020 matches Delta's documented maker rebate tier.
+        return float(_cfg("COMMISSION_RATE_MAKER", -0.00020))
 
     @property
     def TICK_SIZE(self) -> float:
@@ -444,23 +453,26 @@ class MakerTakerDecision:
                 )
 
             # ── 5. Compute limit price — guarded against tight spreads ──────
-            # For LONG maker: post at bid+tick, clamped below ask so we never
-            # cross the spread and take immediately. Fallback: bid (guaranteed maker).
-            # For SHORT maker: post at ask-tick, clamped above bid. Fallback MUST be
-            # ask+tick (not ask), because ask itself is the taker-fill price for a
-            # SHORT sell — posting AT ask crosses the spread on many venues.
+            # For LONG maker: post at bid (guaranteed maker position in book).
+            # A tick above bid risks crossing to taker if spread is 1 tick.
+            # For SHORT maker: post at ask (the resting ask is always maker for
+            # a sell order on most venues). Bug #29 fix: the old fallback posted
+            # ask+tick which places the order ABOVE all current asks — it would
+            # sit unexecuted above the market, never filling.
             if side == "long":
                 candidate   = round(bid + tick, 1)
                 limit_price = min(candidate, round(ask - tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    limit_price = bid   # guaranteed maker fallback (post at bid)
+                    limit_price = bid   # guaranteed maker fallback
             else:
                 candidate   = round(ask - tick, 1)
                 limit_price = max(candidate, round(bid + tick, 1))
                 if limit_price <= bid or limit_price >= ask:
-                    # ask itself is the taker-fill price for a SHORT — must post
-                    # strictly ABOVE the current ask so it rests in the book.
-                    limit_price = round(ask + tick, 1)   # guaranteed maker fallback
+                    # Bug #29 fix: post AT ask (not ask+tick).
+                    # ask is the best resting sell in the book — our order
+                    # joins it as a maker. ask+tick was ABOVE the market and
+                    # would never fill.
+                    limit_price = ask   # join the best ask as a maker
 
             return (
                 True, limit_price,
@@ -512,7 +524,8 @@ class ExecutionCostEngine:
 
     @property
     def MAKER_RATE(self) -> float:
-        return float(_cfg("COMMISSION_RATE_MAKER", self.TAKER_RATE * 0.40))
+        # Bug #26 fix: Delta maker rebate is negative (see MakerTakerDecision above).
+        return float(_cfg("COMMISSION_RATE_MAKER", -0.00020))
 
     def __init__(self):
         self._spread  = SpreadTracker()
@@ -553,33 +566,40 @@ class ExecutionCostEngine:
         """
         Total estimated round-trip cost in basis points.
 
+        Bug #26 fix: MAKER_RATE on Delta is a REBATE (negative value, e.g. −0.00020).
+        A negative entry_fee_bps means the exchange pays us — it reduces the total cost.
+        The old code treated it as an additive positive cost, overstating round-trip
+        cost for maker entries and causing fee-floor over-rejection.
+
+        Bug #31 fix: maker entries are NOT zero-slippage in all market conditions.
+        Queue slippage (price moves while our limit rests) is small but non-zero.
+        We model it as FEE_MAKER_SLIP_FRAC × expected_taker_slippage (default 20%).
+        This prevents the engine from treating maker entries as perfectly costless,
+        which was causing it to prefer maker entry even when the market was moving
+        fast enough to make queue-slippage material.
+
         Taker entry (market):
           entry_fee(taker) + exit_fee(taker) + half_spread×2 + slippage×2
-          Both legs cross the spread; both legs have market-order slippage.
 
         Maker entry (limit):
-          entry_fee(maker) + exit_fee(taker) + half_spread×1 + slippage×1
-          Entry does NOT cross the spread (we post, we don't take).
-          Entry has zero slippage (fills at exactly the posted price).
-          Only the SL/TP exit (always market) incurs spread-cross + slippage.
-
-        BUG FIX: original code charged half_spread*2 + slip*2 unconditionally,
-        which over-stated round-trip cost for maker entries by one full spread
-        and one full slippage, producing a min_tp floor that was too high for
-        maker-routed trades and causing legitimate setups to be rejected.
+          entry_fee(maker, may be negative rebate) + exit_fee(taker)
+          + half_spread×1 (exit only crosses spread)
+          + maker_queue_slip (fraction of taker slippage — queue risk)
+          + taker_slip (exit market slippage)
         """
-        entry_fee   = (self.MAKER_RATE if use_maker_entry else self.TAKER_RATE) * 10_000
-        exit_fee    = self.TAKER_RATE * 10_000      # SL/TP always market = taker
-        half_spread = self._spread.median_bps() / 2.0
-        slip        = self._slip.expected_bps()
+        entry_fee_bps = self.MAKER_RATE * 10_000 if use_maker_entry else self.TAKER_RATE * 10_000
+        exit_fee_bps  = self.TAKER_RATE * 10_000   # SL/TP always market = taker
+        half_spread   = self._spread.median_bps() / 2.0
+        slip          = self._slip.expected_bps()
 
         if use_maker_entry:
-            # Entry: maker fee only — no spread cross, no slippage
-            # Exit:  taker spread cross + slippage
-            return entry_fee + exit_fee + half_spread + slip
+            # entry_fee_bps may be negative (rebate) — math is correct either way.
+            # Maker queue slippage: fraction of taker slippage (Bug #31 fix).
+            maker_slip_frac = float(_cfg("FEE_MAKER_SLIP_FRAC", 0.20))
+            maker_queue_slip = slip * maker_slip_frac
+            return entry_fee_bps + exit_fee_bps + half_spread + maker_queue_slip + slip
         else:
-            # Both legs are market: entry + exit each cross half spread and have slippage
-            return entry_fee + exit_fee + half_spread * 2 + slip * 2
+            return entry_fee_bps + exit_fee_bps + half_spread * 2 + slip * 2
 
     def min_required_tp_move(
         self,

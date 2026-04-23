@@ -222,6 +222,7 @@ class ConvictionFilter:
         entry_type: str            = "",
         sweep_wick_price: float    = 0.0,
         measured_displacement_atr: float = 0.0,
+        live_balance: float        = 0.0,   # Bug #16: real account balance for drawdown gate
     ) -> ConvictionResult:
         """
         Evaluate conviction for a potential entry.
@@ -238,6 +239,28 @@ class ConvictionFilter:
         factors  = ConvictionFactors()
         rejects: List[str] = []
         allows:  List[str] = []
+
+        # ══════════════════════════════════════════════════════════════════
+        # SESSION TIMING GATE — checked FIRST so that blocked_by_timing is
+        # never conflated with a real factor-score failure.  The score field
+        # is 0.0 on timing blocks (no factor scoring ran), which makes
+        # Telegram alerts unambiguous: score=0.00 + INTERVAL reason = pacing,
+        # not an ICT quality failure.
+        # Bug #22 fix: previously this ran AFTER factor scoring, so the alert
+        # showed e.g. score=0.78 with a timing-block reason — operators read
+        # that as "high-quality trade was blocked" when the real cause was the
+        # 300s pacing interval.
+        # ══════════════════════════════════════════════════════════════════
+        timing_block = self._check_session_limits(now, session, live_balance=live_balance)
+        if timing_block:
+            logger.debug(
+                f"ConvictionFilter TIMING_BLOCK (pre-score): {timing_block}")
+            return ConvictionResult(
+                allowed=False, score=0.0, factors=factors,
+                reject_reasons=[timing_block],
+                allow_reasons=[], rr_ratio=0.0,
+                pool_tf="", pool_sig=0.0,
+                blocked_by_timing=True)
 
         # ── Extract pool info ──────────────────────────────────────────────
         pool_price, pool_tf, pool_sig, pool_htf_count = \
@@ -390,12 +413,21 @@ class ConvictionFilter:
         factors.ote_score = _raw_ote_score
         _dr_mod_applied   = 0.0
         if dr_data_available:
+            # Bug #15 fix: bidirectional DR modifier, range −0.15 → +0.15.
+            # The previous formulas wrapped the bracket in max(0.0, …) which
+            # clamped the modifier to ≥ 0, making it one-directional:
+            #   LONG  at full premium → modifier was 0.0 (should be −0.15)
+            #   LONG  at equilibrium  → modifier was +0.15 (should be 0.0)
+            # Removing the clamp restores the continuous penalty for
+            # counter-range entries while preserving the bonus for on-range ones.
             if trade_side == "long":
-                # Discount zone good for longs; premium zone bad
-                _dr_mod = 0.15 * (1.0 - 2.0 * max(0.0, dr_pd - 0.50))
+                # dr_pd=0.0 (full discount) → +0.15; dr_pd=0.5 (EQ) → 0.0;
+                # dr_pd=1.0 (full premium)  → −0.15
+                _dr_mod = 0.15 * (1.0 - 2.0 * dr_pd)
             else:
-                # Premium zone good for shorts; discount zone bad
-                _dr_mod = 0.15 * (2.0 * max(0.0, dr_pd - 0.50))
+                # dr_pd=1.0 (full premium)  → +0.15; dr_pd=0.5 (EQ) → 0.0;
+                # dr_pd=0.0 (full discount) → −0.15
+                _dr_mod = 0.15 * (2.0 * dr_pd - 1.0)
             # No inversion for reversals — BSL sweep→short in premium and
             # SSL sweep→long in discount are both correct ICT directional bias.
             _dr_mod_applied   = _dr_mod
@@ -441,16 +473,6 @@ class ConvictionFilter:
                 f"ote={factors.ote_score:.2f} "
                 f"sess={factors.session_score:.2f} "
                 f"amd={factors.amd_score:.2f}]")
-
-        # ── Session timing gate (checked LAST — score is always real) ─────
-        timing_block = self._check_session_limits(now, session)
-        if timing_block:
-            return ConvictionResult(
-                allowed=False, score=score, factors=factors,
-                reject_reasons=[timing_block] + rejects,
-                allow_reasons=allows, rr_ratio=rr,
-                pool_tf=pool_tf, pool_sig=pool_sig,
-                blocked_by_timing=True)
 
         # ── Final decision ─────────────────────────────────────────────────
         allowed = score_passed
@@ -526,8 +548,25 @@ class ConvictionFilter:
     # SESSION LIMITS
     # ─────────────────────────────────────────────────────────────────────
 
-    def _check_session_limits(self, now: float, session: str) -> Optional[str]:
-        """Check timing/pacing gates.  Returns reason string if blocked."""
+    def _check_session_limits(
+        self, now: float, session: str, live_balance: float = 0.0,
+    ) -> Optional[str]:
+        """Check timing/pacing gates.  Returns reason string if blocked.
+
+        live_balance: the current account balance in USD.  When > 0 the
+        drawdown circuit breaker is expressed as a fraction of the *real*
+        account rather than a static notional.  Callers should pass
+        risk_manager.available_balance (or equivalent) so the gate is
+        automatically calibrated to account size.
+
+        Bug #16 fix: previously SESSION_DRAWDOWN_NOTIONAL defaulted to
+        $10,000 regardless of the actual account size, making the circuit
+        breaker fire at 200% of balance for a $500 account and at 2% for
+        a $50,000 account.  Now:
+          • live_balance > 0  → use it as the notional (overrides config)
+          • live_balance == 0 → fall back to SESSION_DRAWDOWN_NOTIONAL config
+                                (set this to your actual balance in config.py)
+        """
         st = self._session_state
 
         # Pacing interval
@@ -549,19 +588,27 @@ class ConvictionFilter:
                 f"ENTRY_CAP: {st.entries_taken}/{MAX_ENTRIES_PER_SESSION} "
                 f"entries exhausted this session.")
 
-        # Bug #2 fix: Cumulative session drawdown circuit breaker.
-        # session_pnl is in absolute USD terms.  We normalise it to a notional
-        # $10 000 account so the 4% gate is exchange-agnostic.  Operators who
-        # want a margin-relative gate should override SESSION_DRAWDOWN_NOTIONAL
-        # in config.  This guard prevents a single bad session from compounding
-        # beyond the daily VaR limit regardless of the consecutive-loss pattern.
+        # Cumulative session drawdown circuit breaker.
+        # Bug #16 fix: use live_balance as the notional when the caller
+        # supplies it (preferred), so the gate always scales to the real
+        # account size.  When live_balance is not available, fall back to
+        # SESSION_DRAWDOWN_NOTIONAL from config (operators must keep that
+        # in sync with their actual deposit — document in config.py).
         try:
             import config as _cfg
-            _notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 10_000.0))
-            _max_dd_pct = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 10.0))
+            _cfg_notional = float(getattr(_cfg, 'SESSION_DRAWDOWN_NOTIONAL', 0.0))
+            _max_dd_pct   = float(getattr(_cfg, 'SESSION_MAX_DRAWDOWN_PCT', 4.0))
         except Exception:
-            _notional   = 10_000.0
-            _max_dd_pct = 10.0
+            _cfg_notional = 0.0
+            _max_dd_pct   = 4.0
+
+        # Priority: live_balance > config notional > skip the gate
+        if live_balance > 0:
+            _notional = live_balance
+        elif _cfg_notional > 0:
+            _notional = _cfg_notional
+        else:
+            _notional = 0.0   # no notional available — skip gate
 
         if _notional > 0 and st.session_pnl < 0:
             _dd_pct = abs(st.session_pnl) / _notional * 100.0
@@ -765,7 +812,12 @@ class ConvictionFilter:
             if dir_ok and action == "reverse":
                 return min(0.60 + conf * 0.25, 0.85)
             if dir_ok and action in ("wait", "continue"):
-                return 0.30
+                # Bug #23 fix: continuation with direction agreement scores 0.55,
+                # matching the ICT BOS structural fallback floor.  The old 0.30
+                # penalized a post-sweep continuation below even the no-CISD
+                # baseline, which made continuation entries unfairly hard to clear.
+                # A confirmed CISD in continuation direction is a valid entry context.
+                return 0.55
             if not dir_ok:
                 return 0.05
             return 0.20

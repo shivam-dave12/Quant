@@ -76,11 +76,20 @@ _HUNT_OFF_THRESHOLD = 0.05
 # ASYNC SEND WORKER
 # ======================================================================
 
-_send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=200)
+_send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=25)   # Bug #36: 200→25 caps backlog at ~30s
 _worker_started: bool            = False
 _worker_lock:   threading.Lock   = threading.Lock()
 _MIN_INTERVAL = 1.2
 _MAX_RETRIES  = 4
+
+# Bug #36 fix: critical message keywords that bypass the async queue and
+# send synchronously.  This guarantees that UNPROTECTED position alerts,
+# crash reports, and killswitch confirmations are never dropped even when
+# the queue is full during a burst of routine heartbeat messages.
+_CRITICAL_KEYWORDS = frozenset((
+    "UNPROTECTED", "CRASH", "KILLSWITCH", "💀", "🚨", "CIRCUIT_BREAKER",
+    "EMERGENCY", "emergency_flatten", "BOT CRASH",
+))
 
 
 def _send_worker() -> None:
@@ -192,15 +201,47 @@ def _ensure_worker_started() -> None:
 
 
 def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
-    """Enqueue a Telegram message for async delivery.  Never blocks the caller."""
+    """Enqueue a Telegram message for async delivery.  Never blocks the caller.
+
+    Bug #36 fix: critical messages (UNPROTECTED, CRASH, KILLSWITCH, etc.) are
+    sent via a dedicated daemon thread that bypasses the queue entirely.  This
+    guarantees delivery even when the queue is full due to a burst of routine
+    heartbeat/status messages.  The dedicated thread is fire-and-forget — the
+    caller is not blocked.
+    """
     if not telegram_config.TELEGRAM_ENABLED:
         return False
     _ensure_worker_started()
+
+    # Check if this message is critical and should bypass the queue
+    is_critical = any(kw in message for kw in _CRITICAL_KEYWORDS)
+    if is_critical:
+        def _send_critical_now():
+            import requests as _req
+            try:
+                url = (f"https://api.telegram.org/bot"
+                       f"{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage")
+                send_text = message[:4000]
+                if parse_mode == "HTML":
+                    send_text = _sanitize_html(send_text)
+                _req.post(url, json={
+                    "chat_id":                  telegram_config.TELEGRAM_CHAT_ID,
+                    "text":                     send_text,
+                    "parse_mode":               parse_mode,
+                    "disable_web_page_preview": True,
+                }, timeout=10)
+            except Exception as _ce:
+                logger.error("Critical Telegram send failed: %s", _ce)
+        t = threading.Thread(target=_send_critical_now, daemon=True,
+                             name="telegram-critical")
+        t.start()
+        return True
+
     try:
         _send_queue.put_nowait((message, parse_mode))
         return True
     except _queue_mod.Full:
-        logger.warning("Telegram queue full — dropping message")
+        logger.warning("Telegram queue full — dropping non-critical message")
         return False
 
 
