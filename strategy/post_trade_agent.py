@@ -715,6 +715,16 @@ class PostTradeAgent:
     # EXTERNAL API
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _clear_pending_context(self) -> None:
+        """Clear per-trade exit context after a close is processed."""
+        self._pending_exit_type = ""
+        self._pending_fill_price = 0.0
+        self._pending_mfe_pts = 0.0
+        self._pending_mae_pts = 0.0
+        self._pending_atr = 0.0
+        self._pending_sweep_price = 0.0
+        self._pending_session = ""
+
     def set_exit_context(
         self,
         exit_type:    str,
@@ -850,6 +860,8 @@ class PostTradeAgent:
                 f"PostTradeAgent.on_trade_closed non-fatal error: {e}",
                 exc_info=True
             )
+        finally:
+            self._clear_pending_context()
 
     def get_parameter_recommendations(self) -> Dict[str, Any]:
         """

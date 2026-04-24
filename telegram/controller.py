@@ -669,7 +669,10 @@ class TelegramBotController:
             # LAYER 5 — TRAIL / POST-SWEEP ENGINE
             # BOS swing → CHoCH tighten → 15m structure
             # ══════════════════════════════════════════════════════════
-            from strategy.quant_strategy import PositionPhase
+            try:
+                from strategy.quant_strategy import PositionPhase
+            except ImportError:
+                from quant_strategy import PositionPhase
             lines.append("\n<b>━━ LAYER 5: TRAIL / POST-SWEEP ENGINE</b>")
 
             if pos.phase == PositionPhase.ACTIVE:
@@ -1824,7 +1827,10 @@ class TelegramBotController:
                 try:
                     # BUG-FIX C30: bare 'from quant_strategy import' fails when the module
                     # is loaded as strategy.quant_strategy (ModuleNotFoundError).
-                    from strategy.quant_strategy import PositionState
+                    try:
+                        from strategy.quant_strategy import PositionState
+                    except ImportError:
+                        from quant_strategy import PositionState
                     with strat._lock:
                         strat._pos = PositionState()
                         strat._confirm_long = strat._confirm_short = 0
@@ -1855,7 +1861,10 @@ class TelegramBotController:
         if strat is None: return "❌ Strategy not initialised."
 
         try:
-            from strategy.quant_strategy import PositionPhase
+            try:
+                from strategy.quant_strategy import PositionPhase
+            except ImportError:
+                from quant_strategy import PositionPhase
             with strat._lock:
                 phase = strat._pos.phase
             if phase not in (PositionPhase.FLAT, PositionPhase.ENTERING):

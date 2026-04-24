@@ -2003,7 +2003,10 @@ class ForceFlatFromEnteringAction(HealAction):
 
         def _do_reset() -> None:
             # Import the PositionPhase class from the strategy module
-            from quant_strategy import PositionPhase  # type: ignore
+            try:
+                from strategy.quant_strategy import PositionPhase
+            except ImportError:
+                from quant_strategy import PositionPhase  # type: ignore
             pos = _safe_getattr(strat, "_pos", None)
             if pos is not None:
                 pos.phase = PositionPhase.FLAT
@@ -2082,7 +2085,10 @@ class AdoptExchangeFlatAction(HealAction):
                 except Exception as e:  # noqa: BLE001
                     logger.error("watchdog: _finalise_exit failed during adopt: %s", e)
                     # Fallback: force FLAT manually
-                    from quant_strategy import PositionState  # type: ignore
+                    try:
+                        from strategy.quant_strategy import PositionState
+                    except ImportError:
+                        from quant_strategy import PositionState  # type: ignore
                     strat._pos = PositionState()
                     strat._last_exit_time = _now()
 
@@ -2738,7 +2744,7 @@ class Watchdog:
         elif not severities:
             agg = Status.UNKNOWN
         elif any(s >= Severity.CRITICAL for s in severities):
-            agg = Status.FROZEN  # should already be engaged
+            agg = Status.DEGRADED
         elif any(s >= Severity.HEAL for s in severities):
             agg = Status.HEALING
         elif any(s >= Severity.WARN for s in severities):

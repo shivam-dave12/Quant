@@ -620,7 +620,7 @@ class QuantBot:
             return
 
         stale_sec  = float(config.WS_STALE_SECONDS)
-        ws_healthy = ws.is_healthy(timeout_seconds=int(stale_sec))
+        ws_healthy = ws.is_healthy(timeout_seconds=round(stale_sec))
 
         price_stale_sec = getattr(config, "PRICE_STALE_SECONDS", 90.0)
         price_fresh     = self.data_manager.is_price_fresh(

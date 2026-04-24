@@ -68,8 +68,20 @@ except ImportError:
     except ImportError:
         _REQUIRED_CONVICTION_SCORE = 0.45
 
-_HUNT_ON_THRESHOLD  = 0.10
-_HUNT_OFF_THRESHOLD = 0.05
+try:
+    from strategy.direction_engine import (
+        _HUNT_ON_THRESHOLD,
+        _HUNT_OFF_THRESHOLD,
+    )
+except ImportError:
+    try:
+        from direction_engine import (  # type: ignore
+            _HUNT_ON_THRESHOLD,
+            _HUNT_OFF_THRESHOLD,
+        )
+    except ImportError:
+        _HUNT_ON_THRESHOLD = 0.10
+        _HUNT_OFF_THRESHOLD = 0.05
 
 
 # ======================================================================

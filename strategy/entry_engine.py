@@ -731,21 +731,6 @@ class EntryEngine:
                 continue
             sweeps.append(s)
 
-        # [DIAG-NO-TRADES]: throttled (30s) log so we can see exactly which
-        # gate is eating sweeps when no POST-SWEEP ENTERED fires.  Only emits
-        # when there's something interesting (either source non-empty or
-        # nothing passed through).  Safe to leave in production.
-        _src_total = len(snap.recent_sweeps or [])
-        if _src_total > 0 or len(sweeps) == 0:
-            _nt_last = getattr(self, '_nt_collect_last', 0.0)
-            if now - _nt_last >= 30.0:
-                self._nt_collect_last = now
-                logger.info(
-                    f"[DIAG-NT:COLLECT] source={_src_total} "
-                    f"→ stale={_skipped_stale} low_q={_skipped_low_quality} "
-                    f"proc={_skipped_processed} → passed={len(sweeps)} "
-                    f"state={self._state.name}")
-
         if (not sweeps
                 and self._state not in (EngineState.POST_SWEEP,
                                         EngineState.IN_POSITION,

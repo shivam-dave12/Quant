@@ -1,28 +1,28 @@
-"""
-ict_engine.py — Industry-Grade ICT/SMC Analysis Engine v6.0
+﻿"""
+ict_engine.py â€” Industry-Grade ICT/SMC Analysis Engine v6.0
 ============================================================
 Full rewrite: AMD cycle, multi-timeframe structure, complete PD array stack.
 
 ICT Concepts Implemented
-─────────────────────────
-1. AMD Cycle (Accumulation → Manipulation → Distribution)
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+1. AMD Cycle (Accumulation â†’ Manipulation â†’ Distribution)
    Smart money accumulates in a range, runs stops in one direction
    (Judas swing / manipulation), then delivers price the opposite way
    (distribution). All entries align with the expected distribution leg.
 
-2. Multi-Timeframe Market Structure (1D → 4H → 1H → 15M → 5M → 1M)
+2. Multi-Timeframe Market Structure (1D â†’ 4H â†’ 1H â†’ 15M â†’ 5M â†’ 1M)
    Per timeframe:
    - Swing sequence (HH/HL = bullish, LH/LL = bearish)
-   - BOS  — Break of Structure: close beyond last significant swing
-   - CHoCH — Change of Character: first opposing structural break
+   - BOS  â€” Break of Structure: close beyond last significant swing
+   - CHoCH â€” Change of Character: first opposing structural break
    - Premium/Discount: price position in the recent H-L range
    - Equilibrium (50% of range)
 
 3. PD Array Stack (delivery/reversal zones)
-   OB  — Order Block (last opposite candle before strong impulse)
-   FVG — Fair Value Gap (3-candle imbalance)
-   BSL — Buy-Side Liquidity (equal highs / buy stops above)
-   SSL — Sell-Side Liquidity (equal lows / sell stops below)
+   OB  â€” Order Block (last opposite candle before strong impulse)
+   FVG â€” Fair Value Gap (3-candle imbalance)
+   BSL â€” Buy-Side Liquidity (equal highs / buy stops above)
+   SSL â€” Sell-Side Liquidity (equal lows / sell stops below)
 
 4. Liquidity Sweep Detection
    Price wicks THROUGH a pool and CLOSES on the opposite side.
@@ -35,18 +35,18 @@ ICT Concepts Implemented
    (independent components, never a blended guess)
 
 Backward-Compatible Public API
-───────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 update(candles_5m, candles_15m, price, now_ms,
        candles_1m=None, candles_1h=None, candles_4h=None, candles_1d=None)
-get_confluence(side, price, now_ms, atr) → ICTConfluence
-get_ob_sl_level(side, price, atr, now_ms, htf_only=False) → Optional[float]
+get_confluence(side, price, now_ms, atr) â†’ ICTConfluence
+get_ob_sl_level(side, price, atr, now_ms, htf_only=False) â†’ Optional[float]
 get_structural_tp_targets(side, price, atr, now_ms, min_dist, max_dist,
-                           htf_only=False) → List[(price, score, label)]
-get_amd_state() → AMDState
-get_market_bias() → MarketBias
-get_status() → Dict
-get_full_status(price, atr, now_ms) → Dict
-check_sl_path_for_structure(pos_side, current_sl, new_sl, now_ms) → (bool, str)
+                           htf_only=False) â†’ List[(price, score, label)]
+get_amd_state() â†’ AMDState
+get_market_bias() â†’ MarketBias
+get_status() â†’ Dict
+get_full_status(price, atr, now_ms) â†’ Dict
+check_sl_path_for_structure(pos_side, current_sl, new_sl, now_ms) â†’ (bool, str)
 """
 
 from __future__ import annotations
@@ -60,33 +60,36 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+_OTE_FIB_LOW = 0.50
+_OTE_FIB_HIGH = 0.786
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL HELPER — used by _predict_next_hunt() (private/deprecated path)
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# MODULE-LEVEL HELPER â€” used by _predict_next_hunt() (private/deprecated path)
 # Direction logic has moved to direction_engine.DirectionEngine which carries
 # its own _sigmoid.  This stays to avoid breaking the private fallback.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _fast_sigmoid(z: float, steepness: float = 1.0) -> float:
-    """Fast symmetric sigmoid mapping ℝ → (-1, 1). No math.exp needed."""
+    """Fast symmetric sigmoid mapping â„ â†’ (-1, 1). No math.exp needed."""
     sz = z * steepness
     return max(-1.0, min(1.0, sz / (1.0 + abs(sz) * 0.5)))
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class OrderBlock:
-    """ICT Order Block — last opposite candle before a strong impulse."""
+    """ICT Order Block â€” last opposite candle before a strong impulse."""
     low:       float
     high:      float
     timestamp: int            # epoch ms
     direction: str            # "bullish" | "bearish"
     timeframe: str            # "1m"|"5m"|"15m"|"1h"|"4h"|"1d"
-    strength:  float = 50.0  # 0–100; higher TF = higher base
+    strength:  float = 50.0  # 0â€“100; higher TF = higher base
     visit_count:      int   = 0
     bos_confirmed:    bool  = False
     has_displacement: bool  = False
@@ -111,24 +114,21 @@ class OrderBlock:
         return self.low <= price <= self.high
 
     def in_optimal_zone(self, price: float) -> bool:
-        """OTE = 61.8%–78.6% retracement into OB body (ICT standard Fibonacci).
+        """OTE body band aligned with entry/direction engine fib bounds.
 
-        BUG-OB-OTE-FIB FIX: old code used 50%–79%.  ICT defines OTE as the
-        61.8%–78.6% Fibonacci retracement of the DISPLACEMENT MOVE.  When
-        applied to the OB body as a proxy, the correct bounds are 61.8%–78.6%
-        of the body depth (not 50%), matching the fib levels used in
-        ICTSweepDetector.OTE_LOWER_FIB / OTE_UPPER_FIB.
+        Uses the same 50.0%-78.6% bounds as the post-sweep entry engines so
+        operator confluence and execution gates do not drift.
         """
         if self.size < 1e-10:
             return False
         if self.direction == "bullish":
             # Bullish OB body = [low, high]; OTE = deep into body from top
-            top = self.high - 0.618 * self.size   # 61.8% from top
-            bot = self.high - 0.786 * self.size   # 78.6% from top
+            top = self.high - _OTE_FIB_LOW * self.size
+            bot = self.high - _OTE_FIB_HIGH * self.size
         else:
             # Bearish OB body = [low, high]; OTE = deep into body from bottom
-            bot = self.low + 0.618 * self.size    # 61.8% from bottom
-            top = self.low + 0.786 * self.size    # 78.6% from bottom
+            bot = self.low + _OTE_FIB_LOW * self.size
+            top = self.low + _OTE_FIB_HIGH * self.size
         return bot <= price <= top
 
     def is_active(self, now_ms: int) -> bool:
@@ -145,7 +145,7 @@ class OrderBlock:
 @dataclass
 class BreakerBlock:
     """
-    ICT Breaker Block — a MITIGATED Order Block that has flipped polarity.
+    ICT Breaker Block â€” a MITIGATED Order Block that has flipped polarity.
 
     When price closes THROUGH an OB's far extreme, the OB is mitigated and
     becomes a Breaker Block.  The Breaker Block now acts as OPPOSING structure:
@@ -159,12 +159,12 @@ class BreakerBlock:
     low:       float
     high:      float
     timestamp: int
-    original_direction: str   # "bullish" | "bearish" — direction of the mitigated OB
+    original_direction: str   # "bullish" | "bearish" â€” direction of the mitigated OB
     direction: str            # FLIPPED: "bearish" | "bullish"
     timeframe: str
     strength:  float = 50.0
     visit_count: int = 0
-    max_age_ms: int = 86_400_000 * 2   # Breakers live longer — structural flip
+    max_age_ms: int = 86_400_000 * 2   # Breakers live longer â€” structural flip
 
     @property
     def midpoint(self) -> float:
@@ -185,17 +185,17 @@ class BreakerBlock:
 @dataclass
 class RejectionBlock:
     """
-    ICT Rejection Block — an OB where price was REJECTED on the first visit.
+    ICT Rejection Block â€” an OB where price was REJECTED on the first visit.
 
-    Standard OB: price enters the zone → institutional orders fill → price continues.
+    Standard OB: price enters the zone â†’ institutional orders fill â†’ price continues.
     Rejection Block: price wicks INTO the zone but CLOSES OUTSIDE it (wick rejection).
-    This signals a failed OB test — the zone is now a strong reversal level
+    This signals a failed OB test â€” the zone is now a strong reversal level
     because trapped traders who entered on the wick are stopped out on continuation.
 
     A Rejection Block is created when:
       - An OB is tested (price enters the zone)
       - The CLOSE of the testing candle is OUTSIDE the OB range
-      - The wick was ≥ 50% of the candle range (significant rejection)
+      - The wick was â‰¥ 50% of the candle range (significant rejection)
     """
     low:       float
     high:      float
@@ -219,7 +219,7 @@ class RejectionBlock:
 
 @dataclass
 class FairValueGap:
-    """ICT FVG — 3-candle imbalance (candle[i-1].extremity vs candle[i+1].extremity)."""
+    """ICT FVG â€” 3-candle imbalance (candle[i-1].extremity vs candle[i+1].extremity)."""
     bottom:    float
     top:       float
     timestamp: int
@@ -249,7 +249,7 @@ class FairValueGap:
 
         BUG-FVG-FILL-WICK FIX: the old code measured wick overlap (h/l range)
         against the gap.  In ICT, a candle's WICK touching the FVG is NOT a
-        fill — only a CLOSE into the gap counts.  The fill percentage now
+        fill â€” only a CLOSE into the gap counts.  The fill percentage now
         measures how deeply the deepest CLOSE has penetrated the gap:
 
           Bullish FVG (gap sits below current action, price fills downward):
@@ -302,6 +302,30 @@ class LiquidityLevel:
 
 
 @dataclass
+class ICTSweepRecord:
+    """Durable sweep event emitted at detection time.
+
+    Liquidity pools are mutable and can be rebuilt/merged later. This record is
+    the authoritative bridge source for downstream entry logic.
+    """
+    price: float
+    level_type: str
+    sweep_timestamp: int
+    displacement_confirmed: bool
+    displacement_score: float
+    wick_rejection: bool
+    candle_high: float
+    candle_low: float
+    candle_close: float
+    timeframe: str = "5m"
+    swept: bool = True
+
+    @property
+    def pool_type(self) -> str:
+        return "EQH" if self.level_type == "BSL" else "EQL"
+
+
+@dataclass
 class TFStructure:
     """Per-timeframe market structure snapshot."""
     timeframe:     str
@@ -316,7 +340,7 @@ class TFStructure:
     choch_level:     float = 0.0
     choch_timestamp: int  = 0     # epoch ms of CHoCH confirmation candle
     choch_bar_index: int  = -1    # candle index within lb-slice; -1 = none
-    choch_direction: str  = ""    # "bullish"|"bearish"|"" — direction of the CHoCH break
+    choch_direction: str  = ""    # "bullish"|"bearish"|"" â€” direction of the CHoCH break
                                   # bearish trend CHoCH = "bullish" (close above LH)
                                   # bullish trend CHoCH = "bearish" (close below HL)
     range_high:    float = 0.0
@@ -329,7 +353,7 @@ class TFStructure:
 @dataclass
 class DealingRange:
     """
-    ICT Dealing Range — the range between the last significant BSL and SSL.
+    ICT Dealing Range â€” the range between the last significant BSL and SSL.
 
     This is the range smart money is 'dealing' within.  Institutional entries
     occur at the extremes of the dealing range (discount SSL for longs,
@@ -337,10 +361,10 @@ class DealingRange:
     sell-side territory.
 
     Quadrants (ICT standard):
-      0.00–0.25: Deep Discount       → highest conviction long zone
-      0.25–0.50: Discount            → valid long zone
-      0.50–0.75: Premium             → valid short zone
-      0.75–1.00: Deep Premium        → highest conviction short zone
+      0.00â€“0.25: Deep Discount       â†’ highest conviction long zone
+      0.25â€“0.50: Discount            â†’ valid long zone
+      0.50â€“0.75: Premium             â†’ valid short zone
+      0.75â€“1.00: Deep Premium        â†’ highest conviction short zone
     """
     low:          float   # SSL level (bottom of dealing range)
     high:         float   # BSL level (top of dealing range)
@@ -365,22 +389,22 @@ class DealingRange:
 @dataclass
 class PowerOf3State:
     """
-    ICT Power of 3 (AMD time model) — session-based AMD thirds.
+    ICT Power of 3 (AMD time model) â€” session-based AMD thirds.
 
     The session is divided into three time-based phases:
       Accumulation (first third): range formation, stop accumulation
-      Manipulation (middle third): Judas swing — false breakout of the range
+      Manipulation (middle third): Judas swing â€” false breakout of the range
       Distribution (final third): real move to the opposing liquidity
 
-    For NY session (13:30–21:00 UTC = 7.5 hours):
-      Accumulation: 13:30–16:00 (2.5h)
-      Manipulation: 16:00–18:30 (2.5h)
-      Distribution: 18:30–21:00 (2.5h)
+    For NY session (13:30â€“21:00 UTC = 7.5 hours):
+      Accumulation: 13:30â€“16:00 (2.5h)
+      Manipulation: 16:00â€“18:30 (2.5h)
+      Distribution: 18:30â€“21:00 (2.5h)
 
-    For London session (07:00–15:00 UTC = 8 hours):
-      Accumulation: 07:00–09:40 (~2.7h)
-      Manipulation: 09:40–12:20 (~2.7h)
-      Distribution: 12:20–15:00 (~2.7h)
+    For London session (07:00â€“15:00 UTC = 8 hours):
+      Accumulation: 07:00â€“09:40 (~2.7h)
+      Manipulation: 09:40â€“12:20 (~2.7h)
+      Distribution: 12:20â€“15:00 (~2.7h)
     """
     session: str          # "LONDON" | "NEW_YORK" | "ASIA" | "OFF_HOURS"
     po3_phase: str        # "ACCUMULATION" | "MANIPULATION" | "DISTRIBUTION"
@@ -423,7 +447,7 @@ class AMDState:
     """Accumulation-Manipulation-Distribution cycle state."""
     phase:           str              # "ACCUMULATION"|"MANIPULATION"|"DISTRIBUTION"|"REACCUMULATION"|"REDISTRIBUTION"
     bias:            str              # "bullish"|"bearish"|"neutral"
-    confidence:      float            # 0–1
+    confidence:      float            # 0â€“1
     sweep_origin:    Optional[float] = None
     delivery_target: Optional[float] = None
     time_in_phase_ms: int = 0
@@ -435,7 +459,7 @@ class AMDState:
 class MarketBias:
     """Multi-timeframe directional bias summary."""
     direction:  str              # "bullish"|"bearish"|"neutral"
-    strength:   float            # 0–1
+    strength:   float            # 0â€“1
     tf_1d:      str  = "neutral"
     tf_4h:      str  = "neutral"
     tf_1h:      str  = "neutral"
@@ -449,16 +473,16 @@ class MarketBias:
 
 @dataclass
 class ICTConfluence:
-    """Full ICT confluence result — all components explicit."""
-    # Component scores (sum ≈ total before guards)
-    structure_score: float = 0.0   # MTF trend alignment (0–0.30)
-    amd_score:       float = 0.0   # AMD phase alignment  (0–0.25)
-    pd_array_score:  float = 0.0   # PD array proximity   (0–0.25)
-    liquidity_score: float = 0.0   # Sweep + pool stack   (0–0.15)
-    session_score:   float = 0.0   # Kill zone / session  (0–0.05)
+    """Full ICT confluence result â€” all components explicit."""
+    # Component scores (sum â‰ˆ total before guards)
+    structure_score: float = 0.0   # MTF trend alignment (0â€“0.30)
+    amd_score:       float = 0.0   # AMD phase alignment  (0â€“0.25)
+    pd_array_score:  float = 0.0   # PD array proximity   (0â€“0.25)
+    liquidity_score: float = 0.0   # Sweep + pool stack   (0â€“0.15)
+    session_score:   float = 0.0   # Kill zone / session  (0â€“0.05)
     total:           float = 0.0   # final (guarded)
 
-    # Legacy fields — kept for backward compat with quant_strategy.py callers
+    # Legacy fields â€” kept for backward compat with quant_strategy.py callers
     ob_score:       float = 0.0
     fvg_score:      float = 0.0
     sweep_score:    float = 0.0
@@ -492,7 +516,7 @@ class ICTConfluence:
 
     details: str = ""
 
-    # ── Unified Hunt Prediction (populated in get_confluence) ─────────────
+    # â”€â”€ Unified Hunt Prediction (populated in get_confluence) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # These fields let all downstream consumers (ICTEntryGate, ICTSLEngine,
     # ICTTPEngine, ICTTrailEngine) use the hunt prediction without re-computing.
     hunt_prediction:   Dict  = None    # full dict from DirectionEngine.predict_hunt()
@@ -503,9 +527,9 @@ class ICTConfluence:
             object.__setattr__(self, 'hunt_prediction', {})
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # MAIN ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class ICTEngine:
     """
@@ -516,10 +540,10 @@ class ICTEngine:
     PD arrays (OB, FVG) scored by timeframe strength.
     """
 
-    # ── Defaults (overridden by config) ───────────────────────────────────
+    # â”€â”€ Defaults (overridden by config) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     OB_MIN_IMPULSE_PCT    = 0.15   # minimum % body move to qualify as impulse
     OB_MIN_BODY_RATIO     = 0.40   # body/range ratio for impulse candle
-    OB_IMPULSE_SIZE_MULT  = 1.30   # impulse must be N× larger than OB candle
+    OB_IMPULSE_SIZE_MULT  = 1.30   # impulse must be NÃ— larger than OB candle
     OB_MAX_AGE_MS         = 86_400_000     # 24 h   (5m/15m OBs)
     HTF_OB_MAX_AGE_MS     = 259_200_000    # 72 h   (1h/4h OBs)
     DAILY_OB_MAX_AGE_MS   = 1_296_000_000  # 15 days (1d OBs)
@@ -527,9 +551,9 @@ class ICTEngine:
     FVG_MAX_AGE_MS         = 86_400_000
     LIQ_TOUCH_TOL_PCT      = 0.0040  # 0.40% tolerance for equal highs/lows (BTC ~$280)
     SWEEP_DISP_MIN         = 0.40    # min body/range for displacement
-    SWEEP_MAX_AGE_MS       = 7_200_000    # 2 h — swept pool is "fresh"
-    AMD_MANIP_WINDOW_MS    = 900_000      # 15 min — manipulation phase
-    AMD_DISTRIB_WINDOW_MS  = 5_400_000    # 90 min — distribution delivery
+    SWEEP_MAX_AGE_MS       = 7_200_000    # 2 h â€” swept pool is "fresh"
+    AMD_MANIP_WINDOW_MS    = 900_000      # 15 min â€” manipulation phase
+    AMD_DISTRIB_WINDOW_MS  = 5_400_000    # 90 min â€” distribution delivery
 
     # TF-specific OB base strengths (reflects institutional significance)
     TF_BASE_STRENGTH = {
@@ -542,32 +566,33 @@ class ICTEngine:
 
     # Kill zone hours (NY time = UTC + offset).
     # KZ_ASIA_END wraps across midnight: Asia KZ is ny >= 20 OR ny < 1.
-    # Default of 24 was a latent bug — if _load_config ever fails to set the
+    # Default of 24 was a latent bug â€” if _load_config ever fails to set the
     # instance attribute, ny < 24 is always True, making every hour ASIA_KZ.
     KZ_ASIA_START   = 20; KZ_ASIA_END   = 1
     KZ_LONDON_START = 2;  KZ_LONDON_END  = 5
     KZ_NY_START     = 7;  KZ_NY_END     = 10
 
     def __init__(self):
-        # Capacity: 6 TFs × up to 40 OBs each = 240 + headroom.
+        # Capacity: 6 TFs Ã— up to 40 OBs each = 240 + headroom.
         # Previous maxlen=60 caused eviction of older OBs which were then
-        # re-detected on the next scan and re-inserted as "new" — losing their
+        # re-detected on the next scan and re-inserted as "new" â€” losing their
         # true age, corrupting mitigation tracking, and causing OB count churn.
         self.order_blocks_bull: Deque[OrderBlock]   = deque(maxlen=250)
         self.order_blocks_bear: Deque[OrderBlock]   = deque(maxlen=250)
-        # FVG capacity: 6 TFs × every 3-candle pattern.  60 was too small for
+        # FVG capacity: 6 TFs Ã— every 3-candle pattern.  60 was too small for
         # 300 5m candles + 200 15m candles scanned per update.
         self.fvgs_bull:         Deque[FairValueGap] = deque(maxlen=250)
         self.fvgs_bear:         Deque[FairValueGap] = deque(maxlen=250)
-        # Liquidity pools: 6 TFs × many swing points, need room for HTF pools
+        # Liquidity pools: 6 TFs Ã— many swing points, need room for HTF pools
         self.liquidity_pools:   Deque[LiquidityLevel] = deque(maxlen=200)
-        # ICT-3 FIX: maxlen 500 → 2000. During extended warmup processing
+        self.sweep_events:      Deque[ICTSweepRecord] = deque(maxlen=500)
+        # ICT-3 FIX: maxlen 500 â†’ 2000. During extended warmup processing
         # (1000+ historical candles), 500 registered sweeps can evict within
         # the same session, allowing a re-registered stale sweep to corrupt
         # _select_best_sweep with a stale timestamp. 2000 gives ample headroom
         # for warmup + normal session load.
         self._registered_sweeps: Deque[Tuple] = deque(maxlen=2000)
-        # Advanced PD array types — doubled to accommodate HTF structures
+        # Advanced PD array types â€” doubled to accommodate HTF structures
         self.breaker_blocks_bull: Deque[BreakerBlock]   = deque(maxlen=60)
         self.breaker_blocks_bear: Deque[BreakerBlock]   = deque(maxlen=60)
         self.rejection_blocks:    Deque[RejectionBlock] = deque(maxlen=60)
@@ -580,14 +605,14 @@ class ICTEngine:
 
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
 
-        # ── Advanced structural state ──────────────────────────────────
+        # â”€â”€ Advanced structural state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # DealingRange: range between the most significant SSL and BSL
         self._dealing_range: Optional[DealingRange]  = None
         # Power of 3: session-time-based AMD phase estimate
         self._po3:           Optional[PowerOf3State] = None
         # IPDA quarterly draw levels (from 1D candles)
         self._ipda:          Optional[IPDALevels]    = None
-        # Propulsion OBs — the specific OBs that caused the most recent BOS
+        # Propulsion OBs â€” the specific OBs that caused the most recent BOS
         # on 5m/15m/1h.  These are the highest-conviction structural levels.
         self._propulsion_obs_bull: List[OrderBlock] = []
         self._propulsion_obs_bear: List[OrderBlock] = []
@@ -600,14 +625,14 @@ class ICTEngine:
         self._session  = ""
         self._killzone = ""
 
-        # ── Order-flow data (set externally each tick via set_order_flow_data) ──
+        # â”€â”€ Order-flow data (set externally each tick via set_order_flow_data) â”€â”€
         # These are injected via set_order_flow_data() and also forwarded to
         # DirectionEngine by quant_strategy Step 3b for hunt prediction.
         # Range: [-1, +1]  positive = net buying pressure
         self._tick_flow:  float = 0.0   # TickFlowEngine signal
         self._cvd_trend:  float = 0.0   # CVD slope signal
 
-        # ── Cached hunt prediction (refreshed in update()) ─────────────────
+        # â”€â”€ Cached hunt prediction (refreshed in update()) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._last_hunt_pred: Dict = {}
         self._last_hunt_ms:   int  = 0
 
@@ -623,9 +648,9 @@ class ICTEngine:
 
         self._load_config()
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # CONFIG LOAD
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _load_config(self):
         try:
@@ -653,9 +678,9 @@ class ICTEngine:
         except ImportError:
             pass
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # RESET
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def reset_state(self):
         self.order_blocks_bull.clear()
@@ -663,6 +688,7 @@ class ICTEngine:
         self.fvgs_bull.clear()
         self.fvgs_bear.clear()
         self.liquidity_pools.clear()
+        self.sweep_events.clear()
         self._registered_sweeps.clear()
         self.breaker_blocks_bull.clear()
         self.breaker_blocks_bear.clear()
@@ -681,9 +707,9 @@ class ICTEngine:
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
         self._initialized = False
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # v8.0: PRUNE EXPIRED / MITIGATED ENTRIES
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _prune_expired(self, now_ms: int) -> None:
         """
@@ -694,7 +720,7 @@ class ICTEngine:
         Without pruning, dead entries accumulate in the deques (up to maxlen=250).
         The dedup check in _detect_obs/_detect_fvgs compares new candidates against
         ALL entries (including dead ones). A new OB at the same structural level as
-        an expired OB is rejected by dedup — it looks like a duplicate. Consumer
+        an expired OB is rejected by dedup â€” it looks like a duplicate. Consumer
         code calls is_active() and doesn't see the dead entry, but the new one was
         never added either. Result: OB count drops when entries expire and doesn't
         recover until the dead entry is evicted by maxlen pressure.
@@ -702,13 +728,13 @@ class ICTEngine:
         This creates the observed fluctuation pattern:
         1. OB detected at $70,000 from 5m candle, added to deque
         2. 24h later: OB expires (is_active=False), but remains in deque
-        3. New 5m OB forms at ~$70,000 — dedup sees the dead one → blocks insert
+        3. New 5m OB forms at ~$70,000 â€” dedup sees the dead one â†’ blocks insert
         4. Active OB count drops by 1 (dead one filtered, new one blocked)
-        5. Eventually maxlen evicts the dead one → new OB can be added → count jumps
+        5. Eventually maxlen evicts the dead one â†’ new OB can be added â†’ count jumps
 
         Pruning before detection eliminates this entire failure mode.
         """
-        # ── OBs: remove expired (age) and mitigated ───────────────────
+        # â”€â”€ OBs: remove expired (age) and mitigated â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for deq in (self.order_blocks_bull, self.order_blocks_bear):
             to_remove = [
                 ob for ob in deq
@@ -722,7 +748,7 @@ class ICTEngine:
                 except ValueError:
                     pass
 
-        # ── FVGs: remove expired (age) and fully filled ───────────────
+        # â”€â”€ FVGs: remove expired (age) and fully filled â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for deq in (self.fvgs_bull, self.fvgs_bear):
             to_remove = [
                 fvg for fvg in deq
@@ -735,7 +761,7 @@ class ICTEngine:
                 except ValueError:
                     pass
 
-        # ── Breaker blocks: remove expired ─────────────────────────────
+        # â”€â”€ Breaker blocks: remove expired â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for deq in (self.breaker_blocks_bull, self.breaker_blocks_bear):
             to_remove = [
                 bb for bb in deq
@@ -748,7 +774,7 @@ class ICTEngine:
                 except ValueError:
                     pass
 
-        # ── Rejection blocks: remove expired ───────────────────────────
+        # â”€â”€ Rejection blocks: remove expired â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         to_remove = [
             rb for rb in self.rejection_blocks
             if not rb.is_active(now_ms)
@@ -759,9 +785,9 @@ class ICTEngine:
             except ValueError:
                 pass
 
-    # ─────────────────────────────────────────────────────────────────────
-    # MAIN UPDATE — called every 5s
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # MAIN UPDATE â€” called every 5s
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def update(self, candles_5m: List[Dict], candles_15m: List[Dict],
                price: float, now_ms: int,
@@ -800,22 +826,22 @@ class ICTEngine:
         except Exception:
             self._last_atr = 0.0
 
-        # ── v8.0: PRUNE EXPIRED/MITIGATED entries BEFORE detection ─────
+        # â”€â”€ v8.0: PRUNE EXPIRED/MITIGATED entries BEFORE detection â”€â”€â”€â”€â”€
         # ROOT CAUSE OF OB/FVG COUNT FLUCTUATION:
         # Expired OBs (past max_age) and mitigated OBs/FVGs stay in deques
         # until the 250-entry maxlen evicts them. The dedup tolerance check
         # in _detect_obs/_detect_fvgs matches against these dead entries,
         # blocking legitimate new OBs at the same structural level from being
         # added. Consumer code filters with is_active() and sees fewer OBs.
-        # When maxlen finally evicts dead entries, new ones appear → count jumps.
+        # When maxlen finally evicts dead entries, new ones appear â†’ count jumps.
         # Fix: remove all dead entries BEFORE running detection.
         self._prune_expired(now_ms)
 
-        # ── Session / Kill Zone ────────────────────────────────────────
+        # â”€â”€ Session / Kill Zone â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._update_session(now_ms)
 
-        # ── Per-TF Market Structure ────────────────────────────────────
-        # Each TF analyzed independently — trend/BOS/CHoCH/PD
+        # â”€â”€ Per-TF Market Structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Each TF analyzed independently â€” trend/BOS/CHoCH/PD
         if candles_1d and len(candles_1d) >= 6:
             self._tf["1d"] = self._analyze_structure(candles_1d, "1d", price)
         if candles_4h and len(candles_4h) >= 6:
@@ -829,7 +855,7 @@ class ICTEngine:
         if candles_1m and len(candles_1m) >= 6:
             self._tf["1m"] = self._analyze_structure(candles_1m, "1m", price)
 
-        # ── Combined swing points (for liquidity clustering) ───────────
+        # â”€â”€ Combined swing points (for liquidity clustering) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Pass HTF candles so equal highs/lows on 1H/4H/1D are tagged
         # with their source timeframe for proper significance weighting.
         self._detect_swing_points(candles_5m, candles_15m,
@@ -837,7 +863,7 @@ class ICTEngine:
                                    candles_4h=candles_4h,
                                    candles_1d=candles_1d)
 
-        # ── Order Blocks — all timeframes ─────────────────────────────
+        # â”€â”€ Order Blocks â€” all timeframes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # 1m: micro-OBs for trail anchoring (short lookback, short life)
         if candles_1m and len(candles_1m) >= 5:
             self._detect_obs(candles_1m[-40:], price, now_ms, tf="1m",
@@ -862,7 +888,7 @@ class ICTEngine:
             self._detect_obs(candles_1d, price, now_ms, tf="1d",
                              base_str=97.0, max_age=self.DAILY_OB_MAX_AGE_MS)
 
-        # ── Fair Value Gaps — key timeframes ──────────────────────────
+        # â”€â”€ Fair Value Gaps â€” key timeframes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # 1m: micro-FVGs for structure in ranging markets (short life)
         if candles_1m and len(candles_1m) >= 5:
             self._detect_fvgs(candles_1m[-60:], "1m", price, now_ms, 1_800_000)  # 30 min
@@ -874,7 +900,7 @@ class ICTEngine:
         if candles_4h and len(candles_4h) >= 5:
             self._detect_fvgs(candles_4h, "4h", price, now_ms, self.HTF_OB_MAX_AGE_MS * 2)
 
-        # ── FVG fill tracking (TF-specific — institutional) ──────────
+        # â”€â”€ FVG fill tracking (TF-specific â€” institutional) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # v5.1: each TF's FVGs are filled ONLY by candles from that TF.
         # A 5m close into a 4h FVG is a reaction, not mitigation.
         if candles_1m and len(candles_1m) >= 3:
@@ -887,12 +913,12 @@ class ICTEngine:
         if candles_4h and len(candles_4h) >= 3:
             self._update_fvg_fills(candles_4h, "4h")
 
-        # ── Liquidity pool detection + sweep ─────────────────────────
+        # â”€â”€ Liquidity pool detection + sweep â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._detect_liquidity_pools(price, now_ms)
         self._detect_sweeps(candles_5m, candles_15m, price, now_ms,
                             candles_1h=candles_1h)
 
-        # ── OB mitigation tracking ────────────────────────────────────
+        # â”€â”€ OB mitigation tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Bug-23 fix: previously called twice (5m then 15m), iterating the
         # full OB list each time and potentially using a different last-close
         # for the same OB on consecutive passes. A single pass with the
@@ -903,50 +929,50 @@ class ICTEngine:
         else:
             self._update_ob_mitigation(candles_5m)   # fallback to 5m only
 
-        # ── Breaker + Rejection block detection ───────────────────────
+        # â”€â”€ Breaker + Rejection block detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._detect_breaker_blocks(candles_5m, now_ms)
         if len(candles_15m) >= 3:
             self._detect_rejection_blocks(candles_15m, price, now_ms, "15m")
         if candles_1h and len(candles_1h) >= 3:
             self._detect_rejection_blocks(candles_1h, price, now_ms, "1h")
 
-        # ── Propulsion OB detection ───────────────────────────────────
+        # â”€â”€ Propulsion OB detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._detect_propulsion_obs(now_ms)
 
-        # ── OB visit tracking ─────────────────────────────────────────
+        # â”€â”€ OB visit tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._update_ob_visits(price, now_ms)
 
-        # ── Dealing Range ─────────────────────────────────────────────
+        # â”€â”€ Dealing Range â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._update_dealing_range(price)
 
-        # ── Power of 3 (session AMD thirds) ───────────────────────────
+        # â”€â”€ Power of 3 (session AMD thirds) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._update_po3(now_ms)
 
-        # ── IPDA levels (1D candles needed) ───────────────────────────
+        # â”€â”€ IPDA levels (1D candles needed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if candles_1d and len(candles_1d) >= 20:
             self._update_ipda(candles_1d, price)
 
-        # ── AMD phase ─────────────────────────────────────────────────
+        # â”€â”€ AMD phase â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._update_amd(price, now_ms, candles_5m)
 
         self._initialized = True
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PER-TF MARKET STRUCTURE ANALYSIS
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _analyze_structure(self, candles: List[Dict],
                             tf: str, price: float) -> TFStructure:
         """
-        Swing → trend + BOS/CHoCH + premium/discount for one timeframe.
+        Swing â†’ trend + BOS/CHoCH + premium/discount for one timeframe.
 
         ARCHITECTURE:
           - Full lookback (60 bars) for BOS/CHoCH/swing LEVEL detection
           - TREND uses only last 20 bars of confirmed swings to reflect
             the CURRENT regime, not the historical average.
-            (20 × 15m = 5h window; 20 × 5m = 100min window)
+            (20 Ã— 15m = 5h window; 20 Ã— 5m = 100min window)
           - Strict fractal: ALL 4 neighbours must be strictly < (>).
-            Equal neighbours disqualify the bar — no doji/flat false swings.
+            Equal neighbours disqualify the bar â€” no doji/flat false swings.
           - BOS uses the last CLOSED candle, not the forming live candle.
           - CHoCH sets choch_direction for downstream trail engine.
         """
@@ -954,14 +980,14 @@ class ICTEngine:
         if len(candles) < 8:
             return out
 
-        # ── Full-range swing detection (for BOS/CHoCH levels + P/D range) ──
+        # â”€â”€ Full-range swing detection (for BOS/CHoCH levels + P/D range) â”€â”€
         lb = min(60, len(candles))
         recent = candles[-lb:]
 
         highs: List[Tuple[int, float]] = []
         lows:  List[Tuple[int, float]] = []
         # ICT-1 FIX: the previous `range(2, len(recent) - 2)` allowed i to reach
-        # len(recent) - 3, whose forward neighbour i+2 is len(recent) - 1 — the
+        # len(recent) - 3, whose forward neighbour i+2 is len(recent) - 1 â€” the
         # LIVE forming candle. A confirmed fractal must only use fully closed
         # bars on both sides. Shrinking the upper bound excludes the live candle
         # from any fractal check.
@@ -969,7 +995,7 @@ class ICTEngine:
             h = float(recent[i]['h'])
             l = float(recent[i]['l'])
             # All four neighbours must be strictly greater/less.
-            # Equal neighbours (flat) disqualify — prevents double-counting
+            # Equal neighbours (flat) disqualify â€” prevents double-counting
             # of identical candles in choppy ranges.
             if (h > float(recent[i-1]['h']) and h > float(recent[i-2]['h']) and
                     h > float(recent[i+1]['h']) and h > float(recent[i+2]['h'])):
@@ -978,7 +1004,7 @@ class ICTEngine:
                     l < float(recent[i+1]['l']) and l < float(recent[i+2]['l'])):
                 lows.append((i, l))
 
-        # ── Trend: use only the RECENT 20-bar swing window ───────────────
+        # â”€â”€ Trend: use only the RECENT 20-bar swing window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Using 60 bars for trend includes historical regimes (rallies/drops
         # from hours ago) that no longer represent current structure.
         # 20-bar window isolates the active swing sequence.
@@ -1006,10 +1032,10 @@ class ICTEngine:
                 trend = "bullish"
             elif lh and ll:
                 trend = "bearish"
-            # Mixed (HH+LL or LH+HL) = ranging — no label issued
+            # Mixed (HH+LL or LH+HL) = ranging â€” no label issued
         out.trend = trend
 
-        # ── Last/prev swing levels (from full 60-bar window) ─────────────
+        # â”€â”€ Last/prev swing levels (from full 60-bar window) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if highs:
             out.last_sh = highs[-1][1]
             out.prev_sh = highs[-2][1] if len(highs) >= 2 else 0.0
@@ -1017,7 +1043,7 @@ class ICTEngine:
             out.last_sl_ = lows[-1][1]
             out.prev_sl_ = lows[-2][1] if len(lows) >= 2 else 0.0
 
-        # ── BOS (Break of Structure) ──────────────────────────────────────
+        # â”€â”€ BOS (Break of Structure) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # RULE: close of the last CLOSED candle (index -2) beyond the last
         # confirmed swing extreme. The forming candle (-1) is excluded because
         # its close updates every tick and triggers spurious intra-bar BOS.
@@ -1033,18 +1059,18 @@ class ICTEngine:
             out.bos_direction = "bearish"
             out.bos_timestamp = last_closed_ts
 
-        # ── CHoCH (Change of Character) ───────────────────────────────────
+        # â”€â”€ CHoCH (Change of Character) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # ICT: first confirmed close BEYOND the opposing swing extreme.
         # The DIRECTION of the CHoCH is the direction OF THE BREAK (not the
         # prior trend). This is the field the trail engine reads.
         #
         #   Bearish trend CHoCH = close above the last Lower-High
-        #     → break is BULLISH (price moving up through a lower-high)
-        #     → choch_direction = "bullish"
+        #     â†’ break is BULLISH (price moving up through a lower-high)
+        #     â†’ choch_direction = "bullish"
         #
         #   Bullish trend CHoCH = close below the last Higher-Low
-        #     → break is BEARISH (price moving down through a higher-low)
-        #     → choch_direction = "bearish"
+        #     â†’ break is BEARISH (price moving down through a higher-low)
+        #     â†’ choch_direction = "bearish"
         #
         # We use the FULL 60-bar highs/lows for CHoCH level accuracy
         # (the lower-high may be 30+ bars ago on 15m).
@@ -1063,7 +1089,7 @@ class ICTEngine:
                 out.choch_timestamp = last_closed_ts
                 out.choch_direction = "bearish"   # the break direction
 
-        # ── Premium / Discount ────────────────────────────────────────
+        # â”€â”€ Premium / Discount â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # ICT P/D uses the range between the last confirmed swing high and
         # swing low (the current dealing range), not the absolute range which
         # can be distorted by a single spike candle.
@@ -1086,9 +1112,9 @@ class ICTEngine:
 
         return out
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # AMD PHASE DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _select_best_sweep(self, swept: list, now_ms: int) -> 'LiquidityLevel':
         """
@@ -1099,23 +1125,23 @@ class ICTEngine:
         high-conviction BSL swept 40 minutes ago that still has active delivery.
 
         Selection criteria (within AMD_DISTRIB_WINDOW_MS = 90 min):
-          freshness    × 0.60  — recent sweeps far more likely to be the regime driver
-          displacement × 0.25  — institutional confirmation of directional intent
-          wick_rejection × 0.10 — price rejected the swept level (conviction close)
-          touch_count  × 0.05  — more touches = deeper stop cluster = stronger magnet
+          freshness    Ã— 0.60  â€” recent sweeps far more likely to be the regime driver
+          displacement Ã— 0.25  â€” institutional confirmation of directional intent
+          wick_rejection Ã— 0.10 â€” price rejected the swept level (conviction close)
+          touch_count  Ã— 0.05  â€” more touches = deeper stop cluster = stronger magnet
 
-        ICT-8 FIX: window narrowed from 135min (1.5× distrib) to 90min. A
+        ICT-8 FIX: window narrowed from 135min (1.5Ã— distrib) to 90min. A
         90-minute-old high-quality sweep should not override a 5-minute-old
         low-quality sweep that represents the CURRENT regime. Freshness weight
         raised from 0.40 to 0.60 to further favour recent sweeps.
 
         Falls back to most-recent if all candidates are outside the window.
         """
-        window_ms = self.AMD_DISTRIB_WINDOW_MS   # 90 min — was 1.5× = 135 min
+        window_ms = self.AMD_DISTRIB_WINDOW_MS   # 90 min â€” was 1.5Ã— = 135 min
         candidates = [p for p in swept
                       if (now_ms - p.sweep_timestamp) < window_ms]
         if not candidates:
-            # All sweeps are old — fall back to most recent
+            # All sweeps are old â€” fall back to most recent
             return max(swept, key=lambda p: p.sweep_timestamp)
 
         def _sweep_quality(p: 'LiquidityLevel') -> float:
@@ -1137,16 +1163,16 @@ class ICTEngine:
     def _update_amd(self, price: float, now_ms: int,
                     candles_5m: Optional[List[Dict]] = None) -> None:
         """
-        AMD cycle: Accumulation → Manipulation → Distribution → Re-accumulation
+        AMD cycle: Accumulation â†’ Manipulation â†’ Distribution â†’ Re-accumulation
 
         PHASE TRANSITIONS (in order):
           MANIPULATION  < 15 min after sweep (Judas swing active, no entry)
           DISTRIBUTION  15-90 min, requires EITHER:
                           (a) 5m BOS confirmed AFTER the sweep timestamp, OR
-                          (b) displacement ≥ 1.0 ATR from sweep level confirms
+                          (b) displacement â‰¥ 1.0 ATR from sweep level confirms
                               delivery has started
                           Note: (a) adds +0.05 confidence; (b) adds 0.0
-          PRE-DIST      15-30 min, no BOS yet → extended MANIP with reduced conf
+          PRE-DIST      15-30 min, no BOS yet â†’ extended MANIP with reduced conf
           REACCUM/REDIS > 90 min, 15m trending but 5m ranging (mid-trend pause)
           ACCUMULATION  > 90 min, old sweep, confidence decays to neutral
 
@@ -1159,14 +1185,14 @@ class ICTEngine:
           Fix: bos_in_delivery_dir requires bos_timestamp > sweep_timestamp.
 
         DISPLACEMENT FALLBACK (no BOS case):
-          For bearish AMD (BSL swept at X): if price < X − 1.0×ATR, the delivery
+          For bearish AMD (BSL swept at X): if price < X âˆ’ 1.0Ã—ATR, the delivery
           leg is clearly underway regardless of 5m BOS state.
-          For bullish AMD (SSL swept at X): if price > X + 1.0×ATR, same logic.
+          For bullish AMD (SSL swept at X): if price > X + 1.0Ã—ATR, same logic.
           This ATR is approximated from the 5m range as a proxy since raw ATR is
           not stored on ICTEngine state.
 
         DELIVERY TARGET SCORING:
-          Most significant opposing pool (touch_count × weight / dist) wins.
+          Most significant opposing pool (touch_count Ã— weight / dist) wins.
           Higher touch_count = more clustered stops = stronger delivery magnet.
         """
         swept = [p for p in self.liquidity_pools if p.swept]
@@ -1177,7 +1203,7 @@ class ICTEngine:
             return
 
         # Bug-15 fix: use quality-weighted sweep selection instead of
-        # always taking the most recent — a minor low-conviction sweep should
+        # always taking the most recent â€” a minor low-conviction sweep should
         # not override a high-conviction sweep that is still in active delivery.
         latest      = self._select_best_sweep(swept, now_ms)
         age_ms      = now_ms - latest.sweep_timestamp
@@ -1186,7 +1212,7 @@ class ICTEngine:
 
         bias = "bullish" if sweep_type == "SSL" else "bearish"
 
-        # ── Confidence from sweep quality ────────────────────────────
+        # â”€â”€ Confidence from sweep quality â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         conf = 0.50
         # v3.0: graduated displacement confidence using continuous score
         _disp_sc = getattr(latest, 'displacement_score', 0.0)
@@ -1198,8 +1224,8 @@ class ICTEngine:
         freshness = max(0.0, 1.0 - age_ms / (self.AMD_DISTRIB_WINDOW_MS * 2))
         conf = min(0.95, conf + freshness * 0.15)
 
-        # ── ATR proxy from 5m candles ────────────────────────────────
-        # Bug-14 fix: the original formula used total-range × 0.025 which
+        # â”€â”€ ATR proxy from 5m candles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Bug-14 fix: the original formula used total-range Ã— 0.025 which
         # produced values ~80% too small versus the real ATR (e.g. $30 vs
         # $136 on BTC). This caused displacement_confirms to fire after a
         # trivial move, prematurely advancing AMD to DISTRIBUTION.
@@ -1220,10 +1246,10 @@ class ICTEngine:
         else:
             # Fallback only if candles unavailable (should not happen post-init)
             rng5m     = max(tf5m.range_high - tf5m.range_low, 1.0)
-            atr_proxy = max(rng5m * 0.035, 1.0)  # 3.5% of range ≈ 14-period ATR
+            atr_proxy = max(rng5m * 0.035, 1.0)  # 3.5% of range â‰ˆ 14-period ATR
 
-        # ── BOS gate: must have occurred AFTER the sweep ─────────────
-        # bos_timestamp == 0 means BOS was never set (warmup artifact) — treat as no BOS
+        # â”€â”€ BOS gate: must have occurred AFTER the sweep â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # bos_timestamp == 0 means BOS was never set (warmup artifact) â€” treat as no BOS
         bos_after_sweep = (
             tf5m.bos_timestamp > 0 and
             tf5m.bos_timestamp > latest.sweep_timestamp and
@@ -1231,19 +1257,19 @@ class ICTEngine:
              (bias == "bearish" and tf5m.bos_direction == "bearish"))
         )
 
-        # ── Displacement fallback: delivery leg started, BOS pending ─
-        # After BSL swept at X (bearish), distribution = price below X − 1×ATR
-        # After SSL swept at X (bullish), distribution = price above X + 1×ATR
+        # â”€â”€ Displacement fallback: delivery leg started, BOS pending â”€
+        # After BSL swept at X (bearish), distribution = price below X âˆ’ 1Ã—ATR
+        # After SSL swept at X (bullish), distribution = price above X + 1Ã—ATR
         displacement_confirms = (
             (bias == "bearish" and price < sweep_price - 1.0 * atr_proxy) or
             (bias == "bullish" and price > sweep_price + 1.0 * atr_proxy)
         )
 
-        # ── Phase determination ──────────────────────────────────────
+        # â”€â”€ Phase determination â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         EXTENDED_MANIP_MS = self.AMD_MANIP_WINDOW_MS + 900_000  # 15 + 15 = 30 min
 
         if age_ms < self.AMD_MANIP_WINDOW_MS:
-            # Acute manipulation — Judas swing still active, no entry
+            # Acute manipulation â€” Judas swing still active, no entry
             phase   = "MANIPULATION"
             details = (f"Judas swing {sweep_type} @ ${sweep_price:.0f} | "
                        f"{age_ms//1000:.0f}s ago")
@@ -1256,7 +1282,7 @@ class ICTEngine:
                 details = (f"Delivering after {sweep_type} sweep @ ${sweep_price:.0f} | "
                            f"{age_ms//60000:.0f}m ago | 5m_BOS confirmed")
             elif displacement_confirms:
-                # Price has moved ≥1 ATR in delivery direction — distributing
+                # Price has moved â‰¥1 ATR in delivery direction â€” distributing
                 phase   = "DISTRIBUTION"
                 details = (f"Delivering after {sweep_type} sweep @ ${sweep_price:.0f} | "
                            f"{age_ms//60000:.0f}m ago | displacement confirmed")
@@ -1265,7 +1291,7 @@ class ICTEngine:
                 phase   = "MANIPULATION"
                 conf    = max(conf - 0.08, 0.35)
                 details = (f"Post-sweep {sweep_type} @ ${sweep_price:.0f} | "
-                           f"{age_ms//60000:.0f}m — awaiting 5m BOS or displacement")
+                           f"{age_ms//60000:.0f}m â€” awaiting 5m BOS or displacement")
             else:
                 # Past 30 min with no BOS and no displacement: force DISTRIBUTION
                 # with reduced confidence (structural evidence missing but time
@@ -1292,7 +1318,7 @@ class ICTEngine:
                     bias = "neutral"
                 details = f"Old {sweep_type} sweep {age_ms//60000:.0f}m ago"
 
-        # ── Delivery target: most significant opposing unswept pool ──
+        # â”€â”€ Delivery target: most significant opposing unswept pool â”€â”€
         target = None
         unswept = [p for p in self.liquidity_pools if not p.swept]
 
@@ -1311,16 +1337,16 @@ class ICTEngine:
             if ssl:
                 target = max(ssl, key=_pool_score).price
 
-        # ── Reconcile bias with HTF MARKET STRUCTURE ─────────────────────
+        # â”€â”€ Reconcile bias with HTF MARKET STRUCTURE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # CRITICAL FIX: The sweep-derived bias is WRONG when the sweep is a
         # CONTINUATION sweep (liquidity consumed during a trend) rather than
         # a MANIPULATION sweep (Judas swing that reverses).
         #
         # EXAMPLE FROM LIVE BUG:
-        #   Price drops from $66,600 → $65,300 (clearly bearish distribution)
-        #   SSL @ $65,916 swept on the way down (continuation — not reversal)
+        #   Price drops from $66,600 â†’ $65,300 (clearly bearish distribution)
+        #   SSL @ $65,916 swept on the way down (continuation â€” not reversal)
         #   SSL @ $66,067 swept with displacement (continuation during drop)
-        #   Code says: SSL swept → bullish bias (WRONG — price is distributing DOWN)
+        #   Code says: SSL swept â†’ bullish bias (WRONG â€” price is distributing DOWN)
         #
         # ICT INSTITUTIONAL RULE:
         #   HTF structure (4H/1H) determines the MACRO bias.
@@ -1331,7 +1357,7 @@ class ICTEngine:
         # IMPLEMENTATION:
         #   1. Read 4H and 1H structure from ICT engine
         #   2. If HTF is directionally aligned (both bearish or both bullish),
-        #      OVERRIDE sweep-derived bias to match HTF — NO confidence gate.
+        #      OVERRIDE sweep-derived bias to match HTF â€” NO confidence gate.
         #   3. If HTF is mixed/ranging, keep sweep-derived bias (no override)
         #   4. If only 15m is available, require it to be strong to override
         st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
@@ -1341,11 +1367,11 @@ class ICTEngine:
         if phase in ("DISTRIBUTION", "REACCUMULATION", "REDISTRIBUTION", "MANIPULATION"):
             # Start with sweep-derived bias
             if sweep_type == "BSL":
-                bias = "bearish"   # ran buy stops above → deliver DOWN
+                bias = "bearish"   # ran buy stops above â†’ deliver DOWN
             else:
-                bias = "bullish"   # ran sell stops below → deliver UP
+                bias = "bullish"   # ran sell stops below â†’ deliver UP
 
-            # ── HTF OVERRIDE (no confidence gate — structure > sweep) ─────
+            # â”€â”€ HTF OVERRIDE (no confidence gate â€” structure > sweep) â”€â”€â”€â”€â”€
             # 4H is the dominant timeframe for institutional bias.
             # If 4H is clearly directional, it overrides sweep-derived bias.
             _4h_bearish = st_4h.trend == "bearish"
@@ -1362,27 +1388,27 @@ class ICTEngine:
             # Strong HTF consensus (2+ timeframes agree) overrides sweep
             if _bear_count >= 2 and bias == "bullish":
                 bias = "bearish"
-                details += f" | HTF OVERRIDE→bearish ({_bear_count}/3 TFs bearish)"
+                details += f" | HTF OVERRIDEâ†’bearish ({_bear_count}/3 TFs bearish)"
             elif _bull_count >= 2 and bias == "bearish":
                 bias = "bullish"
-                details += f" | HTF OVERRIDE→bullish ({_bull_count}/3 TFs bullish)"
+                details += f" | HTF OVERRIDEâ†’bullish ({_bull_count}/3 TFs bullish)"
 
             # Single strong 4H override (4H is institutional anchor)
             elif _4h_bearish and bias == "bullish":
                 bias = "bearish"
-                details += " | 4H OVERRIDE→bearish"
+                details += " | 4H OVERRIDEâ†’bearish"
             elif _4h_bullish and bias == "bearish":
                 bias = "bullish"
-                details += " | 4H OVERRIDE→bullish"
+                details += " | 4H OVERRIDEâ†’bullish"
 
         self._amd = AMDState(
             phase=phase, bias=bias, confidence=conf,
             sweep_origin=sweep_price, delivery_target=target,
             time_in_phase_ms=age_ms, sweep_type=sweep_type, details=details)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # OB DETECTION (unified for all timeframes)
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_obs(self, candles: List[Dict], price: float, now_ms: int,
                     tf: str, base_str: float, max_age: int) -> None:
@@ -1395,13 +1421,13 @@ class ICTEngine:
         """
         if len(candles) < 5:
             return
-        # Bug #42 fix: replace price×0.002 dedup tolerance with ATR-relative
-        # tolerance.  At BTC $95k: price×0.002 = $190, which merges valid OBs
-        # from consecutive sessions that happen to land $100–$180 apart.
-        # 0.10×ATR scales with actual volatility: at ATR=$265 this is $26.5 —
+        # Bug #42 fix: replace priceÃ—0.002 dedup tolerance with ATR-relative
+        # tolerance.  At BTC $95k: priceÃ—0.002 = $190, which merges valid OBs
+        # from consecutive sessions that happen to land $100â€“$180 apart.
+        # 0.10Ã—ATR scales with actual volatility: at ATR=$265 this is $26.5 â€”
         # tight enough to preserve genuinely distinct levels while still
         # collapsing near-exact duplicates from overlapping TF scans.
-        # When atr is not available (warmup), fall back to price×0.0003 ($28.5).
+        # When atr is not available (warmup), fall back to priceÃ—0.0003 ($28.5).
         _atr = getattr(self, '_last_atr', 0.0)
         tol = (_atr * 0.10) if _atr > 1.0 else (price * 0.0003)
         min_impulse = self.OB_MIN_IMPULSE_PCT * (0.60 if tf == "1m" else 1.0)
@@ -1417,12 +1443,12 @@ class ICTEngine:
 
         # Age pre-filter: skip candles whose OB timestamp would be older than
         # max_age already.  Without this, scanning 300 candles detects OBs that
-        # is_active() immediately rejects → they get re-inserted on the next call
-        # → detect/expire/re-detect churn that causes OB count fluctuation.
+        # is_active() immediately rejects â†’ they get re-inserted on the next call
+        # â†’ detect/expire/re-detect churn that causes OB count fluctuation.
         # A candle at bar i has timestamp ts = candle[i]['t'].  If ts < now_ms -
         # max_age, that candle's OB would expire on the first is_active() call.
         # We still need to scan it to provide context for impulse detection on
-        # candles after it — so we mark it rather than slicing the list.
+        # candles after it â€” so we mark it rather than slicing the list.
         _cutoff_ms = now_ms - max_age
 
         for i in range(2, len(candles) - 1):
@@ -1431,13 +1457,13 @@ class ICTEngine:
             ch, cl = float(cur['h']), float(cur['l'])
             ts = int(cur.get('t', now_ms))
             # Skip OB candidates whose age would already exceed max_age at
-            # detection time — they would be immediately inactive on next call.
+            # detection time â€” they would be immediately inactive on next call.
             if ts > 0 and ts < _cutoff_ms:
                 continue
 
             # BUG-OB-SINGLE-CANDLE-IMPULSE FIX: check up to 3 candles ahead.
             # Original code only looked at candles[i+1]; if the impulse arrived
-            # 2-3 bars later (OB → doji → big move) the OB was silently missed.
+            # 2-3 bars later (OB â†’ doji â†’ big move) the OB was silently missed.
             imp_up   = False
             imp_down = False
             nh = nl = no = nc = nr = nb = 0.0
@@ -1466,7 +1492,7 @@ class ICTEngine:
                 if large: s += 7.0
                 return min(s, 100.0)
 
-            # ── Bullish OB: bearish candle before bullish impulse ──────
+            # â”€â”€ Bullish OB: bearish candle before bullish impulse â”€â”€â”€â”€â”€â”€
             if imp_up and cc < co:
                 bos  = bool(prior_h and any(nh > ph for ph in prior_h[:5]))
                 disp = nr > 0 and nb / nr >= self.SWEEP_DISP_MIN
@@ -1478,7 +1504,7 @@ class ICTEngine:
                 s    = _score(bos, disp, wk, big)
                 # BUG-OB-ZONE FIX: store the candle BODY (open-to-close),
                 # not the full wick range.  Using wick-to-wick meant
-                # contains_price() fired on wick touches above the body —
+                # contains_price() fired on wick touches above the body â€”
                 # a non-event in ICT.  Bullish OB body = [close, open]
                 # because this is a bearish candle (cc < co).
                 ob_low, ob_high = cc, co
@@ -1490,7 +1516,7 @@ class ICTEngine:
                         has_displacement=disp, has_wick_rejection=wk,
                         max_age_ms=max_age))
 
-            # ── Bearish OB: bullish candle before bearish impulse ──────
+            # â”€â”€ Bearish OB: bullish candle before bearish impulse â”€â”€â”€â”€â”€â”€
             if imp_down and cc > co:
                 bos  = bool(prior_l and any(nl < pl for pl in prior_l[:5]))
                 disp = nr > 0 and nb / nr >= self.SWEEP_DISP_MIN
@@ -1511,20 +1537,20 @@ class ICTEngine:
                         has_displacement=disp, has_wick_rejection=wk,
                         max_age_ms=max_age))
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # FVG DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_fvgs(self, candles: List[Dict], tf: str,
                      price: float, now_ms: int, max_age: int) -> None:
         """
         3-candle FVG:
           Bullish FVG (upward impulse): c3.low > c1.high
-            → gap_bot = c1.high (h1), gap_top = c3.low (l3)
-            → price attracted back DOWN to fill this upward imbalance.
+            â†’ gap_bot = c1.high (h1), gap_top = c3.low (l3)
+            â†’ price attracted back DOWN to fill this upward imbalance.
           Bearish FVG (downward impulse): c1.low > c3.high
-            → gap_bot = c3.high (h3), gap_top = c1.low (l1)
-            → price attracted back UP to fill this downward imbalance.
+            â†’ gap_bot = c3.high (h3), gap_top = c1.low (l1)
+            â†’ price attracted back UP to fill this downward imbalance.
 
         BUG-FVG-DIRECTION FIX: the original code had both definitions
         completely swapped.  It stored downward-move gaps (l1 > h3) in
@@ -1539,12 +1565,12 @@ class ICTEngine:
         _tf_mult = {"1m": 0.40, "5m": 0.70, "15m": 1.0, "1h": 1.2, "4h": 1.5, "1d": 2.0}
         min_sz = price * self.FVG_MIN_SIZE_PCT / 100.0 * _tf_mult.get(tf, 1.0)
         # FVG dedup tolerance: 0.15% of price (~$105 at $70k).
-        # Using min_sz*0.5 (~$5-$10) was far too tight — two FVGs detected
+        # Using min_sz*0.5 (~$5-$10) was far too tight â€” two FVGs detected
         # from consecutive scans with microscopically different candle timestamps
         # but identical levels would both be inserted, doubling FVG count.
         tol    = price * 0.0015
 
-        # Age pre-filter: same logic as _detect_obs — skip candles that would
+        # Age pre-filter: same logic as _detect_obs â€” skip candles that would
         # produce FVGs already beyond max_age, preventing detect/expire churn.
         _fvg_cutoff_ms = now_ms - max_age
 
@@ -1577,9 +1603,9 @@ class ICTEngine:
                         bottom=gap_bot2, top=gap_top2, timestamp=ts,
                         direction="bearish", timeframe=tf, max_age_ms=max_age))
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # FVG FILL TRACKING
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_fvg_fills(self, candles: List[Dict], tf: str = "") -> None:
         """
@@ -1589,7 +1615,7 @@ class ICTEngine:
 
         ROOT CAUSE OF 0 FVGs: the old code used 5m and 1m candle closes to
         fill ALL FVGs regardless of source timeframe. A 5m candle closing past
-        the midpoint of a 4h FVG marked it as "mitigated" — killing all HTF
+        the midpoint of a 4h FVG marked it as "mitigated" â€” killing all HTF
         FVGs in ranging markets.
 
         Institutional ICT: FVG mitigation requires a CLOSE on the SAME
@@ -1606,9 +1632,9 @@ class ICTEngine:
                     continue  # skip: wrong TF candles for this FVG
                 fvg.update_fill(check)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # SWING POINTS (combined for liquidity detection)
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_swing_points(self, candles_5m: List[Dict],
                               candles_15m: List[Dict],
@@ -1627,7 +1653,7 @@ class ICTEngine:
         self._swing_highs_meta.clear()
         self._swing_lows_meta.clear()
 
-        # LTF swings (5m, 15m) — liquidity pool tag: 5m or 15m
+        # LTF swings (5m, 15m) â€” liquidity pool tag: 5m or 15m
         for candles, tf_tag in ((candles_5m, "5m"), (candles_15m, "15m")):
             if len(candles) < 7:
                 continue
@@ -1643,7 +1669,7 @@ class ICTEngine:
                     self._swing_lows.append(l)
                     self._swing_lows_meta.append((l, tf_tag))
 
-        # HTF swings — tighter fractal (2/2) since HTF candles are already slow
+        # HTF swings â€” tighter fractal (2/2) since HTF candles are already slow
         for candles, tf_tag in (
                 (candles_1h  or [], "1h"),
                 (candles_4h  or [], "4h"),
@@ -1662,9 +1688,9 @@ class ICTEngine:
                     self._swing_lows.append(l)
                     self._swing_lows_meta.append((l, tf_tag))
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # LIQUIDITY POOL DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_liquidity_pools(self, price: float, now_ms: int) -> None:
         """Cluster equal highs (BSL) and equal lows (SSL).
@@ -1685,20 +1711,20 @@ class ICTEngine:
         """
         tol = price * self.LIQ_TOUCH_TOL_PCT
 
-        # ── Step 1: Build fresh candidate pools from current swing data ─
+        # â”€â”€ Step 1: Build fresh candidate pools from current swing data â”€
         _fresh_pools: List[LiquidityLevel] = []
         self._cluster_liq_into(_fresh_pools, self._swing_highs, "BSL", tol, price,
                                meta=self._swing_highs_meta)
         self._cluster_liq_into(_fresh_pools, self._swing_lows, "SSL", tol, price,
                                meta=self._swing_lows_meta)
 
-        # BUG-6 FIX: Steps 2+3 were O(n×m) — `any(abs(existing.price - fresh.price) <= tol …)`
+        # BUG-6 FIX: Steps 2+3 were O(nÃ—m) â€” `any(abs(existing.price - fresh.price) <= tol â€¦)`
         # iterated over all _fresh_pools for every existing pool, then again for every fresh pool.
-        # Worst case: 200 existing × 200 fresh = 40 000 comparisons every 5 seconds.
-        # Fix: build a keyed index of fresh pools — key = (round(price, 0), level_type).
+        # Worst case: 200 existing Ã— 200 fresh = 40 000 comparisons every 5 seconds.
+        # Fix: build a keyed index of fresh pools â€” key = (round(price, 0), level_type).
         # Two pools that map to the same key are guaranteed within `tol` of each other
-        # when tol ≈ price * 0.001 (0.1 %), because the rounding bucket size (1 USD) is
-        # far smaller than tol (≈$65 on a $65 000 BTC price), so any pair within tol
+        # when tol â‰ˆ price * 0.001 (0.1 %), because the rounding bucket size (1 USD) is
+        # far smaller than tol (â‰ˆ$65 on a $65 000 BTC price), so any pair within tol
         # will always round to the same integer dollar bucket.
         _fresh_index: Dict[Tuple[float, str], LiquidityLevel] = {}
         for fp in _fresh_pools:
@@ -1715,7 +1741,7 @@ class ICTEngine:
                 return fp
             return None
 
-        # ── Step 2: Partition existing pools ────────────────────────────
+        # â”€â”€ Step 2: Partition existing pools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         max_swept_age = self.AMD_DISTRIB_WINDOW_MS * 3
         kept: List[LiquidityLevel] = []
 
@@ -1736,9 +1762,9 @@ class ICTEngine:
                 if _TF_R.get(fp.timeframe, 1) > _TF_R.get(existing.timeframe, 1):
                     existing.timeframe = fp.timeframe
                 kept.append(existing)
-            # else: pool lost swing support → drop it (structural invalidation)
+            # else: pool lost swing support â†’ drop it (structural invalidation)
 
-        # ── Step 3: Add genuinely new pools not already in kept ─────────
+        # â”€â”€ Step 3: Add genuinely new pools not already in kept â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Build an O(1) index over the kept list to avoid a nested loop.
         _kept_index: Dict[Tuple[float, str], bool] = {
             (round(k.price, 0), k.level_type): True for k in kept
@@ -1758,7 +1784,7 @@ class ICTEngine:
         # transferring touch_count from dropped duplicates to the survivor.
         if len(kept) > 1:
             _deduped: List[LiquidityLevel] = []
-            # Process BSL and SSL separately — a BSL and SSL at the same price
+            # Process BSL and SSL separately â€” a BSL and SSL at the same price
             # are distinct (different sides).
             for _side in ("BSL", "SSL"):
                 _side_pools = sorted(
@@ -1768,7 +1794,7 @@ class ICTEngine:
                 _last: Optional[LiquidityLevel] = None
                 for p in _side_pools:
                     if _last is not None and abs(p.price - _last.price) <= tol:
-                        # Duplicate — merge touch_count into the survivor
+                        # Duplicate â€” merge touch_count into the survivor
                         _last.touch_count = max(_last.touch_count, p.touch_count)
                         # Prefer higher-TF label
                         _TF_R2 = {"1d": 5, "4h": 4, "1h": 3, "15m": 2, "5m": 1}
@@ -1784,7 +1810,7 @@ class ICTEngine:
                     _last = p
             kept = _deduped
 
-        # ── Step 4: Replace the deque ──────────────────────────────────
+        # â”€â”€ Step 4: Replace the deque â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self.liquidity_pools.clear()
         for p in kept:
             self.liquidity_pools.append(p)
@@ -1830,7 +1856,7 @@ class ICTEngine:
     def _cluster_liq(self, prices: List[float], kind: str,
                      tol: float, ref: float,
                      meta: Optional[List[Tuple[float, str]]] = None) -> None:
-        """Legacy wrapper — delegates to _cluster_liq_into writing to self.liquidity_pools."""
+        """Legacy wrapper â€” delegates to _cluster_liq_into writing to self.liquidity_pools."""
         _tmp: List = []
         self._cluster_liq_into(_tmp, prices, kind, tol, ref, meta=meta)
         for p in _tmp:
@@ -1838,9 +1864,9 @@ class ICTEngine:
                        for lp in self.liquidity_pools):
                 self.liquidity_pools.append(p)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # LIQUIDITY SWEEP DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_sweeps(self, candles_5m: List[Dict], candles_15m: List[Dict],
                        price: float, now_ms: int,
@@ -1866,13 +1892,33 @@ class ICTEngine:
         # pools swept in the same 5-min window collided on the same bucket key,
         # causing one sweep to be silently dropped.
         # Using now_ms means each call to update() within the same sweep session
-        # gets a unique key — which is correct, since we only call update() when
+        # gets a unique key â€” which is correct, since we only call update() when
         # new candle data arrives (not every tick).
         # The _registered_sweeps deque with maxlen=500 prevents unbounded growth.
 
         def _candle_ts(c: dict) -> int:
             raw = c.get('t', 0)
             return int(raw) if raw else now_ms
+
+        def _record_sweep_event(pool: LiquidityLevel, c: dict,
+                                disp: bool, disp_score: float) -> None:
+            ts = _candle_ts(c)
+            key = (round(pool.price, 0), pool.level_type, ts)
+            for ev in reversed(self.sweep_events):
+                if (round(ev.price, 0), ev.level_type, ev.sweep_timestamp) == key:
+                    return
+            self.sweep_events.append(ICTSweepRecord(
+                price=pool.price,
+                level_type=pool.level_type,
+                sweep_timestamp=ts,
+                displacement_confirmed=disp,
+                displacement_score=disp_score,
+                wick_rejection=True,
+                candle_high=float(c['h']),
+                candle_low=float(c['l']),
+                candle_close=float(c['c']),
+                timeframe=getattr(pool, 'timeframe', '5m') or '5m',
+            ))
 
         for pool in list(self.liquidity_pools):
             if pool.swept:
@@ -1895,9 +1941,10 @@ class ICTEngine:
                     pool.displacement_confirmed = disp
                     pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
+                    _record_sweep_event(pool, c, disp, disp_score)
                     logger.info(
-                        f"🔱 ICT BSL SWEPT @ ${pool.price:.0f} disp={disp}"
-                        f"({disp_score:.2f}) → BEARISH BIAS")
+                        f"ðŸ”± ICT BSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) â†’ BEARISH BIAS")
                     break
 
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
@@ -1909,14 +1956,15 @@ class ICTEngine:
                     pool.displacement_confirmed = disp
                     pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
+                    _record_sweep_event(pool, c, disp, disp_score)
                     logger.info(
-                        f"🔱 ICT SSL SWEPT @ ${pool.price:.0f} disp={disp}"
-                        f"({disp_score:.2f}) → BULLISH BIAS")
+                        f"ðŸ”± ICT SSL SWEPT @ ${pool.price:.0f} disp={disp}"
+                        f"({disp_score:.2f}) â†’ BULLISH BIAS")
                     break
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # OB MITIGATION TRACKING
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_ob_mitigation(self, candles: List[Dict]) -> None:
         """
@@ -1924,7 +1972,7 @@ class ICTEngine:
 
         BUG-OB-MITIGATION-NO-CLOSE-CHECK FIX: the original code only used
         visit_count as a proxy for mitigation.  In ICT, an OB is MITIGATED
-        when a candle CLOSES through the OB's opposite extreme — not when
+        when a candle CLOSES through the OB's opposite extreme â€” not when
         price merely touches or wicks through it.
 
           Bullish OB (body = [low, high], low=close, high=open of the bear candle):
@@ -1935,7 +1983,7 @@ class ICTEngine:
             Mitigated when a candle CLOSES ABOVE the OB high (bullish close
             pierces the top of the OB body).
 
-        Uses the last CLOSED candle ([-2]) — not the forming candle.
+        Uses the last CLOSED candle ([-2]) â€” not the forming candle.
         """
         if len(candles) < 2:
             return
@@ -1959,9 +2007,9 @@ class ICTEngine:
                     f"OB mitigated: bear ${ob.low:.0f}-${ob.high:.0f} "
                     f"tf={ob.timeframe} close=${last_close:.0f} > ob.high")
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # OB VISIT TRACKING
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_ob_visits(self, price: float, now_ms: int) -> None:
         cooldown = {(True, True): 600_000, (True, False): 450_000,
@@ -1974,19 +2022,19 @@ class ICTEngine:
                 ob.visit_count       += 1
                 ob._last_visit_time   = now_ms
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # BREAKER BLOCK DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_breaker_blocks(self, candles: List[Dict], now_ms: int) -> None:
         """
         Detect Breaker Blocks from recently mitigated OBs.
 
         A Breaker Block forms when:
-          1. A Bullish OB is mitigated (close below ob.low) → becomes Bearish Breaker
-          2. A Bearish OB is mitigated (close above ob.high) → becomes Bullish Breaker
+          1. A Bullish OB is mitigated (close below ob.low) â†’ becomes Bearish Breaker
+          2. A Bearish OB is mitigated (close above ob.high) â†’ becomes Bullish Breaker
 
-        The Breaker zone IS the mitigated OB zone — price is expected to retrace
+        The Breaker zone IS the mitigated OB zone â€” price is expected to retrace
         back into it and then continue in the new (flipped) direction.
         """
         if len(candles) < 2:
@@ -1997,7 +2045,7 @@ class ICTEngine:
         for ob in self.order_blocks_bull:
             if not ob.mitigated:
                 continue
-            # Bull OB mitigated → Bearish Breaker (resistance)
+            # Bull OB mitigated â†’ Bearish Breaker (resistance)
             if not any(abs(b.low - ob.low) < 5.0 and abs(b.high - ob.high) < 5.0
                        for b in self.breaker_blocks_bear):
                 self.breaker_blocks_bear.append(BreakerBlock(
@@ -2006,12 +2054,12 @@ class ICTEngine:
                     timeframe=ob.timeframe, strength=ob.strength,
                     max_age_ms=self.HTF_OB_MAX_AGE_MS))
                 logger.debug(
-                    f"📦 BREAKER BEAR: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
+                    f"ðŸ“¦ BREAKER BEAR: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
 
         for ob in self.order_blocks_bear:
             if not ob.mitigated:
                 continue
-            # Bear OB mitigated → Bullish Breaker (support)
+            # Bear OB mitigated â†’ Bullish Breaker (support)
             if not any(abs(b.low - ob.low) < 5.0 and abs(b.high - ob.high) < 5.0
                        for b in self.breaker_blocks_bull):
                 self.breaker_blocks_bull.append(BreakerBlock(
@@ -2020,11 +2068,11 @@ class ICTEngine:
                     timeframe=ob.timeframe, strength=ob.strength,
                     max_age_ms=self.HTF_OB_MAX_AGE_MS))
                 logger.debug(
-                    f"📦 BREAKER BULL: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
+                    f"ðŸ“¦ BREAKER BULL: ${ob.low:.0f}-${ob.high:.0f} tf={ob.timeframe}")
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # REJECTION BLOCK DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_rejection_blocks(self, candles: List[Dict],
                                   price: float, now_ms: int, tf: str) -> None:
@@ -2034,9 +2082,9 @@ class ICTEngine:
         A Rejection Block occurs when:
           - Price enters a bull OB (wicks below ob.high into ob range)
           - But CLOSES back ABOVE ob.high (rejected from inside)
-          - And the lower wick is ≥ 50% of the candle's total range
+          - And the lower wick is â‰¥ 50% of the candle's total range
 
-        This creates a strong reversal signal — the OB held as support.
+        This creates a strong reversal signal â€” the OB held as support.
         Symmetric logic for bear OBs (wick up into zone, close below).
         """
         if len(candles) < 3:
@@ -2079,17 +2127,17 @@ class ICTEngine:
                                 wick_size_pct=round(wick_dn / cr, 2),
                                 strength=ob.strength + 10.0))
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PROPULSION OB DETECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _detect_propulsion_obs(self, now_ms: int) -> None:
         """
-        Identify Propulsion OBs — the specific OBs whose impulse caused a BOS.
+        Identify Propulsion OBs â€” the specific OBs whose impulse caused a BOS.
 
         In ICT, the OB immediately BEFORE a BOS impulse is the most significant
-        structural level — institutional orders at that price caused the market
-        to break structure.  These are 'Propulsion Blocks' — the highest-
+        structural level â€” institutional orders at that price caused the market
+        to break structure.  These are 'Propulsion Blocks' â€” the highest-
         conviction re-entry zones after price returns.
 
         Detection: for each TF that has a confirmed BOS, find the last active OB
@@ -2122,9 +2170,9 @@ class ICTEngine:
                                for p in self._propulsion_obs_bear):
                         self._propulsion_obs_bear.append(best)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # DEALING RANGE
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_dealing_range(self, price: float) -> None:
         """
@@ -2133,7 +2181,7 @@ class ICTEngine:
 
         BUG-8 FIX: When swept pools at $68K+ are used as DR anchors, the 'low'
         (SSL) ends up ABOVE current price ($66.7K), producing current_pd < 0
-        (−370% to −409%). This happens because:
+        (âˆ’370% to âˆ’409%). This happens because:
           1. Multiple SSL/BSL pools were swept during the stop-hunt
           2. The remaining 'best_ssl' (highest sig) is actually above current price
           3. The formula (price - ssl) / range becomes negative
@@ -2142,10 +2190,10 @@ class ICTEngine:
           After selecting best_ssl and best_bsl, verify:
           - best_ssl.price < price (SSL must be BELOW current price)
           - best_bsl.price > price (BSL must be ABOVE current price)
-          - range must be at least 0.5 × 15m ATR (not a degenerate range)
+          - range must be at least 0.5 Ã— 15m ATR (not a degenerate range)
 
         If validation fails, FALL BACK to the current 15m confirmed swing range
-        (last confirmed swing low → last confirmed swing high). This always
+        (last confirmed swing low â†’ last confirmed swing high). This always
         produces a valid DR because _analyze_structure only sets range_high/low
         from confirmed fractal swings, never from active sweeps.
 
@@ -2159,7 +2207,7 @@ class ICTEngine:
         def sig(p):
             return p.touch_count * TF_WEIGHT.get(getattr(p, 'timeframe', '5m'), 1)
 
-        # ── Attempt pool-anchored DR ──────────────────────────────────────
+        # â”€â”€ Attempt pool-anchored DR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         low = high = None
         ssl_tf = bsl_tf = "pool"
         if ssl_below and bsl_above:
@@ -2174,7 +2222,7 @@ class ICTEngine:
                 ssl_tf = getattr(best_ssl, 'timeframe', '5m')
                 bsl_tf = getattr(best_bsl, 'timeframe', '5m')
 
-        # ── Fallback: use 15m confirmed swing structure ───────────────────
+        # â”€â”€ Fallback: use 15m confirmed swing structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if low is None:
             st_15m = self._tf.get("15m", TFStructure(timeframe="15m"))
             # last_sl_ and last_sh are from confirmed fractal swings in full 60-bar window
@@ -2211,16 +2259,16 @@ class ICTEngine:
             bsl_source_tf=bsl_tf,
             range_size=rng)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # POWER OF 3
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_po3(self, now_ms: int) -> None:
         """
         Power of 3: session-time-based AMD phase estimation.
 
         Divides each active session into three equal time periods:
-          Accumulation → Manipulation → Distribution
+          Accumulation â†’ Manipulation â†’ Distribution
         """
         try:
             dt  = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
@@ -2278,14 +2326,14 @@ class ICTEngine:
                 session_progress=round(sess_prog, 3),
                 phase_progress=round(phase_prog, 3),
                 session_start_utc=sess_start,
-                session_end_utc=sess_end,  # no cap — wrap-around handled by uh_norm
+                session_end_utc=sess_end,  # no cap â€” wrap-around handled by uh_norm
                 is_prime_entry_window=is_prime)
         except Exception:
             self._po3 = None
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # IPDA LEVELS
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_ipda(self, candles_1d: List[Dict], price: float) -> None:
         """
@@ -2316,15 +2364,15 @@ class ICTEngine:
         d40_l   = _lo(candles_1d[-40:]) if len(candles_1d) >= 40 else d20_l
 
         # Bias: determined by price position relative to PQ equilibrium.
-        # Below PQ midpoint → bullish draw (targeting PQH).
-        # Above PQ midpoint → bearish draw (targeting PQL).
-        # Previous logic: price < PQH → bullish (always true in any pullback).
+        # Below PQ midpoint â†’ bullish draw (targeting PQH).
+        # Above PQ midpoint â†’ bearish draw (targeting PQL).
+        # Previous logic: price < PQH â†’ bullish (always true in any pullback).
         pq_eq = (pq_high + pq_low) / 2.0 if (pq_high > 0 and pq_low > 0) else 0.0
         if pq_eq > 0:
             if price < pq_eq:
-                bias = "bullish"    # below PQ equilibrium → drawing to PQH
+                bias = "bullish"    # below PQ equilibrium â†’ drawing to PQH
             elif price > pq_eq:
-                bias = "bearish"    # above PQ equilibrium → drawing to PQL
+                bias = "bearish"    # above PQ equilibrium â†’ drawing to PQL
             else:
                 bias = "neutral"
         else:
@@ -2350,9 +2398,9 @@ class ICTEngine:
             day_40_high=d40_h, day_40_low=d40_l,
             bias=bias, nearest_draw=nearest_val, nearest_draw_label=nearest_lbl)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # SESSION / KILL ZONE
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _update_session(self, now_ms: int) -> None:
         """Unified session and kill zone detection in NY time to prevent DST desync."""
@@ -2417,16 +2465,16 @@ class ICTEngine:
                 self._session  = "NEW_YORK"
             elif _ny_sess:
                 self._session  = "NEW_YORK"
-            # 16.0–KZ_ASIA_START → OFF_HOURS (default)
+            # 16.0â€“KZ_ASIA_START â†’ OFF_HOURS (default)
 
         except Exception:
             self._session  = "UNKNOWN"
             self._killzone = ""
 
-    # ─────────────────────────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: ORDER-FLOW DATA INJECTION
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def set_order_flow_data(self, tick_flow: float, cvd_trend: float) -> None:
         """
@@ -2434,7 +2482,7 @@ class ICTEngine:
 
         Called by quant_strategy.py each tick BEFORE get_confluence() so that
         the liquidity score reflects the most current order-flow state.
-        Hunt prediction is now delegated to DirectionEngine — see
+        Hunt prediction is now delegated to DirectionEngine â€” see
         inject_hunt_prediction() below.
 
         tick_flow:  TickFlowEngine signal in [-1, +1].
@@ -2454,7 +2502,7 @@ class ICTEngine:
         Called by quant_strategy.py immediately after DirectionEngine.predict_hunt()
         so that get_confluence(), get_status(), and get_full_status() continue to
         consume hunt data without modification.  ICTEngine no longer owns the
-        prediction logic — it owns the structural context that DirectionEngine reads.
+        prediction logic â€” it owns the structural context that DirectionEngine reads.
 
         pred_dict keys (mirrors old predict_next_hunt return shape):
           predicted, confidence, delivery_direction, raw_score,
@@ -2464,14 +2512,14 @@ class ICTEngine:
         self._last_hunt_pred = pred_dict or {}
         self._last_hunt_ms   = now_ms
 
-    # ─────────────────────────────────────────────────────────────────────
-    # DEPRECATED: predict_next_hunt() — kept as private fallback only.
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # DEPRECATED: predict_next_hunt() â€” kept as private fallback only.
     # Hunt prediction has been moved to direction_engine.DirectionEngine.
     # ICTEngine exposes inject_hunt_prediction() so callers (get_confluence,
     # get_status, Tier-L) remain unchanged.  Do NOT promote this back to
-    # public — it would create a split-brain where two engines produce
+    # public â€” it would create a split-brain where two engines produce
     # conflicting hunt signals with different factor weights.
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _predict_next_hunt(self, price: float, atr: float, now_ms: int,
                            candles_5m: Optional[List[Dict]] = None) -> Dict:
@@ -2479,32 +2527,32 @@ class ICTEngine:
         9-factor prediction of which liquidity pool gets hunted FIRST.
 
         This is the primary decision signal for the unified engine.
-        All factors use data already available inside ICTEngine — no new
+        All factors use data already available inside ICTEngine â€” no new
         API calls, no external dependencies beyond set_order_flow_data().
 
         Returns a dict:
           predicted:          "BSL" | "SSL" | None
-          confidence:         0.0–1.0  (absolute prediction strength)
+          confidence:         0.0â€“1.0  (absolute prediction strength)
           delivery_direction: "bearish" | "bullish"  (direction AFTER hunt)
           scenario:           "CONTINUATION" | "REVERSAL" | "PULLBACK_CONT"
           bsl_score:          raw score for BSL hunt
           ssl_score:          raw score for SSL hunt
-          dealing_range_pd:   current P/D position 0–1
+          dealing_range_pd:   current P/D position 0â€“1
           reason:             human-readable explanation string
           swept_pool:         price of predicted target pool
           opposing_pool:      price of post-hunt delivery target
           confidence_factors: dict of per-factor contributions
 
         Factor weights (sum to 1.0):
-          1. AMD phase + bias          0.25  — strongest signal
-          2. Dealing-range P/D         0.18  — position within range
-          3. Order-flow (tick_flow)    0.15  — real-time buying/selling
-          4. CVD slope                 0.12  — sustained volume pressure
-          5. OB magnet pull            0.10  — OBs between price and pool
-          6. FVG path density          0.08  — FVG delivery highways
-          7. Displacement bias         0.07  — recent candle body direction
-          8. Session timing            0.03  — London/NY session tendencies
-          9. Micro-structure (5m BOS)  0.02  — short-term structure break
+          1. AMD phase + bias          0.25  â€” strongest signal
+          2. Dealing-range P/D         0.18  â€” position within range
+          3. Order-flow (tick_flow)    0.15  â€” real-time buying/selling
+          4. CVD slope                 0.12  â€” sustained volume pressure
+          5. OB magnet pull            0.10  â€” OBs between price and pool
+          6. FVG path density          0.08  â€” FVG delivery highways
+          7. Displacement bias         0.07  â€” recent candle body direction
+          8. Session timing            0.03  â€” London/NY session tendencies
+          9. Micro-structure (5m BOS)  0.02  â€” short-term structure break
         """
         _WEIGHTS = {
             "amd":       0.25,
@@ -2551,21 +2599,21 @@ class ICTEngine:
         range_size = max(bsl_price - ssl_price, 1e-9)
         a = max(atr, 1e-9)
 
-        # Score: positive → BSL hunt more likely, negative → SSL hunt
+        # Score: positive â†’ BSL hunt more likely, negative â†’ SSL hunt
         components: Dict[str, float] = {}
 
-        # ── Factor 1: AMD phase + bias (0.25) ─────────────────────────────
+        # â”€â”€ Factor 1: AMD phase + bias (0.25) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # MANIPULATION with bearish bias = price going to run BSL (Judas swing up)
         # before delivering DOWN. Score: +BSL for bullish Judas, +SSL for bearish.
-        # DISTRIBUTION confirms which side was swept → score the opposing side.
+        # DISTRIBUTION confirms which side was swept â†’ score the opposing side.
         f_amd = 0.0
         amd = self._amd
         if amd.phase == "MANIPULATION":
             if amd.bias == "bullish":
-                # SSL was swept → bullish delivery → BSL is the next target
+                # SSL was swept â†’ bullish delivery â†’ BSL is the next target
                 f_amd = +0.80
             elif amd.bias == "bearish":
-                # BSL was swept → bearish delivery → SSL is the next target
+                # BSL was swept â†’ bearish delivery â†’ SSL is the next target
                 f_amd = -0.80
         elif amd.phase in ("DISTRIBUTION", "REDISTRIBUTION"):
             if amd.bias == "bullish":
@@ -2573,32 +2621,32 @@ class ICTEngine:
             elif amd.bias == "bearish":
                 f_amd = -0.70   # delivering down to SSL
         elif amd.phase == "REACCUMULATION":
-            f_amd = +0.40   # mid-trend pause → resume bullish → BSL
+            f_amd = +0.40   # mid-trend pause â†’ resume bullish â†’ BSL
         elif amd.phase == "ACCUMULATION":
-            f_amd = 0.0     # neutral — no directional AMD signal
+            f_amd = 0.0     # neutral â€” no directional AMD signal
         f_amd *= amd.confidence
         f_amd = max(-1.0, min(1.0, f_amd))
         components["amd"] = f_amd
 
-        # ── Factor 2: Dealing-range P/D position (0.18) ──────────────────
-        # Deep discount → SSL unlikely target (price far from SSL), BSL likely.
-        # Deep premium → BSL unlikely, SSL likely.
+        # â”€â”€ Factor 2: Dealing-range P/D position (0.18) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Deep discount â†’ SSL unlikely target (price far from SSL), BSL likely.
+        # Deep premium â†’ BSL unlikely, SSL likely.
         # Linear: f_dr = +1.0 at dr_pd=0, -1.0 at dr_pd=1.0
         f_dr = 1.0 - 2.0 * dr_pd   # discount=+1, premium=-1
         f_dr = max(-1.0, min(1.0, f_dr))
         components["dr_pos"] = f_dr
 
-        # ── Factor 3: Order-flow tick pressure (0.15) ─────────────────────
-        # tick_flow > 0 = net buying → BSL hunt; < 0 → SSL hunt
+        # â”€â”€ Factor 3: Order-flow tick pressure (0.15) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # tick_flow > 0 = net buying â†’ BSL hunt; < 0 â†’ SSL hunt
         f_flow = _fast_sigmoid(self._tick_flow, steepness=1.5)
         components["flow"] = f_flow
 
-        # ── Factor 4: CVD slope (0.12) ────────────────────────────────────
-        # Rising CVD = institutions buying → targeting BSL stops
+        # â”€â”€ Factor 4: CVD slope (0.12) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Rising CVD = institutions buying â†’ targeting BSL stops
         f_cvd = _fast_sigmoid(self._cvd_trend, steepness=1.2)
         components["cvd"] = f_cvd
 
-        # ── Factor 5: OB magnet pull (0.10) ───────────────────────────────
+        # â”€â”€ Factor 5: OB magnet pull (0.10) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Bullish OBs between price and BSL pull price toward BSL.
         # Bearish OBs between price and SSL pull price toward SSL.
         f_ob = 0.0
@@ -2618,7 +2666,7 @@ class ICTEngine:
             pass
         components["ob_magnet"] = f_ob
 
-        # ── Factor 6: FVG path density (0.08) ────────────────────────────
+        # â”€â”€ Factor 6: FVG path density (0.08) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Unfilled bullish FVGs between price and BSL = upward delivery highway.
         # Unfilled bearish FVGs between price and SSL = downward delivery highway.
         f_fvg = 0.0
@@ -2636,8 +2684,8 @@ class ICTEngine:
             pass
         components["fvg_path"] = f_fvg
 
-        # ── Factor 7: Displacement bias from recent 5m candles (0.07) ────
-        # Net bullish bodies → BSL hunt; net bearish → SSL hunt
+        # â”€â”€ Factor 7: Displacement bias from recent 5m candles (0.07) â”€â”€â”€â”€
+        # Net bullish bodies â†’ BSL hunt; net bearish â†’ SSL hunt
         f_disp = 0.0
         _c5 = candles_5m or []
         if len(_c5) >= 6 and a > 1e-10:
@@ -2655,7 +2703,7 @@ class ICTEngine:
                 f_disp = -0.50
         components["disp_bias"] = f_disp
 
-        # ── Factor 8: Session timing (0.03) ───────────────────────────────
+        # â”€â”€ Factor 8: Session timing (0.03) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Uses self._session / self._killzone already computed by _update_session()
         # (called in update()).  This avoids the previous DST bug (hardcoded UTC
         # minutes 480-540 / 810-930 were only correct for EDT, wrong by 1h in EST)
@@ -2678,7 +2726,7 @@ class ICTEngine:
             pass
         components["session"] = f_sess
 
-        # ── Factor 9: 5m micro-structure BOS (0.02) ───────────────────────
+        # â”€â”€ Factor 9: 5m micro-structure BOS (0.02) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         f_micro = 0.0
         t5m = self._tf.get("5m")
         if t5m is not None:
@@ -2688,7 +2736,7 @@ class ICTEngine:
                 f_micro = -0.80
         components["micro"] = f_micro
 
-        # ── Weighted sum ───────────────────────────────────────────────────
+        # â”€â”€ Weighted sum â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         score = sum(components[k] * _WEIGHTS[k] for k in _WEIGHTS)
         score = max(-1.0, min(1.0, score))
 
@@ -2714,7 +2762,7 @@ class ICTEngine:
 
         # Determine predicted pool and delivery direction
         if score > 0:
-            # Heading to BSL → BSL swept → delivery DOWN to SSL
+            # Heading to BSL â†’ BSL swept â†’ delivery DOWN to SSL
             predicted          = "BSL"
             delivery_direction = "bearish"
             swept_pool_price   = bsl_price
@@ -2724,7 +2772,7 @@ class ICTEngine:
                       f"DR_pd={dr_pd:.2f} | "
                       f"flow={self._tick_flow:+.2f} cvd={self._cvd_trend:+.2f}")
         else:
-            # Heading to SSL → SSL swept → delivery UP to BSL
+            # Heading to SSL â†’ SSL swept â†’ delivery UP to BSL
             predicted          = "SSL"
             delivery_direction = "bullish"
             swept_pool_price   = ssl_price
@@ -2759,11 +2807,11 @@ class ICTEngine:
         After the hunted pool is reached/swept, predict the POST-HUNT scenario.
 
         Three scenarios (mutually exclusive, scored by evidence):
-          CONTINUATION    — price continues PAST the hunt target without reversing.
+          CONTINUATION    â€” price continues PAST the hunt target without reversing.
                             Evidence: strong AMD, multiple TF alignment, no HTF opposing OB.
-          REVERSAL        — price sweeps the pool and reverses immediately.
+          REVERSAL        â€” price sweeps the pool and reverses immediately.
                             Evidence: AMD flip, displacement confirmed, OTE zone reached.
-          PULLBACK_CONT   — price reverses slightly (OTE retracement) then continues.
+          PULLBACK_CONT   â€” price reverses slightly (OTE retracement) then continues.
                             Evidence: AMD distribution, FVG in OTE zone, moderate flow.
 
         The scenario drives:
@@ -2773,7 +2821,7 @@ class ICTEngine:
 
         Returns:
           scenario:       "CONTINUATION" | "REVERSAL" | "PULLBACK_CONT" | "UNCERTAIN"
-          confidence:     0.0–1.0
+          confidence:     0.0â€“1.0
           entry_timing:   "IMMEDIATE" | "WAIT_OTE" | "WAIT_PULLBACK_CONFIRM"
           details:        human-readable explanation
         """
@@ -2795,7 +2843,7 @@ class ICTEngine:
         deliv  = hunt_pred.get("delivery_direction", "")
         conf   = hunt_pred.get("confidence", 0.0)
 
-        # ── Score each scenario ────────────────────────────────────────────
+        # â”€â”€ Score each scenario â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         cont_score    = 0.0
         rev_score     = 0.0
         pullback_score= 0.0
@@ -2914,9 +2962,9 @@ class ICTEngine:
             "pullback_score": round(pullback_score, 3),
         }
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: MARKET BIAS
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_market_bias(self) -> MarketBias:
         """Consolidated MTF + AMD directional bias."""
@@ -2963,45 +3011,45 @@ class ICTEngine:
     def get_amd_state(self) -> AMDState:
         return self._amd
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: CONFLUENCE SCORING
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_confluence(self, side: str, price: float,
                        now_ms: int, atr: float = 0.0) -> ICTConfluence:
         """
-        Industry-grade ICT confluence score — 5 independent components.
+        Industry-grade ICT confluence score â€” 5 independent components.
 
-        1. STRUCTURE ALIGNMENT (0–0.30)
+        1. STRUCTURE ALIGNMENT (0â€“0.30)
            Per major TF (4H, 1H, 15M): +0.10 each if trend = side direction.
            1D alignment adds +0.05 bonus. Ranging TFs add +0.04 each (neutral).
 
-        2. AMD PHASE ALIGNMENT (0–0.25)
+        2. AMD PHASE ALIGNMENT (0â€“0.25)
            DISTRIBUTION + matching bias:    +0.25
            MANIPULATION + matching bias:    +0.20
            REACCUM/REDIS + matching bias:   +0.12
            Baseline:                        +0.05
-           AMD actively opposing trade:     −0.05 penalty
+           AMD actively opposing trade:     âˆ’0.05 penalty
 
-        3. PD ARRAY PROXIMITY (0–0.25)
-           Inside OB (OTE):                +0.15 × quality_multiplier
-           Inside OB (body):               +0.10 × quality_multiplier
+        3. PD ARRAY PROXIMITY (0â€“0.25)
+           Inside OB (OTE):                +0.15 Ã— quality_multiplier
+           Inside OB (body):               +0.10 Ã— quality_multiplier
            Near OB (within OB_PROXIMITY):  partial decaying credit
-           Inside FVG:                     +0.10 × freshness
+           Inside FVG:                     +0.10 Ã— freshness
            FVG+OB overlap bonus:           +0.05
 
-        4. LIQUIDITY STACK (0–0.15)
+        4. LIQUIDITY STACK (0â€“0.15)
            Recent sweep aligning with trade: up to +0.15 (quality-weighted)
            3+ stacked unswept pools ahead:  +0.03 bonus
 
-        5. SESSION / KILL ZONE (0–0.05)
+        5. SESSION / KILL ZONE (0â€“0.05)
            Active KZ:   +0.05
            London/NY:   +0.03
            Asia:        +0.01
 
         Guards:
-           No OB AND no sweep → cap total at 0.30
-           ICT_REQUIRE_OB_OR_FVG AND neither → cap at 0.20
+           No OB AND no sweep â†’ cap total at 0.30
+           ICT_REQUIRE_OB_OR_FVG AND neither â†’ cap at 0.20
         """
         if not self._initialized:
             return ICTConfluence(total=0.0, details="not initialized")
@@ -3014,7 +3062,7 @@ class ICTEngine:
         t15m = self._tf["15m"]
         t1d  = self._tf["1d"]
 
-        # ── 1. Structure ──────────────────────────────────────────────
+        # â”€â”€ 1. Structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ss = 0.0
         for tf_s, weight, tf_obj in (("4H", 0.10, t4h),
                                       ("1H", 0.10, t1h),
@@ -3029,7 +3077,7 @@ class ICTEngine:
             details.append(f"1D:{side[:4]}")
         out.structure_score = min(0.30, ss)
 
-        # ── 2. AMD ────────────────────────────────────────────────────
+        # â”€â”€ 2. AMD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         amd = self._amd
         matches = ((side == "long"  and amd.bias == "bullish") or
                    (side == "short" and amd.bias == "bearish"))
@@ -3041,22 +3089,22 @@ class ICTEngine:
             else:                                  out.amd_score = 0.05
             details.append(f"AMD:{amd.phase[:5]}({amd.bias[:4]})")
         elif amd.phase in ("DISTRIBUTION", "MANIPULATION"):
-            out.amd_score = -0.05   # actively opposing → small penalty
+            out.amd_score = -0.05   # actively opposing â†’ small penalty
         else:
-            # FIX 3: ACCUMULATION / neutral bias — no delivery signal yet, but
+            # FIX 3: ACCUMULATION / neutral bias â€” no delivery signal yet, but
             # no structural opposition either.  A minimal baseline (0.02) prevents
             # the total from being dragged further from the adaptive Tier-B floor.
             # This is mathematically correct: ACCUMULATION means "consolidating,
-            # not opposing" — it should not penalise the confluence score.
+            # not opposing" â€” it should not penalise the confluence score.
             out.amd_score = 0.02
 
-        # ── 3. PD Array ───────────────────────────────────────────────
+        # â”€â”€ 3. PD Array â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         pd = 0.0
         active_ob  = None
         active_fvg = None
         conf_sweep = False
 
-        # OB scoring — find best active OB
+        # OB scoring â€” find best active OB
         obs_dir = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         active_obs = sorted([o for o in obs_dir if o.is_active(now_ms)],
                             key=lambda o: o.strength, reverse=True)
@@ -3109,19 +3157,19 @@ class ICTEngine:
         # scoring adds its own portion.  The legacy ob_score field must be
         # normalised against the OB-cap (0.15), not against the combined
         # pd_array_score.  When an FVG is also active the combined score can
-        # exceed 0.15, giving ob_score > 1.0 — an impossible display value.
+        # exceed 0.15, giving ob_score > 1.0 â€” an impossible display value.
         _ob_pd_contrib = pd   # OB-only contribution, before FVG is added
 
-        # FVG scoring — BUG-FVG-POOL FIX
+        # FVG scoring â€” BUG-FVG-POOL FIX
         #
         # ROOT CAUSE: The code only searched same-direction FVGs for the trade side:
-        #   LONG  → fvgs_bull only   SHORT → fvgs_bear only
+        #   LONG  â†’ fvgs_bull only   SHORT â†’ fvgs_bear only
         #
         # This is wrong for reversion trades in a one-directional market.
         # In a declining market (common LONG reversion setup):
         #   - Downward impulse candles create BEARISH FVGs above current price.
         #   - Those bearish FVGs represent the imbalances price will FILL on the
-        #     way back up — they ARE the delivery corridor for a LONG trade.
+        #     way back up â€” they ARE the delivery corridor for a LONG trade.
         #   - They live in fvgs_bear, which was never checked for side="long".
         #
         # ICT delivery mechanics:
@@ -3143,7 +3191,7 @@ class ICTEngine:
         act_same  = [f for f in fvgs_same if f.is_active(now_ms)]
         act_opp   = [f for f in fvgs_opp  if f.is_active(now_ms)]
 
-        # 1. Price INSIDE an FVG (highest conviction — entry is at a structural imbalance)
+        # 1. Price INSIDE an FVG (highest conviction â€” entry is at a structural imbalance)
         for fvg in act_same:
             if fvg.is_price_in_gap(price):
                 fresh = 1.0 - fvg.fill_percentage
@@ -3158,7 +3206,7 @@ class ICTEngine:
                 break
 
         # Check opposite-direction in-gap only if same-direction didn't match
-        # (lower conviction — delivery-path context rather than structural entry)
+        # (lower conviction â€” delivery-path context rather than structural entry)
         if active_fvg is None:
             for fvg in act_opp:
                 if fvg.is_price_in_gap(price):
@@ -3170,7 +3218,7 @@ class ICTEngine:
                     active_fvg = fvg
                     break
 
-        # 2. Proximity FVG — price is approaching but hasn't entered yet.
+        # 2. Proximity FVG â€” price is approaching but hasn't entered yet.
         #
         # Checked pools:
         #   PRIMARY (same-direction): support/resistance FVGs in the standard window
@@ -3178,14 +3226,14 @@ class ICTEngine:
         #     - LONG:  bearish FVGs ABOVE price (created by prior sell-off, filled on rally)
         #     - SHORT: bullish FVGs BELOW price (created by prior rally, filled on decline)
         #
-        # Proximity window: same-direction = FVG_PROXIMITY_ATR (0.8×ATR)
-        #                   opposite-direction = up to 2.0×ATR (delivery targets can be further)
+        # Proximity window: same-direction = FVG_PROXIMITY_ATR (0.8Ã—ATR)
+        #                   opposite-direction = up to 2.0Ã—ATR (delivery targets can be further)
         if active_fvg is None and atr > 1e-10:
             _best_fvg   = None
             _best_score = 0.0
             _best_label = ""
 
-            # ── Same-direction FVGs ───────────────────────────────────────
+            # â”€â”€ Same-direction FVGs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             for fvg in act_same:
                 score = 0.0
                 if side == "long":
@@ -3195,7 +3243,7 @@ class ICTEngine:
                         if da <= self.FVG_PROXIMITY_ATR:
                             pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                             score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                    # Delivery: bullish FVG above price (sweep-and-go — price below FVG)
+                    # Delivery: bullish FVG above price (sweep-and-go â€” price below FVG)
                     elif fvg.bottom > price:
                         da = (fvg.bottom - price) / atr
                         if da <= self.FVG_PROXIMITY_ATR:
@@ -3208,7 +3256,7 @@ class ICTEngine:
                         if da <= self.FVG_PROXIMITY_ATR:
                             pf = 1.0 - da / self.FVG_PROXIMITY_ATR
                             score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10, 0.035)
-                    # Delivery: bearish FVG below price (sweep-and-go — price above FVG)
+                    # Delivery: bearish FVG below price (sweep-and-go â€” price above FVG)
                     elif fvg.top < price:
                         da = (price - fvg.top) / atr
                         if da <= self.FVG_PROXIMITY_ATR:
@@ -3219,8 +3267,8 @@ class ICTEngine:
                     _best_fvg   = fvg
                     _best_label = "same_dir"
 
-            # ── Opposite-direction delivery FVGs ─────────────────────────
-            # Extended proximity window: delivery targets can be 2×ATR away
+            # â”€â”€ Opposite-direction delivery FVGs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Extended proximity window: delivery targets can be 2Ã—ATR away
             _DELIVERY_PROX_ATR = max(self.FVG_PROXIMITY_ATR * 2.5, 2.0)
             for fvg in act_opp:
                 score = 0.0
@@ -3230,7 +3278,7 @@ class ICTEngine:
                         da = (fvg.bottom - price) / atr
                         if da <= _DELIVERY_PROX_ATR:
                             pf = 1.0 - da / _DELIVERY_PROX_ATR
-                            # 80% of same-direction weight — still meaningful
+                            # 80% of same-direction weight â€” still meaningful
                             score = min(0.35 * pf * (1 - fvg.fill_percentage) * 0.10 * 0.80,
                                         0.028)
                     # Bearish FVG below price being tested from above (less common)
@@ -3289,20 +3337,20 @@ class ICTEngine:
         out.ob_score  = min(1.0, _ob_pd_contrib / 0.15) if active_ob  else 0.0
         out.fvg_score = (1.0 - active_fvg.fill_percentage) if active_fvg else 0.0
 
-        # ── 4. Liquidity + Hunt Prediction  (UNIFIED — core decision driver) ──
+        # â”€â”€ 4. Liquidity + Hunt Prediction  (UNIFIED â€” core decision driver) â”€â”€
         #
-        # Liquidity is NOT a peripheral metric — it IS the ICT setup.
+        # Liquidity is NOT a peripheral metric â€” it IS the ICT setup.
         # DirectionEngine.predict_hunt() runs in quant_strategy Step 3b and its
         # result is injected via inject_hunt_prediction() before get_confluence()
         # is called.  The confidence feeds the confluence score at the same weight
         # as structure.
         #
         # Two sub-components:
-        #   A. Sweep freshness     (max 0.10) — same as before, slightly tighter
-        #   B. Hunt prediction     (max 0.20) — aligning with predicted delivery
+        #   A. Sweep freshness     (max 0.10) â€” same as before, slightly tighter
+        #   B. Hunt prediction     (max 0.20) â€” aligning with predicted delivery
         #                                        direction gives a big bonus;
         #                                        opposing prediction gives a penalty
-        # Combined cap: 0.30  (was 0.15) — liquidity now equals structure weight.
+        # Combined cap: 0.30  (was 0.15) â€” liquidity now equals structure weight.
 
         liq        = 0.0
         conf_sweep = False
@@ -3341,7 +3389,7 @@ class ICTEngine:
         # Sub-component B: hunt prediction alignment
         # Prediction is injected externally by DirectionEngine via
         # inject_hunt_prediction() before get_confluence() is called.
-        # No self-computation here — ICTEngine owns context, not the decision.
+        # No self-computation here â€” ICTEngine owns context, not the decision.
         hunt_pred  = self._last_hunt_pred or {}
         hunt_score = 0.0
 
@@ -3371,12 +3419,12 @@ class ICTEngine:
             hunt_pred.get("delivery_direction") ==
             ("bullish" if side == "long" else "bearish"))
 
-        # ── 5. Session / Kill Zone × P/D multiplier ──────────────────
+        # â”€â”€ 5. Session / Kill Zone Ã— P/D multiplier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # ICT core principle: Kill Zone entries are ONLY high-probability
         # when price is in the CORRECT P/D zone for the trade direction.
         # A London KZ SHORT must be in PREMIUM. A NY KZ LONG must be in DISCOUNT.
         # Flat KZ bonus regardless of P/D was giving equal weight to KZ
-        # entries at the wrong end of the dealing range — now multiplied.
+        # entries at the wrong end of the dealing range â€” now multiplied.
         t4h_pd = t4h.premium_discount
         pd_aligned = ((side == "long"  and t4h_pd < 0.50) or
                       (side == "short" and t4h_pd > 0.50))
@@ -3385,28 +3433,28 @@ class ICTEngine:
         if self._killzone:
             out.session_score = min(0.05, 0.05 * pd_mult)
             details.append(
-                f"KZ={self._killzone} PD={'✓' if pd_aligned else '✗'}"
+                f"KZ={self._killzone} PD={'âœ“' if pd_aligned else 'âœ—'}"
                 f"({pd_mult:.2f}x)")
         elif self._session in ("NEW_YORK", "LONDON"):
             out.session_score = min(0.03, 0.03 * pd_mult)
             details.append(f"Session={self._session}")
         elif self._session == "ASIA":
             # Asia session is the primary accumulation AND manipulation zone
-            # for crypto markets — institutional-grade volume. Not a dead session.
+            # for crypto markets â€” institutional-grade volume. Not a dead session.
             out.session_score = min(0.03, 0.03 * pd_mult)
-            details.append(f"Session=ASIA PD={'✓' if pd_aligned else '✗'}")
+            details.append(f"Session=ASIA PD={'âœ“' if pd_aligned else 'âœ—'}")
         else:
-            # FIX 4: Off-session / AVOID — minimal baseline so this component
+            # FIX 4: Off-session / AVOID â€” minimal baseline so this component
             # never contributes a pure zero.  A 0.01 baseline reflects that even
             # outside named sessions price action still has structural validity.
-            # This is NOT a kill-zone bonus — just prevents the score from being
+            # This is NOT a kill-zone bonus â€” just prevents the score from being
             # artificially suppressed by a timing boundary.
             out.session_score = 0.01 * pd_mult
             details.append(f"Session=OFF({self._session or 'AVOID'})")
         out.session_name = self._session
         out.killzone     = self._killzone
 
-        # ── 5b. Breaker Block bonus ───────────────────────────────────
+        # â”€â”€ 5b. Breaker Block bonus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Price at a Breaker Block is ICT's highest-conviction reversal signal.
         # A Bullish Breaker (previously mitigated Bear OB) at current price
         # = strong support for long entries.
@@ -3420,7 +3468,7 @@ class ICTEngine:
                 out.session_score = min(0.09, out.session_score + bb_score)
                 break
 
-        # ── 5c. Propulsion OB bonus ───────────────────────────────────
+        # â”€â”€ 5c. Propulsion OB bonus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Price at a Propulsion OB (the OB that caused the BOS) = highest
         # structural re-entry conviction. Add a meaningful bonus.
         prop_pool = self._propulsion_obs_bull if side == "long" else self._propulsion_obs_bear
@@ -3432,11 +3480,11 @@ class ICTEngine:
                 out.pd_array_score = min(0.25, out.pd_array_score + 0.05)
                 break
 
-        # ── Total ─────────────────────────────────────────────────────
+        # â”€â”€ Total â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # BUG-AMD-OPPOSING-PENALTY-NULLIFIED FIX: the old code used
         # max(0.0, out.amd_score) which silently floored the -0.05 penalty
         # to zero, making opposing AMD have NO effect on the confluence total.
-        # The penalty is intentional — actively opposing AMD should reduce
+        # The penalty is intentional â€” actively opposing AMD should reduce
         # the total score to discourage entries against the delivery.
         raw = (out.structure_score +
                out.amd_score +       # allow negative AMD penalty to apply
@@ -3454,13 +3502,13 @@ class ICTEngine:
         if not has_ob and not has_sweep:
             raw = min(raw, 0.30)
         if self.ICT_REQUIRE_OB_OR_FVG and not has_ob and active_fvg is None:
-            # FIX 5: No OB and no FVG — cap the total so trades cannot slip through
+            # FIX 5: No OB and no FVG â€” cap the total so trades cannot slip through
             # with zero structural evidence.  Cap at 0.15 (below the ADX<20 floor
-            # of 0.12 but at the ADX<25 boundary of 0.20) — this means no Tier-B
+            # of 0.12 but at the ADX<25 boundary of 0.20) â€” this means no Tier-B
             # entry fires in a ranging market without at least a sweep or session
             # KZ credit pushing the score above 0.15.  The ADX<20 floor (0.12)
             # is reachable even with this cap, allowing entries in deep-range.
-            # The ADX<25 floor (0.20) is NOT reachable without OB/FVG/sweep/KZ —
+            # The ADX<25 floor (0.20) is NOT reachable without OB/FVG/sweep/KZ â€”
             # correct: structure-less ranging markets should not trade Tier-B freely.
             raw = min(raw, 0.15)
             details.append("REQUIRE_OB_OR_FVG_CAP(0.15)")
@@ -3479,7 +3527,7 @@ class ICTEngine:
             1 if t15m.trend == side else (0.5 if t15m.trend == "ranging" else 0),
         ]) >= 2.5
 
-        # ── Advanced ICT fields ───────────────────────────────────────
+        # â”€â”€ Advanced ICT fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Delivery target + confidence
         out.delivery_target     = amd.delivery_target
         out.delivery_confidence = amd.confidence if amd.phase in (
@@ -3489,11 +3537,11 @@ class ICTEngine:
         out.pd_grade = t4h.pd_grade
 
         # MTF OB stack: count HTF OBs structurally relevant to this trade.
-        # STABILITY FIX: old code used contains_price(price) — a boolean that
+        # STABILITY FIX: old code used contains_price(price) â€” a boolean that
         # flips on every tick as price moves in/out of the OB body, causing
         # the Stack count to oscillate 3-5 OBs between consecutive updates.
         # Fix: count all active HTF OBs within OB_PROXIMITY_ATR of price.
-        # This window is stable — price must move ~1.5×ATR to change whether an
+        # This window is stable â€” price must move ~1.5Ã—ATR to change whether an
         # OB is "in range", vs the $5 needed to exit a body zone tick-to-tick.
         obs_dir = self.order_blocks_bull if side == "long" else self.order_blocks_bear
         _prox_atr = max(atr, 1e-9) * self.OB_PROXIMITY_ATR
@@ -3504,7 +3552,7 @@ class ICTEngine:
         )
         out.mtf_ob_count = htf_ob_count
 
-        # MTF FVG stack — count active FVGs in BOTH same-direction AND opposite-direction
+        # MTF FVG stack â€” count active FVGs in BOTH same-direction AND opposite-direction
         # pools. Opposite-direction FVGs in the delivery path are equally valid structure.
         # This matches the fixed FVG scoring branch above that now checks both pools.
         _fvg_stack = 0
@@ -3546,9 +3594,9 @@ class ICTEngine:
         #
         # Delivery corridor definitions:
         #   SHORT (BSL swept, bearish): bull OBs between current price and sweep
-        #     origin are already in the delivery wake — exclude.
+        #     origin are already in the delivery wake â€” exclude.
         #   LONG  (SSL swept, bullish): bear OBs between sweep origin and AMD
-        #     delivery target are in the path being delivered INTO — price will
+        #     delivery target are in the path being delivered INTO â€” price will
         #     push through them, so they are not structural reversal risks.
         #     Fix-3: the original LONG condition used `price` as upper bound,
         #     which is always False when price < sweep_origin (before OTE entry).
@@ -3557,7 +3605,7 @@ class ICTEngine:
         _amd_phase           = self._amd.phase
         _amd_bias            = self._amd.bias
         _amd_delivery_target = self._amd.delivery_target
-        # REDISTRIBUTION is also an active delivery phase — OBs inside the
+        # REDISTRIBUTION is also an active delivery phase â€” OBs inside the
         # delivery corridor must be excluded from reversal-risk scoring here too.
         _in_distribution     = _amd_phase in ("DISTRIBUTION", "MANIPULATION", "REDISTRIBUTION")
         opp_obs = self.order_blocks_bear if side == "long" else self.order_blocks_bull
@@ -3571,7 +3619,7 @@ class ICTEngine:
                     if (side == "short" and _amd_bias == "bearish" and
                             ob.midpoint <= _amd_sweep_origin and
                             ob.midpoint >= price):
-                        continue   # bull OB between price and BSL sweep — delivery wake
+                        continue   # bull OB between price and BSL sweep â€” delivery wake
                     if side == "long" and _amd_bias == "bullish":
                         _upper = (_amd_delivery_target
                                   if _amd_delivery_target is not None
@@ -3580,8 +3628,8 @@ class ICTEngine:
                                 ob.midpoint <= _upper):
                             continue   # bear OB inside LONG delivery corridor
                 # Visit discount: each time an OB was tested and HELD, the reversal
-                # risk decreases.  A 4H bear OB visited 2× in a ranging market is the
-                # range ceiling — price bounces off it but doesn't break.  In ICT terms,
+                # risk decreases.  A 4H bear OB visited 2Ã— in a ranging market is the
+                # range ceiling â€” price bounces off it but doesn't break.  In ICT terms,
                 # virgin OBs (visit=0) have highest reversal conviction.
                 visit_discount = max(0.40, 1.0 - ob.visit_count * 0.25)
                 rev_risk = max(rev_risk, ob.strength / 100.0 * (1.0 - dist / (2.0 * atr)) * visit_discount)
@@ -3598,7 +3646,7 @@ class ICTEngine:
         if lmap["nearest_ssl"] and atr > 1e-9:
             out.nearest_ssl_dist_atr = lmap["nearest_ssl"]["dist_atr"]
 
-        # ── MTF stacking bonus to total ───────────────────────────────
+        # â”€â”€ MTF stacking bonus to total â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Each additional TF confirming an OB or FVG at this price = +0.03
         mtf_stack_bonus = min(0.06, (htf_ob_count + out.fvg_stack_count) * 0.03)
         if mtf_stack_bonus > 0:
@@ -3615,9 +3663,9 @@ class ICTEngine:
         out.details = " | ".join(details) if details else "no ICT structure"
         return out
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: OB SL LEVEL
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_ob_sl_level(self, side: str, price: float, atr: float,
                          now_ms: int,
@@ -3625,8 +3673,8 @@ class ICTEngine:
         """
         OB-anchored SL placement.
 
-        htf_only=True (entry): 15m+ OBs (strength ≥ 70), visit_count ≤ 1.
-          A v=2 OB is a consumed zone — SL placed there fires on the breakdown.
+        htf_only=True (entry): 15m+ OBs (strength â‰¥ 70), visit_count â‰¤ 1.
+          A v=2 OB is a consumed zone â€” SL placed there fires on the breakdown.
         htf_only=False (trail): all active OBs, sorted by proximity to price.
 
         FVG escape + liquidity-pool escape applied before returning.
@@ -3691,9 +3739,9 @@ class ICTEngine:
             return sl_f
         return None
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: STRUCTURAL TP TARGETS
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_structural_tp_targets(self, side: str, price: float, atr: float,
                                    now_ms: int, min_dist: float, max_dist: float,
@@ -3708,7 +3756,7 @@ class ICTEngine:
         _htf = self.HTF_STRENGTH_THRESHOLD
         cands: List[Tuple[float, float, str]] = []
 
-        # ── Swept liquidity origins ───────────────────────────────────
+        # â”€â”€ Swept liquidity origins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for pool in self.liquidity_pools:
             if not pool.swept:
                 continue
@@ -3726,15 +3774,15 @@ class ICTEngine:
                 if pool.displacement_confirmed: score += 0.5
                 cands.append((level, score, f"SweepOrigin_{pool.level_type}@${level:.0f}"))
 
-        # ── Open FVGs in trade direction ──────────────────────────────
+        # â”€â”€ Open FVGs in trade direction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # TP target FVGs: for a LONG, the target imbalances are BEARISH FVGs above
         # price (gaps created by prior sell-offs, price will fill on the way up).
         # For a SHORT, target imbalances are BULLISH FVGs below price.
-        # Note: fvgs_bear used for LONG, fvgs_bull used for SHORT — this is correct.
+        # Note: fvgs_bear used for LONG, fvgs_bull used for SHORT â€” this is correct.
         # These are the delivery-path imbalances that act as TP magnets.
         #
         # ALSO include same-direction FVGs that are BEYOND current price in the
-        # trade direction — e.g. bullish FVGs that were created by an earlier up-move
+        # trade direction â€” e.g. bullish FVGs that were created by an earlier up-move
         # and sit above price are valid LONG TP zones too.
         _fvg_pools_for_tp = []
         if side == "long":
@@ -3765,7 +3813,7 @@ class ICTEngine:
                 if min_dist <= df <= max_dist:
                     cands.append((fe, score * 0.85, f"FVG_far@${fe:.0f} tf={fvg.timeframe}"))
 
-        # ── Virgin OBs in path ────────────────────────────────────────
+        # â”€â”€ Virgin OBs in path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         obs_t = self.order_blocks_bull if side == "short" else self.order_blocks_bear
         for ob in obs_t:
             if not ob.is_active(now_ms) or ob.visit_count > 0:
@@ -3781,7 +3829,7 @@ class ICTEngine:
             cands.append((level, score,
                           f"VirginOB@${level:.0f} s={ob.strength:.0f} tf={ob.timeframe}"))
 
-        # ── Unswept liquidity pools as targets ────────────────────────
+        # â”€â”€ Unswept liquidity pools as targets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for pool in self.liquidity_pools:
             if pool.swept:
                 continue
@@ -3798,9 +3846,9 @@ class ICTEngine:
 
         return cands
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: TRAIL SL PATH CHECK
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def check_sl_path_for_structure(self, pos_side: str, current_sl: float,
                                      new_sl: float, now_ms: int,
@@ -3842,9 +3890,9 @@ class ICTEngine:
                     return True, f"Fresh bear FVG @ ${fvg.midpoint:.0f} tf={fvg.timeframe}"
         return False, ""
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: PREMIUM/DISCOUNT MATRIX
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_pd_matrix(self, price: float, now_ms: int) -> Dict:
         """
@@ -3852,8 +3900,8 @@ class ICTEngine:
 
         Returns:
           grades: {tf: "PREMIUM"|"EQ"|"DISCOUNT"} for each active TF
-          aligned_long:  int — TFs agreeing on DISCOUNT (buy setup)
-          aligned_short: int — TFs agreeing on PREMIUM (sell setup)
+          aligned_long:  int â€” TFs agreeing on DISCOUNT (buy setup)
+          aligned_short: int â€” TFs agreeing on PREMIUM (sell setup)
           verdict: "STRONG_DISC"|"DISC"|"EQ"|"PREM"|"STRONG_PREM"|"SPLIT"
           matrix_str: human-readable e.g. "1D:DISC 4H:DISC 1H:EQ 15M:PREM"
           long_score:  0-1 score favouring long (4H+1D weighted)
@@ -3900,9 +3948,9 @@ class ICTEngine:
             "short_score": round(short_score, 3),
         }
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: MTF LIQUIDITY MAP
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_mtf_liquidity_map(self, price: float, atr: float,
                                now_ms: int) -> Dict:
@@ -3917,7 +3965,7 @@ class ICTEngine:
         Each pool entry:
           price, type, tf, touch_count, dist_atr, significance, swept
 
-        significance = touch_count × tf_weight / (1 + dist_atr)
+        significance = touch_count Ã— tf_weight / (1 + dist_atr)
         Sorting: by significance descending, so highest-conviction targets first.
         """
         TF_WEIGHT = {"1d": 5.0, "4h": 4.0, "1h": 3.0, "15m": 2.0, "5m": 1.0}
@@ -3963,9 +4011,9 @@ class ICTEngine:
             "amd_target":   amd_target,
         }
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: DELIVERY PROFILE
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_delivery_profile(self, side: str, price: float,
                               atr: float, now_ms: int) -> Dict:
@@ -3989,7 +4037,7 @@ class ICTEngine:
         a = max(atr, 1e-9)
         amd = self._amd
 
-        # ── Primary target: AMD delivery + scored pools ───────────────
+        # â”€â”€ Primary target: AMD delivery + scored pools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         candidates: List[Tuple[float, float, str]] = []
 
         # AMD delivery target (highest priority)
@@ -4030,7 +4078,7 @@ class ICTEngine:
                       "dist_atr": round(abs(candidates[1][0] - price) / a, 2)}
                      if len(candidates) >= 2 else None)
 
-        # ── FVG chain in delivery path ────────────────────────────────
+        # â”€â”€ FVG chain in delivery path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # LONG delivery: FVGs above price (price filling upward)
         # SHORT delivery: FVGs below price (price filling downward)
         fvg_pool = self.fvgs_bear if side == "long" else self.fvgs_bull
@@ -4050,7 +4098,7 @@ class ICTEngine:
                                    "dist_atr": round((price - fvg.top) / a, 2)})
         fvg_chain.sort(key=lambda x: x["dist_atr"])
 
-        # ── OB chain in delivery path ─────────────────────────────────
+        # â”€â”€ OB chain in delivery path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Virgin OBs between price and primary target
         ob_pool = self.order_blocks_bear if side == "long" else self.order_blocks_bull
         ob_chain = []
@@ -4067,7 +4115,7 @@ class ICTEngine:
                                   "dist_atr": round((price - ob.high) / a, 2)})
         ob_chain.sort(key=lambda x: x["dist_atr"])
 
-        # ── Invalidation: nearest strong opposing OB ──────────────────
+        # â”€â”€ Invalidation: nearest strong opposing OB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         inv_obs = self.order_blocks_bull if side == "short" else self.order_blocks_bear
         invalidation = None
         for ob in sorted([o for o in inv_obs if o.is_active(now_ms) and o.strength >= 70.0],
@@ -4081,12 +4129,12 @@ class ICTEngine:
                                 "dist_atr": round((ob.low - price) / a, 2)}
                 break
 
-        # ── PD matrix alignment ───────────────────────────────────────
+        # â”€â”€ PD matrix alignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         pdm = self.get_pd_matrix(price, now_ms)
         pd_favours = ((side == "long"  and pdm["aligned_long"]  >= 2) or
                       (side == "short" and pdm["aligned_short"] >= 2))
 
-        # ── Chain score ───────────────────────────────────────────────
+        # â”€â”€ Chain score â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         chain_score = 0.0
         if primary:         chain_score += 0.30
         if fvg_chain:       chain_score += min(0.20, len(fvg_chain) * 0.07)
@@ -4110,9 +4158,9 @@ class ICTEngine:
             "amd_conf":           round(amd.confidence, 2),
         }
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: HTF REVERSAL ZONES
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_htf_reversal_zones(self, price: float, atr: float,
                                 now_ms: int) -> List[Dict]:
@@ -4166,11 +4214,11 @@ class ICTEngine:
                 if _gz_in_delivery and _gz_amd_sweep is not None:
                     if (direction == "long" and _gz_amd_bias == "bearish" and
                             ob.midpoint <= _gz_amd_sweep and ob.midpoint >= price):
-                        continue   # bull OB between price and BSL sweep — delivery wake
+                        continue   # bull OB between price and BSL sweep â€” delivery wake
                     if direction == "short" and _gz_amd_bias == "bullish":
                         # Fix-3: use delivery_target as corridor upper bound for LONG
                         # (bear OBs from sweep origin up to delivery target are the
-                        # delivery path — not reversal zones)
+                        # delivery path â€” not reversal zones)
                         _gz_dt = self._amd.delivery_target
                         _gz_upper = (_gz_dt if _gz_dt is not None
                                      else (_gz_amd_sweep + 15.0 * max(atr, 1.0)))
@@ -4242,9 +4290,9 @@ class ICTEngine:
         zones.sort(key=lambda z: -z["score"])
         return zones[:8]
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: JUDAS SWING CONTEXT
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_judas_swing_context(self, price: float, atr: float,
                                  now_ms: int) -> Dict:
@@ -4285,25 +4333,25 @@ class ICTEngine:
         sweep_type    = amd.sweep_type   # "BSL" or "SSL"
         age_sec       = amd.time_in_phase_ms // 1000
 
-        # BSL swept = fake move UP (buy stops harvested) → delivery DOWN
+        # BSL swept = fake move UP (buy stops harvested) â†’ delivery DOWN
         judas_dir    = "up"   if sweep_type == "BSL" else "down"
         deliv_dir    = "down" if judas_dir == "up"   else "up"
 
-        # Estimated Judas extent: pool price ± 1.0 ATR past the pool
+        # Estimated Judas extent: pool price Â± 1.0 ATR past the pool
         judas_extent = (sweep_price + 1.0 * a if judas_dir == "up"
                         else sweep_price - 1.0 * a)
 
         # OTE entry zone: 61.8%-78.6% retracement of the Judas move
         # We approximate using the displacement from the sweep pool
-        # OTE zone: 61.8%–78.6% retracement of the Judas move.
+        # OTE zone: 61.8%â€“78.6% retracement of the Judas move.
         # The Judas move is from sweep_price to the current Judas extreme.
         # For BSL swept (judas UP): institutional price moved UP from sweep level;
-        # OTE for a SHORT entry is a pullback to 61.8%–78.6% of that upward move.
+        # OTE for a SHORT entry is a pullback to 61.8%â€“78.6% of that upward move.
         # For SSL swept (judas DOWN): OTE for a LONG entry is a bounce to
-        # 61.8%–78.6% of the downward Judas move.
-        # The original code multiplied by 0.30 — a comment described it as "rough
+        # 61.8%â€“78.6% of the downward Judas move.
+        # The original code multiplied by 0.30 â€” a comment described it as "rough
         # estimate" but it compressed the zone to ~9% of the actual retracement,
-        # making ENTERING_OTE trigger 3× too early and at the wrong price level.
+        # making ENTERING_OTE trigger 3Ã— too early and at the wrong price level.
         move_approx = abs(price - sweep_price)
         if judas_dir == "up":
             # BSL swept: Judas moved price UP. OTE for SHORT = retrace back.
@@ -4324,7 +4372,7 @@ class ICTEngine:
 
         # Urgency
         if price_in_judas:
-            urgency = "WAIT"  # still in the fake move — no entry
+            urgency = "WAIT"  # still in the fake move â€” no entry
         else:
             dist_to_ote = min(abs(price - ote_low), abs(price - ote_high)) / a
             urgency = "ENTERING_OTE" if dist_to_ote < 0.30 else "APPROACHING"
@@ -4341,22 +4389,22 @@ class ICTEngine:
             "urgency":            urgency,
         }
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: AMD SESSION CONTEXT
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_amd_session_context(self, now_ms: int) -> Dict:
         """
         Session-based AMD expectations using the ICT session model.
 
         ICT session model:
-          Asia   (23:00-07:00 UTC): Accumulation — range formation, consolidation.
+          Asia   (23:00-07:00 UTC): Accumulation â€” range formation, consolidation.
                  Watch for equal highs/lows being formed (future liquidity pools).
-          London (07:00-15:00 UTC): Manipulation — Judas swing.
+          London (07:00-15:00 UTC): Manipulation â€” Judas swing.
                  Expect a false breakout of the Asia range; direction of the
                  Judas swing reveals the London bias. Entry AGAINST the Judas
                  swing in the OTE zone.
-          NY     (13:30-21:00 UTC): Distribution — real directional move.
+          NY     (13:30-21:00 UTC): Distribution â€” real directional move.
                  AMD delivery to the opposing liquidity pool. Highest-probability
                  entries during the NY open kill zone (13:30-14:30 UTC).
 
@@ -4392,13 +4440,13 @@ class ICTEngine:
                     "entry_quality": "AVOID",
                     "asia_range": asia_range, "judas_direction": "",
                     "delivery_target": None,
-                    "session_bias_notes": "Weekend — no institutional activity"}
+                    "session_bias_notes": "Weekend â€” no institutional activity"}
 
         if sess == "ASIA" or (uh >= 23.0 or uh < 7.0):
             eq = "LOW"
             if killz == "ASIA_KZ": eq = "MEDIUM"
             notes = ("Asia: accumulation phase. Watch for equal highs/lows being "
-                     "formed — these are tomorrow's liquidity pools. Avoid counter-trend "
+                     "formed â€” these are tomorrow's liquidity pools. Avoid counter-trend "
                      "entries. Best use: map the range for London Judas swing setup.")
             return {"session": "ASIA", "expected_phase": "ACCUMULATION",
                     "entry_quality": eq, "asia_range": asia_range,
@@ -4409,7 +4457,7 @@ class ICTEngine:
         if sess == "LONDON" or (7.0 <= uh < 13.5):
             eq = "HIGH" if killz == "LONDON_KZ" else "MEDIUM"
             judas_dir = ""
-            notes = ("London: manipulation phase. Expect a Judas swing — a false "
+            notes = ("London: manipulation phase. Expect a Judas swing â€” a false "
                      "breakout of the Asia range. Trade AGAINST the initial London "
                      "spike in the OTE zone.")
             if amd.phase == "MANIPULATION" and amd.sweep_origin:
@@ -4507,9 +4555,9 @@ class ICTEngine:
         arrays.sort(key=lambda x: x["dist_atr"])
         return {"arrays": arrays[:20], "count": len(arrays)}
 
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PUBLIC: STATUS
-    # ─────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_status(self) -> Dict:
         # Include hunt prediction summary if available
@@ -4549,9 +4597,9 @@ class ICTEngine:
             return {
                 # Primary keys (new canonical names)
                 "low": ob.low, "high": ob.high,
-                "midpoint": _mid, "mid": _mid,          # both aliases — controller uses midpoint
+                "midpoint": _mid, "mid": _mid,          # both aliases â€” controller uses midpoint
                 "strength": ob.strength,
-                "visit_count": _vc, "visits": _vc,      # both aliases — controller uses visit_count
+                "visit_count": _vc, "visits": _vc,      # both aliases â€” controller uses visit_count
                 "tf": ob.timeframe, "bos": ob.bos_confirmed,
                 "in_ob": ob.contains_price(price), "in_ote": ob.in_optimal_zone(price),
                 "dist_pts": dist, "dist_atr": round(abs(dist)/a, 2),
@@ -4607,7 +4655,7 @@ class ICTEngine:
             # Include both old short names and canonical names for controller compat
             e = {
                 "type":       p.level_type,
-                "pool_type":  p.pool_type,          # "EQH" / "EQL" — controller uses pool_type
+                "pool_type":  p.pool_type,          # "EQH" / "EQL" â€” controller uses pool_type
                 "price":      p.price,
                 "touches":    p.touch_count,
                 "touch_count": p.touch_count,       # controller uses touch_count
