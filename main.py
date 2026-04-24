@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import signal
 import sys
 import threading
@@ -54,12 +55,41 @@ import config
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+_MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
+_MOJIBAKE_RUN = re.compile(
+    r"[\u00a0-\u00ff\u0152\u0153\u0160\u0161\u0178"
+    r"\u2018-\u201d\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
+)
+
+
+def _repair_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was accidentally decoded as cp1252."""
+    if not any(s in text for s in _MOJIBAKE_SENTINELS):
+        return text
+
+    def _fix(match: re.Match) -> str:
+        frag = match.group(0)
+        if not any(s in frag for s in _MOJIBAKE_SENTINELS):
+            return frag
+        try:
+            repaired = frag.encode("cp1252").decode("utf-8")
+        except UnicodeError:
+            return frag
+        old_bad = sum(frag.count(s) for s in _MOJIBAKE_SENTINELS)
+        new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
+        return repaired if new_bad < old_bad else frag
+
+    return _MOJIBAKE_RUN.sub(_fix, text)
+
 
 class ISTFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=IST)
         s  = dt.strftime("%Y-%m-%d %H:%M:%S")
         return f"{s},{int(record.msecs):03d}"
+
+    def format(self, record):
+        return _repair_mojibake(super().format(record))
 
 
 _ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")

@@ -2555,6 +2555,7 @@ class QuantStrategy:
         # Key format: (pool_price_float, sweep_timestamp_int_ms)
         # Entries are pruned when older than 60s to prevent unbounded growth.
         self._notified_sweeps: set = set()
+        self._last_ict_bridge_diag_ts: float = 0.0
         # Track previous killzone so on_session_change() fires exactly once per
         # London/NY/Asia/OFF_HOURS boundary â€” resets conviction session quota.
         self._last_conviction_kz: str = ""
@@ -3854,12 +3855,23 @@ class QuantStrategy:
 
                 _ict_sweep_sources = []
                 _seen_ict_sweeps = set()
+                _diag_event_raw = 0
+                _diag_event_sources = 0
+                _diag_pool_raw = 0
+                _diag_pool_sources = 0
+                _diag_age_drop = 0
+                _diag_ee_forwarded = 0
+                _diag_dir_forwarded = 0
+                _diag_dir_dedup = 0
+                _diag_cross_skip = 0
 
                 # Prefer durable ICT sweep events emitted at detection time.
                 # liquidity_pools are mutable and may be rebuilt/merged after
                 # the "ICT ... SWEPT" log; events preserve the authoritative
                 # sweep even if the pool object no longer carries swept=True.
-                for ev in list(getattr(self._ict, 'sweep_events', []) or []):
+                _ict_events = list(getattr(self._ict, 'sweep_events', []) or [])
+                _diag_event_raw = len(_ict_events)
+                for ev in _ict_events:
                     _key = (
                         round(float(getattr(ev, 'price', 0.0) or 0.0), 0),
                         str(getattr(ev, 'level_type', '') or ''),
@@ -3871,10 +3883,13 @@ class QuantStrategy:
                         continue
                     _seen_ict_sweeps.add(_key)
                     _ict_sweep_sources.append(ev)
+                    _diag_event_sources += 1
 
                 # Fallback for older ICT engine versions and for any swept
                 # pool that did survive in the mutable pool registry.
-                for pool in list(getattr(self._ict, 'liquidity_pools', []) or []):
+                _ict_pools = list(getattr(self._ict, 'liquidity_pools', []) or [])
+                _diag_pool_raw = len(_ict_pools)
+                for pool in _ict_pools:
                     if not getattr(pool, 'swept', False):
                         continue
                     _key = (
@@ -3886,12 +3901,14 @@ class QuantStrategy:
                         continue
                     _seen_ict_sweeps.add(_key)
                     _ict_sweep_sources.append(pool)
+                    _diag_pool_sources += 1
 
                 for pool in _ict_sweep_sources:
                     if not getattr(pool, 'swept', False):
                         continue
                     if (pool.sweep_timestamp < _base_age_limit_ms
                             and pool.sweep_timestamp < _bar_age_limit_ms):
+                        _diag_age_drop += 1
                         continue
                     c5 = candles_by_tf.get("5m", [])
                     # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
@@ -3936,6 +3953,7 @@ class QuantStrategy:
                         candle_low=_cl,
                         candle_close=_cc,
                     ))
+                    _diag_ee_forwarded += 1
                     # Notify DirectionEngine so it can open a PostSweepState
                     # and begin the accumulative Bayesian evidence model.
                     # DEDUPLICATION: the bridge loop runs every 250ms and
@@ -3985,6 +4003,7 @@ class QuantStrategy:
                                                 f"{_quality_threshold:.2f} â€” skipped, "
                                                 f"preserving existing PostSweepState")
                                             _should_forward = False
+                                            _diag_cross_skip += 1
 
                                 if _should_forward:
                                     self._dir_engine.on_sweep(
@@ -3995,6 +4014,9 @@ class QuantStrategy:
                                         now              = now,
                                         quality          = _new_quality,
                                     )
+                                    _diag_dir_forwarded += 1
+                            else:
+                                _diag_dir_dedup += 1
                             # BUG-D1 FIX: Prune _notified_sweeps unconditionally
                             # per-pool-visit (not just inside _should_forward path)
                             # so the set stays bounded even when no new sweeps arrive.
@@ -4005,6 +4027,28 @@ class QuantStrategy:
                             }
                         except Exception:
                             pass
+                _diag_now = time.time()
+                _diag_interval = float(_cfg("ICT_BRIDGE_DIAG_INTERVAL_SEC", 15.0))
+                if (_diag_ee_forwarded > 0 or _diag_event_raw > 0 or _diag_pool_sources > 0):
+                    if _diag_now - self._last_ict_bridge_diag_ts >= _diag_interval:
+                        self._last_ict_bridge_diag_ts = _diag_now
+                        logger.info(
+                            "ICT_BRIDGE_DIAG events_raw=%d event_sources=%d "
+                            "pools_raw=%d swept_pool_sources=%d candidates=%d "
+                            "age_drop=%d ee_forwarded=%d dir_forwarded=%d "
+                            "dir_dedup=%d cross_skip=%d ctx_ict_sweeps=%d",
+                            _diag_event_raw,
+                            _diag_event_sources,
+                            _diag_pool_raw,
+                            _diag_pool_sources,
+                            len(_ict_sweep_sources),
+                            _diag_age_drop,
+                            _diag_ee_forwarded,
+                            _diag_dir_forwarded,
+                            _diag_dir_dedup,
+                            _diag_cross_skip,
+                            len(getattr(ict_ctx, "ict_sweeps", []) or []),
+                        )
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")
 

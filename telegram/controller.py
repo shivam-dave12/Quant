@@ -25,6 +25,7 @@ All command handlers reflect the liquidity-first decision architecture:
 """
 
 import logging
+import re
 import time
 import threading
 import requests
@@ -39,6 +40,31 @@ import config
 from telegram.notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
+
+_MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
+_MOJIBAKE_RUN = re.compile(
+    r"[\u00a0-\u00ff\u0152\u0153\u0160\u0161\u0178"
+    r"\u2018-\u201d\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
+)
+
+
+def _repair_mojibake(text: str) -> str:
+    if not any(s in text for s in _MOJIBAKE_SENTINELS):
+        return text
+
+    def _fix(match: re.Match) -> str:
+        frag = match.group(0)
+        if not any(s in frag for s in _MOJIBAKE_SENTINELS):
+            return frag
+        try:
+            repaired = frag.encode("cp1252").decode("utf-8")
+        except UnicodeError:
+            return frag
+        old_bad = sum(frag.count(s) for s in _MOJIBAKE_SENTINELS)
+        new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
+        return repaired if new_bad < old_bad else frag
+
+    return _MOJIBAKE_RUN.sub(_fix, text)
 
 # ── v9 display engine (optional) ─────────────────────────────────────────────
 try:
@@ -2568,6 +2594,9 @@ def main():
             from datetime import datetime
             dt = datetime.fromtimestamp(record.created, tz=IST)
             return f"{dt.strftime('%Y-%m-%d %H:%M:%S')},{int(record.msecs):03d}"
+
+        def format(self, record):
+            return _repair_mojibake(super().format(record))
 
     _fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     _fh  = logging.FileHandler("telegram_controller.log", encoding="utf-8")
