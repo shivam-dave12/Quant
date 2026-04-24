@@ -952,7 +952,7 @@ class ConvictionFilter:
             elif contra:
                 # CONTRA: penalize proportional to confidence
                 # High confidence contra = very bad (smart money going other way)
-                return max(base * (0.30 - conf * 0.25), 0.0)
+                return max(base * (0.05 + (1.0 - conf) * 0.25), 0.0)
             else:
                 # Neutral bias — use base with slight penalty
                 return base * 0.65

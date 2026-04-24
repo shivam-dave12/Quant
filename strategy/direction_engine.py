@@ -123,6 +123,19 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    import config as _de_cfg
+except Exception:  # pragma: no cover - config import can fail in isolated tests
+    _de_cfg = None
+
+
+def _cfg(name: str, default):
+    """Read direction-engine config at call-time with a safe fallback."""
+    if _de_cfg is None:
+        return default
+    val = getattr(_de_cfg, name, None)
+    return default if val is None else val
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OPTIONAL IMPORT — LiquidityMap types
 # Used to enrich Factor 5 (pool asymmetry) and static sweep scoring.
@@ -278,6 +291,7 @@ class PostSweepState:
     swept_pool_price:   float
     swept_pool_type:    str    # "BSL" | "SSL"
     entered_at:         float  # epoch seconds
+    quality:            float = 0.5
 
     # ── Static baseline (scored ONCE after _PS_EVAL_DELAY_SEC) ──────
     static_rev_base:    float = 0.0
@@ -558,7 +572,7 @@ class DirectionEngine:
             if _bos == 'bullish':
                 _vote += +0.25
             elif _bos == 'bearish':
-                _vote -= +0.25
+                _vote -= 0.25
             # CHoCH is an early reversal warning — reduces the vote
             if _choch == 'bearish' and _trend == 'bullish':
                 _vote -= 0.15
@@ -1065,6 +1079,7 @@ class DirectionEngine:
             swept_pool_price = swept_pool_price,
             swept_pool_type  = pool_type,
             entered_at       = now,
+            quality          = float(quality),
             highest_since    = price,
             # Bug #33 fix: lowest_since must start at float('inf'), not price.
             lowest_since     = float('inf'),
@@ -1430,8 +1445,7 @@ class DirectionEngine:
             #   • Session hint embedded in ps → session-weight contribution
             #   • Pool type → dealing range proxy (BSL swept → bearish reversal likely)
             # This keeps the static baseline proportional even without ICT engine.
-            _sweep_quality = float(getattr(ps.sweep if hasattr(ps, 'sweep') else ps,
-                                           'quality', 0.35) or 0.35)
+            _sweep_quality = float(getattr(ps, 'quality', 0.35) or 0.35)
             _pool_type     = str(getattr(ps, 'swept_pool_type', '') or '')
 
             # Sweep quality → reversal base (mirrors the ICT path quality scoring)

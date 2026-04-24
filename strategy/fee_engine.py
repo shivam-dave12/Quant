@@ -508,7 +508,7 @@ class ExecutionCostEngine:
             side, qty, price, orderbook, signal_urgency)
 
         # After fill confirmed:
-        self._fee_engine.record_fill(expected_price, fill_price)
+        self._fee_engine.record_fill(expected_price, fill_price, leg="entry")
 
         # In _compute_sl_tp to gate TP viability:
         min_move = self._fee_engine.min_required_tp_move(
@@ -529,7 +529,9 @@ class ExecutionCostEngine:
 
     def __init__(self):
         self._spread  = SpreadTracker()
-        self._slip    = SlippageTracker()
+        self._entry_slip = SlippageTracker()
+        self._exit_slip  = SlippageTracker()
+        self._slip       = self._exit_slip  # backward-compatible read alias
         self._floor   = ProfitFloorModel()
         self._mtd     = MakerTakerDecision()
 
@@ -556,9 +558,17 @@ class ExecutionCostEngine:
         """Call on every orderbook snapshot (already called in data_manager tick)."""
         self._spread.update(orderbook, price)
 
-    def record_fill(self, expected_price: float, fill_price: float) -> None:
-        """Call after every fill to feed back realized slippage."""
-        self._slip.record(expected_price, fill_price)
+    def record_fill(self, expected_price: float, fill_price: float,
+                    leg: str = "entry") -> None:
+        """
+        Feed back realized slippage for one execution leg.
+
+        Entry and exit slippage are tracked separately so maker-entry queue
+        risk is not charged on top of a blended all-fill EWMA.
+        """
+        leg_key = str(leg or "entry").lower()
+        tracker = self._exit_slip if leg_key == "exit" else self._entry_slip
+        tracker.record(expected_price, fill_price)
 
     # ── Query ─────────────────────────────────────────────────────────────────
 
@@ -590,16 +600,17 @@ class ExecutionCostEngine:
         entry_fee_bps = self.MAKER_RATE * 10_000 if use_maker_entry else self.TAKER_RATE * 10_000
         exit_fee_bps  = self.TAKER_RATE * 10_000   # SL/TP always market = taker
         half_spread   = self._spread.median_bps() / 2.0
-        slip          = self._slip.expected_bps()
+        entry_slip    = self._entry_slip.expected_bps()
+        exit_slip     = self._exit_slip.expected_bps()
 
         if use_maker_entry:
             # entry_fee_bps may be negative (rebate) — math is correct either way.
             # Maker queue slippage: fraction of taker slippage (Bug #31 fix).
             maker_slip_frac = float(_cfg("FEE_MAKER_SLIP_FRAC", 0.20))
-            maker_queue_slip = slip * maker_slip_frac
-            return entry_fee_bps + exit_fee_bps + half_spread + maker_queue_slip + slip
+            maker_queue_slip = entry_slip * maker_slip_frac
+            return entry_fee_bps + exit_fee_bps + half_spread + maker_queue_slip + exit_slip
         else:
-            return entry_fee_bps + exit_fee_bps + half_spread * 2 + slip * 2
+            return entry_fee_bps + exit_fee_bps + half_spread * 2 + entry_slip + exit_slip
 
     def min_required_tp_move(
         self,
@@ -646,13 +657,18 @@ class ExecutionCostEngine:
         taker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=False)
         maker_cost = self.effective_roundtrip_cost_bps(use_maker_entry=True)
         spread_samples = self._spread.sample_count
-        slip_warmed    = self._slip._ewma is not None
+        entry_slip_warmed = self._entry_slip._ewma is not None
+        exit_slip_warmed  = self._exit_slip._ewma is not None
         return {
             "spread_median_bps":    round(self._spread.median_bps(), 2),
             "spread_p90_bps":       round(self._spread.percentile_bps(0.90), 2),
             "spread_samples":       spread_samples,
-            "slippage_ewma_bps":    round(self._slip.expected_bps(), 2),
-            "slip_warmed":          slip_warmed,
+            "slippage_ewma_bps":    round(self._exit_slip.expected_bps(), 2),
+            "entry_slippage_ewma_bps": round(self._entry_slip.expected_bps(), 2),
+            "exit_slippage_ewma_bps":  round(self._exit_slip.expected_bps(), 2),
+            "slip_warmed":          entry_slip_warmed or exit_slip_warmed,
+            "entry_slip_warmed":    entry_slip_warmed,
+            "exit_slip_warmed":     exit_slip_warmed,
             "rt_cost_taker_bps":    round(taker_cost, 2),
             "rt_cost_maker_bps":    round(maker_cost, 2),
             "maker_saving_bps":     round(taker_cost - maker_cost, 2),

@@ -3853,11 +3853,19 @@ class QuantStrategy:
                 # for the full bar duration).
                 _bar_age_limit_ms  = _cur_5m_start_ms - 300_000  # prev bar start
 
+                # [DIAG-NT:BRIDGE] counters for per-pool instrumentation
+                _bridge_seen = 0
+                _bridge_fwd = 0
+                _bridge_drop_age = 0
+                _bridge_drop_unswept = 0
                 for pool in self._ict.liquidity_pools:
+                    _bridge_seen += 1
                     if not pool.swept:
+                        _bridge_drop_unswept += 1
                         continue
                     if (pool.sweep_timestamp < _base_age_limit_ms
                             and pool.sweep_timestamp < _bar_age_limit_ms):
+                        _bridge_drop_age += 1
                         continue
                     c5 = candles_by_tf.get("5m", [])
                     # BUG-A5 FIX: Find the candle that ACTUALLY crossed the pool price.
@@ -3957,6 +3965,7 @@ class QuantStrategy:
                                         now              = now,
                                         quality          = _new_quality,
                                     )
+                                    _bridge_fwd += 1
                             # BUG-D1 FIX: Prune _notified_sweeps unconditionally
                             # per-pool-visit (not just inside _should_forward path)
                             # so the set stays bounded even when no new sweeps arrive.
@@ -3967,6 +3976,19 @@ class QuantStrategy:
                             }
                         except Exception:
                             pass
+
+                # [DIAG-NT:BRIDGE] throttled (30s) summary of what the ICT
+                # bridge saw this tick. If you see age_drop>0 and forwarded=0
+                # across many ticks, the bridge age window is eating sweeps.
+                if _bridge_seen > 0:
+                    _btl = getattr(self, '_nt_bridge_last', 0.0)
+                    if now - _btl >= 30.0:
+                        self._nt_bridge_last = now
+                        logger.info(
+                            f"[DIAG-NT:BRIDGE] seen={_bridge_seen} "
+                            f"unswept_skip={_bridge_drop_unswept} "
+                            f"age_drop={_bridge_drop_age} "
+                            f"forwarded={_bridge_fwd}")
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")
 
@@ -4036,6 +4058,35 @@ class QuantStrategy:
                         f"{_ps_decision.reason[:80]}")
             except Exception as _pse:
                 logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
+
+        # [DIAG-NO-TRADES]: throttled snapshot of the decision surface.
+        # Added to diagnose "no trades after first trade" — tells us the
+        # entry-engine state, sweep counts in both pipelines, registry sizes,
+        # and any active cooldowns — once every 30s.
+        _nt_now = now
+        if not hasattr(self, '_nt_last_log') or _nt_now - self._nt_last_log >= 30.0:
+            self._nt_last_log = _nt_now
+            try:
+                _ee_state = getattr(self._entry_engine, '_state', None)
+                _ee_state_name = _ee_state.name if _ee_state is not None else "?"
+                _last_entry_at = getattr(self._entry_engine, '_last_entry_at', 0.0)
+                _ps = len(getattr(self._entry_engine, '_processed_sweeps', {}))
+                _ns = len(getattr(self, '_notified_sweeps', set()))
+                _rs = len(getattr(liq_snapshot, 'recent_sweeps', []) or [])
+                _ics = len(getattr(ict_ctx, 'ict_sweeps', []) or [])
+                _gbu = getattr(self._entry_engine, '_gate_blocked_until', 0.0) or 0.0
+                _mbu = getattr(self._entry_engine, '_momentum_blocked_until', 0.0) or 0.0
+                _cd_rem = max(0.0, _gbu - _nt_now)
+                _mbu_rem = max(0.0, _mbu - _nt_now)
+                _since_entry = (_nt_now - _last_entry_at) if _last_entry_at > 0 else -1.0
+                logger.info(
+                    f"[DIAG-NT] EE={_ee_state_name} "
+                    f"snap_sweeps={_rs} ict_sweeps={_ics} "
+                    f"proc_reg={_ps} notif_reg={_ns} "
+                    f"gate_cd={_cd_rem:.0f}s mom_cd={_mbu_rem:.0f}s "
+                    f"last_entry={_since_entry:.0f}s_ago")
+            except Exception as _nt_e:
+                logger.debug(f"[DIAG-NT] snapshot emit error: {_nt_e}")
 
         # Step 7: Feed to entry engine
         self._entry_engine.update(
@@ -4902,7 +4953,7 @@ class QuantStrategy:
         # ── Record slippage for fee engine (PATCH 5f) ─────────────────────────────
         if self._fee_engine is not None:
             try:
-                self._fee_engine.record_fill(price, fill_price)
+                self._fee_engine.record_fill(price, fill_price, leg="entry")
             except Exception as e:
                 logger.debug(f"record_fill error (non-fatal): {e}")
 
@@ -6276,6 +6327,14 @@ class QuantStrategy:
         fill_price = float(exit_info["fill_price"])  # exact execution price
         fee_paid   = float(exit_info["fee_paid"])    # paid_commission from Delta
         fired_id   = exit_info["order_id"]
+        if self._fee_engine is not None and fill_price > 0:
+            try:
+                expected_exit = pos.tp_price if exit_type == "tp" else pos.sl_price
+                if expected_exit > 0:
+                    self._fee_engine.record_fill(
+                        expected_exit, fill_price, leg="exit")
+            except Exception as e:
+                logger.debug(f"record exit fill error (non-fatal): {e}")
 
         if exit_type == "tp":
             exit_reason = "tp_hit";       is_tp_hit = True;  is_sl_hit = False

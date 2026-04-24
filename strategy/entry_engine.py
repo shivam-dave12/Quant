@@ -123,6 +123,7 @@ _PS_DISP_MIN_ATR    = 0.25   # lower displacement requirement
 _PS_DISP_STRONG_ATR = 0.8    # easier strong displacement
 _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
+_PS_NEUTRAL_TICK_DECAY = 0.98
 
 # Momentum entry
 _MOMENTUM_MIN_BODY_RATIO   = 0.65
@@ -133,6 +134,8 @@ _MOMENTUM_SL_BUFFER_ATR    = 0.15
 _MOMENTUM_MIN_RR           = 1.0    # allow tighter momentum entries
 _MOMENTUM_COOLDOWN_SEC     = 15.0   # faster momentum cooldown
 _MOMENTUM_MAX_PER_HOUR     = 10     # allow more momentum entries
+_MOMENTUM_BLOCK_SEC        = 30.0   # default cooldown when gate blocks
+_MOMENTUM_BLOCK_ATR_MOVE   = 0.25   # ATR distance that lifts block early
 
 # HTF TP escalation
 _HTF_TP_TIMEFRAMES   = ('1h', '4h', '1d')
@@ -394,8 +397,6 @@ class EntryEngine:
         self._momentum_block_entry_price: float = 0.0
         self._momentum_block_candle_ts:   int   = 0
         self._momentum_block_sl:          Optional[float] = None
-        _MOMENTUM_BLOCK_SEC      = 30.0   # default cooldown when gate blocks
-        _MOMENTUM_BLOCK_ATR_MOVE = 0.25   # ATR distance that lifts block early
 
         # ── Diagnostic: sweep-rejection counters ──────────────────────────
         # Populated by _collect_sweeps() on every tick. Read by the strategy's
@@ -555,7 +556,7 @@ class EntryEngine:
         entry_price: float,
         candle_ts: int,
         locked_sl: float,
-        cooldown_sec: float = 30.0,
+        cooldown_sec: float = _MOMENTUM_BLOCK_SEC,
     ) -> None:
         """
         FIX-SPAM + FIX-SL-FLIP: Called by quant_strategy when the conviction gate
@@ -730,6 +731,21 @@ class EntryEngine:
                 continue
             sweeps.append(s)
 
+        # [DIAG-NO-TRADES]: throttled (30s) log so we can see exactly which
+        # gate is eating sweeps when no POST-SWEEP ENTERED fires.  Only emits
+        # when there's something interesting (either source non-empty or
+        # nothing passed through).  Safe to leave in production.
+        _src_total = len(snap.recent_sweeps or [])
+        if _src_total > 0 or len(sweeps) == 0:
+            _nt_last = getattr(self, '_nt_collect_last', 0.0)
+            if now - _nt_last >= 30.0:
+                self._nt_collect_last = now
+                logger.info(
+                    f"[DIAG-NT:COLLECT] source={_src_total} "
+                    f"→ stale={_skipped_stale} low_q={_skipped_low_quality} "
+                    f"proc={_skipped_processed} → passed={len(sweeps)} "
+                    f"state={self._state.name}")
+
         if (not sweeps
                 and self._state not in (EngineState.POST_SWEEP,
                                         EngineState.IN_POSITION,
@@ -886,7 +902,7 @@ class EntryEngine:
         if now < self._momentum_blocked_until:
             moved = (abs(price - self._momentum_block_entry_price) / max(atr, 1e-10)
                      if atr > 0 else 0.0)
-            if moved < 0.25:
+            if moved < _MOMENTUM_BLOCK_ATR_MOVE:
                 return False
             # Price moved enough — clear the block so we can re-evaluate
             self._momentum_blocked_until = 0.0
@@ -1055,7 +1071,7 @@ class EntryEngine:
         self._post_sweep = _PostSweepState(
             sweep=sweep, entered_at=now,
             initial_flow=flow.conviction, initial_flow_dir=flow.direction,
-            highest_since=price, lowest_since=price,
+            highest_since=price, lowest_since=float('inf'),
             ict_sweep_event=ict_event,
         )
         self._state = EngineState.POST_SWEEP
@@ -1341,16 +1357,19 @@ class EntryEngine:
         # ── Accumulate with decay ─────────────────────────────────────
         decay = 0.92
         if rev_d > 0 and cont_d > 0:
-            ps.rev_evidence += rev_d
-            ps.cont_evidence += cont_d
             ps.rev_evidence *= decay
             ps.cont_evidence *= decay
+            ps.rev_evidence += rev_d
+            ps.cont_evidence += cont_d
         elif rev_d > 0:
             ps.rev_evidence += rev_d
             ps.cont_evidence *= decay
         elif cont_d > 0:
             ps.cont_evidence += cont_d
             ps.rev_evidence *= decay
+        else:
+            ps.rev_evidence *= _PS_NEUTRAL_TICK_DECAY
+            ps.cont_evidence *= _PS_NEUTRAL_TICK_DECAY
 
         rev_total = max(ps.static_rev_base + ps.rev_evidence, 0.0)
         cont_total = max(ps.static_cont_base + ps.cont_evidence, 0.0)
