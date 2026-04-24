@@ -4045,12 +4045,20 @@ class QuantStrategy:
                 if (_diag_ee_forwarded > 0 or _diag_event_raw > 0 or _diag_pool_sources > 0):
                     if _diag_now - self._last_ict_bridge_diag_ts >= _diag_interval:
                         self._last_ict_bridge_diag_ts = _diag_now
+                        _scan = {}
+                        try:
+                            _scan = dict(getattr(self._ict, "_last_sweep_scan", {}) or {})
+                        except Exception:
+                            _scan = {}
                         logger.info(
                             "ICT_BRIDGE_DIAG events_raw=%d event_sources=%d "
                             "pools_raw=%d swept_pool_sources=%d candidates=%d "
                             "fresh=%d age_drop=%d youngest_age=%.1fs oldest_age=%.1fs "
                             "ee_forwarded=%d dir_forwarded=%d "
-                            "dir_dedup=%d cross_skip=%d ctx_ict_sweeps=%d",
+                            "dir_dedup=%d cross_skip=%d ctx_ict_sweeps=%d | "
+                            "ICT_SCAN c5=%s c15=%s c1h=%s c5_age=%ss c15_age=%ss "
+                            "unswept=%s checks=%s hits=%s fresh_hits=%s hist_hits=%s "
+                            "latest_hit_age=%ss",
                             _diag_event_raw,
                             _diag_event_sources,
                             _diag_pool_raw,
@@ -4065,6 +4073,17 @@ class QuantStrategy:
                             _diag_dir_dedup,
                             _diag_cross_skip,
                             len(getattr(ict_ctx, "ict_sweeps", []) or []),
+                            _scan.get("c5", "?"),
+                            _scan.get("c15", "?"),
+                            _scan.get("c1h", "?"),
+                            _scan.get("c5_last_age_s", "?"),
+                            _scan.get("c15_last_age_s", "?"),
+                            _scan.get("unswept", "?"),
+                            _scan.get("checks", "?"),
+                            _scan.get("hits", "?"),
+                            _scan.get("fresh_hits", "?"),
+                            _scan.get("historical_hits", "?"),
+                            _scan.get("latest_hit_age_s", "?"),
                         )
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")

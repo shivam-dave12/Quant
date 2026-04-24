@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 _MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
 _MOJIBAKE_RUN = re.compile(
-    r"[\u00a0-\u00ff\u0100-\u017f"
+    r"[\u0080-\u009f\u00a0-\u00ff\u0100-\u017f\u02c0-\u02ff"
     r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
 )
 _MOJIBAKE_DIRECT = {
@@ -69,7 +69,9 @@ _MOJIBAKE_DIRECT = {
     "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
     "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
     "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
-    "â±ï¸": "⏱️", "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+    "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â³": "⏳",
+    "â‰ˆ": "≈", "Â±": "±", "Ã—": "×", "Ïƒ": "σ",
+    "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
 }
 
 
@@ -134,6 +136,7 @@ _MAX_RETRIES  = 4
 # crash reports, and killswitch confirmations are never dropped even when
 # the queue is full during a burst of routine heartbeat messages.
 _CRITICAL_KEYWORDS = frozenset((
+    "💀", "🚨",
     "UNPROTECTED", "CRASH", "KILLSWITCH", "💀", "🚨", "CIRCUIT_BREAKER",
     "EMERGENCY", "emergency_flatten", "BOT CRASH",
 ))

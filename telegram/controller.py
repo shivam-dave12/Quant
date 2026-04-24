@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 _MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
 _MOJIBAKE_RUN = re.compile(
-    r"[\u00a0-\u00ff\u0100-\u017f"
+    r"[\u0080-\u009f\u00a0-\u00ff\u0100-\u017f\u02c0-\u02ff"
     r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
 )
 _MOJIBAKE_DIRECT = {
@@ -51,7 +51,9 @@ _MOJIBAKE_DIRECT = {
     "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
     "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
     "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
-    "â±ï¸": "⏱️", "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+    "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â³": "⏳",
+    "â‰ˆ": "≈", "Â±": "±", "Ã—": "×", "Ïƒ": "σ",
+    "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
 }
 
 
@@ -118,6 +120,7 @@ class TelegramBotController:
     def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
         """Send message with auto-chunking (Telegram 4096 char limit)."""
         try:
+            message = _repair_mojibake(str(message))
             if len(message) > 4000:
                 chunks = []
                 while message:
@@ -142,6 +145,7 @@ class TelegramBotController:
                 return False
 
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
+        text = _repair_mojibake(str(text))
         if parse_mode == "HTML":
             text = _sanitize_html(text)
         url     = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"

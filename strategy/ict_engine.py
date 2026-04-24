@@ -54,7 +54,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Deque, NamedTuple
+from typing import Any, List, Dict, Optional, Tuple, Deque, NamedTuple
 from collections import deque
 from datetime import datetime, timezone
 
@@ -639,6 +639,7 @@ class ICTEngine:
         self._last_update    = 0.0
         self._UPDATE_INTERVAL = 5.0
         self._initialized    = False
+        self._last_sweep_scan: Dict[str, Any] = {}
 
         # Config overrides
         self.ICT_REQUIRE_OB_OR_FVG = False
@@ -1886,6 +1887,33 @@ class ICTEngine:
             all_c += list(candles_1h[-5:])
         all_c.sort(key=lambda c: int(c.get("t", 0)))
 
+        def _age_s(candles: List[Dict]) -> float:
+            try:
+                ts = int((candles[-1] or {}).get("t", 0) or 0)
+                return max(0.0, (now_ms - ts) / 1000.0) if ts > 0 else -1.0
+            except Exception:
+                return -1.0
+
+        _cur_5m_start_ms = (now_ms // 300_000) * 300_000
+        _fresh_base_ms = now_ms - 60_000
+        _fresh_bar_ms = _cur_5m_start_ms - 300_000
+        scan = {
+            "at_ms": now_ms,
+            "c5": len(candles_5m or []),
+            "c15": len(candles_15m or []),
+            "c1h": len(candles_1h or []),
+            "c5_last_age_s": round(_age_s(candles_5m or []), 1),
+            "c15_last_age_s": round(_age_s(candles_15m or []), 1),
+            "c1h_last_age_s": round(_age_s(candles_1h or []), 1),
+            "pools": len(self.liquidity_pools),
+            "unswept": 0,
+            "checks": 0,
+            "hits": 0,
+            "fresh_hits": 0,
+            "historical_hits": 0,
+            "latest_hit_age_s": -1.0,
+        }
+
         # BUG-SWEEP-DEDUP FIX: dedup key is (pool_price_rounded, candle_ts).
         # When c['t'] is absent, use now_ms directly (wall-clock millisecond).
         # The old approach bucketed to 5-min boundaries, which meant two DIFFERENT
@@ -1935,7 +1963,9 @@ class ICTEngine:
         for pool in list(self.liquidity_pools):
             if pool.swept:
                 continue
+            scan["unswept"] += 1
             for c in all_c:
+                scan["checks"] += 1
                 h, l = float(c['h']), float(c['l'])
                 cl, op = float(c['c']), float(c['o'])
                 body = abs(cl - op)
@@ -1949,6 +1979,14 @@ class ICTEngine:
                     disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
+                    _hit_age_s = max(0.0, (now_ms - pool.sweep_timestamp) / 1000.0)
+                    scan["hits"] += 1
+                    scan["latest_hit_age_s"] = round(_hit_age_s, 1)
+                    if (pool.sweep_timestamp >= _fresh_base_ms
+                            or pool.sweep_timestamp >= _fresh_bar_ms):
+                        scan["fresh_hits"] += 1
+                    else:
+                        scan["historical_hits"] += 1
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
                     pool.displacement_score = disp_score
@@ -1962,6 +2000,14 @@ class ICTEngine:
                     disp = disp_score >= self.SWEEP_DISP_MIN * 0.75
                     pool.swept = True
                     pool.sweep_timestamp = _candle_ts(c)
+                    _hit_age_s = max(0.0, (now_ms - pool.sweep_timestamp) / 1000.0)
+                    scan["hits"] += 1
+                    scan["latest_hit_age_s"] = round(_hit_age_s, 1)
+                    if (pool.sweep_timestamp >= _fresh_base_ms
+                            or pool.sweep_timestamp >= _fresh_bar_ms):
+                        scan["fresh_hits"] += 1
+                    else:
+                        scan["historical_hits"] += 1
                     pool.wick_rejection  = True
                     pool.displacement_confirmed = disp
                     pool.displacement_score = disp_score
@@ -1969,6 +2015,7 @@ class ICTEngine:
                     _record_sweep_event(pool, c, disp, disp_score)
                     _log_sweep(pool, "BULLISH", disp, disp_score, pool.sweep_timestamp)
                     break
+        self._last_sweep_scan = scan
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # OB MITIGATION TRACKING
