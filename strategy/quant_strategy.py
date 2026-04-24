@@ -4229,6 +4229,7 @@ class QuantStrategy:
                             locked_sl   = signal.sl_price,
                             cooldown_sec= 30.0,
                         )
+                        self._entry_engine.consume_signal()
                     elif hasattr(self._entry_engine, 'mark_gate_blocked'):
                         self._entry_engine.mark_gate_blocked(
                             signal.side, reject_str[:40], cooldown_sec=10.0)
@@ -4285,8 +4286,7 @@ class QuantStrategy:
                 ict_tier=_tier,
                 prefetched_bal_info=bal_info,   # Bug #5: reuse fetched balance
             )
-            self._entry_engine.consume_signal()
-            self._entry_engine.on_entry_placed()
+            self._entry_engine.on_entry_placed(signal)
             self._entry_confirm_key = None
             self._entry_confirm_count = 0
 

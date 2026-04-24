@@ -1390,10 +1390,13 @@ class EntryEngineStuckCheck(HealthCheck):
     could explain "no trades after first" if `on_position_closed()` was
     never called).
 
-    We detect: bot `_pos.phase == FLAT` but entry_engine._state is NOT in
-    {SCANNING, POST_SWEEP}. This means the entry engine is still in
-    IN_POSITION or ENTERING while the bot has no position. It will reject
-    every new sweep until self-recovery (up to 4 hours).
+    We detect:
+      * bot `_pos.phase == FLAT` but entry_engine._state is NOT in
+        {SCANNING, POST_SWEEP}. This means the entry engine is still in
+        IN_POSITION or ENTERING while the bot has no position.
+      * bot is FLAT and entry_engine is SCANNING, but `_signal` remains
+        latched for >60s. A pending signal should be consumed, blocked, or
+        launched within a tick or two; a stale signal suppresses new scans.
     """
     name = "entry_engine_stuck"
     category = "L3_ENGINE"
@@ -1413,6 +1416,32 @@ class EntryEngineStuckCheck(HealthCheck):
 
         ee_state = _safe_getattr(engine, "_state", None)
         ee_state_name = getattr(ee_state, "name", str(ee_state))
+
+        signal = _safe_getattr(engine, "_signal", None)
+        if ee_state_name == "SCANNING" and signal is not None:
+            created_at = float(_safe_getattr(signal, "created_at", 0.0) or 0.0)
+            age = _now() - created_at if created_at > 0 else 0.0
+            side = _safe_getattr(signal, "side", "?")
+            entry_type = _safe_getattr(signal, "entry_type", "")
+            entry_type_name = getattr(entry_type, "name", str(entry_type))
+            if age < 60.0:
+                return self._info(
+                    f"entry engine has pending {entry_type_name} {side} signal "
+                    f"while bot=FLAT ({age:.0f}s old; within grace)",
+                    age_sec=round(age, 1),
+                    engine_state=ee_state_name,
+                    signal_side=side,
+                    signal_type=entry_type_name,
+                )
+            return self._heal(
+                f"entry engine has stale {entry_type_name} {side} signal "
+                f"for {age:.0f}s while bot=FLAT — new scans are suppressed",
+                action="reset_entry_engine",
+                age_sec=round(age, 1),
+                engine_state=ee_state_name,
+                signal_side=side,
+                signal_type=entry_type_name,
+            )
 
         # Allowed engine states while bot is FLAT
         if ee_state_name in ("SCANNING", "POST_SWEEP"):
@@ -1490,22 +1519,31 @@ class NotifierQueueDepthCheck(HealthCheck):
     heal_confirmations = 2
 
     def check(self) -> HealthResult:
-        # Try common import paths
+        # Try common import paths. telegram.notifier exposes _send_queue in
+        # this codebase; older variants used _queue/_tg_queue.
         q = None
         try:
             from telegram import notifier as _n
-            q = _safe_getattr(_n, "_queue", None) or _safe_getattr(_n, "_tg_queue", None)
+            q = (
+                _safe_getattr(_n, "_send_queue", None)
+                or _safe_getattr(_n, "_queue", None)
+                or _safe_getattr(_n, "_tg_queue", None)
+            )
         except Exception:
             pass
         if q is None:
             try:
                 import notifier as _n  # type: ignore
-                q = _safe_getattr(_n, "_queue", None) or _safe_getattr(_n, "_tg_queue", None)
+                q = (
+                    _safe_getattr(_n, "_send_queue", None)
+                    or _safe_getattr(_n, "_queue", None)
+                    or _safe_getattr(_n, "_tg_queue", None)
+                )
             except Exception:
                 pass
 
         if q is None:
-            return self._info("notifier queue not accessible")
+            return self._ok("notifier queue not accessible", accessible=False)
 
         try:
             depth = q.qsize()
@@ -1661,15 +1699,22 @@ class NoTradesAfterFirstCheck(HealthCheck):
                 since_min=round(since / 60, 1), can_trade=False, reason=reason,
             )
 
+        engine = _safe_getattr(self._strategy, "_entry_engine", None)
+        signal = _safe_getattr(engine, "_signal", None)
+        signal_type = _safe_getattr(signal, "entry_type", "")
+        signal_created = float(_safe_getattr(signal, "created_at", 0.0) or 0.0)
         metrics = {
             "since_min": round(since / 60, 1),
             "total_trades": total_trades,
             "can_trade": True,
             "engine_state": getattr(
-                _safe_getattr(_safe_getattr(self._strategy, "_entry_engine", None),
-                              "_state", None),
+                _safe_getattr(engine, "_state", None),
                 "name", "?",
             ),
+            "pending_signal": signal is not None,
+            "pending_signal_age_sec": round(_now() - signal_created, 1) if signal_created > 0 else None,
+            "pending_signal_type": getattr(signal_type, "name", str(signal_type)) if signal is not None else None,
+            "pending_signal_side": _safe_getattr(signal, "side", None),
         }
 
         if since >= self.CRITICAL_SEC:
@@ -2236,9 +2281,14 @@ class ResetEntryEngineAction(HealAction):
 
     def capture_before(self, ctx: HealContext) -> Dict[str, Any]:
         ee = _safe_getattr(ctx.strategy, "_entry_engine", None)
+        signal = _safe_getattr(ee, "_signal", None)
+        entry_type = _safe_getattr(signal, "entry_type", "")
         return {
             "engine_state": getattr(_safe_getattr(ee, "_state", None), "name", "?"),
             "state_entered": _safe_getattr(ee, "_state_entered", 0.0),
+            "signal_side": _safe_getattr(signal, "side", None),
+            "signal_type": getattr(entry_type, "name", str(entry_type)) if signal is not None else None,
+            "signal_created_at": _safe_getattr(signal, "created_at", None),
         }
 
     def apply(self, ctx: HealContext) -> Tuple[bool, str]:

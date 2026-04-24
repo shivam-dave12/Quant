@@ -461,7 +461,7 @@ class EntryEngine:
         self._signal = None
         return sig
 
-    def on_entry_placed(self) -> None:
+    def on_entry_placed(self, signal: Optional[EntrySignal] = None) -> None:
         """
         Called by quant_strategy when a trade order is confirmed sent.
 
@@ -477,8 +477,11 @@ class EntryEngine:
         self._state_entered = time.time()
         self._last_entry_at = time.time()
         # Increment momentum budget for the active signal type (if momentum).
-        if (self._signal is not None and
-                getattr(self._signal, 'entry_type', None) ==
+        # quant_strategy may already have consumed self._signal, so accept the
+        # signal explicitly as the canonical source when available.
+        active_signal = signal or self._signal
+        if (active_signal is not None and
+                getattr(active_signal, 'entry_type', None) ==
                 EntryType.DISPLACEMENT_MOMENTUM):
             self._momentum_entries_1h += 1
         self._signal = None
