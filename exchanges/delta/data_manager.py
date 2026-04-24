@@ -84,6 +84,8 @@ class DeltaDataManager:
         self._lock            = threading.RLock()
         self._forming_ts:     Dict[str, int] = {}
         self._warmup_complete = False
+        self._last_candle_rest_refresh: Dict[str, float] = {}
+        self._candle_refresh_inflight: set[str] = set()
 
         self._strategy_ref = None
         self.is_ready      = False
@@ -294,6 +296,137 @@ class DeltaDataManager:
                     time.sleep(2.0)
 
     # ── Candle deque helper ───────────────────────────────────────────────────
+
+    def _tf_seconds(self, label: str) -> float:
+        cfg = self._WARMUP_CONFIG.get(label)
+        if not cfg:
+            return 300.0
+        return float(cfg[0]) * 60.0
+
+    def _candle_stale_threshold(self, label: str) -> float:
+        grace = float(getattr(config, "DELTA_CANDLE_STALE_GRACE_SEC", 45.0))
+        return max(90.0, self._tf_seconds(label) + grace)
+
+    def _schedule_stale_candle_refresh(self, label: str, age_sec: float) -> None:
+        if label not in self._WARMUP_CONFIG or not self._warmup_complete:
+            return
+
+        throttle = float(getattr(config, "DELTA_CANDLE_REFRESH_THROTTLE_SEC", 45.0))
+        now = time.time()
+        with self._lock:
+            if label in self._candle_refresh_inflight:
+                return
+            last = self._last_candle_rest_refresh.get(label, 0.0)
+            if now - last < throttle:
+                return
+            self._last_candle_rest_refresh[label] = now
+            self._candle_refresh_inflight.add(label)
+
+        logger.warning(
+            f"Delta {label} candles stale age={age_sec:.1f}s "
+            f"(threshold={self._candle_stale_threshold(label):.1f}s); "
+            "starting REST self-heal"
+        )
+        threading.Thread(
+            target=self._refresh_klines_replace,
+            args=(label,),
+            name=f"delta-candle-refresh-{label}",
+            daemon=True,
+        ).start()
+
+    def _refresh_klines_replace(self, label: str, limit: int = 0, retries: int = 1) -> None:
+        cfg = self._WARMUP_CONFIG.get(label)
+        if not cfg:
+            with self._lock:
+                self._candle_refresh_inflight.discard(label)
+            return
+
+        interval_min, default_limit, deque_attr = cfg
+        limit = limit or min(default_limit, 300)
+        symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+        candles: List[Candle] = []
+        latest_age = -1.0
+
+        try:
+            for attempt in range(1, retries + 2):
+                try:
+                    end_ms = int(time.time() * 1000)
+                    start_ms = end_ms - limit * interval_min * 60 * 1000
+                    resp = self.api.get_candles(
+                        symbol=symbol,
+                        resolution=interval_min,
+                        start_time=start_ms,
+                        end_time=end_ms,
+                        limit=limit,
+                    )
+                    if not resp.get("success"):
+                        logger.warning(
+                            f"Delta REST refresh {label} attempt {attempt}: "
+                            f"{resp.get('error')}"
+                        )
+                        if attempt <= retries:
+                            time.sleep(1.0)
+                        continue
+
+                    raw = sorted(
+                        [c for c in (resp.get("result") or []) if c.get("t") and c.get("c")],
+                        key=lambda c: c["t"],
+                    )
+                    for c in raw:
+                        try:
+                            candle = Candle(
+                                timestamp=c["t"] / 1000.0,
+                                open=float(c["o"]),
+                                high=float(c["h"]),
+                                low=float(c["l"]),
+                                close=float(c["c"]),
+                                volume=float(c["v"]),
+                            )
+                            if candle.close > 0:
+                                candles.append(candle)
+                        except Exception:
+                            continue
+                    break
+                except Exception as e:
+                    logger.warning(f"Delta REST refresh {label} attempt {attempt}: {e}")
+                    if attempt <= retries:
+                        time.sleep(1.0)
+
+            if not candles:
+                logger.error(f"Delta REST refresh {label}: no usable candles returned")
+                return
+
+            with self._lock:
+                target: deque = getattr(self, deque_attr)
+                merged = {int(c.timestamp * 1000): c for c in target}
+                for candle in candles:
+                    merged[int(candle.timestamp * 1000)] = candle
+                maxlen = target.maxlen or default_limit
+                ordered = [merged[k] for k in sorted(merged)][-maxlen:]
+                target.clear()
+                target.extend(ordered)
+
+                if target:
+                    tf_key = {
+                        "1m": "1", "5m": "5", "15m": "15",
+                        "1h": "60", "4h": "240", "1d": "1440",
+                    }.get(label)
+                    if tf_key:
+                        self._forming_ts[tf_key] = int(target[-1].timestamp * 1000)
+                    if label == "1m":
+                        self._last_price = target[-1].close
+                        self._last_price_update_time = time.time()
+                    latest_age = time.time() - target[-1].timestamp
+                stored = len(target)
+
+            self.stats.record_candle()
+            logger.warning(
+                f"Delta REST refresh {label}: merged={len(candles)} "
+                f"stored={stored} latest_age={latest_age:.1f}s"
+            )
+        finally:
+            with self._lock:
+                self._candle_refresh_inflight.discard(label)
 
     def _process_ws_candle(self, data: Dict, candle: Candle,
                            target: deque, tf_key: str, tf_label: str) -> None:
@@ -567,9 +700,16 @@ class DeltaDataManager:
             "15m": self._candles_15m, "1h": self._candles_1h,
             "4h": self._candles_4h,  "1d": self._candles_1d,
         }
-        src = tf_map.get(timeframe, self._candles_5m)
+        label = timeframe if timeframe in tf_map else "5m"
+        src = tf_map.get(label, self._candles_5m)
         with self._lock:
             candles = list(src)
+
+        if candles:
+            latest_age = time.time() - float(candles[-1].timestamp)
+            if latest_age > self._candle_stale_threshold(label):
+                self._schedule_stale_candle_refresh(label, latest_age)
+
         return [
             {"t": int(c.timestamp * 1000), "o": c.open, "h": c.high,
              "l": c.low, "c": c.close, "v": c.volume}

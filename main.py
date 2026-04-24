@@ -78,12 +78,25 @@ def _repair_mojibake(text: str) -> str:
     for bad, good in _MOJIBAKE_DIRECT.items():
         text = text.replace(bad, good)
 
+    def _as_original_utf8_bytes(frag: str) -> bytes:
+        out = bytearray()
+        for ch in frag:
+            try:
+                out.extend(ch.encode("cp1252"))
+            except UnicodeEncodeError:
+                code = ord(ch)
+                if code <= 0xFF:
+                    out.append(code)
+                else:
+                    raise
+        return bytes(out)
+
     def _fix(match: re.Match) -> str:
         frag = match.group(0)
         if not any(s in frag for s in _MOJIBAKE_SENTINELS):
             return frag
         try:
-            repaired = frag.encode("cp1252").decode("utf-8")
+            repaired = _as_original_utf8_bytes(frag).decode("utf-8")
         except UnicodeError:
             return frag
         old_bad = sum(frag.count(s) for s in _MOJIBAKE_SENTINELS)
@@ -117,6 +130,7 @@ _stream_handler.setFormatter(_ist_fmt)
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),
     handlers=[_file_handler, _stream_handler],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
