@@ -910,8 +910,7 @@ class ConvictionFilter:
         # Not in any meaningful zone
         return max(0.10, 0.30 - abs(fib - 0.618) * 2.0)
 
-    @staticmethod
-    def _score_amd(trade_side: str, ict_engine) -> float:
+    def _score_amd(self, trade_side: str, ict_engine) -> float:
         """
         Score AMD phase alignment [0-1].
 
@@ -933,6 +932,9 @@ class ConvictionFilter:
             conf = float(getattr(amd, 'confidence', 0.5) or 0.5)
 
             base = _AMD_PHASE_SCORE.get(phase, 0.30)
+            min_conf = float(getattr(self, '_adaptive_amd_min_conf', 0.0) or 0.0)
+            if min_conf > 0.0 and conf < min_conf:
+                base *= max(0.10, conf / max(min_conf, 1e-9))
 
             # Direction alignment check
             aligned = (

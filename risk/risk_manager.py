@@ -273,8 +273,11 @@ class RiskManager:
 
             sl_pct = price_distance / entry_price
 
-            if sl_pct < 0.0005:
-                logger.error(f"SL too tight: {sl_pct*100:.3f}% (min 0.05%)")
+            min_sl_pct = float(getattr(config, "MIN_SL_DISTANCE_PCT", 0.004))
+            if sl_pct < min_sl_pct:
+                logger.error(
+                    f"SL too tight: {sl_pct*100:.3f}% "
+                    f"(min {min_sl_pct*100:.2f}%)")
                 return None
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")

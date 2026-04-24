@@ -219,8 +219,8 @@ class BayesianEstimate:
     Regularised with a Beta(2, 2) prior — centres at 50% WR with low variance,
     avoids degenerate estimates from 1–2 sample dimensions.
 
-    Credible intervals use the Wilson score method which is far more accurate
-    than the normal approximation when n < 30 (typical in live trading).
+    Display uses the Bayesian posterior mean. Wilson intervals use the
+    observed win frequency (MLE), not the posterior mean.
     """
     alpha: float = _BETA_PRIOR_ALPHA   # α = wins + prior
     beta:  float = _BETA_PRIOR_BETA    # β = losses + prior
@@ -242,13 +242,32 @@ class BayesianEstimate:
         return max(0, int(round(self.alpha + self.beta
                                 - _BETA_PRIOR_ALPHA - _BETA_PRIOR_BETA)))
 
+    @property
+    def wins(self) -> int:
+        """Observed wins, excluding prior pseudo-counts."""
+        return max(0, int(round(self.alpha - _BETA_PRIOR_ALPHA)))
+
+    @property
+    def losses(self) -> int:
+        """Observed losses, excluding prior pseudo-counts."""
+        return max(0, int(round(self.beta - _BETA_PRIOR_BETA)))
+
+    @property
+    def observed_wr(self) -> float:
+        """MLE win-rate from real observations only."""
+        return self.wins / self.n if self.n > 0 else 0.0
+
+    @property
+    def obs_label(self) -> str:
+        return f"{self.wins}W/{self.losses}L obs"
+
     def ci_lower(self, confidence: float = _RECOMMENDATION_CI) -> float:
-        """Lower bound of Wilson score credible interval."""
-        return _wilson_lower(self.n, self.mean, confidence)
+        """Lower Wilson bound from observed frequency."""
+        return _wilson_lower(self.n, self.observed_wr, confidence)
 
     def ci_upper(self, confidence: float = _RECOMMENDATION_CI) -> float:
-        """Upper bound of Wilson score credible interval."""
-        return _wilson_upper(self.n, self.mean, confidence)
+        """Upper Wilson bound from observed frequency."""
+        return _wilson_upper(self.n, self.observed_wr, confidence)
 
     def is_significant(
         self, confidence: float = _RECOMMENDATION_CI, baseline: float = 0.50
@@ -806,18 +825,25 @@ class PostTradeAgent:
           4. Classify structural causation (why SL/TP fired)
           5. Update all dimension statistics (Bayesian)
           6. Update Information Coefficient buffer
-          7. Run adaptive parameter engine (Bayesian decision)
-          8. Store record and log analysis
+          7. Store record so adaptive windows include the just-closed trade
+          8. Run adaptive parameter engine (Bayesian decision) and log analysis
         """
         try:
             rec = self._build_record(trade_record, pos, atr)
+            entry_session = str(
+                getattr(pos, "entry_session", "") or
+                trade_record.get("entry_session", "") or
+                ""
+            ).upper()
+            if entry_session:
+                self._pending_session = entry_session
             self._compute_geometry(rec, atr, pos)
             self._compute_entry_quality(rec, pos, atr, ict_engine, liq_snapshot)
             self._classify_causation(rec)
             self._update_statistics(rec)
             self._update_ic(rec)
-            self._run_adaptive_engine(rec)
             self._store_record(rec)
+            self._run_adaptive_engine(rec)
             self._log_analysis(rec)
         except Exception as e:
             logger.error(
@@ -868,8 +894,8 @@ class PostTradeAgent:
 
         lines.append(
             f"\n<b>Overall</b>: {n} trades | "
-            f"WR={overall.bayes.mean:.0%} "
-            f"(CI {overall.bayes.ci_lower():.0%}–{overall.bayes.ci_upper():.0%}) | "
+            f"BayesWR={overall.bayes.mean:.0%} ({overall.bayes.obs_label}) "
+            f"(CI {overall.bayes.ci_lower():.0%}-{overall.bayes.ci_upper():.0%}) | "
             f"IC={ic:+.3f} {ic_icon}"
         )
         lines.append(
@@ -887,7 +913,8 @@ class PostTradeAgent:
                 if d and d.bayes.n >= 1:
                     lines.append(
                         f"  Tier-{tier}: n={d.bayes.n}  "
-                        f"WR={d.bayes.mean:.0%} ({d.bayes.ci_lower():.0%}–{d.bayes.ci_upper():.0%})  "
+                        f"BayesWR={d.bayes.mean:.0%} ({d.bayes.obs_label}; "
+                        f"CI {d.bayes.ci_lower():.0%}-{d.bayes.ci_upper():.0%})  "
                         f"avgR={d.avg_actual_r:.2f}  avgPnL=${d.avg_pnl:+.2f}  "
                         f"G={d.avg_g_ratio:.2f}"
                     )
@@ -902,7 +929,7 @@ class PostTradeAgent:
                 if d.bayes.n >= 1:
                     lines.append(
                         f"  {phase[:12]}: n={d.bayes.n}  "
-                        f"WR={d.bayes.mean:.0%}  "
+                        f"BayesWR={d.bayes.mean:.0%} ({d.bayes.obs_label})  "
                         f"SLeff={d.avg_sl_eff:.2f}  "
                         f"EEff={d.avg_entry_eff:.2f}  "
                         f"avgR={d.avg_actual_r:.2f}"
@@ -918,7 +945,7 @@ class PostTradeAgent:
                 if d.bayes.n >= 1:
                     lines.append(
                         f"  {sess[:12]}: n={d.bayes.n}  "
-                        f"WR={d.bayes.mean:.0%}  "
+                        f"BayesWR={d.bayes.mean:.0%} ({d.bayes.obs_label})  "
                         f"avgPnL=${d.avg_pnl:+.2f}"
                     )
 
@@ -1022,7 +1049,7 @@ class PostTradeAgent:
         side = str(t.get("side", "long") or "long")
         raw_composite = float(t.get("composite", 0.0) or 0.0)
         # IC requires signed composite: same sign as trade direction
-        signed_composite = raw_composite if side == "long" else -abs(raw_composite)
+        signed_composite = raw_composite if side == "long" else -raw_composite
 
         return TradeRecord(
             ts           = float(t.get("ts",          time.time())),
@@ -1299,7 +1326,7 @@ class PostTradeAgent:
             self._get_or_create(
                 self._stats_by_mode, rec.mode).add_trade(rec)
 
-        # Session (captured at exit-context time)
+        # Session (captured at entry time and passed through PositionState)
         if self._pending_session:
             self._get_or_create(
                 self._stats_by_session,
@@ -1377,7 +1404,7 @@ class PostTradeAgent:
              wick sweeps reduce) are equally possible.
         """
         now     = time.time()
-        n_total = len(self.records) + 1   # including the trade just processed
+        n_total = len(self.records)
 
         # Guard: nothing to do until we have sufficient observations
         if n_total < _MIN_SAMPLES:
@@ -1682,8 +1709,8 @@ class PostTradeAgent:
                     dimension=f"SESSION_{sess_key}",
                     severity="WARN",
                     message=(
-                        f"Session {sess_key}: WR={d.bayes.mean:.0%} "
-                        f"(n={d.bayes.n}, CI upper={ci_u:.0%}) "
+                        f"Session {sess_key}: BayesWR={d.bayes.mean:.0%} "
+                        f"({d.bayes.obs_label}, CI upper={ci_u:.0%}) "
                         f"— structural underperformance"
                     ),
                     recommendation=(
@@ -1695,13 +1722,18 @@ class PostTradeAgent:
 
         # ── 8. IC ALERT ───────────────────────────────────────────────────────
         ic = self._compute_ic()
-        if len(self._ic_buffer) >= 10 and ic < -0.10:
+        ic_n = len(self._ic_buffer)
+        if ic_n >= 30 and ic < -0.10:
+            ic_den = math.sqrt(max(1e-12, 1.0 - ic * ic))
+            ic_t = abs(ic) * math.sqrt(max(1, ic_n - 2)) / ic_den
+            if ic_t <= 1.96:
+                return
             self._emit_insight(
                 dimension="IC_SIGNAL",
                 severity="WARN",
                 message=(
                     f"Information Coefficient IC={ic:.3f} — signals are "
-                    f"inversely predictive (n={len(self._ic_buffer)})"
+                    f"inversely predictive (n={ic_n}, t={ic_t:.2f})"
                 ),
                 recommendation=(
                     "Review entry logic — signals appear to be contra-indicators. "
@@ -1884,6 +1916,11 @@ def format_trade_analysis_alert(
         lines.append(
             f"  ⚠️ <i>TP too ambitious — only {g.tp_efficiency:.0%} reached</i>")
 
+    wr_text = f"BayesWR <b>{overall_wr:.0%}</b>"
+    if agent is not None:
+        b = agent._stats_overall.bayes
+        wr_text = f"BayesWR <b>{b.mean:.0%}</b> ({b.obs_label})"
+
     lines += [
         "",
         f"<b>🏛️ ENTRY QUALITY</b>",
@@ -1903,8 +1940,7 @@ def format_trade_analysis_alert(
 
     lines += [
         "",
-        f"<b>📈 SESSION</b>: WR <b>{overall_wr:.0%}</b>  "
-        f"(Bayesian estimate)",
+        f"<b>SESSION</b>: {wr_text}",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 

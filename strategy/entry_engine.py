@@ -86,6 +86,14 @@ _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
 _CONT_SL_BUFFER_ATR = 0.40
 
+try:
+    import config as _sl_cfg
+    _MIN_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MIN_SL_DISTANCE_PCT", 0.004))
+    _MAX_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MAX_SL_DISTANCE_PCT", 0.035))
+except Exception:
+    _MIN_SL_DISTANCE_PCT = 0.004
+    _MAX_SL_DISTANCE_PCT = 0.035
+
 # Post-Sweep phases (seconds after sweep)
 # MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
 # tune phase windows for different market conditions (trending vs ranging)
@@ -967,7 +975,8 @@ class EntryEngine:
         if rr < adj_rr:
             return False
 
-        if abs(price - sl) / price < 0.001 or abs(price - sl) / price > 0.035:
+        if (abs(price - sl) / price < _MIN_SL_DISTANCE_PCT or
+                abs(price - sl) / price > _MAX_SL_DISTANCE_PCT):
             return False
 
         if target is None:
@@ -1430,7 +1439,8 @@ class EntryEngine:
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
         risk = abs(price - sl)
-        if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
+        if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
+                risk / price > _MAX_SL_DISTANCE_PCT):
             self._post_sweep = None
             self._reset(now)
             return
@@ -1505,7 +1515,8 @@ class EntryEngine:
 
         risk = abs(price - sl)
         reward = abs(tp - price)
-        if risk < 1e-10 or risk / price < 0.001 or risk / price > 0.035:
+        if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
+                risk / price > _MAX_SL_DISTANCE_PCT):
             self._post_sweep = None
             self._reset(now)
             return
@@ -1603,7 +1614,7 @@ class EntryEngine:
 
         if sl is not None:
             dist = abs(price - sl) / price
-            if dist < 0.001 or dist > 0.035:
+            if dist < _MIN_SL_DISTANCE_PCT or dist > _MAX_SL_DISTANCE_PCT:
                 sl = None
 
         if sl is None:
@@ -1613,7 +1624,7 @@ class EntryEngine:
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
         dist = abs(price - sl) / price
-        if dist < 0.001 or dist > 0.035:
+        if dist < _MIN_SL_DISTANCE_PCT or dist > _MAX_SL_DISTANCE_PCT:
             return None
         return sl
 

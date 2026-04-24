@@ -123,6 +123,32 @@ def _cfg(name: str, default):
     val = getattr(config, name, None)
     return default if val is None else val
 
+_ADAPTIVE_PARAM_PROVIDER = None
+
+def _set_adaptive_param_provider(provider) -> None:
+    global _ADAPTIVE_PARAM_PROVIDER
+    _ADAPTIVE_PARAM_PROVIDER = provider
+
+def _adaptive_param_value(name: str, default: float,
+                          min_value: float = None,
+                          max_value: float = None) -> float:
+    provider = _ADAPTIVE_PARAM_PROVIDER
+    try:
+        params = getattr(provider, "params", None)
+        state = getattr(params, name, None)
+        if state is None:
+            return float(default)
+        value = float(getattr(state, "effective_value", default))
+        if not math.isfinite(value):
+            return float(default)
+        if min_value is not None:
+            value = max(float(min_value), value)
+        if max_value is not None:
+            value = min(float(max_value), value)
+        return value
+    except Exception:
+        return float(default)
+
 class QCfg:
     @staticmethod
     def SYMBOL() -> str: return str(config.SYMBOL)
@@ -153,11 +179,15 @@ class QCfg:
     @staticmethod
     def EXIT_REVERSAL_THRESH() -> float: return float(_cfg("QUANT_EXIT_REVERSAL_THRESH", 0.40))
     @staticmethod
-    def CONFIRM_TICKS() -> int: return int(_cfg("QUANT_CONFIRM_TICKS", 2))
+    def CONFIRM_TICKS() -> int:
+        return max(1, int(round(_adaptive_param_value(
+            "entry_confirm_ticks", _cfg("QUANT_CONFIRM_TICKS", 2), 1.0, 10.0))))
     @staticmethod
     def SL_SWING_LOOKBACK() -> int: return int(_cfg("QUANT_SL_SWING_LOOKBACK", 12))
     @staticmethod
-    def SL_BUFFER_ATR_MULT() -> float: return float(_cfg("QUANT_SL_BUFFER_ATR_MULT", 0.4))
+    def SL_BUFFER_ATR_MULT() -> float:
+        return _adaptive_param_value(
+            "sl_buffer_atr", _cfg("QUANT_SL_BUFFER_ATR_MULT", 0.4), 0.05, 5.0)
     @staticmethod
     def TP_VWAP_FRACTION() -> float: return float(_cfg("QUANT_TP_VWAP_FRACTION", 0.50))
     @staticmethod
@@ -173,7 +203,7 @@ class QCfg:
     @staticmethod
     def TRAIL_VOL_DECAY_MULT() -> float: return float(_cfg("QUANT_TRAIL_VOL_DECAY_MULT", 0.6))
     @staticmethod
-    def MIN_SL_PCT() -> float: return float(_cfg("MIN_SL_DISTANCE_PCT", 0.003))
+    def MIN_SL_PCT() -> float: return float(_cfg("MIN_SL_DISTANCE_PCT", 0.004))
     @staticmethod
     def MAX_SL_PCT() -> float: return float(_cfg("MAX_SL_DISTANCE_PCT", 0.035))
     @staticmethod
@@ -1467,7 +1497,8 @@ class InstitutionalLevels:
                    ict_engine=None,
                    now_ms: int = 0,
                    candles_15m: Optional[List[Dict]] = None,
-                   liq_map=None) -> Optional[float]:
+                   liq_map=None,
+                   tp_distance_mult: float = 1.0) -> Optional[float]:
         """
         Initial TP placement — v7.0 INSTITUTIONAL PRIORITY.
 
@@ -1506,9 +1537,10 @@ class InstitutionalLevels:
             return None
 
         _ict_now_ms  = now_ms if now_ms > 0 else int(time.time() * 1000)
-        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR()
-        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR()
-        _min_rr_gate = QCfg.REVERSION_MIN_RR()
+        tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
+        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR() * tp_distance_mult
+        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR() * tp_distance_mult
+        _min_rr_gate = QCfg.REVERSION_MIN_RR() * tp_distance_mult
 
         # ── scored candidates pool ─────────────────────────────────────────────
         scored: List[Tuple[float, float, str]] = []   # (level, score, label)
@@ -2273,6 +2305,7 @@ class PositionState:
     consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
     be_ratchet_applied: bool = False  # v5.1: counter-BOS BE already forced
     last_ratchet_r: float = 0.0      # v6.1: last R-level ratcheted (prevents re-fire)
+    entry_session: str = ""          # canonical session captured at entry
     ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" — ICT confluence tier at entry
     # FIX 8: store actual HTF scores at entry time for post-trade attribution.
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
@@ -2524,6 +2557,11 @@ class QuantStrategy:
         # Track previous killzone so on_session_change() fires exactly once per
         # London/NY/Asia/OFF_HOURS boundary — resets conviction session quota.
         self._last_conviction_kz: str = ""
+        self.watchdog_trading_frozen: bool = False
+        self._last_watchdog_freeze_log: float = 0.0
+        self._entry_confirm_key = None
+        self._entry_confirm_count = 0
+        self._last_entry_confirm_log = 0.0
 
         # ── Post-Trade Analysis Agent (v2.0) ──────────────────────────────────
         # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
@@ -2546,6 +2584,8 @@ class QuantStrategy:
                 )
 
         # ── Unified entry gate state ──────────────────────────────────────
+        _set_adaptive_param_provider(self._post_trade_agent)
+
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
         self._log_init()
@@ -2569,6 +2609,36 @@ class QuantStrategy:
         pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
         logger.info(f"   PostTradeAgent: {pta_status}")
         logger.info("=" * 72)
+
+    def _current_entry_session(self) -> str:
+        if self._ict is None:
+            return ""
+        for attr in ("_session", "_killzone"):
+            value = str(getattr(self._ict, attr, "") or "").upper()
+            if value and value not in ("NONE", "OFF_HOURS"):
+                return value
+        return ""
+
+    def _apply_post_trade_adaptive_params(self) -> None:
+        _set_adaptive_param_provider(self._post_trade_agent)
+        pta = self._post_trade_agent
+        if pta is None:
+            return
+        try:
+            params = pta.params
+            try:
+                import strategy.entry_engine as _ee
+            except Exception:
+                import entry_engine as _ee  # type: ignore
+            _ee._PS_OTE_FIB_LOW = float(params.ote_fib_low.effective_value)
+            if self._conviction is not None:
+                setattr(
+                    self._conviction,
+                    "_adaptive_amd_min_conf",
+                    float(params.amd_conf_threshold.effective_value),
+                )
+        except Exception as e:
+            logger.debug(f"Adaptive parameter wiring error: {e}")
 
     def get_position(self) -> Optional[Dict]:
         with self._lock: return None if self._pos.is_flat() else self._pos.to_dict()
@@ -3392,6 +3462,14 @@ class QuantStrategy:
             logger.error("EntryEngine or LiquidityMap unavailable — no entry evaluation")
             return
 
+        if getattr(self, "watchdog_trading_frozen", False):
+            if now - self._last_watchdog_freeze_log >= 30.0:
+                self._last_watchdog_freeze_log = now
+                logger.warning("Entries blocked: watchdog circuit breaker is engaged")
+            return
+
+        self._apply_post_trade_adaptive_params()
+
         # Step 1: Spread gate
         spread_ok, spread_ratio = self._spread_atr_gate(data_manager)
         if not spread_ok:
@@ -3972,12 +4050,35 @@ class QuantStrategy:
         # Step 8: Check for signal and execute
         signal = self._entry_engine.get_signal()
         if signal is not None:
+            required_confirms = QCfg.CONFIRM_TICKS()
+            sig_key = (
+                signal.side,
+                getattr(signal.entry_type, "value", str(signal.entry_type)),
+                round(float(signal.entry_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
+                round(float(signal.sl_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
+                round(float(signal.tp_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
+            )
+            if sig_key == self._entry_confirm_key:
+                self._entry_confirm_count += 1
+            else:
+                self._entry_confirm_key = sig_key
+                self._entry_confirm_count = 1
+            if self._entry_confirm_count < required_confirms:
+                if now - self._last_entry_confirm_log >= 5.0:
+                    self._last_entry_confirm_log = now
+                    logger.info(
+                        f"Entry confirm gate: {signal.side.upper()} "
+                        f"{self._entry_confirm_count}/{required_confirms}")
+                return
+
             bal_info = risk_manager.get_available_balance()
             total_bal = float((bal_info or {}).get("total", 0))
             allowed, reason = self._risk_gate.can_trade(total_bal)
             if not allowed:
                 logger.info(f"Signal blocked by risk manager: {reason}")
                 self._entry_engine.consume_signal()
+                self._entry_confirm_key = None
+                self._entry_confirm_count = 0
                 return
 
             # ── UNIFIED ENTRY GATE — advisory logging only (no blocking) ───
@@ -4156,6 +4257,8 @@ class QuantStrategy:
                             ))
                         except Exception as _cv_tg_e:
                             logger.debug(f"ConvictionGate Telegram error: {_cv_tg_e}")
+                    self._entry_confirm_key = None
+                    self._entry_confirm_count = 0
                     return
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
@@ -4184,6 +4287,8 @@ class QuantStrategy:
             )
             self._entry_engine.consume_signal()
             self._entry_engine.on_entry_placed()
+            self._entry_confirm_key = None
+            self._entry_confirm_count = 0
 
         # Step 9: Periodic thinking log — institutional context
         if now - self._last_think_log_v2 >= 30.0:
@@ -4326,9 +4431,9 @@ class QuantStrategy:
             # v6.0: regime-adaptive min_dist for PATH-B
             _regime_str = self._regime.regime.value if hasattr(self._regime, 'regime') else "RANGING"
             if _regime_str in ("TRENDING_UP", "TRENDING_DOWN"):
-                _path_b_min_dist = max(price * 0.005, 1.0 * atr)
+                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 1.0 * atr)
             elif _regime_str == "TRANSITIONING":
-                _path_b_min_dist = max(price * 0.004, 0.7 * atr)
+                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 0.7 * atr)
             else:
                 _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
 
@@ -4470,7 +4575,9 @@ class QuantStrategy:
                     ict_engine=self._ict,
                     now_ms=now_ms_slatp,
                     candles_15m=candles_15m,
-                    liq_map=self._liq_map)
+                    liq_map=self._liq_map,
+                    tp_distance_mult=_adaptive_param_value(
+                        "tp_distance_mult", 1.0, 0.10, 3.0))
 
         # BUG-1 FIX: compute_tp returns None when R:R gate hard-rejects the setup.
         # Calling _round_to_tick(None) raises TypeError: unsupported operand type(s)
@@ -4919,6 +5026,7 @@ class QuantStrategy:
 
         sdf = abs(fill_price - sl_price)
         ir  = sdf * qty
+        entry_session = self._current_entry_session()
 
         # ── Build entry volume for trailing vol-decay detection ───────────────────
         try:
@@ -4948,6 +5056,7 @@ class QuantStrategy:
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
             entry_fee_paid  = entry_fee_paid,     # v8.1: exact from Delta paid_commission
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
+            entry_session   = entry_session,
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
             entry_htf_15m   = self._htf.trend_15m,
             entry_htf_4h    = self._htf.trend_4h,
@@ -6427,6 +6536,7 @@ class QuantStrategy:
             # Which tier / signals drove this trade? Track these to learn
             # which combinations actually produce wins vs losses.
             "ict_tier":     getattr(pos, 'ict_entry_tier', ''),
+            "entry_session": getattr(pos, 'entry_session', ''),
             "regime":       (pos.entry_signal.market_regime
                              if pos.entry_signal else ''),
             "composite":    (round(pos.entry_signal.composite, 4)
@@ -7292,7 +7402,7 @@ class QuantStrategy:
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
                 tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=_adopt_sl_dist,
-                entry_atr=_adopt_atr)
+                entry_atr=_adopt_atr, entry_session=self._current_entry_session())
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
             # Reset duplicate guards for the newly adopted position

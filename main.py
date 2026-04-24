@@ -134,6 +134,10 @@ from telegram.notifier import (
     install_global_telegram_log_handler,
     send_telegram_message,
 )
+try:
+    from watchdog import build_default_watchdog
+except ImportError:
+    build_default_watchdog = None
 
 install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=5.0)
 
@@ -183,6 +187,7 @@ class QuantBot:
         self.order_manager:    Optional[ExecutionRouter]   = None  # alias
         self.risk_manager:     Optional[RiskManager]       = None
         self.strategy:         Optional[QuantStrategy]     = None
+        self.watchdog                                      = None
 
         self.trading_enabled      = True
         self.trading_pause_reason = ""
@@ -286,6 +291,38 @@ class QuantBot:
     # START
     # =========================================================================
 
+    def _publish_tick_time(self) -> None:
+        if self.strategy is not None:
+            try:
+                setattr(self.strategy, "_last_tick_time", self._last_tick_time)
+            except Exception:
+                pass
+
+    def _start_watchdog(self) -> None:
+        if build_default_watchdog is None:
+            logger.error("Full watchdog unavailable: build_default_watchdog import failed")
+            send_telegram_message("âš ï¸ <b>WATCHDOG UNAVAILABLE</b>\nImport failed; fallback stale-tick logger only.")
+            return
+        if self.watchdog is not None:
+            return
+        try:
+            forensic_dir = getattr(config, "WATCHDOG_FORENSIC_DIR", ".")
+            self.watchdog = build_default_watchdog(
+                strategy=self.strategy,
+                data_manager=self.data_manager,
+                execution_router=self.execution_router,
+                risk_manager=self.risk_manager,
+                notifier=send_telegram_message,
+                config_module=config,
+                forensic_dir=forensic_dir,
+            )
+            self.watchdog.start()
+        except Exception as e:
+            self.watchdog = None
+            logger.exception("Full watchdog failed to start")
+            send_telegram_message(
+                f"âš ï¸ <b>WATCHDOG START FAILED</b>\n<code>{e}</code>\nFallback stale-tick logger only.")
+
     def start(self) -> bool:
         try:
             if not all([self.execution_router, self.risk_manager,
@@ -339,6 +376,10 @@ class QuantBot:
                         f"Dual-feed: {agg_status['alive']}")
 
             self.running = True
+            with self._tick_lock:
+                self._last_tick_time = time.time()
+                self._publish_tick_time()
+            self._start_watchdog()
 
             # ── Startup Telegram notification ─────────────────────────────────
             from strategy.quant_strategy import QCfg
@@ -667,9 +708,11 @@ class QuantBot:
         logger.info("📊 Main loop active (250ms tick)")
         with self._tick_lock:
             self._last_tick_time = time.time()
+            self._publish_tick_time()
 
-        _wd = threading.Thread(target=self._watchdog_loop, daemon=True, name="watchdog")
-        _wd.start()
+        if self.watchdog is None:
+            _wd = threading.Thread(target=self._watchdog_loop, daemon=True, name="watchdog")
+            _wd.start()
 
         while self.running:
             try:
@@ -701,6 +744,7 @@ class QuantBot:
 
                 with self._tick_lock:
                     self._last_tick_time = time.time()
+                    self._publish_tick_time()
 
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt — shutting down")
@@ -738,6 +782,14 @@ class QuantBot:
 
         if self.data_manager:
             self.data_manager.stop()
+
+        if self.watchdog is not None:
+            try:
+                self.watchdog.stop()
+            except Exception as e:
+                logger.warning("watchdog stop failed: %s", e)
+            finally:
+                self.watchdog = None
 
         send_telegram_message(stop_msg)
         logger.info("Liquidity-first quant bot stopped")
