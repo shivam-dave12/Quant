@@ -1920,6 +1920,18 @@ class ICTEngine:
                 timeframe=getattr(pool, 'timeframe', '5m') or '5m',
             ))
 
+        def _log_sweep(pool: LiquidityLevel, bias_label: str,
+                       disp: bool, disp_score: float, ts: int) -> None:
+            age_s = max(0.0, (now_ms - ts) / 1000.0)
+            msg = (
+                f"🔱 ICT {pool.level_type} SWEPT @ ${pool.price:.0f} "
+                f"disp={disp}({disp_score:.2f}) age={age_s:.0f}s → {bias_label} BIAS"
+            )
+            if age_s <= 600.0:
+                logger.info(msg)
+            else:
+                logger.debug("historical " + msg)
+
         for pool in list(self.liquidity_pools):
             if pool.swept:
                 continue
@@ -1942,9 +1954,7 @@ class ICTEngine:
                     pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     _record_sweep_event(pool, c, disp, disp_score)
-                    logger.info(
-                        f"ðŸ”± ICT BSL SWEPT @ ${pool.price:.0f} disp={disp}"
-                        f"({disp_score:.2f}) â†’ BEARISH BIAS")
+                    _log_sweep(pool, "BEARISH", disp, disp_score, pool.sweep_timestamp)
                     break
 
                 elif pool.level_type == "SSL" and l < pool.price and cl > pool.price:
@@ -1957,9 +1967,7 @@ class ICTEngine:
                     pool.displacement_score = disp_score
                     self._registered_sweeps.append(key)
                     _record_sweep_event(pool, c, disp, disp_score)
-                    logger.info(
-                        f"ðŸ”± ICT SSL SWEPT @ ${pool.price:.0f} disp={disp}"
-                        f"({disp_score:.2f}) â†’ BULLISH BIAS")
+                    _log_sweep(pool, "BULLISH", disp, disp_score, pool.sweep_timestamp)
                     break
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

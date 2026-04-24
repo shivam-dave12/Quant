@@ -3864,6 +3864,8 @@ class QuantStrategy:
                 _diag_dir_forwarded = 0
                 _diag_dir_dedup = 0
                 _diag_cross_skip = 0
+                _diag_youngest_age_ms = None
+                _diag_oldest_age_ms = None
 
                 # Prefer durable ICT sweep events emitted at detection time.
                 # liquidity_pools are mutable and may be rebuilt/merged after
@@ -3906,8 +3908,19 @@ class QuantStrategy:
                 for pool in _ict_sweep_sources:
                     if not getattr(pool, 'swept', False):
                         continue
-                    if (pool.sweep_timestamp < _base_age_limit_ms
-                            and pool.sweep_timestamp < _bar_age_limit_ms):
+                    _sweep_ts = int(getattr(pool, 'sweep_timestamp', 0) or 0)
+                    if _sweep_ts > 0:
+                        _age_ms = max(0, now_ms - _sweep_ts)
+                        _diag_youngest_age_ms = (
+                            _age_ms if _diag_youngest_age_ms is None
+                            else min(_diag_youngest_age_ms, _age_ms)
+                        )
+                        _diag_oldest_age_ms = (
+                            _age_ms if _diag_oldest_age_ms is None
+                            else max(_diag_oldest_age_ms, _age_ms)
+                        )
+                    if (_sweep_ts < _base_age_limit_ms
+                            and _sweep_ts < _bar_age_limit_ms):
                         _diag_age_drop += 1
                         continue
                     c5 = candles_by_tf.get("5m", [])
@@ -4035,14 +4048,18 @@ class QuantStrategy:
                         logger.info(
                             "ICT_BRIDGE_DIAG events_raw=%d event_sources=%d "
                             "pools_raw=%d swept_pool_sources=%d candidates=%d "
-                            "age_drop=%d ee_forwarded=%d dir_forwarded=%d "
+                            "fresh=%d age_drop=%d youngest_age=%.1fs oldest_age=%.1fs "
+                            "ee_forwarded=%d dir_forwarded=%d "
                             "dir_dedup=%d cross_skip=%d ctx_ict_sweeps=%d",
                             _diag_event_raw,
                             _diag_event_sources,
                             _diag_pool_raw,
                             _diag_pool_sources,
                             len(_ict_sweep_sources),
+                            max(0, len(_ict_sweep_sources) - _diag_age_drop),
                             _diag_age_drop,
+                            ((_diag_youngest_age_ms or 0) / 1000.0),
+                            ((_diag_oldest_age_ms or 0) / 1000.0),
                             _diag_ee_forwarded,
                             _diag_dir_forwarded,
                             _diag_dir_dedup,

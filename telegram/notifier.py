@@ -59,6 +59,41 @@ import telegram.config as telegram_config
 
 logger = logging.getLogger(__name__)
 
+_MOJIBAKE_SENTINELS = ("ð", "â", "Ã", "Â", "Î", "Ï")
+_MOJIBAKE_RUN = re.compile(
+    r"[\u00a0-\u00ff\u0100-\u017f"
+    r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
+)
+_MOJIBAKE_DIRECT = {
+    "ðŸŽ¯": "🎯", "ðŸ§­": "🧭", "ðŸ“Š": "📊", "ðŸ’°": "💰",
+    "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
+    "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
+    "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
+    "â±ï¸": "⏱️", "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+}
+
+
+def _repair_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was accidentally decoded as cp1252."""
+    if not any(s in text for s in _MOJIBAKE_SENTINELS):
+        return text
+    for bad, good in _MOJIBAKE_DIRECT.items():
+        text = text.replace(bad, good)
+
+    def _fix(match: re.Match) -> str:
+        frag = match.group(0)
+        if not any(s in frag for s in _MOJIBAKE_SENTINELS):
+            return frag
+        try:
+            repaired = frag.encode("cp1252").decode("utf-8")
+        except UnicodeError:
+            return frag
+        old_bad = sum(frag.count(s) for s in _MOJIBAKE_SENTINELS)
+        new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
+        return repaired if new_bad < old_bad else frag
+
+    return _MOJIBAKE_RUN.sub(_fix, text)
+
 # REQUIRED_SCORE from authoritative source
 try:
     from strategy.conviction_filter import REQUIRED_SCORE as _REQUIRED_CONVICTION_SCORE
@@ -120,6 +155,7 @@ def _send_worker() -> None:
             break
 
         message, parse_mode = item
+        message = _repair_mojibake(str(message))
 
         for attempt in range(_MAX_RETRIES):
             gap = _MIN_INTERVAL - (time.time() - last_send_ts)
@@ -223,6 +259,7 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
     """
     if not telegram_config.TELEGRAM_ENABLED:
         return False
+    message = _repair_mojibake(str(message))
     _ensure_worker_started()
 
     # Check if this message is critical and should bypass the queue
