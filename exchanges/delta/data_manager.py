@@ -305,7 +305,11 @@ class DeltaDataManager:
 
     def _candle_stale_threshold(self, label: str) -> float:
         grace = float(getattr(config, "DELTA_CANDLE_STALE_GRACE_SEC", 45.0))
-        return max(90.0, self._tf_seconds(label) + grace)
+        tf_sec = self._tf_seconds(label)
+        # REST often returns the latest CLOSED candle. Its start timestamp is
+        # normally up to ~2 bars old just before the next close arrives, so a
+        # tf+grace threshold creates false stale alarms on healthy feeds.
+        return max(120.0, (2.0 * tf_sec) + grace)
 
     def _schedule_stale_candle_refresh(self, label: str, age_sec: float) -> None:
         if label not in self._WARMUP_CONFIG or not self._warmup_complete:
@@ -322,7 +326,20 @@ class DeltaDataManager:
             self._last_candle_rest_refresh[label] = now
             self._candle_refresh_inflight.add(label)
 
-        logger.warning(
+        # BUG-DM-SPAM-FIX: Downgraded WARNING → INFO (was flooding Telegram).
+        # This is a ROUTINE recovery event, not a warning. WS delivery for
+        # low-activity bars (especially 5m/15m/1h/4h/1d where a bar can go
+        # minutes without a tick) naturally makes `get_candles()` see an
+        # ageing last-bar — the self-heal REST refresh is expected
+        # maintenance, triggered O(once per timeframe per minute) at most
+        # (throttled via DELTA_CANDLE_REFRESH_THROTTLE_SEC). Real failure
+        # modes remain at WARNING / ERROR:
+        #   - `_refresh_klines_replace` attempt errors → logger.warning
+        #   - `_refresh_klines_replace` no-data return → logger.error
+        # The warning level is preserved for the quant_bot.log file (full
+        # fidelity) but INFO-level here means it no longer trips the
+        # TelegramLogHandler (WARNING+ only) in notifier.py.
+        logger.info(
             f"Delta {label} candles stale age={age_sec:.1f}s "
             f"(threshold={self._candle_stale_threshold(label):.1f}s); "
             "starting REST self-heal"
@@ -420,7 +437,13 @@ class DeltaDataManager:
                 stored = len(target)
 
             self.stats.record_candle()
-            logger.warning(
+            # BUG-DM-SPAM-FIX: Downgraded WARNING → INFO (paired with the
+            # stale-detection downgrade above). This is the success-completion
+            # log of a routine self-heal; it carries diagnostic metrics
+            # (merged/stored/latest_age) worth keeping locally but does not
+            # warrant a Telegram alert. Real failures earlier in this method
+            # stay at WARNING / ERROR.
+            logger.info(
                 f"Delta REST refresh {label}: merged={len(candles)} "
                 f"stored={stored} latest_age={latest_age:.1f}s"
             )

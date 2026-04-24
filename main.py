@@ -103,7 +103,14 @@ def _repair_mojibake(text: str) -> str:
         new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
         return repaired if new_bad < old_bad else frag
 
-    return _MOJIBAKE_RUN.sub(_fix, text)
+    for _ in range(3):
+        repaired = _MOJIBAKE_RUN.sub(_fix, text)
+        if repaired == text or not any(s in repaired for s in _MOJIBAKE_SENTINELS):
+            return repaired
+        text = repaired
+        for bad, good in _MOJIBAKE_DIRECT.items():
+            text = text.replace(bad, good)
+    return text
 
 
 class ISTFormatter(logging.Formatter):

@@ -4313,7 +4313,11 @@ class QuantStrategy:
                     # Deduplicate: only log at INFO when score or reason changes
                     _conv_key = (signal.side, round(_conv_result.score, 2), reject_str[:60])
                     _conv_last = getattr(self, "_last_conv_block_key", None)
-                    if _conv_key != _conv_last:
+                    _is_circuit_block = any(
+                        ("CIRCUIT" in str(r).upper() or "DRAWDOWN" in str(r).upper())
+                        for r in (_conv_result.reject_reasons or [])
+                    )
+                    if _is_circuit_block or _conv_key != _conv_last:
                         self._last_conv_block_key = _conv_key
                         logger.info(
                             f"ðŸš« CONVICTION GATE BLOCKED [{signal.side.upper()}] "

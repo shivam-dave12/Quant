@@ -107,7 +107,14 @@ def _repair_mojibake(text: str) -> str:
         new_bad = sum(repaired.count(s) for s in _MOJIBAKE_SENTINELS)
         return repaired if new_bad < old_bad else frag
 
-    return _MOJIBAKE_RUN.sub(_fix, text)
+    for _ in range(3):
+        repaired = _MOJIBAKE_RUN.sub(_fix, text)
+        if repaired == text or not any(s in repaired for s in _MOJIBAKE_SENTINELS):
+            return repaired
+        text = repaired
+        for bad, good in _MOJIBAKE_DIRECT.items():
+            text = text.replace(bad, good)
+    return text
 
 # REQUIRED_SCORE from authoritative source
 try:
@@ -1168,8 +1175,75 @@ def format_liquidity_trail_update(
 # LOGGING HANDLER — forward WARNING+ logs to Telegram
 # ======================================================================
 
+# ──────────────────────────────────────────────────────────────────────
+# Telegram suppression patterns
+#
+# Certain WARNING-level log records are routine/diagnostic noise that
+# should never page the user on Telegram (but should still appear in
+# the local quant_bot.log file). Any record whose formatted message
+# contains ANY of these substrings is dropped by TelegramLogHandler
+# before the send.
+#
+# Matching is substring-against-the-formatted-message (case-sensitive
+# to avoid accidental over-match). Formatter is
+# "%(name)s: %(message)s" so logger-name prefixes are also searchable
+# (e.g. "exchanges.delta.data_manager:").
+#
+# Maintained here so new noisy warnings can be muted centrally without
+# editing every call site. Extend via `add_telegram_suppress_pattern`.
+# ──────────────────────────────────────────────────────────────────────
+_TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
+    # Delta data-manager routine self-heal (main cause of historic spam —
+    # now also downgraded to INFO at source, but kept here as
+    # belt-and-braces in case another path logs these at WARNING).
+    "Delta REST refresh ",
+    "candles stale age=",
+    "starting REST self-heal",
+    # Watchdog daily-counter consistency check — a known false-positive
+    # comparison (gate counts ENTRIES; risk_manager counts COMPLETED
+    # trades, or may not even track the same field). Fires every 5 min
+    # while a position is open. Diagnostic only, no auto-heal path.
+    "daily_counter_consistency",
+    "daily counter drift",
+]
+_TELEGRAM_SUPPRESS_LOCK = threading.Lock()
+
+
+def add_telegram_suppress_pattern(pattern: str) -> None:
+    """Register an additional substring pattern to suppress from Telegram."""
+    if not pattern:
+        return
+    with _TELEGRAM_SUPPRESS_LOCK:
+        if pattern not in _TELEGRAM_SUPPRESS_PATTERNS:
+            _TELEGRAM_SUPPRESS_PATTERNS.append(pattern)
+
+
+def clear_telegram_suppress_patterns() -> None:
+    """Remove all suppression patterns (primarily for tests)."""
+    with _TELEGRAM_SUPPRESS_LOCK:
+        _TELEGRAM_SUPPRESS_PATTERNS.clear()
+
+
+def _is_suppressed_for_telegram(formatted_msg: str) -> bool:
+    if not formatted_msg:
+        return False
+    with _TELEGRAM_SUPPRESS_LOCK:
+        patterns = tuple(_TELEGRAM_SUPPRESS_PATTERNS)
+    for pat in patterns:
+        if pat and pat in formatted_msg:
+            return True
+    return False
+
+
 class TelegramLogHandler(logging.Handler):
-    """Forward WARNING+ log records to Telegram with throttling and buffering."""
+    """Forward WARNING+ log records to Telegram with throttling and buffering.
+
+    Suppression: records whose formatted message matches any substring in
+    `_TELEGRAM_SUPPRESS_PATTERNS` are dropped silently and do NOT consume
+    the throttle/buffer slots. This prevents a recurring noisy WARNING
+    from crowding out a genuinely important one that happens to arrive
+    during the same throttle window.
+    """
 
     def __init__(self, level: int = logging.WARNING, throttle_seconds: float = 5.0):
         super().__init__(level)
@@ -1180,6 +1254,14 @@ class TelegramLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Format once, so suppression and send use the same text.
+            msg = self.format(record)
+
+            # Early exit for suppressed patterns — don't advance throttle
+            # state, don't occupy a buffer slot.
+            if _is_suppressed_for_telegram(msg):
+                return
+
             with self._lock:
                 now = time.time()
                 if now - self._last_ts < self._throttle:
@@ -1187,11 +1269,17 @@ class TelegramLogHandler(logging.Handler):
                     return
                 self._last_ts = now
 
-            msg = self.format(record)
             if self._buffer:
-                buffered = [self.format(r) for r in list(self._buffer)]
+                buffered_records = list(self._buffer)
                 self._buffer.clear()
-                msg = "\n".join(buffered) + "\n" + msg
+                # Filter buffered records through suppression too — a pattern
+                # may have been added since they were buffered.
+                buffered_msgs = [
+                    self.format(r) for r in buffered_records
+                    if not _is_suppressed_for_telegram(self.format(r))
+                ]
+                if buffered_msgs:
+                    msg = "\n".join(buffered_msgs) + "\n" + msg
 
             send_telegram_message(f"⚠️ <code>{_esc(msg[:1500])}</code>")
         except Exception:

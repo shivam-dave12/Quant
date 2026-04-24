@@ -1699,6 +1699,36 @@ class NoTradesAfterFirstCheck(HealthCheck):
                 since_min=round(since / 60, 1), can_trade=False, reason=reason,
             )
 
+        # The strategy's hard trade halt lives inside ConvictionFilter, not
+        # DailyRiskGate. Without checking it, this watchdog reports a false
+        # "signal suppression" warning while the session drawdown breaker is
+        # intentionally blocking entries.
+        conv = _safe_getattr(self._strategy, "_conviction", None)
+        if conv is not None:
+            try:
+                bal = 0.0
+                rm = _safe_getattr(self, "_rm", None)
+                if rm is not None:
+                    bal = float(
+                        _safe_getattr(rm, "available_balance", 0.0)
+                        or _safe_getattr(rm, "current_balance", 0.0)
+                        or 0.0
+                    )
+                if bal <= 1e-6 and rg is not None:
+                    bal = float(_safe_getattr(rg, "_daily_open_bal", 0.0) or 0.0)
+                limit_check = _safe_getattr(conv, "_check_session_limits", None)
+                conv_reason = limit_check(_now(), "", live_balance=bal) if limit_check else ""
+            except Exception:
+                conv_reason = ""
+            if conv_reason:
+                return self._info(
+                    f"{since/60:.0f}min since last trade, conviction gate blocks: "
+                    f"{conv_reason}",
+                    since_min=round(since / 60, 1),
+                    can_trade=False,
+                    reason=conv_reason,
+                )
+
         engine = _safe_getattr(self._strategy, "_entry_engine", None)
         signal = _safe_getattr(engine, "_signal", None)
         signal_type = _safe_getattr(signal, "entry_type", "")
@@ -1738,8 +1768,25 @@ class DailyCounterConsistencyCheck(HealthCheck):
     separate RiskManager exists) may drift because `record_trade` was
     not always called.
 
-    This check warns on drift. Does not auto-heal because the 'right'
-    counter depends on which one the strategy is using for gating.
+    Semantic invariant (NOT previously enforced):
+        DailyRiskGate._daily_trades counts trade STARTS (bumped on
+        `record_trade_start()` at entry confirmation).
+
+        RiskManager._daily_trades (if present) should count COMPLETED
+        trades (bumped on `record_trade()` at exit finalisation).
+
+    Therefore the EXPECTED drift is:
+        drift == open_positions_count
+
+    i.e. `drift == 1` while any position is ACTIVE/ENTERING/EXITING is
+    NOT a bug. The previous implementation used a flat `drift > 1`
+    threshold which fired false-positives every 5 min whenever a
+    position was held through the check interval (or when two
+    sequential entries happened without the exits being recorded).
+
+    This check warns on UNEXPLAINED drift. Does not auto-heal because
+    the 'right' counter depends on which one the strategy is using for
+    gating.
     """
     name = "daily_counter_consistency"
     category = "L5_ACTIVITY"
@@ -1751,19 +1798,80 @@ class DailyCounterConsistencyCheck(HealthCheck):
         rg = _safe_getattr(strat, "_risk_gate", None)
         rm = self._rm
         rg_count = int(_safe_getattr(rg, "_daily_trades", 0) or 0) if rg else 0
-        rm_count = int(_safe_getattr(rm, "_daily_trades", 0) or 0) if rm else 0
+
+        def _rm_daily_count(obj) -> int:
+            if obj is None:
+                return 0
+            raw = _safe_getattr(obj, "_daily_trades", None)
+            if raw is not None:
+                try:
+                    return int(raw)
+                except Exception:
+                    try:
+                        return len(raw)
+                    except Exception:
+                        pass
+            trades = _safe_getattr(obj, "daily_trades", None)
+            if trades is not None:
+                try:
+                    return len(trades)
+                except Exception:
+                    try:
+                        return int(trades)
+                    except Exception:
+                        pass
+            return 0
+
+        rm_count = _rm_daily_count(rm)
         total = int(_safe_getattr(strat, "_total_trades", 0) or 0)
 
         if rg is None and rm is None:
             return self._ok("no counters to compare")
 
+        # ── Probe for an open position ─────────────────────────────────
+        # If the strategy currently holds a position (phase != FLAT), it
+        # has been counted by DailyRiskGate at entry but not yet by
+        # RiskManager (which waits for exit finalisation). Subtract that
+        # from the observed drift before deciding whether to warn.
+        in_flight = 0
+        pos = _safe_getattr(strat, "_pos", None)
+        if pos is not None:
+            phase_obj = _safe_getattr(pos, "phase", None)
+            phase_name = getattr(phase_obj, "name", str(phase_obj or "")).upper()
+            # ENTERING/ACTIVE/EXITING all represent "gate counted, rm not yet"
+            if phase_name and phase_name != "FLAT":
+                in_flight = 1
+
         drift = abs(rg_count - rm_count)
-        if rm is not None and drift > 1:
+        explained = max(0, drift - in_flight)
+
+        # Only warn when RiskManager actually exposes a counter AND the
+        # drift cannot be explained by in-flight positions AND the
+        # unexplained gap is > 1 (absorb 1 step of benign skew from a
+        # just-closed trade whose record_trade hook hasn't landed yet).
+        if rm is not None and explained > 1:
             return self._warn(
                 f"daily counter drift: DailyRiskGate={rg_count} vs "
-                f"RiskManager={rm_count} (diff={drift})",
-                rg_count=rg_count, rm_count=rm_count, total_trades=total,
+                f"RiskManager={rm_count} (diff={drift}, in_flight={in_flight}, "
+                f"unexplained={explained})",
+                rg_count=rg_count, rm_count=rm_count,
+                in_flight=in_flight, unexplained=explained,
+                total_trades=total,
             )
+
+        # INFO-level observation — shows up in quant_bot.log for
+        # forensics but does not page Telegram. Only emitted when RM
+        # actually exists (otherwise there's nothing to "drift from",
+        # and rg_count alone is not a drift signal).
+        if rm is not None and drift > 0:
+            return self._info(
+                f"daily counters: DailyRiskGate={rg_count} "
+                f"RiskManager={rm_count} (diff={drift} explained by "
+                f"in_flight={in_flight})",
+                rg_count=rg_count, rm_count=rm_count,
+                in_flight=in_flight, total_trades=total,
+            )
+
         return self._ok(rg_count=rg_count, rm_count=rm_count, total_trades=total)
 
 

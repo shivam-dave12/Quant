@@ -1877,6 +1877,15 @@ class ICTEngine:
         The wick proves stops were harvested. Displacement (strong body) =
         institutional confirmation that the sweep was intentional.
         """
+        if self.sweep_events:
+            event_cutoff_ms = now_ms - max(int(self.SWEEP_MAX_AGE_MS), 300_000)
+            maxlen = self.sweep_events.maxlen or 500
+            self.sweep_events = deque(
+                (ev for ev in self.sweep_events
+                 if int(getattr(ev, "sweep_timestamp", 0) or 0) >= event_cutoff_ms),
+                maxlen=maxlen,
+            )
+
         # Merge candle slices from multiple timeframes and sort by open-time so
         # the sweep-detection loop always processes candles in chronological order.
         # Without sorting, 15m and 1h candles (appended after 5m) could be older
