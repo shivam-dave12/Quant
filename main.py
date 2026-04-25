@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 import signal
 import sys
@@ -136,18 +137,24 @@ class TerminalFormatter(ISTFormatter):
     }
     _RESET = "\033[0m"
 
+    def __init__(self, enable_color: bool = True):
+        super().__init__()
+        self._enable_color = enable_color
+
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=IST)
         return f"{dt.strftime('%H:%M:%S')}.{int(record.msecs):03d}"
 
     def format(self, record):
         msg = _repair_mojibake(record.getMessage())
+        if not self._enable_color:
+            msg = _ANSI_LOG_RE.sub("", msg)
         visible = _ANSI_LOG_RE.sub("", msg).lstrip()
         if visible.startswith("+ DELTA ") or visible.startswith("+ ENGINE "):
             return "\n" + msg
 
         level = record.levelname[:4].ljust(4)
-        color = self._LEVEL_COLOR.get(record.levelno, "")
+        color = self._LEVEL_COLOR.get(record.levelno, "") if self._enable_color else ""
         reset = self._RESET if color else ""
         module = record.name.rsplit(".", 1)[-1]
         prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {module:<18} | "
@@ -157,7 +164,13 @@ class TerminalFormatter(ISTFormatter):
 
 
 _ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-_term_fmt = TerminalFormatter()
+_term_fmt = TerminalFormatter(
+    enable_color=(
+        bool(getattr(sys.stdout, "isatty", lambda: False)())
+        or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
+        or os.getenv("PY_COLORS", "") == "1"
+    )
+)
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
 _file_handler.setFormatter(_ist_fmt)

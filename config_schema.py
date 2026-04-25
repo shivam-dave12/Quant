@@ -315,10 +315,10 @@ class TrailConfig(BaseModel):
 
     @model_validator(mode="after")
     def trail_tier_ordering(self) -> "TrailConfig":
-        """Trail tiers must be strictly increasing in R."""
-        if not (self.QUANT_TRAIL_BE_R < self.QUANT_TRAIL_LOCK_R < self.QUANT_TRAIL_AGGRESSIVE_R):
+        """BE and Fib lock may share the same checkpoint; aggressive must be later."""
+        if not (self.QUANT_TRAIL_BE_R <= self.QUANT_TRAIL_LOCK_R < self.QUANT_TRAIL_AGGRESSIVE_R):
             raise ValueError(
-                f"Trail tiers must satisfy BE_R < LOCK_R < AGGRESSIVE_R. "
+                f"Trail tiers must satisfy BE_R <= LOCK_R < AGGRESSIVE_R. "
                 f"Got: {self.QUANT_TRAIL_BE_R} / {self.QUANT_TRAIL_LOCK_R} / "
                 f"{self.QUANT_TRAIL_AGGRESSIVE_R}."
             )

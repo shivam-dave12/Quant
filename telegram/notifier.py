@@ -200,6 +200,8 @@ def _classify_priority(message: str) -> int:
         "ENTRY", "EXIT", "POOL-GATE", "TRADE OPEN", "TRADE CLOSED",
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
         "POST-EXIT GATE", "IC GATE",
+        "POOL GATE", "CONVICTION BLOCK", "FIB TRAIL", "LIQUIDITY DRAW",
+        "POST-SWEEP VERDICT",
     )):
         return PRIO_IMPORTANT
     return PRIO_ROUTINE

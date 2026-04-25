@@ -1066,6 +1066,9 @@ class EntryEngine:
             else:
                 sl = ch + _noise_floor
             risk = abs(price - sl)
+        if not self._sl_is_protective(disp_dir, sl, price):
+            return False
+
         if risk > atr * _SL_MAX_ATR_MULT:
             return False
         if risk / price > _MAX_SL_DISTANCE_PCT:
@@ -1538,6 +1541,28 @@ class EntryEngine:
         max_risk = atr * _SL_MAX_ATR_MULT
         return min_risk, max_risk
 
+    @staticmethod
+    def _sl_is_protective(side: str, sl: float, price: float) -> bool:
+        """Protective stop must be on the loss side of live price."""
+        if sl <= 0 or price <= 0:
+            return False
+        if side == "long":
+            return sl < price
+        if side == "short":
+            return sl > price
+        return False
+
+    def _reject_bad_sl(self, side: str, sl: float, price: float,
+                       sweep_price: float, now: float, reason: str) -> bool:
+        if self._sl_is_protective(side, sl, price):
+            return False
+        logger.info(
+            f"ENTRY REJECTED (invalid SL): side={side} entry=${price:.1f} "
+            f"sl=${sl:.1f} sweep=${sweep_price:.1f} reason={reason}")
+        self._post_sweep = None
+        self._reset(now)
+        return True
+
     # ── Sweep entry handlers ──────────────────────────────────────────
 
     def _handle_reversal(self, sweep, decision, snap, flow, ict,
@@ -1558,6 +1583,8 @@ class EntryEngine:
             sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
+            return
         risk = abs(price - sl)
 
         if risk < 1e-10:
@@ -1589,6 +1616,9 @@ class EntryEngine:
                 f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
 
         # ── ATR ceiling: reject structurally overlarge SL ─────────────────
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal structural stop wrong-side"):
+            return
+
         if risk > max_risk:
             logger.info(
                 f"ENTRY REJECTED (SL too wide): risk={risk:.1f} = {risk/atr:.1f}x ATR "
@@ -1699,6 +1729,9 @@ class EntryEngine:
             logger.debug(
                 f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
                 f"({risk/atr:.2f}x ATR) side={side}")
+
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "continuation structural stop wrong-side"):
+            return
 
         # ── ATR ceiling ───────────────────────────────────────────────────
         if risk > atr * _SL_MAX_ATR_MULT:
@@ -1873,6 +1906,8 @@ class EntryEngine:
             return None
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            return None
         risk = abs(price - sl)
 
         # Hard floor: noise minimum
