@@ -1051,29 +1051,11 @@ def format_post_sweep_verdict(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. POOL GATE ALERT
+# 4. POOL GATE ALERT  (full v9.1 definition is further below)
+# NOTE: The v1 bare-bones definition was removed — it had a different
+# signature (no pos_entry/sl/tp) and was silently shadowed by the v9.1
+# version, making it dead and misleading code.
 # ══════════════════════════════════════════════════════════════════════
-
-def format_pool_gate_alert(
-    action:        str,
-    side:          str,
-    pool_side:     str,
-    pool_price:    float,
-    current_price: float,
-    reason:        str   = "",
-    rev_score:     float = 0.0,
-    cont_score:    float = 0.0,
-    **_kw: Any,
-) -> str:
-    ai = {"exit":"🚪","reverse":"🔄","continue":"➡️"}.get(action.lower(),"❓")
-    L = [
-        f"{ai} <b>Pool Gate  {_esc(action.upper())}</b>",
-        f"  Position {_esc(side.upper())}  ·  Pool {_esc(pool_side)} @ {_fp(pool_price)}",
-        f"  Price {_fp(current_price)}  ·  REV {rev_score:.1f}  CONT {cont_score:.1f}",
-    ]
-    if reason:
-        L.append(f"  {_esc(reason)}")
-    return "\n".join(L)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1234,6 +1216,14 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     # while a position is open. Diagnostic only, no auto-heal path.
     "daily_counter_consistency",
     "daily counter drift",
+    # Pool-gate diagnostic messages — these are downgraded to INFO at source
+    # and a formatted Telegram alert is sent via send_telegram_message()
+    # directly.  Belt-and-braces guard: if any code path accidentally logs
+    # these at WARNING they must NOT produce a second Telegram notification.
+    "POOL-GATE reverse signal: no exit taken",
+    "POOL-GATE BE blocked: desired=",
+    "POOL-GATE BE still blocked: desired=",
+    "POOL-GATE reverse held:",
 ]
 _TELEGRAM_SUPPRESS_LOCK = threading.Lock()
 

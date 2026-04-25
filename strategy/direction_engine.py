@@ -427,21 +427,33 @@ class DirectionEngine:
         self,
         key: tuple,
         action: str,
-        reason: str,
-        cooldown_sec: float = 30.0,
+        reason: str,           # kept for API compat; NOT used in dedup state
+        cooldown_sec: float = 120.0,
     ) -> bool:
-        """Debounce identical pool-gate decisions so one regime flip emits once."""
+        """Debounce pool-gate decisions so one regime flip emits at most once
+        per cooldown window.
+
+        BUG-SPAM FIX: the previous implementation used ``(action, reason[:80])``
+        as the dedup *state*.  The reason string embeds a dynamic tick-flow
+        value, e.g. ``FLOW_REVERSED(flow=-0.83)``, which changes on every tick.
+        This made the state comparison always False → debounce never fired →
+        a new ``ContinuationDecision(action="reverse")`` was emitted on every
+        tick → O(ticks/s) Telegram messages.
+
+        Fix: key already encodes (pool_gate, side, entry, action).  A plain
+        timestamp check is sufficient — no reason-string comparison needed.
+        Cooldown raised from 30 s → 120 s to match the quant_strategy guard.
+        """
         now = time.time()
-        last = self._pool_gate_last_emit.get(key)
-        state = (action, reason[:80])
-        if last and last[0] == state and now - float(last[1]) < cooldown_sec:
+        last_ts = self._pool_gate_last_emit.get(key)
+        if last_ts is not None and now - float(last_ts) < cooldown_sec:
             return False
-        self._pool_gate_last_emit[key] = (state, now)
-        # Bounded cleanup for long-running processes.
-        cutoff = now - max(cooldown_sec * 4.0, 120.0)
+        self._pool_gate_last_emit[key] = now
+        # Bounded cleanup — evict entries older than 4× cooldown.
+        cutoff = now - max(cooldown_sec * 4.0, 480.0)
         self._pool_gate_last_emit = {
             k: v for k, v in self._pool_gate_last_emit.items()
-            if float(v[1]) >= cutoff
+            if float(v) >= cutoff
         }
         return True
 

@@ -248,7 +248,10 @@ try:
 except ImportError:
     build_default_watchdog = None
 
-install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=5.0)
+# Throttle raised 5 s → 30 s: pool-gate and other per-tick warnings
+# arrive faster than 5 s and would still flood Telegram even after
+# the primary dedup fixes.  30 s is a safe floor for operator paging.
+install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

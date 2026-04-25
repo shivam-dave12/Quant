@@ -1,4 +1,4 @@
-﻿"""
+"""
 QUANT STRATEGY v10.0 â€” INSTITUTIONAL LIQUIDITY-FIRST
 =====================================================
 Architecture:
@@ -553,9 +553,13 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
         # Exact round-trip cost: entry paid_commission (exact) + estimated exit
         # fee (same rate applied symmetrically â€” we don't have the exit fee yet).
         _entry_fee_per_btc = _exact_fee / _qty
-        # Estimate exit fee at the same rate as entry (conservative)
-        _exit_fee_rate = _entry_fee_per_btc / max(entry_price, 1.0)
-        _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_fee_rate
+        # Estimate exit fee using config commission rate.
+        # BUG FIX: the old formula derived _exit_fee_rate = entry_fee_per_btc / price
+        # which is simply the entry commission rate, making _fee_per_btc = 2 ×
+        # entry_fee_per_btc — the exit leg was double-counted, yielding a BE price
+        # that was too far from entry and causing premature "too close" rejections.
+        _exit_rate     = float(getattr(config, 'COMMISSION_RATE', 0.00055))
+        _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_rate
     else:
         # Fallback: bilateral commission-rate estimate
         _rate        = float(getattr(config, 'COMMISSION_RATE', 0.00055))
@@ -5719,10 +5723,13 @@ class QuantStrategy:
                     # to breakeven (capital protection) and send a Telegram
                     # awareness alert.  The existing SL/TP bracket remains live
                     # and manages the exit when the market decides.
+                    # BUG-SPAM FIX: reason embeds FLOW_REVERSED(flow=-0.83)
+                    # which changes every tick → key never matched → fired
+                    # every tick.  Use only stable trade-identity fields;
+                    # the 120 s timer is the sole repeat-rate guard.
                     _gate_key = (
                         f"{pos.side}:{round(pos.entry_price, 1)}:"
-                        f"{round(getattr(_gate, 'confidence', 0.0), 1)}:"
-                        f"{str(getattr(_gate, 'reason', ''))[:80]}"
+                        f"{round(getattr(_gate, 'confidence', 0.0), 1)}"
                     )
                     _gate_notice_due = (
                         _gate_key != pos.pool_gate_reverse_notice_key or
@@ -5732,7 +5739,10 @@ class QuantStrategy:
                         with self._lock:
                             pos.pool_gate_reverse_notice_key = _gate_key
                             pos.pool_gate_reverse_notice_at = now
-                        logger.warning(
+                        # Downgraded WARNING→INFO: send_telegram_message() below
+                        # already delivers the Telegram alert.  WARNING level would
+                        # cause TelegramLogHandler to send a second duplicate message.
+                        logger.info(
                             f"POOL-GATE reverse signal: no exit taken; "
                             f"existing bracket remains live. "
                             f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
@@ -5756,14 +5766,19 @@ class QuantStrategy:
                     if _safe_be_tick is None:
                         _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
                         _gap_atr = abs(price - _be_tick) / max(_atr_now, 1e-10)
-                        _key = f"{pos.side}:{round(pos.entry_price, 1)}:{_gate.reason[:60]}"
+                        # BUG-SPAM FIX: reason contains dynamic flow float → key
+                        # changed every tick → 120 s guard never triggered.
+                        _key = f"{pos.side}:{round(pos.entry_price, 1)}"
                         if (_key != pos.pool_gate_reverse_regime_key or
                                 now - pos.pool_gate_reverse_signaled_at >= 120.0):
                             with self._lock:
                                 pos.pool_gate_reverse_regime_key = _key
                                 pos.pool_gate_reverse_signaled_at = now
                                 pos.pool_gate_reverse_attempts += 1
-                            logger.warning(
+                            # Downgraded WARNING→INFO: diagnostic only; the
+                            # existing bracket is still live and protected.
+                            # WARNING level would double-send via TelegramLogHandler.
+                            logger.info(
                                 f"POOL-GATE BE blocked: desired=${_be_tick:,.2f} "
                                 f"price=${price:,.2f} gap={_gap_atr:.2f}ATR; "
                                 "too close to market, existing SL/TP remains protected")
