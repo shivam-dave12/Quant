@@ -2341,6 +2341,8 @@ class PositionState:
     pool_gate_reverse_signaled_at: float = 0.0
     pool_gate_reverse_regime_key:  str = ""
     pool_gate_reverse_attempts:    int = 0
+    pool_gate_reverse_notice_at:   float = 0.0
+    pool_gate_reverse_notice_key:  str = ""
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -2507,7 +2509,7 @@ class QuantStrategy:
         self._exit_sync_in_progress = False   # EXITING sync thread running
         self._trail_in_progress     = False   # trail REST call running in background
         self._trail_started_at      = 0.0     # v9.1: timestamp for self-heal of stuck flag
-        self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
+        self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 120.0
         self._last_fed_trade_ts = 0.0
 
         self._last_pd_gate_log: dict = {}  # throttle P/D zone gate log
@@ -3393,7 +3395,7 @@ class QuantStrategy:
             if _amd_brief:
                 lines_out.append(f"  AMD: {_amd_brief}")
             lines_out.append(f"â””{'â”€'*60}")
-            logger.info("\n" + "\n".join(lines_out))
+            logger.debug("\n" + "\n".join(lines_out))
         else:
             # SCANNING display
             engine_state = "SCANNING"
@@ -3424,7 +3426,7 @@ class QuantStrategy:
                 lines_out.append(f"  {g}")
             lines_out.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
             lines_out.append(f"â””{'â”€'*60}")
-            logger.info("\n" + "\n".join(lines_out))
+            logger.debug("\n" + "\n".join(lines_out))
 
 
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
@@ -4166,7 +4168,7 @@ class QuantStrategy:
                         except Exception:
                             pass
                 _diag_now = time.time()
-                _diag_interval = float(_cfg("ICT_BRIDGE_DIAG_INTERVAL_SEC", 15.0))
+                _diag_interval = float(_cfg("ICT_BRIDGE_DIAG_INTERVAL_SEC", 60.0))
                 if (_diag_ee_forwarded > 0 or _diag_event_raw > 0 or _diag_pool_sources > 0):
                     if _diag_now - self._last_ict_bridge_diag_ts >= _diag_interval:
                         self._last_ict_bridge_diag_ts = _diag_now
@@ -4175,7 +4177,7 @@ class QuantStrategy:
                             _scan = dict(getattr(self._ict, "_last_sweep_scan", {}) or {})
                         except Exception:
                             _scan = {}
-                        logger.info(
+                        logger.debug(
                             "ICT_BRIDGE_DIAG events_raw=%d event_sources=%d "
                             "pools_raw=%d swept_pool_sources=%d candidates=%d "
                             "fresh=%d age_drop=%d youngest_age=%.1fs oldest_age=%.1fs "
@@ -5717,10 +5719,27 @@ class QuantStrategy:
                     # to breakeven (capital protection) and send a Telegram
                     # awareness alert.  The existing SL/TP bracket remains live
                     # and manages the exit when the market decides.
-                    logger.warning(
-                        f"âš ï¸ POOL-GATE: REVERSE signal â€” no exit taken, "
-                        f"migrating SL to BE if not already there. "
-                        f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
+                    _gate_key = (
+                        f"{pos.side}:{round(pos.entry_price, 1)}:"
+                        f"{round(getattr(_gate, 'confidence', 0.0), 1)}:"
+                        f"{str(getattr(_gate, 'reason', ''))[:80]}"
+                    )
+                    _gate_notice_due = (
+                        _gate_key != pos.pool_gate_reverse_notice_key or
+                        now - pos.pool_gate_reverse_notice_at >= 120.0
+                    )
+                    if _gate_notice_due:
+                        with self._lock:
+                            pos.pool_gate_reverse_notice_key = _gate_key
+                            pos.pool_gate_reverse_notice_at = now
+                        logger.warning(
+                            f"POOL-GATE reverse signal: no exit taken; "
+                            f"existing bracket remains live. "
+                            f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
+                    else:
+                        logger.debug(
+                            f"POOL-GATE reverse held: conf={_gate.confidence:.2f} | "
+                            f"{_gate.reason[:100]}")
 
                     _be_tick  = _round_to_tick(
                         _calc_be_price(pos.side, pos.entry_price,
@@ -5739,7 +5758,7 @@ class QuantStrategy:
                         _gap_atr = abs(price - _be_tick) / max(_atr_now, 1e-10)
                         _key = f"{pos.side}:{round(pos.entry_price, 1)}:{_gate.reason[:60]}"
                         if (_key != pos.pool_gate_reverse_regime_key or
-                                now - pos.pool_gate_reverse_signaled_at >= 30.0):
+                                now - pos.pool_gate_reverse_signaled_at >= 120.0):
                             with self._lock:
                                 pos.pool_gate_reverse_regime_key = _key
                                 pos.pool_gate_reverse_signaled_at = now
@@ -5748,6 +5767,10 @@ class QuantStrategy:
                                 f"POOL-GATE BE blocked: desired=${_be_tick:,.2f} "
                                 f"price=${price:,.2f} gap={_gap_atr:.2f}ATR; "
                                 "too close to market, existing SL/TP remains protected")
+                        else:
+                            logger.debug(
+                                f"POOL-GATE BE still blocked: desired=${_be_tick:,.2f} "
+                                f"price=${price:,.2f} gap={_gap_atr:.2f}ATR")
                     if _be_needed and pos.sl_order_id and not pos.be_ratchet_applied:
                         try:
                             _es = "sell" if pos.side == "long" else "buy"
@@ -5814,7 +5837,7 @@ class QuantStrategy:
                         except Exception as _be_e:
                             logger.debug(
                                 f"Pool-gate BE migration error (non-fatal): {_be_e}")
-                    else:
+                    elif _gate_notice_due:
                         # SL is already at or beyond BE, or no sl_order_id yet.
                         # Send awareness-only alert so operator can see the signal.
                         try:

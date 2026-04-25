@@ -339,7 +339,7 @@ class DeltaDataManager:
         # The warning level is preserved for the quant_bot.log file (full
         # fidelity) but INFO-level here means it no longer trips the
         # TelegramLogHandler (WARNING+ only) in notifier.py.
-        logger.info(
+        logger.debug(
             f"Delta {label} candles stale age={age_sec:.1f}s "
             f"(threshold={self._candle_stale_threshold(label):.1f}s); "
             "starting REST self-heal"
@@ -443,7 +443,7 @@ class DeltaDataManager:
             # (merged/stored/latest_age) worth keeping locally but does not
             # warrant a Telegram alert. Real failures earlier in this method
             # stay at WARNING / ERROR.
-            logger.info(
+            logger.debug(
                 f"Delta REST refresh {label}: merged={len(candles)} "
                 f"stored={stored} latest_age={latest_age:.1f}s"
             )

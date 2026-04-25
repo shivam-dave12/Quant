@@ -913,18 +913,23 @@ class LiquidityMap:
 
         # Step 4: Sweep detection (last CLOSED candle per timeframe)
         new_sweeps: List[SweepResult] = []
+        sweep_log_parts: List[str] = []
         for tf, reg in self._registries.items():
             candles = candles_by_tf.get(tf)
             if candles:
                 tf_sweeps = reg.check_sweeps(candles, atr, now)
                 for s in tf_sweeps:
-                    logger.info(
+                    sweep_log_parts.append(
                         f"🎯 SWEEP [{tf}] {s.pool.side.value} "
-                        f"${s.pool.price:,.1f} -> direction={s.direction} "
-                        f"quality={s.quality:.2f} wick=${s.wick_extreme:,.1f} "
-                        f"vol_ratio={s.volume_ratio:.1f}x"
+                        f"@${s.pool.price:,.0f}->{s.direction} "
+                        f"q={s.quality:.2f} wick=${s.wick_extreme:,.0f} "
+                        f"vol={s.volume_ratio:.1f}x"
                     )
                 new_sweeps.extend(tf_sweeps)
+        if sweep_log_parts:
+            preview = " | ".join(sweep_log_parts[:8])
+            suffix = f" | +{len(sweep_log_parts) - 8} more" if len(sweep_log_parts) > 8 else ""
+            logger.info(f"SWEEPS detected: {preview}{suffix}")
 
         # Step 5: SWEPT -> CONSUMED promotion
         for reg in self._registries.values():
