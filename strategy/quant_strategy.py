@@ -2475,6 +2475,9 @@ class QuantStrategy:
             DirectionEngine() if _DIRECTION_ENGINE_AVAILABLE else None)
         # v5.0: ICT Sweep-and-Go institutional engine
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
+        # Post-sweep Telegram dedup: only send when verdict changes (action+direction+conf bucket).
+        # Without this, send_telegram_message fires every tick (~0.5s) for the full post-sweep window.
+        self._ps_tg_last_hash: str = ""
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
@@ -4197,23 +4200,42 @@ class QuantStrategy:
                     try:
                         from telegram.notifier import format_post_sweep_verdict
                         _ps_state = getattr(self._dir_engine, '_ps_state', None)
-                        send_telegram_message(format_post_sweep_verdict(
-                            action           = _ps_decision.action,
-                            direction        = getattr(_ps_decision, 'direction', ''),
-                            confidence       = _ps_decision.confidence,
-                            phase            = getattr(_ps_decision, 'phase', ''),
-                            cisd_active      = getattr(_ps_decision, 'cisd_active', False),
-                            ote_active       = getattr(_ps_decision, 'ote_active', False),
-                            displacement_atr = getattr(_ps_decision, 'displacement_atr', 0.0),
-                            rev_score        = getattr(_ps_decision, 'rev_score', 0.0),
-                            cont_score       = getattr(_ps_decision, 'cont_score', 0.0),
-                            rev_reasons      = getattr(_ps_decision, 'rev_reasons', []),
-                            cont_reasons     = getattr(_ps_decision, 'cont_reasons', []),
-                            reason           = _ps_decision.reason,
-                            swept_pool_price = getattr(_ps_state, 'swept_pool_price', None) if _ps_state else None,
-                            swept_pool_type  = getattr(_ps_state, 'swept_pool_type',  '')   if _ps_state else '',
-                            current_price    = price,
-                        ))
+                        # Dedup: only send when verdict changes (action + direction +
+                        # confidence rounded to 5% bucket). Prevents per-tick spam
+                        # for the entire post-sweep window (~30–120 ticks per sweep).
+                        _conf_bucket = round(getattr(_ps_decision, 'confidence', 0.0) * 20) / 20
+                        _ps_verdict_hash = (
+                            f"{_ps_decision.action}|"
+                            f"{getattr(_ps_decision, 'direction', '')}|"
+                            f"{_conf_bucket:.2f}"
+                        )
+                        if _ps_verdict_hash != self._ps_tg_last_hash:
+                            self._ps_tg_last_hash = _ps_verdict_hash
+                            # swept_pool_price: attribute may be 0.0 if PostSweepState
+                            # was created via an internal direction_engine path that
+                            # doesn't receive pool.price. Fall back to None so the
+                            # formatter shows "—" instead of "$0.0".
+                            _swept_price = getattr(_ps_state, 'swept_pool_price', None) if _ps_state else None
+                            if _swept_price is not None and _swept_price <= 0:
+                                _swept_price = None
+                            send_telegram_message(format_post_sweep_verdict(
+                                action           = _ps_decision.action,
+                                direction        = getattr(_ps_decision, 'direction', ''),
+                                confidence       = _ps_decision.confidence,
+                                phase            = getattr(_ps_decision, 'phase', ''),
+                                cisd_active      = getattr(_ps_decision, 'cisd_active', False),
+                                ote_active       = getattr(_ps_decision, 'ote_active', False),
+                                displacement_atr = getattr(_ps_decision, 'displacement_atr', 0.0),
+                                rev_score        = getattr(_ps_decision, 'rev_score', 0.0),
+                                cont_score       = getattr(_ps_decision, 'cont_score', 0.0),
+                                rev_reasons      = getattr(_ps_decision, 'rev_reasons', []),
+                                cont_reasons     = getattr(_ps_decision, 'cont_reasons', []),
+                                reason           = _ps_decision.reason,
+                                swept_pool_price = _swept_price,
+                                swept_pool_type  = getattr(_ps_state, 'swept_pool_type', '') if _ps_state else '',
+                                current_price    = price,
+                                atr              = atr,
+                            ))
                     except Exception as _tg_ps:
                         logger.debug(f"DirectionEngine post-sweep Telegram error: {_tg_ps}")
                 elif _ps_decision is not None:
@@ -5305,6 +5327,7 @@ class QuantStrategy:
         if self._dir_engine is not None:
             try:
                 self._dir_engine.clear_sweep()
+                self._ps_tg_last_hash = ""  # reset dedup so next sweep sends a fresh message
             except Exception:
                 pass
 

@@ -95,9 +95,17 @@ try:
     import config as _sl_cfg
     _MIN_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MIN_SL_DISTANCE_PCT", 0.004))
     _MAX_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MAX_SL_DISTANCE_PCT", 0.035))
+    # ATR-based SL floor: guards against high-price / low-ATR regimes where
+    # MIN_SL_DISTANCE_PCT * price >> ATR, which blocks 100% of sweep entries.
+    # Example: BTC $77K, ATR $42 → 0.40% minimum = $310 = 7.4× ATR.
+    # When the wick-based SL is tighter than this ATR floor it is EXPANDED
+    # (not rejected) to this distance. _MIN_SL_DISTANCE_PCT remains the
+    # authoritative ceiling check (wide SL still rejects as before).
+    _SL_MIN_ATR_MULT = float(getattr(_sl_cfg, "SL_ATR_BUFFER_MULT", 0.75))
 except Exception:
     _MIN_SL_DISTANCE_PCT = 0.004
     _MAX_SL_DISTANCE_PCT = 0.035
+    _SL_MIN_ATR_MULT     = 0.75
 
 # Post-Sweep phases (seconds after sweep)
 # MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
@@ -1013,8 +1021,14 @@ class EntryEngine:
         if rr < adj_rr:
             return False
 
-        if (abs(price - sl) / price < _MIN_SL_DISTANCE_PCT or
-                abs(price - sl) / price > _MAX_SL_DISTANCE_PCT):
+        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
+        if abs(price - sl) < _sl_atr_floor:
+            # Expand momentum SL to ATR floor (same policy as sweep SL)
+            if disp_dir == "long":
+                sl = price - _sl_atr_floor
+            else:
+                sl = price + _sl_atr_floor
+        if abs(price - sl) / price > _MAX_SL_DISTANCE_PCT:
             return False
 
         if target is None:
@@ -1473,13 +1487,33 @@ class EntryEngine:
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
         risk = abs(price - sl)
-        if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
-                risk / price > _MAX_SL_DISTANCE_PCT):
+
+        # ATR floor expansion: if wick was too shallow, expand SL instead of
+        # rejecting. The wick determines structural direction; ATR sets magnitude.
+        # _SL_MIN_ATR_MULT (default 0.75) is calibrated vs _REV_SL_BUFFER_ATR=0.35
+        # so the expansion is ~2× the buffer — enough room for institutional noise.
+        if risk < 1e-10:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL dist): risk={risk:.1f} "
-                f"({risk / price * 100:.3f}%) "
-                f"required=[{_MIN_SL_DISTANCE_PCT * 100:.2f}%–"
-                f"{_MAX_SL_DISTANCE_PCT * 100:.2f}%] "
+                f"⚠️ ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
+        if risk < _sl_atr_floor:
+            # Expand SL to ATR floor; re-push behind pools with updated level
+            if side == "long":
+                sl = price - _sl_atr_floor
+            else:
+                sl = price + _sl_atr_floor
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+            logger.debug(
+                f"SL expanded to {risk:.1f}pts ({risk/price*100:.3f}%) "
+                f"ATR-floor={_sl_atr_floor:.1f} side={side}")
+        if risk / price > _MAX_SL_DISTANCE_PCT:
+            logger.info(
+                f"⚠️ ENTRY REJECTED (SL too wide): risk={risk:.1f} "
+                f"({risk / price * 100:.3f}%) max={_MAX_SL_DISTANCE_PCT * 100:.2f}% "
                 f"side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
@@ -1559,13 +1593,29 @@ class EntryEngine:
 
         risk = abs(price - sl)
         reward = abs(tp - price)
-        if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
-                risk / price > _MAX_SL_DISTANCE_PCT):
+
+        # ATR floor expansion (same logic as _handle_reversal)
+        if risk < 1e-10:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL dist): risk={risk:.1f} "
-                f"({risk / price * 100:.3f}%) "
-                f"required=[{_MIN_SL_DISTANCE_PCT * 100:.2f}%–"
-                f"{_MAX_SL_DISTANCE_PCT * 100:.2f}%] "
+                f"⚠️ ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
+        if risk < _sl_atr_floor:
+            if side == "long":
+                sl = price - _sl_atr_floor
+            else:
+                sl = price + _sl_atr_floor
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+            reward = abs(tp - price)
+            logger.debug(
+                f"SL (cont) expanded to {risk:.1f}pts ATR-floor={_sl_atr_floor:.1f}")
+        if risk / price > _MAX_SL_DISTANCE_PCT:
+            logger.info(
+                f"⚠️ ENTRY REJECTED (SL too wide): risk={risk:.1f} "
+                f"({risk / price * 100:.3f}%) max={_MAX_SL_DISTANCE_PCT * 100:.2f}% "
                 f"side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
@@ -1672,13 +1722,20 @@ class EntryEngine:
                 sl = None
 
         if sl is None:
-            fallback = 1.5 * atr
+            fallback = max(1.5 * atr, atr * _SL_MIN_ATR_MULT)
             sl = price - fallback if side == "long" else price + fallback
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
-        dist = abs(price - sl) / price
-        if dist < _MIN_SL_DISTANCE_PCT or dist > _MAX_SL_DISTANCE_PCT:
+        risk = abs(price - sl)
+        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
+        if risk < _sl_atr_floor:
+            sl = price - _sl_atr_floor if side == "long" else price + _sl_atr_floor
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+
+        dist = risk / price
+        if dist > _MAX_SL_DISTANCE_PCT:
             return None
         return sl
 

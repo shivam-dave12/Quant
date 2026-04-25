@@ -586,9 +586,40 @@ def _build_gate_diagnostic(
     return gates
 
 
-# ======================================================================
-# 1. PERIODIC REPORT
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
+# FORMAT FUNCTIONS  — clean, signal-first Telegram output
+# ══════════════════════════════════════════════════════════════════════
+
+# ─── shared mini-helpers ──────────────────────────────────────────────
+
+def _fp(p):
+    return f"${p:,.1f}" if p is not None else "—"
+
+def _fpct(v):
+    return f"{v:.2f}%"
+
+def _bar10(score: float) -> str:
+    n = max(0, min(10, int(score * 10 + 0.5)))
+    return "█" * n + "░" * (10 - n)
+
+def _si(session: str) -> str:
+    s = (session or "").upper()
+    if "LONDON" in s: return "🇬🇧"
+    if "NY"     in s: return "🇺🇸"
+    if "ASIA"   in s: return "🌏"
+    return "🌐"
+
+def _pd(pd: float) -> str:
+    if pd < 0.25: return "DEEP-DISC"
+    if pd < 0.40: return "DISCOUNT"
+    if pd < 0.60: return "EQUILIB"
+    if pd < 0.75: return "PREMIUM"
+    return "DEEP-PREM"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 1. PERIODIC REPORT  (15-min dashboard)
+# ══════════════════════════════════════════════════════════════════════
 
 def format_periodic_report(
     current_price:       float = 0.0,
@@ -626,251 +657,188 @@ def format_periodic_report(
     sweep_analysis:      Optional[Dict] = None,
     direction_hunt:        Optional[Any] = None,
     direction_ps_analysis: Optional[Any] = None,
-    **_kwargs: Any,
+    **_kw: Any,
 ) -> str:
-    """15-minute institutional Telegram dashboard."""
-    ist_tz  = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(ist_tz).strftime("%H:%M IST")
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist).strftime("%H:%M IST")
     now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    sess_icon = _session_icon(session)
-    kz_str    = " 🔥KZ" if in_killzone else ""
-    pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
-
-    _STATE_ICONS = {
-        "SCANNING":    "🔍",
-        "TRACKING":    "📡",
-        "READY":       "🎯",
-        "ENTERING":    "⚡",
-        "IN_POSITION": "📊",
-        "POST_SWEEP":  "🌊",
+    STATE_ICONS = {
+        "SCANNING":"🔍","TRACKING":"📡","READY":"🎯",
+        "ENTERING":"⚡","IN_POSITION":"📊","POST_SWEEP":"🌊",
     }
-    state_icon = _STATE_ICONS.get((bot_state or "").upper(), "⚪")
+    si        = STATE_ICONS.get((bot_state or "").upper(), "⚪")
+    pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
+    kz_str    = "  🔥 KZ" if in_killzone else ""
+    sess_icon = _si(session)
+    fc_bar    = _bar10(min(1.0, abs(flow_conviction)))
+    fc_arrow  = "▲" if flow_conviction > 0.05 else ("▼" if flow_conviction < -0.05 else "─")
 
-    _PD_LABEL = (
-        "DEEP DISC"  if dealing_range_pd < 0.25 else
-        "DISCOUNT"   if dealing_range_pd < 0.40 else
-        "EQ"         if dealing_range_pd < 0.60 else
-        "PREMIUM"    if dealing_range_pd < 0.75 else
-        "DEEP PREM"
-    )
+    L = []   # lines
 
-    lines: List[str] = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>STATUS</b>  {_esc(now_ist)} / {_esc(now_utc)}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    # ── Header ───────────────────────────────────────────────────────────
+    L += [
+        f"<b>📊 STATUS  •  {now_ist}  /  {now_utc}</b>",
+        f"<code>BTC {_fp(current_price)}   ATR {_fp(atr)}   Bal {_fp(balance)}</code>",
+        f"{pnl_icon} Day <b>{_fp(daily_pnl)}</b>   Total {_fp(total_pnl)}",
         "",
     ]
 
-    lines.append(f"💰 BTC: <b>{_fmt_price(current_price)}</b>")
-    atr_part = f"  ATR: {_fmt_price(atr)}" if atr > 0 else ""
-    lines.append(f"  💵 Bal: {_fmt_price(balance)}{atr_part}")
-    lines.append(
-        f"  {pnl_icon} Day: <b>{_fmt_price(daily_pnl)}</b>  |  "
-        f"Total: {_fmt_price(total_pnl)}"
+    # ── Engine + session ──────────────────────────────────────────────────
+    L.append(
+        f"{si} <b>{_esc(bot_state)}</b>"
+        f"  {sess_icon} {_esc(session)}{kz_str}"
     )
 
-    lines.append("")
-    lines.append(f"{state_icon} <b>{_esc(bot_state)}</b>  "
-                 f"{sess_icon} {_esc(session)}{kz_str}")
+    # ── Market structure ──────────────────────────────────────────────────
+    L += ["", "<b>🏛 Market Structure</b>"]
+    L.append(f"  AMD  <b>{_esc(amd_phase)}</b>  ({_esc(amd_bias)})   {_pd(dealing_range_pd)} ({dealing_range_pd:.0%})")
+    parts = []
+    if structure_4h:  parts.append(f"4H {_esc(structure_4h)}")
+    if structure_15m: parts.append(f"15m {_esc(structure_15m)}")
+    if htf_bias:      parts.append(f"HTF {_esc(htf_bias)}")
+    if parts:
+        L.append(f"  {' · '.join(parts)}   Regime {_esc(regime)}")
 
-    lines.append("")
-    lines.append("🏛️ <b>MARKET STRUCTURE</b>")
-    lines.append(f"  AMD: {_esc(amd_phase)} ({_esc(amd_bias)})")
-
-    htf_parts: List[str] = []
-    if structure_4h:  htf_parts.append(f"4H:{_esc(structure_4h)}")
-    if structure_15m: htf_parts.append(f"15m:{_esc(structure_15m)}")
-    if htf_bias:      htf_parts.append(f"HTF:{_esc(htf_bias)}")
-    if htf_parts:
-        lines.append(f"  {' | '.join(htf_parts)}")
-
-    lines.append(f"  Dealing range: {_PD_LABEL} ({dealing_range_pd:.0%})")
-    lines.append(f"  Regime: {_esc(regime)}")
-
-    lines.append("")
-    lines.append("🎯 <b>LIQUIDITY</b>")
-    lines.append(f"  BSL ▲ {int(n_bsl_pools)} pools  |  "
-                 f"SSL ▼ {int(n_ssl_pools)} pools")
-
+    # ── Liquidity ─────────────────────────────────────────────────────────
+    L += ["", "<b>💧 Liquidity</b>"]
+    L.append(f"  BSL ▲ {int(n_bsl_pools)} pools  ·  SSL ▼ {int(n_ssl_pools)} pools")
     if nearest_bsl:
-        lines.append(
-            f"  ▲ Nearest BSL: {_fmt_price(nearest_bsl.get('price', 0))} "
-            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR "
-            f"sig={nearest_bsl.get('significance', 0):.0f} "
-            f"{_esc(nearest_bsl.get('timeframe', ''))})"
+        L.append(
+            f"  ▲ {_fp(nearest_bsl.get('price',0))}"
+            f"  {nearest_bsl.get('dist_atr',0):.1f}ATR"
+            f"  sig={nearest_bsl.get('significance',0):.0f}"
+            f"  {_esc(nearest_bsl.get('timeframe',''))}"
         )
     if nearest_ssl:
-        lines.append(
-            f"  ▼ Nearest SSL: {_fmt_price(nearest_ssl.get('price', 0))} "
-            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR "
-            f"sig={nearest_ssl.get('significance', 0):.0f} "
-            f"{_esc(nearest_ssl.get('timeframe', ''))})"
+        L.append(
+            f"  ▼ {_fp(nearest_ssl.get('price',0))}"
+            f"  {nearest_ssl.get('dist_atr',0):.1f}ATR"
+            f"  sig={nearest_ssl.get('significance',0):.0f}"
+            f"  {_esc(nearest_ssl.get('timeframe',''))}"
         )
-
     if primary_target_str and primary_target_str != "—":
-        lines.append(f"  🎯 Target: {_esc(primary_target_str)}")
+        L.append(f"  🎯 {_esc(primary_target_str)}")
 
-    if sweep_analysis:
-        # KEY-SYNC FIX: entry_engine writes both short-form ("rev_score",
-        # "cont_score") and long-form ("reversal_score", "continuation_score")
-        # keys. Read long-form with short-form fallback so this works regardless
-        # of which version of entry_engine is deployed.
-        rs = float(sweep_analysis.get("reversal_score",
-                   sweep_analysis.get("rev_score", 0)))
-        cs = float(sweep_analysis.get("continuation_score",
-                   sweep_analysis.get("cont_score", 0)))
-        rr = (sweep_analysis.get("reversal_reasons")
-              or sweep_analysis.get("rev_reasons") or [])
-        cr = (sweep_analysis.get("continuation_reasons")
-              or sweep_analysis.get("cont_reasons") or [])
-        sw_side  = sweep_analysis.get("sweep_side", "?")
-        sw_price = sweep_analysis.get("sweep_price", 0)
-        sw_qual  = sweep_analysis.get("sweep_quality", 0)
-        winner = ("REVERSAL"     if rs > cs + 15 else
-                  "CONTINUATION" if cs > rs + 15 else
-                  "UNDECIDED")
-        lines.append("")
-        qual_str = f" q={sw_qual:.0%}" if sw_qual > 0 else ""
-        lines.append(
-            f"🌊 <b>SWEEP ANALYSIS</b> ({_esc(sw_side)} @ {_fmt_price(sw_price)}{qual_str})"
-        )
-        lines.append(f"  REV: {rs:.0f}  |  CONT: {cs:.0f}  →  <b>{_esc(winner)}</b>")
-        if rr:
-            lines.append(f"  Rev:  {_esc(', '.join(str(r) for r in rr[:3]))}")
-        if cr:
-            lines.append(f"  Cont: {_esc(', '.join(str(r) for r in cr[:3]))}")
-
-    if direction_hunt is not None:
-        dh_pred  = getattr(direction_hunt, "predicted", None)
-        dh_conf  = float(getattr(direction_hunt, "confidence", 0.0))
-        dh_deliv = getattr(direction_hunt, "delivery_direction", "")
-        dh_bsl   = float(getattr(direction_hunt, "bsl_score", 0.0))
-        dh_ssl   = float(getattr(direction_hunt, "ssl_score", 0.0))
-        dh_raw   = float(getattr(direction_hunt, "raw_score",  0.0))
-
-        hunt_icon  = "🔵" if dh_pred == "BSL" else ("🟠" if dh_pred == "SSL" else "⚪")
-        deliv_icon = "🟢" if dh_deliv == "bullish" else ("🔴" if dh_deliv == "bearish" else "⚪")
-
-        lines.append("")
-        lines.append(f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(dh_pred or 'NEUTRAL')}")
-        lines.append(
-            f"  [{_score_bar(dh_conf)}] {dh_conf:.0%}  "
-            f"{deliv_icon} {_esc(dh_deliv or '—')}"
-        )
-        lines.append(f"  BSL={dh_bsl:.3f}  SSL={dh_ssl:.3f}  raw={dh_raw:+.3f}")
-
-    if direction_ps_analysis is not None:
-        ps_action = getattr(direction_ps_analysis, "action", "?")
-        ps_dir    = getattr(direction_ps_analysis, "direction", "")
-        ps_conf   = float(getattr(direction_ps_analysis, "confidence", 0.0))
-        ps_phase  = getattr(direction_ps_analysis, "phase", "")
-        ps_rev    = float(getattr(direction_ps_analysis, "rev_score",  0.0))
-        ps_cont   = float(getattr(direction_ps_analysis, "cont_score", 0.0))
-        ps_cisd   = getattr(direction_ps_analysis, "cisd_active", False)
-        ps_ote    = getattr(direction_ps_analysis, "ote_active",  False)
-        ps_disp   = float(getattr(direction_ps_analysis, "displacement_atr", 0.0))
-
-        ps_winner = ("REVERSAL"     if ps_rev  > ps_cont + 15 else
-                     "CONTINUATION" if ps_cont > ps_rev  + 15 else
-                     "CONTESTED")
-        ps_ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
-            ps_action.lower(), "❓"
-        )
-        ps_di = "🟢" if ps_dir == "long" else ("🔴" if ps_dir == "short" else "⚪")
-
-        lines.append("")
-        lines.append(
-            f"{ps_ai} <b>POST-SWEEP VERDICT</b>: {_esc(ps_action.upper())}  "
-            f"{ps_di} {_esc(ps_dir.upper() or '—')}"
-        )
-        lines.append(f"  conf={ps_conf:.0%}  phase={_esc(ps_phase)}")
-        lines.append(f"  REV={ps_rev:.1f}  CONT={ps_cont:.1f}  → {_esc(ps_winner)}")
-
-        ps_flags: List[str] = []
-        if ps_cisd: ps_flags.append("CISD✓")
-        if ps_ote:  ps_flags.append("OTE✓")
-        if ps_disp > 0: ps_flags.append(f"disp={ps_disp:.2f}ATR")
-        if ps_flags:
-            lines.append("  " + "  ".join(_esc(x) for x in ps_flags))
-
-    lines.append("")
-    gate_lines = _build_gate_diagnostic(
-        direction_hunt   = direction_hunt,
-        amd_phase        = amd_phase,
-        dealing_range_pd = dealing_range_pd,
-        session          = session,
-        flow_conviction  = flow_conviction,
-        flow_direction   = flow_direction,
-        htf_bias         = htf_bias,
+    # ── Flow ─────────────────────────────────────────────────────────────
+    L += ["", "<b>⚡ Order Flow</b>"]
+    L.append(
+        f"  {_esc((flow_direction or 'neutral').upper())}  [{_esc(fc_bar)}] {fc_arrow}  {flow_conviction:+.2f}"
     )
-    lines.extend(gate_lines)
 
+    # ── Sweep analysis ────────────────────────────────────────────────────
+    if sweep_analysis:
+        rs  = float(sweep_analysis.get("reversal_score",   sweep_analysis.get("rev_score",  0)))
+        cs  = float(sweep_analysis.get("continuation_score",sweep_analysis.get("cont_score", 0)))
+        rr  = sweep_analysis.get("reversal_reasons")   or sweep_analysis.get("rev_reasons")  or []
+        cr  = sweep_analysis.get("continuation_reasons")or sweep_analysis.get("cont_reasons") or []
+        sw  = sweep_analysis.get("sweep_side","?")
+        spx = sweep_analysis.get("sweep_price",0)
+        spq = sweep_analysis.get("sweep_quality",0)
+        winner = ("REVERSAL" if rs>cs+15 else "CONTINUATION" if cs>rs+15 else "UNDECIDED")
+        L += ["", f"<b>🌊 Sweep  {_esc(sw)} @ {_fp(spx)}  q={spq:.0%}</b>"]
+        L.append(f"  REV {rs:.0f}  CONT {cs:.0f}  → <b>{_esc(winner)}</b>")
+        if rr: L.append(f"  Rev:  {_esc(', '.join(str(x) for x in rr[:3]))}")
+        if cr: L.append(f"  Cont: {_esc(', '.join(str(x) for x in cr[:3]))}")
+
+    # ── Hunt prediction ───────────────────────────────────────────────────
+    if direction_hunt is not None:
+        pred   = getattr(direction_hunt,"predicted",None)
+        conf   = float(getattr(direction_hunt,"confidence",0.0))
+        deliv  = getattr(direction_hunt,"delivery_direction","")
+        bsl_s  = float(getattr(direction_hunt,"bsl_score",0.0))
+        ssl_s  = float(getattr(direction_hunt,"ssl_score",0.0))
+        hi     = "🔵" if pred=="BSL" else ("🟠" if pred=="SSL" else "⚪")
+        di     = "🟢" if deliv=="bullish" else ("🔴" if deliv=="bearish" else "⚪")
+        L += ["", f"{hi} <b>Hunt  {_esc(pred or 'NEUTRAL')}</b>"]
+        L.append(f"  [{_esc(_bar10(conf))}] {conf:.0%}  {di} {_esc(deliv or '—')}")
+        L.append(f"  BSL {bsl_s:.3f}  ·  SSL {ssl_s:.3f}")
+
+    # ── Post-sweep verdict ────────────────────────────────────────────────
+    if direction_ps_analysis is not None:
+        pa     = getattr(direction_ps_analysis,"action","?")
+        pd_dir = getattr(direction_ps_analysis,"direction","")
+        pc     = float(getattr(direction_ps_analysis,"confidence",0.0))
+        pr     = float(getattr(direction_ps_analysis,"rev_score",0.0))
+        pc2    = float(getattr(direction_ps_analysis,"cont_score",0.0))
+        phase  = getattr(direction_ps_analysis,"phase","")
+        ai     = {"reverse":"🔄","continue":"➡️","wait":"⏳"}.get(pa.lower(),"❓")
+        di2    = "🟢" if pd_dir=="long" else ("🔴" if pd_dir=="short" else "⚪")
+        win    = ("REVERSAL" if pr>pc2+15 else "CONTINUATION" if pc2>pr+15 else "CONTESTED")
+        L += ["", f"{ai} <b>Post-Sweep  {_esc(pa.upper())}</b>  {di2} {_esc((pd_dir or '—').upper())}"]
+        L.append(f"  REV {pr:.1f}  CONT {pc2:.1f}  → {_esc(win)}  conf {pc:.0%}  phase {_esc(phase)}")
+
+    # ── Gate status ───────────────────────────────────────────────────────
+    L += ["", "<b>🚦 Entry Gates</b>"]
+    def _gate(ok: bool, label: str) -> str:
+        return f"  {'✅' if ok else '⚪'} {label}"
+
+    s = (session or "").upper()
+    L.append(_gate(s in ("LONDON","NY","LONDON_NY"), f"Session  {_esc(s or 'off')}"))
+
+    pred_  = getattr(direction_hunt,"predicted",None) if direction_hunt else None
+    conf_  = float(getattr(direction_hunt,"confidence",0.0)) if direction_hunt else 0.0
+    L.append(_gate(pred_ in ("BSL","SSL") and conf_ >= _HUNT_ON_THRESHOLD,
+                   f"Hunt  {_esc(pred_ or 'NEUTRAL')} ({conf_:.0%})"))
+
+    L.append(_gate(abs(flow_conviction) >= 0.20 and flow_direction in ("long","short"),
+                   f"Flow  {_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})"))
+
+    amd_ok = "MANIPULATION" in (amd_phase or "").upper() or "DISTRIBUTION" in (amd_phase or "").upper()
+    L.append(_gate(amd_ok, f"AMD  {_esc(amd_phase or 'UNKNOWN')}"))
+
+    pd_ok = dealing_range_pd < 0.40 or dealing_range_pd > 0.60
+    L.append(_gate(pd_ok, f"P/D  {_pd(dealing_range_pd)} ({dealing_range_pd:.0%})"))
+    L.append(_gate(bool(htf_bias) and htf_bias.lower() != "mixed", f"HTF  {_esc(htf_bias or 'mixed')}"))
+
+    # ── Active position ───────────────────────────────────────────────────
     if position:
         side    = (position.get("side") or "?").upper()
         p_entry = entry_price or position.get("entry_price", 0)
         qty     = float(position.get("quantity", 0) or 0)
+        icon    = "🟢" if side == "LONG" else "🔴"
 
-        side_icon = "🟢" if side == "LONG" else "🔴"
-        lines.append("")
-        lines.append(f"{side_icon} <b>POSITION: {_esc(side)}</b>")
-        lines.append(f"  Entry: {_fmt_price(p_entry)}")
-
+        L += ["", f"<b>{icon} Position  {_esc(side)}</b>"]
+        L.append(f"  Entry {_fp(p_entry)}")
         if current_sl:
-            sl_dist = abs(current_price - current_sl) / max(atr, 1) if atr > 0 else 0
-            lines.append(f"  SL: {_fmt_price(current_sl)} ({sl_dist:.1f}ATR)")
+            sl_atr = abs(current_price - current_sl) / max(atr, 1) if atr else 0
+            L.append(f"  SL    {_fp(current_sl)}  ({sl_atr:.1f}ATR)")
         if current_tp:
-            tp_dist = abs(current_tp - current_price) / max(atr, 1) if atr > 0 else 0
-            lines.append(f"  TP: {_fmt_price(current_tp)} ({tp_dist:.1f}ATR)")
+            tp_atr = abs(current_tp - current_price) / max(atr, 1) if atr else 0
+            L.append(f"  TP    {_fp(current_tp)}  ({tp_atr:.1f}ATR)")
 
         if p_entry and current_price:
-            move = ((current_price - p_entry) if side == "LONG"
-                    else (p_entry - current_price))
+            move   = (current_price - p_entry) if side == "LONG" else (p_entry - current_price)
             risk_d = abs(p_entry - current_sl) if current_sl else 0
-            ur_r   = move / risk_d if risk_d > 0 else 0
-            upnl   = move * qty if qty > 0 else move
-            icon   = "🟢" if move >= 0 else "🔴"
-
-            bar = "░" * 16
-            prog = 0.0
-            if current_tp:
-                total = abs(current_tp - p_entry)
-                if total > 0:
-                    prog = min(1.0, max(0.0, abs(current_price - p_entry) / total))
-                    if move < 0:
-                        prog = 0.0
-                    filled = int(prog * 16)
-                    bar = "█" * filled + "░" * (16 - filled)
-
-            if qty > 0:
-                lines.append(f"  {icon} <b>${upnl:+.2f}</b> ({ur_r:+.2f}R)")
-            else:
-                lines.append(f"  {icon} {move:+.1f}pts ({ur_r:+.2f}R)")
-            lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
+            ur_r   = move / risk_d if risk_d else 0
+            upnl   = move * qty if qty else move
+            total  = abs(current_tp - p_entry) if current_tp else 0
+            prog   = min(1.0, max(0.0, abs(current_price - p_entry) / total)) if total and move >= 0 else 0.0
+            mi     = "🟢" if move >= 0 else "🔴"
+            pnl_str = f"${upnl:+.2f}" if qty else f"{move:+.1f}pts"
+            L.append(f"  {mi} <b>{pnl_str}</b>  ({ur_r:+.2f}R)")
+            L.append(f"  [{_esc(_bar10(prog) * 2)}] {prog*100:.0f}% → TP")
 
         if breakeven_moved:
-            lines.append(f"  🔒 BE locked | {profit_locked_pct:.1f}R secured")
+            L.append(f"  🔒 BE locked  ·  {profit_locked_pct:.1f}R secured")
 
-    lines.append("")
-    lines.append("📈 <b>PERFORMANCE</b>")
-    lines.append(f"  Trades: {int(total_trades)}  |  WR: {win_rate:.1f}%")
-    if consecutive_losses > 0:
-        lines.append(f"  ⚠️ Consecutive losses: {int(consecutive_losses)}")
+    # ── Performance ───────────────────────────────────────────────────────
+    L += ["", "<b>📈 Performance</b>"]
+    L.append(f"  Trades {int(total_trades)}  ·  WR {win_rate:.1f}%")
+    if consecutive_losses:
+        L.append(f"  ⚠️ Consecutive losses  {int(consecutive_losses)}")
 
     if extra_lines:
-        lines.append("")
-        for el in extra_lines:
-            if el and el.strip():
-                # extra_lines can contain HTML — let _sanitize_html handle it
-                lines.append(el)
+        L.append("")
+        L.extend(el for el in extra_lines if el and el.strip())
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
+    return "\n".join(L)
 
 
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 # 2. HUNT PREDICTION
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 
 def format_direction_hunt_alert(
     predicted:           Optional[str],
@@ -884,37 +852,26 @@ def format_direction_hunt_alert(
     current_price:       float = 0.0,
     atr:                 float = 0.0,
 ) -> str:
-    hunt_icon = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
-    deliv_icon = "🟢" if delivery_direction == "bullish" else \
-                 ("🔴" if delivery_direction == "bearish" else "⚪")
-    lines = [
-        f"{hunt_icon} <b>HUNT PREDICTION</b>: {_esc(predicted or 'NEUTRAL')}",
-        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
-        f"  Delivery:   {deliv_icon} {_esc(delivery_direction or '—')}",
-        f"  BSL score:  {bsl_score:+.3f}",
-        f"  SSL score:  {ssl_score:+.3f}",
-        f"  Raw:        {raw_score:+.3f}",
+    hi = "🔵" if predicted == "BSL" else ("🟠" if predicted == "SSL" else "⚪")
+    di = "🟢" if delivery_direction == "bullish" else ("🔴" if delivery_direction == "bearish" else "⚪")
+
+    L = [
+        f"{hi} <b>Hunt Prediction  •  {_esc(predicted or 'NEUTRAL')}</b>",
+        f"  [{_esc(_bar10(confidence))}] {confidence:.0%}  {di} {_esc(delivery_direction or '—')}",
+        f"  BSL {bsl_score:+.3f}  ·  SSL {ssl_score:+.3f}  ·  raw {raw_score:+.3f}",
     ]
-    if current_price > 0:
-        lines.append(f"  Price:      {_fmt_price(current_price)}")
-    if atr > 0:
-        lines.append(f"  ATR:        {_fmt_price(atr)}")
+    if current_price:
+        L.append(f"  Price {_fp(current_price)}   ATR {_fp(atr) if atr else '—'}")
     if nearest_bsl:
-        lines.append(
-            f"  ▲ BSL target: {_fmt_price(nearest_bsl.get('price', 0))} "
-            f"({nearest_bsl.get('dist_atr', 0):.1f}ATR)"
-        )
+        L.append(f"  ▲ BSL {_fp(nearest_bsl.get('price',0))}  ({nearest_bsl.get('dist_atr',0):.1f}ATR)")
     if nearest_ssl:
-        lines.append(
-            f"  ▼ SSL target: {_fmt_price(nearest_ssl.get('price', 0))} "
-            f"({nearest_ssl.get('dist_atr', 0):.1f}ATR)"
-        )
-    return "\n".join(lines)
+        L.append(f"  ▼ SSL {_fp(nearest_ssl.get('price',0))}  ({nearest_ssl.get('dist_atr',0):.1f}ATR)")
+    return "\n".join(L)
 
 
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 # 3. POST-SWEEP VERDICT
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 
 def format_post_sweep_verdict(
     action:           str,
@@ -923,106 +880,99 @@ def format_post_sweep_verdict(
     phase:            str,
     rev_score:        float,
     cont_score:       float,
-    cisd_active:      bool = False,
-    ote_active:       bool = False,
+    cisd_active:      bool  = False,
+    ote_active:       bool  = False,
     displacement_atr: float = 0.0,
     sweep_side:       str   = "",
     sweep_price:      float = 0.0,
     current_price:    float = 0.0,
     atr:              float = 0.0,
-    **_kwargs: Any,
+    **_kw: Any,
 ) -> str:
-    ai = {"reverse": "🔄", "continue": "➡️", "wait": "⏳"}.get(
-        action.lower(), "❓"
-    )
+    ai = {"reverse":"🔄","continue":"➡️","wait":"⏳"}.get(action.lower(),"❓")
     di = "🟢" if direction == "long" else ("🔴" if direction == "short" else "⚪")
-    winner = ("REVERSAL"     if rev_score  > cont_score + 15 else
-              "CONTINUATION" if cont_score > rev_score  + 15 else
-              "CONTESTED")
+    winner = ("REVERSAL" if rev_score>cont_score+15 else
+              "CONTINUATION" if cont_score>rev_score+15 else "CONTESTED")
 
-    lines = [
-        f"{ai} <b>POST-SWEEP VERDICT</b>: {_esc(action.upper())}  "
-        f"{di} {_esc(direction.upper() or '—')}",
-        f"  Confidence: [{_score_bar(confidence)}] {confidence:.0%}",
-        f"  Phase:      {_esc(phase)}",
-        f"  Sweep:      {_esc(sweep_side)} @ {_fmt_price(sweep_price)}",
-        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}  → {_esc(winner)}",
+    flags = []
+    if cisd_active:         flags.append("CISD ✓")
+    if ote_active:          flags.append("OTE ✓")
+    if displacement_atr>0:  flags.append(f"disp {displacement_atr:.2f}ATR")
+
+    L = [
+        f"{ai} <b>Post-Sweep  {_esc(action.upper())}</b>  {di} {_esc((direction or '—').upper())}",
+        f"  [{_esc(_bar10(confidence))}] {confidence:.0%}  phase {_esc(phase)}",
+        f"  Sweep  {_esc(sweep_side)} @ {_fp(sweep_price)}",
+        f"  REV {rev_score:.1f}  CONT {cont_score:.1f}  → <b>{_esc(winner)}</b>",
     ]
-    flags: List[str] = []
-    if cisd_active: flags.append("CISD✓")
-    if ote_active:  flags.append("OTE✓")
-    if displacement_atr > 0: flags.append(f"disp={displacement_atr:.2f}ATR")
     if flags:
-        lines.append("  " + "  ".join(_esc(f) for f in flags))
-    if current_price > 0:
-        lines.append(f"  Price={_fmt_price(current_price)}  ATR={_fmt_price(atr)}")
-    return "\n".join(lines)
+        L.append("  " + "  ·  ".join(_esc(f) for f in flags))
+    if current_price:
+        L.append(f"  Price {_fp(current_price)}  ATR {_fp(atr)}")
+    return "\n".join(L)
 
 
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 # 4. POOL GATE ALERT
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 
 def format_pool_gate_alert(
-    action:          str,                # "exit" | "reverse" | "continue"
-    side:            str,                # position side
-    pool_side:       str,                # "BSL" | "SSL"
-    pool_price:      float,
-    current_price:   float,
-    reason:          str = "",
-    rev_score:       float = 0.0,
-    cont_score:      float = 0.0,
-    **_kwargs: Any,
+    action:        str,
+    side:          str,
+    pool_side:     str,
+    pool_price:    float,
+    current_price: float,
+    reason:        str   = "",
+    rev_score:     float = 0.0,
+    cont_score:    float = 0.0,
+    **_kw: Any,
 ) -> str:
-    act_icon = {"exit": "🚪", "reverse": "🔄", "continue": "➡️"}.get(
-        action.lower(), "❓"
-    )
-    lines = [
-        f"{act_icon} <b>POOL-GATE {_esc(action.upper())}</b>",
-        f"  Position:  {_esc(side.upper())}",
-        f"  Pool hit:  {_esc(pool_side)} @ {_fmt_price(pool_price)}",
-        f"  Price:     {_fmt_price(current_price)}",
-        f"  REV={rev_score:.1f}  CONT={cont_score:.1f}",
+    ai = {"exit":"🚪","reverse":"🔄","continue":"➡️"}.get(action.lower(),"❓")
+    L = [
+        f"{ai} <b>Pool Gate  {_esc(action.upper())}</b>",
+        f"  Position {_esc(side.upper())}  ·  Pool {_esc(pool_side)} @ {_fp(pool_price)}",
+        f"  Price {_fp(current_price)}  ·  REV {rev_score:.1f}  CONT {cont_score:.1f}",
     ]
     if reason:
-        lines.append(f"  Reason: {_esc(reason)}")
-    return "\n".join(lines)
+        L.append(f"  {_esc(reason)}")
+    return "\n".join(L)
 
 
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 # 5. CONVICTION BLOCK ALERT
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
 
 def format_conviction_block_alert(
-    side:               str,
-    factor_scores:      Dict[str, float],
-    weighted_total:     float,
-    reasons:            Optional[List[str]] = None,
-    required_score:     float = _REQUIRED_CONVICTION_SCORE,
-    **_kwargs: Any,
+    side:           str,
+    factor_scores:  Dict[str, float],
+    weighted_total: float,
+    reasons:        Optional[List[str]] = None,
+    required_score: float = _REQUIRED_CONVICTION_SCORE,
+    **_kw: Any,
 ) -> str:
     deficit = max(0.0, required_score - weighted_total)
-    lines = [
-        f"🚫 <b>CONVICTION BLOCKED</b> {_esc(side.upper())}",
-        f"  Total: <b>{weighted_total:.2f}</b> / {required_score:.2f}  "
-        f"(need +{deficit:.2f})",
+    total_bar = _bar10(min(1.0, weighted_total / max(required_score, 0.01)))
+
+    L = [
+        f"🚫 <b>Conviction Blocked  •  {_esc(side.upper())}</b>",
+        f"  Score  <b>{weighted_total:.2f}</b> / {required_score:.2f}"
+        f"  [{_esc(total_bar)}]  need +{deficit:.2f}",
         "",
-        "  <b>Factor scores</b>",
+        "  <b>Factors</b>",
     ]
     for factor, score in factor_scores.items():
-        bar = _score_bar(min(1.0, max(0.0, score)), width=10)
-        lines.append(f"    {_esc(factor):<12} [{bar}] {score:+.2f}")
+        L.append(f"  <code>{_esc(factor):<14}</code> [{_esc(_bar10(min(1.0,max(0.0,score))))}] {score:+.2f}")
+
     if reasons:
-        lines.append("")
-        lines.append("  <b>Rejection reasons</b>")
+        L += ["", "  <b>Reasons</b>"]
         for r in reasons[:5]:
-            lines.append(f"    • {_esc(r)}")
-    return "\n".join(lines)
+            L.append(f"  · {_esc(r)}")
+    return "\n".join(L)
 
 
-# ======================================================================
-# 6. LIQUIDITY TRAIL UPDATE (v5.0 FIB ENGINE)
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════════
+# 6. LIQUIDITY TRAIL UPDATE  (Fibonacci engine v5.0)
+# ══════════════════════════════════════════════════════════════════════
 
 def format_liquidity_trail_update(
     side:          str,
@@ -1035,141 +985,82 @@ def format_liquidity_trail_update(
     entry_price:   float,
     current_price: float,
     atr:           float,
-    session:       str = "",
-    # v5.0 extras (all optional so v4.0 callers still work)
-    fib_ratio:     Optional[float]   = None,
-    r_multiple:    float             = 0.0,
-    swing_low:     Optional[float]   = None,
-    swing_high:    Optional[float]   = None,
-    momentum_gate: str               = "",
-    htf_aligned:   Optional[bool]    = None,
-    is_cluster:    bool              = False,
-    n_cluster_tfs: int               = 1,
-    pool_boost:    bool              = False,
-    pool_between_expand: bool        = False,
-    buffer_atr:    float             = 0.0,
+    session:       str           = "",
+    fib_ratio:     Optional[float] = None,
+    r_multiple:    float           = 0.0,
+    swing_low:     Optional[float] = None,
+    swing_high:    Optional[float] = None,
+    momentum_gate: str             = "",
+    htf_aligned:   Optional[bool]  = None,
+    is_cluster:    bool            = False,
+    n_cluster_tfs: int             = 1,
+    pool_boost:    bool            = False,
+    pool_between_expand: bool      = False,
+    buffer_atr:    float           = 0.0,
 ) -> str:
-    """
-    Fibonacci SL trail advance alert (v5.0 engine).
+    si       = "🟢" if (side or "").lower() == "long" else "🔴"
+    PHASE_I  = {"STRUCTURAL":"🏛️","AGGRESSIVE":"🎯","BE_LOCK":"🔒",
+                "COUNTER_BOS":"🚨","HANDS_OFF":"⏸","HOLD":"⏸"}
+    phase_i  = PHASE_I.get(phase, "📍")
+    sess_i   = _si(session)
 
-    Shows the full anchor reasoning: Fib ratio + swing context + momentum
-    source + HTF alignment + liquidity confluence tags.
-    Throttled in quant_strategy to one per 120s.
-    """
-    side_icon = "🟢" if (side or "").lower() == "long" else "🔴"
-    phase_icons = {
-        "STRUCTURAL":   "🏛️",
-        "AGGRESSIVE":   "🎯",
-        "BE_LOCK":      "🔒",
-        "COUNTER_BOS":  "🚨",
-        "HANDS_OFF":    "⏸",
-        "HOLD":         "⏸",
-    }
-    phase_icon = phase_icons.get(phase, "📍")
+    fib_str  = f"{fib_ratio:.3f}" if fib_ratio is not None else "?"
+    golden   = fib_ratio in (0.382, 0.500, 0.618) if fib_ratio is not None else False
+    fib_tag  = f"✨ <b>{fib_str}</b>" if golden else f"<b>{fib_str}</b>"
 
-    # Fib ratio display
-    fib_str = f"{fib_ratio:.3f}" if fib_ratio is not None else "?"
-    golden = fib_ratio in (0.382, 0.500, 0.618) if fib_ratio is not None else False
-    ratio_tag = f"✨ <b>{fib_str}</b>" if golden else f"<b>{fib_str}</b>"
+    tags = []
+    if is_cluster:            tags.append(f"×{n_cluster_tfs}TF")
+    if pool_boost:            tags.append("+pool")
+    if pool_between_expand:   tags.append("+expand")
+    tag_str = "  " + "  ".join(_esc(t) for t in tags) if tags else ""
 
-    # Cluster tag
-    cluster_tag = ""
-    if is_cluster:
-        cluster_tag = f" ×{int(n_cluster_tfs)}TF"
+    gate_i = {"DISP":"💥","CVD":"📈","BOS":"🏗️","NONE":"⚪"}.get(momentum_gate,"⚪")
+    htf_s  = ("🟢 aligned" if htf_aligned is True else
+               "🔴 counter" if htf_aligned is False else "⚪ n/a")
 
-    # Pool confluence
-    pool_tag = ""
-    if pool_boost:
-        pool_tag = " +pool"
-    if pool_between_expand:
-        pool_tag += " +expand"
-
-    # Momentum source
-    gate_emoji = {"DISP": "💥", "CVD": "📈", "BOS": "🏗️", "NONE": "⚪"}.get(
-        momentum_gate, "⚪"
-    )
-
-    # HTF alignment
-    htf_str = (
-        "🟢 aligned" if htf_aligned is True else
-        "🔴 counter" if htf_aligned is False else
-        "⚪ n/a"
-    )
-
-    sess_icons = {"LONDON": "🇬🇧", "NY": "🇺🇸", "ASIA": "🌏", "": "🌐"}
-    sess_icon  = sess_icons.get((session or "").upper(), "🌐")
-
-    # Profit locked in R from entry
     r_locked = 0.0
-    if atr > 1e-10 and entry_price > 0:
-        if (side or "").lower() == "long":
-            r_locked_pts = new_sl - entry_price
-        else:
-            r_locked_pts = entry_price - new_sl
-        r_locked = r_locked_pts / atr
+    if atr > 1e-10 and entry_price:
+        pts = (new_sl - entry_price) if (side or "").lower() == "long" else (entry_price - new_sl)
+        r_locked = pts / atr
+    dist_atr = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
 
-    dist_to_sl_atr = abs(current_price - new_sl) / atr if atr > 1e-10 else 0.0
-
-    lines: List[str] = [
-        f"{side_icon} <b>FIBONACCI TRAIL</b>  {phase_icon} {_esc(phase)}  "
-        f"({r_multiple:.2f}R)",
+    L = [
+        f"{si} <b>Fibonacci Trail</b>  {phase_i} {_esc(phase)}  {r_multiple:.2f}R",
         "",
-        f"  🎯 SL → <b>{_fmt_price(new_sl)}</b>  "
-        f"({r_locked:+.2f}R from entry)",
-        f"  📐 Fib: {ratio_tag}{_esc(cluster_tag)}{_esc(pool_tag)}  "
-        f"{_fmt_price(anchor_price)} ({_fmt_tf(anchor_tf)})",
+        f"  SL → <b>{_fp(new_sl)}</b>  ({r_locked:+.2f}R from entry)",
+        f"  Fib  {fib_tag}{tag_str}   anchor {_fp(anchor_price)} ({_esc(anchor_tf)})",
     ]
 
     if swing_low is not None and swing_high is not None:
-        swing_rng = abs(swing_high - swing_low)
-        lines.append(
-            f"  📊 Swing: {_fmt_price(swing_low)} → {_fmt_price(swing_high)}  "
-            f"({swing_rng:.0f}pts)"
-        )
+        rng = abs(swing_high - swing_low)
+        L.append(f"  Swing  {_fp(swing_low)} → {_fp(swing_high)}  ({rng:.0f} pts)")
 
-    if buffer_atr > 0:
-        lines.append(f"  🪶 Buffer: {buffer_atr:.2f} ATR")
+    if buffer_atr:
+        L.append(f"  Buffer  {buffer_atr:.2f} ATR")
 
-    if phase in ("STRUCTURAL", "AGGRESSIVE"):
-        lines.append(
-            f"  {gate_emoji} Momentum: {_esc(momentum_gate or 'n/a')}  "
-            f"HTF: {htf_str}"
-        )
+    if phase in ("STRUCTURAL","AGGRESSIVE"):
+        L.append(f"  {gate_i} Momentum {_esc(momentum_gate or 'n/a')}  ·  HTF {htf_s}")
 
-    lines.append(
-        f"  📏 Distance: {dist_to_sl_atr:.2f} ATR  |  Q: {anchor_sig:.1f}"
-    )
+    L.append(f"  Distance {dist_atr:.2f}ATR  ·  Q {anchor_sig:.1f}")
+    L += [
+        "",
+        f"  Entry {_fp(entry_price)}  ·  Price {_fp(current_price)}  {sess_i} {_esc(session or 'unknown')}",
+    ]
 
-    lines.append("")
-    lines.append(
-        f"  Entry: {_fmt_price(entry_price)}  |  "
-        f"Price: {_fmt_price(current_price)}  "
-        f"{sess_icon} {_esc(session or 'unknown')}"
-    )
-
-    if phase == "COUNTER_BOS":
-        lines.append(
-            "  <i>🚨 Counter-BOS broke entry — thesis invalidated, locked to BE</i>"
-        )
-    elif phase == "BE_LOCK":
-        lines.append(
-            "  <i>🔒 BE + exact fees + slippage locked; trade is now risk-free</i>"
-        )
+    notes = {
+        "COUNTER_BOS": "<i>🚨 Counter-BOS broke entry — thesis invalidated, locked to BE</i>",
+        "BE_LOCK":     "<i>🔒 Risk-free — BE + fees + slippage locked</i>",
+    }
+    if phase in notes:
+        L.append("  " + notes[phase])
     elif is_cluster:
-        lines.append(
-            "  <i>Multi-TF Fib confluence — strongest possible anchor</i>"
-        )
+        L.append("  <i>Multi-TF Fib confluence — strongest anchor</i>")
     elif pool_boost:
-        lines.append(
-            "  <i>Fibonacci + liquidity pool confluence</i>"
-        )
+        L.append("  <i>Fibonacci + liquidity pool confluence</i>")
     else:
-        lines.append(
-            "  <i>SL anchored to institutional Fib retracement</i>"
-        )
+        L.append("  <i>SL anchored to institutional Fib retracement</i>")
 
-    return "\n".join(lines)
-
+    return "\n".join(L)
 
 # ======================================================================
 # LOGGING HANDLER — forward WARNING+ logs to Telegram
