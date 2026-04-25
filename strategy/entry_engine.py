@@ -90,6 +90,8 @@ _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
 _CONT_SL_BUFFER_ATR = 0.40
+_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
+_TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
 
 try:
     import config as _sl_cfg
@@ -1752,14 +1754,33 @@ class EntryEngine:
             return None, None
 
         pools = snap.bsl_pools if side == "long" else snap.ssl_pools
-        candidates = [t for t in pools
-                      if _MIN_TARGET_ATR <= t.distance_atr <= _HTF_TP_MAX_ATR
-                      and t.significance >= _MIN_POOL_SIGNIFICANCE]
-        candidates.sort(key=lambda t: t.distance_atr)
-        for target in candidates:
+        scored: List[Tuple[float, float, float, PoolTarget]] = []
+        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+        min_net_move = max(
+            atr * _TP_MIN_NET_ATR,
+            self._estimated_entry_be_move(price, atr),
+        )
+        for target in pools:
+            if not (_MIN_TARGET_ATR <= target.distance_atr <= _HTF_TP_MAX_ATR):
+                continue
+            if target.significance < _MIN_POOL_SIGNIFICANCE:
+                continue
             tp = self._pool_to_tp(target, side, price, atr)
-            if tp and abs(tp - price) / risk >= min_rr:
-                return tp, target
+            if not tp:
+                continue
+            reward = abs(tp - price)
+            rr = reward / risk
+            if rr < required_rr:
+                continue
+            if reward < min_net_move:
+                continue
+            score = self._pool_draw_score(target, rr, required_rr)
+            scored.append((score, rr, -target.distance_atr, target))
+
+        if scored:
+            scored.sort(reverse=True, key=lambda x: (x[0], x[1], x[2]))
+            best = scored[0][3]
+            return self._pool_to_tp(best, side, price, atr), best
 
         return None, None
 
@@ -1775,7 +1796,41 @@ class EntryEngine:
                      and t.significance >= _MIN_POOL_SIGNIFICANCE * 0.5]
         if not reachable:
             return None
-        return min(reachable, key=lambda t: t.distance_atr)
+        return max(reachable, key=lambda t: self._pool_draw_score(t, 1.0, 1.0))
+
+    @staticmethod
+    def _estimated_entry_be_move(price: float, atr: float) -> float:
+        """Conservative pre-fill BE move: round-trip fees plus slippage reserve."""
+        try:
+            import config as _cfg_be
+            maker = abs(float(getattr(_cfg_be, "COMMISSION_RATE_MAKER", 0.0002)))
+            taker = abs(float(getattr(_cfg_be, "COMMISSION_RATE", 0.00055)))
+            rate = max(maker, min(taker, 0.00035))
+        except Exception:
+            rate = 0.00035
+        return price * rate * 2.0 + 0.12 * atr
+
+    @staticmethod
+    def _pool_draw_score(target: PoolTarget, rr: float, required_rr: float) -> float:
+        """Institutional liquidity draw score; not nearest-only, not significance-only."""
+        dist = max(float(target.distance_atr or 0.0), 1e-9)
+        sig = max(float(target.adjusted_sig()), 0.01)
+        pool = target.pool
+        tf_rank = TF_HIERARCHY.get(getattr(pool, "timeframe", "1m"), 1)
+        tf_mult = 1.0 + 0.08 * max(tf_rank - 2, 0)
+        htf_mult = 1.0 + 0.10 * max(float(getattr(pool, "htf_count", 0) or 0), 0.0)
+        struct_mult = 1.0
+        if getattr(pool, "ob_aligned", False):
+            struct_mult += 0.18
+        if getattr(pool, "fvg_aligned", False):
+            struct_mult += 0.10
+        confluence_mult = 1.0 + 0.06 * max(len(getattr(target, "tf_sources", []) or []) - 1, 0)
+
+        near_penalty = 1.0 - math.exp(-dist / 0.80)
+        far_decay = math.exp(-dist / 18.0)
+        distance_draw = near_penalty * far_decay
+        rr_quality = 1.0 + min(max(rr - required_rr, 0.0), 3.0) * 0.18
+        return sig * tf_mult * htf_mult * struct_mult * confluence_mult * distance_draw * rr_quality
 
     def _pool_to_tp(self, target, side, price, atr):
         buf = atr * min(0.50, 0.10 + 0.05 * target.distance_atr)

@@ -123,7 +123,41 @@ class ISTFormatter(logging.Formatter):
         return _repair_mojibake(super().format(record))
 
 
+_ANSI_LOG_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class TerminalFormatter(ISTFormatter):
+    _LEVEL_COLOR = {
+        logging.DEBUG: "\033[2m",
+        logging.INFO: "\033[96m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[1;91m",
+    }
+    _RESET = "\033[0m"
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=IST)
+        return f"{dt.strftime('%H:%M:%S')}.{int(record.msecs):03d}"
+
+    def format(self, record):
+        msg = _repair_mojibake(record.getMessage())
+        visible = _ANSI_LOG_RE.sub("", msg).lstrip()
+        if visible.startswith("+ DELTA ") or visible.startswith("+ ENGINE "):
+            return "\n" + msg
+
+        level = record.levelname[:4].ljust(4)
+        color = self._LEVEL_COLOR.get(record.levelno, "")
+        reset = self._RESET if color else ""
+        module = record.name.rsplit(".", 1)[-1]
+        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {module:<18} | "
+        if record.exc_info:
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        return prefix + msg.replace("\n", "\n" + " " * len(_ANSI_LOG_RE.sub("", prefix)))
+
+
 _ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_term_fmt = TerminalFormatter()
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
 _file_handler.setFormatter(_ist_fmt)
@@ -132,7 +166,7 @@ _stream_handler = logging.StreamHandler(
     stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     if hasattr(sys.stdout, "buffer") else sys.stdout
 )
-_stream_handler.setFormatter(_ist_fmt)
+_stream_handler.setFormatter(_term_fmt)
 
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),

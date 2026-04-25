@@ -1308,7 +1308,7 @@ class TelegramLogHandler(logging.Handler):
                 if buffered_msgs:
                     msg = "\n".join(buffered_msgs) + "\n" + msg
 
-            send_telegram_message(f"⚠️ <code>{_esc(msg[:1500])}</code>")
+            send_telegram_message(format_log_alert(record.levelname, record.name, msg))
         except Exception:
             pass
 
@@ -1632,3 +1632,467 @@ def format_status_card(
                 f"<code>UPNL  {_fpnl(upnl):<14} R     {r:+.2f}</code>"
             )
     return "\n".join(rows)
+
+
+# ============================================================================
+# v3 operator-grade Telegram cards
+# ============================================================================
+
+_TG_RULE = "<code>" + ("\u2500" * 34) + "</code>"
+
+
+def _tg_price(value: Any, digits: int = 2) -> str:
+    try:
+        if value is None:
+            return "-"
+        return f"${float(value):,.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _tg_num(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):,.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _tg_pnl(value: Any) -> str:
+    try:
+        v = float(value)
+        sign = "+" if v >= 0 else "-"
+        return f"{sign}${abs(v):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _tg_bar(value: float, width: int = 12) -> str:
+    try:
+        ratio = min(1.0, max(0.0, abs(float(value))))
+    except Exception:
+        ratio = 0.0
+    filled = int(ratio * width + 0.5)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def _tg_arrow(value: float = 0.0, side: str = "") -> str:
+    s = (side or "").lower()
+    if s in ("long", "bullish", "bsl"):
+        return "\u25b2"
+    if s in ("short", "bearish", "ssl"):
+        return "\u25bc"
+    try:
+        v = float(value)
+        if v > 0.05:
+            return "\u25b2"
+        if v < -0.05:
+            return "\u25bc"
+    except Exception:
+        pass
+    return "\u2022"
+
+
+def _tg_get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tg_pool_line(label: str, pool: Any) -> Optional[str]:
+    if not pool:
+        return None
+    price = _tg_get(pool, "price", 0.0)
+    dist = _tg_get(pool, "dist_atr", _tg_get(pool, "distance_atr", 0.0))
+    sig = _tg_get(pool, "significance", _tg_get(pool, "sig", 0.0))
+    tf = _tg_get(pool, "timeframe", _tg_get(pool, "tf", ""))
+    touches = _tg_get(pool, "touches", "")
+    extra = f" t={_esc(touches)}" if touches not in ("", None) else ""
+    return (
+        f"<code>{_esc(label):<4} {_tg_price(price):>13}  "
+        f"{float(dist or 0):>4.1f}A  sig {float(sig or 0):>5.1f}  "
+        f"{_esc(tf or '-'):>4}{extra}</code>"
+    )
+
+
+def _tg_limit(lines: List[str], max_chars: int = 3900) -> str:
+    out: List[str] = []
+    size = 0
+    for line in lines:
+        add = len(line) + 1
+        if size + add > max_chars:
+            out.append("<i>...trimmed for Telegram limit</i>")
+            break
+        out.append(line)
+        size += add
+    return "\n".join(out)
+
+
+def _tg_section(icon: str, title: str) -> str:
+    return f"\n{icon} <b>{_esc(title)}</b>"
+
+
+def format_periodic_report(
+    current_price:       float = 0.0,
+    balance:             float = 0.0,
+    total_trades:        int   = 0,
+    win_rate:            float = 0.0,
+    daily_pnl:           float = 0.0,
+    total_pnl:           float = 0.0,
+    consecutive_losses:  int   = 0,
+    bot_state:           str   = "SCANNING",
+    n_bsl_pools:         int   = 0,
+    n_ssl_pools:         int   = 0,
+    primary_target_str:  str   = "-",
+    flow_conviction:     float = 0.0,
+    flow_direction:      str   = "",
+    amd_phase:           str   = "UNKNOWN",
+    session:             str   = "REGULAR",
+    in_killzone:         bool  = False,
+    regime:              str   = "UNKNOWN",
+    position:            Optional[Dict] = None,
+    current_sl:          Optional[float] = None,
+    current_tp:          Optional[float] = None,
+    entry_price:         Optional[float] = None,
+    breakeven_moved:     bool  = False,
+    profit_locked_pct:   float = 0.0,
+    extra_lines:         Optional[List[str]] = None,
+    atr:                 float = 0.0,
+    htf_bias:            str   = "",
+    dealing_range_pd:    float = 0.5,
+    structure_15m:       str   = "",
+    structure_4h:        str   = "",
+    amd_bias:            str   = "",
+    nearest_bsl:         Optional[Dict] = None,
+    nearest_ssl:         Optional[Dict] = None,
+    sweep_analysis:      Optional[Dict] = None,
+    direction_hunt:        Optional[Any] = None,
+    direction_ps_analysis: Optional[Any] = None,
+    **_kw: Any,
+) -> str:
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M IST")
+    kz = "KZ ON" if in_killzone else "KZ off"
+    flow_side = (flow_direction or "neutral").upper()
+    flow_icon = _tg_arrow(flow_conviction, flow_direction)
+    pd_label = _pd(float(dealing_range_pd or 0.5))
+    pnl_icon = "\U0001f7e2" if float(daily_pnl or 0) >= 0 else "\U0001f534"
+
+    lines = [
+        f"\U0001f4ca <b>DELTA STATUS</b>  <code>{_esc(now_ist)}</code>",
+        _TG_RULE,
+        f"<code>BTC     {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
+        f"<code>BAL     {_tg_price(balance):>14}   TRD {int(total_trades):>4}   WR {float(win_rate or 0):>5.1f}%</code>",
+        f"{pnl_icon} <code>DAY     {_tg_pnl(daily_pnl):>14}   ALL {_tg_pnl(total_pnl):>14}</code>",
+        f"<code>STATE   {_esc((bot_state or 'SCANNING').upper()):<14} {_esc((session or '-').upper()):<10} {kz}</code>",
+        _tg_section("\U0001f3db", "Market Context"),
+        f"<code>AMD     {_esc(amd_phase or '-'):<16} bias {_esc(amd_bias or '-')}</code>",
+        f"<code>PD      {_esc(pd_label):<16} {float(dealing_range_pd or 0.5):>5.0%}   regime {_esc(regime or '-')}</code>",
+        f"<code>STRUCT  15m={_esc(structure_15m or '-'):<10} 4h={_esc(structure_4h or '-'):<10} HTF={_esc(htf_bias or '-')}</code>",
+        _tg_section("\U0001f4a7", "Liquidity Map"),
+        f"<code>POOLS   BSL {int(n_bsl_pools):>3}     SSL {int(n_ssl_pools):>3}</code>",
+    ]
+    for label, pool in (("BSL", nearest_bsl), ("SSL", nearest_ssl)):
+        row = _tg_pool_line(label, pool)
+        if row:
+            lines.append(row)
+    if primary_target_str and str(primary_target_str) not in ("-", "—"):
+        lines.append(f"<code>TARGET  {_esc(str(primary_target_str)[:70])}</code>")
+
+    lines += [
+        _tg_section("\u26a1", "Order Flow"),
+        f"<code>FLOW    {flow_icon} {flow_side:<9} [{_tg_bar(flow_conviction)}] {float(flow_conviction or 0):+5.2f}</code>",
+    ]
+
+    if direction_hunt is not None:
+        pred = _tg_get(direction_hunt, "predicted", "NEUTRAL")
+        conf = float(_tg_get(direction_hunt, "confidence", 0.0) or 0.0)
+        delivery = _tg_get(direction_hunt, "delivery_direction", "")
+        lines.append(
+            f"<code>HUNT    {_esc(str(pred or 'NEUTRAL')):<9} [{_tg_bar(conf)}] {conf:>5.0%} {_esc(delivery or '-')}</code>"
+        )
+
+    if sweep_analysis:
+        rev = float(sweep_analysis.get("reversal_score", sweep_analysis.get("rev_score", 0.0)) or 0.0)
+        cont = float(sweep_analysis.get("continuation_score", sweep_analysis.get("cont_score", 0.0)) or 0.0)
+        winner = "REVERSAL" if rev > cont + 15 else ("CONTINUATION" if cont > rev + 15 else "CONTESTED")
+        lines += [
+            _tg_section("\U0001f30a", "Sweep Read"),
+            f"<code>POOL    {_esc(sweep_analysis.get('sweep_side', '-')):<8} @ {_tg_price(sweep_analysis.get('sweep_price', 0.0)):>13}</code>",
+            f"<code>SCORE   REV {rev:>5.1f}   CONT {cont:>5.1f}   {winner}</code>",
+        ]
+
+    if direction_ps_analysis is not None:
+        action = _tg_get(direction_ps_analysis, "action", "-")
+        direction = _tg_get(direction_ps_analysis, "direction", "-")
+        conf = float(_tg_get(direction_ps_analysis, "confidence", 0.0) or 0.0)
+        phase = _tg_get(direction_ps_analysis, "phase", "-")
+        lines.append(f"<code>PS      {_esc(str(action).upper()):<9} {_esc(str(direction).upper()):<6} {conf:>5.0%} phase {_esc(phase)}</code>")
+
+    lines += [_tg_section("\U0001f6a6", "Execution Gates")]
+    lines.append(f"<code>SESSION {'PASS' if session else 'WAIT':<6}  FLOW {'PASS' if abs(flow_conviction) >= 0.20 else 'WAIT':<6}  HTF {'PASS' if htf_bias and htf_bias.lower() != 'mixed' else 'WAIT':<6}</code>")
+
+    if position:
+        side = str(position.get("side") or "?").upper()
+        qty = float(position.get("quantity") or 0.0)
+        entry = float(entry_price or position.get("entry_price") or 0.0)
+        sl = float(current_sl or position.get("sl_price") or 0.0)
+        tp = float(current_tp or position.get("tp_price") or 0.0)
+        move = (float(current_price or 0.0) - entry) if side == "LONG" else (entry - float(current_price or 0.0))
+        risk = abs(entry - sl)
+        r_now = move / risk if risk > 1e-10 else 0.0
+        upnl = move * qty if qty else move
+        rr = abs(tp - entry) / risk if risk > 1e-10 and tp else 0.0
+        lines += [
+            _tg_section("\U0001f512", "Active Position"),
+            f"<code>SIDE    {_esc(side):<8} qty {qty:.6f}   R {r_now:+.2f}</code>",
+            f"<code>ENTRY   {_tg_price(entry):>14}   UPNL {_tg_pnl(upnl):>14}</code>",
+            f"<code>SL      {_tg_price(sl):>14}   TP {_tg_price(tp):>14}   RR 1:{rr:.2f}</code>",
+        ]
+        if breakeven_moved:
+            lines.append(f"<code>LOCK    BE protected   secured {float(profit_locked_pct or 0):+.2f}R</code>")
+
+    lines += [
+        _tg_section("\U0001f4c8", "Risk & Performance"),
+        f"<code>LOSS STREAK {int(consecutive_losses):>2}   TOTAL TRADES {int(total_trades):>4}</code>",
+    ]
+    if extra_lines:
+        lines.append(_tg_section("\U0001f4dd", "Notes"))
+        for item in extra_lines[:8]:
+            if item and str(item).strip():
+                lines.append(f"<i>{_esc(str(item)[:220])}</i>")
+    return _tg_limit(lines)
+
+
+def format_direction_hunt_alert(
+    predicted:           Optional[str],
+    confidence:          float,
+    delivery_direction:  str,
+    bsl_score:           float,
+    ssl_score:           float,
+    nearest_bsl:         Optional[Dict] = None,
+    nearest_ssl:         Optional[Dict] = None,
+    raw_score:           float = 0.0,
+    current_price:       float = 0.0,
+    atr:                 float = 0.0,
+    **_kw: Any,
+) -> str:
+    reason = _kw.get("reason", "")
+    factors = _kw.get("factors", None)
+    lines = [
+        f"\U0001f9ed <b>LIQUIDITY DRAW</b>  <code>{_esc(predicted or 'NEUTRAL')}</code>",
+        _TG_RULE,
+        f"<code>CONF    [{_tg_bar(confidence)}] {float(confidence or 0):>5.0%}   delivery {_esc(delivery_direction or '-')}</code>",
+        f"<code>SCORE   BSL {float(bsl_score or 0):+7.3f}   SSL {float(ssl_score or 0):+7.3f}   raw {float(raw_score or 0):+7.3f}</code>",
+    ]
+    if current_price:
+        lines.append(f"<code>MARK    {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>")
+    for label, pool in (("BSL", nearest_bsl), ("SSL", nearest_ssl)):
+        row = _tg_pool_line(label, pool)
+        if row:
+            lines.append(row)
+    if _kw.get("swept_pool_price") or _kw.get("opposing_pool_price"):
+        lines.append(f"<code>SWEPT   {_tg_price(_kw.get('swept_pool_price')):>14}   OPP {_tg_price(_kw.get('opposing_pool_price')):>14}</code>")
+    if _kw.get("amd_phase") or _kw.get("htf_bias"):
+        lines.append(f"<code>CTX     AMD {_esc(_kw.get('amd_phase', '-') or '-'):<14} HTF {_esc(_kw.get('htf_bias', '-') or '-')}</code>")
+    if factors:
+        if isinstance(factors, dict):
+            frag = ", ".join(f"{k}:{v}" for k, v in list(factors.items())[:5])
+        else:
+            frag = ", ".join(str(x) for x in list(factors)[:5])
+        lines.append(f"<i>{_esc(frag[:220])}</i>")
+    if reason:
+        lines.append(f"<i>{_esc(str(reason)[:260])}</i>")
+    return _tg_limit(lines)
+
+
+def format_post_sweep_verdict(
+    action:           str,
+    direction:        str,
+    confidence:       float,
+    phase:            str,
+    rev_score:        float,
+    cont_score:       float,
+    cisd_active:      bool  = False,
+    ote_active:       bool  = False,
+    displacement_atr: float = 0.0,
+    sweep_side:       str   = "",
+    sweep_price:      float = 0.0,
+    current_price:    float = 0.0,
+    atr:              float = 0.0,
+    **_kw: Any,
+) -> str:
+    swept_price = _kw.get("swept_pool_price", sweep_price)
+    swept_side = _kw.get("swept_pool_type", sweep_side)
+    winner = "REVERSAL" if rev_score > cont_score + 15 else ("CONTINUATION" if cont_score > rev_score + 15 else "CONTESTED")
+    tags = []
+    if cisd_active:
+        tags.append("CISD")
+    if ote_active:
+        tags.append("OTE")
+    if displacement_atr:
+        tags.append(f"disp {float(displacement_atr):.2f}A")
+    lines = [
+        f"\U0001f30a <b>POST-SWEEP VERDICT</b>  <code>{_esc(str(action).upper())}</code>",
+        _TG_RULE,
+        f"<code>DIR     {_esc(str(direction).upper() or '-'):<8} [{_tg_bar(confidence)}] {float(confidence or 0):>5.0%}   phase {_esc(phase or '-')}</code>",
+        f"<code>POOL    {_esc(swept_side or '-'):<8} @ {_tg_price(swept_price):>13}   mark {_tg_price(current_price):>13}</code>",
+        f"<code>SCORE   REV {float(rev_score or 0):>6.1f}   CONT {float(cont_score or 0):>6.1f}   {winner}</code>",
+    ]
+    if tags:
+        lines.append(f"<code>TAGS    {_esc(' / '.join(tags))}</code>")
+    for label, key in (("REV", "rev_reasons"), ("CONT", "cont_reasons")):
+        vals = _kw.get(key) or []
+        if vals:
+            lines.append(f"<i>{label}: {_esc(', '.join(str(x) for x in vals[:4])[:240])}</i>")
+    if _kw.get("reason"):
+        lines.append(f"<i>{_esc(str(_kw.get('reason'))[:260])}</i>")
+    return _tg_limit(lines)
+
+
+def format_pool_gate_alert(
+    action:        str,
+    side:          str = "",
+    pool_side:     str = "",
+    pool_price:    float = 0.0,
+    current_price: float = 0.0,
+    reason:        str   = "",
+    rev_score:     float = 0.0,
+    cont_score:    float = 0.0,
+    **_kw: Any,
+) -> str:
+    side = side or _kw.get("pos_side", "")
+    confidence = float(_kw.get("confidence", 0.0) or 0.0)
+    lines = [
+        f"\U0001f6a6 <b>POOL GATE</b>  <code>{_esc(str(action).upper())}</code>",
+        _TG_RULE,
+        f"<code>POS     {_esc(str(side).upper() or '-'):<8} mark {_tg_price(current_price):>13}   conf {confidence:>5.0%}</code>",
+    ]
+    if pool_price:
+        lines.append(f"<code>POOL    {_esc(pool_side or '-'):<8} @ {_tg_price(pool_price):>13}</code>")
+    if _kw.get("pos_entry") or _kw.get("pos_sl") or _kw.get("pos_tp"):
+        lines.append(
+            f"<code>BRKT    entry {_tg_price(_kw.get('pos_entry')):>13}   SL {_tg_price(_kw.get('pos_sl')):>13}   TP {_tg_price(_kw.get('pos_tp')):>13}</code>"
+        )
+    if rev_score or cont_score:
+        lines.append(f"<code>SCORE   REV {float(rev_score or 0):>6.1f}   CONT {float(cont_score or 0):>6.1f}</code>")
+    if reason:
+        lines.append(f"<i>{_esc(str(reason)[:300])}</i>")
+    return _tg_limit(lines)
+
+
+def format_conviction_block_alert(
+    side:           str,
+    factor_scores:  Optional[Dict[str, float]] = None,
+    weighted_total: Optional[float] = None,
+    reasons:        Optional[List[str]] = None,
+    required_score: float = _REQUIRED_CONVICTION_SCORE,
+    **_kw: Any,
+) -> str:
+    score = float(weighted_total if weighted_total is not None else _kw.get("score", 0.0) or 0.0)
+    factors = factor_scores or _kw.get("factors") or {}
+    reject_reasons = reasons or _kw.get("reject_reasons") or []
+    allow_reasons = _kw.get("allow_reasons") or []
+    deficit = max(0.0, float(required_score or 0.0) - score)
+    lines = [
+        f"\U0001f6ab <b>CONVICTION BLOCK</b>  <code>{_esc(str(side).upper())}</code>",
+        _TG_RULE,
+        f"<code>SCORE   {score:>6.2f} / {float(required_score or 0):>5.2f}   need +{deficit:.2f}   [{_tg_bar(score / max(required_score, 0.01))}]</code>",
+    ]
+    if _kw.get("entry_price") or _kw.get("sl_price") or _kw.get("tp_price"):
+        lines.append(
+            f"<code>SETUP   entry {_tg_price(_kw.get('entry_price')):>13}   SL {_tg_price(_kw.get('sl_price')):>13}   TP {_tg_price(_kw.get('tp_price')):>13}   RR 1:{float(_kw.get('rr_ratio', 0) or 0):.2f}</code>"
+        )
+    if factors:
+        lines.append(_tg_section("\U0001f9ee", "Factor Stack"))
+        for name, val in list(factors.items())[:10]:
+            try:
+                fval = float(val)
+            except Exception:
+                fval = 0.0
+            lines.append(f"<code>{_esc(str(name))[:18]:<18} {fval:+6.2f} [{_tg_bar(fval)}]</code>")
+    if reject_reasons:
+        lines.append(_tg_section("\u26d4", "Reject Reasons"))
+        for item in reject_reasons[:6]:
+            lines.append(f"<i>{_esc(str(item)[:220])}</i>")
+    if allow_reasons:
+        lines.append(_tg_section("\u2705", "Positive Evidence"))
+        for item in allow_reasons[:4]:
+            lines.append(f"<i>{_esc(str(item)[:180])}</i>")
+    return _tg_limit(lines)
+
+
+def format_liquidity_trail_update(
+    side:          str,
+    new_sl:        float,
+    anchor_price:  float,
+    anchor_tf:     str,
+    anchor_sig:    float,
+    phase:         str,
+    is_swept:      bool,
+    entry_price:   float,
+    current_price: float,
+    atr:           float,
+    session:       str           = "",
+    fib_ratio:     Optional[float] = None,
+    r_multiple:    float           = 0.0,
+    swing_low:     Optional[float] = None,
+    swing_high:    Optional[float] = None,
+    momentum_gate: str             = "",
+    htf_aligned:   Optional[bool]  = None,
+    is_cluster:    bool            = False,
+    n_cluster_tfs: int             = 1,
+    pool_boost:    bool            = False,
+    pool_between_expand: bool      = False,
+    buffer_atr:    float           = 0.0,
+) -> str:
+    side_u = str(side or "").upper()
+    move = (float(current_price or 0) - float(entry_price or 0)) if side_u == "LONG" else (float(entry_price or 0) - float(current_price or 0))
+    locked = (float(new_sl or 0) - float(entry_price or 0)) if side_u == "LONG" else (float(entry_price or 0) - float(new_sl or 0))
+    locked_atr = locked / max(float(atr or 0), 1e-10)
+    tags = []
+    if is_cluster:
+        tags.append(f"{int(n_cluster_tfs)}TF cluster")
+    if pool_boost:
+        tags.append("pool boost")
+    if pool_between_expand:
+        tags.append("buffer expanded")
+    if is_swept:
+        tags.append("anchor swept")
+    if htf_aligned is not None:
+        tags.append("HTF aligned" if htf_aligned else "HTF mixed")
+    lines = [
+        f"\U0001f512 <b>FIB TRAIL ADVANCE</b>  <code>{_esc(side_u)}</code>",
+        _TG_RULE,
+        f"<code>SL      {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
+        f"<code>R       live {float(r_multiple or 0):+6.2f}R   lock {locked:+8.1f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",
+        f"<code>FIB     {fib_ratio if fib_ratio is not None else '-':>8}   anchor {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}</code>",
+        f"<code>MARK    {_tg_price(current_price):>14}   ENTRY {_tg_price(entry_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
+    ]
+    if swing_low is not None or swing_high is not None:
+        lines.append(f"<code>SWING   low {_tg_price(swing_low):>13}   high {_tg_price(swing_high):>13}</code>")
+    if momentum_gate:
+        lines.append(f"<code>GATE    {_esc(momentum_gate)}</code>")
+    if tags:
+        lines.append(f"<i>{_esc(' / '.join(tags))}</i>")
+    if session or buffer_atr:
+        lines.append(f"<code>CTX     session {_esc(session or '-')}   buffer {float(buffer_atr or 0):.2f} ATR</code>")
+    return _tg_limit(lines)
+
+
+def format_log_alert(level: str, logger_name: str, message: str) -> str:
+    level_u = (level or "WARNING").upper()
+    icon = {
+        "WARNING": "\u26a0\ufe0f",
+        "ERROR": "\U0001f6a8",
+        "CRITICAL": "\U0001f6a8",
+    }.get(level_u, "\U0001f4dd")
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M:%S IST")
+    clean = _repair_mojibake(str(message or "")).strip()
+    lines = [
+        f"{icon} <b>LOG { _esc(level_u) }</b>  <code>{_esc(now_ist)}</code>",
+        _TG_RULE,
+        f"<code>SRC     {_esc((logger_name or '-')[-32:])}</code>",
+        f"<pre>{_esc(clean[:1800])}</pre>",
+    ]
+    return _tg_limit(lines, max_chars=2200)
