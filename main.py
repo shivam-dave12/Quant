@@ -114,108 +114,72 @@ def _repair_mojibake(text: str) -> str:
     return text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ANSI COLOUR HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-
-try:
-    _COLOR_ON = os.isatty(sys.stdout.fileno())
-except Exception:
-    _COLOR_ON = False
-if os.getenv("QUANT_NO_COLOR") or os.getenv("NO_COLOR"):
-    _COLOR_ON = False
-
-
-def _ansi(code: str, t: str) -> str:
-    return f"\033[{code}m{t}\033[0m" if _COLOR_ON else t
-
-
-_LEVEL_STYLE = {
-    "DEBUG":    ("2;37",    "0"),
-    "INFO":     ("1;96",    "0"),
-    "WARNING":  ("1;33",    "33"),
-    "ERROR":    ("1;91",    "91"),
-    "CRITICAL": ("1;97;41", "1;91"),
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FORMATTERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ColorISTFormatter(logging.Formatter):
-    """
-    Coloured stream formatter.
-    Layout:  HH:MM:SS  LEVEL     module.submodule   message
-    """
-
-    def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=IST)
-        return _ansi("2;37", dt.strftime("%H:%M:%S"))
-
-    def format(self, record):
-        record   = logging.makeLogRecord(record.__dict__)
-        ts       = self.formatTime(record)
-        lvl_name = record.levelname
-        badge_c, msg_c = _LEVEL_STYLE.get(lvl_name, ("37", "0"))
-        badge    = _ansi(badge_c, f"{lvl_name:<9}")
-        parts    = (record.name or "root").split(".")
-        module   = ".".join(parts[-2:]) if len(parts) >= 2 else parts[0]
-        mod      = _ansi("1;97", f"{module:<28}")
-        raw_msg  = _repair_mojibake(record.getMessage())
-        raw_msg  = _ANSI_RE.sub("", raw_msg)
-        msg      = _ansi(msg_c, raw_msg) if msg_c != "0" else raw_msg
-        exc = ""
-        if record.exc_info:
-            if not record.exc_text:
-                record.exc_text = self.formatException(record.exc_info)
-        if record.exc_text:
-            exc = "\n" + _ansi("91", record.exc_text)
-        return f"{ts}  {badge}  {mod}  {msg}{exc}"
-
-
-class PlainISTFormatter(logging.Formatter):
-    """
-    Plain formatter for quant_bot.log — same data, no ANSI.
-    Layout:  YYYY-MM-DD HH:MM:SS,mmm  LEVEL     module.submodule   message
-    """
-
+class ISTFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=IST)
         s  = dt.strftime("%Y-%m-%d %H:%M:%S")
         return f"{s},{int(record.msecs):03d}"
 
     def format(self, record):
-        record  = logging.makeLogRecord(record.__dict__)
-        ts      = self.formatTime(record)
-        lvl     = f"{record.levelname:<9}"
-        parts   = (record.name or "root").split(".")
-        module  = ".".join(parts[-2:]) if len(parts) >= 2 else parts[0]
-        raw_msg = _repair_mojibake(record.getMessage())
-        raw_msg = _ANSI_RE.sub("", raw_msg)
-        base    = f"{ts}  {lvl}  {module:<28}  {raw_msg}"
+        return _repair_mojibake(super().format(record))
+
+
+_ANSI_LOG_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class TerminalFormatter(ISTFormatter):
+    _LEVEL_COLOR = {
+        logging.DEBUG: "\033[2m",
+        logging.INFO: "\033[96m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[1;91m",
+    }
+    _RESET = "\033[0m"
+
+    def __init__(self, enable_color: bool = True):
+        super().__init__()
+        self._enable_color = enable_color
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=IST)
+        return f"{dt.strftime('%H:%M:%S')}.{int(record.msecs):03d}"
+
+    def format(self, record):
+        msg = _repair_mojibake(record.getMessage())
+        if not self._enable_color:
+            msg = _ANSI_LOG_RE.sub("", msg)
+        visible = _ANSI_LOG_RE.sub("", msg).lstrip()
+        if visible.startswith("+ DELTA ") or visible.startswith("+ ENGINE "):
+            return "\n" + msg
+
+        level = record.levelname[:4].ljust(4)
+        color = self._LEVEL_COLOR.get(record.levelno, "") if self._enable_color else ""
+        reset = self._RESET if color else ""
+        module = record.name.rsplit(".", 1)[-1]
+        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {module:<18} | "
         if record.exc_info:
-            if not record.exc_text:
-                record.exc_text = self.formatException(record.exc_info)
-        if record.exc_text:
-            base += "\n" + record.exc_text
-        return base
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        return prefix + msg.replace("\n", "\n" + " " * len(_ANSI_LOG_RE.sub("", prefix)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING WIRING
-# ─────────────────────────────────────────────────────────────────────────────
+_ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_term_fmt = TerminalFormatter(
+    enable_color=(
+        bool(getattr(sys.stdout, "isatty", lambda: False)())
+        or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
+        or os.getenv("PY_COLORS", "") == "1"
+    )
+)
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
-_file_handler.setFormatter(PlainISTFormatter())
+_file_handler.setFormatter(_ist_fmt)
 
 _stream_handler = logging.StreamHandler(
     stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     if hasattr(sys.stdout, "buffer") else sys.stdout
 )
-_stream_handler.setFormatter(ColorISTFormatter())
+_stream_handler.setFormatter(_term_fmt)
 
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),

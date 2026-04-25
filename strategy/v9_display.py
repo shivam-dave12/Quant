@@ -1,205 +1,336 @@
 # -*- coding: utf-8 -*-
 """
-strategy/v9_display.py — Display Engine  v10
-=============================================
-All functions are pure formatters — no side-effects.
+strategy/v9_display.py — Display Engine v10  (pretty terminal + Telegram)
+==========================================================================
+All functions are pure formatters — no side effects.
 
-TERMINAL  : ANSI-coloured box layouts.
-            Disable colours with env var  QUANT_NO_COLOR=1
-TELEGRAM  : HTML-formatted messages (parse_mode=HTML)
-
-Used by: quant_strategy.py · main.py · controller.py · notifier.py
+TERMINAL:  ANSI colours, box-drawing, progress bars, colour-coded signals.
+TELEGRAM:  Clean HTML, consistent emoji anchors, signal-first layout.
 """
 
 from __future__ import annotations
-import os
-import sys
-import re
+
 import time
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_IST = timezone(timedelta(hours=5, minutes=30))
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ANSI COLOUR PALETTE
+# ANSI palette  (terminal only)
 # ─────────────────────────────────────────────────────────────────────────────
+class C:
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+    DIM  = "\033[2m"
 
-ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*m")
+    BLK  = "\033[30m"; RED  = "\033[31m"; GRN  = "\033[32m"
+    YLW  = "\033[33m"; BLU  = "\033[34m"; MAG  = "\033[35m"
+    CYN  = "\033[36m"; WHT  = "\033[37m"
 
+    BRED = "\033[91m"; BGRN = "\033[92m"; BYLW = "\033[93m"
+    BBLU = "\033[94m"; BMAG = "\033[95m"; BCYN = "\033[96m"; BWHT = "\033[97m"
 
-def strip_ansi(text: str) -> str:
-    """Strip ANSI escape codes (used by file-log formatter in main.py)."""
-    return ANSI_ESC_RE.sub("", text)
+    BG_RED  = "\033[41m"; BG_GRN  = "\033[42m"
+    BG_YLW  = "\033[43m"; BG_BLU  = "\033[44m"
 
+def _c(text: str, *codes: str) -> str:
+    return "".join(codes) + str(text) + C.RST
 
-def _detect_color() -> bool:
-    if os.getenv("QUANT_NO_COLOR") or os.getenv("NO_COLOR"):
-        return False
-    if os.getenv("TERM", "") in ("dumb", ""):
-        return False
-    try:
-        stdout = getattr(sys, "__stdout__", sys.stdout)
-        return bool(hasattr(stdout, "fileno") and os.isatty(stdout.fileno()))
-    except Exception:
-        return False
-
-
-_COLOR_ON: bool = _detect_color()
-
-
-class _C:
-    """ANSI colour helpers — each returns the string with codes (or plain if disabled)."""
-
-    @staticmethod
-    def _e(code: str, t: str) -> str:
-        return f"\033[{code}m{t}\033[0m" if _COLOR_ON else t
-
-    # ── structural ────────────────────────────────────────────────────────
-    @staticmethod
-    def bold(t: str) -> str:      return _C._e("1",    t)
-    @staticmethod
-    def dim(t: str) -> str:       return _C._e("2",    t)
-
-    # ── semantic ──────────────────────────────────────────────────────────
-    @staticmethod
-    def header(t: str) -> str:    return _C._e("1;97", t)   # bold white
-    @staticmethod
-    def subhdr(t: str) -> str:    return _C._e("1;96", t)   # bold cyan
-    @staticmethod
-    def label(t: str) -> str:     return _C._e("90",   t)   # dark grey
-    @staticmethod
-    def muted(t: str) -> str:     return _C._e("2;37", t)   # dim white
-    @staticmethod
-    def price(t: str) -> str:     return _C._e("1;97", t)   # bold white
-    @staticmethod
-    def bsl(t: str) -> str:       return _C._e("96",   t)   # bright cyan
-    @staticmethod
-    def ssl(t: str) -> str:       return _C._e("95",   t)   # bright magenta
-    @staticmethod
-    def target(t: str) -> str:    return _C._e("1;93", t)   # bold yellow
-    @staticmethod
-    def long_(t: str) -> str:     return _C._e("92",   t)   # bright green
-    @staticmethod
-    def short_(t: str) -> str:    return _C._e("91",   t)   # bright red
-    @staticmethod
-    def pnl_pos(t: str) -> str:   return _C._e("1;92", t)   # bold bright green
-    @staticmethod
-    def pnl_neg(t: str) -> str:   return _C._e("1;91", t)   # bold bright red
-    @staticmethod
-    def warn(t: str) -> str:      return _C._e("33",   t)   # yellow
-    @staticmethod
-    def sep(t: str) -> str:       return _C._e("2;37", t)   # dim (box chrome)
-    # state-specific colours
-    @staticmethod
-    def c_scan(t: str) -> str:    return _C._e("36",   t)   # cyan
-    @staticmethod
-    def c_track(t: str) -> str:   return _C._e("33",   t)   # yellow
-    @staticmethod
-    def c_ready(t: str) -> str:   return _C._e("1;93", t)   # bold yellow
-    @staticmethod
-    def c_sweep(t: str) -> str:   return _C._e("35",   t)   # magenta
-    @staticmethod
-    def c_enter(t: str) -> str:   return _C._e("1;93", t)   # bold yellow
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BOX-DRAWING HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-_W = 74  # box width (characters, excluding ANSI)
-
-
-def _top(w: int = _W) -> str:
-    return _C.sep("╔" + "═" * (w - 2) + "╗")
-
-def _bot(w: int = _W) -> str:
-    return _C.sep("╚" + "═" * (w - 2) + "╝")
-
-def _thick(w: int = _W) -> str:
-    return _C.sep("╠" + "═" * (w - 2) + "╣")
-
-def _thin(w: int = _W) -> str:
-    return _C.sep("╟" + "─" * (w - 2) + "╢")
-
-def _rule(w: int = _W) -> str:
-    return _C.sep("─" * w)
-
-def _row(content: str) -> str:
-    """Left-border ║ + one space + content (no right padding needed)."""
-    return _C.sep("║") + "  " + content
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MICRO-FORMATTERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fp(p: float) -> str:
-    return f"${p:,.2f}" if p >= 1000 else f"${p:.4f}"
-
+def _price(p: float) -> str:
+    return f"${p:,.2f}"
 
 def _esc(s: Any) -> str:
-    """HTML-escape for Telegram."""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _bar(ratio: float, width: int = 20, full: str = "█", empty: str = "░") -> str:
+    filled = max(0, min(width, int(ratio * width)))
+    return full * filled + empty * (width - filled)
 
-def _flow_bar(conviction: float, width: int = 6) -> str:
-    n = min(width, max(0, int(abs(conviction) * width + 0.5)))
-    empty = width - n
+def _pnl_color(v: float) -> str:
+    return C.BGRN if v >= 0 else C.BRED
+
+def _ist_now() -> str:
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M:%S IST")
+
+def _flow_bar(conviction: float, width: int = 8) -> str:
+    n = min(width, int(abs(conviction) * width))
     if conviction > 0.05:
-        return _C.long_("▓" * n + "░" * empty + " ▲")
-    if conviction < -0.05:
-        return _C.short_("▓" * n + "░" * empty + " ▼")
-    return _C.muted("░" * width + " ─")
+        return _c("▓" * n + "░" * (width - n) + " ▲", C.BGRN)
+    elif conviction < -0.05:
+        return _c("▓" * n + "░" * (width - n) + " ▼", C.BRED)
+    return _c("─" * width + " ─", C.DIM)
 
 
-def _pbar(pct: float, width: int = 20, clr=None) -> str:
-    filled = max(0, min(width, int(pct * width)))
-    bar = "█" * filled + "░" * (width - filled)
-    return clr(bar) if clr else bar
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. TERMINAL HEARTBEAT  (main.py — every 60 s)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def _pnl_c(v: float) -> str:
-    s = f"${v:+,.2f}"
-    return _C.pnl_pos(s) if v >= 0 else _C.pnl_neg(s)
+def _visible_len(text: Any) -> int:
+    return len(_ANSI_RE.sub("", str(text)))
 
 
-def _r_c(v: float) -> str:
-    s = f"{v:+.2f}R"
-    return _C.pnl_pos(s) if v >= 0 else _C.pnl_neg(s)
+def _term_progress(value: float, width: int = 18) -> str:
+    filled = max(0, min(width, int(abs(value) * width + 0.5)))
+    return "#" * filled + "." * (width - filled)
 
 
-def _pd_label(pd: float) -> str:
-    if pd < 0.25: return "DEEP-DISC"
-    if pd < 0.40: return "DISCOUNT"
-    if pd < 0.60: return "EQUILIB"
-    if pd < 0.75: return "PREMIUM"
-    return "DEEP-PREM"
+def _term_box(title: str, rows: List[str], width: int = 98, accent: str = C.BBLU) -> str:
+    inner = width - 4
+    title = f" {title.strip()} "
+    top_fill = max(0, width - 2 - len(title))
+    top = _c("+" + title + "-" * top_fill + "+", accent, C.BOLD)
+    bottom = _c("+" + "-" * (width - 2) + "+", accent)
+    out = [top]
+    for row in rows:
+        text = str(row)
+        pad = max(0, inner - _visible_len(text))
+        out.append(_c("| ", accent) + text + " " * pad + _c(" |", accent))
+    out.append(bottom)
+    return "\n".join(out)
 
 
-_SESS_ICONS = {
-    "asia": "🌙", "london": "🌅", "ny": "🏛️",
-    "new_york": "🏛️", "late_ny": "🌇", "london_ny": "🌅",
-}
-_STATE_ICON = {
-    "SCANNING": "🔍", "TRACKING": "📡", "READY": "🎯",
-    "POST_SWEEP": "🌊", "ENTERING": "⚡", "IN_POSITION": "📊",
-}
-_STATE_CLR = {
-    "SCANNING":   _C.c_scan,
-    "TRACKING":   _C.c_track,
-    "READY":      _C.c_ready,
-    "POST_SWEEP": _C.c_sweep,
-    "ENTERING":   _C.c_enter,
-}
+def _term_section(name: str) -> str:
+    return _c(f"[{name.upper()}]", C.BOLD, C.BWHT)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  TERMINAL HEARTBEAT  (main.py — every 60 s)
-# ─────────────────────────────────────────────────────────────────────────────
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _pool_value(item: Any, attr: str, default: Any = None) -> Any:
+    try:
+        pool = getattr(item, "pool", item)
+        return getattr(pool, attr, default)
+    except Exception:
+        return default
+
+
+def _pool_metric(item: Any, attr: str, default: Any = None) -> Any:
+    try:
+        return getattr(item, attr, default)
+    except Exception:
+        return default
+
+
+def _fmt_term_pool(item: Any, label: str, price: float, atr: float, target: Optional[Any]) -> str:
+    px = _safe_float(_pool_value(item, "price", 0.0))
+    dist = _pool_metric(item, "distance_atr", None)
+    if dist is None and atr > 0 and px > 0:
+        dist = abs(px - price) / atr
+    sig = _safe_float(_pool_metric(item, "significance", _pool_value(item, "significance", 0.0)))
+    tf = str(_pool_value(item, "timeframe", "") or "")
+    touches = int(_safe_float(_pool_value(item, "touches", 0), 0))
+    flags: List[str] = []
+    if bool(_pool_value(item, "ob_aligned", False)):
+        flags.append("OB")
+    if bool(_pool_value(item, "fvg_aligned", False)):
+        flags.append("FVG")
+    htf = int(_safe_float(_pool_value(item, "htf_count", 0), 0))
+    if htf >= 2:
+        flags.append(f"HTF{htf}")
+    is_target = False
+    try:
+        is_target = bool(target and abs(px - target.pool.price) <= max(atr * 0.3, 30.0))
+    except Exception:
+        pass
+    mark = _c("TARGET", C.BYLW, C.BOLD) if is_target else ""
+    color = C.BGRN if label == "BSL" else C.BRED
+    return (
+        f"{_c(label, color, C.BOLD):<12} {_c(_price(px), C.BCYN):<20} "
+        f"{_safe_float(dist):>4.1f} ATR  sig {sig:>5.1f}  t {touches:<2d} "
+        f"{tf:<4} {'/'.join(flags):<12} {mark}"
+    )
+
+
+def _target_summary(target: Optional[Any]) -> str:
+    if target is None:
+        return _c("none", C.DIM)
+    try:
+        side = str(getattr(target, "direction", "") or "").upper()
+        px = _pool_value(target, "price", getattr(target.pool, "price", 0.0))
+        dist = _safe_float(getattr(target, "distance_atr", 0.0))
+        sig = _safe_float(getattr(target, "significance", 0.0))
+        sources = getattr(target, "tf_sources", None) or []
+        src = f" | TF {','.join(str(x) for x in sources[:4])}" if sources else ""
+        return f"{_c(side or 'POOL', C.BYLW, C.BOLD)} -> {_c(_price(px), C.BCYN)} | {dist:.1f} ATR | sig {sig:.0f}{src}"
+    except Exception:
+        return _c("detected", C.BYLW)
+
+
+def _format_heartbeat_industry(
+    price: float,
+    feed: str,
+    exchange: str,
+    position: Optional[Dict],
+    engine_state: str,
+    tracking_info: Optional[Dict],
+    primary_target: Optional[Any],
+    nearest_bsl_atr: float,
+    nearest_ssl_atr: float,
+    recent_sweep_count: int,
+    total_trades: int,
+    total_pnl: float,
+    flow_conviction: float = 0.0,
+    flow_direction: str = "",
+    bsl_pools: Optional[list] = None,
+    ssl_pools: Optional[list] = None,
+    atr: float = 0.0,
+    cvd_trend: float = 0.0,
+    tick_flow: float = 0.0,
+    session: str = "",
+    kill_zone: str = "",
+    amd_phase: str = "",
+    amd_bias: str = "",
+    dealing_range_pd: float = 0.5,
+    structure_15m: str = "",
+    structure_4h: str = "",
+    sweep_analysis: Optional[Dict] = None,
+    htf_bias: str = "",
+) -> str:
+    rows: List[str] = []
+    side_color = C.BCYN
+    if position:
+        side_color = C.BGRN if str(position.get("side", "")).lower() == "long" else C.BRED
+    state_color = C.BGRN if engine_state in ("READY", "IN_POSITION") else C.BCYN
+    kz = _c("KILLZONE", C.BYLW, C.BOLD) if kill_zone else _c("off-kz", C.DIM)
+    pd_label = (
+        "deep-discount" if dealing_range_pd < 0.25 else
+        "discount" if dealing_range_pd < 0.40 else
+        "equilibrium" if dealing_range_pd < 0.60 else
+        "premium" if dealing_range_pd < 0.75 else "deep-premium"
+    )
+
+    rows.append(
+        f"{_term_section('market')} {_c(_price(price), C.BOLD, side_color)}  "
+        f"feed {feed or '-'} | exchange {exchange or '-'} | ATR {_c(f'${atr:,.1f}' if atr else '-', C.YLW)}"
+    )
+    rows.append(
+        f"state {_c(engine_state or 'SCANNING', C.BOLD, state_color)} | "
+        f"session {(session or '-').upper()} | {kz} | {_c(_ist_now(), C.DIM)}"
+    )
+    rows.append(
+        f"AMD {amd_phase or '-'} / {amd_bias or '-'} | PD {pd_label} {dealing_range_pd:.0%} | "
+        f"15m {structure_15m or '-'} | 4H {structure_4h or '-'} | HTF {htf_bias or '-'}"
+    )
+    rows.append("")
+    rows.append(f"{_term_section('liquidity')} target {_target_summary(primary_target)}")
+    rows.append(
+        f"nearest BSL {_c(f'{nearest_bsl_atr:.1f} ATR', C.BGRN)} | "
+        f"nearest SSL {_c(f'{nearest_ssl_atr:.1f} ATR', C.BRED)} | recent sweeps {recent_sweep_count}"
+    )
+    for item in (bsl_pools or [])[:3]:
+        rows.append(_fmt_term_pool(item, "BSL", price, atr, primary_target))
+    for item in (ssl_pools or [])[:3]:
+        rows.append(_fmt_term_pool(item, "SSL", price, atr, primary_target))
+
+    rows.append("")
+    flow_bar = _term_progress(min(1.0, abs(flow_conviction)), 20)
+    flow_col = C.BGRN if flow_conviction > 0.05 else (C.BRED if flow_conviction < -0.05 else C.DIM)
+    rows.append(
+        f"{_term_section('flow')} {_c((flow_direction or 'neutral').upper(), C.BOLD, flow_col)} "
+        f"[{_c(flow_bar, flow_col)}] {flow_conviction:+.2f} | CVD {cvd_trend:+.2f} | tick {tick_flow:+.2f}"
+    )
+    if tracking_info:
+        rows.append(
+            f"tracking {str(tracking_info.get('direction', '?')).upper()} -> "
+            f"{tracking_info.get('target', '?')} | ticks {tracking_info.get('flow_ticks', 0)} | "
+            f"started {tracking_info.get('started', '-')}"
+        )
+    if sweep_analysis:
+        rev = _safe_float(sweep_analysis.get("reversal_score", sweep_analysis.get("rev_score", 0.0)))
+        cont = _safe_float(sweep_analysis.get("continuation_score", sweep_analysis.get("cont_score", 0.0)))
+        sweep_side = sweep_analysis.get("sweep_side", "?")
+        sweep_px = _safe_float(sweep_analysis.get("sweep_price", 0.0))
+        winner = "REVERSAL" if rev > cont + 15 else ("CONTINUATION" if cont > rev + 15 else "CONTESTED")
+        rows.append(f"sweep {sweep_side} @ {_price(sweep_px)} | REV {rev:.1f} vs CONT {cont:.1f} | {winner}")
+
+    rows.append("")
+    if position:
+        side = str(position.get("side", "?")).upper()
+        entry = _safe_float(position.get("entry_price", 0.0))
+        sl = _safe_float(position.get("sl_price", 0.0))
+        tp = _safe_float(position.get("tp_price", 0.0))
+        qty = _safe_float(position.get("quantity", 0.0))
+        init_sl = _safe_float(position.get("initial_sl_dist", abs(entry - sl)), abs(entry - sl))
+        move = (price - entry) if side == "LONG" else (entry - price)
+        r_now = move / init_sl if init_sl > 1e-10 else 0.0
+        rr = abs(tp - entry) / abs(entry - sl) if entry and sl and tp and abs(entry - sl) > 1e-10 else 0.0
+        upnl = move * qty if qty else move
+        prog = min(1.0, max(0.0, abs(price - entry) / max(abs(tp - entry), 1e-9))) if move >= 0 and tp else 0.0
+        rows.append(
+            f"{_term_section('position')} {_c(side, C.BOLD, side_color)} qty {qty:.6f} | "
+            f"entry {_c(_price(entry), C.CYN)} | mark {_c(_price(price), C.BCYN)}"
+        )
+        if atr > 0:
+            rows.append(
+                f"SL {_c(_price(sl), C.BRED)} ({abs(price - sl) / atr:.1f} ATR) | "
+                f"TP {_c(_price(tp), C.BGRN)} ({abs(tp - price) / atr:.1f} ATR) | planned R:R 1:{rr:.2f}"
+            )
+        else:
+            rows.append(f"SL {_c(_price(sl), C.BRED)} | TP {_c(_price(tp), C.BGRN)} | planned R:R 1:{rr:.2f}")
+        rows.append(
+            f"unrealized {_c(f'${upnl:+,.2f}' if qty else f'{upnl:+,.1f} pts', _pnl_color(upnl))} | "
+            f"R {_c(f'{r_now:+.2f}', _pnl_color(r_now))} | to-target [{_c(_term_progress(prog, 20), C.BGRN)}] {prog:.0%}"
+        )
+    else:
+        rows.append(f"{_term_section('position')} flat | scanning with no synthetic fallback levels")
+
+    rows.append(
+        f"{_term_section('performance')} trades {total_trades} | session PnL "
+        f"{_c(_price(total_pnl), _pnl_color(total_pnl))}"
+    )
+    return _term_box("DELTA LIQUIDITY ENGINE", rows)
+
+
+def _format_thinking_terminal_industry(
+    engine_state: str,
+    flow_direction: str,
+    flow_conviction: float,
+    cvd_trend: float,
+    tick_flow: float,
+    ob_imbalance: float,
+    primary_target: Optional[Any],
+    nearest_bsl_atr: float,
+    nearest_ssl_atr: float,
+    recent_sweep_count: int,
+    tracking_info: Optional[Dict],
+    amd_phase: str = "",
+    amd_bias: str = "",
+    structure_5m: str = "",
+    kill_zone: str = "",
+    price: float = 0.0,
+    atr: float = 0.0,
+) -> str:
+    flow_col = C.BGRN if flow_conviction > 0.05 else (C.BRED if flow_conviction < -0.05 else C.DIM)
+    rows = [
+        f"price {_c(_price(price), C.BCYN, C.BOLD)} | ATR {_c(f'${atr:,.1f}' if atr else '-', C.YLW)} | "
+        f"state {_c(engine_state or 'SCANNING', C.BOLD, C.BCYN)} | {_c(_ist_now(), C.DIM)}",
+        f"flow {_c((flow_direction or 'neutral').upper(), C.BOLD, flow_col)} "
+        f"[{_c(_term_progress(min(1.0, abs(flow_conviction)), 18), flow_col)}] {flow_conviction:+.2f} | "
+        f"tick {tick_flow:+.2f} | CVD {cvd_trend:+.2f} | OB {ob_imbalance:+.2f}",
+        f"target {_target_summary(primary_target)}",
+        f"liquidity BSL {nearest_bsl_atr:.1f} ATR | SSL {nearest_ssl_atr:.1f} ATR | sweeps {recent_sweep_count}",
+        f"ICT AMD {amd_phase or '-'} / {amd_bias or '-'} | 5m {structure_5m or '-'} | killzone {kill_zone or '-'}",
+    ]
+    if tracking_info:
+        rows.append(
+            f"tracking {str(tracking_info.get('direction', '?')).upper()} -> "
+            f"{tracking_info.get('target', '?')} | ticks {tracking_info.get('flow_ticks', 0)}"
+        )
+    return _term_box("ENGINE THINKING", rows, width=92, accent=C.BCYN)
+
 
 def format_heartbeat(
     price: float,
@@ -231,249 +362,214 @@ def format_heartbeat(
     sweep_analysis: Optional[Dict] = None,
     htf_bias: str = "",
 ) -> str:
-    """Rich ANSI-coloured box heartbeat. Called every 60 s from main.py."""
+    return _format_heartbeat_industry(
+        price=price,
+        feed=feed,
+        exchange=exchange,
+        position=position,
+        engine_state=engine_state,
+        tracking_info=tracking_info,
+        primary_target=primary_target,
+        nearest_bsl_atr=nearest_bsl_atr,
+        nearest_ssl_atr=nearest_ssl_atr,
+        recent_sweep_count=recent_sweep_count,
+        total_trades=total_trades,
+        total_pnl=total_pnl,
+        flow_conviction=flow_conviction,
+        flow_direction=flow_direction,
+        bsl_pools=bsl_pools,
+        ssl_pools=ssl_pools,
+        atr=atr,
+        cvd_trend=cvd_trend,
+        tick_flow=tick_flow,
+        session=session,
+        kill_zone=kill_zone,
+        amd_phase=amd_phase,
+        amd_bias=amd_bias,
+        dealing_range_pd=dealing_range_pd,
+        structure_15m=structure_15m,
+        structure_4h=structure_4h,
+        sweep_analysis=sweep_analysis,
+        htf_bias=htf_bias,
+    )
+    W = 72
+    TOP  = _c("╔" + "═" * (W - 2) + "╗", C.BBLU)
+    BOT  = _c("╚" + "═" * (W - 2) + "╝", C.BBLU)
+    MID  = _c("╠" + "═" * (W - 2) + "╣", C.BBLU)
+    SEP  = _c("├" + "─" * (W - 2) + "┤", C.BLU)
+    BAR  = lambda s: _c("║ ", C.BBLU) + s + _c(" ║", C.BBLU)
 
-    ist_now = datetime.now(_IST)
-    utc_now = datetime.now(timezone.utc)
-    ts       = f"{ist_now.strftime('%H:%M:%S')} IST  /  {utc_now.strftime('%H:%M')} UTC"
+    def pad(s: str, raw_len: int) -> str:
+        """Pad to fill inner width accounting for ANSI codes."""
+        inner = W - 4
+        vis   = inner - raw_len
+        return s + " " * max(0, vis)
 
-    sess_key  = (session or "").lower().replace(" ", "_")
-    sess_icon = _SESS_ICONS.get(sess_key, "⚪")
-    kz_str    = "  🔥 KZ" if kill_zone else ""
+    now = _ist_now()
     atr_str   = f"${atr:.1f}" if atr > 0 else "—"
-    pd_lbl    = _pd_label(dealing_range_pd)
+    pd_label  = (
+        "DEEP-DISC" if dealing_range_pd < 0.25 else
+        "DISCOUNT"  if dealing_range_pd < 0.40 else
+        "EQUIL"     if dealing_range_pd < 0.60 else
+        "PREMIUM"   if dealing_range_pd < 0.75 else "DEEP-PREM"
+    )
+    sess_map  = {"asia": "🌙", "london": "🌅", "ny": "🏛️", "late_ny": "🌇"}
+    sess_icon = sess_map.get((session or "").lower().replace(" ", "_"), "⚪")
+    kz_str    = _c(" 🔥 KZ", C.BYLW) if kill_zone else ""
 
-    lines = ["\n" + _top()]
+    lines = [TOP]
 
-    # ── IN-POSITION block ──────────────────────────────────────────────────
+    # ── IN POSITION ───────────────────────────────────────────────────────────
     if position:
-        side  = (position.get("side") or "?").upper()
+        side  = position.get("side", "?").upper()
         entry = position.get("entry_price", 0.0)
-        sl    = position.get("sl_price",    0.0)
-        tp    = position.get("tp_price",    0.0)
-
-        # Title row
-        pos_icon = "🟢" if side == "LONG" else "🔴"
-        clr_side = _C.long_ if side == "LONG" else _C.short_
-        lines.append(_row(
-            f"{pos_icon}  {_C.header('IN ' + side)}"
-            f"    {_C.price(f'BTC ${price:,.2f}')}"
-            f"    {sess_icon} {_C.dim((session or '').upper())}{kz_str}"
-            f"    {_C.label(ts)}"
-        ))
-        lines.append(_thick())
-
+        sl    = position.get("sl_price", 0.0)
+        tp    = position.get("tp_price", 0.0)
         if entry <= 0 or side not in ("LONG", "SHORT"):
-            lines.append(_row(_C.warn("  Awaiting fill confirmation…")))
-            lines.append(_bot())
+            lines.append(BAR(_c(f"  {_price(price)}  [{feed}]  PENDING FILL", C.BYLW)))
+            lines.append(BOT)
             return "\n".join(lines)
 
-        pnl      = (price - entry) if side == "LONG" else (entry - price)
-        init_sl  = position.get("initial_sl_dist", abs(entry - sl)) or abs(entry - sl)
-        curr_r   = pnl / init_sl if init_sl > 1e-10 else 0.0
-        peak     = position.get("peak_profit", pnl)
-        peak_r   = peak / init_sl if init_sl > 1e-10 else 0.0
-        sl_dist  = abs(price - sl)
-        tp_dist  = abs(price - tp)
-        sl_atr   = sl_dist / atr if atr > 1e-10 else 0.0
-        tp_atr   = tp_dist / atr if atr > 1e-10 else 0.0
-        trail    = position.get("trail_active", False)
+        pnl       = (price - entry) if side == "LONG" else (entry - price)
+        init_sl   = position.get("initial_sl_dist", abs(entry - sl)) or abs(entry - sl)
+        curr_r    = pnl / init_sl if init_sl > 1e-10 else 0.0
+        sl_atr    = abs(price - sl) / atr if atr > 1e-10 else 0.0
+        tp_atr    = abs(price - tp) / atr if atr > 1e-10 else 0.0
+        peak_r    = position.get("peak_profit", pnl) / init_sl if init_sl > 1e-10 else 0.0
+        trail     = position.get("trail_active", False)
+        progress  = min(1.0, max(0, abs(price - entry) / max(abs(tp - entry), 1))) if pnl >= 0 else 0.0
+        pc        = C.BGRN if side == "LONG" else C.BRED
+        pi        = "▲ LONG" if side == "LONG" else "▼ SHORT"
 
-        total_mv = abs(tp - entry)
-        prog     = (min(1.0, abs(price - entry) / total_mv) if total_mv > 0 else 0)
-        if pnl < 0:
-            prog = 0
-        bar_clr  = _C.pnl_pos if pnl >= 0 else _C.pnl_neg
-        bar_str  = "[" + _pbar(prog, 22, bar_clr) + f"]  {prog*100:.0f}% → TP"
+        header = f"  {_c(pi, C.BOLD, pc)}   {_c(_price(price), C.BOLD, C.BCYN)}   {sess_icon} {(session or '').upper()}{kz_str}   {_c(now, C.DIM)}"
+        lines.append(BAR(header))
+        lines.append(MID)
 
-        lines += [
-            _row(
-                f"  {_C.label('Entry')}  {_C.price(f'${entry:,.2f}')}"
-                f"    {_C.label('ATR')} {atr_str}"
-                f"    {_C.muted(pd_lbl)}  {_C.dim(f'({dealing_range_pd:.0%})')}"
-            ),
-            _row(
-                f"  {_C.label('SL')}     {clr_side(f'${sl:,.2f}')}"
-                f"    {_C.dim(f'({sl_atr:.1f} ATR from price)')}"
-                + (_C.warn("    🔒 TRAIL") if trail else "")
-            ),
-            _row(
-                f"  {_C.label('TP')}     {clr_side(f'${tp:,.2f}')}"
-                f"    {_C.dim(f'({tp_atr:.1f} ATR from price)')}"
-            ),
-            _thin(),
-            _row(
-                f"  PnL  {_pnl_c(pnl)}"
-                f"    {_r_c(curr_r)}"
-                f"    {_C.label('Peak')} {_C.dim(f'{peak_r:.2f}R')}"
-            ),
-            _row(f"  {bar_str}"),
-            _thin(),
-            _row(
-                f"  {_C.label('AMD')}   {amd_phase or '—'}"
-                + (f"  {_C.dim(f'({amd_bias})')}" if amd_bias else "")
-                + f"    {_C.label('15m')} {structure_15m or '—'}"
-                f"    {_C.label('4H')} {structure_4h or '—'}"
-            ),
-            _row(
-                f"  {_C.label('Flow')}  {_flow_bar(flow_conviction)}"
-                f"  {_C.dim(flow_direction or 'neutral')} ({flow_conviction:+.2f})"
-                f"    CVD {cvd_trend:+.2f}    Tick {tick_flow:+.2f}"
-            ),
-        ]
+        lines.append(BAR(f"  Entry  {_c(_price(entry), C.CYN)}   ATR {_c(atr_str, C.YLW)}   {_c(pd_label, C.DIM)}"))
+        lines.append(BAR(f"  SL     {_c(_price(sl), C.BRED)}   ({sl_atr:.1f} ATR){_c('  🔒 TRAIL', C.BYLW) if trail else ''}"))
+        lines.append(BAR(f"  TP     {_c(_price(tp), C.BGRN)}   ({tp_atr:.1f} ATR)"))
+        lines.append(SEP)
 
-    # ── FLAT / SCANNING block ──────────────────────────────────────────────
-    else:
-        st_key  = (engine_state or "SCANNING").upper()
-        st_icon = _STATE_ICON.get(st_key, "⚪")
-        st_clr  = _STATE_CLR.get(st_key, _C.muted)
+        pnl_col = C.BGRN if pnl >= 0 else C.BRED
+        pnl_line = f"  PnL  {_c(f'{pnl:+.1f} pts', C.BOLD, pnl_col)}   {_c(f'{curr_r:+.2f}R', pnl_col)}   Peak {_c(f'{peak_r:.2f}R', C.DIM)}"
+        lines.append(BAR(pnl_line))
+        bar_str  = f"  [{_c(_bar(progress), C.BGRN)}] {progress*100:.0f}% → TP"
+        lines.append(BAR(bar_str))
+        lines.append(SEP)
+        lines.append(BAR(f"  AMD {_c(amd_phase or '—', C.MAG)}({amd_bias or '—'})   15m {_c(structure_15m or '—', C.CYN)}   4H {_c(structure_4h or '—', C.CYN)}"))
+        lines.append(BAR(f"  Flow {_flow_bar(flow_conviction)}  {flow_direction or 'neutral'}({flow_conviction:+.2f})   CVD {cvd_trend:+.2f}   Tick {tick_flow:+.2f}"))
+        lines.append(SEP)
+        lines.append(BAR(f"  Trades {total_trades}   Session PnL {_c(_price(total_pnl), _pnl_color(total_pnl))}"))
+        lines.append(BOT)
+        return "\n".join(lines)
 
-        # Title
-        lines.append(_row(
-            f"⚡  {_C.header('QUANT v10')}"
-            f"    {_C.price(f'BTC ${price:,.2f}')}"
-            f"    {sess_icon} {_C.dim((session or '').upper())}{kz_str}"
-            f"    {_C.label(ts)}"
-        ))
-        lines.append(_row(
-            f"  {st_icon}  {st_clr(st_key)}"
-            f"    {_C.label('ATR')} {atr_str}"
-            f"    {_C.muted(pd_lbl)}  {_C.dim(f'({dealing_range_pd:.0%})')}"
-        ))
-        lines.append(_thick())
+    # ── SCANNING / TRACKING ───────────────────────────────────────────────────
+    state_map = {
+        "TRACKING":   _c("📡 TRACKING",   C.BCYN),
+        "READY":      _c("🎯 READY",      C.BGRN, C.BOLD),
+        "POST_SWEEP": _c("🌊 POST-SWEEP", C.BMAG),
+        "SCANNING":   _c("🔍 SCANNING",   C.DIM),
+    }
+    state_str = state_map.get(engine_state, _c(engine_state, C.DIM))
+    if engine_state == "TRACKING" and tracking_info:
+        d = tracking_info.get("direction", "?").upper()
+        t = tracking_info.get("target", "?")
+        n = tracking_info.get("flow_ticks", 0)
+        state_str = _c(f"📡 TRACKING {d}→{t}  ({n} ticks)", C.BCYN)
 
-        # Pool rows helper
-        def _pool_rows(pools, side_lbl, near_atr, clr_fn) -> List[str]:
-            rows: List[str] = []
-            if pools:
-                for i, p in enumerate(pools[:4]):
-                    try:
-                        flags: List[str] = []
-                        if getattr(p.pool, "ob_aligned",  False): flags.append("OB")
-                        if getattr(p.pool, "fvg_aligned", False): flags.append("FVG")
-                        htf = getattr(p.pool, "htf_count", 0)
-                        if htf >= 2: flags.append(f"HTFx{htf}")
-                        flag_s = f" [{','.join(flags)}]" if flags else ""
-                        is_tgt = (
-                            primary_target is not None and
-                            abs(p.pool.price - primary_target.pool.price)
-                            < max(atr * 0.3, 30)
-                        )
-                        tgt_m = _C.target("  ◀ TARGET") if is_tgt else ""
-                        tf_s  = getattr(p.pool, "timeframe", "")
-                        dist  = getattr(p, "distance_atr", 0.0)
-                        sig   = getattr(p, "significance", 0.0)
-                        t_ch  = getattr(p.pool, "touches", 0)
-                        pfx   = f"  {side_lbl}" if i == 0 else "         "
-                        rows.append(_row(
-                            clr_fn(f"{pfx}  ${p.pool.price:,.1f}")
-                            + f"  {_C.dim(f'{dist:.1f} ATR')}"
-                            + f"  sig={sig:.0f}"
-                            + f"  t={t_ch}"
-                            + (f"  {_C.dim(tf_s)}" if tf_s else "")
-                            + (_C.muted(flag_s) if flags else "")
-                            + tgt_m
-                        ))
-                    except Exception:
-                        pass
-            if not rows:
-                rows.append(_row(f"  {side_lbl}  {_C.muted('no pools in range')}"))
-            return rows
+    header = f"  ⚡ v10 LIQUIDITY-FIRST   {_c(_price(price), C.BOLD, C.BCYN)}   {sess_icon} {(session or '').upper()}{kz_str}   {_c(now, C.DIM)}"
+    sub    = f"  {state_str}   ATR {_c(atr_str, C.YLW)}   {_c(pd_label, C.DIM)}"
+    lines.append(BAR(header))
+    lines.append(BAR(sub))
+    lines.append(MID)
 
-        lines += _pool_rows(bsl_pools or [], "▲ BSL", nearest_bsl_atr, _C.bsl)
-        lines.append(_row(""))
-        lines += _pool_rows(ssl_pools or [], "▼ SSL", nearest_ssl_atr, _C.ssl)
-        lines.append(_thin())
-
-        # Target
-        if primary_target:
-            try:
-                t = primary_target
-                lines.append(_row(
-                    f"  🎯  {_C.target('Target')}"
-                    f"    {t.direction.upper()} → {_C.price(f'${t.pool.price:,.1f}')}"
-                    f"    {_C.dim(f'({t.distance_atr:.1f} ATR  sig={t.significance:.0f})')}"
-                ))
-            except Exception:
-                lines.append(_row(f"  🎯  {_C.muted('Target: data pending')}"))
+    # Pool rows
+    def _prow(pools, label, near_atr, color):
+        rows = []
+        if pools:
+            for i, p in enumerate(pools[:4]):
+                try:
+                    flags = []
+                    if getattr(p.pool, "ob_aligned",  False): flags.append("OB")
+                    if getattr(p.pool, "fvg_aligned", False): flags.append("FVG")
+                    htf = getattr(p.pool, "htf_count", 0)
+                    if htf >= 2: flags.append(f"HTF×{htf}")
+                    f_str = f" [{','.join(flags)}]" if flags else ""
+                    is_tgt = (primary_target is not None and
+                              abs(p.pool.price - primary_target.pool.price) < max(atr * 0.3, 30))
+                    tgt    = _c(" ◀ TARGET", C.BYLW, C.BOLD) if is_tgt else ""
+                    tf     = getattr(p.pool, "timeframe", "")
+                    da     = getattr(p, "distance_atr",  0.0)
+                    sig    = getattr(p, "significance",  0.0)
+                    tch    = getattr(p.pool, "touches",  0)
+                    pfx    = f"  {label}" if i == 0 else "       "
+                    rows.append(BAR(
+                        f"{_c(pfx, color)}  {_c(_price(p.pool.price), C.BCYN)}"
+                        f"  {da:.1f}ATR  sig={sig:.0f}  t={tch}"
+                        f"{f'  {tf}' if tf else ''}  {_c(f_str, C.DIM)}{tgt}"
+                    ))
+                except Exception:
+                    pass
         else:
-            lines.append(_row(f"  🎯  {_C.muted('Target: none detected')}"))
+            rows.append(BAR(f"  {_c(label, color)}  {near_atr:.1f} ATR away"))
+        return rows
 
-        # Flow + structure
-        fl_dir = flow_direction or "neutral"
-        fl_clr = _C.long_ if flow_conviction > 0.05 else (
-                 _C.short_ if flow_conviction < -0.05 else _C.muted)
-        lines.append(_row(
-            f"  {_C.label('Flow')}  {_flow_bar(flow_conviction)}"
-            f"  {fl_clr(fl_dir)} ({flow_conviction:+.2f})"
-            f"    CVD {cvd_trend:+.2f}    Tick {tick_flow:+.2f}"
-        ))
-        lines.append(_row(
-            f"  {_C.label('AMD')}   {amd_phase or '—'}"
-            + (f"  {_C.dim(f'({amd_bias})')}" if amd_bias else "")
-            + f"    {_C.label('15m')} {structure_15m or '—'}"
-            + f"    {_C.label('4H')} {structure_4h or '—'}"
-        ))
+    lines.extend(_prow(bsl_pools or [], "BSL ▲", nearest_bsl_atr, C.BGRN))
+    lines.append(BAR(""))
+    lines.extend(_prow(ssl_pools or [], "SSL ▼", nearest_ssl_atr, C.BRED))
+    lines.append(SEP)
 
-        # Post-sweep analysis
-        if engine_state == "POST_SWEEP" and sweep_analysis:
-            rs  = sweep_analysis.get("rev_score",  0)
-            cs  = sweep_analysis.get("cont_score", 0)
-            rr  = sweep_analysis.get("rev_reasons",  [])
-            cr  = sweep_analysis.get("cont_reasons", [])
-            sw_side  = sweep_analysis.get("sweep_side",    "?")
-            sw_price = sweep_analysis.get("sweep_price",   0)
-            sw_qual  = sweep_analysis.get("sweep_quality", 0)
-            winner   = (
-                "REVERSAL"     if rs >= 45 and abs(rs - cs) >= 10 else
-                "CONTINUATION" if cs >= 40 and abs(rs - cs) >= 10 else "WAIT"
-            )
-            tot = max(rs + cs, 1)
-            rv  = int(rs / tot * 18)
-            ct  = 18 - rv
-            sbar = "◀" + _C.short_("█" * rv) + _C.long_("█" * ct) + "▶"
-            lines.append(_thin())
-            lines.append(_row(
-                f"  🌊  {_C.c_sweep('SWEEP')}    "
-                f"{sw_side} @ ${sw_price:,.0f}    q={sw_qual:.0%}"
+    # Target
+    if primary_target:
+        try:
+            t = primary_target
+            lines.append(BAR(
+                f"  🎯 Target  {_c(t.direction.upper(), C.BOLD)}  →  {_c(_price(t.pool.price), C.BCYN)}"
+                f"   {t.distance_atr:.1f} ATR  sig={t.significance:.0f}"
             ))
-            lines.append(_row(f"  {sbar}"))
-            lines.append(_row(
-                f"  REV {rs:.0f}  {' · '.join(rr[:2]) if rr else '—'}"
-                f"    CONT {cs:.0f}  {' · '.join(cr[:2]) if cr else '—'}"
-            ))
-            lines.append(_row(
-                f"  → {_C.target(winner)}    gap={abs(rs-cs):.0f}"
-            ))
+        except Exception:
+            lines.append(BAR("  🎯 Target  —"))
+    else:
+        lines.append(BAR(f"  🎯 Target  {_c('none', C.DIM)}"))
 
-        # Tracking detail
-        if engine_state == "TRACKING" and tracking_info:
-            d     = tracking_info.get("direction", "?").upper()
-            tgt   = tracking_info.get("target",     "?")
-            ticks = tracking_info.get("flow_ticks",  0)
-            start = tracking_info.get("started",     "")
-            lines.append(_thin())
-            lines.append(_row(
-                f"  📡  {_C.c_track('TRACKING')}"
-                f"    {d} → {tgt}"
-                f"    {_C.dim(f'{ticks} ticks  ·  {start}')}"
-            ))
+    lines.append(BAR(
+        f"  Flow  {_flow_bar(flow_conviction)}  {flow_direction or 'neutral'}({flow_conviction:+.2f})"
+        f"   CVD {cvd_trend:+.2f}   Tick {tick_flow:+.2f}"
+    ))
+    lines.append(BAR(
+        f"  AMD {_c(amd_phase or '—', C.MAG)}({amd_bias or '—'})"
+        f"   15m {_c(structure_15m or '—', C.CYN)}"
+        f"   4H  {_c(structure_4h  or '—', C.CYN)}"
+    ))
 
-    # ── Footer ─────────────────────────────────────────────────────────────
-    lines.append(_thick())
-    parts = []
-    if recent_sweep_count > 0:
-        parts.append(f"Sweeps {recent_sweep_count}")
-    parts.append(f"T={total_trades}")
-    parts.append(f"Session PnL  {_pnl_c(total_pnl)}")
-    lines.append(_row("  " + _C.dim("    ·    ".join(parts))))
-    lines.append(_bot())
+    # Post-sweep inset
+    if engine_state == "POST_SWEEP" and sweep_analysis:
+        rs      = sweep_analysis.get("rev_score", 0)
+        cs      = sweep_analysis.get("cont_score", 0)
+        sw_side = sweep_analysis.get("sweep_side", "?")
+        sw_px   = sweep_analysis.get("sweep_price", 0)
+        sw_q    = sweep_analysis.get("sweep_quality", 0)
+        total   = max(rs + cs, 1)
+        rev_w   = int(rs / total * 20)
+        bar     = _c("◀" + "█" * rev_w, C.BRED) + _c("░" * (20 - rev_w) + "▶", C.BGRN)
+        winner  = ("REVERSAL" if rs >= 45 and abs(rs-cs) >= 10 else
+                   "CONTINUATION" if cs >= 40 and abs(rs-cs) >= 10 else "WAIT")
+        lines.append(SEP)
+        lines.append(BAR(f"  🌊 SWEEP  {sw_side} @ ${sw_px:,.0f}  q={sw_q:.0%}"))
+        lines.append(BAR(f"  {bar}"))
+        lines.append(BAR(f"  REV={rs:.0f}  CONT={cs:.0f}  → {_c(winner, C.BOLD, C.BYLW)}"))
+
+    lines.append(SEP)
+    sweep_p = f"Sweeps={recent_sweep_count}" if recent_sweep_count else ""
+    stats   = "  ".join(p for p in [sweep_p, f"Trades={total_trades}", f"PnL={_c(_price(total_pnl), _pnl_color(total_pnl))}"] if p)
+    lines.append(BAR(f"  {stats}"))
+    lines.append(BOT)
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  TERMINAL THINKING LOG  (quant_strategy.py — every 30 s)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. TERMINAL THINKING LOG  (quant_strategy.py — every 30 s)
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_thinking_terminal(
     engine_state: str,
@@ -494,83 +590,77 @@ def format_thinking_terminal(
     price: float = 0.0,
     atr: float = 0.0,
 ) -> str:
-    """Compact thinking snapshot — every 30 s."""
-    ts      = datetime.now(_IST).strftime("%H:%M:%S")
-    atr_str = f"${atr:.1f}" if atr > 0 else "—"
-    st_clr  = _STATE_CLR.get((engine_state or "").upper(), _C.muted)
+    return _format_thinking_terminal_industry(
+        engine_state=engine_state,
+        flow_direction=flow_direction,
+        flow_conviction=flow_conviction,
+        cvd_trend=cvd_trend,
+        tick_flow=tick_flow,
+        ob_imbalance=ob_imbalance,
+        primary_target=primary_target,
+        nearest_bsl_atr=nearest_bsl_atr,
+        nearest_ssl_atr=nearest_ssl_atr,
+        recent_sweep_count=recent_sweep_count,
+        tracking_info=tracking_info,
+        amd_phase=amd_phase,
+        amd_bias=amd_bias,
+        structure_5m=structure_5m,
+        kill_zone=kill_zone,
+        price=price,
+        atr=atr,
+    )
+    ts    = _ist_now()
+    state = _c(engine_state, C.BOLD, C.BCYN if engine_state != "SCANNING" else C.DIM)
+    hdr   = (
+        f"  {_c('▸ THINK', C.BOLD, C.BBLU)}"
+        f"  {_c(_price(price), C.BCYN)}"
+        f"  ATR {_c(f'${atr:.1f}', C.YLW)}"
+        f"  {state}"
+        f"  {_c(ts, C.DIM)}"
+    )
+    W   = 68
+    sep = _c("  " + "·" * (W - 2), C.DIM)
 
-    lines = [
-        _rule(),
-        _row(
-            f"{_C.label(ts)}"
-            f"    {_C.price(f'BTC ${price:,.2f}')}"
-            f"    {_C.label('ATR')} {atr_str}"
-            f"    {_C.dim('State:')} {st_clr(engine_state or '—')}"
-        ),
-    ]
-
-    # Flow
-    fl_dir = flow_direction or "neutral"
-    fl_clr = _C.long_ if flow_conviction > 0.05 else (
-             _C.short_ if flow_conviction < -0.05 else _C.muted)
-    lines.append(_row(
-        f"  {_C.label('Flow')}   {_flow_bar(flow_conviction)}"
-        f"  {fl_clr(fl_dir)} ({flow_conviction:+.2f})"
-        f"    Tick {tick_flow:+.2f}  CVD {cvd_trend:+.2f}  OB {ob_imbalance:+.2f}"
-    ))
-
-    # Target / liquidity
-    tgt_str = "none"
+    tgt_str = _c("none", C.DIM)
     if primary_target:
         try:
             t = primary_target
             tgt_str = (
-                f"{t.direction} → ${t.pool.price:,.0f}"
-                f"  ({t.pool.side.value}  {t.distance_atr:.1f}ATR"
-                f"  sig={t.significance:.0f}"
-                f"  TFs={','.join(t.tf_sources)})"
+                f"{_c(t.direction, C.BOLD)} → {_c(_price(t.pool.price), C.BCYN)}"
+                f"  {t.distance_atr:.1f}ATR  sig={t.significance:.0f}"
             )
         except Exception:
-            tgt_str = "data pending"
-    lines.append(_row(
-        f"  {_C.label('Target')} {_C.target(tgt_str)}"
-    ))
-    lines.append(_row(
-        f"  {_C.label('BSL')} {nearest_bsl_atr:.1f}A"
-        f"    {_C.label('SSL')} {nearest_ssl_atr:.1f}A"
-        f"    {_C.label('Sweeps(5m)')} {recent_sweep_count}"
-    ))
+            pass
 
-    # ICT context
-    ict: List[str] = []
-    if amd_phase:   ict.append(f"AMD={amd_phase[:4]}")
-    if amd_bias:    ict.append(f"Bias={amd_bias}")
-    if structure_5m: ict.append(f"5m={structure_5m}")
-    if kill_zone:   ict.append(f"KZ={kill_zone}")
-    if ict:
-        lines.append(_row(
-            f"  {_C.label('ICT')}    {_C.dim('  ·  '.join(ict))}"
-        ))
+    ict_parts = []
+    if amd_phase:    ict_parts.append(f"AMD={_c(amd_phase[:6], C.MAG)}")
+    if amd_bias:     ict_parts.append(f"Bias={amd_bias}")
+    if structure_5m: ict_parts.append(f"5m={_c(structure_5m, C.CYN)}")
+    if kill_zone:    ict_parts.append(_c(f"🔥 KZ={kill_zone}", C.BYLW))
 
-    # Tracking
+    lines = [
+        sep, hdr, sep,
+        f"  Flow  {_flow_bar(flow_conviction)}  {flow_direction or 'neutral'}"
+        f"({flow_conviction:+.2f})   Tick {tick_flow:+.2f}   CVD {cvd_trend:+.2f}   OB {ob_imbalance:+.2f}",
+        f"  Target  {tgt_str}",
+        f"  BSL {_c(f'{nearest_bsl_atr:.1f}ATR', C.BGRN)}   SSL {_c(f'{nearest_ssl_atr:.1f}ATR', C.BRED)}"
+        f"   Sweeps(5m)={recent_sweep_count}",
+    ]
+    if ict_parts:
+        lines.append(f"  ICT   {' │ '.join(ict_parts)}")
     if tracking_info:
-        d     = tracking_info["direction"].upper()
-        tgt   = tracking_info["target"]
-        ticks = tracking_info["flow_ticks"]
-        start = tracking_info["started"]
-        lines.append(_row(
-            f"  📡 {_C.c_track('Tracking')}"
-            f"    {d} → {tgt}"
-            f"    {_C.dim(f'{ticks} ticks  ·  {start}')}"
-        ))
-
-    lines.append(_rule())
+        d = tracking_info.get("direction","?").upper()
+        t = tracking_info.get("target","?")
+        n = tracking_info.get("flow_ticks", 0)
+        s = tracking_info.get("started","")
+        lines.append(f"  {_c('▶ Tracking', C.BCYN, C.BOLD)}  {d} → {t}   {n} ticks   {_c(s, C.DIM)}")
+    lines.append(sep)
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  TELEGRAM: /thinking   (HTML)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. TELEGRAM: /thinking
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_thinking_telegram(
     price: float,
@@ -601,98 +691,95 @@ def format_thinking_telegram(
     position: Optional[Dict] = None,
     trail_phase: str = "",
 ) -> str:
-
-    si = _STATE_ICON.get((engine_state or "").upper(), "⚪")
-    threshold = abs(flow_conviction) - 0.55
-    flow_icon = "🟢" if flow_conviction > 0.3 else ("🔴" if flow_conviction < -0.3 else "⚪")
+    STATE_ICONS = {
+        "SCANNING":   "🔍", "TRACKING":   "📡", "READY":      "🎯",
+        "ENTERING":   "⚡", "IN_POSITION":"📊", "POST_SWEEP": "🌊",
+    }
+    si = STATE_ICONS.get(engine_state, "⚪")
+    fc_bar = "█" * min(10, int(abs(flow_conviction) * 10)) + "░" * max(0, 10 - int(abs(flow_conviction) * 10))
+    fc_dir = "▲" if flow_conviction > 0.05 else ("▼" if flow_conviction < -0.05 else "─")
+    zone   = "DISCOUNT" if in_discount else ("PREMIUM" if in_premium else "EQUILIBRIUM")
 
     lines = [
-        f"🧠 <b>THINKING  ·  BTC ${price:,.2f}</b>",
-        f"<code>ATR ${atr:.1f} ({atr_pctile:.0%})  ·  {_esc(engine_state)}</code>",
-        "",
-        f"{si} <b>{_esc(engine_state)}</b>",
+        f"<b>🧠 THINKING  •  ${price:,.2f}</b>",
+        f"<code>{si} {_esc(engine_state):<12}  ATR ${atr:.1f} ({atr_pctile:.0%})</code>",
     ]
+
     if tracking_info:
-        lines.append(
-            f"  📡 Tracking <b>{_esc(tracking_info['direction']).upper()}</b>"
-            f" → {_esc(tracking_info['target'])}"
-            f"    {tracking_info['flow_ticks']}t  ·  {_esc(tracking_info['started'])}"
-        )
+        d = tracking_info.get("direction","?").upper()
+        t = tracking_info.get("target","?")
+        n = tracking_info.get("flow_ticks", 0)
+        lines.append(f"  <b>Tracking</b>  {_esc(d)} → {_esc(t)}  ({n} ticks)")
 
     # Flow
     lines += [
         "",
-        "⚡ <b>ORDER FLOW</b>",
-        f"  {flow_icon} <b>{_esc((flow_direction or 'neutral').upper())}</b>"
-        f"  conv={flow_conviction:+.2f}",
-        f"  Tick {tick_flow:+.2f}  ·  Streak {tick_streak}"
-        f"  ·  CVD {cvd_trend:+.2f}  ·  OB {ob_imbalance:+.2f}",
-        ("  ✅ Flow gate PASS  (+" + f"{threshold:.2f})"
-         if threshold >= 0 else
-         f"  ❌ Flow gate  {threshold:.2f} below threshold"),
+        f"<b>⚡ Order Flow</b>",
+        f"  Direction   <b>{_esc((flow_direction or 'neutral').upper())}</b>  [{_esc(fc_bar)}] {fc_dir}  {flow_conviction:+.2f}",
+        f"  Tick {tick_flow:+.2f}   Streak {tick_streak}   CVD {cvd_trend:+.2f}   OB {ob_imbalance:+.2f}",
     ]
+    thresh_delta = abs(flow_conviction) - 0.55
+    gate_str = (f"✅ +{thresh_delta:.2f} above threshold" if thresh_delta >= 0
+                else f"⛔ {thresh_delta:.2f} below threshold")
+    lines.append(f"  Gate  {gate_str}")
 
     # Liquidity
-    lines += ["", "🎯 <b>LIQUIDITY MAP</b>",
-              f"  BSL {nearest_bsl_atr:.1f} ATR  ·  SSL {nearest_ssl_atr:.1f} ATR"]
+    lines += ["", "<b>💧 Liquidity</b>"]
+    lines.append(f"  BSL {nearest_bsl_atr:.1f}ATR  ·  SSL {nearest_ssl_atr:.1f}ATR")
     if primary_target:
         try:
             t = primary_target
             lines.append(
-                f"  <b>Target: {_esc(t.direction).upper()} → ${t.pool.price:,.1f}</b>"
-                f"  ({t.distance_atr:.1f}A  sig={t.significance:.0f}  t={t.pool.touches})"
+                f"  🎯 <b>{_esc(t.direction.upper())} → ${t.pool.price:,.1f}</b>"
+                f"  {t.distance_atr:.1f}ATR  sig={t.significance:.0f}  t={t.pool.touches}"
             )
             if t.tf_sources:
-                lines.append(f"  TFs: {_esc(', '.join(t.tf_sources))}")
+                lines.append(f"     TFs: {_esc(', '.join(t.tf_sources))}")
         except Exception:
-            pass
+            lines.append("  Target  —")
+    else:
+        lines.append("  Target  none")
 
-    for lbl, pools in [("▲ BSL", bsl_pools[:3]), ("▼ SSL", ssl_pools[:3])]:
+    for label, pools in [("BSL ▲", bsl_pools[:3]), ("SSL ▼", ssl_pools[:3])]:
         if pools:
-            lines.append(f"  {lbl}:")
+            lines.append(f"  <b>{label}</b>")
             for p in pools:
                 try:
                     flags = []
-                    if p.pool.ob_aligned:    flags.append("OB")
-                    if p.pool.fvg_aligned:   flags.append("FVG")
-                    if p.pool.htf_count >= 2: flags.append(f"HTFx{p.pool.htf_count}")
-                    fs = f" [{','.join(flags)}]" if flags else ""
+                    if p.pool.ob_aligned: flags.append("OB")
+                    if p.pool.fvg_aligned: flags.append("FVG")
+                    if p.pool.htf_count >= 2: flags.append(f"HTF×{p.pool.htf_count}")
+                    f_str = f" [{','.join(flags)}]" if flags else ""
                     lines.append(
-                        f"    ${p.pool.price:,.1f}"
-                        f"  {p.distance_atr:.1f}A  sig={p.significance:.0f}"
-                        f"  t={p.pool.touches}{_esc(fs)}"
+                        f"    ${p.pool.price:,.1f}  {p.distance_atr:.1f}ATR"
+                        f"  sig={p.significance:.0f}  t={p.pool.touches}{_esc(f_str)}"
                     )
                 except Exception:
                     pass
 
     if recent_sweeps:
-        lines.append(f"  Recent sweeps ({len(recent_sweeps)}):")
+        lines.append(f"  <b>Sweeps ({len(recent_sweeps)})</b>")
         for s in recent_sweeps[:3]:
             try:
                 age = time.time() - s.detected_at
                 lines.append(
                     f"    {_esc(s.pool.side.value)} ${s.pool.price:,.1f}"
-                    f"  q={s.quality:.2f}  dir={_esc(s.direction)}  {age:.0f}s ago"
+                    f"  q={s.quality:.2f}  {age:.0f}s ago"
                 )
             except Exception:
                 pass
 
     # ICT
-    zone = "DISCOUNT" if in_discount else ("PREMIUM" if in_premium else "EQUILIBRIUM")
-    amd_bias_icon = "🟢" if amd_bias == "bullish" else ("🔴" if amd_bias == "bearish" else "⚪")
-    lines += [
-        "",
-        "🏛️ <b>ICT CONTEXT</b>",
-        f"  AMD  <b>{_esc(amd_phase or '—')}</b>"
-        f"  {amd_bias_icon} {_esc(amd_bias or '—')}  conf={amd_confidence:.2f}",
-        f"  Zone {zone}  ·  5m {_esc(structure_5m or '?')}  ·  15m {_esc(structure_15m or '?')}",
-    ]
+    lines += ["", "<b>🏛 ICT Context</b>"]
+    if amd_phase:
+        lines.append(f"  AMD  <b>{_esc(amd_phase)}</b>  {_esc(amd_bias or 'neutral')}  conf={amd_confidence:.2f}")
+    lines.append(f"  Zone {_esc(zone)}  ·  5m {_esc(structure_5m or '?')}  ·  15m {_esc(structure_15m or '?')}")
     if kill_zone:
-        lines.append(f"  KZ {_esc(kill_zone.upper())}")
+        lines.append(f"  🔥 Kill zone  <b>{_esc(kill_zone.upper())}</b>")
 
     # Position
     if position:
-        side  = (position.get("side") or "?").upper()
+        side  = position.get("side","?").upper()
         entry = position.get("entry_price", 0.0)
         sl    = position.get("sl_price", 0.0)
         tp    = position.get("tp_price", 0.0)
@@ -700,39 +787,35 @@ def format_thinking_telegram(
             pnl_pts = (price - entry) if side == "LONG" else (entry - price)
             init_sl = position.get("initial_sl_dist", abs(entry - sl))
             curr_r  = pnl_pts / init_sl if init_sl > 1e-10 else 0.0
-            pos_icon = "🟢" if pnl_pts >= 0 else "🔴"
+            icon    = "🟢" if side == "LONG" else "🔴"
             lines += [
                 "",
-                f"{pos_icon} <b>POSITION  {side}</b>",
-                f"  ${entry:,.2f}  {pnl_pts:+.1f}pts ({curr_r:+.1f}R)",
+                f"<b>{icon} Position  {_esc(side)}</b>",
+                f"  ${entry:,.2f}  →  {pnl_pts:+.1f} pts  ({curr_r:+.1f}R)",
                 f"  SL ${sl:,.2f}  ·  TP ${tp:,.2f}",
             ]
             if trail_phase:
-                lines.append(f"  Trail {_esc(trail_phase)}")
+                lines.append(f"  Trail  {_esc(trail_phase)}")
 
     # Verdict
-    verdicts: Dict[str, str] = {
-        "TRACKING":    "Building conviction — flow sustained toward pool",
-        "READY":       "⚡ Entry imminent — conviction met, computing SL/TP",
-        "POST_SWEEP":  "Evaluating: reverse, continue, or wait?",
-        "IN_POSITION": "Managing active position",
+    verdicts = {
+        "TRACKING":   "Building conviction — flow sustained toward pool",
+        "READY":      "⚡ Entry imminent — conviction met",
+        "POST_SWEEP": "Evaluating: reverse, continue, or wait?",
+        "IN_POSITION":"Managing active trade",
     }
-    verdict = verdicts.get(engine_state)
-    if not verdict:
-        if abs(flow_conviction) < 0.3:
-            verdict = "Waiting for directional flow"
-        elif not primary_target:
-            verdict = "Flow present — no significant pool in range"
-        else:
-            verdict = "Monitoring flow alignment with target pool"
-    lines += ["", f"💭 <b>VERDICT</b>", f"  {_esc(verdict)}"]
-
+    verdict = verdicts.get(engine_state) or (
+        "Waiting for directional flow" if abs(flow_conviction) < 0.3 else
+        "Flow present — no pool in range" if not primary_target else
+        "Monitoring flow alignment with target"
+    )
+    lines += ["", f"<b>💬 Verdict</b>", f"  {_esc(verdict)}"]
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  TELEGRAM: /pools
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. TELEGRAM: /pools
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_pools_telegram(
     price: float,
@@ -743,65 +826,58 @@ def format_pools_telegram(
     recent_sweeps: list,
     tf_coverage: Dict[str, int],
 ) -> str:
-
-    tf_parts = [f"{tf}:{c}"
-                for tf in ["1m","5m","15m","1h","4h","1d"]
-                if (c := tf_coverage.get(tf, 0)) > 0]
+    tf_parts = [f"{tf}:{n}" for tf in ["1m","5m","15m","1h","4h","1d"]
+                if (n := tf_coverage.get(tf, 0)) > 0]
 
     lines = [
-        f"🗺️ <b>LIQUIDITY MAP  ·  BTC ${price:,.2f}</b>",
-        f"<code>ATR ${atr:.1f}"
-        + (f"  ·  TFs: {' '.join(tf_parts)}" if tf_parts else "")
-        + "</code>",
+        f"<b>💧 Liquidity Map  •  ${price:,.2f}</b>",
+        f"ATR ${atr:.1f}   TFs {' '.join(tf_parts) or '—'}",
     ]
 
     if primary_target:
         try:
             t = primary_target
             lines.append(
-                f"\n🎯 <b>Target: {_esc(t.direction).upper()}"
-                f" → ${t.pool.price:,.1f}</b>"
-                f"  ({t.distance_atr:.1f}ATR  sig={t.significance:.0f})"
+                f"\n🎯 Primary  <b>{_esc(t.direction.upper())} → ${t.pool.price:,.1f}</b>"
+                f"  {t.distance_atr:.1f}ATR  sig={t.significance:.0f}"
             )
         except Exception:
             pass
 
-    for lbl, pools in [
-        ("▲ BSL  —  buy stops above", bsl_pools),
-        ("▼ SSL  —  sell stops below", ssl_pools),
-    ]:
-        lines.append(f"\n<b>{lbl}</b>")
-        if pools:
-            for i, p in enumerate(pools[:6]):
-                try:
-                    flags = []
-                    if p.pool.ob_aligned:    flags.append("OB")
-                    if p.pool.fvg_aligned:   flags.append("FVG")
-                    if p.pool.htf_count >= 2: flags.append(f"HTFx{p.pool.htf_count}")
-                    fs = f" [{','.join(flags)}]" if flags else ""
-                    is_tgt = (primary_target and
-                              abs(p.pool.price - primary_target.pool.price) < atr * 0.3)
-                    lines.append(
-                        f"  {i+1}. <b>${p.pool.price:,.1f}</b>"
-                        f"  {p.distance_atr:.1f}A  sig={p.significance:.0f}"
-                        f"  t={p.pool.touches}  {_esc(p.pool.timeframe)}"
-                        + _esc(fs)
-                        + ("  ←" if is_tgt else "")
-                    )
-                except Exception:
-                    pass
-        else:
+    def _pool_section(label, pools):
+        lines.append(f"\n<b>{label}</b>")
+        if not pools:
             lines.append("  (none detected)")
+            return
+        for i, p in enumerate(pools[:6]):
+            try:
+                flags = []
+                if p.pool.ob_aligned:  flags.append("OB")
+                if p.pool.fvg_aligned: flags.append("FVG")
+                if p.pool.htf_count >= 2: flags.append(f"HTF×{p.pool.htf_count}")
+                f_str  = f" [{','.join(flags)}]" if flags else ""
+                mark   = " ← TGT" if (primary_target and
+                          abs(p.pool.price - primary_target.pool.price) < atr * 0.3) else ""
+                lines.append(
+                    f"  {i+1}. <code>${p.pool.price:,.1f}</code>"
+                    f"  {p.distance_atr:.1f}ATR  sig={p.significance:.0f}"
+                    f"  t={p.pool.touches}  {_esc(p.pool.timeframe)}"
+                    f"{_esc(f_str)}{mark}"
+                )
+            except Exception:
+                pass
+
+    _pool_section("BSL ▲ (buy stops above)", bsl_pools)
+    _pool_section("SSL ▼ (sell stops below)", ssl_pools)
 
     if recent_sweeps:
-        lines.append("\n<b>Recent sweeps</b>")
+        lines.append("\n<b>🌊 Recent Sweeps</b>")
         for s in recent_sweeps[:5]:
             try:
                 age = time.time() - s.detected_at
                 lines.append(
                     f"  {_esc(s.pool.side.value)} ${s.pool.price:,.1f}"
-                    f"  q={s.quality:.2f}  vol={s.volume_ratio:.1f}×"
-                    f"  dir={_esc(s.direction)}  {age:.0f}s ago"
+                    f"  q={s.quality:.2f}  vol={s.volume_ratio:.1f}×  {age:.0f}s ago"
                 )
             except Exception:
                 pass
@@ -809,9 +885,9 @@ def format_pools_telegram(
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  TELEGRAM: /flow
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. TELEGRAM: /flow
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_flow_telegram(
     price: float,
@@ -827,58 +903,57 @@ def format_flow_telegram(
     recent_buy_vol: float = 0.0,
     recent_sell_vol: float = 0.0,
 ) -> str:
-    dir_icon = "🟢" if flow_conviction > 0.1 else ("🔴" if flow_conviction < -0.1 else "⚪")
-    threshold = abs(flow_conviction) - 0.55
-    cvd_agrees = (
-        (flow_direction == "long"  and cvd_trend >  0.20) or
-        (flow_direction == "short" and cvd_trend < -0.20)
-    )
-
-    def _neutral(v, buy_t=0.5, sell_t=-0.5):
-        if v > buy_t:  return "↑↑ strong buy"
-        if v < sell_t: return "↓↓ strong sell"
-        return "── neutral"
+    fc_bar = "█" * min(10, int(abs(flow_conviction)*10)) + "░" * max(0,10 - int(abs(flow_conviction)*10))
+    dir_up = flow_conviction > 0.05
+    dir_dn = flow_conviction < -0.05
+    arrow  = "▲ BUY" if dir_up else ("▼ SELL" if dir_dn else "─ NEUTRAL")
 
     lines = [
-        f"⚡ <b>ORDER FLOW  ·  BTC ${price:,.2f}</b>",
-        "",
-        f"{dir_icon} <b>{_esc((flow_direction or 'neutral').upper())}</b>"
-        f"    conviction {flow_conviction:+.2f}",
+        f"<b>⚡ Order Flow  •  ${price:,.2f}</b>",
+        f"<b>{_esc((flow_direction or 'neutral').upper())}</b>  [{_esc(fc_bar)}] {arrow}  {flow_conviction:+.2f}",
         "",
         "<b>Components</b>",
-        f"<code>"
-        f"Tick flow     {tick_flow:+.2f}   {_neutral(tick_flow)}\n"
-        f"CVD trend     {cvd_trend:+.2f}   {'bearish' if cvd_trend < -0.2 else ('bullish' if cvd_trend > 0.2 else 'flat')}\n"
-        f"CVD diverge   {cvd_divergence:+.2f}\n"
-        f"OB imbalance  {ob_imbalance:+.2f}   {'bids heavy' if ob_imbalance > 0.15 else ('asks heavy' if ob_imbalance < -0.15 else 'balanced')}\n"
-        f"Tick streak   {tick_streak}"
-        + (f"  ({_esc(streak_direction)})" if streak_direction else "")
-        + "</code>",
     ]
 
-    if recent_buy_vol > 0 or recent_sell_vol > 0:
+    def _comp(name: str, val: float, thresh_pos: float, thresh_neg: float) -> str:
+        if val > thresh_pos:   tag = "▲ bullish"
+        elif val < thresh_neg: tag = "▼ bearish"
+        else:                  tag = "── flat"
+        return f"  <code>{name:<14}</code> {val:+.2f}  {tag}"
+
+    lines.append(_comp("Tick flow",    tick_flow,    0.5, -0.5))
+    lines.append(_comp("CVD trend",    cvd_trend,    0.2, -0.2))
+    lines.append(_comp("CVD diverge",  cvd_divergence, 0.1, -0.1))
+    lines.append(_comp("OB imbalance", ob_imbalance, 0.15,-0.15))
+    lines.append(f"  <code>Tick streak    </code> {tick_streak}  ({_esc(streak_direction or 'none')})")
+
+    if recent_buy_vol or recent_sell_vol:
         total   = recent_buy_vol + recent_sell_vol
-        buy_pct = recent_buy_vol / total * 100 if total > 0 else 50
+        buy_pct = recent_buy_vol / total * 100 if total else 50
+        bar     = "█" * int(buy_pct / 5) + "░" * (20 - int(buy_pct / 5))
         lines += [
             "",
-            "<b>Volume split</b>",
-            f"  Buy {buy_pct:.0f}%  ·  Sell {100-buy_pct:.0f}%",
+            f"<b>Volume Split</b>",
+            f"  Buy {buy_pct:.0f}%  [{_esc(bar)}]  Sell {100-buy_pct:.0f}%",
         ]
+
+    cvd_ok  = (flow_direction == "long" and cvd_trend > 0.20) or (flow_direction == "short" and cvd_trend < -0.20)
+    tick_ok = tick_streak >= 3
+    conv_ok = abs(flow_conviction) >= 0.55
 
     lines += [
         "",
-        "<b>Entry gates</b>",
-        f"  {'✅' if threshold >= 0 else '❌'}  Conviction ≥ 0.55    ({abs(flow_conviction):.2f})",
-        f"  {'✅' if cvd_agrees else '❌'}  CVD agrees with flow",
-        f"  {'✅' if tick_streak >= 3 else '❌'}  Sustained ≥ 3 ticks  ({tick_streak})",
+        "<b>Entry Gates</b>",
+        f"  {'✅' if conv_ok else '⛔'} Conviction ≥ 0.55   ({abs(flow_conviction):.2f})",
+        f"  {'✅' if cvd_ok  else '⛔'} CVD agrees",
+        f"  {'✅' if tick_ok else '⛔'} Sustained ≥ 3 ticks  ({tick_streak})",
     ]
-
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  TELEGRAM: 15-min periodic report  (v9 version)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. TELEGRAM: Periodic report
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_periodic_report_v9(
     price: float,
@@ -907,87 +982,74 @@ def format_periodic_report_v9(
     current_tp: float = 0.0,
     trail_phase: str = "",
 ) -> str:
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
-    si = _STATE_ICON.get((engine_state or "").upper(), "⚪")
-    fl_icon = "🟢" if flow_conviction > 0.05 else ("🔴" if flow_conviction < -0.05 else "⚪")
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    pnl_icon  = "🟢" if daily_pnl >= 0 else "🔴"
+    STATE_ICONS = {
+        "SCANNING":"🔍","TRACKING":"📡","READY":"🎯",
+        "ENTERING":"⚡","IN_POSITION":"📊","POST_SWEEP":"🌊",
+    }
+    si = STATE_ICONS.get(engine_state, "⚪")
+    fc_arrow = "▲" if flow_conviction > 0.05 else ("▼" if flow_conviction < -0.05 else "─")
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊  <b>STATUS</b>  ·  {si} {_esc(engine_state)}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>📊 STATUS  •  {now_utc}</b>",
+        f"<code>BTC ${price:,.2f}   ATR ${atr:.1f}   Bal ${balance:,.2f}</code>",
+        f"{pnl_icon} Day <b>${daily_pnl:+.2f}</b>   Session <b>${total_pnl:+.2f}</b>",
         "",
-        f"💎  BTC  <b>${price:,.2f}</b>    ATR ${atr:.1f}",
-        f"💼  Balance  <b>${balance:,.2f}</b>",
-        f"{pnl_icon}  Day  <b>${daily_pnl:+,.2f}</b>    Total  ${total_pnl:+,.2f}",
+        f"{si} <b>{_esc(engine_state)}</b>   Flow {_esc((flow_direction or 'neutral').upper())} {fc_arrow} {flow_conviction:+.2f}",
     ]
 
     if tracking_info:
-        lines.append(
-            f"\n📡  Tracking <b>{_esc(tracking_info['direction']).upper()}</b>"
-            f" → {_esc(tracking_info['target'])}"
-            f"  ({tracking_info['flow_ticks']}t)"
-        )
+        d = tracking_info.get("direction","?").upper()
+        t = tracking_info.get("target","?")
+        n = tracking_info.get("flow_ticks", 0)
+        lines.append(f"  📡 {_esc(d)} → {_esc(t)}  ({n} ticks)")
 
-    lines.append(
-        f"{fl_icon}  Flow  {_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})"
-    )
-
-    lines += [
-        "",
-        "─────────────────────────────────",
-        "🎯  <b>LIQUIDITY</b>",
-    ]
+    # Liquidity
+    lines += ["", "<b>💧 Liquidity</b>"]
     if primary_target:
         try:
             t = primary_target
-            lines.append(
-                f"  Target  <b>{_esc(t.direction).upper()} → ${t.pool.price:,.1f}</b>"
-                f"  ({t.distance_atr:.1f}A  sig={t.significance:.0f})"
-            )
+            lines.append(f"  🎯 <b>{_esc(t.direction.upper())} → ${t.pool.price:,.1f}</b>  {t.distance_atr:.1f}ATR  sig={t.significance:.0f}")
         except Exception:
-            pass
-    lines.append(
-        f"  Pools  ▲{bsl_count} BSL  ·  ▼{ssl_count} SSL"
-        f"  ·  Sweeps {recent_sweep_count}"
-    )
-    lines.append(f"  Nearest  BSL {nearest_bsl_atr:.1f}A  ·  SSL {nearest_ssl_atr:.1f}A")
+            lines.append("  Target  —")
+    else:
+        lines.append("  Target  none")
+
+    lines.append(f"  BSL {bsl_count}  ·  SSL {ssl_count}  ·  BSL {nearest_bsl_atr:.1f}ATR  SSL {nearest_ssl_atr:.1f}ATR  ·  Sweeps {recent_sweep_count}")
 
     if amd_phase:
-        kz = f"  ·  KZ {_esc(kill_zone)}" if kill_zone else ""
-        lines.append(
-            f"\n🏛️  AMD  <b>{_esc(amd_phase)}</b>"
-            f"  ({_esc(amd_bias or 'neutral')}){kz}"
-        )
+        kz = f"  🔥 {_esc(kill_zone)}" if kill_zone else ""
+        lines.append(f"  AMD <b>{_esc(amd_phase)}</b> ({_esc(amd_bias or 'neutral')}){kz}")
 
+    # Position
     if position:
-        side  = (position.get("side") or "?").upper()
+        side  = position.get("side","?").upper()
         entry = position.get("entry_price", 0.0)
         if entry > 0:
-            pnl_pts  = (price - entry) if side == "LONG" else (entry - price)
-            pos_icon = "🟢" if pnl_pts >= 0 else "🔴"
+            pnl_pts = (price - entry) if side == "LONG" else (entry - price)
+            icon = "🟢" if side == "LONG" else "🔴"
             lines += [
                 "",
-                f"{pos_icon}  <b>POSITION  {side}</b>",
-                f"  Entry ${entry:,.2f}  ·  {pnl_pts:+.1f}pts",
+                f"<b>{icon} Position  {_esc(side)}</b>",
+                f"  Entry ${entry:,.2f}   PnL {pnl_pts:+.1f} pts",
                 f"  SL ${current_sl:,.2f}  ·  TP ${current_tp:,.2f}",
             ]
             if trail_phase:
                 lines.append(f"  Trail {_esc(trail_phase)}")
 
+    # Performance
     lines += [
         "",
-        "─────────────────────────────────",
-        "📈  <b>PERFORMANCE</b>",
-        f"  Trades {total_trades}  ·  WR {win_rate:.0f}%"
-        f"  ·  CL {consecutive_losses}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>📈 Performance</b>",
+        f"  Trades {total_trades}  ·  WR {win_rate:.0f}%  ·  ConsecL {consecutive_losses}",
     ]
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  TELEGRAM: Entry alert  (v9)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. TELEGRAM: Entry alert
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_entry_alert_v9(
     side: str,
@@ -998,77 +1060,69 @@ def format_entry_alert_v9(
     rr_ratio: float,
     quantity: float,
     target_pool_price: float = 0.0,
-    target_pool_type:  str   = "",
-    target_pool_sig:   float = 0.0,
-    target_tf_sources: str   = "",
-    flow_conviction:   float = 0.0,
-    cvd_trend:         float = 0.0,
-    sweep_pool_price:  float = 0.0,
-    sweep_quality:     float = 0.0,
-    ict_validation:    str   = "",
-    amd_phase:         str   = "",
-    kill_zone:         str   = "",
+    target_pool_type: str = "",
+    target_pool_sig: float = 0.0,
+    target_tf_sources: str = "",
+    flow_conviction: float = 0.0,
+    cvd_trend: float = 0.0,
+    sweep_pool_price: float = 0.0,
+    sweep_quality: float = 0.0,
+    ict_validation: str = "",
+    amd_phase: str = "",
+    kill_zone: str = "",
 ) -> str:
-    side_upper  = side.upper()
-    side_icon   = "🟢" if side_upper == "LONG" else "🔴"
-    risk        = abs(entry_price - sl_price)
-    reward      = abs(tp_price   - entry_price)
+    is_long = side.upper() == "LONG"
+    icon    = "🟢" if is_long else "🔴"
+    risk    = abs(entry_price - sl_price)
+    reward  = abs(tp_price    - entry_price)
     dollar_risk = risk * quantity
 
-    type_labels = {
-        "APPROACH":     "APPROACH  ·  flow → pool",
-        "REVERSAL":     "SWEEP REVERSAL",
-        "CONTINUATION": "SWEEP CONTINUATION",
+    TYPE_MAP = {
+        "APPROACH":     "Flow → Pool",
+        "REVERSAL":     "Sweep Reversal",
+        "CONTINUATION": "Sweep Continuation",
     }
-    type_label = type_labels.get(entry_type.upper(), entry_type)
+    type_label = TYPE_MAP.get(entry_type.upper(), entry_type)
 
     lines = [
-        f"{side_icon} <b>NEW TRADE  ·  {side_upper}</b>",
-        f"<code>{_esc(type_label)}</code>",
+        f"<b>{icon} NEW TRADE  •  {_esc(side.upper())}  [{_esc(type_label)}]</b>",
         "",
-        "<b>Levels</b>",
-        f"<code>"
-        f"Entry   ${entry_price:,.2f}\n"
-        f"SL      ${sl_price:,.2f}   risk ${risk:.1f}\n"
-        f"TP      ${tp_price:,.2f}   reward ${reward:.1f}\n"
-        f"R:R     1:{rr_ratio:.1f}   qty {quantity:.4f} BTC   ${dollar_risk:.2f} at risk"
-        "</code>",
-        "",
-        "<b>Why this trade</b>",
+        f"<code>Entry  ${entry_price:,.2f}</code>",
+        f"<code>SL     ${sl_price:,.2f}   risk ${risk:.1f}</code>",
+        f"<code>TP     ${tp_price:,.2f}   reward ${reward:.1f}</code>",
+        f"<code>R:R    1 : {rr_ratio:.1f}   Qty {quantity:.4f} BTC   ${dollar_risk:.2f} at risk</code>",
     ]
 
-    if entry_type.upper() == "APPROACH":
-        lines.append(f"  Flow pushing {side.lower()} toward unswept pool")
-        if target_pool_price > 0:
-            lines.append(
-                f"  Target  {_esc(target_pool_type)} ${target_pool_price:,.1f}"
-                f"  (sig={target_pool_sig:.0f})"
-            )
-            if target_tf_sources:
-                lines.append(f"  TFs  {_esc(target_tf_sources)}")
-    elif entry_type.upper() == "REVERSAL":
-        lines.append("  Pool swept → CISD confirmed → reversing")
-        if sweep_pool_price > 0:
-            lines.append(f"  Swept   ${sweep_pool_price:,.1f}  (q={sweep_quality:.2f})")
-        if target_pool_price > 0:
-            lines.append(f"  Deliver to  ${target_pool_price:,.1f}")
-    elif entry_type.upper() == "CONTINUATION":
+    lines.append("\n<b>Rationale</b>")
+    et = entry_type.upper()
+    if et == "APPROACH":
+        lines.append(f"  Flow pushing {_esc(side.lower())} → unswept pool")
+        if target_pool_price:
+            lines.append(f"  Target  {_esc(target_pool_type)} ${target_pool_price:,.1f}  sig={target_pool_sig:.0f}")
+        if target_tf_sources:
+            lines.append(f"  Seen on  {_esc(target_tf_sources)}")
+    elif et == "REVERSAL":
+        lines.append("  Pool swept → CISD → reversing")
+        if sweep_pool_price:
+            lines.append(f"  Swept  ${sweep_pool_price:,.1f}  q={sweep_quality:.2f}")
+        if target_pool_price:
+            lines.append(f"  Delivering to  ${target_pool_price:,.1f}")
+    elif et == "CONTINUATION":
         lines.append("  Pool swept — flow continues")
-        if target_pool_price > 0:
+        if target_pool_price:
             lines.append(f"  Next target  ${target_pool_price:,.1f}")
 
     lines.append(f"  Flow {flow_conviction:+.2f}  ·  CVD {cvd_trend:+.2f}")
     if ict_validation:
         lines.append(f"  ICT  {_esc(ict_validation)}")
     if kill_zone:
-        lines.append(f"  Session  {_esc(kill_zone.upper())}")
-
+        lines.append(f"  🔥 Session  {_esc(kill_zone.upper())}")
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8.  TELEGRAM: /status  (v9 full report)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. TELEGRAM: /status
+# ═════════════════════════════════════════════════════════════════════════════
 
 def format_status_report_v9(
     price: float,
@@ -1095,96 +1149,91 @@ def format_status_report_v9(
     avg_win: float = 0.0,
     avg_loss: float = 0.0,
     expectancy: float = 0.0,
-    position_lines: Optional[List[str]] = None,
-    fee_lines: Optional[List[str]] = None,
+    position_lines: List[str] = None,
+    fee_lines: List[str] = None,
 ) -> str:
-    wr       = winning_trades / total_trades * 100 if total_trades > 0 else 0.0
-    losses   = total_trades - winning_trades
-    si       = _STATE_ICON.get((engine_state or "").upper(), "⚪")
-    fl_icon  = "🟢" if flow_conviction > 0.05 else ("🔴" if flow_conviction < -0.05 else "⚪")
-    pnl_icon = "🟢" if total_pnl >= 0 else "🔴"
+    wr     = winning_trades / total_trades * 100 if total_trades else 0.0
+    losses = total_trades - winning_trades
+    STATE_ICONS = {
+        "SCANNING":"🔍","TRACKING":"📡","READY":"🎯",
+        "ENTERING":"⚡","IN_POSITION":"📊","POST_SWEEP":"🌊",
+    }
+    si = STATE_ICONS.get(engine_state, "⚪")
+    fc_arrow = "▲" if flow_conviction > 0.05 else ("▼" if flow_conviction < -0.05 else "─")
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📊  <b>QUANT v10  —  FULL STATUS</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>📊 STATUS  v10 LIQUIDITY-FIRST</b>",
+        f"<code>BTC ${price:,.2f}   ATR ${atr:.1f} ({atr_pctile:.0%})   Bal ${balance:,.2f}</code>",
         "",
-        f"💎  BTC  <b>${price:,.2f}</b>    ATR ${atr:.1f} ({atr_pctile:.0%})",
-        f"💼  Balance  <b>${balance:,.2f}</b>",
-        "",
-        f"{si}  <b>{_esc(engine_state)}</b>",
-        f"{fl_icon}  Flow  {_esc(flow_direction or 'neutral')} ({flow_conviction:+.2f})",
+        f"{si} <b>{_esc(engine_state)}</b>   Flow {_esc((flow_direction or 'neutral').upper())} {fc_arrow} {flow_conviction:+.2f}",
     ]
-
     if tracking_info:
-        lines.append(
-            f"  📡 <b>{_esc(tracking_info['direction']).upper()}</b>"
-            f" → {_esc(tracking_info['target'])}"
-            f"  ({tracking_info['flow_ticks']}t)"
-        )
+        d = tracking_info.get("direction","?").upper()
+        t = tracking_info.get("target","?")
+        n = tracking_info.get("flow_ticks", 0)
+        lines.append(f"  📡 {_esc(d)} → {_esc(t)}  ({n} ticks)")
 
-    lines += ["", "─────────────────────────────────", "🎯  <b>LIQUIDITY</b>"]
+    # Liquidity
+    lines += ["", "<b>💧 Liquidity</b>"]
     if primary_target:
         try:
             t = primary_target
-            lines.append(
-                f"  <b>{_esc(t.direction).upper()} → ${t.pool.price:,.1f}</b>"
-                f"  ({t.distance_atr:.1f}ATR  sig={t.significance:.0f})"
-            )
+            lines.append(f"  🎯 <b>{_esc(t.direction.upper())} → ${t.pool.price:,.1f}</b>  {t.distance_atr:.1f}ATR  sig={t.significance:.0f}")
         except Exception:
-            pass
+            lines.append("  Target  —")
+    else:
+        lines.append("  Target  none")
+
     lines.append(
-        f"  ▲{bsl_count} BSL  ▼{ssl_count} SSL"
-        f"  ·  BSL {nearest_bsl_atr:.1f}A  SSL {nearest_ssl_atr:.1f}A"
-        f"  ·  Sweeps {recent_sweep_count}"
+        f"  Pools {bsl_count} BSL / {ssl_count} SSL"
+        f"   BSL {nearest_bsl_atr:.1f}ATR  SSL {nearest_ssl_atr:.1f}ATR"
+        f"   Sweeps {recent_sweep_count}"
     )
 
-    lines += ["", "─────────────────────────────────", "📈  <b>PERFORMANCE</b>"]
-    lines += [
-        f"  Trades {total_trades}    W {winning_trades}  L {losses}    WR {wr:.0f}%",
-        f"  {pnl_icon}  Total PnL  <b>${total_pnl:+.2f}</b>",
-        f"<code>"
-        f"Avg W  ${avg_win:+.2f}  ·  Avg L ${avg_loss:+.2f}  ·  E ${expectancy:+.2f}\n"
-        f"Daily {daily_trades}/{max_daily}  ·  CL {consec_losses}/{max_consec}"
-        "</code>",
-    ]
-
+    # Fee engine
     if fee_lines:
-        lines += [""] + fee_lines
+        lines.append("")
+        lines.extend(fee_lines)
 
+    # Position
     if position_lines:
-        lines += [""] + position_lines
+        lines.append("")
+        lines.extend(position_lines)
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    # Performance
+    lines += [
+        "",
+        "<b>📈 Session P&amp;L</b>",
+        f"  Trades {total_trades}  W {winning_trades}  L {losses}  WR {wr:.0f}%",
+        f"  PnL ${total_pnl:+.2f}   AvgW ${avg_win:+.2f}   AvgL ${avg_loss:+.2f}",
+        f"  Expectancy ${expectancy:+.2f}/trade",
+        f"  Daily {daily_trades}/{max_daily}   ConsecL {consec_losses}/{max_consec}",
+    ]
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9.  HELP TEXT
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 9. HELP TEXT
+# ═════════════════════════════════════════════════════════════════════════════
 
 HELP_TEXT = (
     "<b>Commands</b>\n"
-    "\n"
-    "/status      Full status + liquidity overview\n"
-    "/thinking    Live decision stack · flow · pools\n"
-    "/pools       Full liquidity pool map (all TFs)\n"
-    "/flow        Detailed orderflow breakdown\n"
-    "/position    Current position details\n"
-    "/trades      Recent trade history\n"
-    "/stats       Performance analysis\n"
-    "/balance     Wallet balance\n"
-    "\n"
-    "/pause       Pause trading (keep monitoring)\n"
-    "/resume      Resume trading\n"
-    "/trail [on|off|auto]   Toggle trailing SL\n"
-    "/config      Show config values\n"
-    "/set &lt;key&gt; &lt;value&gt;   Adjust config live\n"
-    "/setexchange &lt;delta|coinswitch&gt;   Switch execution\n"
-    "\n"
-    "/killswitch  Emergency close + cancel all\n"
-    "/resetrisk   Clear consecutive-loss lockout\n"
-    "/start       Start bot\n"
-    "/stop        Stop bot\n"
-    "/help        This list"
+    "/status       — Full status + liquidity overview\n"
+    "/thinking     — Live decision stack + flow + pools\n"
+    "/pools        — Full liquidity pool map (all TFs)\n"
+    "/flow         — Detailed orderflow breakdown\n"
+    "/position     — Current position details\n"
+    "/trades       — Recent trade history\n"
+    "/stats        — Performance analysis\n"
+    "/balance      — Wallet balance\n"
+    "/pause        — Pause trading (keep monitoring)\n"
+    "/resume       — Resume trading\n"
+    "/trail [on|off|auto] — Toggle trailing SL\n"
+    "/config       — Show config values\n"
+    "/set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
+    "/setexchange &lt;delta|coinswitch&gt; — Switch exchange\n"
+    "/killswitch   — Emergency close + cancel all\n"
+    "/resetrisk    — Clear consecutive-loss lockout\n"
+    "/start  /stop — Start / stop bot\n"
+    "/help         — This list"
 )
