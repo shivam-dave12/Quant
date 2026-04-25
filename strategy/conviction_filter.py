@@ -67,6 +67,7 @@ try:
         CONVICTION_MAX_SESSION_LOSSES      as _CFG_MAX_SESS_LOSSES,
         CONVICTION_MIN_ENTRY_INTERVAL_SEC  as _CFG_INTERVAL_SEC,
         CONVICTION_MAX_ENTRIES_PER_SESSION as _CFG_MAX_ENTRIES,
+        CONVICTION_PRODUCT_MIN_CORE        as _CFG_PRODUCT_MIN_CORE,
     )
 except ImportError:
     # BUG-C1 FIX: Calibrated crypto-specific defaults.
@@ -83,6 +84,7 @@ except ImportError:
     _CFG_MAX_SESS_LOSSES = 2
     _CFG_INTERVAL_SEC = 300
     _CFG_MAX_ENTRIES = 5
+    _CFG_PRODUCT_MIN_CORE = 0.45
 
 # ── Internal constants ────────────────────────────────────────────────────────
 
@@ -95,6 +97,7 @@ OTE_FIB_HIGH = _CFG_OTE_HIGH
 MAX_SESSION_LOSSES = _CFG_MAX_SESS_LOSSES
 MIN_ENTRY_INTERVAL_SEC = _CFG_INTERVAL_SEC
 MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
+PRODUCT_MIN_CORE = _CFG_PRODUCT_MIN_CORE
 
 # ── Dealing range — scoring zones (no hard block) ────────────────────────────
 DR_LONG_MAX_PD = 0.65    # Longs preferred in discount but allowed wider
@@ -464,6 +467,18 @@ class ConvictionFilter:
 
         # ── Score gate ─────────────────────────────────────────────────────
         score_passed = score >= REQUIRED_SCORE
+        core_product = min(
+            factors.pool_sig_score,
+            factors.displacement_score,
+            factors.cisd_score,
+        )
+        product_passed = core_product >= PRODUCT_MIN_CORE
+        if not product_passed:
+            rejects.append(
+                f"PRODUCT_CORE: {core_product:.2f} < {PRODUCT_MIN_CORE:.2f} "
+                f"[pool={factors.pool_sig_score:.2f} "
+                f"disp={factors.displacement_score:.2f} "
+                f"cisd={factors.cisd_score:.2f}]")
         if not score_passed:
             rejects.append(
                 f"SCORE: {score:.3f} < {REQUIRED_SCORE} "
@@ -475,7 +490,7 @@ class ConvictionFilter:
                 f"amd={factors.amd_score:.2f}]")
 
         # ── Final decision ─────────────────────────────────────────────────
-        allowed = score_passed
+        allowed = score_passed and product_passed
         if allowed:
             logger.info(
                 f"✅ CONVICTION PASSED ({score:.3f}) | {' | '.join(allows[:5])}")

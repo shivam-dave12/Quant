@@ -19,7 +19,7 @@ Architecture
                          ─────────────────
                          get_candles()       → primary DM
                          get_last_price()    → weighted average
-                         get_orderbook()     → fused OB snapshot
+                         get_orderbook()     → executable primary OB + secondary side-channel
                          get_recent_trades() → merged + deduplicated
                          ─────────────────
                                    ▼
@@ -330,6 +330,10 @@ class MarketAggregator:
     # ── Price — weighted average (display only) ────────────────────────────
 
     def get_last_price(self) -> float:
+        return self._primary.get_last_price()
+
+    def get_consensus_price(self) -> float:
+        """Weighted cross-venue price for display/diagnostics only."""
         p_price = self._primary.get_last_price()
         if self._secondary is None or not self._secondary_alive:
             return p_price
@@ -348,91 +352,39 @@ class MarketAggregator:
 
     def get_orderbook(self) -> Dict:
         """
-        Merge orderbooks from both exchanges.
+        Return the executable primary venue book.
 
-        Strategy:
-          1. Collect bids and asks from both feeds up to AGG_OB_DEPTH_LEVELS each.
-          2. Combine price levels — at the same price point, sum quantities.
-          3. Re-sort: bids descending, asks ascending.
-          4. Return the top AGG_OB_DEPTH_LEVELS levels of each side.
-
-        This creates a 'virtual' aggregated book that shows true depth
-        across both venues.  CVD and OFI signals computed on this book
-        are substantially more reliable than single-exchange snapshots.
+        Cross-venue synthetic depth is useful for diagnostics, but it is not an
+        executable book: merging CoinSwitch and Delta levels can invent liquidity
+        that cannot be hit by a single Delta order. Consumers that route orders,
+        compute spread, or validate stop placement must see the primary book.
+        The secondary book is attached under `_secondary_book` as a side-channel
+        for analytics that explicitly opt into non-executable context.
         """
         p_ob = self._primary.get_orderbook()
+        primary_book = {
+            "bids": _norm_levels((p_ob or {}).get("bids", []) or (p_ob or {}).get("buy", []))[:self._ob_depth],
+            "asks": _norm_levels((p_ob or {}).get("asks", []) or (p_ob or {}).get("sell", []))[:self._ob_depth],
+            "timestamp": (p_ob or {}).get("timestamp", time.time()),
+            "_sources": 1,
+            "_executable_source": "primary",
+        }
 
         if self._secondary is None or not self._secondary_alive:
-            # Normalise even single-exchange OBs so consumers get [[p,q]] always
-            return {
-                "bids": _norm_levels(p_ob.get("bids", []) or p_ob.get("buy", [])),
-                "asks": _norm_levels(p_ob.get("asks", []) or p_ob.get("sell", [])),
-                "timestamp": p_ob.get("timestamp", time.time()),
-            }
+            return primary_book
 
         try:
             s_ob = self._secondary.get_orderbook()
-            if not s_ob:
-                return p_ob
+            if s_ob:
+                primary_book["_secondary_book"] = {
+                    "bids": _norm_levels(s_ob.get("bids", []) or s_ob.get("buy", []))[:self._ob_depth],
+                    "asks": _norm_levels(s_ob.get("asks", []) or s_ob.get("sell", []))[:self._ob_depth],
+                    "timestamp": s_ob.get("timestamp", time.time()),
+                }
+                primary_book["_sources"] = 2
         except Exception:
-            return p_ob
-
-        def merge_side(p_levels: list, s_levels: list, ascending: bool) -> list:
-            # BUG-AGG-4 FIX (orderbook merge price granularity):
-            # The original code rounded to 2 decimals via round(lvl[0], 2).
-            # For BTC at ~$77k, 2-decimal rounding is ~$0.01 — finer than
-            # either exchange's tick size (Delta ~$0.5, CoinSwitch ~$0.1).
-            # The effect was that levels at $77098.44 and $77098.45 became
-            # DIFFERENT keys even though neither exchange quotes at that
-            # granularity — creating phantom "walls" at fractional-tick
-            # prices that don't exist in reality. Imbalance/OFI computed
-            # on this merged book reads a distorted shape of liquidity.
-            #
-            # Fix: round to the coarsest tick size (max of both, from config).
-            # Levels at $77098.4 and $77098.5 on a $0.1 tick grid remain
-            # distinct; levels at $77098.44 and $77098.45 get correctly
-            # bucketed into $77098.5. This preserves real liquidity topology.
-            _tick = float(getattr(config, 'TICK_SIZE', 0.1))
-            if _tick <= 0:
-                _tick = 0.1
-            _inv_tick = 1.0 / _tick
-
-            combined: Dict[float, float] = {}
-            all_levels = (
-                _norm_levels(p_levels)[:self._ob_depth] +
-                _norm_levels(s_levels)[:self._ob_depth]
-            )
-            for lvl in all_levels:
-                try:
-                    # Snap to tick grid: round(price / tick) * tick
-                    px_raw = float(lvl[0])
-                    qty    = float(lvl[1])
-                    if px_raw <= 0 or qty < 0:
-                        continue
-                    px = round(round(px_raw * _inv_tick) * _tick,
-                               # preserve enough decimals for any reasonable tick
-                               6)
-                    combined[px] = combined.get(px, 0.0) + qty
-                except Exception:
-                    continue
-            sorted_levels = sorted(combined.items(),
-                                   key=lambda x: x[0],
-                                   reverse=not ascending)
-            return [[px, qty] for px, qty in sorted_levels[:self._ob_depth]]
-
-        merged_bids = merge_side(p_ob.get("bids", []) or p_ob.get("buy", []),
-                                 s_ob.get("bids", []) or s_ob.get("buy", []),
-                                 ascending=False)
-        merged_asks = merge_side(p_ob.get("asks", []) or p_ob.get("sell", []),
-                                 s_ob.get("asks", []) or s_ob.get("sell", []),
-                                 ascending=True)
-
-        return {
-            "bids":      merged_bids,
-            "asks":      merged_asks,
-            "timestamp": time.time(),
-            "_sources":  2,
-        }
+            pass
+        return primary_book
 
     # ── Trades — merged from both exchanges ──────────────────────────────────
 

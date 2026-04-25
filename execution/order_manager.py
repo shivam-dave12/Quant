@@ -705,6 +705,35 @@ class OrderManager:
         if s in ("SHORT", "SELL"): return "SELL"
         raise ValueError(f"Invalid side '{side}'")
 
+    def _active_tick_size(self) -> float:
+        getter = getattr(config, "get_tick_size", None)
+        if callable(getter):
+            return float(getter())
+        return float(getattr(config, "TICK_SIZE", 0.1))
+
+    def _round_price_to_tick(self, price: float) -> float:
+        tick = max(self._active_tick_size(), 1e-9)
+        rounded = round(float(price) / tick) * tick
+        return round(rounded, 8)
+
+    def _sl_limit_price(self, api_side: str, trigger_price: float) -> float:
+        tick = self._active_tick_size()
+        offset_ticks = int(getattr(config, "SL_LIMIT_OFFSET_TICKS", 20))
+        limit_offset = offset_ticks * tick
+        raw = trigger_price + limit_offset if api_side == "BUY" else trigger_price - limit_offset
+        return self._round_price_to_tick(raw)
+
+    def _validate_stop_trigger(self, api_side: str, trigger_price: float,
+                               current_price: Optional[float]) -> Optional[str]:
+        if current_price is None or current_price <= 0:
+            return None
+        tick = self._active_tick_size()
+        if api_side == "BUY" and trigger_price <= current_price + tick * 0.5:
+            return f"BUY stop {trigger_price:.2f} must be above market {current_price:.2f}"
+        if api_side == "SELL" and trigger_price >= current_price - tick * 0.5:
+            return f"SELL stop {trigger_price:.2f} must be below market {current_price:.2f}"
+        return None
+
     def _check_window_rate_limit(self) -> bool:
         now = time.time()
         if now - self._rate_window_start > 60:
@@ -1309,9 +1338,6 @@ class OrderManager:
         """
         try:
             api_side = self._normalize_side(side)
-            tick  = float(getattr(config, 'TICK_SIZE', 0.1))
-            offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
-            limit_offset = offset_ticks * tick
 
             # Initialise limit_price to None; only assigned when use_limit=True.
             # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
@@ -1327,10 +1353,8 @@ class OrderManager:
             # SHORT SL (buy to close): limit = stop + offset (max price we'll pay)
             # LONG  SL (sell to close): limit = stop - offset (min price we'll accept)
             if use_limit:
-                if api_side == "BUY":
-                    limit_price = round(trigger_price + limit_offset, 1)
-                else:
-                    limit_price = round(trigger_price - limit_offset, 1)
+                limit_price = self._sl_limit_price(api_side, trigger_price)
+                limit_offset = abs(limit_price - trigger_price)
                 logger.info(
                     f"SL-LIMIT {side} qty={quantity} stop=${trigger_price:,.2f} "
                     f"limit=${limit_price:,.2f} (±{limit_offset:.1f}pts offset)")
@@ -1394,7 +1418,8 @@ class OrderManager:
     def replace_stop_loss(self, existing_sl_order_id: Optional[str],
                           side: str, quantity: float,
                           new_trigger_price: float,
-                          old_trigger_price: Optional[float] = None) -> Optional[Dict]:
+                          old_trigger_price: Optional[float] = None,
+                          current_price: Optional[float] = None) -> Optional[Dict]:
         """
         Update trailing SL to new_trigger_price.
 
@@ -1427,16 +1452,15 @@ class OrderManager:
              Caller MUST emergency-flatten the position immediately.
           {"error": "<other>"} — SL was NOT touched; current SL still live.
         """
-        tick  = float(getattr(config, 'TICK_SIZE', 0.1))
-        offset_ticks = int(getattr(config, 'SL_LIMIT_OFFSET_TICKS', 20))
-        limit_offset = offset_ticks * tick
         api_side = self._normalize_side(side)
+        new_trigger_price = self._round_price_to_tick(new_trigger_price)
+        invalid_reason = self._validate_stop_trigger(api_side, new_trigger_price, current_price)
+        if invalid_reason:
+            logger.warning("SL replace rejected before REST: %s", invalid_reason)
+            return {"error": "INVALID_SL_PRICE", "reason": invalid_reason, "sl_cancelled": False}
 
         # Compute limit_price for the stop-limit (same logic as place_stop_loss)
-        if api_side == "BUY":
-            new_limit_price = round(new_trigger_price + limit_offset, 1)
-        else:
-            new_limit_price = round(new_trigger_price - limit_offset, 1)
+        new_limit_price = self._sl_limit_price(api_side, new_trigger_price)
 
         try:
             # ── Path 1: Edit-in-place (Delta only) ───────────────────────────
@@ -1477,8 +1501,14 @@ class OrderManager:
                 else:
                     logger.warning(
                         f"SL edit failed sc={sc} err={err} "
-                        f"— falling back to cancel+replace"
+                        f"— keeping existing SL live; retry next tick"
                     )
+                    return {
+                        "error": "EDIT_FAILED_RETRY",
+                        "reason": str(err)[:200],
+                        "sl_cancelled": False,
+                        "order_id": existing_sl_order_id,
+                    }
 
             # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
             cancelled_old = False

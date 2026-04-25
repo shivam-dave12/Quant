@@ -82,10 +82,12 @@ WIRING IN quant_strategy.py  (see quant_strategy_patches.py for exact splice poi
 from __future__ import annotations
 
 import logging
+import json
 import math
+import os
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -96,7 +98,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Minimum real observations before a dimension generates recommendations
-_MIN_SAMPLES = 5
+_MIN_SAMPLES = 30
 
 # Rolling window for statistics (trades)
 _ROLLING_WINDOW = 20
@@ -705,6 +707,13 @@ class PostTradeAgent:
 
         # ── Full trade records (last 200) ───────────────────────────────────────
         self.records:  List[TradeRecord] = []
+        try:
+            import config as _pta_cfg
+            default_path = os.path.join(os.getcwd(), "data", "post_trade_records.jsonl")
+            self._records_path = str(getattr(_pta_cfg, "POST_TRADE_RECORDS_PATH", default_path))
+        except Exception:
+            self._records_path = os.path.join(os.getcwd(), "data", "post_trade_records.jsonl")
+        self._load_records()
 
         # ── Insights (for Telegram / /learn command) ───────────────────────────
         self.insights: List[AgentInsight] = []
@@ -1407,7 +1416,7 @@ class PostTradeAgent:
         Core Bayesian adaptive engine. Runs after each trade closure.
 
         Design principles (all must hold before any adjustment fires):
-          1. Minimum _MIN_SAMPLES (5) real observations.
+          1. Minimum _MIN_SAMPLES real observations.
           2. Wilson credible interval must fully clear the neutral threshold.
           3. Minimum 3 trades between adjustments (prevents oscillation).
           4. All adjustments are multiplicative deltas capped at ±40% of base.
@@ -1814,10 +1823,54 @@ class PostTradeAgent:
     # INTERNAL: Store & Log
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _record_from_dict(self, data: Dict[str, Any]) -> Optional[TradeRecord]:
+        try:
+            payload = dict(data)
+            geom = payload.pop("geometry", {}) or {}
+            eq = payload.pop("entry_quality", {}) or {}
+            return TradeRecord(
+                **payload,
+                geometry=ExitGeometry(**geom),
+                entry_quality=EntryQuality(**eq),
+            )
+        except Exception as e:
+            logger.debug(f"PostTradeAgent: skipped corrupt persisted record: {e}")
+            return None
+
+    def _load_records(self) -> None:
+        try:
+            if not self._records_path or not os.path.exists(self._records_path):
+                return
+            loaded: List[TradeRecord] = []
+            with open(self._records_path, "r", encoding="utf-8") as fh:
+                for line in fh.readlines()[-200:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = self._record_from_dict(json.loads(line))
+                    if rec is not None:
+                        loaded.append(rec)
+            self.records = loaded[-200:]
+            for rec in self.records:
+                self._update_statistics(rec)
+                self._update_ic(rec)
+            if self.records:
+                logger.info(f"PostTradeAgent loaded {len(self.records)} persisted records")
+        except Exception as e:
+            logger.warning(f"PostTradeAgent: unable to load persisted records: {e}")
+
     def _store_record(self, rec: TradeRecord) -> None:
         self.records.append(rec)
         if len(self.records) > 200:
             self.records = self.records[-200:]
+        try:
+            _dir = os.path.dirname(self._records_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            with open(self._records_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(asdict(rec), sort_keys=True) + "\n")
+        except Exception as e:
+            logger.warning(f"PostTradeAgent: unable to persist trade record: {e}")
 
     def _log_analysis(self, rec: TradeRecord) -> None:
         g  = rec.geometry

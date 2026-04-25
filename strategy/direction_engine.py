@@ -408,6 +408,7 @@ class DirectionEngine:
         self._committed_direction:  Optional[str] = None   # "BSL" | "SSL" | None
         self._committed_confidence: float         = 0.0
         self._committed_score:      float         = 0.0
+        self._pool_gate_last_emit: Dict[tuple, tuple] = {}
 
     # =========================================================================
     # 1. HUNT PREDICTION ENGINE
@@ -421,6 +422,28 @@ class DirectionEngine:
             return t.pool.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)
         except Exception:
             return True   # safe default
+
+    def _pool_gate_emit_allowed(
+        self,
+        key: tuple,
+        action: str,
+        reason: str,
+        cooldown_sec: float = 30.0,
+    ) -> bool:
+        """Debounce identical pool-gate decisions so one regime flip emits once."""
+        now = time.time()
+        last = self._pool_gate_last_emit.get(key)
+        state = (action, reason[:80])
+        if last and last[0] == state and now - float(last[1]) < cooldown_sec:
+            return False
+        self._pool_gate_last_emit[key] = (state, now)
+        # Bounded cleanup for long-running processes.
+        cutoff = now - max(cooldown_sec * 4.0, 120.0)
+        self._pool_gate_last_emit = {
+            k: v for k, v in self._pool_gate_last_emit.items()
+            if float(v[1]) >= cutoff
+        }
+        return True
 
     def predict_hunt(
         self,
@@ -1903,23 +1926,41 @@ class DirectionEngine:
 
         # Case 1: Flow reversed + structural BOS against → REVERSE
         if _flow_reversed and _counter_bos:
+            _reason = (
+                f"FLOW_REVERSED(flow={tick_flow:+.2f}) + COUNTER_BOS "
+                f"— structure invalidated")
+            _key = ("pool_gate", pos_side, round(pos_entry, 1), "reverse")
+            if not self._pool_gate_emit_allowed(_key, "reverse", _reason):
+                return ContinuationDecision(
+                    action="hold",
+                    confidence=0.0,
+                    reason="POOL_GATE reverse debounced; bracket/trail already managing",
+                    next_target=None,
+                )
             return ContinuationDecision(
                 action="reverse",
                 confidence=0.80,
-                reason=(
-                    f"FLOW_REVERSED(flow={tick_flow:+.2f}) + COUNTER_BOS "
-                    f"— structure invalidated"),
+                reason=_reason,
                 next_target=None,
             )
 
         # Case 2: AMD intact + flow OK + next pool viable → CONTINUE
         if _amd_aligned and not _counter_bos and not _flow_reversed and _next_pool_viable:
+            _reason = (
+                f"AMD_DELIVERY_INTACT + FLOW_OK + NEXT_POOL "
+                f"@ ${_next_pool_resolved:,.0f} ({_next_rr:.1f}R potential)")
+            _key = ("pool_gate", pos_side, round(pos_entry, 1), "continue",
+                    round(float(_next_pool_resolved), 1))
+            if not self._pool_gate_emit_allowed(_key, "continue", _reason):
+                return ContinuationDecision(
+                    action="hold",
+                    confidence=0.0,
+                    reason="POOL_GATE continue debounced; TP immutability/trail already managing",
+                )
             return ContinuationDecision(
                 action="continue",
                 confidence=0.70,
-                reason=(
-                    f"AMD_DELIVERY_INTACT + FLOW_OK + NEXT_POOL "
-                    f"@ ${_next_pool_resolved:,.0f} ({_next_rr:.1f}R potential)"),
+                reason=_reason,
                 next_target=_next_pool_resolved,
             )
 

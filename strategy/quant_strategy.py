@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
+from core.pnl import gross_pnl_usd
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
 try:
@@ -169,7 +170,11 @@ class QCfg:
     @staticmethod
     def COMMISSION_RATE() -> float: return float(_cfg("COMMISSION_RATE", 0.00055))
     @staticmethod
-    def TICK_SIZE() -> float: return float(_cfg("TICK_SIZE", 0.1))
+    def TICK_SIZE() -> float:
+        getter = getattr(config, "get_tick_size", None)
+        if callable(getter):
+            return float(getter())
+        return float(_cfg("TICK_SIZE", 0.1))
     @staticmethod
     def SLIPPAGE_TOL() -> float: return float(_cfg("QUANT_SLIPPAGE_TOLERANCE", 0.0005))
     @staticmethod
@@ -564,6 +569,23 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
 
     _buf = _fee_per_btc + _slippage_buf
     return (entry_price + _buf if pos_side == "long" else entry_price - _buf)
+
+
+def _safe_be_migration_price(pos_side: str, desired_sl: float, current_price: float,
+                             atr: float) -> Optional[float]:
+    """Return a BE SL only if it leaves structural breathing room from market."""
+    if desired_sl <= 0 or current_price <= 0:
+        return None
+    tick = max(QCfg.TICK_SIZE(), 1e-10)
+    pct_floor = current_price * float(getattr(config, "MIN_SL_DISTANCE_PCT", 0.004))
+    atr_floor = max(float(atr or 0.0), 0.0) * float(
+        getattr(config, "POOL_GATE_BE_MIN_ATR_DIST", 0.40)
+    )
+    min_gap = max(2.0 * tick, pct_floor, atr_floor)
+    rounded = _round_to_tick(desired_sl)
+    if pos_side == "long":
+        return rounded if rounded < current_price - min_gap else None
+    return rounded if rounded > current_price + min_gap else None
 
 def _sigmoid(z: float, steepness: float = 1.0) -> float:
     return max(-1.0, min(1.0, z * steepness / (1.0 + abs(z * steepness) * 0.5)))
@@ -2316,6 +2338,9 @@ class PositionState:
     # Updated every trail tick so set_exit_context() can use the true value
     # rather than the SL-distance approximation.
     peak_adverse:  float = 0.0
+    pool_gate_reverse_signaled_at: float = 0.0
+    pool_gate_reverse_regime_key:  str = ""
+    pool_gate_reverse_attempts:    int = 0
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -2519,7 +2544,10 @@ class QuantStrategy:
 
         # -- v9.0: New liquidity-first engines --
         self._liq_map = LiquidityMap() if _LIQ_MAP_AVAILABLE else None
-        self._entry_engine = EntryEngine() if _ENTRY_ENGINE_AVAILABLE else None
+        self._entry_engine = (
+            EntryEngine(on_self_recovery=self._on_entry_engine_self_recovery)
+            if _ENTRY_ENGINE_AVAILABLE else None
+        )
         self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
 
         # â”€â”€ ISSUE-4 FIX: Conviction Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2748,6 +2776,26 @@ class QuantStrategy:
             return True, ratio
         except Exception:
             return True, 0.0
+
+    def _on_entry_engine_self_recovery(self, state_name: str, age_sec: float) -> None:
+        """Surface EntryEngine self-recovery and clear stale reconcile latches."""
+        logger.warning(
+            f"EntryEngine self-recovered from {state_name} after {age_sec:.0f}s; "
+            "strategy reconcile latches cleared"
+        )
+        try:
+            self._reconcile_pending = False
+            self._reconcile_data = None
+        except Exception:
+            pass
+        try:
+            send_telegram_message(
+                f"⚠️ <b>ENTRY ENGINE SELF-RECOVERY</b>\n"
+                f"State: {state_name} for {age_sec:.0f}s\n"
+                f"Reconcile latches cleared; next tick will re-evaluate state."
+            )
+        except Exception:
+            pass
 
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
         # â”€â”€ Bug 1 fix: locked section is non-blocking â€” only state reads/writes.
@@ -4156,6 +4204,18 @@ class QuantStrategy:
                 logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
 
         # Step 7: Feed to entry engine
+        _regime_key = (
+            str(getattr(ict_ctx, "amd_phase", "")),
+            str(getattr(ict_ctx, "amd_bias", "")),
+            round(float(getattr(self._htf, "trend_15m", 0.0)), 1),
+            round(float(getattr(self._htf, "trend_4h", 0.0)), 1),
+        )
+        _prev_regime_key = getattr(self, "_entry_engine_regime_key", None)
+        if (_prev_regime_key is not None and _prev_regime_key != _regime_key
+                and hasattr(self._entry_engine, "invalidate_sweep_locks")):
+            self._entry_engine.invalidate_sweep_locks("regime_change")
+        self._entry_engine_regime_key = _regime_key
+
         self._entry_engine.update(
             liq_snapshot=liq_snapshot,
             flow_state=flow_state,
@@ -5320,35 +5380,36 @@ class QuantStrategy:
             f"  (structure context)")
 
         # Tier
-        _tier_labels = {"S": "ðŸ¥‡ Tier-S â€” OTE Sweep-and-Go",
-                        "A": "ðŸ¥ˆ Tier-A â€” ICT Structural",
-                        "B": "ðŸ¥‰ Tier-B â€” Quant+ICT Confluence",
-                        "":  "âšª No ICT tier"}
+        _tier_labels = {"S": "🥇 Tier-S — OTE Sweep-and-Go",
+                        "A": "🥈 Tier-A — ICT Structural",
+                        "B": "🥉 Tier-B — Quant+ICT Confluence",
+                        "":  "⚪ No ICT tier"}
         _tier_badge = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
 
         # Side icon
-        _side_icon = "ðŸŸ¢" if side == "long" else "ðŸ”´"
+        _side_icon = "🟢" if side == "long" else "🔴"
 
         # Trail plan for "what's next"
         _trail_plan = (
-            "BOS confirmed â†’ P1 swing trail"
-            " â†’ CHoCH tighten (P2)"
-            " â†’ 15m structure (P3 at 1.5R+)")
-        _ratchet_plan = "BE @0.5R â†’ +0.15R@1R â†’ +0.5R@1.5R â†’ +1R@2R â†’ trailing@2.5R+"
+            "BOS confirmed -> P1 swing trail"
+            " -> CHoCH tighten (P2)"
+            " -> 15m structure (P3 at 1.5R+)")
+        _ratchet_plan = "BE @0.5R -> +0.15R@1R -> +0.5R@1.5R -> +1R@2R -> trailing@2.5R+"
+        _sep = "-" * 30
 
         send_telegram_message(
-            f"{_side_icon} <b>{side.upper()} ENTERED â€” {_et_label}</b>\n"
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-            f"<b>ðŸ’° LEVELS</b>\n"
+            f"{_side_icon} <b>{side.upper()} ENTERED - {_et_label}</b>\n"
+            f"{_sep}\n"
+            f"<b>💰 LEVELS</b>\n"
             f"Entry:    <b>${fill_price:,.2f}</b>\n"
             f"SL:       ${sl_price:,.2f}"
-            f"  (âˆ’${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}Ã—ATR)\n"
+            f"  (-${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}xATR)\n"
             f"TP:       ${tp_price:,.2f}"
-            f"  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}Ã—ATR)\n"
-            f"R:R:      1:{rr_a:.2f}  â”‚  Risk: ${dollar_risk:.2f} USDT\n"
+            f"  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}xATR)\n"
+            f"R:R:      1:{rr_a:.2f}  |  Risk: ${dollar_risk:.2f} USDT\n"
             f"Qty:      {qty:.4f} BTC\n"
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-            f"<b>ðŸŽ¯ WHY WE ENTERED</b>\n"
+            f"{_sep}\n"
+            f"<b>🎯 WHY WE ENTERED</b>\n"
             f"Pool TP:  {_pool_tp_str}"
             f"{_swept_str}\n"
             f"Reason:   {_entry_reason}\n"
@@ -5357,11 +5418,11 @@ class QuantStrategy:
             f"{_amd_str}"
             f"{_ict_in_ote_str}"
             f"{_htf_str}\n"
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-            f"<b>â© WHAT'S NEXT</b>\n"
+            f"{_sep}\n"
+            f"<b>WHAT'S NEXT</b>\n"
             f"Trail:    {_trail_plan}\n"
             f"Ratchet:  {_ratchet_plan}\n"
-            f"Exits:    SL hit â”‚ TP (pool) hit â”‚ Regime flip â”‚ Max-hold\n"
+            f"Exits:    SL hit | TP (pool) hit | Regime flip | Max-hold\n"
             f"Monitor:  /position  or  /thinking"
         )
         logger.info(
@@ -5500,10 +5561,28 @@ class QuantStrategy:
                         _calc_be_price(pos.side, pos.entry_price,
                                        self._atr_5m.atr if self._atr_5m else 1.0,
                                        pos=pos))
+                    _safe_be_tick = _safe_be_migration_price(
+                        pos.side, _be_tick, price,
+                        self._atr_5m.atr if self._atr_5m else 0.0)
                     _be_needed = (
-                        (pos.side == "long"  and pos.sl_price < _be_tick) or
-                        (pos.side == "short" and pos.sl_price > _be_tick)
+                        _safe_be_tick is not None and
+                        ((pos.side == "long"  and pos.sl_price < _safe_be_tick) or
+                         (pos.side == "short" and pos.sl_price > _safe_be_tick))
                     )
+                    if _safe_be_tick is None:
+                        _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
+                        _gap_atr = abs(price - _be_tick) / max(_atr_now, 1e-10)
+                        _key = f"{pos.side}:{round(pos.entry_price, 1)}:{_gate.reason[:60]}"
+                        if (_key != pos.pool_gate_reverse_regime_key or
+                                now - pos.pool_gate_reverse_signaled_at >= 30.0):
+                            with self._lock:
+                                pos.pool_gate_reverse_regime_key = _key
+                                pos.pool_gate_reverse_signaled_at = now
+                                pos.pool_gate_reverse_attempts += 1
+                            logger.warning(
+                                f"POOL-GATE BE blocked: desired=${_be_tick:,.2f} "
+                                f"price=${price:,.2f} gap={_gap_atr:.2f}ATR; "
+                                "too close to market, existing SL/TP remains protected")
                     if _be_needed and pos.sl_order_id and not pos.be_ratchet_applied:
                         try:
                             _es = "sell" if pos.side == "long" else "buy"
@@ -5511,8 +5590,9 @@ class QuantStrategy:
                                 existing_sl_order_id = pos.sl_order_id,
                                 side                 = _es,
                                 quantity             = pos.quantity,
-                                new_trigger_price    = _be_tick,
+                                new_trigger_price    = _safe_be_tick,
                                 old_trigger_price    = pos.sl_price,
+                                current_price        = price,
                             )
                             if _be_result is None:
                                 # replace_stop_loss returning None means SL already
@@ -5549,18 +5629,18 @@ class QuantStrategy:
                                     f"(requested ${_be_tick:,.2f}).")
                             elif isinstance(_be_result, dict) and "error" not in _be_result:
                                 with self._lock:
-                                    pos.sl_price           = _be_tick
+                                    pos.sl_price           = _safe_be_tick
                                     pos.sl_order_id        = (_be_result.get("order_id")
                                                               or pos.sl_order_id)
                                     pos.be_ratchet_applied = True
-                                    self.current_sl_price  = _be_tick
+                                    self.current_sl_price  = _safe_be_tick
                                 logger.info(
                                     f"ðŸ”’ POOL-GATE REVERSE â†’ SL migrated to BE "
-                                    f"${_be_tick:,.2f} (no exit; bracket manages)")
+                                    f"${_safe_be_tick:,.2f} (no exit; bracket manages)")
                                 send_telegram_message(
                                     f"âš ï¸ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
                                     f"Pool hit with contra AMD flow â€” <b>no exit taken</b>\n"
-                                    f"SL migrated to breakeven: <b>${_be_tick:,.2f}</b>\n"
+                                    f"SL migrated to breakeven: <b>${_safe_be_tick:,.2f}</b>\n"
                                     f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                             else:
                                 logger.debug(
@@ -6041,6 +6121,7 @@ class QuantStrategy:
             quantity             = pos.quantity,
             new_trigger_price    = _new_liq_sl,
             old_trigger_price    = pos.sl_price,
+            current_price        = price,
         )
         if _lt_result is None:
             # replace_stop_loss returns None ONLY when it verified the SL
@@ -6438,18 +6519,13 @@ class QuantStrategy:
             and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
         )
 
-        if _is_delta and fill_price > 0:
-            # Exact inverse-perpetual formula for Delta BTCUSD (1 USD per contract)
-            usd_contracts = pos.quantity * pos.entry_price
-            if pos.side == "long":
-                gross_btc = usd_contracts * (1.0 / pos.entry_price - 1.0 / fill_price)
-            else:
-                gross_btc = usd_contracts * (1.0 / fill_price - 1.0 / pos.entry_price)
-            gross = gross_btc * fill_price
-        else:
-            # Linear (USDT-margined) â€” CoinSwitch or fill_price unavailable
-            gross = ((fill_price - pos.entry_price) if pos.side == "long"
-                     else (pos.entry_price - fill_price)) * pos.quantity
+        gross = gross_pnl_usd(
+            pos.side,
+            pos.entry_price,
+            fill_price,
+            pos.quantity,
+            inverse=bool(_is_delta and fill_price > 0),
+        )
 
         # Entry fee: prefer exact paid_commission captured at entry (v8.1).
         # Fallback: commission_rate Ã— entry_notional (rate-exact, value estimated).
@@ -7086,35 +7162,15 @@ class QuantStrategy:
         exit_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
                      if _is_delta else QCfg.COMMISSION_RATE())
 
-        if _is_delta:
-            # Exact inverse-perpetual PnL for Delta BTCUSD (1 USD per contract)
-            # usd_contracts = how many $1 contracts needed to hold qty_btc exposure
-            usd_contracts = pos.quantity * pos.entry_price
-            if pos.side == "long":
-                # LONG: profit when exit > entry
-                gross_btc = usd_contracts * (1.0 / pos.entry_price - 1.0 / exit_price)
-            else:
-                # SHORT: profit when exit < entry
-                gross_btc = usd_contracts * (1.0 / exit_price - 1.0 / pos.entry_price)
-            gross = gross_btc * exit_price   # BTC profit â†’ USD at exit price
-            # Fee basis: qty_btc Ã— price (standard, matches exchange invoice)
-            entry_fee = pos.entry_price * pos.quantity * entry_rate
-            exit_fee  = exit_price      * pos.quantity * exit_rate
-            # Sanity: verify against linear approximation (should differ by < 0.1% for |Î”|<3%)
-            _linear = ((exit_price - pos.entry_price) if pos.side == "long"
-                       else (pos.entry_price - exit_price)) * pos.quantity
-            if abs(_linear) > 1e-10:
-                _discrepancy_pct = abs(gross - _linear) / abs(_linear)
-                if _discrepancy_pct > 0.005:   # > 0.5% discrepancy â†’ log as warning
-                    logger.warning(
-                        f"PnL sanity: inverse={gross:.4f} linear={_linear:.4f} "
-                        f"discrepancy={_discrepancy_pct:.3%} â€” large move detected")
-        else:
-            # Linear (USDT-margined, CoinSwitch) â€” standard formula
-            gross     = ((exit_price - pos.entry_price) if pos.side == "long"
-                         else (pos.entry_price - exit_price)) * pos.quantity
-            entry_fee = pos.entry_price * pos.quantity * entry_rate
-            exit_fee  = exit_price      * pos.quantity * exit_rate
+        gross = gross_pnl_usd(
+            pos.side,
+            pos.entry_price,
+            exit_price,
+            pos.quantity,
+            inverse=bool(_is_delta),
+        )
+        entry_fee = pos.entry_price * pos.quantity * entry_rate
+        exit_fee  = exit_price      * pos.quantity * exit_rate
 
         net_pnl = gross - entry_fee - exit_fee
         logger.debug(

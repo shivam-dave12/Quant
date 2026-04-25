@@ -223,7 +223,9 @@ class LiquidityPool:
         """
         base        = float(self.tf_rank)
         touch_bonus = min(float(self.touches - 1), 5.0)
-        htf_mult    = _HTF_CONFLUENCE_MULT if self.htf_count >= 2 else 1.0
+        htf_mult    = 1.0 + math.log1p(max(self.htf_count - 1, 0)) * (
+            _HTF_CONFLUENCE_MULT - 1.0
+        )
         structural  = 0.0
         if self.ob_aligned:
             structural += 2.0
@@ -231,7 +233,8 @@ class LiquidityPool:
             structural += 1.0
         max_age           = _POOL_MAX_AGE.get(self.timeframe, 7200)
         age               = time.time() - self.created_at
-        freshness_penalty = -1.0 if age > max_age * 0.5 else 0.0
+        age_ratio = max(0.0, min(age / max(max_age, 1.0), 2.0))
+        freshness_penalty = -1.0 * (age_ratio ** 1.7)
         raw = (base + touch_bonus + structural + freshness_penalty) * htf_mult
         return max(0.1, raw)
 

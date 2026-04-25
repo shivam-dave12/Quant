@@ -23,6 +23,7 @@ from collections import deque
 
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
+from core.pnl import gross_pnl_usd
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class RiskManager:
         self.balance_cache_time    = 0.0
         self.balance_cache_ttl     = config.BALANCE_CACHE_TTL_SEC
         self._balance_fetch_in_progress = False
+        self._balance_fetch_started_at = 0.0
 
         # Daily reset (IST UTC+5:30)
         self._IST = timezone(timedelta(hours=5, minutes=30))
@@ -119,6 +121,16 @@ class RiskManager:
         """
         with self._lock:
             now = time.time()
+            fetch_timeout = float(getattr(config, "BALANCE_FETCH_LOCK_TIMEOUT_SEC", 45.0))
+            if (self._balance_fetch_in_progress
+                    and self._balance_fetch_started_at > 0
+                    and now - self._balance_fetch_started_at > fetch_timeout):
+                logger.warning(
+                    "Balance fetch flag stale for %.1fs; clearing and retrying",
+                    now - self._balance_fetch_started_at,
+                )
+                self._balance_fetch_in_progress = False
+                self._balance_fetch_started_at = 0.0
             if now - self.balance_cache_time < self.balance_cache_ttl:
                 return {
                     "available": self.available_balance,
@@ -134,6 +146,7 @@ class RiskManager:
             if self.api is None:
                 return None
             self._balance_fetch_in_progress = True
+            self._balance_fetch_started_at = now
             _fallback_avail = self.available_balance
             _fallback_total = self.current_balance
 
@@ -144,6 +157,7 @@ class RiskManager:
             if balance_data is None:
                 with self._lock:
                     self._balance_fetch_in_progress = False
+                    self._balance_fetch_started_at = 0.0
                 return {"available": _fallback_avail, "total": _fallback_total,
                         "cached": True, "error": "null response"}
 
@@ -151,6 +165,7 @@ class RiskManager:
                 logger.error(f"Balance fetch error: {balance_data['error']}")
                 with self._lock:
                     self._balance_fetch_in_progress = False
+                    self._balance_fetch_started_at = 0.0
                 return {"available": _fallback_avail, "total": _fallback_total,
                         "cached": True, "error": balance_data["error"]}
 
@@ -163,6 +178,7 @@ class RiskManager:
                 self.current_balance   = total
                 self.balance_cache_time = time.time()
                 self._balance_fetch_in_progress = False
+                self._balance_fetch_started_at = 0.0
                 if self.initial_balance == 0.0:
                     self.initial_balance = total
                     logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
@@ -173,6 +189,7 @@ class RiskManager:
             logger.error(f"Error fetching balance: {e}", exc_info=True)
             with self._lock:
                 self._balance_fetch_in_progress = False
+                self._balance_fetch_started_at = 0.0
             return {"available": _fallback_avail, "total": _fallback_total,
                     "cached": True, "error": str(e)}
 
@@ -244,7 +261,12 @@ class RiskManager:
             # margin leaves less than the maker+taker round-trip fee.
             # Reserve: 2× taker rate (worst case) × 1.15 safety margin.
             _taker_rate = float(getattr(config, "COMMISSION_RATE", 0.00055))
-            _max_notional = available * float(config.LEVERAGE)
+            _max_allowed_margin = min(
+                available * (float(config.BALANCE_USAGE_PERCENTAGE) / 100.0),
+                float(config.MAX_MARGIN_PER_TRADE),
+            )
+            _max_allowed_margin = max(_max_allowed_margin, float(config.MIN_MARGIN_PER_TRADE))
+            _max_notional = _max_allowed_margin * float(config.LEVERAGE)
             _fee_budget   = _max_notional * _taker_rate * 2.0 * 1.15
             available_after_fees = max(0.0, available - _fee_budget)
             if available_after_fees < config.MIN_MARGIN_PER_TRADE:
@@ -281,6 +303,29 @@ class RiskManager:
                 return None
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
+
+            leverage = max(float(config.LEVERAGE), 1.0)
+            maint_margin = float(getattr(config, "MAINTENANCE_MARGIN_RATE", 0.005))
+            liq_buffer = float(getattr(config, "LIQUIDATION_BUFFER_PCT", 0.005))
+            liq_move = max((1.0 / leverage) - maint_margin, 0.0)
+            if side == "LONG":
+                liq_price = entry_price * (1.0 - liq_move)
+                min_safe_sl = liq_price * (1.0 + liq_buffer)
+                if stop_loss <= min_safe_sl:
+                    logger.error(
+                        "SL fails liquidation sanity: LONG SL %.2f <= liq+buffer %.2f",
+                        stop_loss, min_safe_sl,
+                    )
+                    return None
+            else:
+                liq_price = entry_price * (1.0 + liq_move)
+                max_safe_sl = liq_price * (1.0 - liq_buffer)
+                if stop_loss >= max_safe_sl:
+                    logger.error(
+                        "SL fails liquidation sanity: SHORT SL %.2f >= liq-buffer %.2f",
+                        stop_loss, max_safe_sl,
+                    )
+                    return None
 
             # ── Step 1: Dollar risk budget (based on fee-adjusted balance) ─
             # CFG-1 fix: RISK_PER_TRADE is now a FRACTION (0.006 = 0.6%) per
@@ -391,9 +436,14 @@ class RiskManager:
 
             # ── Min time between trades ───────────────────────────────────────
             time_since_last = now - self.last_trade_time
+            min_trade_gap_sec = float(getattr(
+                config,
+                "MIN_TIME_BETWEEN_TRADES_SEC",
+                float(config.MIN_TIME_BETWEEN_TRADES) * 60.0,
+            ))
             if (self.last_trade_time > 0 and
-                    time_since_last < config.MIN_TIME_BETWEEN_TRADES * 60):
-                remaining = int(config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
+                    time_since_last < min_trade_gap_sec):
+                remaining = int(min_trade_gap_sec - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
             # ── Loss cooldown — Bug #3 fix ────────────────────────────────────
@@ -444,8 +494,9 @@ class RiskManager:
             # ── Consecutive losses ────────────────────────────────────────────
             if self.consecutive_losses >= self.max_consecutive_losses:
                 hours_since_last = (now - self.last_trade_time) / 3600
-                AUTO_RESET_HOURS = 0.5  # 30 min auto-reset (was 4 hours)
-                if self.last_trade_time > 0 and hours_since_last >= AUTO_RESET_HOURS:
+                AUTO_RESET_HOURS = float(getattr(config, "CONSEC_LOSS_AUTO_RESET_HOURS", 2.0))
+                allow_auto_reset = bool(getattr(config, "ALLOW_TIME_BASED_CONSEC_LOSS_RESET", False))
+                if allow_auto_reset and self.last_trade_time > 0 and hours_since_last >= AUTO_RESET_HOURS:
                     logger.warning(
                         f"Consecutive losses auto-reset: {self.consecutive_losses} losses "
                         f"but {hours_since_last:.1f}h elapsed (> {AUTO_RESET_HOURS}h). "
@@ -454,9 +505,14 @@ class RiskManager:
                     self.consecutive_losses = 0
                 else:
                     remaining_m = max(0.0, (AUTO_RESET_HOURS - hours_since_last) * 60)
+                    reset_hint = (
+                        f"auto-reset in {remaining_m:.0f}m"
+                        if allow_auto_reset else
+                        "operator reset or day boundary required"
+                    )
                     return False, (
                         f"Max consecutive losses ({self.consecutive_losses}) — "
-                        f"auto-reset in {remaining_m:.0f}m or at day boundary"
+                        f"{reset_hint}"
                     )
 
             return True, "OK"
@@ -503,33 +559,14 @@ class RiskManager:
             if pnl_override is not None:
                 pnl = float(pnl_override)
             else:
-                if side.upper() == "LONG":
-                    gross_pnl = (exit_price - entry_price) * quantity
-                else:
-                    gross_pnl = (entry_price - exit_price) * quantity
-
-                # Bug #6 fix: Delta uses an INVERSE perpetual where the
-                # contract is denominated in USD and settled in BTC.
-                # For an inverse perp, the linear formula is an approximation
-                # that overstates PnL when the move is large.
-                # Correct formula (inverse perp):
-                #   gross_pnl = (1/entry_price − 1/exit_price) × quantity × contract_value_usd
-                # Delta BTCUSD contract_value = $1 (1 USD per contract).
-                # quantity here is in BTC (converted by order_manager), so:
-                #   gross_pnl_usd = quantity × entry_price × (exit_price/entry_price − 1) × (entry_price/exit_price)
-                # which simplifies to the linear formula only when entry≈exit.
-                # For now we apply a correction factor when the exchange is Delta inverse.
-                _is_inverse = str(getattr(config, "EXCHANGE", "")).lower() == "delta"
-                if _is_inverse and entry_price > 1e-10 and exit_price > 1e-10:
-                    # True inverse PnL in USD terms.
-                    # Derivation: position = quantity BTC × entry_price USD/BTC contracts
-                    # Entry value in BTC = quantity; exit value in BTC = quantity × entry/exit
-                    # PnL in USD = (entry - exit) × quantity / exit  [SHORT]
-                    # PnL in USD = (exit - entry) × quantity / exit  [LONG] — per BTC value at exit
-                    if side.upper() == "LONG":
-                        gross_pnl = quantity * entry_price * (1.0/entry_price - 1.0/exit_price)
-                    else:
-                        gross_pnl = quantity * entry_price * (1.0/exit_price - 1.0/entry_price)
+                _is_inverse = str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
+                gross_pnl = gross_pnl_usd(
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    quantity_btc=quantity,
+                    inverse=_is_inverse,
+                )
 
                 fee_rate   = getattr(config, "COMMISSION_RATE", 0.00055)
                 commission = (entry_price + exit_price) * quantity * fee_rate

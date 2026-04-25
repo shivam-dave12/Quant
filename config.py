@@ -51,21 +51,24 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.02     # 2% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
-MAX_DAILY_LOSS_PCT       = 5.0       # day circuit breaker (relaxed)
+MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 5         # allow more losses before lockout
+MAX_CONSECUTIVE_LOSSES   = 4
 MAX_DAILY_TRADES         = 30        # allow more trades per day
 ONE_POSITION_AT_A_TIME   = True
-MIN_TIME_BETWEEN_TRADES  = 0.5       # 30 seconds between trades
+MIN_TIME_BETWEEN_TRADES  = 0.5       # minutes; legacy alias for 30 seconds
+MIN_TIME_BETWEEN_TRADES_SEC = 30.0
 TRADE_COOLDOWN_SECONDS   = 30        # 30s cooldown after loss
-MIN_RISK_REWARD_RATIO    = 1.2       # allow tighter setups
+MIN_RISK_REWARD_RATIO    = 1.5       # institutional floor; reject thin R:R setups
 TARGET_RISK_REWARD_RATIO = 2.0
 MAX_RR_RATIO             = 20.0
 
 # ── Order execution ───────────────────────────────────────────────────────────
-TICK_SIZE                        = 0.1
+TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
+TICK_SIZE_DELTA                  = 0.5
+TICK_SIZE_COINSWITCH             = 0.1
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -137,6 +140,34 @@ RATE_LIMIT_ORDERS        = 15
 
 # ── SL infrastructure ─────────────────────────────────────────────────────────
 SL_LIMIT_OFFSET_TICKS    = 20
+
+def get_tick_size(exchange: str | None = None) -> float:
+    """Authoritative tick-size lookup for execution-sensitive price rounding."""
+    ex = (exchange or EXECUTION_EXCHANGE or "").lower()
+    if ex == "delta":
+        return float(TICK_SIZE_DELTA)
+    if ex == "coinswitch":
+        return float(TICK_SIZE_COINSWITCH)
+    return float(TICK_SIZE)
+
+
+def validate_config() -> None:
+    """Fail fast on inconsistent trading-risk configuration."""
+    errors = []
+    if MIN_RISK_REWARD_RATIO < 1.5:
+        errors.append("MIN_RISK_REWARD_RATIO must be >= 1.5")
+    if abs(CONVICTION_MIN_RR - MIN_RISK_REWARD_RATIO) > 1e-9:
+        errors.append("CONVICTION_MIN_RR must match MIN_RISK_REWARD_RATIO")
+    if abs(QUANT_REVERSION_MIN_RR - MIN_RISK_REWARD_RATIO) > 1e-9:
+        errors.append("QUANT_REVERSION_MIN_RR must match MIN_RISK_REWARD_RATIO")
+    if get_tick_size() <= 0:
+        errors.append("tick size must be positive")
+    if MAX_DAILY_LOSS_PCT <= 0 or MAX_DAILY_LOSS_PCT > 10:
+        errors.append("MAX_DAILY_LOSS_PCT must be in (0, 10]")
+    if errors:
+        raise ValueError("Invalid config: " + "; ".join(errors))
+
+
 SL_BUFFER_TICKS          = 5
 MIN_SL_DISTANCE_PCT      = 0.004     # BTC@$66K = $264 min SL distance
 MAX_SL_DISTANCE_PCT      = 0.035
@@ -234,7 +265,7 @@ QUANT_TREND_COMPOSITE_MIN      = 0.35
 QUANT_TREND_CONFIRM_TICKS      = 3
 QUANT_TREND_CHANDELIER_N       = 1.5
 QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # more spread tolerance
-QUANT_REVERSION_MIN_RR         = 1.2      # lowered to allow more setups
+QUANT_REVERSION_MIN_RR         = 1.5      # single authoritative R:R floor
 QUANT_REVERSION_MAX_RR         = 5.0
 QUANT_TREND_MIN_RR             = 1.2
 QUANT_TREND_MAX_RR             = 5.0
@@ -318,7 +349,8 @@ CONVICTION_POOL_MIN_TF_RANK        = 1       # allow all TF pools
 CONVICTION_DISPLACEMENT_BODY_ATR   = 0.40    # lower displacement requirement
 CONVICTION_OTE_FIB_LOW             = 0.382
 CONVICTION_OTE_FIB_HIGH            = 0.886
-CONVICTION_MIN_RR                  = 1.2     # match risk management R:R
+CONVICTION_MIN_RR                  = 1.5     # match risk management R:R
+CONVICTION_PRODUCT_MIN_CORE        = 0.45    # pool/displacement/CISD must each be real
 CONVICTION_MAX_SESSION_LOSSES      = 5       # allow more losses per session
 CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 10      # 10s pacing (on_tick cooldown is primary)
 CONVICTION_MAX_ENTRIES_PER_SESSION = 20      # allow many entries per session
@@ -348,3 +380,5 @@ QUANT_CHOCH_EXPIRY_BARS = 10
 
 # ── Legacy alias ──────────────────────────────────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE
+
+validate_config()

@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
@@ -80,7 +81,11 @@ _CISD_MAX_WAIT_SEC   = 360
 _ENTRY_COOLDOWN_SEC  = 10.0   # faster re-entry
 
 # SL / TP
-_MIN_RR_RATIO       = 1.2    # match config MIN_RISK_REWARD_RATIO
+try:
+    import config as _cfg
+    _MIN_RR_RATIO = float(getattr(_cfg, "MIN_RISK_REWARD_RATIO", 1.5))
+except Exception:
+    _MIN_RR_RATIO = 1.5
 _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
@@ -315,9 +320,10 @@ class _PostSweepState:
 class EntryEngine:
     """Institutional sweep-only entry engine."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_self_recovery=None) -> None:
         self._state          = EngineState.SCANNING
         self._state_entered  = time.time()
+        self._on_self_recovery = on_self_recovery
         self._signal:        Optional[EntrySignal]     = None
         self._post_sweep:    Optional[_PostSweepState] = None
         self._last_entry_at  = 0.0
@@ -406,6 +412,7 @@ class EntryEngine:
         # {"stale": int, "low_quality": int, "processed": int}
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
+        self._sweep_quality_hist = defaultdict(lambda: deque(maxlen=200))
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -452,6 +459,11 @@ class EntryEngine:
                 logger.warning(
                     f"Engine SELF-RECOVERY: stuck in {self._state.name} "
                     f"for {now - self._state_entered:.0f}s")
+                if self._on_self_recovery is not None:
+                    try:
+                        self._on_self_recovery(self._state.name, now - self._state_entered)
+                    except Exception as e:
+                        logger.debug(f"EntryEngine self-recovery callback failed: {e}")
                 self._reset(now)
 
     def get_signal(self) -> Optional[EntrySignal]:
@@ -854,6 +866,28 @@ class EntryEngine:
         """Return True if sweep is within its processed-sweep hold window."""
         return self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now
 
+    def invalidate_sweep_locks(self, reason: str = "regime_change") -> int:
+        """Clear processed sweep locks when the market regime materially changes."""
+        n = len(self._processed_sweeps)
+        self._processed_sweeps.clear()
+        self._gate_blocked_until = 0.0
+        self._gate_block_key = ()
+        if n:
+            logger.info(f"EntryEngine sweep locks invalidated ({n}) reason={reason}")
+        return n
+
+    def _tf_quality_threshold(self, tf: str) -> float:
+        """Adaptive TF-quality gate based on recent accepted/rejected sweep quality."""
+        bootstrap = {'1m': 0.35, '5m': 0.30, '15m': 0.24, '4h': 0.20, '1h': 0.22, '1d': 0.18}
+        hist = list(self._sweep_quality_hist[tf])
+        if len(hist) < 30:
+            return bootstrap.get(tf, 0.25)
+        hist.sort()
+        # Keep roughly the top 40% of each timeframe's own quality distribution.
+        idx = min(len(hist) - 1, max(0, int(len(hist) * 0.60)))
+        dynamic = hist[idx]
+        return max(0.18, min(0.55, dynamic))
+
     def _find_ict_event(self, sweep, ict_ctx, atr) -> Optional[ICTSweepEvent]:
         for ev in (getattr(ict_ctx, 'ict_sweeps', None) or []):
             if abs(ev.pool_price - sweep.pool.price) < atr * 0.1:
@@ -1015,17 +1049,10 @@ class EntryEngine:
 
     def _enter_post_sweep(self, sweep, snap, flow, ict, price, atr, now,
                           ict_event=None) -> None:
-        # FIX-TF-QUALITY: Thresholds previously had a dangerous gap vs
-        # _MIN_SWEEP_QUALITY (0.15).  Any 5m sweep with quality 0.15–0.54
-        # passed _collect_sweeps but was silently rejected here and locked out
-        # for 60s with NO log entry — the primary cause of "engine stuck in
-        # SCANNING after first trade".  Thresholds are now aligned downward to
-        # reflect the actual quality range produced by the sweep-detection
-        # pipeline (ICT bridge max = 0.85; typical non-wick sweep ≈ 0.35–0.55).
-        # Lower-TF sweeps still require more quality than higher-TF sweeps.
-        tf_quality = {'1m': 0.45, '5m': 0.35, '15m': 0.25, '4h': 0.20}
         tf = getattr(sweep.pool, 'timeframe', '5m')
-        if sweep.quality < tf_quality.get(tf, 0.25):
+        self._sweep_quality_hist[tf].append(float(sweep.quality))
+        required_quality = self._tf_quality_threshold(tf)
+        if sweep.quality < required_quality:
             # EE-4 FIX: register the rejected sweep in _processed_sweeps so
             # _collect_sweeps() doesn't re-present it every 250ms for the full
             # 60s detection window. 60s hold matches the detection window
@@ -1037,7 +1064,7 @@ class EntryEngine:
             logger.warning(
                 f"SWEEP REJECTED (tf_quality): {sweep.pool.side.value} "
                 f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
-                f"required={tf_quality.get(tf, 0.25):.2f} tf={tf} "
+                f"required={required_quality:.2f} tf={tf} "
                 f"→ locked 60s"
             )
             return

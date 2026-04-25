@@ -585,20 +585,24 @@ class CircuitBreaker:
     def __init__(self, strategy: Any,
                  heal_log: HealActionLog,
                  notifier: Optional[Callable[[str], Any]] = None,
-                 runaway_heal_threshold: int = 6,
-                 runaway_window_sec: float = 300.0):
+                 runaway_heal_threshold: int = 15,
+                 runaway_window_sec: float = 300.0,
+                 open_duration_sec: float = 300.0):
         self._strategy = strategy
         self._heal_log = heal_log
         self._notify = notifier
         self._runaway_n = int(runaway_heal_threshold)
         self._runaway_window = float(runaway_window_sec)
+        self._open_duration = float(open_duration_sec)
         self._engaged = False
         self._engaged_at: Optional[float] = None
         self._reason: Optional[str] = None
+        self._state = "CLOSED"
         self._lock = threading.Lock()
 
     @property
     def engaged(self) -> bool:
+        self._maybe_half_open()
         return self._engaged
 
     @property
@@ -615,6 +619,24 @@ class CircuitBreaker:
         except Exception as e:  # noqa: BLE001
             logger.error("watchdog: unable to set watchdog_trading_frozen: %s", e)
 
+    def _maybe_half_open(self) -> None:
+        with self._lock:
+            if (not self._engaged or self._engaged_at is None or
+                    _now() - self._engaged_at < self._open_duration):
+                return
+            prev_reason = self._reason
+            self._engaged = False
+            self._state = "HALF_OPEN"
+            self._reason = f"HALF_OPEN probe after: {prev_reason}"
+            self._engaged_at = None
+        self._set_strategy_flag(False)
+        msg = (f"⚠️ <b>WATCHDOG CIRCUIT BREAKER HALF-OPEN</b>\n"
+               f"Prior reason: {prev_reason}\n"
+               f"Entries are allowed for probe; breaker will re-trip on new criticals.")
+        logger.warning(msg.replace("<b>", "").replace("</b>", ""))
+        if self._notify is not None:
+            _safe_call(self._notify, msg)
+
     def trip(self, reason: str, auto: bool = False) -> None:
         with self._lock:
             if self._engaged:
@@ -622,6 +644,7 @@ class CircuitBreaker:
             self._engaged = True
             self._engaged_at = _now()
             self._reason = reason
+            self._state = "OPEN"
         self._set_strategy_flag(True)
         mode = "AUTO" if auto else "MANUAL"
         msg = (f"🛑 <b>WATCHDOG CIRCUIT BREAKER — {mode}</b>\n"
@@ -656,6 +679,7 @@ class CircuitBreaker:
             prev_reason = self._reason
             self._reason = None
             self._engaged_at = None
+            self._state = "CLOSED"
         self._set_strategy_flag(False)
         msg = (f"✅ <b>WATCHDOG CIRCUIT BREAKER CLEARED</b>\n"
                f"Cleared by: {operator}\n"
@@ -694,6 +718,7 @@ class HealthCheck:
     category: str = "L?_UNKNOWN"
     interval_sec: float = 5.0
     heal_confirmations: int = 3
+    safe_when_breaker_engaged: bool = False
 
     def __init__(self, strategy: Any, router: Any = None,
                  data_manager: Any = None, risk_manager: Any = None,
@@ -849,6 +874,7 @@ class StuckExitCompletedFlagCheck(HealthCheck):
     category = "L1_STATE"
     interval_sec = 10.0
     heal_confirmations = 2
+    safe_when_breaker_engaged = True
     THRESH_SEC = 30.0
 
     def check(self) -> HealthResult:
@@ -892,6 +918,7 @@ class StuckPosSyncFlagCheck(HealthCheck):
     category = "L1_STATE"
     interval_sec = 15.0
     heal_confirmations = 2
+    safe_when_breaker_engaged = True
     THRESH_SEC = 120.0   # sync has a 30s REST timeout; 120s is ample
 
     def _sync_thread_alive(self, name_contains: str) -> bool:
@@ -935,6 +962,7 @@ class StuckExitSyncFlagCheck(HealthCheck):
     category = "L1_STATE"
     interval_sec = 15.0
     heal_confirmations = 2
+    safe_when_breaker_engaged = True
     THRESH_SEC = 180.0   # EXITING can legitimately take longer
 
     def _sync_thread_alive(self) -> bool:
@@ -971,6 +999,7 @@ class StuckTrailFlagCheck(HealthCheck):
     category = "L1_STATE"
     interval_sec = 15.0
     heal_confirmations = 2
+    safe_when_breaker_engaged = True
     THRESH_SEC = 60.0
 
     def check(self) -> HealthResult:
@@ -1004,6 +1033,7 @@ class StuckReconcilePendingCheck(HealthCheck):
     category = "L1_STATE"
     interval_sec = 20.0
     heal_confirmations = 2
+    safe_when_breaker_engaged = True
     THRESH_SEC = 180.0
 
     def check(self) -> HealthResult:
@@ -2757,7 +2787,7 @@ class Watchdog:
             return
 
         # Is the breaker engaged?
-        if self._breaker.engaged:
+        if self._breaker.engaged and not getattr(check, "safe_when_breaker_engaged", False):
             logger.warning(
                 "watchdog[%s] heal SUPPRESSED (breaker engaged): %s",
                 check.name, result.message,
