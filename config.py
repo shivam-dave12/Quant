@@ -382,3 +382,12 @@ QUANT_CHOCH_EXPIRY_BARS = 10
 EXCHANGE = COINSWITCH_EXCHANGE
 
 validate_config()
+
+# ── Pydantic schema validation (Arch fix — structured, typed, cross-field) ──────
+# Runs after validate_config() so both passes see the same constant values.
+# Raises ValueError with a precise field-level message on any inconsistency.
+# Downstream modules can use: from config_schema import cfg
+try:
+    from config_schema import cfg as _cfg_validated  # noqa: F401
+except ImportError:
+    pass  # config_schema.py not present; schema validation skipped

@@ -2616,6 +2616,16 @@ class QuantStrategy:
         # â”€â”€ Unified entry gate state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _set_adaptive_param_provider(self._post_trade_agent)
 
+        # Wire IC-gate Telegram notifier so PostTradeAgent can push alerts
+        # without importing quant_strategy (dependency inversion).
+        if self._post_trade_agent is not None and hasattr(
+            self._post_trade_agent, "set_ic_gate_notifier"
+        ):
+            try:
+                self._post_trade_agent.set_ic_gate_notifier(send_telegram_message)
+            except Exception:
+                pass
+
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
         self._log_init()
@@ -3517,6 +3527,20 @@ class QuantStrategy:
                 self._last_watchdog_freeze_log = now
                 logger.warning("Entries blocked: watchdog circuit breaker is engaged")
             return
+
+        # IC Circuit-Breaker gate
+        # PostTradeAgent trips this when rolling IC is statistically negative
+        # (signals are inversely predictive). Auto-unblocks after IC recovers.
+        if self._post_trade_agent is not None and hasattr(
+            self._post_trade_agent, "should_block_entry"
+        ):
+            _ic_blocked, _ic_reason = self._post_trade_agent.should_block_entry()
+            if _ic_blocked:
+                _ts = getattr(self, "_last_ic_gate_log", 0.0)
+                if now - _ts >= 60.0:
+                    self._last_ic_gate_log = now  # type: ignore[attr-defined]
+                    logger.warning("Entries blocked: IC gate engaged -- %s", _ic_reason)
+                return
 
         self._apply_post_trade_adaptive_params()
 

@@ -173,6 +173,17 @@ _CONSUMED_THRESHOLD_ATR = 0.5
 # check_consumed() has already promoted them to CONSUMED.
 _SWEPT_IN_BSL_MAX_AGE: float = 7_200.0   # 2 hours
 
+# Issue-2 FIX: Minimum time that must elapse after a pool is swept before a new
+# cluster at the same price level is allowed to create a fresh DETECTED pool.
+# Without this guard, each 1m REST refresh that adds new candles still clustering
+# near the swept level causes _merge_pools pass-1 to find no active match, and the
+# new-pool creation fallback spawns a fresh DETECTED pool at the same price.
+# check_sweeps() then re-detects a "new" sweep on that pool, generating a
+# SweepResult with a new detected_at timestamp that bypasses _processed_sweeps
+# (keyed on timestamp).  300s = one full 5m bar — long enough for genuine stop
+# re-accumulation to require new structural evidence before detection is allowed.
+_REBIRTH_MIN_AGE_SEC: float = 300.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -582,6 +593,31 @@ class _TimeframeRegistry:
                         f"${centroid:,.1f} (was {prev_status})"
                     )
                     break
+
+            if not matched:
+                # Issue-2 FIX: Before creating a new pool, check whether this
+                # cluster overlaps a RECENTLY swept pool in _swept_bsl/_swept_ssl.
+                # Swept pools are removed from _bsl/_ssl (Bug #43 fix) so pass 2's
+                # search through `merged` never finds them — causing a brand-new
+                # DETECTED pool to be spawned at the same price, which check_sweeps()
+                # then re-detects as a fresh sweep with a new detected_at, bypassing
+                # _processed_sweeps and producing duplicate signals every REST cycle.
+                # Solution: suppress new pool creation if any recently-swept pool
+                # (swept_at < _REBIRTH_MIN_AGE_SEC ago) sits within radius of this
+                # cluster.  After the cooldown the cluster will naturally form a
+                # genuine new pool reflecting authentic stop re-accumulation.
+                swept_list = self._swept_bsl if side == PoolSide.BSL else self._swept_ssl
+                for sp in swept_list:
+                    if (sp.swept_at > 0
+                            and now - sp.swept_at < _REBIRTH_MIN_AGE_SEC
+                            and abs(sp.price - centroid) <= radius):
+                        matched = True  # suppress new-pool creation at this level
+                        logger.debug(
+                            f"[{self.tf}] New pool suppressed (recently swept): "
+                            f"{side.value} ${centroid:,.1f} "
+                            f"swept {now - sp.swept_at:.0f}s ago "
+                            f"(cooldown={_REBIRTH_MIN_AGE_SEC:.0f}s)")
+                        break
 
             if not matched:
                 merged.append(LiquidityPool(

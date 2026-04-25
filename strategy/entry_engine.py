@@ -1475,6 +1475,12 @@ class EntryEngine:
         risk = abs(price - sl)
         if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
                 risk / price > _MAX_SL_DISTANCE_PCT):
+            logger.info(
+                f"⚠️ ENTRY REJECTED (SL dist): risk={risk:.1f} "
+                f"({risk / price * 100:.3f}%) "
+                f"required=[{_MIN_SL_DISTANCE_PCT * 100:.2f}%–"
+                f"{_MAX_SL_DISTANCE_PCT * 100:.2f}%] "
+                f"side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1494,6 +1500,10 @@ class EntryEngine:
 
         rr = abs(tp - price) / risk
         if rr < _MIN_RR_RATIO:
+            logger.info(
+                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"side={side} sweep=${sweep.pool.price:.1f} "
+                f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1551,6 +1561,12 @@ class EntryEngine:
         reward = abs(tp - price)
         if (risk < 1e-10 or risk / price < _MIN_SL_DISTANCE_PCT or
                 risk / price > _MAX_SL_DISTANCE_PCT):
+            logger.info(
+                f"⚠️ ENTRY REJECTED (SL dist): risk={risk:.1f} "
+                f"({risk / price * 100:.3f}%) "
+                f"required=[{_MIN_SL_DISTANCE_PCT * 100:.2f}%–"
+                f"{_MAX_SL_DISTANCE_PCT * 100:.2f}%] "
+                f"side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1562,6 +1578,10 @@ class EntryEngine:
                 tp, target = tp2, target2
                 rr = abs(tp - price) / risk
             else:
+                logger.info(
+                    f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                    f"(no HTF fallback TP) side={side} sweep=${sweep.pool.price:.1f} "
+                    f"entry=${price:.1f} sl=${sl:.1f}")
                 self._post_sweep = None
                 self._reset(now)
                 return

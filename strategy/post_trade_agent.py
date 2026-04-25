@@ -100,6 +100,23 @@ logger = logging.getLogger(__name__)
 # Minimum real observations before a dimension generates recommendations
 _MIN_SAMPLES = 30
 
+# ── IC Circuit-Breaker constants ──────────────────────────────────────────────
+# Block new entries when the rolling Information Coefficient is statistically
+# significantly negative (signals are acting as contra-indicators).
+#
+# Design principles:
+#   • Statistical significance gate (t-test, α=0.05) prevents false trips on noise.
+#   • Minimum block duration prevents rapid toggle / whipsaw.
+#   • Auto-unblock only when IC has *recovered* AND enough new trades have
+#     accumulated to establish a fresh positive sample (not just time elapsed).
+#   • Telegram alert fires on trip AND on recovery.
+#
+_IC_GATE_TRIGGER_IC      = -0.10   # block when IC ≤ this value
+_IC_GATE_TRIGGER_T_STAT  =  1.96   # and t-stat exceeds 95th-percentile threshold
+_IC_GATE_MIN_BLOCK_SEC   = 3600.0  # minimum block duration (1 hour) before auto-unblock
+_IC_GATE_UNBLOCK_IC      =  0.0    # IC must recover to ≥ this to unblock
+_IC_GATE_UNBLOCK_TRADES  =    5    # minimum new trades recorded after block before unblock
+
 # Rolling window for statistics (trades)
 _ROLLING_WINDOW = 20
 
@@ -705,6 +722,16 @@ class PostTradeAgent:
         self._ic_by_tier:    Dict[str, deque] = defaultdict(lambda: deque(maxlen=15))
         self._ic_by_session: Dict[str, deque] = defaultdict(lambda: deque(maxlen=15))
 
+        # ── IC Circuit-Breaker state ────────────────────────────────────────────
+        # Persistent across trades; reset only on explicit unblock.
+        self._ic_gate_blocked:      bool  = False   # True → strategy must not open new entries
+        self._ic_gate_blocked_at:   float = 0.0     # time.time() when gate was tripped
+        self._ic_gate_reason:       str   = ""      # human-readable trip reason
+        self._ic_gate_trades_at_block: int = 0      # len(records) when gate was tripped
+        # Notifier callback set by quant_strategy so gate can push Telegram alerts
+        # without importing the strategy module (dependency inversion).
+        self._ic_gate_notifier: Optional[Any] = None
+
         # ── Full trade records (last 200) ───────────────────────────────────────
         self.records:  List[TradeRecord] = []
         try:
@@ -871,6 +898,110 @@ class PostTradeAgent:
             )
         finally:
             self._clear_pending_context()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # PUBLIC API — IC Circuit-Breaker
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def set_ic_gate_notifier(self, notifier: Any) -> None:
+        """
+        Register a callable(str) used to push Telegram alerts when the IC gate
+        trips or recovers.  Called by quant_strategy.__init__ after instantiation:
+
+            self._post_trade_agent.set_ic_gate_notifier(send_telegram_message)
+        """
+        self._ic_gate_notifier = notifier
+
+    def should_block_entry(self) -> Tuple[bool, str]:
+        """
+        Primary entry-gate hook.  Call this inside the strategy's entry evaluation
+        path *after* the watchdog frozen check.
+
+        Returns
+        -------
+        (blocked, reason)
+            blocked  — True if the IC gate is currently tripped and entries should
+                       be suppressed.
+            reason   — Human-readable string suitable for a warning log / Telegram.
+
+        Auto-unblock contract
+        ---------------------
+        The gate will NOT self-clear unless ALL three conditions hold:
+          1. At least _IC_GATE_MIN_BLOCK_SEC have elapsed since tripping.
+          2. At least _IC_GATE_UNBLOCK_TRADES new trades have been closed since
+             tripping (ensures fresh evidence, not just time).
+          3. The current rolling IC has recovered to ≥ _IC_GATE_UNBLOCK_IC.
+
+        This prevents the gate from toggling on a streak of lucky wins immediately
+        after tripping — the IC must genuinely recover over a real sample.
+        """
+        if not self._ic_gate_blocked:
+            return False, ""
+
+        now         = time.time()
+        age_sec     = now - self._ic_gate_blocked_at
+        trades_since = len(self.records) - self._ic_gate_trades_at_block
+        current_ic  = self._compute_ic()
+
+        time_ok   = age_sec     >= _IC_GATE_MIN_BLOCK_SEC
+        trades_ok = trades_since >= _IC_GATE_UNBLOCK_TRADES
+        ic_ok     = current_ic  >= _IC_GATE_UNBLOCK_IC
+
+        if time_ok and trades_ok and ic_ok:
+            self._ic_gate_blocked = False
+            recovery_msg = (
+                f"✅ <b>IC GATE UNBLOCKED</b>\n"
+                f"IC recovered to {current_ic:+.3f} after {int(age_sec)}s / "
+                f"{trades_since} new trades since block.\n"
+                f"New entries are now permitted."
+            )
+            logger.warning(
+                "IC gate UNBLOCKED — IC=%.3f age=%.0fs trades_since=%d",
+                current_ic, age_sec, trades_since,
+            )
+            self._emit_insight(
+                dimension="IC_SIGNAL",
+                severity="INFO",
+                message=f"IC gate unblocked — IC recovered to {current_ic:+.3f}",
+                recommendation="Monitor for continued positive IC before scaling back up.",
+                confidence=min(0.85, current_ic + 0.5),
+            )
+            if self._ic_gate_notifier is not None:
+                try:
+                    self._ic_gate_notifier(recovery_msg)
+                except Exception:
+                    pass
+            return False, ""
+
+        # Still blocked — build a fresh reason string for the caller's log
+        parts = []
+        if not time_ok:
+            parts.append(f"{int(_IC_GATE_MIN_BLOCK_SEC - age_sec)}s until min-duration expires")
+        if not trades_ok:
+            parts.append(f"{_IC_GATE_UNBLOCK_TRADES - trades_since} more trades needed")
+        if not ic_ok:
+            parts.append(f"IC={current_ic:+.3f} still below recovery threshold {_IC_GATE_UNBLOCK_IC:+.2f}")
+        return True, f"IC gate active: {'; '.join(parts)}"
+
+    def clear_ic_gate(self, operator: str = "operator") -> None:
+        """
+        Manual operator override — clears the IC gate unconditionally.
+        Intended for use from the Telegram /watchdog_unfreeze or /ic_clear command.
+        """
+        if not self._ic_gate_blocked:
+            return
+        self._ic_gate_blocked = False
+        msg = (
+            f"✅ <b>IC GATE MANUALLY CLEARED</b> by {operator}\n"
+            f"Prior reason: {self._ic_gate_reason}\n"
+            f"New entries permitted. Monitor IC closely."
+        )
+        logger.warning("IC gate cleared manually by %s", operator)
+        if self._ic_gate_notifier is not None:
+            try:
+                self._ic_gate_notifier(msg)
+            except Exception:
+                pass
 
     def get_parameter_recommendations(self) -> Dict[str, Any]:
         """
@@ -1741,28 +1872,60 @@ class PostTradeAgent:
                     confidence=1.0 - ci_u,
                 )
 
-        # ── 8. IC ALERT ───────────────────────────────────────────────────────
-        ic = self._compute_ic()
+        # ── 8. IC ALERT + CIRCUIT-BREAKER ────────────────────────────────────
+        ic   = self._compute_ic()
         ic_n = len(self._ic_buffer)
-        if ic_n >= 30 and ic < -0.10:
+
+        if ic_n >= 30 and ic < _IC_GATE_TRIGGER_IC:
             ic_den = math.sqrt(max(1e-12, 1.0 - ic * ic))
-            ic_t = abs(ic) * math.sqrt(max(1, ic_n - 2)) / ic_den
-            if ic_t <= 1.96:
-                return
-            self._emit_insight(
-                dimension="IC_SIGNAL",
-                severity="WARN",
-                message=(
-                    f"Information Coefficient IC={ic:.3f} — signals are "
-                    f"inversely predictive (n={ic_n}, t={ic_t:.2f})"
-                ),
-                recommendation=(
-                    "Review entry logic — signals appear to be contra-indicators. "
-                    "Consider reversing composite sign threshold or increasing "
-                    "ICT confluence requirement."
-                ),
-                confidence=min(0.90, abs(ic) * 3.0),
-            )
+            ic_t   = abs(ic) * math.sqrt(max(1, ic_n - 2)) / ic_den
+
+            if ic_t > _IC_GATE_TRIGGER_T_STAT:
+                # ── Statistically confirmed negative IC ─────────────────────
+                self._emit_insight(
+                    dimension="IC_SIGNAL",
+                    severity="WARN",
+                    message=(
+                        f"Information Coefficient IC={ic:.3f} — signals are "
+                        f"inversely predictive (n={ic_n}, t={ic_t:.2f})"
+                    ),
+                    recommendation=(
+                        "Review entry logic — signals appear to be contra-indicators. "
+                        "Consider reversing composite sign threshold or increasing "
+                        "ICT confluence requirement."
+                    ),
+                    confidence=min(0.90, abs(ic) * 3.0),
+                )
+
+                # ── Trip the circuit-breaker if not already blocked ──────────
+                if not self._ic_gate_blocked:
+                    self._ic_gate_blocked       = True
+                    self._ic_gate_blocked_at    = time.time()
+                    self._ic_gate_reason        = (
+                        f"IC={ic:.3f} (t={ic_t:.2f}, n={ic_n}) "
+                        f"— signals statistically inversely predictive"
+                    )
+                    self._ic_gate_trades_at_block = len(self.records)
+
+                    trip_msg = (
+                        f"🛑 <b>IC GATE TRIPPED — entries blocked</b>\n"
+                        f"Information Coefficient: <b>{ic:+.3f}</b>  "
+                        f"(t={ic_t:.2f}, n={ic_n})\n"
+                        f"Signals are statistically <b>inversely predictive</b>.\n"
+                        f"New entries suppressed until IC recovers to "
+                        f"{_IC_GATE_UNBLOCK_IC:+.2f} over ≥{_IC_GATE_UNBLOCK_TRADES} trades "
+                        f"and ≥{int(_IC_GATE_MIN_BLOCK_SEC / 60):.0f} min have elapsed.\n"
+                        f"Use /ic_clear to override manually after investigation."
+                    )
+                    logger.critical(
+                        "IC gate TRIPPED — IC=%.3f t=%.2f n=%d; entries blocked",
+                        ic, ic_t, ic_n,
+                    )
+                    if self._ic_gate_notifier is not None:
+                        try:
+                            self._ic_gate_notifier(trip_msg)
+                        except Exception:
+                            pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # INTERNAL: Guard — rate-limit parameter adjustments
