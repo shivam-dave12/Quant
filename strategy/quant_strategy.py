@@ -2506,6 +2506,7 @@ class QuantStrategy:
         self._pos_sync_in_progress  = False   # ACTIVE sync thread running
         self._exit_sync_in_progress = False   # EXITING sync thread running
         self._trail_in_progress     = False   # trail REST call running in background
+        self._trail_started_at      = 0.0     # v9.1: timestamp for self-heal of stuck flag
         self._last_exit_side = ""; self._last_think_log = 0.0; self._think_interval = 30.0
         self._last_fed_trade_ts = 0.0
 
@@ -2615,6 +2616,38 @@ class QuantStrategy:
                     "PostTradeAgent not found â€” post-trade analysis disabled. "
                     "Place post_trade_agent.py in strategy/ to enable."
                 )
+
+        # ─── Post-Exit Re-Entry Gate (v9.1) ──────────────────────────────────
+        # Six-lens gate that replaces the flat 30s cooldown with regime-aware
+        # logic. Stops the "exit → re-enter in 30s → take another stop" loop
+        # observed in production (2026-04-25): SHORT SL @ 11:39:58 → LONG
+        # entered 2m38s later → SL → SHORT entered 3m37s after THAT → SL.
+        # The gate is wired in two places:
+        #   (1) record_exit() called from _finalise_exit (already wired above)
+        #   (2) accept() called from the entry block before _enter_trade
+        try:
+            from strategy.post_exit_gate import PostExitGate
+            self._post_exit_gate = PostExitGate()
+        except ImportError:
+            try:
+                from post_exit_gate import PostExitGate
+                self._post_exit_gate = PostExitGate()
+            except ImportError:
+                self._post_exit_gate = None
+                logger.warning(
+                    "PostExitGate not found â€” using flat QUANT_COOLDOWN_SEC. "
+                    "Place post_exit_gate.py in strategy/ to enable."
+                )
+
+        # _last_closed_* attributes are populated by _record_pnl so that
+        # _finalise_exit can hand them to PostExitGate.record_exit().
+        self._last_closed_side: str = ""
+        self._last_closed_reason: str = ""
+        self._last_closed_exit_price: float = 0.0
+        self._last_closed_entry_price: float = 0.0
+        self._last_closed_mfe_pts: float = 0.0
+        self._last_closed_mae_pts: float = 0.0
+        self._last_closed_atr: float = 0.0
 
         # â”€â”€ Unified entry gate state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _set_adaptive_param_provider(self._post_trade_agent)
@@ -2839,6 +2872,23 @@ class QuantStrategy:
                 p = data_manager.get_last_price()
                 if p > 1.0:
                     self._last_known_price = p
+            except Exception:
+                pass
+
+            # ─── v9.1: tick liveness stamp (used by watchdog TickAgeCheck) ───
+            self._last_tick_time = now
+
+            # ─── v9.1: feed PostExitGate the post-exit price extreme ─────────
+            # Cheap call: gate tracks max(price) for longs, min(price) for
+            # shorts since the last exit, used by SAME_DIRECTION_EXHAUSTION
+            # to verify a real pullback before allowing same-side re-entry.
+            try:
+                _gate = getattr(self, "_post_exit_gate", None)
+                if _gate is not None and self._pos.phase == PositionPhase.FLAT:
+                    _atr_for_gate = (self._atr_5m.atr
+                                       if hasattr(self, "_atr_5m") and self._atr_5m
+                                       else 0.0)
+                    _gate.observe_tick(self._last_known_price, _atr_for_gate)
             except Exception:
                 pass
 
@@ -4504,6 +4554,81 @@ class QuantStrategy:
             }
             _tier = _tier_map.get(signal.entry_type, "A")
 
+            # ─── v9.1: Post-Exit Re-Entry Gate ────────────────────────────────
+            # The flat 30s cooldown is satisfied at this point (cooldown_ok was
+            # checked upstream in on_tick). The PostExitGate adds regime-aware
+            # filtering on top: side-flip resistance after SL, same-direction
+            # exhaustion after TP, ATR-shock penalty, structure-proof, and
+            # exponential cooldown decay on consecutive losses.
+            #
+            # The gate is a SECOND defense layer; the entry engine has already
+            # found a qualifying signal. If the gate vetoes, we discard the
+            # signal and the engine returns to SCANNING (so the next sweep
+            # gets a fresh evaluation rather than re-running this stale one).
+            if getattr(self, "_post_exit_gate", None) is not None:
+                try:
+                    from strategy.post_exit_gate import GateContext
+                except ImportError:
+                    from post_exit_gate import GateContext  # type: ignore
+
+                # Gather decision inputs (best-effort; gate handles missing data)
+                _bos_since_exit = 0
+                _choch_active = False
+                ict_eng = getattr(self, "_ict", None)
+                if ict_eng is not None:
+                    try:
+                        # Count BOS confirmations on signal.side since last exit
+                        _bos_since_exit = _DynamicStructureTrail._bos_count(ict_eng, signal.side)
+                        _ch_tf, _ch_lvl = _DynamicStructureTrail._choch(ict_eng, signal.side)
+                        _choch_active = (_ch_tf is not None and _ch_lvl > 0.0)
+                    except Exception:
+                        pass
+
+                _consec_losses = 0
+                if hasattr(self, "_risk_gate") and self._risk_gate is not None:
+                    try:
+                        _consec_losses = int(getattr(self._risk_gate, "consec_losses", 0))
+                    except Exception:
+                        pass
+
+                _sweep_present = signal.entry_type in (
+                    EntryType.SWEEP_REVERSAL, EntryType.SWEEP_CONTINUATION,
+                )
+                _displacement_present = (signal.entry_type == EntryType.DISPLACEMENT_MOMENTUM)
+
+                _gate_ctx = GateContext(
+                    now=now,
+                    side=signal.side,
+                    price=signal.entry_price,
+                    atr=float(atr or 0.0),
+                    bos_count_since_exit=_bos_since_exit,
+                    choch_active=_choch_active,
+                    flow_conviction=float(getattr(flow_state, "conviction", 0.0) or 0.0),
+                    consec_losses=_consec_losses,
+                    sweep_present=_sweep_present,
+                    displacement_present=_displacement_present,
+                    post_trade_agent=getattr(self, "_post_trade_agent", None),
+                )
+                _gate_dec = self._post_exit_gate.accept(_gate_ctx)
+                if not _gate_dec.allow:
+                    # Throttle the log to avoid spam (re-evaluated each tick)
+                    _gate_log_key = f"_pegate_log_{_gate_dec.lens}"
+                    if now - getattr(self, _gate_log_key, 0.0) >= 30.0:
+                        setattr(self, _gate_log_key, now)
+                        logger.info(
+                            "ðŸš« Post-Exit Gate blocked %s entry: %s â€” %s",
+                            signal.side.upper(), _gate_dec.lens, _gate_dec.detail,
+                        )
+                    # Discard the signal and return to SCANNING so the next
+                    # sweep gets fresh evaluation
+                    try:
+                        self._entry_engine.consume_signal()
+                    except Exception:
+                        pass
+                    self._entry_confirm_key = None
+                    self._entry_confirm_count = 0
+                    return
+
             # v9: capture full EntrySignal before the thread consumes it
             self._last_entry_signal = signal
 
@@ -5812,8 +5937,32 @@ class QuantStrategy:
                     # normally regardless of whether a trail thread is in flight.
                     _can_launch = False
                     with self._lock:
+                        # v9.1 FIX: self-heal a stuck _trail_in_progress flag.
+                        # Production logs (2026-04-25 10:34:46) showed watchdog
+                        # firing `stuck_trail_flag` after a thread had been
+                        # "alive" for 61s. If the bg-thread is killed (OOM,
+                        # signal) between the try-body and the finally, the
+                        # flag is stuck. Pre-empt the watchdog: if flag set
+                        # for >60s with no live trail thread, clear it before
+                        # checking. This eliminates the race that caused the
+                        # watchdog WARN.
+                        if self._trail_in_progress:
+                            _flag_age = now - getattr(self, "_trail_started_at", 0.0)
+                            if _flag_age > 60.0:
+                                _live_trail_threads = any(
+                                    ("trail" in t.name.lower()) and t.is_alive()
+                                    for t in threading.enumerate()
+                                )
+                                if not _live_trail_threads:
+                                    logger.warning(
+                                        "Trail flag stuck %.0fs with no live thread â€” self-healing",
+                                        _flag_age,
+                                    )
+                                    self._trail_in_progress = False
+                                    self._trail_started_at = 0.0
                         if not self._trail_in_progress:
                             self._trail_in_progress = True
+                            self._trail_started_at = now
                             _can_launch = True
 
                     if _can_launch:
@@ -5835,6 +5984,7 @@ class QuantStrategy:
                                 logger.error("Trail background error: %s", _te, exc_info=True)
                             finally:
                                 self._trail_in_progress = False
+                                self._trail_started_at = 0.0
 
                         threading.Thread(target=_bg_trail, daemon=True,
                                          name=f"trail-sl-{int(now*1000)%100000}").start()
@@ -6748,6 +6898,24 @@ class QuantStrategy:
         # â”€â”€ Record the trade â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._pnl_recorded_for = pos_entry_time
 
+        # ─── v9.1: capture closed-trade context for PostExitGate ──────────────
+        # Persisted on the strategy so _finalise_exit (which runs AFTER
+        # _record_pnl) can hand it to PostExitGate.record_exit() without
+        # plumbing extra arguments through the call chain.
+        try:
+            self._last_closed_side         = getattr(pos, "side", "") or ""
+            self._last_closed_reason       = exit_reason or ""
+            self._last_closed_exit_price   = float(exit_price or 0.0)
+            self._last_closed_entry_price  = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            self._last_closed_mfe_pts      = float(getattr(pos, "peak_profit", 0.0) or 0.0)
+            self._last_closed_mae_pts      = float(getattr(pos, "mae_pts", 0.0) or 0.0)
+            self._last_closed_atr          = float(
+                getattr(self._atr_5m, "atr", 0.0)
+                if hasattr(self, "_atr_5m") and self._atr_5m else 0.0
+            )
+        except Exception as _cc:
+            logger.debug(f"_record_pnl context capture failed (non-fatal): {_cc}")
+
         self._total_trades += 1
         self._total_pnl    += pnl
         is_win = pnl > 0
@@ -6975,6 +7143,87 @@ class QuantStrategy:
         # BUG-FIX C: reset per-trade trail diagnostic flags so each new position
         # re-emits the "sl_order_id not set" warning if the problem recurs.
         self._trail_no_sl_warned = False
+
+        # ─── v9.1 FIX: delayed _exit_completed clear ──────────────────────────
+        # Production logs (2026-04-25) showed watchdog firing `stuck_exit_completed`
+        # repeatedly: ~40s after every exit, _exit_completed was still True
+        # because no new entry had triggered _enter_trade's reset path. The
+        # watchdog cleared it defensively, but each firing produced a Telegram
+        # WARN and contributed to queue saturation.
+        #
+        # Root cause: _exit_completed is intentionally left True for race
+        # protection between the sync thread and the reconcile thread (both
+        # can race into _record_exchange_exit). Once both threads have settled
+        # — empirically <10s — the race window is gone and the flag has no
+        # remaining purpose until the next entry.
+        #
+        # Fix: schedule a one-shot daemon timer to clear the flag 60s after
+        # _finalise_exit. Race-protection window: 0–60s (more than enough).
+        # Watchdog threshold: 30s → no longer fires because the flag is
+        # already False well within the post-exit grace.
+        #
+        # This timer is idempotent: if a new entry happens first and resets
+        # the flag explicitly, the timer's later clear is a no-op (still
+        # False; assignment is harmless).
+        try:
+            def _delayed_exit_completed_clear():
+                # Safe even after a new position has opened — re-checks phase
+                # under the lock. Only clears if we're STILL flat and the
+                # flag is STILL true (i.e. nobody else has touched it).
+                try:
+                    with self._lock:
+                        pos = getattr(self, "_pos", None)
+                        phase_name = getattr(getattr(pos, "phase", None), "name", "")
+                        if phase_name == "FLAT" and getattr(self, "_exit_completed", False):
+                            self._exit_completed = False
+                            self._pnl_recorded_for = 0.0
+                            logger.info(
+                                "Race-window expired: _exit_completed cleared "
+                                "(60s after _finalise_exit; pre-empts watchdog heal)"
+                            )
+                except Exception as _ec:
+                    logger.debug(f"_delayed_exit_completed_clear noop: {_ec}")
+
+            t = threading.Timer(60.0, _delayed_exit_completed_clear)
+            t.daemon = True
+            t.name = f"exit-claim-clear-{int(time.time())}"
+            t.start()
+        except Exception as _te:
+            logger.debug(f"failed to schedule _exit_completed clear: {_te}")
+
+        # ─── v9.1: notify the post-exit gate ──────────────────────────────────
+        # The PostExitGate consumes the just-closed trade context to gate the
+        # next entry. If the gate isn't wired (older deployments), this is a
+        # silent no-op.
+        try:
+            gate = getattr(self, "_post_exit_gate", None)
+            if gate is not None:
+                # The exit context is captured in attributes set by _record_pnl
+                # (which always runs before _finalise_exit). We pull the exit
+                # info from the just-closed _pos snapshot saved on the strategy
+                # via _last_closed_* attributes (set by _record_pnl below).
+                last_side  = getattr(self, "_last_closed_side", "") or ""
+                last_reas  = getattr(self, "_last_closed_reason", "") or ""
+                last_exit  = float(getattr(self, "_last_closed_exit_price", 0.0) or 0.0)
+                last_entry = float(getattr(self, "_last_closed_entry_price", 0.0) or 0.0)
+                last_mfe   = float(getattr(self, "_last_closed_mfe_pts", 0.0) or 0.0)
+                last_mae   = float(getattr(self, "_last_closed_mae_pts", 0.0) or 0.0)
+                last_atr   = float(getattr(self, "_last_closed_atr", 0.0) or 0.0)
+                if last_atr <= 0 and hasattr(self, "_atr_5m") and self._atr_5m:
+                    last_atr = float(self._atr_5m.atr or 0.0)
+                gate.record_exit(
+                    side=last_side,
+                    exit_reason=last_reas,
+                    exit_price=last_exit,
+                    entry_price=last_entry,
+                    mfe_pts=last_mfe,
+                    mae_pts=last_mae,
+                    atr=last_atr,
+                    exit_time=time.time(),
+                )
+        except Exception as _pge:
+            logger.debug(f"PostExitGate.record_exit skipped: {_pge}")
+
         logger.info("Position closed â€” FLAT")
 
     def _compute_quantity(self, risk_manager, price,

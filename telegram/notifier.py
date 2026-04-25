@@ -145,11 +145,85 @@ except ImportError:
 # ASYNC SEND WORKER
 # ======================================================================
 
-_send_queue:    _queue_mod.Queue = _queue_mod.Queue(maxsize=25)   # Bug #36: 200→25 caps backlog at ~30s
-_worker_started: bool            = False
-_worker_lock:   threading.Lock   = threading.Lock()
+# ──────────────────────────────────────────────────────────────────────────
+# v2.1 QUEUE: tiered priority queue with adaptive shedding
+#
+# The old design had three problems:
+#   1. maxsize=25 saturates in <30s during heartbeat bursts
+#      (200 items × 1.2s/msg = 4-min backlog)
+#   2. CRITICAL messages were promoted to a separate thread, but everything
+#      else went through a single FIFO — so a routine status report would
+#      delay an exit notification for a full minute.
+#   3. When the queue filled, ALL non-critical messages dropped — including
+#      operator command responses to Telegram /position, /trades, etc.
+#
+# v2.1 design:
+#   - PriorityQueue with 3 tiers:
+#       0=CRITICAL (errors, exits, exchange events) — never dropped
+#       1=IMPORTANT (entries, gate alerts, /command replies) — dropped LAST
+#       2=ROUTINE (periodic reports, status, log mirror) — dropped FIRST
+#   - maxsize=200 (4-min buffer at 1.2s/msg)
+#   - When full, ROUTINE messages are evicted to make room for higher tiers.
+#   - CRITICAL still also has a fast-path bypass thread for true emergencies.
+# ──────────────────────────────────────────────────────────────────────────
+
+PRIO_CRITICAL  = 0
+PRIO_IMPORTANT = 1
+PRIO_ROUTINE   = 2
+
+_send_queue: _queue_mod.PriorityQueue = _queue_mod.PriorityQueue(maxsize=200)
+_queue_seq: int = 0          # monotonic tiebreaker for PriorityQueue ordering
+_queue_seq_lock = threading.Lock()
+_worker_started: bool        = False
+_worker_lock: threading.Lock = threading.Lock()
 _MIN_INTERVAL = 1.2
 _MAX_RETRIES  = 4
+
+# Watchdog uses these counters via /watchdog_status and notifier_queue_depth check
+_dropped_routine: int   = 0
+_dropped_important: int = 0
+
+
+def _next_seq() -> int:
+    global _queue_seq
+    with _queue_seq_lock:
+        _queue_seq += 1
+        return _queue_seq
+
+
+def _classify_priority(message: str) -> int:
+    """Triage by content. Operator-controllable via add_telegram_suppress_pattern."""
+    upper = message.upper()
+    if any(kw in message for kw in _CRITICAL_KEYWORDS) or "🚨" in message or "💀" in message:
+        return PRIO_CRITICAL
+    if any(tag in upper for tag in (
+        "ENTRY", "EXIT", "POOL-GATE", "TRADE OPEN", "TRADE CLOSED",
+        "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
+        "POST-EXIT GATE", "IC GATE",
+    )):
+        return PRIO_IMPORTANT
+    return PRIO_ROUTINE
+
+
+def _shed_routine_for_room() -> bool:
+    """When the queue is full, drop one ROUTINE item to free a slot.
+    Returns True if a slot was freed."""
+    global _dropped_routine
+    # PriorityQueue doesn't expose internals safely; we approximate by
+    # iterating its internal heap under its mutex. This is best-effort:
+    # we accept that we may not always find a routine to evict.
+    try:
+        with _send_queue.mutex:  # type: ignore[attr-defined]
+            heap = _send_queue.queue  # type: ignore[attr-defined]
+            for i, item in enumerate(heap):
+                if item[0] >= PRIO_ROUTINE:
+                    heap.pop(i)
+                    _dropped_routine += 1
+                    return True
+    except Exception:
+        pass
+    return False
+
 
 # Bug #36 fix: critical message keywords that bypass the async queue and
 # send synchronously.  This guarantees that UNPROTECTED position alerts,
@@ -157,13 +231,14 @@ _MAX_RETRIES  = 4
 # the queue is full during a burst of routine heartbeat messages.
 _CRITICAL_KEYWORDS = frozenset((
     "💀", "🚨",
-    "UNPROTECTED", "CRASH", "KILLSWITCH", "💀", "🚨", "CIRCUIT_BREAKER",
+    "UNPROTECTED", "CRASH", "KILLSWITCH", "CIRCUIT_BREAKER",
     "EMERGENCY", "emergency_flatten", "BOT CRASH",
+    "ORPHAN POSITION", "SIDE MISMATCH", "EXIT UNCONFIRMED",
 ))
 
 
 def _send_worker() -> None:
-    """Background daemon — drains the queue and sends to Telegram."""
+    """Background daemon — drains the priority queue and sends to Telegram."""
     import random
     import requests as _req
 
@@ -177,7 +252,16 @@ def _send_worker() -> None:
         if item is None:
             break
 
-        message, parse_mode = item
+        # PriorityQueue items: (priority, seq, message, parse_mode)
+        # Legacy callers may still push (message, parse_mode); handle both.
+        if len(item) == 4:
+            _prio, _seq, message, parse_mode = item
+        elif len(item) == 2:
+            message, parse_mode = item
+        else:
+            logger.error("notifier: unexpected queue item shape: %d", len(item))
+            _send_queue.task_done()
+            continue
         message = _repair_mojibake(str(message))
 
         for attempt in range(_MAX_RETRIES):
@@ -310,11 +394,48 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
         return True
 
     try:
-        _send_queue.put_nowait((message, parse_mode))
-        return True
-    except _queue_mod.Full:
-        logger.warning("Telegram queue full — dropping non-critical message")
+        prio = _classify_priority(message)
+        item = (prio, _next_seq(), message, parse_mode)
+        try:
+            _send_queue.put_nowait(item)
+            return True
+        except _queue_mod.Full:
+            # Try shedding a ROUTINE message to make room for higher tiers
+            global _dropped_important
+            if prio < PRIO_ROUTINE and _shed_routine_for_room():
+                try:
+                    _send_queue.put_nowait(item)
+                    return True
+                except _queue_mod.Full:
+                    pass
+            if prio == PRIO_ROUTINE:
+                # Routine — drop silently with a single rate-limited log
+                global _dropped_routine
+                _dropped_routine += 1
+                return False
+            _dropped_important += 1
+            logger.warning(
+                "Telegram queue full — DROPPING priority=%d message (dropped: routine=%d important=%d)",
+                prio, _dropped_routine, _dropped_important,
+            )
+            return False
+    except Exception as _qe:
+        logger.error("notifier: enqueue failed: %s", _qe)
         return False
+
+
+def get_queue_stats() -> Dict[str, Any]:
+    """Watchdog and /diagnostics introspection."""
+    try:
+        depth = _send_queue.qsize()
+    except Exception:
+        depth = -1
+    return {
+        "depth":            depth,
+        "maxsize":          _send_queue.maxsize,
+        "dropped_routine":  _dropped_routine,
+        "dropped_important": _dropped_important,
+    }
 
 
 # ======================================================================
@@ -411,11 +532,26 @@ def _sanitize_html(text: str) -> str:
     out: List[str] = []
     stack: List[str] = []
 
+    def _escape_naked_angles(s: str) -> str:
+        """
+        v2.1 BUG-FIX: any < or > surviving in a text run is provably NOT a
+        well-formed HTML tag (the tokenizer regex already extracted all
+        well-formed tags). They must be escaped or Telegram parses them.
+
+        Root-cause example: trail labels emit '(<1.0R)' — the '<' matches
+        no tag (the regex requires [A-Za-z] after '<'), so it survives as
+        text. Telegram then tries to parse '<1.0r)' as an HTML tag and
+        returns 400 'Unsupported start tag'.
+        """
+        return s.replace("<", "&lt;").replace(">", "&gt;")
+
     for tok in tokens:
         if tok[0] == "text":
-            # Normalise naked ampersands; leave < and > alone (none should
-            # exist here — tokenizer consumed all tag-shaped <...>)
-            out.append(_normalise_ampersands(tok[1]))
+            # First normalise &, then escape any leftover < or > that
+            # weren't consumed by the tag tokenizer (provably invalid HTML)
+            txt = _normalise_ampersands(tok[1])
+            txt = _escape_naked_angles(txt)
+            out.append(txt)
             continue
 
         _, closing, name, attrs = tok
@@ -1185,3 +1321,314 @@ def install_global_telegram_log_handler(
     handler = TelegramLogHandler(level=level, throttle_seconds=throttle_seconds)
     handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     logging.getLogger().addHandler(handler)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v9.1 — INDUSTRY-GRADE TELEGRAM TEMPLATES
+# ══════════════════════════════════════════════════════════════════════════
+# These templates are used by quant_strategy.py and the controller for the
+# user-facing high-frequency notifications (entry, exit, trail, gate veto).
+#
+# Design rules:
+#   1. Lead with the fact (side / price / outcome) — user must know the
+#      WHAT in the first line.
+#   2. Numerics in <code> blocks for monospace alignment in Telegram.
+#   3. No decorative borders (Telegram's renderer handles spacing).
+#   4. <b>...</b> reserved for the SINGLE most important value per block.
+#   5. All dynamic strings go through _esc() — never f-string raw.
+#
+# Public:
+#   format_entry_alert(...)
+#   format_exit_alert(...)
+#   format_trail_advance(...)
+#   format_gate_block_alert(...)
+#   format_status_card(...)              — replaces verbose periodic_report
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _arrow(side: str) -> str:
+    s = (side or "").lower()
+    return "▲" if s == "long" else ("▼" if s == "short" else "•")
+
+
+def _badge_pnl(pnl: float) -> str:
+    if pnl > 0:  return "🟢"
+    if pnl < 0:  return "🔴"
+    return "⚪"
+
+
+def _fpts(v: float) -> str:
+    sign = "+" if v >= 0 else "−"
+    return f"{sign}{abs(v):,.1f} pts"
+
+
+def _fpnl(v: float) -> str:
+    sign = "+" if v >= 0 else "−"
+    return f"{sign}${abs(v):,.2f}"
+
+
+def format_entry_alert(
+    side:        str,
+    entry:       float,
+    sl:          float,
+    tp:          float,
+    qty:         float,
+    mode:        str,
+    tier:        str,
+    sl_atr:      float,
+    tp_atr:      float,
+    rr:          float,
+    reason:      str = "",
+    session:     str = "",
+    flow_conv:   float = 0.0,
+) -> str:
+    """
+    Industry-grade entry alert. Single screen, monospace columns.
+
+    ▲ LONG  $77,420.00   SWEEP_REVERSAL · S
+    ─────────────────────────
+    SL  $77,300.00  (0.8 ATR)
+    TP  $77,800.00  (3.0 ATR)   R:R 1:3.16
+    QTY 0.0250                  flow ▲ +0.42
+    SSL sweep + bullish FVG + flow alignment
+    """
+    side_u = side.upper()
+    head_emoji = "🟢" if side_u == "LONG" else "🔴"
+    arr = _arrow(side)
+
+    flow_glyph = "▲" if flow_conv > 0.05 else ("▼" if flow_conv < -0.05 else "·")
+
+    rows = [
+        f"{head_emoji} <b>{_esc(arr)} {_esc(side_u)}</b>  "
+        f"<code>{_fmt_price(entry)}</code>"
+        f"   {_esc(mode.upper())} · {_esc(tier or '-')}",
+        "<code>──────────────────────────────</code>",
+        f"<code>SL  {_fmt_price(sl):<14}</code>  ({sl_atr:.1f} ATR)",
+        f"<code>TP  {_fmt_price(tp):<14}</code>  ({tp_atr:.1f} ATR)   R:R 1:{rr:.2f}",
+        f"<code>QTY {qty:<14.4f}</code>  flow {_esc(flow_glyph)} {flow_conv:+.2f}",
+    ]
+    if session:
+        rows.append(f"<code>SESS {_esc(session.upper())}</code>")
+    if reason:
+        rows.append(f"<i>{_esc(reason[:160])}</i>")
+    return "\n".join(rows)
+
+
+def format_exit_alert(
+    side:        str,
+    entry:       float,
+    exit_price:  float,
+    pnl:         float,
+    r_realised:  float,
+    mfe_r:       float,
+    reason:      str,
+    hold_min:    float,
+    fees:        float = 0.0,
+    qty:         float = 0.0,
+) -> str:
+    """
+    Industry-grade exit alert. Outcome icon leads.
+
+    ✅ EXIT LONG  $77,800.00   tp_hit
+    ─────────────────────────
+    PNL  +$10.04   (+4.00R)   MFE 4.20R
+    HOLD 23m   FEE $0.014
+    77,400.00 → 77,800.00   400.0 pts
+    """
+    side_u = side.upper()
+    win = pnl > 0
+    head_icon = "✅" if win else "❌"
+    reason_label = {
+        "tp_hit":       "TP HIT",
+        "sl_hit":       "SL HIT",
+        "trail_sl_hit": "TRAIL EXIT",
+    }.get(reason, (reason or "exit").upper())
+
+    pts_realised = (exit_price - entry) if side_u == "LONG" else (entry - exit_price)
+
+    rows = [
+        f"{head_icon} <b>EXIT {_esc(side_u)}</b>  "
+        f"<code>{_fmt_price(exit_price)}</code>"
+        f"   {_esc(reason_label)}",
+        "<code>──────────────────────────────</code>",
+        (f"<b>PNL {_fpnl(pnl)}</b>"
+         f"   <code>{r_realised:+.2f}R</code>   MFE {mfe_r:.2f}R"),
+        (f"<code>HOLD {hold_min:5.0f}m   FEE ${fees:.4f}</code>"
+         + (f"   QTY {qty:.4f}" if qty > 0 else "")),
+        f"<code>{_fmt_price(entry)} → {_fmt_price(exit_price)}</code>"
+        f"   <i>{_fpts(pts_realised)}</i>",
+    ]
+    return "\n".join(rows)
+
+
+def format_trail_advance(
+    side:          str,
+    new_sl:        float,
+    old_sl:        float,
+    phase:         str,
+    r_locked:      float,
+    r_multiple:    float,
+    entry:         float,
+    current_price: float,
+    atr:           float,
+    anchor_tf:     str = "",
+    anchor_price:  float = 0.0,
+    fib_ratio:     Optional[float] = None,
+) -> str:
+    """
+    Industry-grade trail advance alert. Compact — fires often, must scan
+    fast.
+
+        🔒 TRAIL ↑ LONG   $77,540.00   PHASE_1_BE_FLOOR (1.20R)
+        ─────────────────────────
+        SL    $77,520.00 → $77,540.00   locked +0.20R
+        FIB   0.500   anchor 15m @ $77,420.00
+    """
+    side_u = side.upper()
+    arrow = "↑" if side_u == "LONG" else "↓"
+    phase_disp = phase.upper() if phase else "TRAIL"
+    rows = [
+        f"🔒 <b>TRAIL {_esc(arrow)} {_esc(side_u)}</b>"
+        f"   <code>{_fmt_price(new_sl)}</code>"
+        f"   <i>{_esc(phase_disp)}</i>  ({r_multiple:.2f}R)",
+        "<code>──────────────────────────────</code>",
+        (f"<code>SL    {_fmt_price(old_sl)} → {_fmt_price(new_sl)}</code>"
+         f"   locked <b>{r_locked:+.2f}R</b>"),
+    ]
+    if fib_ratio is not None and anchor_price > 0:
+        rows.append(
+            f"<code>FIB   {fib_ratio:.3f}</code>"
+            f"   anchor {_esc(anchor_tf or '?')} @ <code>{_fmt_price(anchor_price)}</code>"
+        )
+    elif anchor_price > 0:
+        rows.append(
+            f"<code>ANCHOR {_esc(anchor_tf or '?')} @ {_fmt_price(anchor_price)}</code>"
+        )
+    return "\n".join(rows)
+
+
+def format_gate_block_alert(
+    side:        str,
+    lens:        str,
+    detail:      str,
+    retry_in:    float,
+    consec_loss: int = 0,
+) -> str:
+    """
+    Post-Exit Gate veto. Throttled by quant_strategy (30s/lens) so this
+    fires at most once per minute per lens.
+
+        🚫 POST-EXIT GATE
+        Side    SHORT
+        Lens    SIDE_FLIP_DISTANCE
+        Why     only 0.42 ATR from SL — need ≥1.5 ATR
+        Retry   in 12s   (1L streak)
+    """
+    streak = f"   <i>({consec_loss}L streak)</i>" if consec_loss > 0 else ""
+    return (
+        "🚫 <b>POST-EXIT GATE</b>\n"
+        "<code>──────────────────────────────</code>\n"
+        f"<code>SIDE   {_esc(side.upper())}</code>\n"
+        f"<code>LENS   {_esc(lens)}</code>\n"
+        f"<i>{_esc(detail[:200])}</i>\n"
+        f"<code>RETRY  in {retry_in:.0f}s</code>{streak}"
+    )
+
+
+def format_status_card(
+    price:          float,
+    atr:            float,
+    balance:        float,
+    daily_pnl:      float,
+    total_pnl:      float,
+    total_trades:   int,
+    win_rate:       float,
+    consec_loss:    int,
+    state:          str,
+    session:        str,
+    in_killzone:    bool,
+    amd_phase:      str,
+    amd_bias:       str,
+    flow_conv:      float,
+    flow_dir:       str,
+    structure_15m:  str = "",
+    structure_4h:   str = "",
+    nearest_bsl:    Optional[Dict] = None,
+    nearest_ssl:    Optional[Dict] = None,
+    primary_target: str = "",
+    position:       Optional[Dict] = None,
+) -> str:
+    """
+    Industry-grade replacement for the verbose periodic_report. Single-
+    screen card, monospace columns, no nested sections.
+
+        📊 STATUS  12:18 IST          NY KZ
+        ─────────────────────────
+        BTC      $77,520.50   ATR 125.7
+        BAL      $1,000.00
+        PNL DAY  +$15.50      TOTAL +$420.10
+        ─────────────────────────
+        STATE    SCANNING       4 trades · WR 50%
+        AMD      DISTRIBUTION/bearish
+        STRUCT   15m=range  4h=down
+        FLOW     ▲ +0.42       BSL 1.4 ATR / SSL 3.2 ATR
+        TARGET   $77,800 (BSL ▲)
+    """
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist).strftime("%H:%M IST")
+    kz_tag = "  🔥 KZ" if in_killzone else ""
+
+    flow_glyph = "▲" if flow_conv > 0.05 else ("▼" if flow_conv < -0.05 else "·")
+    pnl_emoji = _badge_pnl(daily_pnl)
+    rule = "<code>──────────────────────────────</code>"
+
+    rows = [
+        f"📊 <b>STATUS</b>  {_esc(now_ist)}   <i>{_esc((session or '').upper())}</i>{kz_tag}",
+        rule,
+        f"<code>BTC      {_fmt_price(price):<14} ATR {atr:6.1f}</code>",
+        f"<code>BAL      {_fmt_price(balance)}</code>",
+        (f"{pnl_emoji} <code>PNL DAY  {_fpnl(daily_pnl):<14} TOTAL {_fpnl(total_pnl)}</code>"),
+        rule,
+        (f"<code>STATE    {_esc((state or 'SCANNING').upper()):<14}</code>"
+         f"   {total_trades} trades · WR {win_rate:.0f}%"
+         + (f" · {consec_loss}L" if consec_loss else "")),
+        f"<code>AMD      {_esc(amd_phase or '—'):<14} {_esc(amd_bias or '—')}</code>",
+    ]
+    if structure_15m or structure_4h:
+        rows.append(
+            f"<code>STRUCT   15m={_esc(structure_15m or '—'):<6} 4h={_esc(structure_4h or '—')}</code>"
+        )
+    nbsl = (f"BSL {nearest_bsl.get('dist_atr', 0):.1f}A" if nearest_bsl else "BSL —")
+    nssl = (f"SSL {nearest_ssl.get('dist_atr', 0):.1f}A" if nearest_ssl else "SSL —")
+    rows.append(
+        f"<code>FLOW     {_esc(flow_glyph)} {flow_conv:+.2f} {(flow_dir or 'neutral')[:6]:<7}"
+        f"</code>   {nbsl} / {nssl}"
+    )
+    if primary_target and primary_target != "—":
+        rows.append(f"<code>TARGET   {_esc(primary_target[:50])}</code>")
+
+    if position:
+        side = (position.get("side") or "?").upper()
+        side_emoji = "🟢" if side == "LONG" else "🔴"
+        entry = float(position.get("entry_price") or 0)
+        sl    = float(position.get("sl_price") or 0)
+        tp    = float(position.get("tp_price") or 0)
+        qty   = float(position.get("quantity") or 0)
+        if entry > 0 and side in ("LONG", "SHORT"):
+            move = (price - entry) if side == "LONG" else (entry - price)
+            init_sl = float(position.get("initial_sl_dist") or abs(entry - sl) or 1)
+            r = move / init_sl if init_sl else 0
+            upnl = move * qty
+            rows.append(rule)
+            rows.append(
+                f"{side_emoji} <b>{_esc(_arrow(side))} {_esc(side)}</b>"
+                f"   <code>ENTRY {_fmt_price(entry)}</code>"
+            )
+            rows.append(
+                f"<code>SL    {_fmt_price(sl):<14} TP    {_fmt_price(tp)}</code>"
+            )
+            rows.append(
+                f"<code>UPNL  {_fpnl(upnl):<14} R     {r:+.2f}</code>"
+            )
+    return "\n".join(rows)

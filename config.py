@@ -270,6 +270,29 @@ QUANT_MAX_HOLD_SEC             = 3600      # 60 min max hold
 QUANT_COOLDOWN_SEC             = 30        # 30s between trades
 QUANT_LOSS_LOCKOUT_SEC         = 300       # 5 min lockout after consec losses
 QUANT_POS_SYNC_SEC             = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST-EXIT RE-ENTRY GATE (strategy/post_exit_gate.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# Six-lens gate that replaces the flat 30s cooldown with regime-aware logic.
+# Goal: stop the "exit → re-enter in 30s → take another stop" failure mode.
+#
+# Each constant tunes one lens. Defaults are conservative for BTC perps on a
+# 1m/5m/15m liquidity-first stack; relax with caution.
+
+POST_EXIT_BASE_SEC                = 60.0   # absolute floor on time-since-exit
+POST_EXIT_LOSS_DECAY_FACTOR       = 2.0    # 2^(N-1) cooldown after N losses
+POST_EXIT_LOSS_DECAY_CAP_SEC      = 900.0  # 15-min ceiling on loss decay
+POST_EXIT_FLIP_BASE_SEC           = 120.0  # min time before opposite-side after SL
+POST_EXIT_FLIP_MIN_ATR_FROM_EXIT  = 1.5    # opposite side needs ≥1.5 ATR distance
+POST_EXIT_FLIP_REQUIRES_BOS       = True   # opposite side also needs BOS/CHoCH
+POST_EXIT_TP_SAMESIDE_BASE_SEC    = 90.0   # min time before same-side after TP
+POST_EXIT_TP_SAMESIDE_PULLBACK_PCT = 0.50  # need 50% retrace of prior MFE
+POST_EXIT_ATR_SHOCK_PCT           = 0.40   # ±40% ATR change = regime shock
+POST_EXIT_ATR_SHOCK_PENALTY_SEC   = 180.0  # extra cooldown on ATR shock
+POST_EXIT_STRUCTURE_PROOF_REQUIRED = True  # require BOS/CHoCH/sweep/displacement
+POST_EXIT_STRUCTURE_PROOF_TIMEOUT  = 240.0 # gate self-relaxes after 4 min
+POST_EXIT_LOSS_SAMESIDE_DEAD_SEC  = 300.0  # reserved (not used by current lenses)
 QUANT_W_VWAP_DEV               = 0.30
 QUANT_W_CVD_DIV                = 0.25
 QUANT_W_OB                     = 0.20
