@@ -140,6 +140,25 @@ RATE_LIMIT_ORDERS        = 15
 
 # ── SL infrastructure ─────────────────────────────────────────────────────────
 SL_LIMIT_OFFSET_TICKS    = 20
+# ── SL sizing architecture ─────────────────────────────────────────────────────
+# DESIGN PRINCIPLE: SL is a STRUCTURAL concept, not a price-ratio concept.
+# For ICT sweep entries the invalidation level is the wick extreme. The SL
+# buffer must be sized relative to current ATR (volatility-regime-invariant),
+# NOT as a percentage of asset price (which diverges from ATR as price rises).
+#
+# Example of why PCT floor is wrong:
+#   BTC $77K, ATR $42 → MIN_SL_DISTANCE_PCT=0.40% = $308 = 7.3x ATR
+#   A real 2-ATR SL = $84 = 0.11% → REJECTED by the PCT floor, 0 trades.
+#
+# The correct gates are ATR-relative:
+#   Floor : SL_MIN_ATR_MULT * ATR   (noise floor — SL smaller than this is inside spread)
+#   Ceiling: SL_MAX_ATR_MULT * ATR  (catastrophic-loss guard — never risk >N ATR)
+#
+# ATR-regime adaptation (SL_REGIME_BUFF_SLOPE):
+#   Low-vol  (ATR pctile=0  ): regime_mult = 0.60  → tighter buffer (less noise)
+#   Normal   (ATR pctile=0.5): regime_mult = 1.00  → standard buffer
+#   High-vol (ATR pctile=1.0): regime_mult = 1.40  → wider buffer (more noise)
+#   Formula: regime_mult = 0.60 + SL_REGIME_BUFF_SLOPE * atr_pctile
 
 def get_tick_size(exchange: str | None = None) -> float:
     """Authoritative tick-size lookup for execution-sensitive price rounding."""
@@ -169,12 +188,25 @@ def validate_config() -> None:
 
 
 SL_BUFFER_TICKS          = 5
-MIN_SL_DISTANCE_PCT      = 0.004     # BTC@$66K = $264 min SL distance
+# Primary ATR-relative gates (replaces the broken PCT floor for sweep entries)
+SL_MIN_ATR_MULT              = 0.20   # noise floor: SL < 0.20 ATR = inside spread, reject
+SL_MAX_ATR_MULT_FROM_ENTRY   = 4.0    # ceiling: SL > 4 ATR = catastrophic risk, reject
+# Structural wick clearance: SL must extend at least this fraction of wick_depth
+# PAST the wick tip (not inside the wick body).
+# 0.10 = 10% of wick depth as extra clearance (e.g., 7pt wick → 0.7pt)
+SL_SWEEP_WICK_CLEARANCE_MULT = 0.10
+# ATR-regime adaptation slope: scales SL buffer by current ATR percentile rank.
+# regime_mult = 0.60 + SL_REGIME_BUFF_SLOPE * atr_pctile
+# Low-vol (p=0): mult=0.60 — tight; Normal (p=0.5): mult=1.00; High-vol (p=1): mult=1.40
+SL_REGIME_BUFF_SLOPE         = 0.80
+# Legacy PCT gates — kept ONLY for absolute sanity checks on quant_strategy trail SL.
+# NOT used as structural floors for sweep or momentum entry sizing (ATR gates above replace them).
+MIN_SL_DISTANCE_PCT      = 0.0003    # sanity only: $23 at BTC $77K — catches float errors
 MAX_SL_DISTANCE_PCT      = 0.035
 SL_MIN_IMPROVEMENT_PCT   = 0.001
 SL_RATCHET_ONLY          = True
 SL_ATR_PERIOD            = 14
-SL_ATR_BUFFER_MULT       = 0.75
+SL_ATR_BUFFER_MULT       = 0.75      # trail manager buffer (separate from entry SL)
 SL_MIN_CLEARANCE_ATR_MULT    = 1.5
 SL_MIN_IMPROVEMENT_ATR_MULT  = 0.20   # prevents micro SL updates
 TRAILING_SL_CHECK_INTERVAL   = 10

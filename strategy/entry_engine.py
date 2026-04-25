@@ -93,19 +93,30 @@ _CONT_SL_BUFFER_ATR = 0.40
 
 try:
     import config as _sl_cfg
-    _MIN_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MIN_SL_DISTANCE_PCT", 0.004))
+    # ── ATR-regime SL gates (structural, volatility-invariant) ──────────────
+    # SL sizing is ATR-relative, not price-percentage-relative.
+    # A PCT floor (e.g. 0.40% of price) divorces from market structure when ATR
+    # diverges from price: BTC $77K ATR=$42 → 0.40% = $308 = 7.3×ATR → 0 trades.
+    # ATR-relative gates are correct across all vol regimes and price levels.
+    #
+    # Noise floor — SL narrower than this sits inside typical spread noise:
+    _SL_MIN_ATR_MULT     = float(getattr(_sl_cfg, "SL_MIN_ATR_MULT", 0.20))
+    # ATR ceiling — SL wider than this is catastrophic; reject the setup:
+    _SL_MAX_ATR_MULT     = float(getattr(_sl_cfg, "SL_MAX_ATR_MULT_FROM_ENTRY", 4.0))
+    # Wick structural clearance — SL must extend this fraction of wick_depth
+    # PAST the wick tip, anchoring it to the actual structural level:
+    _SL_WICK_CLEARANCE   = float(getattr(_sl_cfg, "SL_SWEEP_WICK_CLEARANCE_MULT", 0.10))
+    # Regime-adaptation slope: regime_mult = 0.60 + slope × atr_pctile
+    # p=0 (low-vol) → mult=0.60 tight; p=0.5 → 1.00 normal; p=1.0 → 1.40 wide:
+    _SL_REGIME_SLOPE     = float(getattr(_sl_cfg, "SL_REGIME_BUFF_SLOPE", 0.80))
+    # Legacy PCT ceiling — secondary sanity guard only (not a structural floor):
     _MAX_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MAX_SL_DISTANCE_PCT", 0.035))
-    # ATR-based SL floor: guards against high-price / low-ATR regimes where
-    # MIN_SL_DISTANCE_PCT * price >> ATR, which blocks 100% of sweep entries.
-    # Example: BTC $77K, ATR $42 → 0.40% minimum = $310 = 7.4× ATR.
-    # When the wick-based SL is tighter than this ATR floor it is EXPANDED
-    # (not rejected) to this distance. _MIN_SL_DISTANCE_PCT remains the
-    # authoritative ceiling check (wide SL still rejects as before).
-    _SL_MIN_ATR_MULT = float(getattr(_sl_cfg, "SL_ATR_BUFFER_MULT", 0.75))
 except Exception:
-    _MIN_SL_DISTANCE_PCT = 0.004
+    _SL_MIN_ATR_MULT     = 0.20
+    _SL_MAX_ATR_MULT     = 4.0
+    _SL_WICK_CLEARANCE   = 0.10
+    _SL_REGIME_SLOPE     = 0.80
     _MAX_SL_DISTANCE_PCT = 0.035
-    _SL_MIN_ATR_MULT     = 0.75
 
 # Post-Sweep phases (seconds after sweep)
 # MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
@@ -422,7 +433,21 @@ class EntryEngine:
         self._last_bridge_skip: Optional[Dict[str, int]] = None
         self._sweep_quality_hist = defaultdict(lambda: deque(maxlen=200))
 
+        # ATR-percentile rank [0,1] updated by quant_strategy each tick via
+        # set_atr_pctile().  Drives _regime_sl_mult() so SL buffers scale with
+        # the current volatility regime: tight in low-vol, wide in high-vol.
+        # Default 0.5 = normal regime (regime_mult=1.0) until live data arrives.
+        self._atr_pctile: float = 0.5
+
     # ── Public API ────────────────────────────────────────────────────
+
+    def set_atr_pctile(self, pctile: float) -> None:
+        """Update current ATR percentile rank [0, 1] from quant_strategy.
+
+        Called each tick alongside live ATR so SL buffers adapt to the volatility
+        regime without a config redeploy. Same interface as ICTTrailManager.
+        """
+        self._atr_pctile = max(0.0, min(1.0, pctile))
 
     def update(
         self,
@@ -1021,14 +1046,21 @@ class EntryEngine:
         if rr < adj_rr:
             return False
 
-        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
-        if abs(price - sl) < _sl_atr_floor:
-            # Expand momentum SL to ATR floor (same policy as sweep SL)
+        # ── Momentum SL validation (ATR-regime, not PCT) ─────────────────
+        # Momentum SL is anchored to the displacement candle body (structural).
+        # Validate against ATR gates, not price-percentage floors.
+        risk = abs(price - sl)
+        _noise_floor = atr * _SL_MIN_ATR_MULT
+        if risk < _noise_floor:
+            # SL is inside the noise band — expand to candle body + noise floor
             if disp_dir == "long":
-                sl = price - _sl_atr_floor
+                sl = cl_val - _noise_floor
             else:
-                sl = price + _sl_atr_floor
-        if abs(price - sl) / price > _MAX_SL_DISTANCE_PCT:
+                sl = ch + _noise_floor
+            risk = abs(price - sl)
+        if risk > atr * _SL_MAX_ATR_MULT:
+            return False
+        if risk / price > _MAX_SL_DISTANCE_PCT:
             return False
 
         if target is None:
@@ -1470,6 +1502,41 @@ class EntryEngine:
         return PostSweepDecision(action="wait", direction="", confidence=0.0,
                                   reason=f"WAIT [{rev_total:.0f}v{cont_total:.0f}]")
 
+    # ── Internal: regime-adaptive SL helpers ────────────────────────
+
+    def _regime_sl_mult(self) -> float:
+        """SL buffer multiplier scaled by current ATR-percentile regime.
+
+        Derived from set_atr_pctile() (updated each tick by quant_strategy).
+        Defaults to 1.0 (no adjustment) until live percentile data is supplied.
+
+        Formula: 0.60 + _SL_REGIME_SLOPE * atr_pctile
+          Low-vol  (p=0.0) → 0.60  tight buffers, market is compressed
+          Normal   (p=0.5) → 1.00  standard buffers
+          High-vol (p=1.0) → 1.40  wide buffers, bars have large wicks
+        """
+        return 0.60 + _SL_REGIME_SLOPE * self._atr_pctile
+
+    def _sl_structural_bounds(self, wick_extreme: float, pool_price: float,
+                               side: str, price: float, atr: float
+                               ) -> tuple:
+        """Return (min_risk, max_risk) for a sweep SL anchored to the wick.
+
+        min_risk: the tighter of (a) wick clearance = max(wick_depth*CLEARANCE, 0.20 ATR)
+                  and (b) noise floor = 0.20 ATR.  Both ensure the SL is past the wick
+                  and above the bid/ask spread noise.
+        max_risk: ATR ceiling = _SL_MAX_ATR_MULT * ATR.  Beyond this the position
+                  size becomes too small for meaningful returns at the target R:R.
+        """
+        wick_depth  = abs(wick_extreme - pool_price)
+        # Minimum clearance: SL must clear at least this far beyond the wick tip
+        wick_clear  = max(wick_depth * _SL_WICK_CLEARANCE, atr * _SL_MIN_ATR_MULT)
+        # Minimum risk from current entry price (clamp to entry-to-wick distance)
+        entry_to_wick = abs(price - wick_extreme)
+        min_risk = entry_to_wick + wick_clear   # total risk = entry→wick + clearance
+        max_risk = atr * _SL_MAX_ATR_MULT
+        return min_risk, max_risk
+
     # ── Sweep entry handlers ──────────────────────────────────────────
 
     def _handle_reversal(self, sweep, decision, snap, flow, ict,
@@ -1477,44 +1544,61 @@ class EntryEngine:
         side = decision.direction
         ps = self._post_sweep
 
-        # SL: sweep wick + buffer
+        # ── SL: structural placement behind sweep wick (ICT methodology) ──
+        # The wick extreme IS the engineered stop-hunt level. SL goes behind it.
+        # If price revisits the wick, the sweep narrative is invalidated.
+        #
+        # Buffer scales with ATR-regime: compressed vol → tight buffer, expanded
+        # vol → wider buffer (regime_mult: 0.60 low-vol → 1.40 high-vol).
+        regime_mult = self._regime_sl_mult()
         if side == "long":
-            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR
+            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
         else:
-            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR
+            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
 
-        # Liquidity push
         sl = self._push_sl_behind_pools(sl, side, price, atr)
-
         risk = abs(price - sl)
 
-        # ATR floor expansion: if wick was too shallow, expand SL instead of
-        # rejecting. The wick determines structural direction; ATR sets magnitude.
-        # _SL_MIN_ATR_MULT (default 0.75) is calibrated vs _REV_SL_BUFFER_ATR=0.35
-        # so the expansion is ~2× the buffer — enough room for institutional noise.
         if risk < 1e-10:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
-        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
-        if risk < _sl_atr_floor:
-            # Expand SL to ATR floor; re-push behind pools with updated level
+
+        # ── Structural floor: SL must clear the wick tip ──────────────────
+        # Enforce: SL is placed at minimum max(wick_depth * CLEARANCE, 0.20 ATR)
+        # PAST the wick extreme. This anchors SL to the structural level, not an
+        # arbitrary price-ratio floor that ignores market structure entirely.
+        min_risk, max_risk = self._sl_structural_bounds(
+            sweep.wick_extreme, sweep.pool.price, side, price, atr)
+
+        if risk < min_risk:
+            wick_clear = max(
+                abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
+                atr * _SL_MIN_ATR_MULT)
             if side == "long":
-                sl = price - _sl_atr_floor
+                sl = sweep.wick_extreme - wick_clear
             else:
-                sl = price + _sl_atr_floor
+                sl = sweep.wick_extreme + wick_clear
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
             logger.debug(
-                f"SL expanded to {risk:.1f}pts ({risk/price*100:.3f}%) "
-                f"ATR-floor={_sl_atr_floor:.1f} side={side}")
+                f"SL anchored to wick: risk={risk:.1f}pts ({risk/atr:.2f}x ATR) "
+                f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
+
+        # ── ATR ceiling: reject structurally overlarge SL ─────────────────
+        if risk > max_risk:
+            logger.info(
+                f"ENTRY REJECTED (SL too wide): risk={risk:.1f} = {risk/atr:.1f}x ATR "
+                f"(max={_SL_MAX_ATR_MULT}x) side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
         if risk / price > _MAX_SL_DISTANCE_PCT:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL too wide): risk={risk:.1f} "
-                f"({risk / price * 100:.3f}%) max={_MAX_SL_DISTANCE_PCT * 100:.2f}% "
-                f"side={side} sweep=${sweep.pool.price:.1f}")
+                f"ENTRY REJECTED (SL exceeds PCT ceiling): {risk/price*100:.3f}% "
+                f"(max={_MAX_SL_DISTANCE_PCT*100:.2f}%) side={side}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1580,11 +1664,15 @@ class EntryEngine:
             self._reset(now)
             return
 
-        # SL: BEYOND the swept pool
+        # ── SL: structural placement behind swept pool level ─────────────
+        # Continuation thesis: price is now moving AWAY from the pool in sweep
+        # direction. If price returns to the pool level, the continuation is
+        # invalidated. SL goes behind pool price with a regime-adaptive buffer.
+        regime_mult = self._regime_sl_mult()
         if side == "long":
-            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR
+            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR * regime_mult
         else:
-            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR
+            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
@@ -1594,29 +1682,41 @@ class EntryEngine:
         risk = abs(price - sl)
         reward = abs(tp - price)
 
-        # ATR floor expansion (same logic as _handle_reversal)
         if risk < 1e-10:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
-        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
-        if risk < _sl_atr_floor:
+
+        # ── Structural floor: pool clearance ─────────────────────────────
+        # SL must extend at least _SL_MIN_ATR_MULT * ATR from entry (noise floor).
+        # For continuation, the pool is the structural anchor — not the wick.
+        pool_clearance = atr * _SL_MIN_ATR_MULT
+        if risk < pool_clearance:
             if side == "long":
-                sl = price - _sl_atr_floor
+                sl = sweep.pool.price - pool_clearance
             else:
-                sl = price + _sl_atr_floor
+                sl = sweep.pool.price + pool_clearance
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
             reward = abs(tp - price)
             logger.debug(
-                f"SL (cont) expanded to {risk:.1f}pts ATR-floor={_sl_atr_floor:.1f}")
+                f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
+                f"({risk/atr:.2f}x ATR) side={side}")
+
+        # ── ATR ceiling ───────────────────────────────────────────────────
+        if risk > atr * _SL_MAX_ATR_MULT:
+            logger.info(
+                f"ENTRY REJECTED (SL too wide): {risk/atr:.1f}x ATR "
+                f"(max={_SL_MAX_ATR_MULT}x) side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
         if risk / price > _MAX_SL_DISTANCE_PCT:
             logger.info(
-                f"⚠️ ENTRY REJECTED (SL too wide): risk={risk:.1f} "
-                f"({risk / price * 100:.3f}%) max={_MAX_SL_DISTANCE_PCT * 100:.2f}% "
-                f"side={side} sweep=${sweep.pool.price:.1f}")
+                f"ENTRY REJECTED (SL exceeds PCT ceiling): {risk/price*100:.3f}% "
+                f"side={side}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1703,7 +1803,17 @@ class EntryEngine:
         return tp
 
     def _compute_sl(self, ict, side, price, atr):
-        """ICT OB-based SL with ATR fallback."""
+        """ICT Order Block-based SL for momentum/displacement entries.
+
+        Placement priority:
+          1. Nearest OB on the entry side (structural anchor — tightest valid SL)
+          2. 1.5 ATR fallback if no valid OB (regime-adaptive default)
+
+        Validation (ATR-relative, not price-percentage):
+          - OB SL rejected if it places risk outside [0.20 ATR, 4.0 ATR]
+          - Fallback guaranteed to be in that range
+          - Legacy PCT ceiling kept as absolute sanity guard
+        """
         if side == "long":
             ob = ict.nearest_ob_price
         else:
@@ -1717,25 +1827,31 @@ class EntryEngine:
                 sl = ob + atr * 0.20
 
         if sl is not None:
-            dist = abs(price - sl) / price
-            if dist < _MIN_SL_DISTANCE_PCT or dist > _MAX_SL_DISTANCE_PCT:
+            ob_risk = abs(price - sl)
+            # Reject OB-based SL if it falls outside the ATR validity band
+            if ob_risk < atr * _SL_MIN_ATR_MULT or ob_risk > atr * _SL_MAX_ATR_MULT:
                 sl = None
 
         if sl is None:
-            fallback = max(1.5 * atr, atr * _SL_MIN_ATR_MULT)
+            # Fallback: 1.5 ATR from entry (covers OB-free conditions)
+            # regime_mult scales it: tight in low-vol, wider in high-vol
+            fallback = max(1.5 * atr * self._regime_sl_mult(), atr * _SL_MIN_ATR_MULT)
             sl = price - fallback if side == "long" else price + fallback
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
-
         risk = abs(price - sl)
-        _sl_atr_floor = atr * _SL_MIN_ATR_MULT if atr > 0 else 0.0
-        if risk < _sl_atr_floor:
-            sl = price - _sl_atr_floor if side == "long" else price + _sl_atr_floor
+
+        # Hard floor: noise minimum
+        if risk < atr * _SL_MIN_ATR_MULT:
+            sl = price - atr * _SL_MIN_ATR_MULT if side == "long" else price + atr * _SL_MIN_ATR_MULT
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
 
-        dist = risk / price
-        if dist > _MAX_SL_DISTANCE_PCT:
+        # ATR ceiling
+        if risk > atr * _SL_MAX_ATR_MULT:
+            return None
+        # Legacy PCT ceiling
+        if risk / price > _MAX_SL_DISTANCE_PCT:
             return None
         return sl
 
