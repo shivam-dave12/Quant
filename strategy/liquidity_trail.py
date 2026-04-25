@@ -107,7 +107,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 PHASE_0_MAX_R = 1.0    # below this → hands off (structural SL trusted)
-PHASE_1_MAX_R = 2.0    # BE lock zone
+PHASE_1_MAX_R = 1.0    # BE checkpoint; do not trap 1R-2R before structure
 PHASE_2_MAX_R = 3.5    # Fib structural zone (1H/15m swings)
 # Phase 3 ≥ 3.5R (Fib aggressive — all TFs, HTF-gated)
 
@@ -514,11 +514,12 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 1 — BREAKEVEN LOCK
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_1_MAX_R:
-            self._last_phase = "BE_LOCK"
-            return self._try_be_lock(
-                pos_side, price, entry_price, current_sl, atr,
-                r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+        self._last_phase = "BE_LOCK"
+        _be_result = self._try_be_lock(
+            pos_side, price, entry_price, current_sl, atr,
+            r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+        if _be_result.new_sl is not None:
+            return _be_result
 
         # ── Build candle-by-TF map for Phase 2/3 ──────────────────────
         candles_by_tf: Dict[str, List[dict]] = {
@@ -617,6 +618,12 @@ class LiquidityTrailEngine:
         """Move SL to breakeven + exact fees + slippage buffer."""
         be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
         be_price = round(be_price, 1)
+
+        invalid_reason = self._stop_trigger_invalid_reason(pos_side, be_price, price)
+        if invalid_reason:
+            return self._hold(
+                f"BE_NOT_EXECUTABLE: {invalid_reason}",
+                hold_reason, r_multiple=r_multiple)
 
         # Already locked?
         already = ((pos_side == "long"  and current_sl >= be_price) or
@@ -839,12 +846,15 @@ class LiquidityTrailEngine:
                  else (best.price + buf_points)
         new_sl = round(new_sl, 1)
 
-        # BE floor: Phase 2/3 SL must never go below exact BE
+        # BE floor applies only when BE is executable as a protective stop now.
+        # For a short, a BE price below market is a target, not a valid buy-stop.
         be_price = round(self._be_price(pos_side, entry_price, atr, pos, fee_engine), 1)
-        if pos_side == "long" and new_sl < be_price:
-            new_sl = be_price
-        if pos_side == "short" and new_sl > be_price:
-            new_sl = be_price
+        be_invalid = self._stop_trigger_invalid_reason(pos_side, be_price, price)
+        if be_invalid is None:
+            if pos_side == "long" and new_sl < be_price:
+                new_sl = be_price
+            if pos_side == "short" and new_sl > be_price:
+                new_sl = be_price
 
         # ── Step 10: Validate ──────────────────────────────────────────
         result = self._validate_sl(
@@ -1490,6 +1500,12 @@ class LiquidityTrailEngine:
                 f"RATCHET_FAIL: new_sl=${new_sl:,.1f} >= current=${current_sl:,.1f}",
                 hold_reason, r_multiple=r_multiple)
 
+        invalid_reason = self._stop_trigger_invalid_reason(pos_side, new_sl, price)
+        if invalid_reason:
+            return self._hold(
+                f"STOP_NOT_EXECUTABLE: {invalid_reason}",
+                hold_reason, r_multiple=r_multiple)
+
         # Breathing room
         dist_to_price = abs(price - new_sl) / atr
         if dist_to_price < min_breathing:
@@ -1549,6 +1565,34 @@ class LiquidityTrailEngine:
     # ─────────────────────────────────────────────────────────────────────
     # HELPERS
     # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stop_trigger_invalid_reason(
+        pos_side: str, stop_price: float, market_price: float,
+    ) -> Optional[str]:
+        """Return why a protective stop cannot be placed at the current market."""
+        if stop_price <= 0 or market_price <= 0:
+            return "non-positive stop or market price"
+        try:
+            import config as _cfg
+            if hasattr(_cfg, "get_tick_size"):
+                tick = float(_cfg.get_tick_size())
+            else:
+                tick = float(getattr(_cfg, "TICK_SIZE", 0.1))
+        except Exception:
+            tick = 0.1
+        min_gap = max(tick * 0.5, 1e-9)
+        if pos_side == "long" and stop_price >= market_price - min_gap:
+            return (
+                f"SELL stop ${stop_price:,.1f} must be below market "
+                f"${market_price:,.1f}"
+            )
+        if pos_side == "short" and stop_price <= market_price + min_gap:
+            return (
+                f"BUY stop ${stop_price:,.1f} must be above market "
+                f"${market_price:,.1f}"
+            )
+        return None
 
     @staticmethod
     def _get_primary_swing(

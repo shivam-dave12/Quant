@@ -4854,15 +4854,10 @@ class QuantStrategy:
 
             # â”€â”€ Step 3: ATR fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if sl_price is None:
-                _min_dist   = _path_b_min_dist
-                _max_dist   = price * QCfg.MAX_SL_PCT()
-                _atr_sl_dist = max(_min_dist, min(_max_dist, 1.5 * atr))
-                sl_price   = _round_to_tick(
-                    price - _atr_sl_dist if side == "long" else price + _atr_sl_dist)
-                _sl_source = "ATR_fallback"
                 logger.warning(
-                    f"âš ï¸ SL ATR fallback: ${sl_price:,.2f} "
-                    f"({_atr_sl_dist:.0f}pts / {_atr_sl_dist/atr:.2f}ATR) â€” no 15m structure found")
+                    "SL/TP fallback rejected: no ICT OB or 15m swing SL "
+                    "available; refusing ATR-derived stop")
+                return None, None
 
             # â”€â”€ v6.0: PATH-B LIQUIDITY PROXIMITY GUARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # move it behind the pool so the sweep doesn't take us out.
@@ -5144,11 +5139,12 @@ class QuantStrategy:
             self._force_tp = None
 
         if not _using_force_levels:
-            sl_price, tp_price = self._compute_sl_tp(
-                data_manager, price, side, atr, mode=mode,
-                signal_confidence=signal_confidence,
-                use_maker_entry=use_maker,
-            )
+            logger.warning(
+                "Entry rejected: EntryEngine did not provide executable "
+                "liquidity TP + ICT/liquidity SL levels; refusing PATH-B fallback")
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
         else:
             # Force levels active â€” fee engine check is advisory only (no block)
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
@@ -5283,22 +5279,19 @@ class QuantStrategy:
         if is_adverse_slip and adverse_slip_pct > QCfg.SLIPPAGE_TOL():
             logger.info(
                 f"âš ï¸ Adverse slippage {adverse_slip_pct:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} "
-                f"â€” recomputing SL/TP from fill price ${fill_price:,.2f}")
-            new_sl, new_tp = self._compute_sl_tp(
-                data_manager, fill_price, side, atr, mode=mode,
-                signal_confidence=signal_confidence,
-                use_maker_entry=(actual_fill_type == "maker"),
+                f"â€” validating original structural SL/TP against fill ${fill_price:,.2f}")
+            _levels_valid = (
+                (side == "long" and sl_price < fill_price and tp_price > fill_price) or
+                (side == "short" and sl_price > fill_price and tp_price < fill_price)
             )
-            if new_sl is None:
-                # After adverse slippage, trade no longer clears fee floor â€” abort
+            if not _levels_valid:
                 logger.warning(
-                    f"âŒ Post-slippage TP gate rejected â€” aborting trade "
+                    f"âŒ Post-slippage structural levels invalid â€” aborting trade "
                     f"(adverse slip={adverse_slip_pct:.4%})")
                 exit_side = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
                 self._last_exit_time = time.time()
                 return
-            sl_price, tp_price = new_sl, new_tp
         elif not is_adverse_slip and abs(fill_price - price) / price > QCfg.SLIPPAGE_TOL():
             # Favorable fill: market moved our way. Log it but keep original SL/TP.
             fav_pct = abs(fill_price - price) / price
@@ -6285,6 +6278,20 @@ class QuantStrategy:
 
         # Engine returned a new SL â€” dispatch to exchange
         _new_liq_sl = _liq_result.new_sl
+        _tick_gap = max(QCfg.TICK_SIZE() * 0.5, 1e-9)
+        _invalid_stop = (
+            (pos.side == "long" and _new_liq_sl >= price - _tick_gap) or
+            (pos.side == "short" and _new_liq_sl <= price + _tick_gap)
+        )
+        if _invalid_stop:
+            if now - self._last_trail_block_log >= 30.0:
+                self._last_trail_block_log = now
+                _verb = "SELL below" if pos.side == "long" else "BUY above"
+                logger.warning(
+                    f"FibTrail dispatch blocked: {pos.side.upper()} protective "
+                    f"stop ${_new_liq_sl:,.1f} is not executable at market "
+                    f"${price:,.1f}; requires {_verb} market. No REST retry.")
+            return False
         logger.info(
             f"ðŸ¦ FibTrail [{_liq_result.phase}] "
             f"R={_liq_result.r_multiple:.2f}R â†’ SL ${_new_liq_sl:.1f} | "

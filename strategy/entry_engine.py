@@ -615,11 +615,10 @@ class EntryEngine:
            A 30s cooldown matches _ENTRY_COOLDOWN_SEC and aligns with the typical
            time for market structure to change enough to warrant re-evaluation.
 
-        2. SL FLIP (FIX-SL-FLIP): _compute_sl() picks between an ICT OB-based SL
-           and an ATR fallback depending on whether ict.nearest_ob_price is non-zero
-           that tick. The OB presence flickers tick-to-tick (it's fetched live),
-           causing the SL to alternate between two values ($66,851 vs $66,855 in the
-           logs). locked_sl freezes the SL computed at signal-generation time and
+        2. SL FLIP (FIX-SL-FLIP): _compute_sl() depends on live ICT OB structure.
+           OB presence can flicker tick-to-tick while the context refreshes,
+           causing the SL to alternate between nearby structural values. locked_sl
+           freezes the SL computed at signal-generation time and
            reuses it for any subsequent signal within the cooldown window, ensuring
            the conviction gate always scores the SAME R:R.
 
@@ -1027,8 +1026,12 @@ class EntryEngine:
         else:
             sl = cl_val - buf if disp_dir == "long" else ch + buf
             ict_sl = self._compute_sl(ict, disp_dir, price, atr)
-            if ict_sl is not None:
-                sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
+            if ict_sl is None:
+                logger.info(
+                    f"MOMENTUM REJECTED (no ICT SL): side={disp_dir} "
+                    f"entry=${price:.1f}")
+                return False
+            sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
 
         risk = abs(price - sl)
         if risk < 1e-10:
@@ -1038,7 +1041,10 @@ class EntryEngine:
         tp, target = self._find_tp(snap, disp_dir, price, atr, sl,
                                     _MOMENTUM_MIN_RR * (2.0 - amd_mult))
         if tp is None:
-            tp = price + risk * 2.0 if disp_dir == "long" else price - risk * 2.0
+            logger.info(
+                f"MOMENTUM REJECTED (no liquidity TP): side={disp_dir} "
+                f"entry=${price:.1f} sl=${sl:.1f}")
+            return False
 
         reward = abs(tp - price)
         rr = reward / risk
@@ -1062,13 +1068,6 @@ class EntryEngine:
             return False
         if risk / price > _MAX_SL_DISTANCE_PCT:
             return False
-
-        if target is None:
-            pools = snap.bsl_pools if disp_dir == "long" else snap.ssl_pools
-            reachable = [t for t in pools if t.distance_atr <= _HTF_TP_MAX_ATR]
-            if not reachable:
-                return False
-            target = min(reachable, key=lambda t: t.distance_atr)
 
         self._last_momentum_candle_ts = disp_candle_ts
         # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
@@ -1608,10 +1607,10 @@ class EntryEngine:
 
         # TP: pool → HTF → 2R (only if CISD)
         tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
-        cisd_ok = ps is not None and ps.cisd_detected
-        if tp is None and cisd_ok:
-            tp = price + risk * 2.0 if side == "long" else price - risk * 2.0
         if tp is None:
+            logger.info(
+                f"ENTRY REJECTED (no liquidity TP): side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1625,12 +1624,6 @@ class EntryEngine:
             self._post_sweep = None
             self._reset(now)
             return
-
-        if target is None:
-            target = PoolTarget(
-                pool=sweep.pool, distance_atr=0, direction=side,
-                significance=getattr(sweep.pool, 'significance', 3.0),
-                tf_sources=[])
 
         disp = f" DISP={ps.max_displacement:.1f}ATR" if ps else ""
         cisd = f" CISD={ps.cisd_type}" if ps and ps.cisd_detected else ""
@@ -1760,24 +1753,13 @@ class EntryEngine:
 
         pools = snap.bsl_pools if side == "long" else snap.ssl_pools
         candidates = [t for t in pools
-                      if _MIN_TARGET_ATR <= t.distance_atr <= _MAX_TARGET_ATR
+                      if _MIN_TARGET_ATR <= t.distance_atr <= _HTF_TP_MAX_ATR
                       and t.significance >= _MIN_POOL_SIGNIFICANCE]
-        if candidates:
-            best = max(candidates, key=lambda t: t.adjusted_sig())
-            tp = self._pool_to_tp(best, side, price, atr)
+        candidates.sort(key=lambda t: t.distance_atr)
+        for target in candidates:
+            tp = self._pool_to_tp(target, side, price, atr)
             if tp and abs(tp - price) / risk >= min_rr:
-                return tp, best
-
-        # HTF escalation
-        htf = [t for t in pools
-               if (t.pool.timeframe in _HTF_TP_TIMEFRAMES
-                   or t.pool.htf_count >= _HTF_TP_MIN_HTF_COUNT)
-               and _MIN_TARGET_ATR <= t.distance_atr <= _HTF_TP_MAX_ATR]
-        htf.sort(key=lambda t: t.distance_atr)
-        for t in htf:
-            tp = self._pool_to_tp(t, side, price, atr)
-            if tp and abs(tp - price) / risk >= min_rr:
-                return tp, t
+                return tp, target
 
         return None, None
 
@@ -1793,7 +1775,7 @@ class EntryEngine:
                      and t.significance >= _MIN_POOL_SIGNIFICANCE * 0.5]
         if not reachable:
             return None
-        return max(reachable, key=lambda t: t.adjusted_sig())
+        return min(reachable, key=lambda t: t.distance_atr)
 
     def _pool_to_tp(self, target, side, price, atr):
         buf = atr * min(0.50, 0.10 + 0.05 * target.distance_atr)
@@ -1807,13 +1789,13 @@ class EntryEngine:
 
         Placement priority:
           1. Nearest OB on the entry side (structural anchor — tightest valid SL)
-          2. 1.5 ATR fallback if no valid OB (regime-adaptive default)
-
         Validation (ATR-relative, not price-percentage):
           - OB SL rejected if it places risk outside [0.20 ATR, 4.0 ATR]
-          - Fallback guaranteed to be in that range
           - Legacy PCT ceiling kept as absolute sanity guard
         """
+        if ict is None:
+            return None
+
         if side == "long":
             ob = ict.nearest_ob_price
         else:
@@ -1833,19 +1815,14 @@ class EntryEngine:
                 sl = None
 
         if sl is None:
-            # Fallback: 1.5 ATR from entry (covers OB-free conditions)
-            # regime_mult scales it: tight in low-vol, wider in high-vol
-            fallback = max(1.5 * atr * self._regime_sl_mult(), atr * _SL_MIN_ATR_MULT)
-            sl = price - fallback if side == "long" else price + fallback
+            return None
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
 
         # Hard floor: noise minimum
         if risk < atr * _SL_MIN_ATR_MULT:
-            sl = price - atr * _SL_MIN_ATR_MULT if side == "long" else price + atr * _SL_MIN_ATR_MULT
-            sl = self._push_sl_behind_pools(sl, side, price, atr)
-            risk = abs(price - sl)
+            return None
 
         # ATR ceiling
         if risk > atr * _SL_MAX_ATR_MULT:
