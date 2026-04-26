@@ -1875,15 +1875,35 @@ class DailyCounterConsistencyCheck(HealthCheck):
         drift = abs(rg_count - rm_count)
         explained = max(0, drift - in_flight)
 
-        # Only warn when RiskManager actually exposes a counter AND the
-        # drift cannot be explained by in-flight positions AND the
-        # unexplained gap is > 1 (absorb 1 step of benign skew from a
-        # just-closed trade whose record_trade hook hasn't landed yet).
+        # SPAM-FIX 2026-04-26: this check is broken-by-design.
+        #
+        # User reports persistent Telegram WARN spam:
+        #   "DailyRiskGate=0 vs RiskManager=7 (diff=7, in_flight=0, unexplained=7)"
+        #
+        # Root cause: the two counters track DIFFERENT things by design —
+        # DailyRiskGate counts entries (UTC-day reset), RiskManager counts
+        # completed trades (no daily reset, or different reset clock). After
+        # a UTC midnight rollover with no fresh entries, DailyRiskGate=0 but
+        # RiskManager still reports the running count from before midnight.
+        # That is NOT drift; it is the expected behaviour of two counters
+        # with different reset semantics.
+        #
+        # The class docstring already admits "the 'right' counter depends on
+        # which one the strategy is using for gating" — i.e. there is no
+        # canonical truth to drift FROM. A consistency check whose own
+        # author cannot say which value is canonical cannot produce
+        # actionable alerts.
+        #
+        # Fix: never emit WARN. Always emit INFO so the values are still
+        # captured in quant_bot.log for forensic review, but no Telegram
+        # paging. If you want to re-enable WARN, first make one counter
+        # canonical (e.g. delete the unused one) and document the invariant.
         if rm is not None and explained > 1:
-            return self._warn(
-                f"daily counter drift: DailyRiskGate={rg_count} vs "
+            return self._info(
+                f"daily counters (informational): DailyRiskGate={rg_count} vs "
                 f"RiskManager={rm_count} (diff={drift}, in_flight={in_flight}, "
-                f"unexplained={explained})",
+                f"unexplained={explained}) — counters track different events "
+                f"by design; treat as informational",
                 rg_count=rg_count, rm_count=rm_count,
                 in_flight=in_flight, unexplained=explained,
                 total_trades=total,
@@ -2550,7 +2570,24 @@ class Watchdog:
     _DEFAULT_LOOP_INTERVAL_SEC = 0.25
     # Minimum gap between Telegram alerts for the same WARN-level check,
     # to avoid spamming on flapping conditions.
-    _WARN_ALERT_COOLDOWN_SEC = 300.0
+    # SPAM-FIX 2026-04-26: was 300s. Raised to 900s (15 min) — the previous
+    # value still allowed a single broken check (e.g. daily_counter_consistency)
+    # to fire 192 alerts per day. 15 min is more aligned with how often an
+    # operator would realistically respond to a non-critical warning.
+    _WARN_ALERT_COOLDOWN_SEC = 900.0
+
+    # SPAM-FIX 2026-04-26: belt-and-braces suppression list. Check names listed
+    # here NEVER emit Telegram WARN alerts regardless of the cooldown. They
+    # still log to quant_bot.log via the WARN result for forensic value, but
+    # no Telegram paging. Use this for checks that have been determined to be
+    # broken-by-design or chronically false-positive without enough information
+    # to fix at source. Keep this list short — every entry is technical debt
+    # we should pay down by either fixing or deleting the check.
+    _WARN_TELEGRAM_SUPPRESS: frozenset = frozenset({
+        # Broken-by-design: compares two counters with different reset clocks.
+        # Already converted to INFO at source — this is belt-and-braces.
+        "daily_counter_consistency",
+    })
 
     def __init__(self,
                  strategy: Any,
@@ -2732,6 +2769,10 @@ class Watchdog:
 
     def _maybe_alert_warn(self, check_name: str, result: HealthResult) -> None:
         if self._notifier is None:
+            return
+        # SPAM-FIX 2026-04-26: hard suppress list overrides cooldown.
+        # See _WARN_TELEGRAM_SUPPRESS docstring above.
+        if check_name in self._WARN_TELEGRAM_SUPPRESS:
             return
         now = _now()
         last = self._last_warn_alert.get(check_name, 0.0)

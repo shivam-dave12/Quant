@@ -128,6 +128,17 @@ class TelegramBotController:
         self.last_update_id = 0
         self.running        = False
 
+        # SPAM-FIX 2026-04-26: rate-limit getUpdates HTTP error logs.
+        # Telegram occasionally bursts 8–15 consecutive 429/502 responses on
+        # getUpdates (seen in production log 06:40:52 — 06:40:59). Each was
+        # WARN-level → forwarded to Telegram via TelegramLogHandler →
+        # amplified the burst into a self-spam loop. We now log at INFO and
+        # only emit a single WARN per unique (status_code) per 60s window so
+        # genuine outages are still visible without flooding.
+        self._last_getupdates_warn_ts: dict = {}   # status_code -> last warn ts
+        self._getupdates_warn_throttle: float = 60.0
+        self._last_getupdates_conn_warn_ts: float = 0.0
+
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
 
@@ -192,14 +203,37 @@ class TelegramBotController:
             }
             resp = requests.get(url, params=params, timeout=(5.0, _read_timeout))
             if resp.status_code != 200:
-                logger.warning("Telegram API HTTP %d — getUpdates skipped", resp.status_code)
+                # SPAM-FIX 2026-04-26: throttled per-status-code logging.
+                # See __init__ comment. Net effect: at most 1 WARN per
+                # status_code per 60s; the rest are INFO-level and stay out
+                # of Telegram entirely.
+                _now = time.time()
+                _last = self._last_getupdates_warn_ts.get(resp.status_code, 0.0)
+                if _now - _last >= self._getupdates_warn_throttle:
+                    self._last_getupdates_warn_ts[resp.status_code] = _now
+                    logger.warning(
+                        "Telegram API HTTP %d — getUpdates skipped (further "
+                        "occurrences within %.0fs will be logged at INFO)",
+                        resp.status_code, self._getupdates_warn_throttle,
+                    )
+                else:
+                    logger.info(
+                        "Telegram API HTTP %d — getUpdates skipped",
+                        resp.status_code,
+                    )
                 return []
             data = resp.json()
             return data.get("result", []) if data.get("ok") else []
         except requests.exceptions.Timeout:
             return []
         except requests.exceptions.ConnectionError as e:
-            logger.warning("Telegram connection error (will retry): %s", e)
+            # Same throttling treatment for connection-reset bursts.
+            _now = time.time()
+            if _now - self._last_getupdates_conn_warn_ts >= self._getupdates_warn_throttle:
+                self._last_getupdates_conn_warn_ts = _now
+                logger.warning("Telegram connection error (will retry): %s", e)
+            else:
+                logger.info("Telegram connection error (will retry): %s", e)
             return []
         except ValueError as e:
             logger.error("Telegram JSON parse error in getUpdates: %s", e)
