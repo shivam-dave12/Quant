@@ -5115,6 +5115,13 @@ class QuantStrategy:
             # v9: capture full EntrySignal before the thread consumes it
             self._last_entry_signal = signal
 
+            # Mark the entry engine before the background thread starts. If the
+            # thread rejects pre-order sizing/levels, its finally block can reset
+            # the engine deterministically. Calling this after thread start races
+            # with fast sizing rejections and can leave EntryEngine=ENTERING while
+            # the strategy is already FLAT.
+            self._entry_engine.on_entry_placed(signal)
+
             self._launch_entry_async(
                 data_manager, order_manager, risk_manager,
                 side=signal.side, sig=_min_sig,
@@ -5122,7 +5129,6 @@ class QuantStrategy:
                 ict_tier=_tier,
                 prefetched_bal_info=bal_info,   # Bug #5: reuse fetched balance
             )
-            self._entry_engine.on_entry_placed(signal)
             self._entry_confirm_key = None
             self._entry_confirm_count = 0
 
@@ -6498,10 +6504,10 @@ class QuantStrategy:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
         # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-        # FIBONACCI TRAIL ENGINE (v5.0) Ã¢â‚¬â€ SOLE TRAILING ENGINE
+        # INSTITUTIONAL LIQUIDITY/STRUCTURE TRAIL ENGINE - SOLE TRAILING ENGINE
         # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-        # Pure-Fibonacci trailing: bar-close-gated, close-confirmation counter,
-        # swing-invalidation, momentum gate, liquidity-aware buffer, HTF
+        # Liquidity/structure trailing: bar-close-gated, close-confirmation counter,
+        # swing-invalidation, momentum gate, liquidity/PD-array buffers, HTF
         # alignment, Counter-BOS sovereign override, OTE pullback freeze.
         # No fallback logic: if the engine returns new_sl=None, we HOLD.
         # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
@@ -6597,12 +6603,12 @@ class QuantStrategy:
                 self._last_trail_block_log = now
                 _verb = "SELL below" if pos.side == "long" else "BUY above"
                 logger.warning(
-                    f"FibTrail dispatch blocked: {pos.side.upper()} protective "
+                    f"InstitutionalTrail dispatch blocked: {pos.side.upper()} protective "
                     f"stop ${_new_liq_sl:,.1f} is not executable at market "
                     f"${price:,.1f}; requires {_verb} market. No REST retry.")
             return False
         logger.info(
-            f"Ã°Å¸ÂÂ¦ FibTrail [{_liq_result.phase}] "
+            f"Ã°Å¸ÂÂ¦ InstitutionalTrail [{_liq_result.phase}] "
             f"R={_liq_result.r_multiple:.2f}R Ã¢â€ â€™ SL ${_new_liq_sl:.1f} | "
             f"{_liq_result.reason}")
 
@@ -6619,13 +6625,13 @@ class QuantStrategy:
             )
         if not _pos_still_valid:
             logger.warning(
-                "FibTrail: position changed between compute and REST dispatch "
+                "InstitutionalTrail: position changed between compute and REST dispatch "
                 "Ã¢â‚¬â€ aborting trail to prevent orphaned stop order")
             return False
 
         _lt_side = "sell" if pos.side == "long" else "buy"
         logger.info(
-            f"Ã°Å¸ÂÂ¦ FibTrail SL dispatch [STOP-LIMIT] "
+            f"Ã°Å¸ÂÂ¦ InstitutionalTrail SL dispatch [STOP-LIMIT] "
             f"trigger=${_new_liq_sl:,.1f} side={_lt_side} qty={pos.quantity} "
             f"phase={_liq_result.phase}")
         _lt_result = order_manager.replace_stop_loss(
@@ -6696,7 +6702,7 @@ class QuantStrategy:
                         self.current_sl_price = _restore_trig
                 return False
 
-            logger.warning(f"FibTrail: SL replace failed ({err}) Ã¢â‚¬â€ keeping current SL")
+            logger.warning(f"InstitutionalTrail: SL replace failed ({err}) Ã¢â‚¬â€ keeping current SL")
             return False
 
         # Success Ã¢â‚¬â€ update position state under lock
@@ -6709,7 +6715,7 @@ class QuantStrategy:
             self._pos.consecutive_trail_holds = 0
             if not self._pos.trail_active:
                 self._pos.trail_active = True
-                logger.info("Ã¢Å“â€¦ Fibonacci trail now active")
+                logger.info("Ã¢Å“â€¦ Institutional trail now active")
             if _liq_result.phase == "BE_LOCK":
                 self._pos.be_ratchet_applied = True
 
@@ -6746,7 +6752,7 @@ class QuantStrategy:
                     buffer_atr    = (_a.buffer_atr if _a else 0.0),
                 ))
             except Exception as _lt_tg_e:
-                logger.debug(f"FibTrail Telegram error: {_lt_tg_e}")
+                logger.debug(f"InstitutionalTrail Telegram error: {_lt_tg_e}")
         return True
 
     def _exit_trade(self, order_manager, price, reason):
@@ -7673,11 +7679,29 @@ class QuantStrategy:
         # into a commission-rejection zone.
         risk_capital = available_after_fees * risk_pct * total_mult
         qty_raw      = risk_capital / sl_dist
+        max_allowed_margin = available_after_fees * _bal_usage_frac
+        max_risk_cap = max(risk_capital * 1.15, available_after_fees * risk_pct * 1.15)
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ Lot-step + hard limits Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-        qty = math.floor(qty_raw / step) * step
-        qty = round(qty, 8)
-        qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
+        def _lot(q: float) -> float:
+            return round(max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), q)), 8)
+
+        floor_qty = math.floor(qty_raw / step) * step
+        ceil_qty = math.ceil(qty_raw / step) * step
+        candidates = {_lot(floor_qty), _lot(ceil_qty), _lot(QCfg.MIN_QTY())}
+        valid_qty = []
+        for cand in candidates:
+            cand_margin = cand * price / QCfg.LEVERAGE()
+            cand_risk = cand * sl_dist
+            if cand_margin <= max_allowed_margin and cand_risk <= max_risk_cap:
+                valid_qty.append(cand)
+        if not valid_qty:
+            logger.warning(
+                f"Sizing rejected: no exchange lot fits risk/margin envelope | "
+                f"raw_qty={qty_raw:.6f} target_risk=${risk_capital:.2f} "
+                f"hard_cap=${max_risk_cap:.2f} margin_cap=${max_allowed_margin:.2f}")
+            return None
+        qty = min(valid_qty, key=lambda q: (abs((q * sl_dist) - risk_capital), -q))
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE Ã¢â€â‚¬
         # Bug #1 fix: the old guard compared required_margin against
@@ -7686,7 +7710,6 @@ class QuantStrategy:
         # cap means the bot should never commit more than 60% of available
         # funds as margin on any single trade Ã¢â‚¬â€ the remaining 40% stays liquid
         # for commission, funding, and drawdown headroom.
-        max_allowed_margin = available_after_fees * _bal_usage_frac
         required_margin = qty * price / QCfg.LEVERAGE()
         if required_margin > max_allowed_margin:
             logger.warning(
@@ -7710,7 +7733,6 @@ class QuantStrategy:
         risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
         margin_used   = qty * price / QCfg.LEVERAGE()
         actual_fees   = qty * price * _taker_rate * 2.0   # worst-case round-trip
-        max_risk_cap = max(risk_capital * 1.15, available_after_fees * risk_pct * 1.15)
         if dollar_risk > max_risk_cap:
             logger.warning(
                 f"Sizing rejected: exchange min lot would over-risk account | "
@@ -7723,6 +7745,7 @@ class QuantStrategy:
             f"tier={ict_tier or 'none'} "
             f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
             f"a={amd_mod:+.2f} i={inst_mult:.2f}) | "
+            f"target_risk=${risk_capital:.2f} raw_qty={qty_raw:.4f} | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
             f"margin=${margin_used:.2f} | feesÃ¢â€°Ë†${actual_fees:.3f} | "
             f"headroom=${available - margin_used - actual_fees:.2f} | qty={qty}"

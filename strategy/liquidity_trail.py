@@ -1,5 +1,5 @@
 """
-liquidity_trail.py — Institutional Fibonacci SL Trailing Engine v5.0
+liquidity_trail.py — Institutional Liquidity/Structure SL Trailing Engine v6.0
 =====================================================================
 ADVANCED REWRITE — Drop-in replacement.  Sole trailing engine for the
 entire system (no fallbacks, no chandelier, no dynamic-structure class).
@@ -292,7 +292,7 @@ except Exception:
 @dataclass
 class PoolAnchor:
     """
-    A Fibonacci anchor that the SL can be set behind.
+    A structural anchor that the SL can be set behind.
 
     Backward compatible with the v4.0 PoolAnchor: callers reading
     .price / .timeframe / .sig / .is_swept / .quality work unchanged.
@@ -315,6 +315,8 @@ class PoolAnchor:
     n_cluster_tfs: int  = 1
     # Liquidity-aware buffer expansion was applied
     pool_between_expand: bool = False
+    # "fib" | "liquidity_pool" | "order_block" | "breaker_block"
+    anchor_kind:   str = "fib"
 
 
 @dataclass
@@ -341,7 +343,7 @@ class LiquidityTrailResult:
 
 class LiquidityTrailEngine:
     """
-    Institutional Fibonacci SL Trailing Engine v5.0 — sole trail.
+    Institutional liquidity/structure SL Trailing Engine v6.0 - sole trail.
 
     Stateful per-position.  Call .reset() when a position closes.
     """
@@ -413,7 +415,7 @@ class LiquidityTrailEngine:
         cvd_trend:       float = 0.0,
     ) -> LiquidityTrailResult:
         """
-        Compute the next SL based on advanced Fibonacci phase logic.
+        Compute the next SL using liquidity, ICT structure, and delivery gates.
 
         Returns LiquidityTrailResult with new_sl=None to HOLD current SL,
         or new_sl=<float> to replace with the returned value.
@@ -467,6 +469,12 @@ class LiquidityTrailEngine:
         profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
         r_peak    = max(profit, peak_profit)
         r_multiple = r_peak / init_dist if init_dist > 1e-10 else 0.0
+        candles_by_tf: Dict[str, List[dict]] = {
+            "1m":  candles_1m  or [],
+            "5m":  candles_5m  or [],
+            "15m": candles_15m or [],
+            "1h":  candles_1h  or [],
+        }
 
         # Bug #19 fix: counter-BOS re-arm after Phase 1 completes.
         # The original design fired the override exactly once per position.
@@ -514,12 +522,14 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 1 — BREAKEVEN LOCK
         # ══════════════════════════════════════════════════════════════
-        self._last_phase = "BE_LOCK"
-        _be_result = self._try_be_lock(
-            pos_side, price, entry_price, current_sl, atr,
-            r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
-        if _be_result.new_sl is not None:
-            return _be_result
+        early_momentum_gate = self._momentum_gate(
+            pos_side, atr, candles_by_tf.get("5m", []), cvd_trend,
+            ict_engine, now_)
+        be_gate_ok, be_gate_reason = self._structural_be_gate(
+            pos_side, price, entry_price, atr, r_multiple,
+            early_momentum_gate, ict_engine, liq_snapshot, now_)
+        if not be_gate_ok and hold_reason is not None:
+            hold_reason.append(f"BE_WAIT_STRUCT: {be_gate_reason}")
 
         # ── Build candle-by-TF map for Phase 2/3 ──────────────────────
         candles_by_tf: Dict[str, List[dict]] = {
@@ -530,11 +540,11 @@ class LiquidityTrailEngine:
         }
 
         # ══════════════════════════════════════════════════════════════
-        # PHASE 2 / 3 — FIBONACCI TRAIL
+        # PHASE 2 / 3 - STRUCTURE TRAIL
         # ══════════════════════════════════════════════════════════════
         if r_multiple < PHASE_2_MAX_R:
             self._last_phase = "STRUCTURAL"
-            return self._fibonacci_trail(
+            _trail_result = self._fibonacci_trail(
                 pos_side, price, entry_price, current_sl, atr, init_dist,
                 r_multiple, liq_snapshot, ict_engine, now_, sess_mult,
                 candles_by_tf=candles_by_tf, pos=pos, fee_engine=fee_engine,
@@ -544,10 +554,17 @@ class LiquidityTrailEngine:
                 min_breathing=MIN_BREATHING_ATR_PHASE2,
                 closes_required=PHASE2_CLOSES_REQUIRED,
                 hold_reason=hold_reason)
+            if _trail_result.new_sl is not None or not be_gate_ok:
+                return _trail_result
+            _be_result = self._try_be_lock(
+                pos_side, price, entry_price, current_sl, atr,
+                r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
+                gate_reason=be_gate_reason)
+            return _be_result if _be_result.new_sl is not None else _trail_result
 
         # Phase 3
         self._last_phase = "AGGRESSIVE"
-        return self._fibonacci_trail(
+        _trail_result = self._fibonacci_trail(
             pos_side, price, entry_price, current_sl, atr, init_dist,
             r_multiple, liq_snapshot, ict_engine, now_, sess_mult,
             candles_by_tf=candles_by_tf, pos=pos, fee_engine=fee_engine,
@@ -557,6 +574,13 @@ class LiquidityTrailEngine:
             min_breathing=MIN_BREATHING_ATR_PHASE3,
             closes_required=PHASE3_CLOSES_REQUIRED,
             hold_reason=hold_reason)
+        if _trail_result.new_sl is not None or not be_gate_ok:
+            return _trail_result
+        _be_result = self._try_be_lock(
+            pos_side, price, entry_price, current_sl, atr,
+            r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
+            gate_reason=be_gate_reason)
+        return _be_result if _be_result.new_sl is not None else _trail_result
 
     # ─────────────────────────────────────────────────────────────────────
     # PHASE 1 — BE LOCK with exact fees
@@ -610,10 +634,74 @@ class LiquidityTrailEngine:
             rate = 0.00055
         return entry_price * rate * 2.0
 
+    @staticmethod
+    def _structural_be_gate(
+        pos_side: str, price: float, entry_price: float, atr: float,
+        r_multiple: float, momentum_gate: str, ict_engine, liq_snapshot, now: float,
+    ) -> Tuple[bool, str]:
+        """
+        Allow a BE/protection lock only after the trade has delivered structure.
+
+        This prevents the old retail behaviour of moving to BE solely because
+        price printed a numeric R multiple. The lock now needs directional flow,
+        a fresh aligned BOS, or enough delivery beyond a live opposing pool.
+        """
+        profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
+        if profit <= max(0.75 * atr, 1e-9):
+            return False, f"delivery={profit/atr:.2f}ATR<0.75ATR"
+
+        if momentum_gate != "NONE":
+            return True, f"structural_delivery={momentum_gate}"
+
+        if ict_engine is not None:
+            now_ms = int(now * 1000) if now > 1e6 else int(time.time() * 1000)
+            for tf in ("5m", "15m"):
+                try:
+                    st = ict_engine._tf.get(tf)
+                    direction = getattr(st, "bos_direction", None)
+                    ts = int(getattr(st, "bos_timestamp", 0) or 0)
+                    if ts > 0 and now_ms - ts <= TRAIL_MOMENTUM_BOS_MAX_AGE_MS:
+                        if pos_side == "long" and direction == "bullish":
+                            return True, f"structural_delivery=BOS:{tf}"
+                        if pos_side == "short" and direction == "bearish":
+                            return True, f"structural_delivery=BOS:{tf}"
+                except Exception:
+                    pass
+
+        if liq_snapshot is not None and r_multiple >= 1.25:
+            try:
+                opp_pools = (getattr(liq_snapshot, "bsl_pools", []) if pos_side == "long"
+                             else getattr(liq_snapshot, "ssl_pools", []))
+                delivered = []
+                for pt in (opp_pools or []):
+                    pool = getattr(pt, "pool", pt)
+                    pp = float(getattr(pool, "price", 0.0) or 0.0)
+                    if pp <= 0:
+                        continue
+                    if pos_side == "long" and entry_price < pp < price:
+                        delivered.append(pt)
+                    if pos_side == "short" and price < pp < entry_price:
+                        delivered.append(pt)
+                if delivered:
+                    best = max(delivered, key=lambda p: float(
+                        p.adjusted_sig() if hasattr(p, "adjusted_sig")
+                        else getattr(p, "significance", 0.0) or 0.0
+                    ))
+                    pool = getattr(best, "pool", best)
+                    tf = str(getattr(pool, "timeframe", "?") or "?")
+                    sig = float(best.adjusted_sig() if hasattr(best, "adjusted_sig")
+                                else getattr(best, "significance", 0.0) or 0.0)
+                    return True, f"structural_delivery=pool:{tf}:sig={sig:.1f}"
+            except Exception:
+                pass
+
+        return False, "awaiting aligned displacement/CVD/BOS/liquidity delivery"
+
     def _try_be_lock(
         self, pos_side: str, price: float, entry_price: float,
         current_sl: float, atr: float, r_multiple: float,
         hold_reason: Optional[List[str]], pos=None, fee_engine=None,
+        gate_reason: str = "",
     ) -> LiquidityTrailResult:
         """Move SL to breakeven + exact fees + slippage buffer."""
         be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
@@ -656,17 +744,20 @@ class LiquidityTrailEngine:
         commission_rt = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
         # Re-derive fee-only component for logging
         fee_component = abs(commission_rt - entry_price) - 0.12 * atr
+        gate_tag = f" | {gate_reason}" if gate_reason else ""
         reason = (
             f"[BE_LOCK] R={r_multiple:.2f}R → BE=${be_price:,.1f} "
             f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"
         )
+        if gate_tag:
+            reason = f"{reason}{gate_tag}"
         logger.info(f"Trail: {reason}")
         return LiquidityTrailResult(
             new_sl=be_price, anchor=None, reason=reason,
             phase="BE_LOCK", r_multiple=r_multiple)
 
     # ─────────────────────────────────────────────────────────────────────
-    # PHASE 2 / 3 — FIBONACCI TRAIL CORE
+    # PHASE 2 / 3 - STRUCTURE TRAIL CORE
     # ─────────────────────────────────────────────────────────────────────
 
     def _fibonacci_trail(
@@ -681,7 +772,7 @@ class LiquidityTrailEngine:
         hold_reason: Optional[List[str]],
     ) -> LiquidityTrailResult:
         """
-        Advanced Fibonacci trail logic.
+        Advanced liquidity/structure trail logic.
 
         Order of operations:
           1. HTF alignment check (Phase 3 only — downgrade to P2 buffers if not)
@@ -751,19 +842,25 @@ class LiquidityTrailEngine:
                 tf, cfg["weight"], effective_buf_table, liq_snapshot)
             all_anchors.extend(tf_anchors)
 
-        if not swings_by_tf:
+        structural_anchors = self._build_structural_anchors(
+            pos_side, price, atr, liq_snapshot, ict_engine, now,
+            primary_swing=None)
+
+        if not swings_by_tf and not structural_anchors:
             return self._hold(
                 f"{phase_name}: no valid swings on allowed TFs "
                 f"({'1H/15m' if phase_num == 2 else 'all'}) — all swing origins broken or candles insufficient",
                 hold_reason, r_multiple=r_multiple)
 
-        if not all_anchors:
+        if not all_anchors and not structural_anchors:
             return self._hold(
-                f"{phase_name}: no Fib levels behind price from valid swings",
+                f"{phase_name}: no structural anchors behind price from valid swings",
                 hold_reason, r_multiple=r_multiple)
 
         # ── Step 4: Cluster for multi-TF confluence ────────────────────
         clustered = self._cluster_levels(all_anchors, atr)
+        if structural_anchors:
+            clustered = structural_anchors + clustered
 
         # ── Step 5: OTE pullback freeze ────────────────────────────────
         primary_swing = self._get_primary_swing(swings_by_tf)
@@ -797,7 +894,7 @@ class LiquidityTrailEngine:
             swings_by_tf)
         if best is None:
             return self._hold(
-                f"{phase_name}: no Fib anchor with close-confirmation "
+                f"{phase_name}: no structural anchor with close-confirmation "
                 f"(need {closes_required} closed bar(s) past level)",
                 hold_reason, r_multiple=r_multiple,
                 swing_low=primary_swing[0] if primary_swing else None,
@@ -815,9 +912,12 @@ class LiquidityTrailEngine:
                     best = self._locked_anchor
 
         # ── Step 9: Compute SL with buffer + liquidity-aware expansion ─
-        raw_buf = effective_buf_table.get(
-            best.fib_ratio or 0.0,
-            _DEFAULT_BUF_P2 if phase_num == 2 else _DEFAULT_BUF_P3
+        raw_buf = (
+            best.buffer_atr if best.fib_ratio is None else
+            effective_buf_table.get(
+                best.fib_ratio or 0.0,
+                _DEFAULT_BUF_P2 if phase_num == 2 else _DEFAULT_BUF_P3
+            )
         )
         buf_mult = sess_mult
 
@@ -871,7 +971,7 @@ class LiquidityTrailEngine:
             return result
         return self._hold(
             f"{phase_name}: validation failed — "
-            f"fib={best.fib_ratio:.3f}@${best.price:,.0f}({best.timeframe})",
+            f"{(f'fib={best.fib_ratio:.3f}' if best.fib_ratio is not None else best.anchor_kind)}@${best.price:,.0f}({best.timeframe})",
             hold_reason, r_multiple=r_multiple)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1086,6 +1186,113 @@ class LiquidityTrailEngine:
     # ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _build_structural_anchors(
+        pos_side: str, price: float, atr: float, liq_snapshot=None,
+        ict_engine=None, now: float = 0.0,
+        primary_swing: Optional[Tuple[float, float]] = None,
+    ) -> List[PoolAnchor]:
+        """
+        Build first-class defensive anchors from live liquidity and ICT PD arrays.
+
+        LONG protects below SSL/support; SHORT protects above BSL/resistance.
+        These anchors outrank synthetic Fib geometry when they are confirmed.
+        """
+        anchors: List[PoolAnchor] = []
+        side_tag = "SSL" if pos_side == "long" else "BSL"
+
+        def _tf_weight(tf: str) -> float:
+            return float(_TF_CFG.get(str(tf).lower(), {"weight": 1.5})["weight"])
+
+        def _protective(anchor_price: float) -> bool:
+            if anchor_price <= 0:
+                return False
+            if pos_side == "long" and anchor_price >= price:
+                return False
+            if pos_side == "short" and anchor_price <= price:
+                return False
+            dist_atr = abs(price - anchor_price) / max(atr, 1e-9)
+            return 0.25 <= dist_atr <= MAX_SL_DIST_ATR
+
+        def _add(price_anchor: float, tf: str, quality: float, buffer_atr: float,
+                 kind: str, pool_boost: bool = False) -> None:
+            if not _protective(price_anchor):
+                return
+            dist_atr = abs(price - price_anchor) / max(atr, 1e-9)
+            anchors.append(PoolAnchor(
+                price        = round(price_anchor, 1),
+                side         = side_tag,
+                timeframe    = str(tf or "5m").lower(),
+                sig          = round(quality, 3),
+                buffer_atr   = round(buffer_atr, 3),
+                is_swept     = False,
+                distance_atr = round(dist_atr, 2),
+                quality      = round(quality, 3),
+                fib_ratio    = None,
+                swing_low    = primary_swing[0] if primary_swing else None,
+                swing_high   = primary_swing[1] if primary_swing else None,
+                pool_boost   = pool_boost,
+                anchor_kind  = kind,
+            ))
+
+        if liq_snapshot is not None:
+            pools = (getattr(liq_snapshot, "ssl_pools", []) if pos_side == "long"
+                     else getattr(liq_snapshot, "bsl_pools", []))
+            for pt in (pools or []):
+                try:
+                    pool = getattr(pt, "pool", pt)
+                    status = str(getattr(pool, "status", "") or "").upper()
+                    if "SWEPT" in status or "CONSUMED" in status:
+                        continue
+                    pp = float(getattr(pool, "price", 0.0) or 0.0)
+                    tf = str(getattr(pool, "timeframe", "") or "5m").lower()
+                    sig = float(pt.adjusted_sig() if hasattr(pt, "adjusted_sig")
+                                else getattr(pt, "significance", 0.0) or 0.0)
+                    sources = getattr(pt, "tf_sources", []) or []
+                    htf_count = sum(1 for s in sources if str(s).lower() in ("15m", "1h", "4h", "1d"))
+                    quality = (5.0 + sig) * (1.0 + 0.18 * htf_count) * (1.0 + 0.15 * _tf_weight(tf))
+                    buffer = max(0.35, min(0.95, 0.85 - min(quality, 16.0) * 0.025))
+                    _add(pp, tf, quality, buffer, "liquidity_pool", pool_boost=True)
+                except Exception:
+                    continue
+
+        if ict_engine is not None:
+            now_ms = int(now * 1000) if now > 1e6 else int(time.time() * 1000)
+            arrays = (
+                ((getattr(ict_engine, "order_blocks_bull", []) or []), "order_block"),
+                ((getattr(ict_engine, "breaker_blocks_bull", []) or []), "breaker_block"),
+            ) if pos_side == "long" else (
+                ((getattr(ict_engine, "order_blocks_bear", []) or []), "order_block"),
+                ((getattr(ict_engine, "breaker_blocks_bear", []) or []), "breaker_block"),
+            )
+            for array, kind in arrays:
+                for block in list(array):
+                    try:
+                        if hasattr(block, "is_active") and not block.is_active(now_ms):
+                            continue
+                        tf = str(getattr(block, "timeframe", "5m") or "5m").lower()
+                        strength = float(getattr(block, "strength", 50.0) or 50.0)
+                        anchor_px = (float(getattr(block, "low", 0.0) or 0.0)
+                                     if pos_side == "long"
+                                     else float(getattr(block, "high", 0.0) or 0.0))
+                        quality = 6.5 + (strength / 14.0) + _tf_weight(tf)
+                        if bool(getattr(block, "bos_confirmed", False)):
+                            quality += 1.25
+                        if bool(getattr(block, "has_displacement", False)):
+                            quality += 1.00
+                        if kind == "breaker_block":
+                            quality += 1.50
+                        buffer = max(0.40, min(1.05, 0.95 - min(quality, 18.0) * 0.025))
+                        _add(anchor_px, tf, quality, buffer, kind)
+                    except Exception:
+                        continue
+
+        if pos_side == "long":
+            anchors.sort(key=lambda a: (-a.quality, -a.price))
+        else:
+            anchors.sort(key=lambda a: (-a.quality, a.price))
+        return anchors[:12]
+
+    @staticmethod
     def _cluster_levels(
         anchors: List[PoolAnchor], atr: float,
     ) -> List[PoolAnchor]:
@@ -1206,6 +1413,9 @@ class LiquidityTrailEngine:
                 # Not enough candles to confirm — allow passage ONLY for the
                 # most conservative golden ratios where the institutional
                 # interpretation already implies structural significance.
+                if a.anchor_kind != "fib" and a.quality >= 8.0:
+                    confirmed.append(a)
+                    continue
                 if a.fib_ratio in _INSTITUTIONAL_RATIOS and a.is_cluster:
                     confirmed.append(a)
                 continue
@@ -1490,6 +1700,10 @@ class LiquidityTrailEngine:
         momentum_gate: str, htf_aligned: Optional[bool],
     ) -> Optional[LiquidityTrailResult]:
         """Apply all institutional guards.  Return result if valid, None if rejected."""
+        anchor_label = (
+            f"fib={anchor.fib_ratio:.3f}"
+            if anchor.fib_ratio is not None else anchor.anchor_kind
+        )
         # Ratchet
         if pos_side == "long"  and new_sl <= current_sl:
             return self._hold(
@@ -1511,7 +1725,7 @@ class LiquidityTrailEngine:
         if dist_to_price < min_breathing:
             return self._hold(
                 f"BREATHING: {dist_to_price:.2f}ATR<{min_breathing}ATR "
-                f"fib={anchor.fib_ratio:.3f}@${anchor.price:,.0f}({anchor.timeframe})",
+                f"{anchor_label}@${anchor.price:,.0f}({anchor.timeframe})",
                 hold_reason, r_multiple=r_multiple)
 
         # Anti-tightening (preserve initial SL structure)
@@ -1543,7 +1757,7 @@ class LiquidityTrailEngine:
         cluster_tag = f" [×{anchor.n_cluster_tfs}TF]" if anchor.is_cluster else ""
         pool_tag = " +pool" if anchor.pool_boost else ""
         expand_tag = " +expand" if anchor.pool_between_expand else ""
-        ratio_tag = f"fib={anchor.fib_ratio:.3f}" if anchor.fib_ratio is not None else "fib=?"
+        ratio_tag = anchor_label
         improvement = abs(new_sl - current_sl)
 
         reason = (
