@@ -1820,7 +1820,7 @@ class TelegramBotController:
             return (
                 f"🔄 <b>Trailing SL: AUTO</b>\n"
                 f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Fibonacci v5.0 (bar-close gated, momentum-confirmed)\n"
+                f"Engine: Fibonacci v5.0 (bar-close gated, sweep-confirmed)\n"
                 f"Send <code>/trail on</code> or <code>/trail off</code> to override."
             )
 

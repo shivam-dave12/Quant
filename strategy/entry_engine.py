@@ -7,8 +7,6 @@ Architecture:
 
   1. SWEEP REVERSAL  — Pool swept + displacement + CISD → enter reversal
   2. SWEEP CONTINUATION — Pool swept + flow continues → ride the flow
-  3. DISPLACEMENT MOMENTUM — Institutional candle detected → enter with flow
-
   NO approach entries. Institutions do not front-run the sweep.
 
 State Machine:
@@ -140,17 +138,6 @@ _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
 _PS_NEUTRAL_TICK_DECAY = 0.98
 
-# Momentum entry
-_MOMENTUM_MIN_BODY_RATIO   = 0.65
-_MOMENTUM_MIN_VOL_RATIO    = 1.3
-_MOMENTUM_MIN_ATR_MOVE     = 0.6
-_MOMENTUM_LOOKBACK_CANDLES = 3
-_MOMENTUM_SL_BUFFER_ATR    = 0.15
-_MOMENTUM_MIN_RR           = 1.0    # allow tighter momentum entries
-_MOMENTUM_COOLDOWN_SEC     = 15.0   # faster momentum cooldown
-_MOMENTUM_MAX_PER_HOUR     = 10     # allow more momentum entries
-_MOMENTUM_BLOCK_SEC        = 30.0   # default cooldown when gate blocks
-_MOMENTUM_BLOCK_ATR_MOVE   = 0.25   # ATR distance that lifts block early
 
 # HTF TP escalation
 _HTF_TP_TIMEFRAMES   = ('1h', '4h', '1d')
@@ -180,7 +167,6 @@ class EntryType(Enum):
     PRE_SWEEP_APPROACH    = "APPROACH"      # disabled — kept for compat
     SWEEP_REVERSAL        = "REVERSAL"
     SWEEP_CONTINUATION    = "CONTINUATION"
-    DISPLACEMENT_MOMENTUM = "MOMENTUM"
 
 
 @dataclass
@@ -277,9 +263,6 @@ class EntrySignal:
     reason:         str   = ""
     ict_validation: str   = ""
     created_at:     float = field(default_factory=time.time)
-    # FIX-SL-FLIP: candle timestamp that produced this signal — passed back to
-    # mark_momentum_blocked() so the frozen SL can be keyed to the right candle.
-    displacement_candle_ts: int = 0
 
 
 @dataclass
@@ -348,71 +331,6 @@ class EntryEngine:
         self._last_sweep_reversal_dir  = ""
         self._last_sweep_reversal_time = 0.0
 
-        # Momentum tracking
-        self._momentum_entries_1h     = 0
-        self._momentum_hour_start     = 0.0
-        self._last_momentum_candle_ts = 0
-
-        # Compat stubs for TRACKING/READY (unused in sweep-only mode)
-        self._tracking = None
-        self._proximity_confirms = 0
-        self._proximity_target   = None
-        self._proximity_side     = ""
-
-        # BUG-B2 FIX: Gate-block cooldown (POST_SWEEP signals)
-        # When unified_entry_gate or conviction_filter blocks a signal from the
-        # active POST_SWEEP state, the post_sweep evidence model remains alive and
-        # will regenerate the identical signal on the next tick (250ms later).
-        # Without this guard, the bot enters a busy-loop: generate → block → consume
-        # → generate → block, cycling at 4 Hz and exhausting every pool evaluation
-        # before any structural evidence can accumulate.
-        #
-        # _gate_blocked_until: epoch timestamp after which signal generation is
-        #   allowed again. Set by mark_gate_blocked() called from quant_strategy.
-        # _gate_block_key: (side, reason_prefix) dedup so a DIFFERENT gate reason
-        #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
-        self._gate_blocked_until: float = 0.0
-        self._gate_block_key: tuple = ()
-
-        # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
-        # After a verdict fires, _handle_reversal/_handle_continuation previously
-        # cleared _post_sweep but did NOT record the sweep as processed.  On the
-        # next SCANNING tick _collect_sweeps() found the same sweep (still within
-        # the 60s window) and re-entered POST_SWEEP — looping every ~5s for up to
-        # 60s per sweep.
-        #
-        # Key schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
-        #   pool_price   — rounded to dollar to absorb tick-level float noise
-        #   pool_side    — "BSL" or "SSL" — different sides at same price are distinct
-        #   detected_at  — rounded to second; ensures a NEW sweep at the same level
-        #                  (detected_at differs) is never suppressed by a stale entry
-        #
-        # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
-        # window PLUS the 45s gate-block cooldown with 15s margin.
-        #
-        # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
-        # must survive a state reset so the same sweep cannot sneak back in.
-        # force_reset() clears it fully when the operator demands a hard reset.
-        self._processed_sweeps: Dict[tuple, float] = {}
-
-        # FIX-SPAM: Momentum signal gate-block (independent of post-sweep gate).
-        # Momentum signals have no conviction cooldown of their own — when the
-        # conviction gate rejects a momentum signal, the engine immediately
-        # regenerates the identical signal on the next 250ms tick, producing
-        # hundreds of log lines per minute for the same setup.
-        #
-        # _momentum_blocked_until: suppress momentum signal generation until this
-        #   epoch time.  Lifted early if price moves > _MOMENTUM_BLOCK_ATR_MOVE ATR
-        #   from the entry price at block time (genuine structural change).
-        # _momentum_block_entry_price: entry price when block was set (for ATR check).
-        # _momentum_block_candle_ts: candle timestamp at block time.  A new candle
-        #   (different ts) always lifts the block immediately.
-        # _momentum_block_sl: the SL at the time of blocking — frozen so the signal
-        #   does not flip between two SL values on alternating ticks (FIX-SL-FLIP).
-        self._momentum_blocked_until:     float = 0.0
-        self._momentum_block_entry_price: float = 0.0
-        self._momentum_block_candle_ts:   int   = 0
-        self._momentum_block_sl:          Optional[float] = None
 
         # ── Diagnostic: sweep-rejection counters ──────────────────────────
         # Populated by _collect_sweeps() on every tick. Read by the strategy's
@@ -499,28 +417,10 @@ class EntryEngine:
         return sig
 
     def on_entry_placed(self, signal: Optional[EntrySignal] = None) -> None:
-        """
-        Called by quant_strategy when a trade order is confirmed sent.
-
-        Bug #17 fix: _momentum_entries_1h was previously incremented when the
-        momentum SIGNAL was generated, not when the entry was actually placed.
-        A signal blocked by the conviction gate still consumed a budget slot,
-        so two blocked signals exhausted the 3-per-hour cap even with zero
-        fills.  The counter now increments here — strictly after consume_signal()
-        has been called and the order submitted — giving an accurate count of
-        attempted (not generated) entries.
-        """
+        """Called by quant_strategy when a trade order is confirmed sent."""
         self._state = EngineState.ENTERING
         self._state_entered = time.time()
         self._last_entry_at = time.time()
-        # Increment momentum budget for the active signal type (if momentum).
-        # quant_strategy may already have consumed self._signal, so accept the
-        # signal explicitly as the canonical source when available.
-        active_signal = signal or self._signal
-        if (active_signal is not None and
-                getattr(active_signal, 'entry_type', None) ==
-                EntryType.DISPLACEMENT_MOMENTUM):
-            self._momentum_entries_1h += 1
         self._signal = None
 
     def on_entry_failed(self) -> None:
@@ -587,41 +487,6 @@ class EntryEngine:
                 time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
             )
 
-    def mark_momentum_blocked(
-        self,
-        entry_price: float,
-        candle_ts: int,
-        locked_sl: float,
-        cooldown_sec: float = _MOMENTUM_BLOCK_SEC,
-    ) -> None:
-        """
-        FIX-SPAM + FIX-SL-FLIP: Called when a DISPLACEMENT_MOMENTUM setup is
-        structurally blocked by either the strategy layer or this engine.
-
-        Two problems solved in one call:
-
-        1. SPAM (FIX-SPAM): Without this, the scanning state regenerates the same
-           momentum signal every 250ms because _last_entry_at is only updated on
-           on_entry_placed() (which never fires when the conviction gate blocks).
-           A 30s cooldown matches _ENTRY_COOLDOWN_SEC and aligns with the typical
-           time for market structure to change enough to warrant re-evaluation.
-
-        2. SL FLIP (FIX-SL-FLIP): _compute_sl() depends on live ICT OB structure.
-           OB presence can flicker tick-to-tick while the context refreshes,
-           causing the SL to alternate between nearby structural values. locked_sl
-           freezes the SL computed at signal-generation time and
-           reuses it for any subsequent signal within the cooldown window, ensuring
-           the conviction gate always scores the SAME R:R.
-
-        The block is lifted early if:
-          - A new (different) candle is found (candle_ts changed)
-          - Price moves more than 0.25 ATR from entry_price (structural shift)
-        """
-        self._momentum_blocked_until     = time.time() + cooldown_sec
-        self._momentum_block_entry_price = entry_price
-        self._momentum_block_candle_ts   = candle_ts
-        self._momentum_block_sl          = locked_sl
-
     def on_position_closed(self) -> None:
         self._reset(time.time())
 
@@ -629,8 +494,6 @@ class EntryEngine:
         self._reset(time.time())
         self._flow_ewma = 0.0
         self._flow_ewma_last_update = 0.0
-        self._momentum_entries_1h = 0
-        self._last_momentum_candle_ts = 0
         # BUG-5 FIX: Hard operator reset — clear processed-sweep registry fully.
         # Normal _reset() intentionally keeps entries so a cooldown survives a
         # state transition. force_reset() is called explicitly by the operator
@@ -921,196 +784,8 @@ class EntryEngine:
 
     def _do_scanning(self, snap, flow, ict, price, atr, now,
                      candles_1m, candles_5m) -> None:
-        """Check for displacement momentum candles."""
-        if self._check_displacement_momentum(
-                snap, flow, ict, price, atr, now, candles_1m, candles_5m):
-            return
-
-    # ── Displacement Momentum ─────────────────────────────────────────
-
-    def _check_displacement_momentum(self, snap, flow, ict, price, atr,
-                                      now, candles_1m, candles_5m) -> bool:
-        if now - self._last_entry_at < _MOMENTUM_COOLDOWN_SEC:
-            return False
-        if now - self._momentum_hour_start > 3600.0:
-            self._momentum_entries_1h = 0
-            self._momentum_hour_start = now
-        if self._momentum_entries_1h >= _MOMENTUM_MAX_PER_HOUR:
-            return False
-
-        # FIX-SPAM: Respect momentum gate-block cooldown.
-        # Lift early if price has moved significantly (new market structure) or
-        # a different candle is now the best displacement candidate.
-        if now < self._momentum_blocked_until:
-            moved = (abs(price - self._momentum_block_entry_price) / max(atr, 1e-10)
-                     if atr > 0 else 0.0)
-            if moved < _MOMENTUM_BLOCK_ATR_MOVE:
-                return False
-            # Price moved enough — clear the block so we can re-evaluate
-            self._momentum_blocked_until = 0.0
-
-        # Find displacement candle
-        disp_candle = None
-        disp_tf = ""
-        disp_dir = ""
-
-        for candles, tf in [(candles_5m, "5m"), (candles_1m, "1m")]:
-            if not candles or len(candles) < _MOMENTUM_LOOKBACK_CANDLES + 20:
-                continue
-            avg_vol = sum(float(c.get('v', 0)) for c in candles[-22:-2]) / 20.0
-
-            for offset in range(2, 2 + _MOMENTUM_LOOKBACK_CANDLES):
-                if offset >= len(candles):
-                    break
-                c = candles[-offset]
-                o, cl = float(c['o']), float(c['c'])
-                h, lo = float(c['h']), float(c['l'])
-                v = float(c.get('v', 0))
-                ts = int(c.get('t', 0) or 0)
-
-                if ts > 0 and ts == self._last_momentum_candle_ts:
-                    continue
-
-                body = abs(cl - o)
-                rng = h - lo
-                if rng < 1e-10:
-                    continue
-                if body / rng < _MOMENTUM_MIN_BODY_RATIO:
-                    continue
-                if rng / max(atr, 1e-10) < _MOMENTUM_MIN_ATR_MOVE:
-                    continue
-                if v / max(avg_vol, 1e-10) < _MOMENTUM_MIN_VOL_RATIO:
-                    continue
-
-                candle_dir = "long" if cl > o else "short"
-                ewma = self._ewma_dir()
-                if ewma and ewma != candle_dir:
-                    continue
-
-                disp_candle = c
-                disp_tf = tf
-                disp_dir = candle_dir
-                break
-            if disp_candle is not None:
-                break
-
-        if disp_candle is None:
-            return False
-
-        disp_close = float(disp_candle['c'])
-        disp_high = float(disp_candle['h'])
-        disp_low = float(disp_candle['l'])
-        disp_range = max(disp_high - disp_low, 1e-10)
-
-        # Institutional momentum is an execution tactic, not permission to chase.
-        # If price has already extended away from the displacement close, wait for
-        # a retrace or a new liquidity event instead of buying/selling late.
-        chase_budget = max(atr * 0.45, disp_range * 0.35)
-        late_extension = (
-            price - disp_close if disp_dir == "long"
-            else disp_close - price
-        )
-        if late_extension > chase_budget:
-            logger.debug(
-                f"MOMENTUM REJECTED (late extension): side={disp_dir} "
-                f"ext={late_extension / max(atr, 1e-10):.2f}ATR "
-                f"budget={chase_budget / max(atr, 1e-10):.2f}ATR")
-            return False
-
-        pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
-        if disp_dir == "long" and (getattr(ict, 'in_premium', False) or pd >= 0.62):
-            logger.debug(
-                f"MOMENTUM REJECTED (premium chase): side=long PD={pd:.2f}")
-            return False
-        if disp_dir == "short" and (getattr(ict, 'in_discount', False) or pd <= 0.38):
-            logger.debug(
-                f"MOMENTUM REJECTED (discount chase): side=short PD={pd:.2f}")
-            return False
-
-        amd_mult = self._amd_modifier(ict, disp_dir)
-
-        # FIX-SL-FLIP: If this is the same candle that was previously blocked,
-        # reuse the frozen SL to prevent tick-to-tick SL oscillation caused by
-        # ict.nearest_ob_price flickering in/out between ticks.
-        disp_candle_ts = int(disp_candle.get('t', 0) or 0)
-        _reuse_frozen_sl = (
-            self._momentum_block_sl is not None
-            and disp_candle_ts == self._momentum_block_candle_ts
-            and disp_candle_ts > 0
-        )
-
-        # SL
-        ch, cl_val = float(disp_candle['h']), float(disp_candle['l'])
-        buf = atr * _MOMENTUM_SL_BUFFER_ATR
-        if _reuse_frozen_sl:
-            sl = self._momentum_block_sl
-        else:
-            sl = cl_val - buf if disp_dir == "long" else ch + buf
-            ict_sl = self._compute_sl(ict, disp_dir, price, atr)
-            if ict_sl is None:
-                self.mark_momentum_blocked(price, disp_candle_ts, sl)
-                logger.debug(
-                    f"MOMENTUM REJECTED (no ICT SL): side={disp_dir} "
-                    f"entry=${price:.1f}")
-                return False
-            sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
-
-        risk = abs(price - sl)
-        if risk < 1e-10:
-            return False
-
-        # TP (pool → HTF escalation → 2R fallback)
-        tp, target = self._find_tp(snap, disp_dir, price, atr, sl,
-                                    _MOMENTUM_MIN_RR * (2.0 - amd_mult))
-        if tp is None:
-            self.mark_momentum_blocked(price, disp_candle_ts, sl)
-            logger.debug(
-                f"MOMENTUM REJECTED (no liquidity TP): side={disp_dir} "
-                f"entry=${price:.1f} sl=${sl:.1f}")
-            return False
-
-        reward = abs(tp - price)
-        rr = reward / risk
-        adj_rr = _MOMENTUM_MIN_RR * (2.0 - amd_mult)
-        if rr < adj_rr:
-            return False
-
-        # ── Momentum SL validation (ATR-regime, not PCT) ─────────────────
-        # Momentum SL is anchored to the displacement candle body (structural).
-        # Validate against ATR gates, not price-percentage floors.
-        risk = abs(price - sl)
-        _noise_floor = atr * _SL_MIN_ATR_MULT
-        if risk < _noise_floor:
-            # SL is inside the noise band — expand to candle body + noise floor
-            if disp_dir == "long":
-                sl = cl_val - _noise_floor
-            else:
-                sl = ch + _noise_floor
-            risk = abs(price - sl)
-        if not self._sl_is_protective(disp_dir, sl, price):
-            return False
-
-        if not self._sl_before_liquidation(disp_dir, sl, price):
-            return False
-
-        self._last_momentum_candle_ts = disp_candle_ts
-        # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
-        # It is incremented in on_entry_placed() ONLY if the signal is consumed
-        # and the order actually submitted.  Incrementing here would charge the
-        # hourly budget for signals that are subsequently blocked by the
-        # conviction gate, unfairly exhausting the momentum allowance. (Bug #17)
-
-        self._signal = EntrySignal(
-            side=disp_dir, entry_type=EntryType.DISPLACEMENT_MOMENTUM,
-            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
-            target_pool=target,
-            conviction=abs(flow.conviction) * amd_mult,
-            reason=f"DISPLACEMENT {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}",
-            ict_validation=self._ict_summary(ict, disp_dir),
-            displacement_candle_ts=disp_candle_ts,
-        )
-        logger.info(f"MOMENTUM SIGNAL: {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}")
-        return True
+        """Scan for sweep events. Entry is sweep-only."""
+        pass
 
     # ═══════════════════════════════════════════════════════════════════
     # POST-SWEEP PIPELINE

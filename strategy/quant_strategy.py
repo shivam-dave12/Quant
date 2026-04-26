@@ -2332,7 +2332,7 @@ class PositionState:
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
-    trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
+    trade_mode: str = "reversion"  # "reversion" | "trend"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" Ã¢â‚¬â€ for correct PnL fee calc
     entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
@@ -2514,7 +2514,7 @@ class QuantStrategy:
         # (c) _enter_trade() resets all state after a confirmed fill.
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
-        self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
+        self._tp_gate_rejection_mode = ""   # "reversion" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
         # BUG 2 FIX: timestamp when the limit ENTRY order actually hit the exchange.
@@ -2756,8 +2756,7 @@ class QuantStrategy:
         Stable event identity for confirmation.
 
         The old key used live entry/SL/TP ticks, so the same sweep became a
-        different key as price moved. This keys sweeps to the pool event and
-        momentum to the displacement candle.
+        different key as price moved. This keys sweeps to their pool event.
         """
         side = str(getattr(signal, "side", "") or "")
         etype = self._signal_entry_type_value(signal)
@@ -2778,10 +2777,6 @@ class QuantStrategy:
                 round(pool_price / bucket),
                 round(detected_at, 1),
             )
-
-        candle_ts = int(getattr(signal, "displacement_candle_ts", 0) or 0)
-        if etype == EntryType.DISPLACEMENT_MOMENTUM.value or candle_ts > 0:
-            return ("momentum", side, etype, candle_ts)
 
         entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
         bucket = max(tick * 8.0, float(atr or 0.0) * 0.10, 1e-9)
@@ -2834,52 +2829,12 @@ class QuantStrategy:
         return ""
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
-        etype = self._signal_entry_type_value(signal)
-        side = str(getattr(signal, "side", "") or "")
-        if etype != EntryType.DISPLACEMENT_MOMENTUM.value:
-            return ""
-
-        hunt = getattr(self, "_last_hunt_prediction", None)
-        hunt_ts = float(getattr(hunt, "timestamp_ms", 0.0) or 0.0) if hunt else 0.0
-        if hunt_ts > 0.0 and (time.time() * 1000.0 - hunt_ts) > 90000.0:
-            hunt = None
-        hunt_side = self._hunt_delivery_side(hunt)
-        hunt_conf = float(getattr(hunt, "confidence", 0.0) or 0.0) if hunt else 0.0
-        hunt_raw = abs(float(getattr(hunt, "raw_score", 0.0) or 0.0)) if hunt else 0.0
-        if hunt_side and hunt_side != side and max(hunt_conf, hunt_raw) >= 0.10:
-            predicted = str(getattr(hunt, "predicted", "") or "liquidity")
-            return (
-                f"momentum {side} opposes active {predicted} draw "
-                f"({hunt_side}, conf={hunt_conf:.2f}, raw={hunt_raw:.2f})"
-            )
-
-        pd = float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)
-        in_premium = bool(getattr(ict_ctx, "in_premium", False))
-        in_discount = bool(getattr(ict_ctx, "in_discount", False))
-        if side == "long" and (in_premium or pd >= 0.62):
-            return f"momentum long is chasing premium delivery (PD={pd:.2f})"
-        if side == "short" and (in_discount or pd <= 0.38):
-            return f"momentum short is chasing discount delivery (PD={pd:.2f})"
-
-        sig_created = float(getattr(signal, "created_at", time.time()) or time.time())
-        sig_age = max(0.0, time.time() - sig_created)
-        sig_entry = float(getattr(signal, "entry_price", price) or price)
-        drift_atr = abs(float(price or 0.0) - sig_entry) / max(float(atr or 0.0), 1e-9)
-        if sig_age > 12.0 and drift_atr > 0.20:
-            return f"stale momentum signal age={sig_age:.1f}s drift={drift_atr:.2f}ATR"
+        """Institutional veto for entry signals. Momentum entry type removed."""
         return ""
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
-            if (getattr(signal, "entry_type", None) == EntryType.DISPLACEMENT_MOMENTUM
-                    and hasattr(self._entry_engine, "mark_momentum_blocked")):
-                self._entry_engine.mark_momentum_blocked(
-                    entry_price=float(getattr(signal, "entry_price", 0.0) or 0.0),
-                    candle_ts=int(getattr(signal, "displacement_candle_ts", 0) or 0),
-                    locked_sl=float(getattr(signal, "sl_price", 0.0) or 0.0),
-                    cooldown_sec=cooldown_sec,
-                )
-            elif hasattr(self._entry_engine, "mark_gate_blocked"):
+            if hasattr(self._entry_engine, "mark_gate_blocked"):
                 self._entry_engine.mark_gate_blocked(
                     str(getattr(signal, "side", "") or ""),
                     reason[:40],
@@ -5047,7 +5002,6 @@ class QuantStrategy:
                 EntryType.SWEEP_REVERSAL: "S",
                 EntryType.PRE_SWEEP_APPROACH: "A",
                 EntryType.SWEEP_CONTINUATION: "B",
-                EntryType.DISPLACEMENT_MOMENTUM: "A",
             }
             _tier = _tier_map.get(signal.entry_type, "A")
             _inst_dec_for_tier = getattr(self, "_last_institutional_decision", None)
@@ -5098,7 +5052,7 @@ class QuantStrategy:
                 _sweep_present = signal.entry_type in (
                     EntryType.SWEEP_REVERSAL, EntryType.SWEEP_CONTINUATION,
                 )
-                _displacement_present = (signal.entry_type == EntryType.DISPLACEMENT_MOMENTUM)
+                _displacement_present = False  # momentum entry type removed
 
                 _gate_ctx = GateContext(
                     now=now,
