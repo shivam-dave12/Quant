@@ -2481,9 +2481,19 @@ class QuantStrategy:
             DirectionEngine() if _DIRECTION_ENGINE_AVAILABLE else None)
         # v5.0: ICT Sweep-and-Go institutional engine
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
-        # Post-sweep Telegram dedup: only send when verdict changes (action+direction+conf bucket).
-        # Without this, send_telegram_message fires every tick (~0.5s) for the full post-sweep window.
+        # Post-sweep Telegram dedup: only send when verdict CHANGES MEANINGFULLY.
+        # SPAM-FIX 2026-04-26: production logs showed 16–18 POST-SWEEP VERDICT
+        # Telegram messages PER MINUTE (22:31–22:34, 15:53–15:54). The old dedup
+        # used a 5% confidence bucket which jitters across boundaries every few
+        # ticks. New dedup enforces ALL of:
+        #   1. coarser 1/7 confidence buckets (~14% wide), AND
+        #   2. minimum 60s between sends, AND
+        #   3. only re-fire if action OR direction changes, OR |Δconf| ≥ 0.15
         self._ps_tg_last_hash: str = ""
+        self._ps_tg_last_ts: float = 0.0
+        self._ps_tg_last_conf: float = -1.0
+        self._ps_tg_last_action: str = ""
+        self._ps_tg_last_direction: str = ""
         self._pos = PositionState(); self._last_sig = SignalBreakdown()
         self._risk_gate = DailyRiskGate()
         self._confirm_long = 0; self._confirm_short = 0
@@ -4256,17 +4266,48 @@ class QuantStrategy:
                     try:
                         from telegram.notifier import format_post_sweep_verdict
                         _ps_state = getattr(self._dir_engine, '_ps_state', None)
-                        # Dedup: only send when verdict changes (action + direction +
-                        # confidence rounded to 5% bucket). Prevents per-tick spam
-                        # for the entire post-sweep window (~30–120 ticks per sweep).
-                        _conf_bucket = round(getattr(_ps_decision, 'confidence', 0.0) * 20) / 20
-                        _ps_verdict_hash = (
-                            f"{_ps_decision.action}|"
-                            f"{getattr(_ps_decision, 'direction', '')}|"
-                            f"{_conf_bucket:.2f}"
+                        # SPAM-FIX 2026-04-26: production logs (32k lines, 16
+                        # full hours) showed 16–18 POST-SWEEP VERDICT messages
+                        # per minute during 22:31–22:34 and 15:53–15:54. Root
+                        # cause: 5% confidence bucket. Confidence wiggles
+                        # across the boundary every few ticks → hash changes
+                        # → re-emits.
+                        #
+                        # New dedup: emit ONLY if ALL THREE conditions met:
+                        #   (a) action OR direction CHANGED  (→ structural flip)
+                        #   (b) |Δconfidence| ≥ 0.15           (→ meaningful)
+                        #   (c) ≥ 60s since last emission      (→ rate floor)
+                        #
+                        # Equivalently: emit if a structural flip happened OR
+                        # 60s elapsed AND confidence moved ≥ 0.15.
+                        _ps_action    = _ps_decision.action
+                        _ps_direction = getattr(_ps_decision, 'direction', '')
+                        _ps_conf      = float(getattr(_ps_decision, 'confidence', 0.0))
+
+                        _structural_change = (
+                            _ps_action != self._ps_tg_last_action
+                            or _ps_direction != self._ps_tg_last_direction
                         )
-                        if _ps_verdict_hash != self._ps_tg_last_hash:
-                            self._ps_tg_last_hash = _ps_verdict_hash
+                        _conf_delta = abs(_ps_conf - self._ps_tg_last_conf) \
+                                      if self._ps_tg_last_conf >= 0 else 1.0
+                        _meaningful_conf_move = _conf_delta >= 0.15
+                        _rate_floor_ok = (now - self._ps_tg_last_ts) >= 60.0
+
+                        _should_emit = (
+                            _structural_change
+                            or (_meaningful_conf_move and _rate_floor_ok)
+                        )
+
+                        if _should_emit:
+                            self._ps_tg_last_action    = _ps_action
+                            self._ps_tg_last_direction = _ps_direction
+                            self._ps_tg_last_conf      = _ps_conf
+                            self._ps_tg_last_ts        = now
+                            # Keep _ps_tg_last_hash for backward-compat with
+                            # any external code that may inspect it.
+                            self._ps_tg_last_hash = (
+                                f"{_ps_action}|{_ps_direction}|{round(_ps_conf*7)/7:.3f}"
+                            )
                             # swept_pool_price: attribute may be 0.0 if PostSweepState
                             # was created via an internal direction_engine path that
                             # doesn't receive pool.price. Fall back to None so the
@@ -5452,6 +5493,12 @@ class QuantStrategy:
             try:
                 self._dir_engine.clear_sweep()
                 self._ps_tg_last_hash = ""  # reset dedup so next sweep sends a fresh message
+                # SPAM-FIX 2026-04-26: also reset the v2 dedup state so the
+                # very first verdict of the next post-sweep window emits.
+                self._ps_tg_last_ts        = 0.0
+                self._ps_tg_last_conf      = -1.0
+                self._ps_tg_last_action    = ""
+                self._ps_tg_last_direction = ""
             except Exception:
                 pass
 

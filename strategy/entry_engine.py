@@ -1111,7 +1111,14 @@ class EntryEngine:
             self._processed_sweeps[_reject_key] = now + 60.0
             # FIX-TF-QUALITY-LOG: surface the rejection so "no trades" sessions
             # are diagnosable without a custom debug patch.
-            logger.warning(
+            # SPAM-FIX 2026-04-26: was logger.warning -> Telegram-flooded the
+            # operator (113×/session in production logs) and crowded out
+            # genuinely actionable warnings via TelegramLogHandler. This is a
+            # routine, low-quality-pool gate rejection — INFO is the right
+            # level. Diagnosability is preserved in quant_bot.log; the line
+            # is also belt-and-braces matched in notifier._TELEGRAM_SUPPRESS_PATTERNS
+            # so no future log-handler regression can re-flood Telegram with it.
+            logger.info(
                 f"SWEEP REJECTED (tf_quality): {sweep.pool.side.value} "
                 f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
                 f"required={required_quality:.2f} tf={tf} "
@@ -1781,41 +1788,87 @@ class EntryEngine:
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _find_tp(self, snap, side, price, atr, sl, min_rr):
-        """Find TP: nearest pool → HTF escalation. Returns (tp, target)."""
+        """Find TP via the EV-ranked liquidity pool selector.
+
+        Returns (tp_price, target) or (None, None) if no pool qualifies.
+
+        Delegates to liquidity_pool_selector.select_tp(), which scores each
+        candidate as:
+            EV = P(sweep) × confluence × rr_quality × (1 − gauntlet_penalty)
+
+        where the components combine per-pool MTF sweep probability
+        (mtf_pool_probability), HTF alignment, OB/FVG structure, killzone
+        bonus, freshness, touch penalty, and an opposing-pool gauntlet
+        penalty (pools between entry and TP that eat momentum on the way).
+
+        After the selector picks a candidate, this method enforces one
+        strategy-level gate the selector can't know about: the net move
+        must clear the round-trip break-even threshold (commission + slip).
+        """
         risk = abs(price - sl)
         if risk < 1e-10:
             return None, None
 
-        pools = snap.bsl_pools if side == "long" else snap.ssl_pools
-        scored: List[Tuple[float, float, float, PoolTarget]] = []
-        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+        try:
+            from strategy.liquidity_pool_selector import select_tp as _sel_tp
+        except ImportError:
+            from liquidity_pool_selector import select_tp as _sel_tp   # type: ignore
+
+        _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
+        tp_price, target, score = _sel_tp(
+            snap=snap, side=side, entry=price, sl=sl, atr=atr,
+            ict=getattr(self, "_ict", None), htf=_htf_ref,
+            min_rr=float(min_rr) + _TP_RR_SAFETY_BUFFER,
+        )
+        if tp_price is None or target is None:
+            return None, None
+
+        # Strategy-level BE gate: TP must clear round-trip fees + slippage.
         min_net_move = max(
             atr * _TP_MIN_NET_ATR,
             self._estimated_entry_be_move(price, atr),
         )
-        for target in pools:
-            if not (_MIN_TARGET_ATR <= target.distance_atr <= _HTF_TP_MAX_ATR):
-                continue
-            if target.significance < _MIN_POOL_SIGNIFICANCE:
-                continue
-            tp = self._pool_to_tp(target, side, price, atr)
-            if not tp:
-                continue
-            reward = abs(tp - price)
-            rr = reward / risk
-            if rr < required_rr:
-                continue
-            if reward < min_net_move:
-                continue
-            score = self._pool_draw_score(target, rr, required_rr)
-            scored.append((score, rr, -target.distance_atr, target))
+        if abs(tp_price - price) < min_net_move:
+            return None, None
 
-        if scored:
-            scored.sort(reverse=True, key=lambda x: (x[0], x[1], x[2]))
-            best = scored[0][3]
-            return self._pool_to_tp(best, side, price, atr), best
+        if score is not None:
+            logger.debug(
+                "TP pick: $%.1f dist=%.1fATR rr=%.2f P=%.2f EV=%.3f gauntlet=%d (%s)",
+                tp_price, score.distance_atr, score.rr,
+                score.sweep_prob, score.ev, score.gauntlet_n,
+                ", ".join(score.reasons) if score.reasons else "—",
+            )
+        return tp_price, target
 
-        return None, None
+    def _find_sl_pool(self, snap, side, entry, atr, ict=None,
+                       invalidation_price=None, max_buffer_atr=2.0):
+        """
+        Anchor SL to the highest-significance protective pool just past
+        structural invalidation, with a quality-scaled buffer beyond it.
+
+        Delegates to liquidity_pool_selector.select_sl(). The buffer width
+        scales INVERSELY with the chosen pool's quality: an institutional
+        pool (OB-aligned, multi-TF, fresh) earns a thin 0.18 ATR buffer;
+        a weaker protective pool gets up to 0.55 ATR.
+
+        Returns (sl_price, target, pick) or (None, None, None) when no
+        protective pool meets the search criteria; caller decides on
+        OB-based or ATR-based fallback.
+        """
+        try:
+            from strategy.liquidity_pool_selector import select_sl as _sel_sl
+        except ImportError:
+            from liquidity_pool_selector import select_sl as _sel_sl   # type: ignore
+
+        _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
+        return _sel_sl(
+            snap=snap, side=side, entry=entry, atr=atr,
+            ict=ict if ict is not None else getattr(self, "_ict", None),
+            htf=_htf_ref,
+            invalidation_price=invalidation_price,
+            max_buffer_atr=max_buffer_atr,
+        )
+
 
     def _find_opposing_target(self, direction, snap, price, atr):
         # EE-3 FIX: previously capped at _MAX_TARGET_ATR (8.0 ATR), which
@@ -1864,13 +1917,6 @@ class EntryEngine:
         distance_draw = near_penalty * far_decay
         rr_quality = 1.0 + min(max(rr - required_rr, 0.0), 3.0) * 0.18
         return sig * tf_mult * htf_mult * struct_mult * confluence_mult * distance_draw * rr_quality
-
-    def _pool_to_tp(self, target, side, price, atr):
-        buf = atr * min(0.50, 0.10 + 0.05 * target.distance_atr)
-        tp = target.pool.price - buf if side == "long" else target.pool.price + buf
-        if side == "long" and tp <= price: return None
-        if side == "short" and tp >= price: return None
-        return tp
 
     def _compute_sl(self, ict, side, price, atr):
         """ICT Order Block-based SL for momentum/displacement entries.
