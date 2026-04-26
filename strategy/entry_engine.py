@@ -1572,6 +1572,72 @@ class EntryEngine:
 
     # ── Sweep entry handlers ──────────────────────────────────────────
 
+    def _apply_institutional_sl_envelope(
+        self,
+        snap,
+        side: str,
+        price: float,
+        atr: float,
+        structural_sl: float,
+        invalidation_price: float,
+        label: str,
+    ):
+        """
+        Build the executable stop from structural invalidation, live noise,
+        and protective liquidity. Returns (sl, reason).
+        """
+        if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
+            return None, "non-protective structural SL"
+
+        max_risk = atr * _SL_MAX_ATR_MULT
+        sl = structural_sl
+        risk = abs(price - sl)
+        invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
+        noise_floor = max(
+            atr * (0.45 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0)),
+            invalidation_gap + atr * 0.28,
+        )
+
+        if risk < noise_floor:
+            sl = price - noise_floor if side == "long" else price + noise_floor
+            risk = abs(price - sl)
+
+        pool_sl, _pool_target, pool_pick = self._find_sl_pool(
+            snap=snap,
+            side=side,
+            entry=price,
+            atr=atr,
+            ict=getattr(self, "_ict", None),
+            invalidation_price=invalidation_price,
+            max_buffer_atr=2.0,
+        )
+        if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
+            pool_risk = abs(price - pool_sl)
+            if pool_risk > risk and pool_risk <= max_risk:
+                sl = pool_sl
+                risk = pool_risk
+                details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                logger.debug(
+                    "SL envelope %s: anchored to protective pool at $%.1f "
+                    "(risk %.2fATR; %s)",
+                    label, sl, risk / max(atr, 1e-10), details)
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        risk = abs(price - sl)
+
+        if not self._sl_is_protective(side, sl, price):
+            return None, "SL crossed market after liquidity push"
+        if risk > max_risk:
+            return None, f"risk {risk/atr:.2f}x ATR exceeds max {_SL_MAX_ATR_MULT:.1f}x"
+        if risk / price > _MAX_SL_DISTANCE_PCT:
+            return None, f"risk {risk/price*100:.3f}% exceeds pct ceiling"
+        if risk > abs(price - structural_sl) + 1e-9:
+            logger.info(
+                "SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, noise floor %.2fATR)",
+                label, structural_sl, sl, risk / max(atr, 1e-10),
+                noise_floor / max(atr, 1e-10))
+        return sl, "ok"
+
     def _handle_reversal(self, sweep, decision, snap, flow, ict,
                           price, atr, now) -> None:
         side = decision.direction
@@ -1623,6 +1689,17 @@ class EntryEngine:
                 f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
 
         # ── ATR ceiling: reject structurally overlarge SL ─────────────────
+        sl, sl_reason = self._apply_institutional_sl_envelope(
+            snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
+        if sl is None:
+            logger.info(
+                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+        risk = abs(price - sl)
+
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal structural stop wrong-side"):
             return
 
@@ -1736,6 +1813,18 @@ class EntryEngine:
             logger.debug(
                 f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
                 f"({risk/atr:.2f}x ATR) side={side}")
+
+        sl, sl_reason = self._apply_institutional_sl_envelope(
+            snap, side, price, atr, sl, sweep.pool.price, "continuation")
+        if sl is None:
+            logger.info(
+                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+        risk = abs(price - sl)
+        reward = abs(tp - price)
 
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "continuation structural stop wrong-side"):
             return

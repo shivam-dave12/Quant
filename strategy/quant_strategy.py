@@ -1,15 +1,15 @@
 """
-QUANT STRATEGY v10.0 â€” INSTITUTIONAL LIQUIDITY-FIRST
+QUANT STRATEGY v10.0 Ã¢â‚¬â€ INSTITUTIONAL LIQUIDITY-FIRST
 =====================================================
 Architecture:
-  LiquidityMap â†’ EntryEngine â†’ ConvictionFilter â†’ UnifiedGate â†’ Execution
+  LiquidityMap Ã¢â€ â€™ EntryEngine Ã¢â€ â€™ ConvictionFilter Ã¢â€ â€™ UnifiedGate Ã¢â€ â€™ Execution
   ICT Engine = structural context (AMD, OB, FVG, BOS, sweep detection)
   DirectionEngine = hunt prediction + post-sweep evaluation
   Quant Scout = order-flow timing (VWAP, CVD, tick flow, OB imbalance)
 
 Entry: Only via EntryEngine (sweep reversal, continuation, displacement)
-SL/TP: EntryEngine provides primary levels; ICT OB â†’ 15m swing â†’ ATR fallback
-Trail: LiquidityTrailEngine (primary) â†’ _DynamicStructureTrail (fallback)
+SL/TP: EntryEngine provides primary levels; ICT OB Ã¢â€ â€™ 15m swing Ã¢â€ â€™ ATR fallback
+Trail: LiquidityTrailEngine (primary) Ã¢â€ â€™ _DynamicStructureTrail (fallback)
 Exit: SL/TP bracket on exchange. Trail moves SL only.
 """
 
@@ -35,10 +35,10 @@ except ImportError:
 try:
     from strategy.fee_engine import ExecutionCostEngine
 except ImportError:
-    ExecutionCostEngine = None   # fee_engine.py not yet present â€” graceful fallback
+    ExecutionCostEngine = None   # fee_engine.py not yet present Ã¢â‚¬â€ graceful fallback
 
 
-# â”€â”€ ICT Institutional Trade Engine â€” fully inlined; external module removed â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ ICT Institutional Trade Engine Ã¢â‚¬â€ fully inlined; external module removed Ã¢â€â‚¬
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ except ImportError:
     except ImportError:
         _ENTRY_ENGINE_AVAILABLE = False
 
-# â”€â”€ DirectionEngine â€” hunt prediction, post-sweep evaluation, pool-hit gate â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ DirectionEngine Ã¢â‚¬â€ hunt prediction, post-sweep evaluation, pool-hit gate Ã¢â€â‚¬
 # Replaces ICTEngine.predict_next_hunt() with a dedicated 10-factor engine.
 # ICTEngine retains structural context; DirectionEngine owns the decisions.
 _DIRECTION_ENGINE_AVAILABLE = False
@@ -85,10 +85,10 @@ except ImportError:
         HuntPrediction   = None   # type: ignore
         DirectionBias    = None   # type: ignore
 
-# â”€â”€ ISSUE-4 FIX: Conviction Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# 7-factor mandatory gate before any entry. Mandatory gates: pool TF â‰¥ 15m,
+# Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# 7-factor mandatory gate before any entry. Mandatory gates: pool TF Ã¢â€°Â¥ 15m,
 # dealing range valid, AMD not ACCUMULATION, session not ASIA.
-# Required conviction score â‰¥ 0.75 for all weighted factors.
+# Required conviction score Ã¢â€°Â¥ 0.75 for all weighted factors.
 _CONVICTION_FILTER_AVAILABLE = False
 try:
     from strategy.conviction_filter import ConvictionFilter, ConvictionResult
@@ -101,7 +101,7 @@ except ImportError:
         ConvictionFilter = None   # type: ignore
         ConvictionResult = None   # type: ignore
 
-# â”€â”€ ISSUE-3 FIX: Liquidity-Only Trailing SL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-3 FIX: Liquidity-Only Trailing SL Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # SL anchors to swept/unswept pool structure instead of fixed ATR ratchets.
 # Significance-based buffer; session-aware (London tighter, Asia disabled).
 _LIQ_TRAIL_AVAILABLE = False
@@ -117,9 +117,9 @@ except ImportError:
         LiquidityTrailResult  = None   # type: ignore
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # CONFIG ACCESSOR
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 def _cfg(name: str, default):
     val = getattr(config, name, None)
     return default if val is None else val
@@ -225,7 +225,7 @@ class QCfg:
     def TRAIL_INTERVAL_S() -> int:
         """DEPRECATED v6.0: Time-based trail interval eliminated.
         Trail is now structure-event-driven. This accessor is kept for
-        backward compat only â€” it is NOT used in any trail logic."""
+        backward compat only Ã¢â‚¬â€ it is NOT used in any trail logic."""
         return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
     @staticmethod
     def TRAIL_MIN_MOVE_ATR() -> float: return float(_cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08))
@@ -285,7 +285,7 @@ class QCfg:
     def OB_HIST_LEN() -> int: return int(_cfg("QUANT_OB_HIST_LEN", 60))
     @staticmethod
     def TICK_AGG_WINDOW_SEC() -> float: return float(_cfg("QUANT_TICK_AGG_WINDOW_SEC", 30.0))
-    # â”€â”€ New v4.1 accessors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ New v4.1 accessors Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def TP_MAX_RR() -> float: return float(_cfg("QUANT_TP_MAX_RR", 3.5))
     @staticmethod
@@ -296,7 +296,7 @@ class QCfg:
     def TRAIL_CHANDELIER_N_END() -> float: return float(_cfg("QUANT_TRAIL_CHANDELIER_N_END", 1.2))
     @staticmethod
     def TRAIL_HVN_SNAP_THRESH() -> float: return float(_cfg("QUANT_TRAIL_HVN_SNAP_THRESH", 0.55))
-    # â”€â”€ v4.2: Trend-following mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.2: Trend-following mode Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def ADX_PERIOD() -> int: return int(_cfg("QUANT_ADX_PERIOD", 14))
     @staticmethod
@@ -319,7 +319,7 @@ class QCfg:
     def TREND_CONFIRM_TICKS() -> int: return int(_cfg("QUANT_TREND_CONFIRM_TICKS", 3))
     @staticmethod
     def TREND_CHANDELIER_N() -> float: return float(_cfg("QUANT_TREND_CHANDELIER_N", 1.5))
-    # â”€â”€ v4.4: Mode-aware R:R â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.4: Mode-aware R:R Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def REVERSION_MIN_RR() -> float: return float(_cfg("QUANT_REVERSION_MIN_RR", 1.5))
     @staticmethod
@@ -328,7 +328,7 @@ class QCfg:
     def TREND_MIN_RR() -> float: return float(_cfg("QUANT_TREND_MIN_RR", 3.0))
     @staticmethod
     def TREND_MAX_RR() -> float: return float(_cfg("QUANT_TREND_MAX_RR", 5.0))
-    # â”€â”€ v4.5: Institutional trail params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.5: Institutional trail params Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def TRAIL_AGGRESSIVE_R() -> float: return float(_cfg("QUANT_TRAIL_AGGRESSIVE_R", 1.5))
     @staticmethod
@@ -345,12 +345,12 @@ class QCfg:
     def TRAIL_PB_DEPTH_ATR() -> float: return float(_cfg("QUANT_TRAIL_PB_DEPTH_ATR", 0.80))
     @staticmethod
     def TRAIL_REV_MIN_SIGNALS() -> int: return int(_cfg("QUANT_TRAIL_REV_MIN_SIGNALS", 3))
-    # â”€â”€ v4.4: Smart max-hold exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.4: Smart max-hold exit Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def SMART_MAX_HOLD() -> bool: return bool(_cfg("QUANT_SMART_MAX_HOLD", True))
     @staticmethod
     def MAX_HOLD_PROFIT_SL_ATR() -> float: return float(_cfg("QUANT_MAX_HOLD_PROFIT_SL_ATR", 0.5))
-    # â”€â”€ v4.6: Thesis-aware max-hold extension â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.6: Thesis-aware max-hold extension Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def MAX_HOLD_EXTENSIONS() -> int: return int(_cfg("QUANT_MAX_HOLD_EXTENSIONS", 3))
     @staticmethod
@@ -359,10 +359,10 @@ class QCfg:
     def THESIS_MAX_DRAWDOWN_PCT() -> float: return float(_cfg("QUANT_THESIS_MAX_DRAWDOWN_PCT", 0.70))
     @staticmethod
     # MOD-7 FIX: A 1000% drawdown cap is no cap at all. Industry standard for
-    # systematic strategies is 10-20%. Default set to 15% â€” operators who need
+    # systematic strategies is 10-20%. Default set to 15% Ã¢â‚¬â€ operators who need
     # more headroom should set MAX_DRAWDOWN_PCT explicitly in config.py.
     def MAX_DRAWDOWN_PCT() -> float: return float(_cfg("MAX_DRAWDOWN_PCT", 15.0))
-    # â”€â”€ v4.6: Natural TP + SL ATR cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.6: Natural TP + SL ATR cap Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def TP_MIN_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MIN_ATR_MULT", 0.5))
     @staticmethod
@@ -371,7 +371,7 @@ class QCfg:
     def REVERSION_REJECT_RR() -> float: return float(_cfg("QUANT_REVERSION_REJECT_RR", 0.20))
     @staticmethod
     def SL_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_SL_MAX_ATR_MULT", 4.0))
-    # â”€â”€ v4.9: ICT-anchored trailing SL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.9: ICT-anchored trailing SL Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def ICT_ZONE_FREEZE_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_ZONE_FREEZE_ENABLED", True))
     @staticmethod
@@ -384,7 +384,7 @@ class QCfg:
     def ICT_LIQ_CEILING_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_LIQ_CEILING_ENABLED", True))
     @staticmethod
     def ICT_LIQ_POOL_BUFFER_ATR() -> float: return float(_cfg("QUANT_ICT_LIQ_POOL_BUFFER_ATR", 0.50))
-    # â”€â”€ v5.0: ICT Sweep Engine params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v5.0: ICT Sweep Engine params Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def ICT_SWEEP_ENTRY_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_SWEEP_ENTRY_ENABLED", True))
     @staticmethod
@@ -405,11 +405,11 @@ class QCfg:
     def ICT_TP_MIN_RR_REVERSION() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_REVERSION", 1.8))
     @staticmethod
     def ICT_TP_MIN_RR_TREND() -> float: return float(_cfg("QUANT_ICT_TP_MIN_RR_TREND", 2.5))
-    # â”€â”€ v5.1: CHoCH staleness expiry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v5.1: CHoCH staleness expiry Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def CHOCH_EXPIRY_BARS() -> int: return int(_cfg("QUANT_CHOCH_EXPIRY_BARS", 10))
-    # â”€â”€ v6.1: Institutional Trail v2.0 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Feature 1 â€” OB + Breaker Block Priority
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v6.1: Institutional Trail v2.0 Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    # Feature 1 Ã¢â‚¬â€ OB + Breaker Block Priority
     # Anchors SL to nearest active OB or Breaker Block before falling back to swings.
     @staticmethod
     def TRAIL_OB_BREAKER_PRIORITY() -> bool:
@@ -417,7 +417,7 @@ class QCfg:
     @staticmethod
     def TRAIL_OB_BREAKER_BUFFER_ATR() -> float:
         return float(_cfg("QUANT_TRAIL_OB_BREAKER_BUFFER_ATR", 0.22))
-    # Feature 2 â€” AMD-Phase Adaptive Buffer multipliers for struct buffers
+    # Feature 2 Ã¢â‚¬â€ AMD-Phase Adaptive Buffer multipliers for struct buffers
     @staticmethod
     def TRAIL_AMD_MANIP_BUFFER_MULT() -> float:
         """MANIPULATION: wider buffer protects against Judas wicks."""
@@ -430,12 +430,12 @@ class QCfg:
     def TRAIL_AMD_REDIST_BUFFER_MULT() -> float:
         """REACCUMULATION: slight widen for mid-trend pause."""
         return float(_cfg("QUANT_TRAIL_AMD_REDIST_BUFFER_MULT", 1.12))
-    # Feature 3 â€” HTF Structure Cascade
-    # Checks 4H swing â†’ 1H swing â†’ 15m â†’ 5m â†’ 1m in priority order.
+    # Feature 3 Ã¢â‚¬â€ HTF Structure Cascade
+    # Checks 4H swing Ã¢â€ â€™ 1H swing Ã¢â€ â€™ 15m Ã¢â€ â€™ 5m Ã¢â€ â€™ 1m in priority order.
     @staticmethod
     def TRAIL_HTF_CASCADE_ENABLED() -> bool:
         return bool(_cfg("QUANT_TRAIL_HTF_CASCADE_ENABLED", True))
-    # Feature 4 â€” Liquidity Pool Ceiling / Floor Protection
+    # Feature 4 Ã¢â‚¬â€ Liquidity Pool Ceiling / Floor Protection
     @staticmethod
     def TRAIL_LIQ_POOL_PROX_ATR() -> float:
         """Proximity window for pool ceiling/floor gate (ATR multiples)."""
@@ -444,7 +444,7 @@ class QCfg:
     def TRAIL_LIQ_FLOOR_BUFFER_ATR() -> float:
         """Buffer behind the pool for the ceiling/floor guard."""
         return float(_cfg("QUANT_TRAIL_LIQ_FLOOR_BUFFER_ATR", 0.30))
-    # Feature 5 â€” Displacement + CVD Confirmation Gate
+    # Feature 5 Ã¢â‚¬â€ Displacement + CVD Confirmation Gate
     # Trail only advances when a displacement candle + CVD trend confirm momentum.
     @staticmethod
     def TRAIL_DISP_CVD_GATE() -> bool:
@@ -455,14 +455,14 @@ class QCfg:
         return float(_cfg("QUANT_TRAIL_CVD_MIN_TREND", 0.12))
     @staticmethod
     def TRAIL_DISP_MIN_ATR_MULT() -> float:
-        """Minimum candle body (Ã— ATR) to qualify as a displacement candle."""
+        """Minimum candle body (Ãƒâ€” ATR) to qualify as a displacement candle."""
         return float(_cfg("QUANT_TRAIL_DISP_MIN_ATR_MULT", 0.58))
     @staticmethod
     def TRAIL_DISP_CVD_MIN_R() -> float:
         """Gate is only active above this R-multiple (below = BE move allowed freely)."""
         return float(_cfg("QUANT_TRAIL_DISP_CVD_MIN_R", 0.30))
 
-    # â”€â”€ v7.0: Institutional Liquidity-First Trail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ v7.0: Institutional Liquidity-First Trail Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     # Primary reference is the live LiquidityMap pool, not a chandelier.
     # New SL = (nearest unswept pool) +/- dynamic_buffer.
     # 15m/1h pool acts as the hard safety floor.
@@ -488,7 +488,7 @@ class QCfg:
         return bool(_cfg("QUANT_TRAIL_LIQ_BOS_CONFIRM_GATE", True))
     @staticmethod
     def TRAIL_LIQ_BOS_MAX_AGE_MS() -> int:
-        # Bug #37 fix: default reduced 10_000_000 (10 min) â†’ 2_000_000 (2 min).
+        # Bug #37 fix: default reduced 10_000_000 (10 min) Ã¢â€ â€™ 2_000_000 (2 min).
         # A BOS from 9 minutes ago is structural history, not live momentum.
         return int(_cfg("QUANT_TRAIL_LIQ_BOS_MAX_AGE_MS", 2_000_000))
     @staticmethod
@@ -519,10 +519,10 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
 
     FORMULA:
       fee_per_btc  = exact_entry_fee / qty   if exact fee available (v8.1+)
-                   = entry_price Ã— COMMISSION_RATE Ã— 2   otherwise
-      slippage_buf = 0.12 Ã— ATR   (half-spread estimate; tighter than old 0.15,
-                                   wider than old 0.10 â€” a calibrated middle ground)
-      be_price     = entry_price Â± (fee_per_btc + slippage_buf)
+                   = entry_price Ãƒâ€” COMMISSION_RATE Ãƒâ€” 2   otherwise
+      slippage_buf = 0.12 Ãƒâ€” ATR   (half-spread estimate; tighter than old 0.15,
+                                   wider than old 0.10 Ã¢â‚¬â€ a calibrated middle ground)
+      be_price     = entry_price Ã‚Â± (fee_per_btc + slippage_buf)
 
     EXACT FEE:
       Delta's paid_commission is the actual taker/maker fee in USD for the entry
@@ -533,7 +533,7 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
       pos_side     : 'long' | 'short'
       entry_price  : position entry price
       atr          : current ATR (5m)
-      pos          : PositionState (optional) â€” used for exact fee + quantity
+      pos          : PositionState (optional) Ã¢â‚¬â€ used for exact fee + quantity
 
     RETURNS:
       Break-even price as float.  For long: entry_price + buf.
@@ -542,7 +542,7 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
     # MOD-5 FIX: Use the module-level `config` import instead of importing
     # inside the function on every call. Python caches imports, but repeated
     # function-level imports confuse profilers and signal sloppy architecture.
-    # â”€â”€ Fee per BTC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Fee per BTC Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     _exact_fee = 0.0
     _qty       = 0.0
     if pos is not None:
@@ -551,12 +551,12 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
 
     if _exact_fee > 1e-6 and _qty > 1e-10:
         # Exact round-trip cost: entry paid_commission (exact) + estimated exit
-        # fee (same rate applied symmetrically â€” we don't have the exit fee yet).
+        # fee (same rate applied symmetrically Ã¢â‚¬â€ we don't have the exit fee yet).
         _entry_fee_per_btc = _exact_fee / _qty
         # Estimate exit fee using config commission rate.
         # BUG FIX: the old formula derived _exit_fee_rate = entry_fee_per_btc / price
-        # which is simply the entry commission rate, making _fee_per_btc = 2 ×
-        # entry_fee_per_btc — the exit leg was double-counted, yielding a BE price
+        # which is simply the entry commission rate, making _fee_per_btc = 2 Ã—
+        # entry_fee_per_btc â€” the exit leg was double-counted, yielding a BE price
         # that was too far from entry and causing premature "too close" rejections.
         _exit_rate     = float(getattr(config, 'COMMISSION_RATE', 0.00055))
         _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_rate
@@ -565,10 +565,10 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
         _rate        = float(getattr(config, 'COMMISSION_RATE', 0.00055))
         _fee_per_btc = entry_price * _rate * 2.0
 
-    # â”€â”€ Slippage allowance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Slippage allowance Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     # 0.12 ATR: tighter than the old 0.15 used in counter-BOS (that was overly
     # conservative) and wider than the 0.10 used in display (that was too tight).
-    # At $255 ATR this is $30.6 â€” covers a normal half-spread on BTC perps.
+    # At $255 ATR this is $30.6 Ã¢â‚¬â€ covers a normal half-spread on BTC perps.
     _slippage_buf = 0.12 * atr
 
     _buf = _fee_per_btc + _slippage_buf
@@ -594,32 +594,32 @@ def _safe_be_migration_price(pos_side: str, desired_sl: float, current_price: fl
 def _sigmoid(z: float, steepness: float = 1.0) -> float:
     return max(-1.0, min(1.0, z * steepness / (1.0 + abs(z * steepness) * 0.5)))
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# ENGINE 1: VWAP DEVIATION â€” Primary Mean-Reversion Signal
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# ENGINE 1: VWAP DEVIATION Ã¢â‚¬â€ Primary Mean-Reversion Signal
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class VWAPEngine:
     """
-    VWAP Deviation â€” Primary Mean-Reversion Signal.
+    VWAP Deviation Ã¢â‚¬â€ Primary Mean-Reversion Signal.
 
-    v4.8 REWRITE â€” 3 critical bugs fixed:
+    v4.8 REWRITE Ã¢â‚¬â€ 3 critical bugs fixed:
 
-    BUG 1: DEAD ZONE â€” Signal returned 0.0 unless |dev| > 0.72 ATR.
-           In ranging markets (ADX<25), price oscillates Â±0.3-0.5 ATR.
+    BUG 1: DEAD ZONE Ã¢â‚¬â€ Signal returned 0.0 unless |dev| > 0.72 ATR.
+           In ranging markets (ADX<25), price oscillates Ã‚Â±0.3-0.5 ATR.
            The VWAP signal (30% weight) was PERMANENTLY ZERO, crippling
            the composite score. 90% of the time the highest-weighted
            signal contributed nothing.
            FIX: Smooth sigmoid from ANY deviation. No dead zone.
-           At 0.3 ATR: signal â‰ˆ Â±0.25. At 0.7 ATR: signal â‰ˆ Â±0.65.
+           At 0.3 ATR: signal Ã¢â€°Ë† Ã‚Â±0.25. At 0.7 ATR: signal Ã¢â€°Ë† Ã‚Â±0.65.
 
-    BUG 2: OVEREXTENDED GATE â€” Required 1.2Ã—ATR ($233) from VWAP.
+    BUG 2: OVEREXTENDED GATE Ã¢â‚¬â€ Required 1.2Ãƒâ€”ATR ($233) from VWAP.
            In ranging market, price never reaches this. Gate blocked ALL
-           entries even when Î£=+0.557 with 4/6 confluence.
+           entries even when ÃŽÂ£=+0.557 with 4/6 confluence.
            FIX: Regime-adaptive threshold:
-             Ranging (ADX<25):  0.5Ã—ATR (~$97)
-             Transitioning:     0.7Ã—ATR (~$136)
-             Trending (ADX>25): 1.0Ã—ATR (~$194)
+             Ranging (ADX<25):  0.5Ãƒâ€”ATR (~$97)
+             Transitioning:     0.7Ãƒâ€”ATR (~$136)
+             Trending (ADX>25): 1.0Ãƒâ€”ATR (~$194)
 
-    BUG 3: SIGMOID TOO FLAT â€” _sigmoid(-dev / (entry_thresh * 2.0), 1.5)
+    BUG 3: SIGMOID TOO FLAT Ã¢â‚¬â€ _sigmoid(-dev / (entry_thresh * 2.0), 1.5)
            With entry_thresh=1.2, sigmoid input at 0.5 ATR = 0.21.
            Output after sigmoid: ~0.15. Barely contributes to composite.
            FIX: Steeper sigmoid with direct ATR-normalized input.
@@ -650,15 +650,15 @@ class VWAPEngine:
                            positive = price below VWAP (long bias).
 
         Signal magnitude scales with deviation:
-          0.2 ATR â†’ Â±0.15 (weak)
-          0.5 ATR â†’ Â±0.40 (moderate)
-          0.8 ATR â†’ Â±0.65 (strong)
-          1.2 ATR â†’ Â±0.85 (very strong)
-          2.0 ATR â†’ Â±0.97 (extreme)
+          0.2 ATR Ã¢â€ â€™ Ã‚Â±0.15 (weak)
+          0.5 ATR Ã¢â€ â€™ Ã‚Â±0.40 (moderate)
+          0.8 ATR Ã¢â€ â€™ Ã‚Â±0.65 (strong)
+          1.2 ATR Ã¢â€ â€™ Ã‚Â±0.85 (very strong)
+          2.0 ATR Ã¢â€ â€™ Ã‚Â±0.97 (extreme)
         """
         if self._vwap < 1e-10 or atr < 1e-10: return 0.0
         dev = (price - self._vwap) / atr
-        # Smooth sigmoid â€” reversion signal opposes the deviation
+        # Smooth sigmoid Ã¢â‚¬â€ reversion signal opposes the deviation
         # Steepness 1.2 gives good sensitivity: starts producing meaningful
         # signal at 0.2 ATR, saturates around 2.0 ATR
         return max(-1.0, min(1.0, _sigmoid(-dev, 1.2)))
@@ -671,9 +671,9 @@ class VWAPEngine:
         In trending markets, it takes a larger deviation to be "overextended"
         because the trend creates sustained VWAP distance.
 
-          ADX < 25 (ranging):       0.4Ã—ATR threshold
-          25 â‰¤ ADX < 35 (transit):  0.6Ã—ATR threshold
-          ADX â‰¥ 35 (trending):      0.9Ã—ATR threshold
+          ADX < 25 (ranging):       0.4Ãƒâ€”ATR threshold
+          25 Ã¢â€°Â¤ ADX < 35 (transit):  0.6Ãƒâ€”ATR threshold
+          ADX Ã¢â€°Â¥ 35 (trending):      0.9Ãƒâ€”ATR threshold
         """
         if self._vwap < 1e-10 or atr < 1e-10: return False
         dev_abs = abs(price - self._vwap) / atr
@@ -699,18 +699,18 @@ class VWAPEngine:
     @property
     def deviation_atr(self) -> float: return self._deviation_atr
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # ENGINE 2: CVD DIVERGENCE + TRUE TICK DELTA
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class CVDEngine:
     """
-    Cumulative Volume Delta engine â€” v6.0 (true tick tape + candle fallback).
+    Cumulative Volume Delta engine Ã¢â‚¬â€ v6.0 (true tick tape + candle fallback).
 
     Two data paths:
     1. TRUE CVD (preferred): running sum of (buy_qty - sell_qty) per real trade tick.
        Sourced from TickFlowEngine.on_trade() calls via _feed_microstructure.
-       Provides genuine institutional buy/sell pressure â€” no approximation.
-    2. CANDLE CVD (fallback): (2C-H-L)/(H-L) Ã— V per bar when real ticks
+       Provides genuine institutional buy/sell pressure Ã¢â‚¬â€ no approximation.
+    2. CANDLE CVD (fallback): (2C-H-L)/(H-L) Ãƒâ€” V per bar when real ticks
        are unavailable (warmup period or stream gap).
 
     Both paths feed the same divergence and trend signal computations.
@@ -718,10 +718,10 @@ class CVDEngine:
     is insufficient (<50 ticks).
     """
     def __init__(self):
-        # Candle-based delta history (OHLCV approximation â€” fallback)
+        # Candle-based delta history (OHLCV approximation Ã¢â‚¬â€ fallback)
         self._deltas: deque = deque(maxlen=QCfg.CVD_WINDOW() * QCfg.CVD_HIST_MULT())
         self._last_bar_ts: int = 0
-        # True tick-tape CVD â€” (buy_vol - sell_vol) per trade, running window
+        # True tick-tape CVD Ã¢â‚¬â€ (buy_vol - sell_vol) per trade, running window
         self._tick_cvd: deque = deque(maxlen=2000)   # 2000 most recent tick deltas
         self._tick_ts:  deque = deque(maxlen=2000)   # timestamps for windowing
         self._tick_count: int = 0                     # total ticks received
@@ -801,26 +801,26 @@ class CVDEngine:
         """
         CVD divergence: detect when order flow disagrees with price direction.
 
-        Prefers true tick CVD when â‰¥50 ticks available; falls back to candle OHLCV.
+        Prefers true tick CVD when Ã¢â€°Â¥50 ticks available; falls back to candle OHLCV.
 
         Returns [-1, +1]:
-          Positive = CVD rising while price falling (bullish divergence â€” buy signal)
-          Negative = CVD falling while price rising (bearish divergence â€” sell signal)
+          Positive = CVD rising while price falling (bullish divergence Ã¢â‚¬â€ buy signal)
+          Negative = CVD falling while price rising (bearish divergence Ã¢â‚¬â€ sell signal)
           Zero     = CVD and price agree (no divergence)
         """
         w = QCfg.CVD_WINDOW()
 
-        # â”€â”€ Path 1: True tick CVD (preferred) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Path 1: True tick CVD (preferred) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         true_cvd = self._get_true_cvd_array(window_sec=max(w * 60, 600.0))
         if true_cvd is not None and len(true_cvd) >= w + 10:
             arr = true_cvd; n = len(arr)
             # FIX 6: arr is a running cumulative sum. The old code did
-            # sum(arr[-(w//2):]) which summed already-cumulative values â€”
+            # sum(arr[-(w//2):]) which summed already-cumulative values Ã¢â‚¬â€
             # a "sum of sums" that measures nothing about rate of change.
             # Correct: use level differences to extract the actual CVD
             # change over each half-window.
             midpoint   = n - w // 2
-            recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD Î” in recent half
+            recent_cvd  = arr[-1] - arr[midpoint - 1]          # CVD ÃŽâ€ in recent half
             # FIX: max(0, n-w)-1 can be -1 when n==w, wrapping to last element.
             _start_idx  = max(0, n - w)
             _start_val  = arr[_start_idx] if _start_idx > 0 else 0.0
@@ -848,11 +848,11 @@ class CVDEngine:
             if (1.0 if cvd_z > 0 else -1.0) == price_dir: return 0.0
             return -price_dir * min(abs(cvd_z), 3.0) / 3.0
 
-        # â”€â”€ Path 2: Candle OHLCV approximation (fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Path 2: Candle OHLCV approximation (fallback) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # FIX 10: The old code built all_sums as a rolling-sum distribution and
         # divided cvd_slope (a difference of half-window sums) by its std.  These
-        # have different statistical distributions â€” difference-of-sums has variance
-        # 2ÏƒÂ², making the Z-score ~40% too small â†’ CVD signal chronically underweighted.
+        # have different statistical distributions Ã¢â‚¬â€ difference-of-sums has variance
+        # 2ÃÆ’Ã‚Â², making the Z-score ~40% too small Ã¢â€ â€™ CVD signal chronically underweighted.
         # Fix: build the distribution from the SAME statistic as cvd_slope (slopes),
         # so the Z-score is standardised against an identical distribution.
         arr = list(self._deltas); n = len(arr)
@@ -888,10 +888,10 @@ class CVDEngine:
         """
         w = QCfg.CVD_WINDOW()
 
-        # â”€â”€ Path 1: True tick CVD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Path 1: True tick CVD Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # BUG-CVD-TREND-CUMSUM FIX: arr is a running cumulative sum.
         # The old code computed sum(arr[i:i+w]) which is the sum of already-
-        # cumulative values â€” a completely different statistic.  The correct
+        # cumulative values Ã¢â‚¬â€ a completely different statistic.  The correct
         # measure of "how much did CVD change over window w?" is:
         #     arr[i+w-1] - arr[i-1]   (delta = end - start of window)
         # Using the wrong statistic made high-conviction buyside periods
@@ -916,7 +916,7 @@ class CVDEngine:
                 return _sigmoid(recent_delta / (abs(mu) + 1e-10), 0.5)
             return _sigmoid((recent_delta - mu) / std, 0.7)
 
-        # â”€â”€ Path 2: Candle OHLCV fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Path 2: Candle OHLCV fallback Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         arr = list(self._deltas); n = len(arr)
         if n < w + 10: return 0.0
         sums = []
@@ -936,9 +936,9 @@ class CVDEngine:
         """Number of real trade ticks received since startup."""
         return self._tick_count
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # ENGINE 3: ORDERBOOK IMBALANCE
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class OrderbookEngine:
     def __init__(self):
         self._imbalance_hist: deque = deque(maxlen=QCfg.OB_HIST_LEN())
@@ -978,18 +978,18 @@ class OrderbookEngine:
         sm = max(0.5, min(1.0, 1.0 - (self._spread_ratio - 0.0002) * 100.0))
         return _sigmoid(z, 0.6) * sm
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # ENGINE 4: TICK FLOW (regime-adaptive window)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class TickFlowEngine:
     """
-    Real-time trade flow engine â€” v6.0 (regime-adaptive window).
+    Real-time trade flow engine Ã¢â‚¬â€ v6.0 (regime-adaptive window).
 
     Window adapts to ATR percentile regime:
-      Low vol  (ATR pctile < 30%): 60s â€” accumulate more signal in quiet markets
-      Normal   (30%â€“70%):          30s â€” baseline
-      High vol (ATR pctile > 70%): 15s â€” faster response in trending/volatile markets
-      Extreme  (ATR pctile > 90%): 10s â€” highest responsiveness
+      Low vol  (ATR pctile < 30%): 60s Ã¢â‚¬â€ accumulate more signal in quiet markets
+      Normal   (30%Ã¢â‚¬â€œ70%):          30s Ã¢â‚¬â€ baseline
+      High vol (ATR pctile > 70%): 15s Ã¢â‚¬â€ faster response in trending/volatile markets
+      Extreme  (ATR pctile > 90%): 10s Ã¢â‚¬â€ highest responsiveness
 
     Z-score normalised against rolling history so absolute volume differences
     across sessions do not bias the signal.
@@ -1036,9 +1036,9 @@ class TickFlowEngine:
     def get_signal(self) -> float:
         return self._last_signal
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # ENGINE 5: VOLUME EXHAUSTION
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class VolumeExhaustionEngine:
     def __init__(self): self._last_signal = 0.0
 
@@ -1055,7 +1055,7 @@ class VolumeExhaustionEngine:
         pd = 1.0 if pc > 0 else -1.0
         rv = sum(float(c['v']) for c in recent); ev = sum(float(c['v']) for c in earlier)
         if ev < 1e-10:
-            # FIX 11: zero-volume early session â€” reset signal, don't leave stale value
+            # FIX 11: zero-volume early session Ã¢â‚¬â€ reset signal, don't leave stale value
             self._last_signal = 0.0
             return 0.0
         vr = rv / ev
@@ -1064,24 +1064,24 @@ class VolumeExhaustionEngine:
         else: self._last_signal = 0.0
         return self._last_signal
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# ADX ENGINE â€” Wilder's Average Directional Index
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# ADX ENGINE Ã¢â‚¬â€ Wilder's Average Directional Index
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class ADXEngine:
     """
     Proper Wilder ADX(14) with +DI/-DI.
 
-    Seeding: requires at least 2Ã—period candles to bootstrap Wilder smoothing.
+    Seeding: requires at least 2Ãƒâ€”period candles to bootstrap Wilder smoothing.
     Incremental: each new candle updates the Wilder-smoothed TR, +DM, -DM, then
     computes DX and Wilder-smooths it into ADX.
 
     Interpretation:
-      ADX < 20  â†’ no trend (ranging)
-      ADX 20-25 â†’ transitional / weak trend
-      ADX > 25  â†’ established trend
-      ADX > 40  â†’ strong trend
-      +DI > -DI â†’ bullish pressure dominant
-      -DI > +DI â†’ bearish pressure dominant
+      ADX < 20  Ã¢â€ â€™ no trend (ranging)
+      ADX 20-25 Ã¢â€ â€™ transitional / weak trend
+      ADX > 25  Ã¢â€ â€™ established trend
+      ADX > 40  Ã¢â€ â€™ strong trend
+      +DI > -DI Ã¢â€ â€™ bullish pressure dominant
+      -DI > +DI Ã¢â€ â€™ bearish pressure dominant
     """
     def __init__(self):
         self._adx               = 0.0
@@ -1118,8 +1118,8 @@ class ADXEngine:
         # candles[-1] is the live forming bar whose open-time is constant for
         # the full 5-minute bar.  The old dedup fired every tick for 5 minutes;
         # the incremental path only ran once at bar open when candles[-1] was
-        # brand-new (H=L=Câ‰ˆopen, flat) â†’ DMâ‰ˆ0, TRâ‰ˆ0 â†’ Wilder smoothing just
-        # decayed prior values by 13/14 â†’ ADX appeared frozen.
+        # brand-new (H=L=CÃ¢â€°Ë†open, flat) Ã¢â€ â€™ DMÃ¢â€°Ë†0, TRÃ¢â€°Ë†0 Ã¢â€ â€™ Wilder smoothing just
+        # decayed prior values by 13/14 Ã¢â€ â€™ ADX appeared frozen.
         #
         # Correct contract: dedup on candles[-2]['t'] (last closed bar).
         # That timestamp changes exactly once per 5m close.
@@ -1129,13 +1129,13 @@ class ADXEngine:
         # BUG-6 FIX: was period*2+1. With that guard, len(candles)=period*2+1=29:
         #   closed = candles[:-1] has 28 bars -> loop produces 27 DM values
         #   inner check (len(plus_dms) < period*2) -> 27 < 28 -> True -> returns early.
-        # Outer gate passed but inner seed gate failed â€” silent 5-min extra delay.
+        # Outer gate passed but inner seed gate failed Ã¢â‚¬â€ silent 5-min extra delay.
         # Fix: require period*2+2 so closed has period*2+1 bars -> period*2 DM values
         # -> inner check (period*2 < period*2) -> False -> seeds correctly.
         if len(candles) < period * 2 + 2: return self._adx
 
         if not self._seeded:
-            # Seed on CLOSED bars only â€” exclude candles[-1] (forming).
+            # Seed on CLOSED bars only Ã¢â‚¬â€ exclude candles[-1] (forming).
             closed = candles[:-1]
             plus_dms: List[float] = []
             minus_dms: List[float] = []
@@ -1228,14 +1228,14 @@ class ADXEngine:
         return self._seeded and self._adx < QCfg.ADX_RANGE_THRESH()
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # MARKET REGIME + CLASSIFIER
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class MarketRegime(Enum):
-    RANGING       = "RANGING"       # consolidation â€” reversion mode is primary
-    TRANSITIONING = "TRANSITIONING" # unclear â€” reversion with tighter gates
-    TRENDING_UP   = "TRENDING_UP"   # directional up â€” trend entries only
-    TRENDING_DOWN = "TRENDING_DOWN" # directional down â€” trend entries only
+    RANGING       = "RANGING"       # consolidation Ã¢â‚¬â€ reversion mode is primary
+    TRANSITIONING = "TRANSITIONING" # unclear Ã¢â‚¬â€ reversion with tighter gates
+    TRENDING_UP   = "TRENDING_UP"   # directional up Ã¢â‚¬â€ trend entries only
+    TRENDING_DOWN = "TRENDING_DOWN" # directional down Ã¢â‚¬â€ trend entries only
 
 
 class RegimeClassifier:
@@ -1245,12 +1245,12 @@ class RegimeClassifier:
     Inputs and weights:
       ADX(14) on 5m (50%):  Wilder's trend strength. > 25 = trending.
       ATR expansion (30%):  current_atr / mean(atr[-20]). > 1.3 = directional vol.
-      HTF alignment (20%):  4hÃ—0.6 + 15mÃ—0.4 trend score magnitude. Macro confirms.
+      HTF alignment (20%):  4hÃƒâ€”0.6 + 15mÃƒâ€”0.4 trend score magnitude. Macro confirms.
 
     Regime thresholds:
-      TRENDING   â† confidence â‰¥ 0.55 AND ADX confirms AND +DI/-DI direction clear
-      RANGING    â† confidence < 0.30
-      TRANSITIONING â† otherwise
+      TRENDING   Ã¢â€ Â confidence Ã¢â€°Â¥ 0.55 AND ADX confirms AND +DI/-DI direction clear
+      RANGING    Ã¢â€ Â confidence < 0.30
+      TRANSITIONING Ã¢â€ Â otherwise
 
     Direction requires ADX's +DI/-DI to broadly agree with the HTF composite.
     This prevents regime flip on a single-candle spike.
@@ -1284,7 +1284,7 @@ class RegimeClassifier:
         # INCLUDES hist[-1] (current ATR value) in the baseline mean.  This
         # creates a self-reference: dividing current ATR by a mean that already
         # contains it always understates true expansion (ratio drifts toward 1.0).
-        # Fix: use hist[-21:-1] â€” the 20 bars BEFORE the current bar â€” as the
+        # Fix: use hist[-21:-1] Ã¢â‚¬â€ the 20 bars BEFORE the current bar Ã¢â‚¬â€ as the
         # baseline, matching standard ATR-expansion calculation practice.
         hist = list(atr._atr_hist)
         expansion = 1.0
@@ -1293,7 +1293,7 @@ class RegimeClassifier:
             if baseline > 1e-10:
                 expansion = hist[-1] / baseline
         elif len(hist) >= 2:
-            # Insufficient history for a full 20-bar baseline â€” use prior bars only
+            # Insufficient history for a full 20-bar baseline Ã¢â‚¬â€ use prior bars only
             prior = hist[:-1]
             baseline = sum(prior) / len(prior)
             if baseline > 1e-10:
@@ -1308,15 +1308,15 @@ class RegimeClassifier:
 
         confidence = adx_score * 0.50 + expansion_score * 0.30 + htf_score * 0.20
 
-        # â”€â”€ v5.1: DI NEUTRAL OVERRIDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ v5.1: DI NEUTRAL OVERRIDE Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # ROOT CAUSE of missed crash: ADX=42 (strong trend) but +DI/-DI spread
-        # < 4pts â†’ trend_dir="neutral" â†’ regime stuck at TRANSITIONING.
+        # < 4pts Ã¢â€ â€™ trend_dir="neutral" Ã¢â€ â€™ regime stuck at TRANSITIONING.
         # During flash crashes, Wilder-smoothed DI takes several candles to
         # separate because it's an EMA of directional movement.
         #
         # Fix: when ADX >= 35 but DI is neutral, use 15m structure as the
         # fast direction indicator. 15m BOS/CHoCH updates on confirmed swings.
-        # Also: ATR expansion >= 1.5Ã— = volatility event, use 15m direction.
+        # Also: ATR expansion >= 1.5Ãƒâ€” = volatility event, use 15m direction.
         _di_override_dir = trend_dir
         if trend_dir == "neutral" and adx_val >= 35.0:
             if htf.trend_15m < -0.30:
@@ -1346,12 +1346,12 @@ class RegimeClassifier:
         else:
             regime = MarketRegime.TRANSITIONING
 
-        # â”€â”€ v6.0: BREAKOUT FAST-TRIGGER OVERLAY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ v6.0: BREAKOUT FAST-TRIGGER OVERLAY Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # ADX is a lagging indicator (EMA of directional movement). In a fresh
         # breakout, ADX takes 10-15 candles to react. By then the move is over.
         #
         # Fast-trigger: when breakout detector fires AND VWAP deviation exceeds
-        # 2.0Ã—ATR, immediately promote to TRENDING regardless of ADX.
+        # 2.0Ãƒâ€”ATR, immediately promote to TRENDING regardless of ADX.
         # This unlocks _evaluate_trend_entry within 1-2 candles of the move.
         if breakout_active and abs(vwap_dev_atr) >= 2.0:
             if breakout_dir == "up" and regime != MarketRegime.TRENDING_UP:
@@ -1359,14 +1359,14 @@ class RegimeClassifier:
                 confidence = max(confidence, 0.60)
                 _di_override_dir = "up"
                 logger.debug(
-                    f"ðŸš€ Regime FAST-TRIGGER: â†’ TRENDING_UP "
+                    f"Ã°Å¸Å¡â‚¬ Regime FAST-TRIGGER: Ã¢â€ â€™ TRENDING_UP "
                     f"(breakout_up + VWAP_dev={vwap_dev_atr:+.1f}ATR)")
             elif breakout_dir == "down" and regime != MarketRegime.TRENDING_DOWN:
                 regime = MarketRegime.TRENDING_DOWN
                 confidence = max(confidence, 0.60)
                 _di_override_dir = "down"
                 logger.debug(
-                    f"ðŸš€ Regime FAST-TRIGGER: â†’ TRENDING_DOWN "
+                    f"Ã°Å¸Å¡â‚¬ Regime FAST-TRIGGER: Ã¢â€ â€™ TRENDING_DOWN "
                     f"(breakout_down + VWAP_dev={vwap_dev_atr:+.1f}ATR)")
 
         self._regime     = regime
@@ -1399,16 +1399,16 @@ class RegimeClassifier:
         return True
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# BREAKOUT DETECTOR â€” Adaptive multi-evidence scoring (v4.7)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# BREAKOUT DETECTOR Ã¢â‚¬â€ Adaptive multi-evidence scoring (v4.7)
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class InstitutionalLevels:
     """
     Computes SL/TP/Trail levels using:
-    1. Volume Profile (from candles) â€” find High-Volume Nodes where price consolidates
-    2. Orderbook Liquidity Walls â€” find where large resting orders cluster
-    3. Swing Structure â€” recent pivot highs/lows on multiple timeframes
-    4. VWAP bands (Â±1Ïƒ, Â±2Ïƒ) â€” institutional reference levels
+    1. Volume Profile (from candles) Ã¢â‚¬â€ find High-Volume Nodes where price consolidates
+    2. Orderbook Liquidity Walls Ã¢â‚¬â€ find where large resting orders cluster
+    3. Swing Structure Ã¢â‚¬â€ recent pivot highs/lows on multiple timeframes
+    4. VWAP bands (Ã‚Â±1ÃÆ’, Ã‚Â±2ÃÆ’) Ã¢â‚¬â€ institutional reference levels
 
     SL: Behind the strongest protective level (wall / HVN / swing)
     TP: At the nearest attraction level toward VWAP (HVN / wall / VWAP itself)
@@ -1468,7 +1468,7 @@ class InstitutionalLevels:
     @staticmethod
     def find_orderbook_walls(orderbook: Dict, side: str, depth: int = 20, wall_mult: float = 2.5) -> List[Tuple[float, float]]:
         """
-        Find price levels where resting liquidity is wall_mult Ã— average.
+        Find price levels where resting liquidity is wall_mult Ãƒâ€” average.
         Returns [(price, qty), ...] sorted by qty descending.
         side='bid' for support walls, 'ask' for resistance walls.
         """
@@ -1526,33 +1526,33 @@ class InstitutionalLevels:
                    liq_map=None,
                    tp_distance_mult: float = 1.0) -> Optional[float]:
         """
-        Initial TP placement â€” v7.0 INSTITUTIONAL PRIORITY.
+        Initial TP placement Ã¢â‚¬â€ v7.0 INSTITUTIONAL PRIORITY.
 
         HIERARCHY (all candidates scored; highest wins):
 
-          TIER-S  score â‰¥ 7.0  Liquidity pool (LiquidityMap)
+          TIER-S  score Ã¢â€°Â¥ 7.0  Liquidity pool (LiquidityMap)
                                 The LiquidityMap has the richest multi-TF pool data.
                                 BSL above (for LONG) / SSL below (for SHORT) is
-                                WHERE price is magnetically attracted to â€” stop
+                                WHERE price is magnetically attracted to Ã¢â‚¬â€ stop
                                 clusters draw price like gravity. This is always
                                 the PRIMARY TP in ICT methodology.
 
-          TIER-A  score â‰¥ 6.0  ICT swept liquidity origin
+          TIER-A  score Ã¢â€°Â¥ 6.0  ICT swept liquidity origin
                                 After a sweep-and-reverse, price delivers back to
                                 the raid origin. Mandatory when present.
 
-          TIER-B  score â‰¥ 5.0  ICT structural (FVG, virgin OB, ict_engine pools)
+          TIER-B  score Ã¢â€°Â¥ 5.0  ICT structural (FVG, virgin OB, ict_engine pools)
                                 Imbalances and institutional footprints in the
                                 delivery direction.
 
-          TIER-C  score â‰¥ 4.0  15m swing extremes
+          TIER-C  score Ã¢â€°Â¥ 4.0  15m swing extremes
                                 Confirmed structural swing levels.
 
-          TIER-D  score â‰¥ 3.5  VWAP / Ïƒ-bands
+          TIER-D  score Ã¢â€°Â¥ 3.5  VWAP / ÃÆ’-bands
                                 Statistical reference levels.
 
-          REJECT  If NO candidate survives the R:R gate â†’ return None.
-                  The caller must NOT enter this trade â€” no naked R-floor.
+          REJECT  If NO candidate survives the R:R gate Ã¢â€ â€™ return None.
+                  The caller must NOT enter this trade Ã¢â‚¬â€ no naked R-floor.
 
         CRITICAL: There is NO R-floor fallback. If no structural target
         exists that satisfies the minimum R:R, the trade is rejected.
@@ -1568,7 +1568,7 @@ class InstitutionalLevels:
         max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR() * tp_distance_mult
         _min_rr_gate = QCfg.REVERSION_MIN_RR() * tp_distance_mult
 
-        # â”€â”€ scored candidates pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ scored candidates pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         scored: List[Tuple[float, float, str]] = []   # (level, score, label)
 
         def _valid(level: float, min_dist: float = None) -> bool:
@@ -1584,7 +1584,7 @@ class InstitutionalLevels:
             if _valid(level, min_dist):
                 scored.append((level, score, label))
 
-        # â•â• TIER-S: LiquidityMap pools (primary target â€” richest data) â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIER-S: LiquidityMap pools (primary target Ã¢â‚¬â€ richest data) Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         # LiquidityMap tracks equal highs/lows across all TFs with clustering,
         # HTF confluence promotion, and proximity weighting. These are the real
         # liquidity clusters smart money hunts.
@@ -1601,7 +1601,7 @@ class InstitutionalLevels:
                     # HTF confluence multiplier
                     if pool.htf_count >= 2:
                         _score += 0.5
-                    # Touch count bonus â€” more touches = deeper stop cluster
+                    # Touch count bonus Ã¢â‚¬â€ more touches = deeper stop cluster
                     _score += min(pool.touches * 0.1, 0.5)
                     # Target is just BEFORE the pool (so we don't trigger the stops,
                     # we exit into the liquidity that attracts price there)
@@ -1610,7 +1610,7 @@ class InstitutionalLevels:
             except Exception as _le:
                 logger.debug(f"LiqMap TP scan error: {_le}")
 
-        # â•â• TIER-A: ICT swept liquidity origin â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIER-A: ICT swept liquidity origin Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         # After a sweep-and-reverse, AMD delivery target is the most important level.
         if ict_engine is not None:
             try:
@@ -1620,7 +1620,7 @@ class InstitutionalLevels:
             except Exception:
                 pass
 
-        # â•â• TIER-B: ICT structural targets (FVGs, OBs, ict_engine pools) â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIER-B: ICT structural targets (FVGs, OBs, ict_engine pools) Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         if ict_engine is not None:
             try:
                 _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)
@@ -1656,7 +1656,7 @@ class InstitutionalLevels:
             except Exception:
                 pass
 
-        # â•â• TIER-C: 15m swing extremes â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIER-C: 15m swing extremes Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         if candles_15m and len(candles_15m) >= 3:
             _lb   = min(40, len(candles_15m) - 2)
             sh_15, sl_15 = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
@@ -1670,20 +1670,20 @@ class InstitutionalLevels:
                     if sl_v < price - min_tp_dist:
                         add(sl_v + _buf, 4.0, f"15m_SWING_LOW@${sl_v:,.0f}")
 
-        # â•â• TIER-D: VWAP / Ïƒ-bands â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIER-D: VWAP / ÃÆ’-bands Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         if vwap > 0:
             if side == "long" and vwap > price:
                 add(vwap, 3.5, "VWAP")
                 if vwap_std > 0:
                     for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                        add(vwap - mult * vwap_std, sc, f"VWAP-{mult}Ïƒ")
+                        add(vwap - mult * vwap_std, sc, f"VWAP-{mult}ÃÆ’")
             elif side == "short" and vwap < price:
                 add(vwap, 3.5, "VWAP")
                 if vwap_std > 0:
                     for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                        add(vwap + mult * vwap_std, sc, f"VWAP+{mult}Ïƒ")
+                        add(vwap + mult * vwap_std, sc, f"VWAP+{mult}ÃÆ’")
 
-        # â•â• TIERED SELECTION â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢Â TIERED SELECTION Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         if vwap > 0 and vwap_std > 0:
             for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.8), (2.0, 2.5)]:
                 if side == "long":
@@ -1711,7 +1711,7 @@ class InstitutionalLevels:
                     if rr >= _min_rr_gate - 1e-9:
                         tp = cand_lvl
                         logger.info(
-                            f"ðŸŽ¯ TP [{tier_lbl}] ${tp:,.2f} ({cand_lb}) "
+                            f"Ã°Å¸Å½Â¯ TP [{tier_lbl}] ${tp:,.2f} ({cand_lb}) "
                             f"score={cand_sc:.1f} "
                             f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
                             f"R:R=1:{rr:.2f} | {len(scored)} candidates total")
@@ -1719,7 +1719,7 @@ class InstitutionalLevels:
                     else:
                         logger.debug(
                             f"   TP candidate ${cand_lvl:,.1f} [{cand_lb}] "
-                            f"score={cand_sc:.1f} R:R={rr:.2f} < {_min_rr_gate:.1f} â€” skip")
+                            f"score={cand_sc:.1f} R:R={rr:.2f} < {_min_rr_gate:.1f} Ã¢â‚¬â€ skip")
                 if tp is not None:
                     break
 
@@ -1774,7 +1774,7 @@ def _ict_atr_inline(candles: list, period: int) -> float:
 
 class _DynamicStructureTrail:
     """
-    Slim ICT structure-query helper â€” v5.0 refactor.
+    Slim ICT structure-query helper Ã¢â‚¬â€ v5.0 refactor.
 
     The v7.0 trail logic that used to live here (chandelier fallback,
     dynamic-buffer computation, liquidity-first anchor selection,
@@ -1783,17 +1783,17 @@ class _DynamicStructureTrail:
 
     Retained here (as classmethods / static methods) are ONLY the pure
     ICT-state query helpers used by the display layer:
-      _bos_count     â€” how many aligned BOS events across TFs
-      _counter_bos   â€” is there a fresh BOS AGAINST the position?
-      _choch         â€” most relevant CHoCH against the position
-      _phase         â€” simple phase label (R-multiple driven)
-      _session_mult  â€” DST-aware session buffer multiplier
+      _bos_count     Ã¢â‚¬â€ how many aligned BOS events across TFs
+      _counter_bos   Ã¢â‚¬â€ is there a fresh BOS AGAINST the position?
+      _choch         Ã¢â‚¬â€ most relevant CHoCH against the position
+      _phase         Ã¢â‚¬â€ simple phase label (R-multiple driven)
+      _session_mult  Ã¢â‚¬â€ DST-aware session buffer multiplier
 
     All SL trailing decisions are made by LiquidityTrailEngine in
     strategy/liquidity_trail.py.  This class NO LONGER drives SL moves.
     """
 
-    # â”€â”€ Structure event detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Structure event detection Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
     @staticmethod
     def _bos_count(ict_engine, pos_side: str, now_ms: int = 0) -> int:
@@ -1893,11 +1893,11 @@ class _DynamicStructureTrail:
             return 1.0
 
 
-_DYNAMIC_TRAIL_AVAILABLE = True   # helper class â€” always available
+_DYNAMIC_TRAIL_AVAILABLE = True   # helper class Ã¢â‚¬â€ always available
 
 
 # ATR ENGINE
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class ATREngine:
     def __init__(self):
         self._atr = 0.0; self._atr_hist: deque = deque(maxlen=QCfg.ATR_PCTILE_WINDOW())
@@ -1953,7 +1953,7 @@ class ATREngine:
         if len(candles) < period + 1: return self._atr
 
         if not self._seeded:
-            # Seed on closed bars only â€” exclude forming candles[-1]
+            # Seed on closed bars only Ã¢â‚¬â€ exclude forming candles[-1]
             closed = candles[:-1]
             trs = [max(float(closed[i]['h'])-float(closed[i]['l']),
                        abs(float(closed[i]['h'])-float(closed[i-1]['c'])),
@@ -1963,7 +1963,7 @@ class ATREngine:
             atr = sum(trs[:period]) / period
             for tr in trs[period:]:
                 atr = (atr * (period - 1) + tr) / period
-            # Only keep the final seeded ATR â€” prevents warmup-era volatility
+            # Only keep the final seeded ATR Ã¢â‚¬â€ prevents warmup-era volatility
             # from poisoning live percentile ranking.
             self._atr_hist.clear()
             self._atr_hist.append(atr)
@@ -2003,39 +2003,39 @@ class ATREngine:
     def regime_penalty(self) -> float:
         return 1.0 if self.regime_valid() else 0.0
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# HTF TREND FILTER â€” VETO ONLY
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# HTF TREND FILTER Ã¢â‚¬â€ VETO ONLY
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class HTFTrendFilter:
     """
-    HTF Trend Filter â€” v7.0 (ICT structure-primary, EMA fallback).
+    HTF Trend Filter Ã¢â‚¬â€ v7.0 (ICT structure-primary, EMA fallback).
 
-    v7.0 REWRITE â€” replaces naive EMA slope with ICT swing-structure scores.
+    v7.0 REWRITE Ã¢â‚¬â€ replaces naive EMA slope with ICT swing-structure scores.
 
     ROOT CAUSE of old veto instability:
       The EMA(8) slope was normalised by 5m ATR. A single large candle shifts
-      the EMA meaningfully â€” the veto flipped on/off tick-by-tick in volatile
+      the EMA meaningfully Ã¢â‚¬â€ the veto flipped on/off tick-by-tick in volatile
       markets, randomly blocking entries mid-setup.
 
-    NEW APPROACH â€” two-layer score per timeframe:
+    NEW APPROACH Ã¢â‚¬â€ two-layer score per timeframe:
 
-    LAYER 1: ICT Swing Structure (primary â€” from ICTEngine._tf)
+    LAYER 1: ICT Swing Structure (primary Ã¢â‚¬â€ from ICTEngine._tf)
       Score from -1.0 to +1.0 built from:
         (a) Swing sequence: HH/HL = +1.0, LH/LL = -1.0, ranging = 0.0
         (b) BOS direction: bullish break = +0.4 bonus, bearish = -0.4 bonus
-        (c) CHoCH signal: character change adds Â±0.3 early warning
-      This is pure price structure â€” it does not flip on a single candle
+        (c) CHoCH signal: character change adds Ã‚Â±0.3 early warning
+      This is pure price structure Ã¢â‚¬â€ it does not flip on a single candle
       because fractal swings require 2 bars on each side to confirm.
 
-    LAYER 2: EMA slope (secondary â€” used ONLY when ICT not initialised)
+    LAYER 2: EMA slope (secondary Ã¢â‚¬â€ used ONLY when ICT not initialised)
       Same as v6 but normalised to 4h ATR equivalent for better scaling.
-      Acts as a bridge during the first 10â€“20 minutes of warmup.
+      Acts as a bridge during the first 10Ã¢â‚¬â€œ20 minutes of warmup.
 
     VETO LOGIC (unchanged contract with quant_strategy):
       LONG  veto: 15m < -HTF_15M_VETO(0.35) OR (15m < -0.20 AND 4h < -0.20)
       SHORT veto: 15m > +HTF_15M_VETO(0.35) OR (15m > +0.20 AND 4h > +0.20)
 
-    The thresholds remain the same â€” the INPUTS are now structurally stable.
+    The thresholds remain the same Ã¢â‚¬â€ the INPUTS are now structurally stable.
     """
     def __init__(self):
         self._trend_15m  = 0.0
@@ -2058,13 +2058,13 @@ class HTFTrendFilter:
         Convert a TFStructure object into a [-1, +1] directional score.
 
         Component weights:
-          Swing trend:  Â±0.60  (dominant â€” multi-bar confirmation)
-          BOS:          Â±0.25  (structural break confirmation)
-          CHoCH:        Â±0.15  (early character-change warning â€” expires after
+          Swing trend:  Ã‚Â±0.60  (dominant Ã¢â‚¬â€ multi-bar confirmation)
+          BOS:          Ã‚Â±0.25  (structural break confirmation)
+          CHoCH:        Ã‚Â±0.15  (early character-change warning Ã¢â‚¬â€ expires after
                                 CHOCH_EXPIRY_BARS candles; stale CHoCH ignored)
 
         Ranging markets with no clear swing sequence return near-zero,
-        which does NOT trigger a veto â€” correct behaviour since ranging
+        which does NOT trigger a veto Ã¢â‚¬â€ correct behaviour since ranging
         means no strong directional bias, not a contrary signal.
         """
         if tf_struct is None:
@@ -2081,7 +2081,7 @@ class HTFTrendFilter:
                 score += 0.25
             elif tf_struct.bos_direction == "bearish":
                 score -= 0.25
-        # CHoCH is an early reversal signal â€” only apply when recent (within
+        # CHoCH is an early reversal signal Ã¢â‚¬â€ only apply when recent (within
         # CHOCH_EXPIRY_BARS bars).  A CHoCH from 50+ candles ago indicates
         # the trend long since resumed; applying it indefinitely softens an
         # established HTF score with stale information.
@@ -2095,9 +2095,9 @@ class HTFTrendFilter:
         # BUG-STALE-CHOCH FIX: when choch_bar_index == -1 (no bar index, e.g. old
         # serialised state) we have no way to know how stale this CHoCH is.
         # Applying it unconditionally can permanently soften an established HTF
-        # score by Â±0.15 â€” enough to flip the veto threshold on the 15m TF.
+        # score by Ã‚Â±0.15 Ã¢â‚¬â€ enough to flip the veto threshold on the 15m TF.
         # Resolution: skip CHoCH entirely when the bar index is unavailable.
-        # The swing trend (Â±0.60) and BOS (Â±0.25) are sufficient without it.
+        # The swing trend (Ã‚Â±0.60) and BOS (Ã‚Â±0.25) are sufficient without it.
         return max(-1.0, min(1.0, score))
 
     def update(self, candles_15m, candles_4h, atr_5m, ict_engine=None):
@@ -2110,7 +2110,7 @@ class HTFTrendFilter:
             atr_5m:       current 5m ATR (for EMA fallback normalisation)
             ict_engine:   ICTEngine instance (None = use EMA fallback)
         """
-        # â”€â”€ PRIMARY: ICT swing-structure scores â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ PRIMARY: ICT swing-structure scores Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if ict_engine is not None and getattr(ict_engine, '_initialized', False):
             tf_15m = ict_engine._tf.get("15m")
             tf_4h  = ict_engine._tf.get("4h")
@@ -2119,7 +2119,7 @@ class HTFTrendFilter:
             self._ict_source = True
             return
 
-        # â”€â”€ FALLBACK: EMA slope (ICT not yet initialised) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ FALLBACK: EMA slope (ICT not yet initialised) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._ict_source = False
         fast = QCfg.EMA_FAST()
         if len(candles_15m) > fast + 5 and atr_5m > 1e-10:
@@ -2147,7 +2147,7 @@ class HTFTrendFilter:
 
     def vetoes_trade(self, side: str) -> bool:
         """
-        HTF veto â€” DISABLED. Always returns False.
+        HTF veto Ã¢â‚¬â€ DISABLED. Always returns False.
         HTF context is advisory only; conviction filter scores HTF via structure.
         """
         return False
@@ -2182,17 +2182,17 @@ class HTFTrendFilter:
         return self._ict_source
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# WEIGHT SCHEDULER â€” regime-adaptive signal weights
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# WEIGHT SCHEDULER Ã¢â‚¬â€ regime-adaptive signal weights
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class WeightScheduler:
     """
-    Regime-adaptive signal weight scheduler â€” v7.0.
+    Regime-adaptive signal weight scheduler Ã¢â‚¬â€ v7.0.
 
     Signal mix that maximises edge varies by market regime:
 
     RANGING:
-      VWAP deviation is the dominant edge â€” price reverts reliably to VWAP.
+      VWAP deviation is the dominant edge Ã¢â‚¬â€ price reverts reliably to VWAP.
       OrderBook imbalance provides tight structural validation.
       CVD divergence confirms exhaustion at extremes.
       W: VWAP=0.40, OB=0.25, CVD=0.20, TICK=0.10, VEX=0.05
@@ -2202,7 +2202,7 @@ class WeightScheduler:
       W: VWAP=0.30, CVD=0.25, OB=0.20, TICK=0.15, VEX=0.10
 
     TRENDING_UP / TRENDING_DOWN:
-      CVD trend signal and tick flow dominate â€” they show active directional
+      CVD trend signal and tick flow dominate Ã¢â‚¬â€ they show active directional
       participation. VWAP is lagging (price is above/below it by design).
       W: CVD=0.35, TICK=0.25, OB=0.20, VWAP=0.15, VEX=0.05
 
@@ -2245,9 +2245,9 @@ class WeightScheduler:
                 f"TICK={w[3]:.2f} VEX={w[4]:.2f}")
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # SIGNAL BREAKDOWN
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 @dataclass
 class SignalBreakdown:
     vwap_dev: float = 0.0; cvd_div: float = 0.0; orderbook: float = 0.0
@@ -2273,7 +2273,7 @@ class SignalBreakdown:
     amd_phase: str = "ACCUMULATION"  # AMD cycle phase
     amd_bias: str = "neutral"         # AMD directional bias
     amd_conf: float = 0.0             # AMD confidence 0-1
-    mtf_aligned: bool = False         # True if â‰¥3 of 4 major TFs agree
+    mtf_aligned: bool = False         # True if Ã¢â€°Â¥3 of 4 major TFs agree
     in_discount: bool = False         # Price in 4H discount zone (<40% PD)
     in_premium:  bool = False         # Price in 4H premium zone (>60% PD)
     mtf_details: str = ""             # MTF structure summary
@@ -2303,12 +2303,12 @@ class SignalBreakdown:
         ict_str = f" ICT={self.ict_total:.2f}" if self.ict_total > 0.01 else ""
         return (f"VWAP={self.vwap_dev:+.3f} CVD={self.cvd_div:+.3f} "
                 f"OB={self.orderbook:+.3f} TF={self.tick_flow:+.3f} "
-                f"VEX={self.vol_exhaust:+.3f} -> Î£={self.composite:+.4f}{ict_str} "
+                f"VEX={self.vol_exhaust:+.3f} -> ÃŽÂ£={self.composite:+.4f}{ict_str} "
                 f"dev={self.deviation_atr:+.1f}ATR confirm={self.n_confirming}/5")
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # POSITION STATE
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class PositionPhase(Enum):
     FLAT = auto(); ENTERING = auto(); ACTIVE = auto(); EXITING = auto()
 
@@ -2325,7 +2325,7 @@ class PositionState:
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
     trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
-    entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" â€” for correct PnL fee calc
+    entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" Ã¢â‚¬â€ for correct PnL fee calc
     entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
@@ -2333,9 +2333,9 @@ class PositionState:
     be_ratchet_applied: bool = False  # v5.1: counter-BOS BE already forced
     last_ratchet_r: float = 0.0      # v6.1: last R-level ratcheted (prevents re-fire)
     entry_session: str = ""          # canonical session captured at entry
-    ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" â€” ICT confluence tier at entry
+    ict_entry_tier: str = ""  # v7.0: "S" | "A" | "B" | "" Ã¢â‚¬â€ ICT confluence tier at entry
     # FIX 8: store actual HTF scores at entry time for post-trade attribution.
-    # Previously deviation_atr was stored under "htf_15m" key â€” all HTF analytics were wrong.
+    # Previously deviation_atr was stored under "htf_15m" key Ã¢â‚¬â€ all HTF analytics were wrong.
     entry_htf_15m: float = 0.0
     entry_htf_4h:  float = 0.0
     # PostTradeAgent MAE tracking: exact Maximum Adverse Excursion in points.
@@ -2355,9 +2355,9 @@ class PositionState:
                 "entry_price": self.entry_price,
                 "sl_price": self.sl_price, "tp_price": self.tp_price}
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # DAILY RISK GATE with consecutive loss lockout
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class DailyRiskGate:
     # BUG-TZ FIX: Trading day boundary must be midnight IST (UTC+5:30), not
     # midnight UTC.  date.today() on a cloud server (UTC) flips at midnight
@@ -2395,7 +2395,7 @@ class DailyRiskGate:
                 return False, f"Loss lockout: {int(self._loss_lockout_until - now)}s remaining"
             # FIX 2: Reset consec_losses when lockout expires so the bot can
             # actually trade again.  Without this the lockout re-arms on every
-            # call after expiry because consec_losses is still â‰¥ MAX â€” infinite loop.
+            # call after expiry because consec_losses is still Ã¢â€°Â¥ MAX Ã¢â‚¬â€ infinite loop.
             elif self._loss_lockout_until > 0 and now >= self._loss_lockout_until:
                 self._consec_losses = 0
                 self._loss_lockout_until = 0.0
@@ -2403,7 +2403,7 @@ class DailyRiskGate:
                 return False, f"Daily cap: {self._daily_trades}/{QCfg.MAX_DAILY_TRADES()}"
             if self._consec_losses >= QCfg.MAX_CONSEC_LOSSES():
                 self._loss_lockout_until = now + QCfg.LOSS_LOCKOUT_SEC()
-                return False, f"Consec loss cap â†’ {QCfg.LOSS_LOCKOUT_SEC()}s lockout"
+                return False, f"Consec loss cap Ã¢â€ â€™ {QCfg.LOSS_LOCKOUT_SEC()}s lockout"
             if self._daily_open_bal > 1e-10:
                 lp = -self._daily_pnl / self._daily_open_bal * 100.0
                 if lp >= QCfg.MAX_DAILY_LOSS_PCT():
@@ -2421,7 +2421,7 @@ class DailyRiskGate:
 
     def force_reset(self, reset_consec: bool = True, reset_daily: bool = False) -> str:
         """
-        Manual override reset â€” callable from Telegram /resetrisk.
+        Manual override reset Ã¢â‚¬â€ callable from Telegram /resetrisk.
 
         reset_consec: clears consecutive_losses + loss_lockout (default True)
         reset_daily:  also clears daily_pnl + daily_trades counter (opt-in only)
@@ -2435,7 +2435,7 @@ class DailyRiskGate:
                 prev_lo = self._loss_lockout_until
                 self._consec_losses       = 0
                 self._loss_lockout_until  = 0.0
-                parts.append(f"consec_losses {prev_cl}â†’0")
+                parts.append(f"consec_losses {prev_cl}Ã¢â€ â€™0")
                 if prev_lo > 0:
                     import time as _t
                     remaining = max(0, int(prev_lo - _t.time()))
@@ -2445,8 +2445,8 @@ class DailyRiskGate:
                 prev_dp  = self._daily_pnl
                 self._daily_trades = 0
                 self._daily_pnl    = 0.0
-                parts.append(f"daily_trades {prev_dt}â†’0")
-                parts.append(f"daily_pnl ${prev_dp:+.2f}â†’$0.00")
+                parts.append(f"daily_trades {prev_dt}Ã¢â€ â€™0")
+                parts.append(f"daily_pnl ${prev_dp:+.2f}Ã¢â€ â€™$0.00")
             return "; ".join(parts) if parts else "nothing to reset"
 
     @property
@@ -2456,16 +2456,16 @@ class DailyRiskGate:
     def consec_losses(self):
         with self._lock: return self._consec_losses
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # MAIN STRATEGY CLASS
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class QuantStrategy:
     def __init__(self, order_manager=None):
         self._om = order_manager; self._lock = threading.RLock()
         self._vwap = VWAPEngine(); self._cvd = CVDEngine()
         self._ob_eng = OrderbookEngine(); self._tick_eng = TickFlowEngine()
         self._vol_exh = VolumeExhaustionEngine()
-        # â”€â”€ Execution cost engine (PATCH 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Execution cost engine (PATCH 2) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._fee_engine = ExecutionCostEngine() if ExecutionCostEngine is not None else None
         self._prev_price_for_urgency: float = 0.0
         self._atr_1m = ATREngine(); self._atr_5m = ATREngine()
@@ -2474,7 +2474,7 @@ class QuantStrategy:
         self._regime = RegimeClassifier()
         # v4.8: ICT/SMC structural confluence engine
         self._ict = ICTEngine() if _ICT_AVAILABLE else None
-        # DirectionEngine â€” owns hunt prediction, post-sweep eval, pool-hit gate.
+        # DirectionEngine Ã¢â‚¬â€ owns hunt prediction, post-sweep eval, pool-hit gate.
         # Reads structural context from self._ict; writes results back via
         # inject_hunt_prediction() so the rest of the stack is unaware of the split.
         self._dir_engine: Optional[object] = (
@@ -2482,13 +2482,13 @@ class QuantStrategy:
         # v5.0: ICT Sweep-and-Go institutional engine
         self._last_sweep_log = 0.0   # throttle sweep-status log spam
         # Post-sweep Telegram dedup: only send when verdict CHANGES MEANINGFULLY.
-        # SPAM-FIX 2026-04-26: production logs showed 16–18 POST-SWEEP VERDICT
-        # Telegram messages PER MINUTE (22:31–22:34, 15:53–15:54). The old dedup
+        # SPAM-FIX 2026-04-26: production logs showed 16â€“18 POST-SWEEP VERDICT
+        # Telegram messages PER MINUTE (22:31â€“22:34, 15:53â€“15:54). The old dedup
         # used a 5% confidence bucket which jitters across boundaries every few
         # ticks. New dedup enforces ALL of:
         #   1. coarser 1/7 confidence buckets (~14% wide), AND
         #   2. minimum 60s between sends, AND
-        #   3. only re-fire if action OR direction changes, OR |Δconf| ≥ 0.15
+        #   3. only re-fire if action OR direction changes, OR |Î”conf| â‰¥ 0.15
         self._ps_tg_last_hash: str = ""
         self._ps_tg_last_ts: float = 0.0
         self._ps_tg_last_conf: float = -1.0
@@ -2513,7 +2513,7 @@ class QuantStrategy:
         # The ENTERING watchdog must count from HERE, not from phase-onset, because
         # `place_bracket_limit_entry` can spend real time on: credential refresh,
         # margin check, REST retry on 429/502, and bracket-child order-ID resolution.
-        # The old watchdog counted from phase onset â€” fired while the fill poll was
+        # The old watchdog counted from phase onset Ã¢â‚¬â€ fired while the fill poll was
         # still blocking, leaving a live position on the exchange while our state
         # reset to FLAT.  0.0 = order not placed yet (watchdog uses pre-order tolerance).
         self._entry_order_placed_at = 0.0
@@ -2536,14 +2536,14 @@ class QuantStrategy:
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         # DUPLICATE P&L GUARD v2: two-layer protection.
         #
-        # Layer 1: _exit_completed (bool) â€” set True the moment ANY exit path
+        # Layer 1: _exit_completed (bool) Ã¢â‚¬â€ set True the moment ANY exit path
         #   finishes recording PnL.  Checked at the TOP of _record_exchange_exit()
         #   BEFORE any telegram sends.  Never reset until a new position opens.
         #   This prevents both double-counting AND double-reporting.
         #
-        # Layer 2: _pnl_recorded_for (float) â€” stores the entry_time of the
+        # Layer 2: _pnl_recorded_for (float) Ã¢â‚¬â€ stores the entry_time of the
         #   position whose close has been recorded.  Checked inside _record_pnl()
-        #   as a secondary guard.  NOT reset in _finalise_exit() â€” only reset
+        #   as a secondary guard.  NOT reset in _finalise_exit() Ã¢â‚¬â€ only reset
         #   when a new position enters ACTIVE phase.
         self._exit_completed: bool = False
         self._pnl_recorded_for: float = 0.0
@@ -2570,7 +2570,7 @@ class QuantStrategy:
         )
         self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
 
-        # â”€â”€ ISSUE-4 FIX: Conviction Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Evaluates 7 ICT factors before any entry order is placed.
         # Mandatory hard blocks: pool TF, dealing range, AMD phase, session.
         # Weighted score must reach 0.75; tracks session-level quality state.
@@ -2578,7 +2578,7 @@ class QuantStrategy:
             ConvictionFilter() if _CONVICTION_FILTER_AVAILABLE else None
         )
 
-        # â”€â”€ ISSUE-3 FIX: Liquidity-Only Trailing SL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-3 FIX: Liquidity-Only Trailing SL Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # SL anchors to swept/unswept pool structure; significance-based buffer.
         # Takes priority over chandelier trail. Chandelier runs as fallback only.
         self._liq_trail: Optional[object] = (
@@ -2587,7 +2587,7 @@ class QuantStrategy:
         self._flow_streak_dir_v2 = ""
         self._flow_streak_count_v2 = 0
         # BUG-FIX-3: These attrs are read by main.py heartbeat via getattr().
-        # Without explicit assignment they're missing â†’ heartbeat always shows
+        # Without explicit assignment they're missing Ã¢â€ â€™ heartbeat always shows
         # "Flow: neutral(+0.00)" regardless of actual order-flow state.
         self._flow_conviction: float = 0.0
         self._flow_direction:  str   = ""
@@ -2605,7 +2605,7 @@ class QuantStrategy:
         self._notified_sweeps: set = set()
         self._last_ict_bridge_diag_ts: float = 0.0
         # Track previous killzone so on_session_change() fires exactly once per
-        # London/NY/Asia/OFF_HOURS boundary â€” resets conviction session quota.
+        # London/NY/Asia/OFF_HOURS boundary Ã¢â‚¬â€ resets conviction session quota.
         self._last_conviction_kz: str = ""
         self.watchdog_trading_frozen: bool = False
         self._last_watchdog_freeze_log: float = 0.0
@@ -2613,10 +2613,10 @@ class QuantStrategy:
         self._entry_confirm_count = 0
         self._last_entry_confirm_log = 0.0
 
-        # â”€â”€ Post-Trade Analysis Agent (v2.0) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Post-Trade Analysis Agent (v2.0) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
         # R-multiples), entry quality (OTE/AMD/ICT/session), structural causation
-        # (WICK_SWEEP/BOS_BREAK/AMD_FLIP/POOL_REACHED/â€¦), Bayesian adaptive
+        # (WICK_SWEEP/BOS_BREAK/AMD_FLIP/POOL_REACHED/Ã¢â‚¬Â¦), Bayesian adaptive
         # parameters, and Information Coefficient (IC) signal tracking.
         # Non-fatal: bot operates normally if the file is missing.
         try:
@@ -2629,15 +2629,15 @@ class QuantStrategy:
             except ImportError:
                 self._post_trade_agent = None
                 logger.warning(
-                    "PostTradeAgent not found â€” post-trade analysis disabled. "
+                    "PostTradeAgent not found Ã¢â‚¬â€ post-trade analysis disabled. "
                     "Place post_trade_agent.py in strategy/ to enable."
                 )
 
-        # ─── Post-Exit Re-Entry Gate (v9.1) ──────────────────────────────────
+        # â”€â”€â”€ Post-Exit Re-Entry Gate (v9.1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Six-lens gate that replaces the flat 30s cooldown with regime-aware
-        # logic. Stops the "exit → re-enter in 30s → take another stop" loop
-        # observed in production (2026-04-25): SHORT SL @ 11:39:58 → LONG
-        # entered 2m38s later → SL → SHORT entered 3m37s after THAT → SL.
+        # logic. Stops the "exit â†’ re-enter in 30s â†’ take another stop" loop
+        # observed in production (2026-04-25): SHORT SL @ 11:39:58 â†’ LONG
+        # entered 2m38s later â†’ SL â†’ SHORT entered 3m37s after THAT â†’ SL.
         # The gate is wired in two places:
         #   (1) record_exit() called from _finalise_exit (already wired above)
         #   (2) accept() called from the entry block before _enter_trade
@@ -2651,7 +2651,7 @@ class QuantStrategy:
             except ImportError:
                 self._post_exit_gate = None
                 logger.warning(
-                    "PostExitGate not found â€” using flat QUANT_COOLDOWN_SEC. "
+                    "PostExitGate not found Ã¢â‚¬â€ using flat QUANT_COOLDOWN_SEC. "
                     "Place post_exit_gate.py in strategy/ to enable."
                 )
 
@@ -2665,7 +2665,7 @@ class QuantStrategy:
         self._last_closed_mae_pts: float = 0.0
         self._last_closed_atr: float = 0.0
 
-        # â”€â”€ Unified entry gate state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Unified entry gate state Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         _set_adaptive_param_provider(self._post_trade_agent)
 
         # Wire IC-gate Telegram notifier so PostTradeAgent can push alerts
@@ -2684,9 +2684,9 @@ class QuantStrategy:
 
     def _log_init(self):
         logger.info("=" * 72)
-        logger.info("âš¡ QuantStrategy v10.0 â€” INSTITUTIONAL LIQUIDITY-FIRST")
+        logger.info("Ã¢Å¡Â¡ QuantStrategy v10.0 Ã¢â‚¬â€ INSTITUTIONAL LIQUIDITY-FIRST")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-        entry_status = "ACTIVE (LiquidityMap â†’ EntryEngine â†’ ConvictionFilter)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
+        entry_status = "ACTIVE (LiquidityMap Ã¢â€ â€™ EntryEngine Ã¢â€ â€™ ConvictionFilter)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   LiquidityMap: {liq_status}")
@@ -2743,14 +2743,14 @@ class QuantStrategy:
         ATR engines now use soft_reset() instead of reset_state().
         reset_state() zeroed self._atr = 0.0 which caused _compute_signals
         to return None for up to 75 minutes (5m re-seed window) with zero
-        log output â€” the bot appeared completely dead after every reconnect.
+        log output Ã¢â‚¬â€ the bot appeared completely dead after every reconnect.
         soft_reset() preserves the last valid ATR value so signals continue
         working immediately while the engine re-seeds from fresh candles.
         """
         with self._lock:
             self._cvd.reset_state()
             self._atr_1m.soft_reset()   # preserves ATR value; re-seeds from next batch
-            self._atr_5m.soft_reset()   # same â€” avoids 75-min silence after reconnect
+            self._atr_5m.soft_reset()   # same Ã¢â‚¬â€ avoids 75-min silence after reconnect
             self._adx.reset_state()
             if self._ict: self._ict.reset_state()
             if self._dir_engine is not None:
@@ -2758,7 +2758,7 @@ class QuantStrategy:
                     self._dir_engine.clear_sweep()
                 except Exception:
                     pass
-            logger.info("â™»ï¸ Strategy engines soft-reset after stream restart (ATR values preserved)")
+            logger.info("Ã¢â„¢Â»Ã¯Â¸Â Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
         """v4.3: Telegram command to override trailing SL on/off, even mid-position.
@@ -2766,9 +2766,9 @@ class QuantStrategy:
         with self._lock:
             self._pos.trail_override = enabled
             if enabled is None:
-                logger.info("Trail override cleared â†’ using config default")
+                logger.info("Trail override cleared Ã¢â€ â€™ using config default")
             else:
-                logger.info(f"Trail override set â†’ {'ENABLED' if enabled else 'DISABLED'}")
+                logger.info(f"Trail override set Ã¢â€ â€™ {'ENABLED' if enabled else 'DISABLED'}")
 
     def get_trail_enabled(self) -> bool:
         """Check if trailing is enabled considering override."""
@@ -2784,12 +2784,12 @@ class QuantStrategy:
         BUG FIX: Previously called self._fee_engine._spread.median_bps() which
         returns a hardcoded FEE_SPREAD_DEFAULT_BPS=2.0 sentinel whenever fewer
         than 5 samples have been collected. On startup the tracker is empty, so
-        every tick returned 2.0 bps (13Ã— the real BTC spread of ~0.15 bps),
+        every tick returned 2.0 bps (13Ãƒâ€” the real BTC spread of ~0.15 bps),
         blocking all entries with ratio=0.468 > 0.30 indefinitely.
 
         Fix: compute the live spread directly from the current orderbook at
         evaluation time. The fee engine's rolling tracker continues updating
-        independently for round-trip cost estimation â€” it is not used here.
+        independently for round-trip cost estimation Ã¢â‚¬â€ it is not used here.
 
         Also adds a 60s log throttle to suppress repeated identical messages.
         """
@@ -2799,7 +2799,7 @@ class QuantStrategy:
             if atr < 1e-10 or price < 1.0:
                 return True, 0.0
 
-            # â”€â”€ Live bid/ask from current orderbook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Live bid/ask from current orderbook Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             ob    = data_manager.get_orderbook()
             bids  = (ob or {}).get("bids", [])
             asks  = (ob or {}).get("asks", [])
@@ -2820,7 +2820,7 @@ class QuantStrategy:
             spread_bps = (ask - bid) / mid * 10_000.0
             spread_usd = ask - bid
 
-            # â”€â”€ Ratio: spread-dollars / ATR-dollars â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Ratio: spread-dollars / ATR-dollars Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             ratio     = (spread_bps / 10_000.0 * price) / atr
             max_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO", 0.30))
 
@@ -2830,9 +2830,9 @@ class QuantStrategy:
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
                     logger.info(
-                        f"â›” Spread/ATR gate: {ratio:.3f} > {max_ratio} "
+                        f"Ã¢â€ºâ€ Spread/ATR gate: {ratio:.3f} > {max_ratio} "
                         f"(spread={spread_bps:.2f}bps / ${spread_usd:.2f}, "
-                        f"ATR=${atr:.1f}) â€” too expensive")
+                        f"ATR=${atr:.1f}) Ã¢â‚¬â€ too expensive")
                 return False, ratio
 
             return True, ratio
@@ -2852,7 +2852,7 @@ class QuantStrategy:
             pass
         try:
             send_telegram_message(
-                f"⚠️ <b>ENTRY ENGINE SELF-RECOVERY</b>\n"
+                f"âš ï¸ <b>ENTRY ENGINE SELF-RECOVERY</b>\n"
                 f"State: {state_name} for {age_sec:.0f}s\n"
                 f"Reconcile latches cleared; next tick will re-evaluate state."
             )
@@ -2860,7 +2860,7 @@ class QuantStrategy:
             pass
 
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
-        # â”€â”€ Bug 1 fix: locked section is non-blocking â€” only state reads/writes.
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Bug 1 fix: locked section is non-blocking Ã¢â‚¬â€ only state reads/writes.
         # All exchange API calls (_sync_position, _evaluate_entry, _manage_active,
         # _finalise_exit) happen AFTER the lock is released so trailing-SL
         # replace_stop_loss, bracket fill polls, and reconcile writes can never
@@ -2875,7 +2875,7 @@ class QuantStrategy:
                 return
             self._last_eval_time = now
 
-            # Local data feeds â€” all in-process reads, no I/O
+            # Local data feeds Ã¢â‚¬â€ all in-process reads, no I/O
             self._feed_microstructure(data_manager)
             try:
                 ob = data_manager.get_orderbook()
@@ -2891,10 +2891,10 @@ class QuantStrategy:
             except Exception:
                 pass
 
-            # ─── v9.1: tick liveness stamp (used by watchdog TickAgeCheck) ───
+            # â”€â”€â”€ v9.1: tick liveness stamp (used by watchdog TickAgeCheck) â”€â”€â”€
             self._last_tick_time = now
 
-            # ─── v9.1: feed PostExitGate the post-exit price extreme ─────────
+            # â”€â”€â”€ v9.1: feed PostExitGate the post-exit price extreme â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Cheap call: gate tracks max(price) for longs, min(price) for
             # shorts since the last exit, used by SAME_DIRECTION_EXHAUSTION
             # to verify a real pullback before allowing same-side re-entry.
@@ -2928,12 +2928,12 @@ class QuantStrategy:
             exiting_stuck     = (phase == PositionPhase.EXITING and (now - self._exiting_since) > 120.0)
             cooldown_ok       = (now - self._last_exit_time >= float(QCfg.COOLDOWN_SEC()))
 
-        # â”€â”€ All blocking exchange I/O below â€” lock is NOT held â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ All blocking exchange I/O below Ã¢â‚¬â€ lock is NOT held Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
         if phase == PositionPhase.ACTIVE:
             if need_pos_sync and not self._pos_sync_in_progress:
                 # Dispatch position sync to a background thread.
-                # _sync_position calls get_open_position() â†’ Delta REST with a 30s timeout.
+                # _sync_position calls get_open_position() Ã¢â€ â€™ Delta REST with a 30s timeout.
                 # Running it in the main thread blocks on_tick, trail management, and the
                 # heartbeat for up to 30s every 30s (100% duty cycle = permanently frozen).
                 self._pos_sync_in_progress = True
@@ -2956,7 +2956,7 @@ class QuantStrategy:
             # sync thread that also writes to self._pos via _sync_position.
             # While self._lock guards individual field mutations, _update_trailing_sl
             # performs multi-step read-then-modify sequences that release the lock
-            # between steps (e.g. peak_profit update â†’ replace_stop_loss REST call).
+            # between steps (e.g. peak_profit update Ã¢â€ â€™ replace_stop_loss REST call).
             # A sync result arriving in that window can produce stale peak/SL values.
             #
             # Solution: skip one trail-management tick while a sync is in flight.
@@ -2985,13 +2985,13 @@ class QuantStrategy:
             if exiting_stuck:
                 # v8.0: check if exit was already completed by sync/reconcile thread
                 if self._exit_completed:
-                    logger.info("EXITING stuck >120s but exit already completed â€” finalising")
+                    logger.info("EXITING stuck >120s but exit already completed Ã¢â‚¬â€ finalising")
                     with self._lock:
                         self._finalise_exit()
                 else:
-                    logger.warning("âš ï¸ EXITING stuck >120s â€” recording PnL then force-finalising")
+                    logger.warning("Ã¢Å¡Â Ã¯Â¸Â EXITING stuck >120s Ã¢â‚¬â€ recording PnL then force-finalising")
                     send_telegram_message(
-                        "âš ï¸ <b>EXITING TIMEOUT</b>\n"
+                        "Ã¢Å¡Â Ã¯Â¸Â <b>EXITING TIMEOUT</b>\n"
                         "Stuck in EXITING phase for >120s.\n"
                         "Recording PnL=0 (unconfirmed) and resetting to FLAT.\n"
                         "<b>Check exchange for open position!</b>")
@@ -3002,13 +3002,13 @@ class QuantStrategy:
 
         elif phase == PositionPhase.ENTERING:
             # Bracket fill is being polled by a background thread.
-            # This phase blocks re-entry on every tick until fill confirmed (â†’ACTIVE)
-            # or the entry aborts (â†’FLAT via finally in _launch_entry_async).
+            # This phase blocks re-entry on every tick until fill confirmed (Ã¢â€ â€™ACTIVE)
+            # or the entry aborts (Ã¢â€ â€™FLAT via finally in _launch_entry_async).
             #
-            # BUG 2 FIX â€” two-stage watchdog:
+            # BUG 2 FIX Ã¢â‚¬â€ two-stage watchdog:
             #   Stage A (pre-order): from phase-onset until the limit order
             #     actually hits the exchange.  Bounded by PRE_ORDER_TOLERANCE
-            #     (default 45 s) â€” covers signing, credential refresh, retries.
+            #     (default 45 s) Ã¢â‚¬â€ covers signing, credential refresh, retries.
             #     If this expires, something is wrong BEFORE any order exists,
             #     so it is safe to force-FLAT.
             #
@@ -3019,7 +3019,7 @@ class QuantStrategy:
             #
             # The old single-stage watchdog counted from phase-onset, so a 60 s
             # order-placement delay (bracket child resolution) + 60 s fill poll
-            # already exceeded 90 s â€” fired while the position was still live.
+            # already exceeded 90 s Ã¢â‚¬â€ fired while the position was still live.
             PRE_ORDER_TOLERANCE = 45.0
             _entry_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 120.0))
             _watchdog_buffer = max(30.0, _entry_timeout * 0.25)
@@ -3031,7 +3031,7 @@ class QuantStrategy:
                 _limit = PRE_ORDER_TOLERANCE
                 _stage = "pre-order"
             else:
-                # Stage B: order placed â€” wait for fill
+                # Stage B: order placed Ã¢â‚¬â€ wait for fill
                 _elapsed = now - _order_placed_at
                 _limit = _entry_timeout + _watchdog_buffer
                 _stage = "post-order"
@@ -3040,11 +3040,11 @@ class QuantStrategy:
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
                         logger.warning(
-                            f"âš ï¸ ENTERING watchdog [{_stage}]: >{int(_limit)}s "
-                            f"elapsed={_elapsed:.0f}s without fill â€” forcing FLAT "
+                            f"Ã¢Å¡Â Ã¯Â¸Â ENTERING watchdog [{_stage}]: >{int(_limit)}s "
+                            f"elapsed={_elapsed:.0f}s without fill Ã¢â‚¬â€ forcing FLAT "
                             f"(check exchange for orphaned position)")
                         send_telegram_message(
-                            f"âš ï¸ <b>ENTERING TIMEOUT</b>\n"
+                            f"Ã¢Å¡Â Ã¯Â¸Â <b>ENTERING TIMEOUT</b>\n"
                             f"Stage: {_stage}  elapsed={_elapsed:.0f}s  limit={int(_limit)}s\n"
                             f"State reset to FLAT.\n"
                             f"<b>Check exchange for open position!</b>")
@@ -3053,7 +3053,7 @@ class QuantStrategy:
                         self._entry_order_placed_at = 0.0
                         if self._entry_engine is not None:
                             self._entry_engine.on_entry_failed()
-                            logger.info("ðŸ”„ Entry engine reset to SCANNING after ENTERING watchdog")
+                            logger.info("Ã°Å¸â€â€ž Entry engine reset to SCANNING after ENTERING watchdog")
 
         elif phase == PositionPhase.FLAT:
             if cooldown_ok:
@@ -3074,10 +3074,10 @@ class QuantStrategy:
         mark_entry_placed() uses the same clock as _check_session_limits,
         preventing clock-drift pacing errors (Bug #21).
 
-        ict_tier: "S" | "A" | "B" | "" â€” passed through to _enter_trade so
+        ict_tier: "S" | "A" | "B" | "" Ã¢â‚¬â€ passed through to _enter_trade so
         confidence-weighted position sizing can scale size by conviction tier.
 
-        prefetched_bal_info: Bug #5 fix â€” the balance dict already fetched in
+        prefetched_bal_info: Bug #5 fix Ã¢â‚¬â€ the balance dict already fetched in
         _evaluate_entry (REST call #1) is forwarded here so _enter_trade does
         not make a second identical REST call in the same tick. Between the two
         calls the balance cannot change (no position is open), but the redundancy
@@ -3091,7 +3091,7 @@ class QuantStrategy:
         with self._lock:
             self._pos.phase      = PositionPhase.ENTERING
             self._entering_since = time.time()
-            # BUG 2: reset order-placed timestamp â€” Stage A (pre-order) begins
+            # BUG 2: reset order-placed timestamp Ã¢â‚¬â€ Stage A (pre-order) begins
             self._entry_order_placed_at = 0.0
 
         _dm, _om, _rm  = data_manager, order_manager, risk_manager
@@ -3117,26 +3117,26 @@ class QuantStrategy:
                         # Gate rejections (TP R:R, SL/TP sanity, fee floor) set
                         # _last_tp_gate_rejection right before returning from
                         # _enter_trade.  If that timestamp is within the last 5s
-                        # we know no order was ever sent â€” do NOT engage the
+                        # we know no order was ever sent Ã¢â‚¬â€ do NOT engage the
                         # cooldown.  Signals resume immediately on the next tick.
                         #
                         # Real failures (exchange error, partial fill abort, etc.)
                         # do not touch _last_tp_gate_rejection, so the gate will
-                        # be more than 5s old â†’ full cooldown applies as before.
+                        # be more than 5s old Ã¢â€ â€™ full cooldown applies as before.
                         _gate_reject = (time.time() - self._last_tp_gate_rejection) < 5.0
                         if _gate_reject:
                             logger.info(
-                                f"âšª Entry gate rejected (mode={mode} side={side}) "
-                                f"â€” resetting to FLAT, no cooldown (signals resume immediately)")
+                                f"Ã¢Å¡Âª Entry gate rejected (mode={mode} side={side}) "
+                                f"Ã¢â‚¬â€ resetting to FLAT, no cooldown (signals resume immediately)")
                         else:
                             logger.warning(
-                                f"âš ï¸ Entry thread exited without activation "
-                                f"(mode={mode} side={side}) â€” resetting to FLAT")
+                                f"Ã¢Å¡Â Ã¯Â¸Â Entry thread exited without activation "
+                                f"(mode={mode} side={side}) Ã¢â‚¬â€ resetting to FLAT")
                             self._last_exit_time = time.time()
                         self._pos.phase = PositionPhase.FLAT
                     # CRITICAL: Always reset entry engine when thread exits
                     # without opening a position. on_entry_failed() is the
-                    # single canonical reset path â€” it handles state machine
+                    # single canonical reset path Ã¢â‚¬â€ it handles state machine
                     # transition and counter cleanup atomically.
                     if (self._entry_engine is not None
                             and self._pos.phase != PositionPhase.ACTIVE):
@@ -3160,10 +3160,10 @@ class QuantStrategy:
                     _price = t.get("price", 0.0)
                     _qty   = t.get("quantity", 0.0)
                     _buy   = t.get("side") == "buy"
-                    # â”€â”€ Wire to TickFlowEngine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    # Ã¢â€â‚¬Ã¢â€â‚¬ Wire to TickFlowEngine Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                     self._tick_eng.on_trade(_price, _qty, _buy, ts)
-                    # â”€â”€ Wire to CVDEngine true tick path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                    # This enables true cumulative volume delta â€” sum of actual
+                    # Ã¢â€â‚¬Ã¢â€â‚¬ Wire to CVDEngine true tick path Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                    # This enables true cumulative volume delta Ã¢â‚¬â€ sum of actual
                     # (buy - sell) dollar volume per tick, not OHLCV approximation
                     if _price > 0 and _qty > 0:
                         self._cvd.update_from_tick(_price, _qty, _buy)
@@ -3184,7 +3184,7 @@ class QuantStrategy:
             if _now - self._last_data_warn >= 30.0:
                 self._last_data_warn = _now
                 logger.info(
-                    f"â³ Signals blocked: 1m candles={len(candles_1m)}/{QCfg.MIN_1M_BARS()} "
+                    f"Ã¢ÂÂ³ Signals blocked: 1m candles={len(candles_1m)}/{QCfg.MIN_1M_BARS()} "
                     f"(waiting for warmup)")
             return None
         if len(candles_5m) < QCfg.MIN_5M_BARS():
@@ -3192,7 +3192,7 @@ class QuantStrategy:
             if _now - self._last_data_warn >= 30.0:
                 self._last_data_warn = _now
                 logger.info(
-                    f"â³ Signals blocked: 5m candles={len(candles_5m)}/{QCfg.MIN_5M_BARS()} "
+                    f"Ã¢ÂÂ³ Signals blocked: 5m candles={len(candles_5m)}/{QCfg.MIN_5M_BARS()} "
                     f"(waiting for warmup)")
             return None
         atr_1m = self._atr_1m.compute(candles_1m); atr_5m = self._atr_5m.compute(candles_5m)
@@ -3201,7 +3201,7 @@ class QuantStrategy:
             if _now - self._last_atr_warn >= 30.0:
                 self._last_atr_warn = _now
                 logger.info(
-                    "â³ Signals blocked: ATR not seeded yet â€” stream reconnect recovery. "
+                    "Ã¢ÂÂ³ Signals blocked: ATR not seeded yet Ã¢â‚¬â€ stream reconnect recovery. "
                     f"1m_atr={atr_1m:.2f} 5m_atr={atr_5m:.2f} "
                     f"(need {QCfg.ATR_PERIOD()} candles of live data)")
             return None
@@ -3210,13 +3210,13 @@ class QuantStrategy:
             _now = time.time()
             if _now - self._last_price_warn >= 30.0:
                 self._last_price_warn = _now
-                logger.info("â³ Signals blocked: no valid price from data manager")
+                logger.info("Ã¢ÂÂ³ Signals blocked: no valid price from data manager")
             return None
 
         self._vwap.update(candles_1m, atr_5m)
         self._cvd.update(candles_1m)   # candle path fallback; tick path fed in _feed_microstructure
 
-        # â”€â”€ HTF filter â€” PRIMARY: ICT structure, FALLBACK: EMA slope â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ HTF filter Ã¢â‚¬â€ PRIMARY: ICT structure, FALLBACK: EMA slope Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Pass the ICT engine so HTFTrendFilter can read BOS/CHoCH swing structure
         # directly instead of using a fragile EMA slope that flips on single candles.
         try:
@@ -3226,28 +3226,28 @@ class QuantStrategy:
         except Exception:
             pass
 
-        # â”€â”€ Regime classification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Regime classification Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._adx.compute(candles_5m)
         regime = self._regime.update(
             self._adx, self._atr_5m, self._htf,
             vwap_dev_atr=self._vwap.deviation_atr if hasattr(self._vwap, 'deviation_atr') else 0.0,
         )
 
-        # â”€â”€ Regime-adaptive weights (v7.0) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Regime-adaptive weights (v7.0) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Signal weights shift based on market regime so the composite score
         # reflects what actually matters in each regime:
-        #   Ranging  â†’ VWAP dominates; OB second
-        #   Trending â†’ CVD + TICK dominate; VWAP deprioritised (lagging in trends)
-        #   Breakout â†’ TICK first; CVD second
+        #   Ranging  Ã¢â€ â€™ VWAP dominates; OB second
+        #   Trending Ã¢â€ â€™ CVD + TICK dominate; VWAP deprioritised (lagging in trends)
+        #   Breakout Ã¢â€ â€™ TICK first; CVD second
         w_vwap, w_cvd, w_ob, w_tick, w_vex = WeightScheduler.get(regime)
 
-        # â”€â”€ Mean-reversion signals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Mean-reversion signals Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         vs  = self._vwap.get_reversion_signal(price, atr_5m)
         obs = self._ob_eng.get_signal()
         ts  = self._tick_eng.get_signal()
         ve  = self._vol_exh.compute(candles_1m)
 
-        # â”€â”€ v6.0 FIX: CVD signal = blend of DIVERGENCE + TREND â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ v6.0 FIX: CVD signal = blend of DIVERGENCE + TREND Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # PROBLEM: get_divergence_signal() returns 0 when CVD and price AGREE.
         # In a trend with strong buying AND rising price, CVD divergence = 0.
         # The strongest possible order flow confirmation was invisible.
@@ -3265,18 +3265,18 @@ class QuantStrategy:
         else:
             cs = _cvd_div * 0.80 + _cvd_trend * 0.20
 
-        # â”€â”€ v6.0 FIX: Cap VWAP deviation influence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ v6.0 FIX: Cap VWAP deviation influence Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # PROBLEM: VWAP deviation maxes at -1.0 whenever price is >1.2 ATR away.
         # In a trend, VWAP stays behind permanently, so vs = -1.0 ALWAYS.
         # This turns 30-40% of the composite into a permanent directional bias
         # that measures DISTANCE, not selling pressure.
         #
         # FIX: In trending markets AND during AMD MANIPULATION, cap VWAP
-        # influence at Â±0.5. During MANIPULATION, VWAP distance is irrelevant â€”
+        # influence at Ã‚Â±0.5. During MANIPULATION, VWAP distance is irrelevant Ã¢â‚¬â€
         # the swept pool IS the signal. VWAP can point the opposite direction
         # (price below VWAP = LONG signal) while AMD says SHORT (BSL swept).
         # Without this cap, VWAP=+1.0 at 0.30 weight = +0.30 in composite,
-        # which alone clears the Â±0.30 entry threshold in the WRONG direction.
+        # which alone clears the Ã‚Â±0.30 entry threshold in the WRONG direction.
         _vs_capped = vs
         if regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
             _vs_capped = max(-0.50, min(0.50, vs))
@@ -3286,12 +3286,12 @@ class QuantStrategy:
         direction = 1.0 if comp >= 0 else -1.0
         nc = sum(1 for s in [_vs_capped, cs, obs, ts, ve] if s * direction > 0.05)
 
-        # â”€â”€ Trend-following score (TRENDING regime) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Trend-following score (TRENDING regime) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # B4 FIX: The original formula used obs (Level-2 bid/ask z-score) at 20%
-        # weight.  obs updates every orderbook snapshot â€” a momentary bid spike adds
+        # weight.  obs updates every orderbook snapshot Ã¢â‚¬â€ a momentary bid spike adds
         # +0.10 to trend_score, enough to flip a borderline TREND_COMPOSITE_MIN check
         # and block a valid SHORT with no logged reason.
-        # Replacement: ADX +DI/-DI spread â€” structural and candle-frequency stable.
+        # Replacement: ADX +DI/-DI spread Ã¢â‚¬â€ structural and candle-frequency stable.
         # Normalised to [-1, +1] using the sum of both DI values as denominator
         # (dynamic, avoids the arbitrary /50 that underweighted the signal).
         _di_sum = max(self._adx.plus_di + self._adx.minus_di, 20.0)
@@ -3302,7 +3302,7 @@ class QuantStrategy:
         trend_score = htf_comp * 0.50 + cvd_trend * 0.30 + _di_spread * 0.20
         trend_score = max(-1.0, min(1.0, trend_score))
 
-        # â”€â”€ Build signal breakdown with full attribution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Build signal breakdown with full attribution Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # FIX 7: Store the raw order-flow composite BEFORE any ICT boost so
         # the reversion entry can restore it when computing for the opposite side.
         # Un-applying the boost from the clamped value gives a wrong pre-boost
@@ -3332,9 +3332,9 @@ class QuantStrategy:
 
         def bar(v, w=12):
             h=w//2; f=min(int(abs(v)*h+0.5),h)
-            return (" "*h+"â–ˆ"*f+"â–‘"*(h-f)) if v>=0 else ("â–‘"*(h-f)+"â–ˆ"*f+" "*h)
+            return (" "*h+"Ã¢â€“Ë†"*f+"Ã¢â€“â€˜"*(h-f)) if v>=0 else ("Ã¢â€“â€˜"*(h-f)+"Ã¢â€“Ë†"*f+" "*h)
         def fmt(l,v):
-            a = "â–²" if v>0.05 else ("â–¼" if v<-0.05 else "â”€")
+            a = "Ã¢â€“Â²" if v>0.05 else ("Ã¢â€“Â¼" if v<-0.05 else "Ã¢â€â‚¬")
             return f"  {l:<6} {bar(v)} {a} {v:+.3f}"
 
         c   = sig.composite
@@ -3365,11 +3365,11 @@ class QuantStrategy:
             be_locked = ((pos.side == "long" and pos.sl_price >= _be_price) or
                          (pos.side == "short" and pos.sl_price <= _be_price))
 
-            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"ðŸŸ¢ PHASE 3 â€” AGGRESSIVE ({mfe_r:.2f}R)"
-            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"ðŸŸ  PHASE 2 â€” STRUCTURE ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"ðŸŸ¡ PHASE 1 â€” BE FLOOR ({mfe_r:.2f}R)"
-            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"â¬œ PHASE 0 â€” CHANDELIER ({mfe_r:.2f}R)"
-            else: trail_phase = -1; phase_lbl = f"â¬œ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
+            if mfe_r >= 2.0: trail_phase = 3; phase_lbl = f"Ã°Å¸Å¸Â¢ PHASE 3 Ã¢â‚¬â€ AGGRESSIVE ({mfe_r:.2f}R)"
+            elif mfe_r >= 1.0: trail_phase = 2; phase_lbl = f"Ã°Å¸Å¸Â  PHASE 2 Ã¢â‚¬â€ STRUCTURE ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.40: trail_phase = 1; phase_lbl = f"Ã°Å¸Å¸Â¡ PHASE 1 Ã¢â‚¬â€ BE FLOOR ({mfe_r:.2f}R)"
+            elif mfe_r >= 0.10: trail_phase = 0; phase_lbl = f"Ã¢Â¬Å“ PHASE 0 Ã¢â‚¬â€ CHANDELIER ({mfe_r:.2f}R)"
+            else: trail_phase = -1; phase_lbl = f"Ã¢Â¬Å“ HANDS OFF ({mfe_r:.2f}R < 0.10R)"
 
             _margin_pnl_pct = 0.0
             try:
@@ -3383,7 +3383,7 @@ class QuantStrategy:
             sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
             tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
             _bar_filled = min(int(mfe_r * 4), 16)
-            _prog_bar = "â–ˆ" * _bar_filled + "â–‘" * (16 - _bar_filled)
+            _prog_bar = "Ã¢â€“Ë†" * _bar_filled + "Ã¢â€“â€˜" * (16 - _bar_filled)
 
             _amd_brief = ""
             if self._ict is not None and self._ict._initialized:
@@ -3393,22 +3393,22 @@ class QuantStrategy:
                 except Exception: pass
 
             lines_out = [
-                f"â”Œâ”€â”€â”€ ðŸ“Š IN-POSITION [{pos.side.upper()}] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€",
-                f"  Price ${price:,.2f} â”‚ ATR={atr:.1f} â”‚ Hold={now - pos.entry_time:.0f}s",
+                f"Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Ã°Å¸â€œÅ  IN-POSITION [{pos.side.upper()}] Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬",
+                f"  Price ${price:,.2f} Ã¢â€â€š ATR={atr:.1f} Ã¢â€â€š Hold={now - pos.entry_time:.0f}s",
                 f"  Entry ${pos.entry_price:,.2f}  SL ${pos.sl_price:,.2f}  TP ${pos.tp_price:,.2f}",
-                f"  SL dist: {sl_dist_atr:.1f}ATR â”‚ TP dist: {tp_dist_atr:.1f}ATR",
-                f"  â”€" * 30,
+                f"  SL dist: {sl_dist_atr:.1f}ATR Ã¢â€â€š TP dist: {tp_dist_atr:.1f}ATR",
+                f"  Ã¢â€â‚¬" * 30,
                 f"  R-PROGRESS: current={cur_r:+.2f}R  peak={mfe_r:.2f}R",
-                f"  [{_prog_bar}] {mfe_r:.2f}R â”‚ Margin PnL: {_margin_pnl_pct:+.1f}%",
-                f"  â”€" * 30,
+                f"  [{_prog_bar}] {mfe_r:.2f}R Ã¢â€â€š Margin PnL: {_margin_pnl_pct:+.1f}%",
+                f"  Ã¢â€â‚¬" * 30,
                 f"  TRAIL: {phase_lbl}",
-                f"  BOS: {bos_cnt} â”‚ CHoCH: "
+                f"  BOS: {bos_cnt} Ã¢â€â€š CHoCH: "
                 + (f"{choch_tf} @ ${choch_lvl:,.0f}" if choch_active else "none"),
-                f"  BE: " + ("âœ… LOCKED" if be_locked else f"âŒ needs ${_be_price:,.2f}"),
+                f"  BE: " + ("Ã¢Å“â€¦ LOCKED" if be_locked else f"Ã¢ÂÅ’ needs ${_be_price:,.2f}"),
             ]
             if _amd_brief:
                 lines_out.append(f"  AMD: {_amd_brief}")
-            lines_out.append(f"â””{'â”€'*60}")
+            lines_out.append(f"Ã¢â€â€{'Ã¢â€â‚¬'*60}")
             logger.debug("\n" + "\n".join(lines_out))
         else:
             # SCANNING display
@@ -3417,52 +3417,52 @@ class QuantStrategy:
                 engine_state = self._entry_engine.state
 
             gates = [
-                f"{'âœ…' if sig.overextended else 'âšª'} Overextended ({sig.deviation_atr:+.1f}ATR)",
-                f"{'âœ…' if sig.regime_ok else 'âŒ'} ATR Regime ({sig.atr_pct:.0%})",
-                f"âšª HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
-                f"ðŸ“Š {regime_lbl} â”‚ ADX={sig.adx:.1f}",
+                f"{'Ã¢Å“â€¦' if sig.overextended else 'Ã¢Å¡Âª'} Overextended ({sig.deviation_atr:+.1f}ATR)",
+                f"{'Ã¢Å“â€¦' if sig.regime_ok else 'Ã¢ÂÅ’'} ATR Regime ({sig.atr_pct:.0%})",
+                f"Ã¢Å¡Âª HTF (15m={self._htf.trend_15m:+.2f} 4h={self._htf.trend_4h:+.2f})",
+                f"Ã°Å¸â€œÅ  {regime_lbl} Ã¢â€â€š ADX={sig.adx:.1f}",
             ]
             if self._ict is not None and self._ict._initialized:
                 amd_phase = getattr(self._ict._amd, 'phase', '?') if self._ict._amd else '?'
                 amd_bias = getattr(self._ict._amd, 'bias', '?') if self._ict._amd else '?'
-                gates.append(f"ðŸ›ï¸ AMD: {amd_phase} ({amd_bias})")
+                gates.append(f"Ã°Å¸Ââ€ºÃ¯Â¸Â AMD: {amd_phase} ({amd_bias})")
 
             cd = max(0.0, QCfg.COOLDOWN_SEC() - (now - self._last_exit_time))
-            header = (f"â”Œâ”€â”€â”€ ðŸ§  v10 LIQUIDITY-FIRST  ${price:,.2f}  "
-                      f"VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} â”€â”€â”€â”€")
+            header = (f"Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Ã°Å¸Â§Â  v10 LIQUIDITY-FIRST  ${price:,.2f}  "
+                      f"VWAP=${sig.vwap_price:,.2f}  ATR={sig.atr:.1f} Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬")
             lines_out = [header]
             lines_out += [fmt("VWAP", sig.vwap_dev), fmt("CVD", sig.cvd_div),
                           fmt("OB", sig.orderbook), fmt("TICK", sig.tick_flow),
-                          fmt("VEX", sig.vol_exhaust), f"  {'â”€'*42}",
-                          f"  Î£={c:+.4f} â”‚ State: {engine_state}",
-                          f"  â”€â”€ GATES â”€â”€"]
+                          fmt("VEX", sig.vol_exhaust), f"  {'Ã¢â€â‚¬'*42}",
+                          f"  ÃŽÂ£={c:+.4f} Ã¢â€â€š State: {engine_state}",
+                          f"  Ã¢â€â‚¬Ã¢â€â‚¬ GATES Ã¢â€â‚¬Ã¢â€â‚¬"]
             for g in gates:
                 lines_out.append(f"  {g}")
             lines_out.append(f"  Cooldown: {f'{cd:.0f}s' if cd > 0 else 'ready'}")
-            lines_out.append(f"â””{'â”€'*60}")
+            lines_out.append(f"Ã¢â€â€{'Ã¢â€â‚¬'*60}")
             logger.debug("\n" + "\n".join(lines_out))
 
 
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
-        Institutional Unified Entry Gate â€” ADVISORY ONLY (fully data-driven).
+        Institutional Unified Entry Gate Ã¢â‚¬â€ ADVISORY ONLY (fully data-driven).
 
         This gate logs structural coherence notes for diagnostics but does NOT
         block any trade. All actual gating is handled by the conviction_filter
         score. The architecture is:
 
-          ConvictionFilter â†’ SCORE gates the trade (single source of truth)
-          UnifiedGate     â†’ LOGS advisory signals for post-trade attribution
+          ConvictionFilter Ã¢â€ â€™ SCORE gates the trade (single source of truth)
+          UnifiedGate     Ã¢â€ â€™ LOGS advisory signals for post-trade attribution
 
         Philosophy: no binary veto on session, AMD phase, flow direction, or HTF
         structure. The data-driven score in conviction_filter already weights all
         of these factors. A double-gate creates false precision (two separate
         thresholds on the same signal) and blocks valid setups.
         """
-        advisories = []   # informational only â€” never blocks
+        advisories = []   # informational only Ã¢â‚¬â€ never blocks
 
-        # â”€â”€ AMD Phase context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ AMD Phase context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         amd_phase = (ict_ctx.amd_phase or "").upper()
         amd_bias  = (ict_ctx.amd_bias  or "").lower()
         amd_conf  = ict_ctx.amd_confidence
@@ -3477,7 +3477,7 @@ class QuantStrategy:
             if _is_sweep_rev or _has_ps_hint:
                 advisories.append(f"AMD=ACCUM sweep-reversal (phase lag expected, scoring handles it)")
             else:
-                advisories.append(f"AMD=ACCUM non-reversal â€” low amd_score will penalise conviction")
+                advisories.append(f"AMD=ACCUM non-reversal Ã¢â‚¬â€ low amd_score will penalise conviction")
 
         if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
             bias_contra = (
@@ -3487,13 +3487,13 @@ class QuantStrategy:
             if bias_contra and not _has_ps_hint:
                 advisories.append(
                     f"AMD_ADVISORY: MANIP bias={amd_bias} conf={amd_conf:.2f} "
-                    f"vs {signal.side} â€” contra-AMD, conviction will penalise")
+                    f"vs {signal.side} Ã¢â‚¬â€ contra-AMD, conviction will penalise")
 
-        # â”€â”€ AMD lag override for fresh sweeps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ AMD lag override for fresh sweeps Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # (Already applied to ict_ctx.amd_phase in _evaluate_entry; repeated
         #  here for gate logging completeness only)
 
-        # â”€â”€ Direction Engine context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Direction Engine context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._dir_engine is not None:
             try:
                 _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
@@ -3512,11 +3512,11 @@ class QuantStrategy:
                                 advisories.append(
                                     f"DIR_ADVISORY: hunt delivery={_del_dir} "
                                     f"conf={_hunt_conf:.2f} vs {signal.side} "
-                                    f"(not blocking â€” conviction_filter weights flow)")
+                                    f"(not blocking Ã¢â‚¬â€ conviction_filter weights flow)")
             except Exception:
                 pass
 
-        # â”€â”€ HTF Structure context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ HTF Structure context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._ict is not None and getattr(self._ict, '_initialized', False):
             try:
                 tf_data = getattr(self._ict, '_tf', {})
@@ -3530,15 +3530,15 @@ class QuantStrategy:
                     if signal.side == "long" and both_bearish:
                         advisories.append(
                             f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bearish vs LONG "
-                            f"(not blocking â€” conviction_filter scores HTF via structure)")
+                            f"(not blocking Ã¢â‚¬â€ conviction_filter scores HTF via structure)")
                     elif signal.side == "short" and both_bullish:
                         advisories.append(
                             f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bullish vs SHORT "
-                            f"(not blocking â€” conviction_filter scores HTF via structure)")
+                            f"(not blocking Ã¢â‚¬â€ conviction_filter scores HTF via structure)")
             except Exception:
                 pass
 
-        # â”€â”€ Order Flow context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Order Flow context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         tf  = flow_state.tick_flow if flow_state else 0.0
         cvd = flow_state.cvd_trend if flow_state else 0.0
         flow_opposes = (
@@ -3550,45 +3550,45 @@ class QuantStrategy:
                 f"FLOW_ADVISORY: tick={tf:+.2f} cvd={cvd:+.2f} "
                 f"vs {signal.side} (scored in conviction_filter, not blocking)")
 
-        # â”€â”€ Session context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Session context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         session = str(getattr(ict_ctx, 'kill_zone', '') or '')
         if not session and self._ict:
             session = str(getattr(self._ict, '_killzone', '') or '')
         if session.upper() == "ASIA":
             advisories.append(
-                "SESSION_ADVISORY: ASIA â€” conviction_filter applies session_score=0.60 "
+                "SESSION_ADVISORY: ASIA Ã¢â‚¬â€ conviction_filter applies session_score=0.60 "
                 "(not blocking here)")
 
-        # â”€â”€ R:R context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ R:R context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 1.2:
             advisories.append(
-                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 â€” "
+                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 Ã¢â‚¬â€ "
                 f"conviction_filter applies R:R penalty to pool_sig_score")
 
-        # â”€â”€ Log all advisories at DEBUG (not INFO â€” avoids log spam) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Log all advisories at DEBUG (not INFO Ã¢â‚¬â€ avoids log spam) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if advisories:
             logger.debug(
                 f"UNIFIED_GATE [{signal.side.upper()}] advisories (not blocking): "
                 f"{' | '.join(advisories[:4])}")
 
-        # ALWAYS PASS â€” conviction_filter score is the sole gate
+        # ALWAYS PASS Ã¢â‚¬â€ conviction_filter score is the sole gate
         return True, "UNIFIED_GATE_PASS"
 
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
         """
-        v9.0 â€” Liquidity-First Entry Engine.
+        v9.0 Ã¢â‚¬â€ Liquidity-First Entry Engine.
         Single decision flow.  Falls back to legacy if new engine unavailable.
 
         Session note: this method runs regardless of session label (WEEKEND,
         OFF_HOURS, etc.).  Crypto markets are 24/7.  Session-awareness is
         handled by the factor scoring inside ConvictionFilter (WEEKEND scores
         0.65, ASIA is hard-blocked) and DirectionEngine Factor 8.  There is
-        no early exit for weekends â€” a valid liquidity hunt at 3am Saturday
+        no early exit for weekends Ã¢â‚¬â€ a valid liquidity hunt at 3am Saturday
         is as real as one on Tuesday during the London open.
         """
         if not _ENTRY_ENGINE_AVAILABLE or self._entry_engine is None or self._liq_map is None:
-            logger.error("EntryEngine or LiquidityMap unavailable â€” no entry evaluation")
+            logger.error("EntryEngine or LiquidityMap unavailable Ã¢â‚¬â€ no entry evaluation")
             return
 
         if getattr(self, "watchdog_trading_frozen", False):
@@ -3626,7 +3626,7 @@ class QuantStrategy:
 
         # Step 2: Gather candles (all timeframes)
         # v3.0: Request full buffer depth for structural timeframes.
-        # The data manager returns whatever it has â€” on fresh startup
+        # The data manager returns whatever it has Ã¢â‚¬â€ on fresh startup
         # this will be ~200 (REST warmup limit), but after continuous
         # operation the WebSocket feed accumulates 7 days of history.
         # This gives the liquidity map progressively deeper structure
@@ -3639,10 +3639,10 @@ class QuantStrategy:
             except Exception:
                 candles_by_tf[tf] = []
 
-        # â”€â”€ BUG-FIX-1: v9 path NEVER called _compute_signals(), which was the
+        # Ã¢â€â‚¬Ã¢â€â‚¬ BUG-FIX-1: v9 path NEVER called _compute_signals(), which was the
         # ONLY place ATREngine, VWAPEngine, CVDEngine, ADXEngine, and HTFTrendFilter
-        # were updated.  Result: atr_5m.atr == 0.0 forever â†’ every tick exits at
-        # the ATR gate â†’ _liq_map.update() never runs â†’ "no pools in range" + "ATR: â€”"
+        # were updated.  Result: atr_5m.atr == 0.0 forever Ã¢â€ â€™ every tick exits at
+        # the ATR gate Ã¢â€ â€™ _liq_map.update() never runs Ã¢â€ â€™ "no pools in range" + "ATR: Ã¢â‚¬â€"
         # permanently.  Fix: update all engines from the freshly-fetched candles
         # RIGHT HERE, before any logic that reads self._atr_5m.atr.
         try:
@@ -3672,9 +3672,9 @@ class QuantStrategy:
             if _now_ts - self._last_atr_warn >= 30.0:
                 self._last_atr_warn = _now_ts
                 logger.info(
-                    f"â³ v9 entry: ATR not seeded yet "
+                    f"Ã¢ÂÂ³ v9 entry: ATR not seeded yet "
                     f"({len(candles_by_tf.get('5m', []))} 5m candles, "
-                    f"need {QCfg.MIN_5M_BARS()} â€” waiting for warmup)")
+                    f"need {QCfg.MIN_5M_BARS()} Ã¢â‚¬â€ waiting for warmup)")
             return
 
         # Step 3: Update ICT engine (preserved -- provides structural context)
@@ -3696,7 +3696,7 @@ class QuantStrategy:
             except Exception as e:
                 logger.debug(f"ICT update error: {e}")
 
-        # Step 3b: DirectionEngine â€” hunt prediction
+        # Step 3b: DirectionEngine Ã¢â‚¬â€ hunt prediction
         # Runs AFTER ICT update so structural context (AMD, MTF, pools, OBs/FVGs)
         # is fully refreshed.  Result is injected into ICT cache so every downstream
         # caller (get_confluence, get_status, Tier-L) reads DirectionEngine output
@@ -3706,7 +3706,7 @@ class QuantStrategy:
                 _tf_de  = self._tick_eng.get_signal() if self._tick_eng else 0.0
                 _cvd_de = self._cvd.get_trend_signal() if self._cvd else 0.0
                 # FIX-8: pass previous tick's snapshot (before this tick's
-                # liq_map.update() runs â€” see direction_engine FIX-8 guide).
+                # liq_map.update() runs Ã¢â‚¬â€ see direction_engine FIX-8 guide).
                 # _last_snapshot is set by get_snapshot() at the end of the
                 # previous tick; it is None on the very first tick, which the
                 # direction_engine handles gracefully (falls back to ICT pools).
@@ -3722,7 +3722,7 @@ class QuantStrategy:
                     candles_5m   = candles_by_tf.get("5m", []),
                     liq_snapshot = _prev_liq_snap,
                 )
-                # Bridge HuntPrediction dataclass â†’ legacy dict shape that the
+                # Bridge HuntPrediction dataclass Ã¢â€ â€™ legacy dict shape that the
                 # rest of the codebase already consumes via _last_hunt_pred.
                 self._ict.inject_hunt_prediction({
                     "predicted":          _hunt.predicted,
@@ -3740,7 +3740,7 @@ class QuantStrategy:
                 }, now_ms)
                 # Throttle DIR_ENGINE log: only emit at INFO when prediction
                 # changes or at most once per 30s (same NEUTRAL repeated every tick
-                # is pure noise â€” moved routine ticks to debug).
+                # is pure noise Ã¢â‚¬â€ moved routine ticks to debug).
                 _de_log_key = (_hunt.predicted, round(_hunt.confidence, 1))
                 _de_last_key = getattr(self, "_dir_engine_last_log_key", None)
                 _de_last_ts  = getattr(self, "_dir_engine_last_log_ts", 0.0)
@@ -3748,7 +3748,7 @@ class QuantStrategy:
                     self._dir_engine_last_log_key = _de_log_key
                     self._dir_engine_last_log_ts  = now
                     logger.info(
-                        f"ðŸ§­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"Ã°Å¸Â§Â­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} "
                         f"delivery={_hunt.delivery_direction} "
                         f"raw={_hunt.raw_score:+.3f} "
@@ -3756,7 +3756,7 @@ class QuantStrategy:
                         f"| {_hunt.reason[:100]}")
                 else:
                     logger.debug(
-                        f"ðŸ§­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"Ã°Å¸Â§Â­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} raw={_hunt.raw_score:+.3f} "
                         f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
                         f"| {_hunt.reason[:100]}")
@@ -3823,7 +3823,7 @@ class QuantStrategy:
             pass
         # BUG-1 FIX: Persist directional tick_flow/cvd_trend for use in
         # generate_periodic_report().  _flow_conviction is a non-negative
-        # magnitude scalar â€” passing it to evaluate_sweep() as tick_flow
+        # magnitude scalar Ã¢â‚¬â€ passing it to evaluate_sweep() as tick_flow
         # (which expects a signed [-1,+1] direction) corrupts the post-sweep
         # reversal score displayed in the periodic heartbeat report.
         self._last_tick_flow = tick_flow
@@ -3885,7 +3885,7 @@ class QuantStrategy:
                 # When AMD reports ACCUMULATION but a liquidity sweep occurred in
                 # the last 2 bars (10m at 5m TF), the Wilder-smoothing lag is causing
                 # the phase misread. Override to MANIPULATION so gate 1 logic is
-                # correct. Confidence set to 0.50 (moderate â€” sweep confirmed but
+                # correct. Confidence set to 0.50 (moderate Ã¢â‚¬â€ sweep confirmed but
                 # full MANIPULATION evidence not yet accumulated).
                 _fresh_sweep_ms = now_ms - 600_000  # 10 minutes = 2 bars at 5m
                 if (ict_ctx.amd_phase == "ACCUMULATION"
@@ -3897,7 +3897,7 @@ class QuantStrategy:
                     if _has_fresh_sweep:
                         logger.debug(
                             "AMD_LAG_OVERRIDE: Fresh sweep detected while AMD=ACCUMULATION "
-                            "â€” overriding to MANIPULATION (Wilder-smoothing lag)")
+                            "Ã¢â‚¬â€ overriding to MANIPULATION (Wilder-smoothing lag)")
                         ict_ctx.amd_phase = "MANIPULATION"
                         ict_ctx.amd_confidence = max(ict_ctx.amd_confidence, 0.50)
                 mb = self._ict.get_market_bias()
@@ -3944,11 +3944,11 @@ class QuantStrategy:
                     ict_ctx.kill_zone = sess.get("session", "")
                 except Exception:
                     pass
-                # â”€â”€ CONVICTION GATE: session boundary reset â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                # When the killzone changes (OFF_HOURSâ†’NEW_YORK, NEW_YORKâ†’LONDON
+                # Ã¢â€â‚¬Ã¢â€â‚¬ CONVICTION GATE: session boundary reset Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                # When the killzone changes (OFF_HOURSÃ¢â€ â€™NEW_YORK, NEW_YORKÃ¢â€ â€™LONDON
                 # etc.) reset entries_taken and consecutive_losses so each new
                 # institutional session gets a fresh quota.  MIN_ENTRY_INTERVAL
-                # cooldown is also cleared â€” it is intra-session pacing only.
+                # cooldown is also cleared Ã¢â‚¬â€ it is intra-session pacing only.
                 _new_kz = ict_ctx.kill_zone or str(getattr(self._ict, '_killzone', '') or '')
                 if (self._conviction is not None
                         and _new_kz
@@ -3969,7 +3969,7 @@ class QuantStrategy:
         # and the post-sweep pipeline never fires.
         if (self._ict is not None and _ENTRY_ENGINE_AVAILABLE):
             try:
-                # â”€â”€ FIX (ict-bridge-stale): widen window from 30s to 60s â”€â”€
+                # Ã¢â€â‚¬Ã¢â€â‚¬ FIX (ict-bridge-stale): widen window from 30s to 60s Ã¢â€â‚¬Ã¢â€â‚¬
                 # The original 30s window meant only ~10% of each 5m bar had
                 # sweep visibility (sweeps are detected at 5m bar close).
                 # A genuine ICT sweep would flip ict_engine's state but never
@@ -4135,7 +4135,7 @@ class QuantStrategy:
                                 # pool is of the OPPOSITE type, only forward the sweep
                                 # when its quality exceeds the active state's quality
                                 # by a 20% premium.  Lower-quality cross-pool sweeps
-                                # are skipped â€” the existing evaluation continues
+                                # are skipped Ã¢â‚¬â€ the existing evaluation continues
                                 # uninterrupted.  Same-type sweeps (structural
                                 # continuation of the same pool side) always forward.
                                 _new_quality = float(
@@ -4154,7 +4154,7 @@ class QuantStrategy:
                                                 f"{pool.level_type} @${pool.price:,.1f} "
                                                 f"quality={_new_quality:.2f} <= active "
                                                 f"{_active_type} threshold="
-                                                f"{_quality_threshold:.2f} â€” skipped, "
+                                                f"{_quality_threshold:.2f} Ã¢â‚¬â€ skipped, "
                                                 f"preserving existing PostSweepState")
                                             _should_forward = False
                                             _diag_cross_skip += 1
@@ -4231,12 +4231,12 @@ class QuantStrategy:
 
         # Step 6c: Post-sweep evaluation (DirectionEngine accumulative model)
         # Runs every tick while DirectionEngine has an open PostSweepState.
-        # Evidence builds across ticks â€” momentary noise cannot flip the decision.
+        # Evidence builds across ticks Ã¢â‚¬â€ momentary noise cannot flip the decision.
         # Bug-4 fix: the verdict (action/direction/confidence) is written into
         # ict_ctx.direction_hint* BEFORE entry_engine.update() so that
         # _evaluate_post_sweep_accumulative() can consume it as a dynamic
         # weighting factor.  Previously the verdict was only logged and Telegrammed
-        # â€” DirectionEngine was purely observational and had no effect on entries.
+        # Ã¢â‚¬â€ DirectionEngine was purely observational and had no effect on entries.
         if self._dir_engine is not None and getattr(self._dir_engine, 'in_post_sweep', False):
             try:
                 _tf_ps  = self._tick_eng.get_signal() if self._tick_eng else 0.0
@@ -4248,7 +4248,7 @@ class QuantStrategy:
                     ict_engine   = self._ict,
                     tick_flow    = _tf_ps,
                     cvd_trend    = _cvd_ps,
-                    liq_snapshot = liq_snapshot,   # fresh â€” liq_map.update() already ran
+                    liq_snapshot = liq_snapshot,   # fresh Ã¢â‚¬â€ liq_map.update() already ran
                 )
                 # Store for conviction gate's CISD factor (issue-2 fix)
                 if _ps_decision is not None:
@@ -4259,7 +4259,7 @@ class QuantStrategy:
                     ict_ctx.direction_hint_side       = getattr(_ps_decision, 'direction', '')
                     ict_ctx.direction_hint_confidence = _ps_decision.confidence
                     logger.info(
-                        f"ðŸ” POST-SWEEP [{_ps_decision.action.upper()}]: "
+                        f"Ã°Å¸â€Â POST-SWEEP [{_ps_decision.action.upper()}]: "
                         f"dir={getattr(_ps_decision, 'direction', '?')} "
                         f"conf={_ps_decision.confidence:.2f} "
                         f"| {_ps_decision.reason[:80]}")
@@ -4267,19 +4267,19 @@ class QuantStrategy:
                         from telegram.notifier import format_post_sweep_verdict
                         _ps_state = getattr(self._dir_engine, '_ps_state', None)
                         # SPAM-FIX 2026-04-26: production logs (32k lines, 16
-                        # full hours) showed 16–18 POST-SWEEP VERDICT messages
-                        # per minute during 22:31–22:34 and 15:53–15:54. Root
+                        # full hours) showed 16â€“18 POST-SWEEP VERDICT messages
+                        # per minute during 22:31â€“22:34 and 15:53â€“15:54. Root
                         # cause: 5% confidence bucket. Confidence wiggles
-                        # across the boundary every few ticks → hash changes
-                        # → re-emits.
+                        # across the boundary every few ticks â†’ hash changes
+                        # â†’ re-emits.
                         #
                         # New dedup: emit ONLY if ALL THREE conditions met:
-                        #   (a) action OR direction CHANGED  (→ structural flip)
-                        #   (b) |Δconfidence| ≥ 0.15           (→ meaningful)
-                        #   (c) ≥ 60s since last emission      (→ rate floor)
+                        #   (a) action OR direction CHANGED  (â†’ structural flip)
+                        #   (b) |Î”confidence| â‰¥ 0.15           (â†’ meaningful)
+                        #   (c) â‰¥ 60s since last emission      (â†’ rate floor)
                         #
                         # Equivalently: emit if a structural flip happened OR
-                        # 60s elapsed AND confidence moved ≥ 0.15.
+                        # 60s elapsed AND confidence moved â‰¥ 0.15.
                         _ps_action    = _ps_decision.action
                         _ps_direction = getattr(_ps_decision, 'direction', '')
                         _ps_conf      = float(getattr(_ps_decision, 'confidence', 0.0))
@@ -4311,7 +4311,7 @@ class QuantStrategy:
                             # swept_pool_price: attribute may be 0.0 if PostSweepState
                             # was created via an internal direction_engine path that
                             # doesn't receive pool.price. Fall back to None so the
-                            # formatter shows "—" instead of "$0.0".
+                            # formatter shows "â€”" instead of "$0.0".
                             _swept_price = getattr(_ps_state, 'swept_pool_price', None) if _ps_state else None
                             if _swept_price is not None and _swept_price <= 0:
                                 _swept_price = None
@@ -4336,12 +4336,12 @@ class QuantStrategy:
                     except Exception as _tg_ps:
                         logger.debug(f"DirectionEngine post-sweep Telegram error: {_tg_ps}")
                 elif _ps_decision is not None:
-                    # "wait" â€” clear any stale hint so entry_engine doesn't act on it
+                    # "wait" Ã¢â‚¬â€ clear any stale hint so entry_engine doesn't act on it
                     ict_ctx.direction_hint            = ""
                     ict_ctx.direction_hint_side       = ""
                     ict_ctx.direction_hint_confidence = 0.0
                     logger.debug(
-                        f"â³ POST-SWEEP [{_ps_decision.action.upper()}]: "
+                        f"Ã¢ÂÂ³ POST-SWEEP [{_ps_decision.action.upper()}]: "
                         f"{_ps_decision.reason[:80]}")
             except Exception as _pse:
                 logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
@@ -4402,7 +4402,7 @@ class QuantStrategy:
                 self._entry_confirm_count = 0
                 return
 
-            # â”€â”€ UNIFIED ENTRY GATE â€” advisory logging only (no blocking) â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ UNIFIED ENTRY GATE Ã¢â‚¬â€ advisory logging only (no blocking) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             self._unified_entry_gate(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
 
@@ -4412,9 +4412,9 @@ class QuantStrategy:
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
 
-            # â”€â”€ ISSUE-4 FIX: Conviction Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # Evaluate 7 ICT factors (mandatory gates + weighted score â‰¥ 0.75).
-            # Retrieve the PostSweepDecision â€” try dir_engine first, fall back
+            # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            # Evaluate 7 ICT factors (mandatory gates + weighted score Ã¢â€°Â¥ 0.75).
+            # Retrieve the PostSweepDecision Ã¢â‚¬â€ try dir_engine first, fall back
             # to entry_engine's _last_sweep_analysis (which has CISD, displacement,
             # etc. from the actual sweep evaluation that produced this signal).
             if self._conviction is not None:
@@ -4474,8 +4474,8 @@ class QuantStrategy:
 
                 # FIX-OTE-REVERSAL: pass the sweep wick extreme so the conviction
                 # filter can use it as the correct Fibonacci anchor for OTE scoring.
-                # Without this, reversal entries always score OTEâ‰ˆ0.10 because
-                # pool_price â‰ˆ current price (no retrace has occurred yet post-sweep).
+                # Without this, reversal entries always score OTEÃ¢â€°Ë†0.10 because
+                # pool_price Ã¢â€°Ë† current price (no retrace has occurred yet post-sweep).
                 _sweep_wick = 0.0
                 if hasattr(signal, 'sweep_result') and signal.sweep_result is not None:
                     _sweep_wick = float(
@@ -4523,25 +4523,25 @@ class QuantStrategy:
                     if _is_circuit_block or _conv_key != _conv_last:
                         self._last_conv_block_key = _conv_key
                         logger.info(
-                            f"ðŸš« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
+                            f"Ã°Å¸Å¡Â« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
                     else:
                         logger.debug(
-                            f"ðŸš« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
+                            f"Ã°Å¸Å¡Â« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
                             f"score={_conv_result.score:.3f} | {reject_str}")
                     # BUG-B2 / FIX-SPAM / FIX-SL-FLIP:
                     # Route the gate-block notification to the correct suppressor
                     # based on signal type.
                     #
-                    # DISPLACEMENT_MOMENTUM â†’ mark_momentum_blocked():
+                    # DISPLACEMENT_MOMENTUM Ã¢â€ â€™ mark_momentum_blocked():
                     #   Freezes the SL at signal.sl_price so it doesn't oscillate
                     #   between the ICT-OB path and the ATR-fallback path on
                     #   alternating ticks. Also suppresses spam for 30s (configurable).
                     #
-                    # POST_SWEEP (REVERSAL / CONTINUATION) â†’ mark_gate_blocked():
+                    # POST_SWEEP (REVERSAL / CONTINUATION) Ã¢â€ â€™ mark_gate_blocked():
                     #   Existing 45s cooldown for the evidence-accumulation model.
                     #   Not used for momentum because momentum has no evidence state
-                    #   to accumulate â€” the cooldown logic is different.
+                    #   to accumulate Ã¢â‚¬â€ the cooldown logic is different.
                     _is_momentum = (
                         hasattr(signal, 'entry_type')
                         and signal.entry_type is not None
@@ -4601,7 +4601,7 @@ class QuantStrategy:
             }
             _tier = _tier_map.get(signal.entry_type, "A")
 
-            # ─── v9.1: Post-Exit Re-Entry Gate ────────────────────────────────
+            # â”€â”€â”€ v9.1: Post-Exit Re-Entry Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # The flat 30s cooldown is satisfied at this point (cooldown_ok was
             # checked upstream in on_tick). The PostExitGate adds regime-aware
             # filtering on top: side-flip resistance after SL, same-direction
@@ -4663,7 +4663,7 @@ class QuantStrategy:
                     if now - getattr(self, _gate_log_key, 0.0) >= 30.0:
                         setattr(self, _gate_log_key, now)
                         logger.info(
-                            "ðŸš« Post-Exit Gate blocked %s entry: %s â€” %s",
+                            "Ã°Å¸Å¡Â« Post-Exit Gate blocked %s entry: %s Ã¢â‚¬â€ %s",
                             signal.side.upper(), _gate_dec.lens, _gate_dec.detail,
                         )
                     # Discard the signal and return to SCANNING so the next
@@ -4690,7 +4690,7 @@ class QuantStrategy:
             self._entry_confirm_key = None
             self._entry_confirm_count = 0
 
-        # Step 9: Periodic thinking log â€” institutional context
+        # Step 9: Periodic thinking log Ã¢â‚¬â€ institutional context
         if now - self._last_think_log_v2 >= 30.0:
             self._last_think_log_v2 = now
             state = self._entry_engine.state
@@ -4760,10 +4760,10 @@ class QuantStrategy:
                     cs = _sa.get('cont_score', 0)
                     parts.append(f"SweepScore=R{rs:.0f}/C{cs:.0f}")
 
-            # â”€â”€ Scan-skip diagnostics (observability fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Scan-skip diagnostics (observability fix) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # When the engine is in SCANNING and not transitioning, surface
             # WHY. Silent rejection previously made "no trades" impossible
-            # to diagnose â€” see 4-hour log with 12 ICT sweeps fired and
+            # to diagnose Ã¢â‚¬â€ see 4-hour log with 12 ICT sweeps fired and
             # zero reaching the entry engine.
             if state == "SCANNING":
                 try:
@@ -4791,257 +4791,34 @@ class QuantStrategy:
             logger.info(f"[THINK] {' | '.join(parts)}")
 
 
-    def _compute_sl_tp(self, data_manager, price, side, atr, mode="reversion",
-                       signal_confidence=0.5, use_maker_entry=False):
-        """
-        Institutional SL/TP computation â€” ICT OB â†’ 15m swing â†’ ATR fallback.
-        
-        Primary path: EntryEngine provides force_sl/force_tp (used in _enter_trade).
-        This method is the FALLBACK when force levels are invalid.
-        
-        Hierarchy: ICT 15m OB â†’ 15m swing structure â†’ ATR fallback.
-        TP: Liquidity pool â†’ ICT structural â†’ VWAP tiered selection.
-        Fee-normalized TP floor gate applied at the end.
-        """
-        try: candles_5m = data_manager.get_candles("5m", limit=QCfg.SL_SWING_LOOKBACK()+5)
-        except Exception: candles_5m = []
-        try: candles_1m = data_manager.get_candles("1m", limit=150)
-        except Exception: candles_1m = []
-        try: candles_15m = data_manager.get_candles("15m", limit=60)
-        except Exception: candles_15m = []
-        try: orderbook = data_manager.get_orderbook()
-        except Exception: orderbook = {"bids": [], "asks": []}
-        vwap = self._vwap.vwap; vwap_std = self._vwap.vwap_std
-        atr_pctile = self._atr_5m.get_percentile()
-
-
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # v5.0 PATH-A â€” ICT SWEEP ENGINE (highest conviction, best R:R)
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        sl_price    = None
-        tp_price    = None
-        _sl_source  = "none"
-
-        now_ms_slatp = int(time.time() * 1000)
-
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # SL/TP COMPUTATION â€” ICT OB â†’ 15m swing â†’ ATR fallback
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        if sl_price is None:
-            # v6.0: regime-adaptive min_dist for PATH-B
-            _regime_str = self._regime.regime.value if hasattr(self._regime, 'regime') else "RANGING"
-            if _regime_str in ("TRENDING_UP", "TRENDING_DOWN"):
-                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 1.0 * atr)
-            elif _regime_str == "TRANSITIONING":
-                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 0.7 * atr)
-            else:
-                _path_b_min_dist = max(price * QCfg.MIN_SL_PCT(), 0.40 * atr)
-
-            # â”€â”€ Step 1: ICT 15m OB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            _ob_min_dist = max(0.5 * atr, _path_b_min_dist)
-            _ob_max_dist = price * QCfg.MAX_SL_PCT()
-            if self._ict is not None:
-                try:
-                    ob_sl = self._ict.get_ob_sl_level(
-                        side, price, atr, now_ms_slatp, htf_only=True)
-                    if ob_sl is not None:
-                        ob_dist      = abs(price - ob_sl)
-                        ob_valid_dir = ((side == "long"  and ob_sl < price) or
-                                        (side == "short" and ob_sl > price))
-                        if ob_valid_dir and _ob_min_dist <= ob_dist <= _ob_max_dist:
-                            sl_price   = _round_to_tick(ob_sl)
-                            _sl_source = "ICT_OB"
-                            logger.info(
-                                f"ðŸ›ï¸ ICT OB SL: ${sl_price:,.2f} "
-                                f"({ob_dist:.1f}pts / {ob_dist/atr:.2f}ATR)")
-                        elif ob_valid_dir and ob_dist < _ob_min_dist:
-                            logger.debug(
-                                f"ICT OB SL too close ({ob_dist:.1f}pts < "
-                                f"{_ob_min_dist:.1f}min) â€” proceeding to 15m swing")
-                except Exception as _e:
-                    logger.debug(f"ICT OB SL error: {_e}")
-
-            # â”€â”€ Step 2: 15m swing structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            if sl_price is None and candles_15m and len(candles_15m) >= 3:
-                _lb_15m = min(40, len(candles_15m) - 2)
-                _sh_15m, _sl_15m = InstitutionalLevels.find_swing_extremes(
-                    candles_15m, _lb_15m)
-                buf_mult = QCfg.SL_BUFFER_ATR_MULT() * (
-                    1.4 - 0.8 * min(max(atr_pctile, 0.0), 1.0))
-                _sl_buf  = buf_mult * atr
-                _min_dist = _path_b_min_dist
-                _max_dist = price * QCfg.MAX_SL_PCT()
-                _candidates: List[Tuple[float, float]] = []
-
-                if side == "long":
-                    for lvl in _sl_15m:
-                        if lvl < price:
-                            dist = price - lvl
-                            if dist <= _max_dist:
-                                _candidates.append((lvl - _sl_buf * 0.80,
-                                                    1.0 / max(dist, 1.0)))
-                else:
-                    for lvl in _sh_15m:
-                        if lvl > price:
-                            dist = lvl - price
-                            if dist <= _max_dist:
-                                _candidates.append((lvl + _sl_buf * 0.80,
-                                                    1.0 / max(dist, 1.0)))
-
-                if _candidates:
-                    best = max(_candidates, key=lambda x: x[1])
-                    _swing_sl = _round_to_tick(best[0])
-                    sl_dist = abs(price - _swing_sl)
-                    if sl_dist >= _min_dist:
-                        sl_price   = _swing_sl
-                        _sl_source = "15m_swing"
-                        logger.info(
-                            f"ðŸ“ 15m Swing SL: ${sl_price:,.2f} "
-                            f"({sl_dist:.0f}pts / {sl_dist/atr:.2f}ATR)")
-
-            # â”€â”€ Step 3: ATR fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            if sl_price is None:
-                logger.warning(
-                    "SL/TP fallback rejected: no ICT OB or 15m swing SL "
-                    "available; refusing ATR-derived stop")
-                return None, None
-
-            # â”€â”€ v6.0: PATH-B LIQUIDITY PROXIMITY GUARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # move it behind the pool so the sweep doesn't take us out.
-            if sl_price is not None and self._ict is not None:
-                try:
-                    _liq_guard_dist = 0.6 * atr
-                    _liq_buffer     = 0.35 * atr
-                    _max_dist_liq   = price * QCfg.MAX_SL_PCT()
-                    for pool in self._ict.liquidity_pools:
-                        if pool.swept:
-                            continue
-                        dist_sl_to_pool = abs(sl_price - pool.price)
-                        if dist_sl_to_pool > _liq_guard_dist:
-                            continue
-                        if side == "long" and pool.level_type == "SSL" and pool.price < price:
-                            new_sl = pool.price - _liq_buffer
-                            if abs(price - new_sl) <= _max_dist_liq:
-                                logger.info(
-                                    f"ðŸ›¡ï¸ PATH-B LIQ GUARD: SL ${sl_price:,.2f} â†’ "
-                                    f"${new_sl:,.2f} (behind SSL@${pool.price:,.0f})")
-                                sl_price = _round_to_tick(new_sl)
-                                _sl_source += "(liq_guard)"
-                        elif side == "short" and pool.level_type == "BSL" and pool.price > price:
-                            new_sl = pool.price + _liq_buffer
-                            if abs(new_sl - price) <= _max_dist_liq:
-                                logger.info(
-                                    f"ðŸ›¡ï¸ PATH-B LIQ GUARD: SL ${sl_price:,.2f} â†’ "
-                                    f"${new_sl:,.2f} (behind BSL@${pool.price:,.0f})")
-                                sl_price = _round_to_tick(new_sl)
-                                _sl_source += "(liq_guard)"
-                except Exception:
-                    pass
-
-        # â”€â”€ Mode-aware SL sizing (trend/momentum ATR cap) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if mode in ("trend", "momentum"):
-            max_sl_atr = float(_cfg("QUANT_TREND_SL_ATR_MULT", 3.0))
-            max_sl_dist = max_sl_atr * atr
-            current_dist = abs(price - sl_price)
-            if current_dist > max_sl_dist:
-                sl_price = _round_to_tick(
-                    price - max_sl_dist if side == "long" else price + max_sl_dist)
-                logger.info(
-                    f"ðŸ“ Trend SL capped: {current_dist:.0f}â†’{max_sl_dist:.0f}pts "
-                    f"({max_sl_atr:.1f}Ã—ATR) | SL=${sl_price:,.2f}")
-            # Liquidation safety buffer
-            liq_buffer = 0.5 * atr
-            if side == "long":
-                liq_price = price - (price / QCfg.LEVERAGE()) * 0.95
-                if sl_price < liq_price + liq_buffer:
-                    sl_price = _round_to_tick(liq_price + liq_buffer)
-            else:
-                liq_price = price + (price / QCfg.LEVERAGE()) * 0.95
-                if sl_price > liq_price - liq_buffer:
-                    sl_price = _round_to_tick(liq_price - liq_buffer)
-
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # TP COMPUTATION (PATH-B only â€” PATH-A already computed tp_price)
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        if tp_price is None:
-            tp_price = InstitutionalLevels.compute_tp(
-                    price, side, atr, sl_price, candles_1m, orderbook, vwap, vwap_std,
-                    candles_5m=candles_5m,
-                    ict_engine=self._ict,
-                    now_ms=now_ms_slatp,
-                    candles_15m=candles_15m,
-                    liq_map=self._liq_map,
-                    tp_distance_mult=_adaptive_param_value(
-                        "tp_distance_mult", 1.0, 0.10, 3.0))
-
-        # BUG-1 FIX: compute_tp returns None when R:R gate hard-rejects the setup.
-        # Calling _round_to_tick(None) raises TypeError: unsupported operand type(s)
-        # for /: 'NoneType' and 'float'.  Gate the None explicitly here so the
-        # traceback never propagates past this function.
-        if tp_price is None:
-            _tp_gate_rr = (QCfg.REVERSION_MIN_RR() if mode not in ("trend","momentum")
-                           else QCfg.TREND_MIN_RR())
-            logger.info(
-                f"â›” TP gate (PATH-B): no valid TP target for {side.upper()} "
-                f"â€” minimum R:R={_tp_gate_rr:.1f} not achievable with current structure "
-                f"â€” rejecting trade (no entry)")
-            return None, None
-
-        tp_price = _round_to_tick(tp_price)
-
-        # â”€â”€ Basic direction sanity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if side == "long"  and (sl_price >= price or tp_price <= price): return None, None
-        if side == "short" and (sl_price <= price or tp_price >= price): return None, None
-
-        # â”€â”€ Fee TP advisory (no longer blocks trades) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if self._fee_engine is not None and self._fee_engine.is_warmed_up():
-            tp_distance = abs(tp_price - price)
-            sl_distance = abs(sl_price - price)
-            try:
-                min_tp = self._fee_engine.min_required_tp_move(
-                    price             = price,
-                    atr               = atr,
-                    atr_percentile    = atr_pctile,
-                    use_maker_entry   = use_maker_entry,
-                    signal_confidence = signal_confidence,
-                )
-                if tp_distance < min_tp:
-                    logger.debug(
-                        f"Fee advisory: TP dist {tp_distance:.0f} < fee floor {min_tp:.0f} "
-                        f"(not blocking â€” trade proceeds)")
-            except Exception as e:
-                logger.debug(f"Fee check error (non-fatal): {e}")
-
-        return sl_price, tp_price
-
     def _enter_trade(self, data_manager, order_manager, risk_manager, side, sig, mode="reversion",
                      ict_tier: str = "", prefetched_bal_info: dict = None,
                      entry_now: float = 0.0):
         """
-        Position entry â€” v7.0 (confidence-weighted sizing via ict_tier).
+        Position entry Ã¢â‚¬â€ v7.0 (confidence-weighted sizing via ict_tier).
 
-        ict_tier: "S" | "A" | "B" | "" â€” controls position size multiplier:
-          Tier-S: 1.00Ã— base margin  (full conviction â€” confirmed sweep + AMD)
-          Tier-A: 0.80Ã— base margin  (high conviction â€” structural alignment)
-          Tier-B: 0.65Ã— base margin  (standard quant + ICT gate)
-          "":     0.50Ã— base margin  (minimal exposure â€” no ICT gate)
+        ict_tier: "S" | "A" | "B" | "" Ã¢â‚¬â€ controls position size multiplier:
+          Tier-S: 1.00Ãƒâ€” base margin  (full conviction Ã¢â‚¬â€ confirmed sweep + AMD)
+          Tier-A: 0.80Ãƒâ€” base margin  (high conviction Ã¢â‚¬â€ structural alignment)
+          Tier-B: 0.65Ãƒâ€” base margin  (standard quant + ICT gate)
+          "":     0.50Ãƒâ€” base margin  (minimal exposure Ã¢â‚¬â€ no ICT gate)
 
-        Additionally modulated by composite score (Â±10%) and AMD confidence (Â±8%).
+        Additionally modulated by composite score (Ã‚Â±10%) and AMD confidence (Ã‚Â±8%).
 
-        prefetched_bal_info: Bug #5 â€” when supplied, the REST balance call is
+        prefetched_bal_info: Bug #5 Ã¢â‚¬â€ when supplied, the REST balance call is
         skipped. _evaluate_entry already fetched the balance in the same tick;
         making a second call adds latency with no benefit (balance cannot change
-        between the two calls â€” no position is open at this point).
+        between the two calls Ã¢â‚¬â€ no position is open at this point).
         """
         price = data_manager.get_last_price()
         if price < 1.0: return
         atr = self._atr_5m.atr
         if atr < 1e-10: return
 
-        # â”€â”€ Risk gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Risk gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Bug #5 fix: reuse prefetched balance when available; only call the REST
         # endpoint as a fallback (e.g. when _enter_trade is invoked outside of the
-        # normal _evaluate_entry â†’ _launch_entry_async path).
+        # normal _evaluate_entry Ã¢â€ â€™ _launch_entry_async path).
         if prefetched_bal_info is not None:
             bal_info = prefetched_bal_info
         else:
@@ -5049,22 +4826,22 @@ class QuantStrategy:
         if bal_info is None: return
         total_bal = float(bal_info.get("total", bal_info.get("available", 0.0)))
         self._risk_gate.set_opening_balance(total_bal)
-        # NOTE: risk gate already checked in _evaluate_entry â€” no duplicate check here
+        # NOTE: risk gate already checked in _evaluate_entry Ã¢â‚¬â€ no duplicate check here
 
-        # â”€â”€ Map composite score â†’ signal_confidence [0, 1] (PATCH 5a) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # NOTE: moved BEFORE _compute_sl_tp so signal_confidence is available.
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Map composite score Ã¢â€ â€™ signal_confidence [0, 1] (PATCH 5a) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        # NOTE: kept before entry routing so signal_confidence is available.
         raw_composite     = abs(sig.composite) if sig.composite is not None else 0.0
         signal_confidence = min(1.0, raw_composite / 0.6)   # 0.6 composite = full confidence
 
-        # â”€â”€ Limit price: prefer OTE signal price, fall back to live book â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Limit price: prefer OTE signal price, fall back to live book Ã¢â€â‚¬Ã¢â€â‚¬
         # Bug #4 fix: the original code always computed limit_px from the
         # live orderbook bid/ask, ignoring signal.entry_price entirely.
-        # signal.entry_price is the OTE-precise level (50%â€“78.6% Fibonacci
+        # signal.entry_price is the OTE-precise level (50%Ã¢â‚¬â€œ78.6% Fibonacci
         # retracement) computed by EntryEngine from the sweep structure.
         # Replacing it with the live bid/ask destroys OTE precision:
-        #   â€¢ For a LONG reversal, OTE might be $94,800 but bid is $95,100 â€”
+        #   Ã¢â‚¬Â¢ For a LONG reversal, OTE might be $94,800 but bid is $95,100 Ã¢â‚¬â€
         #     placing at bid fills immediately at taker cost and misses OTE.
-        #   â€¢ The institutional advantage of the OTE level is the expected
+        #   Ã¢â‚¬Â¢ The institutional advantage of the OTE level is the expected
         #     bounce from that specific Fibonacci zone; if we don't place there
         #     we're not in the trade at the right structural price.
         #
@@ -5079,7 +4856,7 @@ class QuantStrategy:
         # default to maker.  Non-OTE (book-offset) entries consult the fee engine
         # based on signal urgency to decide whether to post limit or take market.
         # Note: signal_confidence is already computed above from sig.composite.
-        use_maker = True   # default â€” OTE limit orders are always maker
+        use_maker = True   # default Ã¢â‚¬â€ OTE limit orders are always maker
         tick      = QCfg.TICK_SIZE()
         offset    = float(getattr(config, 'LIMIT_ORDER_OFFSET_TICKS', 3)) * tick
 
@@ -5123,7 +4900,7 @@ class QuantStrategy:
             logger.warning(
                 f"_enter_trade: signal.entry_price=${_sig_entry:,.1f} is "
                 f"{abs(_sig_entry - price):.0f}pts from market (>{_stale_threshold:.0f}pts=2ATR) "
-                f"â€” falling back to live book. Signal may be from a prior tick."
+                f"Ã¢â‚¬â€ falling back to live book. Signal may be from a prior tick."
             )
 
         # Keep fee engine updated for diagnostics and TP gate
@@ -5149,23 +4926,22 @@ class QuantStrategy:
                 )
                 if not _fe_maker:
                     use_maker = False
-                    logger.debug(f"FeeEngine: taker entry selected â€” {_fe_reason}")
+                    logger.debug(f"FeeEngine: taker entry selected Ã¢â‚¬â€ {_fe_reason}")
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
-        # â”€â”€ FIX Bug-B STEP 1: Compute SL/TP FIRST â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # SL/TP computation does not depend on position size â€” it uses price, ATR,
+        # Ã¢â€â‚¬Ã¢â€â‚¬ FIX Bug-B STEP 1: Compute SL/TP FIRST Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        # SL/TP computation does not depend on position size Ã¢â‚¬â€ it uses price, ATR,
         # mode, and signal_confidence only.  Computing it first lets us pass the
         # ACTUAL SL distance (not an ATR proxy) into position sizing, which is the
         # correct industry-grade approach: risk-in-dollars / SL-distance = quantity.
 
         # -- v9.0: Use force SL/TP from entry engine if available --
         # BUG-4 FIX: When the v9 entry engine provides force_sl/force_tp,
-        # use them DIRECTLY. The old code set sl_price/tp_price here but
-        # then immediately called _compute_sl_tp() which OVERWROTE them
-        # with PATH-B values (widening SL from 53pts to 162pts).
+        # use them DIRECTLY. The stale PATH-B fallback was removed so these
+        # structural levels cannot be overwritten.
         _force_sl = getattr(self, '_force_sl', None)
         _force_tp = getattr(self, '_force_tp', None)
         _using_force_levels = False
@@ -5181,19 +4957,19 @@ class QuantStrategy:
                 sl_price = _fsl
                 tp_price = _ftp
                 _using_force_levels = True
-                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f} (skipping PATH-B)")
+                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
             self._force_sl = None
             self._force_tp = None
 
         if not _using_force_levels:
             logger.warning(
                 "Entry rejected: EntryEngine did not provide executable "
-                "liquidity TP + ICT/liquidity SL levels; refusing PATH-B fallback")
+                "liquidity TP + ICT/liquidity SL levels; refusing entry")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
         else:
-            # Force levels active â€” fee engine check is advisory only (no block)
+            # Force levels active Ã¢â‚¬â€ fee engine check is advisory only (no block)
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
                     _tp_dist = abs(tp_price - price)
@@ -5216,7 +4992,7 @@ class QuantStrategy:
         if sd < 1e-10: return
         rr = td / sd
 
-        # â”€â”€ FIX Bug-B STEP 2: Size using actual SL distance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ FIX Bug-B STEP 2: Size using actual SL distance Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Now that sl_price is known, pass it to _compute_quantity so the base size
         # comes from risk_manager.calculate_position_size (dollar-risk / SL-dist).
         # The tier/composite/AMD multiplier is applied on top of that base.
@@ -5226,12 +5002,12 @@ class QuantStrategy:
         )
         if qty is None or qty < QCfg.MIN_QTY(): return
         logger.info(
-            f"ðŸŽ¯ ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"Ã°Å¸Å½Â¯ ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
             f"{'maker' if use_maker else 'taker'} | VWAP=${sig.vwap_price:,.2f} | {sig}"
         )
 
-        # â”€â”€ Place entry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Place entry Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Delta: bracket limit order (entry + SL + TP in one API call).
         #   Avoids bad_schema from separate stop/take-profit order placement.
         # CoinSwitch: standard limit entry, SL/TP placed separately after fill.
@@ -5245,8 +5021,8 @@ class QuantStrategy:
         def _on_order_placed(_oid: str) -> None:
             self._entry_order_placed_at = time.time()
             logger.info(
-                f"â±ï¸  Entry order placed on exchange (order_id={_oid[:12]}â€¦) "
-                f"â€” watchdog switched to Stage B (fill-poll)")
+                f"Ã¢ÂÂ±Ã¯Â¸Â  Entry order placed on exchange (order_id={_oid[:12]}Ã¢â‚¬Â¦) "
+                f"Ã¢â‚¬â€ watchdog switched to Stage B (fill-poll)")
 
         limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
         is_bracket = False
@@ -5270,11 +5046,11 @@ class QuantStrategy:
             )
 
         if not entry_data:
-            logger.error("âŒ Entry order failed")
-            self._last_exit_time = time.time()  # engage cooldown â€” prevents hammer-retrying
+            logger.error("Ã¢ÂÅ’ Entry order failed")
+            self._last_exit_time = time.time()  # engage cooldown Ã¢â‚¬â€ prevents hammer-retrying
             return
 
-        # â”€â”€ Extract fill price â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Extract fill price Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         fill_price = (
             float(entry_data.get("fill_price")          or 0)
             or float(entry_data.get("average_price")    or 0)
@@ -5286,26 +5062,26 @@ class QuantStrategy:
         # v8.1: exact entry fee from Delta paid_commission (propagated by order_manager)
         entry_fee_paid = float(entry_data.get("paid_commission", 0) or 0)
         if entry_fee_paid > 0:
-            logger.info(f"ðŸ’° Entry fee (exact): ${entry_fee_paid:.4f}")
+            logger.info(f"Ã°Å¸â€™Â° Entry fee (exact): ${entry_fee_paid:.4f}")
 
         # v4.6 BUG FIX #8: Use actual filled quantity for partial fills
         # order_manager.place_limit_entry returns adjusted quantity on partial fill
         filled_qty = float(entry_data.get("quantity", 0)) if "quantity" in entry_data else 0
         if filled_qty > 0 and filled_qty != qty:
-            logger.info(f"âš ï¸ Partial fill: {filled_qty:.4f} of {qty:.4f} â€” using filled qty")
+            logger.info(f"Ã¢Å¡Â Ã¯Â¸Â Partial fill: {filled_qty:.4f} of {qty:.4f} Ã¢â‚¬â€ using filled qty")
             qty = filled_qty
 
-        # â”€â”€ Record slippage for fee engine (PATCH 5f) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Record slippage for fee engine (PATCH 5f) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._fee_engine is not None:
             try:
                 self._fee_engine.record_fill(price, fill_price, leg="entry")
             except Exception as e:
                 logger.debug(f"record_fill error (non-fatal): {e}")
 
-        # â”€â”€ Recompute SL/TP from actual fill only on ADVERSE slippage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Recompute SL/TP from actual fill only on ADVERSE slippage Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # CRITICAL BUG FIX: The old code used abs(fill_price - price) which fired
         # on FAVORABLE fills too. A SHORT limit at $73,629 filling at $73,683
-        # (market moved up, maker got better price) is NOT slippage â€” it's
+        # (market moved up, maker got better price) is NOT slippage Ã¢â‚¬â€ it's
         # favorable execution. Recomputing in that case then hit pctile=0.00
         # (ATR percentile drops in the seconds between decision and fill) and
         # the fee floor rejected the now-open position, instantly closing it.
@@ -5315,7 +5091,7 @@ class QuantStrategy:
         #   SHORT: fill_price < price (sold for less than the market snapshot)
         #
         # Favorable execution (market moved in our direction between decision
-        # and fill) should NOT trigger recompute â€” the SL/TP from the original
+        # and fill) should NOT trigger recompute Ã¢â‚¬â€ the SL/TP from the original
         # decision are still valid or better.
         is_adverse_slip = (
             (side == "long"  and fill_price > price) or
@@ -5325,15 +5101,15 @@ class QuantStrategy:
 
         if is_adverse_slip and adverse_slip_pct > QCfg.SLIPPAGE_TOL():
             logger.info(
-                f"âš ï¸ Adverse slippage {adverse_slip_pct:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} "
-                f"â€” validating original structural SL/TP against fill ${fill_price:,.2f}")
+                f"Ã¢Å¡Â Ã¯Â¸Â Adverse slippage {adverse_slip_pct:.4%} > tol {QCfg.SLIPPAGE_TOL():.4%} "
+                f"Ã¢â‚¬â€ validating original structural SL/TP against fill ${fill_price:,.2f}")
             _levels_valid = (
                 (side == "long" and sl_price < fill_price and tp_price > fill_price) or
                 (side == "short" and sl_price > fill_price and tp_price < fill_price)
             )
             if not _levels_valid:
                 logger.warning(
-                    f"âŒ Post-slippage structural levels invalid â€” aborting trade "
+                    f"Ã¢ÂÅ’ Post-slippage structural levels invalid Ã¢â‚¬â€ aborting trade "
                     f"(adverse slip={adverse_slip_pct:.4%})")
                 exit_side = "sell" if side == "long" else "buy"
                 order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
@@ -5343,10 +5119,10 @@ class QuantStrategy:
             # Favorable fill: market moved our way. Log it but keep original SL/TP.
             fav_pct = abs(fill_price - price) / price
             logger.info(
-                f"âœ… Favorable fill: ${fill_price:,.2f} vs snapshot ${price:,.2f} "
-                f"(+{fav_pct:.4%} in our direction) â€” keeping original SL/TP")
+                f"Ã¢Å“â€¦ Favorable fill: ${fill_price:,.2f} vs snapshot ${price:,.2f} "
+                f"(+{fav_pct:.4%} in our direction) Ã¢â‚¬â€ keeping original SL/TP")
 
-        # â”€â”€ Place SL/TP (or retrieve bracket child order IDs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Place SL/TP (or retrieve bracket child order IDs) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         exit_side = "sell" if side == "long" else "buy"
 
         if is_bracket:
@@ -5365,12 +5141,12 @@ class QuantStrategy:
             sl_data = {"order_id": sl_order_id_raw} if sl_order_id_raw else None
             tp_data = {"order_id": tp_order_id_raw} if tp_order_id_raw else None
             if sl_order_id_raw:
-                logger.info(f"âœ… Bracket SL order: {sl_order_id_raw} @ ${sl_price:,.2f}")
+                logger.info(f"Ã¢Å“â€¦ Bracket SL order: {sl_order_id_raw} @ ${sl_price:,.2f}")
             if tp_order_id_raw:
-                logger.info(f"âœ… Bracket TP order: {tp_order_id_raw} @ ${tp_price:,.2f}")
+                logger.info(f"Ã¢Å“â€¦ Bracket TP order: {tp_order_id_raw} @ ${tp_price:,.2f}")
             if not sl_order_id_raw or not tp_order_id_raw:
                 logger.warning(
-                    "âš ï¸ Bracket child order IDs not found after fill â€” "
+                    "Ã¢Å¡Â Ã¯Â¸Â Bracket child order IDs not found after fill Ã¢â‚¬â€ "
                     "trailing SL may not work. Check open orders manually.")
         else:
             # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
@@ -5402,13 +5178,13 @@ class QuantStrategy:
                 self._last_exit_time = time.time()
                 return
 
-        # â”€â”€ Log execution cost snapshot (PATCH 5g) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Log execution cost snapshot (PATCH 5g) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._fee_engine is not None:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()
                 sdf  = abs(fill_price - sl_price)
                 logger.info(
-                    f"ðŸ“Š ExecCost | spread={snap['spread_median_bps']:.1f}bps "
+                    f"Ã°Å¸â€œÅ  ExecCost | spread={snap['spread_median_bps']:.1f}bps "
                     f"slip={snap['slippage_ewma_bps']:.1f}bps "
                     f"rt_cost_{'maker' if actual_fill_type == 'maker' else 'taker'}"
                     f"={snap['rt_cost_maker_bps' if actual_fill_type == 'maker' else 'rt_cost_taker_bps']:.1f}bps "
@@ -5421,14 +5197,14 @@ class QuantStrategy:
         ir  = sdf * qty
         entry_session = self._current_entry_session()
 
-        # â”€â”€ Build entry volume for trailing vol-decay detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Build entry volume for trailing vol-decay detection Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         try:
             c1m       = data_manager.get_candles("1m", limit=10)
             entry_vol = sum(float(c['v']) for c in c1m[-5:]) / 5.0 if len(c1m) >= 5 else 0.0
         except Exception:
             entry_vol = 0.0
 
-        # â”€â”€ Update position state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Update position state Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._pos = PositionState(
             phase           = PositionPhase.ACTIVE,
             side            = side,
@@ -5454,7 +5230,7 @@ class QuantStrategy:
             entry_htf_15m   = self._htf.trend_15m,
             entry_htf_4h    = self._htf.trend_4h,
         )
-        # â”€â”€ Reconcile safety: discard any in-flight reconcile data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Reconcile safety: discard any in-flight reconcile data Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._reconcile_data        = None
         self._last_reconcile_time   = time.time()
         self.current_sl_price       = sl_price
@@ -5488,7 +5264,7 @@ class QuantStrategy:
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             self._entry_engine.on_position_opened()
 
-        # â”€â”€ Clear post-sweep evidence â€” trade now open â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Clear post-sweep evidence Ã¢â‚¬â€ trade now open Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._dir_engine is not None:
             try:
                 self._dir_engine.clear_sweep()
@@ -5502,37 +5278,37 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ v9 Entry Telegram notification â€” pool-first, not quant-scout â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ v9 Entry Telegram notification Ã¢â‚¬â€ pool-first, not quant-scout Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         sl_dist_pts = abs(fill_price - sl_price)
         tp_dist_pts = abs(fill_price - tp_price)
         rr_a        = tp_dist_pts / sl_dist_pts if sl_dist_pts > 1e-10 else 0.0
         dollar_risk = sl_dist_pts * qty
 
-        # â”€â”€ Entry type label (from EntrySignal.entry_type) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Entry type label (from EntrySignal.entry_type) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         _et_labels = {
-            "sweep_reversal":     "ðŸ›ï¸ SWEEP REVERSAL",
-            "pre_sweep_approach": "âš¡ PRE-SWEEP APPROACH",
-            "sweep_continuation": "ðŸ“ˆ SWEEP CONTINUATION",
+            "sweep_reversal":     "Ã°Å¸Ââ€ºÃ¯Â¸Â SWEEP REVERSAL",
+            "pre_sweep_approach": "Ã¢Å¡Â¡ PRE-SWEEP APPROACH",
+            "sweep_continuation": "Ã°Å¸â€œË† SWEEP CONTINUATION",
         }
         _et_label = _et_labels.get(mode, mode.upper())
 
-        # â”€â”€ Pool target, flow conviction, entry reason â€” from EntrySignal â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Pool target, flow conviction, entry reason Ã¢â‚¬â€ from EntrySignal Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # _last_entry_signal is stored on self by the v9 tick loop just before
         # _launch_entry_async is called, so it is always available here.
         _es = getattr(self, '_last_entry_signal', None)
-        _pool_tp_str   = "â€”"
+        _pool_tp_str   = "Ã¢â‚¬â€"
         _swept_str     = ""
-        _flow_conv_str = "â€”"
-        _entry_reason  = "â€”"
+        _flow_conv_str = "Ã¢â‚¬â€"
+        _entry_reason  = "Ã¢â‚¬â€"
         _ict_val_str   = ""
 
         if _es is not None:
             try:
-                # Pool being targeted â†’ this IS the TP origin
+                # Pool being targeted Ã¢â€ â€™ this IS the TP origin
                 _pt = _es.target_pool
                 if _pt and hasattr(_pt, 'pool'):
                     _pool_tp_str = (
-                        f"{'BSL â–²' if _pt.pool.side.value == 'BSL' else 'SSL â–¼'}"
+                        f"{'BSL Ã¢â€“Â²' if _pt.pool.side.value == 'BSL' else 'SSL Ã¢â€“Â¼'}"
                         f" @ ${_pt.pool.price:,.0f}"
                         f"  (sig={_pt.significance:.2f}"
                         f"  x{_pt.pool.touches} touches)")
@@ -5545,7 +5321,7 @@ class QuantStrategy:
                     _sw_side  = _sw.pool.side.value if hasattr(_sw, 'pool') else "?"
                     _sw_px    = _sw.pool.price      if hasattr(_sw, 'pool') else 0.0
                     _sw_qual  = getattr(_sw, 'quality', 0.0)
-                    _sw_disp  = "âœ…DISP" if getattr(_sw, 'displacement_confirmed', False) else "âš ï¸weak"
+                    _sw_disp  = "Ã¢Å“â€¦DISP" if getattr(_sw, 'displacement_confirmed', False) else "Ã¢Å¡Â Ã¯Â¸Âweak"
                     _swept_str = (
                         f"\nSwept:    {_sw_side} @ ${_sw_px:,.0f}"
                         f"  quality={_sw_qual:.0%}  {_sw_disp}")
@@ -5566,14 +5342,14 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ ICT / AMD context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ICT / AMD context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         _amd_str = ""
         if getattr(sig, 'amd_phase', '') and getattr(sig, 'amd_conf', 0.0) > 0.01:
-            _amd_icons = {"DISTRIBUTION": "ðŸŽ¯", "MANIPULATION": "âš¡",
-                          "REACCUMULATION": "ðŸ”„", "REDISTRIBUTION": "ðŸ”„",
-                          "ACCUMULATION": "ðŸ’¤"}
-            _amd_i   = _amd_icons.get(sig.amd_phase, "â“")
-            _bias_i  = "ðŸŸ¢" if getattr(sig,'amd_bias','') == "bullish" else ("ðŸ”´" if getattr(sig,'amd_bias','') == "bearish" else "âšª")
+            _amd_icons = {"DISTRIBUTION": "Ã°Å¸Å½Â¯", "MANIPULATION": "Ã¢Å¡Â¡",
+                          "REACCUMULATION": "Ã°Å¸â€â€ž", "REDISTRIBUTION": "Ã°Å¸â€â€ž",
+                          "ACCUMULATION": "Ã°Å¸â€™Â¤"}
+            _amd_i   = _amd_icons.get(sig.amd_phase, "Ã¢Ââ€œ")
+            _bias_i  = "Ã°Å¸Å¸Â¢" if getattr(sig,'amd_bias','') == "bullish" else ("Ã°Å¸â€Â´" if getattr(sig,'amd_bias','') == "bearish" else "Ã¢Å¡Âª")
             _amd_str = (
                 f"\nAMD:      {_amd_i} {sig.amd_phase}"
                 f"  {_bias_i}{getattr(sig,'amd_bias','?')}"
@@ -5585,7 +5361,7 @@ class QuantStrategy:
             _ob_n  = min(getattr(sig, 'ict_ob', 0.0) / 2.0, 1.0)
             _fvg_n = min(getattr(sig, 'ict_fvg', 0.0) / 1.5, 1.0)
             _ict_in_ote_str = (
-                f"\nICT:      Î£={sig.ict_total:.2f}"
+                f"\nICT:      ÃŽÂ£={sig.ict_total:.2f}"
                 f"  OB={_ob_n:.2f}  FVG={_fvg_n:.2f}"
                 f"  Swp={getattr(sig,'ict_sweep',0.0):.2f}")
             if _ict_val_str:
@@ -5598,14 +5374,14 @@ class QuantStrategy:
             f"  (structure context)")
 
         # Tier
-        _tier_labels = {"S": "🥇 Tier-S — OTE Sweep-and-Go",
-                        "A": "🥈 Tier-A — ICT Structural",
-                        "B": "🥉 Tier-B — Quant+ICT Confluence",
-                        "":  "⚪ No ICT tier"}
+        _tier_labels = {"S": "ðŸ¥‡ Tier-S â€” OTE Sweep-and-Go",
+                        "A": "ðŸ¥ˆ Tier-A â€” ICT Structural",
+                        "B": "ðŸ¥‰ Tier-B â€” Quant+ICT Confluence",
+                        "":  "âšª No ICT tier"}
         _tier_badge = _tier_labels.get(ict_tier, f"Tier-{ict_tier}")
 
         # Side icon
-        _side_icon = "🟢" if side == "long" else "🔴"
+        _side_icon = "ðŸŸ¢" if side == "long" else "ðŸ”´"
 
         # Trail plan for "what's next"
         _trail_plan = (
@@ -5618,7 +5394,7 @@ class QuantStrategy:
         send_telegram_message(
             f"{_side_icon} <b>{side.upper()} ENTERED - {_et_label}</b>\n"
             f"{_sep}\n"
-            f"<b>💰 LEVELS</b>\n"
+            f"<b>ðŸ’° LEVELS</b>\n"
             f"Entry:    <b>${fill_price:,.2f}</b>\n"
             f"SL:       ${sl_price:,.2f}"
             f"  (-${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}xATR)\n"
@@ -5627,7 +5403,7 @@ class QuantStrategy:
             f"R:R:      1:{rr_a:.2f}  |  Risk: ${dollar_risk:.2f} USDT\n"
             f"Qty:      {qty:.4f} BTC\n"
             f"{_sep}\n"
-            f"<b>🎯 WHY WE ENTERED</b>\n"
+            f"<b>ðŸŽ¯ WHY WE ENTERED</b>\n"
             f"Pool TP:  {_pool_tp_str}"
             f"{_swept_str}\n"
             f"Reason:   {_entry_reason}\n"
@@ -5644,7 +5420,7 @@ class QuantStrategy:
             f"Monitor:  /position  or  /thinking"
         )
         logger.info(
-            f"âœ… ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
+            f"Ã¢Å“â€¦ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
         )
 
@@ -5652,11 +5428,11 @@ class QuantStrategy:
         pos = self._pos; price = data_manager.get_last_price()
         if price < 1.0: return
 
-        # â”€â”€ Conditionally compute signals â€” only when trade mode consumes them â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Conditionally compute signals Ã¢â‚¬â€ only when trade mode consumes them Ã¢â€â‚¬Ã¢â€â‚¬
         # Bug #7/#19 fix: _compute_signals() runs all five signal engines (VWAP,
         # CVD, ADX, OB, tick) on every active tick, but in the dominant trade mode
         # "reversion" (all liquidity-first entries) the result is used only for
-        # _log_thinking() â€” pure overhead.  The WeightScheduler and its dynamic
+        # _log_thinking() Ã¢â‚¬â€ pure overhead.  The WeightScheduler and its dynamic
         # regime weights are also dead code in the v10 liquidity-first path
         # (_evaluate_entry routes through pool-based logic, never calls
         # _compute_signals).
@@ -5664,7 +5440,7 @@ class QuantStrategy:
         # Gate: only compute when trade_mode is "trend" (regime-flip exit check)
         # or "flow" (sustained counter-flow exit check).  In "reversion" mode we
         # still call _log_thinking with the last cached signal so the thinking log
-        # continues to appear â€” it just isn't recomputed every tick.
+        # continues to appear Ã¢â‚¬â€ it just isn't recomputed every tick.
         _needs_signals = pos.trade_mode in ("trend", "flow")
         sig = None
         if _needs_signals:
@@ -5686,17 +5462,17 @@ class QuantStrategy:
                         (pos.side == "long"  and self._regime.regime == MarketRegime.TRENDING_DOWN) or
                         (pos.side == "short" and self._regime.regime == MarketRegime.TRENDING_UP))
                     if regime_flipped:
-                        logger.info(f"ðŸ”„ Regime flip â†’ exit {pos.side.upper()} [{pos.trade_mode}]")
+                        logger.info(f"Ã°Å¸â€â€ž Regime flip Ã¢â€ â€™ exit {pos.side.upper()} [{pos.trade_mode}]")
                         self._exit_trade(order_manager, price, "regime_flip"); return
 
             # v6.0: Momentum trades exit via SL, TP, or trailing SL ONLY.
-            # BREAKOUT_EXPIRED exit REMOVED â€” it was closing positions right before
+            # BREAKOUT_EXPIRED exit REMOVED Ã¢â‚¬â€ it was closing positions right before
             # TP hit because breakout timer expired while the move was still in progress.
             # Momentum trades are structurally managed: SL trails via ICT structure,
             # TP is at the opposing liquidity pool. No premature composite-based exit.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
-            # Not on a single tick flip â€” on sustained counter-flow + BOS reversal.
+            # Not on a single tick flip Ã¢â‚¬â€ on sustained counter-flow + BOS reversal.
             # Guard: only run when signals were freshly computed (not cached).
             if _needs_signals and pos.trade_mode == "flow":
                 # BUG-FIX: compute profit here; it was used below without being defined
@@ -5721,8 +5497,8 @@ class QuantStrategy:
                         (pos.side == "short" and _tick_now > 0.40))
                     if _flow_opposing and _flow_profit > 0:
                         logger.info(
-                            f"ðŸ”„ Flow reversal: 5m BOS + opposing tick "
-                            f"({_tick_now:+.2f}) â†’ exit {pos.side.upper()} [flow]")
+                            f"Ã°Å¸â€â€ž Flow reversal: 5m BOS + opposing tick "
+                            f"({_tick_now:+.2f}) Ã¢â€ â€™ exit {pos.side.upper()} [flow]")
                         self._exit_trade(order_manager, price, "flow_reversal")
                         return
 
@@ -5730,13 +5506,13 @@ class QuantStrategy:
         # Trades exit via SL, TP, trailing SL, regime flip, or breakout expiry only.
         # A timer cannot know if the trade is working.
 
-        # â”€â”€ DirectionEngine: pool-hit gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ DirectionEngine: pool-hit gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Runs every tick while in position. When price is near a pool, the gate
         # determines whether to exit (TP hit), reverse, continue to next pool, or hold.
-        # action="exit"     â†’ close position now (pool TP reached)
-        # action="reverse"  â†’ close and open opposite
-        # action="continue" â†’ update TP to next pool, tighten SL
-        # action="hold"     â†’ nothing, let existing SL/TP manage
+        # action="exit"     Ã¢â€ â€™ close position now (pool TP reached)
+        # action="reverse"  Ã¢â€ â€™ close and open opposite
+        # action="continue" Ã¢â€ â€™ update TP to next pool, tighten SL
+        # action="hold"     Ã¢â€ â€™ nothing, let existing SL/TP manage
         if self._dir_engine is not None and not pos.is_flat():
             try:
                 _tf_ph  = self._tick_eng.get_signal() if self._tick_eng else 0.0
@@ -5765,13 +5541,13 @@ class QuantStrategy:
                 if _gate is not None and _gate.action == "reverse":
                     # BUG-3 FIX: pool_hit_gate "reverse" must NEVER close the
                     # position.  The gate fires every tick once AMD flips contra
-                    # â€” exiting on each tick would fire multiple exits and leave
+                    # Ã¢â‚¬â€ exiting on each tick would fire multiple exits and leave
                     # the bot flat at a suboptimal price.  Instead: migrate SL
                     # to breakeven (capital protection) and send a Telegram
                     # awareness alert.  The existing SL/TP bracket remains live
                     # and manages the exit when the market decides.
                     # BUG-SPAM FIX: reason embeds FLOW_REVERSED(flow=-0.83)
-                    # which changes every tick → key never matched → fired
+                    # which changes every tick â†’ key never matched â†’ fired
                     # every tick.  Use only stable trade-identity fields;
                     # the 120 s timer is the sole repeat-rate guard.
                     _gate_key = (
@@ -5786,7 +5562,7 @@ class QuantStrategy:
                         with self._lock:
                             pos.pool_gate_reverse_notice_key = _gate_key
                             pos.pool_gate_reverse_notice_at = now
-                        # Downgraded WARNING→INFO: send_telegram_message() below
+                        # Downgraded WARNINGâ†’INFO: send_telegram_message() below
                         # already delivers the Telegram alert.  WARNING level would
                         # cause TelegramLogHandler to send a second duplicate message.
                         logger.info(
@@ -5813,8 +5589,8 @@ class QuantStrategy:
                     if _safe_be_tick is None:
                         _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
                         _gap_atr = abs(price - _be_tick) / max(_atr_now, 1e-10)
-                        # BUG-SPAM FIX: reason contains dynamic flow float → key
-                        # changed every tick → 120 s guard never triggered.
+                        # BUG-SPAM FIX: reason contains dynamic flow float â†’ key
+                        # changed every tick â†’ 120 s guard never triggered.
                         _key = f"{pos.side}:{round(pos.entry_price, 1)}"
                         if (_key != pos.pool_gate_reverse_regime_key or
                                 now - pos.pool_gate_reverse_signaled_at >= 120.0):
@@ -5822,7 +5598,7 @@ class QuantStrategy:
                                 pos.pool_gate_reverse_regime_key = _key
                                 pos.pool_gate_reverse_signaled_at = now
                                 pos.pool_gate_reverse_attempts += 1
-                            # Downgraded WARNING→INFO: diagnostic only; the
+                            # Downgraded WARNINGâ†’INFO: diagnostic only; the
                             # existing bracket is still live and protected.
                             # WARNING level would double-send via TelegramLogHandler.
                             logger.info(
@@ -5846,12 +5622,12 @@ class QuantStrategy:
                             )
                             if _be_result is None:
                                 # replace_stop_loss returning None means SL already
-                                # fired â€” treat as a fill event and bail out.
+                                # fired Ã¢â‚¬â€ treat as a fill event and bail out.
                                 self._record_exchange_exit(None)
                                 return
                             if isinstance(_be_result, dict) and _be_result.get("error") == "UNPROTECTED":
                                 logger.critical(
-                                    "ðŸ’€ POOL-GATE BE: SL replace UNPROTECTED â€” "
+                                    "Ã°Å¸â€™â‚¬ POOL-GATE BE: SL replace UNPROTECTED Ã¢â‚¬â€ "
                                     "emergency-flattening.")
                                 try:
                                     if hasattr(order_manager, "emergency_flatten"):
@@ -5875,7 +5651,7 @@ class QuantStrategy:
                                         pos.sl_price = _r_trig
                                         self.current_sl_price = _r_trig
                                 logger.warning(
-                                    f"âš ï¸ POOL-GATE BE: SL restored at ${_r_trig:,.2f} "
+                                    f"Ã¢Å¡Â Ã¯Â¸Â POOL-GATE BE: SL restored at ${_r_trig:,.2f} "
                                     f"(requested ${_be_tick:,.2f}).")
                             elif isinstance(_be_result, dict) and "error" not in _be_result:
                                 with self._lock:
@@ -5885,11 +5661,11 @@ class QuantStrategy:
                                     pos.be_ratchet_applied = True
                                     self.current_sl_price  = _safe_be_tick
                                 logger.info(
-                                    f"ðŸ”’ POOL-GATE REVERSE â†’ SL migrated to BE "
+                                    f"Ã°Å¸â€â€™ POOL-GATE REVERSE Ã¢â€ â€™ SL migrated to BE "
                                     f"${_safe_be_tick:,.2f} (no exit; bracket manages)")
                                 send_telegram_message(
-                                    f"âš ï¸ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
-                                    f"Pool hit with contra AMD flow â€” <b>no exit taken</b>\n"
+                                    f"Ã¢Å¡Â Ã¯Â¸Â <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
+                                    f"Pool hit with contra AMD flow Ã¢â‚¬â€ <b>no exit taken</b>\n"
                                     f"SL migrated to breakeven: <b>${_safe_be_tick:,.2f}</b>\n"
                                     f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
                             else:
@@ -5907,7 +5683,7 @@ class QuantStrategy:
                             send_telegram_message(format_pool_gate_alert(
                                 action        = "hold",
                                 confidence    = _gate.confidence,
-                                reason        = f"[REVERSE signal â€” no exit] {_gate.reason}",
+                                reason        = f"[REVERSE signal Ã¢â‚¬â€ no exit] {_gate.reason}",
                                 pos_side      = pos.side,
                                 pos_entry     = pos.entry_price,
                                 current_price = price,
@@ -5917,14 +5693,14 @@ class QuantStrategy:
                             ))
                         except Exception:
                             send_telegram_message(
-                                f"âš ï¸ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
-                                f"SL already at/beyond BE â€” bracket manages\n"
+                                f"Ã¢Å¡Â Ã¯Â¸Â <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
+                                f"SL already at/beyond BE Ã¢â‚¬â€ bracket manages\n"
                                 f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
-                    # NOTE: no early return â€” trail engine must still run this tick.
+                    # NOTE: no early return Ã¢â‚¬â€ trail engine must still run this tick.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
-                    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                    # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
                     # TP IMMUTABILITY POLICY
-                    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+                    # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
                     # The Take Profit is set at entry and NEVER amended.
                     #
                     # WHY:
@@ -5932,7 +5708,7 @@ class QuantStrategy:
                     #   Extending TP further when the first target isn't reached
                     #   guarantees the trade dies to a trailing SL instead.
                     #
-                    #   The original TP was set at the opposing liquidity pool â€”
+                    #   The original TP was set at the opposing liquidity pool Ã¢â‚¬â€
                     #   the structural delivery target.  If the market doesn't
                     #   reach it, the SL trail manages the exit with whatever
                     #   profit was captured.
@@ -5947,21 +5723,21 @@ class QuantStrategy:
                     #
                     _next = _gate.next_target
                     logger.info(
-                        f"ðŸ“ POOL-GATE CONTINUE: next target ${_next:,.0f} â€” "
+                        f"Ã°Å¸â€œÂ POOL-GATE CONTINUE: next target ${_next:,.0f} Ã¢â‚¬â€ "
                         f"TP stays at ${pos.tp_price:,.0f} (immutability policy) | "
                         f"conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
                     # DO NOT call replace_take_profit.
                     # DO NOT modify pos.tp_price.
                     # The existing SL/TP bracket manages the exit.
-                # action="hold" â†’ do nothing, let existing SL/TP manage
+                # action="hold" Ã¢â€ â€™ do nothing, let existing SL/TP manage
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
 
-                # â”€â”€ Trailing SL â€” v6.0 STRUCTURE-EVENT-DRIVEN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # Ã¢â€â‚¬Ã¢â€â‚¬ Trailing SL Ã¢â‚¬â€ v6.0 STRUCTURE-EVENT-DRIVEN Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # ARCHITECTURE CHANGE: Time-based TRAIL_INTERVAL_S (10s timer) REMOVED.
         #
         # Old problem: The 10s timer missed critical structure events. A BOS could
-        # form at t=1s, but trail wouldn't check until t=10s â€” by which time price
+        # form at t=1s, but trail wouldn't check until t=10s Ã¢â‚¬â€ by which time price
         # had already reversed past the structure level. The timer also fired during
         # quiet periods when nothing changed, wasting REST calls.
         #
@@ -5969,7 +5745,7 @@ class QuantStrategy:
         #   1. On EVERY tick: detect if ICT structure state has changed since last
         #      trail computation (new BOS, CHoCH, swing, OB, or significant price move).
         #   2. If structure changed OR price made new high/low: compute new trail SL
-        #      locally (pure math, no REST call â€” sub-millisecond).
+        #      locally (pure math, no REST call Ã¢â‚¬â€ sub-millisecond).
         #   3. Only dispatch REST call to exchange when computation yields an actual
         #      SL improvement. One-in-flight guard prevents duplicate edits.
         #   4. Minimum 3s cooldown between successful REST trail moves to prevent
@@ -5980,7 +5756,7 @@ class QuantStrategy:
         #   - ZERO wasted REST calls (only fires when SL actually needs to move)
         #   - Institutional-grade responsiveness to market structure shifts
         if self.get_trail_enabled():
-            # â”€â”€ Step 1: Detect structure change or new price extreme â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Step 1: Detect structure change or new price extreme Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             _structure_changed = self._detect_structure_change(data_manager, price, pos, now)
             _new_extreme = False
             if pos.side == "long" and price > pos.peak_price_abs:
@@ -6000,16 +5776,16 @@ class QuantStrategy:
 
             if _should_trail:
                 self._last_trail_check_price = price
-                # â”€â”€ Step 2: Check minimum REST cooldown (3s between moves) â”€â”€â”€â”€
+                # Ã¢â€â‚¬Ã¢â€â‚¬ Step 2: Check minimum REST cooldown (3s between moves) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 _min_trail_rest_cd = 3.0
                 _last_trail_success = getattr(self, '_last_trail_rest_time', 0.0)
                 _rest_ok = (now - _last_trail_success) >= _min_trail_rest_cd
 
                 if _rest_ok:
-                    # â”€â”€ Step 3: One-in-flight guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    # Ã¢â€â‚¬Ã¢â€â‚¬ Step 3: One-in-flight guard Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                     # BUG-FIX A: the original code did `return` when in-flight,
                     # which aborted ALL of _manage_active (pool-gate, max-hold,
-                    # everything) for the duration of the REST call (~3â€“30s on
+                    # everything) for the duration of the REST call (~3Ã¢â‚¬â€œ30s on
                     # exchange timeout).  Replaced with a _can_launch flag so only
                     # the trail thread dispatch is gated; _manage_active continues
                     # normally regardless of whether a trail thread is in flight.
@@ -6033,7 +5809,7 @@ class QuantStrategy:
                                 )
                                 if not _live_trail_threads:
                                     logger.warning(
-                                        "Trail flag stuck %.0fs with no live thread â€” self-healing",
+                                        "Trail flag stuck %.0fs with no live thread Ã¢â‚¬â€ self-healing",
                                         _flag_age,
                                     )
                                     self._trail_in_progress = False
@@ -6086,7 +5862,7 @@ class QuantStrategy:
 
         FINGERPRINT APPROACH:
           Build a structural fingerprint (tuple of key state values) on each call.
-          If fingerprint differs from last stored fingerprint â†’ structure changed.
+          If fingerprint differs from last stored fingerprint Ã¢â€ â€™ structure changed.
           This is O(1) comparison regardless of how many structures exist.
 
         Returns True if structure has changed, False otherwise.
@@ -6094,7 +5870,7 @@ class QuantStrategy:
         # Build current structural fingerprint
         _fp_parts = []
 
-        # â”€â”€ ICT engine structure state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ICT engine structure state Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._ict is not None and getattr(self._ict, '_initialized', False):
             try:
                 for _tf_name in ("1m", "5m", "15m"):
@@ -6138,7 +5914,7 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ 1m swing structure (new swing = structure changed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ 1m swing structure (new swing = structure changed) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         try:
             _c1m = data_manager.get_candles("1m", limit=15)
             if _c1m and len(_c1m) >= 6:
@@ -6151,7 +5927,7 @@ class QuantStrategy:
         except Exception:
             pass
 
-        # â”€â”€ 5m swing structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ 5m swing structure Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         try:
             _c5m = data_manager.get_candles("5m", limit=15)
             if _c5m and len(_c5m) >= 6:
@@ -6163,28 +5939,28 @@ class QuantStrategy:
         except Exception:
             pass
 
-        # â”€â”€ Build fingerprint and compare â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Build fingerprint and compare Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         _current_fp = tuple(_fp_parts)
         _last_fp = getattr(self, '_last_structure_fingerprint', None)
         self._last_structure_fingerprint = _current_fp
 
         if _last_fp is None:
-            # First call â€” no previous state to compare
+            # First call Ã¢â‚¬â€ no previous state to compare
             return True
 
         return _current_fp != _last_fp
 
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
-        """Institutional trail v5.0 â€” 5-feature upgrade (OB/Breaker priority,
+        """Institutional trail v5.0 Ã¢â‚¬â€ 5-feature upgrade (OB/Breaker priority,
         AMD-phase adaptive buffer, 4H/1H HTF cascade, liq pool ceiling,
         displacement+CVD gate). All SL changes are LIMIT orders only."""
         pos = self._pos; atr = self._atr_5m.atr
         if atr < 1e-10: return False
         if pos.entry_price < 1.0:
-            logger.warning("Trail: entry_price invalid (%.2f) â€” skipping", pos.entry_price)
+            logger.warning("Trail: entry_price invalid (%.2f) Ã¢â‚¬â€ skipping", pos.entry_price)
             return False
         if not pos.sl_order_id:
-            # BUG-FIX B: was logger.debug â€” invisible in production where INFO is the
+            # BUG-FIX B: was logger.debug Ã¢â‚¬â€ invisible in production where INFO is the
             # floor.  This condition means the trail is permanently blocked for the
             # entire trade since sl_order_id is never set after entry.  Raising to
             # WARNING makes the blockage immediately visible in logs and Telegram.
@@ -6192,7 +5968,7 @@ class QuantStrategy:
             if not getattr(self, _warn_key, False):
                 setattr(self, _warn_key, True)
                 logger.warning(
-                    "Trail BLOCKED: sl_order_id not set â€” trailing SL disabled "
+                    "Trail BLOCKED: sl_order_id not set Ã¢â‚¬â€ trailing SL disabled "
                     "for this position.  Check SL order placement in _enter_trade.")
             return False
         profit = (price-pos.entry_price) if pos.side=="long" else (pos.entry_price-price)
@@ -6201,7 +5977,7 @@ class QuantStrategy:
         # must be executed under self._lock to prevent TOCTOU races with the main
         # thread (_log_thinking, _manage_active) and the reconcile thread.
         # Python's GIL protects individual attr stores but NOT the if/assign pattern:
-        #   T1: reads peak_profit=50, T2: reads peak_profit=50 â†’ both pass â†’ T2 overwrites T1.
+        #   T1: reads peak_profit=50, T2: reads peak_profit=50 Ã¢â€ â€™ both pass Ã¢â€ â€™ T2 overwrites T1.
         with self._lock:
             if profit > pos.peak_profit:
                 pos.peak_profit = profit
@@ -6229,7 +6005,7 @@ class QuantStrategy:
         hold_secs = now - pos.entry_time
         now_ms = int(now * 1000)
 
-        # â”€â”€ Issue 2 fix: Refresh ICT engine with live multi-timeframe structure â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Issue 2 fix: Refresh ICT engine with live multi-timeframe structure Ã¢â€â‚¬Ã¢â€â‚¬
         # Also captures HTF candles (4h/1h) here for the trail engine cascade.
         _trail_candles_15m = None
         _trail_candles_1h  = None
@@ -6249,7 +6025,7 @@ class QuantStrategy:
                 # because a new 5m bar may have closed between the entry-path
                 # ICT update and this trail tick.  We only force a refresh if
                 # at least TRAIL_ICT_MIN_REFRESH_SEC (2s) have elapsed since
-                # the last actual update â€” this prevents a full re-scan every
+                # the last actual update Ã¢â‚¬â€ this prevents a full re-scan every
                 # 250ms while still ensuring the trail sees bars that closed
                 # within the last 2 seconds.
                 _trail_ict_min_refresh = float(
@@ -6273,17 +6049,17 @@ class QuantStrategy:
             except Exception as _ict_refresh_e:
                 logger.debug(f"Trail ICT refresh error (non-fatal): {_ict_refresh_e}")
 
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # FIBONACCI TRAIL ENGINE (v5.0) â€” SOLE TRAILING ENGINE
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+        # FIBONACCI TRAIL ENGINE (v5.0) Ã¢â‚¬â€ SOLE TRAILING ENGINE
+        # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         # Pure-Fibonacci trailing: bar-close-gated, close-confirmation counter,
         # swing-invalidation, momentum gate, liquidity-aware buffer, HTF
         # alignment, Counter-BOS sovereign override, OTE pullback freeze.
         # No fallback logic: if the engine returns new_sl=None, we HOLD.
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
         if self._liq_trail is None:
-            # Engine not wired in â€” no trailing possible.
-            logger.debug("Trail: LiquidityTrailEngine not initialised â€” HOLD")
+            # Engine not wired in Ã¢â‚¬â€ no trailing possible.
+            logger.debug("Trail: LiquidityTrailEngine not initialised Ã¢â‚¬â€ HOLD")
             return False
 
         # Live CVD trend for the momentum gate
@@ -6324,28 +6100,28 @@ class QuantStrategy:
                 candles_1h      = _trail_candles_1h,
             )
         except Exception as _lt_e:
-            logger.exception("Trail: compute error â€” HOLD")
+            logger.exception("Trail: compute error Ã¢â‚¬â€ HOLD")
             return False
 
         # Bug #18b fix: check trail_blocked before treating new_sl=None as a
         # structural HOLD.  trail_blocked=True means the engine was deliberately
-        # gated (e.g. ASIA session disabled) â€” this is policy, not a failure to
+        # gated (e.g. ASIA session disabled) Ã¢â‚¬â€ this is policy, not a failure to
         # find a valid Fib level.  Log it separately so the operator can
         # distinguish "no valid swing" from "session blocked".
         # Also: do NOT increment consecutive_trail_holds on a policy block,
         # because that counter is used for "trail is stuck" detection and a
-        # blocked trail is not stuck â€” it is intentionally paused.
+        # blocked trail is not stuck Ã¢â‚¬â€ it is intentionally paused.
         if _liq_result.new_sl is None:
             if getattr(_liq_result, 'trail_blocked', False):
                 _log_interval = 60.0   # less noisy for policy blocks
                 if now - self._last_trail_block_log >= _log_interval:
                     self._last_trail_block_log = now
                     logger.info(
-                        f"ðŸš« Trail POLICY_BLOCK [{_liq_result.block_reason}] "
-                        f"SL=${pos.sl_price:,.1f} â€” not incrementing hold counter")
+                        f"Ã°Å¸Å¡Â« Trail POLICY_BLOCK [{_liq_result.block_reason}] "
+                        f"SL=${pos.sl_price:,.1f} Ã¢â‚¬â€ not incrementing hold counter")
                 return False
 
-            # Structural HOLD â€” engine searched but found no valid Fib level
+            # Structural HOLD Ã¢â‚¬â€ engine searched but found no valid Fib level
             pos.consecutive_trail_holds += 1
             _log_interval = 30.0
             if now - self._last_trail_block_log >= _log_interval:
@@ -6356,12 +6132,12 @@ class QuantStrategy:
                 _mfe_r = pos.peak_profit / init_dist_r if init_dist_r > 1e-10 else 0.0
                 hm = (now - pos.entry_time) / 60.0
                 logger.info(
-                    f"ðŸ”’ Trail HOLD [{_liq_result.phase}] | {_hold_str} | "
+                    f"Ã°Å¸â€â€™ Trail HOLD [{_liq_result.phase}] | {_hold_str} | "
                     f"profit={profit:.1f}pts MFE={pos.peak_profit:.1f}pts R={_mfe_r:.2f} | "
                     f"SL=${pos.sl_price:,.1f} hold={hm:.0f}m")
             return False
 
-        # Engine returned a new SL â€” dispatch to exchange
+        # Engine returned a new SL Ã¢â‚¬â€ dispatch to exchange
         _new_liq_sl = _liq_result.new_sl
         _tick_gap = max(QCfg.TICK_SIZE() * 0.5, 1e-9)
         _invalid_stop = (
@@ -6378,8 +6154,8 @@ class QuantStrategy:
                     f"${price:,.1f}; requires {_verb} market. No REST retry.")
             return False
         logger.info(
-            f"ðŸ¦ FibTrail [{_liq_result.phase}] "
-            f"R={_liq_result.r_multiple:.2f}R â†’ SL ${_new_liq_sl:.1f} | "
+            f"Ã°Å¸ÂÂ¦ FibTrail [{_liq_result.phase}] "
+            f"R={_liq_result.r_multiple:.2f}R Ã¢â€ â€™ SL ${_new_liq_sl:.1f} | "
             f"{_liq_result.reason}")
 
         # SIG-3 FIX: Verify position identity before issuing REST call.
@@ -6396,12 +6172,12 @@ class QuantStrategy:
         if not _pos_still_valid:
             logger.warning(
                 "FibTrail: position changed between compute and REST dispatch "
-                "â€” aborting trail to prevent orphaned stop order")
+                "Ã¢â‚¬â€ aborting trail to prevent orphaned stop order")
             return False
 
         _lt_side = "sell" if pos.side == "long" else "buy"
         logger.info(
-            f"ðŸ¦ FibTrail SL dispatch [STOP-LIMIT] "
+            f"Ã°Å¸ÂÂ¦ FibTrail SL dispatch [STOP-LIMIT] "
             f"trigger=${_new_liq_sl:,.1f} side={_lt_side} qty={pos.quantity} "
             f"phase={_liq_result.phase}")
         _lt_result = order_manager.replace_stop_loss(
@@ -6416,24 +6192,24 @@ class QuantStrategy:
             # replace_stop_loss returns None ONLY when it verified the SL
             # order is a TRUE fill (not a self-cancellation ghost). Safe
             # to record exchange exit.
-            logger.warning("ðŸš¨ SL already fired during trail dispatch")
+            logger.warning("Ã°Å¸Å¡Â¨ SL already fired during trail dispatch")
             self._record_exchange_exit(None)
             return True
         if isinstance(_lt_result, dict) and _lt_result.get("error"):
             err = _lt_result.get("error", "unknown")
 
-            # â”€â”€ FIX (third-trade bug): UNPROTECTED means SL is GONE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ FIX (third-trade bug): UNPROTECTED means SL is GONE Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # The cancel succeeded but the replace failed AND the restore
-            # failed â€” position is live on the exchange with no stop-loss.
+            # failed Ã¢â‚¬â€ position is live on the exchange with no stop-loss.
             # This is the exact state that blew up the third trade. The only
             # institutionally-correct response is to flatten at market and
             # let the reconcile path record the exit.
             if err == "UNPROTECTED":
                 logger.critical(
-                    "ðŸ’€ TRAIL: SL replace returned UNPROTECTED â€” "
+                    "Ã°Å¸â€™â‚¬ TRAIL: SL replace returned UNPROTECTED Ã¢â‚¬â€ "
                     "position has no stop-loss on exchange. Emergency-flattening.")
                 send_telegram_message(
-                    "ðŸš¨ <b>UNPROTECTED POSITION</b>\n"
+                    "Ã°Å¸Å¡Â¨ <b>UNPROTECTED POSITION</b>\n"
                     "SL could not be moved or restored.\n"
                     "Emergency-flattening at market.")
                 try:
@@ -6455,14 +6231,14 @@ class QuantStrategy:
 
             # Partial success: old SL cancelled, new one at requested trigger
             # failed, but we successfully restored an SL at a fallback trigger.
-            # The trail did not move as intended â€” update our tracking to the
+            # The trail did not move as intended Ã¢â‚¬â€ update our tracking to the
             # restored trigger so we don't re-fire the same failing replace
             # every tick, but do NOT mark the trail as advanced.
             if err == "PLACE_FAILED_RESTORED":
                 _restore_oid = _lt_result.get("restore_order_id")
                 _restore_trig = float(_lt_result.get("restore_trigger", 0) or 0)
                 logger.warning(
-                    f"âš ï¸ Trail: SL restored at ${_restore_trig:,.2f} (not the "
+                    f"Ã¢Å¡Â Ã¯Â¸Â Trail: SL restored at ${_restore_trig:,.2f} (not the "
                     f"requested ${_new_liq_sl:,.1f}). Updating tracking.")
                 with self._lock:
                     if _restore_oid:
@@ -6472,10 +6248,10 @@ class QuantStrategy:
                         self.current_sl_price = _restore_trig
                 return False
 
-            logger.warning(f"FibTrail: SL replace failed ({err}) â€” keeping current SL")
+            logger.warning(f"FibTrail: SL replace failed ({err}) Ã¢â‚¬â€ keeping current SL")
             return False
 
-        # Success â€” update position state under lock
+        # Success Ã¢â‚¬â€ update position state under lock
         with self._lock:
             self._pos.sl_price = _new_liq_sl
             _new_oid = (_lt_result or {}).get("order_id")
@@ -6485,7 +6261,7 @@ class QuantStrategy:
             self._pos.consecutive_trail_holds = 0
             if not self._pos.trail_active:
                 self._pos.trail_active = True
-                logger.info("âœ… Fibonacci trail now active")
+                logger.info("Ã¢Å“â€¦ Fibonacci trail now active")
             if _liq_result.phase == "BE_LOCK":
                 self._pos.be_ratchet_applied = True
 
@@ -6528,7 +6304,7 @@ class QuantStrategy:
     def _exit_trade(self, order_manager, price, reason):
         pos = self._pos
         if pos.phase != PositionPhase.ACTIVE: return
-        logger.info(f"ðŸšª EXIT {pos.side.upper()} @ ${price:,.2f} | {reason}")
+        logger.info(f"Ã°Å¸Å¡Âª EXIT {pos.side.upper()} @ ${price:,.2f} | {reason}")
         self._pos.phase = PositionPhase.EXITING
         self._exiting_since = time.time()
         order_manager.cancel_all_exit_orders(sl_order_id=pos.sl_order_id, tp_order_id=pos.tp_order_id)
@@ -6539,14 +6315,14 @@ class QuantStrategy:
         # _record_exchange_exit() (called by the reconcile / sync path once the
         # exchange confirms the position is flat) will record the exact PnL.
         # Calling _record_pnl here first created a guaranteed duplicate: this
-        # estimated entry fires immediately, then the exact entry fires ~1â€“30 s
+        # estimated entry fires immediately, then the exact entry fires ~1Ã¢â‚¬â€œ30 s
         # later when _sync_position or _reconcile_apply confirms the close.
-        # The _pnl_recorded_for guard would drop the second call â€” but the first
+        # The _pnl_recorded_for guard would drop the second call Ã¢â‚¬â€ but the first
         # call was the ESTIMATED one. Now we always record the exact value first.
         #
         # If the exchange confirmation never arrives (network failure), the
         # EXITING watchdog fires after 120s and calls _finalise_exit() which
-        # records PnL=0 via the "unconfirmed" path â€” acceptable fallback.
+        # records PnL=0 via the "unconfirmed" path Ã¢â‚¬â€ acceptable fallback.
         # Telegram message still uses local price estimate for immediacy.
         fill_type = getattr(pos, 'entry_fill_type', 'taker')
         pnl_est = self._estimate_pnl(pos, price, entry_fill_type=fill_type)
@@ -6557,11 +6333,11 @@ class QuantStrategy:
         achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         tp_dist      = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
         planned_rr   = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
-        result_icon  = "âœ…" if pnl_est > 0 else "âŒ"
+        result_icon  = "Ã¢Å“â€¦" if pnl_est > 0 else "Ã¢ÂÅ’"
 
         send_telegram_message(
-            f"ðŸšª <b>CLOSING POSITION â€” {reason.upper()}</b>\n"
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+            f"Ã°Å¸Å¡Âª <b>CLOSING POSITION Ã¢â‚¬â€ {reason.upper()}</b>\n"
+            f"Ã¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€Â\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
             f"Entry:    ${pos.entry_price:,.2f}\n"
             f"Est exit: ~${price:,.2f}  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
@@ -6569,7 +6345,7 @@ class QuantStrategy:
             f"<i>Awaiting exchange confirmation...</i>"
         )
         self._last_exit_side = pos.side
-        # _finalise_exit() is NOT called here â€” let _sync_position / _reconcile_apply
+        # _finalise_exit() is NOT called here Ã¢â‚¬â€ let _sync_position / _reconcile_apply
         # confirm the position is flat on the exchange and then call _record_exchange_exit,
         # which records exact PnL and calls _finalise_exit().  The EXITING watchdog (120s)
         # is the safety net if exchange confirmation never arrives.
@@ -6579,12 +6355,12 @@ class QuantStrategy:
         v5.1: Exchange-confirmed exit only. No price heuristics. No estimated fees.
 
         Calls identify_exit_order() which queries GET /v2/orders/{id} for both
-        the SL and TP order IDs directly â€” state:"closed" + paid_commission from
+        the SL and TP order IDs directly Ã¢â‚¬â€ state:"closed" + paid_commission from
         the exchange response. One retry after 1 s if both orders still show open
         (covers the sub-second propagation window between fill and state update).
 
         If after the retry the exchange still cannot confirm which order closed:
-          - Position state is finalised to FLAT (mandatory â€” prevents orphaned state)
+          - Position state is finalised to FLAT (mandatory Ã¢â‚¬â€ prevents orphaned state)
           - PnL recorded as 0.0 with confirmed=False in the trade record
           - Telegram alert sent with both order IDs for manual reconciliation
           - Operator should verify on the Delta dashboard
@@ -6593,21 +6369,21 @@ class QuantStrategy:
           - exit_type, fill_price, fee_paid all from exchange (exact)
           - Gross PnL computed from actual fill price using exact inverse-perp formula
           - Exit fee = paid_commission from Delta (exact USD)
-          - Entry fee = commission_rate Ã— entry_notional (exact rate, estimated value
+          - Entry fee = commission_rate Ãƒâ€” entry_notional (exact rate, estimated value
             because we do not yet store paid_commission at entry order placement)
           - fee_breakdown.exact_fees = True signals that exit side is exact
         """
         pos = self._pos
         if pos.phase == PositionPhase.FLAT:
-            logger.debug("_record_exchange_exit skipped â€” already FLAT")
+            logger.debug("_record_exchange_exit skipped Ã¢â‚¬â€ already FLAT")
             return
 
-        # â”€â”€ ATOMIC EXIT CLAIM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ATOMIC EXIT CLAIM Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # ROOT CAUSE OF DOUBLE NOTIFICATION (observed in logs):
-        #   11:47:18.152  sync thread    â†’ enters _record_exchange_exit, sees _exit_completed=False
-        #   11:47:18.775  reconcile thread â†’ enters _record_exchange_exit, sees _exit_completed=False
-        #   11:47:18.906  sync thread    â†’ finishes identify_exit_order, logs, sends telegram, records PnL
-        #   11:47:19.659  reconcile thread â†’ finishes identify_exit_order, logs AGAIN, sends telegram AGAIN
+        #   11:47:18.152  sync thread    Ã¢â€ â€™ enters _record_exchange_exit, sees _exit_completed=False
+        #   11:47:18.775  reconcile thread Ã¢â€ â€™ enters _record_exchange_exit, sees _exit_completed=False
+        #   11:47:18.906  sync thread    Ã¢â€ â€™ finishes identify_exit_order, logs, sends telegram, records PnL
+        #   11:47:19.659  reconcile thread Ã¢â€ â€™ finishes identify_exit_order, logs AGAIN, sends telegram AGAIN
         #
         # The old guard (checking _exit_completed without a lock) was non-atomic:
         # both threads read False before either set True.  _exit_completed was only
@@ -6619,12 +6395,12 @@ class QuantStrategy:
         with self._lock:
             if self._exit_completed:
                 logger.info(
-                    "_record_exchange_exit skipped â€” exit already claimed by another thread "
+                    "_record_exchange_exit skipped Ã¢â‚¬â€ exit already claimed by another thread "
                     f"(phase={pos.phase.name})")
                 return
             self._exit_completed = True   # CLAIM: this thread owns the exit
 
-        # â”€â”€â”€ Step 1: Get exchange-confirmed exit data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Step 1: Get exchange-confirmed exit data Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Query both order IDs directly. One retry after 1 s.
         exit_info: Dict = {"confirmed": False}
 
@@ -6638,7 +6414,7 @@ class QuantStrategy:
             except Exception as e:
                 logger.error(f"identify_exit_order (attempt 1) error: {e}", exc_info=True)
 
-            # v6.0: Exponential backoff retry â€” 4 additional attempts (1s, 2s, 3s, 5s)
+            # v6.0: Exponential backoff retry Ã¢â‚¬â€ 4 additional attempts (1s, 2s, 3s, 5s)
             # Exchange state propagation can take up to 5-8s under load.
             # Old single 1s retry missed ~40% of confirmations (observed in prod logs).
             _retry_delays = [1.0, 2.0, 3.0, 5.0]
@@ -6653,12 +6429,12 @@ class QuantStrategy:
                         trail_active = pos.trail_active,
                     )
                     if exit_info.get("confirmed"):
-                        logger.info(f"âœ… Exit confirmed on retry {_retry_idx + 2} (after {_delay}s)")
+                        logger.info(f"Ã¢Å“â€¦ Exit confirmed on retry {_retry_idx + 2} (after {_delay}s)")
                 except Exception as e:
                     logger.error(f"identify_exit_order (retry {_retry_idx + 2}) error: {e}", exc_info=True)
 
         if not exit_info.get("confirmed"):
-            # v6.0: Final fallback â€” query exchange position directly.
+            # v6.0: Final fallback Ã¢â‚¬â€ query exchange position directly.
             # If position is flat on exchange, we know SL or TP fired even if
             # individual order state queries failed.
             _try_position_fallback = False
@@ -6683,14 +6459,14 @@ class QuantStrategy:
                         _ex_qty = abs(float(_ex_pos.get("size", _ex_pos.get("quantity", 0))))
                         if _ex_qty < 1e-10:
                             _try_position_fallback = True
-                            logger.info("Position is FLAT on exchange â€” exit occurred, reconstructing")
+                            logger.info("Position is FLAT on exchange Ã¢â‚¬â€ exit occurred, reconstructing")
                         else:
                             _ex_still_open = True
                 except Exception as _pos_e:
                     logger.debug(f"Position fallback check error: {_pos_e}")
 
             if _try_position_fallback:
-                # Position is confirmed flat â€” reconstruct exit from available data
+                # Position is confirmed flat Ã¢â‚¬â€ reconstruct exit from available data
                 _last_price = 0.0
                 try:
                     _last_price = self._dm.get_last_price() if self._dm else 0.0
@@ -6703,10 +6479,10 @@ class QuantStrategy:
                     else:
                         _approx_pnl = (pos.entry_price - _last_price) * pos.quantity
                 logger.warning(
-                    f"âš ï¸ EXIT CONFIRMED via position check (order state unavailable). "
+                    f"Ã¢Å¡Â Ã¯Â¸Â EXIT CONFIRMED via position check (order state unavailable). "
                     f"Approx PnL: ${_approx_pnl:.2f}")
                 send_telegram_message(
-                    f"âš ï¸ <b>EXIT CONFIRMED (position fallback)</b>\n"
+                    f"Ã¢Å¡Â Ã¯Â¸Â <b>EXIT CONFIRMED (position fallback)</b>\n"
                     f"Individual order state unavailable but position is FLAT.\n"
                     f"Approx PnL: ${_approx_pnl:.2f}\n"
                     f"Entry: ${pos.entry_price:,.2f}")
@@ -6716,10 +6492,10 @@ class QuantStrategy:
                 self._finalise_exit()
                 return
 
-            # â”€â”€ FIX (third-trade bug): exchange reports position STILL OPEN â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ FIX (third-trade bug): exchange reports position STILL OPEN Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # Previously the code recorded pnl=0 / set phase=FLAT here, while
             # the exchange had an unprotected live position. That caused the
-            # reconcile to re-adopt the live position â€” and the ex_side parse
+            # reconcile to re-adopt the live position Ã¢â‚¬â€ and the ex_side parse
             # bug flipped it to SHORT. NEVER record a phantom flat while the
             # exchange shows an open position. Instead:
             #   1. Release the _exit_completed claim so a future call can retry.
@@ -6729,10 +6505,10 @@ class QuantStrategy:
             #      can book the real exit once the flatten settles.
             if _ex_still_open:
                 logger.critical(
-                    "ðŸ’€ EXIT UNCONFIRMED but exchange position is STILL OPEN â€” "
+                    "Ã°Å¸â€™â‚¬ EXIT UNCONFIRMED but exchange position is STILL OPEN Ã¢â‚¬â€ "
                     "refusing to record phantom FLAT. Triggering emergency flatten.")
                 send_telegram_message(
-                    "ðŸš¨ <b>EXIT UNCONFIRMED + EXCHANGE STILL OPEN</b>\n"
+                    "Ã°Å¸Å¡Â¨ <b>EXIT UNCONFIRMED + EXCHANGE STILL OPEN</b>\n"
                     "Emergency-flattening to force a known-flat state.\n"
                     f"Entry: ${pos.entry_price:,.2f} | Side: {pos.side.upper()}")
                 try:
@@ -6753,18 +6529,18 @@ class QuantStrategy:
                 # Do NOT call _record_pnl(0) and do NOT _finalise_exit.
                 return
 
-            # Truly unconfirmed AND exchange reports flat (or unreachable) â€”
+            # Truly unconfirmed AND exchange reports flat (or unreachable) Ã¢â‚¬â€
             # record zero PnL as the last-resort state-convergence.
             _sl_disp = str(pos.sl_order_id or "unknown")
             _tp_disp = str(pos.tp_order_id or "unknown")
             logger.warning(
-                f"âš ï¸ EXIT UNCONFIRMED after {len(_retry_delays)+1} attempts â€” closing FLAT with pnl=0. "
+                f"Ã¢Å¡Â Ã¯Â¸Â EXIT UNCONFIRMED after {len(_retry_delays)+1} attempts Ã¢â‚¬â€ closing FLAT with pnl=0. "
                 f"SL order={_sl_disp} TP order={_tp_disp}"
             )
             send_telegram_message(
-                f"âš ï¸ <b>EXIT UNCONFIRMED</b>\n"
+                f"Ã¢Å¡Â Ã¯Â¸Â <b>EXIT UNCONFIRMED</b>\n"
                 f"Exchange did not confirm after {len(_retry_delays)+1} attempts ({sum(_retry_delays)+0:.0f}s).\n"
-                f"PnL recorded as $0.00 â€” verify on Delta dashboard.\n"
+                f"PnL recorded as $0.00 Ã¢â‚¬â€ verify on Delta dashboard.\n"
                 f"Entry: ${pos.entry_price:,.2f} | "
                 f"SL: {_sl_disp} | TP: {_tp_disp}"
             )
@@ -6774,7 +6550,7 @@ class QuantStrategy:
             self._finalise_exit()
             return
 
-        # â”€â”€â”€ Exchange-confirmed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Exchange-confirmed Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         exit_type  = exit_info["exit_type"]          # "tp" | "sl" | "trail_sl"
         fill_price = float(exit_info["fill_price"])  # exact execution price
         fee_paid   = float(exit_info["fee_paid"])    # paid_commission from Delta
@@ -6795,13 +6571,13 @@ class QuantStrategy:
         else:
             exit_reason = "sl_hit";       is_tp_hit = False; is_sl_hit = True
 
-        _disp = (fired_id[:10] + "â€¦") if len(fired_id) > 10 else fired_id
+        _disp = (fired_id[:10] + "Ã¢â‚¬Â¦") if len(fired_id) > 10 else fired_id
         logger.info(
-            f"âœ… Exit confirmed: {exit_reason} @ ${fill_price:,.2f} "
+            f"Ã¢Å“â€¦ Exit confirmed: {exit_reason} @ ${fill_price:,.2f} "
             f"fee=${fee_paid:.4f} order={_disp}"
         )
 
-        # â”€â”€â”€ Step 2: PnL â€” exact gross from actual fill, exact exit fee â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Step 2: PnL Ã¢â‚¬â€ exact gross from actual fill, exact exit fee Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         import config as _cfg_x
         _is_delta = (
             getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
@@ -6817,7 +6593,7 @@ class QuantStrategy:
         )
 
         # Entry fee: prefer exact paid_commission captured at entry (v8.1).
-        # Fallback: commission_rate Ã— entry_notional (rate-exact, value estimated).
+        # Fallback: commission_rate Ãƒâ€” entry_notional (rate-exact, value estimated).
         _entry_fee_exact = getattr(pos, "entry_fee_paid", 0.0) or 0.0
         entry_fee_is_exact = _entry_fee_exact > 0
         if entry_fee_is_exact:
@@ -6851,17 +6627,17 @@ class QuantStrategy:
         }
 
         logger.info(
-            f"ðŸ“Š Exit price=${fill_price:,.2f} reason={exit_reason} "
+            f"Ã°Å¸â€œÅ  Exit price=${fill_price:,.2f} reason={exit_reason} "
             f"entry=${pos.entry_price:,.2f} gross=${gross:+.4f} "
             f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}(exact) "
             f"net=${pnl:+.4f}"
         )
 
-        # â”€â”€â”€ Step 3: Record PnL and trade history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Step 3: Record PnL and trade history Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
-        # â”€â”€ PostTradeAgent: capture exit context before trade_record exists â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ PostTradeAgent: capture exit context before trade_record exists Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Must run BEFORE _record_pnl() because trade_record doesn't carry
-        # fill_price, peak_adverse, or ict/liq context â€” those are on pos/engine.
+        # fill_price, peak_adverse, or ict/liq context Ã¢â‚¬â€ those are on pos/engine.
         if self._post_trade_agent is not None:
             try:
                 _liq_snap_pt = getattr(self._liq_map, '_last_snapshot', None)
@@ -6881,8 +6657,8 @@ class QuantStrategy:
 
         # Bug #10 fix: call risk_manager.record_trade so RiskManager's own
         # counters (consecutive_losses, daily_pnl, winning_trades, last_trade_time)
-        # are updated.  Without this call, risk_manager.can_trade() gates â€”
-        # including the loss cooldown, daily loss %, and max consecutive losses â€”
+        # are updated.  Without this call, risk_manager.can_trade() gates Ã¢â‚¬â€
+        # including the loss cooldown, daily loss %, and max consecutive losses Ã¢â‚¬â€
         # always read stale zeros because record_trade was never invoked.
         # We pass pnl_override so risk_manager does not re-compute PnL from
         # prices (which would use the linear formula for an inverse-perp account).
@@ -6900,7 +6676,7 @@ class QuantStrategy:
         except Exception as _rm_rec_e:
             logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")
 
-        # â”€â”€â”€ Step 4: Telegram notification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Step 4: Telegram notification Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         hold_min     = (time.time() - pos.entry_time) / 60.0 if pos.entry_time > 0 else 0.0
         init_sl_dist = (pos.initial_sl_dist if pos.initial_sl_dist > 1e-10
                         else abs(pos.entry_price - pos.sl_price))
@@ -6909,15 +6685,15 @@ class QuantStrategy:
         achieved_r   = raw_pts / init_sl_dist if init_sl_dist > 1e-10 else 0.0
 
         if is_tp_hit:
-            result_icon = "ðŸŽ¯"; result_label = "TP HIT";   result_color = "WIN âœ…"
+            result_icon = "Ã°Å¸Å½Â¯"; result_label = "TP HIT";   result_color = "WIN Ã¢Å“â€¦"
         elif is_sl_hit and pnl > 0:
-            result_icon = "ðŸ”’"
+            result_icon = "Ã°Å¸â€â€™"
             result_label = "TRAIL SL (profitable)" if pos.trail_active else "SL HIT (profitable)"
-            result_color = "WIN âœ…"
+            result_color = "WIN Ã¢Å“â€¦"
         elif is_sl_hit and pos.trail_active:
-            result_icon = "ðŸ”’"; result_label = "TRAIL SL"; result_color = "LOSS âŒ"
+            result_icon = "Ã°Å¸â€â€™"; result_label = "TRAIL SL"; result_color = "LOSS Ã¢ÂÅ’"
         else:
-            result_icon = "ðŸ›‘"; result_label = "SL HIT";   result_color = "LOSS âŒ"
+            result_icon = "Ã°Å¸â€ºâ€˜"; result_label = "SL HIT";   result_color = "LOSS Ã¢ÂÅ’"
 
         mfe_r      = pos.peak_profit / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         tp_dist    = abs(pos.tp_price - pos.entry_price) if pos.tp_price > 0 else 0.0
@@ -6940,8 +6716,8 @@ class QuantStrategy:
             pass
 
         send_telegram_message(
-            f"{result_icon} <b>{result_color} â€” {result_label}</b>\n"
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+            f"{result_icon} <b>{result_color} Ã¢â‚¬â€ {result_label}</b>\n"
+            f"Ã¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€Â\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
             f"Entry:    ${pos.entry_price:,.2f}\n"
             f"Exit:     <b>${fill_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
@@ -6951,9 +6727,9 @@ class QuantStrategy:
             f"PnL:      <b>${pnl:+.2f} USDT</b>  ({_exit_margin_pct:+.1f}% on ${_exit_margin_used:.2f} margin)\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
-            + (f"Trail:    âœ… SL moved {_trail_imp:+.1f}pts vs orig\n"
-               if pos.trail_active else "Trail:    â€” not activated\n") +
-            f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+            + (f"Trail:    Ã¢Å“â€¦ SL moved {_trail_imp:+.1f}pts vs orig\n"
+               if pos.trail_active else "Trail:    Ã¢â‚¬â€ not activated\n") +
+            f"Ã¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€ÂÃ¢â€Â\n"
             f"<i>Session: {self._total_trades}T | WR: {self._win_rate():.0%} | "
             f"Total PnL: ${self._total_pnl:+.2f}</i>"
         )
@@ -6966,11 +6742,11 @@ class QuantStrategy:
         """
         Record a completed trade. Returns True if recorded, False if duplicate.
 
-        _total_trades incremented HERE (at close), not at entry â€” ensures
+        _total_trades incremented HERE (at close), not at entry Ã¢â‚¬â€ ensures
         win-rate denominator only counts closed trades.
 
         IDEMPOTENCY: entry_time-based guard. Each position's PnL is recorded
-        exactly once. The _exit_completed flag is NOT checked here â€” it is used
+        exactly once. The _exit_completed flag is NOT checked here Ã¢â‚¬â€ it is used
         as an atomic entry barrier in _record_exchange_exit() to prevent
         concurrent threads from both entering that function.
 
@@ -6983,14 +6759,14 @@ class QuantStrategy:
         if pos_entry_time > 0 and abs(self._pnl_recorded_for - pos_entry_time) < 0.001:
             logger.warning(
                 f"_record_pnl: duplicate call for position entry_time={pos_entry_time:.3f} "
-                f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) â€” skipped to prevent double-count"
+                f"(exit_reason={exit_reason}, pnl={pnl:+.4f}) Ã¢â‚¬â€ skipped to prevent double-count"
             )
             return False
 
-        # â”€â”€ Record the trade â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Record the trade Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         self._pnl_recorded_for = pos_entry_time
 
-        # ─── v9.1: capture closed-trade context for PostExitGate ──────────────
+        # â”€â”€â”€ v9.1: capture closed-trade context for PostExitGate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Persisted on the strategy so _finalise_exit (which runs AFTER
         # _record_pnl) can hand it to PostExitGate.record_exit() without
         # plumbing extra arguments through the call chain.
@@ -7015,7 +6791,7 @@ class QuantStrategy:
             self._winning_trades += 1
         self._risk_gate.record_trade_result(pnl)
 
-        # â”€â”€ ISSUE-4 FIX: Conviction Gate â€” session quality tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â‚¬â€ session quality tracking Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Record win/loss so the consecutive-loss session guard can block
         # further entries after MAX_SESSION_LOSSES in the same session.
         if self._conviction is not None:
@@ -7031,7 +6807,7 @@ class QuantStrategy:
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
         _fb = fee_breakdown or {}
         self._trade_history.append({
-            # â”€â”€ Core trade data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Core trade data Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "ts":           time.time(),
             "side":         getattr(pos, 'side', '?'),
             "mode":         getattr(pos, 'trade_mode', '?'),
@@ -7048,15 +6824,15 @@ class QuantStrategy:
             "trailed":      getattr(pos, 'trail_active', False),
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
-            # â”€â”€ v6.0: Margin-based P&L % â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ v6.0: Margin-based P&L % Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "margin_pnl_pct": 0.0,  # filled below
-            # â”€â”€ Fee breakdown (exact from Delta /v2/fills, estimated otherwise) â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Fee breakdown (exact from Delta /v2/fills, estimated otherwise) Ã¢â€â‚¬Ã¢â€â‚¬
             "gross_pnl":    _fb.get("gross_pnl",  pnl),
             "entry_fee":    _fb.get("entry_fee",  0.0),
             "exit_fee":     _fb.get("exit_fee",   0.0),
             "total_fees":   _fb.get("total_fees", 0.0),
             "exact_fees":   _fb.get("exact_fees", False),
-            # â”€â”€ v7.0: Signal attribution â€” enables post-trade analysis â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ v7.0: Signal attribution Ã¢â‚¬â€ enables post-trade analysis Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # Which tier / signals drove this trade? Track these to learn
             # which combinations actually produce wins vs losses.
             "ict_tier":     getattr(pos, 'ict_entry_tier', ''),
@@ -7074,7 +6850,7 @@ class QuantStrategy:
             "amd_conf":     (round(pos.entry_signal.amd_conf, 3)
                              if pos.entry_signal else 0.0),
             # BUG-5 FIX: was storing deviation_atr (VWAP distance) under the key
-            # "htf_15m" â€” makes the entire HTF attribution analytics meaningless.
+            # "htf_15m" Ã¢â‚¬â€ makes the entire HTF attribution analytics meaningless.
             # Now reads the actual HTF scores captured at entry time from PositionState.
             # entry_htf_15m and entry_htf_4h are set in _enter_trade from self._htf.
             "htf_15m":      round(getattr(pos, 'entry_htf_15m', 0.0), 3),
@@ -7094,13 +6870,13 @@ class QuantStrategy:
             "htf_ict_src":  (pos.entry_signal.htf_ict_source
                              if pos.entry_signal and hasattr(pos.entry_signal, 'htf_ict_source') else False),
         })
-        # Keep last 200 trades in memory â€” in-place trim avoids allocating a new list
-        # deque(maxlen=200) automatically evicts the oldest entry â€” no manual trim needed.
+        # Keep last 200 trades in memory Ã¢â‚¬â€ in-place trim avoids allocating a new list
+        # deque(maxlen=200) automatically evicts the oldest entry Ã¢â‚¬â€ no manual trim needed.
 
-        # â”€â”€ PostTradeAgent: full 5-dimension analysis + Telegram debrief â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ PostTradeAgent: full 5-dimension analysis + Telegram debrief Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Runs after _trade_history.append() so trade_record is available.
         # The Telegram debrief is a separate message from the raw exit summary
-        # already sent in _record_exchange_exit â€” it is purely analytical.
+        # already sent in _record_exchange_exit Ã¢â‚¬â€ it is purely analytical.
         if self._post_trade_agent is not None and self._trade_history:
             try:
                 _liq_snap_pt2 = getattr(self._liq_map, '_last_snapshot', None)
@@ -7157,7 +6933,7 @@ class QuantStrategy:
         # v6.0: Log margin % P&L
         _wl = "WIN" if is_win else "LOSS"
         logger.info(
-            f"ðŸ“Š TRADE {_wl}: PnL=${pnl:+.4f} | margin%={_margin_pnl_pct_final:+.1f}% "
+            f"Ã°Å¸â€œÅ  TRADE {_wl}: PnL=${pnl:+.4f} | margin%={_margin_pnl_pct_final:+.1f}% "
             f"on ${_margin_used_final:.2f} margin | reason={exit_reason} | "
             f"trades={self._total_trades} WR={self._winning_trades}/{self._total_trades} "
             f"session=${self._total_pnl:+.4f}")
@@ -7172,7 +6948,7 @@ class QuantStrategy:
         # _anchor_lock_until across the lifetime of the instance (one instance
         # per QuantStrategy, reused for every position).  If position A closed
         # while anchored to a 15m SSL at $66,800 and position B opens within
-        # the 90-second lock window, the engine would reuse A's stale anchor â€”
+        # the 90-second lock window, the engine would reuse A's stale anchor Ã¢â‚¬â€
         # structurally irrelevant and potentially in the wrong direction for B.
         # reset() clears both fields atomically; it is intentionally idempotent.
         if hasattr(self, '_liq_trail') and self._liq_trail is not None:
@@ -7188,14 +6964,14 @@ class QuantStrategy:
         # as the primary BSL/SSL target.
         #
         # Without this call, _last_snapshot carries the pre-close pool layout
-        # where the swept pool that triggered the trade has distance_atr â‰ˆ 0 and
+        # where the swept pool that triggered the trade has distance_atr Ã¢â€°Ë† 0 and
         # artificially inflated significance (touch bonuses accumulated before
         # death). DirectionEngine.predict_hunt() then biases the hunt score toward
         # the dead level, suppresses the Factor 5 asymmetry for live opposing pools,
-        # and returns NEUTRAL or wrong-side â€” blocking the post-close entry engine
+        # and returns NEUTRAL or wrong-side Ã¢â‚¬â€ blocking the post-close entry engine
         # from finding a qualifying signal until the snapshot naturally refreshes
         # (which requires liq_map.update() to produce a new snapshot, which only
-        # happens on the NEXT tick's _evaluate_entry path, ~250ms later â€” but the
+        # happens on the NEXT tick's _evaluate_entry path, ~250ms later Ã¢â‚¬â€ but the
         # damage is done because the snapshot used is always N-1).
         #
         # reset_snapshot() sets _last_snapshot = None. predict_hunt() then falls
@@ -7225,7 +7001,7 @@ class QuantStrategy:
         # These guards must persist until a new position opens (in _enter_trade).
         # Resetting them here was the v7.0 root cause of double-counting:
         # _finalise_exit() ran, reset the guard, then a late sync/reconcile
-        # thread called _record_pnl() and the guard was open â†’ duplicate.
+        # thread called _record_pnl() and the guard was open Ã¢â€ â€™ duplicate.
         self._pos = PositionState(); self._last_exit_time = time.time()
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
         # v6.0: Reset structure-event trail state for next trade
@@ -7236,7 +7012,7 @@ class QuantStrategy:
         # re-emits the "sl_order_id not set" warning if the problem recurs.
         self._trail_no_sl_warned = False
 
-        # ─── v9.1 FIX: delayed _exit_completed clear ──────────────────────────
+        # â”€â”€â”€ v9.1 FIX: delayed _exit_completed clear â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Production logs (2026-04-25) showed watchdog firing `stuck_exit_completed`
         # repeatedly: ~40s after every exit, _exit_completed was still True
         # because no new entry had triggered _enter_trade's reset path. The
@@ -7246,12 +7022,12 @@ class QuantStrategy:
         # Root cause: _exit_completed is intentionally left True for race
         # protection between the sync thread and the reconcile thread (both
         # can race into _record_exchange_exit). Once both threads have settled
-        # — empirically <10s — the race window is gone and the flag has no
+        # â€” empirically <10s â€” the race window is gone and the flag has no
         # remaining purpose until the next entry.
         #
         # Fix: schedule a one-shot daemon timer to clear the flag 60s after
-        # _finalise_exit. Race-protection window: 0–60s (more than enough).
-        # Watchdog threshold: 30s → no longer fires because the flag is
+        # _finalise_exit. Race-protection window: 0â€“60s (more than enough).
+        # Watchdog threshold: 30s â†’ no longer fires because the flag is
         # already False well within the post-exit grace.
         #
         # This timer is idempotent: if a new entry happens first and resets
@@ -7259,7 +7035,7 @@ class QuantStrategy:
         # False; assignment is harmless).
         try:
             def _delayed_exit_completed_clear():
-                # Safe even after a new position has opened — re-checks phase
+                # Safe even after a new position has opened â€” re-checks phase
                 # under the lock. Only clears if we're STILL flat and the
                 # flag is STILL true (i.e. nobody else has touched it).
                 try:
@@ -7283,7 +7059,7 @@ class QuantStrategy:
         except Exception as _te:
             logger.debug(f"failed to schedule _exit_completed clear: {_te}")
 
-        # ─── v9.1: notify the post-exit gate ──────────────────────────────────
+        # â”€â”€â”€ v9.1: notify the post-exit gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # The PostExitGate consumes the just-closed trade context to gate the
         # next entry. If the gate isn't wired (older deployments), this is a
         # silent no-op.
@@ -7316,7 +7092,7 @@ class QuantStrategy:
         except Exception as _pge:
             logger.debug(f"PostExitGate.record_exit skipped: {_pge}")
 
-        logger.info("Position closed â€” FLAT")
+        logger.info("Position closed Ã¢â‚¬â€ FLAT")
 
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,
@@ -7324,47 +7100,47 @@ class QuantStrategy:
                            sl_price: Optional[float] = None,
                            prefetched_bal_info: dict = None) -> Optional[float]:
         """
-        Risk-calibrated position sizing â€” v9.0 (CRIT-1 fix).
+        Risk-calibrated position sizing Ã¢â‚¬â€ v9.0 (CRIT-1 fix).
 
         FORMULA (industry standard):
-          sl_dist      = |price âˆ’ sl_price|                         (points)
-          risk_capital = available_balance Ã— RISK_PER_TRADE         (USD at risk)
-          qty_raw      = risk_capital Ã— total_mult / sl_dist        (BTC)
+          sl_dist      = |price Ã¢Ë†â€™ sl_price|                         (points)
+          risk_capital = available_balance Ãƒâ€” RISK_PER_TRADE         (USD at risk)
+          qty_raw      = risk_capital Ãƒâ€” total_mult / sl_dist        (BTC)
 
         This guarantees a fixed dollar loss at SL regardless of SL distance.
-        A 50-point SL and a 500-point SL both risk exactly RISK_PER_TRADE Ã— balance.
+        A 50-point SL and a 500-point SL both risk exactly RISK_PER_TRADE Ãƒâ€” balance.
 
         total_mult is a confidence scalar clamped to [0.40, 1.05]:
           ICT tier base:
-            Tier-S: 1.00Ã—  (full conviction â€” OTE sweep + AMD confirmed)
-            Tier-A: 0.80Ã—  (high conviction â€” ICT structural alignment)
-            Tier-B: 0.65Ã—  (standard quant + ICT confluence gate)
-            "":     0.50Ã—  (no ICT tier â€” reduced exposure)
+            Tier-S: 1.00Ãƒâ€”  (full conviction Ã¢â‚¬â€ OTE sweep + AMD confirmed)
+            Tier-A: 0.80Ãƒâ€”  (high conviction Ã¢â‚¬â€ ICT structural alignment)
+            Tier-B: 0.65Ãƒâ€”  (standard quant + ICT confluence gate)
+            "":     0.50Ãƒâ€”  (no ICT tier Ã¢â‚¬â€ reduced exposure)
 
         Composite score modifier (additive):
-          |composite| â‰¥ 0.70 â†’ +0.10
-          |composite| â‰¥ 0.50 â†’ +0.05
-          |composite| <  0.35 â†’ âˆ’0.10
+          |composite| Ã¢â€°Â¥ 0.70 Ã¢â€ â€™ +0.10
+          |composite| Ã¢â€°Â¥ 0.50 Ã¢â€ â€™ +0.05
+          |composite| <  0.35 Ã¢â€ â€™ Ã¢Ë†â€™0.10
 
         AMD confidence modifier (additive):
-          amd_conf â‰¥ 0.85 â†’ +0.08
-          amd_conf â‰¥ 0.70 â†’ +0.04
-          amd_conf <  0.50 â†’ âˆ’0.05
+          amd_conf Ã¢â€°Â¥ 0.85 Ã¢â€ â€™ +0.08
+          amd_conf Ã¢â€°Â¥ 0.70 Ã¢â€ â€™ +0.04
+          amd_conf <  0.50 Ã¢â€ â€™ Ã¢Ë†â€™0.05
 
         Margin guard: computed notional must not exceed available balance.
         """
-        # â”€â”€ SL distance guard â€” required for risk-based sizing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ SL distance guard Ã¢â‚¬â€ required for risk-based sizing Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if sl_price is None or sl_price <= 0:
-            logger.warning("_compute_quantity: sl_price required for risk-based sizing â€” aborting")
+            logger.warning("_compute_quantity: sl_price required for risk-based sizing Ã¢â‚¬â€ aborting")
             return None
         sl_dist = abs(price - sl_price)
         if sl_dist < 1e-8:
-            logger.warning(f"_compute_quantity: sl_dist={sl_dist:.2f} too small â€” aborting")
+            logger.warning(f"_compute_quantity: sl_dist={sl_dist:.2f} too small Ã¢â‚¬â€ aborting")
             return None
 
         step = QCfg.LOT_STEP()
 
-        # â”€â”€ Tier multiplier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Tier multiplier Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         _tier_base = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
         _pta = self._post_trade_agent
         if _pta is not None:
@@ -7377,7 +7153,7 @@ class QuantStrategy:
             _tier_adj = 1.0
         tier_mult = _tier_base * _tier_adj
 
-        # â”€â”€ Composite score modifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Composite score modifier Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         comp_mod = 0.0
         if sig is not None:
             abs_comp = abs(sig.composite)
@@ -7385,7 +7161,7 @@ class QuantStrategy:
             elif abs_comp >= 0.50: comp_mod = +0.05
             elif abs_comp <  0.35: comp_mod = -0.10
 
-        # â”€â”€ AMD confidence modifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ AMD confidence modifier Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         amd_mod = 0.0
         if sig is not None and sig.amd_conf > 0:
             if   sig.amd_conf >= 0.85: amd_mod = +0.08
@@ -7394,7 +7170,7 @@ class QuantStrategy:
 
         total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
 
-        # â”€â”€ Available balance (reuse prefetched â€” SIG-8 fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Available balance (reuse prefetched Ã¢â‚¬â€ SIG-8 fix) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()
         if bal is None:
             logger.warning("_compute_quantity: get_available_balance returned None")
@@ -7409,7 +7185,7 @@ class QuantStrategy:
         _bal_usage_pct = float(_cfg("BALANCE_USAGE_PERCENTAGE", 60.0))
         _bal_usage_frac = max(0.01, min(1.0, _bal_usage_pct / 100.0))
 
-        # â”€â”€ BUG 3 FIX: commission reserve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ BUG 3 FIX: commission reserve Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Delta rejects orders with `insufficient_commission` when available
         # balance minus required margin leaves less than the maker+taker round-
         # trip commission.  The old guard only compared margin to available
@@ -7417,18 +7193,18 @@ class QuantStrategy:
         # on a position that needs ~2.5-3 % of balance just to cover the exit
         # taker fee.  This silently wasted bracket-order REST calls.
         #
-        # Reserve: we charge an aggressive 2Ã— the live taker rate (entry taker
+        # Reserve: we charge an aggressive 2Ãƒâ€” the live taker rate (entry taker
         # worst-case + exit taker) plus a 15 % safety margin for slippage
         # variance.  For a $446 notional at COMMISSION_RATE=0.00055 this
-        # reserves ~$0.56 â€” enough to clear Delta's internal commission check
-        # with room to spare.  On a 30Ã— leveraged account this represents <1 %
+        # reserves ~$0.56 Ã¢â‚¬â€ enough to clear Delta's internal commission check
+        # with room to spare.  On a 30Ãƒâ€” leveraged account this represents <1 %
         # of the margin, a negligible position-size reduction for the safety.
         _taker_rate = float(_cfg("COMMISSION_RATE", 0.00055))
         _fee_reserve = price * _taker_rate * 2.0 * 1.15   # qty multiplied in next
         # We don't know qty yet, but we can compute a conservative reserve
         # from the max possible qty given available:
-        #   max_notional â‰ˆ available Ã— leverage (all balance as margin)
-        #   fee_reserve  â‰ˆ max_notional Ã— taker_rate Ã— 2 Ã— 1.15
+        #   max_notional Ã¢â€°Ë† available Ãƒâ€” leverage (all balance as margin)
+        #   fee_reserve  Ã¢â€°Ë† max_notional Ãƒâ€” taker_rate Ãƒâ€” 2 Ãƒâ€” 1.15
         _max_allowed_margin_raw = available * _bal_usage_frac
         _max_notional_headroom = _max_allowed_margin_raw * float(QCfg.LEVERAGE())
         _fee_budget = _max_notional_headroom * _taker_rate * 2.0 * 1.15
@@ -7441,7 +7217,7 @@ class QuantStrategy:
             )
             return None
 
-        # â”€â”€ Risk-based sizing (CRIT-1 fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Risk-based sizing (CRIT-1 fix) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # risk_pct: fraction of balance to risk per trade (e.g. 0.006 = 0.6%)
         risk_pct     = float(_cfg("RISK_PER_TRADE", 0.006))
         # Base risk capital on balance-after-fee-reserve so we don't over-size
@@ -7449,17 +7225,17 @@ class QuantStrategy:
         risk_capital = available_after_fees * risk_pct * total_mult
         qty_raw      = risk_capital / sl_dist
 
-        # â”€â”€ Lot-step + hard limits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Lot-step + hard limits Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         qty = math.floor(qty_raw / step) * step
         qty = round(qty, 8)
         qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), qty))
 
-        # â”€â”€ Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE Ã¢â€â‚¬
         # Bug #1 fix: the old guard compared required_margin against
-        # available_after_fees * 1.01 (â‰ˆ 101%), completely ignoring the
+        # available_after_fees * 1.01 (Ã¢â€°Ë† 101%), completely ignoring the
         # BALANCE_USAGE_PERCENTAGE config (e.g. 60%).  A 60% balance-usage
         # cap means the bot should never commit more than 60% of available
-        # funds as margin on any single trade â€” the remaining 40% stays liquid
+        # funds as margin on any single trade Ã¢â‚¬â€ the remaining 40% stays liquid
         # for commission, funding, and drawdown headroom.
         max_allowed_margin = available_after_fees * _bal_usage_frac
         required_margin = qty * price / QCfg.LEVERAGE()
@@ -7468,7 +7244,7 @@ class QuantStrategy:
                 f"Sizing guard: required margin ${required_margin:.2f} > "
                 f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
                 f"({_bal_usage_pct:.0f}% of ${available_after_fees:.2f} after fees) "
-                f"â€” scaling down"
+                f"Ã¢â‚¬â€ scaling down"
             )
             max_qty = math.floor(
                 (max_allowed_margin * QCfg.LEVERAGE() / price) / step
@@ -7480,18 +7256,18 @@ class QuantStrategy:
         if qty < QCfg.MIN_QTY():
             return None
 
-        # â”€â”€ Dollar-risk verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Dollar-risk verification Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         dollar_risk   = sl_dist * qty
         risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
         margin_used   = qty * price / QCfg.LEVERAGE()
         actual_fees   = qty * price * _taker_rate * 2.0   # worst-case round-trip
 
         logger.info(
-            f"âœ… Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "
+            f"Ã¢Å“â€¦ Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "
             f"tier={ict_tier or 'none'} "
             f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f}) | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
-            f"margin=${margin_used:.2f} | feesâ‰ˆ${actual_fees:.3f} | "
+            f"margin=${margin_used:.2f} | feesÃ¢â€°Ë†${actual_fees:.3f} | "
             f"headroom=${available - margin_used - actual_fees:.2f} | qty={qty}"
         )
         return qty
@@ -7499,26 +7275,26 @@ class QuantStrategy:
     @staticmethod
     def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
         """
-        Corrected PnL formula â€” v5.1.
+        Corrected PnL formula Ã¢â‚¬â€ v5.1.
 
         ROOT CAUSE OF PREVIOUS BUG:
         The old Delta branch computed:
             contracts = pos.quantity / DELTA_CONTRACT_VALUE_BTC   # e.g. 0.005/0.001 = 5
-        But Delta BTCUSD inverse perp has 1 USD per contract â€” NOT 0.001 BTC per contract.
-        To hold 0.005 BTC exposure at $68,856, you need 0.005 Ã— 68,856 = 344 USD contracts.
+        But Delta BTCUSD inverse perp has 1 USD per contract Ã¢â‚¬â€ NOT 0.001 BTC per contract.
+        To hold 0.005 BTC exposure at $68,856, you need 0.005 Ãƒâ€” 68,856 = 344 USD contracts.
         Dividing by 0.001 gave 5 contracts = $5 notional instead of $344 notional.
-        Result: gross PnL was ~68Ã— too small; net was always dominated by fees â†’ showed loss
+        Result: gross PnL was ~68Ãƒâ€” too small; net was always dominated by fees Ã¢â€ â€™ showed loss
         even when trailing SL locked 98 points of profit.
 
         FIX:
         For Delta BTCUSD inverse perp, convert BTC quantity to USD contracts by
         multiplying by entry_price (the correct economic relationship):
-            usd_contracts = pos.quantity Ã— pos.entry_price
+            usd_contracts = pos.quantity Ãƒâ€” pos.entry_price
         Then apply the standard inverse-perp formula.
 
         Mathematical note: for moves < 3% (all our trades), the inverse-perp formula
         is equivalent to the linear formula to 3 significant figures:
-            gross â‰ˆ pos.quantity Ã— |exit_price âˆ’ entry_price|
+            gross Ã¢â€°Ë† pos.quantity Ãƒâ€” |exit_price Ã¢Ë†â€™ entry_price|
         We use the exact inverse formula for correctness, but the linear approximation
         is included as a sanity check in debug logs.
 
@@ -7527,7 +7303,7 @@ class QuantStrategy:
 
         Fee basis: notional is measured at entry price (standard industry practice).
         """
-        # Uses the module-level `config` import â€” no per-call import overhead.
+        # Uses the module-level `config` import Ã¢â‚¬â€ no per-call import overhead.
         _is_delta = (getattr(config, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
                      and getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
 
@@ -7570,7 +7346,7 @@ class QuantStrategy:
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
 
     def get_stats(self):
-        """Returns stats based on CLOSED trades only â€” correct win-rate denominator."""
+        """Returns stats based on CLOSED trades only Ã¢â‚¬â€ correct win-rate denominator."""
         return {
             "total_trades":   self._total_trades,
             "winning_trades": self._winning_trades,
@@ -7596,14 +7372,14 @@ class QuantStrategy:
         atr = self._atr_5m.atr
         price = self._last_known_price
 
-        # â”€â”€ Session stats from _trade_history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Session stats from _trade_history Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         total_t  = self._total_trades
         wins     = self._winning_trades
         wr       = wins / total_t * 100.0 if total_t > 0 else 0.0
         total_pnl = self._total_pnl
         daily_pnl = getattr(self, '_daily_pnl', total_pnl)
 
-        # â”€â”€ Balance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Balance Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         balance = 0.0
         try:
             if hasattr(self, '_risk_manager') and self._risk_manager:
@@ -7611,7 +7387,7 @@ class QuantStrategy:
         except Exception:
             pass
 
-        # â”€â”€ ICT context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ICT context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         session      = ""
         kill_zone    = ""
         amd_phase    = ""
@@ -7646,7 +7422,7 @@ class QuantStrategy:
             except Exception:
                 regime = str(self._regime.regime) if self._regime else ""
 
-        # â”€â”€ HTF bias â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ HTF bias Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         htf_bias = ""
         if self._htf:
             try:
@@ -7654,10 +7430,10 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ Pool map summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Pool map summary Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         n_bsl = 0
         n_ssl = 0
-        target_str = "â€”"
+        target_str = "Ã¢â‚¬â€"
         flow_conv = getattr(self, '_flow_conviction', 0.0)
         flow_dir  = getattr(self, '_flow_direction', '')
         nearest_bsl = None
@@ -7671,7 +7447,7 @@ class QuantStrategy:
                 n_ssl = len([p for p in snap.ssl_pools if p.pool.price < price])
                 pt = snap.primary_target
                 if pt:
-                    direction = "BSL â–²" if pt.pool.side.value == "BSL" else "SSL â–¼"
+                    direction = "BSL Ã¢â€“Â²" if pt.pool.side.value == "BSL" else "SSL Ã¢â€“Â¼"
                     target_str = (f"{direction} ${pt.pool.price:,.0f} "
                                   f"({pt.distance_atr:.1f}ATR sig={pt.significance:.0f})")
 
@@ -7699,17 +7475,17 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ Engine state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Engine state Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         engine_state = "SCANNING"
         if hasattr(self, '_entry_engine') and self._entry_engine is not None:
             engine_state = self._entry_engine.state
 
-        # â”€â”€ Sweep analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Sweep analysis Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # GATE FIX: only surface sweep_analysis when the engine is actively in
         # POST_SWEEP. _last_sweep_analysis persists on the entry engine after the
         # POST_SWEEP window closes and the engine resets to SCANNING. Passing the
         # stale dict unconditionally caused every subsequent heartbeat to show
-        # "REV:0 CONT:0 UNDECIDED ? @ $0.0" for the rest of the session â€” not
+        # "REV:0 CONT:0 UNDECIDED ? @ $0.0" for the rest of the session Ã¢â‚¬â€ not
         # because there was no sweep analysis, but because the stale dict was
         # rendered on every report long after the sweep event resolved.
         if (engine_state == "POST_SWEEP"
@@ -7720,7 +7496,7 @@ class QuantStrategy:
             except Exception:
                 pass
 
-        # â”€â”€ Position dict â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Position dict Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         pos_dict = None
         pos_entry = None
         pos_sl = None
@@ -7746,7 +7522,7 @@ class QuantStrategy:
             be_moved = ((p.side == "long" and p.sl_price >= _be_price) or
                         (p.side == "short" and p.sl_price <= _be_price))
 
-        # â”€â”€ Build extra lines (execution costs + expectancy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Build extra lines (execution costs + expectancy) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         extra = []
         hist = self._trade_history
         if total_t > 0:
@@ -7783,7 +7559,7 @@ class QuantStrategy:
             try:
                 snap = self._fee_engine.diagnostic_snapshot()
                 warmed = snap.get('engine_warmed', False)
-                tag = "âœ…" if warmed else f"â³ ({snap.get('spread_samples',0)} samples)"
+                tag = "Ã¢Å“â€¦" if warmed else f"Ã¢ÂÂ³ ({snap.get('spread_samples',0)} samples)"
                 extra.append(f"  Costs {tag}: spread={snap['spread_median_bps']:.1f}bps "
                              f"slip={snap['slippage_ewma_bps']:.1f}bps")
             except Exception:
@@ -7792,7 +7568,7 @@ class QuantStrategy:
         extra.append(f"  ATR: ${atr:.1f} ({self._atr_5m.get_percentile():.0%} pctile)")
         extra.append(f"  VWAP: ${self._vwap.vwap:,.0f} (dev={self._vwap.deviation_atr:+.1f}ATR)")
 
-        # â”€â”€ DirectionEngine state for periodic report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ DirectionEngine state for periodic report Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         direction_hunt       = None
         direction_ps_analysis = None
         if _DIRECTION_ENGINE_AVAILABLE and self._dir_engine is not None:
@@ -7810,7 +7586,7 @@ class QuantStrategy:
                         pass
                     # BUG-1 FIX: Use _last_tick_flow/_last_cvd_trend (signed
                     # direction signals, set in _evaluate_entry each tick).
-                    # _flow_conviction is a non-negative magnitude â€” passing it
+                    # _flow_conviction is a non-negative magnitude Ã¢â‚¬â€ passing it
                     # here as tick_flow made all heartbeat reversal scores
                     # appear weakly-bullish regardless of true market direction.
                     _ps_eval = self._dir_engine.evaluate_sweep(
@@ -7867,7 +7643,7 @@ class QuantStrategy:
             direction_ps_analysis=direction_ps_analysis,
         )
 
-    # â”€â”€â”€ RECONCILIATION (unchanged logic, fixed PnL) â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ RECONCILIATION (unchanged logic, fixed PnL) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     def _reconcile_query_thread(self, order_manager):
         try:
             ex_pos = order_manager.get_open_position()
@@ -7910,13 +7686,13 @@ class QuantStrategy:
             if ex_entry < 1.0:
                 logger.warning(
                     f"Reconcile: skipping adoption of {ex_side} size={ex_size} "
-                    f"â€” entry_price={ex_entry:.2f} not yet settled on exchange")
+                    f"Ã¢â‚¬â€ entry_price={ex_entry:.2f} not yet settled on exchange")
                 return
 
-            # â”€â”€ FIX (third-trade bug): refuse ambiguous-side adoption â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ FIX (third-trade bug): refuse ambiguous-side adoption Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # The original code did `"long" if ex_side=="LONG" else "short"`,
             # which silently produced SHORT whenever ex_side was anything other
-            # than the exact literal "LONG" â€” including empty string, missing
+            # than the exact literal "LONG" Ã¢â‚¬â€ including empty string, missing
             # key, or lowercase. In the third-trade incident the exchange
             # returned an empty side on a genuinely-LONG position and the bot
             # adopted it as SHORT, then tracked an inverted phantom for 27m.
@@ -7939,18 +7715,18 @@ class QuantStrategy:
 
             if iside_from_str and iside_from_size and iside_from_str != iside_from_size:
                 logger.error(
-                    f"ðŸš¨ Reconcile: side conflict â€” str={ex_side} signed_size={ex_size_raw} "
-                    f"â€” REFUSING adoption. Will retry on next reconcile cycle.")
+                    f"Ã°Å¸Å¡Â¨ Reconcile: side conflict Ã¢â‚¬â€ str={ex_side} signed_size={ex_size_raw} "
+                    f"Ã¢â‚¬â€ REFUSING adoption. Will retry on next reconcile cycle.")
                 return
 
             iside = iside_from_str or iside_from_size
             if iside is None:
                 logger.error(
-                    f"ðŸš¨ Reconcile: ambiguous side (str={ex_side!r}, "
-                    f"size={ex_size_raw}) â€” REFUSING adoption of size={ex_size} "
+                    f"Ã°Å¸Å¡Â¨ Reconcile: ambiguous side (str={ex_side!r}, "
+                    f"size={ex_size_raw}) Ã¢â‚¬â€ REFUSING adoption of size={ex_size} "
                     f"at entry=${ex_entry:,.2f}. Will retry on next reconcile cycle.")
                 return
-            # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
             sl_oid=tp_oid=None; sl_p=tp_p=0.0
 
@@ -7970,14 +7746,14 @@ class QuantStrategy:
                           (iside == "short" and sl_p > ex_entry))
                 if not _sl_ok:
                     logger.warning(
-                        f"âš ï¸ Reconcile: discovered SL @ ${sl_p:,.2f} is on the "
-                        f"WRONG side of {iside} entry ${ex_entry:,.2f} â€” "
+                        f"Ã¢Å¡Â Ã¯Â¸Â Reconcile: discovered SL @ ${sl_p:,.2f} is on the "
+                        f"WRONG side of {iside} entry ${ex_entry:,.2f} Ã¢â‚¬â€ "
                         f"ignoring (was likely a prior trade's orphan).")
                     sl_oid = None; sl_p = 0.0
 
             # Compute initial_sl_dist for the adopted position.
             # When sl_p is known: use the actual distance from entry to SL.
-            # When sl_p is zero (no SL on exchange): fall back to 1.5Ã—ATR so the
+            # When sl_p is zero (no SL on exchange): fall back to 1.5Ãƒâ€”ATR so the
             # LiquidityTrailEngine has a valid R-denominator and doesn't stay
             # permanently in PHASE_0_HANDS_OFF at 0/0 = 0R.
             _adopt_atr = self._atr_5m.atr if (hasattr(self, '_atr_5m') and self._atr_5m and self._atr_5m.atr > 0) else 0.0
@@ -7994,23 +7770,23 @@ class QuantStrategy:
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
             self._pnl_recorded_for = 0.0
-            logger.warning(f"âš¡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
-            send_telegram_message(f"âš¡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+            logger.warning(f"Ã¢Å¡Â¡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
+            send_telegram_message(f"Ã¢Å¡Â¡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
 
-            # â”€â”€ FIX-ADOPT-ENGINE: Wire all per-position stateful engines at adoption.
-            # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ FIX-ADOPT-ENGINE: Wire all per-position stateful engines at adoption.
+            # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # The original _reconcile_apply set pos.phase = ACTIVE and returned.
             # It did NOT call any of the per-position engine lifecycle hooks that
             # _enter_trade calls after a normal order fill. This created three distinct
             # failure modes, all presenting as "bot stuck after adopted trade closes":
             #
             # (A) EntryEngine stays in EngineState.SCANNING (on_position_opened() never
-            #     called â†’ never transitions to IN_POSITION). The 14400s stuck-state
+            #     called Ã¢â€ â€™ never transitions to IN_POSITION). The 14400s stuck-state
             #     watchdog inside entry_engine.update() only fires for IN_POSITION, so
             #     a 4h+ adoption never triggers self-recovery. If _finalise_exit() ever
             #     throws between setting pos=FLAT and calling on_position_closed(), the
-            #     engine stays in SCANNING permanently â€” the state is already correct but
-            #     on_position_closed() â†’ _reset() â†’ purge _processed_sweeps is skipped,
+            #     engine stays in SCANNING permanently Ã¢â‚¬â€ the state is already correct but
+            #     on_position_closed() Ã¢â€ â€™ _reset() Ã¢â€ â€™ purge _processed_sweeps is skipped,
             #     leaving stale sweep holds that block re-entry.
             #
             # (B) LiquidityTrailEngine retains _locked_anchor from the PREVIOUS trade.
@@ -8023,13 +7799,13 @@ class QuantStrategy:
             #     predict_hunt() is called BEFORE liq_map.update() per direction_engine
             #     FIX-8. The snapshot in use carries whatever pool layout existed BEFORE
             #     the adoption. If a sweep happened just before adoption (which is common
-            #     â€” the bot adopted because its own trade signal was fast and the position
+            #     Ã¢â‚¬â€ the bot adopted because its own trade signal was fast and the position
             #     was already on exchange), the swept pool is still in the snapshot as the
             #     primary target. After adoption, that stale pool biases hunt predictions
             #     for the entire position lifetime.
             #
             # (D) DirectionEngine may have a stale PostSweepState if a sweep was detected
-            #     in the ticks leading up to adoption. clear_sweep() is idempotent â€” safe
+            #     in the ticks leading up to adoption. clear_sweep() is idempotent Ã¢â‚¬â€ safe
             #     to call even when no post-sweep state is active.
             #
             # Fixes applied here match the exact call sequence in _enter_trade (line ~4906):
@@ -8057,12 +7833,12 @@ class QuantStrategy:
                 except Exception as _de_e:
                     logger.debug(f"dir_engine.clear_sweep() at adopt error: {_de_e}")
 
-            # â”€â”€ FIX: if the adopted position has NO SL, this is an unprotected
+            # Ã¢â€â‚¬Ã¢â€â‚¬ FIX: if the adopted position has NO SL, this is an unprotected
             # state inherited from a prior failure. Trigger emergency flatten
             # rather than track a live unprotected position.
             if sl_oid is None:
                 logger.critical(
-                    f"ðŸ’€ Adopted {iside.upper()} has NO stop-loss on exchange â€” "
+                    f"Ã°Å¸â€™â‚¬ Adopted {iside.upper()} has NO stop-loss on exchange Ã¢â‚¬â€ "
                     f"emergency-flattening to prevent unbounded loss.")
                 try:
                     order_manager.emergency_flatten(reason="adopted_unprotected")
@@ -8070,7 +7846,7 @@ class QuantStrategy:
                     logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
             return
         if phase==PositionPhase.ACTIVE and ex_size<QCfg.MIN_QTY():
-            logger.info("ðŸ“¡ Reconcile: exchange FLAT â†’ TP/SL fired")
+            logger.info("Ã°Å¸â€œÂ¡ Reconcile: exchange FLAT Ã¢â€ â€™ TP/SL fired")
             self._record_exchange_exit(ex_pos); return
         if phase==PositionPhase.ACTIVE and ex_size>=QCfg.MIN_QTY():
             if (not self._pos.sl_order_id or not self._pos.tp_order_id) and open_orders:
@@ -8087,7 +7863,7 @@ class QuantStrategy:
                         if not _ok:
                             logger.warning(
                                 f"Reconcile: recovered SL @ ${trig:,.2f} contradicts "
-                                f"{_side} entry ${_ep:,.2f} â€” ignoring")
+                                f"{_side} entry ${_ep:,.2f} Ã¢â‚¬â€ ignoring")
                             continue
                         # Bug #8 fix: write sl_price under self._lock so the trail
                         # thread (which also writes sl_price under this lock) cannot
@@ -8099,14 +7875,14 @@ class QuantStrategy:
                             self.current_sl_price  = trig
                             if self._pos.initial_sl_dist == 0 and _ep > 0:
                                 self._pos.initial_sl_dist = abs(_ep - trig)
-                        logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}â€¦ @ ${trig:.2f}")
+                        logger.info(f"Reconcile: recovered SL order {o['order_id'][:8]}Ã¢â‚¬Â¦ @ ${trig:.2f}")
                     elif not self._pos.tp_order_id and _is_tp(ot):
                         # Bug #8 fix: same atomic write for TP fields.
                         with self._lock:
                             self._pos.tp_order_id  = o["order_id"]
                             self._pos.tp_price     = trig
                             self.current_tp_price  = trig
-                        logger.info(f"Reconcile: recovered TP order {o['order_id'][:8]}â€¦ @ ${trig:.2f}")
+                        logger.info(f"Reconcile: recovered TP order {o['order_id'][:8]}Ã¢â‚¬Â¦ @ ${trig:.2f}")
 
     def _sync_position(self, order_manager):
         try: ex_pos = order_manager.get_open_position()
@@ -8115,14 +7891,14 @@ class QuantStrategy:
         ex_size = float(ex_pos.get("size",0.0))
         if self._pos.phase==PositionPhase.ACTIVE:
             if ex_size<QCfg.MIN_QTY():
-                logger.info("ðŸ“¡ Sync: exchange FLAT â†’ TP/SL fired")
+                logger.info("Ã°Å¸â€œÂ¡ Sync: exchange FLAT Ã¢â€ â€™ TP/SL fired")
                 self._record_exchange_exit(ex_pos)
         elif self._pos.phase==PositionPhase.EXITING:
             if ex_size<QCfg.MIN_QTY():
                 # v8.0 FIX: call _record_exchange_exit, NOT _finalise_exit.
                 # The old code skipped PnL recording entirely for the normal
-                # EXITINGâ†’flat sync path.  _exit_trade sends estimated PnL via
+                # EXITINGÃ¢â€ â€™flat sync path.  _exit_trade sends estimated PnL via
                 # telegram but defers actual recording to this confirmation.
                 # Calling _finalise_exit directly meant PnL was never recorded.
-                logger.info("ðŸ“¡ Sync: EXITING confirmed FLAT â†’ recording exit")
+                logger.info("Ã°Å¸â€œÂ¡ Sync: EXITING confirmed FLAT Ã¢â€ â€™ recording exit")
                 self._record_exchange_exit(ex_pos)

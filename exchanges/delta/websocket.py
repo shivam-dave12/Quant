@@ -1,10 +1,10 @@
 """
-delta_websocket.py — Delta Exchange WebSocket Plugin
+delta_websocket.py â€” Delta Exchange WebSocket Plugin
 =====================================================
 Production-grade WebSocket client for Delta Exchange.
 
 Features:
-  - Native WebSocket (websocket-client library) — Delta uses raw WS, not Socket.IO
+  - Native WebSocket (websocket-client library) â€” Delta uses raw WS, not Socket.IO
   - Automatic reconnection with exponential backoff (max 30s)
   - Full auto-resubscription after reconnect (callbacks survive)
   - Thread-safe callback management
@@ -15,19 +15,19 @@ Features:
 
 Channel reference:
   Public (no auth):
-    v2/ticker:{symbol}              — best bid/ask, last price, 24h stats
-    v2/orderbook:{symbol}:{depth}   — L2 orderbook (depth = 5|10|20|50|200)
-    all_trades:{symbol}             — public trade feed
-    candlestick_1m:{symbol}         — 1-minute OHLCV
-    candlestick_{N}m:{symbol}       — Nm OHLCV (N = 3,5,15,30,60,120,240,1d)
-    mark_price:{symbol}             — mark price updates
-    funding_rate:{symbol}           — funding rate changes
+    v2/ticker:{symbol}              â€” best bid/ask, last price, 24h stats
+    v2/orderbook:{symbol}:{depth}   â€” L2 orderbook (depth = 5|10|20|50|200)
+    all_trades:{symbol}             â€” public trade feed
+    candlestick_1m:{symbol}         â€” 1-minute OHLCV
+    candlestick_{N}m:{symbol}       â€” Nm OHLCV (N = 3,5,15,30,60,120,240,1d)
+    mark_price:{symbol}             â€” mark price updates
+    funding_rate:{symbol}           â€” funding rate changes
 
   Private (requires auth):
-    v2/user/orders:{symbol}         — own order updates (create/fill/cancel)
-    v2/user/fills:{symbol}          — own fill events
-    v2/user/positions:{symbol}      — own position changes
-    v2/user/account                 — account balance / margin changes
+    v2/user/orders:{symbol}         â€” own order updates (create/fill/cancel)
+    v2/user/fills:{symbol}          â€” own fill events
+    v2/user/positions:{symbol}      â€” own position changes
+    v2/user/account                 â€” account balance / margin changes
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import websocket          # pip install websocket-client
 from dotenv import load_dotenv
@@ -51,16 +51,16 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 DELTA_WS_LIVE    = "wss://socket.india.delta.exchange"    # Delta India production
 DELTA_WS_TESTNET = "wss://socket-ind.testnet.deltaex.org"  # Delta India testnet
 
-# NOTE: wss://socket.delta.exchange is Delta GLOBAL — different product, different keys.
+# NOTE: wss://socket.delta.exchange is Delta GLOBAL â€” different product, different keys.
 
-# Candle channel name map: minutes → channel name prefix
+# Candle channel name map: minutes â†’ channel name prefix
 _CANDLE_CHANNEL: Dict[int, str] = {
     1:     "candlestick_1m",
     3:     "candlestick_3m",
@@ -77,9 +77,9 @@ _CANDLE_CHANNEL: Dict[int, str] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DATA CLASSES
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _Subscription:
     """
@@ -105,9 +105,9 @@ class _Subscription:
         self.delta_channel_spec = delta_channel_spec or {"name": channel}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # MAIN CLIENT
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class DeltaWebSocket:
     """
@@ -152,7 +152,7 @@ class DeltaWebSocket:
         self._last_message_time: Optional[datetime] = None
         self._msg_count:         int = 0
 
-        # Subscriptions: channel_name → _Subscription
+        # Subscriptions: channel_name â†’ _Subscription
         self._subs_lock = threading.RLock()
         self._subs:     Dict[str, _Subscription] = {}
 
@@ -173,7 +173,7 @@ class DeltaWebSocket:
         self.account_callbacks:    List[Callable]             = []
 
         logger.info(
-            f"DeltaWebSocket initialized — endpoint: {self.ws_url} "
+            f"DeltaWebSocket initialized â€” endpoint: {self.ws_url} "
             f"(testnet={testnet})"
         )
 
@@ -229,7 +229,7 @@ class DeltaWebSocket:
             self._connection_failures = 0
             self._reconnect_delay     = 1.0
             self._last_message_time   = datetime.now()
-            logger.info("✅ DeltaWebSocket connected")
+            logger.info("âœ… DeltaWebSocket connected")
             connected_event.set()
             # Authenticate if credentials available
             if self._is_authenticated():
@@ -359,7 +359,7 @@ class DeltaWebSocket:
         then sends the auth frame). Private channels are subscribed exclusively in
         _dispatch when the key-auth response arrives with success=True.
         Sending privates before auth confirmation causes Delta to reject them
-        silently, requiring a second subscription anyway — causing a race condition
+        silently, requiring a second subscription anyway â€” causing a race condition
         and duplicate subscriptions on every reconnect.
         """
         with self._subs_lock:
@@ -373,7 +373,7 @@ class DeltaWebSocket:
 
         if public_channels:
             self._subscribe_channels(public_channels)
-            logger.info(f"🔄 Resubscribed {len(public_channels)} public channels")
+            logger.info(f"ðŸ”„ Resubscribed {len(public_channels)} public channels")
 
     # =========================================================================
     # MESSAGE DISPATCH
@@ -388,33 +388,33 @@ class DeltaWebSocket:
           {"type": "all_trades",    "symbol": "BTCUSDT", "data": [...]}
           {"type": "candlestick_1m","symbol": "BTCUSDT", "open": ..., "close": ...}
           {"type": "v2/ticker",     "symbol": "BTCUSDT", ...}
-          {"type": "subscriptions", "payload": {...}}   ← subscription confirmation
+          {"type": "subscriptions", "payload": {...}}   â† subscription confirmation
           {"type": "heartbeat"}
 
-        The "type" field IS the channel name — no separate "channel" field.
+        The "type" field IS the channel name â€” no separate "channel" field.
         """
         msg_type = str(data.get("type", "")).lower()
         symbol   = str(data.get("symbol", "")).upper()
 
-        # ── System messages — ignore silently ─────────────────────────────────
+        # â”€â”€ System messages â€” ignore silently â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type in ("subscriptions", "heartbeat", "info"):
             logger.debug(f"WS system message: {msg_type}")
             return
 
-        # ── Auth response ─────────────────────────────────────────────────────
+        # â”€â”€ Auth response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type in ("key-auth", "auth"):
             if data.get("success"):
-                logger.info("✅ DeltaWebSocket authenticated (private channels active)")
+                logger.info("âœ… DeltaWebSocket authenticated (private channels active)")
                 with self._subs_lock:
                     priv = [s.delta_channel_spec for s in self._subs.values() if s.is_private]
                 if priv:
                     self._subscribe_channels(priv)
-                    logger.info(f"🔄 Resubscribed {len(priv)} private channels")
+                    logger.info(f"ðŸ”„ Resubscribed {len(priv)} private channels")
             else:
-                logger.error(f"❌ DeltaWebSocket auth failed: status={data.get('status','')} {data.get('message','')}")
+                logger.error(f"âŒ DeltaWebSocket auth failed: status={data.get('status','')} {data.get('message','')}")
             return
 
-        # ── Orderbook: type = "l2_orderbook" ─────────────────────────────────
+        # â”€â”€ Orderbook: type = "l2_orderbook" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type == "l2_orderbook":
             # Log the first raw orderbook message so we can verify field names
             if not getattr(self, '_ob_raw_logged', False):
@@ -422,14 +422,14 @@ class DeltaWebSocket:
                 buy_sample  = data.get("buy",  [])[:1]
                 sell_sample = data.get("sell", [])[:1]
                 logger.info(
-                    f"🔍 Orderbook raw sample — "
+                    f"ðŸ” Orderbook raw sample â€” "
                     f"buy[0]={buy_sample}  sell[0]={sell_sample}"
                 )
             fmt = self._fmt_orderbook(data)
             self._fire(self.orderbook_callbacks.get(symbol, []), fmt)
             return
 
-        # ── Trades: type = "all_trades" ───────────────────────────────────────
+        # â”€â”€ Trades: type = "all_trades" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type == "all_trades":
             # Delta sends a list of trades under "data" key
             trade_list = data.get("data", data.get("trades", [data]))
@@ -441,33 +441,33 @@ class DeltaWebSocket:
                     self._fire(self.trades_callbacks.get(symbol, []), self._fmt_trade(t))
             return
 
-        # ── Ticker: type = "v2/ticker" or "ticker" ────────────────────────────
+        # â”€â”€ Ticker: type = "v2/ticker" or "ticker" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if "ticker" in msg_type:
             self._fire(self.ticker_callbacks.get(symbol, []), data)
             return
 
-        # ── Candlestick: type = "candlestick_1m", "candlestick_5m", etc. ─────
+        # â”€â”€ Candlestick: type = "candlestick_1m", "candlestick_5m", etc. â”€â”€â”€â”€â”€
         if msg_type.startswith("candlestick_"):
             interval_key = self._parse_candle_interval_from_type(msg_type)
             if interval_key is None:
-                return   # unrecognised format — warning already logged, skip
+                return   # unrecognised format â€” warning already logged, skip
             self._fire(
                 self.candlestick_callbacks.get(interval_key, []),
                 self._fmt_candle(data, interval_key),
             )
             return
 
-        # ── Mark price ────────────────────────────────────────────────────────
+        # â”€â”€ Mark price â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if "mark_price" in msg_type:
             self._fire(self.mark_price_callbacks.get(symbol, []), data)
             return
 
-        # ── Funding rate ──────────────────────────────────────────────────────
+        # â”€â”€ Funding rate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if "funding_rate" in msg_type:
             self._fire(self.funding_callbacks.get(symbol, []), data)
             return
 
-        # ── Private: own orders ───────────────────────────────────────────────
+        # â”€â”€ Private: own orders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type == "orders" or "user/orders" in msg_type or msg_type == "user_orders":
             payload = data.get("payload", data)
             sym = str(payload.get("product_symbol", symbol)).upper()
@@ -475,7 +475,7 @@ class DeltaWebSocket:
             self._fire(cbs, payload)
             return
 
-        # ── Private: fills ────────────────────────────────────────────────────
+        # â”€â”€ Private: fills â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type == "fills" or "user/fills" in msg_type:
             payload = data.get("payload", data)
             sym = str(payload.get("product_symbol", symbol)).upper()
@@ -483,7 +483,7 @@ class DeltaWebSocket:
             self._fire(cbs, payload)
             return
 
-        # ── Private: positions ────────────────────────────────────────────────
+        # â”€â”€ Private: positions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type == "positions" or "user/positions" in msg_type or "position" in msg_type:
             payload = data.get("payload", data)
             sym = str(payload.get("symbol", symbol)).upper()
@@ -491,7 +491,7 @@ class DeltaWebSocket:
             self._fire(cbs, payload)
             return
 
-        # ── Private: account ──────────────────────────────────────────────────
+        # â”€â”€ Private: account â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if msg_type in ("trading_notifications","account_updates") or "user/account" in msg_type or "account" in msg_type:
             self._fire(self.account_callbacks, data.get("payload", data))
             return
@@ -503,12 +503,12 @@ class DeltaWebSocket:
         """
         Extract interval key from Delta message type string.
         Examples:
-          "candlestick_1m"  → "1"
-          "candlestick_5m"  → "5"
-          "candlestick_1h"  → "60"
-          "candlestick_1d"  → "1440"
+          "candlestick_1m"  â†’ "1"
+          "candlestick_5m"  â†’ "5"
+          "candlestick_1h"  â†’ "60"
+          "candlestick_1d"  â†’ "1440"
 
-        Returns None on any parse failure — callers must guard against None
+        Returns None on any parse failure â€” callers must guard against None
         to avoid misdirecting candles to the wrong timeframe bucket.
         Previously returned "1" as fallback, which silently routed 4h/1d
         candles to the 1m callback if Delta sent an unexpected type string.
@@ -517,16 +517,16 @@ class DeltaWebSocket:
             # Remove "candlestick_" prefix
             suffix = msg_type.replace("candlestick_", "")  # e.g. "1m", "5m", "1h"
             if suffix.endswith("m"):
-                return suffix[:-1]                          # "5m" → "5"
+                return suffix[:-1]                          # "5m" â†’ "5"
             if suffix.endswith("h"):
-                return str(int(suffix[:-1]) * 60)           # "1h" → "60"
+                return str(int(suffix[:-1]) * 60)           # "1h" â†’ "60"
             if suffix.endswith("d"):
                 return str(int(suffix[:-1]) * 1440)
             if suffix.endswith("w"):
                 return str(int(suffix[:-1]) * 10080)
         except Exception:
             pass
-        logger.warning(f"WS: unrecognised candlestick type '{msg_type}' — skipping")
+        logger.warning(f"WS: unrecognised candlestick type '{msg_type}' â€” skipping")
         return None
 
     @staticmethod
@@ -538,7 +538,7 @@ class DeltaWebSocket:
                 logger.error(f"WS callback error: {e}", exc_info=True)
 
     # =========================================================================
-    # DATA FORMATTERS — convert Delta WS format to bot-internal format
+    # DATA FORMATTERS â€” convert Delta WS format to bot-internal format
     # =========================================================================
 
     @staticmethod
@@ -572,10 +572,10 @@ class DeltaWebSocket:
                     # BUG-DWS-1 FIX: return native floats, not strings.
                     # Returning str(p_f) forced every consumer (market_aggregator,
                     # fee_engine, orderbook engine) to silently re-cast on every
-                    # orderbook update — adding per-tick overhead and masking type
+                    # orderbook update â€” adding per-tick overhead and masking type
                     # errors. All other exchanges already produce float pairs.
                     return [p_f, s_f]
-                # price == 0 → level deletion message; no useful data
+                # price == 0 â†’ level deletion message; no useful data
                 return None
             elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 p_f = float(lvl[0]) if lvl[0] else 0.0
@@ -647,37 +647,37 @@ class DeltaWebSocket:
         ts_raw = data.get("time", data.get("t", 0))
         ts_sec = int(ts_raw) if ts_raw else 0
         return {
-            "t": ts_sec * 1000,                            # s → ms
+            "t": ts_sec * 1000,                            # s â†’ ms
             "o": float(data.get("open",   0) or 0),
             "h": float(data.get("high",   0) or 0),
             "l": float(data.get("low",    0) or 0),
             "c": float(data.get("close",  0) or 0),
             "v": float(data.get("volume", 0) or 0),
             "i": interval_key,
-            # Delta doesn't send an "is_closed" flag — treat every message as
+            # Delta doesn't send an "is_closed" flag â€” treat every message as
             # a forming update; data_manager handles closed logic via next candle arrival
             "x": False,
         }
 
     @staticmethod
     def _parse_candle_interval(channel: str) -> Optional[str]:
-        """Extract interval string from channel name, e.g. 'candlestick_5m:BTCUSDT' → '5'.
-        Returns None on any parse failure — callers must guard against None."""
+        """Extract interval string from channel name, e.g. 'candlestick_5m:BTCUSDT' â†’ '5'.
+        Returns None on any parse failure â€” callers must guard against None."""
         # Channel format: candlestick_Xm:SYMBOL or candlestick_1h:SYMBOL
         try:
             part = channel.split(":")[0]          # e.g. 'candlestick_5m'
             suffix = part.split("_", 1)[1]        # e.g. '5m', '1h', '1d'
             if suffix.endswith("m"):
-                return suffix[:-1]                 # '5m' → '5'
+                return suffix[:-1]                 # '5m' â†’ '5'
             if suffix.endswith("h"):
-                return str(int(suffix[:-1]) * 60)  # '1h' → '60'
+                return str(int(suffix[:-1]) * 60)  # '1h' â†’ '60'
             if suffix.endswith("d"):
                 return str(int(suffix[:-1]) * 1440)
             if suffix.endswith("w"):
                 return str(int(suffix[:-1]) * 10080)
         except Exception:
             pass
-        logger.warning(f"WS: unrecognised candle channel '{channel}' — skipping")
+        logger.warning(f"WS: unrecognised candle channel '{channel}' â€” skipping")
         return None
 
     # =========================================================================
@@ -720,7 +720,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"📊 Subscribed orderbook: {sym_upper}")
+        logger.info(f"ðŸ“Š Subscribed orderbook: {sym_upper}")
 
     def subscribe_trades(
         self,
@@ -754,7 +754,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"💹 Subscribed trades: {sym_upper}")
+        logger.info(f"ðŸ’¹ Subscribed trades: {sym_upper}")
 
     def subscribe_ticker(
         self,
@@ -781,7 +781,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"📈 Subscribed ticker: {sym_upper}")
+        logger.info(f"ðŸ“ˆ Subscribed ticker: {sym_upper}")
 
     def subscribe_candlestick(
         self,
@@ -825,7 +825,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"🕯️  Subscribed {channel_name}: {sym_upper} (key={interval_key})")
+        logger.info(f"ðŸ•¯ï¸  Subscribed {channel_name}: {sym_upper} (key={interval_key})")
 
     def subscribe_mark_price(
         self,
@@ -887,7 +887,7 @@ class DeltaWebSocket:
         or without symbols for all products.
         """
         if not self._is_authenticated():
-            logger.warning("subscribe_orders: no credentials — private channel unavailable")
+            logger.warning("subscribe_orders: no credentials â€” private channel unavailable")
             return
         sym_upper = symbol.upper()
         channel   = f"user_orders.{sym_upper}"
@@ -904,7 +904,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"🔐 Subscribed orders: {sym_upper}")
+        logger.info(f"ðŸ” Subscribed orders: {sym_upper}")
 
     def subscribe_fills(
         self,
@@ -930,7 +930,7 @@ class DeltaWebSocket:
 
         if self.is_connected:
             self._subscribe_channels([spec])
-        logger.info(f"🔐 Subscribed fills: {sym_upper}")
+        logger.info(f"ðŸ” Subscribed fills: {sym_upper}")
 
     def subscribe_positions(
         self,
@@ -1019,69 +1019,10 @@ class DeltaWebSocket:
         return self._msg_count
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TYPE ALIAS — unused but avoids NameError in _fire
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# TYPE ALIAS â€” unused but avoids NameError in _fire
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from typing import Any
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    ob_count = [0]
-    trade_count = [0]
-    candle_count = [0]
-
-    def on_ob(data):
-        ob_count[0] += 1
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        if ob_count[0] <= 3:
-            if bids and asks:
-                bb = bids[0][0]; ba = asks[0][0]
-                warn = " ⚠️ ZERO PRICE - check raw log above" if float(bb) == 0 else ""
-                print(f"  📊 OB  best_bid={bb} best_ask={ba}  "
-                      f"(depth: {len(bids)}×{len(asks)}){warn}")
-            else:
-                print(f"  📊 OB received but bids/asks empty — raw keys: {list(data.keys())}")
-
-    def on_trade(data):
-        trade_count[0] += 1
-        if trade_count[0] <= 5:
-            side = "SELL" if data.get("m") else "BUY"
-            print(f"  💹 Trade  {side}  price={data.get('p')}  qty={data.get('q')}")
-
-    def on_candle(data):
-        candle_count[0] += 1
-        if candle_count[0] <= 3:
-            print(f"  🕯️  Candle[{data.get('i')}m]  "
-                  f"o={data.get('o')}  h={data.get('h')}  "
-                  f"l={data.get('l')}  c={data.get('c')}  v={data.get('v')}")
-
-    symbol = "BTCUSD"
-    ws = DeltaWebSocket()
-    ws.subscribe_orderbook(symbol, callback=on_ob, depth=5)
-    ws.subscribe_trades(symbol, callback=on_trade)
-    ws.subscribe_candlestick(symbol, interval=1, callback=on_candle)
-
-    print(f"Connecting to {ws.ws_url}...")
-    connected = ws.connect(timeout=15)
-    if connected:
-        print("✅ Connected! Listening for 60s...")
-        for i in range(60):
-            time.sleep(1)
-            if i % 10 == 9:
-                print(f"  [{i+1}s] OB updates: {ob_count[0]}  Trades: {trade_count[0]}  Candles: {candle_count[0]}")
-        print(f"\n=== FINAL COUNTS ===")
-        print(f"  Orderbook updates: {ob_count[0]}")
-        print(f"  Trades:            {trade_count[0]}")
-        print(f"  Candle updates:    {candle_count[0]}")
-        print(f"  Total WS messages: {ws.message_count}")
-    else:
-        print("❌ Connection failed")
-
-    ws.disconnect()
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

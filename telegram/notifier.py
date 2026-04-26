@@ -398,6 +398,9 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
     try:
         prio = _classify_priority(message)
 
+        if not _content_dedup_should_pass(prio, message):
+            return False
+
         # SPAM-FIX 2026-04-26: rate governor.  Drops non-CRITICAL messages
         # silently when the rolling 60s window exceeds TG_RATE_LIMIT_PER_MIN.
         # A periodic summary log is emitted so the operator sees it happened.
@@ -445,6 +448,7 @@ def get_queue_stats() -> Dict[str, Any]:
         "dropped_routine":  _dropped_routine,
         "dropped_important": _dropped_important,
         "dedup_hits":       _dedup_hits,
+        "content_dedup_hits": _content_dedup_hits,
         "rate_governed":    _rate_governed,
     }
 
@@ -482,10 +486,14 @@ _rate_window: deque = deque(maxlen=512)  # ts of recent non-CRITICAL sends
 _rate_governed: int = 0
 _rate_suppressed_summary_ts: float = 0.0
 _rate_suppressed_since_summary: int = 0
+_content_dedup_lock = threading.Lock()
+_content_dedup_state: Dict[str, float] = {}
+_content_dedup_hits: int = 0
 
 # Tunables — overridable via add_telegram_suppress_pattern's neighbour API
 TG_RATE_LIMIT_PER_MIN: int = 30          # rolling 60s budget for non-CRITICAL
 TG_RATE_SUMMARY_INTERVAL: float = 300.0  # how often to emit "[N suppressed]"
+TG_CONTENT_DEDUP_TTL: float = 20.0       # same alert shape within this window
 
 
 def _dedup_should_send(key: str, ttl: float) -> bool:
@@ -539,6 +547,39 @@ def _rate_governor_should_pass(prio: int) -> bool:
         return True
 
 
+_CONTENT_NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\$?\d[\d,]*(?:\.\d+)?%?")
+_CONTENT_WS_RE = re.compile(r"\s+")
+
+
+def _content_fingerprint(message: str) -> str:
+    text = re.sub(r"<[^>]*>", " ", str(message))
+    text = _html_lib.unescape(text)
+    text = _CONTENT_NUMBER_RE.sub("#", text)
+    text = _CONTENT_WS_RE.sub(" ", text).strip().upper()
+    return text[:280]
+
+
+def _content_dedup_should_pass(prio: int, message: str) -> bool:
+    if prio == PRIO_CRITICAL or TG_CONTENT_DEDUP_TTL <= 0:
+        return True
+    key = _content_fingerprint(message)
+    if not key:
+        return True
+    global _content_dedup_hits
+    now = time.time()
+    with _content_dedup_lock:
+        next_ok = _content_dedup_state.get(key, 0.0)
+        if now < next_ok:
+            _content_dedup_hits += 1
+            return False
+        _content_dedup_state[key] = now + TG_CONTENT_DEDUP_TTL
+        if len(_content_dedup_state) > 800:
+            for k, v in list(_content_dedup_state.items()):
+                if v < now:
+                    _content_dedup_state.pop(k, None)
+        return True
+
+
 def send_telegram_dedup(
     key: str,
     ttl: float,
@@ -575,6 +616,8 @@ def reset_dedup_state() -> None:
         _dedup_state.clear()
     with _rate_lock:
         _rate_window.clear()
+    with _content_dedup_lock:
+        _content_dedup_state.clear()
 
 
 # ======================================================================

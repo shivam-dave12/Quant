@@ -57,10 +57,18 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────────────────────────
-# Optional MTF probability dependency — degrade gracefully if not installed.
+# MTF probability dependency.
+#
+# The codebase ships modules under the `strategy.` package, so try that path
+# first. Fall back to the bare-name import for direct/standalone runs (tests,
+# REPL, dev scripts). Only when BOTH paths fail do we use the local fallback
+# math — and even then we log at DEBUG, not WARNING: this is a wiring issue
+# for the developer, not an actionable alert for the operator running the bot,
+# and a WARNING here would route into the Telegram queue via the log handler.
 # ────────────────────────────────────────────────────────────────────────────
+_MTF_AVAILABLE = False
 try:
-    from mtf_pool_probability import (   # type: ignore
+    from strategy.mtf_pool_probability import (   # type: ignore
         MTFPoolProbability,
         PoolProbability as _PoolProb,
         _DECAY_LAMBDA,
@@ -68,13 +76,35 @@ try:
         _MAX_REACH_ATR,
     )
     _MTF_AVAILABLE = True
+except ImportError:
+    try:
+        from mtf_pool_probability import (   # type: ignore
+            MTFPoolProbability,
+            PoolProbability as _PoolProb,
+            _DECAY_LAMBDA,
+            _TF_BASE_PROB,
+            _MAX_REACH_ATR,
+        )
+        _MTF_AVAILABLE = True
+    except ImportError as _e:
+        logger.debug(
+            "mtf_pool_probability not importable from either 'strategy.' or "
+            "bare path — selector will use local fallback (exp decay × "
+            "tf_base_prob). Reason: %s", _e,
+        )
+
+if not _MTF_AVAILABLE:
+    # Local fallback constants — must mirror mtf_pool_probability so behaviour
+    # stays consistent when the real module is wired in later.
+    _DECAY_LAMBDA = {"2m": 0.50, "5m": 0.80, "15m": 1.20,
+                     "1h":  2.50, "4h":  4.00, "1d":  6.00}
+    _TF_BASE_PROB = {"2m": 0.35, "5m": 0.45, "15m": 0.55,
+                     "1h":  0.70, "4h":  0.80, "1d":  0.65}
+    _MAX_REACH_ATR = {"2m": 1.5, "5m": 3.0, "15m": 5.0,
+                      "1h":  8.0, "4h": 12.0, "1d": 18.0}
+    _mtf_engine = None   # type: ignore[assignment]
+else:
     _mtf_engine = MTFPoolProbability()
-except Exception as _e:
-    logger.warning("mtf_pool_probability unavailable in selector: %s", _e)
-    _MTF_AVAILABLE = False
-    _DECAY_LAMBDA = {"5m": 0.8, "15m": 1.2, "1h": 2.5, "4h": 4.0, "1d": 6.0}
-    _TF_BASE_PROB = {"5m": 0.45, "15m": 0.55, "1h": 0.70, "4h": 0.80, "1d": 0.65}
-    _MAX_REACH_ATR = {"5m": 3.0, "15m": 5.0, "1h": 8.0, "4h": 12.0, "1d": 18.0}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -347,6 +377,44 @@ def _reach_buffer(distance_atr: float, atr: float) -> float:
     return max(0.10, min(0.50, 0.10 + 0.05 * distance_atr)) * atr
 
 
+def _breakeven_move(entry: float, atr: float) -> float:
+    """Conservative round-trip cost + execution-noise estimate."""
+    try:
+        import config as _cfg
+        maker = abs(float(getattr(_cfg, "COMMISSION_RATE_MAKER", 0.0002)))
+        taker = abs(float(getattr(_cfg, "COMMISSION_RATE", 0.00055)))
+        fee_rate = max(maker, min(taker, 0.00045))
+    except Exception:
+        fee_rate = 0.00045
+    return max(entry * fee_rate * 2.0, 0.0) + 0.18 * max(atr, 0.0)
+
+
+def _target_utility(raw_prob: float, rr: float, min_rr: float,
+                    distance_atr: float, reward: float,
+                    be_move: float) -> Tuple[float, Dict[str, float]]:
+    """
+    Convert hit probability into trade utility.
+
+    Near pools often have high sweep probability but too little room after
+    fees, slippage, and BE migration. This utility still respects probability,
+    but pays for durable R and distance beyond the cost envelope.
+    """
+    rr_excess = max(0.0, rr - float(min_rr))
+    rr_utility = math.sqrt(max(rr, 0.0)) * (1.0 + min(rr_excess * 0.35, 1.25))
+    delivery_room = max(0.0, reward - be_move)
+    be_surplus_atr = delivery_room / max(be_move, 1e-9)
+    be_quality = 0.35 + 0.65 * min(be_surplus_atr / 2.0, 1.0)
+    distance_quality = 1.0 - math.exp(-max(distance_atr - 0.35, 0.0) / 1.8)
+    distance_quality = max(0.25, distance_quality)
+    utility = raw_prob * rr_utility * be_quality * distance_quality
+    return utility, {
+        "rr_utility": rr_utility,
+        "be_quality": be_quality,
+        "distance_quality": distance_quality,
+        "be_move": be_move,
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # TP POOL SCORING
 # ════════════════════════════════════════════════════════════════════════════
@@ -382,6 +450,7 @@ def score_tp_pools(
 
     now_ts = now or time.time()
     out: List[PoolScore] = []
+    be_move = _breakeven_move(entry, atr)
 
     for target in pools:
         try:
@@ -426,9 +495,8 @@ def score_tp_pools(
                 * _touch_penalty(pool)
             )
 
-            # RR quality bonus: each +1R above min_rr adds 30% (capped at +90%).
-            rr_excess = max(0.0, rr - float(min_rr))
-            rr_quality = 1.0 + min(rr_excess * _W_RR_QUALITY, 0.90)
+            utility, utility_components = _target_utility(
+                raw_prob, rr, float(min_rr), dist_atr, reward, be_move)
 
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
@@ -438,7 +506,7 @@ def score_tp_pools(
             #   - probability dominates (multiplicative base).
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
-            ev = raw_prob * _W_PROBABILITY * confluence * rr_quality * gauntlet_mult
+            ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -447,6 +515,8 @@ def score_tp_pools(
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
+            if utility_components["be_quality"] < 0.75:
+                reasons.append("thin post-BE room")
             if _safe(pool, "ob_aligned", False):
                 reasons.append("OB-aligned")
             if _safe(pool, "fvg_aligned", False):
@@ -466,7 +536,10 @@ def score_tp_pools(
                 components   = {
                     "raw_prob":    raw_prob,
                     "confluence":  confluence,
-                    "rr_quality":  rr_quality,
+                    "rr_quality":  utility_components["rr_utility"],
+                    "be_quality":  utility_components["be_quality"],
+                    "distance_quality": utility_components["distance_quality"],
+                    "be_move":     utility_components["be_move"],
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
                 },
@@ -541,7 +614,6 @@ def score_sl_pool(
     for t in candidates:
         sig = float(_safe(t, "significance", 0.0))
         struct = _structural_bonus(t.pool)
-        htf_m  = _htf_alignment_bonus(t.pool, side, htf)
         fresh  = _freshness_bonus(t.pool)
         touch  = _touch_penalty(t.pool)
 

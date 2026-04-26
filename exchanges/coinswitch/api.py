@@ -1,5 +1,5 @@
 """
-exchanges/coinswitch/api.py — CoinSwitch Futures REST API
+exchanges/coinswitch/api.py â€” CoinSwitch Futures REST API
 =========================================================
 """
 
@@ -42,7 +42,7 @@ class FuturesAPI:
         """
         Generate ED25519 signature
 
-        IMPORTANT — VERIFY AGAINST COINSWITCH OFFICIAL DOCS BEFORE RELYING ON THIS:
+        IMPORTANT â€” VERIFY AGAINST COINSWITCH OFFICIAL DOCS BEFORE RELYING ON THIS:
         The historical codebase always signed with the literal string "{}" as
         the body, regardless of method. If CoinSwitch actually requires the
         JSON body of POST/DELETE requests to be signed, this is WRONG and
@@ -59,7 +59,7 @@ class FuturesAPI:
             method: HTTP method
             endpoint: API endpoint
             params: Query parameters (GET only)
-            payload: Body payload (POST/DELETE) — NOT included in signature
+            payload: Body payload (POST/DELETE) â€” NOT included in signature
                      under the current spec.
 
         Returns:
@@ -77,7 +77,7 @@ class FuturesAPI:
         # URL in its ENCODED form. Any query-parameter value containing
         # reserved characters ('+', '/', '=', '%', ' ', '&') would cause
         # the signature to be computed over a DIFFERENT string than the
-        # server reconstructs from the URL → signature mismatch → 401.
+        # server reconstructs from the URL â†’ signature mismatch â†’ 401.
         # Fix: sign the EXACT string we send on the wire.
         #
         # If CoinSwitch's reference impl requires the unquoted form (their
@@ -108,7 +108,7 @@ class FuturesAPI:
 
         Always returns a dict. On any failure (network, HTTP error, invalid
         JSON response body) returns {"error": "...", "status_code": <int|None>}.
-        Never raises — callers rely on dict semantics everywhere.
+        Never raises â€” callers rely on dict semantics everywhere.
         """
         signature = self._generate_signature(method, endpoint, params, payload)
 
@@ -446,19 +446,3 @@ class FuturesAPI:
             }
 
 
-if __name__ == "__main__":
-    # Quick test
-    try:
-        api = FuturesAPI()
-        print("✓ Futures API initialized successfully")
-        
-        # Test getting positions
-        positions = api.get_positions()
-        print(f"✓ Positions retrieved: {positions}")
-        
-        # Test getting wallet balance
-        balance = api.get_wallet_balance()
-        print(f"✓ Wallet balance retrieved")
-    
-    except Exception as e:
-        print(f"✗ Error: {e}")

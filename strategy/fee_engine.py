@@ -510,7 +510,7 @@ class ExecutionCostEngine:
         # After fill confirmed:
         self._fee_engine.record_fill(expected_price, fill_price, leg="entry")
 
-        # In _compute_sl_tp to gate TP viability:
+        # In entry validation to assess TP viability:
         min_move = self._fee_engine.min_required_tp_move(
             price, atr, atr_pctile, use_maker, composite_score)
 

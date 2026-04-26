@@ -163,6 +163,44 @@ class TerminalFormatter(ISTFormatter):
         return prefix + msg.replace("\n", "\n" + " " * len(_ANSI_LOG_RE.sub("", prefix)))
 
 
+class TerminalBurstFilter(logging.Filter):
+    """Suppress repeated tick-level terminal messages while keeping file logs intact."""
+
+    _NOISY_MARKERS = (
+        "Trail HOLD",
+        "FibTrail",
+        "POOL-GATE",
+        "POST-SWEEP",
+        "SWEEP REJECTED",
+        "ENTRY REJECTED (R:R)",
+        "FLOW_ADVISORY",
+    )
+    _NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\$?\d[\d,]*(?:\.\d+)?%?")
+
+    def __init__(self, interval_sec: float = 20.0):
+        super().__init__()
+        self.interval_sec = interval_sec
+        self._next_ok = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = _repair_mojibake(record.getMessage())
+        if not any(marker in msg for marker in self._NOISY_MARKERS):
+            return True
+        key = (record.name, self._NUMBER_RE.sub("#", msg)[:240])
+        now = time.time()
+        with self._lock:
+            next_ok = self._next_ok.get(key, 0.0)
+            if now < next_ok:
+                return False
+            self._next_ok[key] = now + self.interval_sec
+            if len(self._next_ok) > 500:
+                expired = [k for k, v in self._next_ok.items() if v < now]
+                for k in expired:
+                    self._next_ok.pop(k, None)
+            return True
+
+
 _ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 _term_fmt = TerminalFormatter(
     enable_color=(
@@ -180,6 +218,7 @@ _stream_handler = logging.StreamHandler(
     if hasattr(sys.stdout, "buffer") else sys.stdout
 )
 _stream_handler.setFormatter(_term_fmt)
+_stream_handler.addFilter(TerminalBurstFilter())
 
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),
