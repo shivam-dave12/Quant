@@ -1,16 +1,12 @@
 """
 risk/risk_manager.py — Liquidity-First Risk Manager
 =====================================================
-Position sizing and risk control for the liquidity-first architecture.
+Account risk ledger for the liquidity-first architecture.
 
-Key changes from VWAP-reversion model:
-  - calculate_position_size() now accepts an optional pool_tp_price so the
-    R:R is evaluated against the actual opposing-pool target, not a VWAP
-    fraction.  When pool_tp_price is provided it is used as the TP reference
-    for R:R validation; the dollar risk budget is unchanged.
-  - All other risk limits (daily loss, consecutive losses, drawdown, cooldown)
-    are retained unchanged — they are architecture-agnostic.
-  - Balance caching and thread-safety model unchanged.
+Entry sizing now lives in QuantStrategy's institutional decision path, where
+actual SL distance, liquidity-backed TP, liquidation guard, and engine
+confluence are available together. RiskManager owns account state: balance,
+cooldowns, daily loss, trade history, and reset bookkeeping.
 """
 
 import logging
@@ -42,15 +38,11 @@ class TradeRecord:
 
 class RiskManager:
     """
-    Liquidity-first risk manager.
+    Liquidity-first account risk manager.
 
-    Position sizing model (pool-to-pool):
-      1. Dollar risk  = RISK_PER_TRADE% of available balance.
-      2. Notional     = dollar_risk / sl_distance_pct.
-      3. qty (BTC)    = notional / entry_price.
-      4. Margin cap   applied if needed.
-      5. R:R validated against pool_tp_price (opposing pool sweep) when
-         provided; falls back to MIN_RISK_REWARD_RATIO config guard.
+    This class intentionally does not size entries. Sizing requires the full
+    institutional thesis context, so QuantStrategy owns it and RiskManager
+    supplies the account ledger and trade gates.
     """
 
     def __init__(self, shared_api=None):
@@ -192,221 +184,6 @@ class RiskManager:
                 self._balance_fetch_started_at = 0.0
             return {"available": _fallback_avail, "total": _fallback_total,
                     "cached": True, "error": str(e)}
-
-    # =========================================================================
-    # POSITION SIZING (pool-aware)
-    # =========================================================================
-
-    def calculate_position_size(
-        self,
-        entry_price:   float,
-        stop_loss:     float,
-        side:          str,
-        pool_tp_price: Optional[float] = None,   # ← opposing pool sweep price
-    ) -> Optional[float]:
-        """
-        Calculate BTC position size for a liquidity-pool trade.
-
-        Sizing steps:
-          1. Dollar risk  = RISK_PER_TRADE% of available balance.
-          2. Notional     = dollar_risk / sl_distance_pct.
-          3. qty (BTC)    = notional / entry_price.
-          4. Margin cap   if margin > BALANCE_USAGE_PERCENTAGE% or
-                          MAX_MARGIN_PER_TRADE → scale down.
-          5. R:R guard    if pool_tp_price is supplied, verify that the
-                          trade's R:R meets MIN_RISK_REWARD_RATIO before
-                          returning.  A pool-based TP should always pass;
-                          if it fails the pool target is too close and the
-                          setup should be skipped.
-          6. Hard limits  MIN/MAX_POSITION_SIZE.
-
-        Args:
-            entry_price:   Intended fill price (OTE limit or market).
-            stop_loss:     ICT structural SL (sweep wick → OB → swing).
-            side:          "LONG" | "SHORT".
-            pool_tp_price: Price of the opposing liquidity pool (target).
-                           When provided, R:R is validated before returning.
-                           Pass None to skip R:R validation (used during
-                           sizing preview before TP is confirmed).
-
-        Returns:
-            BTC quantity (float) or None if size is invalid.
-
-        NOTE: No division by LEVERAGE.  `quantity` is the actual BTC position.
-        Leverage is implicit — the exchange holds (quantity × price / leverage)
-        as margin.  Dividing qty by leverage during sizing was a prior bug
-        that produced positions 25× too small.
-        """
-        try:
-            entry_price = float(entry_price)
-            stop_loss   = float(stop_loss)
-            side        = str(side).upper()
-
-            if side not in ("LONG", "SHORT"):
-                logger.error(f"Invalid side: {side}")
-                return None
-
-            # ── Balance ───────────────────────────────────────────────
-            balance_info = self.get_available_balance()
-            if not balance_info:
-                logger.error("Failed to get balance")
-                return None
-            available = balance_info.get("available", 0.0)
-            if available <= 0:
-                logger.error(f"No available balance: {available}")
-                return None
-
-            # ── BUG 3 FIX: commission reserve ─────────────────────────
-            # Delta rejects `insufficient_commission` when balance minus
-            # margin leaves less than the maker+taker round-trip fee.
-            # Reserve: 2× taker rate (worst case) × 1.15 safety margin.
-            _taker_rate = float(getattr(config, "COMMISSION_RATE", 0.00055))
-            _max_allowed_margin = min(
-                available * (float(config.BALANCE_USAGE_PERCENTAGE) / 100.0),
-                float(config.MAX_MARGIN_PER_TRADE),
-            )
-            _max_allowed_margin = max(_max_allowed_margin, float(config.MIN_MARGIN_PER_TRADE))
-            _max_notional = _max_allowed_margin * float(config.LEVERAGE)
-            _fee_budget   = _max_notional * _taker_rate * 2.0 * 1.15
-            available_after_fees = max(0.0, available - _fee_budget)
-            if available_after_fees < config.MIN_MARGIN_PER_TRADE:
-                logger.error(
-                    f"Balance after fee reserve ${available_after_fees:.2f} < "
-                    f"MIN_MARGIN ${config.MIN_MARGIN_PER_TRADE:.2f} "
-                    f"(raw=${available:.2f} fee_reserve=${_fee_budget:.2f})"
-                )
-                return None
-
-            # ── SL distance ───────────────────────────────────────────
-            if side == "LONG":
-                price_distance = entry_price - stop_loss
-                if stop_loss >= entry_price:
-                    logger.error(f"Invalid LONG SL: {stop_loss} must be < entry {entry_price}")
-                    return None
-            else:
-                price_distance = stop_loss - entry_price
-                if stop_loss <= entry_price:
-                    logger.error(f"Invalid SHORT SL: {stop_loss} must be > entry {entry_price}")
-                    return None
-
-            if price_distance <= 0:
-                logger.error(f"Invalid SL distance: {price_distance:.2f}")
-                return None
-
-            sl_pct = price_distance / entry_price
-
-            min_sl_pct = float(getattr(config, "MIN_SL_DISTANCE_PCT", 0.004))
-            if sl_pct < min_sl_pct:
-                logger.error(
-                    f"SL too tight: {sl_pct*100:.3f}% "
-                    f"(min {min_sl_pct*100:.2f}%)")
-                return None
-            if sl_pct > 0.10:
-                logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
-
-            leverage = max(float(config.LEVERAGE), 1.0)
-            maint_margin = float(getattr(config, "MAINTENANCE_MARGIN_RATE", 0.005))
-            liq_buffer = float(getattr(config, "LIQUIDATION_BUFFER_PCT", 0.005))
-            liq_move = max((1.0 / leverage) - maint_margin, 0.0)
-            if side == "LONG":
-                liq_price = entry_price * (1.0 - liq_move)
-                min_safe_sl = liq_price * (1.0 + liq_buffer)
-                if stop_loss <= min_safe_sl:
-                    logger.error(
-                        "SL fails liquidation sanity: LONG SL %.2f <= liq+buffer %.2f",
-                        stop_loss, min_safe_sl,
-                    )
-                    return None
-            else:
-                liq_price = entry_price * (1.0 + liq_move)
-                max_safe_sl = liq_price * (1.0 - liq_buffer)
-                if stop_loss >= max_safe_sl:
-                    logger.error(
-                        "SL fails liquidation sanity: SHORT SL %.2f >= liq-buffer %.2f",
-                        stop_loss, max_safe_sl,
-                    )
-                    return None
-
-            # ── Step 1: Dollar risk budget (based on fee-adjusted balance) ─
-            # CFG-1 fix: RISK_PER_TRADE is now a FRACTION (0.006 = 0.6%) per
-            # config.py convention, aligned with quant_strategy._compute_quantity.
-            # Previously this divided by 100 treating the value as a percent,
-            # while quant_strategy used the raw value as a fraction — so the
-            # same 0.60 gave 0.6% here but 60% there, producing 100× over-sizing
-            # with the "required margin > available — scaling down" warnings.
-            # Now both consumers read the same fraction; the max-risk cap is
-            # also expressed as a fraction (5% absolute ceiling).
-            dollar_risk     = available_after_fees * config.RISK_PER_TRADE
-            dollar_risk     = max(config.MIN_MARGIN_PER_TRADE, dollar_risk)
-            _max_risk_frac  = min(config.RISK_PER_TRADE * 3.0, 0.05)
-            max_dollar_risk = available_after_fees * _max_risk_frac
-            dollar_risk     = min(dollar_risk, max_dollar_risk)
-
-            # ── Step 2: Risk-based notional + qty ─────────────────────
-            notional      = dollar_risk / sl_pct
-            position_size = notional / entry_price
-
-            # ── Step 3: Margin cap (uses fee-adjusted balance) ────────
-            margin_required = position_size * entry_price / config.LEVERAGE
-            max_margin = min(
-                available_after_fees * (config.BALANCE_USAGE_PERCENTAGE / 100),
-                config.MAX_MARGIN_PER_TRADE
-            )
-            max_margin = max(max_margin, config.MIN_MARGIN_PER_TRADE)
-
-            if margin_required > max_margin:
-                scale         = max_margin / margin_required
-                position_size = position_size * scale
-                notional      = position_size * entry_price
-                margin_required = max_margin
-                logger.debug(f"Position scaled by {scale:.3f} to respect margin cap ${max_margin:.2f}")
-
-            # ── Step 4: Hard limits ───────────────────────────────────
-            position_size = max(config.MIN_POSITION_SIZE,
-                                min(position_size, config.MAX_POSITION_SIZE))
-            position_size = round(position_size, 4)
-
-            if position_size < config.MIN_POSITION_SIZE:
-                logger.error(
-                    f"Position size too small: {position_size} BTC "
-                    f"(min: {config.MIN_POSITION_SIZE})"
-                )
-                return None
-
-            # ── Step 5: Pool-based R:R logging (advisory — no longer blocks) ─
-            if pool_tp_price is not None:
-                tp_distance = abs(pool_tp_price - entry_price)
-                actual_rr   = tp_distance / price_distance if price_distance > 0 else 0.0
-                logger.debug(f"Pool R:R: {actual_rr:.2f}:1 "
-                             f"(pool_tp=${pool_tp_price:,.2f})")
-
-            # ── Logging ───────────────────────────────────────────────
-            actual_notional    = position_size * entry_price
-            actual_margin      = actual_notional / config.LEVERAGE
-            actual_dollar_risk = position_size * price_distance
-            actual_risk_pct    = actual_dollar_risk / available * 100
-
-            pool_rr_str = ""
-            if pool_tp_price is not None:
-                tp_dist  = abs(pool_tp_price - entry_price)
-                pool_rr  = tp_dist / price_distance if price_distance > 0 else 0.0
-                pool_rr_str = f" | Pool R:R: {pool_rr:.2f}:1 (TP@${pool_tp_price:,.2f})"
-
-            logger.info(
-                f"✅ Position sized: {position_size:.4f} BTC | "
-                f"Notional: ${actual_notional:,.0f} | "
-                f"Margin: ${actual_margin:.2f} | "
-                f"$ Risk @ SL: ${actual_dollar_risk:.2f} ({actual_risk_pct:.2f}%)"
-                + pool_rr_str
-            )
-            return position_size
-
-        except ValueError as e:
-            logger.error(f"Value error in position calculation: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Error calculating position size: {e}", exc_info=True)
-            return None
 
     # =========================================================================
     # TRADE NOTIFICATIONS

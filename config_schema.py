@@ -235,16 +235,23 @@ class SLConfig(BaseModel):
         ge=1,
         le=200,
     )
-    MIN_SL_DISTANCE_PCT: float = Field(
-        default_factory=lambda: _c("MIN_SL_DISTANCE_PCT", 0.004),
+    SL_MIN_ATR_MULT: float = Field(
+        default_factory=lambda: _c("SL_MIN_ATR_MULT", 0.20),
         gt=0.0,
-        le=0.10,
-        description="Minimum SL distance as fraction of price (0.004 = 0.4%).",
+        le=3.0,
+        description="ATR noise floor for entry stops; not an SL ceiling.",
     )
-    MAX_SL_DISTANCE_PCT: float = Field(
-        default_factory=lambda: _c("MAX_SL_DISTANCE_PCT", 0.035),
-        gt=0.0,
-        le=0.20,
+    SL_SWEEP_WICK_CLEARANCE_MULT: float = Field(
+        default_factory=lambda: _c("SL_SWEEP_WICK_CLEARANCE_MULT", 0.10),
+        ge=0.0,
+        le=2.0,
+        description="Extra wick-depth clearance beyond swept structure.",
+    )
+    SL_REGIME_BUFF_SLOPE: float = Field(
+        default_factory=lambda: _c("SL_REGIME_BUFF_SLOPE", 0.80),
+        ge=0.0,
+        le=3.0,
+        description="ATR-percentile slope for volatility-regime SL buffers.",
     )
     SL_ATR_BUFFER_MULT: float = Field(
         default_factory=lambda: _c("SL_ATR_BUFFER_MULT", 0.75),
@@ -265,17 +272,6 @@ class SLConfig(BaseModel):
             "SL to BE.  Prevents the pool-gate BE loop (BUG 1/11/32)."
         ),
     )
-
-    @model_validator(mode="after")
-    def sl_distance_ordering(self) -> "SLConfig":
-        """MAX_SL_DISTANCE_PCT must exceed MIN_SL_DISTANCE_PCT."""
-        if self.MIN_SL_DISTANCE_PCT >= self.MAX_SL_DISTANCE_PCT:
-            raise ValueError(
-                f"MIN_SL_DISTANCE_PCT ({self.MIN_SL_DISTANCE_PCT}) "
-                f"must be < MAX_SL_DISTANCE_PCT ({self.MAX_SL_DISTANCE_PCT})."
-            )
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Sub-model: Trailing Stop
@@ -433,7 +429,7 @@ class TradingConfig(BaseModel):
         from config_schema import cfg
 
         cfg.risk.RISK_PER_TRADE
-        cfg.sl.MIN_SL_DISTANCE_PCT
+        cfg.sl.SL_MIN_ATR_MULT
         cfg.trail.QUANT_TRAIL_BE_R
         cfg.rr.MIN_RISK_REWARD_RATIO
     """
@@ -460,29 +456,6 @@ class TradingConfig(BaseModel):
                     f"{name} = {val} is below the institutional floor of {floor}."
                 )
         return self
-
-    @model_validator(mode="after")
-    def sl_inside_rr_envelope(self) -> "TradingConfig":
-        """
-        SL distance must be geometrically consistent with the R:R floor.
-
-        If MAX_SL_DISTANCE_PCT × MIN_RISK_REWARD_RATIO > 35% of price, the TP
-        would be unreachably far for most intraday BTC moves.  This is a smell,
-        not a hard error — emitted as a warning rather than a raised exception.
-        """
-        implied_tp_pct = self.sl.MAX_SL_DISTANCE_PCT * self.risk.MIN_RISK_REWARD_RATIO
-        if implied_tp_pct > 0.35:
-            import warnings
-            warnings.warn(
-                f"MAX_SL_DISTANCE_PCT ({self.sl.MAX_SL_DISTANCE_PCT:.3f}) × "
-                f"MIN_RISK_REWARD_RATIO ({self.risk.MIN_RISK_REWARD_RATIO}) = "
-                f"{implied_tp_pct:.3f} (>{0.35:.0%} of price).  "
-                f"TP will be unreachably far for intraday moves.  "
-                f"Consider tightening MAX_SL_DISTANCE_PCT.",
-                stacklevel=3,
-            )
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Singleton — built once at import time, raises on invalid config

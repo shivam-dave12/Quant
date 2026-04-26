@@ -1616,8 +1616,9 @@ class ConfigDriftCheck(HealthCheck):
     _PAIRS: Sequence[Tuple[str, str, str, float]] = (
         ("QUANT_TRAIL_BE_R",   "liquidity_trail", "PHASE_0_MAX_R",  1e-9),
         ("QUANT_TRAIL_LOCK_R", "liquidity_trail", "PHASE_1_MAX_R",  1e-9),
-        ("MIN_SL_DISTANCE_PCT", "entry_engine", "_MIN_SL_DISTANCE_PCT", 1e-12),
-        ("MAX_SL_DISTANCE_PCT", "entry_engine", "_MAX_SL_DISTANCE_PCT", 1e-12),
+        ("SL_MIN_ATR_MULT", "entry_engine", "_SL_MIN_ATR_MULT", 1e-12),
+        ("SL_SWEEP_WICK_CLEARANCE_MULT", "entry_engine", "_SL_WICK_CLEARANCE", 1e-12),
+        ("SL_REGIME_BUFF_SLOPE", "entry_engine", "_SL_REGIME_SLOPE", 1e-12),
     )
 
     def check(self) -> HealthResult:

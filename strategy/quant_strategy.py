@@ -208,10 +208,6 @@ class QCfg:
     @staticmethod
     def TRAIL_VOL_DECAY_MULT() -> float: return float(_cfg("QUANT_TRAIL_VOL_DECAY_MULT", 0.6))
     @staticmethod
-    def MIN_SL_PCT() -> float: return float(_cfg("MIN_SL_DISTANCE_PCT", 0.004))
-    @staticmethod
-    def MAX_SL_PCT() -> float: return float(_cfg("MAX_SL_DISTANCE_PCT", 0.035))
-    @staticmethod
     def MIN_RR_RATIO() -> float: return float(_cfg("MIN_RISK_REWARD_RATIO", 2.0))
     @staticmethod
     def ATR_PERIOD() -> int: return int(_cfg("SL_ATR_PERIOD", 14))
@@ -362,15 +358,13 @@ class QCfg:
     # systematic strategies is 10-20%. Default set to 15% Ã¢â‚¬â€ operators who need
     # more headroom should set MAX_DRAWDOWN_PCT explicitly in config.py.
     def MAX_DRAWDOWN_PCT() -> float: return float(_cfg("MAX_DRAWDOWN_PCT", 15.0))
-    # Ã¢â€â‚¬Ã¢â€â‚¬ v4.6: Natural TP + SL ATR cap Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    # v4.6: Natural TP + liquidity-aware risk geometry
     @staticmethod
     def TP_MIN_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MIN_ATR_MULT", 0.5))
     @staticmethod
     def TP_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_TP_MAX_ATR_MULT", 6.0))
     @staticmethod
     def REVERSION_REJECT_RR() -> float: return float(_cfg("QUANT_REVERSION_REJECT_RR", 0.20))
-    @staticmethod
-    def SL_MAX_ATR_MULT() -> float: return float(_cfg("QUANT_SL_MAX_ATR_MULT", 4.0))
     # Ã¢â€â‚¬Ã¢â€â‚¬ v4.9: ICT-anchored trailing SL Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     @staticmethod
     def ICT_ZONE_FREEZE_ENABLED() -> bool: return bool(_cfg("QUANT_ICT_ZONE_FREEZE_ENABLED", True))
@@ -581,11 +575,10 @@ def _safe_be_migration_price(pos_side: str, desired_sl: float, current_price: fl
     if desired_sl <= 0 or current_price <= 0:
         return None
     tick = max(QCfg.TICK_SIZE(), 1e-10)
-    pct_floor = current_price * float(getattr(config, "MIN_SL_DISTANCE_PCT", 0.004))
     atr_floor = max(float(atr or 0.0), 0.0) * float(
         getattr(config, "POOL_GATE_BE_MIN_ATR_DIST", 0.40)
     )
-    min_gap = max(2.0 * tick, pct_floor, atr_floor)
+    min_gap = max(2.0 * tick, atr_floor)
     rounded = _round_to_tick(desired_sl)
     if pos_side == "long":
         return rounded if rounded < current_price - min_gap else None
@@ -2307,6 +2300,22 @@ class SignalBreakdown:
                 f"dev={self.deviation_atr:+.1f}ATR confirm={self.n_confirming}/5")
 
 # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# INSTITUTIONAL DECISION
+@dataclass
+class InstitutionalDecision:
+    allowed: bool
+    score: float
+    grade: str = "B"
+    size_mult: float = 1.0
+    reject_reasons: List[str] = field(default_factory=list)
+    allow_reasons: List[str] = field(default_factory=list)
+    rr: float = 0.0
+    sl_atr: float = 0.0
+    tp_atr: float = 0.0
+    target_realism: float = 0.0
+    liquidation_price: float = 0.0
+    liquidation_guard: float = 0.0
+
 # POSITION STATE
 # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 class PositionPhase(Enum):
@@ -2612,6 +2621,10 @@ class QuantStrategy:
         self._entry_confirm_key = None
         self._entry_confirm_count = 0
         self._last_entry_confirm_log = 0.0
+        self._last_hunt_prediction = None
+        self._institutional_veto_log_ts = {}
+        self._last_institutional_decision = None
+        self._active_institutional_size_mult = 1.0
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ Post-Trade Analysis Agent (v2.0) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
@@ -2731,6 +2744,433 @@ class QuantStrategy:
                 )
         except Exception as e:
             logger.debug(f"Adaptive parameter wiring error: {e}")
+
+    @staticmethod
+    def _signal_entry_type_value(signal) -> str:
+        et = getattr(signal, "entry_type", "")
+        return getattr(et, "value", str(et))
+
+    def _entry_signal_identity(self, signal, atr: float):
+        """
+        Stable event identity for confirmation.
+
+        The old key used live entry/SL/TP ticks, so the same sweep became a
+        different key as price moved. This keys sweeps to the pool event and
+        momentum to the displacement candle.
+        """
+        side = str(getattr(signal, "side", "") or "")
+        etype = self._signal_entry_type_value(signal)
+        tick = max(float(QCfg.TICK_SIZE()), 1e-9)
+        sweep = getattr(signal, "sweep_result", None)
+        if sweep is not None:
+            pool = getattr(sweep, "pool", None)
+            pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+            pool_side_obj = getattr(pool, "side", "")
+            pool_side = getattr(pool_side_obj, "value", str(pool_side_obj))
+            detected_at = float(getattr(sweep, "detected_at", 0.0) or 0.0)
+            bucket = max(tick * 8.0, float(atr or 0.0) * 0.03, 1e-9)
+            return (
+                "sweep",
+                side,
+                etype,
+                pool_side,
+                round(pool_price / bucket),
+                round(detected_at, 1),
+            )
+
+        candle_ts = int(getattr(signal, "displacement_candle_ts", 0) or 0)
+        if etype == EntryType.DISPLACEMENT_MOMENTUM.value or candle_ts > 0:
+            return ("momentum", side, etype, candle_ts)
+
+        entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
+        bucket = max(tick * 8.0, float(atr or 0.0) * 0.10, 1e-9)
+        return ("generic", side, etype, round(entry / bucket))
+
+    def _entry_required_confirms(self, signal, atr: float) -> int:
+        base = max(1, int(QCfg.CONFIRM_TICKS()))
+        etype = self._signal_entry_type_value(signal)
+        rr = max(0.0, float(getattr(signal, "rr_ratio", 0.0) or 0.0))
+        conviction = max(0.0, min(1.0, float(getattr(signal, "conviction", 0.0) or 0.0)))
+        sweep = getattr(signal, "sweep_result", None)
+        quality = max(0.0, min(1.0, float(getattr(sweep, "quality", 0.0) or 0.0)))
+
+        if etype == EntryType.SWEEP_REVERSAL.value:
+            event_edge = (
+                0.40 * quality
+                + 0.35 * conviction
+                + 0.25 * min(rr / 3.0, 1.0)
+            )
+            if event_edge >= 0.55:
+                return 1
+            return min(base, 2)
+
+        if etype == EntryType.SWEEP_CONTINUATION.value:
+            event_edge = (
+                0.45 * quality
+                + 0.35 * conviction
+                + 0.20 * min(rr / 2.5, 1.0)
+            )
+            if event_edge >= 0.62:
+                return 1
+            return min(base, 2)
+
+        return base
+
+    @staticmethod
+    def _hunt_delivery_side(hunt) -> str:
+        if hunt is None:
+            return ""
+        delivery = str(getattr(hunt, "delivery_direction", "") or "").lower()
+        if delivery == "bullish":
+            return "long"
+        if delivery == "bearish":
+            return "short"
+        predicted = str(getattr(hunt, "predicted", "") or "").upper()
+        if predicted == "BSL":
+            return "long"
+        if predicted == "SSL":
+            return "short"
+        return ""
+
+    def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
+        etype = self._signal_entry_type_value(signal)
+        side = str(getattr(signal, "side", "") or "")
+        if etype != EntryType.DISPLACEMENT_MOMENTUM.value:
+            return ""
+
+        hunt = getattr(self, "_last_hunt_prediction", None)
+        hunt_ts = float(getattr(hunt, "timestamp_ms", 0.0) or 0.0) if hunt else 0.0
+        if hunt_ts > 0.0 and (time.time() * 1000.0 - hunt_ts) > 90000.0:
+            hunt = None
+        hunt_side = self._hunt_delivery_side(hunt)
+        hunt_conf = float(getattr(hunt, "confidence", 0.0) or 0.0) if hunt else 0.0
+        hunt_raw = abs(float(getattr(hunt, "raw_score", 0.0) or 0.0)) if hunt else 0.0
+        if hunt_side and hunt_side != side and max(hunt_conf, hunt_raw) >= 0.10:
+            predicted = str(getattr(hunt, "predicted", "") or "liquidity")
+            return (
+                f"momentum {side} opposes active {predicted} draw "
+                f"({hunt_side}, conf={hunt_conf:.2f}, raw={hunt_raw:.2f})"
+            )
+
+        pd = float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)
+        in_premium = bool(getattr(ict_ctx, "in_premium", False))
+        in_discount = bool(getattr(ict_ctx, "in_discount", False))
+        if side == "long" and (in_premium or pd >= 0.62):
+            return f"momentum long is chasing premium delivery (PD={pd:.2f})"
+        if side == "short" and (in_discount or pd <= 0.38):
+            return f"momentum short is chasing discount delivery (PD={pd:.2f})"
+
+        sig_created = float(getattr(signal, "created_at", time.time()) or time.time())
+        sig_age = max(0.0, time.time() - sig_created)
+        sig_entry = float(getattr(signal, "entry_price", price) or price)
+        drift_atr = abs(float(price or 0.0) - sig_entry) / max(float(atr or 0.0), 1e-9)
+        if sig_age > 12.0 and drift_atr > 0.20:
+            return f"stale momentum signal age={sig_age:.1f}s drift={drift_atr:.2f}ATR"
+        return ""
+
+    def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
+        try:
+            if (getattr(signal, "entry_type", None) == EntryType.DISPLACEMENT_MOMENTUM
+                    and hasattr(self._entry_engine, "mark_momentum_blocked")):
+                self._entry_engine.mark_momentum_blocked(
+                    entry_price=float(getattr(signal, "entry_price", 0.0) or 0.0),
+                    candle_ts=int(getattr(signal, "displacement_candle_ts", 0) or 0),
+                    locked_sl=float(getattr(signal, "sl_price", 0.0) or 0.0),
+                    cooldown_sec=cooldown_sec,
+                )
+            elif hasattr(self._entry_engine, "mark_gate_blocked"):
+                self._entry_engine.mark_gate_blocked(
+                    str(getattr(signal, "side", "") or ""),
+                    reason[:40],
+                    cooldown_sec=cooldown_sec,
+                )
+        except Exception as e:
+            logger.debug(f"Entry signal suppression error: {e}")
+        try:
+            self._entry_engine.consume_signal()
+        except Exception:
+            pass
+        self._entry_confirm_key = None
+        self._entry_confirm_count = 0
+
+    @staticmethod
+    def _bounded(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, float(value)))
+
+    @staticmethod
+    def _tf_rank(tf: str) -> int:
+        return {
+            "1m": 1, "2m": 1, "3m": 1, "5m": 2,
+            "15m": 3, "30m": 3, "1h": 4, "4h": 5, "1d": 6,
+        }.get(str(tf or "").lower(), 1)
+
+    def _sl_liquidation_sanity(self, side: str, entry: float, sl: float):
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        if entry <= 0 or sl <= 0:
+            return False, 0.0, 0.0, "missing entry/SL"
+        side = str(side or "").lower()
+        leverage = max(float(QCfg.LEVERAGE()), 1.0)
+        maint_margin = float(_cfg("MAINTENANCE_MARGIN_RATE", 0.005))
+        liq_buffer = float(_cfg("LIQUIDATION_BUFFER_PCT", 0.005))
+        liq_move = max((1.0 / leverage) - maint_margin, 0.001)
+        if side == "long":
+            liq_price = entry * (1.0 - liq_move)
+            guard = liq_price * (1.0 + liq_buffer)
+            if sl >= entry:
+                return False, liq_price, guard, "long SL is not protective"
+            if sl <= guard:
+                return False, liq_price, guard, (
+                    f"long SL ${sl:,.1f} is beyond liquidation guard ${guard:,.1f}"
+                )
+            return True, liq_price, guard, ""
+        if side == "short":
+            liq_price = entry * (1.0 + liq_move)
+            guard = liq_price * (1.0 - liq_buffer)
+            if sl <= entry:
+                return False, liq_price, guard, "short SL is not protective"
+            if sl >= guard:
+                return False, liq_price, guard, (
+                    f"short SL ${sl:,.1f} is beyond liquidation guard ${guard:,.1f}"
+                )
+            return True, liq_price, guard, ""
+        return False, 0.0, 0.0, "unknown side"
+
+    def _target_pool_realism(self, signal, liq_snapshot, side: str,
+                             entry: float, tp: float, sl: float, atr: float):
+        reasons = []
+        rejects = []
+        target = getattr(signal, "target_pool", None)
+        if target is None or getattr(target, "pool", None) is None:
+            return 0.0, reasons, ["TP is not backed by a live liquidity pool"]
+
+        pool = target.pool
+        pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+        pool_tf = str(getattr(pool, "timeframe", "") or "")
+        tf_rank = self._tf_rank(pool_tf)
+        significance = float(getattr(target, "significance", 0.0) or 0.0)
+        distance_atr = float(getattr(target, "distance_atr", 0.0) or 0.0)
+        if distance_atr <= 0:
+            distance_atr = abs(tp - entry) / max(float(atr or 0.0), 1e-9)
+
+        direction_ok = (
+            (side == "long" and tp > entry and pool_price > entry) or
+            (side == "short" and tp < entry and pool_price < entry)
+        )
+        if not direction_ok:
+            rejects.append("TP pool is not in the trade delivery direction")
+
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rr = reward / max(risk, 1e-9)
+        sig_score = self._bounded(significance / 8.0)
+        tf_score = self._bounded(tf_rank / 4.0)
+        rr_score = self._bounded(math.sqrt(max(rr, 0.0) / 4.0))
+
+        max_reach = {1: 3.0, 2: 5.0, 3: 8.0, 4: 12.0, 5: 18.0, 6: 24.0}.get(tf_rank, 8.0)
+        if distance_atr <= 0.35:
+            reach_score = 0.25
+        elif distance_atr <= max_reach:
+            reach_score = 1.0 - math.exp(-(distance_atr - 0.35) / 2.0)
+            reach_score = max(0.40, reach_score)
+        else:
+            reach_score = max(0.25, 1.0 - ((distance_atr - max_reach) / max(max_reach, 1.0)))
+
+        opposing = []
+        if liq_snapshot is not None:
+            opposing = list(getattr(liq_snapshot, "ssl_pools", []) or []) if side == "long" else list(getattr(liq_snapshot, "bsl_pools", []) or [])
+        lo, hi = sorted((entry, tp))
+        gauntlet = 0
+        threshold = max(significance * 0.60, 1.0)
+        for opp in opposing:
+            opp_pool = getattr(opp, "pool", None)
+            opp_price = float(getattr(opp_pool, "price", 0.0) or 0.0)
+            if opp_price <= lo or opp_price >= hi:
+                continue
+            opp_sig = float(getattr(opp, "significance", 0.0) or 0.0)
+            if opp_sig >= threshold:
+                gauntlet += 1
+        gauntlet_score = max(0.35, 1.0 - gauntlet * 0.18)
+
+        realism = (
+            0.28 * sig_score
+            + 0.22 * tf_score
+            + 0.20 * rr_score
+            + 0.18 * reach_score
+            + 0.12 * gauntlet_score
+        )
+
+        if distance_atr > max_reach and realism < 0.72:
+            rejects.append(
+                f"TP reach {distance_atr:.1f}ATR exceeds {pool_tf or 'low-TF'} delivery envelope"
+            )
+        if rr >= 3.0 and realism >= 0.65:
+            reasons.append(f"high-RR backed by {pool_tf or 'pool'} liquidity")
+        if gauntlet:
+            reasons.append(f"{gauntlet} opposing pool(s) before TP")
+        reasons.append(
+            f"target_realism={realism:.2f} tf={pool_tf or '?'} sig={significance:.1f}"
+        )
+        return realism, reasons, rejects
+
+    def _institutional_decision_matrix(self, signal, ict_ctx, flow_state,
+                                       liq_snapshot, price: float,
+                                       atr: float) -> InstitutionalDecision:
+        side = str(getattr(signal, "side", "") or "").lower()
+        entry = float(getattr(signal, "entry_price", price) or price)
+        sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+        tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
+        etype = self._signal_entry_type_value(signal)
+        rejects = []
+        allows = []
+
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
+        rr = tp_dist / max(sl_dist, 1e-9)
+        sl_atr = sl_dist / max(float(atr or 0.0), 1e-9)
+        tp_atr = tp_dist / max(float(atr or 0.0), 1e-9)
+
+        liq_ok, liq_price, liq_guard, liq_reason = self._sl_liquidation_sanity(side, entry, sl)
+        if not liq_ok:
+            rejects.append(liq_reason)
+        elif liq_price > 0:
+            allows.append(f"SL before liquidation guard ${liq_guard:,.1f}")
+
+        if rr < 1.15:
+            rejects.append(f"R:R {rr:.2f} has no institutional expectancy after costs")
+        if sl_atr < 0.55:
+            rejects.append(f"SL {sl_atr:.2f}ATR is inside execution noise")
+        if side == "long" and tp <= entry:
+            rejects.append("long TP is not above entry")
+        if side == "short" and tp >= entry:
+            rejects.append("short TP is not below entry")
+
+        target_realism, target_allows, target_rejects = self._target_pool_realism(
+            signal, liq_snapshot, side, entry, tp, sl, atr)
+        allows.extend(target_allows)
+        rejects.extend(target_rejects)
+
+        sweep = getattr(signal, "sweep_result", None)
+        quality = float(getattr(sweep, "quality", 0.0) or 0.0)
+        conviction = self._bounded(float(getattr(signal, "conviction", 0.0) or 0.0))
+        is_sweep = etype in (EntryType.SWEEP_REVERSAL.value, EntryType.SWEEP_CONTINUATION.value)
+        if is_sweep:
+            event_q = self._bounded(0.38 + 0.30 * quality + 0.22 * conviction + 0.10 * min(rr / 4.0, 1.0))
+        else:
+            event_q = self._bounded(0.35 + 0.25 * conviction + 0.20 * target_realism)
+
+        side_sign = 1.0 if side == "long" else -1.0
+        tf = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
+        cvd = float(getattr(flow_state, "cvd_trend", 0.0) or 0.0)
+        signed_flow = side_sign * (0.55 * tf + 0.45 * cvd)
+        flow_q = self._bounded(0.50 + 0.50 * signed_flow, 0.05, 1.0)
+        if is_sweep and event_q >= 0.70:
+            flow_q = max(flow_q, 0.40)
+
+        hint_side = str(getattr(ict_ctx, "direction_hint_side", "") or "").lower()
+        hint_conf = float(getattr(ict_ctx, "direction_hint_confidence", 0.0) or 0.0)
+        hunt = getattr(self, "_last_hunt_prediction", None)
+        hunt_side = self._hunt_delivery_side(hunt)
+        hunt_conf = float(getattr(hunt, "confidence", 0.0) or 0.0) if hunt else 0.0
+        if hint_side:
+            direction_q = self._bounded(0.45 + (0.55 * hint_conf if hint_side == side else -0.40 * hint_conf))
+            if hint_side != side and hint_conf >= 0.65:
+                rejects.append(f"post-sweep engine favours {hint_side} ({hint_conf:.2f})")
+        elif hunt_side:
+            direction_q = self._bounded(0.52 + (0.42 * hunt_conf if hunt_side == side else -0.35 * hunt_conf))
+            if hunt_side != side and hunt_conf >= 0.55 and not is_sweep:
+                rejects.append(f"DirectionEngine draw favours {hunt_side} ({hunt_conf:.2f})")
+        else:
+            direction_q = 0.55
+
+        trend15 = float(getattr(self._htf, "trend_15m", 0.0) or 0.0) if self._htf else 0.0
+        trend4h = float(getattr(self._htf, "trend_4h", 0.0) or 0.0) if self._htf else 0.0
+        htf_signed = side_sign * (0.45 * trend15 + 0.55 * trend4h)
+        structure_q = self._bounded(0.55 + 0.35 * htf_signed, 0.15, 1.0)
+        if is_sweep and event_q >= 0.70 and target_realism >= 0.65:
+            structure_q = max(structure_q, 0.55)
+
+        pd = float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)
+        pd_preference = (1.0 - pd) if side == "long" else pd
+        pd_q = self._bounded(0.30 + 0.70 * pd_preference)
+
+        amd_phase = str(getattr(ict_ctx, "amd_phase", "") or "").upper()
+        amd_bias = str(getattr(ict_ctx, "amd_bias", "") or "").lower()
+        amd_conf = float(getattr(ict_ctx, "amd_confidence", 0.0) or 0.0)
+        phase_q = {
+            "MANIPULATION": 0.95, "DISTRIBUTION": 0.85,
+            "REDISTRIBUTION": 0.78, "REACCUMULATION": 0.75,
+            "ACCUMULATION": 0.48,
+        }.get(amd_phase, 0.55)
+        bias_agrees = (
+            (side == "long" and "bull" in amd_bias) or
+            (side == "short" and "bear" in amd_bias) or
+            amd_bias in ("", "neutral")
+        )
+        amd_q = self._bounded(phase_q + (0.12 * amd_conf if bias_agrees else -0.18 * amd_conf))
+
+        if sl_atr <= 0.8:
+            risk_q = 0.45 + 0.35 * (sl_atr / 0.8)
+        elif sl_atr <= 5.0:
+            risk_q = 1.0
+        else:
+            risk_q = max(0.55, 1.0 - (sl_atr - 5.0) / 10.0)
+        if rr >= 3.0 and target_realism >= 0.70:
+            risk_q = max(risk_q, 0.78)
+        risk_q = self._bounded(risk_q)
+
+        score = (
+            0.18 * event_q
+            + 0.17 * direction_q
+            + 0.13 * structure_q
+            + 0.12 * flow_q
+            + 0.18 * target_realism
+            + 0.12 * risk_q
+            + 0.05 * pd_q
+            + 0.05 * amd_q
+        )
+        if rr >= 3.0 and target_realism >= 0.65:
+            score += min((rr - 3.0) * 0.025, 0.10)
+        score = self._bounded(score)
+
+        threshold = 0.57 if is_sweep else 0.66
+        if rr >= 3.0 and target_realism >= 0.72:
+            threshold -= 0.04
+        allowed = (not rejects) and score >= threshold
+        if not allowed and not rejects:
+            rejects.append(f"synergy score {score:.2f} < {threshold:.2f}")
+
+        if score >= 0.82 and rr >= 2.5 and target_realism >= 0.72:
+            grade = "S"
+        elif score >= 0.70 and target_realism >= 0.60:
+            grade = "A"
+        else:
+            grade = "B"
+
+        size_mult = self._bounded(0.75 + (score - threshold) * 0.90, 0.55, 1.12)
+        if rr >= 3.0 and target_realism >= 0.75:
+            size_mult = min(1.15, size_mult + 0.05)
+        if rejects:
+            size_mult = 0.0
+
+        allows.append(
+            f"score={score:.2f} grade={grade} RR={rr:.2f} "
+            f"SL={sl_atr:.2f}ATR TP={tp_atr:.2f}ATR"
+        )
+        return InstitutionalDecision(
+            allowed=allowed,
+            score=score,
+            grade=grade,
+            size_mult=size_mult,
+            reject_reasons=rejects,
+            allow_reasons=allows,
+            rr=rr,
+            sl_atr=sl_atr,
+            tp_atr=tp_atr,
+            target_realism=target_realism,
+            liquidation_price=liq_price,
+            liquidation_guard=liq_guard,
+        )
 
     def get_position(self) -> Optional[Dict]:
         with self._lock: return None if self._pos.is_flat() else self._pos.to_dict()
@@ -3724,6 +4164,7 @@ class QuantStrategy:
                 )
                 # Bridge HuntPrediction dataclass Ã¢â€ â€™ legacy dict shape that the
                 # rest of the codebase already consumes via _last_hunt_pred.
+                self._last_hunt_prediction = _hunt
                 self._ict.inject_hunt_prediction({
                     "predicted":          _hunt.predicted,
                     "confidence":         round(_hunt.confidence, 3),
@@ -4371,14 +4812,24 @@ class QuantStrategy:
         # Step 8: Check for signal and execute
         signal = self._entry_engine.get_signal()
         if signal is not None:
-            required_confirms = QCfg.CONFIRM_TICKS()
-            sig_key = (
-                signal.side,
-                getattr(signal.entry_type, "value", str(signal.entry_type)),
-                round(float(signal.entry_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
-                round(float(signal.sl_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
-                round(float(signal.tp_price or 0.0) / max(QCfg.TICK_SIZE(), 1e-9)),
-            )
+            inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)
+            if inst_veto:
+                veto_key = (
+                    str(getattr(signal, "side", "") or ""),
+                    self._signal_entry_type_value(signal),
+                    inst_veto[:48],
+                )
+                last_veto_log = self._institutional_veto_log_ts.get(veto_key, 0.0)
+                if now - last_veto_log >= 30.0:
+                    self._institutional_veto_log_ts[veto_key] = now
+                    logger.info(
+                        f"Institutional entry veto: {signal.side.upper()} "
+                        f"{self._signal_entry_type_value(signal)} | {inst_veto}")
+                self._suppress_rejected_entry_signal(signal, inst_veto, cooldown_sec=30.0)
+                return
+
+            required_confirms = self._entry_required_confirms(signal, atr)
+            sig_key = self._entry_signal_identity(signal, atr)
             if sig_key == self._entry_confirm_key:
                 self._entry_confirm_count += 1
             else:
@@ -4387,7 +4838,7 @@ class QuantStrategy:
             if self._entry_confirm_count < required_confirms:
                 if now - self._last_entry_confirm_log >= 5.0:
                     self._last_entry_confirm_log = now
-                    logger.info(
+                    logger.debug(
                         f"Entry confirm gate: {signal.side.upper()} "
                         f"{self._entry_confirm_count}/{required_confirms}")
                 return
@@ -4397,12 +4848,31 @@ class QuantStrategy:
             allowed, reason = self._risk_gate.can_trade(total_bal)
             if not allowed:
                 logger.info(f"Signal blocked by risk manager: {reason}")
-                self._entry_engine.consume_signal()
-                self._entry_confirm_key = None
-                self._entry_confirm_count = 0
+                self._suppress_rejected_entry_signal(signal, reason, cooldown_sec=60.0)
                 return
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ UNIFIED ENTRY GATE Ã¢â‚¬â€ advisory logging only (no blocking) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            # Institutional decision matrix: all engines vote on one trade thesis.
+            _inst_decision = self._institutional_decision_matrix(
+                signal, ict_ctx, flow_state, liq_snapshot, price, atr)
+            self._last_institutional_decision = _inst_decision
+            self._active_institutional_size_mult = _inst_decision.size_mult
+            if not _inst_decision.allowed:
+                reject_str = " | ".join(_inst_decision.reject_reasons[:3])
+                logger.info(
+                    f"Institutional matrix blocked {signal.side.upper()} "
+                    f"{signal.entry_type.value}: score={_inst_decision.score:.2f} "
+                    f"RR={_inst_decision.rr:.2f} target={_inst_decision.target_realism:.2f} | "
+                    f"{reject_str}")
+                self._suppress_rejected_entry_signal(
+                    signal, reject_str or "institutional matrix blocked", cooldown_sec=45.0)
+                return
+            logger.info(
+                f"Institutional matrix PASS [{_inst_decision.grade}] "
+                f"score={_inst_decision.score:.2f} RR={_inst_decision.rr:.2f} "
+                f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR "
+                f"target={_inst_decision.target_realism:.2f} "
+                f"size_mult={_inst_decision.size_mult:.2f}")
+
             self._unified_entry_gate(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
 
@@ -4600,6 +5070,13 @@ class QuantStrategy:
                 EntryType.DISPLACEMENT_MOMENTUM: "A",
             }
             _tier = _tier_map.get(signal.entry_type, "A")
+            _inst_dec_for_tier = getattr(self, "_last_institutional_decision", None)
+            if _inst_dec_for_tier is not None and getattr(_inst_dec_for_tier, "allowed", False):
+                _tier = str(getattr(_inst_dec_for_tier, "grade", _tier) or _tier)
+            try:
+                _min_sig.ict_entry_tier = _tier
+            except Exception:
+                pass
 
             # â”€â”€â”€ v9.1: Post-Exit Re-Entry Gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # The flat 30s cooldown is satisfied at this point (cooldown_ok was
@@ -4991,11 +5468,23 @@ class QuantStrategy:
         td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
+        _liq_entry_ref = limit_px if limit_px > 0 else price
+        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
+            side, _liq_entry_ref, sl_price)
+        if not _liq_ok:
+            logger.warning(
+                f"Entry rejected by liquidation guard: {side.upper()} "
+                f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
+        logger.info(
+            f"Liquidation guard OK: est_liq=${_liq_px:,.1f} "
+            f"guard=${_liq_guard:,.1f} SL=${sl_price:,.1f}")
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ FIX Bug-B STEP 2: Size using actual SL distance Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-        # Now that sl_price is known, pass it to _compute_quantity so the base size
-        # comes from risk_manager.calculate_position_size (dollar-risk / SL-dist).
-        # The tier/composite/AMD multiplier is applied on top of that base.
+        # Now that sl_price is known, size from dollar risk / actual SL distance.
+        # The institutional decision multiplier is applied on top of that base.
         qty = self._compute_quantity(
             risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info
@@ -7168,7 +7657,8 @@ class QuantStrategy:
             elif sig.amd_conf >= 0.70: amd_mod = +0.04
             elif sig.amd_conf <  0.50: amd_mod = -0.05
 
-        total_mult = max(0.40, min(1.05, tier_mult + comp_mod + amd_mod))
+        inst_mult = float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
+        total_mult = max(0.30, min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult))
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ Available balance (reuse prefetched Ã¢â‚¬â€ SIG-8 fix) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         bal = prefetched_bal_info if prefetched_bal_info is not None else risk_manager.get_available_balance()
@@ -7265,7 +7755,8 @@ class QuantStrategy:
         logger.info(
             f"Ã¢Å“â€¦ Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "
             f"tier={ict_tier or 'none'} "
-            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} a={amd_mod:+.2f}) | "
+            f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
+            f"a={amd_mod:+.2f} i={inst_mult:.2f}) | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
             f"margin=${margin_used:.2f} | feesÃ¢â€°Ë†${actual_fees:.3f} | "
             f"headroom=${available - margin_used - actual_fees:.2f} | qty={qty}"

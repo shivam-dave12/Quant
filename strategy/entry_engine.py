@@ -95,30 +95,19 @@ _TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_c
 
 try:
     import config as _sl_cfg
-    # ── ATR-regime SL gates (structural, volatility-invariant) ──────────────
-    # SL sizing is ATR-relative, not price-percentage-relative.
-    # A PCT floor (e.g. 0.40% of price) divorces from market structure when ATR
-    # diverges from price: BTC $77K ATR=$42 → 0.40% = $308 = 7.3×ATR → 0 trades.
-    # ATR-relative gates are correct across all vol regimes and price levels.
-    #
-    # Noise floor — SL narrower than this sits inside typical spread noise:
+    # Institutional SL geometry: structure first, ATR noise floor second,
+    # liquidation guard last. Wide stops are allowed when structure requires it.
     _SL_MIN_ATR_MULT     = float(getattr(_sl_cfg, "SL_MIN_ATR_MULT", 0.20))
-    # ATR ceiling — SL wider than this is catastrophic; reject the setup:
-    _SL_MAX_ATR_MULT     = float(getattr(_sl_cfg, "SL_MAX_ATR_MULT_FROM_ENTRY", 4.0))
     # Wick structural clearance — SL must extend this fraction of wick_depth
     # PAST the wick tip, anchoring it to the actual structural level:
     _SL_WICK_CLEARANCE   = float(getattr(_sl_cfg, "SL_SWEEP_WICK_CLEARANCE_MULT", 0.10))
     # Regime-adaptation slope: regime_mult = 0.60 + slope × atr_pctile
     # p=0 (low-vol) → mult=0.60 tight; p=0.5 → 1.00 normal; p=1.0 → 1.40 wide:
     _SL_REGIME_SLOPE     = float(getattr(_sl_cfg, "SL_REGIME_BUFF_SLOPE", 0.80))
-    # Legacy PCT ceiling — secondary sanity guard only (not a structural floor):
-    _MAX_SL_DISTANCE_PCT = float(getattr(_sl_cfg, "MAX_SL_DISTANCE_PCT", 0.035))
 except Exception:
     _SL_MIN_ATR_MULT     = 0.20
-    _SL_MAX_ATR_MULT     = 4.0
     _SL_WICK_CLEARANCE   = 0.10
     _SL_REGIME_SLOPE     = 0.80
-    _MAX_SL_DISTANCE_PCT = 0.035
 
 # Post-Sweep phases (seconds after sweep)
 # MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
@@ -1008,6 +997,36 @@ class EntryEngine:
         if disp_candle is None:
             return False
 
+        disp_close = float(disp_candle['c'])
+        disp_high = float(disp_candle['h'])
+        disp_low = float(disp_candle['l'])
+        disp_range = max(disp_high - disp_low, 1e-10)
+
+        # Institutional momentum is an execution tactic, not permission to chase.
+        # If price has already extended away from the displacement close, wait for
+        # a retrace or a new liquidity event instead of buying/selling late.
+        chase_budget = max(atr * 0.45, disp_range * 0.35)
+        late_extension = (
+            price - disp_close if disp_dir == "long"
+            else disp_close - price
+        )
+        if late_extension > chase_budget:
+            logger.debug(
+                f"MOMENTUM REJECTED (late extension): side={disp_dir} "
+                f"ext={late_extension / max(atr, 1e-10):.2f}ATR "
+                f"budget={chase_budget / max(atr, 1e-10):.2f}ATR")
+            return False
+
+        pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
+        if disp_dir == "long" and (getattr(ict, 'in_premium', False) or pd >= 0.62):
+            logger.debug(
+                f"MOMENTUM REJECTED (premium chase): side=long PD={pd:.2f}")
+            return False
+        if disp_dir == "short" and (getattr(ict, 'in_discount', False) or pd <= 0.38):
+            logger.debug(
+                f"MOMENTUM REJECTED (discount chase): side=short PD={pd:.2f}")
+            return False
+
         amd_mult = self._amd_modifier(ict, disp_dir)
 
         # FIX-SL-FLIP: If this is the same candle that was previously blocked,
@@ -1069,9 +1088,7 @@ class EntryEngine:
         if not self._sl_is_protective(disp_dir, sl, price):
             return False
 
-        if risk > atr * _SL_MAX_ATR_MULT:
-            return False
-        if risk / price > _MAX_SL_DISTANCE_PCT:
+        if not self._sl_before_liquidation(disp_dir, sl, price):
             return False
 
         self._last_momentum_candle_ts = disp_candle_ts
@@ -1533,11 +1550,12 @@ class EntryEngine:
                                ) -> tuple:
         """Return (min_risk, max_risk) for a sweep SL anchored to the wick.
 
-        min_risk: the tighter of (a) wick clearance = max(wick_depth*CLEARANCE, 0.20 ATR)
-                  and (b) noise floor = 0.20 ATR.  Both ensure the SL is past the wick
-                  and above the bid/ask spread noise.
-        max_risk: ATR ceiling = _SL_MAX_ATR_MULT * ATR.  Beyond this the position
-                  size becomes too small for meaningful returns at the target R:R.
+        min_risk: entry-to-wick distance plus the larger of wick-depth
+                  clearance and ATR noise clearance. Both ensure the SL is past
+                  the wick and outside spread noise.
+        max_risk: distance to the liquidation guard. Wide structural stops are
+                  allowed when risk-based sizing can scale down; they are rejected
+                  only if they would sit beyond the exchange liquidation buffer.
         """
         wick_depth  = abs(wick_extreme - pool_price)
         # Minimum clearance: SL must clear at least this far beyond the wick tip
@@ -1545,7 +1563,8 @@ class EntryEngine:
         # Minimum risk from current entry price (clamp to entry-to-wick distance)
         entry_to_wick = abs(price - wick_extreme)
         min_risk = entry_to_wick + wick_clear   # total risk = entry→wick + clearance
-        max_risk = atr * _SL_MAX_ATR_MULT
+        _liq, _guard, liq_room = self._liquidation_guard(side, price)
+        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
         return min_risk, max_risk
 
     @staticmethod
@@ -1558,6 +1577,39 @@ class EntryEngine:
         if side == "short":
             return sl > price
         return False
+
+    @staticmethod
+    def _liquidation_guard(side: str, entry: float) -> tuple:
+        try:
+            import config as _liq_cfg
+            leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+            maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
+            liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
+        except Exception:
+            leverage = 1.0
+            maint_margin = 0.005
+            liq_buffer = 0.005
+        entry = float(entry or 0.0)
+        if entry <= 0:
+            return 0.0, 0.0, 0.0
+        liq_move = max((1.0 / leverage) - maint_margin, 0.001)
+        if side == "long":
+            liq_price = entry * (1.0 - liq_move)
+            guard = liq_price * (1.0 + liq_buffer)
+            return liq_price, guard, max(entry - guard, 0.0)
+        liq_price = entry * (1.0 + liq_move)
+        guard = liq_price * (1.0 - liq_buffer)
+        return liq_price, guard, max(guard - entry, 0.0)
+
+    def _sl_before_liquidation(self, side: str, sl: float, price: float) -> bool:
+        if not self._sl_is_protective(side, sl, price):
+            return False
+        _liq, guard, room = self._liquidation_guard(side, price)
+        if room <= 0:
+            return False
+        if side == "long":
+            return sl > guard
+        return sl < guard
 
     def _reject_bad_sl(self, side: str, sl: float, price: float,
                        sweep_price: float, now: float, reason: str) -> bool:
@@ -1589,7 +1641,8 @@ class EntryEngine:
         if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
             return None, "non-protective structural SL"
 
-        max_risk = atr * _SL_MAX_ATR_MULT
+        _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
+        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
         sl = structural_sl
         risk = abs(price - sl)
         invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
@@ -1627,10 +1680,8 @@ class EntryEngine:
 
         if not self._sl_is_protective(side, sl, price):
             return None, "SL crossed market after liquidity push"
-        if risk > max_risk:
-            return None, f"risk {risk/atr:.2f}x ATR exceeds max {_SL_MAX_ATR_MULT:.1f}x"
-        if risk / price > _MAX_SL_DISTANCE_PCT:
-            return None, f"risk {risk/price*100:.3f}% exceeds pct ceiling"
+        if not self._sl_before_liquidation(side, sl, price):
+            return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
         if risk > abs(price - structural_sl) + 1e-9:
             logger.info(
                 "SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, noise floor %.2fATR)",
@@ -1688,7 +1739,7 @@ class EntryEngine:
                 f"SL anchored to wick: risk={risk:.1f}pts ({risk/atr:.2f}x ATR) "
                 f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
 
-        # ── ATR ceiling: reject structurally overlarge SL ─────────────────
+        # ── Institutional SL envelope ─────────────────────────────────────
         sl, sl_reason = self._apply_institutional_sl_envelope(
             snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
         if sl is None:
@@ -1703,17 +1754,10 @@ class EntryEngine:
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal structural stop wrong-side"):
             return
 
-        if risk > max_risk:
+        if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL too wide): risk={risk:.1f} = {risk/atr:.1f}x ATR "
-                f"(max={_SL_MAX_ATR_MULT}x) side={side} sweep=${sweep.pool.price:.1f}")
-            self._post_sweep = None
-            self._reset(now)
-            return
-        if risk / price > _MAX_SL_DISTANCE_PCT:
-            logger.info(
-                f"ENTRY REJECTED (SL exceeds PCT ceiling): {risk/price*100:.3f}% "
-                f"(max={_MAX_SL_DISTANCE_PCT*100:.2f}%) side={side}")
+                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1829,18 +1873,11 @@ class EntryEngine:
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "continuation structural stop wrong-side"):
             return
 
-        # ── ATR ceiling ───────────────────────────────────────────────────
-        if risk > atr * _SL_MAX_ATR_MULT:
+        # ── Liquidation guard ─────────────────────────────────────────────
+        if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL too wide): {risk/atr:.1f}x ATR "
-                f"(max={_SL_MAX_ATR_MULT}x) side={side} sweep=${sweep.pool.price:.1f}")
-            self._post_sweep = None
-            self._reset(now)
-            return
-        if risk / price > _MAX_SL_DISTANCE_PCT:
-            logger.info(
-                f"ENTRY REJECTED (SL exceeds PCT ceiling): {risk/price*100:.3f}% "
-                f"side={side}")
+                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -2012,9 +2049,9 @@ class EntryEngine:
 
         Placement priority:
           1. Nearest OB on the entry side (structural anchor — tightest valid SL)
-        Validation (ATR-relative, not price-percentage):
-          - OB SL rejected if it places risk outside [0.20 ATR, 4.0 ATR]
-          - Legacy PCT ceiling kept as absolute sanity guard
+        Validation:
+          - OB SL must clear live noise.
+          - OB SL must remain before the exchange liquidation guard.
         """
         if ict is None:
             return None
@@ -2033,8 +2070,7 @@ class EntryEngine:
 
         if sl is not None:
             ob_risk = abs(price - sl)
-            # Reject OB-based SL if it falls outside the ATR validity band
-            if ob_risk < atr * _SL_MIN_ATR_MULT or ob_risk > atr * _SL_MAX_ATR_MULT:
+            if ob_risk < atr * _SL_MIN_ATR_MULT or not self._sl_before_liquidation(side, sl, price):
                 sl = None
 
         if sl is None:
@@ -2049,11 +2085,7 @@ class EntryEngine:
         if risk < atr * _SL_MIN_ATR_MULT:
             return None
 
-        # ATR ceiling
-        if risk > atr * _SL_MAX_ATR_MULT:
-            return None
-        # Legacy PCT ceiling
-        if risk / price > _MAX_SL_DISTANCE_PCT:
+        if not self._sl_before_liquidation(side, sl, price):
             return None
         return sl
 
