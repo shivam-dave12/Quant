@@ -2708,7 +2708,7 @@ class QuantStrategy:
         dir_status = "ACTIVE" if self._dir_engine else "UNAVAILABLE"
         logger.info(f"   DirectionEngine: {dir_status}")
         conv_status = "ACTIVE" if self._conviction else "UNAVAILABLE"
-        logger.info(f"   ConvictionGate: {conv_status}")
+        logger.info(f"   ConvictionModel: {conv_status}")
         liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
         logger.info(f"   LiquidityTrail: {liq_trail}")
         pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
@@ -3889,16 +3889,16 @@ class QuantStrategy:
         Institutional Unified Entry Gate Ã¢â‚¬â€ ADVISORY ONLY (fully data-driven).
 
         This gate logs structural coherence notes for diagnostics but does NOT
-        block any trade. All actual gating is handled by the conviction_filter
-        score. The architecture is:
+        block any trade. Final trade permission is owned by the institutional
+        decision matrix; the conviction model contributes advisory sizing.
 
-          ConvictionFilter Ã¢â€ â€™ SCORE gates the trade (single source of truth)
-          UnifiedGate     Ã¢â€ â€™ LOGS advisory signals for post-trade attribution
+          InstitutionalMatrix -> owns the trade thesis and TP/SL realism
+          ConvictionFilter    -> advisory confluence score and safety circuits
+          UnifiedGate         -> diagnostics for post-trade attribution
 
         Philosophy: no binary veto on session, AMD phase, flow direction, or HTF
-        structure. The data-driven score in conviction_filter already weights all
-        of these factors. A double-gate creates false precision (two separate
-        thresholds on the same signal) and blocks valid setups.
+        structure. The data-driven matrix already weights all of these factors.
+        A double-gate creates false precision and blocks valid setups.
         """
         advisories = []   # informational only Ã¢â‚¬â€ never blocks
 
@@ -4023,7 +4023,7 @@ class QuantStrategy:
         Session note: this method runs regardless of session label (WEEKEND,
         OFF_HOURS, etc.).  Crypto markets are 24/7.  Session-awareness is
         handled by the factor scoring inside ConvictionFilter (WEEKEND scores
-        0.65, ASIA is hard-blocked) and DirectionEngine Factor 8.  There is
+        0.80, ASIA scores 0.60 without a hard block) and DirectionEngine Factor 8.  There is
         no early exit for weekends Ã¢â‚¬â€ a valid liquidity hunt at 3am Saturday
         is as real as one on Tuesday during the London open.
         """
@@ -4983,79 +4983,38 @@ class QuantStrategy:
                 )
                 if not _conv_result.allowed:
                     reject_str = " | ".join(_conv_result.reject_reasons[:3])
-                    # Deduplicate: only log at INFO when score or reason changes
-                    _conv_key = (signal.side, round(_conv_result.score, 2), reject_str[:60])
-                    _conv_last = getattr(self, "_last_conv_block_key", None)
-                    _is_circuit_block = any(
-                        ("CIRCUIT" in str(r).upper() or "DRAWDOWN" in str(r).upper())
+                    _is_safety_block = any(
+                        any(token in str(r).upper() for token in (
+                            "CIRCUIT", "DRAWDOWN", "MAX_SESSION", "SESSION_LOSS",
+                            "DAILY LOSS", "LOSS LIMIT",
+                        ))
                         for r in (_conv_result.reject_reasons or [])
                     )
-                    if _is_circuit_block or _conv_key != _conv_last:
+                    if _is_safety_block:
+                        logger.info(
+                            f"Institutional safety block [{signal.side.upper()}] "
+                            f"score={_conv_result.score:.3f} | {reject_str}")
+                        self._suppress_rejected_entry_signal(
+                            signal, reject_str or "institutional safety block", cooldown_sec=120.0)
+                        return
+
+                    conv_score = max(0.0, min(1.0, float(getattr(_conv_result, "score", 0.0) or 0.0)))
+                    advisory_mult = max(0.55, min(1.0, 0.55 + 0.75 * conv_score))
+                    current_inst_mult = float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
+                    self._active_institutional_size_mult = max(
+                        0.30, min(current_inst_mult, current_inst_mult * advisory_mult))
+                    _conv_key = (signal.side, round(conv_score, 2), reject_str[:80])
+                    if _conv_key != getattr(self, "_last_conv_block_key", None):
                         self._last_conv_block_key = _conv_key
                         logger.info(
-                            f"Ã°Å¸Å¡Â« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
-                            f"score={_conv_result.score:.3f} | {reject_str}")
+                            f"Conviction advisory [{signal.side.upper()}] "
+                            f"score={conv_score:.3f}; matrix owns thesis, "
+                            f"size_mult {current_inst_mult:.2f}->{self._active_institutional_size_mult:.2f} | "
+                            f"{reject_str}")
                     else:
                         logger.debug(
-                            f"Ã°Å¸Å¡Â« CONVICTION GATE BLOCKED [{signal.side.upper()}] "
-                            f"score={_conv_result.score:.3f} | {reject_str}")
-                    # BUG-B2 / FIX-SPAM / FIX-SL-FLIP:
-                    # Route the gate-block notification to the correct suppressor
-                    # based on signal type.
-                    #
-                    # DISPLACEMENT_MOMENTUM Ã¢â€ â€™ mark_momentum_blocked():
-                    #   Freezes the SL at signal.sl_price so it doesn't oscillate
-                    #   between the ICT-OB path and the ATR-fallback path on
-                    #   alternating ticks. Also suppresses spam for 30s (configurable).
-                    #
-                    # POST_SWEEP (REVERSAL / CONTINUATION) Ã¢â€ â€™ mark_gate_blocked():
-                    #   Existing 45s cooldown for the evidence-accumulation model.
-                    #   Not used for momentum because momentum has no evidence state
-                    #   to accumulate Ã¢â‚¬â€ the cooldown logic is different.
-                    _is_momentum = (
-                        hasattr(signal, 'entry_type')
-                        and signal.entry_type is not None
-                        and 'MOMENTUM' in str(signal.entry_type).upper()
-                    )
-                    if _is_momentum and hasattr(self._entry_engine, 'mark_momentum_blocked'):
-                        self._entry_engine.mark_momentum_blocked(
-                            entry_price = signal.entry_price,
-                            candle_ts   = getattr(signal, 'displacement_candle_ts', 0),
-                            locked_sl   = signal.sl_price,
-                            cooldown_sec= 30.0,
-                        )
-                        self._entry_engine.consume_signal()
-                    elif hasattr(self._entry_engine, 'mark_gate_blocked'):
-                        self._entry_engine.mark_gate_blocked(
-                            signal.side, reject_str[:40], cooldown_sec=10.0)
-                        # BUG-3 FIX (GATE-ORPHAN): consume_signal AFTER mark_gate_blocked
-                        # (same ordering rationale as the unified gate path above).
-                        self._entry_engine.consume_signal()
-                    else:
-                        self._entry_engine.consume_signal()
-                    # Telegram alert for conviction block (throttled 60s per side)
-                    _conv_tg_key = f"_conv_tg_last_{signal.side}"
-                    if now - getattr(self, _conv_tg_key, 0.0) >= 60.0:
-                        setattr(self, _conv_tg_key, now)
-                        try:
-                            from telegram.notifier import format_conviction_block_alert
-                            from telegram.notifier import send_telegram_message as _stm
-                            _stm(format_conviction_block_alert(
-                                side          = signal.side,
-                                score         = _conv_result.score,
-                                reject_reasons= _conv_result.reject_reasons,
-                                allow_reasons = _conv_result.allow_reasons,
-                                factors       = _conv_result.factors,
-                                entry_price   = signal.entry_price,
-                                sl_price      = signal.sl_price,
-                                tp_price      = signal.tp_price,
-                                rr_ratio      = _conv_result.rr_ratio,
-                            ))
-                        except Exception as _cv_tg_e:
-                            logger.debug(f"ConvictionGate Telegram error: {_cv_tg_e}")
-                    self._entry_confirm_key = None
-                    self._entry_confirm_count = 0
-                    return
+                            f"Conviction advisory [{signal.side.upper()}] "
+                            f"score={conv_score:.3f} | {reject_str}")
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
             _min_sig.atr = atr
@@ -7751,6 +7710,13 @@ class QuantStrategy:
         risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
         margin_used   = qty * price / QCfg.LEVERAGE()
         actual_fees   = qty * price * _taker_rate * 2.0   # worst-case round-trip
+        max_risk_cap = max(risk_capital * 1.15, available_after_fees * risk_pct * 1.15)
+        if dollar_risk > max_risk_cap:
+            logger.warning(
+                f"Sizing rejected: exchange min lot would over-risk account | "
+                f"qty={qty} SL-dist={sl_dist:.1f}pts risk=${dollar_risk:.2f} "
+                f"cap=${max_risk_cap:.2f} ({risk_pct_act:.2f}% of ${available:.2f})")
+            return None
 
         logger.info(
             f"Ã¢Å“â€¦ Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "

@@ -110,12 +110,9 @@ _TF_RANK: Dict[str, int] = {
 }
 
 # ── Session quality ───────────────────────────────────────────────────────────
-# ASIA is the only hard-blocked session (no institutional delivery, no named
-# kill zone, pure accumulation / range).
-#
-# WEEKEND is NOT hard-blocked.  Crypto markets run 24/7.  Liquidity hunts,
+# No session is hard-blocked here. Crypto markets run 24/7; liquidity hunts,
 # AMD cycles, HTF structure, displacement, and CISD are all equally valid on
-# a Saturday.  What changes is the ABSENCE of a named institutional kill zone
+# a Saturday or during Asia/off-hours. What changes is the absence of a named
 # (London open / NY open).  We model that as a moderate score reduction rather
 # than a veto — the conviction gate's displacement + CISD + pool-TF weights
 # already handle the lower-quality setups naturally.
@@ -492,8 +489,8 @@ class ConvictionFilter:
         # ── Final decision ─────────────────────────────────────────────────
         allowed = score_passed and product_passed
         if allowed:
-            logger.info(
-                f"✅ CONVICTION PASSED ({score:.3f}) | {' | '.join(allows[:5])}")
+            logger.debug(
+                f"Conviction advisory PASS ({score:.3f}) | {' | '.join(allows[:5])}")
         return ConvictionResult(
             allowed=allowed, score=score, factors=factors,
             reject_reasons=rejects, allow_reasons=allows,
@@ -986,9 +983,8 @@ class ConvictionFilter:
           3. ict_engine._killzone — kill-zone-only label, last resort
 
         WEEKEND is checked FIRST in every source so it is never masked by a
-        partial string match against NY / LONDON / ASIA.  Previously the method
-        checked NY before WEEKEND, so "WEEKEND" fell through to return '' and
-        the hard-block gate never fired.
+        partial string match against NY / LONDON / ASIA. This keeps session
+        scoring accurate without turning any session label into a hard veto.
         """
         sources = [session_hint]
         if ict_engine is not None:

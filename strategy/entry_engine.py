@@ -595,8 +595,8 @@ class EntryEngine:
         cooldown_sec: float = _MOMENTUM_BLOCK_SEC,
     ) -> None:
         """
-        FIX-SPAM + FIX-SL-FLIP: Called by quant_strategy when the conviction gate
-        blocks a DISPLACEMENT_MOMENTUM signal.
+        FIX-SPAM + FIX-SL-FLIP: Called when a DISPLACEMENT_MOMENTUM setup is
+        structurally blocked by either the strategy layer or this engine.
 
         Two problems solved in one call:
 
@@ -1048,7 +1048,8 @@ class EntryEngine:
             sl = cl_val - buf if disp_dir == "long" else ch + buf
             ict_sl = self._compute_sl(ict, disp_dir, price, atr)
             if ict_sl is None:
-                logger.info(
+                self.mark_momentum_blocked(price, disp_candle_ts, sl)
+                logger.debug(
                     f"MOMENTUM REJECTED (no ICT SL): side={disp_dir} "
                     f"entry=${price:.1f}")
                 return False
@@ -1062,7 +1063,8 @@ class EntryEngine:
         tp, target = self._find_tp(snap, disp_dir, price, atr, sl,
                                     _MOMENTUM_MIN_RR * (2.0 - amd_mult))
         if tp is None:
-            logger.info(
+            self.mark_momentum_blocked(price, disp_candle_ts, sl)
+            logger.debug(
                 f"MOMENTUM REJECTED (no liquidity TP): side={disp_dir} "
                 f"entry=${price:.1f} sl=${sl:.1f}")
             return False
