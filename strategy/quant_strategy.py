@@ -2332,7 +2332,7 @@ class PositionState:
     entry_signal: Optional[SignalBreakdown] = None
     peak_profit: float = 0.0; entry_atr: float = 0.0; entry_vol: float = 0.0
     peak_price_abs: float = 0.0  # actual peak price hit (highest for long, lowest for short)
-    trade_mode: str = "reversion"  # "reversion" | "trend"
+    trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" Ã¢â‚¬â€ for correct PnL fee calc
     entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
@@ -2514,7 +2514,7 @@ class QuantStrategy:
         # (c) _enter_trade() resets all state after a confirmed fill.
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
         self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
-        self._tp_gate_rejection_mode = ""   # "reversion" | "trend" for per-mode logging
+        self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
         # BUG 2 FIX: timestamp when the limit ENTRY order actually hit the exchange.
@@ -2756,7 +2756,7 @@ class QuantStrategy:
         Stable event identity for confirmation.
 
         The old key used live entry/SL/TP ticks, so the same sweep became a
-        different key as price moved. This keys sweeps to their pool event.
+        different key as price moved. This keys entries to the liquidity sweep event.
         """
         side = str(getattr(signal, "side", "") or "")
         etype = self._signal_entry_type_value(signal)
@@ -2777,6 +2777,7 @@ class QuantStrategy:
                 round(pool_price / bucket),
                 round(detected_at, 1),
             )
+
 
         entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
         bucket = max(tick * 8.0, float(atr or 0.0) * 0.10, 1e-9)
@@ -2829,7 +2830,7 @@ class QuantStrategy:
         return ""
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
-        """Institutional veto for entry signals. Momentum entry type removed."""
+        """No standalone momentum entries remain; sweep entries are vetted elsewhere."""
         return ""
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
@@ -5052,7 +5053,7 @@ class QuantStrategy:
                 _sweep_present = signal.entry_type in (
                     EntryType.SWEEP_REVERSAL, EntryType.SWEEP_CONTINUATION,
                 )
-                _displacement_present = False  # momentum entry type removed
+                _displacement_present = False
 
                 _gate_ctx = GateContext(
                     now=now,
@@ -5899,11 +5900,8 @@ class QuantStrategy:
                         logger.info(f"Ã°Å¸â€â€ž Regime flip Ã¢â€ â€™ exit {pos.side.upper()} [{pos.trade_mode}]")
                         self._exit_trade(order_manager, price, "regime_flip"); return
 
-            # v6.0: Momentum trades exit via SL, TP, or trailing SL ONLY.
-            # BREAKOUT_EXPIRED exit REMOVED Ã¢â‚¬â€ it was closing positions right before
-            # TP hit because breakout timer expired while the move was still in progress.
-            # Momentum trades are structurally managed: SL trails via ICT structure,
-            # TP is at the opposing liquidity pool. No premature composite-based exit.
+            # Liquidity-hunt trades exit via SL, TP, or trailing SL only.
+            # No premature composite-based exit while the liquidity-delivery thesis is active.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
             # Not on a single tick flip Ã¢â‚¬â€ on sustained counter-flow + BOS reversal.

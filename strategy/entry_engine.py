@@ -5,12 +5,14 @@ Architecture:
   Price moves from pool to pool. Smart money sweeps stops, then delivers
   the opposite direction. This engine ONLY enters on confirmed events:
 
-  1. SWEEP REVERSAL  — Pool swept + displacement + CISD → enter reversal
+  1. SWEEP REVERSAL     — Pool swept + displacement + CISD → enter reversal
   2. SWEEP CONTINUATION — Pool swept + flow continues → ride the flow
-  NO approach entries. Institutions do not front-run the sweep.
+
+  NO approach entries. NO standalone momentum entries. Institutions do not front-run
+  the sweep; every entry must be tied to a confirmed liquidity sweep.
 
 State Machine:
-  SCANNING    → monitors for sweeps and displacement candles
+  SCANNING    → monitors for liquidity sweeps only
   POST_SWEEP  → 4-phase accumulative evidence model after sweep detected
   ENTERING    → entry placed, waiting for fill
   IN_POSITION → position live, managed by quant_strategy.py
@@ -331,6 +333,48 @@ class EntryEngine:
         self._last_sweep_reversal_dir  = ""
         self._last_sweep_reversal_time = 0.0
 
+
+        # Compat stubs for TRACKING/READY (unused in sweep-only mode)
+        self._tracking = None
+        self._proximity_confirms = 0
+        self._proximity_target   = None
+        self._proximity_side     = ""
+
+        # BUG-B2 FIX: Gate-block cooldown (POST_SWEEP signals)
+        # When unified_entry_gate or conviction_filter blocks a signal from the
+        # active POST_SWEEP state, the post_sweep evidence model remains alive and
+        # will regenerate the identical signal on the next tick (250ms later).
+        # Without this guard, the bot enters a busy-loop: generate → block → consume
+        # → generate → block, cycling at 4 Hz and exhausting every pool evaluation
+        # before any structural evidence can accumulate.
+        #
+        # _gate_blocked_until: epoch timestamp after which signal generation is
+        #   allowed again. Set by mark_gate_blocked() called from quant_strategy.
+        # _gate_block_key: (side, reason_prefix) dedup so a DIFFERENT gate reason
+        #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
+        self._gate_blocked_until: float = 0.0
+        self._gate_block_key: tuple = ()
+
+        # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
+        # After a verdict fires, _handle_reversal/_handle_continuation previously
+        # cleared _post_sweep but did NOT record the sweep as processed.  On the
+        # next SCANNING tick _collect_sweeps() found the same sweep (still within
+        # the 60s window) and re-entered POST_SWEEP — looping every ~5s for up to
+        # 60s per sweep.
+        #
+        # Key schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
+        #   pool_price   — rounded to dollar to absorb tick-level float noise
+        #   pool_side    — "BSL" or "SSL" — different sides at same price are distinct
+        #   detected_at  — rounded to second; ensures a NEW sweep at the same level
+        #                  (detected_at differs) is never suppressed by a stale entry
+        #
+        # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
+        # window PLUS the 45s gate-block cooldown with 15s margin.
+        #
+        # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
+        # must survive a state reset so the same sweep cannot sneak back in.
+        # force_reset() clears it fully when the operator demands a hard reset.
+        self._processed_sweeps: Dict[tuple, float] = {}
 
         # ── Diagnostic: sweep-rejection counters ──────────────────────────
         # Populated by _collect_sweeps() on every tick. Read by the strategy's
@@ -784,10 +828,11 @@ class EntryEngine:
 
     def _do_scanning(self, snap, flow, ict, price, atr, now,
                      candles_1m, candles_5m) -> None:
-        """Scan for sweep events. Entry is sweep-only."""
-        pass
+        """Sweep-only mode: scanning is handled by _collect_sweeps() in update()."""
+        return
 
     # ═══════════════════════════════════════════════════════════════════
+    # POST-SWEEP PIPELINE    # ═══════════════════════════════════════════════════════════════════
     # POST-SWEEP PIPELINE
     # ═══════════════════════════════════════════════════════════════════
 
