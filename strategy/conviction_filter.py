@@ -18,8 +18,8 @@ WHY REWRITE:
 
 INSTITUTIONAL CONVICTION MODEL v3.1:
 
-  NO HARD GATES — all factors are data-driven score contributions.
-  Poor values reduce the score; exceptional setups can still pass.
+  HARD INSTITUTIONAL VETOES plus weighted factor scoring.
+  Poor values reduce the score; missing structure or sub-minimum product blocks.
 
   WEIGHTED FACTORS (scored 0-1, weighted sum must pass threshold):
     1. Pool significance quality        0.20
@@ -99,7 +99,7 @@ MIN_ENTRY_INTERVAL_SEC = _CFG_INTERVAL_SEC
 MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
 PRODUCT_MIN_CORE = _CFG_PRODUCT_MIN_CORE
 
-# ── Dealing range — scoring zones (no hard block) ────────────────────────────
+# ── Dealing range scoring zones ──────────────────────────────────────────────
 DR_LONG_MAX_PD = 0.65    # Longs preferred in discount but allowed wider
 DR_SHORT_MIN_PD = 0.35   # Shorts preferred in premium but allowed wider
 
@@ -282,42 +282,42 @@ class ConvictionFilter:
         elif pool_htf_count >= 1: effective_rank = max(native_rank, 2)
         else:                     effective_rank = native_rank
 
-        is_approach = any(k in entry_type.lower()
+        entry_type_l = entry_type.lower()
+        is_approach = any(k in entry_type_l
                           for k in ("approach", "pre_sweep", "proximity"))
-        _is_reversal_type = "reversal" in entry_type.lower()
+        _is_reversal_type = "reversal" in entry_type_l
 
         # ══════════════════════════════════════════════════════════════════
         # MANDATORY HARD GATES — any failure = immediate rejection
         # ══════════════════════════════════════════════════════════════════
 
-        # ── GATE 1: Pool timeframe — data-driven (no hard block) ────────────
+        # ── GATE 1: Pool timeframe — hard minimum plus attribution score ────
         # Pool TF rank feeds directly into _rank_bonus in Factor 1 scoring:
         #   rank 1 (1m) → _rank_bonus = 0.25   (very low contribution)
         #   rank 2 (5m) → _rank_bonus = 0.50   (moderate)
         #   rank 3 (15m)→ _rank_bonus = 0.75   (good)
         #   rank 4 (1h+)→ _rank_bonus = 1.00   (excellent)
-        # Low-rank pools score poorly and almost never clear REQUIRED_SCORE.
-        # No early return — the score gates the trade.
+        # Low-rank pools are hard vetoed, while still scored for attribution.
         if effective_rank < POOL_MIN_TF_RANK:
             hard_rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) "
                 f"rank={effective_rank} < required {POOL_MIN_TF_RANK}")
             rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
-                f"— will score low (not hard-blocked; data-driven)")
+                f"— hard institutional veto; scored for attribution")
             # Falls through to factor scoring.
 
-# ── GATE 2: Dealing range — fully data-driven score factor (no hard block) ──
-        # The dealing range P/D position is incorporated as a SCORE FACTOR in the
-        # conviction model, not as a hard veto. This is correct ICT methodology:
+# ── GATE 2: Dealing range — score factor plus data-availability veto ──
+        # The dealing range P/D position is incorporated as a score factor, and
+        # missing structural range data is an institutional hard veto:
         #
         #   For APPROACH entries:  discount = good zone to buy (score bonus)
         #   For REVERSAL entries:  premium SSL sweep = false move down, LONG is correct
         #                          (dealing range gate is irrelevant / inverted)
         #   For CONTINUATION:      scoring reflects the directional bias naturally
         #
-        # None of this needs a hard block. A poor dealing-range position reduces
-        # the score; an exceptional setup in the wrong zone can still pass.
+        # Poor position reduces the score; missing structural range data blocks
+        # execution because premium/discount cannot be validated.
         dr_pd, dr_data_available = self._get_dealing_range_pd(
             price, ict_engine, liq_snapshot)
         if not dr_data_available:
@@ -330,11 +330,10 @@ class ConvictionFilter:
             f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) {entry_type} — data-driven scoring only")
         factors.dealing_range_ok = dr_data_available
 
-        # ── GATE 3: R:R — data-driven score modifier (no hard block) ─────────
-        # R:R below minimum does NOT veto — it reduces the pool_sig_score.
-        # Rationale: a setup can have genuinely poor R:R due to tight structure
-        # but still be valid. A 1.5 R:R setup with exceptional CISD + OTE is
-        # better than a 3:1 R:R with no confirmation. Let the composite score decide.
+        # ── GATE 3: R:R — score modifier plus hard minimum ─────────
+        # R:R below minimum vetoes the trade and reduces the pool_sig_score.
+        # Rationale: attribution still records low-R:R quality, but live
+        # execution requires both structural confirmation and minimum expectancy.
         #
         # R:R score modifier applied to pool_sig_score (aligned with MIN_RR=1.2):
         #   R:R >= 2.5  → +0.10 bonus
@@ -367,11 +366,11 @@ class ConvictionFilter:
         amd_phase = self._get_amd_phase(ict_engine)
         # No hard block. amd_phase is passed to _score_amd() below.
         
-        # ── Gate 6: Approach entries — data-driven (no hard block) ─────────────
+        # ── Gate 6: Approach entries — hard veto until sweep confirmation ─────
         # Approach entries score very low on displacement (0.20) and CISD (0.10)
         # because no sweep/wick/structural confirmation exists yet. The resulting
-        # score (typically <0.45) almost never clears REQUIRED_SCORE=0.65.
-        # No unconditional block — the score alone gates the trade.
+        # score is retained for attribution, but live execution is vetoed until
+        # sweep confirmation exists.
         if is_approach:
             hard_rejects.append("APPROACH_HARD: pre-sweep setup is not executable")
             rejects.append("APPROACH: pre-sweep — expect very low displacement/CISD scores")
@@ -379,6 +378,15 @@ class ConvictionFilter:
 
         if _is_reversal_type and sweep_wick_price <= 0:
             hard_rejects.append("REVERSAL_WICK_MISSING: cannot anchor OTE to sweep wick")
+
+        _requires_measured_displacement = (
+            _is_reversal_type
+            or "continuation" in entry_type_l
+            or "displacement" in entry_type_l
+        )
+        if _requires_measured_displacement and measured_displacement_atr <= 0:
+            hard_rejects.append(
+                "DISPLACEMENT_MISSING: no measured post-sweep displacement")
 
         # ══════════════════════════════════════════════════════════════════
         # FACTOR SCORING — weighted conviction model
@@ -503,7 +511,7 @@ class ConvictionFilter:
         allowed = score_passed and product_passed and not hard_rejects
         if allowed:
             logger.debug(
-                f"Conviction advisory PASS ({score:.3f}) | {' | '.join(allows[:5])}")
+                f"Conviction gate PASS ({score:.3f}) | {' | '.join(allows[:5])}")
         return ConvictionResult(
             allowed=allowed, score=score, factors=factors,
             reject_reasons=rejects, allow_reasons=allows,

@@ -281,7 +281,7 @@ QUANT_W_OB                     = 0.20
 QUANT_W_TICK_FLOW              = 0.15
 QUANT_W_VOL_EXHAUSTION         = 0.10
 QUANT_HTF_ENABLED              = True
-QUANT_HTF_VETO_STRENGTH        = 0.00     # disabled — advisory only
+QUANT_HTF_VETO_STRENGTH        = 0.70
 QUANT_OB_DEPTH_LEVELS          = 5
 QUANT_OB_HIST_LEN              = 60
 QUANT_TICK_AGG_WINDOW_SEC      = 30.0
@@ -375,9 +375,9 @@ ICT_OB_PROXIMITY_ATR        = 1.5
 ICT_FVG_PROXIMITY_ATR       = 0.8
 ICT_SWEEP_DISP_BONUS        = 0.12
 
-# ── HTF context (no veto — advisory only) ─────────────────────────────────────
-QUANT_HTF_15M_VETO           = 0.00     # disabled — no HTF veto
-QUANT_HTF_BOTH_VETO          = 0.00     # disabled — no HTF veto
+# ── HTF context ───────────────────────────────────────────────────────────────
+QUANT_HTF_15M_VETO           = 0.35
+QUANT_HTF_BOTH_VETO          = 0.20
 
 # ── Conviction Filter ─────────────────────────────────────────────────────────
 CONVICTION_MIN_SCORE               = 0.68

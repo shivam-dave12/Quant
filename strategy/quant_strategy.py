@@ -2140,10 +2140,9 @@ class HTFTrendFilter:
 
     def vetoes_trade(self, side: str) -> bool:
         """
-        HTF veto Ã¢â‚¬â€ DISABLED. Always returns False.
-        HTF context is advisory only; conviction filter scores HTF via structure.
+        Return True when HTF trend is materially opposed to the proposed side.
+        Thresholds come from QUANT_HTF_15M_VETO and QUANT_HTF_BOTH_VETO.
         """
-        return False
         if not QCfg.HTF_ENABLED():
             return False
         t15       = self._trend_15m
@@ -2894,6 +2893,38 @@ class QuantStrategy:
             pass
         self._entry_confirm_key = None
         self._entry_confirm_count = 0
+
+    def _block_failed_conviction(self, signal, conv_result) -> None:
+        reject_reasons = [str(r) for r in (getattr(conv_result, "reject_reasons", None) or [])]
+        reject_str = " | ".join(reject_reasons[:3])
+        conv_score = max(0.0, min(1.0, float(getattr(conv_result, "score", 0.0) or 0.0)))
+        upper_reasons = " | ".join(reject_reasons).upper()
+        is_safety_block = any(token in upper_reasons for token in (
+            "CIRCUIT", "DRAWDOWN", "MAX_SESSION", "SESSION_LOSS",
+            "DAILY LOSS", "LOSS LIMIT",
+        ))
+        block_label = "Institutional safety block" if is_safety_block else "Institutional conviction block"
+        cooldown = 120.0 if is_safety_block else 60.0
+        self._active_institutional_size_mult = 0.0
+
+        block_key = (
+            str(getattr(signal, "side", "") or ""),
+            round(conv_score, 2),
+            block_label,
+            reject_str[:120],
+        )
+        if block_key != getattr(self, "_last_conv_block_key", None):
+            self._last_conv_block_key = block_key
+            logger.info(
+                f"{block_label} [{str(getattr(signal, 'side', '') or '').upper()}] "
+                f"score={conv_score:.3f} | {reject_str}")
+        else:
+            logger.debug(
+                f"{block_label} [{str(getattr(signal, 'side', '') or '').upper()}] "
+                f"score={conv_score:.3f} | {reject_str}")
+
+        self._suppress_rejected_entry_signal(
+            signal, reject_str or block_label.lower(), cooldown_sec=cooldown)
 
     @staticmethod
     def _bounded(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -3888,19 +3919,19 @@ class QuantStrategy:
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
-        Institutional Unified Entry Gate Ã¢â‚¬â€ ADVISORY ONLY (fully data-driven).
+        Institutional Unified Entry Gate diagnostics.
 
         This gate logs structural coherence notes for diagnostics but does NOT
         block any trade. Final trade permission is owned by the institutional
-        decision matrix; the conviction model contributes advisory sizing.
+        decision matrix plus the conviction gate's hard veto.
 
-          InstitutionalMatrix -> owns the trade thesis and TP/SL realism
-          ConvictionFilter    -> advisory confluence score and safety circuits
+          InstitutionalMatrix -> trade thesis and TP/SL realism
+          ConvictionFilter    -> final product-quality and safety veto
           UnifiedGate         -> diagnostics for post-trade attribution
 
-        Philosophy: no binary veto on session, AMD phase, flow direction, or HTF
-        structure. The data-driven matrix already weights all of these factors.
-        A double-gate creates false precision and blocks valid setups.
+        Philosophy: this diagnostic layer does not veto session, AMD phase,
+        flow direction, or HTF structure; those controls live in the matrix and
+        conviction gate.
         """
         advisories = []   # informational only Ã¢â‚¬â€ never blocks
 
@@ -4898,7 +4929,7 @@ class QuantStrategy:
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
 
             logger.info(
-                f"SIGNAL: {signal.entry_type.value} {signal.side.upper()} "
+                f"ENTRY CANDIDATE: {signal.entry_type.value} {signal.side.upper()} "
                 f"@ ${signal.entry_price:,.1f} | "
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
@@ -5003,39 +5034,8 @@ class QuantStrategy:
                     live_balance     = float((bal_info or {}).get("available", 0.0)),
                 )
                 if not _conv_result.allowed:
-                    reject_str = " | ".join(_conv_result.reject_reasons[:3])
-                    _is_safety_block = any(
-                        any(token in str(r).upper() for token in (
-                            "CIRCUIT", "DRAWDOWN", "MAX_SESSION", "SESSION_LOSS",
-                            "DAILY LOSS", "LOSS LIMIT",
-                        ))
-                        for r in (_conv_result.reject_reasons or [])
-                    )
-                    if _is_safety_block:
-                        logger.info(
-                            f"Institutional safety block [{signal.side.upper()}] "
-                            f"score={_conv_result.score:.3f} | {reject_str}")
-                        self._suppress_rejected_entry_signal(
-                            signal, reject_str or "institutional safety block", cooldown_sec=120.0)
-                        return
-
-                    conv_score = max(0.0, min(1.0, float(getattr(_conv_result, "score", 0.0) or 0.0)))
-                    advisory_mult = max(0.55, min(1.0, 0.55 + 0.75 * conv_score))
-                    current_inst_mult = float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
-                    self._active_institutional_size_mult = max(
-                        0.30, min(current_inst_mult, current_inst_mult * advisory_mult))
-                    _conv_key = (signal.side, round(conv_score, 2), reject_str[:80])
-                    if _conv_key != getattr(self, "_last_conv_block_key", None):
-                        self._last_conv_block_key = _conv_key
-                        logger.info(
-                            f"Conviction advisory [{signal.side.upper()}] "
-                            f"score={conv_score:.3f}; matrix owns thesis, "
-                            f"size_mult {current_inst_mult:.2f}->{self._active_institutional_size_mult:.2f} | "
-                            f"{reject_str}")
-                    else:
-                        logger.debug(
-                            f"Conviction advisory [{signal.side.upper()}] "
-                            f"score={conv_score:.3f} | {reject_str}")
+                    self._block_failed_conviction(signal, _conv_result)
+                    return
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
             _min_sig.atr = atr
@@ -5432,7 +5432,7 @@ class QuantStrategy:
                 self._last_tp_gate_rejection = time.time()
             return
         else:
-            # Force levels active Ã¢â‚¬â€ fee engine check is advisory only (no block)
+            # Force levels active; fee/slippage expectancy is a hard execution gate.
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
                     _tp_dist = abs(tp_price - price)
@@ -5442,7 +5442,12 @@ class QuantStrategy:
                         use_maker_entry=use_maker,
                         signal_confidence=signal_confidence)
                     if _tp_dist < _min_tp:
-                        logger.debug(f"Fee advisory: TP dist {_tp_dist:.0f} < fee floor {_min_tp:.0f} (not blocking)")
+                        logger.info(
+                            f"Entry rejected by fee floor: TP dist {_tp_dist:.0f} "
+                            f"< required {_min_tp:.0f} after fees/slippage")
+                        with self._lock:
+                            self._last_tp_gate_rejection = time.time()
+                        return
                 except Exception:
                     pass
         if sl_price is None:
