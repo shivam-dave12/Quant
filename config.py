@@ -55,14 +55,14 @@ RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 4
-MAX_DAILY_TRADES         = 30        # allow more trades per day
+MAX_CONSECUTIVE_LOSSES   = 2
+MAX_DAILY_TRADES         = 10        # institutional selectivity over frequency
 ONE_POSITION_AT_A_TIME   = True
-MIN_TIME_BETWEEN_TRADES  = 0.5       # minutes; legacy alias for 30 seconds
-MIN_TIME_BETWEEN_TRADES_SEC = 30.0
-TRADE_COOLDOWN_SECONDS   = 30        # 30s cooldown after loss
-MIN_RISK_REWARD_RATIO    = 1.5       # institutional floor; reject thin R:R setups
-TARGET_RISK_REWARD_RATIO = 2.0
+MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; legacy alias for 300 seconds
+MIN_TIME_BETWEEN_TRADES_SEC = 300.0
+TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
+MIN_RISK_REWARD_RATIO    = 2.0       # hard floor; reject thin R:R setups
+TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Order execution ───────────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ QUANT_CVD_DIVERGENCE_MIN       = 0.15
 QUANT_OB_CONFIRM_MIN           = 0.10
 QUANT_COMPOSITE_ENTRY_MIN      = 0.35
 QUANT_EXIT_REVERSAL_THRESH     = 0.40
-QUANT_CONFIRM_TICKS            = 1        # confirm faster
+QUANT_CONFIRM_TICKS            = 2        # require sustained confirmation
 QUANT_SL_SWING_LOOKBACK        = 12
 QUANT_SL_BUFFER_ATR_MULT       = 0.4
 QUANT_TP_VWAP_FRACTION         = 0.65
@@ -245,12 +245,13 @@ QUANT_EMA_FAST                 = 8
 QUANT_EMA_SLOW                 = 21
 QUANT_VOL_FLOW_WINDOW          = 10
 QUANT_ATR_PCTILE_WINDOW        = 100
-QUANT_ATR_MIN_PCTILE           = 0.00
-QUANT_ATR_MAX_PCTILE           = 1.00     # don't block high-vol entries
+QUANT_ATR_MIN_PCTILE           = 0.05
+QUANT_ATR_MAX_PCTILE           = 0.97
 QUANT_MAX_HOLD_SEC             = 3600      # 60 min max hold
-QUANT_COOLDOWN_SEC             = 30        # 30s between trades
-QUANT_LOSS_LOCKOUT_SEC         = 300       # 5 min lockout after consec losses
+QUANT_COOLDOWN_SEC             = 300       # 5m between trades
+QUANT_LOSS_LOCKOUT_SEC         = 1800      # 30 min lockout after consec losses
 QUANT_POS_SYNC_SEC             = 30
+RECONCILE_POST_EXIT_SETTLE_SEC = 15.0      # ignore stale position feed right after local exit
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POST-EXIT RE-ENTRY GATE (strategy/post_exit_gate.py)
@@ -301,9 +302,9 @@ QUANT_TREND_COMPOSITE_MIN      = 0.35
 QUANT_TREND_CONFIRM_TICKS      = 3
 QUANT_TREND_CHANDELIER_N       = 1.5
 QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # more spread tolerance
-QUANT_REVERSION_MIN_RR         = 1.5      # single authoritative R:R floor
+QUANT_REVERSION_MIN_RR         = 2.0      # single authoritative R:R floor
 QUANT_REVERSION_MAX_RR         = 5.0
-QUANT_TREND_MIN_RR             = 1.2
+QUANT_TREND_MIN_RR             = 2.0
 QUANT_TREND_MAX_RR             = 5.0
 QUANT_TREND_SL_ATR_MULT        = 2.0
 QUANT_TP_MIN_ATR_MULT          = 0.5
@@ -314,8 +315,8 @@ QUANT_MAX_HOLD_PROFIT_SL_ATR   = 0.5
 QUANT_MAX_HOLD_EXTENSIONS      = 5
 QUANT_HOLD_EXTENSION_SEC       = 1200
 QUANT_THESIS_MAX_DRAWDOWN_PCT  = 0.70
-QUANT_MIN_RAW_COMPOSITE        = 0.20     # lowered composite threshold
-QUANT_MIN_CONFIRMING           = 2        # need only 2 confirming signals
+QUANT_MIN_RAW_COMPOSITE        = 0.35
+QUANT_MIN_CONFIRMING           = 3
 
 # ── Fee engine ────────────────────────────────────────────────────────────────
 FEE_SPREAD_HIST_MAXLEN      = 500
@@ -379,16 +380,16 @@ QUANT_HTF_15M_VETO           = 0.00     # disabled — no HTF veto
 QUANT_HTF_BOTH_VETO          = 0.00     # disabled — no HTF veto
 
 # ── Conviction Filter ─────────────────────────────────────────────────────────
-CONVICTION_MIN_SCORE               = 0.45    # lowered to allow trades to execute
-CONVICTION_POOL_MIN_TF_RANK        = 1       # allow all TF pools
-CONVICTION_DISPLACEMENT_BODY_ATR   = 0.40    # lower displacement requirement
-CONVICTION_OTE_FIB_LOW             = 0.382
-CONVICTION_OTE_FIB_HIGH            = 0.886
-CONVICTION_MIN_RR                  = 1.5     # match risk management R:R
-CONVICTION_PRODUCT_MIN_CORE        = 0.45    # pool/displacement/CISD must each be real
-CONVICTION_MAX_SESSION_LOSSES      = 5       # allow more losses per session
-CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 10      # 10s pacing (on_tick cooldown is primary)
-CONVICTION_MAX_ENTRIES_PER_SESSION = 20      # allow many entries per session
+CONVICTION_MIN_SCORE               = 0.68
+CONVICTION_POOL_MIN_TF_RANK        = 3       # 15m+ pool or HTF-promoted 5m
+CONVICTION_DISPLACEMENT_BODY_ATR   = 0.70
+CONVICTION_OTE_FIB_LOW             = 0.500
+CONVICTION_OTE_FIB_HIGH            = 0.786
+CONVICTION_MIN_RR                  = 2.0     # match risk management R:R
+CONVICTION_PRODUCT_MIN_CORE        = 0.60    # pool/displacement/CISD must each be real
+CONVICTION_MAX_SESSION_LOSSES      = 2
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 300
+CONVICTION_MAX_ENTRIES_PER_SESSION = 6
 
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25

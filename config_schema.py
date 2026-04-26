@@ -101,18 +101,18 @@ class RiskConfig(BaseModel):
         le=20,
     )
     MAX_DAILY_TRADES: int = Field(
-        default_factory=lambda: _c("MAX_DAILY_TRADES", 30),
+        default_factory=lambda: _c("MAX_DAILY_TRADES", 10),
         ge=1,
         le=500,
     )
     MIN_RISK_REWARD_RATIO: float = Field(
-        default_factory=lambda: _c("MIN_RISK_REWARD_RATIO", 1.5),
+        default_factory=lambda: _c("MIN_RISK_REWARD_RATIO", 2.0),
         ge=1.0,
         le=10.0,
         description="Institutional R:R floor.  Must be >= 1.5.",
     )
     TARGET_RISK_REWARD_RATIO: float = Field(
-        default_factory=lambda: _c("TARGET_RISK_REWARD_RATIO", 2.0),
+        default_factory=lambda: _c("TARGET_RISK_REWARD_RATIO", 3.0),
         ge=1.0,
         le=20.0,
     )
@@ -178,38 +178,53 @@ class ConvictionConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     CONVICTION_MIN_SCORE: float = Field(
-        default_factory=lambda: _c("CONVICTION_MIN_SCORE", 0.45),
+        default_factory=lambda: _c("CONVICTION_MIN_SCORE", 0.68),
         ge=0.0,
         le=1.0,
     )
     CONVICTION_MIN_RR: float = Field(
-        default_factory=lambda: _c("CONVICTION_MIN_RR", 1.5),
+        default_factory=lambda: _c("CONVICTION_MIN_RR", 2.0),
         ge=1.0,
         le=10.0,
     )
+    CONVICTION_POOL_MIN_TF_RANK: int = Field(
+        default_factory=lambda: _c("CONVICTION_POOL_MIN_TF_RANK", 3),
+        ge=1,
+        le=6,
+    )
+    CONVICTION_DISPLACEMENT_BODY_ATR: float = Field(
+        default_factory=lambda: _c("CONVICTION_DISPLACEMENT_BODY_ATR", 0.70),
+        ge=0.0,
+        le=5.0,
+    )
     CONVICTION_PRODUCT_MIN_CORE: float = Field(
-        default_factory=lambda: _c("CONVICTION_PRODUCT_MIN_CORE", 0.45),
+        default_factory=lambda: _c("CONVICTION_PRODUCT_MIN_CORE", 0.60),
         ge=0.0,
         le=1.0,
     )
     CONVICTION_OTE_FIB_LOW: float = Field(
-        default_factory=lambda: _c("CONVICTION_OTE_FIB_LOW", 0.382),
+        default_factory=lambda: _c("CONVICTION_OTE_FIB_LOW", 0.500),
         ge=0.0,
         le=1.0,
     )
     CONVICTION_OTE_FIB_HIGH: float = Field(
-        default_factory=lambda: _c("CONVICTION_OTE_FIB_HIGH", 0.886),
+        default_factory=lambda: _c("CONVICTION_OTE_FIB_HIGH", 0.786),
         ge=0.0,
         le=1.0,
     )
     CONVICTION_MAX_SESSION_LOSSES: int = Field(
-        default_factory=lambda: _c("CONVICTION_MAX_SESSION_LOSSES", 5),
+        default_factory=lambda: _c("CONVICTION_MAX_SESSION_LOSSES", 2),
         ge=1,
         le=50,
     )
     CONVICTION_MIN_ENTRY_INTERVAL_SEC: float = Field(
-        default_factory=lambda: _c("CONVICTION_MIN_ENTRY_INTERVAL_SEC", 10.0),
+        default_factory=lambda: _c("CONVICTION_MIN_ENTRY_INTERVAL_SEC", 300.0),
         ge=0.0,
+    )
+    CONVICTION_MAX_ENTRIES_PER_SESSION: int = Field(
+        default_factory=lambda: _c("CONVICTION_MAX_ENTRIES_PER_SESSION", 6),
+        ge=1,
+        le=100,
     )
 
     @model_validator(mode="after")
@@ -393,13 +408,13 @@ class RRConsistencyConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     MIN_RISK_REWARD_RATIO: float = Field(
-        default_factory=lambda: _c("MIN_RISK_REWARD_RATIO", 1.5), ge=1.0
+        default_factory=lambda: _c("MIN_RISK_REWARD_RATIO", 2.0), ge=1.0
     )
     CONVICTION_MIN_RR: float = Field(
-        default_factory=lambda: _c("CONVICTION_MIN_RR", 1.5), ge=1.0
+        default_factory=lambda: _c("CONVICTION_MIN_RR", 2.0), ge=1.0
     )
     QUANT_REVERSION_MIN_RR: float = Field(
-        default_factory=lambda: _c("QUANT_REVERSION_MIN_RR", 1.5), ge=1.0
+        default_factory=lambda: _c("QUANT_REVERSION_MIN_RR", 2.0), ge=1.0
     )
 
     @model_validator(mode="after")

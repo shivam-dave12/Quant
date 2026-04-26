@@ -926,6 +926,10 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     #    surfaced via the throttled trail Telegram update, no need for
     #    duplicate via log handler.
     "FibTrail dispatch blocked:",
+    # 7. Circuit-breaker steady state. The breaker trip/clear messages are
+    #    actionable; the per-entry "still frozen" state is local telemetry.
+    "Entries blocked: watchdog circuit breaker is engaged",
+    "Entries still blocked by watchdog circuit breaker",
 ]
 _TELEGRAM_SUPPRESS_LOCK = threading.Lock()
 

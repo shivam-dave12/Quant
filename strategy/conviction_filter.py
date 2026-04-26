@@ -238,6 +238,7 @@ class ConvictionFilter:
         """
         factors  = ConvictionFactors()
         rejects: List[str] = []
+        hard_rejects: List[str] = []
         allows:  List[str] = []
 
         # ══════════════════════════════════════════════════════════════════
@@ -298,6 +299,9 @@ class ConvictionFilter:
         # Low-rank pools score poorly and almost never clear REQUIRED_SCORE.
         # No early return — the score gates the trade.
         if effective_rank < POOL_MIN_TF_RANK:
+            hard_rejects.append(
+                f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) "
+                f"rank={effective_rank} < required {POOL_MIN_TF_RANK}")
             rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
                 f"— will score low (not hard-blocked; data-driven)")
@@ -317,6 +321,7 @@ class ConvictionFilter:
         dr_pd, dr_data_available = self._get_dealing_range_pd(
             price, ict_engine, liq_snapshot)
         if not dr_data_available:
+            hard_rejects.append("DEALING_RANGE_MISSING: no structural P/D range")
             logger.debug(
                 "DEALING_RANGE: no structural data yet — scoring with neutral 0.50")
         _pd_label = ("PREMIUM" if dr_pd > 0.60 else
@@ -342,8 +347,10 @@ class ConvictionFilter:
                   -0.10 if rr >= 0.8 else
                   -0.20)
         if rr < 0.8:
+            hard_rejects.append(f"RR_HARD: {rr:.2f} < {MIN_RR:.1f}")
             rejects.append(f"RR_VERY_LOW: {rr:.2f} — score penalty applied")
         elif rr < MIN_RR:
+            hard_rejects.append(f"RR_HARD: {rr:.2f} < {MIN_RR:.1f}")
             rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — minor score penalty")
 
 # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
@@ -366,8 +373,12 @@ class ConvictionFilter:
         # score (typically <0.45) almost never clears REQUIRED_SCORE=0.65.
         # No unconditional block — the score alone gates the trade.
         if is_approach:
+            hard_rejects.append("APPROACH_HARD: pre-sweep setup is not executable")
             rejects.append("APPROACH: pre-sweep — expect very low displacement/CISD scores")
             # Falls through to factor scoring (no early return).
+
+        if _is_reversal_type and sweep_wick_price <= 0:
+            hard_rejects.append("REVERSAL_WICK_MISSING: cannot anchor OTE to sweep wick")
 
         # ══════════════════════════════════════════════════════════════════
         # FACTOR SCORING — weighted conviction model
@@ -487,7 +498,9 @@ class ConvictionFilter:
                 f"amd={factors.amd_score:.2f}]")
 
         # ── Final decision ─────────────────────────────────────────────────
-        allowed = score_passed and product_passed
+        if hard_rejects:
+            rejects.extend(hard_rejects)
+        allowed = score_passed and product_passed and not hard_rejects
         if allowed:
             logger.debug(
                 f"Conviction advisory PASS ({score:.3f}) | {' | '.join(allows[:5])}")

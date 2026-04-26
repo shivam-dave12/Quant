@@ -2618,6 +2618,8 @@ class QuantStrategy:
         self._last_conviction_kz: str = ""
         self.watchdog_trading_frozen: bool = False
         self._last_watchdog_freeze_log: float = 0.0
+        self._watchdog_freeze_seen: bool = False
+        self._watchdog_freeze_active_since: float = 0.0
         self._entry_confirm_key = None
         self._entry_confirm_count = 0
         self._last_entry_confirm_log = 0.0
@@ -4032,10 +4034,29 @@ class QuantStrategy:
             return
 
         if getattr(self, "watchdog_trading_frozen", False):
-            if now - self._last_watchdog_freeze_log >= 30.0:
+            if not self._watchdog_freeze_seen:
+                self._watchdog_freeze_seen = True
+                self._watchdog_freeze_active_since = now
                 self._last_watchdog_freeze_log = now
-                logger.warning("Entries blocked: watchdog circuit breaker is engaged")
+                logger.info("Entries blocked: watchdog circuit breaker is engaged")
+            elif now - self._last_watchdog_freeze_log >= 300.0:
+                self._last_watchdog_freeze_log = now
+                frozen_for = max(0.0, now - self._watchdog_freeze_active_since)
+                logger.info(
+                    "Entries still blocked by watchdog circuit breaker "
+                    "(frozen_for=%.0fs)",
+                    frozen_for,
+                )
             return
+        if self._watchdog_freeze_seen:
+            frozen_for = max(0.0, now - self._watchdog_freeze_active_since)
+            logger.info(
+                "Watchdog circuit breaker cleared; entry evaluation resumed "
+                "(frozen_for=%.0fs)",
+                frozen_for,
+            )
+            self._watchdog_freeze_seen = False
+            self._watchdog_freeze_active_since = 0.0
 
         # IC Circuit-Breaker gate
         # PostTradeAgent trips this when rolling IC is statistically negative
@@ -8160,6 +8181,17 @@ class QuantStrategy:
                            "TAKE_PROFIT_MARKET_ORDER","TAKE_PROFIT_ORDER") or
                     ("PROFIT" in ot or "TAKE_PROFIT" in ot))
         if phase==PositionPhase.FLAT and ex_size>=QCfg.MIN_QTY():
+            settle_sec = float(getattr(config, "RECONCILE_POST_EXIT_SETTLE_SEC", 15.0))
+            last_exit = float(getattr(self, "_last_exit_time", 0.0) or 0.0)
+            since_exit = time.time() - last_exit if last_exit > 0.0 else 999.0
+            if bool(getattr(self, "_exit_completed", False)) and 0.0 <= since_exit < settle_sec:
+                logger.info(
+                    "Reconcile: deferring FLAT adoption %.1fs after local exit "
+                    "(settlement window %.1fs)",
+                    since_exit,
+                    settle_sec,
+                )
+                return
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
             # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
@@ -8321,7 +8353,15 @@ class QuantStrategy:
                     f"Ã°Å¸â€™â‚¬ Adopted {iside.upper()} has NO stop-loss on exchange Ã¢â‚¬â€ "
                     f"emergency-flattening to prevent unbounded loss.")
                 try:
-                    order_manager.emergency_flatten(reason="adopted_unprotected")
+                    if hasattr(order_manager, "emergency_flatten"):
+                        order_manager.emergency_flatten(reason="adopted_unprotected")
+                    else:
+                        close_side = "sell" if iside == "long" else "buy"
+                        order_manager.place_market_order(
+                            side=close_side,
+                            quantity=ex_size,
+                            reduce_only=True,
+                        )
                 except Exception as _ef_e:
                     logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
             return

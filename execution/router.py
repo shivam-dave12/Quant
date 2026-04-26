@@ -174,6 +174,7 @@ class ExecutionRouter:
     def place_limit_order(self, *a, **kw):  return self.active.place_limit_order(*a, **kw)
     def place_limit_entry(self, *a, **kw):  return self.active.place_limit_entry(*a, **kw)
     def place_bracket_limit_entry(self, *a, **kw): return self.active.place_bracket_limit_entry(*a, **kw)
+    def emergency_flatten(self, *a, **kw): return self.active.emergency_flatten(*a, **kw)
     def place_stop_loss(self, *a, **kw):    return self.active.place_stop_loss(*a, **kw)
     def place_take_profit(self, *a, **kw):  return self.active.place_take_profit(*a, **kw)
     def replace_stop_loss(self, *a, **kw):  return self.active.replace_stop_loss(*a, **kw)
