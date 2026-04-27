@@ -82,6 +82,44 @@ FIX-12 Primary target in get_snapshot() uses t.adjusted_sig().
         Old: max(reachable, key=lambda t: t.pool.proximity_adjusted_sig(...))
         This ignored the adjacency bonus. Now consistent with entry_engine.
 
+FIXES IN v2.3
+─────────────
+FIX-C1  Same-level pool re-creation now requires fresh structural evidence.
+        Swept pools still disappear from the active map immediately, but a new
+        cluster at the same level is allowed back into the map as soon as it is
+        backed by a newer swing source. This prevents duplicate sweep spam from
+        stale historical swings while allowing genuinely newly formed pools to
+        appear for every tracked timeframe.
+
+FIX-C2  LiquidityMap can create registries for additional candle timeframes
+        present in candles_by_tf instead of silently ignoring them.
+
+FIX-C3  HTF confluence scoring now counts neighbours on BOTH sides of a price
+        cluster and stores htf_count as total timeframe count including self.
+        The old one-sided sliding window undercounted lower-priced clusters and
+        reduced significance incorrectly.
+
+FIXES IN v2.4 — ACTIVE-ZONE / ARCHIVE-ZONE MODEL
+────────────────────────────────────────────────
+FIX-D1  Swept pools are now treated as ARCHIVED CONTEXT ONLY, not reborn
+        live targets.  A same-price live pool is created as a NEW object only
+        when a newer post-sweep swing/range source exists.  This prevents
+        zombie "rebirth" while still allowing genuine stop re-accumulation.
+
+FIX-D2  Fresh-pool validation compares normalized candle-source timestamps
+        and swing indexes against the archived swept zone.  This works with
+        second, millisecond, or nanosecond candle timestamps and degrades safely
+        when timestamps are missing.
+
+FIX-D3  Added rolling external-liquidity fallback zones.  If a timeframe has
+        no fresh swing cluster on one side, the recent confirmed range high/low
+        is seeded as a low-touch DETECTED pool.  This keeps the map populated
+        without trading stale swept pools.
+
+FIX-D4  Tradeable significance is now timeframe-aware.  1m/2m/3m pools are
+        allowed into the map with low rank, while HTF pools still score higher.
+        The entry/conviction engines remain responsible for filtering quality.
+
 INTERFACE BUG FIXED IN v2.1
 ────────────────────────────
 The previous rewrite broke the public API by removing 'price' and
@@ -115,25 +153,43 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 TF_HIERARCHY: Dict[str, int] = {
-    "1m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6,
+    "1m": 1, "2m": 1, "3m": 1,
+    "5m": 2,
+    "15m": 3, "30m": 3,
+    "1h": 4, "2h": 4,
+    "4h": 5,
+    "1d": 6,
 }
 
 # FIX-1: Reduced lookback for faster intraday pool formation
 _SWING_LOOKBACK: Dict[str, int] = {
-    "1m": 3, "5m": 3, "15m": 3, "1h": 4, "4h": 5, "1d": 3,
+    "1m": 3, "2m": 3, "3m": 3,
+    "5m": 3,
+    "15m": 3, "30m": 3,
+    "1h": 4, "2h": 4,
+    "4h": 5,
+    "1d": 3,
 }
 
 _CLUSTER_RADIUS_ATR: Dict[str, float] = {
-    "1m": 0.12, "5m": 0.20, "15m": 0.30,
-    "1h": 0.45, "4h": 0.60, "1d": 0.90,
+    "1m": 0.12, "2m": 0.14, "3m": 0.16,
+    "5m": 0.20,
+    "15m": 0.30, "30m": 0.35,
+    "1h": 0.45, "2h": 0.52,
+    "4h": 0.60,
+    "1d": 0.90,
 }
 
 # FIX-8: 7-day uniform retention — institutional structure persists across sessions
 _POOL_MAX_AGE: Dict[str, float] = {
     "1m":  14400,    # 4 hours
+    "2m":  21600,    # 6 hours
+    "3m":  28800,    # 8 hours
     "5m":  604800,   # 7 days
     "15m": 604800,   # 7 days
+    "30m": 604800,   # 7 days
     "1h":  604800,   # 7 days
+    "2h":  604800,   # 7 days
     "4h":  604800,   # 7 days
     "1d":  2592000,  # 30 days
 }
@@ -142,6 +198,40 @@ _MAX_POOLS_PER_TF = 30         # was 15 — wider window needs more capacity
 
 # FIX-2: Lowered threshold so new 5m pools (sig~2.0) are included
 TRADEABLE_POOL_MIN_SIG = 1.8   # was 3.0
+
+# v2.4: timeframe-aware display/tradeability floor.  LTF pools are noisy but
+# should not vanish from the map; downstream sweep/displacement/conviction gates
+# decide whether they are good enough to trade.
+TRADEABLE_POOL_MIN_SIG_BY_TF: Dict[str, float] = {
+    "1m": 0.80, "2m": 0.90, "3m": 1.00,
+    "5m": 1.50,
+    "15m": 1.80, "30m": 1.80,
+    "1h": 2.00, "2h": 2.00,
+    "4h": 2.20,
+    "1d": 2.40,
+}
+
+_TF_SECONDS: Dict[str, int] = {
+    "1m": 60, "2m": 120, "3m": 180,
+    "5m": 300,
+    "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200,
+    "4h": 14400,
+    "1d": 86400,
+}
+
+# v2.4: fallback external-liquidity windows.  These create one low-touch range
+# high/low pool only when the swing-cluster detector has no fresh level on that
+# side.  Most recent lookback bars are excluded, so a just-swept wick is not
+# immediately reintroduced as a target.
+_ROLLING_EXTREME_WINDOW: Dict[str, int] = {
+    "1m": 90, "2m": 90, "3m": 80,
+    "5m": 72,
+    "15m": 64, "30m": 56,
+    "1h": 48, "2h": 42,
+    "4h": 36,
+    "1d": 30,
+}
 
 _HTF_CONFLUENCE_MULT    = 2.5
 
@@ -215,6 +305,12 @@ class LiquidityPool:
     swept_at:   float      = 0.0
     sweep_wick: float      = 0.0
 
+    # Latest candle source that contributed to this pool's swing cluster.
+    # Used to distinguish a genuinely NEW same-level pool after a sweep from
+    # stale historical swings that would otherwise be re-added every refresh.
+    source_latest_idx: int = -1
+    source_latest_ts:  int = 0
+
     ob_aligned:  bool = False   # set by _align_with_ict()
     fvg_aligned: bool = False   # set by _align_with_ict()
     htf_count:   int  = 0       # set by _promote_htf_confluence()
@@ -259,9 +355,12 @@ class LiquidityPool:
 
     @property
     def is_tradeable(self) -> bool:
+        tf_floor = TRADEABLE_POOL_MIN_SIG_BY_TF.get(
+            self.timeframe, TRADEABLE_POOL_MIN_SIG
+        )
         return (
             self.status in (PoolStatus.DETECTED, PoolStatus.CONFIRMED)
-            and self.significance >= TRADEABLE_POOL_MIN_SIG
+            and self.significance >= tf_floor
         )
 
 
@@ -354,60 +453,249 @@ def _find_swing_lows(candles: List[Dict], lookback: int = 3) -> List[Tuple[int, 
     return results
 
 
-def _detect_equal_levels(
+
+@dataclass(frozen=True)
+class _LevelCluster:
+    """Cluster metadata for a liquidity level detected from swing extremes."""
+    price: float
+    count: int
+    latest_idx: int = -1
+    latest_ts: int = 0
+
+
+def _candle_ts(candles: Optional[List[Dict]], idx: int) -> int:
+    """Return a stable integer candle timestamp for a swing-source index."""
+    if candles is None or idx < 0 or idx >= len(candles):
+        return 0
+    try:
+        c = candles[idx]
+        if hasattr(c, "get"):
+            raw = (
+                c.get("t", 0)
+                or c.get("timestamp", 0)
+                or c.get("time", 0)
+                or c.get("start", 0)
+                or c.get("open_time", 0)
+            )
+            return int(raw or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def _ts_to_epoch_seconds(ts: int | float | None) -> float:
+    """Normalize common candle timestamp units to epoch seconds."""
+    try:
+        v = float(ts or 0.0)
+    except Exception:
+        return 0.0
+    if v <= 0:
+        return 0.0
+    # nanoseconds / microseconds / milliseconds / seconds
+    if v > 1e17:
+        return v / 1e9
+    if v > 1e14:
+        return v / 1e6
+    if v > 1e11:
+        return v / 1e3
+    return v
+
+
+def _source_is_fresh_after_sweep(
+    *,
+    latest_ts: int,
+    latest_idx: int,
+    swept_pool: LiquidityPool,
+    timeframe: str,
+    now: float,
+) -> bool:
+    """
+    True only when a same-level post-sweep pool has NEW structural evidence.
+
+    Industry-grade rule:
+      - The swept pool remains archived and non-tradeable.
+      - A new live pool can be created at the same zone only if its newest
+        source candle is after the sweep event, or, when timestamps are missing,
+        its source index is sufficiently newer and the sweep cooldown elapsed.
+    """
+    swept_at = float(getattr(swept_pool, "swept_at", 0.0) or 0.0)
+    if swept_at <= 0:
+        return True
+
+    tf_sec = float(_TF_SECONDS.get(timeframe, 60))
+    latest_s = _ts_to_epoch_seconds(latest_ts)
+    prev_s = _ts_to_epoch_seconds(getattr(swept_pool, "source_latest_ts", 0))
+
+    # Best path: timestamp says the new swing/range source was created after
+    # the sweep.  Use a half-bar buffer to avoid same-candle re-addition.
+    if latest_s > 0:
+        return latest_s >= swept_at + max(1.0, tf_sec * 0.5)
+
+    # Fallback path for feeds without timestamps: require both a newer source
+    # index and elapsed wall-clock time.  Index-only comparisons can be unstable
+    # on rolling candle windows, so this path is deliberately conservative.
+    prev_idx = int(getattr(swept_pool, "source_latest_idx", -1) or -1)
+    if latest_idx > prev_idx + _SWING_LOOKBACK.get(timeframe, 3):
+        return now - swept_at >= max(_REBIRTH_MIN_AGE_SEC, tf_sec)
+
+    # Last-resort: if old source timestamp exists and new timestamp is newer,
+    # still require cooldown.  This covers feeds with non-epoch sequence stamps.
+    if latest_s > 0 and prev_s > 0 and latest_s > prev_s:
+        return now - swept_at >= max(_REBIRTH_MIN_AGE_SEC, tf_sec)
+
+    return False
+
+
+def _append_unique_cluster(
+    clusters: List[_LevelCluster],
+    cluster: _LevelCluster,
+    atr: float,
+    radius_mult: float,
+) -> None:
+    """Append cluster only if no existing centroid is already nearby."""
+    radius = atr * radius_mult
+    for c in clusters:
+        if abs(c.price - cluster.price) <= radius:
+            return
+    clusters.append(cluster)
+
+
+def _range_extreme_cluster(
+    candles: List[Dict],
+    timeframe: str,
+    side: PoolSide,
+) -> Optional[_LevelCluster]:
+    """
+    Low-touch external-liquidity fallback from the recent confirmed range.
+
+    This is NOT a swept-pool resurrection.  It is the current rolling range high
+    or low after excluding the most recent confirmation bars.  If the market is
+    trending and equal-high/low clusters are temporarily absent, this keeps a
+    genuine unswept external liquidity objective in the map.
+    """
+    lookback = _SWING_LOOKBACK.get(timeframe, 3)
+    window = _ROLLING_EXTREME_WINDOW.get(timeframe, 60)
+
+    # Exclude forming candle plus the right-side confirmation bars.  This avoids
+    # turning a just-swept wick into a new active pool immediately.
+    end = max(0, len(candles) - 1 - lookback)
+    start = max(0, end - window)
+    if end - start < max(lookback * 2, 8):
+        return None
+
+    segment = candles[start:end]
+    best_idx = -1
+    best_price = 0.0
+
+    if side == PoolSide.BSL:
+        best_local, best_candle = max(
+            enumerate(segment), key=lambda kv: float(kv[1].get('h', 0.0))
+        )
+        best_idx = start + best_local
+        best_price = float(best_candle.get('h', 0.0))
+    else:
+        best_local, best_candle = min(
+            enumerate(segment), key=lambda kv: float(kv[1].get('l', 0.0))
+        )
+        best_idx = start + best_local
+        best_price = float(best_candle.get('l', 0.0))
+
+    if best_price <= 0:
+        return None
+
+    return _LevelCluster(
+        price=best_price,
+        count=1,
+        latest_idx=best_idx,
+        latest_ts=_candle_ts(candles, best_idx),
+    )
+
+
+def _detect_equal_level_clusters(
     swings:             List[Tuple[int, float]],
+    candles:            Optional[List[Dict]],
     atr:                float,
     cluster_radius_atr: float,
-) -> List[Tuple[float, int]]:
+) -> List[_LevelCluster]:
     """
     Cluster swing extremes within cluster_radius × ATR of the cluster CENTROID.
 
-    Bug #20 fix: the original implementation compared each new price against
-    the LAST price added to the current cluster (single-linkage). With a chain
-    like [100.0, 100.15, 100.30] and radius=0.20×ATR, the first two merge
-    correctly, then 100.30 is compared against 100.15 (not 100.0), and since
-    0.15 ≤ 0.20 it merges — producing a cluster that spans 0.30×ATR (50% over
-    budget). At BTC ATR=$67 and radius=0.20 this means swings $20 apart merged
-    as "equal highs", inflating touch count and creating a single pool where two
-    distinct stop clusters actually exist.
-
-    Fix: track the running centroid. A new price only joins the cluster if its
-    distance from the current centroid is ≤ radius. The centroid is updated
-    incrementally after each admission — O(n) and numerically stable.
-
-    Returns [(centroid_price, touch_count), ...] sorted ascending.
+    In addition to (price, touch_count), this detailed form carries the newest
+    swing-source timestamp in the cluster.  That lets _merge_pools decide
+    whether a post-sweep same-level cluster is a fresh pool or just stale
+    historical swing data being replayed on every REST/candle refresh.
     """
     if not swings or atr < 1e-10:
         return []
 
     radius        = atr * cluster_radius_atr
     sorted_swings = sorted(swings, key=lambda s: s[1])
-    clusters:     List[Tuple[float, int]] = []
+    clusters:     List[_LevelCluster] = []
 
-    # Running cluster represented as (sum_of_prices, count) for O(1) centroid.
     cluster_sum:   float = 0.0
     cluster_count: int   = 0
+    latest_idx:    int   = -1
+    latest_ts:     int   = 0
 
-    for _, price in sorted_swings:
+    def _flush() -> None:
+        nonlocal cluster_sum, cluster_count, latest_idx, latest_ts
+        if cluster_count <= 0:
+            return
+        clusters.append(_LevelCluster(
+            price=cluster_sum / cluster_count,
+            count=cluster_count,
+            latest_idx=latest_idx,
+            latest_ts=latest_ts,
+        ))
+
+    for idx, price in sorted_swings:
+        ts = _candle_ts(candles, idx)
         if cluster_count == 0:
             cluster_sum   = price
             cluster_count = 1
+            latest_idx    = idx
+            latest_ts     = ts
         else:
             centroid = cluster_sum / cluster_count
             if abs(price - centroid) <= radius:
-                # Price is within radius of the centroid — admit to cluster.
                 cluster_sum   += price
                 cluster_count += 1
+                if idx > latest_idx:
+                    latest_idx = idx
+                if ts > latest_ts:
+                    latest_ts = ts
             else:
-                # Price is outside — flush the current cluster and start a new one.
-                clusters.append((cluster_sum / cluster_count, cluster_count))
+                _flush()
                 cluster_sum   = price
                 cluster_count = 1
+                latest_idx    = idx
+                latest_ts     = ts
 
-    if cluster_count > 0:
-        clusters.append((cluster_sum / cluster_count, cluster_count))
-
+    _flush()
     return clusters
+
+
+def _detect_equal_levels(
+    swings:             List[Tuple[int, float]],
+    atr:                float,
+    cluster_radius_atr: float,
+) -> List[Tuple[float, int]]:
+    """
+    Backward-compatible public helper.
+
+    Returns [(centroid_price, touch_count), ...] sorted ascending.  The strategy
+    registry uses _detect_equal_level_clusters() internally so it can retain
+    source timestamps for post-sweep pool rebirth logic.
+    """
+    return [
+        (cluster.price, cluster.count)
+        for cluster in _detect_equal_level_clusters(
+            swings=swings,
+            candles=None,
+            atr=atr,
+            cluster_radius_atr=cluster_radius_atr,
+        )
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -446,10 +734,27 @@ class _TimeframeRegistry:
         lookback  = _SWING_LOOKBACK.get(self.tf, 3)       # FIX-1
         cluster_r = _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
 
-        bsl_clusters = _detect_equal_levels(
-            _find_swing_highs(candles, lookback), atr, cluster_r)
-        ssl_clusters = _detect_equal_levels(
-            _find_swing_lows(candles, lookback),  atr, cluster_r)
+        bsl_clusters = _detect_equal_level_clusters(
+            _find_swing_highs(candles, lookback), candles, atr, cluster_r)
+        ssl_clusters = _detect_equal_level_clusters(
+            _find_swing_lows(candles, lookback),  candles, atr, cluster_r)
+
+        # v2.4: seed one rolling external-liquidity boundary only if the normal
+        # swing/cluster detector has no level for that side.  This prevents the
+        # map from going empty in trend days without relying on swept pools.
+        if not bsl_clusters:
+            rb = _range_extreme_cluster(candles, self.tf, PoolSide.BSL)
+            if rb is not None:
+                _append_unique_cluster(bsl_clusters, rb, atr, cluster_r)
+        if not ssl_clusters:
+            rs = _range_extreme_cluster(candles, self.tf, PoolSide.SSL)
+            if rs is not None:
+                _append_unique_cluster(ssl_clusters, rs, atr, cluster_r)
+
+        # v2.4: never keep dead zones in active registries during merge.  Swept
+        # pools belong in the archive; live maps contain only fresh unswept zones.
+        self._bsl = [p for p in self._bsl if p.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)]
+        self._ssl = [p for p in self._ssl if p.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED)]
 
         self._bsl = self._merge_pools(self._bsl, bsl_clusters, PoolSide.BSL, atr, now)
         self._ssl = self._merge_pools(self._ssl, ssl_clusters, PoolSide.SSL, atr, now)
@@ -499,7 +804,7 @@ class _TimeframeRegistry:
     def _merge_pools(
         self,
         existing: List[LiquidityPool],
-        clusters: List[Tuple[float, int]],
+        clusters: List[_LevelCluster],
         side:     PoolSide,
         atr:      float,
         now:      float,
@@ -543,7 +848,11 @@ class _TimeframeRegistry:
         merged = list(existing)
         used   = set()
 
-        for centroid, count in clusters:
+        for cluster in clusters:
+            centroid   = float(cluster.price)
+            count      = int(cluster.count)
+            latest_idx = int(getattr(cluster, "latest_idx", -1) or -1)
+            latest_ts  = int(getattr(cluster, "latest_ts", 0) or 0)
 
             # ── Pass 1: match active pools ─────────────────────────────────
             matched = False
@@ -556,6 +865,8 @@ class _TimeframeRegistry:
                     pool.price      = (pool.price + centroid) / 2.0  # FIX-9
                     pool.touches    = max(pool.touches, count)
                     pool.last_touch = now
+                    pool.source_latest_idx = max(pool.source_latest_idx, latest_idx)
+                    pool.source_latest_ts  = max(pool.source_latest_ts, latest_ts)
                     if count >= 2:
                         pool.status = PoolStatus.CONFIRMED
                     used.add(i)
@@ -565,59 +876,69 @@ class _TimeframeRegistry:
             if matched:
                 continue
 
-            # ── Pass 2: FIX-B1 — rebirth a SWEPT/CONSUMED pool ───────────
-            # Only runs when pass 1 found no active pool at this level.
-            # Rebirth takes priority over creating a brand-new pool to avoid
-            # accumulating parallel duplicates at the same price cluster.
+            # ── Pass 2: v2.4 active/archive separation ───────────────
+            # Swept/consumed pools are NOT reborn as live targets.  They remain
+            # archived context only.  A same-zone live pool is allowed only when
+            # this cluster carries fresh post-sweep structural evidence; when it
+            # does, we create a NEW LiquidityPool object below.
             for i, pool in enumerate(merged):
                 if i in used:
                     continue
                 if pool.status not in (PoolStatus.SWEPT, PoolStatus.CONSUMED):
                     continue
-                if abs(pool.price - centroid) <= radius:
-                    # Rebirth: reset all sweep state, assign fresh creation time.
-                    # htf_count/ob_aligned/fvg_aligned are re-evaluated each tick
-                    # by _promote_htf_confluence() and _align_with_ict().
-                    prev_status = pool.status.value
-                    pool.price      = centroid
-                    pool.status     = PoolStatus.CONFIRMED if count >= 2 else PoolStatus.DETECTED
-                    pool.touches    = count
-                    pool.created_at = now
-                    pool.last_touch = now
-                    pool.swept_at   = 0.0
-                    pool.sweep_wick = 0.0
-                    used.add(i)
-                    matched = True
+                if abs(pool.price - centroid) > radius:
+                    continue
+
+                if _source_is_fresh_after_sweep(
+                    latest_ts=latest_ts,
+                    latest_idx=latest_idx,
+                    swept_pool=pool,
+                    timeframe=self.tf,
+                    now=now,
+                ):
                     logger.debug(
-                        f"[{self.tf}] Pool REBIRTH {pool.side.value} "
-                        f"${centroid:,.1f} (was {prev_status})"
-                    )
-                    break
+                        f"[{self.tf}] New post-sweep pool allowed: "
+                        f"{side.value} ${centroid:,.1f} "
+                        f"after archived {pool.status.value} zone")
+                    continue
+
+                matched = True
+                logger.debug(
+                    f"[{self.tf}] Same-zone pool suppressed (dead active zone): "
+                    f"{side.value} ${centroid:,.1f}")
+                break
 
             if not matched:
-                # Issue-2 FIX: Before creating a new pool, check whether this
-                # cluster overlaps a RECENTLY swept pool in _swept_bsl/_swept_ssl.
-                # Swept pools are removed from _bsl/_ssl (Bug #43 fix) so pass 2's
-                # search through `merged` never finds them — causing a brand-new
-                # DETECTED pool to be spawned at the same price, which check_sweeps()
-                # then re-detects as a fresh sweep with a new detected_at, bypassing
-                # _processed_sweeps and producing duplicate signals every REST cycle.
-                # Solution: suppress new pool creation if any recently-swept pool
-                # (swept_at < _REBIRTH_MIN_AGE_SEC ago) sits within radius of this
-                # cluster.  After the cooldown the cluster will naturally form a
-                # genuine new pool reflecting authentic stop re-accumulation.
+                # Suppress stale same-zone pools using the swept archive.  This
+                # is the core industry-grade rule: archived sweeps are context,
+                # not targets; only fresh post-sweep structure becomes a target.
                 swept_list = self._swept_bsl if side == PoolSide.BSL else self._swept_ssl
                 for sp in swept_list:
-                    if (sp.swept_at > 0
-                            and now - sp.swept_at < _REBIRTH_MIN_AGE_SEC
-                            and abs(sp.price - centroid) <= radius):
-                        matched = True  # suppress new-pool creation at this level
+                    if sp.swept_at <= 0 or abs(sp.price - centroid) > radius:
+                        continue
+
+                    has_fresh_structure = _source_is_fresh_after_sweep(
+                        latest_ts=latest_ts,
+                        latest_idx=latest_idx,
+                        swept_pool=sp,
+                        timeframe=self.tf,
+                        now=now,
+                    )
+
+                    if has_fresh_structure:
                         logger.debug(
-                            f"[{self.tf}] New pool suppressed (recently swept): "
+                            f"[{self.tf}] Fresh same-zone liquidity formed: "
                             f"{side.value} ${centroid:,.1f} "
-                            f"swept {now - sp.swept_at:.0f}s ago "
-                            f"(cooldown={_REBIRTH_MIN_AGE_SEC:.0f}s)")
-                        break
+                            f"source_ts={latest_ts} swept_at={sp.swept_at:.0f}")
+                        continue
+
+                    matched = True
+                    logger.debug(
+                        f"[{self.tf}] New pool suppressed (stale swept archive): "
+                        f"{side.value} ${centroid:,.1f} "
+                        f"swept {now - sp.swept_at:.0f}s ago "
+                        f"source_ts={latest_ts} prev_source_ts={getattr(sp, 'source_latest_ts', 0)}")
+                    break
 
             if not matched:
                 merged.append(LiquidityPool(
@@ -628,6 +949,8 @@ class _TimeframeRegistry:
                     touches    = count,
                     created_at = now,
                     last_touch = now,
+                    source_latest_idx = latest_idx,
+                    source_latest_ts  = latest_ts,
                 ))
 
         return merged
@@ -804,7 +1127,7 @@ class LiquidityMap:
         liq_snapshot = self._liq_map.get_snapshot(price, atr)
     """
 
-    _TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+    _TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")  # extra tfs are added dynamically
 
     def __init__(self) -> None:
         self._registries: Dict[str, _TimeframeRegistry] = {
@@ -898,8 +1221,14 @@ class LiquidityMap:
         if atr < 1e-10:
             return
 
-        # Step 1: Update pool registries
-        for tf, reg in self._registries.items():
+        # Step 1: Update pool registries.
+        # Dynamically add any extra timeframe supplied by the data manager
+        # (for example 2m/3m/30m) instead of silently ignoring it.
+        for tf, candles in candles_by_tf.items():
+            if candles and tf not in self._registries:
+                self._registries[tf] = _TimeframeRegistry(tf)
+
+        for tf, reg in list(self._registries.items()):
             candles = candles_by_tf.get(tf)
             if candles:
                 reg.update(candles, atr, now)
@@ -1059,51 +1388,47 @@ class LiquidityMap:
 
     def _promote_htf_confluence(self, atr: float) -> None:
         """
-        Set pool.htf_count = number of distinct OTHER timeframes that have a
-        pool within 0.7×ATR of this pool (same side only).
+        Set pool.htf_count = total number of distinct timeframes represented
+        near this pool's price, including the pool's own timeframe.
 
-        Bug #16 fix: the original implementation was O(n²) — it iterated every
-        pool against every other pool, producing up to 32,400 comparisons per
-        call at maximum pool density (180 pools across 6 TFs).  This ran inside
-        update() which is called every tick (~4×/second), visibly bloating tick
-        latency under high pool density.
-
-        Fix: sort all pools by (side, price) once — O(n log n) — then use a
-        sliding window per side to find neighbours within the radius.  Each pool
-        is compared only against its actual spatial neighbours, giving O(n) work
-        per side after sorting.  Total complexity: O(n log n).
-
-        Counter is fully recomputed each call — no stale state accumulates.
+        FIX-C3: the previous one-sided sliding window only counted already-seen
+        lower-price neighbours. Lower-priced pools failed to see matching
+        higher-price HTF/LTF pools within radius, so confluence was undercounted.
+        This implementation checks the full price neighbourhood on BOTH sides.
         """
         radius = atr * 0.7
 
-        # Collect all active pools with their timeframe, grouped by side.
         bsl_pools: List[LiquidityPool] = []
         ssl_pools: List[LiquidityPool] = []
         for reg in self._registries.values():
             bsl_pools.extend(reg.bsl_pools)
             ssl_pools.extend(reg.ssl_pools)
 
-        def _apply_sliding_window(pools: List[LiquidityPool]) -> None:
+        def _apply_full_window(pools: List[LiquidityPool]) -> None:
             if not pools:
                 return
-            # Sort by price ascending — enables O(n) sliding window.
+
             pools.sort(key=lambda p: p.price)
             n = len(pools)
             left = 0
-            for right in range(n):
-                # Advance left pointer to maintain window: all pools within radius.
-                while pools[right].price - pools[left].price > radius:
-                    left += 1
-                # Count distinct OTHER timeframes within [left, right].
-                tf_set: set = set()
-                for k in range(left, right + 1):
-                    if pools[k] is not pools[right]:
-                        tf_set.add(pools[k].timeframe)
-                pools[right].htf_count = len(tf_set)
+            right = 0
 
-        _apply_sliding_window(bsl_pools)
-        _apply_sliding_window(ssl_pools)
+            for i, pool in enumerate(pools):
+                while left < n and pool.price - pools[left].price > radius:
+                    left += 1
+                if right < i:
+                    right = i
+                while right + 1 < n and pools[right + 1].price - pool.price <= radius:
+                    right += 1
+
+                tf_set = {pool.timeframe}
+                for k in range(left, right + 1):
+                    if pools[k] is not pool:
+                        tf_set.add(pools[k].timeframe)
+                pool.htf_count = len(tf_set)
+
+        _apply_full_window(bsl_pools)
+        _apply_full_window(ssl_pools)
 
     def _align_with_ict(self, ict_engine, price: float, atr: float) -> None:
         """

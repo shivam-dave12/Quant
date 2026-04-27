@@ -2513,7 +2513,11 @@ class QuantStrategy:
         # is None / expired (checked in the routing block each tick), or
         # (c) _enter_trade() resets all state after a confirmed fill.
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
-        self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
+        # Tracks pre-order gate rejections. Despite the historical name, this
+        # covers TP/fee/liquidation/sizing failures before any exchange order is sent.
+        # Fresh timestamp here means the async entry thread must not start the
+        # normal post-exit cooldown, because no trade existed.
+        self._last_tp_gate_rejection = 0.0
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
@@ -2756,8 +2760,7 @@ class QuantStrategy:
         Stable event identity for confirmation.
 
         The old key used live entry/SL/TP ticks, so the same sweep became a
-        different key as price moved. This keys sweeps to the pool event and
-        momentum to the displacement candle.
+        different key as price moved. This keys entries to the liquidity sweep event.
         """
         side = str(getattr(signal, "side", "") or "")
         etype = self._signal_entry_type_value(signal)
@@ -2779,9 +2782,6 @@ class QuantStrategy:
                 round(detected_at, 1),
             )
 
-        candle_ts = int(getattr(signal, "displacement_candle_ts", 0) or 0)
-        if etype == EntryType.DISPLACEMENT_MOMENTUM.value or candle_ts > 0:
-            return ("momentum", side, etype, candle_ts)
 
         entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
         bucket = max(tick * 8.0, float(atr or 0.0) * 0.10, 1e-9)
@@ -2834,52 +2834,12 @@ class QuantStrategy:
         return ""
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
-        etype = self._signal_entry_type_value(signal)
-        side = str(getattr(signal, "side", "") or "")
-        if etype != EntryType.DISPLACEMENT_MOMENTUM.value:
-            return ""
-
-        hunt = getattr(self, "_last_hunt_prediction", None)
-        hunt_ts = float(getattr(hunt, "timestamp_ms", 0.0) or 0.0) if hunt else 0.0
-        if hunt_ts > 0.0 and (time.time() * 1000.0 - hunt_ts) > 90000.0:
-            hunt = None
-        hunt_side = self._hunt_delivery_side(hunt)
-        hunt_conf = float(getattr(hunt, "confidence", 0.0) or 0.0) if hunt else 0.0
-        hunt_raw = abs(float(getattr(hunt, "raw_score", 0.0) or 0.0)) if hunt else 0.0
-        if hunt_side and hunt_side != side and max(hunt_conf, hunt_raw) >= 0.10:
-            predicted = str(getattr(hunt, "predicted", "") or "liquidity")
-            return (
-                f"momentum {side} opposes active {predicted} draw "
-                f"({hunt_side}, conf={hunt_conf:.2f}, raw={hunt_raw:.2f})"
-            )
-
-        pd = float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)
-        in_premium = bool(getattr(ict_ctx, "in_premium", False))
-        in_discount = bool(getattr(ict_ctx, "in_discount", False))
-        if side == "long" and (in_premium or pd >= 0.62):
-            return f"momentum long is chasing premium delivery (PD={pd:.2f})"
-        if side == "short" and (in_discount or pd <= 0.38):
-            return f"momentum short is chasing discount delivery (PD={pd:.2f})"
-
-        sig_created = float(getattr(signal, "created_at", time.time()) or time.time())
-        sig_age = max(0.0, time.time() - sig_created)
-        sig_entry = float(getattr(signal, "entry_price", price) or price)
-        drift_atr = abs(float(price or 0.0) - sig_entry) / max(float(atr or 0.0), 1e-9)
-        if sig_age > 12.0 and drift_atr > 0.20:
-            return f"stale momentum signal age={sig_age:.1f}s drift={drift_atr:.2f}ATR"
+        """No standalone momentum entries remain; sweep entries are vetted elsewhere."""
         return ""
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
-            if (getattr(signal, "entry_type", None) == EntryType.DISPLACEMENT_MOMENTUM
-                    and hasattr(self._entry_engine, "mark_momentum_blocked")):
-                self._entry_engine.mark_momentum_blocked(
-                    entry_price=float(getattr(signal, "entry_price", 0.0) or 0.0),
-                    candle_ts=int(getattr(signal, "displacement_candle_ts", 0) or 0),
-                    locked_sl=float(getattr(signal, "sl_price", 0.0) or 0.0),
-                    cooldown_sec=cooldown_sec,
-                )
-            elif hasattr(self._entry_engine, "mark_gate_blocked"):
+            if hasattr(self._entry_engine, "mark_gate_blocked"):
                 self._entry_engine.mark_gate_blocked(
                     str(getattr(signal, "side", "") or ""),
                     reason[:40],
@@ -3599,8 +3559,8 @@ class QuantStrategy:
                         _gate_reject = (time.time() - self._last_tp_gate_rejection) < 5.0
                         if _gate_reject:
                             logger.info(
-                                f"Ã¢Å¡Âª Entry gate rejected (mode={mode} side={side}) "
-                                f"Ã¢â‚¬â€ resetting to FLAT, no cooldown (signals resume immediately)")
+                                f"Ã¢Å¡Âª Pre-order entry rejected (mode={mode} side={side}) "
+                                f"Ã¢â‚¬â€ resetting to FLAT, no trade cooldown")
                         else:
                             logger.warning(
                                 f"Ã¢Å¡Â Ã¯Â¸Â Entry thread exited without activation "
@@ -3613,6 +3573,14 @@ class QuantStrategy:
                     # transition and counter cleanup atomically.
                     if (self._entry_engine is not None
                             and self._pos.phase != PositionPhase.ACTIVE):
+                        try:
+                            if _gate_reject and hasattr(self._entry_engine, 'mark_pre_order_rejected'):
+                                self._entry_engine.mark_pre_order_rejected(
+                                    getattr(self, '_last_entry_signal', None),
+                                    cooldown_sec=float(getattr(config, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)),
+                                )
+                        except Exception as _pre_gate_e:
+                            logger.debug(f"EntryEngine pre-order rejection mark failed: {_pre_gate_e}")
                         self._entry_engine.on_entry_failed()
 
         threading.Thread(
@@ -5047,7 +5015,6 @@ class QuantStrategy:
                 EntryType.SWEEP_REVERSAL: "S",
                 EntryType.PRE_SWEEP_APPROACH: "A",
                 EntryType.SWEEP_CONTINUATION: "B",
-                EntryType.DISPLACEMENT_MOMENTUM: "A",
             }
             _tier = _tier_map.get(signal.entry_type, "A")
             _inst_dec_for_tier = getattr(self, "_last_institutional_decision", None)
@@ -5098,7 +5065,7 @@ class QuantStrategy:
                 _sweep_present = signal.entry_type in (
                     EntryType.SWEEP_REVERSAL, EntryType.SWEEP_CONTINUATION,
                 )
-                _displacement_present = (signal.entry_type == EntryType.DISPLACEMENT_MOMENTUM)
+                _displacement_present = False
 
                 _gate_ctx = GateContext(
                     now=now,
@@ -5250,6 +5217,23 @@ class QuantStrategy:
                             parts.append(f"SkipSweep=[{' '.join(_bits)}]")
                 except Exception:
                     pass
+
+            # Pool-plan diagnostics: explains why visible BSL/SSL were not used
+            # as TP/SL after the last sweep verdict.  This is deliberately short
+            # for the terminal heartbeat; full rows are available via /thinking.
+            try:
+                _pool_plan = getattr(self._entry_engine, 'pool_plan_info', None)
+                if callable(_pool_plan):
+                    _pool_plan = _pool_plan()
+                if isinstance(_pool_plan, dict):
+                    _age = time.time() - float(_pool_plan.get('ts', 0.0) or 0.0)
+                    if _age <= 300:
+                        _role = _pool_plan.get('role', 'POOL')
+                        _summary = str(_pool_plan.get('summary', ''))[:120]
+                        if _summary:
+                            parts.append(f"{_role}Plan={_summary}")
+            except Exception:
+                pass
 
             logger.info(f"[THINK] {' | '.join(parts)}")
 
@@ -5480,7 +5464,13 @@ class QuantStrategy:
             risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info
         )
-        if qty is None or qty < QCfg.MIN_QTY(): return
+        if qty is None or qty < QCfg.MIN_QTY():
+            # No order was sent. Treat as a pre-order rejection, not a trade
+            # exit/failure. Otherwise QUANT_COOLDOWN_SEC starts and entry
+            # evaluation appears to stop after a minimum-lot sizing reject.
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
         logger.info(
             f"Ã°Å¸Å½Â¯ ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
@@ -5945,11 +5935,8 @@ class QuantStrategy:
                         logger.info(f"Ã°Å¸â€â€ž Regime flip Ã¢â€ â€™ exit {pos.side.upper()} [{pos.trade_mode}]")
                         self._exit_trade(order_manager, price, "regime_flip"); return
 
-            # v6.0: Momentum trades exit via SL, TP, or trailing SL ONLY.
-            # BREAKOUT_EXPIRED exit REMOVED Ã¢â‚¬â€ it was closing positions right before
-            # TP hit because breakout timer expired while the move was still in progress.
-            # Momentum trades are structurally managed: SL trails via ICT structure,
-            # TP is at the opposing liquidity pool. No premature composite-based exit.
+            # Liquidity-hunt trades exit via SL, TP, or trailing SL only.
+            # No premature composite-based exit while the liquidity-delivery thesis is active.
 
             # v5.1: Flow trades exit when order flow structurally reverses.
             # Not on a single tick flip Ã¢â‚¬â€ on sustained counter-flow + BOS reversal.
