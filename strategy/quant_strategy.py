@@ -4897,7 +4897,7 @@ class QuantStrategy:
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
 
             logger.info(
-                f"ENTRY CANDIDATE: {signal.entry_type.value} {signal.side.upper()} "
+                f"ENTRY SIGNAL CANDIDATE (pre-conviction): {signal.entry_type.value} {signal.side.upper()} "
                 f"@ ${signal.entry_price:,.1f} | "
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
@@ -5101,6 +5101,10 @@ class QuantStrategy:
                     return
 
             # v9: capture full EntrySignal before the thread consumes it
+            logger.info(
+                f"ENTRY CANDIDATE APPROVED: {signal.entry_type.value} {signal.side.upper()} "
+                f"@ ${signal.entry_price:,.1f} | SL=${signal.sl_price:,.1f} "
+                f"TP=${signal.tp_price:,.1f} R:R={signal.rr_ratio:.1f}")
             self._last_entry_signal = signal
 
             # Mark the entry engine before the background thread starts. If the

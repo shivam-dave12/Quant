@@ -584,6 +584,72 @@ class EntryEngine:
         except Exception as e:
             logger.debug(f"mark_pre_order_rejected failed: {e}")
 
+
+    def _arm_refine_watch_from_rejected_sweep(
+        self,
+        sweep: Optional[SweepResult],
+        side: str,
+        entry_price: float,
+        structural_sl: float,
+        reason: str,
+        now: float,
+        target_pool: Optional[PoolTarget] = None,
+        tp_price: float = 0.0,
+    ) -> None:
+        """Keep a valid sweep thesis alive when the first entry is unexecutable.
+
+        This is deliberately *not* a shortcut entry. It only preserves the thesis
+        after an institutional sweep verdict when the current price is too far
+        from true invalidation, so the SL would breach liquidation/margin guards.
+        The pending watch must later rebuild SL/TP from live structure and pass
+        all normal gates before it can emit a signal.
+        """
+        if not _REFINE_ENABLED or sweep is None:
+            return
+        side = str(side or "").lower()
+        if side not in ("long", "short"):
+            return
+        try:
+            entry_price = float(entry_price or 0.0)
+            structural_sl = float(structural_sl or 0.0)
+            if entry_price <= 0 or structural_sl <= 0:
+                return
+            if not self._sl_is_protective(side, structural_sl, entry_price):
+                return
+            cooldown = float(getattr(_cfg, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)) if '_cfg' in globals() else 30.0
+            key = self._sweep_key(sweep)
+            old_exp = self._processed_sweeps.get(key, 0.0)
+            new_exp = now + max(5.0, cooldown)
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+
+            sig = EntrySignal(
+                side=side,
+                entry_type=EntryType.SWEEP_REVERSAL,
+                entry_price=entry_price,
+                sl_price=structural_sl,
+                tp_price=float(tp_price or 0.0),
+                rr_ratio=0.0,
+                target_pool=target_pool,
+                sweep_result=sweep,
+                conviction=0.55,
+                reason=f"REJECTED_SWEEP_REFINE: {reason}",
+                ict_validation="pending_refine",
+            )
+            self._pending_refined = _PendingRefinedEntry(
+                original=sig,
+                created_at=now,
+                expires_at=now + max(60.0, _REFINE_TTL_SEC),
+                reason=f"{reason}; wait for raid-origin pullback",
+            )
+            logger.info(
+                "EntryEngine refine watch armed after SL/risk rejection: %s sweep $%.1f side=%s initial_entry=$%.1f structural_sl=$%.1f reason=%s",
+                getattr(getattr(sweep, 'pool', None), 'timeframe', '?'),
+                float(getattr(getattr(sweep, 'pool', None), 'price', 0.0) or 0.0),
+                side.upper(), entry_price, structural_sl, reason,
+            )
+        except Exception as e:
+            logger.debug(f"_arm_refine_watch_from_rejected_sweep failed: {e}")
+
     def on_entry_failed(self) -> None:
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
             self._reset(time.time())
@@ -1716,6 +1782,7 @@ class EntryEngine:
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
             return
         risk = abs(price - sl)
+        _initial_structural_sl = sl
 
         if risk < 1e-10:
             logger.info(
@@ -1752,6 +1819,15 @@ class EntryEngine:
             logger.info(
                 f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
                 f"sweep=${sweep.pool.price:.1f}")
+            if "liquidation" in str(sl_reason).lower() or "search window" in str(self._last_pool_plan_summary()).lower():
+                self._arm_refine_watch_from_rejected_sweep(
+                    sweep=sweep,
+                    side=side,
+                    entry_price=price,
+                    structural_sl=_initial_structural_sl,
+                    reason=sl_reason,
+                    now=now,
+                )
             self._post_sweep = None
             self._reset(now)
             return
@@ -1764,6 +1840,14 @@ class EntryEngine:
             logger.info(
                 f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason="SL beyond liquidation guard",
+                now=now,
+            )
             self._post_sweep = None
             self._reset(now)
             return
@@ -1885,6 +1969,14 @@ class EntryEngine:
             logger.info(
                 f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason="SL beyond liquidation guard",
+                now=now,
+            )
             self._post_sweep = None
             self._reset(now)
             return
