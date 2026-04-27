@@ -2513,7 +2513,11 @@ class QuantStrategy:
         # is None / expired (checked in the routing block each tick), or
         # (c) _enter_trade() resets all state after a confirmed fill.
         self._last_eval_time = 0.0; self._last_exit_time = 0.0
-        self._last_tp_gate_rejection = 0.0  # tracks last TP gate rejection time
+        # Tracks pre-order gate rejections. Despite the historical name, this
+        # covers TP/fee/liquidation/sizing failures before any exchange order is sent.
+        # Fresh timestamp here means the async entry thread must not start the
+        # normal post-exit cooldown, because no trade existed.
+        self._last_tp_gate_rejection = 0.0
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
@@ -3555,8 +3559,8 @@ class QuantStrategy:
                         _gate_reject = (time.time() - self._last_tp_gate_rejection) < 5.0
                         if _gate_reject:
                             logger.info(
-                                f"Ã¢Å¡Âª Entry gate rejected (mode={mode} side={side}) "
-                                f"Ã¢â‚¬â€ resetting to FLAT, no cooldown (signals resume immediately)")
+                                f"Ã¢Å¡Âª Pre-order entry rejected (mode={mode} side={side}) "
+                                f"Ã¢â‚¬â€ resetting to FLAT, no trade cooldown")
                         else:
                             logger.warning(
                                 f"Ã¢Å¡Â Ã¯Â¸Â Entry thread exited without activation "
@@ -3569,6 +3573,14 @@ class QuantStrategy:
                     # transition and counter cleanup atomically.
                     if (self._entry_engine is not None
                             and self._pos.phase != PositionPhase.ACTIVE):
+                        try:
+                            if _gate_reject and hasattr(self._entry_engine, 'mark_pre_order_rejected'):
+                                self._entry_engine.mark_pre_order_rejected(
+                                    getattr(self, '_last_entry_signal', None),
+                                    cooldown_sec=float(getattr(config, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)),
+                                )
+                        except Exception as _pre_gate_e:
+                            logger.debug(f"EntryEngine pre-order rejection mark failed: {_pre_gate_e}")
                         self._entry_engine.on_entry_failed()
 
         threading.Thread(
@@ -5452,7 +5464,13 @@ class QuantStrategy:
             risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info
         )
-        if qty is None or qty < QCfg.MIN_QTY(): return
+        if qty is None or qty < QCfg.MIN_QTY():
+            # No order was sent. Treat as a pre-order rejection, not a trade
+            # exit/failure. Otherwise QUANT_COOLDOWN_SEC starts and entry
+            # evaluation appears to stop after a minimum-lot sizing reject.
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
         logger.info(
             f"Ã°Å¸Å½Â¯ ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "

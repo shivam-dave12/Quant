@@ -393,6 +393,11 @@ class EntryEngine:
         # were not selected.
         self._last_pool_plan: Optional[Dict[str, Any]] = None
 
+        # Signal handed to quant_strategy for execution. Used when a pre-order
+        # rejection happens before any order reaches the exchange, so the exact
+        # sweep lock can be shortened instead of held for the full 120 seconds.
+        self._active_signal: Optional[EntrySignal] = None
+
         # ATR-percentile rank [0,1] updated by quant_strategy each tick via
         # set_atr_pctile().  Drives _regime_sl_mult() so SL buffers scale with
         # the current volatility regime: tight in low-vol, wide in high-vol.
@@ -468,15 +473,43 @@ class EntryEngine:
         return sig
 
     def on_entry_placed(self, signal: Optional[EntrySignal] = None) -> None:
-        """Called by quant_strategy when a trade order is confirmed sent."""
+        """Called by quant_strategy when a trade order is about to be sent."""
         self._state = EngineState.ENTERING
         self._state_entered = time.time()
         self._last_entry_at = time.time()
+        self._active_signal = signal
         self._signal = None
+
+    def mark_pre_order_rejected(self, signal: Optional[EntrySignal] = None,
+                                cooldown_sec: float = 30.0) -> None:
+        """Shorten the processed-sweep lock after a no-order rejection.
+
+        Sizing, fee-floor, liquidation, and margin-envelope failures occur before
+        an order reaches the exchange. Keep a short anti-spam lock, but allow the
+        same sweep to be reconsidered if price/SL distance changes enough to make
+        the setup executable.
+        """
+        sig = signal or self._active_signal
+        try:
+            sweep = getattr(sig, 'sweep_result', None) if sig is not None else None
+            if sweep is None:
+                return
+            now = time.time()
+            key = self._sweep_key(sweep)
+            old_exp = self._processed_sweeps.get(key, 0.0)
+            new_exp = now + max(5.0, float(cooldown_sec))
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+            logger.info(
+                f"EntryEngine pre-order rejection: sweep lock shortened "
+                f"to {int(self._processed_sweeps[key] - now)}s for "
+                f"{sweep.pool.side.value} ${sweep.pool.price:,.1f}")
+        except Exception as e:
+            logger.debug(f"mark_pre_order_rejected failed: {e}")
 
     def on_entry_failed(self) -> None:
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
             self._reset(time.time())
+        self._active_signal = None
 
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION
@@ -539,6 +572,7 @@ class EntryEngine:
             )
 
     def on_position_closed(self) -> None:
+        self._active_signal = None
         self._reset(time.time())
 
     def force_reset(self) -> None:
