@@ -41,7 +41,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +386,13 @@ class EntryEngine:
         self._last_bridge_skip: Optional[Dict[str, int]] = None
         self._sweep_quality_hist = defaultdict(lambda: deque(maxlen=200))
 
+        # Institutional TP/SL pool-plan diagnostics.  These reports are updated
+        # every time the engine evaluates pool-based TP/SL selection.  They are
+        # intentionally retained across _reset(), so after an entry rejection the
+        # Telegram /thinking command can still show WHY visible BSL/SSL pools
+        # were not selected.
+        self._last_pool_plan: Optional[Dict[str, Any]] = None
+
         # ATR-percentile rank [0,1] updated by quant_strategy each tick via
         # set_atr_pctile().  Drives _regime_sl_mult() so SL buffers scale with
         # the current volatility regime: tight in low-vol, wide in high-vol.
@@ -576,6 +583,11 @@ class EntryEngine:
         if self._last_bridge_skip:
             out["bridge"] = dict(self._last_bridge_skip)
         return out if out else None
+
+    @property
+    def pool_plan_info(self) -> Optional[Dict[str, Any]]:
+        """Last TP/SL candidate report for /thinking and rejection logs."""
+        return dict(self._last_pool_plan) if isinstance(self._last_pool_plan, dict) else None
 
     # ── Internal: reset ───────────────────────────────────────────────
 
@@ -1492,7 +1504,8 @@ class EntryEngine:
         if tp is None:
             logger.info(
                 f"ENTRY REJECTED (no liquidity TP): side={side} "
-                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f}")
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
+                f"| {self._last_pool_plan_summary()}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1604,20 +1617,33 @@ class EntryEngine:
             self._reset(now)
             return
 
-        rr = reward / risk
+        # Continuation TP is re-selected through the same EV-ranked pool selector
+        # as reversal entries.  The DirectionEngine's next_target is a directional
+        # hint, not an execution TP.  This prevents "visible pool = TP" retail
+        # shortcuts and forces every continuation target through R:R, probability,
+        # gauntlet, freshness, and execution-cost gates.
+        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        if tp2 is not None:
+            tp, target = tp2, target2
+            rr = abs(tp - price) / risk
+        else:
+            rr = reward / risk if risk > 1e-10 else 0.0
+            logger.info(
+                f"⚠️ ENTRY REJECTED (R:R/TP): initial_rr={rr:.2f} < institutional TP gate "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
+                f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
         if rr < _MIN_RR_RATIO:
-            tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
-            if tp2 is not None:
-                tp, target = tp2, target2
-                rr = abs(tp - price) / risk
-            else:
-                logger.info(
-                    f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
-                    f"(no HTF fallback TP) side={side} sweep=${sweep.pool.price:.1f} "
-                    f"entry=${price:.1f} sl=${sl:.1f}")
-                self._post_sweep = None
-                self._reset(now)
-                return
+            logger.info(
+                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
+                f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
 
         self._signal = EntrySignal(
             side=side, entry_type=EntryType.SWEEP_CONTINUATION,
@@ -1636,39 +1662,60 @@ class EntryEngine:
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _find_tp(self, snap, side, price, atr, sl, min_rr):
-        """Find TP via the EV-ranked liquidity pool selector.
+        """Find TP via EV-ranked institutional liquidity selection + audit report.
 
-        Returns (tp_price, target) or (None, None) if no pool qualifies.
-
-        Delegates to liquidity_pool_selector.select_tp(), which scores each
-        candidate as:
-            EV = P(sweep) × confluence × rr_quality × (1 − gauntlet_penalty)
-
-        where the components combine per-pool MTF sweep probability
-        (mtf_pool_probability), HTF alignment, OB/FVG structure, killzone
-        bonus, freshness, touch penalty, and an opposing-pool gauntlet
-        penalty (pools between entry and TP that eat momentum on the way).
-
-        After the selector picks a candidate, this method enforces one
-        strategy-level gate the selector can't know about: the net move
-        must clear the round-trip break-even threshold (commission + slip).
+        The selector is intentionally strict: a visible BSL/SSL must still pass
+        side, active-status, reach, R:R, probability, gauntlet, and execution-cost
+        gates.  The important upgrade here is observability: every rejected pool
+        is retained in self._last_pool_plan so logs and /thinking explain WHY the
+        visible pool was not used.
         """
         risk = abs(price - sl)
         if risk < 1e-10:
+            self._record_pool_report({
+                "role": "TP", "side": side, "entry": price, "atr": atr,
+                "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
+        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         try:
-            from strategy.liquidity_pool_selector import select_tp as _sel_tp
+            from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:
-            from liquidity_pool_selector import select_tp as _sel_tp   # type: ignore
+            try:
+                from liquidity_pool_selector import select_tp_with_report as _sel_tp   # type: ignore
+            except ImportError:
+                _sel_tp = None
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
-        tp_price, target, score = _sel_tp(
-            snap=snap, side=side, entry=price, sl=sl, atr=atr,
-            ict=getattr(self, "_ict", None), htf=_htf_ref,
-            min_rr=float(min_rr) + _TP_RR_SAFETY_BUFFER,
-        )
+        if _sel_tp is None:
+            # Last-resort compatibility path.  This should not be used in the
+            # shipped package, but keeps direct single-file runs from breaking.
+            try:
+                from strategy.liquidity_pool_selector import select_tp as _legacy_sel_tp
+            except ImportError:
+                from liquidity_pool_selector import select_tp as _legacy_sel_tp   # type: ignore
+            tp_price, target, score = _legacy_sel_tp(
+                snap=snap, side=side, entry=price, sl=sl, atr=atr,
+                ict=getattr(self, "_ict", None), htf=_htf_ref,
+                min_rr=required_rr,
+            )
+            report = {
+                "role": "TP", "side": side, "entry": price, "atr": atr,
+                "summary": "legacy selector path used; detailed diagnostics unavailable",
+                "selected": None, "candidates": [],
+            }
+        else:
+            tp_price, target, score, report_obj = _sel_tp(
+                snap=snap, side=side, entry=price, sl=sl, atr=atr,
+                ict=getattr(self, "_ict", None), htf=_htf_ref,
+                min_rr=required_rr,
+                now=time.time(),
+            )
+            report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
+
+        self._record_pool_report(report)
         if tp_price is None or target is None:
+            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
         # Strategy-level BE gate: TP must clear round-trip fees + slippage.
@@ -1676,15 +1723,31 @@ class EntryEngine:
             atr * _TP_MIN_NET_ATR,
             self._estimated_entry_be_move(price, atr),
         )
-        if abs(tp_price - price) < min_net_move:
+        net_move = abs(tp_price - price)
+        if net_move < min_net_move:
+            report = dict(report or {})
+            report["strategy_gate"] = (
+                f"selected TP failed execution-cost gate: net_move={net_move:.1f} "
+                f"< required={min_net_move:.1f}")
+            # Mark selected row as rejected by strategy-level cost gate, while
+            # preserving the selector's EV result.
+            selected = report.get("selected") or {}
+            if isinstance(selected, dict):
+                selected["eligible"] = False
+                selected["selected"] = False
+                selected["reason"] = report["strategy_gate"]
+                report["selected"] = selected
+            report["summary"] = report["strategy_gate"]
+            self._record_pool_report(report)
+            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
         if score is not None:
-            logger.debug(
-                "TP pick: $%.1f dist=%.1fATR rr=%.2f P=%.2f EV=%.3f gauntlet=%d (%s)",
+            logger.info(
+                "TP_POOL_SELECTED: $%.1f dist=%.1fATR rr=%.2f P=%.2f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
                 score.sweep_prob, score.ev, score.gauntlet_n,
-                ", ".join(score.reasons) if score.reasons else "—",
+                ", ".join(score.reasons) if score.reasons else "institutional gates passed",
             )
         return tp_price, target
 
@@ -1694,29 +1757,108 @@ class EntryEngine:
         Anchor SL to the highest-significance protective pool just past
         structural invalidation, with a quality-scaled buffer beyond it.
 
-        Delegates to liquidity_pool_selector.select_sl(). The buffer width
-        scales INVERSELY with the chosen pool's quality: an institutional
-        pool (OB-aligned, multi-TF, fresh) earns a thin 0.18 ATR buffer;
-        a weaker protective pool gets up to 0.55 ATR.
-
-        Returns (sl_price, target, pick) or (None, None, None) when no
-        protective pool meets the search criteria; caller decides on
-        OB-based or ATR-based fallback.
+        Also records a full SL candidate audit report.  A visible pool is not
+        automatically usable as SL: it must be on the protective side, beyond
+        invalidation, active/unswept, inside the SL search window, and above the
+        institutional significance floor.
         """
         try:
-            from strategy.liquidity_pool_selector import select_sl as _sel_sl
+            from strategy.liquidity_pool_selector import select_sl_with_report as _sel_sl
         except ImportError:
-            from liquidity_pool_selector import select_sl as _sel_sl   # type: ignore
+            try:
+                from liquidity_pool_selector import select_sl_with_report as _sel_sl   # type: ignore
+            except ImportError:
+                _sel_sl = None
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
-        return _sel_sl(
+        if _sel_sl is None:
+            try:
+                from strategy.liquidity_pool_selector import select_sl as _legacy_sel_sl
+            except ImportError:
+                from liquidity_pool_selector import select_sl as _legacy_sel_sl   # type: ignore
+            return _legacy_sel_sl(
+                snap=snap, side=side, entry=entry, atr=atr,
+                ict=ict if ict is not None else getattr(self, "_ict", None),
+                htf=_htf_ref,
+                invalidation_price=invalidation_price,
+                max_buffer_atr=max_buffer_atr,
+            )
+
+        sl_price, target, pick, report_obj = _sel_sl(
             snap=snap, side=side, entry=entry, atr=atr,
             ict=ict if ict is not None else getattr(self, "_ict", None),
             htf=_htf_ref,
             invalidation_price=invalidation_price,
             max_buffer_atr=max_buffer_atr,
+            now=time.time(),
         )
+        report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
+        self._record_pool_report(report)
+        if sl_price is None or target is None:
+            logger.info("SL_POOL_AUDIT: %s", self._format_pool_plan(report))
+        else:
+            try:
+                logger.info(
+                    "SL_POOL_SELECTED: anchor=$%.1f sl=$%.1f quality=%.2f buffer=%.2fATR (%s)",
+                    float(getattr(target.pool, "price", 0.0)), float(sl_price),
+                    float(getattr(pick, "quality", 0.0) if pick is not None else 0.0),
+                    float(getattr(pick, "buffer_atr", 0.0) if pick is not None else 0.0),
+                    ", ".join(getattr(pick, "reasons", []) or ["protective gates passed"]),
+                )
+            except Exception:
+                pass
+        return sl_price, target, pick
 
+    def _record_pool_report(self, report: Any) -> None:
+        """Store a pool-selection report for /thinking without raising."""
+        try:
+            if report is None:
+                return
+            if hasattr(report, "as_dict"):
+                payload = report.as_dict()
+            elif isinstance(report, dict):
+                payload = dict(report)
+            else:
+                payload = {"summary": str(report), "candidates": []}
+            payload["ts"] = time.time()
+            self._last_pool_plan = payload
+        except Exception:
+            self._last_pool_plan = None
+
+    def _last_pool_plan_summary(self) -> str:
+        try:
+            if not isinstance(self._last_pool_plan, dict):
+                return "pool diagnostics unavailable"
+            return str(self._last_pool_plan.get("summary") or "pool diagnostics unavailable")
+        except Exception:
+            return "pool diagnostics unavailable"
+
+    def _format_pool_plan(self, report: Any, max_rows: int = 4) -> str:
+        """Compact one-line audit text for logs."""
+        try:
+            if hasattr(report, "as_dict"):
+                report = report.as_dict()
+            if not isinstance(report, dict):
+                return str(report)
+            role = report.get("role", "POOL")
+            side = str(report.get("side", "?")).upper()
+            summary = report.get("summary", "")
+            rows = report.get("candidates") or []
+            bits = [f"{role}/{side}: {summary}"]
+            for r in rows[:max_rows]:
+                if not isinstance(r, dict):
+                    continue
+                px = float(r.get("pool_price") or 0.0)
+                tf = r.get("timeframe", "")
+                ps = r.get("pool_side", "")
+                rr = float(r.get("rr") or 0.0)
+                ev = float(r.get("ev") or 0.0)
+                reason = r.get("reason", "")
+                mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
+                bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
+            return " | ".join(bits)
+        except Exception as e:
+            return f"pool audit format error: {e}"
 
     def _find_opposing_target(self, direction, snap, price, atr):
         # EE-3 FIX: previously capped at _MAX_TARGET_ATR (8.0 ATR), which

@@ -705,6 +705,48 @@ class TelegramBotController:
 
             lines.append(f"  Engine: <b>{_esc(engine_state)}</b>")
 
+            # Institutional TP/SL pool-plan diagnostics.  This answers the
+            # operator question: "BSL/SSL is visible, so why was it not selected?"
+            # The rows come from liquidity_pool_selector's hard gates — no gate is
+            # weakened for display.
+            try:
+                plan = getattr(entry_engine, 'pool_plan_info', None) if entry_engine else None
+                if callable(plan):
+                    plan = plan()
+                if isinstance(plan, dict):
+                    age_s = now - float(plan.get('ts', 0.0) or 0.0)
+                    if age_s <= 300:
+                        role = _esc(plan.get('role', 'POOL'))
+                        side = _esc(str(plan.get('side', '?')).upper())
+                        summary = _esc(plan.get('summary', ''))
+                        lines.append(f"  <b>{role} eligibility audit</b> ({side}, {age_s:.0f}s ago)")
+                        if summary:
+                            lines.append(f"  → {summary}")
+                        rows = plan.get('candidates') or []
+                        for r in rows[:5]:
+                            if not isinstance(r, dict):
+                                continue
+                            mark = '✅' if r.get('selected') else ('🟡' if r.get('eligible') else '⛔')
+                            ps = _esc(r.get('pool_side', ''))
+                            tf = _esc(r.get('timeframe', ''))
+                            px = float(r.get('pool_price') or 0.0)
+                            rr = float(r.get('rr') or 0.0)
+                            ev = float(r.get('ev') or 0.0)
+                            reason = _esc(r.get('reason', ''))
+                            if role == 'TP':
+                                tp_px = float(r.get('tp_price') or 0.0)
+                                lines.append(
+                                    f"    {mark} {ps} ${px:,.1f} [{tf}] → TP ${tp_px:,.1f} "
+                                    f"RR={rr:.2f} EV={ev:.3f} — {reason}")
+                            else:
+                                sl_px = float(r.get('sl_price') or 0.0)
+                                q = float(r.get('quality') or 0.0)
+                                lines.append(
+                                    f"    {mark} {ps} ${px:,.1f} [{tf}] → SL ${sl_px:,.1f} "
+                                    f"Q={q:.2f} — {reason}")
+            except Exception as _pe:
+                lines.append(f"  Pool-plan diagnostics error: {_esc(_pe)}")
+
             if sweep is not None:
                 age_m   = (now_ms - sweep.setup_time_ms) / 60_000
                 in_ote  = sweep.ote_entry_zone_low <= price <= sweep.ote_entry_zone_high

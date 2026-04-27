@@ -5206,6 +5206,23 @@ class QuantStrategy:
                 except Exception:
                     pass
 
+            # Pool-plan diagnostics: explains why visible BSL/SSL were not used
+            # as TP/SL after the last sweep verdict.  This is deliberately short
+            # for the terminal heartbeat; full rows are available via /thinking.
+            try:
+                _pool_plan = getattr(self._entry_engine, 'pool_plan_info', None)
+                if callable(_pool_plan):
+                    _pool_plan = _pool_plan()
+                if isinstance(_pool_plan, dict):
+                    _age = time.time() - float(_pool_plan.get('ts', 0.0) or 0.0)
+                    if _age <= 300:
+                        _role = _pool_plan.get('role', 'POOL')
+                        _summary = str(_pool_plan.get('summary', ''))[:120]
+                        if _summary:
+                            parts.append(f"{_role}Plan={_summary}")
+            except Exception:
+                pass
+
             logger.info(f"[THINK] {' | '.join(parts)}")
 
 

@@ -176,6 +176,69 @@ class SLPoolPick:
     reasons:      List[str] = field(default_factory=list)
 
 
+@dataclass
+class PoolCandidateDiagnostic:
+    """Human-readable TP/SL candidate audit row.
+
+    This is deliberately separate from PoolScore/SLPoolPick.  PoolScore only
+    represents candidates that PASSED the institutional gates.  This row also
+    records rejected pools and the exact reason, so display/logging can explain
+    why a visible BSL/SSL was not used as TP/SL.
+    """
+    role:          str
+    side:          str
+    pool_side:     str
+    pool_price:    float
+    timeframe:     str
+    status:        str
+    distance_atr:  float
+    significance:  float
+    touches:       int
+    selected:      bool = False
+    eligible:      bool = False
+    reason:        str  = ""
+    tp_price:      float = 0.0
+    sl_price:      float = 0.0
+    rr:            float = 0.0
+    required_rr:   float = 0.0
+    reward:        float = 0.0
+    risk:          float = 0.0
+    sweep_prob:    float = 0.0
+    ev:            float = 0.0
+    confluence:    float = 1.0
+    gauntlet_n:    int   = 0
+    be_move:       float = 0.0
+    buffer_atr:    float = 0.0
+    quality:       float = 0.0
+    notes:         List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+
+@dataclass
+class PoolSelectionReport:
+    """Full institutional audit report for TP/SL pool selection."""
+    role:        str
+    side:        str
+    entry:       float
+    atr:         float
+    candidates: List[PoolCandidateDiagnostic] = field(default_factory=list)
+    selected:    Optional[PoolCandidateDiagnostic] = None
+    summary:     str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "side": self.side,
+            "entry": self.entry,
+            "atr": self.atr,
+            "summary": self.summary,
+            "selected": self.selected.as_dict() if self.selected else None,
+            "candidates": [c.as_dict() for c in self.candidates],
+        }
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # INTERNAL HELPERS
 # ════════════════════════════════════════════════════════════════════════════
@@ -186,6 +249,58 @@ def _safe(obj: Any, attr: str, default=0.0):
         return v if v is not None else default
     except Exception:
         return default
+
+
+def _enum_value(v: Any, default: str = "") -> str:
+    try:
+        if hasattr(v, "value"):
+            return str(v.value)
+        return str(v) if v is not None else default
+    except Exception:
+        return default
+
+
+def _pool_status(pool: Any) -> str:
+    return _enum_value(_safe(pool, "status", ""), "")
+
+
+def _pool_side(pool: Any) -> str:
+    return _enum_value(_safe(pool, "side", ""), "")
+
+
+def _target_signature(target: Any) -> Tuple[str, float, str]:
+    pool = _safe(target, "pool", None)
+    return (
+        _pool_side(pool),
+        round(float(_safe(pool, "price", 0.0)), 8),
+        str(_safe(pool, "timeframe", "")),
+    )
+
+
+def _candidate_base(role: str, side: str, target: Any, entry: float, atr: float,
+                    risk: float = 0.0, required_rr: float = 0.0,
+                    be_move: float = 0.0) -> PoolCandidateDiagnostic:
+    pool = _safe(target, "pool", None)
+    return PoolCandidateDiagnostic(
+        role         = role,
+        side         = side,
+        pool_side    = _pool_side(pool),
+        pool_price   = float(_safe(pool, "price", 0.0)),
+        timeframe    = str(_safe(pool, "timeframe", "")),
+        status       = _pool_status(pool),
+        distance_atr = float(_safe(target, "distance_atr", 0.0)),
+        significance = float(_safe(target, "significance", 0.0)),
+        touches      = int(_safe(pool, "touches", 1) or 1),
+        risk         = float(risk),
+        required_rr  = float(required_rr),
+        be_move      = float(be_move),
+    )
+
+
+def _sort_report_candidates(rows: List[PoolCandidateDiagnostic], limit: int = 8) -> List[PoolCandidateDiagnostic]:
+    def _key(r: PoolCandidateDiagnostic):
+        return (0 if r.selected else 1 if r.eligible else 2, -r.ev, -r.rr, r.distance_atr)
+    return sorted(rows, key=_key)[:max(1, int(limit))]
 
 
 def _hour_utc(now: Optional[float]) -> int:
@@ -656,6 +771,273 @@ def score_sl_pool(
     )
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL DIAGNOSTICS — why visible pools were/weren't selected
+# ════════════════════════════════════════════════════════════════════════════
+
+def diagnose_tp_pools(
+    snap,
+    side:    str,
+    entry:   float,
+    sl:      float,
+    atr:     float,
+    ict:     Any = None,
+    htf:     Any = None,
+    min_rr:  float = 2.0,
+    now:     Optional[float] = None,
+    session: str = "",
+    limit:   int = 8,
+) -> PoolSelectionReport:
+    """Return a TP candidate audit table without weakening any gate.
+
+    LONG TP candidates must be BSL above entry.  SHORT TP candidates must be
+    SSL below entry.  Rejected rows explain the first hard institutional veto:
+    wrong side, already-swept/consumed, too near, too far, below required R:R,
+    no sweep probability, or valid-but-not-selected by EV ranking.
+    """
+    report = PoolSelectionReport(role="TP", side=side, entry=float(entry), atr=float(atr))
+    if snap is None:
+        report.summary = "no liquidity snapshot"
+        return report
+    if atr <= 0:
+        report.summary = "ATR unavailable"
+        return report
+
+    risk = abs(float(entry) - float(sl))
+    be_move = _breakeven_move(entry, atr)
+    if risk < 1e-10:
+        report.summary = "invalid risk: entry and SL overlap"
+        return report
+
+    pools = list(_safe(snap, "bsl_pools", [])) if side == "long" else list(_safe(snap, "ssl_pools", []))
+    if not pools:
+        report.summary = f"no {'BSL' if side == 'long' else 'SSL'} pools on TP side"
+        return report
+
+    now_ts = now or time.time()
+    rows: List[PoolCandidateDiagnostic] = []
+    accepted: List[Tuple[float, PoolCandidateDiagnostic]] = []
+
+    for target in pools:
+        row = _candidate_base("TP", side, target, entry, atr, risk, float(min_rr), be_move)
+        try:
+            pool = target.pool
+            pool_price = float(_safe(pool, "price", 0.0))
+            status = row.status.upper()
+            max_reach = _MAX_REACH_ATR.get(str(_safe(pool, "timeframe", "5m")), 12.0)
+
+            if status in ("SWEPT", "CONSUMED"):
+                row.reason = f"archived {status.lower()} pool; not a live target"
+                rows.append(row); continue
+            if row.distance_atr < 0.25:
+                row.reason = "too close: no durable delivery room after buffer/costs"
+                rows.append(row); continue
+            if row.distance_atr > max_reach:
+                row.reason = f"too far for TF reach model ({row.distance_atr:.1f}>{max_reach:.1f} ATR)"
+                rows.append(row); continue
+
+            buf = _reach_buffer(row.distance_atr, atr)
+            row.buffer_atr = buf / max(atr, 1e-9)
+            row.tp_price = pool_price - buf if side == "long" else pool_price + buf
+
+            if side == "long" and row.tp_price <= entry + 1e-6:
+                row.reason = "wrong side after TP buffer: BSL is not above entry"
+                rows.append(row); continue
+            if side == "short" and row.tp_price >= entry - 1e-6:
+                row.reason = "wrong side after TP buffer: SSL is not below entry"
+                rows.append(row); continue
+
+            row.reward = abs(row.tp_price - entry)
+            row.rr = row.reward / risk
+            if row.rr < float(min_rr):
+                row.reason = f"R:R {row.rr:.2f} < required {float(min_rr):.2f}"
+                rows.append(row); continue
+
+            raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
+            row.sweep_prob = norm_prob
+            if raw_prob <= 0:
+                row.reason = "zero sweep probability under MTF probability model"
+                rows.append(row); continue
+
+            sig = float(_safe(target, "significance", 0.0))
+            confluence = (
+                _confluence_bonus(target)
+                * _structural_bonus(pool)
+                * _htf_alignment_bonus(pool, side, htf)
+                * _killzone_bonus(pool, now_ts)
+                * _freshness_bonus(pool)
+                * _touch_penalty(pool)
+            )
+            row.confluence = confluence
+            utility, comps = _target_utility(raw_prob, row.rr, float(min_rr), row.distance_atr, row.reward, be_move)
+            n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
+            row.gauntlet_n = n_gauntlet
+            row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
+            row.eligible = True
+            row.reason = "eligible; EV-ranked candidate"
+            row.notes = []
+            if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
+            if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
+            if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
+            accepted.append((row.ev, row))
+            rows.append(row)
+        except Exception as e:
+            row.reason = f"diagnostic error: {e}"
+            rows.append(row)
+
+    accepted.sort(key=lambda x: x[0], reverse=True)
+    if accepted:
+        selected = accepted[0][1]
+        selected.selected = True
+        selected.reason = "selected by EV after all institutional gates"
+        report.selected = selected
+        report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
+                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
+    else:
+        if rows:
+            # Surface the most relevant rejection, not just "no TP".
+            best_reject = sorted(rows, key=lambda r: (-r.rr, r.distance_atr))[0]
+            report.summary = f"no eligible TP pool; best visible pool rejected: {best_reject.reason}"
+        else:
+            report.summary = "no TP candidates found"
+
+    report.candidates = _sort_report_candidates(rows, limit)
+    return report
+
+
+def diagnose_sl_pool(
+    snap,
+    side: str,
+    entry: float,
+    atr: float,
+    ict: Any = None,
+    htf: Any = None,
+    invalidation_price: Optional[float] = None,
+    max_buffer_atr: float = 2.0,
+    now: Optional[float] = None,
+    limit: int = 8,
+) -> PoolSelectionReport:
+    """Return an SL protective-pool audit table without relaxing SL rules."""
+    report = PoolSelectionReport(role="SL", side=side, entry=float(entry), atr=float(atr))
+    if snap is None:
+        report.summary = "no liquidity snapshot"
+        return report
+    if atr <= 0:
+        report.summary = "ATR unavailable"
+        return report
+
+    rows: List[PoolCandidateDiagnostic] = []
+    candidates: List[Tuple[float, PoolCandidateDiagnostic, Any]] = []
+
+    if side == "long":
+        pools = list(_safe(snap, "ssl_pools", []) or [])
+        inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
+        def _protects(t):
+            px = float(_safe(t.pool, "price", 0.0))
+            if px > inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr:
+                return False, "not beyond long invalidation"
+            if (entry - px) > _SL_SEARCH_WINDOW_ATR * atr:
+                return False, f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
+            return True, ""
+    else:
+        pools = list(_safe(snap, "bsl_pools", []) or [])
+        inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
+        def _protects(t):
+            px = float(_safe(t.pool, "price", 0.0))
+            if px < inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr:
+                return False, "not beyond short invalidation"
+            if (px - entry) > _SL_SEARCH_WINDOW_ATR * atr:
+                return False, f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
+            return True, ""
+
+    if not pools:
+        report.summary = f"no protective {'SSL' if side == 'long' else 'BSL'} pools"
+        return report
+
+    for target in pools:
+        row = _candidate_base("SL", side, target, entry, atr)
+        try:
+            status = row.status.upper()
+            if status in ("SWEPT", "CONSUMED"):
+                row.reason = f"archived {status.lower()} pool; not protective"
+                rows.append(row); continue
+            ok, why = _protects(target)
+            if not ok:
+                row.reason = why
+                rows.append(row); continue
+            if row.significance < _SL_MIN_SIGNIFICANCE:
+                row.reason = f"significance {row.significance:.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
+                rows.append(row); continue
+
+            sig = float(_safe(target, "significance", 0.0))
+            struct = _structural_bonus(target.pool)
+            fresh = _freshness_bonus(target.pool)
+            touch = _touch_penalty(target.pool)
+            score = sig * struct * fresh * touch
+            quality = min(score / 10.0, 1.0)
+            buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
+            buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
+            pool_price = float(_safe(target.pool, "price", 0.0))
+            row.sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+            row.buffer_atr = buffer_atr
+            row.quality = quality
+            row.ev = score
+            row.eligible = True
+            row.reason = "eligible protective SL pool"
+            row.notes = [f"score={score:.2f}"]
+            candidates.append((score, row, target))
+            rows.append(row)
+        except Exception as e:
+            row.reason = f"diagnostic error: {e}"
+            rows.append(row)
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if candidates:
+        selected = candidates[0][1]
+        selected.selected = True
+        selected.reason = "selected protective SL anchor"
+        report.selected = selected
+        report.summary = (f"selected ${selected.sl_price:,.1f}; anchor ${selected.pool_price:,.1f}; "
+                          f"quality={selected.quality:.2f}; buffer={selected.buffer_atr:.2f}ATR")
+    else:
+        if rows:
+            report.summary = "no protective SL pool; best visible pool rejected: " + rows[0].reason
+        else:
+            report.summary = "no SL candidates found"
+    report.candidates = _sort_report_candidates(rows, limit)
+    return report
+
+
+def select_tp_with_report(
+    snap, side: str, entry: float, sl: float, atr: float,
+    ict: Any = None, htf: Any = None, min_rr: float = 2.0,
+    now: Optional[float] = None, session: str = "",
+) -> Tuple[Optional[float], Optional[Any], Optional[PoolScore], PoolSelectionReport]:
+    """select_tp() plus a full rejection/selection report."""
+    report = diagnose_tp_pools(snap, side, entry, sl, atr, ict, htf, min_rr, now, session)
+    scores = score_tp_pools(snap, side, entry, sl, atr, ict, htf, min_rr, now, session)
+    if not scores:
+        return None, None, None, report
+    best = scores[0]
+    return best.tp_price, best.target, best, report
+
+
+def select_sl_with_report(
+    snap, side: str, entry: float, atr: float,
+    ict: Any = None, htf: Any = None,
+    invalidation_price: Optional[float] = None,
+    max_buffer_atr: float = 2.0,
+    now: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[Any], Optional[SLPoolPick], PoolSelectionReport]:
+    """select_sl() plus a full protective-pool report."""
+    report = diagnose_sl_pool(snap, side, entry, atr, ict, htf, invalidation_price, max_buffer_atr, now)
+    pick = score_sl_pool(snap, side, entry, atr, ict, htf, invalidation_price, max_buffer_atr, now)
+    if pick is None:
+        return None, None, None, report
+    return pick.sl_price, pick.target, pick, report
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # CONVENIENCE WRAPPERS — one-call API for entry_engine
 # ════════════════════════════════════════════════════════════════════════════
@@ -694,6 +1076,9 @@ def select_sl(
 
 __all__ = [
     "PoolScore", "SLPoolPick",
+    "PoolCandidateDiagnostic", "PoolSelectionReport",
     "score_tp_pools", "score_sl_pool",
+    "diagnose_tp_pools", "diagnose_sl_pool",
     "select_tp", "select_sl",
+    "select_tp_with_report", "select_sl_with_report",
 ]
