@@ -5,14 +5,14 @@ Architecture:
   Price moves from pool to pool. Smart money sweeps stops, then delivers
   the opposite direction. This engine ONLY enters on confirmed events:
 
-  1. SWEEP REVERSAL     — Pool swept + displacement + CISD → enter reversal
+  1. SWEEP REVERSAL  — Pool swept + displacement + CISD → enter reversal
   2. SWEEP CONTINUATION — Pool swept + flow continues → ride the flow
+  3. DISPLACEMENT MOMENTUM — Institutional candle detected → enter with flow
 
-  NO approach entries. NO standalone momentum entries. Institutions do not front-run
-  the sweep; every entry must be tied to a confirmed liquidity sweep.
+  NO approach entries. Institutions do not front-run the sweep.
 
 State Machine:
-  SCANNING    → monitors for liquidity sweeps only
+  SCANNING    → monitors for sweeps and displacement candles
   POST_SWEEP  → 4-phase accumulative evidence model after sweep detected
   ENTERING    → entry placed, waiting for fill
   IN_POSITION → position live, managed by quant_strategy.py
@@ -41,7 +41,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,17 @@ _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
 _PS_NEUTRAL_TICK_DECAY = 0.98
 
+# Momentum entry
+_MOMENTUM_MIN_BODY_RATIO   = 0.65
+_MOMENTUM_MIN_VOL_RATIO    = 1.3
+_MOMENTUM_MIN_ATR_MOVE     = 0.6
+_MOMENTUM_LOOKBACK_CANDLES = 3
+_MOMENTUM_SL_BUFFER_ATR    = 0.15
+_MOMENTUM_MIN_RR           = 1.0    # allow tighter momentum entries
+_MOMENTUM_COOLDOWN_SEC     = 15.0   # faster momentum cooldown
+_MOMENTUM_MAX_PER_HOUR     = 10     # allow more momentum entries
+_MOMENTUM_BLOCK_SEC        = 30.0   # default cooldown when gate blocks
+_MOMENTUM_BLOCK_ATR_MOVE   = 0.25   # ATR distance that lifts block early
 
 # HTF TP escalation
 _HTF_TP_TIMEFRAMES   = ('1h', '4h', '1d')
@@ -169,6 +180,7 @@ class EntryType(Enum):
     PRE_SWEEP_APPROACH    = "APPROACH"      # disabled — kept for compat
     SWEEP_REVERSAL        = "REVERSAL"
     SWEEP_CONTINUATION    = "CONTINUATION"
+    DISPLACEMENT_MOMENTUM = "MOMENTUM"
 
 
 @dataclass
@@ -265,6 +277,9 @@ class EntrySignal:
     reason:         str   = ""
     ict_validation: str   = ""
     created_at:     float = field(default_factory=time.time)
+    # FIX-SL-FLIP: candle timestamp that produced this signal — passed back to
+    # mark_momentum_blocked() so the frozen SL can be keyed to the right candle.
+    displacement_candle_ts: int = 0
 
 
 @dataclass
@@ -333,6 +348,10 @@ class EntryEngine:
         self._last_sweep_reversal_dir  = ""
         self._last_sweep_reversal_time = 0.0
 
+        # Momentum tracking
+        self._momentum_entries_1h     = 0
+        self._momentum_hour_start     = 0.0
+        self._last_momentum_candle_ts = 0
 
         # Compat stubs for TRACKING/READY (unused in sweep-only mode)
         self._tracking = None
@@ -376,6 +395,25 @@ class EntryEngine:
         # force_reset() clears it fully when the operator demands a hard reset.
         self._processed_sweeps: Dict[tuple, float] = {}
 
+        # FIX-SPAM: Momentum signal gate-block (independent of post-sweep gate).
+        # Momentum signals have no conviction cooldown of their own — when the
+        # conviction gate rejects a momentum signal, the engine immediately
+        # regenerates the identical signal on the next 250ms tick, producing
+        # hundreds of log lines per minute for the same setup.
+        #
+        # _momentum_blocked_until: suppress momentum signal generation until this
+        #   epoch time.  Lifted early if price moves > _MOMENTUM_BLOCK_ATR_MOVE ATR
+        #   from the entry price at block time (genuine structural change).
+        # _momentum_block_entry_price: entry price when block was set (for ATR check).
+        # _momentum_block_candle_ts: candle timestamp at block time.  A new candle
+        #   (different ts) always lifts the block immediately.
+        # _momentum_block_sl: the SL at the time of blocking — frozen so the signal
+        #   does not flip between two SL values on alternating ticks (FIX-SL-FLIP).
+        self._momentum_blocked_until:     float = 0.0
+        self._momentum_block_entry_price: float = 0.0
+        self._momentum_block_candle_ts:   int   = 0
+        self._momentum_block_sl:          Optional[float] = None
+
         # ── Diagnostic: sweep-rejection counters ──────────────────────────
         # Populated by _collect_sweeps() on every tick. Read by the strategy's
         # THINK log to surface WHY the engine is not transitioning out of
@@ -385,18 +423,6 @@ class EntryEngine:
         self._last_liq_skip:    Optional[Dict[str, int]] = None
         self._last_bridge_skip: Optional[Dict[str, int]] = None
         self._sweep_quality_hist = defaultdict(lambda: deque(maxlen=200))
-
-        # Institutional TP/SL pool-plan diagnostics.  These reports are updated
-        # every time the engine evaluates pool-based TP/SL selection.  They are
-        # intentionally retained across _reset(), so after an entry rejection the
-        # Telegram /thinking command can still show WHY visible BSL/SSL pools
-        # were not selected.
-        self._last_pool_plan: Optional[Dict[str, Any]] = None
-
-        # Signal handed to quant_strategy for execution. Used when a pre-order
-        # rejection happens before any order reaches the exchange, so the exact
-        # sweep lock can be shortened instead of held for the full 120 seconds.
-        self._active_signal: Optional[EntrySignal] = None
 
         # ATR-percentile rank [0,1] updated by quant_strategy each tick via
         # set_atr_pctile().  Drives _regime_sl_mult() so SL buffers scale with
@@ -473,43 +499,33 @@ class EntryEngine:
         return sig
 
     def on_entry_placed(self, signal: Optional[EntrySignal] = None) -> None:
-        """Called by quant_strategy when a trade order is about to be sent."""
+        """
+        Called by quant_strategy when a trade order is confirmed sent.
+
+        Bug #17 fix: _momentum_entries_1h was previously incremented when the
+        momentum SIGNAL was generated, not when the entry was actually placed.
+        A signal blocked by the conviction gate still consumed a budget slot,
+        so two blocked signals exhausted the 3-per-hour cap even with zero
+        fills.  The counter now increments here — strictly after consume_signal()
+        has been called and the order submitted — giving an accurate count of
+        attempted (not generated) entries.
+        """
         self._state = EngineState.ENTERING
         self._state_entered = time.time()
         self._last_entry_at = time.time()
-        self._active_signal = signal
+        # Increment momentum budget for the active signal type (if momentum).
+        # quant_strategy may already have consumed self._signal, so accept the
+        # signal explicitly as the canonical source when available.
+        active_signal = signal or self._signal
+        if (active_signal is not None and
+                getattr(active_signal, 'entry_type', None) ==
+                EntryType.DISPLACEMENT_MOMENTUM):
+            self._momentum_entries_1h += 1
         self._signal = None
-
-    def mark_pre_order_rejected(self, signal: Optional[EntrySignal] = None,
-                                cooldown_sec: float = 30.0) -> None:
-        """Shorten the processed-sweep lock after a no-order rejection.
-
-        Sizing, fee-floor, liquidation, and margin-envelope failures occur before
-        an order reaches the exchange. Keep a short anti-spam lock, but allow the
-        same sweep to be reconsidered if price/SL distance changes enough to make
-        the setup executable.
-        """
-        sig = signal or self._active_signal
-        try:
-            sweep = getattr(sig, 'sweep_result', None) if sig is not None else None
-            if sweep is None:
-                return
-            now = time.time()
-            key = self._sweep_key(sweep)
-            old_exp = self._processed_sweeps.get(key, 0.0)
-            new_exp = now + max(5.0, float(cooldown_sec))
-            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
-            logger.info(
-                f"EntryEngine pre-order rejection: sweep lock shortened "
-                f"to {int(self._processed_sweeps[key] - now)}s for "
-                f"{sweep.pool.side.value} ${sweep.pool.price:,.1f}")
-        except Exception as e:
-            logger.debug(f"mark_pre_order_rejected failed: {e}")
 
     def on_entry_failed(self) -> None:
         if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
             self._reset(time.time())
-        self._active_signal = None
 
     def on_position_opened(self) -> None:
         self._state = EngineState.IN_POSITION
@@ -571,14 +587,50 @@ class EntryEngine:
                 time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
             )
 
+    def mark_momentum_blocked(
+        self,
+        entry_price: float,
+        candle_ts: int,
+        locked_sl: float,
+        cooldown_sec: float = _MOMENTUM_BLOCK_SEC,
+    ) -> None:
+        """
+        FIX-SPAM + FIX-SL-FLIP: Called when a DISPLACEMENT_MOMENTUM setup is
+        structurally blocked by either the strategy layer or this engine.
+
+        Two problems solved in one call:
+
+        1. SPAM (FIX-SPAM): Without this, the scanning state regenerates the same
+           momentum signal every 250ms because _last_entry_at is only updated on
+           on_entry_placed() (which never fires when the conviction gate blocks).
+           A 30s cooldown matches _ENTRY_COOLDOWN_SEC and aligns with the typical
+           time for market structure to change enough to warrant re-evaluation.
+
+        2. SL FLIP (FIX-SL-FLIP): _compute_sl() depends on live ICT OB structure.
+           OB presence can flicker tick-to-tick while the context refreshes,
+           causing the SL to alternate between nearby structural values. locked_sl
+           freezes the SL computed at signal-generation time and
+           reuses it for any subsequent signal within the cooldown window, ensuring
+           the conviction gate always scores the SAME R:R.
+
+        The block is lifted early if:
+          - A new (different) candle is found (candle_ts changed)
+          - Price moves more than 0.25 ATR from entry_price (structural shift)
+        """
+        self._momentum_blocked_until     = time.time() + cooldown_sec
+        self._momentum_block_entry_price = entry_price
+        self._momentum_block_candle_ts   = candle_ts
+        self._momentum_block_sl          = locked_sl
+
     def on_position_closed(self) -> None:
-        self._active_signal = None
         self._reset(time.time())
 
     def force_reset(self) -> None:
         self._reset(time.time())
         self._flow_ewma = 0.0
         self._flow_ewma_last_update = 0.0
+        self._momentum_entries_1h = 0
+        self._last_momentum_candle_ts = 0
         # BUG-5 FIX: Hard operator reset — clear processed-sweep registry fully.
         # Normal _reset() intentionally keeps entries so a cooldown survives a
         # state transition. force_reset() is called explicitly by the operator
@@ -617,11 +669,6 @@ class EntryEngine:
         if self._last_bridge_skip:
             out["bridge"] = dict(self._last_bridge_skip)
         return out if out else None
-
-    @property
-    def pool_plan_info(self) -> Optional[Dict[str, Any]]:
-        """Last TP/SL candidate report for /thinking and rejection logs."""
-        return dict(self._last_pool_plan) if isinstance(self._last_pool_plan, dict) else None
 
     # ── Internal: reset ───────────────────────────────────────────────
 
@@ -874,11 +921,198 @@ class EntryEngine:
 
     def _do_scanning(self, snap, flow, ict, price, atr, now,
                      candles_1m, candles_5m) -> None:
-        """Sweep-only mode: scanning is handled by _collect_sweeps() in update()."""
-        return
+        """Check for displacement momentum candles."""
+        if self._check_displacement_momentum(
+                snap, flow, ict, price, atr, now, candles_1m, candles_5m):
+            return
+
+    # ── Displacement Momentum ─────────────────────────────────────────
+
+    def _check_displacement_momentum(self, snap, flow, ict, price, atr,
+                                      now, candles_1m, candles_5m) -> bool:
+        if now - self._last_entry_at < _MOMENTUM_COOLDOWN_SEC:
+            return False
+        if now - self._momentum_hour_start > 3600.0:
+            self._momentum_entries_1h = 0
+            self._momentum_hour_start = now
+        if self._momentum_entries_1h >= _MOMENTUM_MAX_PER_HOUR:
+            return False
+
+        # FIX-SPAM: Respect momentum gate-block cooldown.
+        # Lift early if price has moved significantly (new market structure) or
+        # a different candle is now the best displacement candidate.
+        if now < self._momentum_blocked_until:
+            moved = (abs(price - self._momentum_block_entry_price) / max(atr, 1e-10)
+                     if atr > 0 else 0.0)
+            if moved < _MOMENTUM_BLOCK_ATR_MOVE:
+                return False
+            # Price moved enough — clear the block so we can re-evaluate
+            self._momentum_blocked_until = 0.0
+
+        # Find displacement candle
+        disp_candle = None
+        disp_tf = ""
+        disp_dir = ""
+
+        for candles, tf in [(candles_5m, "5m"), (candles_1m, "1m")]:
+            if not candles or len(candles) < _MOMENTUM_LOOKBACK_CANDLES + 20:
+                continue
+            avg_vol = sum(float(c.get('v', 0)) for c in candles[-22:-2]) / 20.0
+
+            for offset in range(2, 2 + _MOMENTUM_LOOKBACK_CANDLES):
+                if offset >= len(candles):
+                    break
+                c = candles[-offset]
+                o, cl = float(c['o']), float(c['c'])
+                h, lo = float(c['h']), float(c['l'])
+                v = float(c.get('v', 0))
+                ts = int(c.get('t', 0) or 0)
+
+                if ts > 0 and ts == self._last_momentum_candle_ts:
+                    continue
+
+                body = abs(cl - o)
+                rng = h - lo
+                if rng < 1e-10:
+                    continue
+                if body / rng < _MOMENTUM_MIN_BODY_RATIO:
+                    continue
+                if rng / max(atr, 1e-10) < _MOMENTUM_MIN_ATR_MOVE:
+                    continue
+                if v / max(avg_vol, 1e-10) < _MOMENTUM_MIN_VOL_RATIO:
+                    continue
+
+                candle_dir = "long" if cl > o else "short"
+                ewma = self._ewma_dir()
+                if ewma and ewma != candle_dir:
+                    continue
+
+                disp_candle = c
+                disp_tf = tf
+                disp_dir = candle_dir
+                break
+            if disp_candle is not None:
+                break
+
+        if disp_candle is None:
+            return False
+
+        disp_close = float(disp_candle['c'])
+        disp_high = float(disp_candle['h'])
+        disp_low = float(disp_candle['l'])
+        disp_range = max(disp_high - disp_low, 1e-10)
+
+        # Institutional momentum is an execution tactic, not permission to chase.
+        # If price has already extended away from the displacement close, wait for
+        # a retrace or a new liquidity event instead of buying/selling late.
+        chase_budget = max(atr * 0.45, disp_range * 0.35)
+        late_extension = (
+            price - disp_close if disp_dir == "long"
+            else disp_close - price
+        )
+        if late_extension > chase_budget:
+            logger.debug(
+                f"MOMENTUM REJECTED (late extension): side={disp_dir} "
+                f"ext={late_extension / max(atr, 1e-10):.2f}ATR "
+                f"budget={chase_budget / max(atr, 1e-10):.2f}ATR")
+            return False
+
+        pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
+        if disp_dir == "long" and (getattr(ict, 'in_premium', False) or pd >= 0.62):
+            logger.debug(
+                f"MOMENTUM REJECTED (premium chase): side=long PD={pd:.2f}")
+            return False
+        if disp_dir == "short" and (getattr(ict, 'in_discount', False) or pd <= 0.38):
+            logger.debug(
+                f"MOMENTUM REJECTED (discount chase): side=short PD={pd:.2f}")
+            return False
+
+        amd_mult = self._amd_modifier(ict, disp_dir)
+
+        # FIX-SL-FLIP: If this is the same candle that was previously blocked,
+        # reuse the frozen SL to prevent tick-to-tick SL oscillation caused by
+        # ict.nearest_ob_price flickering in/out between ticks.
+        disp_candle_ts = int(disp_candle.get('t', 0) or 0)
+        _reuse_frozen_sl = (
+            self._momentum_block_sl is not None
+            and disp_candle_ts == self._momentum_block_candle_ts
+            and disp_candle_ts > 0
+        )
+
+        # SL
+        ch, cl_val = float(disp_candle['h']), float(disp_candle['l'])
+        buf = atr * _MOMENTUM_SL_BUFFER_ATR
+        if _reuse_frozen_sl:
+            sl = self._momentum_block_sl
+        else:
+            sl = cl_val - buf if disp_dir == "long" else ch + buf
+            ict_sl = self._compute_sl(ict, disp_dir, price, atr)
+            if ict_sl is None:
+                self.mark_momentum_blocked(price, disp_candle_ts, sl)
+                logger.debug(
+                    f"MOMENTUM REJECTED (no ICT SL): side={disp_dir} "
+                    f"entry=${price:.1f}")
+                return False
+            sl = min(sl, ict_sl) if disp_dir == "long" else max(sl, ict_sl)
+
+        risk = abs(price - sl)
+        if risk < 1e-10:
+            return False
+
+        # TP (pool → HTF escalation → 2R fallback)
+        tp, target = self._find_tp(snap, disp_dir, price, atr, sl,
+                                    _MOMENTUM_MIN_RR * (2.0 - amd_mult))
+        if tp is None:
+            self.mark_momentum_blocked(price, disp_candle_ts, sl)
+            logger.debug(
+                f"MOMENTUM REJECTED (no liquidity TP): side={disp_dir} "
+                f"entry=${price:.1f} sl=${sl:.1f}")
+            return False
+
+        reward = abs(tp - price)
+        rr = reward / risk
+        adj_rr = _MOMENTUM_MIN_RR * (2.0 - amd_mult)
+        if rr < adj_rr:
+            return False
+
+        # ── Momentum SL validation (ATR-regime, not PCT) ─────────────────
+        # Momentum SL is anchored to the displacement candle body (structural).
+        # Validate against ATR gates, not price-percentage floors.
+        risk = abs(price - sl)
+        _noise_floor = atr * _SL_MIN_ATR_MULT
+        if risk < _noise_floor:
+            # SL is inside the noise band — expand to candle body + noise floor
+            if disp_dir == "long":
+                sl = cl_val - _noise_floor
+            else:
+                sl = ch + _noise_floor
+            risk = abs(price - sl)
+        if not self._sl_is_protective(disp_dir, sl, price):
+            return False
+
+        if not self._sl_before_liquidation(disp_dir, sl, price):
+            return False
+
+        self._last_momentum_candle_ts = disp_candle_ts
+        # NOTE: _momentum_entries_1h is intentionally NOT incremented here.
+        # It is incremented in on_entry_placed() ONLY if the signal is consumed
+        # and the order actually submitted.  Incrementing here would charge the
+        # hourly budget for signals that are subsequently blocked by the
+        # conviction gate, unfairly exhausting the momentum allowance. (Bug #17)
+
+        self._signal = EntrySignal(
+            side=disp_dir, entry_type=EntryType.DISPLACEMENT_MOMENTUM,
+            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
+            target_pool=target,
+            conviction=abs(flow.conviction) * amd_mult,
+            reason=f"DISPLACEMENT {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}",
+            ict_validation=self._ict_summary(ict, disp_dir),
+            displacement_candle_ts=disp_candle_ts,
+        )
+        logger.info(f"MOMENTUM SIGNAL: {disp_dir.upper()} [{disp_tf}] R:R={rr:.1f}")
+        return True
 
     # ═══════════════════════════════════════════════════════════════════
-    # POST-SWEEP PIPELINE    # ═══════════════════════════════════════════════════════════════════
     # POST-SWEEP PIPELINE
     # ═══════════════════════════════════════════════════════════════════
 
@@ -1538,8 +1772,7 @@ class EntryEngine:
         if tp is None:
             logger.info(
                 f"ENTRY REJECTED (no liquidity TP): side={side} "
-                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
-                f"| {self._last_pool_plan_summary()}")
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -1651,33 +1884,20 @@ class EntryEngine:
             self._reset(now)
             return
 
-        # Continuation TP is re-selected through the same EV-ranked pool selector
-        # as reversal entries.  The DirectionEngine's next_target is a directional
-        # hint, not an execution TP.  This prevents "visible pool = TP" retail
-        # shortcuts and forces every continuation target through R:R, probability,
-        # gauntlet, freshness, and execution-cost gates.
-        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
-        if tp2 is not None:
-            tp, target = tp2, target2
-            rr = abs(tp - price) / risk
-        else:
-            rr = reward / risk if risk > 1e-10 else 0.0
-            logger.info(
-                f"⚠️ ENTRY REJECTED (R:R/TP): initial_rr={rr:.2f} < institutional TP gate "
-                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
-                f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
-            self._post_sweep = None
-            self._reset(now)
-            return
-
+        rr = reward / risk
         if rr < _MIN_RR_RATIO:
-            logger.info(
-                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
-                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
-                f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
-            self._post_sweep = None
-            self._reset(now)
-            return
+            tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+            if tp2 is not None:
+                tp, target = tp2, target2
+                rr = abs(tp - price) / risk
+            else:
+                logger.info(
+                    f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                    f"(no HTF fallback TP) side={side} sweep=${sweep.pool.price:.1f} "
+                    f"entry=${price:.1f} sl=${sl:.1f}")
+                self._post_sweep = None
+                self._reset(now)
+                return
 
         self._signal = EntrySignal(
             side=side, entry_type=EntryType.SWEEP_CONTINUATION,
@@ -1696,60 +1916,39 @@ class EntryEngine:
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _find_tp(self, snap, side, price, atr, sl, min_rr):
-        """Find TP via EV-ranked institutional liquidity selection + audit report.
+        """Find TP via the EV-ranked liquidity pool selector.
 
-        The selector is intentionally strict: a visible BSL/SSL must still pass
-        side, active-status, reach, R:R, probability, gauntlet, and execution-cost
-        gates.  The important upgrade here is observability: every rejected pool
-        is retained in self._last_pool_plan so logs and /thinking explain WHY the
-        visible pool was not used.
+        Returns (tp_price, target) or (None, None) if no pool qualifies.
+
+        Delegates to liquidity_pool_selector.select_tp(), which scores each
+        candidate as:
+            EV = P(sweep) × confluence × rr_quality × (1 − gauntlet_penalty)
+
+        where the components combine per-pool MTF sweep probability
+        (mtf_pool_probability), HTF alignment, OB/FVG structure, killzone
+        bonus, freshness, touch penalty, and an opposing-pool gauntlet
+        penalty (pools between entry and TP that eat momentum on the way).
+
+        After the selector picks a candidate, this method enforces one
+        strategy-level gate the selector can't know about: the net move
+        must clear the round-trip break-even threshold (commission + slip).
         """
         risk = abs(price - sl)
         if risk < 1e-10:
-            self._record_pool_report({
-                "role": "TP", "side": side, "entry": price, "atr": atr,
-                "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
-        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         try:
-            from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
+            from strategy.liquidity_pool_selector import select_tp as _sel_tp
         except ImportError:
-            try:
-                from liquidity_pool_selector import select_tp_with_report as _sel_tp   # type: ignore
-            except ImportError:
-                _sel_tp = None
+            from liquidity_pool_selector import select_tp as _sel_tp   # type: ignore
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
-        if _sel_tp is None:
-            # Last-resort compatibility path.  This should not be used in the
-            # shipped package, but keeps direct single-file runs from breaking.
-            try:
-                from strategy.liquidity_pool_selector import select_tp as _legacy_sel_tp
-            except ImportError:
-                from liquidity_pool_selector import select_tp as _legacy_sel_tp   # type: ignore
-            tp_price, target, score = _legacy_sel_tp(
-                snap=snap, side=side, entry=price, sl=sl, atr=atr,
-                ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=required_rr,
-            )
-            report = {
-                "role": "TP", "side": side, "entry": price, "atr": atr,
-                "summary": "legacy selector path used; detailed diagnostics unavailable",
-                "selected": None, "candidates": [],
-            }
-        else:
-            tp_price, target, score, report_obj = _sel_tp(
-                snap=snap, side=side, entry=price, sl=sl, atr=atr,
-                ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=required_rr,
-                now=time.time(),
-            )
-            report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
-
-        self._record_pool_report(report)
+        tp_price, target, score = _sel_tp(
+            snap=snap, side=side, entry=price, sl=sl, atr=atr,
+            ict=getattr(self, "_ict", None), htf=_htf_ref,
+            min_rr=float(min_rr) + _TP_RR_SAFETY_BUFFER,
+        )
         if tp_price is None or target is None:
-            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
         # Strategy-level BE gate: TP must clear round-trip fees + slippage.
@@ -1757,31 +1956,15 @@ class EntryEngine:
             atr * _TP_MIN_NET_ATR,
             self._estimated_entry_be_move(price, atr),
         )
-        net_move = abs(tp_price - price)
-        if net_move < min_net_move:
-            report = dict(report or {})
-            report["strategy_gate"] = (
-                f"selected TP failed execution-cost gate: net_move={net_move:.1f} "
-                f"< required={min_net_move:.1f}")
-            # Mark selected row as rejected by strategy-level cost gate, while
-            # preserving the selector's EV result.
-            selected = report.get("selected") or {}
-            if isinstance(selected, dict):
-                selected["eligible"] = False
-                selected["selected"] = False
-                selected["reason"] = report["strategy_gate"]
-                report["selected"] = selected
-            report["summary"] = report["strategy_gate"]
-            self._record_pool_report(report)
-            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
+        if abs(tp_price - price) < min_net_move:
             return None, None
 
         if score is not None:
-            logger.info(
-                "TP_POOL_SELECTED: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
+            logger.debug(
+                "TP pick: $%.1f dist=%.1fATR rr=%.2f P=%.2f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
                 score.sweep_prob, score.ev, score.gauntlet_n,
-                ", ".join(score.reasons) if score.reasons else "institutional gates passed",
+                ", ".join(score.reasons) if score.reasons else "—",
             )
         return tp_price, target
 
@@ -1791,111 +1974,29 @@ class EntryEngine:
         Anchor SL to the highest-significance protective pool just past
         structural invalidation, with a quality-scaled buffer beyond it.
 
-        Also records a full SL candidate audit report.  A visible pool is not
-        automatically usable as SL: it must be on the protective side, beyond
-        invalidation, active/unswept, inside the SL search window, and above the
-        institutional significance floor.
+        Delegates to liquidity_pool_selector.select_sl(). The buffer width
+        scales INVERSELY with the chosen pool's quality: an institutional
+        pool (OB-aligned, multi-TF, fresh) earns a thin 0.18 ATR buffer;
+        a weaker protective pool gets up to 0.55 ATR.
+
+        Returns (sl_price, target, pick) or (None, None, None) when no
+        protective pool meets the search criteria; caller decides on
+        OB-based or ATR-based fallback.
         """
         try:
-            from strategy.liquidity_pool_selector import select_sl_with_report as _sel_sl
+            from strategy.liquidity_pool_selector import select_sl as _sel_sl
         except ImportError:
-            try:
-                from liquidity_pool_selector import select_sl_with_report as _sel_sl   # type: ignore
-            except ImportError:
-                _sel_sl = None
+            from liquidity_pool_selector import select_sl as _sel_sl   # type: ignore
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
-        if _sel_sl is None:
-            try:
-                from strategy.liquidity_pool_selector import select_sl as _legacy_sel_sl
-            except ImportError:
-                from liquidity_pool_selector import select_sl as _legacy_sel_sl   # type: ignore
-            return _legacy_sel_sl(
-                snap=snap, side=side, entry=entry, atr=atr,
-                ict=ict if ict is not None else getattr(self, "_ict", None),
-                htf=_htf_ref,
-                invalidation_price=invalidation_price,
-                max_buffer_atr=max_buffer_atr,
-            )
-
-        sl_price, target, pick, report_obj = _sel_sl(
+        return _sel_sl(
             snap=snap, side=side, entry=entry, atr=atr,
             ict=ict if ict is not None else getattr(self, "_ict", None),
             htf=_htf_ref,
             invalidation_price=invalidation_price,
             max_buffer_atr=max_buffer_atr,
-            now=time.time(),
         )
-        report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
-        self._record_pool_report(report)
-        if sl_price is None or target is None:
-            logger.info("SL_POOL_AUDIT: %s", self._format_pool_plan(report))
-        else:
-            try:
-                logger.info(
-                    "SL_POOL_SELECTED: anchor=$%.1f sl=$%.1f quality=%.2f buffer=%.2fATR (%s)",
-                    float(getattr(target.pool, "price", 0.0)), float(sl_price),
-                    float(getattr(pick, "quality", 0.0) if pick is not None else 0.0),
-                    float(getattr(pick, "buffer_atr", 0.0) if pick is not None else 0.0),
-                    ", ".join(getattr(pick, "reasons", []) or ["protective gates passed"]),
-                )
-            except Exception:
-                pass
-        return sl_price, target, pick
 
-    def _record_pool_report(self, report: Any) -> None:
-        """Store a pool-selection report for /thinking without raising."""
-        try:
-            if report is None:
-                return
-            if hasattr(report, "as_dict"):
-                payload = report.as_dict()
-            elif isinstance(report, dict):
-                payload = dict(report)
-            else:
-                payload = {"summary": str(report), "candidates": []}
-            payload["ts"] = time.time()
-            self._last_pool_plan = payload
-        except Exception:
-            self._last_pool_plan = None
-
-    def _last_pool_plan_summary(self) -> str:
-        try:
-            if not isinstance(self._last_pool_plan, dict):
-                return "pool diagnostics unavailable"
-            return str(self._last_pool_plan.get("summary") or "pool diagnostics unavailable")
-        except Exception:
-            return "pool diagnostics unavailable"
-
-    def _format_pool_plan(self, report: Any, max_rows: int = 4) -> str:
-        """Compact one-line audit text for logs."""
-        try:
-            if hasattr(report, "as_dict"):
-                report = report.as_dict()
-            if not isinstance(report, dict):
-                return str(report)
-            role = report.get("role", "POOL")
-            side = str(report.get("side", "?")).upper()
-            summary = report.get("summary", "")
-            rows = report.get("candidates") or []
-            bits = [f"{role}/{side}: {summary}"]
-            for r in rows[:max_rows]:
-                if not isinstance(r, dict):
-                    continue
-                px = float(r.get("pool_price") or 0.0)
-                tf = r.get("timeframe", "")
-                ps = r.get("pool_side", "")
-                rr = float(r.get("rr") or 0.0)
-                ev = float(r.get("ev") or 0.0)
-                reason = r.get("reason", "")
-                notes = r.get("notes") or []
-                if isinstance(notes, list) and notes:
-                    reason = f"{reason} ({', '.join(map(str, notes[:3]))})"
-                mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
-                bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
-            return " | ".join(bits)
-        except Exception as e:
-            return f"pool audit format error: {e}"
 
     def _find_opposing_target(self, direction, snap, price, atr):
         # EE-3 FIX: previously capped at _MAX_TARGET_ATR (8.0 ATR), which
