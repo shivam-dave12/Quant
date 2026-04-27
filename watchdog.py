@@ -1666,6 +1666,13 @@ class ConfigDriftCheck(HealthCheck):
 
 class NoTradesAfterFirstCheck(HealthCheck):
     """
+    Dormant/manual diagnostic only.
+
+    This check is intentionally not registered by build_default_watchdog().
+    A no-trade window is not a runtime fault by itself; valid market conditions
+    can keep a liquidity-first strategy flat for long periods.
+
+    Historical purpose:
     The user's specific symptom.
 
     Conditions to flag:
@@ -2588,6 +2595,9 @@ class Watchdog:
         # Broken-by-design: compares two counters with different reset clocks.
         # Already converted to INFO at source — this is belt-and-braces.
         "daily_counter_consistency",
+
+        # Removed from default registration; suppress if manually registered.
+        "no_trades_after_first",
     })
 
     def __init__(self,
@@ -2672,7 +2682,10 @@ class Watchdog:
             # L4
             ConfigDriftCheck(**common),
             # L5
-            NoTradesAfterFirstCheck(**common),
+            # NoTradesAfterFirstCheck intentionally NOT registered.
+            # It produced operator noise during valid low-opportunity market
+            # periods. The watchdog should supervise liveness/correctness, not
+            # alert merely because the strategy correctly chose not to trade.
             DailyCounterConsistencyCheck(**common),
         ])
 
