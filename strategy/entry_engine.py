@@ -1744,7 +1744,7 @@ class EntryEngine:
 
         if score is not None:
             logger.info(
-                "TP_POOL_SELECTED: $%.1f dist=%.1fATR rr=%.2f P=%.2f EV=%.3f gauntlet=%d (%s)",
+                "TP_POOL_SELECTED: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
                 score.sweep_prob, score.ev, score.gauntlet_n,
                 ", ".join(score.reasons) if score.reasons else "institutional gates passed",
@@ -1854,6 +1854,9 @@ class EntryEngine:
                 rr = float(r.get("rr") or 0.0)
                 ev = float(r.get("ev") or 0.0)
                 reason = r.get("reason", "")
+                notes = r.get("notes") or []
+                if isinstance(notes, list) and notes:
+                    reason = f"{reason} ({', '.join(map(str, notes[:3]))})"
                 mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
                 bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
             return " | ".join(bits)

@@ -1,4 +1,4 @@
-﻿"""
+"""
 ict_engine.py â€” Industry-Grade ICT/SMC Analysis Engine v6.0
 ============================================================
 Full rewrite: AMD cycle, multi-timeframe structure, complete PD array stack.

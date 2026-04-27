@@ -139,6 +139,21 @@ _SL_MIN_SIGNIFICANCE       = 1.5   # don't anchor SL to garbage pools
 # Killzones (UTC). London 07-10, NY 12-16. Bonus active during + previous KZ.
 _KILLZONE_HOURS = (7, 8, 9, 10, 12, 13, 14, 15, 16)
 
+# Terminal-target handling.
+#
+# The MTF probability model has a useful ``first-sweep reach`` window for
+# predicting which pool is likely to be hit NEXT. That window must NOT be a
+# hard veto for execution TP: institutional delivery can target HTF external
+# liquidity many ATR away, while the trade is protected by BE migration and
+# liquidity/structure trailing. Therefore distance beyond the TF reach model
+# is a SOFT EV penalty and an audit note, not an automatic rejection.
+# Hard vetoes remain: wrong side, swept/consumed, too close/cost-invalid, and
+# below required R:R.
+_TF_RANK = {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}
+_TERMINAL_TP_MIN_TF_RANK = 3      # 15m+ can be used as terminal delivery objectives
+_TERMINAL_TP_MIN_SIG     = 3.0    # lower-TF distant pools need real significance
+_TERMINAL_REACH_FLOOR    = 0.05   # never zero out a valid terminal objective
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -414,7 +429,19 @@ def _per_pool_sweep_prob(target, price: float, atr: float, now: float) -> Tuple[
             target.pool, price, atr, now, side_str, target,
         )
         if pp is None:
-            return 0.0, 0.0
+            # ``mtf_pool_probability`` returns None for pools outside its
+            # first-sweep reach window. For TP execution we still allow such
+            # pools as terminal delivery objectives if other gates pass; apply
+            # the same exponential distance decay locally instead of zeroing
+            # the candidate. Status/wrong-side pools are vetoed elsewhere.
+            tf = str(_safe(target.pool, "timeframe", "5m"))
+            d = max(float(_safe(target, "distance_atr", 0.0)), 0.0)
+            lam = float(_DECAY_LAMBDA.get(tf, 2.0))
+            base = float(_TF_BASE_PROB.get(tf, 0.50))
+            sig = min(float(_safe(target, "significance", 0.0)) / 12.0, 1.0)
+            raw = math.exp(-d / max(lam, 1e-9)) * base * (1.0 + sig * 0.6)
+            norm = min(raw / 2.0, 1.0)
+            return raw, norm
         raw = float(pp.raw_prob)
         # Normalise against a max-possible reference: a 4h pool 0 ATR away with
         # cap significance, full recency, no touch penalty.
@@ -479,6 +506,38 @@ def _gauntlet_penalty(
 
     pen = min(n * _GAUNTLET_PENALTY_PER, _GAUNTLET_PENALTY_MAX)
     return n, 1.0 - pen
+
+
+def _tf_rank(tf: str) -> int:
+    return _TF_RANK.get(str(tf).lower(), 2)
+
+
+def _max_reach_for_tf(tf: str) -> float:
+    return float(_MAX_REACH_ATR.get(str(tf), _MAX_REACH_ATR.get(str(tf).lower(), 12.0)))
+
+
+def _is_terminal_tp_candidate(target: Any, distance_atr: float) -> bool:
+    """True when a beyond-reach pool is still a valid terminal objective.
+
+    This is deliberately not a permission to trade weak moonshot targets. The
+    pool still has to be active, on the correct side, above minimum R:R, and it
+    is EV-penalised by distance/probability. This only converts the old hard
+    ``too far`` veto into institutional target handling.
+    """
+    pool = _safe(target, "pool", None)
+    tf = str(_safe(pool, "timeframe", "5m"))
+    sig = float(_safe(target, "significance", 0.0))
+    return _tf_rank(tf) >= _TERMINAL_TP_MIN_TF_RANK or sig >= _TERMINAL_TP_MIN_SIG
+
+
+def _terminal_reach_multiplier(distance_atr: float, tf: str) -> float:
+    """Soft penalty for pools beyond the first-sweep reach model."""
+    max_reach = _max_reach_for_tf(tf)
+    if distance_atr <= max_reach:
+        return 1.0
+    lam = max(float(_DECAY_LAMBDA.get(str(tf), 2.0)), 1.25)
+    overshoot = max(0.0, distance_atr - max_reach)
+    return max(_TERMINAL_REACH_FLOOR, math.exp(-overshoot / lam))
 
 
 def _reach_buffer(distance_atr: float, atr: float) -> float:
@@ -550,7 +609,7 @@ def score_tp_pools(
     Score every candidate TP pool. Returns PoolScore[], sorted by EV desc.
 
     The first element is the institutional choice. If empty, no pool meets
-    the constraints — caller should fall back to ATR-based TP.
+    the constraints — caller should reject or wait; no synthetic ATR TP is created.
     """
     if snap is None or atr <= 0:
         return []
@@ -573,10 +632,16 @@ def score_tp_pools(
             dist_atr = float(_safe(target, "distance_atr", 0.0))
             pool_price = float(_safe(pool, "price", 0.0))
 
-            # Reach gates: skip pools too close (no R:R) or too far (low hit-rate).
+            # Reach gates. Too-close remains a hard veto because fees/slippage
+            # and BE migration consume the whole move. Too-far is NOT a hard
+            # veto: distant HTF pools are valid terminal delivery objectives,
+            # but they receive a probability/reach EV penalty below.
             if dist_atr < 0.25:
                 continue
-            if dist_atr > _MAX_REACH_ATR.get(str(_safe(pool, "timeframe", "5m")), 12.0):
+            tf = str(_safe(pool, "timeframe", "5m"))
+            max_reach = _max_reach_for_tf(tf)
+            terminal_target = dist_atr > max_reach
+            if terminal_target and not _is_terminal_tp_candidate(target, dist_atr):
                 continue
 
             # Buffered TP (place TP before the pool, not at it).
@@ -612,6 +677,10 @@ def score_tp_pools(
 
             utility, utility_components = _target_utility(
                 raw_prob, rr, float(min_rr), dist_atr, reward, be_move)
+            reach_mult = _terminal_reach_multiplier(dist_atr, tf)
+            utility *= reach_mult
+            utility_components["reach_mult"] = reach_mult
+            utility_components["max_reach_atr"] = max_reach
 
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
@@ -628,6 +697,9 @@ def score_tp_pools(
                 reasons.append(f"high confluence ×{confluence:.2f}")
             if n_gauntlet > 0:
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
+            if terminal_target:
+                reasons.append(
+                    f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             if utility_components["be_quality"] < 0.75:
@@ -654,6 +726,8 @@ def score_tp_pools(
                     "rr_quality":  utility_components["rr_utility"],
                     "be_quality":  utility_components["be_quality"],
                     "distance_quality": utility_components["distance_quality"],
+                    "reach_mult":  utility_components.get("reach_mult", 1.0),
+                    "max_reach_atr": utility_components.get("max_reach_atr", max_reach),
                     "be_move":     utility_components["be_move"],
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
@@ -825,7 +899,9 @@ def diagnose_tp_pools(
             pool = target.pool
             pool_price = float(_safe(pool, "price", 0.0))
             status = row.status.upper()
-            max_reach = _MAX_REACH_ATR.get(str(_safe(pool, "timeframe", "5m")), 12.0)
+            tf = str(_safe(pool, "timeframe", "5m"))
+            max_reach = _max_reach_for_tf(tf)
+            terminal_target = row.distance_atr > max_reach
 
             if status in ("SWEPT", "CONSUMED"):
                 row.reason = f"archived {status.lower()} pool; not a live target"
@@ -833,8 +909,10 @@ def diagnose_tp_pools(
             if row.distance_atr < 0.25:
                 row.reason = "too close: no durable delivery room after buffer/costs"
                 rows.append(row); continue
-            if row.distance_atr > max_reach:
-                row.reason = f"too far for TF reach model ({row.distance_atr:.1f}>{max_reach:.1f} ATR)"
+            if terminal_target and not _is_terminal_tp_candidate(target, row.distance_atr):
+                row.reason = (
+                    f"distant weak LTF pool ({row.distance_atr:.1f}>{max_reach:.1f} ATR); "
+                    "not a terminal objective")
                 rows.append(row); continue
 
             buf = _reach_buffer(row.distance_atr, atr)
@@ -871,12 +949,16 @@ def diagnose_tp_pools(
             )
             row.confluence = confluence
             utility, comps = _target_utility(raw_prob, row.rr, float(min_rr), row.distance_atr, row.reward, be_move)
+            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf)
+            utility *= reach_mult
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             row.eligible = True
             row.reason = "eligible; EV-ranked candidate"
             row.notes = []
+            if terminal_target:
+                row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
