@@ -496,6 +496,43 @@ def _round_to_tick(price: float) -> float:
     return round(round(price / tick) * tick, 10) if tick > 0 else price
 
 
+def _round_to_tick_protective(pos_side: str, price: float) -> float:
+    """Directionally round a stop/BE level so it remains truly protective.
+
+    LONG BE/profit-lock floors must round UP; SHORT floors must round DOWN.
+    Nearest-tick rounding can leave a tiny net-loss after fees.
+    """
+    tick = max(QCfg.TICK_SIZE(), 1e-10)
+    if pos_side == "long":
+        return round(math.ceil(price / tick) * tick, 10)
+    return round(math.floor(price / tick) * tick, 10)
+
+
+def _stop_exit_fee_rate() -> float:
+    """Estimated future fee rate for SL/stop exits.
+
+    Entry can be maker, but a stop exit is treated as taker/risk-exit.
+    This prevents false breakeven when the entry fee was cheaper than the stop.
+    """
+    candidates = [
+        getattr(config, 'STOP_EXIT_COMMISSION_RATE', None),
+        getattr(config, 'DELTA_TAKER_COMMISSION_RATE', None),
+        getattr(config, 'TAKER_COMMISSION_RATE', None),
+        getattr(config, 'COMMISSION_RATE', None),
+    ]
+    rates = []
+    for v in candidates:
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv >= 0:
+                rates.append(fv)
+        except Exception:
+            pass
+    return max(rates) if rates else 0.00055
+
+
 def _calc_be_price(pos_side: str, entry_price: float, atr: float,
                    pos=None) -> float:
     """
@@ -552,12 +589,13 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
         # which is simply the entry commission rate, making _fee_per_btc = 2 Ã—
         # entry_fee_per_btc â€” the exit leg was double-counted, yielding a BE price
         # that was too far from entry and causing premature "too close" rejections.
-        _exit_rate     = float(getattr(config, 'COMMISSION_RATE', 0.00055))
+        _exit_rate     = _stop_exit_fee_rate()
         _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_rate
     else:
-        # Fallback: bilateral commission-rate estimate
-        _rate        = float(getattr(config, 'COMMISSION_RATE', 0.00055))
-        _fee_per_btc = entry_price * _rate * 2.0
+        # Fallback: bilateral estimate with stop/taker exit leg.
+        _entry_rate  = float(getattr(config, 'COMMISSION_RATE', 0.00055))
+        _exit_rate   = _stop_exit_fee_rate()
+        _fee_per_btc = entry_price * (_entry_rate + _exit_rate)
 
     # Ã¢â€â‚¬Ã¢â€â‚¬ Slippage allowance Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     # 0.12 ATR: tighter than the old 0.15 used in counter-BOS (that was overly
@@ -566,7 +604,8 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
     _slippage_buf = 0.12 * atr
 
     _buf = _fee_per_btc + _slippage_buf
-    return (entry_price + _buf if pos_side == "long" else entry_price - _buf)
+    raw_be = entry_price + _buf if pos_side == "long" else entry_price - _buf
+    return _round_to_tick_protective(pos_side, raw_be)
 
 
 def _safe_be_migration_price(pos_side: str, desired_sl: float, current_price: float,
@@ -579,7 +618,7 @@ def _safe_be_migration_price(pos_side: str, desired_sl: float, current_price: fl
         getattr(config, "POOL_GATE_BE_MIN_ATR_DIST", 0.40)
     )
     min_gap = max(2.0 * tick, atr_floor)
-    rounded = _round_to_tick(desired_sl)
+    rounded = _round_to_tick_protective(pos_side, desired_sl)
     if pos_side == "long":
         return rounded if rounded < current_price - min_gap else None
     return rounded if rounded > current_price + min_gap else None
@@ -2355,6 +2394,8 @@ class PositionState:
     pool_gate_reverse_attempts:    int = 0
     pool_gate_reverse_notice_at:   float = 0.0
     pool_gate_reverse_notice_key:  str = ""
+    profit_defense_last_action_at: float = 0.0
+    profit_defense_last_notice_at: float = 0.0
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -6080,7 +6121,16 @@ class QuantStrategy:
                             logger.debug(
                                 f"POOL-GATE BE still blocked: desired=${_be_tick:,.2f} "
                                 f"price=${price:,.2f} gap={_gap_atr:.2f}ATR")
-                    if _be_needed and pos.sl_order_id and not pos.be_ratchet_applied:
+                    _be_upgrade_allowed = (
+                        _be_needed and pos.sl_order_id and (
+                            (not pos.be_ratchet_applied) or
+                            (pos.side == "long" and
+                             _safe_be_tick > pos.sl_price + max(QCfg.TICK_SIZE(), 0.1)) or
+                            (pos.side == "short" and
+                             _safe_be_tick < pos.sl_price - max(QCfg.TICK_SIZE(), 0.1))
+                        )
+                    )
+                    if _be_upgrade_allowed:
                         try:
                             _es = "sell" if pos.side == "long" else "buy"
                             _be_result = order_manager.replace_stop_loss(
@@ -6421,6 +6471,122 @@ class QuantStrategy:
 
         return _current_fp != _last_fp
 
+    def _profit_defense_exit_if_needed(self, order_manager, price: float, atr: float,
+                                       cvd_trend: float, now: float) -> bool:
+        """Institutional profit-defense, not aggressive trailing.
+
+        Purpose: avoid giving back a delivered move into a reversal when the
+        normal structure trail is intentionally giving the trade breathing room.
+
+        This is deliberately harder to trigger than a normal trail:
+          • MFE must have reached a meaningful delivery threshold.
+          • Price must have given back a large fraction of that MFE.
+          • Current trade must still be net-positive versus exact BE.
+          • There must be adverse evidence (counter CVD or fresh counter BOS).
+
+        It exits at market only in the late deterioration state. It does NOT
+        chase every pullback with a tight stop, so routine institutional
+        re-accumulation pullbacks remain protected by the structural SL.
+        """
+        pos = self._pos
+        if not pos.is_active() or atr <= 1e-10:
+            return False
+        if now - getattr(pos, 'profit_defense_last_action_at', 0.0) < float(
+                getattr(config, 'PROFIT_DEFENSE_MIN_INTERVAL_SEC', 60.0)):
+            return False
+
+        init_dist = max(float(getattr(pos, 'initial_sl_dist', 0.0) or 0.0), 1e-9)
+        profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+        mfe = max(float(getattr(pos, 'peak_profit', 0.0) or 0.0), profit)
+        if mfe <= 1e-9 or profit <= 0:
+            return False
+
+        mfe_r = mfe / init_dist
+        min_mfe_r = float(getattr(config, 'PROFIT_DEFENSE_MIN_MFE_R', 1.20))
+        if mfe_r < min_mfe_r:
+            return False
+
+        giveback = (mfe - max(profit, 0.0)) / max(mfe, 1e-9)
+        min_giveback = float(getattr(config, 'PROFIT_DEFENSE_GIVEBACK_FRAC', 0.65))
+        if giveback < min_giveback:
+            return False
+
+        true_be = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
+        # Require the market to still be above/below true net BE by a small
+        # executable cushion; otherwise we let the exchange SL/reconcile handle it.
+        be_cushion = max(QCfg.TICK_SIZE() * 2.0,
+                         float(getattr(config, 'PROFIT_DEFENSE_BE_CUSHION_ATR', 0.05)) * atr)
+        if pos.side == "long" and price <= true_be + be_cushion:
+            return False
+        if pos.side == "short" and price >= true_be - be_cushion:
+            return False
+
+        cvd_thr = float(getattr(config, 'PROFIT_DEFENSE_COUNTER_CVD', 0.30))
+        counter_cvd = ((pos.side == "long" and cvd_trend <= -cvd_thr) or
+                       (pos.side == "short" and cvd_trend >= cvd_thr))
+
+        counter_bos = False
+        counter_bos_tf = ""
+        try:
+            now_ms = int(now * 1000)
+            for tf in ("1m", "5m", "15m"):
+                st = getattr(self._ict, '_tf', {}).get(tf) if self._ict is not None else None
+                if st is None:
+                    continue
+                d = getattr(st, 'bos_direction', None)
+                ts = int(getattr(st, 'bos_timestamp', 0) or 0)
+                fresh = ts > 0 and now_ms - ts <= int(
+                    getattr(config, 'PROFIT_DEFENSE_BOS_MAX_AGE_MS', 12 * 60 * 1000))
+                if fresh and ((pos.side == "long" and d == "bearish") or
+                              (pos.side == "short" and d == "bullish")):
+                    counter_bos = True
+                    counter_bos_tf = tf
+                    break
+        except Exception:
+            counter_bos = False
+
+        pool_gate_reverse = (
+            float(getattr(pos, 'pool_gate_reverse_signaled_at', 0.0) or 0.0) > 0.0 and
+            now - float(getattr(pos, 'pool_gate_reverse_signaled_at', 0.0) or 0.0) <= float(
+                getattr(config, 'PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC', 180.0))
+        )
+
+        if not (counter_cvd or counter_bos or pool_gate_reverse):
+            if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 120.0:
+                pos.profit_defense_last_notice_at = now
+                logger.info(
+                    f"ProfitDefense HOLD: MFE={mfe_r:.2f}R giveback={giveback:.0%} "
+                    f"but no confirmed adverse structure/flow (cvd={cvd_trend:+.2f})")
+            return False
+
+        net_r_est = (price - true_be) / init_dist if pos.side == "long" else (true_be - price) / init_dist
+        with self._lock:
+            pos.profit_defense_last_action_at = now
+
+        reason_bits = []
+        if counter_cvd:
+            reason_bits.append(f"counter-CVD {cvd_trend:+.2f}")
+        if counter_bos:
+            reason_bits.append(f"counter-BOS {counter_bos_tf}")
+        if pool_gate_reverse:
+            reason_bits.append("pool-gate reversal")
+        reason = ("profit_defense: "
+                  f"MFE={mfe_r:.2f}R giveback={giveback:.0%} "
+                  f"net≈{net_r_est:.2f}R trueBE=${true_be:,.2f} "
+                  f"({', '.join(reason_bits)})")
+        logger.info("🛡️ PROFIT DEFENSE EXIT — %s", reason)
+        try:
+            send_telegram_message(
+                f"🛡️ <b>PROFIT DEFENSE EXIT</b>\n"
+                f"MFE: <b>{mfe_r:.2f}R</b> | Giveback: <b>{giveback:.0%}</b>\n"
+                f"True BE: <b>${true_be:,.2f}</b> | Mark: <b>${price:,.2f}</b>\n"
+                f"Evidence: {', '.join(reason_bits)}\n"
+                f"Action: market flatten to preserve delivered edge.")
+        except Exception:
+            pass
+        self._exit_trade(order_manager, price, reason)
+        return True
+
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
         """Institutional trail v5.0 Ã¢â‚¬â€ 5-feature upgrade (OB/Breaker priority,
         AMD-phase adaptive buffer, 4H/1H HTF cascade, liq pool ceiling,
@@ -6547,6 +6713,12 @@ class QuantStrategy:
                 _trail_snap = self._liq_map.get_snapshot(price, atr)
             except Exception as _liq_snap_e:
                 logger.debug("Trail liq_snapshot error (non-fatal): %s", _liq_snap_e)
+
+        # Institutional profit-defense: only after meaningful delivery + large
+        # giveback + adverse evidence. This preserves edge without aggressively
+        # trailing routine pullbacks.
+        if self._profit_defense_exit_if_needed(order_manager, price, atr, _cvd_trend_now, now):
+            return True
 
         _liq_hold_reasons: list = []
         try:

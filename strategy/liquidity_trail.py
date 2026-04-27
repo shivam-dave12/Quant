@@ -505,7 +505,7 @@ class LiquidityTrailEngine:
                     f"Trail[COUNTER_BOS_OVERRIDE]: 5m BOS against trade broke "
                     f"entry — forcing BE ${be_price:,.1f}")
                 return LiquidityTrailResult(
-                    new_sl=round(be_price, 1), anchor=None,
+                    new_sl=self._round_be_price(pos_side, be_price), anchor=None,
                     reason=f"[COUNTER_BOS_OVERRIDE] SL → BE ${be_price:,.1f}",
                     phase="COUNTER_BOS", r_multiple=r_multiple)
 
@@ -606,8 +606,9 @@ class LiquidityTrailEngine:
 
         if exact_fee > 1e-6 and qty > 1e-10:
             entry_fee_per_unit = exact_fee / qty
-            exit_rate          = entry_fee_per_unit / max(entry_price, 1.0)
-            commission_rt      = entry_fee_per_unit + entry_price * exit_rate
+            exit_rate          = LiquidityTrailEngine._exit_stop_fee_rate()
+            exit_fee_per_unit  = entry_price * exit_rate
+            commission_rt      = entry_fee_per_unit + exit_fee_per_unit
         elif fee_engine is not None:
             try:
                 bps = fee_engine.effective_roundtrip_cost_bps(use_maker_entry=True)
@@ -625,14 +626,73 @@ class LiquidityTrailEngine:
         return be
 
     @staticmethod
+    def _exit_stop_fee_rate() -> float:
+        """Estimated fee rate for the future SL/stop exit leg.
+
+        Entry may be maker, but an SL stop is effectively a taker/risk-exit.
+        Using the entry fee rate for the exit leg understated true breakeven
+        when maker entry + taker stop were mixed.
+        """
+        try:
+            import config as _cfg
+            candidates = [
+                getattr(_cfg, 'STOP_EXIT_COMMISSION_RATE', None),
+                getattr(_cfg, 'DELTA_TAKER_COMMISSION_RATE', None),
+                getattr(_cfg, 'TAKER_COMMISSION_RATE', None),
+                getattr(_cfg, 'COMMISSION_RATE', None),
+            ]
+            rates = []
+            for v in candidates:
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv >= 0:
+                        rates.append(fv)
+                except Exception:
+                    pass
+            return max(rates) if rates else 0.00055
+        except Exception:
+            return 0.00055
+
+    @staticmethod
+    def _be_tick_size() -> float:
+        try:
+            import config as _cfg
+            for name in ('TICK_SIZE', 'PRICE_TICK_SIZE'):
+                v = getattr(_cfg, name, None)
+                if v is not None:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv > 0:
+                        return fv
+        except Exception:
+            pass
+        return 0.5
+
+    @classmethod
+    def _round_be_price(cls, pos_side: str, price: float) -> float:
+        """Directionally round BE so it is truly net protective.
+
+        LONG stop-BE must round UP; SHORT stop-BE must round DOWN.
+        Nearest-tick rounding can turn a mathematical BE into a tiny net loss.
+        """
+        tick = cls._be_tick_size()
+        if tick <= 0:
+            return price
+        if pos_side == 'long':
+            return round(math.ceil(price / tick) * tick, 10)
+        return round(math.floor(price / tick) * tick, 10)
+
+    @staticmethod
     def _static_commission_rt(entry_price: float) -> float:
         """Round-trip commission from static config — last-resort only."""
         try:
             import config as _cfg
-            rate = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
+            entry_rate = float(getattr(_cfg, 'COMMISSION_RATE', 0.00055))
         except Exception:
-            rate = 0.00055
-        return entry_price * rate * 2.0
+            entry_rate = 0.00055
+        exit_rate = LiquidityTrailEngine._exit_stop_fee_rate()
+        return entry_price * (entry_rate + exit_rate)
 
     @staticmethod
     def _structural_be_gate(
@@ -705,7 +765,7 @@ class LiquidityTrailEngine:
     ) -> LiquidityTrailResult:
         """Move SL to breakeven + exact fees + slippage buffer."""
         be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
-        be_price = round(be_price, 1)
+        be_price = self._round_be_price(pos_side, be_price)
 
         invalid_reason = self._stop_trigger_invalid_reason(pos_side, be_price, price)
         if invalid_reason:

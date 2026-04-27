@@ -266,7 +266,9 @@ def _format_heartbeat_industry(
         init_sl = _safe_float(position.get("initial_sl_dist", abs(entry - sl)), abs(entry - sl))
         move = (price - entry) if side == "LONG" else (entry - price)
         r_now = move / init_sl if init_sl > 1e-10 else 0.0
-        rr = abs(tp - entry) / abs(entry - sl) if entry and sl and tp and abs(entry - sl) > 1e-10 else 0.0
+        # Planned R:R must use the ORIGINAL risk. Once SL trails to BE/profit,
+        # using current SL distance makes R:R explode to fake values.
+        rr = abs(tp - entry) / init_sl if entry and tp and init_sl > 1e-10 else 0.0
         upnl = move * qty if qty else move
         prog = min(1.0, max(0.0, abs(price - entry) / max(abs(tp - entry), 1e-9))) if move >= 0 and tp else 0.0
         rows.append(

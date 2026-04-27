@@ -51,7 +51,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05    #  5% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -132,6 +132,8 @@ COMMISSION_RATE              = 0.00055
 COMMISSION_RATE_MAKER        = 0.00020
 DELTA_COMMISSION_RATE        = 0.00050
 DELTA_COMMISSION_RATE_MAKER  = -0.00020
+# Stop/SL exits are treated as taker risk-exits for true net breakeven.
+STOP_EXIT_COMMISSION_RATE   = 0.00055
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 GLOBAL_API_MIN_INTERVAL  = 3.0
@@ -410,6 +412,16 @@ QUANT_TRAIL_AMD_REDIST_BUFFER_MULT = 1.12
 QUANT_TRAIL_HTF_CASCADE_ENABLED    = True
 QUANT_TRAIL_LIQ_POOL_PROX_ATR     = 2.20
 QUANT_TRAIL_LIQ_FLOOR_BUFFER_ATR   = 0.30
+
+# Institutional profit defense: not aggressive trailing.
+# Triggers only after meaningful delivery + large giveback + adverse evidence.
+PROFIT_DEFENSE_MIN_MFE_R       = 1.20
+PROFIT_DEFENSE_GIVEBACK_FRAC   = 0.65
+PROFIT_DEFENSE_COUNTER_CVD     = 0.30
+PROFIT_DEFENSE_BOS_MAX_AGE_MS  = 720_000
+PROFIT_DEFENSE_BE_CUSHION_ATR  = 0.05
+PROFIT_DEFENSE_MIN_INTERVAL_SEC = 60.0
+PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC = 180.0
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
