@@ -554,7 +554,16 @@ class LiquidityTrailEngine:
                 min_breathing=MIN_BREATHING_ATR_PHASE2,
                 closes_required=PHASE2_CLOSES_REQUIRED,
                 hold_reason=hold_reason)
-            if _trail_result.new_sl is not None or not be_gate_ok:
+            _floor_result = self._try_profit_floor_lock(
+                pos_side, price, entry_price, current_sl, atr, init_dist,
+                r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+            if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
+                # Choose the more protective of structural trail and net-profit floor.
+                _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
+                if _floor_result.new_sl is not None and abs(_floor_result.new_sl - _best_sl) < 1e-9:
+                    return _floor_result
+                return _trail_result
+            if not be_gate_ok:
                 return _trail_result
             _be_result = self._try_be_lock(
                 pos_side, price, entry_price, current_sl, atr,
@@ -574,7 +583,15 @@ class LiquidityTrailEngine:
             min_breathing=MIN_BREATHING_ATR_PHASE3,
             closes_required=PHASE3_CLOSES_REQUIRED,
             hold_reason=hold_reason)
-        if _trail_result.new_sl is not None or not be_gate_ok:
+        _floor_result = self._try_profit_floor_lock(
+            pos_side, price, entry_price, current_sl, atr, init_dist,
+            r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+        if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
+            _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
+            if _floor_result.new_sl is not None and abs(_floor_result.new_sl - _best_sl) < 1e-9:
+                return _floor_result
+            return _trail_result
+        if not be_gate_ok:
             return _trail_result
         _be_result = self._try_be_lock(
             pos_side, price, entry_price, current_sl, atr,
@@ -756,6 +773,115 @@ class LiquidityTrailEngine:
                 pass
 
         return False, "awaiting aligned displacement/CVD/BOS/liquidity delivery"
+
+    def _fee_slip_buffer_per_unit(self, entry_price: float, atr: float, pos=None, fee_engine=None) -> float:
+        """Return the price distance required to be net-flat after fees/slippage.
+
+        Shared by BE and profit-floor locks. A floor of +0.35R must mean
+        +0.35R NET, not +0.35R before commissions.
+        """
+        be = self._be_price("long", entry_price, atr, pos, fee_engine)
+        return max(0.0, abs(be - entry_price))
+
+    def _profit_floor_lock_r(self, r_multiple: float) -> float:
+        """Net-R floor unlocked by MFE.
+
+        Institutional behaviour: once a trade has delivered a measurable leg,
+        the exchange stop should not remain at fee-BE.  But we do not trail the
+        market tick-for-tick.  These are broad floors that preserve breathing
+        room while preventing a 30-40% margin move from round-tripping to BE.
+        """
+        try:
+            import config as _cfg
+            tiers = getattr(_cfg, 'TRAIL_PROFIT_FLOOR_TIERS', None)
+            if tiers:
+                best = 0.0
+                for mfe_r, lock_r in tiers:
+                    if r_multiple >= float(mfe_r):
+                        best = max(best, float(lock_r))
+                return max(0.0, best)
+        except Exception:
+            pass
+        if r_multiple >= 3.50:
+            return 1.25
+        if r_multiple >= 2.50:
+            return 0.85
+        if r_multiple >= 1.75:
+            return 0.55
+        if r_multiple >= 1.20:
+            return 0.32
+        return 0.0
+
+    def _try_profit_floor_lock(
+        self, pos_side: str, price: float, entry_price: float,
+        current_sl: float, atr: float, init_dist: float, r_multiple: float,
+        hold_reason: Optional[List[str]], pos=None, fee_engine=None,
+    ) -> LiquidityTrailResult:
+        """Move the exchange SL to a broad MFE-based net-profit floor.
+
+        This is the missing middle layer between BE and aggressive structural
+        trailing. It does NOT chase small pullbacks; it only activates after
+        MFE reaches a tier, and only if the resulting stop still leaves enough
+        breathing room from current price.
+        """
+        if init_dist <= 1e-10 or atr <= 1e-10:
+            return self._hold("PROFIT_FLOOR_WAIT: invalid init_dist/ATR", hold_reason, r_multiple=r_multiple)
+        lock_r = self._profit_floor_lock_r(r_multiple)
+        if lock_r <= 0.0:
+            return self._hold(
+                f"PROFIT_FLOOR_WAIT: MFE={r_multiple:.2f}R below first floor",
+                hold_reason, r_multiple=r_multiple)
+
+        fee_slip = self._fee_slip_buffer_per_unit(entry_price, atr, pos, fee_engine)
+        gross_dist = fee_slip + lock_r * init_dist
+        raw_floor = entry_price + gross_dist if pos_side == "long" else entry_price - gross_dist
+        floor_sl = self._round_be_price(pos_side, raw_floor)
+
+        invalid_reason = self._stop_trigger_invalid_reason(pos_side, floor_sl, price)
+        if invalid_reason:
+            return self._hold(
+                f"PROFIT_FLOOR_NOT_EXECUTABLE: {invalid_reason}",
+                hold_reason, r_multiple=r_multiple)
+
+        is_impr = ((pos_side == "long" and floor_sl > current_sl) or
+                   (pos_side == "short" and floor_sl < current_sl))
+        if not is_impr:
+            return self._hold(
+                f"PROFIT_FLOOR_ALREADY_BETTER: floor=${floor_sl:,.1f} current=${current_sl:,.1f}",
+                hold_reason, r_multiple=r_multiple)
+
+        try:
+            import config as _cfg
+            breath_atr = float(getattr(_cfg, 'TRAIL_PROFIT_FLOOR_MIN_BREATHING_ATR', 0.45))
+            min_impr_atr = float(getattr(_cfg, 'TRAIL_PROFIT_FLOOR_MIN_IMPROVEMENT_ATR', 0.10))
+        except Exception:
+            breath_atr = 0.45
+            min_impr_atr = 0.10
+
+        breathing = abs(price - floor_sl) / atr
+        if breathing < breath_atr:
+            return self._hold(
+                f"PROFIT_FLOOR_TOO_TIGHT: breathing={breathing:.2f}ATR<{breath_atr:.2f}ATR "
+                f"floor={lock_r:.2f}R", hold_reason, r_multiple=r_multiple)
+
+        improvement = abs(floor_sl - current_sl) / atr
+        if improvement < min_impr_atr:
+            return self._hold(
+                f"PROFIT_FLOOR_MICRO_MOVE: {improvement:.3f}ATR<{min_impr_atr:.2f}ATR",
+                hold_reason, r_multiple=r_multiple)
+
+        reason = (f"[PROFIT_FLOOR] MFE={r_multiple:.2f}R → lock≈{lock_r:.2f}R NET "
+                  f"SL=${floor_sl:,.1f} (fee/slip≈${fee_slip:.1f}, breathing={breathing:.2f}ATR)")
+        logger.info(f"Trail: {reason}")
+        return LiquidityTrailResult(new_sl=floor_sl, anchor=None, reason=reason,
+                                    phase="PROFIT_FLOOR", r_multiple=r_multiple)
+
+    @staticmethod
+    def _better_sl(pos_side: str, a: Optional[float], b: Optional[float]) -> Optional[float]:
+        vals = [x for x in (a, b) if x is not None and x > 0]
+        if not vals:
+            return None
+        return max(vals) if pos_side == 'long' else min(vals)
 
     def _try_be_lock(
         self, pos_side: str, price: float, entry_price: float,

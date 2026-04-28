@@ -6551,7 +6551,12 @@ class QuantStrategy:
                 getattr(config, 'PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC', 180.0))
         )
 
-        if not (counter_cvd or counter_bos or pool_gate_reverse):
+        hard_failed_delivery = (
+            mfe_r >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_R', min_mfe_r))
+            and giveback >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC', min_giveback))
+        )
+
+        if not (counter_cvd or counter_bos or pool_gate_reverse or hard_failed_delivery):
             if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 120.0:
                 pos.profit_defense_last_notice_at = now
                 logger.info(
@@ -6560,6 +6565,14 @@ class QuantStrategy:
             return False
 
         net_r_est = (price - true_be) / init_dist if pos.side == "long" else (true_be - price) / init_dist
+        min_net_r = float(getattr(config, 'PROFIT_DEFENSE_MIN_NET_R_TO_EXIT', 0.15))
+        if net_r_est < min_net_r:
+            if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 60.0:
+                pos.profit_defense_last_notice_at = now
+                logger.info(
+                    f"ProfitDefense HOLD: net≈{net_r_est:.2f}R < {min_net_r:.2f}R "
+                    f"after fees; letting exchange SL/reconcile handle it")
+            return False
         with self._lock:
             pos.profit_defense_last_action_at = now
 
@@ -6570,6 +6583,8 @@ class QuantStrategy:
             reason_bits.append(f"counter-BOS {counter_bos_tf}")
         if pool_gate_reverse:
             reason_bits.append("pool-gate reversal")
+        if hard_failed_delivery:
+            reason_bits.append("failed-delivery giveback")
         reason = ("profit_defense: "
                   f"MFE={mfe_r:.2f}R giveback={giveback:.0%} "
                   f"net≈{net_r_est:.2f}R trueBE=${true_be:,.2f} "

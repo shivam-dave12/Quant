@@ -51,11 +51,11 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.03    # 3% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
-MAX_CONSECUTIVE_LOSSES   = 3
+MAX_CONSECUTIVE_LOSSES   = 2
 MAX_DAILY_TRADES         = 10        # institutional selectivity over frequency
 ONE_POSITION_AT_A_TIME   = True
 MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; legacy alias for 300 seconds
@@ -422,6 +422,25 @@ PROFIT_DEFENSE_BOS_MAX_AGE_MS  = 720_000
 PROFIT_DEFENSE_BE_CUSHION_ATR  = 0.05
 PROFIT_DEFENSE_MIN_INTERVAL_SEC = 60.0
 PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC = 180.0
+
+# MFE-based net-profit floor. This is not tight trailing: it only upgrades
+# the exchange SL after the trade has delivered a measurable leg, and the
+# floor is expressed as NET R after fees/slippage.
+TRAIL_PROFIT_FLOOR_TIERS = (
+    (1.20, 0.32),
+    (1.75, 0.55),
+    (2.50, 0.85),
+    (3.50, 1.25),
+)
+TRAIL_PROFIT_FLOOR_MIN_BREATHING_ATR = 0.45
+TRAIL_PROFIT_FLOOR_MIN_IMPROVEMENT_ATR = 0.10
+
+# Failed-delivery defense. At this point the move is no longer a small
+# pullback; it has given back most of the delivered leg. It may flatten at
+# market only if the estimated exit remains meaningfully net-profitable.
+PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_R = 1.20
+PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.65
+PROFIT_DEFENSE_MIN_NET_R_TO_EXIT = 0.15
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
