@@ -51,7 +51,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.03    # 3% of available balance per trade
+RISK_PER_TRADE           = 0.05   # 5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -416,12 +416,12 @@ QUANT_TRAIL_LIQ_FLOOR_BUFFER_ATR   = 0.30
 # Institutional profit defense: not aggressive trailing.
 # Triggers only after meaningful volatility-adjusted delivery + large giveback
 # + adverse evidence. These thresholds are ATR/structure based, not fixed R.
-PROFIT_DEFENSE_MIN_MFE_ATR       = 1.25
-PROFIT_DEFENSE_GIVEBACK_FRAC     = 0.65
+PROFIT_DEFENSE_MIN_MFE_ATR       = 1.80
+PROFIT_DEFENSE_GIVEBACK_FRAC     = 0.72
 PROFIT_DEFENSE_COUNTER_CVD       = 0.30
 PROFIT_DEFENSE_BOS_MAX_AGE_MS    = 720_000
 PROFIT_DEFENSE_BE_CUSHION_ATR    = 0.05
-PROFIT_DEFENSE_MIN_INTERVAL_SEC  = 60.0
+PROFIT_DEFENSE_MIN_INTERVAL_SEC  = 90.0
 PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC = 180.0
 
 # Liquidity-delivery trailing.
@@ -431,20 +431,20 @@ PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC = 180.0
 TRAIL_PHASE0_MAX_DELIVERY_ATR        = 0.75
 TRAIL_STRUCTURE_MIN_DELIVERY_ATR     = 1.10
 TRAIL_AGGRESSIVE_MIN_DELIVERY_ATR    = 2.60
-TRAIL_DELIVERY_LOCK_MIN_MFE_ATR      = 1.05
+TRAIL_DELIVERY_LOCK_MIN_MFE_ATR      = 1.80
 TRAIL_DELIVERY_POOL_MIN_SIG          = 3.0
-TRAIL_DELIVERY_POOL_BUFFER_ATR       = 0.18
-TRAIL_DELIVERY_SWING_BUFFER_ATR      = 0.16
+TRAIL_DELIVERY_POOL_BUFFER_ATR       = 0.30
+TRAIL_DELIVERY_SWING_BUFFER_ATR      = 0.30
 TRAIL_DELIVERY_SWING_LOOKBACK_BARS   = 36
-TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR = 0.42
-TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR = 0.10
+TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR = 0.85
+TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR = 0.25
 
 # Failed-delivery defense. At this point the move is no longer a small
 # pullback; it has given back most of the delivered leg. It may flatten at
 # market only if the estimated exit remains meaningfully net-profitable.
-PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR = 1.25
-PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.65
-PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.15
+PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR = 2.50
+PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.78
+PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.35
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
@@ -462,3 +462,18 @@ try:
     from config_schema import cfg as _cfg_validated  # noqa: F401
 except ImportError:
     pass  # config_schema.py not present; schema validation skipped
+
+# ── Institutional exit accounting / anti-whipsaw controls ────────────────
+# Market/profit-defense exits must be reconciled from their own reduce-only
+# order id, not from cancelled SL/TP child orders. While that order is still
+# propagating, defer PnL booking instead of recording $0.00.
+EXIT_MANUAL_CONFIRM_MAX_WAIT_SEC = 120.0
+
+# Do not flatten just because a trade gave back profit. Institutions treat
+# giveback as a watch condition; actual exit requires counter-flow, counter-BOS,
+# pool-gate reversal, or an explicit override.
+PROFIT_DEFENSE_ALLOW_GIVEBACK_ONLY_EXIT = False
+
+# More breathing room before BE / delivery-lock moves. Prevents being stopped
+# on normal pullbacks while still preventing fee-adjusted loss accounting.
+TRAIL_BE_MIN_BREATHING_ATR = 0.75

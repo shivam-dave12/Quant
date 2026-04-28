@@ -2396,6 +2396,14 @@ class PositionState:
     pool_gate_reverse_notice_key:  str = ""
     profit_defense_last_action_at: float = 0.0
     profit_defense_last_notice_at: float = 0.0
+    # Exact manual/profit-defense exit accounting. When the strategy closes
+    # with a reduce-only market order (not an exchange SL/TP child), the fired
+    # order id must be tracked so PnL is booked from the actual fill instead of
+    # falling back to exchange-flat/zero-PnL reconciliation.
+    manual_exit_order_id: str = ""
+    manual_exit_reason: str = ""
+    manual_exit_requested_at: float = 0.0
+    manual_exit_reference_price: float = 0.0
 
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
@@ -6545,12 +6553,21 @@ class QuantStrategy:
             and giveback >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC', min_giveback))
         )
 
-        if not (counter_cvd or counter_bos or pool_gate_reverse or hard_failed_delivery):
+        # Institutional rule: a giveback by itself is not enough to flatten.
+        # Large moves commonly retrace before continuing. Market-flatten only
+        # when the giveback is accompanied by adverse auction evidence, unless
+        # the operator explicitly enables giveback-only exits.
+        allow_giveback_only = bool(getattr(config, 'PROFIT_DEFENSE_ALLOW_GIVEBACK_ONLY_EXIT', False))
+        adverse_evidence = (counter_cvd or counter_bos or pool_gate_reverse)
+        failed_delivery_evidence = hard_failed_delivery and allow_giveback_only
+
+        if not (adverse_evidence or failed_delivery_evidence):
             if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 120.0:
                 pos.profit_defense_last_notice_at = now
                 logger.info(
                     f"ProfitDefense HOLD: MFE={mfe_atr:.2f}ATR giveback={giveback:.0%} "
-                    f"but no confirmed adverse structure/flow (cvd={cvd_trend:+.2f})")
+                    f"but no confirmed adverse structure/flow (cvd={cvd_trend:+.2f}); "
+                    f"not flattening on pullback alone")
             return False
 
         net_pts = (price - true_be) if pos.side == "long" else (true_be - price)
@@ -6572,7 +6589,7 @@ class QuantStrategy:
             reason_bits.append(f"counter-BOS {counter_bos_tf}")
         if pool_gate_reverse:
             reason_bits.append("pool-gate reversal")
-        if hard_failed_delivery:
+        if failed_delivery_evidence:
             reason_bits.append("failed-delivery giveback")
         reason = ("profit_defense: "
                   f"MFE={mfe_atr:.2f}ATR giveback={giveback:.0%} "
@@ -6956,7 +6973,24 @@ class QuantStrategy:
         self._exiting_since = time.time()
         order_manager.cancel_all_exit_orders(sl_order_id=pos.sl_order_id, tp_order_id=pos.tp_order_id)
         es = "sell" if pos.side=="long" else "buy"
-        order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
+        exit_data = order_manager.place_market_order(side=es, quantity=pos.quantity, reduce_only=True)
+        # Persist the exact reduce-only market-exit order id. This is mandatory
+        # for correct PnL accounting because identify_exit_order() only knows the
+        # exchange SL/TP child ids; profit-defense/manual exits cancel those and
+        # fire a new market order.
+        try:
+            manual_oid = str((exit_data or {}).get('order_id') or (exit_data or {}).get('id') or '')
+            with self._lock:
+                pos.manual_exit_order_id = manual_oid
+                pos.manual_exit_reason = str(reason or 'manual_exit')
+                pos.manual_exit_requested_at = time.time()
+                pos.manual_exit_reference_price = float(price or 0.0)
+            if manual_oid:
+                logger.info(f"Manual/reduce-only exit order tracked: {manual_oid[:10]}… reason={reason}")
+            else:
+                logger.error("Manual/reduce-only exit order was submitted but no order_id was returned; exact PnL will retry via exchange history/fallback")
+        except Exception as _mx_e:
+            logger.error(f"failed to store manual exit order id: {_mx_e}", exc_info=True)
 
         # FIX Bug-D: do NOT call _record_pnl here with an estimated PnL.
         # _record_exchange_exit() (called by the reconcile / sync path once the
@@ -7048,10 +7082,40 @@ class QuantStrategy:
             self._exit_completed = True   # CLAIM: this thread owns the exit
 
         # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Step 1: Get exchange-confirmed exit data Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-        # Query both order IDs directly. One retry after 1 s.
+        # Step 1A: manual/profit-defense reduce-only market exit.
+        # If _exit_trade() flattened with a market order, SL/TP child ids were
+        # cancelled and identify_exit_order() cannot identify the fired order.
+        # Query the tracked market order first and book exact PnL from it.
         exit_info: Dict = {"confirmed": False}
+        manual_exit_id = str(getattr(pos, 'manual_exit_order_id', '') or '').strip()
+        if self._om is not None and manual_exit_id:
+            for _i, _delay in enumerate([0.0, 1.0, 2.0, 3.0, 5.0]):
+                if _delay > 0:
+                    time.sleep(_delay)
+                try:
+                    details = self._om.get_fill_details(manual_exit_id) if hasattr(self._om, 'get_fill_details') else None
+                    status = str((details or {}).get('status', '')).upper()
+                    fill_price = float((details or {}).get('fill_price') or 0.0)
+                    fee_paid = float((details or {}).get('paid_commission') or 0.0)
+                    if status in ('FILLED', 'CLOSED') and fill_price > 0:
+                        exit_info = {
+                            'confirmed': True,
+                            'exit_type': 'manual_exit',
+                            'exit_reason': str(getattr(pos, 'manual_exit_reason', '') or 'manual_exit'),
+                            'fill_price': fill_price,
+                            'order_id': manual_exit_id,
+                            'fee_paid': fee_paid,
+                        }
+                        logger.info(
+                            f"✅ Manual exit confirmed on attempt {_i+1}: order={manual_exit_id[:10]}… "
+                            f"fill=${fill_price:,.2f} fee=${fee_paid:.4f}")
+                        break
+                except Exception as e:
+                    logger.error(f"manual exit order confirmation error attempt {_i+1}: {e}", exc_info=True)
 
-        if self._om is not None:
+        # Step 1B: exchange SL/TP child exit.
+        # Query both order IDs directly. One retry after 1 s.
+        if self._om is not None and not exit_info.get('confirmed'):
             try:
                 exit_info = self._om.identify_exit_order(
                     sl_order_id  = pos.sl_order_id,
@@ -7113,21 +7177,44 @@ class QuantStrategy:
                     logger.debug(f"Position fallback check error: {_pos_e}")
 
             if _try_position_fallback:
-                # Position is confirmed flat Ã¢â‚¬â€ reconstruct exit from available data
+                # Position is confirmed flat. For tracked manual/profit-defense exits,
+                # do NOT book zero PnL just because SL/TP child-order lookup failed.
+                # The market exit order may still be propagating. Defer for a bounded
+                # window, then use the best available mark/reference estimate instead
+                # of poisoning statistics with $0.00.
+                _manual_id = str(getattr(pos, 'manual_exit_order_id', '') or '').strip()
+                _manual_age = time.time() - float(getattr(pos, 'manual_exit_requested_at', 0.0) or 0.0)
+                _max_wait = float(getattr(config, 'EXIT_MANUAL_CONFIRM_MAX_WAIT_SEC', 120.0))
+                if _manual_id and 0.0 <= _manual_age < _max_wait:
+                    logger.info(
+                        f"Manual exit order {_manual_id[:10]}… not confirmed yet; deferring PnL booking "
+                        f"({_manual_age:.0f}s/{_max_wait:.0f}s)")
+                    with self._lock:
+                        self._exit_completed = False
+                    return
+
+                # Reconstruct exit from available data as last resort.
                 _last_price = 0.0
                 try:
                     _last_price = self._dm.get_last_price() if self._dm else 0.0
                 except Exception:
                     pass
+                if _last_price <= 0:
+                    _last_price = float(getattr(pos, 'manual_exit_reference_price', 0.0) or 0.0)
                 _approx_pnl = 0.0
                 if _last_price > 0 and pos.entry_price > 0:
-                    if pos.side == "long":
-                        _approx_pnl = (_last_price - pos.entry_price) * pos.quantity
-                    else:
-                        _approx_pnl = (pos.entry_price - _last_price) * pos.quantity
+                    try:
+                        _approx_pnl = self._estimate_pnl(
+                            pos, _last_price,
+                            entry_fill_type=getattr(pos, 'entry_fill_type', 'taker'))
+                    except Exception:
+                        if pos.side == "long":
+                            _approx_pnl = (_last_price - pos.entry_price) * pos.quantity
+                        else:
+                            _approx_pnl = (pos.entry_price - _last_price) * pos.quantity
                 logger.warning(
-                    f"Ã¢Å¡Â Ã¯Â¸Â EXIT CONFIRMED via position check (order state unavailable). "
-                    f"Approx PnL: ${_approx_pnl:.2f}")
+                    f"⚠️ EXIT CONFIRMED via position check (order state unavailable). "
+                    f"Estimated PnL from best available price ${_last_price:,.2f}: ${_approx_pnl:.2f}")
                 send_telegram_message(
                     f"Ã¢Å¡Â Ã¯Â¸Â <b>EXIT CONFIRMED (position fallback)</b>\n"
                     f"Individual order state unavailable but position is FLAT.\n"
@@ -7204,7 +7291,7 @@ class QuantStrategy:
         fired_id   = exit_info["order_id"]
         if self._fee_engine is not None and fill_price > 0:
             try:
-                expected_exit = pos.tp_price if exit_type == "tp" else pos.sl_price
+                expected_exit = pos.tp_price if exit_type == "tp" else (pos.sl_price if exit_type in ("sl", "trail_sl") else fill_price)
                 if expected_exit > 0:
                     self._fee_engine.record_fill(
                         expected_exit, fill_price, leg="exit")
@@ -7215,6 +7302,10 @@ class QuantStrategy:
             exit_reason = "tp_hit";       is_tp_hit = True;  is_sl_hit = False
         elif exit_type == "trail_sl":
             exit_reason = "trail_sl_hit"; is_tp_hit = False; is_sl_hit = True
+        elif exit_type == "manual_exit":
+            # Preserve the semantic reason, e.g. profit_defense, pool_gate_exit, manual_flatten.
+            exit_reason = str(exit_info.get('exit_reason') or getattr(pos, 'manual_exit_reason', '') or 'manual_exit')
+            is_tp_hit = False; is_sl_hit = False
         else:
             exit_reason = "sl_hit";       is_tp_hit = False; is_sl_hit = True
 

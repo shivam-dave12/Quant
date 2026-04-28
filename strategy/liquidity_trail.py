@@ -963,7 +963,7 @@ class LiquidityTrailEngine:
         if atr <= 1e-10:
             return self._hold("DELIVERY_LOCK_WAIT: invalid ATR", hold_reason)
 
-        min_delivery_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.05)
+        min_delivery_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.80)
         if delivery_atr < min_delivery_atr:
             return self._hold(
                 f"DELIVERY_LOCK_WAIT: delivered={delivery_atr:.2f}ATR<{min_delivery_atr:.2f}ATR",
@@ -991,8 +991,8 @@ class LiquidityTrailEngine:
                 f"DELIVERY_LOCK_ALREADY_BETTER: candidate=${candidate_sl:,.1f} current=${current_sl:,.1f}",
                 hold_reason)
 
-        breath_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.42)
-        min_impr_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR", 0.10)
+        breath_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.85)
+        min_impr_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR", 0.25)
         breathing = abs(price - candidate_sl) / atr
         if breathing < breath_atr:
             return self._hold(
@@ -1050,10 +1050,11 @@ class LiquidityTrailEngine:
                 f"BE_NOT_IMPROVEMENT: BE=${be_price:,.1f} vs SL=${current_sl:,.1f}",
                 hold_reason, r_multiple=r_multiple)
 
-        # Breathing room
-        if abs(price - be_price) / atr < 0.40:
+        # Breathing room.  BE must not sit inside normal pullback noise.
+        be_breath_atr = self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75)
+        if abs(price - be_price) / atr < be_breath_atr:
             return self._hold(
-                f"BE_TOO_TIGHT: breathing={abs(price-be_price)/atr:.2f}ATR<0.40ATR",
+                f"BE_TOO_TIGHT: breathing={abs(price-be_price)/atr:.2f}ATR<{be_breath_atr:.2f}ATR",
                 hold_reason, r_multiple=r_multiple)
 
         # Minimum improvement
@@ -1068,7 +1069,7 @@ class LiquidityTrailEngine:
         gate_tag = f" | {gate_reason}" if gate_reason else ""
         reason = (
             f"[BE_LOCK] analyticR={r_multiple:.2f} → BE=${be_price:,.1f} "
-            f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"
+            f"(fee_buffer≈{max(0.0, fee_component):.1f}pts slip={0.12*atr:.1f}pts)"
         )
         if gate_tag:
             reason = f"{reason}{gate_tag}"
