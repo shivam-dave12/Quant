@@ -468,7 +468,10 @@ class LiquidityTrailEngine:
             return self._hold("INIT_DIST_ZERO: r_multiple undefined", hold_reason)
         profit    = (price - entry_price) if pos_side == "long" else (entry_price - price)
         r_peak    = max(profit, peak_profit)
+        # Keep R for reporting/analytics only.  Trailing phases are driven by
+        # volatility-adjusted delivery, not by the initial SL distance.
         r_multiple = r_peak / init_dist if init_dist > 1e-10 else 0.0
+        delivery_atr = r_peak / atr if atr > 1e-10 else 0.0
         candles_by_tf: Dict[str, List[dict]] = {
             "1m":  candles_1m  or [],
             "5m":  candles_5m  or [],
@@ -512,10 +515,11 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 0 — HANDS OFF
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_0_MAX_R:
+        phase0_delivery_atr = self._cfg_float("TRAIL_PHASE0_MAX_DELIVERY_ATR", 0.75)
+        if delivery_atr < phase0_delivery_atr:
             self._last_phase = "HANDS_OFF"
             return self._hold(
-                f"PHASE_0_HANDS_OFF: R={r_multiple:.2f}<{PHASE_0_MAX_R}R — "
+                f"PHASE_0_HANDS_OFF: delivery={delivery_atr:.2f}ATR<{phase0_delivery_atr:.2f}ATR — "
                 f"initial structural SL is optimal",
                 hold_reason, r_multiple=r_multiple)
 
@@ -540,9 +544,26 @@ class LiquidityTrailEngine:
         }
 
         # ══════════════════════════════════════════════════════════════
+        # PHASE 1 — TRUE BE ONLY, after structural delivery
+        # ══════════════════════════════════════════════════════════════
+        structure_min_delivery_atr = self._cfg_float("TRAIL_STRUCTURE_MIN_DELIVERY_ATR", 1.10)
+        aggressive_min_delivery_atr = self._cfg_float("TRAIL_AGGRESSIVE_MIN_DELIVERY_ATR", 2.60)
+
+        if delivery_atr < structure_min_delivery_atr:
+            self._last_phase = "BE_STRUCTURAL"
+            if not be_gate_ok:
+                return self._hold(
+                    f"BE_WAIT_STRUCT: {be_gate_reason}; delivery={delivery_atr:.2f}ATR",
+                    hold_reason, r_multiple=r_multiple)
+            return self._try_be_lock(
+                pos_side, price, entry_price, current_sl, atr,
+                r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
+                gate_reason=be_gate_reason)
+
+        # ══════════════════════════════════════════════════════════════
         # PHASE 2 / 3 - STRUCTURE TRAIL
         # ══════════════════════════════════════════════════════════════
-        if r_multiple < PHASE_2_MAX_R:
+        if delivery_atr < aggressive_min_delivery_atr:
             self._last_phase = "STRUCTURAL"
             _trail_result = self._fibonacci_trail(
                 pos_side, price, entry_price, current_sl, atr, init_dist,
@@ -554,9 +575,9 @@ class LiquidityTrailEngine:
                 min_breathing=MIN_BREATHING_ATR_PHASE2,
                 closes_required=PHASE2_CLOSES_REQUIRED,
                 hold_reason=hold_reason)
-            _floor_result = self._try_profit_floor_lock(
-                pos_side, price, entry_price, current_sl, atr, init_dist,
-                r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+            _floor_result = self._try_delivery_structure_lock(
+                pos_side, price, entry_price, current_sl, atr, delivery_atr,
+                liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine)
             if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
                 # Choose the more protective of structural trail and net-profit floor.
                 _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
@@ -583,9 +604,9 @@ class LiquidityTrailEngine:
             min_breathing=MIN_BREATHING_ATR_PHASE3,
             closes_required=PHASE3_CLOSES_REQUIRED,
             hold_reason=hold_reason)
-        _floor_result = self._try_profit_floor_lock(
-            pos_side, price, entry_price, current_sl, atr, init_dist,
-            r_multiple, hold_reason, pos=pos, fee_engine=fee_engine)
+        _floor_result = self._try_delivery_structure_lock(
+            pos_side, price, entry_price, current_sl, atr, delivery_atr,
+            liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine)
         if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
             _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
             if _floor_result.new_sl is not None and abs(_floor_result.new_sl - _best_sl) < 1e-9:
@@ -745,7 +766,10 @@ class LiquidityTrailEngine:
                 except Exception:
                     pass
 
-        if liq_snapshot is not None and r_multiple >= 1.25:
+        # Liquidity delivery is volatility/structure based, not R based.
+        # A wide initial SL should not delay protection if price has already
+        # travelled through a meaningful institutional pool.
+        if liq_snapshot is not None and (profit / max(atr, 1e-9)) >= 1.00:
             try:
                 opp_pools = (getattr(liq_snapshot, "bsl_pools", []) if pos_side == "long"
                              else getattr(liq_snapshot, "ssl_pools", []))
@@ -777,104 +801,215 @@ class LiquidityTrailEngine:
     def _fee_slip_buffer_per_unit(self, entry_price: float, atr: float, pos=None, fee_engine=None) -> float:
         """Return the price distance required to be net-flat after fees/slippage.
 
-        Shared by BE and profit-floor locks. A floor of +0.35R must mean
-        +0.35R NET, not +0.35R before commissions.
+        Shared by BE and delivery-lock logic. Protection is based on
+        confirmed market structure/liquidity, not a fixed R multiple.
         """
         be = self._be_price("long", entry_price, atr, pos, fee_engine)
         return max(0.0, abs(be - entry_price))
 
-    def _profit_floor_lock_r(self, r_multiple: float) -> float:
-        """Net-R floor unlocked by MFE.
-
-        Institutional behaviour: once a trade has delivered a measurable leg,
-        the exchange stop should not remain at fee-BE.  But we do not trail the
-        market tick-for-tick.  These are broad floors that preserve breathing
-        room while preventing a 30-40% margin move from round-tripping to BE.
-        """
+    @staticmethod
+    def _cfg_float(name: str, default: float) -> float:
         try:
             import config as _cfg
-            tiers = getattr(_cfg, 'TRAIL_PROFIT_FLOOR_TIERS', None)
-            if tiers:
-                best = 0.0
-                for mfe_r, lock_r in tiers:
-                    if r_multiple >= float(mfe_r):
-                        best = max(best, float(lock_r))
-                return max(0.0, best)
+            value = float(getattr(_cfg, name, default))
+            return value if math.isfinite(value) else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _bar_value(bar, key: str, default: float = 0.0) -> float:
+        try:
+            if isinstance(bar, dict):
+                return float(bar.get(key, default) or default)
+            return float(getattr(bar, key, default) or default)
+        except Exception:
+            return default
+
+    def _pool_sig(self, target) -> float:
+        try:
+            if hasattr(target, "adjusted_sig"):
+                return float(target.adjusted_sig())
         except Exception:
             pass
-        if r_multiple >= 3.50:
-            return 1.25
-        if r_multiple >= 2.50:
-            return 0.85
-        if r_multiple >= 1.75:
-            return 0.55
-        if r_multiple >= 1.20:
-            return 0.32
-        return 0.0
+        try:
+            pool = getattr(target, "pool", target)
+            return float(getattr(pool, "significance", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
-    def _try_profit_floor_lock(
+    def _delivery_lock_from_pools(
+        self, pos_side: str, price: float, true_be: float, atr: float, liq_snapshot
+    ) -> Tuple[Optional[float], str]:
+        """Return a protective stop behind a newly delivered internal pool.
+
+        LONG: after delivery higher, protect behind SSL pools that formed/hold
+              between true BE and current price.
+        SHORT: after delivery lower, protect behind BSL pools that formed/hold
+               between current price and true BE.
+
+        This is deliberately not based on initial SL distance or R.  It asks:
+        "Which market structure has the auction already accepted beyond?"
+        """
+        if liq_snapshot is None or atr <= 1e-10:
+            return None, "no liquidity snapshot"
+
+        pools = getattr(liq_snapshot, "ssl_pools", []) if pos_side == "long" else getattr(liq_snapshot, "bsl_pools", [])
+        if not pools:
+            return None, "no delivered protective pool"
+
+        base_buf = self._cfg_float("TRAIL_DELIVERY_POOL_BUFFER_ATR", 0.18) * atr
+        min_sig = self._cfg_float("TRAIL_DELIVERY_POOL_MIN_SIG", 3.0)
+        candidates = []
+        for target in pools or []:
+            pool = getattr(target, "pool", target)
+            try:
+                pp = float(getattr(pool, "price", 0.0) or 0.0)
+            except Exception:
+                continue
+            if pp <= 0:
+                continue
+            sig = self._pool_sig(target)
+            if sig < min_sig:
+                continue
+            tf = str(getattr(pool, "timeframe", "?") or "?")
+            # Higher-quality pools earn a slightly tighter buffer, but never
+            # a zero/retail-tight buffer.
+            quality_adj = max(0.65, min(1.15, 1.05 - min(sig, 20.0) / 80.0))
+            buf = max(0.10 * atr, base_buf * quality_adj)
+            if pos_side == "long":
+                sl = pp - buf
+                if true_be < sl < price:
+                    candidates.append((sl, sig, tf, pp, buf))
+            else:
+                sl = pp + buf
+                if price < sl < true_be:
+                    candidates.append((sl, sig, tf, pp, buf))
+
+        if not candidates:
+            return None, "no protective pool beyond true BE"
+
+        # Choose the most protective executable level; for a long this is the
+        # highest stop below price, for a short the lowest stop above price.
+        best = max(candidates, key=lambda x: x[0]) if pos_side == "long" else min(candidates, key=lambda x: x[0])
+        sl, sig, tf, pp, buf = best
+        return round(sl, 1), f"pool:{tf}@${pp:,.1f} sig={sig:.1f} buf={buf/atr:.2f}ATR"
+
+    def _delivery_lock_from_swings(
+        self, pos_side: str, price: float, true_be: float, atr: float,
+        candles_by_tf: Dict[str, List[dict]],
+    ) -> Tuple[Optional[float], str]:
+        """Return a protective stop behind last accepted swing structure.
+
+        Uses closed candles only and requires the protected swing to sit on the
+        profitable side of true net BE.  This prevents fake-BE while avoiding
+        fixed-R profit locks.
+        """
+        if atr <= 1e-10:
+            return None, "invalid ATR"
+        lookback = int(self._cfg_float("TRAIL_DELIVERY_SWING_LOOKBACK_BARS", 36))
+        buf_atr = self._cfg_float("TRAIL_DELIVERY_SWING_BUFFER_ATR", 0.16)
+        candidates = []
+
+        for tf in ("1m", "5m", "15m"):
+            candles = list((candles_by_tf or {}).get(tf) or [])
+            if len(candles) < 5:
+                continue
+            # Skip the forming candle.  Scan most recent confirmed swings first.
+            start = max(2, len(candles) - min(lookback, len(candles) - 2))
+            for i in range(len(candles) - 3, start - 1, -1):
+                prev_b, cur_b, next_b = candles[i - 1], candles[i], candles[i + 1]
+                lo_prev = self._bar_value(prev_b, "low")
+                lo_cur  = self._bar_value(cur_b, "low")
+                lo_next = self._bar_value(next_b, "low")
+                hi_prev = self._bar_value(prev_b, "high")
+                hi_cur  = self._bar_value(cur_b, "high")
+                hi_next = self._bar_value(next_b, "high")
+                if min(lo_prev, lo_cur, lo_next, hi_prev, hi_cur, hi_next) <= 0:
+                    continue
+                if pos_side == "long" and lo_cur <= lo_prev and lo_cur <= lo_next:
+                    sl = lo_cur - buf_atr * atr
+                    if true_be < sl < price:
+                        # Prefer recent structure first, then protective price.
+                        candidates.append((sl, i, tf, lo_cur))
+                elif pos_side == "short" and hi_cur >= hi_prev and hi_cur >= hi_next:
+                    sl = hi_cur + buf_atr * atr
+                    if price < sl < true_be:
+                        candidates.append((sl, i, tf, hi_cur))
+
+        if not candidates:
+            return None, "no accepted swing beyond true BE"
+
+        if pos_side == "long":
+            best = max(candidates, key=lambda x: (x[1], x[0]))
+        else:
+            best = max(candidates, key=lambda x: (x[1], -x[0]))
+        sl, _, tf, swing = best
+        return round(sl, 1), f"swing:{tf}@${swing:,.1f}"
+
+    def _try_delivery_structure_lock(
         self, pos_side: str, price: float, entry_price: float,
-        current_sl: float, atr: float, init_dist: float, r_multiple: float,
+        current_sl: float, atr: float, delivery_atr: float,
+        liq_snapshot, candles_by_tf: Dict[str, List[dict]],
         hold_reason: Optional[List[str]], pos=None, fee_engine=None,
     ) -> LiquidityTrailResult:
-        """Move the exchange SL to a broad MFE-based net-profit floor.
+        """Protect delivered profit using confirmed structure/liquidity.
 
-        This is the missing middle layer between BE and aggressive structural
-        trailing. It does NOT chase small pullbacks; it only activates after
-        MFE reaches a tier, and only if the resulting stop still leaves enough
-        breathing room from current price.
+        This replaces the fixed-R profit floor.  Institutions do not decide the
+        stop level from the original SL distance.  The original SL determines
+        size/risk.  Once the trade is live, the stop advances only to market
+        structure that the auction has accepted beyond: internal liquidity pools,
+        confirmed swing lows/highs, and true fee-adjusted BE.
         """
-        if init_dist <= 1e-10 or atr <= 1e-10:
-            return self._hold("PROFIT_FLOOR_WAIT: invalid init_dist/ATR", hold_reason, r_multiple=r_multiple)
-        lock_r = self._profit_floor_lock_r(r_multiple)
-        if lock_r <= 0.0:
+        if atr <= 1e-10:
+            return self._hold("DELIVERY_LOCK_WAIT: invalid ATR", hold_reason)
+
+        min_delivery_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.05)
+        if delivery_atr < min_delivery_atr:
             return self._hold(
-                f"PROFIT_FLOOR_WAIT: MFE={r_multiple:.2f}R below first floor",
-                hold_reason, r_multiple=r_multiple)
+                f"DELIVERY_LOCK_WAIT: delivered={delivery_atr:.2f}ATR<{min_delivery_atr:.2f}ATR",
+                hold_reason)
 
-        fee_slip = self._fee_slip_buffer_per_unit(entry_price, atr, pos, fee_engine)
-        gross_dist = fee_slip + lock_r * init_dist
-        raw_floor = entry_price + gross_dist if pos_side == "long" else entry_price - gross_dist
-        floor_sl = self._round_be_price(pos_side, raw_floor)
+        true_be = self._round_be_price(pos_side, self._be_price(pos_side, entry_price, atr, pos, fee_engine))
+        pool_sl, pool_reason = self._delivery_lock_from_pools(pos_side, price, true_be, atr, liq_snapshot)
+        swing_sl, swing_reason = self._delivery_lock_from_swings(pos_side, price, true_be, atr, candles_by_tf)
 
-        invalid_reason = self._stop_trigger_invalid_reason(pos_side, floor_sl, price)
+        candidate_sl = self._better_sl(pos_side, pool_sl, swing_sl)
+        if candidate_sl is None:
+            return self._hold(
+                f"DELIVERY_LOCK_WAIT: {pool_reason}; {swing_reason}", hold_reason)
+
+        source_reason = pool_reason if pool_sl is not None and abs(candidate_sl - pool_sl) < 1e-9 else swing_reason
+
+        invalid_reason = self._stop_trigger_invalid_reason(pos_side, candidate_sl, price)
         if invalid_reason:
-            return self._hold(
-                f"PROFIT_FLOOR_NOT_EXECUTABLE: {invalid_reason}",
-                hold_reason, r_multiple=r_multiple)
+            return self._hold(f"DELIVERY_LOCK_NOT_EXECUTABLE: {invalid_reason}", hold_reason)
 
-        is_impr = ((pos_side == "long" and floor_sl > current_sl) or
-                   (pos_side == "short" and floor_sl < current_sl))
+        is_impr = ((pos_side == "long" and candidate_sl > current_sl) or
+                   (pos_side == "short" and candidate_sl < current_sl))
         if not is_impr:
             return self._hold(
-                f"PROFIT_FLOOR_ALREADY_BETTER: floor=${floor_sl:,.1f} current=${current_sl:,.1f}",
-                hold_reason, r_multiple=r_multiple)
+                f"DELIVERY_LOCK_ALREADY_BETTER: candidate=${candidate_sl:,.1f} current=${current_sl:,.1f}",
+                hold_reason)
 
-        try:
-            import config as _cfg
-            breath_atr = float(getattr(_cfg, 'TRAIL_PROFIT_FLOOR_MIN_BREATHING_ATR', 0.45))
-            min_impr_atr = float(getattr(_cfg, 'TRAIL_PROFIT_FLOOR_MIN_IMPROVEMENT_ATR', 0.10))
-        except Exception:
-            breath_atr = 0.45
-            min_impr_atr = 0.10
-
-        breathing = abs(price - floor_sl) / atr
+        breath_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.42)
+        min_impr_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR", 0.10)
+        breathing = abs(price - candidate_sl) / atr
         if breathing < breath_atr:
             return self._hold(
-                f"PROFIT_FLOOR_TOO_TIGHT: breathing={breathing:.2f}ATR<{breath_atr:.2f}ATR "
-                f"floor={lock_r:.2f}R", hold_reason, r_multiple=r_multiple)
+                f"DELIVERY_LOCK_TOO_TIGHT: breathing={breathing:.2f}ATR<{breath_atr:.2f}ATR",
+                hold_reason)
 
-        improvement = abs(floor_sl - current_sl) / atr
+        improvement = abs(candidate_sl - current_sl) / atr
         if improvement < min_impr_atr:
             return self._hold(
-                f"PROFIT_FLOOR_MICRO_MOVE: {improvement:.3f}ATR<{min_impr_atr:.2f}ATR",
-                hold_reason, r_multiple=r_multiple)
+                f"DELIVERY_LOCK_MICRO_MOVE: {improvement:.3f}ATR<{min_impr_atr:.2f}ATR",
+                hold_reason)
 
-        reason = (f"[PROFIT_FLOOR] MFE={r_multiple:.2f}R → lock≈{lock_r:.2f}R NET "
-                  f"SL=${floor_sl:,.1f} (fee/slip≈${fee_slip:.1f}, breathing={breathing:.2f}ATR)")
+        reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
+                  f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")
         logger.info(f"Trail: {reason}")
-        return LiquidityTrailResult(new_sl=floor_sl, anchor=None, reason=reason,
-                                    phase="PROFIT_FLOOR", r_multiple=r_multiple)
+        return LiquidityTrailResult(new_sl=candidate_sl, anchor=None, reason=reason,
+                                    phase="DELIVERY_LOCK", r_multiple=0.0)
 
     @staticmethod
     def _better_sl(pos_side: str, a: Optional[float], b: Optional[float]) -> Optional[float]:
@@ -932,7 +1067,7 @@ class LiquidityTrailEngine:
         fee_component = abs(commission_rt - entry_price) - 0.12 * atr
         gate_tag = f" | {gate_reason}" if gate_reason else ""
         reason = (
-            f"[BE_LOCK] R={r_multiple:.2f}R → BE=${be_price:,.1f} "
+            f"[BE_LOCK] analyticR={r_multiple:.2f} → BE=${be_price:,.1f} "
             f"(fees≈${max(0.0, fee_component):.2f} slip=${0.12*atr:.1f})"
         )
         if gate_tag:

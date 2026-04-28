@@ -414,33 +414,37 @@ QUANT_TRAIL_LIQ_POOL_PROX_ATR     = 2.20
 QUANT_TRAIL_LIQ_FLOOR_BUFFER_ATR   = 0.30
 
 # Institutional profit defense: not aggressive trailing.
-# Triggers only after meaningful delivery + large giveback + adverse evidence.
-PROFIT_DEFENSE_MIN_MFE_R       = 1.20
-PROFIT_DEFENSE_GIVEBACK_FRAC   = 0.65
-PROFIT_DEFENSE_COUNTER_CVD     = 0.30
-PROFIT_DEFENSE_BOS_MAX_AGE_MS  = 720_000
-PROFIT_DEFENSE_BE_CUSHION_ATR  = 0.05
-PROFIT_DEFENSE_MIN_INTERVAL_SEC = 60.0
+# Triggers only after meaningful volatility-adjusted delivery + large giveback
+# + adverse evidence. These thresholds are ATR/structure based, not fixed R.
+PROFIT_DEFENSE_MIN_MFE_ATR       = 1.25
+PROFIT_DEFENSE_GIVEBACK_FRAC     = 0.65
+PROFIT_DEFENSE_COUNTER_CVD       = 0.30
+PROFIT_DEFENSE_BOS_MAX_AGE_MS    = 720_000
+PROFIT_DEFENSE_BE_CUSHION_ATR    = 0.05
+PROFIT_DEFENSE_MIN_INTERVAL_SEC  = 60.0
 PROFIT_DEFENSE_POOL_GATE_MAX_AGE_SEC = 180.0
 
-# MFE-based net-profit floor. This is not tight trailing: it only upgrades
-# the exchange SL after the trade has delivered a measurable leg, and the
-# floor is expressed as NET R after fees/slippage.
-TRAIL_PROFIT_FLOOR_TIERS = (
-    (1.20, 0.32),
-    (1.75, 0.55),
-    (2.50, 0.85),
-    (3.50, 1.25),
-)
-TRAIL_PROFIT_FLOOR_MIN_BREATHING_ATR = 0.45
-TRAIL_PROFIT_FLOOR_MIN_IMPROVEMENT_ATR = 0.10
+# Liquidity-delivery trailing.
+# The original SL distance is used for sizing and risk control only. Once live,
+# stop movement is based on accepted market structure: delivered internal
+# liquidity, confirmed swings, true net BE, and ATR breathing room.
+TRAIL_PHASE0_MAX_DELIVERY_ATR        = 0.75
+TRAIL_STRUCTURE_MIN_DELIVERY_ATR     = 1.10
+TRAIL_AGGRESSIVE_MIN_DELIVERY_ATR    = 2.60
+TRAIL_DELIVERY_LOCK_MIN_MFE_ATR      = 1.05
+TRAIL_DELIVERY_POOL_MIN_SIG          = 3.0
+TRAIL_DELIVERY_POOL_BUFFER_ATR       = 0.18
+TRAIL_DELIVERY_SWING_BUFFER_ATR      = 0.16
+TRAIL_DELIVERY_SWING_LOOKBACK_BARS   = 36
+TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR = 0.42
+TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR = 0.10
 
 # Failed-delivery defense. At this point the move is no longer a small
 # pullback; it has given back most of the delivered leg. It may flatten at
 # market only if the estimated exit remains meaningfully net-profitable.
-PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_R = 1.20
+PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR = 1.25
 PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.65
-PROFIT_DEFENSE_MIN_NET_R_TO_EXIT = 0.15
+PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.15
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10

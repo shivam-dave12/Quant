@@ -6473,20 +6473,12 @@ class QuantStrategy:
 
     def _profit_defense_exit_if_needed(self, order_manager, price: float, atr: float,
                                        cvd_trend: float, now: float) -> bool:
-        """Institutional profit-defense, not aggressive trailing.
+        """Institutional failed-delivery defense.
 
-        Purpose: avoid giving back a delivered move into a reversal when the
-        normal structure trail is intentionally giving the trade breathing room.
-
-        This is deliberately harder to trigger than a normal trail:
-          • MFE must have reached a meaningful delivery threshold.
-          • Price must have given back a large fraction of that MFE.
-          • Current trade must still be net-positive versus exact BE.
-          • There must be adverse evidence (counter CVD or fresh counter BOS).
-
-        It exits at market only in the late deterioration state. It does NOT
-        chase every pullback with a tight stop, so routine institutional
-        re-accumulation pullbacks remain protected by the structural SL.
+        This is not R-based profit taking. It protects only when the market has
+        delivered a volatility-adjusted leg and then gives back most of that
+        delivery with adverse evidence. The original SL distance affects sizing;
+        it does not define how much profit must be protected.
         """
         pos = self._pos
         if not pos.is_active() or atr <= 1e-10:
@@ -6495,15 +6487,14 @@ class QuantStrategy:
                 getattr(config, 'PROFIT_DEFENSE_MIN_INTERVAL_SEC', 60.0)):
             return False
 
-        init_dist = max(float(getattr(pos, 'initial_sl_dist', 0.0) or 0.0), 1e-9)
         profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
         mfe = max(float(getattr(pos, 'peak_profit', 0.0) or 0.0), profit)
         if mfe <= 1e-9 or profit <= 0:
             return False
 
-        mfe_r = mfe / init_dist
-        min_mfe_r = float(getattr(config, 'PROFIT_DEFENSE_MIN_MFE_R', 1.20))
-        if mfe_r < min_mfe_r:
+        mfe_atr = mfe / max(atr, 1e-9)
+        min_mfe_atr = float(getattr(config, 'PROFIT_DEFENSE_MIN_MFE_ATR', 1.25))
+        if mfe_atr < min_mfe_atr:
             return False
 
         giveback = (mfe - max(profit, 0.0)) / max(mfe, 1e-9)
@@ -6512,8 +6503,6 @@ class QuantStrategy:
             return False
 
         true_be = _calc_be_price(pos.side, pos.entry_price, atr, pos=pos)
-        # Require the market to still be above/below true net BE by a small
-        # executable cushion; otherwise we let the exchange SL/reconcile handle it.
         be_cushion = max(QCfg.TICK_SIZE() * 2.0,
                          float(getattr(config, 'PROFIT_DEFENSE_BE_CUSHION_ATR', 0.05)) * atr)
         if pos.side == "long" and price <= true_be + be_cushion:
@@ -6552,7 +6541,7 @@ class QuantStrategy:
         )
 
         hard_failed_delivery = (
-            mfe_r >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_R', min_mfe_r))
+            mfe_atr >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR', min_mfe_atr))
             and giveback >= float(getattr(config, 'PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC', min_giveback))
         )
 
@@ -6560,17 +6549,17 @@ class QuantStrategy:
             if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 120.0:
                 pos.profit_defense_last_notice_at = now
                 logger.info(
-                    f"ProfitDefense HOLD: MFE={mfe_r:.2f}R giveback={giveback:.0%} "
+                    f"ProfitDefense HOLD: MFE={mfe_atr:.2f}ATR giveback={giveback:.0%} "
                     f"but no confirmed adverse structure/flow (cvd={cvd_trend:+.2f})")
             return False
 
-        net_r_est = (price - true_be) / init_dist if pos.side == "long" else (true_be - price) / init_dist
-        min_net_r = float(getattr(config, 'PROFIT_DEFENSE_MIN_NET_R_TO_EXIT', 0.15))
-        if net_r_est < min_net_r:
+        net_pts = (price - true_be) if pos.side == "long" else (true_be - price)
+        min_net_atr = float(getattr(config, 'PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT', 0.15))
+        if net_pts < min_net_atr * atr:
             if now - getattr(pos, 'profit_defense_last_notice_at', 0.0) >= 60.0:
                 pos.profit_defense_last_notice_at = now
                 logger.info(
-                    f"ProfitDefense HOLD: net≈{net_r_est:.2f}R < {min_net_r:.2f}R "
+                    f"ProfitDefense HOLD: net≈{net_pts/atr:.2f}ATR < {min_net_atr:.2f}ATR "
                     f"after fees; letting exchange SL/reconcile handle it")
             return False
         with self._lock:
@@ -6586,14 +6575,14 @@ class QuantStrategy:
         if hard_failed_delivery:
             reason_bits.append("failed-delivery giveback")
         reason = ("profit_defense: "
-                  f"MFE={mfe_r:.2f}R giveback={giveback:.0%} "
-                  f"net≈{net_r_est:.2f}R trueBE=${true_be:,.2f} "
+                  f"MFE={mfe_atr:.2f}ATR giveback={giveback:.0%} "
+                  f"net≈{net_pts/atr:.2f}ATR trueBE=${true_be:,.2f} "
                   f"({', '.join(reason_bits)})")
         logger.info("🛡️ PROFIT DEFENSE EXIT — %s", reason)
         try:
             send_telegram_message(
                 f"🛡️ <b>PROFIT DEFENSE EXIT</b>\n"
-                f"MFE: <b>{mfe_r:.2f}R</b> | Giveback: <b>{giveback:.0%}</b>\n"
+                f"MFE: <b>{mfe_atr:.2f}ATR</b> | Giveback: <b>{giveback:.0%}</b>\n"
                 f"True BE: <b>${true_be:,.2f}</b> | Mark: <b>${price:,.2f}</b>\n"
                 f"Evidence: {', '.join(reason_bits)}\n"
                 f"Action: market flatten to preserve delivered edge.")
