@@ -18,6 +18,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI palette  (terminal only)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +203,7 @@ def _format_heartbeat_industry(
     structure_4h: str = "",
     sweep_analysis: Optional[Dict] = None,
     htf_bias: str = "",
+    market_profile: Optional[Dict] = None,
 ) -> str:
     rows: List[str] = []
     side_color = C.BCYN
@@ -224,6 +230,15 @@ def _format_heartbeat_industry(
         f"AMD {amd_phase or '-'} / {amd_bias or '-'} | PD {pd_label} {dealing_range_pd:.0%} | "
         f"15m {structure_15m or '-'} | 4H {structure_4h or '-'} | HTF {htf_bias or '-'}"
     )
+    if market_profile:
+        try:
+            rows.append(
+                f"MI {market_profile.get('regime','?')}/{market_profile.get('volatility','?')}/"
+                f"{market_profile.get('structure','?')} | sel {float(market_profile.get('selectivity',1.0)):.2f} "
+                f"breathe {float(market_profile.get('breathing_mult',1.0)):.2f}"
+            )
+        except Exception:
+            pass
     rows.append("")
     rows.append(f"{_term_section('liquidity')} target {_target_summary(primary_target)}")
     rows.append(

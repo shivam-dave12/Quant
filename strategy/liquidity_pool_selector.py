@@ -56,6 +56,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 # ────────────────────────────────────────────────────────────────────────────
 # MTF probability dependency.
 #
@@ -623,6 +628,15 @@ def score_tp_pools(
         return []
 
     now_ts = now or time.time()
+    selector_profile = build_market_profile(
+        price=entry,
+        atr=atr,
+        liq_snapshot=snap,
+        ict=ict,
+        side=side,
+        session=session,
+    )
+    effective_min_rr = selector_profile.min_rr(float(min_rr))
     out: List[PoolScore] = []
     be_move = _breakeven_move(entry, atr)
 
@@ -656,7 +670,7 @@ def score_tp_pools(
 
             reward = abs(tp_price - entry)
             rr = reward / risk
-            if rr < float(min_rr):
+            if rr < effective_min_rr:
                 continue
 
             # ─── EV components ────────────────────────────────────────────
@@ -676,8 +690,8 @@ def score_tp_pools(
             )
 
             utility, utility_components = _target_utility(
-                raw_prob, rr, float(min_rr), dist_atr, reward, be_move)
-            reach_mult = _terminal_reach_multiplier(dist_atr, tf)
+                raw_prob, rr, effective_min_rr, dist_atr, reward, be_move)
+            reach_mult = _terminal_reach_multiplier(dist_atr, tf) * selector_profile.target_reach_penalty(dist_atr, tf)
             utility *= reach_mult
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach

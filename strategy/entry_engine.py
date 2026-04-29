@@ -46,6 +46,11 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
+try:
     from strategy.liquidity_map import (
         LiquidityMap, LiquidityMapSnapshot, PoolTarget, SweepResult,
         PoolStatus, PoolSide, TF_HIERARCHY,
@@ -144,20 +149,53 @@ except Exception:
     _PS_PHASE_OTE          = 240.0
     _PS_PHASE_MATURE       = 360.0
 
-# Post-Sweep evidence thresholds (lowered to allow entries)
-_PS_THRESHOLD_EARLY  = 45.0
-_PS_THRESHOLD_NORMAL = 35.0
-_PS_THRESHOLD_MATURE = 25.0
-_PS_GAP_MIN          = 8.0
-_PS_DISP_MULT        = 1.10
-_PS_MATURE_MULT      = 0.65
+# Post-Sweep evidence thresholds.
+# Institutional mode: scoring can surface context, but execution requires
+# hard acceptance gates below. Thresholds are deliberately selective; the bot
+# should miss weak noise rather than manufacture trades.
+_PS_THRESHOLD_EARLY  = 62.0
+_PS_THRESHOLD_NORMAL = 52.0
+_PS_THRESHOLD_MATURE = 45.0
+_PS_GAP_MIN          = 14.0
+_PS_DISP_MULT        = 1.15
+_PS_MATURE_MULT      = 0.80
 
 # Displacement requirements
-_PS_DISP_MIN_ATR    = 0.25   # lower displacement requirement
-_PS_DISP_STRONG_ATR = 0.8    # easier strong displacement
+_PS_DISP_MIN_ATR    = 0.55
+_PS_DISP_STRONG_ATR = 1.25
 _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
 _PS_NEUTRAL_TICK_DECAY = 0.98
+
+# Hard entry-quality gates loaded from config. These do not decide direction;
+# they decide whether a direction is EXECUTABLE by institutional standards.
+try:
+    import config as _entry_gate_cfg
+    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))
+    _ENTRY_STRONG_DISP_ATR   = float(getattr(_entry_gate_cfg, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
+    _ENTRY_REQUIRE_CISD_OR_OTE = bool(getattr(_entry_gate_cfg, "ENTRY_REQUIRE_CISD_OR_OTE", True))
+    _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = float(getattr(_entry_gate_cfg, "ENTRY_MAX_CHASE_ATR_WITHOUT_OTE", 1.15))
+    _ENTRY_REVERSAL_PD_LONG_MAX  = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_LONG_MAX", 0.62))
+    _ENTRY_REVERSAL_PD_SHORT_MIN = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38))
+    _ENTRY_CONT_MIN_ACCEPT_ATR = float(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
+    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = bool(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS", True))
+    _ENTRY_FLOW_HARD_OPPOSE = float(getattr(_entry_gate_cfg, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40))
+    _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
+    _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
+    _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
+except Exception:
+    _ENTRY_HARD_MIN_DISP_ATR = 0.75
+    _ENTRY_STRONG_DISP_ATR   = 1.25
+    _ENTRY_REQUIRE_CISD_OR_OTE = True
+    _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = 1.15
+    _ENTRY_REVERSAL_PD_LONG_MAX  = 0.62
+    _ENTRY_REVERSAL_PD_SHORT_MIN = 0.38
+    _ENTRY_CONT_MIN_ACCEPT_ATR = 0.55
+    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = True
+    _ENTRY_FLOW_HARD_OPPOSE = 0.40
+    _ENTRY_CVD_HARD_OPPOSE  = 0.30
+    _ENTRY_HTF_CONTRA_VETO = True
+    _ENTRY_GATE_LOG_SEC = 12.0
 
 
 # HTF TP escalation
@@ -367,6 +405,7 @@ class EntryEngine:
         self._last_entry_at  = 0.0
         self._last_sweep_analysis: Dict = {}
         self._last_liq_snapshot = None
+        self._last_market_profile = None
 
         # Flow EWMA
         self._flow_ewma             = 0.0
@@ -1192,11 +1231,36 @@ class EntryEngine:
             # Same one-tick window fix as above.
             return
 
+
+    def _market_profile(self, snap=None, flow=None, ict=None, price: float = 0.0,
+                        atr: float = 0.0, side: str = ""):
+        """Live adaptive profile used by every entry decision.
+
+        This keeps the entry engine from behaving as a fixed-threshold retail
+        rule-set. Thresholds are still bounded by config priors, but actual
+        acceptance depends on ATR state, liquidity density, HTF structure,
+        AMD phase, flow, spread/session context and pool quality.
+        """
+        try:
+            profile = build_market_profile(
+                price=price,
+                atr=atr,
+                snap=snap,
+                ict=ict,
+                flow=flow,
+                side=side,
+            )
+        except Exception:
+            profile = build_market_profile(price=price, atr=atr)
+        self._last_market_profile = profile
+        return profile
+
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep
         rev_dir = sweep.direction
         cont_dir = "short" if rev_dir == "long" else "long"
         elapsed = now - ps.entered_at
+        profile = self._market_profile(snap, flow, ict, price, atr, rev_dir)
 
         # Phase and thresholds
         if elapsed < _PS_PHASE_DISPLACEMENT:
@@ -1207,6 +1271,11 @@ class EntryEngine:
             phase, mult, base_thr = "OTE", 1.0, _PS_THRESHOLD_NORMAL
         else:
             phase, mult, base_thr = "MATURE", _PS_MATURE_MULT, _PS_THRESHOLD_MATURE
+
+        base_thr = profile.entry_score_threshold(base_thr)
+        gap_min = profile.evidence_gap(_PS_GAP_MIN)
+        disp_min_atr = profile.displacement_min(_PS_DISP_MIN_ATR)
+        disp_strong_atr = profile.strong_displacement(_PS_DISP_STRONG_ATR)
 
         rev_d = 0.0
         cont_d = 0.0
@@ -1292,9 +1361,9 @@ class EntryEngine:
                 cont_d += pts; cont_r.append(f"DIR_CONTINUE({hint_conf:.0%})")
 
         # Live displacement
-        if ps.max_displacement >= _PS_DISP_STRONG_ATR:
+        if ps.max_displacement >= disp_strong_atr:
             rev_d += 10.0; rev_r.append(f"DISP {ps.max_displacement:.1f}ATR")
-        elif ps.max_displacement >= _PS_DISP_MIN_ATR:
+        elif ps.max_displacement >= disp_min_atr:
             rev_d += 5.0
         elif ps.max_displacement < 0.2 and elapsed > 15.0:
             cont_d += 6.0; cont_r.append("NO DISP")
@@ -1417,6 +1486,7 @@ class EntryEngine:
             "cisd":             ps.cisd_detected,
             "displacement_atr": ps.max_displacement,
             "ote":              ps.ote_reached,
+            "market_profile":   profile.as_dict() if hasattr(profile, "as_dict") else {},
         }
 
         threshold = base_thr * mult
@@ -1424,12 +1494,18 @@ class EntryEngine:
             logger.info(
                 f"POST_SWEEP [{phase}] tick={ps.tick_count} "
                 f"rev={rev_total:.0f} cont={cont_total:.0f} "
-                f"(need {threshold:.0f}, gap>={_PS_GAP_MIN:.0f}) "
+                f"(need {threshold:.0f}, gap>={gap_min:.0f}) "
                 f"CISD={'✓' if ps.cisd_detected else '✗'} "
                 f"DISP={ps.max_displacement:.1f}ATR "
                 f"OTE={'✓' if ps.ote_reached else '✗'}")
 
-        if rev_total >= threshold and gap >= _PS_GAP_MIN:
+        if rev_total >= threshold and gap >= gap_min:
+            gate_ok, gate_reason = self._institutional_entry_quality_gate(
+                ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
+            if not gate_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"HARD_GATE_WAIT: {gate_reason}")
             conf = min(1.0, rev_total / 90.0)
             if ps.cisd_detected: conf = min(1.0, conf + 0.15)
             if ps.ote_reached: conf = min(1.0, conf + 0.10)
@@ -1442,7 +1518,13 @@ class EntryEngine:
                 reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] "
                        f"[{phase}] {' + '.join(rev_r[:5])}")
 
-        elif cont_total >= threshold * 0.9 and gap >= _PS_GAP_MIN:
+        elif cont_total >= threshold * 0.9 and gap >= gap_min:
+            gate_ok, gate_reason = self._institutional_entry_quality_gate(
+                ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
+            if not gate_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"HARD_GATE_WAIT: {gate_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
             logger.info(
                 f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}]")
@@ -1614,6 +1696,98 @@ class EntryEngine:
                 label, structural_sl, sl, risk / max(atr, 1e-10),
                 noise_floor / max(atr, 1e-10))
         return sl, "ok"
+
+
+    def _institutional_entry_quality_gate(
+        self, ps, action: str, side: str, snap, flow, ict,
+        price: float, atr: float, now: float, phase: str
+    ) -> tuple[bool, str]:
+        """Dynamic market-aware execution gate before signal construction.
+
+        The evidence model can identify a plausible narrative; this gate decides
+        whether that narrative is executable. It blocks retail-style conditions:
+        weak/zero displacement, chasing after the move, continuation without
+        failed-reclaim/acceptance, contra HTF without strong delivery, and flow
+        pressing against the trade. Thresholds are adaptive via MarketProfile.
+        """
+        profile = self._market_profile(snap, flow, ict, price, atr, side)
+        a = max(float(atr or 0.0), 1e-9)
+        sweep = getattr(ps, "sweep", None)
+        pool = getattr(sweep, "pool", None)
+        pool_price = float(getattr(pool, "price", price) or price)
+        dist_from_sweep_atr = abs(float(price) - pool_price) / a
+
+        min_disp = profile.displacement_min(_ENTRY_HARD_MIN_DISP_ATR)
+        strong_disp = profile.strong_displacement(_ENTRY_STRONG_DISP_ATR)
+        chase_limit = profile.chase_limit(_ENTRY_MAX_CHASE_ATR_WITHOUT_OTE)
+        opp_flow = profile.flow_opposition_threshold(_ENTRY_FLOW_HARD_OPPOSE)
+        opp_cvd = profile.flow_opposition_threshold(_ENTRY_CVD_HARD_OPPOSE)
+
+        disp = float(getattr(ps, "max_displacement", 0.0) or 0.0)
+        cisd = bool(getattr(ps, "cisd_detected", False))
+        ote = bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False))
+        action_l = str(action or "").lower()
+        side_l = str(side or "").lower()
+
+        # 1) No executable auction without accepted delivery or structural proof.
+        if disp < min_disp and not (cisd or ote):
+            return False, (
+                f"dynamic_delivery_missing: DISP={disp:.2f}ATR < "
+                f"{min_disp:.2f}ATR and no CISD/OTE | {profile.compact()}"
+            )
+
+        # 2) Chasing after displacement is only allowed if structure confirms.
+        if dist_from_sweep_atr > chase_limit and not (cisd or ote):
+            return False, (
+                f"chase_block: entry {dist_from_sweep_atr:.2f}ATR from sweep "
+                f"> dynamic limit {chase_limit:.2f}ATR without CISD/OTE | {profile.compact()}"
+            )
+
+        # 3) Flow/CVD hard opposition.
+        flow_dir = str(getattr(flow, "direction", "") or "").lower()
+        flow_conv = abs(float(getattr(flow, "conviction", 0.0) or 0.0))
+        cvd = float(getattr(flow, "cvd_trend", 0.0) or 0.0)
+        if flow_dir and flow_dir != side_l and flow_conv >= opp_flow:
+            return False, (
+                f"flow_hard_contra: {flow_dir} {flow_conv:.2f} >= "
+                f"{opp_flow:.2f} against {side_l} | {profile.compact()}"
+            )
+        if side_l == "long" and cvd <= -opp_cvd:
+            return False, f"cvd_hard_contra: {cvd:.2f} <= -{opp_cvd:.2f} | {profile.compact()}"
+        if side_l == "short" and cvd >= opp_cvd:
+            return False, f"cvd_hard_contra: {cvd:.2f} >= {opp_cvd:.2f} | {profile.compact()}"
+
+        # 4) Continuation must prove acceptance/failed reclaim; no plain momentum continuation.
+        if action_l == "continue":
+            accepted = disp >= profile.displacement_min(_ENTRY_CONT_MIN_ACCEPT_ATR)
+            if not (accepted and (cisd or disp >= strong_disp or ote)):
+                return False, (
+                    f"continuation_acceptance_missing: DISP={disp:.2f}ATR "
+                    f"need acceptance/CISD/retest strong={strong_disp:.2f} | {profile.compact()}"
+                )
+
+        # 5) Reversal in wrong premium/discount is allowed only with strong proof.
+        pd = float(getattr(ict, "dealing_range_pd", 0.5) or 0.5)
+        dr_long_max, dr_short_min = profile.dealing_range_bounds(
+            _ENTRY_REVERSAL_PD_LONG_MAX, _ENTRY_REVERSAL_PD_SHORT_MIN)
+        if action_l == "reverse" and disp < strong_disp:
+            if side_l == "long" and pd > dr_long_max and not (cisd and ote):
+                return False, f"pd_contra_long: PD={pd:.2f}>{dr_long_max:.2f} without strong proof | {profile.compact()}"
+            if side_l == "short" and pd < dr_short_min and not (cisd and ote):
+                return False, f"pd_contra_short: PD={pd:.2f}<{dr_short_min:.2f} without strong proof | {profile.compact()}"
+
+        # 6) HTF contra requires stronger delivery; avoids retail fade trades.
+        s15 = str(getattr(ict, "structure_15m", "") or "").lower()
+        s4h = str(getattr(ict, "structure_4h", "") or "").lower()
+        htf_bull = ("bull" in s15) + ("bull" in s4h)
+        htf_bear = ("bear" in s15) + ("bear" in s4h)
+        if disp < strong_disp:
+            if side_l == "long" and htf_bear >= 2:
+                return False, f"htf_contra_long: 15m/4h bearish and DISP<{strong_disp:.2f}ATR | {profile.compact()}"
+            if side_l == "short" and htf_bull >= 2:
+                return False, f"htf_contra_short: 15m/4h bullish and DISP<{strong_disp:.2f}ATR | {profile.compact()}"
+
+        return True, f"dynamic_entry_gate_pass | {profile.compact()}"
 
     def _evaluate_pending_refined_entry(
         self, snap, flow, ict, price: float, atr: float, now: float

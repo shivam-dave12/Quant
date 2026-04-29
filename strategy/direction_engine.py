@@ -124,6 +124,11 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
+try:
     import config as _de_cfg
 except Exception:  # pragma: no cover - config import can fail in isolated tests
     _de_cfg = None
@@ -497,6 +502,13 @@ class DirectionEngine:
             return self._null_prediction(now_ms, reason="ict_not_initialized")
 
         a = max(atr, 1e-9)
+        profile = build_market_profile(
+            price=price,
+            atr=atr,
+            liq_snapshot=liq_snapshot,
+            ict=ict_engine,
+            flow=type("_Flow", (), {"conviction": float(tick_flow or 0.0) + float(cvd_trend or 0.0)})(),
+        )
         factors = HuntFactors()
 
         # ── Fetch Dealing Range ───────────────────────────────────────────────
@@ -928,12 +940,13 @@ class DirectionEngine:
         # This eliminates the BSL_HUNT ↔ NEUTRAL oscillation observed when the
         # composite score hovers at ~0.168–0.175, which was straddling the old
         # single 0.18 threshold every few seconds.
-        if confidence >= _HUNT_ON_THRESHOLD:
+        hunt_on_threshold, hunt_off_threshold = profile.hunt_thresholds(_HUNT_ON_THRESHOLD, _HUNT_OFF_THRESHOLD)
+        if confidence >= hunt_on_threshold:
             # New or updated committed direction.
             self._committed_direction  = "BSL" if score > 0 else "SSL"
             self._committed_confidence = confidence
             self._committed_score      = score
-        elif confidence < _HUNT_OFF_THRESHOLD:
+        elif confidence < hunt_off_threshold:
             # Score fell below the OFF threshold — genuine NEUTRAL.
             if self._committed_direction is not None:
                 logger.debug(
@@ -967,7 +980,7 @@ class DirectionEngine:
             # NEUTRAL — log actual composite so operators can see how far below ON we are.
             logger.debug(
                 f"DirectionEngine: NEUTRAL | "
-                f"composite={abs(self._committed_score) if self._committed_score else confidence:.3f} "
+                f"composite={abs(self._committed_score) if self._committed_score else confidence:.3f} dyn_on={hunt_on_threshold:.3f} "
                 f"(ON={_HUNT_ON_THRESHOLD} OFF={_HUNT_OFF_THRESHOLD}) "
                 f"raw={score:+.3f} | "
                 f"AMD={factors.amd:+.2f} "

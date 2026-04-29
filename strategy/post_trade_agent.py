@@ -92,6 +92,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -1202,6 +1207,11 @@ class PostTradeAgent:
         raw_composite = float(t.get("composite", 0.0) or 0.0)
         # IC requires signed composite: same sign as trade direction
         signed_composite = raw_composite if side == "long" else -raw_composite
+        profile = build_market_profile(
+            price=float(t.get("exit", t.get("entry", 0.0)) or 0.0),
+            atr=atr,
+            side=side,
+        )
 
         return TradeRecord(
             ts           = float(t.get("ts",          time.time())),
@@ -1216,7 +1226,7 @@ class PostTradeAgent:
             is_win       = bool(t.get("is_win",       False)),
             hold_min     = float(t.get("hold_min",    0.0)),
             ict_tier     = str(t.get("ict_tier",      "") or ""),
-            regime       = str(t.get("regime",        "") or ""),
+            regime       = str(t.get("regime",        "") or profile.regime),
             amd_phase    = str(t.get("amd_phase",     "") or ""),
             amd_bias     = str(t.get("amd_bias",      "") or ""),
             amd_conf     = float(t.get("amd_conf",    0.0)),

@@ -147,6 +147,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -423,6 +428,7 @@ class LiquidityMapSnapshot:
     nearest_bsl_atr:  float
     nearest_ssl_atr:  float
     timestamp:        float
+    market_profile:   Dict = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1135,6 +1141,7 @@ class LiquidityMap:
         }
         self._recent_sweeps: List[SweepResult]          = []
         self._last_snapshot: Optional[LiquidityMapSnapshot] = None
+        self._market_profile = None
 
     # ─────────────────────────────────────────────────────────────────────
     # reset_snapshot() — FIX-B4: invalidate stale post-trade snapshot
@@ -1184,6 +1191,7 @@ class LiquidityMap:
           for the following tick's predict_hunt() — fully accurate from tick N+2.
         """
         self._last_snapshot = None
+        self._market_profile = None
         logger.debug("LiquidityMap: snapshot reset (post-trade stale-pool guard)")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1220,6 +1228,12 @@ class LiquidityMap:
         """
         if atr < 1e-10:
             return
+        self._market_profile = build_market_profile(
+            price=price,
+            atr=atr,
+            candles_by_tf=candles_by_tf,
+            ict=ict_engine,
+        )
 
         # Step 1: Update pool registries.
         # Dynamically add any extra timeframe supplied by the data manager
@@ -1296,6 +1310,7 @@ class LiquidityMap:
             swept_bsl_levels=[], swept_ssl_levels=[],
             nearest_bsl_atr=999.0, nearest_ssl_atr=999.0,
             timestamp=now,
+            market_profile=(self._market_profile.as_dict() if self._market_profile is not None and hasattr(self._market_profile, "as_dict") else {}),
         )
         if atr < 1e-10:
             return empty
@@ -1378,6 +1393,7 @@ class LiquidityMap:
             nearest_bsl_atr  = nearest_bsl,
             nearest_ssl_atr  = nearest_ssl,
             timestamp        = now,
+            market_profile  = (self._market_profile.as_dict() if self._market_profile is not None and hasattr(self._market_profile, "as_dict") else {}),
         )
         self._last_snapshot = snap
         return snap

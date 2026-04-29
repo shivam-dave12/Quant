@@ -52,6 +52,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORT CONFIG — all thresholds centralized
@@ -75,16 +80,16 @@ except ImportError:
     #               where session score 0.55-0.65 caps the ceiling)
     # POOL_MIN_TF_RANK 3 → 2: allow 5m pools that have HTF confluence (effective
     #               rank promoted to 3+ via htf_count); pure 1m pools still blocked
-    _CFG_MIN_SCORE = 0.65
+    _CFG_MIN_SCORE = 0.74
     _CFG_MIN_TF_RANK = 2
-    _CFG_DISP_BODY_ATR = 0.70
+    _CFG_DISP_BODY_ATR = 0.85
     _CFG_OTE_LOW = 0.500
     _CFG_OTE_HIGH = 0.786
     _CFG_MIN_RR = 2.0
     _CFG_MAX_SESS_LOSSES = 2
     _CFG_INTERVAL_SEC = 300
-    _CFG_MAX_ENTRIES = 5
-    _CFG_PRODUCT_MIN_CORE = 0.45
+    _CFG_MAX_ENTRIES = 3
+    _CFG_PRODUCT_MIN_CORE = 0.68
 
 # ── Internal constants ────────────────────────────────────────────────────────
 
@@ -100,8 +105,8 @@ MAX_ENTRIES_PER_SESSION = _CFG_MAX_ENTRIES
 PRODUCT_MIN_CORE = _CFG_PRODUCT_MIN_CORE
 
 # ── Dealing range scoring zones ──────────────────────────────────────────────
-DR_LONG_MAX_PD = 0.65    # Longs preferred in discount but allowed wider
-DR_SHORT_MIN_PD = 0.35   # Shorts preferred in premium but allowed wider
+DR_LONG_MAX_PD = 0.62    # Longs preferred in discount; premium longs need strong structure
+DR_SHORT_MIN_PD = 0.38   # Shorts preferred in premium; discount shorts need strong structure
 
 # ── Timeframe rank lookup ─────────────────────────────────────────────────────
 _TF_RANK: Dict[str, int] = {
@@ -121,10 +126,10 @@ _SESSION_SCORE: Dict[str, float] = {
     "NY":        1.00,
     "NEW_YORK":  1.00,
     "LONDON_NY": 0.95,
-    "WEEKEND":   0.80,   # crypto is 24/7 — weekends are valid
-    "OFF_HOURS": 0.75,   # off-hours still have liquidity hunts
-    "ASIA":      0.60,   # Asia session — lower but NOT blocked
-    "":          0.60,   # unknown session — don't penalize heavily
+    "WEEKEND":   0.65,   # lower-liquidity regime: valid only with stronger proof
+    "OFF_HOURS": 0.60,   # off-hours still valid but require stronger proof
+    "ASIA":      0.50,   # Asia requires cleaner HTF/context alignment
+    "":          0.45,   # unknown session is not institutional-quality by default
 }
 
 # ── AMD phase scores ──────────────────────────────────────────────────────────
@@ -238,8 +243,25 @@ class ConvictionFilter:
         """
         factors  = ConvictionFactors()
         rejects: List[str] = []
+        profile = build_market_profile(
+            price=price,
+            atr=atr,
+            liq_snapshot=liq_snapshot,
+            ict=ict_engine,
+            side=trade_side,
+            session=session,
+        )
+        required_score = profile.conviction_score_floor(REQUIRED_SCORE)
+        min_rr = profile.min_rr(MIN_RR)
+        pool_min_tf_rank = profile.pool_tf_rank_floor(POOL_MIN_TF_RANK)
+        disp_body_atr = profile.displacement_min(DISPLACEMENT_MIN_BODY_ATR)
+        product_min_core = profile.product_core_floor(PRODUCT_MIN_CORE)
+        dr_long_max_pd, dr_short_min_pd = profile.dealing_range_bounds(
+            DR_LONG_MAX_PD, DR_SHORT_MIN_PD)
+
         hard_rejects: List[str] = []
         allows:  List[str] = []
+        allows.append(f"MARKET_PROFILE={profile.compact()}")
 
         # ══════════════════════════════════════════════════════════════════
         # SESSION TIMING GATE — checked FIRST so that blocked_by_timing is
@@ -298,10 +320,10 @@ class ConvictionFilter:
         #   rank 3 (15m)→ _rank_bonus = 0.75   (good)
         #   rank 4 (1h+)→ _rank_bonus = 1.00   (excellent)
         # Low-rank pools are hard vetoed, while still scored for attribution.
-        if effective_rank < POOL_MIN_TF_RANK:
+        if effective_rank < pool_min_tf_rank:
             hard_rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) "
-                f"rank={effective_rank} < required {POOL_MIN_TF_RANK}")
+                f"rank={effective_rank} < required {pool_min_tf_rank}")
             rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
                 f"— hard institutional veto; scored for attribution")
@@ -335,22 +357,22 @@ class ConvictionFilter:
         # Rationale: attribution still records low-R:R quality, but live
         # execution requires both structural confirmation and minimum expectancy.
         #
-        # R:R score modifier applied to pool_sig_score (aligned with MIN_RR=1.2):
+        # R:R score modifier applied to pool_sig_score (aligned with min_rr=1.2):
         #   R:R >= 2.5  → +0.10 bonus
-        #   R:R >= MIN_RR → no modifier
-        #   R:R 0.8-MIN_RR → -0.10 penalty
+        #   R:R >= min_rr → no modifier
+        #   R:R 0.8-min_rr → -0.10 penalty
         #   R:R < 0.8   → -0.20 penalty
         rr = self._compute_rr(trade_side, entry_price, sl_price, tp_price)
         _rr_mod = (0.10 if rr >= 2.5 else
-                   0.00 if rr >= MIN_RR else
+                   0.00 if rr >= min_rr else
                   -0.10 if rr >= 0.8 else
                   -0.20)
         if rr < 0.8:
-            hard_rejects.append(f"RR_HARD: {rr:.2f} < {MIN_RR:.1f}")
+            hard_rejects.append(f"RR_HARD: {rr:.2f} < {min_rr:.1f}")
             rejects.append(f"RR_VERY_LOW: {rr:.2f} — score penalty applied")
-        elif rr < MIN_RR:
-            hard_rejects.append(f"RR_HARD: {rr:.2f} < {MIN_RR:.1f}")
-            rejects.append(f"RR_LOW: {rr:.2f} < {MIN_RR:.1f} — minor score penalty")
+        elif rr < min_rr:
+            hard_rejects.append(f"RR_HARD: {rr:.2f} < {min_rr:.1f}")
+            rejects.append(f"RR_LOW: {rr:.2f} < {min_rr:.1f} — minor score penalty")
 
 # ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
         # All sessions are scored, none are hard-blocked.
@@ -461,6 +483,40 @@ class ConvictionFilter:
         else:
             allows.append(f"OTE={factors.ote_score:.2f} DR={_pd_label}({dr_pd:.2f})")
 
+        # ── Institutional hard product gates ──────────────────────────────
+        # R:R and pool quality are not enough. Live execution needs proof that
+        # auction delivery changed: real displacement plus either CISD, OTE
+        # retest, or exceptional displacement. This removes retail entries that
+        # chase the first post-sweep push with DISP≈0 and no accepted structure.
+        _entry_disp_min = disp_body_atr
+        _entry_strong_disp = max(disp_body_atr * 1.45, 1.20)
+        if _requires_measured_displacement and measured_displacement_atr < _entry_disp_min:
+            hard_rejects.append(
+                f"DISPLACEMENT_HARD: {measured_displacement_atr:.2f}ATR < {_entry_disp_min:.2f}ATR")
+        if _requires_measured_displacement:
+            _has_delivery_proof = (
+                factors.cisd_score >= 0.60 or
+                factors.ote_score >= 0.60 or
+                measured_displacement_atr >= _entry_strong_disp
+            )
+            if not _has_delivery_proof:
+                hard_rejects.append(
+                    "DELIVERY_PROOF_MISSING: need CISD, OTE/retest, or strong displacement")
+
+        if "continuation" in entry_type_l:
+            if factors.cisd_score < 0.60 and measured_displacement_atr < _entry_strong_disp:
+                hard_rejects.append(
+                    "CONTINUATION_PROOF_MISSING: continuation needs BOS/CISD or strong acceptance")
+
+        if dr_data_available:
+            if trade_side == "long" and dr_pd > dr_long_max_pd and measured_displacement_atr < _entry_strong_disp:
+                hard_rejects.append(f"DR_HARD: long at premium PD={dr_pd:.2f}")
+            if trade_side == "short" and dr_pd < dr_short_min_pd and measured_displacement_atr < _entry_strong_disp:
+                hard_rejects.append(f"DR_HARD: short at discount PD={dr_pd:.2f}")
+
+        if factors.amd_score < 0.18 and measured_displacement_atr < _entry_strong_disp:
+            hard_rejects.append(f"AMD_HARD: contra/unclear AMD score={factors.amd_score:.2f}")
+
         # ── Factor 5: Session quality (weight 0.10) ───────────────────────
         factors.session_score = _SESSION_SCORE.get(sess_key, 0.40)
         allows.append(f"SESSION={sess_key}({factors.session_score:.2f})")
@@ -482,22 +538,22 @@ class ConvictionFilter:
         score = round(score, 4)
 
         # ── Score gate ─────────────────────────────────────────────────────
-        score_passed = score >= REQUIRED_SCORE
+        score_passed = score >= required_score
         core_product = min(
             factors.pool_sig_score,
             factors.displacement_score,
             factors.cisd_score,
         )
-        product_passed = core_product >= PRODUCT_MIN_CORE
+        product_passed = core_product >= product_min_core
         if not product_passed:
             rejects.append(
-                f"PRODUCT_CORE: {core_product:.2f} < {PRODUCT_MIN_CORE:.2f} "
+                f"PRODUCT_CORE: {core_product:.2f} < {product_min_core:.2f} "
                 f"[pool={factors.pool_sig_score:.2f} "
                 f"disp={factors.displacement_score:.2f} "
                 f"cisd={factors.cisd_score:.2f}]")
         if not score_passed:
             rejects.append(
-                f"SCORE: {score:.3f} < {REQUIRED_SCORE} "
+                f"SCORE: {score:.3f} < {required_score} "
                 f"[pool={factors.pool_sig_score:.2f} "
                 f"disp={factors.displacement_score:.2f} "
                 f"cisd={factors.cisd_score:.2f} "

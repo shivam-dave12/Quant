@@ -116,6 +116,11 @@ from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunables (sourced from config with safe fallbacks)
@@ -358,6 +363,13 @@ class PostExitGate:
 
         le = self._last
         age = max(0.0, ctx.now - le.exit_time)
+        ctx_profile = build_market_profile(
+            price=ctx.price,
+            atr=ctx.atr,
+            side=ctx.side,
+            flow=type("_Flow", (), {"conviction": ctx.flow_conviction})(),
+        )
+        setattr(ctx, "_market_profile", ctx_profile)
 
         for lens in (
             self._lens_base_cooldown,
@@ -378,7 +390,8 @@ class PostExitGate:
 
     # ─── lens 1: base cooldown ────────────────────────────────────────────
     def _lens_base_cooldown(self, ctx: GateContext, le: LastExit, age: float) -> GateDecision:
-        base = _BASE_SEC()
+        profile = getattr(ctx, "_market_profile", None) or build_market_profile(price=ctx.price, atr=ctx.atr, side=ctx.side)
+        base = _BASE_SEC() * profile.post_exit_cooldown_mult()
         if age >= base:
             return GateDecision(True, 0.0, "", "")
         retry = le.exit_time + base

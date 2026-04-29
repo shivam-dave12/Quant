@@ -60,6 +60,11 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 _OTE_FIB_LOW = 0.50
 _OTE_FIB_HIGH = 0.786
 
@@ -604,6 +609,7 @@ class ICTEngine:
         }
 
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
+        self._market_profile = None
 
         # â”€â”€ Advanced structural state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # DealingRange: range between the most significant SSL and BSL
@@ -706,6 +712,7 @@ class ICTEngine:
         for tf in self._tf:
             self._tf[tf] = TFStructure(timeframe=tf)
         self._amd = AMDState(phase="ACCUMULATION", bias="neutral", confidence=0.3)
+        self._market_profile = None
         self._initialized = False
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -826,6 +833,13 @@ class ICTEngine:
                 self._last_atr = 0.0
         except Exception:
             self._last_atr = 0.0
+
+        self._market_profile = build_market_profile(
+            price=price,
+            atr=float(getattr(self, "_last_atr", 0.0) or 0.0),
+            candles_by_tf={"1m": candles_1m, "5m": candles_5m, "15m": candles_15m, "1h": candles_1h, "4h": candles_4h, "1d": candles_1d},
+            ict=self,
+        )
 
         # â”€â”€ v8.0: PRUNE EXPIRED/MITIGATED entries BEFORE detection â”€â”€â”€â”€â”€
         # ROOT CAUSE OF OB/FVG COUNT FLUCTUATION:

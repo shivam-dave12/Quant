@@ -42,6 +42,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 # -- v9.0: Liquidity-First Entry Engine ------------------------------------
 try:
     from strategy.liquidity_map import LiquidityMap
@@ -2883,7 +2888,56 @@ class QuantStrategy:
         return ""
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
-        """No standalone momentum entries remain; sweep entries are vetted elsewhere."""
+        """Final cheap veto before expensive gates.
+
+        Entry must be a post-sweep institutional event, not a first-push chase.
+        This catches stale or weak signals that slipped through a permissive
+        evidence score before ConvictionFilter runs.
+        """
+        try:
+            side = str(getattr(signal, "side", "") or "").lower()
+            etype = self._signal_entry_type_value(signal).upper()
+            sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+            disp = float(sa.get("displacement_atr", 0.0) or 0.0)
+            cisd = bool(sa.get("cisd", False))
+            ote = bool(sa.get("ote", False))
+            if side not in ("long", "short"):
+                return "invalid side"
+            fs = getattr(self, "_last_flow_state", None)
+            profile = build_market_profile(
+                price=price,
+                atr=atr,
+                ict=ict_ctx,
+                flow=fs,
+                side=side,
+            )
+            min_disp = profile.displacement_min(float(getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
+            strong_disp = profile.strong_displacement(float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25)))
+            if disp < min_disp:
+                return f"accepted displacement {disp:.2f}ATR < {min_disp:.2f}ATR"
+            if not (cisd or ote or disp >= strong_disp):
+                return "missing CISD/OTE/strong accepted displacement"
+
+            sweep = getattr(signal, "sweep_result", None)
+            pool = getattr(sweep, "pool", None)
+            pool_px = float(getattr(pool, "price", 0.0) or 0.0)
+            if "CONTINUATION" in etype and pool_px > 0 and atr > 0:
+                acc = ((float(price) - pool_px) / atr) if side == "long" else ((pool_px - float(price)) / atr)
+                req = float(getattr(config, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
+                if acc < req:
+                    return f"continuation acceptance {acc:.2f}ATR < {req:.2f}ATR"
+
+            if fs is not None:
+                tick = float(getattr(fs, "tick_flow", 0.0) or 0.0)
+                cvd = float(getattr(fs, "cvd_trend", 0.0) or 0.0)
+                ft = profile.flow_opposition_threshold(float(getattr(config, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40)))
+                ct = profile.flow_opposition_threshold(float(getattr(config, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30)))
+                if side == "long" and tick < -ft and cvd < -ct and disp < strong_disp:
+                    return f"flow/cvd oppose long tick={tick:+.2f} cvd={cvd:+.2f}"
+                if side == "short" and tick > ft and cvd > ct and disp < strong_disp:
+                    return f"flow/cvd oppose short tick={tick:+.2f} cvd={cvd:+.2f}"
+        except Exception as e:
+            logger.debug(f"institutional_signal_veto error: {e}")
         return ""
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
@@ -3101,6 +3155,20 @@ class QuantStrategy:
         else:
             event_q = self._bounded(0.35 + 0.25 * conviction + 0.20 * target_realism)
 
+        try:
+            _sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+            _disp_atr = float(_sa.get("displacement_atr", 0.0) or 0.0)
+            _cisd_ok = bool(_sa.get("cisd", False))
+            _ote_ok = bool(_sa.get("ote", False))
+            _min_disp = float(getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))
+            _strong_disp = float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
+            if is_sweep and _disp_atr < _min_disp:
+                rejects.append(f"institutional displacement {_disp_atr:.2f}ATR < {_min_disp:.2f}ATR")
+            if is_sweep and not (_cisd_ok or _ote_ok or _disp_atr >= _strong_disp):
+                rejects.append("no CISD/OTE/strong displacement acceptance")
+        except Exception as _idm_e:
+            logger.debug(f"institutional matrix displacement check error: {_idm_e}")
+
         side_sign = 1.0 if side == "long" else -1.0
         tf = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
         cvd = float(getattr(flow_state, "cvd_trend", 0.0) or 0.0)
@@ -3175,9 +3243,9 @@ class QuantStrategy:
             score += min((rr - 3.0) * 0.025, 0.10)
         score = self._bounded(score)
 
-        threshold = 0.57 if is_sweep else 0.66
-        if rr >= 3.0 and target_realism >= 0.72:
-            threshold -= 0.04
+        threshold = 0.70 if is_sweep else 0.76
+        if rr >= 3.0 and target_realism >= 0.82:
+            threshold -= 0.02
         allowed = (not rejects) and score >= threshold
         if not allowed and not rejects:
             rejects.append(f"synergy score {score:.2f} < {threshold:.2f}")
@@ -4055,6 +4123,50 @@ class QuantStrategy:
                 f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 Ã¢â‚¬â€ "
                 f"conviction_filter applies R:R penalty to pool_sig_score")
 
+        # ── Hard institutional coherence vetoes ───────────────────────────
+        rejects = []
+        try:
+            _sa = getattr(self._entry_engine, '_last_sweep_analysis', None) or {}
+            _disp = float(_sa.get('displacement_atr', 0.0) or 0.0)
+            _cisd = bool(_sa.get('cisd', False))
+            _ote  = bool(_sa.get('ote', False))
+            _min_disp = float(getattr(config, 'ENTRY_HARD_MIN_DISPLACEMENT_ATR', 0.75))
+            _strong_disp = float(getattr(config, 'ENTRY_STRONG_DISPLACEMENT_ATR', 1.25))
+            if _disp < _min_disp:
+                rejects.append(f"displacement {_disp:.2f}ATR < {_min_disp:.2f}ATR")
+            if not (_cisd or _ote or _disp >= _strong_disp):
+                rejects.append("no CISD/OTE/strong accepted displacement")
+
+            _pd = max(0.0, min(1.0, float(getattr(ict_ctx, 'dealing_range_pd', 0.5) or 0.5)))
+            if signal.side == 'long' and _pd > float(getattr(config, 'ENTRY_REVERSAL_PD_LONG_MAX', 0.62)) and _disp < _strong_disp:
+                rejects.append(f"long from premium PD={_pd:.2f}")
+            if signal.side == 'short' and _pd < float(getattr(config, 'ENTRY_REVERSAL_PD_SHORT_MIN', 0.38)) and _disp < _strong_disp:
+                rejects.append(f"short from discount PD={_pd:.2f}")
+
+            _tick = float(getattr(flow_state, 'tick_flow', 0.0) or 0.0)
+            _cvd  = float(getattr(flow_state, 'cvd_trend', 0.0) or 0.0)
+            _ft = float(getattr(config, 'ENTRY_FLOW_HARD_OPPOSE_THRESHOLD', 0.40))
+            _ct = float(getattr(config, 'ENTRY_CVD_HARD_OPPOSE_THRESHOLD', 0.30))
+            if signal.side == 'long' and _tick < -_ft and _cvd < -_ct and _disp < _strong_disp:
+                rejects.append(f"tick/CVD oppose long {_tick:+.2f}/{_cvd:+.2f}")
+            if signal.side == 'short' and _tick > _ft and _cvd > _ct and _disp < _strong_disp:
+                rejects.append(f"tick/CVD oppose short {_tick:+.2f}/{_cvd:+.2f}")
+
+            if 'CONTINUATION' in str(getattr(signal, 'entry_type', '')).upper():
+                _sweep = getattr(signal, 'sweep_result', None)
+                _pool = getattr(_sweep, 'pool', None)
+                _px = float(getattr(_pool, 'price', 0.0) or 0.0)
+                if _px > 0 and atr > 0:
+                    _acc = ((price - _px) / atr) if signal.side == 'long' else ((_px - price) / atr)
+                    _req = float(getattr(config, 'ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR', 0.55))
+                    if _acc < _req:
+                        rejects.append(f"continuation acceptance {_acc:.2f}ATR < {_req:.2f}ATR")
+        except Exception as _uge:
+            logger.debug(f"UNIFIED_GATE hard veto error: {_uge}")
+
+        if rejects:
+            return False, " | ".join(rejects[:4])
+
         # Ã¢â€â‚¬Ã¢â€â‚¬ Log all advisories at DEBUG (not INFO Ã¢â‚¬â€ avoids log spam) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if advisories:
             logger.debug(
@@ -4868,6 +4980,20 @@ class QuantStrategy:
                 and hasattr(self._entry_engine, "invalidate_sweep_locks")):
             self._entry_engine.invalidate_sweep_locks("regime_change")
         self._entry_engine_regime_key = _regime_key
+        self._last_market_profile = build_market_profile(
+            price=price,
+            atr=atr,
+            candles_by_tf=candles_by_tf,
+            liq_snapshot=liq_snapshot,
+            ict=ict_ctx,
+            flow=flow_state,
+            side="",
+            session=str(getattr(self._ict, "_session", "") or ""),
+        )
+        try:
+            setattr(ict_ctx, "market_profile", self._last_market_profile.as_dict())
+        except Exception:
+            pass
 
         self._entry_engine.update(
             liq_snapshot=liq_snapshot,
@@ -4879,6 +5005,7 @@ class QuantStrategy:
         )
 
         # Step 8: Check for signal and execute
+        self._last_flow_state = flow_state
         signal = self._entry_engine.get_signal()
         if signal is not None:
             inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)
@@ -4942,8 +5069,15 @@ class QuantStrategy:
                 f"target={_inst_decision.target_realism:.2f} "
                 f"size_mult={_inst_decision.size_mult:.2f}")
 
-            self._unified_entry_gate(
+            _ug_ok, _ug_reason = self._unified_entry_gate(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
+            if not _ug_ok:
+                logger.info(
+                    f"Institutional unified gate blocked {signal.side.upper()} "
+                    f"{signal.entry_type.value}: {_ug_reason}")
+                self._suppress_rejected_entry_signal(
+                    signal, _ug_reason or "unified institutional gate", cooldown_sec=90.0)
+                return
 
             logger.info(
                 f"ENTRY SIGNAL CANDIDATE (pre-conviction): {signal.entry_type.value} {signal.side.upper()} "

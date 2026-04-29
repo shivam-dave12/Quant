@@ -65,6 +65,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS — calibrated to BTC perpetual intraday micro-structure
@@ -203,6 +208,13 @@ class MTFPoolProbability:
             return self._neutral("atr=0")
 
         a = max(atr, 1e-9)
+        profile = build_market_profile(
+            price=price,
+            atr=atr,
+            liq_snapshot=liq_snapshot,
+            ict=ict_engine,
+            session=session,
+        )
 
         # Detect active session for multipliers
         sess_key = self._detect_session(session, ict_engine)
@@ -214,11 +226,11 @@ class MTFPoolProbability:
         # ── Source 1: LiquidityMap snapshot (primary — richest data) ─────────
         if liq_snapshot is not None:
             for pt in getattr(liq_snapshot, 'bsl_pools', []):
-                pp = self._score_pool(pt.pool, price, a, now, "BSL", pt)
+                pp = self._score_pool(pt.pool, price, a, now, "BSL", pt, profile)
                 if pp is not None:
                     bsl_candidates.append(pp)
             for pt in getattr(liq_snapshot, 'ssl_pools', []):
-                pp = self._score_pool(pt.pool, price, a, now, "SSL", pt)
+                pp = self._score_pool(pt.pool, price, a, now, "SSL", pt, profile)
                 if pp is not None:
                     ssl_candidates.append(pp)
 
@@ -298,6 +310,7 @@ class MTFPoolProbability:
         now:    float,
         side:   str,
         pt      = None,  # PoolTarget (has adjusted_sig())
+        profile = None,
     ) -> Optional[PoolProbability]:
         """
         Score a single pool's sweep probability.
@@ -317,11 +330,15 @@ class MTFPoolProbability:
 
         # Skip pools outside max reach for their TF
         max_reach = _MAX_REACH_ATR.get(tf, 6.0)
+        if profile is not None:
+            max_reach *= max(0.85, min(1.35, profile.breathing_mult))
         if dist_atr > max_reach:
             return None
 
         # ── Component 1: Distance decay ───────────────────────────────
         λ = _DECAY_LAMBDA.get(tf, 2.0)
+        if profile is not None:
+            λ *= max(0.80, min(1.40, profile.breathing_mult))
         c_distance = math.exp(-dist_atr / λ)
 
         # ── Component 2: TF base probability ─────────────────────────

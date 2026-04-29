@@ -31,6 +31,11 @@ import config
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPREAD TRACKER
@@ -628,10 +633,14 @@ class ExecutionCostEngine:
         """
         spread_bps   = self._spread.median_bps()
         rt_cost_bps  = self.effective_roundtrip_cost_bps(use_maker_entry)
-        return self._floor.min_gross_move(
+        fee_profile = build_market_profile(price=price, atr=atr)
+        # In stress/wide-spread regimes a trade must clear more gross distance;
+        # in compressed markets the floor relaxes only slightly.
+        gross_floor = self._floor.min_gross_move(
             price, atr, atr_percentile, rt_cost_bps,
             spread_bps, signal_confidence
         )
+        return gross_floor * fee_profile.selectivity
 
     def decide_entry_type(
         self,

@@ -101,6 +101,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE THRESHOLDS (R-multiple boundaries)
@@ -428,7 +433,15 @@ class LiquidityTrailEngine:
         session = self._detect_session(ict_engine)
         if ASIA_TRAIL_DISABLED and session == "ASIA":
             return self._blocked("ASIA_SESSION_DISABLED", hold_reason)
-        sess_mult = SESSION_BUFFER_MULT.get(session, 1.0)
+        trail_profile = build_market_profile(
+            price=price,
+            atr=atr,
+            liq_snapshot=liq_snapshot,
+            ict=ict_engine,
+            side=pos_side,
+            session=session,
+        )
+        sess_mult = SESSION_BUFFER_MULT.get(session, 1.0) * trail_profile.breathing_mult
 
         # ── R-multiple ────────────────────────────────────────────────
         # Bug #17 fix: init_dist must represent the ORIGINAL risk distance
@@ -515,7 +528,7 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 0 — HANDS OFF
         # ══════════════════════════════════════════════════════════════
-        phase0_delivery_atr = self._cfg_float("TRAIL_PHASE0_MAX_DELIVERY_ATR", 0.75)
+        phase0_delivery_atr = trail_profile.delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_PHASE0_MAX_DELIVERY_ATR", 0.75)) * 0.65
         if delivery_atr < phase0_delivery_atr:
             self._last_phase = "HANDS_OFF"
             return self._hold(
@@ -546,8 +559,8 @@ class LiquidityTrailEngine:
         # ══════════════════════════════════════════════════════════════
         # PHASE 1 — TRUE BE ONLY, after structural delivery
         # ══════════════════════════════════════════════════════════════
-        structure_min_delivery_atr = self._cfg_float("TRAIL_STRUCTURE_MIN_DELIVERY_ATR", 1.10)
-        aggressive_min_delivery_atr = self._cfg_float("TRAIL_AGGRESSIVE_MIN_DELIVERY_ATR", 2.60)
+        structure_min_delivery_atr = trail_profile.delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_STRUCTURE_MIN_DELIVERY_ATR", 1.10))
+        aggressive_min_delivery_atr = trail_profile.delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_AGGRESSIVE_MIN_DELIVERY_ATR", 2.60))
 
         if delivery_atr < structure_min_delivery_atr:
             self._last_phase = "BE_STRUCTURAL"
@@ -963,7 +976,7 @@ class LiquidityTrailEngine:
         if atr <= 1e-10:
             return self._hold("DELIVERY_LOCK_WAIT: invalid ATR", hold_reason)
 
-        min_delivery_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.80)
+        min_delivery_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.80))
         if delivery_atr < min_delivery_atr:
             return self._hold(
                 f"DELIVERY_LOCK_WAIT: delivered={delivery_atr:.2f}ATR<{min_delivery_atr:.2f}ATR",
@@ -991,7 +1004,7 @@ class LiquidityTrailEngine:
                 f"DELIVERY_LOCK_ALREADY_BETTER: candidate=${candidate_sl:,.1f} current=${current_sl:,.1f}",
                 hold_reason)
 
-        breath_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.85)
+        breath_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).trail_breathing_atr(self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.85))
         min_impr_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR", 0.25)
         breathing = abs(price - candidate_sl) / atr
         if breathing < breath_atr:
@@ -1051,7 +1064,7 @@ class LiquidityTrailEngine:
                 hold_reason, r_multiple=r_multiple)
 
         # Breathing room.  BE must not sit inside normal pullback noise.
-        be_breath_atr = self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75)
+        be_breath_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).trail_breathing_atr(self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75))
         if abs(price - be_price) / atr < be_breath_atr:
             return self._hold(
                 f"BE_TOO_TIGHT: breathing={abs(price-be_price)/atr:.2f}ATR<{be_breath_atr:.2f}ATR",

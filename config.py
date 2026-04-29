@@ -51,7 +51,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.05   # 5% of available balance per trade
+RISK_PER_TRADE           = 0.02    # 2% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -382,17 +382,34 @@ QUANT_HTF_15M_VETO           = 0.35
 QUANT_HTF_BOTH_VETO          = 0.20
 
 # ── Conviction Filter ─────────────────────────────────────────────────────────
-CONVICTION_MIN_SCORE               = 0.68
+CONVICTION_MIN_SCORE               = 0.74
 CONVICTION_POOL_MIN_TF_RANK        = 3       # 15m+ pool or HTF-promoted 5m
-CONVICTION_DISPLACEMENT_BODY_ATR   = 0.70
+CONVICTION_DISPLACEMENT_BODY_ATR   = 0.85
 CONVICTION_OTE_FIB_LOW             = 0.500
 CONVICTION_OTE_FIB_HIGH            = 0.786
 CONVICTION_MIN_RR                  = 2.0     # match risk management R:R
-CONVICTION_PRODUCT_MIN_CORE        = 0.60    # pool/displacement/CISD must each be real
+CONVICTION_PRODUCT_MIN_CORE        = 0.68    # pool/displacement/CISD must each be real
 CONVICTION_MAX_SESSION_LOSSES      = 2
-CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 300
-CONVICTION_MAX_ENTRIES_PER_SESSION = 6
+CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 420
+CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
+
+# ── Institutional Entry Quality Gates ─────────────────────────────────────────
+# These are hard execution gates, not score nudges. The bot must see actual
+# auction acceptance after a sweep before it can place risk: displacement,
+# CISD/OTE or strong acceptance, non-chase location, and flow/HTF coherence.
+ENTRY_HARD_MIN_DISPLACEMENT_ATR          = 0.75
+ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
+ENTRY_REQUIRE_CISD_OR_OTE                = True
+ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
+ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
+ENTRY_REVERSAL_PD_SHORT_MIN              = 0.38
+ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR    = 0.55
+ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS   = True
+ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40
+ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30
+ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
+ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
 QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15
@@ -477,3 +494,22 @@ PROFIT_DEFENSE_ALLOW_GIVEBACK_ONLY_EXIT = False
 # More breathing room before BE / delivery-lock moves. Prevents being stopped
 # on normal pullbacks while still preventing fee-adjusted loss accounting.
 TRAIL_BE_MIN_BREATHING_ATR = 0.75
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKET INTELLIGENCE ADAPTIVE PROFILE
+# ─────────────────────────────────────────────────────────────────────────────
+# These are not trading triggers. They are broad regime-boundary priors used by
+# strategy/market_intelligence.py to convert live ATR, liquidity density, spread,
+# HTF structure, AMD phase and flow into adaptive thresholds. The strategy logic
+# should read dynamic profile values rather than embedding fixed cutoffs in each
+# engine.
+MI_COMPRESSED_ATR_PCT = 0.08
+MI_EXPANDED_ATR_PCT   = 0.28
+MI_STRESS_ATR_PCT     = 0.55
+MI_LIQ_DENSITY_RADIUS_ATR = 4.0
+MI_WIDE_SPREAD_BPS = 5.0
+MI_ENABLE_DYNAMIC_ENTRY_GATES = True
+MI_ENABLE_DYNAMIC_CONVICTION_GATES = True
+MI_ENABLE_DYNAMIC_TRAILING_GATES = True
+MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
