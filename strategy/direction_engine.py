@@ -124,6 +124,12 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.quantitative_models import evaluate_post_sweep_quant
+except Exception:  # pragma: no cover
+    from quantitative_models import evaluate_post_sweep_quant  # type: ignore
+
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -1392,14 +1398,31 @@ class DirectionEngine:
         _adj_threshold = base_threshold * score_mult
 
         if rev_total >= _adj_threshold and gap >= _PS_GAP_MIN:
-            _conf = min(1.0, rev_total / 95.0)
-            if ps.cisd_detected: _conf = min(1.0, _conf + 0.15)
-            if ps.ote_reached:   _conf = min(1.0, _conf + 0.10)
+            _q = evaluate_post_sweep_quant(
+                action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement_atr, cisd=ps.cisd_detected,
+                ote=ps.ote_reached, phase=phase, price=price, atr=a,
+                snap=liq_snapshot, flow={"direction": "long" if tick_flow > 0 else ("short" if tick_flow < 0 else ""),
+                                          "conviction": abs(tick_flow), "cvd_trend": cvd_trend},
+                ict=ict_engine)
+            self._last_ps_analysis["quant"] = _q.components
+            self._last_ps_analysis["posterior"] = round(_q.posterior, 4)
+            if not _q.accept:
+                logger.info(f"POST-SWEEP QUANT WAIT: REVERSAL {rev_dir.upper()} | {_q.compact()}")
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0, phase=phase,
+                    cisd_active=ps.cisd_detected, ote_active=ps.ote_reached,
+                    displacement_atr=ps.max_displacement_atr, rev_score=rev_total,
+                    cont_score=cont_total, rev_reasons=rev_reasons[:4], cont_reasons=cont_reasons[:4],
+                    reason=f"QUANT_WAIT reverse: {_q.compact()}")
+            _conf = max(_q.posterior, min(1.0, rev_total / 95.0))
+            if ps.cisd_detected: _conf = min(1.0, _conf + 0.05)
+            if ps.ote_reached:   _conf = min(1.0, _conf + 0.03)
             _reason = (
                 f"REVERSAL [{phase}] rev={rev_total:.0f} > {_adj_threshold:.0f} "
                 f"gap={gap:.0f} CISD={ps.cisd_type or 'none'} "
                 f"DISP={ps.max_displacement_atr:.2f}ATR "
-                f"OTE={'✓' if ps.ote_reached else '✗'}")
+                f"OTE={'✓' if ps.ote_reached else '✗'} | {_q.compact()}")
             logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
             self._ps_state = None
             return PostSweepDecision(
@@ -1419,10 +1442,27 @@ class DirectionEngine:
 
         elif (cont_total >= _adj_threshold * _PS_CONT_THRESHOLD_RATIO
               and gap >= _PS_GAP_MIN):
-            _conf   = min(1.0, cont_total / 90.0)
+            _q = evaluate_post_sweep_quant(
+                action="continue", side=cont_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement_atr, cisd=False, ote=ps.ote_reached,
+                phase=phase, price=price, atr=a, snap=liq_snapshot,
+                flow={"direction": "long" if tick_flow > 0 else ("short" if tick_flow < 0 else ""),
+                      "conviction": abs(tick_flow), "cvd_trend": cvd_trend},
+                ict=ict_engine)
+            self._last_ps_analysis["quant"] = _q.components
+            self._last_ps_analysis["posterior"] = round(_q.posterior, 4)
+            if not _q.accept:
+                logger.info(f"POST-SWEEP QUANT WAIT: CONTINUATION {cont_dir.upper()} | {_q.compact()}")
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0, phase=phase,
+                    cisd_active=ps.cisd_detected, ote_active=ps.ote_reached,
+                    displacement_atr=ps.max_displacement_atr, rev_score=rev_total,
+                    cont_score=cont_total, rev_reasons=rev_reasons[:4], cont_reasons=cont_reasons[:4],
+                    reason=f"QUANT_WAIT continue: {_q.compact()}")
+            _conf   = max(_q.posterior, min(1.0, cont_total / 90.0))
             _reason = (
                 f"CONTINUATION [{phase}] cont={cont_total:.0f} "
-                f"vs rev={rev_total:.0f} gap={gap:.0f}")
+                f"vs rev={rev_total:.0f} gap={gap:.0f} | {_q.compact()}")
             logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
             self._ps_state = None
             return PostSweepDecision(

@@ -102,6 +102,12 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.quantitative_models import adaptive_trailing_stop
+except Exception:  # pragma: no cover
+    from quantitative_models import adaptive_trailing_stop  # type: ignore
+
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -590,7 +596,10 @@ class LiquidityTrailEngine:
                 hold_reason=hold_reason)
             _floor_result = self._try_delivery_structure_lock(
                 pos_side, price, entry_price, current_sl, atr, delivery_atr,
-                liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine)
+                liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine,
+                ict_engine=ict_engine, flow={"direction": pos_side if cvd_trend == 0 else ("long" if cvd_trend > 0 else "short"),
+                                             "conviction": abs(cvd_trend), "cvd_trend": cvd_trend},
+                peak_profit=peak_profit)
             if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
                 # Choose the more protective of structural trail and net-profit floor.
                 _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
@@ -619,7 +628,10 @@ class LiquidityTrailEngine:
             hold_reason=hold_reason)
         _floor_result = self._try_delivery_structure_lock(
             pos_side, price, entry_price, current_sl, atr, delivery_atr,
-            liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine)
+            liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine,
+            ict_engine=ict_engine, flow={"direction": pos_side if cvd_trend == 0 else ("long" if cvd_trend > 0 else "short"),
+                                         "conviction": abs(cvd_trend), "cvd_trend": cvd_trend},
+            peak_profit=peak_profit)
         if _trail_result.new_sl is not None or _floor_result.new_sl is not None:
             _best_sl = self._better_sl(pos_side, _trail_result.new_sl, _floor_result.new_sl)
             if _floor_result.new_sl is not None and abs(_floor_result.new_sl - _best_sl) < 1e-9:
@@ -963,7 +975,8 @@ class LiquidityTrailEngine:
         self, pos_side: str, price: float, entry_price: float,
         current_sl: float, atr: float, delivery_atr: float,
         liq_snapshot, candles_by_tf: Dict[str, List[dict]],
-        hold_reason: Optional[List[str]], pos=None, fee_engine=None,
+        hold_reason: Optional[List[str]], pos=None, fee_engine=None, ict_engine=None,
+        flow=None, peak_profit: float = 0.0,
     ) -> LiquidityTrailResult:
         """Protect delivered profit using confirmed structure/liquidity.
 
@@ -983,15 +996,33 @@ class LiquidityTrailEngine:
                 hold_reason)
 
         true_be = self._round_be_price(pos_side, self._be_price(pos_side, entry_price, atr, pos, fee_engine))
+
+        # Quantitative EAE stop: proposes a stop only when delivered auction is
+        # statistically large enough to survive expected adverse excursion.  This
+        # avoids small-pullback exits while still preventing fee-BE stagnation.
+        qtrail = adaptive_trailing_stop(
+            side=pos_side, price=price, entry_price=entry_price, current_sl=current_sl,
+            atr=atr, peak_profit=max(peak_profit, max((price-entry_price) if pos_side == 'long' else (entry_price-price), 0.0)),
+            true_be=true_be, snap=liq_snapshot, flow=flow, ict=ict_engine)
+
         pool_sl, pool_reason = self._delivery_lock_from_pools(pos_side, price, true_be, atr, liq_snapshot)
         swing_sl, swing_reason = self._delivery_lock_from_swings(pos_side, price, true_be, atr, candles_by_tf)
+        q_sl = None
+        if qtrail.accept:
+            try:
+                q_sl = round(float(qtrail.components.get("candidate_sl", 0.0) or 0.0), 1)
+            except Exception:
+                q_sl = None
 
-        candidate_sl = self._better_sl(pos_side, pool_sl, swing_sl)
+        candidate_sl = self._better_sl(pos_side, self._better_sl(pos_side, pool_sl, swing_sl), q_sl)
         if candidate_sl is None:
             return self._hold(
-                f"DELIVERY_LOCK_WAIT: {pool_reason}; {swing_reason}", hold_reason)
+                f"DELIVERY_LOCK_WAIT: {pool_reason}; {swing_reason}; {qtrail.reason}", hold_reason)
 
-        source_reason = pool_reason if pool_sl is not None and abs(candidate_sl - pool_sl) < 1e-9 else swing_reason
+        if q_sl is not None and abs(candidate_sl - q_sl) < 1e-9:
+            source_reason = "quantEAE:" + qtrail.reason
+        else:
+            source_reason = pool_reason if pool_sl is not None and abs(candidate_sl - pool_sl) < 1e-9 else swing_reason
 
         invalid_reason = self._stop_trigger_invalid_reason(pos_side, candidate_sl, price)
         if invalid_reason:

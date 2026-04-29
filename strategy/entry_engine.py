@@ -46,6 +46,12 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.quantitative_models import evaluate_post_sweep_quant
+except Exception:  # pragma: no cover
+    from quantitative_models import evaluate_post_sweep_quant  # type: ignore
+
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -1500,18 +1506,30 @@ class EntryEngine:
                 f"OTE={'✓' if ps.ote_reached else '✗'}")
 
         if rev_total >= threshold and gap >= gap_min:
+            qd = evaluate_post_sweep_quant(
+                action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
+                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
+                snap=snap, flow=flow, ict=ict)
+            self._last_sweep_analysis["quant_posterior"] = qd.posterior
+            self._last_sweep_analysis["quant_ev"] = qd.expected_value
+            self._last_sweep_analysis["quant_components"] = qd.components
+            if not qd.accept:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"QUANT_WAIT reverse: {qd.compact()}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"HARD_GATE_WAIT: {gate_reason}")
-            conf = min(1.0, rev_total / 90.0)
-            if ps.cisd_detected: conf = min(1.0, conf + 0.15)
-            if ps.ote_reached: conf = min(1.0, conf + 0.10)
+            conf = max(qd.posterior, min(1.0, rev_total / 90.0))
+            if ps.cisd_detected: conf = min(1.0, conf + 0.05)
+            if ps.ote_reached: conf = min(1.0, conf + 0.03)
             logger.info(
                 f"🎯 SWEEP VERDICT: REVERSAL {rev_dir.upper()} [{phase}] "
-                f"(rev={rev_total:.0f} vs cont={cont_total:.0f})")
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}")
             return PostSweepDecision(
                 action="reverse", direction=rev_dir, confidence=conf,
                 next_target=opp,
@@ -1519,6 +1537,18 @@ class EntryEngine:
                        f"[{phase}] {' + '.join(rev_r[:5])}")
 
         elif cont_total >= threshold * 0.9 and gap >= gap_min:
+            qd = evaluate_post_sweep_quant(
+                action="continue", side=cont_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
+                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
+                snap=snap, flow=flow, ict=ict)
+            self._last_sweep_analysis["quant_posterior"] = qd.posterior
+            self._last_sweep_analysis["quant_ev"] = qd.expected_value
+            self._last_sweep_analysis["quant_components"] = qd.components
+            if not qd.accept:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"QUANT_WAIT continue: {qd.compact()}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
@@ -1527,7 +1557,7 @@ class EntryEngine:
                     reason=f"HARD_GATE_WAIT: {gate_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
             logger.info(
-                f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}]")
+                f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}")
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
                 confidence=min(1.0, cont_total / 90.0),
