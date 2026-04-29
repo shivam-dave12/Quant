@@ -162,6 +162,8 @@ def _fmt_term_pool(item: Any, label: str, price: float, atr: float, target: Opti
 def _target_summary(target: Optional[Any]) -> str:
     if target is None:
         return _c("none", C.DIM)
+    if isinstance(target, str):
+        return _c(target, C.BYLW)
     try:
         side = str(getattr(target, "direction", "") or "").upper()
         px = _pool_value(target, "price", getattr(target.pool, "price", 0.0))

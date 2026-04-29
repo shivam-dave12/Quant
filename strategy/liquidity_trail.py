@@ -571,7 +571,8 @@ class LiquidityTrailEngine:
             return self._try_be_lock(
                 pos_side, price, entry_price, current_sl, atr,
                 r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
-                gate_reason=be_gate_reason)
+                gate_reason=be_gate_reason,
+                liq_snapshot=liq_snapshot, ict_engine=ict_engine)
 
         # ══════════════════════════════════════════════════════════════
         # PHASE 2 / 3 - STRUCTURE TRAIL
@@ -605,7 +606,8 @@ class LiquidityTrailEngine:
             _be_result = self._try_be_lock(
                 pos_side, price, entry_price, current_sl, atr,
                 r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
-                gate_reason=be_gate_reason)
+                gate_reason=be_gate_reason,
+                liq_snapshot=liq_snapshot, ict_engine=ict_engine)
             return _be_result if _be_result.new_sl is not None else _trail_result
 
         # Phase 3
@@ -636,7 +638,8 @@ class LiquidityTrailEngine:
         _be_result = self._try_be_lock(
             pos_side, price, entry_price, current_sl, atr,
             r_multiple, hold_reason, pos=pos, fee_engine=fee_engine,
-            gate_reason=be_gate_reason)
+            gate_reason=be_gate_reason,
+            liq_snapshot=liq_snapshot, ict_engine=ict_engine)
         return _be_result if _be_result.new_sl is not None else _trail_result
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1060,7 +1063,7 @@ class LiquidityTrailEngine:
         self, pos_side: str, price: float, entry_price: float,
         current_sl: float, atr: float, r_multiple: float,
         hold_reason: Optional[List[str]], pos=None, fee_engine=None,
-        gate_reason: str = "",
+        gate_reason: str = "", liq_snapshot=None, ict_engine=None,
     ) -> LiquidityTrailResult:
         """Move SL to breakeven + exact fees + slippage buffer."""
         be_price = self._be_price(pos_side, entry_price, atr, pos, fee_engine)
@@ -1089,7 +1092,17 @@ class LiquidityTrailEngine:
                 hold_reason, r_multiple=r_multiple)
 
         # Breathing room.  BE must not sit inside normal pullback noise.
-        be_breath_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).trail_breathing_atr(self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75))
+        # BUGFIX: receive live liquidity/ICT context instead of referencing undefined locals.
+        try:
+            _be_profile = build_market_profile(
+                price=price, atr=atr, liq_snapshot=liq_snapshot,
+                ict=ict_engine, side=pos_side,
+            )
+            be_breath_atr = _be_profile.trail_breathing_atr(
+                self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75)
+            )
+        except Exception:
+            be_breath_atr = self._cfg_float("TRAIL_BE_MIN_BREATHING_ATR", 0.75)
         if abs(price - be_price) / atr < be_breath_atr:
             return self._hold(
                 f"BE_TOO_TIGHT: breathing={abs(price-be_price)/atr:.2f}ATR<{be_breath_atr:.2f}ATR",

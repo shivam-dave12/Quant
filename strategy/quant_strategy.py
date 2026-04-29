@@ -7611,7 +7611,7 @@ class QuantStrategy:
             self._last_closed_exit_price   = float(exit_price or 0.0)
             self._last_closed_entry_price  = float(getattr(pos, "entry_price", 0.0) or 0.0)
             self._last_closed_mfe_pts      = float(getattr(pos, "peak_profit", 0.0) or 0.0)
-            self._last_closed_mae_pts      = float(getattr(pos, "mae_pts", 0.0) or 0.0)
+            self._last_closed_mae_pts      = float(getattr(pos, "peak_adverse", 0.0) or 0.0)
             self._last_closed_atr          = float(
                 getattr(self._atr_5m, "atr", 0.0)
                 if hasattr(self, "_atr_5m") and self._atr_5m else 0.0
@@ -7861,7 +7861,7 @@ class QuantStrategy:
         # remaining purpose until the next entry.
         #
         # Fix: schedule a one-shot daemon timer to clear the flag 60s after
-        # _finalise_exit. Race-protection window: 0â€“60s (more than enough).
+        # _finalise_exit. Race-protection window: 0-20s (enough for normal sync/reconcile; avoids watchdog heal).
         # Watchdog threshold: 30s â†’ no longer fires because the flag is
         # already False well within the post-exit grace.
         #
@@ -7879,15 +7879,14 @@ class QuantStrategy:
                         phase_name = getattr(getattr(pos, "phase", None), "name", "")
                         if phase_name == "FLAT" and getattr(self, "_exit_completed", False):
                             self._exit_completed = False
-                            self._pnl_recorded_for = 0.0
                             logger.info(
                                 "Race-window expired: _exit_completed cleared "
-                                "(60s after _finalise_exit; pre-empts watchdog heal)"
+                                "(20s after _finalise_exit; pre-empts watchdog heal)"
                             )
                 except Exception as _ec:
                     logger.debug(f"_delayed_exit_completed_clear noop: {_ec}")
 
-            t = threading.Timer(60.0, _delayed_exit_completed_clear)
+            t = threading.Timer(20.0, _delayed_exit_completed_clear)
             t.daemon = True
             t.name = f"exit-claim-clear-{int(time.time())}"
             t.start()
@@ -7927,7 +7926,7 @@ class QuantStrategy:
         except Exception as _pge:
             logger.debug(f"PostExitGate.record_exit skipped: {_pge}")
 
-        logger.info("Position closed Ã¢â‚¬â€ FLAT")
+        logger.info("Position closed — FLAT")
 
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,
@@ -8641,7 +8640,6 @@ class QuantStrategy:
             self._confirm_long=self._confirm_short=0
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
-            self._pnl_recorded_for = 0.0
             logger.warning(f"Ã¢Å¡Â¡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
             send_telegram_message(f"Ã¢Å¡Â¡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
 

@@ -351,7 +351,7 @@ class QuantBot:
         try:
             logger.info("=" * 80)
             logger.info("⚡ LIQUIDITY-FIRST QUANT BOT — DUAL-EXCHANGE")
-            logger.info("   Pools → Flow → ICT → Entry at OTE → TP at Pool")
+            logger.info("   LiquidityMap → QuantPosterior → Risk/Execution → Adaptive Exit")
             logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
             logger.info("=" * 80)
@@ -684,6 +684,13 @@ class QuantBot:
                     pass
 
             stats = strat.get_stats() if strat else {}
+            # Operator display: when a trade is active, show the executable TP thesis, not the global hunt target.
+            if pos and isinstance(pos, dict) and pos.get("entry_price", 0) > 0:
+                _side = str(pos.get("side", "")).upper()
+                _tp = float(pos.get("tp_price", 0.0) or 0.0)
+                _sl = float(pos.get("sl_price", 0.0) or 0.0)
+                if _tp > 0:
+                    primary_target = f"ACTIVE {_side} TP -> ${_tp:,.2f} | SL ${_sl:,.2f}"
 
             msg = _fmt_hb(
                 price=price, feed=feed, exchange=exch,
