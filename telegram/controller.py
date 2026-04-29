@@ -3,7 +3,7 @@ telegram/controller.py — Liquidity-First Telegram Bot Controller
 =================================================================
 All command handlers reflect the liquidity-first decision architecture:
 
-  /thinking   — 5-layer decision stack (pools → flow → ICT → entry → trail)
+  /thinking   — quant posterior decision stack
   /status     — Full bot status (pool map + flow + position)
   /pools      — Live liquidity pool map with priority scores
   /flow       — Detailed orderflow state (CVD + OB delta + tick aggression)
@@ -258,7 +258,7 @@ class TelegramBotController:
                 {"command": "start",       "description": "Start trading bot"},
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
-                {"command": "thinking",    "description": "5-layer liquidity-first decision stack"},
+                {"command": "thinking",    "description": "quant posterior decision stack"},
                 {"command": "position",    "description": "Current position + trail"},
                 {"command": "pnl",         "description": "Quick PnL snapshot"},
                 {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
@@ -387,11 +387,11 @@ class TelegramBotController:
             "📊 <b>QUICK VIEW</b>\n"
             "  /pnl — Snapshot: uPnL, realised, last trades\n"
             "  /market — Price, ATR, AMD, MTF, flow, pools\n"
-            "  /sl — SL/TP distances, BE status, R-multiple\n"
+            "  /sl — SL/TP distances, BE status, analytic R\n"
             "  /equity — Balance + unrealised + session return\n"
             "  /risk — Gate status, daily limits, cooldown\n\n"
             "🧠 <b>DECISION ANALYSIS</b>\n"
-            "  /thinking — 5-layer liquidity-first decision stack\n"
+            "  /thinking — quant posterior decision stack\n"
             "  /pools — BSL/SSL pool map with priority scores\n"
             "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
             "  /structures — ICT OB/FVG/AMD secondary layer\n"
@@ -416,12 +416,12 @@ class TelegramBotController:
         )
 
     # ================================================================
-    # /thinking  ← CORE COMMAND — 5-layer liquidity-first stack
+    # /thinking  ← CORE COMMAND — quant posterior execution stack
     # ================================================================
 
     def _cmd_thinking(self) -> str:
         """
-        Live 5-layer liquidity-first decision stack:
+        Live quant posterior decision stack:
 
           LAYER 1 — Liquidity Map    BSL/SSL pools + priority scores
           LAYER 2 — Flow Direction   CVD + OB delta + tick aggression
@@ -1295,7 +1295,7 @@ class TelegramBotController:
         be_locked = ((side == "LONG"  and sl >= _be_price) or
                      (side == "SHORT" and sl <= _be_price and sl > 0))
 
-        # Trail phase — v5.0 Fibonacci engine phase labels (R-multiple driven).
+        # Trail phase — v5.0 Fibonacci engine phase labels (analytic R driven).
         # These MUST match the phase strings emitted by LiquidityTrailEngine:
         #   PHASE_0_MAX_R=1.0  PHASE_1_MAX_R=2.0  PHASE_2_MAX_R=3.5  P3=3.5+
         if mfe_r >= 3.5:
@@ -1590,7 +1590,7 @@ class TelegramBotController:
         Institutional post-trade analysis report.
 
         Shows (all Bayesian-estimated; min 5 real samples per dimension):
-          • Overall WR with Wilson CI, G-Ratio, avg R-multiple, IC score
+          • Overall WR with Wilson CI, G-Ratio, avg analytic R, IC score
           • Per ICT Tier WR + avg PnL + geometry (G-ratio, entry efficiency)
           • Per AMD Phase WR + SL efficiency + entry efficiency + avg R
           • Per Session WR + avg PnL (London / NY / Asia / Kill-zone)
@@ -1909,9 +1909,9 @@ class TelegramBotController:
             "",
             "<b>Trail  (v5.0 Fibonacci — sole engine)</b>",
             f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
-            f"  Phase 0 (&lt;1.0R): HANDS OFF — structural SL trusted",
-            f"  Phase 1 (1.0–2.0R): BE_LOCK — entry + exact fees + slippage",
-            f"  Phase 2 (2.0–3.5R): FIB STRUCTURAL — 1H/15m swings",
+            f"  Hands off: delivery inside expected adverse excursion — structural SL trusted",
+            f"  BE lock: true net BE only after structure/delivery proof",
+            f"  Structural: accepted swings/liquidity anchors",
             f"  Phase 3 (3.5R+):    FIB AGGRESSIVE — all TFs, HTF-gated",
             f"  Close confirm:  P2=2 closes, P3=1 close + displacement",
             f"  Counter-BOS:    sovereign override → BE at any R",
@@ -2566,7 +2566,7 @@ class TelegramBotController:
             f"   {sl_dist:.1f}pts / {sl_atr:.1f}ATR from price",
             f"\n🎯 TP: <b>${p.tp_price:,.2f}</b>",
             f"   {tp_dist:.1f}pts / {tp_atr:.1f}ATR from price",
-            f"\nR-multiple: {cur_r:+.2f}R",
+            f"\nanalytic R: {cur_r:+.2f}R",
             f"Break-even: {be_icon} {'LOCKED' if be_locked else f'needs SL at ${be_price:,.2f}'}",
         ]
 

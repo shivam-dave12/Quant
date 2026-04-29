@@ -1,16 +1,23 @@
 """
-QUANT STRATEGY v10.0 Ã¢â‚¬â€ INSTITUTIONAL LIQUIDITY-FIRST
-=====================================================
+QUANT STRATEGY v10.1 — QUANTITATIVE LIQUIDITY EXECUTION
+=========================================================
 Architecture:
-  LiquidityMap Ã¢â€ â€™ EntryEngine Ã¢â€ â€™ ConvictionFilter Ã¢â€ â€™ UnifiedGate Ã¢â€ â€™ Execution
-  ICT Engine = structural context (AMD, OB, FVG, BOS, sweep detection)
-  DirectionEngine = hunt prediction + post-sweep evaluation
-  Quant Scout = order-flow timing (VWAP, CVD, tick flow, OB imbalance)
+  LiquidityMap -> EntryEngine quantitative posterior -> execution risk -> order routing
 
-Entry: Only via EntryEngine (sweep reversal, continuation, displacement)
-SL/TP: EntryEngine provides primary levels; ICT OB Ã¢â€ â€™ 15m swing Ã¢â€ â€™ ATR fallback
-Trail: LiquidityTrailEngine (primary) Ã¢â€ â€™ _DynamicStructureTrail (fallback)
-Exit: SL/TP bracket on exchange. Trail moves SL only.
+Core principle:
+  Only the quantitative posterior/EV model can approve an executable entry.
+  Legacy heuristic engines are telemetry/features only. They must not override a
+  positive posterior, and they must not create trades by themselves.
+
+Decision ownership:
+  EntryEngine: converts a swept-liquidity auction into a posterior/EV signal.
+  QuantStrategy: applies account/risk/execution safety and places the order.
+  ConvictionFilter: advisory attribution only; hard blocks only for account safety.
+  DirectionEngine: hunt telemetry only; no executable direction injection.
+
+SL/TP:
+  SL must be a protective invalidation level; TP must be live liquidity selected
+  by probability-adjusted payoff after costs.
 """
 
 from __future__ import annotations
@@ -2758,7 +2765,7 @@ class QuantStrategy:
         logger.info("=" * 72)
         logger.info("Ã¢Å¡Â¡ QuantStrategy v10.0 Ã¢â‚¬â€ INSTITUTIONAL LIQUIDITY-FIRST")
         logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-        entry_status = "ACTIVE (LiquidityMap Ã¢â€ â€™ EntryEngine Ã¢â€ â€™ ConvictionFilter)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
+        entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   LiquidityMap: {liq_status}")
@@ -2766,7 +2773,7 @@ class QuantStrategy:
         logger.info(f"   ICT Engine: {ict_status}")
         dir_status = "ACTIVE" if self._dir_engine else "UNAVAILABLE"
         logger.info(f"   DirectionEngine: {dir_status}")
-        conv_status = "ACTIVE" if self._conviction else "UNAVAILABLE"
+        conv_status = "ADVISORY/SAFETY" if self._conviction else "UNAVAILABLE"
         logger.info(f"   ConvictionModel: {conv_status}")
         liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
         logger.info(f"   LiquidityTrail: {liq_trail}")
@@ -2892,7 +2899,7 @@ class QuantStrategy:
 
         Entry must be a post-sweep institutional event, not a first-push chase.
         This catches stale or weak signals that slipped through a permissive
-        evidence score before ConvictionFilter runs.
+        evidence score before the quantitative posterior master runs.
         """
         try:
             side = str(getattr(signal, "side", "") or "").lower()
@@ -2988,6 +2995,39 @@ class QuantStrategy:
 
         self._suppress_rejected_entry_signal(
             signal, reject_str or block_label.lower(), cooldown_sec=cooldown)
+
+
+    @staticmethod
+    def _conviction_reject_is_account_safety(conv_result) -> bool:
+        """Return True only for account/exchange safety blocks.
+
+        ConvictionFilter is not allowed to veto a positive-alpha quantitative
+        entry for score, product-core, session, OTE, AMD, or style reasons.
+        Those are features/diagnostics. Blocking is reserved for account safety
+        and execution safety only.
+        """
+        reasons = " | ".join(str(r) for r in (getattr(conv_result, "reject_reasons", None) or [])).upper()
+        safety_tokens = (
+            "CIRCUIT", "DRAWDOWN", "MAX_SESSION", "SESSION_LOSS",
+            "DAILY LOSS", "LOSS LIMIT", "RISK LOCK", "KILL", "HALT",
+            "LIQUIDATION", "MARGIN", "UNPROTECTED", "EXCHANGE", "NO BALANCE",
+        )
+        return any(token in reasons for token in safety_tokens)
+
+    def _log_conviction_advisory(self, signal, conv_result) -> None:
+        reasons = [str(r) for r in (getattr(conv_result, "reject_reasons", None) or [])]
+        score = max(0.0, min(1.0, float(getattr(conv_result, "score", 0.0) or 0.0)))
+        reason_str = " | ".join(reasons[:3]) if reasons else "no advisory reason"
+        key = (str(getattr(signal, "side", "") or ""), round(score, 2), reason_str[:120])
+        if key != getattr(self, "_last_conv_advisory_key", None):
+            self._last_conv_advisory_key = key
+            logger.info(
+                f"Conviction advisory only [{str(getattr(signal, 'side', '') or '').upper()}] "
+                f"score={score:.3f} | {reason_str}")
+        else:
+            logger.debug(
+                f"Conviction advisory only [{str(getattr(signal, 'side', '') or '').upper()}] "
+                f"score={score:.3f} | {reason_str}")
 
     @staticmethod
     def _bounded(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -4007,16 +4047,15 @@ class QuantStrategy:
         Institutional Unified Entry Gate diagnostics.
 
         This gate logs structural coherence notes for diagnostics but does NOT
-        block any trade. Final trade permission is owned by the institutional
-        decision matrix plus the conviction gate's hard veto.
+        block any trade. Final trade permission is owned by the quantitative
+        posterior/EV model plus account/exchange safety.
 
-          InstitutionalMatrix -> trade thesis and TP/SL realism
-          ConvictionFilter    -> final product-quality and safety veto
-          UnifiedGate         -> diagnostics for post-trade attribution
+          QuantPosterior -> executable alpha approval
+          Risk/Safety    -> account, liquidation, margin and loss-limit veto
+          UnifiedGate    -> diagnostics for post-trade attribution
 
-        Philosophy: this diagnostic layer does not veto session, AMD phase,
-        flow direction, or HTF structure; those controls live in the matrix and
-        conviction gate.
+        Philosophy: diagnostic layers do not veto because of style/score.
+        They provide features and attribution; the posterior model owns edge.
         """
         advisories = []   # informational only Ã¢â‚¬â€ never blocks
 
@@ -4851,14 +4890,11 @@ class QuantStrategy:
             except Exception as e:
                 logger.debug(f"ICT sweep bridge error: {e}")
 
-        # Step 6c: Post-sweep evaluation (DirectionEngine accumulative model)
-        # Runs every tick while DirectionEngine has an open PostSweepState.
-        # Evidence builds across ticks Ã¢â‚¬â€ momentary noise cannot flip the decision.
-        # Bug-4 fix: the verdict (action/direction/confidence) is written into
-        # ict_ctx.direction_hint* BEFORE entry_engine.update() so that
-        # _evaluate_post_sweep_accumulative() can consume it as a dynamic
-        # weighting factor.  Previously the verdict was only logged and Telegrammed
-        # Ã¢â‚¬â€ DirectionEngine was purely observational and had no effect on entries.
+        # Step 6c: DirectionEngine telemetry.
+        # DirectionEngine may estimate hunt context, but it is no longer allowed
+        # to inject executable direction into ICTContext. This removes a major
+        # technical debt: observational verdicts cannot override or bias the
+        # quantitative posterior master.
         if self._dir_engine is not None and getattr(self._dir_engine, 'in_post_sweep', False):
             try:
                 _tf_ps  = self._tick_eng.get_signal() if self._tick_eng else 0.0
@@ -4870,103 +4906,28 @@ class QuantStrategy:
                     ict_engine   = self._ict,
                     tick_flow    = _tf_ps,
                     cvd_trend    = _cvd_ps,
-                    liq_snapshot = liq_snapshot,   # fresh Ã¢â‚¬â€ liq_map.update() already ran
+                    liq_snapshot = liq_snapshot,
                 )
-                # Store for conviction gate's CISD factor (issue-2 fix)
+                # DirectionEngine is telemetry only. It may describe the hunt, but
+                # it cannot inject direction into the executable alpha path.
                 if _ps_decision is not None:
                     self._dir_engine._last_ps_decision = _ps_decision
-                if _ps_decision is not None and _ps_decision.action in ("reverse", "continue"):
-                    # Inject verdict into ICTContext so entry_engine can weight it
-                    ict_ctx.direction_hint            = _ps_decision.action
-                    ict_ctx.direction_hint_side       = getattr(_ps_decision, 'direction', '')
-                    ict_ctx.direction_hint_confidence = _ps_decision.confidence
-                    logger.info(
-                        f"Ã°Å¸â€Â POST-SWEEP [{_ps_decision.action.upper()}]: "
-                        f"dir={getattr(_ps_decision, 'direction', '?')} "
-                        f"conf={_ps_decision.confidence:.2f} "
-                        f"| {_ps_decision.reason[:80]}")
-                    try:
-                        from telegram.notifier import format_post_sweep_verdict
-                        _ps_state = getattr(self._dir_engine, '_ps_state', None)
-                        # SPAM-FIX 2026-04-26: production logs (32k lines, 16
-                        # full hours) showed 16â€“18 POST-SWEEP VERDICT messages
-                        # per minute during 22:31â€“22:34 and 15:53â€“15:54. Root
-                        # cause: 5% confidence bucket. Confidence wiggles
-                        # across the boundary every few ticks â†’ hash changes
-                        # â†’ re-emits.
-                        #
-                        # New dedup: emit ONLY if ALL THREE conditions met:
-                        #   (a) action OR direction CHANGED  (â†’ structural flip)
-                        #   (b) |Î”confidence| â‰¥ 0.15           (â†’ meaningful)
-                        #   (c) â‰¥ 60s since last emission      (â†’ rate floor)
-                        #
-                        # Equivalently: emit if a structural flip happened OR
-                        # 60s elapsed AND confidence moved â‰¥ 0.15.
-                        _ps_action    = _ps_decision.action
-                        _ps_direction = getattr(_ps_decision, 'direction', '')
-                        _ps_conf      = float(getattr(_ps_decision, 'confidence', 0.0))
-
-                        _structural_change = (
-                            _ps_action != self._ps_tg_last_action
-                            or _ps_direction != self._ps_tg_last_direction
-                        )
-                        _conf_delta = abs(_ps_conf - self._ps_tg_last_conf) \
-                                      if self._ps_tg_last_conf >= 0 else 1.0
-                        _meaningful_conf_move = _conf_delta >= 0.15
-                        _rate_floor_ok = (now - self._ps_tg_last_ts) >= 60.0
-
-                        _should_emit = (
-                            _structural_change
-                            or (_meaningful_conf_move and _rate_floor_ok)
-                        )
-
-                        if _should_emit:
-                            self._ps_tg_last_action    = _ps_action
-                            self._ps_tg_last_direction = _ps_direction
-                            self._ps_tg_last_conf      = _ps_conf
-                            self._ps_tg_last_ts        = now
-                            # Keep _ps_tg_last_hash for backward-compat with
-                            # any external code that may inspect it.
-                            self._ps_tg_last_hash = (
-                                f"{_ps_action}|{_ps_direction}|{round(_ps_conf*7)/7:.3f}"
-                            )
-                            # swept_pool_price: attribute may be 0.0 if PostSweepState
-                            # was created via an internal direction_engine path that
-                            # doesn't receive pool.price. Fall back to None so the
-                            # formatter shows "â€”" instead of "$0.0".
-                            _swept_price = getattr(_ps_state, 'swept_pool_price', None) if _ps_state else None
-                            if _swept_price is not None and _swept_price <= 0:
-                                _swept_price = None
-                            send_telegram_message(format_post_sweep_verdict(
-                                action           = _ps_decision.action,
-                                direction        = getattr(_ps_decision, 'direction', ''),
-                                confidence       = _ps_decision.confidence,
-                                phase            = getattr(_ps_decision, 'phase', ''),
-                                cisd_active      = getattr(_ps_decision, 'cisd_active', False),
-                                ote_active       = getattr(_ps_decision, 'ote_active', False),
-                                displacement_atr = getattr(_ps_decision, 'displacement_atr', 0.0),
-                                rev_score        = getattr(_ps_decision, 'rev_score', 0.0),
-                                cont_score       = getattr(_ps_decision, 'cont_score', 0.0),
-                                rev_reasons      = getattr(_ps_decision, 'rev_reasons', []),
-                                cont_reasons     = getattr(_ps_decision, 'cont_reasons', []),
-                                reason           = _ps_decision.reason,
-                                swept_pool_price = _swept_price,
-                                swept_pool_type  = getattr(_ps_state, 'swept_pool_type', '') if _ps_state else '',
-                                current_price    = price,
-                                atr              = atr,
-                            ))
-                    except Exception as _tg_ps:
-                        logger.debug(f"DirectionEngine post-sweep Telegram error: {_tg_ps}")
-                elif _ps_decision is not None:
-                    # "wait" Ã¢â‚¬â€ clear any stale hint so entry_engine doesn't act on it
-                    ict_ctx.direction_hint            = ""
-                    ict_ctx.direction_hint_side       = ""
-                    ict_ctx.direction_hint_confidence = 0.0
-                    logger.debug(
-                        f"Ã¢ÂÂ³ POST-SWEEP [{_ps_decision.action.upper()}]: "
-                        f"{_ps_decision.reason[:80]}")
+                    if _ps_decision.action in ("reverse", "continue"):
+                        logger.debug(
+                            f"DirectionEngine telemetry: action={_ps_decision.action} "
+                            f"dir={getattr(_ps_decision, 'direction', '')} "
+                            f"conf={float(getattr(_ps_decision, 'confidence', 0.0)):.2f} | "
+                            f"{str(getattr(_ps_decision, 'reason', ''))[:120]}")
+                    else:
+                        logger.debug(
+                            f"DirectionEngine telemetry wait: "
+                            f"{str(getattr(_ps_decision, 'reason', ''))[:120]}")
+                # Clear stale hint fields for backward-compatible ICTContext users.
+                ict_ctx.direction_hint = ""
+                ict_ctx.direction_hint_side = ""
+                ict_ctx.direction_hint_confidence = 0.0
             except Exception as _pse:
-                logger.debug(f"DirectionEngine.evaluate_sweep error: {_pse}")
+                logger.debug(f"DirectionEngine.evaluate_sweep telemetry error: {_pse}")
 
         # Step 7: Feed to entry engine
         _regime_key = (
@@ -5080,7 +5041,7 @@ class QuantStrategy:
                 return
 
             logger.info(
-                f"ENTRY SIGNAL CANDIDATE (pre-conviction): {signal.entry_type.value} {signal.side.upper()} "
+                f"ENTRY SIGNAL APPROVED BY QUANT MASTER: {signal.entry_type.value} {signal.side.upper()} "
                 f"@ ${signal.entry_price:,.1f} | "
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
@@ -5185,8 +5146,10 @@ class QuantStrategy:
                     live_balance     = float((bal_info or {}).get("available", 0.0)),
                 )
                 if not _conv_result.allowed:
-                    self._block_failed_conviction(signal, _conv_result)
-                    return
+                    if self._conviction_reject_is_account_safety(_conv_result):
+                        self._block_failed_conviction(signal, _conv_result)
+                        return
+                    self._log_conviction_advisory(signal, _conv_result)
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
             _min_sig.atr = atr

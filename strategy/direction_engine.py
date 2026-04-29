@@ -1423,7 +1423,7 @@ class DirectionEngine:
                 f"gap={gap:.0f} CISD={ps.cisd_type or 'none'} "
                 f"DISP={ps.max_displacement_atr:.2f}ATR "
                 f"OTE={'✓' if ps.ote_reached else '✗'} | {_q.compact()}")
-            logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
+            logger.info(f"DirectionEngine telemetry: {_reason}")
             self._ps_state = None
             return PostSweepDecision(
                 action           = "reverse",
@@ -1463,7 +1463,7 @@ class DirectionEngine:
             _reason = (
                 f"CONTINUATION [{phase}] cont={cont_total:.0f} "
                 f"vs rev={rev_total:.0f} gap={gap:.0f} | {_q.compact()}")
-            logger.info(f"🎯 POST-SWEEP VERDICT: {_reason}")
+            logger.info(f"DirectionEngine telemetry: {_reason}")
             self._ps_state = None
             return PostSweepDecision(
                 action           = "continue",

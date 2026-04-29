@@ -15,9 +15,9 @@ Every advance passes six gates.  A single Fib-level touch never moves the SL.
       winning trade.
 
   2.  CLOSE-CONFIRMATION COUNTER
-      Each candidate Fib level must be broken by N consecutive closes in
-      the trade direction, not a single wick penetration.  N scales with
-      phase: Phase 2 = 2 closes, Phase 3 = 1 close + displacement body.
+      Each candidate structural level must be accepted by consecutive closes in
+      the trade direction, not a single wick penetration. Confirmation demand
+      scales with realised delivery and market uncertainty, not fixed R tiers.
 
   3.  SWING-INVALIDATION
       The grid of Fib levels is built from a (swing_low → swing_high) pair.
@@ -39,18 +39,17 @@ Every advance passes six gates.  A single Fib-level touch never moves the SL.
       front of it.  Stop-hunts sweep into the pool first; our SL must
       survive that sweep.
 
-  6.  HTF TREND-ALIGNMENT (Phase 3 deep trails only)
-      Phase 3 aggressive trails (3.5R+) require the 1H HTF trend to be
-      aligned with the trade direction.  Against-trend deep trails get
-      downgraded to Phase 2 buffers — deep profit on counter-trend trades
-      is more likely to mean-revert and should not be tightly trailed.
+  6.  HTF TREND-ALIGNMENT (deep delivery trails only)
+      Deep-delivery trails require HTF persistence to remain aligned with the
+      trade direction. Against-trend delivery uses wider buffers because deep
+      profit on counter-trend trades is more likely to mean-revert.
 
-PHASE ARCHITECTURE
-------------------
-  Phase 0  (< 1.0R):   HANDS OFF — structural SL from entry is optimal
-  Phase 1  (1.0 – 2.0R): BE LOCK — move to entry + exact fees + slippage
-  Phase 2  (2.0 – 3.5R): FIB STRUCTURAL — 1H/15m swings, wide buffers
-  Phase 3  (3.5R+):      FIB AGGRESSIVE — all TFs, tight buffers, HTF-gated
+DELIVERY ARCHITECTURE
+---------------------
+  HANDS_OFF:      realised delivery is inside expected adverse excursion.
+  BE_STRUCTURAL:  true net BE allowed only after structural delivery proof.
+  STRUCTURAL:     SL can move behind accepted internal liquidity / swings.
+  AGGRESSIVE:     only after deep delivered move with HTF persistence.
 
 COUNTER-BOS SOVEREIGN OVERRIDE
 ------------------------------
@@ -114,13 +113,13 @@ except Exception:  # pragma: no cover - standalone tests
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PHASE THRESHOLDS (R-multiple boundaries)
+# DELIVERY THRESHOLDS (ATR-distribution driven; R retained only for reports)
 # ═══════════════════════════════════════════════════════════════════════════
 
-PHASE_0_MAX_R = 1.0    # below this → hands off (structural SL trusted)
-PHASE_1_MAX_R = 1.0    # BE checkpoint; do not trap 1R-2R before structure
-PHASE_2_MAX_R = 3.5    # Fib structural zone (1H/15m swings)
-# Phase 3 ≥ 3.5R (Fib aggressive — all TFs, HTF-gated)
+PHASE_0_MAX_R = 1.0    # compatibility/reporting only
+PHASE_1_MAX_R = 1.0    # compatibility/reporting only
+PHASE_2_MAX_R = 3.5    # compatibility/reporting only
+# Runtime trail decisions use delivery_atr + adaptive EAE, not R thresholds.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -498,20 +497,15 @@ class LiquidityTrailEngine:
             "1h":  candles_1h  or [],
         }
 
-        # Bug #19 fix: counter-BOS re-arm after Phase 1 completes.
-        # The original design fired the override exactly once per position.
-        # This protected the 0–1R range but left Phase 2+ positions (SL
-        # already above entry) unprotected when a second, deeper structural
-        # break occurred.  Re-arm by clearing the flag whenever the R-multiple
-        # crosses into Phase 2 — the Phase 2 FIB trail is now the primary
-        # protection, but a counter-BOS in that zone is still a valid reason
-        # to move to the nearest Fib level immediately rather than waiting for
-        # the Fib confirmation counter.
-        if self._counter_bos_triggered and r_multiple >= PHASE_1_MAX_R:
+        # Counter-BOS re-arm after meaningful delivered movement.
+        # This is delivery-based, not R-based: once the market has moved beyond
+        # expected noise, a fresh counter-BOS is a new information event and can
+        # invalidate the active delivery thesis.
+        if self._counter_bos_triggered and delivery_atr >= max(1.10, trail_profile.delivery_lock_min_mfe_atr(1.10)):
             self._counter_bos_triggered = False
             logger.debug(
-                "Trail[COUNTER_BOS]: re-armed for Phase 2+ — "
-                f"R={r_multiple:.2f}R ≥ {PHASE_1_MAX_R}R threshold"
+                "Trail[COUNTER_BOS]: re-armed after delivered move — "
+                f"delivery={delivery_atr:.2f}ATR"
             )
 
         # ── Counter-BOS sovereign override ────────────────────────────
