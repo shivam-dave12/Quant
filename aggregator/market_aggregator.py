@@ -345,6 +345,39 @@ class MarketAggregator:
             pass
         return p_price
 
+    def get_feed_reliability(self) -> Dict:
+        """
+        Return data-quality metadata consumed by operator UI and strategy.
+
+        Reliability is not an alpha signal. It is a confidence multiplier for
+        microstructure features. When the secondary feed is unavailable, CVD/OB
+        information remains usable but must be treated as single-venue evidence.
+        """
+        primary_ready = bool(getattr(self._primary, "is_ready", False))
+        secondary_configured = self._secondary is not None
+        secondary_ready = bool(
+            secondary_configured and self._secondary_alive
+            and getattr(self._secondary, "is_ready", True)
+        )
+        sources = 1 + int(secondary_ready)
+        microstructure_weight = 1.0 if secondary_ready else 0.62
+        return {
+            "primary_ready": primary_ready,
+            "secondary_configured": secondary_configured,
+            "secondary_alive": secondary_ready,
+            "sources": sources,
+            "microstructure_weight": microstructure_weight,
+            "mode": "dual" if secondary_ready else "single",
+            "note": (
+                "dual-feed microstructure" if secondary_ready
+                else "single-feed microstructure; posterior should discount CVD/OB"
+            ),
+        }
+
+    def get_data_quality(self) -> Dict:
+        """Backward-compatible alias for dashboards/controllers."""
+        return self.get_feed_reliability()
+
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
         return self._primary.is_price_fresh(max_stale_seconds)
 
@@ -368,6 +401,7 @@ class MarketAggregator:
             "timestamp": (p_ob or {}).get("timestamp", time.time()),
             "_sources": 1,
             "_executable_source": "primary",
+            "_feed_reliability": self.get_feed_reliability(),
         }
 
         if self._secondary is None or not self._secondary_alive:
@@ -421,11 +455,15 @@ class MarketAggregator:
         sell_vol = sum(t["quantity"] for t in merged
                        if t.get("timestamp", 0) >= cutoff and t.get("side") == "sell")
         total = buy_vol + sell_vol
+        reliability = self.get_feed_reliability()
         return {
             "buy_volume":  buy_vol,
             "sell_volume": sell_vol,
             "delta":       buy_vol - sell_vol,
             "delta_pct":   (buy_vol - sell_vol) / total if total > 0 else 0.0,
+            "sources":     reliability.get("sources", 1),
+            "microstructure_weight": reliability.get("microstructure_weight", 1.0),
+            "reliability": reliability,
         }
 
     @property
@@ -434,9 +472,14 @@ class MarketAggregator:
         return getattr(self._primary, "ws", None)
 
     def get_secondary_status(self) -> Dict:
+        reliability = self.get_feed_reliability()
         return {
-            "alive":       self._secondary_alive,
+            "alive":       reliability.get("secondary_alive", False),
             "has_secondary": self._secondary is not None,
             "primary":     type(self._primary).__name__,
             "secondary":   type(self._secondary).__name__ if self._secondary else "none",
+            "mode":        reliability.get("mode", "single"),
+            "sources":     reliability.get("sources", 1),
+            "microstructure_weight": reliability.get("microstructure_weight", 1.0),
+            "note":        reliability.get("note", ""),
         }

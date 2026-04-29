@@ -171,10 +171,10 @@ class RiskConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Sub-model: Conviction / Entry Filter
+# Sub-model: Advisory / Safety Filter
 # ---------------------------------------------------------------------------
 
-class ConvictionConfig(BaseModel):
+class AdvisorySafetyConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     CONVICTION_MIN_SCORE: float = Field(
@@ -228,7 +228,7 @@ class ConvictionConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def ote_band_valid(self) -> "ConvictionConfig":
+    def ote_band_valid(self) -> "AdvisorySafetyConfig":
         """OTE low must be strictly below OTE high."""
         if self.CONVICTION_OTE_FIB_LOW >= self.CONVICTION_OTE_FIB_HIGH:
             raise ValueError(
@@ -236,6 +236,11 @@ class ConvictionConfig(BaseModel):
                 f"must be < CONVICTION_OTE_FIB_HIGH ({self.CONVICTION_OTE_FIB_HIGH})."
             )
         return self
+
+
+# Backward-compatible alias: the old name remains import-safe, but this model
+# is advisory/safety metadata only. QuantPosterior owns alpha approval.
+ConvictionConfig = AdvisorySafetyConfig
 
 
 # ---------------------------------------------------------------------------

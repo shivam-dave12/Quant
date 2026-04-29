@@ -1238,7 +1238,7 @@ def format_status_report_v9(
 HELP_TEXT = (
     "<b>Commands</b>\n"
     "/status       — Full status + liquidity overview\n"
-    "/thinking     — Live decision stack + flow + pools\n"
+    "/thinking     — Posterior EV / uncertainty / execution audit\n"
     "/pools        — Full liquidity pool map (all TFs)\n"
     "/flow         — Detailed orderflow breakdown\n"
     "/position     — Current position details\n"
@@ -1247,7 +1247,7 @@ HELP_TEXT = (
     "/balance      — Wallet balance\n"
     "/pause        — Pause trading (keep monitoring)\n"
     "/resume       — Resume trading\n"
-    "/trail [on|off|auto] — Toggle trailing SL\n"
+    "/trail [on|off|auto] — Adaptive exit override\n"
     "/config       — Show config values\n"
     "/set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
     "/setexchange &lt;delta|coinswitch&gt; — Switch exchange\n"

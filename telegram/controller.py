@@ -1,20 +1,20 @@
 """
-telegram/controller.py — Liquidity-First Telegram Bot Controller
+telegram/controller.py — Institutional Quant Telegram Bot Controller
 =================================================================
-All command handlers reflect the liquidity-first decision architecture:
+All command handlers reflect the QuantPosterior authority model:
 
-  /thinking   — quant posterior decision stack
-  /status     — Full bot status (pool map + flow + position)
+  /thinking   — posterior P(edge), EV, uncertainty, execution audit
+  /status     — Full bot status (posterior flow + position)
   /pools      — Live liquidity pool map with priority scores
   /flow       — Detailed orderflow state (CVD + OB delta + tick aggression)
-  /structures — ICT structure map (OB / FVG / AMD — secondary layer)
-  /position   — Current position with pool TP context
+  /structures — Structure/AMD/PD features used by posterior
+  /position   — Current position with adaptive exit context
   /trades     — Recent trade history
   /stats      — Signal attribution analysis
   /balance    — Wallet balance
   /pause      — Pause trading (keep monitoring)
   /resume     — Resume trading
-  /trail      — Toggle trailing SL on/off/auto
+  /trail      — Adaptive exit override on/off/auto
   /config     — Show current config values
   /killswitch — Emergency: close all positions + cancel orders
   /setexchange — Switch execution exchange (delta|coinswitch)
@@ -258,13 +258,13 @@ class TelegramBotController:
                 {"command": "start",       "description": "Start trading bot"},
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
-                {"command": "thinking",    "description": "quant posterior decision stack"},
-                {"command": "position",    "description": "Current position + trail"},
+                {"command": "thinking",    "description": "posterior EV / uncertainty / execution audit"},
+                {"command": "position",    "description": "Current position + adaptive exit"},
                 {"command": "pnl",         "description": "Quick PnL snapshot"},
                 {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
                 {"command": "pools",       "description": "Live liquidity pool map"},
                 {"command": "flow",        "description": "CVD + OB delta + tick aggression"},
-                {"command": "structures",  "description": "ICT structure map (secondary layer)"},
+                {"command": "structures",  "description": "Structure/AMD/PD posterior features"},
                 {"command": "sl",          "description": "Current SL/TP levels + distances"},
                 {"command": "trades",      "description": "Recent trade history"},
                 {"command": "stats",       "description": "Signal attribution analysis"},
@@ -381,23 +381,23 @@ class TelegramBotController:
     def _cmd_help(self) -> str:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏛️ <b>LIQUIDITY-FIRST BOT  v5.0</b>\n"
+            "🏛️ <b>INSTITUTIONAL QUANT BOT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>Fibonacci trailing · Liquidity-pool entries · ICT structure</i>\n\n"
+            "<i>QuantPosterior master flow · liquidity features · adaptive exit</i>\n\n"
             "📊 <b>QUICK VIEW</b>\n"
             "  /pnl — Snapshot: uPnL, realised, last trades\n"
             "  /market — Price, ATR, AMD, MTF, flow, pools\n"
-            "  /sl — SL/TP distances, BE status, analytic R\n"
+            "  /sl — SL/TP, true net BE, adaptive exit state\n"
             "  /equity — Balance + unrealised + session return\n"
             "  /risk — Gate status, daily limits, cooldown\n\n"
             "🧠 <b>DECISION ANALYSIS</b>\n"
-            "  /thinking — quant posterior decision stack\n"
+            "  /thinking — posterior P(edge), EV, uncertainty, execution audit\n"
             "  /pools — BSL/SSL pool map with priority scores\n"
             "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
-            "  /structures — ICT OB/FVG/AMD secondary layer\n"
-            "  /huntstatus — Liquidity-hunt engine prediction\n\n"
+            "  /structures — structure/AMD/PD features used by posterior\n"
+            "  /huntstatus — liquidity-draw telemetry, not execution authority\n\n"
             "📈 <b>POSITION &amp; HISTORY</b>\n"
-            "  /position — Pos + Fibonacci trail state\n"
+            "  /position — Position + adaptive exit state\n"
             "  /trades — Last 10 trades with R, MFE, fees\n"
             "  /stats — Win rate attribution by tier/reason\n"
             "  /learn — Post-trade Bayesian adaptive params\n"
@@ -405,7 +405,7 @@ class TelegramBotController:
             "⚙️ <b>CONTROL</b>\n"
             "  /start · /stop — Start/stop bot\n"
             "  /pause · /resume — Pause trading (keep monitoring)\n"
-            "  /trail [on|off|auto] — Trail mode override\n"
+            "  /trail [on|off|auto] — Adaptive exit override\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
             "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
@@ -421,14 +421,13 @@ class TelegramBotController:
 
     def _cmd_thinking(self) -> str:
         """
-        Live quant posterior decision stack:
+        Live institutional decision stack:
 
-          LAYER 1 — Liquidity Map    BSL/SSL pools + priority scores
-          LAYER 2 — Flow Direction   CVD + OB delta + tick aggression
-                                     → is flow driving toward target pool?
-          LAYER 3 — ICT Secondary    AMD phase, OB/FVG alignment, P/D zone
-          LAYER 4 — Entry Gate       Sweep/OTE status, SL/TP levels
-          LAYER 5 — Post-trade       Trail engine state (BOS/CHoCH)
+          LAYER 1 — Market state       feed reliability, volatility, session
+          LAYER 2 — Liquidity state    active BSL/SSL + sweep archive
+          LAYER 3 — Posterior model    P(edge), EV, uncertainty, SPRT barrier
+          LAYER 4 — Execution audit    SL/TP eligibility, sizing, liquidation
+          LAYER 5 — Adaptive exit      EAE, true net BE, stop survival
         """
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
@@ -451,13 +450,25 @@ class TelegramBotController:
             pos     = strat._pos
             sig     = strat._last_sig
 
-            lines = [f"<b>🧠 LIQUIDITY-FIRST STACK @ ${price:,.2f}</b>"]
+            lines = [f"<b>🧠 QUANT POSTERIOR STACK @ ${price:,.2f}</b>"]
+            try:
+                rel = dm.get_feed_reliability() if hasattr(dm, 'get_feed_reliability') else (dm.get_secondary_status() if hasattr(dm, 'get_secondary_status') else {})
+                mode = _esc(str(rel.get('mode', 'single')).upper())
+                srcs = int(rel.get('sources', 1) or 1)
+                mw = float(rel.get('microstructure_weight', 1.0) or 1.0)
+                note = _esc(str(rel.get('note', '')))
+                lines.append(f"\n<b>━━ LAYER 0: DATA RELIABILITY</b>")
+                lines.append(f"  Feed: <b>{mode}</b> | sources={srcs} | microstructure weight={mw:.2f}")
+                if note:
+                    lines.append(f"  → {note}")
+            except Exception:
+                pass
 
             # ══════════════════════════════════════════════════════════
             # LAYER 1 — LIQUIDITY MAP
             # Markets move from pool to pool. Which pool are we targeting?
             # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 1: LIQUIDITY MAP</b>")
+            lines.append("\n<b>━━ LAYER 1: LIQUIDITY STATE</b>")
 
             liq_map = getattr(strat, '_liq_map', None)
             if liq_map is not None:
@@ -527,14 +538,14 @@ class TelegramBotController:
                 except Exception as _le:
                     lines.append(f"  LiqMap error: {_le}")
             else:
-                lines.append("  ⏳ Liquidity map not available (v9 engine not active)")
+                lines.append("  ⏳ Liquidity map not available")
 
             # ══════════════════════════════════════════════════════════
             # LAYER 2 — FLOW DIRECTION (primary gate)
             # Is CVD divergence + OB delta + tick aggression driving
             # toward the highest-priority pool?
             # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 2: FLOW DIRECTION  (primary gate)</b>")
+            lines.append("\n<b>━━ LAYER 2: MICROSTRUCTURE FEATURES</b>")
 
             tick_flow    = strat._tick_eng.get_signal() if strat._tick_eng else 0.0
             cvd_trend    = strat._cvd.get_trend_signal() if strat._cvd else 0.0
@@ -612,7 +623,7 @@ class TelegramBotController:
             # LAYER 3 — ICT SECONDARY VALIDATION
             # AMD phase, OB/FVG alignment, premium/discount zone
             # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 3: ICT SECONDARY VALIDATION</b>")
+            lines.append("\n<b>━━ LAYER 3: STRUCTURE / AMD / PD FEATURES</b>")
 
             if ict and ict._initialized:
                 # AMD phase
@@ -641,7 +652,7 @@ class TelegramBotController:
                     lines.append(
                         f"  {amd_icon} AMD: <b>{_esc(amd_phase)}</b>  "
                         f"{bias_icon}{_esc(amd_bias)}  conf={amd_conf:.2f}  "
-                        f"{'✅' if amd_compat else '❌'} flow-compatible")
+                        f"{'✅' if amd_compat else '❌'} feature-compatible")
                     if amd_note:
                         lines.append(amd_note)
                 except Exception as _ae:
@@ -694,10 +705,10 @@ class TelegramBotController:
                 lines.append("  ⏳ ICT engine initialising")
 
             # ══════════════════════════════════════════════════════════
-            # LAYER 4 — ENTRY GATE
-            # Sweep/OTE status, SL at ICT structure, TP at pool
+            # LAYER 4 — POSTERIOR / EXECUTION AUDIT
+            # Posterior decision, SL/TP eligibility, sizing, liquidation
             # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 4: ENTRY</b>")
+            lines.append("\n<b>━━ LAYER 4: POSTERIOR / EXECUTION AUDIT</b>")
 
             sweep = getattr(strat, '_active_sweep_setup', None)
             entry_engine = getattr(strat, '_entry_engine', None)
@@ -885,7 +896,7 @@ class TelegramBotController:
             # ══════════════════════════════════════════════════════════
             lines.append("\n<b>━━ VERDICT</b>")
             if pos.phase == PositionPhase.ACTIVE:
-                lines.append("  📍 Position ACTIVE — managing via ICT structure trail")
+                lines.append("  📍 Position ACTIVE — managing via adaptive exit controller")
             elif toward_pool and sweep is not None and sweep.status == "OTE_READY" and can_ok and cd_rem == 0:
                 lines.append("  🎯 <b>ALL LAYERS GREEN — entry eligible at OTE</b>")
             elif toward_pool and sweep is None:
@@ -1295,7 +1306,7 @@ class TelegramBotController:
         be_locked = ((side == "LONG"  and sl >= _be_price) or
                      (side == "SHORT" and sl <= _be_price and sl > 0))
 
-        # Trail phase — v5.0 Fibonacci engine phase labels (analytic R driven).
+        # Adaptive exit phase — EAE/liquidity-aware labels; R is analytics only.
         # These MUST match the phase strings emitted by LiquidityTrailEngine:
         #   PHASE_0_MAX_R=1.0  PHASE_1_MAX_R=2.0  PHASE_2_MAX_R=3.5  P3=3.5+
         if mfe_r >= 3.5:
@@ -1845,7 +1856,7 @@ class TelegramBotController:
             strat.set_trail_override(True)
             return (
                 "🔒 <b>Trailing SL: FORCED ON</b>\n"
-                "Engine: Fibonacci v5.0 (sole trail)\n"
+                "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
                 "Will advance SL per phase logic regardless of config flag."
             )
         elif arg in ("off", "disable", "0", "false", "no"):
@@ -1862,7 +1873,7 @@ class TelegramBotController:
             return (
                 f"🔄 <b>Trailing SL: AUTO</b>\n"
                 f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Fibonacci v5.0 (bar-close gated, sweep-confirmed)\n"
+                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
                 f"Send <code>/trail on</code> or <code>/trail off</code> to override."
             )
 
@@ -1873,18 +1884,18 @@ class TelegramBotController:
     def _cmd_config(self) -> str:
         import config as cfg
         lines = [
-            "<b>Bot Configuration (liquidity-first)</b>\n",
+            "<b>Bot Configuration (institutional quant flow)</b>\n",
             f"Symbol:     {cfg.SYMBOL}",
             f"Exchange:   {cfg.EXECUTION_EXCHANGE.upper()}",
             f"Leverage:   {cfg.LEVERAGE}x",
             "",
             "<b>Architecture</b>",
-            "  Primary:   BSL/SSL pool map + flow detector",
-            "  Secondary: ICT structures (OB/FVG/AMD)",
-            "  Entry:     Limit at OTE | Market at sweep",
-            "  SL:        ICT structure (wick→OB→swing)",
-            "  TP:        Opposing liquidity pool sweep price",
-            "  Trail:     ICT structure (BOS→CHoCH→15m)",
+            "  Data:      Primary executable venue + dual-feed reliability context",
+            "  Features:  Liquidity pools, sweeps, flow, CVD, AMD, PD, HTF structure",
+            "  Entry:     QuantPosterior P(edge), EV, uncertainty, SPRT barrier",
+            "  SL:        Thesis invalidation + liquidation guard + stop survival",
+            "  TP:        EV-ranked active liquidity target after costs",
+            "  Exit:      Adaptive EAE trail + true net BE + exchange PnL reconciliation",
             "",
             "<b>Position Sizing  (risk-based)</b>",
             # CRIT-1/CRIT-7 FIX: display RISK_PER_TRADE (now the actual sizing lever).
@@ -1907,7 +1918,7 @@ class TelegramBotController:
             f"  Max consec loss:  {getattr(cfg,'MAX_CONSECUTIVE_LOSSES',2)}",
             f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
-            "<b>Trail  (v5.0 Fibonacci — sole engine)</b>",
+            "<b>Exit Controller  (adaptive EAE / liquidity / true net BE)</b>",
             f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
             f"  Hands off: delivery inside expected adverse excursion — structural SL trusted",
             f"  BE lock: true net BE only after structure/delivery proof",

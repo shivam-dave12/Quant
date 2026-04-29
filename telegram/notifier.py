@@ -1,43 +1,20 @@
 """
-telegram/notifier.py — Liquidity-First Telegram Notifier  v2.0
-==============================================================
-Report architecture mirrors the decision hierarchy:
-  DirectionEngine hunt → Pool target → Flow confirmation → ICT context → Entry → Exit
+telegram/notifier.py — Institutional Quant Telegram Notifier
+=============================================================
+Report architecture mirrors the current authority model:
+  MarketAggregator reliability → Liquidity state → QuantPosterior
+  posterior/EV/uncertainty → Risk/Execution → Adaptive Exit.
 
 Public API (imported by strategy layer):
   send_telegram_message()            — async fire-and-forget delivery
-  format_periodic_report()           — 15-min institutional dashboard
-  format_direction_hunt_alert()      — DirectionEngine high-confidence prediction
-  format_post_sweep_verdict()        — post-sweep reversal/continuation decision
-  format_conviction_block_alert()    — conviction gate rejection with factor breakdown
-  format_pool_gate_alert()           — pool-hit gate action (exit/reverse/continue)
-  format_liquidity_trail_update()    — Fibonacci-trail SL advance (v5.0 engine)
+  format_periodic_report()           — institutional dashboard
+  format_direction_hunt_alert()      — liquidity-draw telemetry only
+  format_post_sweep_verdict()        — quant posterior auction decision
+  format_conviction_block_alert()    — safety/advisory diagnostic
+  format_pool_gate_alert()           — liquidity-path exit/reversal telemetry
+  format_liquidity_trail_update()    — adaptive exit / stop update
   install_global_telegram_log_handler()
   TelegramLogHandler
-
-Internal helpers (used by controller.py):
-  _sanitize_html(), _esc()
-
-v2.0 CHANGES
-------------
-1.  _sanitize_html rewritten as a proper state-machine parser. It now:
-      • Normalises stray ampersands to &amp; (was missing — leading cause of
-        byte-offset 2010-2035 parse errors).
-      • Uses a single-pass tokenizer that splits the input into text runs
-        and tag runs, escaping only the text runs.
-      • Emits perfectly balanced tags: unmatched closes are dropped, unclosed
-        opens are auto-closed at end.
-      • Tolerates truncation: a tag fragment with no > at end-of-string is
-        escaped as literal.
-      • Does NOT apply inside <code>/<pre> contents — those are treated as
-        raw text and fully escaped (as Telegram HTML requires).
-
-2.  New _tag(text, name) helper guarantees that the wrapping is correct —
-    all fresh format_* functions use it instead of hand-crafted markup.
-
-3.  format_liquidity_trail_update rewritten for the v5.0 Fibonacci engine:
-    shows fib_ratio, swing context, momentum gate, HTF alignment, buffer
-    details, pool-between-expansion tag, and cluster info.
 """
 
 from __future__ import annotations
@@ -200,8 +177,8 @@ def _classify_priority(message: str) -> int:
         "ENTRY", "EXIT", "POOL-GATE", "TRADE OPEN", "TRADE CLOSED",
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
         "POST-EXIT GATE", "IC GATE",
-        "POOL GATE", "CONVICTION BLOCK", "FIB TRAIL", "LIQUIDITY DRAW",
-        "POST-SWEEP VERDICT",
+        "LIQUIDITY PATH GATE", "SAFETY / ADVISORY BLOCK", "ADAPTIVE EXIT", "LIQUIDITY DRAW",
+        "QUANT POSTERIOR DECISION",
     )):
         return PRIO_IMPORTANT
     return PRIO_ROUTINE
@@ -1507,7 +1484,7 @@ def format_periodic_report(
         conf = float(_tg_get(direction_hunt, "confidence", 0.0) or 0.0)
         delivery = _tg_get(direction_hunt, "delivery_direction", "")
         lines.append(
-            f"<code>HUNT    {_esc(str(pred or 'NEUTRAL')):<9} [{_tg_bar(conf)}] {conf:>5.0%} {_esc(delivery or '-')}</code>"
+            f"<code>DRAW    {_esc(str(pred or 'NEUTRAL')):<9} [{_tg_bar(conf)}] {conf:>5.0%} {_esc(delivery or '-')}</code>"
         )
 
     if sweep_analysis:
@@ -1527,7 +1504,7 @@ def format_periodic_report(
         phase = _tg_get(direction_ps_analysis, "phase", "-")
         lines.append(f"<code>PS      {_esc(str(action).upper()):<9} {_esc(str(direction).upper()):<6} {conf:>5.0%} phase {_esc(phase)}</code>")
 
-    lines += [_tg_section("\U0001f6a6", "Execution Gates")]
+    lines += [_tg_section("\U0001f6a6", "Posterior / Execution")]
     lines.append(f"<code>SESSION {'PASS' if session else 'WAIT':<6}  FLOW {'PASS' if abs(flow_conviction) >= 0.20 else 'WAIT':<6}  HTF {'PASS' if htf_bias and htf_bias.lower() != 'mixed' else 'WAIT':<6}</code>")
 
     if position:
@@ -1631,7 +1608,7 @@ def format_post_sweep_verdict(
     if displacement_atr:
         tags.append(f"disp {float(displacement_atr):.2f}A")
     lines = [
-        f"\U0001f30a <b>POST-SWEEP VERDICT</b>  <code>{_esc(str(action).upper())}</code>",
+        f"🧠 <b>QUANT POSTERIOR DECISION</b>  <code>{_esc(str(action).upper())}</code>",
         _TG_RULE,
         f"<code>DIR     {_esc(str(direction).upper() or '-'):<8} [{_tg_bar(confidence)}] {float(confidence or 0):>5.0%}   phase {_esc(phase or '-')}</code>",
         f"<code>POOL    {_esc(swept_side or '-'):<8} @ {_tg_price(swept_price):>13}   mark {_tg_price(current_price):>13}</code>",
@@ -1662,7 +1639,7 @@ def format_pool_gate_alert(
     side = side or _kw.get("pos_side", "")
     confidence = float(_kw.get("confidence", 0.0) or 0.0)
     lines = [
-        f"\U0001f6a6 <b>POOL GATE</b>  <code>{_esc(str(action).upper())}</code>",
+        f"\U0001f6a6 <b>LIQUIDITY PATH GATE</b>  <code>{_esc(str(action).upper())}</code>",
         _TG_RULE,
         f"<code>POS     {_esc(str(side).upper() or '-'):<8} mark {_tg_price(current_price):>13}   conf {confidence:>5.0%}</code>",
     ]
@@ -1693,7 +1670,7 @@ def format_conviction_block_alert(
     allow_reasons = _kw.get("allow_reasons") or []
     deficit = max(0.0, float(required_score or 0.0) - score)
     lines = [
-        f"\U0001f6ab <b>CONVICTION BLOCK</b>  <code>{_esc(str(side).upper())}</code>",
+        f"🛡️ <b>SAFETY / ADVISORY BLOCK</b>  <code>{_esc(str(side).upper())}</code>",
         _TG_RULE,
         f"<code>SCORE   {score:>6.2f} / {float(required_score or 0):>5.2f}   need +{deficit:.2f}   [{_tg_bar(score / max(required_score, 0.01))}]</code>",
     ]
@@ -1760,11 +1737,11 @@ def format_liquidity_trail_update(
     if htf_aligned is not None:
         tags.append("HTF aligned" if htf_aligned else "HTF mixed")
     lines = [
-        f"\U0001f512 <b>FIB TRAIL ADVANCE</b>  <code>{_esc(side_u)}</code>",
+        f"🔒 <b>ADAPTIVE EXIT STOP UPDATE</b>  <code>{_esc(side_u)}</code>",
         _TG_RULE,
         f"<code>SL      {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
         f"<code>R       live {float(r_multiple or 0):+6.2f}R   lock {locked:+8.1f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",
-        f"<code>FIB     {fib_ratio if fib_ratio is not None else '-':>8}   anchor {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}</code>",
+        f"<code>ANCHOR  {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}   fib {fib_ratio if fib_ratio is not None else '-':>8}</code>",
         f"<code>MARK    {_tg_price(current_price):>14}   ENTRY {_tg_price(entry_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
     ]
     if swing_low is not None or swing_high is not None:

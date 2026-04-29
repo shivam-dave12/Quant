@@ -1,40 +1,35 @@
 """
-main.py — Liquidity-First Dual-Exchange Quant Bot
-===================================================
+main.py — Institutional Quant Posterior Bot
+============================================
 Entry point.
 
-Architecture (liquidity-first):
-  1. Multi-TF liquidity scanner tracks BSL/SSL pools on 1m, 5m, 15m, 1h, 4h.
-  2. Pool priority engine scores every pool by HTF confluence, touch count,
-     freshness, and volume at the level.
-  3. Directional intent detector (primary gate): CVD divergence + orderbook
-     delta + tick aggression determines whether flow is driving TOWARD the
-     highest-priority pool.  If not → wait.
-  4. ICT structure validation (secondary): AMD phase, OB/FVG alignment, and
-     premium/discount zone confirm the structural context for the trade.
-  5. Entry: limit at OTE inside the sweep zone, or market at confirmed sweep.
-  6. SL: placed at ICT structure — sweep wick → OB → swing low/high.
-  7. TP: set at the opposing liquidity pool's sweep price.
-  8. Trail: ICT structure only — BOS swing → CHoCH tighten → 15m structure.
-  9. Post-sweep engine: CVD + structure decides continue/reverse/range.
+Current architecture:
+  1. MarketAggregator builds executable primary data plus dual-feed
+     microstructure context with explicit feed-reliability metadata.
+  2. LiquidityMap supplies active BSL/SSL pools as market-state features;
+     swept pools are context/archive only, not executable targets.
+  3. QuantPosterior is the master alpha decision layer. It converts liquidity,
+     displacement, CVD, order-book imbalance, volatility, dealing-range and
+     HTF structure into posterior probability, uncertainty-adjusted EV and an
+     SPRT-style likelihood barrier.
+  4. DirectionEngine is telemetry only. It may explain liquidity draw context,
+     but it cannot inject executable direction or override the posterior.
+  5. ConvictionFilter is advisory/safety only. It may enforce account safety,
+     drawdown and cooldown rules, but it is not an alpha veto.
+  6. Risk/Execution validates sizing, liquidation distance, exchange lot size,
+     bracket placement and exact fill/fee accounting.
+  7. Adaptive Exit manages the live position using expected adverse excursion,
+     liquidity context, true net breakeven and exchange-reconciled PnL.
 
 Exchange routing:
   - Both exchange data managers start concurrently.
-  - MarketAggregator fuses OB depth + CVD + tick flow from both.
-  - Candles come exclusively from the primary (execution) exchange.
-  - ExecutionRouter owns both OrderManagers; routes to the active one.
-  - /setexchange <delta|coinswitch> switches execution at runtime
-    (blocked while a position is open; no restart needed).
-
-Startup sequence:
-  1. Validate credentials for all configured exchanges.
-  2. Construct API clients + OrderManagers for each exchange.
-  3. Build ExecutionRouter (default from config.EXECUTION_EXCHANGE).
-  4. Construct data managers + MarketAggregator.
-  5. Set leverage on active exchange.
-  6. Start aggregator (boots both DMs concurrently).
-  7. Wait for primary DM readiness.
-  8. Start strategy + main loop.
+  - MarketAggregator fuses OB/CVD/tick context where available, but candles and
+    executable orderbook are always primary-venue only.
+  - Data-quality/reliability is exposed so the strategy can discount single-feed
+    or stale secondary signals instead of treating them as full confidence.
+  - ExecutionRouter owns both OrderManagers and routes to the active exchange.
+  - /setexchange <delta|coinswitch> switches execution at runtime, blocked while
+    a position is open.
 """
 
 from __future__ import annotations
@@ -299,16 +294,14 @@ install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0
 
 class QuantBot:
     """
-    Liquidity-first dual-exchange quant bot.
+    Institutional dual-exchange quant bot.
 
     Decision hierarchy on every tick:
-      1. Are there scored BSL/SSL pools within range?       → LiquidityMap
-      2. Is flow (CVD + OB delta + tick aggression)
-         driving toward the highest-priority pool?          → FlowDetector
-      3. Does ICT structure confirm the trade context?      → ICTEngine
-      4. Entry at OTE or market-at-sweep; SL at structure;
-         TP at opposing pool.                               → EntryEngine
-      5. Trail via ICT structure only (BOS/CHoCH).          → TrailEngine
+      1. Build feed-reliability and market-state context.   → MarketAggregator
+      2. Map live BSL/SSL features and archived sweeps.      → LiquidityMap
+      3. Estimate posterior edge, EV and uncertainty.        → QuantPosterior
+      4. Validate sizing, liquidation, lots and fills.       → Risk/Execution
+      5. Manage live trade via adaptive exit controller.     → LiquidityTrail
 
     Public attributes accessed by the Telegram controller:
       .strategy          — QuantStrategy
@@ -543,17 +536,17 @@ class QuantBot:
                 f"Execution: {self.execution_router.active_exchange.upper()}\n"
                 f"Leverage:  {QCfg.LEVERAGE()}x\n\n"
                 "<b>Architecture:</b>\n"
-                "  1️⃣  Multi-TF liquidity pool scanner\n"
-                "  2️⃣  Pool priority engine (HTF × touches × freshness)\n"
-                "  3️⃣  Flow detector: CVD + OB delta + tick aggression\n"
-                "  4️⃣  ICT validation: AMD + OB/FVG + P/D zone\n"
-                "  5️⃣  Entry at OTE · SL at ICT structure · TP at pool\n"
-                "  6️⃣  Trail: BOS → CHoCH → 15m structure only\n\n"
-                "<b>Active Patches:</b>\n"
-                "  🔬 MTF Pool Probability (Issue-1): distance-decay × TF-base × sig × session\n"
-                "  📘 Plain-Limit TP/SL (Issue-2): resting limit orders — maker rebate, zero latency\n"
-                "  🏦 Liquidity-Only Trail (Issue-3): pool-anchor SL, chandelier fallback\n"
-                "  🎯 Conviction Gate (Issue-4): 7-factor gate, score ≥ 0.75, ~76% WR target\n\n"
+                "  1️⃣  MarketAggregator: primary execution data + dual-feed context\n"
+                "  2️⃣  LiquidityMap: active BSL/SSL features; swept pools archived\n"
+                "  3️⃣  QuantPosterior: P(edge), EV, uncertainty, SPRT barrier\n"
+                "  4️⃣  Risk/Execution: sizing, liquidation guard, exact fills\n"
+                "  5️⃣  Adaptive Exit: EAE, true net BE, liquidity-aware stops\n"
+                "\n"
+                "<b>Authority model:</b>\n"
+                "  🧠 QuantPosterior is the master alpha decision\n"
+                "  🧭 DirectionEngine is telemetry only\n"
+                "  🛡️ ConvictionFilter is advisory/safety only\n"
+                "  💰 PnL is exchange-fill reconciled, not estimated\n\n"
                 f"📡 <b>Data feed:</b> "
                 f"{'DUAL — ' + secondary_name.upper() + ' secondary active' if dual_feed else 'SINGLE — primary only'}\n\n"
                 f"<i>/setexchange delta|coinswitch to switch execution exchange</i>"
