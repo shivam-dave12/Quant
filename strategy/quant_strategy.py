@@ -54,6 +54,15 @@ try:
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
+try:
+    from strategy.expected_utility import build_target_surface, expected_utility_size_multiplier
+except Exception:  # pragma: no cover - standalone tests
+    try:
+        from expected_utility import build_target_surface, expected_utility_size_multiplier  # type: ignore
+    except Exception:
+        build_target_surface = None  # type: ignore
+        expected_utility_size_multiplier = None  # type: ignore
+
 # -- v9.0: Liquidity-First Entry Engine ------------------------------------
 try:
     from strategy.liquidity_map import LiquidityMap
@@ -97,7 +106,7 @@ except ImportError:
         HuntPrediction   = None   # type: ignore
         DirectionBias    = None   # type: ignore
 
-# Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Advisory/Safety Model Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # 7-factor mandatory gate before any entry. Mandatory gates: pool TF Ã¢â€°Â¥ 15m,
 # dealing range valid, AMD not ACCUMULATION, session not ASIA.
 # Required conviction score Ã¢â€°Â¥ 0.75 for all weighted factors.
@@ -2643,7 +2652,7 @@ class QuantStrategy:
         )
         self._ict_trail = ICTTrailManager() if _ENTRY_ENGINE_AVAILABLE else None
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Advisory/Safety Model Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Evaluates 7 ICT factors before any entry order is placed.
         # Mandatory hard blocks: pool TF, dealing range, AMD phase, session.
         # Weighted score must reach 0.75; tracks session-level quality state.
@@ -2895,57 +2904,105 @@ class QuantStrategy:
         return ""
 
     def _institutional_signal_veto(self, signal, price: float, atr: float, ict_ctx) -> str:
-        """Final cheap veto before expensive gates.
+        """Cheap safety sanity only; no style/threshold vetoes.
 
-        Entry must be a post-sweep institutional event, not a first-push chase.
-        This catches stale or weak signals that slipped through a permissive
-        evidence score before the quantitative posterior master runs.
+        Earlier versions used this function as another hidden rule gate
+        (minimum displacement, CISD/OTE, PD, flow opposition). That defeated the
+        QuantPosterior master design. Those observations now belong inside the
+        posterior/expected-utility model and target surface; this method only
+        blocks malformed signals that would be unsafe to route.
         """
         try:
             side = str(getattr(signal, "side", "") or "").lower()
-            etype = self._signal_entry_type_value(signal).upper()
-            sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
-            disp = float(sa.get("displacement_atr", 0.0) or 0.0)
-            cisd = bool(sa.get("cisd", False))
-            ote = bool(sa.get("ote", False))
+            entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
+            sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+            tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
             if side not in ("long", "short"):
                 return "invalid side"
-            fs = getattr(self, "_last_flow_state", None)
-            profile = build_market_profile(
-                price=price,
-                atr=atr,
-                ict=ict_ctx,
-                flow=fs,
-                side=side,
-            )
-            min_disp = profile.displacement_min(float(getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
-            strong_disp = profile.strong_displacement(float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25)))
-            if disp < min_disp:
-                return f"accepted displacement {disp:.2f}ATR < {min_disp:.2f}ATR"
-            if not (cisd or ote or disp >= strong_disp):
-                return "missing CISD/OTE/strong accepted displacement"
-
-            sweep = getattr(signal, "sweep_result", None)
-            pool = getattr(sweep, "pool", None)
-            pool_px = float(getattr(pool, "price", 0.0) or 0.0)
-            if "CONTINUATION" in etype and pool_px > 0 and atr > 0:
-                acc = ((float(price) - pool_px) / atr) if side == "long" else ((pool_px - float(price)) / atr)
-                req = float(getattr(config, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
-                if acc < req:
-                    return f"continuation acceptance {acc:.2f}ATR < {req:.2f}ATR"
-
-            if fs is not None:
-                tick = float(getattr(fs, "tick_flow", 0.0) or 0.0)
-                cvd = float(getattr(fs, "cvd_trend", 0.0) or 0.0)
-                ft = profile.flow_opposition_threshold(float(getattr(config, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40)))
-                ct = profile.flow_opposition_threshold(float(getattr(config, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30)))
-                if side == "long" and tick < -ft and cvd < -ct and disp < strong_disp:
-                    return f"flow/cvd oppose long tick={tick:+.2f} cvd={cvd:+.2f}"
-                if side == "short" and tick > ft and cvd > ct and disp < strong_disp:
-                    return f"flow/cvd oppose short tick={tick:+.2f} cvd={cvd:+.2f}"
+            if entry <= 0 or sl <= 0 or tp <= 0:
+                return "non-positive entry/SL/TP"
+            if side == "long" and not (sl < entry < tp):
+                return "long levels are not protective/orderly"
+            if side == "short" and not (tp < entry < sl):
+                return "short levels are not protective/orderly"
         except Exception as e:
-            logger.debug(f"institutional_signal_veto error: {e}")
+            logger.debug(f"institutional_signal_veto safety error: {e}")
+            return "signal safety validation error"
         return ""
+
+    def _apply_expected_utility_target_surface(self, signal, liq_snapshot, flow_state,
+                                               ict_ctx, price: float, atr: float) -> None:
+        """Optimise TP from the live liquidity target surface.
+
+        This replaces nearest/farthest/fixed-R TP behaviour with a probability ×
+        payoff - risk - cost selection. It mutates the EntrySignal in place only
+        when the selected target improves expected utility. For tiny positions
+        that cannot be split into partials, the best utility target becomes the
+        single exchange TP. Larger positions retain terminal-runner metadata for
+        future manual reduce-only ladder management.
+        """
+        if build_target_surface is None:
+            return
+        try:
+            entry = float(getattr(signal, "entry_price", price) or price)
+            sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+            old_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
+            if entry <= 0 or sl <= 0 or old_tp <= 0:
+                return
+            fee_bps = 8.0
+            slip_bps = 2.0
+            try:
+                if self._fee_engine is not None:
+                    snap = self._fee_engine.diagnostic_snapshot()
+                    fee_bps = float(snap.get('rt_cost_maker_bps', snap.get('rt_cost_taker_bps', fee_bps)) or fee_bps)
+                    slip_bps = float(snap.get('slippage_ewma_bps', slip_bps) or slip_bps)
+            except Exception:
+                pass
+            surface = build_target_surface(
+                side=str(getattr(signal, "side", "") or ""),
+                entry=entry,
+                stop=sl,
+                atr=float(atr or 0.0),
+                snapshot=liq_snapshot,
+                flow=flow_state,
+                ict=ict_ctx,
+                fee_bps=fee_bps,
+                slippage_bps=slip_bps,
+            )
+            self._last_target_surface = surface
+            if not surface.best:
+                logger.debug("TargetSurface: no eligible live target; keeping EntryEngine TP")
+                return
+            old_risk = abs(entry - sl)
+            old_rr = abs(old_tp - entry) / max(old_risk, 1e-9)
+            old_dist_atr = abs(old_tp - entry) / max(float(atr or 0.0), 1e-9)
+            old_u = None
+            for c in surface.candidates:
+                if abs(c.price - old_tp) <= max(QCfg.TICK_SIZE() * 2.0, 1e-9):
+                    old_u = c.utility
+                    break
+            # If old target is not on the live surface, treat it as terminal/lower reliability.
+            if old_u is None:
+                old_u = -0.15 + 0.02 * min(old_rr, 10.0) - 0.02 * old_dist_atr
+            best = surface.best
+            # Switch only for meaningful expected utility improvement. This is
+            # not a fixed TP preference; it prevents oscillation/noisy retargeting.
+            improvement = best.utility - float(old_u)
+            if improvement > 0.04:
+                setattr(signal, "tp_price", best.price)
+                setattr(signal, "target_pool", best.pool_ref)
+                setattr(signal, "rr_ratio", abs(best.price - entry) / max(old_risk, 1e-9))
+                setattr(signal, "target_surface", surface)
+                logger.info(
+                    "TargetSurface selected TP: %s | replaced old TP $%.1f "
+                    "oldU=%+.3f improvement=%+.3f",
+                    best.compact(), old_tp, old_u, improvement,
+                )
+            else:
+                setattr(signal, "target_surface", surface)
+                logger.debug("TargetSurface kept existing TP: oldU=%+.3f best=%s", old_u, best.compact())
+        except Exception as e:
+            logger.debug(f"TargetSurface optimisation error: {e}")
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
@@ -3283,12 +3340,27 @@ class QuantStrategy:
             score += min((rr - 3.0) * 0.025, 0.10)
         score = self._bounded(score)
 
+        # Audit-only diagnostics. The quantitative posterior/EV model owns
+        # alpha approval; this matrix must not veto a valid edge because of
+        # style, PD, HTF, flow, RR preference or score. Only physical/exchange
+        # safety defects remain hard blockers.
         threshold = 0.70 if is_sweep else 0.76
-        if rr >= 3.0 and target_realism >= 0.82:
-            threshold -= 0.02
-        allowed = (not rejects) and score >= threshold
-        if not allowed and not rejects:
-            rejects.append(f"synergy score {score:.2f} < {threshold:.2f}")
+        safety_rejects = []
+        for _r in rejects:
+            _ru = str(_r).upper()
+            if any(tok in _ru for tok in (
+                "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
+                "TP IS NOT", "SL IS NOT", "NON-PROTECTIVE",
+            )):
+                safety_rejects.append(str(_r))
+        if safety_rejects:
+            allowed = False
+        else:
+            allowed = True
+            if rejects:
+                allows.append("advisory: " + " | ".join(str(r) for r in rejects[:3]))
+            if score < threshold:
+                allows.append(f"audit synergy score {score:.2f} < {threshold:.2f} — not a veto")
 
         if score >= 0.82 and rr >= 2.5 and target_realism >= 0.72:
             grade = "S"
@@ -3300,11 +3372,20 @@ class QuantStrategy:
         size_mult = self._bounded(0.75 + (score - threshold) * 0.90, 0.55, 1.12)
         if rr >= 3.0 and target_realism >= 0.75:
             size_mult = min(1.15, size_mult + 0.05)
-        if rejects:
+        try:
+            _surf = getattr(signal, "target_surface", None) or getattr(self, "_last_target_surface", None)
+            if expected_utility_size_multiplier is not None and _surf is not None:
+                _posterior = 0.0
+                _sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+                _posterior = float(_sa.get("posterior", 0.0) or 0.0)
+                size_mult = self._bounded(size_mult * expected_utility_size_multiplier(_surf, _posterior), 0.35, 1.18)
+        except Exception:
+            pass
+        if safety_rejects:
             size_mult = 0.0
 
         allows.append(
-            f"score={score:.2f} grade={grade} RR={rr:.2f} "
+            f"audit_score={score:.2f} grade={grade} RR={rr:.2f} "
             f"SL={sl_atr:.2f}ATR TP={tp_atr:.2f}ATR"
         )
         return InstitutionalDecision(
@@ -3312,7 +3393,7 @@ class QuantStrategy:
             score=score,
             grade=grade,
             size_mult=size_mult,
-            reject_reasons=rejects,
+            reject_reasons=safety_rejects,
             allow_reasons=allows,
             rr=rr,
             sl_atr=sl_atr,
@@ -4204,9 +4285,9 @@ class QuantStrategy:
             logger.debug(f"UNIFIED_GATE hard veto error: {_uge}")
 
         if rejects:
-            return False, " | ".join(rejects[:4])
+            advisories.append("legacy hard-gate advisory: " + " | ".join(rejects[:4]))
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Log all advisories at DEBUG (not INFO Ã¢â‚¬â€ avoids log spam) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        # Log all advisories at DEBUG (not INFO — avoids log spam)
         if advisories:
             logger.debug(
                 f"UNIFIED_GATE [{signal.side.upper()}] advisories (not blocking): "
@@ -4409,7 +4490,7 @@ class QuantStrategy:
                     self._dir_engine_last_log_key = _de_log_key
                     self._dir_engine_last_log_ts  = now
                     logger.info(
-                        f"Ã°Å¸Â§Â­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"Ã°Å¸Â§Â­ DIR_TELEMETRY: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} "
                         f"delivery={_hunt.delivery_direction} "
                         f"raw={_hunt.raw_score:+.3f} "
@@ -4417,7 +4498,7 @@ class QuantStrategy:
                         f"| {_hunt.reason[:100]}")
                 else:
                     logger.debug(
-                        f"Ã°Å¸Â§Â­ DIR_ENGINE: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"Ã°Å¸Â§Â­ DIR_TELEMETRY: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} raw={_hunt.raw_score:+.3f} "
                         f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
                         f"| {_hunt.reason[:100]}")
@@ -4969,6 +5050,7 @@ class QuantStrategy:
         self._last_flow_state = flow_state
         signal = self._entry_engine.get_signal()
         if signal is not None:
+            self._apply_expected_utility_target_surface(signal, liq_snapshot, flow_state, ict_ctx, price, atr)
             inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)
             if inst_veto:
                 veto_key = (
@@ -5016,7 +5098,7 @@ class QuantStrategy:
             if not _inst_decision.allowed:
                 reject_str = " | ".join(_inst_decision.reject_reasons[:3])
                 logger.info(
-                    f"Institutional matrix blocked {signal.side.upper()} "
+                    f"Safety audit blocked {signal.side.upper()} "
                     f"{signal.entry_type.value}: score={_inst_decision.score:.2f} "
                     f"RR={_inst_decision.rr:.2f} target={_inst_decision.target_realism:.2f} | "
                     f"{reject_str}")
@@ -5024,7 +5106,7 @@ class QuantStrategy:
                     signal, reject_str or "institutional matrix blocked", cooldown_sec=45.0)
                 return
             logger.info(
-                f"Institutional matrix PASS [{_inst_decision.grade}] "
+                f"Decision audit PASS [{_inst_decision.grade}] "
                 f"score={_inst_decision.score:.2f} RR={_inst_decision.rr:.2f} "
                 f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR "
                 f"target={_inst_decision.target_realism:.2f} "
@@ -5046,7 +5128,7 @@ class QuantStrategy:
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
 
-            # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+            # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Advisory/Safety Model Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             # Evaluate 7 ICT factors (mandatory gates + weighted score Ã¢â€°Â¥ 0.75).
             # Retrieve the PostSweepDecision Ã¢â‚¬â€ try dir_engine first, fall back
             # to entry_engine's _last_sweep_analysis (which has CISD, displacement,
@@ -5085,7 +5167,7 @@ class QuantStrategy:
                 # MOD-6 FIX: Pass ict._session (canonical "LONDON"/"NY"/"ASIA"),
                 # not ict._killzone ("LONDON_KZ" / "" outside KZ window).
                 # _killzone is empty between kill-zones even when the session is
-                # active, causing the conviction gate to misread the session as ''
+                # active, causing the advisory/safety model to misread the session as ''
                 # and apply a 0.40 penalty instead of the full 1.00 session score.
                 _sess_str = ""
                 if self._ict is not None:
@@ -5554,7 +5636,7 @@ class QuantStrategy:
                 sl_price = _fsl
                 tp_price = _ftp
                 _using_force_levels = True
-                logger.info(f"v9.0 force SL/TP: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
+                logger.info(f"Protective exchange SL/TP armed: SL=${sl_price:,.1f} TP=${tp_price:,.1f}")
             self._force_sl = None
             self._force_tp = None
 
@@ -7626,7 +7708,7 @@ class QuantStrategy:
             self._winning_trades += 1
         self._risk_gate.record_trade_result(pnl)
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Conviction Gate Ã¢â‚¬â€ session quality tracking Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ISSUE-4 FIX: Advisory/Safety Model Ã¢â‚¬â€ session quality tracking Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # Record win/loss so the consecutive-loss session guard can block
         # further entries after MAX_SESSION_LOSSES in the same session.
         if self._conviction is not None:

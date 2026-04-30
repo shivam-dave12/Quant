@@ -405,7 +405,7 @@ class RRConsistencyConfig(BaseModel):
     Cross-module R:R invariant: all three R:R gates must be identical.
 
     The three gates — MIN_RISK_REWARD_RATIO (risk_manager),
-    CONVICTION_MIN_RR (conviction_filter), and QUANT_REVERSION_MIN_RR
+    CONVICTION_MIN_RR (advisory_safety_model), and QUANT_REVERSION_MIN_RR
     (quant_strategy) — must agree.  If they diverge, you get asymmetric
     rejection: e.g. a setup passes conviction at 1.3R but fails risk at 1.5R,
     burning entry-engine cooldown budget for a trade that can never fire.

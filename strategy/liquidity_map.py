@@ -205,7 +205,7 @@ _MAX_POOLS_PER_TF = 30         # was 15 — wider window needs more capacity
 TRADEABLE_POOL_MIN_SIG = 1.8   # was 3.0
 
 # v2.4: timeframe-aware display/tradeability floor.  LTF pools are noisy but
-# should not vanish from the map; downstream sweep/displacement/conviction gates
+# should not vanish from the map; downstream sweep/posterior/execution models
 # decide whether they are good enough to trade.
 TRADEABLE_POOL_MIN_SIG_BY_TF: Dict[str, float] = {
     "1m": 0.80, "2m": 0.90, "3m": 1.00,

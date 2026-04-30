@@ -1151,10 +1151,9 @@ def format_trail_advance(
     fib_ratio:     Optional[float] = None,
 ) -> str:
     """
-    Industry-grade trail advance alert. Compact — fires often, must scan
-    fast.
+    Adaptive exit advance alert. Compact — fires often; reports the stop move and legacy R fields only for analytics compatibility.
 
-        🔒 TRAIL ↑ LONG   $77,540.00   PHASE_1_BE_FLOOR (1.20R)
+        🔒 TRAIL ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION (1.20R)
         ─────────────────────────
         SL    $77,520.00 → $77,540.00   locked +0.20R
         FIB   0.500   anchor 15m @ $77,420.00
@@ -1172,7 +1171,7 @@ def format_trail_advance(
     ]
     if fib_ratio is not None and anchor_price > 0:
         rows.append(
-            f"<code>FIB   {fib_ratio:.3f}</code>"
+            f"<code>ANCHOR_RATIO {fib_ratio:.3f}</code>"
             f"   anchor {_esc(anchor_tf or '?')} @ <code>{_fmt_price(anchor_price)}</code>"
         )
     elif anchor_price > 0:

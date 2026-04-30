@@ -1,5 +1,5 @@
 """
-conviction_filter.py — Institutional Entry Conviction Gate v3.0
+conviction_filter.py — Advisory/Safety Attribution Model
 ================================================================
 COMPLETE REWRITE — not a patch.  Drop-in replacement.
 
@@ -119,7 +119,7 @@ _TF_RANK: Dict[str, int] = {
 # AMD cycles, HTF structure, displacement, and CISD are all equally valid on
 # a Saturday or during Asia/off-hours. What changes is the absence of a named
 # (London open / NY open).  We model that as a moderate score reduction rather
-# than a veto — the conviction gate's displacement + CISD + pool-TF weights
+# than a veto — the advisory/safety model's displacement + CISD + pool-TF weights
 # already handle the lower-quality setups naturally.
 _SESSION_SCORE: Dict[str, float] = {
     "LONDON":    1.00,
@@ -199,7 +199,7 @@ class SessionState:
 
 class ConvictionFilter:
     """
-    Institutional Entry Conviction Gate v3.0.
+    Advisory/Safety attribution model. It may block only account/exchange safety events; alpha approval belongs to QuantPosterior.
     Drop-in replacement.  Same interface, institutional logic.
     """
 
@@ -230,7 +230,7 @@ class ConvictionFilter:
         live_balance: float        = 0.0,   # Bug #16: real account balance for drawdown gate
     ) -> ConvictionResult:
         """
-        Evaluate conviction for a potential entry.
+        Evaluate advisory/safety attribution for a potential entry.
 
         Architecture:
           1. Hard mandatory gates (any fail = immediate rejection)

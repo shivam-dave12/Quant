@@ -716,6 +716,22 @@ class TelegramBotController:
 
             lines.append(f"  Engine: <b>{_esc(engine_state)}</b>")
 
+            # Expected-utility target surface (new master TP logic).
+            try:
+                surf = getattr(strat, '_last_target_surface', None)
+                if surf is not None and getattr(surf, 'candidates', None):
+                    lines.append("  <b>Target surface</b>: probability × payoff − risk − cost")
+                    best = getattr(surf, 'best', None)
+                    terminal = getattr(surf, 'terminal', None)
+                    if best is not None:
+                        lines.append(f"    ✅ Best: {_esc(best.compact())}")
+                    if terminal is not None and terminal is not best:
+                        lines.append(f"    🏁 Runner: {_esc(terminal.compact())}")
+                    for c in list(getattr(surf, 'candidates', []) or [])[:3]:
+                        lines.append(f"    • {_esc(c.compact())}")
+            except Exception as _tse:
+                lines.append(f"  Target-surface diagnostics error: {_esc(_tse)}")
+
             # Institutional TP/SL pool-plan diagnostics.  This answers the
             # operator question: "BSL/SSL is visible, so why was it not selected?"
             # The rows come from liquidity_pool_selector's hard gates — no gate is
