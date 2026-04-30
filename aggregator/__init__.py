@@ -1,1 +1,1 @@
-from aggregator.market_aggregator import MarketAggregator
+"""Local package marker for the institutional quant bot."""

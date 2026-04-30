@@ -2939,68 +2939,35 @@ class QuantStrategy:
 
     def _apply_expected_utility_target_surface(self, signal, liq_snapshot, flow_state,
                                                ict_ctx, price: float, atr: float) -> None:
-        """Optimise SL and TP from live expected-utility surfaces.
+        """Jointly optimise executable SL/TP from live utility surfaces.
 
-        EntryEngine still proposes a raw protective SL and raw liquidity TP. This
-        method is the institutional optimiser: it builds a StopSurface first,
-        then a TargetSurface using the updated risk. Terminal HTF pools are
-        retained as runner objectives, not full-size TP unless they are also the
-        best full-position utility target.
+        v7 fix: the previous implementation optimised StopSurface first and
+        TargetSurface second. That is mathematically greedy: a high-quality but
+        wider stop can destroy executable target utility after the fact. An
+        institutional router must choose the best *pair* of invalidation stop
+        and executable target, then apply both together.
+
+        EntryEngine still supplies raw observation levels. This method evaluates:
+            existing/raw stop + target surface
+            top StopSurface candidates + target surface for each stop
+        and selects the pair with the best joint utility, while keeping terminal
+        objectives as runner metadata only.
         """
         if build_target_surface is None:
             return
         try:
             entry = float(getattr(signal, "entry_price", price) or price)
-            old_sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
-            old_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
-            if entry <= 0 or old_sl <= 0 or old_tp <= 0:
+            raw_sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+            raw_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
+            if entry <= 0 or raw_sl <= 0 or raw_tp <= 0:
                 return
 
             side = str(getattr(signal, "side", "") or "").lower()
+            if side not in ("long", "short"):
+                return
             tick = float(QCfg.TICK_SIZE()) if 'QCfg' in globals() else 0.5
+            atr_f = max(float(atr or 0.0), 1e-9)
 
-            # 1) Stop/invalidation surface. This is not an R/R optimiser. It
-            # selects the stop with the best survival/invalidation utility.
-            stop_surface = None
-            if 'build_stop_surface' in globals() and build_stop_surface is not None:
-                stop_surface = build_stop_surface(
-                    side=side,
-                    entry=entry,
-                    current_stop=old_sl,
-                    atr=float(atr or 0.0),
-                    snapshot=liq_snapshot,
-                    flow=flow_state,
-                    ict=ict_ctx,
-                    tick_size=tick,
-                )
-                self._last_stop_surface = stop_surface
-                best_sl = getattr(stop_surface, 'best', None)
-                if best_sl is not None:
-                    new_sl = float(best_sl.price)
-                    # Apply only if it remains protective and improves the
-                    # invalidation surface materially. Do not tighten for vanity RR.
-                    protective = ((side == 'long' and new_sl < entry) or
-                                  (side == 'short' and new_sl > entry))
-                    _existing_u = None
-                    try:
-                        for _c in getattr(stop_surface, 'candidates', []) or []:
-                            if getattr(_c, 'role', '') == 'existing':
-                                _existing_u = float(getattr(_c, 'utility', -9.0))
-                                break
-                    except Exception:
-                        _existing_u = None
-                    _best_u = float(getattr(best_sl, 'utility', -9.0))
-                    improves = (_best_u > ((_existing_u if _existing_u is not None else -0.25) + 0.055))
-                    changed = abs(new_sl - old_sl) >= max(tick * 2.0, 1e-9)
-                    if protective and improves and changed:
-                        setattr(signal, "sl_price", new_sl)
-                        logger.info(
-                            "StopSurface selected SL: %s | replaced raw SL $%.1f",
-                            best_sl.compact(), old_sl,
-                        )
-                        old_sl = new_sl
-
-            # 2) Execution cost estimates for target surface.
             fee_bps = 8.0
             slip_bps = 2.0
             try:
@@ -3011,61 +2978,126 @@ class QuantStrategy:
             except Exception:
                 pass
 
-            # 3) Target surface after stop/risk update.
-            surface = build_target_surface(
-                side=side,
-                entry=entry,
-                stop=old_sl,
-                atr=float(atr or 0.0),
-                snapshot=liq_snapshot,
-                flow=flow_state,
-                ict=ict_ctx,
-                fee_bps=fee_bps,
-                slippage_bps=slip_bps,
-            )
-            self._last_target_surface = surface
-            if not surface.best:
-                logger.debug("TargetSurface: no eligible live target; keeping raw EntryEngine TP")
+            stop_surface = None
+            raw_stop_candidate = None
+            if 'build_stop_surface' in globals() and build_stop_surface is not None:
+                stop_surface = build_stop_surface(
+                    side=side, entry=entry, current_stop=raw_sl, atr=atr_f,
+                    snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                    tick_size=tick,
+                )
+                self._last_stop_surface = stop_surface
+
+            stop_candidates = []
+            if stop_surface is not None:
+                for c in (getattr(stop_surface, 'candidates', []) or []):
+                    try:
+                        sp = float(getattr(c, 'price', 0.0) or 0.0)
+                        if sp <= 0:
+                            continue
+                        protective = ((side == 'long' and sp < entry) or
+                                      (side == 'short' and sp > entry))
+                        if protective:
+                            stop_candidates.append(c)
+                            if abs(sp - raw_sl) <= max(tick * 2.0, 1e-9) or getattr(c, 'role', '') == 'existing':
+                                raw_stop_candidate = c
+                    except Exception:
+                        continue
+
+            if raw_stop_candidate is None:
+                class _RawStop:
+                    price = raw_sl
+                    utility = 0.0
+                    role = 'existing'
+                    def compact(self):
+                        return f"existing SL=${raw_sl:,.1f}"
+                raw_stop_candidate = _RawStop()
+                stop_candidates.insert(0, raw_stop_candidate)
+            elif raw_stop_candidate not in stop_candidates:
+                stop_candidates.insert(0, raw_stop_candidate)
+
+            unique = {}
+            for c in stop_candidates:
+                try:
+                    k = round(float(getattr(c, 'price', 0.0)) / max(tick, 1e-9))
+                    prev = unique.get(k)
+                    if prev is None or float(getattr(c, 'utility', -9.0)) > float(getattr(prev, 'utility', -9.0)):
+                        unique[k] = c
+                except Exception:
+                    continue
+            stop_candidates = sorted(unique.values(), key=lambda x: float(getattr(x, 'utility', -9.0)), reverse=True)[:7]
+
+            pair_rows = []
+            for sc in stop_candidates:
+                sp = float(getattr(sc, 'price', 0.0) or 0.0)
+                if sp <= 0:
+                    continue
+                protective = ((side == 'long' and sp < entry) or
+                              (side == 'short' and sp > entry))
+                if not protective:
+                    continue
+                surf = build_target_surface(
+                    side=side, entry=entry, stop=sp, atr=atr_f,
+                    snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                    fee_bps=fee_bps, slippage_bps=slip_bps,
+                )
+                best = getattr(surf, 'best', None)
+                if best is None:
+                    continue
+                stop_u = float(getattr(sc, 'utility', 0.0) or 0.0)
+                target_u = float(getattr(best, 'full_position_utility', getattr(best, 'utility', -9.0)) or -9.0)
+                ev_r = float(getattr(best, 'expected_value_r', -9.0) or -9.0)
+                rr = float(getattr(best, 'rr', 0.0) or 0.0)
+                risk_atr = abs(entry - sp) / atr_f
+                joint = (
+                    target_u
+                    + 0.16 * stop_u
+                    + 0.035 * min(rr, 3.2)
+                    - 0.075 * max(risk_atr - 2.6, 0.0)
+                    - (0.35 if ev_r <= 0.0 else 0.0)
+                )
+                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr))
+
+            if not pair_rows:
                 return
 
-            old_risk = abs(entry - old_sl)
-            old_rr = abs(old_tp - entry) / max(old_risk, 1e-9)
-            old_dist_atr = abs(old_tp - entry) / max(float(atr or 0.0), 1e-9)
-            old_u = None
-            for c in surface.candidates:
-                if abs(c.price - old_tp) <= max(tick * 2.0, 1e-9):
-                    old_u = float(getattr(c, 'full_position_utility', c.utility))
-                    break
-            if old_u is None:
-                # If raw target is absent from live surface, treat as poor quality.
-                old_u = -0.45 + 0.04 * min(old_rr, 4.0) - 0.035 * old_dist_atr
+            pair_rows.sort(key=lambda r: r[0], reverse=True)
+            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr = pair_rows[0]
+            self._last_target_surface = chosen_surface
 
-            best = surface.best
-            best_u = float(getattr(best, 'full_position_utility', best.utility))
-            improvement = best_u - float(old_u)
-            if improvement > 0.035:
-                setattr(signal, "tp_price", best.price)
-                setattr(signal, "target_pool", best.pool_ref)
-                setattr(signal, "rr_ratio", abs(best.price - entry) / max(old_risk, 1e-9))
-                setattr(signal, "target_surface", surface)
-                if getattr(surface, 'terminal', None) is not None:
-                    setattr(signal, "terminal_runner_price", surface.terminal.price)
-                    setattr(signal, "runner_fraction", surface.runner_fraction)
+            chosen_sl = float(getattr(chosen_stop, 'price', raw_sl) or raw_sl)
+            chosen_tp = float(getattr(chosen_target, 'price', raw_tp) or raw_tp)
+            old_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
+            new_rr = abs(chosen_tp - entry) / max(abs(entry - chosen_sl), 1e-9)
+
+            changed_sl = abs(chosen_sl - raw_sl) >= max(tick * 2.0, 1e-9)
+            changed_tp = abs(chosen_tp - raw_tp) >= max(tick * 2.0, 1e-9)
+            if changed_sl:
+                setattr(signal, "sl_price", chosen_sl)
+            if changed_tp:
+                setattr(signal, "tp_price", chosen_tp)
+                setattr(signal, "target_pool", getattr(chosen_target, 'pool_ref', getattr(signal, 'target_pool', None)))
+            setattr(signal, "rr_ratio", new_rr)
+            setattr(signal, "target_surface", chosen_surface)
+            setattr(signal, "stop_surface", stop_surface)
+
+            if getattr(chosen_surface, 'terminal', None) is not None:
+                setattr(signal, "terminal_runner_price", chosen_surface.terminal.price)
+                setattr(signal, "runner_fraction", chosen_surface.runner_fraction)
+
+            if changed_sl or changed_tp:
                 logger.info(
-                    "TargetSurface selected executable TP: %s | raw TP $%.1f oldFullU=%+.3f improvement=%+.3f",
-                    best.compact(), old_tp, old_u, improvement,
+                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR | raw SL=$%.1f TP=$%.1f RR=%.2f",
+                    chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
+                    raw_sl, raw_tp, old_rr,
                 )
             else:
-                setattr(signal, "target_surface", surface)
-                logger.debug("TargetSurface kept raw TP: oldFullU=%+.3f best=%s", old_u, best.compact())
-
-            # Keep R:R internally consistent after any SL/TP mutation.
-            try:
-                setattr(signal, "rr_ratio", abs(float(signal.tp_price) - entry) / max(abs(entry - float(signal.sl_price)), 1e-9))
-            except Exception:
-                pass
+                logger.debug(
+                    "JointSurface kept raw SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f target=%s",
+                    raw_sl, raw_tp, old_rr, joint, chosen_target.compact(),
+                )
         except Exception as e:
-            logger.debug(f"Expected-utility surface optimisation error: {e}")
+            logger.debug(f"Expected-utility joint SL/TP optimisation error: {e}")
 
     def _defer_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
@@ -5172,7 +5204,7 @@ class QuantStrategy:
                 _best = getattr(_surf_after, 'best', None)
                 _why = (f"no positive executable target utility; best={_best.compact()}" if _best is not None
                         else "no executable target surface")
-                logger.info(f"TargetSurface abstained {signal.side.upper()} {signal.entry_type.value}: {_why}")
+                logger.info(f"TargetSurface deferred {signal.side.upper()} {signal.entry_type.value}: {_why}")
                 self._defer_entry_signal(signal, _why, cooldown_sec=45.0)
                 return
             inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)

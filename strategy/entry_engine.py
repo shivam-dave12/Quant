@@ -456,6 +456,15 @@ class EntryEngine:
         self._gate_blocked_until: float = 0.0
         self._gate_block_key: tuple = ()
 
+        # Local-log dedup for posterior acceptance during cooldown/deferred states.
+        # QuantStrategy may defer a candidate after target/stop utility surfaces
+        # abstain. While that cooldown is alive, the evidence model should keep
+        # observing the auction, but it must not print "POSTERIOR ACCEPTED" every
+        # tick because routing is intentionally held.
+        self._suppress_posterior_accept_log: bool = False
+        self._last_accept_log_key: tuple = ()
+        self._last_accept_log_ts: float = 0.0
+
         # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
         # After a verdict fires, _handle_reversal/_handle_continuation previously
         # cleared _post_sweep but did NOT record the sweep as processed.  On the
@@ -1199,8 +1208,15 @@ class EntryEngine:
                 logger.info(f"POST_SWEEP: OTE ZONE ({retrace:.1%})")
             ps.ote_holding = in_ote
 
-        # Evaluate evidence
-        decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+        # Evaluate evidence. If a prior candidate was deferred by the
+        # target/stop utility surfaces, keep updating evidence but suppress
+        # repeated "POSTERIOR ACCEPTED" lines. The auction is being monitored;
+        # it is not routeable until the cooldown expires.
+        self._suppress_posterior_accept_log = bool(_defer_suppressed)
+        try:
+            decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+        finally:
+            self._suppress_posterior_accept_log = False
 
         # BUG-B2 FIX: If deferred, allow evidence to accumulate but do not
         # present a new signal yet. Log remaining cooldown at debug level.
@@ -1248,6 +1264,24 @@ class EntryEngine:
             profile = build_market_profile(price=price, atr=atr)
         self._last_market_profile = profile
         return profile
+
+    def _log_posterior_accept_once(self, key: tuple, message: str, now: float) -> None:
+        """Emit posterior-acceptance telemetry only when it is actionable.
+
+        Acceptance can remain true for many ticks while the market sits in the
+        same post-sweep auction. Repeating the same line every 250-500ms makes
+        the operator surface noisy and can hide real execution diagnostics.
+        We log once per action/side/phase/sweep, then only again after 30s.
+        When a target/stop-surface deferral is active, the acceptance is held and
+        should not be logged as route-ready.
+        """
+        if getattr(self, "_suppress_posterior_accept_log", False):
+            return
+        if key == self._last_accept_log_key and (now - self._last_accept_log_ts) < 30.0:
+            return
+        self._last_accept_log_key = key
+        self._last_accept_log_ts = now
+        logger.info(message)
 
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep
@@ -1515,9 +1549,12 @@ class EntryEngine:
             conf = max(qd.posterior, min(1.0, rev_total / 90.0))
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
-            logger.info(
+            self._log_posterior_accept_once(
+                ("reverse", rev_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
                 f"🧠 POSTERIOR ACCEPTED: REVERSAL {rev_dir.upper()} [{phase}] "
-                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}")
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}",
+                now,
+            )
             return PostSweepDecision(
                 action="reverse", direction=rev_dir, confidence=conf,
                 next_target=opp,
@@ -1544,8 +1581,11 @@ class EntryEngine:
                     action="wait", direction="", confidence=0.0,
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
-            logger.info(
-                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}")
+            self._log_posterior_accept_once(
+                ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
+                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
+                now,
+            )
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
                 confidence=min(1.0, cont_total / 90.0),
@@ -1642,7 +1682,7 @@ class EntryEngine:
         if self._sl_is_protective(side, sl, price):
             return False
         logger.info(
-            f"ENTRY REJECTED (invalid SL): side={side} entry=${price:.1f} "
+            f"CANDIDATE DEFERRED [invalid_sl]: side={side} entry=${price:.1f} "
             f"sl=${sl:.1f} sweep=${sweep_price:.1f} reason={reason}")
         self._post_sweep = None
         self._reset(now)
@@ -1999,7 +2039,7 @@ class EntryEngine:
 
         if risk < 1e-10:
             logger.info(
-                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -2030,7 +2070,7 @@ class EntryEngine:
             snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
         if sl is None:
             logger.info(
-                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
                 f"sweep=${sweep.pool.price:.1f}")
             if "liquidation" in str(sl_reason).lower() or "search window" in str(self._last_pool_plan_summary()).lower():
                 self._arm_refine_watch_from_rejected_sweep(
@@ -2051,7 +2091,7 @@ class EntryEngine:
 
         if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._arm_refine_watch_from_rejected_sweep(
                 sweep=sweep,
@@ -2072,7 +2112,7 @@ class EntryEngine:
         tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
         if tp is None:
             logger.info(
-                f"ENTRY REJECTED (no liquidity TP): side={side} "
+                f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
                 f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
                 f"| {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2141,7 +2181,7 @@ class EntryEngine:
 
         if risk < 1e-10:
             logger.info(
-                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -2166,7 +2206,7 @@ class EntryEngine:
             snap, side, price, atr, sl, sweep.pool.price, "continuation")
         if sl is None:
             logger.info(
-                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
                 f"sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
@@ -2180,7 +2220,7 @@ class EntryEngine:
         # ── Liquidation guard ─────────────────────────────────────────────
         if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._arm_refine_watch_from_rejected_sweep(
                 sweep=sweep,
@@ -2206,7 +2246,7 @@ class EntryEngine:
         else:
             rr = reward / risk if risk > 1e-10 else 0.0
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R/TP): initial_rr={rr:.2f} < institutional TP gate "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: initial_rr={rr:.2f} < institutional TP gate "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
             self._post_sweep = None
