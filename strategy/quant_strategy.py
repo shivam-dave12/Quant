@@ -2622,6 +2622,11 @@ class QuantStrategy:
         # the `del self._trade_history[:-200]` list-reallocation pattern.
         self._trade_history: deque = deque(maxlen=200)   # persistent per-session trade log
         self.current_sl_price = 0.0; self.current_tp_price = 0.0
+        # Latest executable SL/TP surface telemetry used by /thinking and heartbeat.
+        # This is intentionally separate from EntryEngine.pool_plan_info, which
+        # reports the raw liquidity-selector proposal before JointSurface reprices
+        # the full executable pair.
+        self._last_joint_surface_plan = None
         # DUPLICATE P&L GUARD v2: two-layer protection.
         #
         # Layer 1: _exit_completed (bool) — set True the moment ANY exit path
@@ -3181,6 +3186,37 @@ class QuantStrategy:
             setattr(signal, "rr_ratio", new_rr)
             setattr(signal, "target_surface", chosen_surface)
             setattr(signal, "stop_surface", stop_surface)
+
+            # Store final executable pair diagnostics.  EntryEngine.pool_plan_info
+            # remains the raw liquidity proposal; this record is the routed
+            # JointSurface decision after sovereign-SL, EAE, cost, posterior,
+            # and first-decision-liquidity repricing.
+            try:
+                _best_txt = chosen_target.compact() if hasattr(chosen_target, "compact") else f"${chosen_tp:.1f}"
+            except Exception:
+                _best_txt = f"${chosen_tp:.1f}"
+            self._last_joint_surface_plan = {
+                "ts": time.time(),
+                "side": side,
+                "entry": entry,
+                "sl": chosen_sl,
+                "tp": chosen_tp,
+                "rr": new_rr,
+                "joint": joint,
+                "target_u": target_u,
+                "ev_r": ev_r,
+                "stop_u": stop_u,
+                "risk_atr": risk_atr,
+                "effective_risk_atr": effective_risk_atr,
+                "eae_atr": survival_floor_atr,
+                "posterior": posterior_prob,
+                "target": _best_txt,
+                "raw_sl": raw_sl,
+                "raw_tp": raw_tp,
+                "raw_rr": old_rr,
+                "positive": bool(getattr(chosen_surface, 'has_positive_edge', False)),
+                "status": "candidate",
+            }
 
             if getattr(chosen_surface, 'terminal', None) is not None:
                 setattr(signal, "terminal_runner_price", chosen_surface.terminal.price)
@@ -5305,6 +5341,13 @@ class QuantStrategy:
                 _best = getattr(_surf_after, 'best', None)
                 _why = (f"no positive executable target utility; best={_best.compact()}" if _best is not None
                         else "no executable target surface")
+                try:
+                    if isinstance(getattr(self, '_last_joint_surface_plan', None), dict):
+                        self._last_joint_surface_plan['status'] = 'deferred'
+                        self._last_joint_surface_plan['defer_reason'] = _why
+                        self._last_joint_surface_plan['ts'] = time.time()
+                except Exception:
+                    pass
                 logger.info(f"TargetSurface deferred {signal.side.upper()} {signal.entry_type.value}: {_why}")
                 self._defer_entry_signal(signal, _why, cooldown_sec=45.0)
                 return
@@ -5705,9 +5748,31 @@ class QuantStrategy:
                 except Exception:
                     pass
 
-            # Pool-plan diagnostics: explains why visible BSL/SSL were not used
-            # as TP/SL after the last sweep verdict.  This is deliberately short
-            # for the terminal heartbeat; full rows are available via /thinking.
+            # JointSurface diagnostics: final executable pair after sovereign SL,
+            # EAE, cost, posterior and first-decision liquidity repricing.
+            try:
+                _surface_plan = getattr(self, '_last_joint_surface_plan', None)
+                if isinstance(_surface_plan, dict):
+                    _age = time.time() - float(_surface_plan.get('ts', 0.0) or 0.0)
+                    if _age <= 300:
+                        _status = str(_surface_plan.get('status', 'candidate')).upper()
+                        _tp = float(_surface_plan.get('tp', 0.0) or 0.0)
+                        _sl = float(_surface_plan.get('sl', 0.0) or 0.0)
+                        _rr = float(_surface_plan.get('rr', 0.0) or 0.0)
+                        _ev = float(_surface_plan.get('ev_r', 0.0) or 0.0)
+                        _tu = float(_surface_plan.get('target_u', 0.0) or 0.0)
+                        _risk = float(_surface_plan.get('risk_atr', 0.0) or 0.0)
+                        _eae = float(_surface_plan.get('eae_atr', 0.0) or 0.0)
+                        parts.append(
+                            f"SurfacePlan={_status} SL=${_sl:,.1f} TP=${_tp:,.1f} "
+                            f"RR={_rr:.2f} EV={_ev:+.2f} U={_tu:+.2f} risk={_risk:.2f}ATR eae={_eae:.2f}"
+                        )
+            except Exception:
+                pass
+
+            # Raw pool-plan diagnostics: explains the pre-JointSurface liquidity
+            # selector proposal.  Label it raw so it cannot be mistaken for the
+            # executable routed TP/SL pair.
             try:
                 _pool_plan = getattr(self._entry_engine, 'pool_plan_info', None)
                 if callable(_pool_plan):
@@ -5715,10 +5780,11 @@ class QuantStrategy:
                 if isinstance(_pool_plan, dict):
                     _age = time.time() - float(_pool_plan.get('ts', 0.0) or 0.0)
                     if _age <= 300:
-                        _role = _pool_plan.get('role', 'POOL')
+                        _role = str(_pool_plan.get('role', 'POOL'))
                         _summary = str(_pool_plan.get('summary', ''))[:120]
                         if _summary:
-                            parts.append(f"{_role}Plan={_summary}")
+                            _label = f"Raw{_role}Plan" if _role in ('TP', 'SL') else f"Raw{_role}Plan"
+                            parts.append(f"{_label}={_summary}")
             except Exception:
                 pass
 
