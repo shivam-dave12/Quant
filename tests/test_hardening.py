@@ -264,5 +264,42 @@ class HardeningTests(unittest.TestCase):
 
 
 
+    def test_stop_surface_never_tightens_sovereign_invalidation(self):
+        from strategy.expected_utility import build_stop_surface
+
+        # Short trade: current_stop is the sovereign invalidation above the
+        # swept wick. A closer BSL pool must NOT pull the exchange SL downward
+        # merely to improve R:R.
+        near_bsl = SimpleNamespace(price=101.0, timeframe="15m", significance=20.0, side="BSL")
+        snap = SimpleNamespace(bsl_pools=[near_bsl], ssl_pools=[], feed_reliability=0.90)
+        flow = SimpleNamespace(tick_flow=-0.10, cvd_trend=-0.10)
+        ict = SimpleNamespace(structure_15m="bearish", structure_4h="bearish", dealing_range_pd=0.75)
+        surf = build_stop_surface(
+            side="short", entry=100.0, current_stop=104.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, tick_size=0.1,
+        )
+        self.assertIsNotNone(surf.best)
+        self.assertGreaterEqual(surf.best.price, 104.0)
+        self.assertTrue(any("sovereign_skip" in n for n in surf.notes))
+
+    def test_target_surface_prefers_first_decision_liquidity_over_far_runner(self):
+        from strategy.expected_utility import build_target_surface
+
+        near = SimpleNamespace(price=102.0, timeframe="15m", significance=12.0, side="BSL")
+        far = SimpleNamespace(price=112.0, timeframe="4h", significance=22.0, side="BSL")
+        snap = SimpleNamespace(bsl_pools=[near, far], ssl_pools=[], feed_reliability=0.92)
+        flow = SimpleNamespace(tick_flow=0.45, cvd_trend=0.50)
+        ict = SimpleNamespace(structure_15m="bullish", structure_4h="bullish", dealing_range_pd=0.30)
+        surf = build_target_surface(
+            side="long", entry=100.0, stop=97.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.92,
+        )
+        self.assertIsNotNone(surf.best)
+        self.assertAlmostEqual(surf.best.price, 102.0)
+        self.assertIn(surf.best.role, ("internal", "external"))
+        self.assertIsNotNone(surf.terminal)
+        self.assertIn(surf.terminal.role, ("runner", "terminal"))
+
+
 if __name__ == "__main__":
     unittest.main()

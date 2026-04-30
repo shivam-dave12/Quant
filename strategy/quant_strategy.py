@@ -3093,6 +3093,41 @@ class QuantStrategy:
             joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr, effective_risk_atr, survival_floor_atr, tight_penalty = pair_rows[0]
 
             chosen_sl = float(getattr(chosen_stop, 'price', raw_sl) or raw_sl)
+
+            # Sovereign invalidation guard.  The SL produced by EntryEngine +
+            # SL-envelope is the thesis boundary (sweep wick / protective
+            # structure + liquidity noise).  JointSurface may widen it or keep
+            # it, but must never move it closer to entry.  Tightening it here
+            # creates fake high R:R and places the stop inside swept liquidity.
+            _tightens_sovereign = (
+                (side == 'long' and chosen_sl > raw_sl + max(tick, 1e-9)) or
+                (side == 'short' and chosen_sl < raw_sl - max(tick, 1e-9))
+            )
+            if _tightens_sovereign:
+                logger.info(
+                    "Sovereign SL preserved: JointSurface tried to tighten $%.1f -> $%.1f; keeping thesis invalidation and repricing targets",
+                    raw_sl, chosen_sl,
+                )
+                chosen_sl = raw_sl
+                repro_surface = build_target_surface(
+                    side=side, entry=entry, stop=chosen_sl, atr=atr_f,
+                    snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                    fee_bps=fee_bps, slippage_bps=slip_bps,
+                    posterior_prob=posterior_prob,
+                    min_effective_risk_atr=survival_floor_atr,
+                )
+                repro_best = getattr(repro_surface, 'best', None)
+                if repro_best is not None:
+                    chosen_surface = repro_surface
+                    chosen_target = repro_best
+                    target_u = float(getattr(repro_best, 'full_position_utility', getattr(repro_best, 'utility', target_u)) or target_u)
+                    ev_r = float(getattr(repro_best, 'expected_value_r', ev_r) or ev_r)
+                    risk_atr = abs(entry - chosen_sl) / atr_f
+                    effective_risk_atr = float(getattr(repro_best, 'effective_risk_atr', risk_atr) or risk_atr)
+                    survival_floor_atr = float(getattr(repro_best, 'survival_floor_atr', survival_floor_atr) or survival_floor_atr)
+                    tight_penalty = 0.0
+                    joint = target_u + 0.16 * stop_u + 0.030 * min(float(getattr(repro_best, 'rr', 0.0) or 0.0), 3.2) - 0.075 * max(effective_risk_atr - 2.6, 0.0) - (0.35 if ev_r <= 0.0 else 0.0)
+
             # If the mathematically best pair is inside expected adverse excursion,
             # do not route that fragile stop. Project it to the thesis-survival
             # boundary and reprice the target surface. This aligns initial SL with
@@ -6655,36 +6690,50 @@ class QuantStrategy:
                     # NOTE: no early return — trail engine must still run this tick.
                 elif _gate is not None and _gate.action == "continue" and _gate.next_target:
                     # ════════════════════════════════════════════════════════════
-                    # TP IMMUTABILITY POLICY
+                    # LIQUIDITY RE-ANCHOR POLICY
                     # ════════════════════════════════════════════════════════════
-                    # The Take Profit is set at entry and NEVER amended.
-                    #
-                    # WHY:
-                    #   In production, 23/24 trades exited via SL.  Only 1 hit TP.
-                    #   Extending TP further when the first target isn't reached
-                    #   guarantees the trade dies to a trailing SL instead.
-                    #
-                    #   The original TP was set at the opposing liquidity pool —
-                    #   the structural delivery target.  If the market doesn't
-                    #   reach it, the SL trail manages the exit with whatever
-                    #   profit was captured.
-                    #
-                    #   If you believe TP should be further, that's a NEW THESIS.
-                    #   Open a new position after the current one closes.
-                    #
-                    # WHAT WE DO INSTEAD:
-                    #   Log the suggestion for post-trade analysis.
-                    #   The trail engine may tighten SL on the next tick,
-                    #   which naturally locks available profit.
-                    #
-                    _next = _gate.next_target
-                    logger.info(
-                        f"📝 POOL-GATE CONTINUE: next target ${_next:,.0f} — "
-                        f"TP stays at ${pos.tp_price:,.0f} (immutability policy) | "
-                        f"conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
-                    # DO NOT call replace_take_profit.
-                    # DO NOT modify pos.tp_price.
-                    # The existing SL/TP bracket manages the exit.
+                    # Full-position TP is not immutable.  When the pool gate finds
+                    # a closer actionable liquidity objective while the position is
+                    # live, the exchange TP is re-anchored to that first-decision
+                    # pool.  Farther pools remain runner/re-entry context.
+                    _next = _round_to_tick(float(_gate.next_target))
+                    _atr_now = max(self._atr_5m.atr if self._atr_5m else 0.0, 1e-9)
+                    _tick = max(QCfg.TICK_SIZE(), 1e-9)
+                    _min_net = max(0.35 * _atr_now, 8.0 * _tick)
+                    _closer_tp = (
+                        (pos.side == "long" and pos.entry_price + _min_net < _next < pos.tp_price - 2.0 * _tick) or
+                        (pos.side == "short" and pos.entry_price - _min_net > _next > pos.tp_price + 2.0 * _tick)
+                    )
+                    if _closer_tp and pos.tp_order_id:
+                        try:
+                            _old_tp = pos.tp_price
+                            _tp_side = "sell" if pos.side == "long" else "buy"
+                            _tp_res = order_manager.replace_take_profit(
+                                existing_tp_order_id=pos.tp_order_id,
+                                side=_tp_side,
+                                quantity=pos.quantity,
+                                new_trigger_price=_next,
+                            )
+                            if _tp_res and not (isinstance(_tp_res, dict) and _tp_res.get("error")):
+                                with self._lock:
+                                    pos.tp_price = _next
+                                    pos.tp_order_id = (
+                                        _tp_res.get("order_id") if isinstance(_tp_res, dict) else pos.tp_order_id
+                                    ) or pos.tp_order_id
+                                logger.info(
+                                    f"🎯 POOL-GATE TP RE-ANCHORED: ${_old_tp:,.0f} -> ${_next:,.0f} "
+                                    f"| conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
+                            else:
+                                logger.info(
+                                    f"POOL-GATE TP re-anchor unavailable; keeping bracket TP ${pos.tp_price:,.0f} | "
+                                    f"candidate=${_next:,.0f} | result={_tp_res}")
+                        except Exception as _tp_e:
+                            logger.debug(f"POOL-GATE TP re-anchor error: {_tp_e}")
+                    else:
+                        logger.info(
+                            f"📝 POOL-GATE CONTINUE: next target ${_next:,.0f} observed; "
+                            f"current TP ${pos.tp_price:,.0f} remains active | "
+                            f"conf={_gate.confidence:.2f} | {_gate.reason[:80]}")
                 # action="hold" → do nothing, let existing SL/TP manage
             except Exception as _pg:
                 logger.debug(f"DirectionEngine.pool_hit_gate error: {_pg}")
