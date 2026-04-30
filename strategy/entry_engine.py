@@ -1677,6 +1677,25 @@ class EntryEngine:
             return sl > guard
         return sl < guard
 
+    @staticmethod
+    def _pool_obj(target):
+        return getattr(target, "pool", target)
+
+    @staticmethod
+    def _pool_status_name(pool) -> str:
+        try:
+            status = getattr(pool, "status", "")
+            if hasattr(status, "value"):
+                return str(status.value).upper()
+            return str(status).upper().rsplit(".", 1)[-1]
+        except Exception:
+            return ""
+
+    @classmethod
+    def _pool_is_live(cls, target) -> bool:
+        status = cls._pool_status_name(cls._pool_obj(target))
+        return status not in ("SWEPT", "CONSUMED")
+
     def _reject_bad_sl(self, side: str, sl: float, price: float,
                        sweep_price: float, now: float, reason: str) -> bool:
         if self._sl_is_protective(side, sl, price):
@@ -1707,6 +1726,18 @@ class EntryEngine:
         if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
             return None, "non-protective structural SL"
 
+        try:
+            profile = self._market_profile(
+                snap=snap,
+                flow=None,
+                ict=getattr(self, "_ict", None),
+                price=price,
+                atr=atr,
+                side=side,
+            )
+        except Exception:
+            profile = None
+
         _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
         max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
         sl = structural_sl
@@ -1719,6 +1750,30 @@ class EntryEngine:
 
         if risk < noise_floor:
             sl = price - noise_floor if side == "long" else price + noise_floor
+            risk = abs(price - sl)
+
+        # Initial stops must survive the routine retest/pullback pocket. A stop
+        # that is technically behind one level but still inside the normal
+        # adverse-excursion zone becomes liquidity for the market, not protection.
+        label_l = str(label or "").lower()
+        base_pullback_atr = 1.18 if "continuation" in label_l else 0.95
+        if "refined" in label_l:
+            base_pullback_atr = 0.82
+        try:
+            pullback_floor_atr = profile.loosen(
+                base_pullback_atr,
+                base_pullback_atr * 0.85,
+                2.40,
+            ) if profile is not None else (
+                base_pullback_atr * (1.0 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0))
+            )
+        except Exception:
+            pullback_floor_atr = base_pullback_atr
+        pullback_floor = max(noise_floor, atr * pullback_floor_atr)
+        if risk < pullback_floor:
+            if pullback_floor > max_risk:
+                return None, "SL pullback envelope breaches liquidation guard"
+            sl = price - pullback_floor if side == "long" else price + pullback_floor
             risk = abs(price - sl)
 
         pool_sl, _pool_target, pool_pick = self._find_sl_pool(
@@ -1741,6 +1796,19 @@ class EntryEngine:
                     "(risk %.2fATR; %s)",
                     label, sl, risk / max(atr, 1e-10), details)
 
+        sl, pocket_reason = self._push_sl_behind_pullback_liquidity(
+            sl=sl,
+            snap=snap,
+            side=side,
+            price=price,
+            atr=atr,
+            max_risk=max_risk,
+            profile=profile,
+            label=label,
+        )
+        if pocket_reason:
+            logger.info("SL envelope %s: %s", label, pocket_reason)
+
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
 
@@ -1754,6 +1822,116 @@ class EntryEngine:
                 label, structural_sl, sl, risk / max(atr, 1e-10),
                 noise_floor / max(atr, 1e-10))
         return sl, "ok"
+
+    def _push_sl_behind_pullback_liquidity(
+        self,
+        *,
+        sl: float,
+        snap,
+        side: str,
+        price: float,
+        atr: float,
+        max_risk: float,
+        profile=None,
+        label: str = "",
+    ):
+        """Protect the whole expected pullback pocket, not only the first level.
+
+        If a live SSL/BSL sits just beyond the proposed SL, placing the stop in
+        front of it invites a normal liquidity tap to close the trade before
+        thesis invalidation. This widens only to live, nearby protective pools
+        inside the adaptive adverse-excursion scan.
+        """
+        if snap is None or atr <= 0 or price <= 0:
+            return sl, ""
+
+        side_l = str(side or "").lower()
+        if side_l not in ("long", "short"):
+            return sl, ""
+
+        label_l = str(label or "").lower()
+        base_scan_atr = 1.85 if "continuation" in label_l else 1.45
+        if "refined" in label_l:
+            base_scan_atr = 1.20
+        try:
+            scan_atr = profile.loosen(
+                base_scan_atr,
+                base_scan_atr * 0.80,
+                3.25,
+            ) if profile is not None else (
+                base_scan_atr * (1.0 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0))
+            )
+        except Exception:
+            scan_atr = base_scan_atr
+
+        current_risk = abs(price - sl)
+        scan_risk = min(max_risk, max(current_risk + 0.45 * atr, scan_atr * atr))
+        if scan_risk <= current_risk + 1e-9:
+            return sl, ""
+
+        targets = (
+            list(getattr(snap, "ssl_pools", []) or [])
+            if side_l == "long"
+            else list(getattr(snap, "bsl_pools", []) or [])
+        )
+        if not targets:
+            return sl, ""
+
+        eligible = []
+        for target in targets:
+            if not self._pool_is_live(target):
+                continue
+            pool = self._pool_obj(target)
+            try:
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+            except Exception:
+                continue
+            if px <= 0:
+                continue
+            try:
+                sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+            except Exception:
+                sig = 0.0
+            if sig < 1.5:
+                continue
+
+            if side_l == "long":
+                if not (price - scan_risk <= px < price):
+                    continue
+                if sl <= px:
+                    continue
+                adverse_rank = -px
+            else:
+                if not (price < px <= price + scan_risk):
+                    continue
+                if sl >= px:
+                    continue
+                adverse_rank = px
+
+            sig_term = max(0.0, min(1.0, math.log1p(max(sig, 0.0)) / math.log(30.0)))
+            atr_pctile = min(max(getattr(self, "_atr_pctile", 0.5), 0.0), 1.0)
+            buffer_atr = max(0.18, min(0.55, 0.22 + 0.10 * atr_pctile + 0.13 * (1.0 - sig_term)))
+            candidate = px - buffer_atr * atr if side_l == "long" else px + buffer_atr * atr
+            risk = abs(price - candidate)
+            if risk <= current_risk + 1e-9 or risk > max_risk:
+                continue
+            eligible.append((adverse_rank, px, candidate, risk, sig, buffer_atr))
+
+        if not eligible:
+            return sl, ""
+
+        # Pick the farthest live pool inside the expected pullback pocket. This
+        # makes the SL protect the whole pocket instead of front-running the
+        # first visible pool.
+        eligible.sort(key=lambda row: row[0], reverse=True)
+        _, px, candidate, risk, sig, buffer_atr = eligible[0]
+        reason = (
+            f"protected pullback liquidity pocket anchor=${px:,.1f} "
+            f"SL ${sl:,.1f}->${candidate:,.1f} "
+            f"risk={risk/max(atr,1e-9):.2f}ATR scan={scan_risk/max(atr,1e-9):.2f}ATR "
+            f"sig={sig:.1f} buffer={buffer_atr:.2f}ATR"
+        )
+        return candidate, reason
 
 
     def _institutional_entry_quality_gate(
@@ -2574,8 +2752,12 @@ class EntryEngine:
         buf = 0.25 * atr
         if side == "long":
             for t in snap.ssl_pools:
-                if sl < t.pool.price < price:
-                    candidate = t.pool.price - buf
+                if not self._pool_is_live(t):
+                    continue
+                pool = self._pool_obj(t)
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if sl < px < price:
+                    candidate = px - buf
                     # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
                     # below the original SL.
                     if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
@@ -2583,8 +2765,12 @@ class EntryEngine:
                     sl = min(sl, candidate)
         else:
             for t in snap.bsl_pools:
-                if price < t.pool.price < sl:
-                    candidate = t.pool.price + buf
+                if not self._pool_is_live(t):
+                    continue
+                pool = self._pool_obj(t)
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if price < px < sl:
+                    candidate = px + buf
                     if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
                         continue
                     sl = max(sl, candidate)

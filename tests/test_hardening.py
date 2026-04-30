@@ -342,6 +342,48 @@ class HardeningTests(unittest.TestCase):
         self.assertLess(sl_price, active_pool.price)
         self.assertIn("selected", report.summary)
 
+    def test_initial_sl_envelope_protects_pullback_liquidity_pocket(self):
+        from strategy.entry_engine import EntryEngine
+
+        engine = object.__new__(EntryEngine)
+        engine._atr_pctile = 0.50
+        engine._last_pool_plan = None
+        engine._last_market_profile = None
+        engine._htf = None
+        engine._ict = None
+
+        close_pool = SimpleNamespace(
+            price=9960.0, side="SSL", timeframe="15m", status="ACTIVE",
+            touches=1, ob_aligned=True, fvg_aligned=False,
+        )
+        deep_pool = SimpleNamespace(
+            price=9925.0, side="SSL", timeframe="15m", status="ACTIVE",
+            touches=1, ob_aligned=True, fvg_aligned=True,
+        )
+        snap = SimpleNamespace(
+            ssl_pools=[
+                SimpleNamespace(pool=close_pool, significance=9.7, distance_atr=0.8, tf_sources=["15m"]),
+                SimpleNamespace(pool=deep_pool, significance=12.5, distance_atr=1.5, tf_sources=["15m"]),
+            ],
+            bsl_pools=[],
+            feed_reliability=0.95,
+        )
+        engine._last_liq_snapshot = snap
+
+        sl, reason = engine._apply_institutional_sl_envelope(
+            snap=snap,
+            side="long",
+            price=10000.0,
+            atr=50.0,
+            structural_sl=9962.0,
+            invalidation_price=9985.0,
+            label="continuation",
+        )
+
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(sl)
+        self.assertLess(sl, deep_pool.price)
+
     def test_tp_selector_ignores_swept_pool_in_actual_scoring(self):
         from strategy.liquidity_pool_selector import select_tp_with_report
 
