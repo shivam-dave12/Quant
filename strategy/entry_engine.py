@@ -2283,7 +2283,7 @@ class EntryEngine:
 
         self._record_pool_report(report)
         if tp_price is None or target is None:
-            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
         # Strategy-level BE gate: TP must clear round-trip fees + slippage.
@@ -2307,12 +2307,12 @@ class EntryEngine:
                 report["selected"] = selected
             report["summary"] = report["strategy_gate"]
             self._record_pool_report(report)
-            logger.info("TP_POOL_AUDIT: %s", self._format_pool_plan(report))
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
         if score is not None:
             logger.info(
-                "TP_POOL_SELECTED: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
+                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
                 score.sweep_prob, score.ev, score.gauntlet_n,
                 ", ".join(score.reasons) if score.reasons else "institutional gates passed",
@@ -2363,11 +2363,11 @@ class EntryEngine:
         report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
         self._record_pool_report(report)
         if sl_price is None or target is None:
-            logger.info("SL_POOL_AUDIT: %s", self._format_pool_plan(report))
+            logger.info("RAW_SL_AUDIT: %s", self._format_pool_plan(report))
         else:
             try:
                 logger.info(
-                    "SL_POOL_SELECTED: anchor=$%.1f sl=$%.1f quality=%.2f buffer=%.2fATR (%s)",
+                    "RAW_SL_ANCHOR: anchor=$%.1f sl=$%.1f quality=%.2f buffer=%.2fATR (%s)",
                     float(getattr(target.pool, "price", 0.0)), float(sl_price),
                     float(getattr(pick, "quality", 0.0) if pick is not None else 0.0),
                     float(getattr(pick, "buffer_atr", 0.0) if pick is not None else 0.0),

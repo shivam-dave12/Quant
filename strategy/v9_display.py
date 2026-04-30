@@ -295,10 +295,10 @@ def _format_heartbeat_industry(
         if atr > 0:
             rows.append(
                 f"SL {_c(_price(sl), C.BRED)} ({abs(price - sl) / atr:.1f} ATR) | "
-                f"TP {_c(_price(tp), C.BGRN)} ({abs(tp - price) / atr:.1f} ATR) | planned R:R 1:{rr:.2f}"
+                f"TP {_c(_price(tp), C.BGRN)} ({abs(tp - price) / atr:.1f} ATR) | initial payoff/risk 1:{rr:.2f}"
             )
         else:
-            rows.append(f"SL {_c(_price(sl), C.BRED)} | TP {_c(_price(tp), C.BGRN)} | planned R:R 1:{rr:.2f}")
+            rows.append(f"SL {_c(_price(sl), C.BRED)} | TP {_c(_price(tp), C.BGRN)} | initial payoff/risk 1:{rr:.2f}")
         rows.append(
             f"unrealized {_c(f'${upnl:+,.2f}' if qty else f'{upnl:+,.1f} pts', _pnl_color(upnl))} | "
             f"R {_c(f'{r_now:+.2f}', _pnl_color(r_now))} | to-target [{_c(_term_progress(prog, 20), C.BGRN)}] {prog:.0%}"

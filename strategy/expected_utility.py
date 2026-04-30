@@ -1,23 +1,29 @@
 """
-expected_utility.py — Institutional target/sizing/exit math
-================================================================
+expected_utility.py — institutional target/stop/sizing math
+============================================================
 
-This module removes the last retail-style decision residue from the strategy:
-fixed target preference, hard premium/discount vetoes, and R-multiple target
-selection.  It converts liquidity pools into a target surface and optimises the
-trade using expected utility after fees, slippage, adverse excursion, feed
-reliability and path gauntlet risk.
+Decision principle
+------------------
+Levels are observations; executable TP/SL are optimisation outputs.
 
-Design rule:
-    Levels are observations.  The executable decision is expected utility.
+This module builds two continuous surfaces:
+  1. StopSurface: where the thesis is statistically invalidated with enough
+     noise/liquidity buffer, without hiding behind arbitrary ATR windows.
+  2. TargetSurface: which liquidity objective has the best expected utility
+     after execution cost, path risk, uncertainty, and adverse selection.
 
-No numpy/pandas dependency; all functions are deterministic and runtime-safe.
+Important design choice
+-----------------------
+A distant HTF pool can be a terminal *runner objective*, but it must not become
+full-size TP simply because it prints a huge R:R. Full-position TP is selected
+from executable utility; terminal objectives get a separate runner utility and
+runner_fraction metadata for future reduce-only laddering.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 _EPS = 1e-12
 
@@ -75,7 +81,9 @@ def _pool_price(obj: Any) -> float:
 def _pool_sig(obj: Any) -> float:
     try:
         if hasattr(obj, "adjusted_sig"):
-            return float(obj.adjusted_sig())
+            v = float(obj.adjusted_sig())
+            if math.isfinite(v):
+                return v
     except Exception:
         pass
     p = _pool(obj)
@@ -110,7 +118,7 @@ def _get_pools_for_side(snapshot: Any, trade_side: str) -> List[Any]:
         return []
 
 
-def _all_opposing_pools(snapshot: Any, trade_side: str) -> List[Any]:
+def _protective_pools(snapshot: Any, trade_side: str) -> List[Any]:
     if snapshot is None:
         return []
     trade_side = (trade_side or "").lower()
@@ -119,6 +127,90 @@ def _all_opposing_pools(snapshot: Any, trade_side: str) -> List[Any]:
         return list(getattr(snapshot, attr, []) or [])
     except Exception:
         return []
+
+
+def _all_opposing_pools(snapshot: Any, trade_side: str) -> List[Any]:
+    return _protective_pools(snapshot, trade_side)
+
+
+def _feed_reliability(snapshot: Any) -> float:
+    for name in ("feed_reliability", "reliability", "data_reliability"):
+        v = _obj_float(snapshot, name, default=-1.0)
+        if v >= 0:
+            return clamp(v, 0.20, 1.0)
+    meta = getattr(snapshot, "meta", None)
+    if isinstance(meta, dict):
+        for key in ("feed_reliability", "reliability", "microstructure_weight"):
+            if key in meta:
+                return clamp(float(meta[key]), 0.20, 1.0)
+    return 0.82
+
+
+def _market_terms(side: str, flow: Any, ict: Any) -> Tuple[float, float, float, float]:
+    side = (side or "").lower()
+    sign = 1.0 if side == "long" else -1.0
+
+    tick = _obj_float(flow, "tick_flow", "tick", default=0.0)
+    cvd = _obj_float(flow, "cvd_trend", "cvd", default=0.0)
+    of_align = clamp(sign * (0.52 * tick + 0.48 * cvd), -1.0, 1.0)
+
+    s15 = _obj_str(ict, "structure_15m", default="").lower()
+    s4h = _obj_str(ict, "structure_4h", default="").lower()
+    htf = 0.0
+    for s, w in ((s15, 0.45), (s4h, 0.55)):
+        if "bull" in s:
+            htf += w if side == "long" else -w
+        elif "bear" in s:
+            htf += w if side == "short" else -w
+    htf = clamp(htf, -1.0, 1.0)
+
+    pd = clamp(_obj_float(ict, "dealing_range_pd", "_pd_percentile", default=0.5), 0.0, 1.0)
+    # PD is an input, not a veto. Longs prefer discount, shorts prefer premium.
+    pd_affinity = clamp(((0.55 - pd) if side == "long" else (pd - 0.45)) / 0.40, -1.0, 1.0)
+
+    conflict = 0.0
+    conflict += 0.42 if of_align * htf < -0.10 else 0.0
+    conflict += 0.24 if abs(of_align) < 0.08 else 0.0
+    conflict += 0.18 if abs(htf) < 0.08 else 0.0
+    conflict = clamp(conflict, 0.0, 1.0)
+    uncertainty = clamp(0.38 * (1.0 - abs(of_align)) + 0.32 * (1.0 - abs(htf)) + 0.30 * conflict, 0.0, 1.0)
+    return of_align, htf, pd_affinity, uncertainty
+
+
+@dataclass
+class StopUtility:
+    price: float
+    anchor: float
+    risk_points: float
+    risk_atr: float
+    stop_run_risk: float
+    survival_probability: float
+    invalidation_quality: float
+    utility: float
+    role: str
+    notes: List[str] = field(default_factory=list)
+    pool_ref: Any = None
+
+    def compact(self) -> str:
+        return (
+            f"{self.role} SL=${self.price:,.1f} risk={self.risk_atr:.2f}ATR "
+            f"survive={self.survival_probability:.2f} stoprun={self.stop_run_risk:.2f} U={self.utility:+.3f}"
+        )
+
+
+@dataclass
+class StopSurface:
+    side: str
+    entry: float
+    current_stop: float
+    best: Optional[StopUtility]
+    candidates: List[StopUtility]
+    notes: List[str] = field(default_factory=list)
+
+    def compact(self, limit: int = 3) -> str:
+        best = self.best.compact() if self.best else "none"
+        rows = " | ".join(c.compact() for c in self.candidates[:limit])
+        return f"best={best}" + (f" | {rows}" if rows else "")
 
 
 @dataclass
@@ -130,6 +222,8 @@ class TargetUtility:
     probability: float
     expected_value_r: float
     utility: float
+    full_position_utility: float
+    runner_utility: float
     payoff_r: float
     loss_r: float
     cost_r: float
@@ -145,7 +239,7 @@ class TargetUtility:
         return (
             f"{self.role} ${self.price:,.1f} p={self.probability:.3f} "
             f"EV={self.expected_value_r:+.3f} U={self.utility:+.3f} "
-            f"RR={self.rr:.2f} d={self.distance_atr:.1f}ATR"
+            f"fullU={self.full_position_utility:+.3f} RR={self.rr:.2f} d={self.distance_atr:.1f}ATR"
         )
 
 
@@ -163,71 +257,100 @@ class TargetSurface:
 
     @property
     def has_positive_edge(self) -> bool:
-        return bool(self.best and self.best.utility > 0.0 and self.best.expected_value_r > 0.0)
+        return bool(self.best and self.best.full_position_utility > 0.0 and self.best.expected_value_r > 0.0)
 
     def compact(self, limit: int = 3) -> str:
         rows = [c.compact() for c in self.candidates[:limit]]
         best = self.best.compact() if self.best else "none"
         term = self.terminal.compact() if self.terminal else "none"
-        return f"best={best}; terminal={term}; runner={self.runner_fraction:.0%}; " + " | ".join(rows)
+        return f"best={best}; runner={term}; runner_frac={self.runner_fraction:.0%}; " + " | ".join(rows)
 
 
-def _feed_reliability(snapshot: Any) -> float:
-    # MarketAggregator exposes feed reliability if available.  Old snapshots do
-    # not; default to neutral-high rather than false precision.
-    for name in ("feed_reliability", "reliability", "data_reliability"):
-        v = _obj_float(snapshot, name, default=-1.0)
-        if v >= 0:
-            return clamp(v, 0.20, 1.0)
-    meta = getattr(snapshot, "meta", None)
-    if isinstance(meta, dict):
-        v = meta.get("feed_reliability", meta.get("reliability", None))
-        if v is not None:
-            return clamp(float(v), 0.20, 1.0)
-    return 0.82
+def build_stop_surface(*, side: str, entry: float, current_stop: float, atr: float,
+                       snapshot: Any, flow: Any = None, ict: Any = None,
+                       tick_size: float = 0.5) -> StopSurface:
+    """Optimise structural invalidation stop.
 
-
-def _market_terms(side: str, flow: Any, ict: Any) -> Tuple[float, float, float, float]:
+    The surface prefers stops behind real protective liquidity/sweep structure,
+    but balances that with risk consumption and stop-run likelihood. It can keep
+    the existing stop when it is superior; it will not tighten merely to improve
+    R:R.
+    """
     side = (side or "").lower()
-    sign = 1.0 if side == "long" else -1.0
+    entry = float(entry or 0.0)
+    current_stop = float(current_stop or 0.0)
+    atr = max(float(atr or 0.0), _EPS)
+    if side not in ("long", "short") or entry <= 0 or current_stop <= 0:
+        return StopSurface(side, entry, current_stop, None, [], ["invalid stop-surface inputs"])
 
-    tick = _obj_float(flow, "tick_flow", default=0.0)
-    cvd = _obj_float(flow, "cvd_trend", default=0.0)
-    of_align = clamp(sign * (0.52 * tick + 0.48 * cvd), -1.0, 1.0)
+    of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
+    reliability = _feed_reliability(snapshot)
+    tick_size = max(float(tick_size or 0.5), 1e-9)
 
-    s15 = _obj_str(ict, "structure_15m", default="").lower()
-    s4h = _obj_str(ict, "structure_4h", default="").lower()
-    htf = 0.0
-    for s, w in ((s15, 0.45), (s4h, 0.55)):
-        if "bull" in s:
-            htf += w if side == "long" else -w
-        elif "bear" in s:
-            htf += w if side == "short" else -w
-    htf = clamp(htf, -1.0, 1.0)
+    raw_candidates: List[Tuple[float, float, str, float, int, Any]] = []
+    # Existing exchange stop remains a candidate.
+    raw_candidates.append((current_stop, current_stop, "existing", 1.0, 3, None))
 
-    pd = clamp(_obj_float(ict, "dealing_range_pd", default=0.5), 0.0, 1.0)
-    # PD is not a veto. It shifts continuation/reversal probability.
-    pd_affinity = clamp(((0.55 - pd) if side == "long" else (pd - 0.45)) / 0.40, -1.0, 1.0)
+    for p in _protective_pools(snapshot, side):
+        px = _pool_price(p)
+        if px <= 0:
+            continue
+        if side == "long" and px >= entry:
+            continue
+        if side == "short" and px <= entry:
+            continue
+        sig = max(_pool_sig(p), 0.0)
+        tf_rank = _pool_tf_rank(p)
+        # Buffer is continuous: larger when uncertainty/reliability are poor,
+        # smaller when structure is high quality. No static ATR window/veto.
+        sig_term = clamp(math.log1p(sig) / math.log(30.0), 0.0, 1.0)
+        buf_atr = clamp(0.055 + 0.115 * uncertainty + 0.060 * (1.0 - reliability) - 0.035 * sig_term,
+                        0.035, 0.240)
+        buffer = max(tick_size * (2.0 + tf_rank), atr * buf_atr)
+        stop = px - buffer if side == "long" else px + buffer
+        raw_candidates.append((stop, px, "liquidity-invalidation", sig, tf_rank, p))
 
-    conflict = 0.0
-    conflict += 0.40 if of_align * htf < -0.10 else 0.0
-    conflict += 0.25 if abs(of_align) < 0.08 else 0.0
-    conflict += 0.20 if abs(htf) < 0.08 else 0.0
-    conflict = clamp(conflict, 0.0, 1.0)
-    uncertainty = clamp(0.38 * (1.0 - abs(of_align)) + 0.32 * (1.0 - abs(htf)) + 0.30 * conflict, 0.0, 1.0)
-    return of_align, htf, pd_affinity, uncertainty
+    cands: List[StopUtility] = []
+    for stop, anchor, role, sig, tf_rank, ref in raw_candidates:
+        if side == "long" and stop >= entry:
+            continue
+        if side == "short" and stop <= entry:
+            continue
+        risk = abs(entry - stop)
+        risk_atr = risk / atr
+        sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
+        tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
+        # Too tight = stop-run risk; too wide = capital drag. Both are continuous.
+        stop_run_risk = clamp(math.exp(-risk_atr / (0.70 + 0.35 * tf_term)) * (1.0 - 0.35 * sig_term), 0.0, 1.0)
+        wide_risk_drag = clamp((risk_atr - (2.2 + 1.6 * tf_term)) / 5.0, 0.0, 1.0)
+        invalidation_quality = clamp(0.38 * sig_term + 0.26 * tf_term + 0.18 * max(htf, 0.0) + 0.18 * reliability,
+                                      0.0, 1.0)
+        survival = clamp(sigmoid(1.20 * invalidation_quality - 1.10 * stop_run_risk - 0.65 * uncertainty - 0.30 * wide_risk_drag),
+                         0.02, 0.98)
+        utility = survival + 0.40 * invalidation_quality - 0.55 * stop_run_risk - 0.22 * wide_risk_drag - 0.08 * risk_atr
+        notes = [f"sig={sig:.1f}", f"tf={tf_rank}", f"U={uncertainty:.2f}", f"feed={reliability:.2f}"]
+        cands.append(StopUtility(stop, anchor, risk, risk_atr, stop_run_risk, survival,
+                                 invalidation_quality, utility, role, notes, ref))
+
+    cands.sort(key=lambda x: x.utility, reverse=True)
+    notes = [f"of={of_align:+.2f}", f"htf={htf:+.2f}", f"pd={pd_affinity:+.2f}",
+             f"U={uncertainty:.2f}", f"feed={reliability:.2f}"]
+    return StopSurface(side, entry, current_stop, cands[0] if cands else None, cands, notes)
+
+
+def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, role: str) -> float:
+    # Continuous horizon cap. At 40+ ATR, probability cannot be large unless
+    # model is explicitly calibrated by realised outcomes in future versions.
+    horizon = 4.2 + 3.3 * tf_term + 2.0 * reliability
+    cap = 0.78 * math.exp(-dist_atr / max(horizon, 1e-6)) + 0.050 * tf_term + 0.030 * reliability
+    if role == "terminal":
+        cap *= 0.55
+    return clamp(cap, 0.0015, 0.92)
 
 
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
                          fee_bps: float = 8.0, slippage_bps: float = 2.0) -> TargetSurface:
-    """Build probability-adjusted utility for all live liquidity targets.
-
-    The selected TP is not nearest/farthest/fixed-R. It is the target that
-    maximises expected utility after path risk and costs.  Far HTF objectives can
-    still be retained as runner targets, but they are not allowed to dominate the
-    whole position purely because they print a large R:R.
-    """
     side = (side or "").lower()
     entry = float(entry or 0.0)
     stop = float(stop or 0.0)
@@ -257,8 +380,9 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         dist_atr = dist / atr
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
+        sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
+        tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
 
-        # Path gauntlet: significant opposing pools between entry and target
         lo, hi = min(entry, px), max(entry, px)
         opp_hits = 0
         opp_sig_sum = 0.0
@@ -269,84 +393,85 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                 if osig > 0:
                     opp_hits += 1
                     opp_sig_sum += osig
-        gauntlet_penalty = clamp(math.exp(-0.055 * opp_sig_sum - 0.18 * opp_hits), 0.18, 1.0)
+        gauntlet_penalty = clamp(math.exp(-0.060 * opp_sig_sum - 0.21 * opp_hits), 0.12, 1.0)
 
-        # Continuous probability model.  No fixed max-distance veto.  Distance
-        # decays probability, but high-quality HTF pools remain valid runner
-        # objectives if utility justifies them.
-        sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
-        tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
-        reach_decay = math.exp(-dist_atr / (5.5 + 3.2 * tf_term + 2.4 * reliability))
+        role = "internal" if dist_atr <= 2.8 else ("external" if dist_atr <= 10.0 else "terminal")
+        reach_decay = math.exp(-dist_atr / (4.2 + 2.9 * tf_term + 1.7 * reliability))
         z = (
-            -0.90
-            + 1.20 * sig_term
-            + 0.65 * tf_term
-            + 0.70 * of_align
-            + 0.52 * htf
-            + 0.32 * pd_affinity
-            + 0.90 * reach_decay
-            - 0.88 * uncertainty
+            -1.05
+            + 1.05 * sig_term
+            + 0.55 * tf_term
+            + 0.74 * of_align
+            + 0.54 * htf
+            + 0.28 * pd_affinity
+            + 0.70 * reach_decay
+            - 0.95 * uncertainty
             + math.log(max(gauntlet_penalty, 1e-6))
         )
-        p_hit = clamp(sigmoid(z) * reliability, 0.002, 0.975)
+        p_base = sigmoid(z) * reliability
+        p_hit = clamp(min(p_base, _target_distance_cap(dist_atr, tf_term, reliability, role)), 0.001, 0.975)
 
-        # Expected adverse excursion and opportunity/stop-run burden increase
-        # when uncertainty is high or liquidity path is gauntleted.
-        path_risk = clamp((1.0 - gauntlet_penalty) + 0.45 * uncertainty + 0.20 * max(-of_align, 0.0), 0.0, 2.0)
-        loss_r = 1.0 + 0.45 * uncertainty + 0.30 * path_risk
+        path_risk = clamp((1.0 - gauntlet_penalty) + 0.48 * uncertainty + 0.24 * max(-of_align, 0.0)
+                          + (0.030 * dist_atr if role == "terminal" else 0.010 * dist_atr), 0.0, 3.0)
+        loss_r = 1.0 + 0.48 * uncertainty + 0.34 * path_risk
         payoff_r = rr
         ev_r = p_hit * payoff_r - (1.0 - p_hit) * loss_r - cost_r
-        utility = ev_r - 0.15 * uncertainty - 0.08 * path_risk
 
-        if dist_atr <= 2.2:
-            role = "internal"
-        elif dist_atr <= 7.5:
-            role = "external"
-        else:
-            role = "terminal"
+        # Full-position utility is deliberately concave in payoff and harsher
+        # for terminal objectives. This prevents lottery TP replacing sane TP.
+        concave_payoff = math.log1p(max(payoff_r, 0.0)) / math.log(2.0)
+        full_position_utility = (
+            p_hit * concave_payoff
+            - (1.0 - p_hit) * loss_r
+            - cost_r
+            - 0.18 * uncertainty
+            - 0.10 * path_risk
+        )
+        if role == "terminal":
+            terminal_drag = 0.35 + 0.030 * dist_atr + 0.25 * uncertainty
+            full_position_utility -= terminal_drag
 
+        # Runner utility may still value terminal skew, but the runner fraction
+        # is separate from the full-size exchange TP.
+        runner_utility = ev_r - 0.11 * uncertainty - 0.08 * path_risk
+        utility = full_position_utility
         notes = [
             f"sig={sig:.1f}", f"tf={tf_rank}", f"reach={reach_decay:.2f}",
             f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
+            f"cap={_target_distance_cap(dist_atr, tf_term, reliability, role):.3f}",
         ]
         cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,
+                                   full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,
                                    path_risk, role, tf_rank, sig, notes, target))
 
-    cands.sort(key=lambda x: x.utility, reverse=True)
-    best = cands[0] if cands else None
+    # Executable TP: full-position utility. Runner objective: runner utility.
+    cands.sort(key=lambda x: x.full_position_utility, reverse=True)
+    non_terminal = [c for c in cands if c.role != "terminal"]
+    best = max(non_terminal, key=lambda x: x.full_position_utility, default=(cands[0] if cands else None))
     terminal_candidates = [c for c in cands if c.role == "terminal"]
-    terminal = max(terminal_candidates, key=lambda x: x.expected_value_r, default=None)
+    terminal = max(terminal_candidates, key=lambda x: x.runner_utility, default=None)
 
-    # Runner fraction is mathematical: only allocate runner weight when terminal
-    # EV is positive and its hit probability is not just lottery-like noise.
     runner_fraction = 0.0
-    if terminal and terminal.expected_value_r > 0.0 and terminal.probability >= 0.015:
-        ratio = terminal.expected_value_r / max((best.expected_value_r if best else terminal.expected_value_r), _EPS)
-        runner_fraction = clamp(0.18 + 0.32 * ratio - 0.22 * uncertainty, 0.0, 0.50)
+    if terminal and terminal.runner_utility > 0.0 and terminal.probability >= 0.008:
+        base = clamp(terminal.runner_utility / max(abs(best.full_position_utility) if best else 1.0, 0.25), 0.0, 1.2)
+        runner_fraction = clamp(0.10 + 0.22 * base - 0.18 * uncertainty, 0.0, 0.35)
 
-    notes = [
-        f"of={of_align:+.2f}", f"htf={htf:+.2f}", f"pd={pd_affinity:+.2f}",
-        f"U={uncertainty:.2f}", f"costR={cost_r:.3f}", f"feed={reliability:.2f}",
-    ]
+    notes = [f"of={of_align:+.2f}", f"htf={htf:+.2f}", f"pd={pd_affinity:+.2f}",
+             f"U={uncertainty:.2f}", f"costR={cost_r:.3f}", f"feed={reliability:.2f}"]
     return TargetSurface(side, entry, stop, risk, best, terminal, cands, runner_fraction, notes)
 
 
 def expected_utility_size_multiplier(surface: Optional[TargetSurface], posterior: float = 0.0) -> float:
-    """Fractional Kelly-style sizing multiplier bounded for live trading.
-
-    It does not increase/decrease trade frequency. It scales size only after the
-    master alpha decision has accepted. Negative/weak target utility scales down.
-    """
+    """Bounded fractional-Kelly style size scaler after alpha acceptance."""
     if not surface or not surface.best:
         return 0.70
     b = max(surface.best.payoff_r, _EPS)
     p = clamp(float(posterior or surface.best.probability), 0.001, 0.999)
     q = 1.0 - p
     kelly = (b * p - q) / b
-    edge = clamp(surface.best.utility, -2.0, 3.0)
-    # Half-Kelly with uncertainty/runner haircut.  Bound keeps risk sane.
-    raw = 0.72 + 0.55 * clamp(kelly, -0.40, 0.80) + 0.12 * clamp(edge, -1.0, 1.0)
+    edge = clamp(surface.best.full_position_utility, -2.0, 3.0)
+    raw = 0.70 + 0.50 * clamp(kelly, -0.40, 0.80) + 0.14 * clamp(edge, -1.0, 1.0)
     if surface.runner_fraction > 0.0:
-        raw += 0.04 * surface.runner_fraction
-    return clamp(raw, 0.45, 1.18)
+        raw += 0.03 * surface.runner_fraction
+    return clamp(raw, 0.42, 1.15)

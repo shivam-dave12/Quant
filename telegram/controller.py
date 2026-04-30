@@ -611,16 +611,30 @@ class TelegramBotController:
                 terminal = getattr(surf, 'terminal', None)
                 runner = _sf(getattr(surf, 'runner_fraction', 0.0))
                 if best:
-                    lines.append(f"  Selected: <b>${best.price:,.1f}</b> p={best.probability:.3f} EV={best.expected_value_r:+.3f} U={best.utility:+.3f} RR={best.rr:.2f}")
+                    lines.append(f"  Executable: <b>${best.price:,.1f}</b> p={best.probability:.3f} EV={best.expected_value_r:+.3f} fullU={getattr(best,'full_position_utility',best.utility):+.3f} RR={best.rr:.2f}")
                 else:
                     lines.append("  Selected: none — no positive-utility live target")
                 if terminal and terminal is not best:
-                    lines.append(f"  Runner objective: ${terminal.price:,.1f} p={terminal.probability:.3f} U={terminal.utility:+.3f} runner={runner:.0%}")
+                    lines.append(f"  Runner objective: ${terminal.price:,.1f} p={terminal.probability:.3f} runnerU={getattr(terminal,'runner_utility',terminal.utility):+.3f} runner={runner:.0%}")
                 cands = list(getattr(surf, 'candidates', []) or [])[:3]
                 for i, c in enumerate(cands, 1):
-                    lines.append(f"    {i}. ${c.price:,.1f} {c.role} p={c.probability:.3f} EV={c.expected_value_r:+.3f} U={c.utility:+.3f} d={c.distance_atr:.1f}ATR")
+                    lines.append(f"    {i}. ${c.price:,.1f} {c.role} p={c.probability:.3f} EV={c.expected_value_r:+.3f} fullU={getattr(c,'full_position_utility',c.utility):+.3f} d={c.distance_atr:.1f}ATR")
             else:
                 lines.append("  No target surface built yet. It appears after a QuantPosterior-approved signal.")
+
+            # Expected-utility stop surface
+            stop_surf = getattr(strat, '_last_stop_surface', None)
+            lines += ["", "<b>EXPECTED-UTILITY STOP SURFACE</b>"]
+            if stop_surf is not None:
+                sbest = getattr(stop_surf, 'best', None)
+                if sbest:
+                    lines.append(f"  Selected: <b>${sbest.price:,.1f}</b> risk={sbest.risk_atr:.2f}ATR survive={sbest.survival_probability:.2f} stoprun={sbest.stop_run_risk:.2f} U={sbest.utility:+.3f}")
+                else:
+                    lines.append("  Selected: none — using exchange protective stop")
+                for i, c in enumerate(list(getattr(stop_surf, 'candidates', []) or [])[:3], 1):
+                    lines.append(f"    {i}. ${c.price:,.1f} {c.role} risk={c.risk_atr:.2f}ATR U={c.utility:+.3f}")
+            else:
+                lines.append("  No stop surface built yet. It appears after a QuantPosterior-approved signal.")
 
             # Execution safety and position/adaptive exit
             can_ok, risk_reason = rm.can_trade()

@@ -55,12 +55,13 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
-    from strategy.expected_utility import build_target_surface, expected_utility_size_multiplier
+    from strategy.expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier
 except Exception:  # pragma: no cover - standalone tests
     try:
-        from expected_utility import build_target_surface, expected_utility_size_multiplier  # type: ignore
+        from expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier  # type: ignore
     except Exception:
         build_target_surface = None  # type: ignore
+        build_stop_surface = None  # type: ignore
         expected_utility_size_multiplier = None  # type: ignore
 
 # -- v9.0: Liquidity-First Entry Engine ------------------------------------
@@ -2932,23 +2933,68 @@ class QuantStrategy:
 
     def _apply_expected_utility_target_surface(self, signal, liq_snapshot, flow_state,
                                                ict_ctx, price: float, atr: float) -> None:
-        """Optimise TP from the live liquidity target surface.
+        """Optimise SL and TP from live expected-utility surfaces.
 
-        This replaces nearest/farthest/fixed-R TP behaviour with a probability ×
-        payoff - risk - cost selection. It mutates the EntrySignal in place only
-        when the selected target improves expected utility. For tiny positions
-        that cannot be split into partials, the best utility target becomes the
-        single exchange TP. Larger positions retain terminal-runner metadata for
-        future manual reduce-only ladder management.
+        EntryEngine still proposes a raw protective SL and raw liquidity TP. This
+        method is the institutional optimiser: it builds a StopSurface first,
+        then a TargetSurface using the updated risk. Terminal HTF pools are
+        retained as runner objectives, not full-size TP unless they are also the
+        best full-position utility target.
         """
         if build_target_surface is None:
             return
         try:
             entry = float(getattr(signal, "entry_price", price) or price)
-            sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+            old_sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
             old_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
-            if entry <= 0 or sl <= 0 or old_tp <= 0:
+            if entry <= 0 or old_sl <= 0 or old_tp <= 0:
                 return
+
+            side = str(getattr(signal, "side", "") or "").lower()
+            tick = float(QCfg.TICK_SIZE()) if 'QCfg' in globals() else 0.5
+
+            # 1) Stop/invalidation surface. This is not an R/R optimiser. It
+            # selects the stop with the best survival/invalidation utility.
+            stop_surface = None
+            if 'build_stop_surface' in globals() and build_stop_surface is not None:
+                stop_surface = build_stop_surface(
+                    side=side,
+                    entry=entry,
+                    current_stop=old_sl,
+                    atr=float(atr or 0.0),
+                    snapshot=liq_snapshot,
+                    flow=flow_state,
+                    ict=ict_ctx,
+                    tick_size=tick,
+                )
+                self._last_stop_surface = stop_surface
+                best_sl = getattr(stop_surface, 'best', None)
+                if best_sl is not None:
+                    new_sl = float(best_sl.price)
+                    # Apply only if it remains protective and improves the
+                    # invalidation surface materially. Do not tighten for vanity RR.
+                    protective = ((side == 'long' and new_sl < entry) or
+                                  (side == 'short' and new_sl > entry))
+                    _existing_u = None
+                    try:
+                        for _c in getattr(stop_surface, 'candidates', []) or []:
+                            if getattr(_c, 'role', '') == 'existing':
+                                _existing_u = float(getattr(_c, 'utility', -9.0))
+                                break
+                    except Exception:
+                        _existing_u = None
+                    _best_u = float(getattr(best_sl, 'utility', -9.0))
+                    improves = (_best_u > ((_existing_u if _existing_u is not None else -0.25) + 0.055))
+                    changed = abs(new_sl - old_sl) >= max(tick * 2.0, 1e-9)
+                    if protective and improves and changed:
+                        setattr(signal, "sl_price", new_sl)
+                        logger.info(
+                            "StopSurface selected SL: %s | replaced raw SL $%.1f",
+                            best_sl.compact(), old_sl,
+                        )
+                        old_sl = new_sl
+
+            # 2) Execution cost estimates for target surface.
             fee_bps = 8.0
             slip_bps = 2.0
             try:
@@ -2958,10 +3004,12 @@ class QuantStrategy:
                     slip_bps = float(snap.get('slippage_ewma_bps', slip_bps) or slip_bps)
             except Exception:
                 pass
+
+            # 3) Target surface after stop/risk update.
             surface = build_target_surface(
-                side=str(getattr(signal, "side", "") or ""),
+                side=side,
                 entry=entry,
-                stop=sl,
+                stop=old_sl,
                 atr=float(atr or 0.0),
                 snapshot=liq_snapshot,
                 flow=flow_state,
@@ -2971,38 +3019,47 @@ class QuantStrategy:
             )
             self._last_target_surface = surface
             if not surface.best:
-                logger.debug("TargetSurface: no eligible live target; keeping EntryEngine TP")
+                logger.debug("TargetSurface: no eligible live target; keeping raw EntryEngine TP")
                 return
-            old_risk = abs(entry - sl)
+
+            old_risk = abs(entry - old_sl)
             old_rr = abs(old_tp - entry) / max(old_risk, 1e-9)
             old_dist_atr = abs(old_tp - entry) / max(float(atr or 0.0), 1e-9)
             old_u = None
             for c in surface.candidates:
-                if abs(c.price - old_tp) <= max(QCfg.TICK_SIZE() * 2.0, 1e-9):
-                    old_u = c.utility
+                if abs(c.price - old_tp) <= max(tick * 2.0, 1e-9):
+                    old_u = float(getattr(c, 'full_position_utility', c.utility))
                     break
-            # If old target is not on the live surface, treat it as terminal/lower reliability.
             if old_u is None:
-                old_u = -0.15 + 0.02 * min(old_rr, 10.0) - 0.02 * old_dist_atr
+                # If raw target is absent from live surface, treat as poor quality.
+                old_u = -0.45 + 0.04 * min(old_rr, 4.0) - 0.035 * old_dist_atr
+
             best = surface.best
-            # Switch only for meaningful expected utility improvement. This is
-            # not a fixed TP preference; it prevents oscillation/noisy retargeting.
-            improvement = best.utility - float(old_u)
-            if improvement > 0.04:
+            best_u = float(getattr(best, 'full_position_utility', best.utility))
+            improvement = best_u - float(old_u)
+            if improvement > 0.035:
                 setattr(signal, "tp_price", best.price)
                 setattr(signal, "target_pool", best.pool_ref)
                 setattr(signal, "rr_ratio", abs(best.price - entry) / max(old_risk, 1e-9))
                 setattr(signal, "target_surface", surface)
+                if getattr(surface, 'terminal', None) is not None:
+                    setattr(signal, "terminal_runner_price", surface.terminal.price)
+                    setattr(signal, "runner_fraction", surface.runner_fraction)
                 logger.info(
-                    "TargetSurface selected TP: %s | replaced old TP $%.1f "
-                    "oldU=%+.3f improvement=%+.3f",
+                    "TargetSurface selected executable TP: %s | raw TP $%.1f oldFullU=%+.3f improvement=%+.3f",
                     best.compact(), old_tp, old_u, improvement,
                 )
             else:
                 setattr(signal, "target_surface", surface)
-                logger.debug("TargetSurface kept existing TP: oldU=%+.3f best=%s", old_u, best.compact())
+                logger.debug("TargetSurface kept raw TP: oldFullU=%+.3f best=%s", old_u, best.compact())
+
+            # Keep R:R internally consistent after any SL/TP mutation.
+            try:
+                setattr(signal, "rr_ratio", abs(float(signal.tp_price) - entry) / max(abs(entry - float(signal.sl_price)), 1e-9))
+            except Exception:
+                pass
         except Exception as e:
-            logger.debug(f"TargetSurface optimisation error: {e}")
+            logger.debug(f"Expected-utility surface optimisation error: {e}")
 
     def _suppress_rejected_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
@@ -5051,6 +5108,14 @@ class QuantStrategy:
         signal = self._entry_engine.get_signal()
         if signal is not None:
             self._apply_expected_utility_target_surface(signal, liq_snapshot, flow_state, ict_ctx, price, atr)
+            _surf_after = getattr(signal, 'target_surface', getattr(self, '_last_target_surface', None))
+            if _surf_after is not None and not getattr(_surf_after, 'has_positive_edge', False):
+                _best = getattr(_surf_after, 'best', None)
+                _why = (f"no positive executable target utility; best={_best.compact()}" if _best is not None
+                        else "no executable target surface")
+                logger.info(f"Quant target-surface blocked {signal.side.upper()} {signal.entry_type.value}: {_why}")
+                self._suppress_rejected_entry_signal(signal, _why, cooldown_sec=45.0)
+                return
             inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)
             if inst_veto:
                 veto_key = (
@@ -5703,10 +5768,13 @@ class QuantStrategy:
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
+        _sig_diag = str(sig) if sig is not None else ""
+        if (getattr(sig, 'vwap_price', 0.0) or 0.0) <= 0:
+            _sig_diag = "posterior/target-surface execution"
         logger.info(
-            f"Ã°Å¸Å½Â¯ ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
-            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} R:R=1:{rr:.2f} | "
-            f"{'maker' if use_maker else 'taker'} | VWAP=${sig.vwap_price:,.2f} | {sig}"
+            f"ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
+            f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ Place entry Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -6093,33 +6161,58 @@ class QuantStrategy:
         _ratchet_plan = "BE @0.5R -> +0.15R@1R -> +0.5R@1.5R -> +1R@2R -> trailing@2.5R+"
         _sep = "-" * 30
 
+        _ts = getattr(_es, 'target_surface', None) if _es is not None else getattr(self, '_last_target_surface', None)
+        _ss = getattr(self, '_last_stop_surface', None)
+        _best_t = getattr(_ts, 'best', None) if _ts is not None else None
+        _term_t = getattr(_ts, 'terminal', None) if _ts is not None else None
+        _best_s = getattr(_ss, 'best', None) if _ss is not None else None
+        _runner_frac = float(getattr(_ts, 'runner_fraction', 0.0) or 0.0) if _ts is not None else 0.0
+        _tp_model = (
+            f"executable p={getattr(_best_t,'probability',0.0):.3f} "
+            f"fullU={getattr(_best_t,'full_position_utility',getattr(_best_t,'utility',0.0)):+.3f} "
+            f"role={getattr(_best_t,'role','-')}"
+            if _best_t is not None else "not available"
+        )
+        _runner_model = (
+            f"runner ${getattr(_term_t,'price',0.0):,.1f} "
+            f"p={getattr(_term_t,'probability',0.0):.3f} "
+            f"weight={_runner_frac:.0%}"
+            if _term_t is not None and _runner_frac > 0.0 else "runner not allocated"
+        )
+        _sl_model = (
+            f"survive={getattr(_best_s,'survival_probability',0.0):.2f} "
+            f"stoprun={getattr(_best_s,'stop_run_risk',0.0):.2f} "
+            f"U={getattr(_best_s,'utility',0.0):+.3f}"
+            if _best_s is not None else "raw protective stop"
+        )
+        _posterior = "-"
+        try:
+            _sa = getattr(self._entry_engine, '_last_sweep_analysis', None)
+            if _sa:
+                _posterior = f"p={float(_sa.get('quant_posterior',0.0)):.3f} EV={float(_sa.get('quant_ev',0.0)):+.3f}R"
+        except Exception:
+            pass
+        _sep = "━━━━━━━━━━━━━━━━━━━━"
         send_telegram_message(
-            f"{_side_icon} <b>{side.upper()} ENTERED - {_et_label}</b>\n"
+            f"{'🟢' if side == 'long' else '🔴'} <b>{side.upper()} OPENED</b>  <code>{_et_label}</code>\n"
             f"{_sep}\n"
-            f"<b>ðŸ’° LEVELS</b>\n"
-            f"Entry:    <b>${fill_price:,.2f}</b>\n"
-            f"SL:       ${sl_price:,.2f}"
-            f"  (-${sl_dist_pts:.1f} / {sl_dist_pts/max(self._atr_5m.atr,1):.2f}xATR)\n"
-            f"TP:       ${tp_price:,.2f}"
-            f"  (+${tp_dist_pts:.1f} / {tp_dist_pts/max(self._atr_5m.atr,1):.2f}xATR)\n"
-            f"R:R:      1:{rr_a:.2f}  |  Risk: ${dollar_risk:.2f} USDT\n"
-            f"Qty:      {qty:.4f} BTC\n"
-            f"{_sep}\n"
-            f"<b>ðŸŽ¯ WHY WE ENTERED</b>\n"
-            f"Pool TP:  {_pool_tp_str}"
+            f"<b>Decision</b>\n"
+            f"Posterior: <code>{_posterior}</code>\n"
+            f"Reason: <code>{_entry_reason[:180]}</code>\n"
+            f"\n<b>Execution</b>\n"
+            f"Entry: <b>${fill_price:,.2f}</b>   Qty: <code>{qty:.6f} BTC</code>\n"
+            f"Risk:  <code>${dollar_risk:.2f}</code>   Payoff/Risk: <code>1:{rr_a:.2f}</code>\n"
+            f"\n<b>Optimised Stop Surface</b>\n"
+            f"SL: <b>${sl_price:,.2f}</b>  ({sl_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
+            f"<code>{_sl_model}</code>\n"
+            f"\n<b>Expected-Utility Target Surface</b>\n"
+            f"TP: <b>${tp_price:,.2f}</b>  ({tp_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
+            f"<code>{_tp_model}</code>\n"
+            f"<code>{_runner_model}</code>\n"
             f"{_swept_str}\n"
-            f"Reason:   {_entry_reason}\n"
-            f"Flow:     conviction={_flow_conv_str}\n"
-            f"Tier:     {_tier_badge}"
-            f"{_amd_str}"
-            f"{_ict_in_ote_str}"
-            f"{_htf_str}\n"
             f"{_sep}\n"
-            f"<b>WHAT'S NEXT</b>\n"
-            f"Trail:    {_trail_plan}\n"
-            f"Ratchet:  {_ratchet_plan}\n"
-            f"Exits:    SL hit | TP (pool) hit | Regime flip | Max-hold\n"
-            f"Monitor:  /position  or  /thinking"
+            f"Adaptive exit: expected-adverse-excursion → true net BE → structure/liquidity trail\n"
+            f"Monitor: /position  /thinking  /trail"
         )
         logger.info(
             f"Ã¢Å“â€¦ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "

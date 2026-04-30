@@ -472,7 +472,7 @@ class LiquidityTrailEngine:
         )
         # BUG-FIX F: if both initial_sl_dist AND the fallback evaluate to 0
         # (e.g. current_sl == entry_price AND ATR is near-zero), r_multiple
-        # collapses to 0.0 permanently and the engine stays in PHASE_0_HANDS_OFF
+        # collapses to 0.0 permanently and the engine stays in ADAPTIVE_EXIT_OBSERVE
         # for the entire trade with no log noise at INFO level.  Emit a one-shot
         # WARNING so the operator can diagnose the root cause (SL order at entry
         # price, or ATR computation failure).
@@ -526,18 +526,18 @@ class LiquidityTrailEngine:
                     phase="COUNTER_BOS", r_multiple=r_multiple)
 
         # ══════════════════════════════════════════════════════════════
-        # PHASE 0 — HANDS OFF
+        # ADAPTIVE EXIT — OBSERVE / NOISE-SURVIVAL
         # ══════════════════════════════════════════════════════════════
         phase0_delivery_atr = trail_profile.delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_PHASE0_MAX_DELIVERY_ATR", 0.75)) * 0.65
         if delivery_atr < phase0_delivery_atr:
             self._last_phase = "HANDS_OFF"
             return self._hold(
-                f"PHASE_0_HANDS_OFF: delivery={delivery_atr:.2f}ATR<{phase0_delivery_atr:.2f}ATR — "
-                f"initial structural SL is optimal",
+                f"ADAPTIVE_EXIT_OBSERVE: delivery={delivery_atr:.2f}ATR<{phase0_delivery_atr:.2f}ATR — "
+                f"market has not exceeded expected adverse-excursion; keep structural invalidation",
                 hold_reason, r_multiple=r_multiple)
 
         # ══════════════════════════════════════════════════════════════
-        # PHASE 1 — BREAKEVEN LOCK
+        # ADAPTIVE EXIT — TRUE NET BREAKEVEN LOCK
         # ══════════════════════════════════════════════════════════════
         early_momentum_gate = self._momentum_gate(
             pos_side, atr, candles_by_tf.get("5m", []), cvd_trend,
@@ -575,7 +575,7 @@ class LiquidityTrailEngine:
                 liq_snapshot=liq_snapshot, ict_engine=ict_engine)
 
         # ══════════════════════════════════════════════════════════════
-        # PHASE 2 / 3 - STRUCTURE TRAIL
+        # ADAPTIVE EXIT — STRUCTURE/DELIVERY TRAIL
         # ══════════════════════════════════════════════════════════════
         if delivery_atr < aggressive_min_delivery_atr:
             self._last_phase = "STRUCTURAL"
@@ -1130,7 +1130,7 @@ class LiquidityTrailEngine:
             phase="BE_LOCK", r_multiple=r_multiple)
 
     # ─────────────────────────────────────────────────────────────────────
-    # PHASE 2 / 3 - STRUCTURE TRAIL CORE
+    # ADAPTIVE EXIT — STRUCTURE/DELIVERY TRAIL CORE
     # ─────────────────────────────────────────────────────────────────────
 
     def _fibonacci_trail(
