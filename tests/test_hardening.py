@@ -39,7 +39,7 @@ class HardeningTests(unittest.TestCase):
         from telegram import notifier
 
         msg = (
-            "strategy.quant_strategy: Entries blocked: "
+            "strategy.quant_strategy: Entries paused: "
             "watchdog circuit breaker is engaged"
         )
         self.assertTrue(notifier._is_suppressed_for_telegram(msg))
@@ -71,7 +71,7 @@ class HardeningTests(unittest.TestCase):
         self.assertTrue(htf.vetoes_trade("long"))
         self.assertFalse(htf.vetoes_trade("short"))
 
-    def test_conviction_hard_rejects_low_rr_even_with_high_score(self):
+    def test_conviction_advises_low_rr_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -89,10 +89,10 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=2.0,
         )
 
-        self.assertFalse(result.allowed)
-        self.assertTrue(any("RR_HARD" in r for r in result.reject_reasons))
+        self.assertTrue(result.allowed)
+        self.assertTrue(any("RR_LOW_EXPECTANCY" in r or "RR_LOW" in r for r in result.reject_reasons))
 
-    def test_conviction_hard_rejects_approach_entries(self):
+    def test_conviction_advises_approach_entries_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -110,10 +110,10 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=2.0,
         )
 
-        self.assertFalse(result.allowed)
-        self.assertTrue(any("APPROACH_HARD" in r for r in result.reject_reasons))
+        self.assertTrue(result.allowed)
+        self.assertTrue(any("APPROACH_PRE_SWEEP" in r or "APPROACH" in r for r in result.reject_reasons))
 
-    def test_conviction_hard_rejects_missing_sweep_displacement(self):
+    def test_conviction_advises_missing_sweep_displacement_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -131,7 +131,7 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=0.0,
         )
 
-        self.assertFalse(result.allowed)
+        self.assertTrue(result.allowed)
         self.assertTrue(any("DISPLACEMENT_MISSING" in r for r in result.reject_reasons))
 
     def test_reconcile_defers_stale_position_right_after_exit(self):
@@ -166,43 +166,23 @@ class HardeningTests(unittest.TestCase):
 
         self.assertEqual(om.flatten_calls, 0)
 
-    def test_quant_strategy_treats_failed_conviction_as_hard_veto(self):
+    def test_quant_strategy_blocks_only_account_safety_conviction(self):
         from strategy.conviction_filter import ConvictionResult
-        from strategy.quant_strategy import EntryType, QuantStrategy
+        from strategy.quant_strategy import QuantStrategy
 
-        class FakeEntryEngine:
-            def __init__(self):
-                self.blocks = []
-                self.consumed = False
-
-            def mark_gate_blocked(self, side, reason, cooldown_sec=0.0):
-                self.blocks.append((side, reason, cooldown_sec))
-
-            def consume_signal(self):
-                self.consumed = True
-
-        strategy = object.__new__(QuantStrategy)
-        strategy._entry_engine = FakeEntryEngine()
-        strategy._active_institutional_size_mult = 1.0
-        strategy._last_conv_block_key = None
-        strategy._entry_confirm_key = ("pending",)
-        strategy._entry_confirm_count = 2
-
-        signal = SimpleNamespace(side="long", entry_type=EntryType.SWEEP_REVERSAL)
-        result = ConvictionResult(
+        safe_quality_result = ConvictionResult(
             allowed=False,
             score=0.512,
             reject_reasons=["PRODUCT_CORE: 0.11 < 0.60"],
         )
+        safety_result = ConvictionResult(
+            allowed=False,
+            score=0.100,
+            reject_reasons=["DRAWDOWN_CIRCUIT_BREAKER: session loss limit hit"],
+        )
 
-        strategy._block_failed_conviction(signal, result)
-
-        self.assertEqual(strategy._active_institutional_size_mult, 0.0)
-        self.assertEqual(strategy._entry_confirm_key, None)
-        self.assertEqual(strategy._entry_confirm_count, 0)
-        self.assertTrue(strategy._entry_engine.consumed)
-        self.assertEqual(strategy._entry_engine.blocks[0][0], "long")
-        self.assertIn("PRODUCT_CORE", strategy._entry_engine.blocks[0][1])
+        self.assertFalse(QuantStrategy._conviction_reject_is_account_safety(safe_quality_result))
+        self.assertTrue(QuantStrategy._conviction_reject_is_account_safety(safety_result))
 
 
 if __name__ == "__main__":

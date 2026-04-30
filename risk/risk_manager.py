@@ -243,6 +243,17 @@ class RiskManager:
                 remaining = int(cooldown - (now - _last_loss))
                 return False, f"Loss cooldown: {remaining}s remaining"
 
+            # RISK-HARDENING: bootstrap balance before gate checks.
+            # A zero current_balance disables percentage drawdown gates; fetch once
+            # before the first trade so daily-loss and drawdown checks are live.
+            if self.current_balance <= 0 and self.api is not None:
+                try:
+                    bal = self.get_available_balance()
+                    if isinstance(bal, dict) and bal.get("error"):
+                        return False, f"Balance unavailable: {bal.get('error')}"
+                except Exception as _bal_gate_err:
+                    return False, f"Balance unavailable: {_bal_gate_err}"
+
             # ── Daily trade limit ─────────────────────────────────────────────
             if len(self.daily_trades) >= self.max_daily_trades:
                 return False, f"Daily trade limit ({self.max_daily_trades})"

@@ -2,7 +2,7 @@
 liquidity_trail.py — Institutional Liquidity/Structure SL Trailing Engine v6.0
 =====================================================================
 ADVANCED REWRITE — Drop-in replacement.  Sole trailing engine for the
-entire system (no fallbacks, no chandelier, no dynamic-structure class).
+entire system (no fallbacks, no liquidity-agnostic trail, no dynamic-structure class).
 
 DESIGN PRINCIPLES
 -----------------
@@ -11,7 +11,7 @@ Every advance passes six gates.  A single Fib-level touch never moves the SL.
   1.  BAR-CLOSE GATE
       SL advances are evaluated ONLY when the last candle of the anchor TF
       closes.  Intrabar wicks never trigger a move.  This eliminates the
-      retail failure mode where a 1-second wick into a pool stops out a
+      fragile stop-management failure mode where a 1-second wick into a pool stops out a
       winning trade.
 
   2.  CLOSE-CONFIRMATION COUNTER
@@ -762,7 +762,7 @@ class LiquidityTrailEngine:
         """
         Allow a BE/protection lock only after the trade has delivered structure.
 
-        This prevents the old retail behaviour of moving to BE solely because
+        This prevents the old fragile behaviour of moving to BE solely because
         price printed a numeric R multiple. The lock now needs directional flow,
         a fresh aligned BOS, or enough delivery beyond a live opposing pool.
         """
@@ -895,7 +895,7 @@ class LiquidityTrailEngine:
                 continue
             tf = str(getattr(pool, "timeframe", "?") or "?")
             # Higher-quality pools earn a slightly tighter buffer, but never
-            # a zero/retail-tight buffer.
+            # a zero/noise-tight buffer.
             quality_adj = max(0.65, min(1.15, 1.05 - min(sig, 20.0) / 80.0))
             buf = max(0.10 * atr, base_buf * quality_adj)
             if pos_side == "long":

@@ -2133,7 +2133,7 @@ HOW TO WIRE direction_engine.py v2.0 INTO quant_strategy.py
         candles_5m     = candles_by_tf.get("5m", []),
         liq_snapshot   = self._liq_map._last_snapshot,   # FIX-3: previous tick's snap
     )
-    # Bridge to ICTEngine legacy dict shape:
+    # Bridge to ICTEngine compatibility telemetry shape:
     self._ict.inject_hunt_prediction({
         "predicted":          _hunt.predicted,
         "confidence":         round(_hunt.confidence, 3),

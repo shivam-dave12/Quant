@@ -7,7 +7,11 @@ No config_overrides.py — everything lives here.
 Calibrated for 65-75% WR, 3-6 trades per session.
 """
 import os
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # production image may not ship python-dotenv
+    def load_dotenv(*_a, **_kw):
+        return False
 load_dotenv()
 
 # ── Exchange routing ──────────────────────────────────────────────────────────
@@ -36,6 +40,7 @@ COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BALANCE_USAGE_PERCENTAGE = 60
+MAX_ENTRY_MARGIN_USAGE_PCT = BALANCE_USAGE_PERCENTAGE  # single-trade margin ceiling
 MIN_MARGIN_PER_TRADE     = 1
 MAX_MARGIN_PER_TRADE     = 10_000
 MIN_POSITION_SIZE        = 0.001
@@ -56,14 +61,35 @@ MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
 MAX_CONSECUTIVE_LOSSES   = 2
+ALLOW_TIME_BASED_CONSEC_LOSS_RESET = False
+CONSEC_LOSS_AUTO_RESET_HOURS = 2.0
 MAX_DAILY_TRADES         = 10        # institutional selectivity over frequency
 ONE_POSITION_AT_A_TIME   = True
-MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; legacy alias for 300 seconds
+MIN_TIME_BETWEEN_TRADES  = 5.0       # minutes; compatibility alias for 300 seconds
 MIN_TIME_BETWEEN_TRADES_SEC = 300.0
 TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
-MIN_RISK_REWARD_RATIO    = 2.0       # hard floor; reject thin R:R setups
+MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
+
+# ── Institutional dynamic execution audit ────────────────────────────────────
+# Style/quality signals are never hidden alpha vetoes. They are continuous
+# references used for score, size multiplier, expected utility, and attribution.
+# Only mechanical account/exchange safety can stop routing.
+INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
+INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
+INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
+INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
+INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
+ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
+ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
+ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
+ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
+ENTRY_MIN_SWEEP_QUALITY            = 0.20
+ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
+IC_IMPAIRMENT_SIZE_MULT            = 0.35
+POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
+
 
 # ── Order execution ───────────────────────────────────────────────────────────
 TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
@@ -289,6 +315,7 @@ QUANT_OB_HIST_LEN              = 60
 QUANT_TICK_AGG_WINDOW_SEC      = 30.0
 QUANT_TP_MAX_RR                = 3.5
 QUANT_SL_SWING_DENSITY_WINDOW  = 0.30
+# Deprecated compatibility only: the live trail is liquidity/structure based.
 QUANT_TRAIL_CHANDELIER_N_START = 3.00
 QUANT_TRAIL_CHANDELIER_N_END   = 1.50
 QUANT_TRAIL_HVN_SNAP_THRESH    = 0.55
@@ -394,11 +421,11 @@ CONVICTION_MIN_ENTRY_INTERVAL_SEC  = 420
 CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
-# ── Institutional Entry Quality Gates ─────────────────────────────────────────
-# These are hard execution gates, not score nudges. The bot must see actual
-# auction acceptance after a sweep before it can place risk: displacement,
-# CISD/OTE or strong acceptance, non-chase location, and flow/HTF coherence.
-ENTRY_HARD_MIN_DISPLACEMENT_ATR          = 0.75
+# ── Institutional Dynamic Entry Quality References ───────────────────────────
+# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
+# signal quality and size; posterior/EV still owns trade expression.
+ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
+ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
 ENTRY_REQUIRE_CISD_OR_OTE                = True
 ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
@@ -406,8 +433,8 @@ ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
 ENTRY_REVERSAL_PD_SHORT_MIN              = 0.38
 ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR    = 0.55
 ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS   = True
-ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40
-ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30
+ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic penalty reference
+ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
 ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
@@ -466,7 +493,7 @@ PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.35
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
 
-# ── Legacy alias ──────────────────────────────────────────────────────────────
+# ── Compatibility alias ───────────────────────────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE
 
 validate_config()

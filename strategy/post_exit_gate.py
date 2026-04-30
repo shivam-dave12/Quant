@@ -16,13 +16,11 @@ the user observed in production:
       direction that just stopped you out has the worst expectancy in the
       book; the move that broke your structure is not done.
 
-This module replaces the flat 30s cooldown with a multi-factor decision:
+This module replaces the flat cooldown with a multi-factor exposure decision:
 
-    accept(side, ctx) -> (allow: bool, decay_until: float, reason: str)
+    accept(side, ctx) -> GateDecision; allow=False means exposure impairment, not alpha hostile lens
 
-The gate composes six orthogonal rejection lenses. Any one veto blocks the
-entry; vetoes carry a `decay_until` timestamp that tells the strategy when
-the same lens will next re-evaluate (instead of polling).
+The lens stack composes six orthogonal risk/readiness checks. A hostile lens returns allow=False so QuantStrategy can reduce size or defer repeated identical theses; it is not an alpha mechanical guard.
 
 DESIGN
 ------
@@ -40,7 +38,7 @@ The gate does NOT make trading decisions about WHETHER to enter — that
 is the entry engine's job. It only decides "is the post-exit window still
 hostile to this re-entry?".
 
-LENSES (in order of evaluation; first veto wins)
+LENSES (in order of evaluation; first hostile lens wins)
 ------------------------------------------------
 1. BASE_COOLDOWN
        Always-on minimum: max(QUANT_COOLDOWN_SEC, POST_EXIT_BASE_SEC).
@@ -160,7 +158,7 @@ _FLIP_REQUIRES_BOS               = lambda: bool (_cfg_get("POST_EXIT_FLIP_REQUIR
 class GateDecision:
     allow:      bool
     retry_at:   float          # epoch s; when this lens should be re-checked
-    lens:       str            # which lens vetoed (or "" on allow)
+    lens:       str            # which lens flagged (or "" on allow)
     detail:     str            # human-readable reason
     metrics:    dict = field(default_factory=dict)
 
@@ -347,7 +345,7 @@ class PostExitGate:
 
     def accept(self, ctx: GateContext) -> GateDecision:
         """
-        Evaluate all six lenses. Returns first veto, or allow.
+        Evaluate all six lenses. Returns first hostile lens, or allow.
         """
         # Operator override
         if ctx.now < self._force_clear_until:
