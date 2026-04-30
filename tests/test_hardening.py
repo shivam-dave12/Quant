@@ -184,6 +184,81 @@ class HardeningTests(unittest.TestCase):
         self.assertFalse(QuantStrategy._conviction_reject_is_account_safety(safe_quality_result))
         self.assertTrue(QuantStrategy._conviction_reject_is_account_safety(safety_result))
 
+    def test_quant_post_sweep_rejects_score_only_low_displacement(self):
+        import strategy.quantitative_models as qm
+
+        qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+        snap = SimpleNamespace(
+            bsl_pools=[
+                SimpleNamespace(price=105.0, significance=15.0),
+                SimpleNamespace(price=108.0, significance=12.0),
+            ],
+            ssl_pools=[SimpleNamespace(price=98.0, significance=10.0)],
+            orderbook={"bids": [[100.0, 100.0]], "asks": [[100.05, 100.0]]},
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.75, cvd_trend=0.60)
+        ict = SimpleNamespace(
+            structure_15m="ranging",
+            structure_4h="ranging",
+            dealing_range_pd=0.20,
+        )
+
+        decision = qm.evaluate_post_sweep_quant(
+            action="continue",
+            side="long",
+            rev_score=80.0,
+            cont_score=287.0,
+            displacement_atr=0.25,
+            cisd=False,
+            ote=False,
+            phase="DISPLACEMENT",
+            price=100.0,
+            atr=1.0,
+            snap=snap,
+            flow=flow,
+            ict=ict,
+        )
+
+        self.assertFalse(decision.accept)
+        self.assertIn("raw auction proof", decision.reason)
+
+    def test_quant_post_sweep_allows_structural_proof_with_low_displacement(self):
+        import strategy.quantitative_models as qm
+
+        qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+        snap = SimpleNamespace(
+            bsl_pools=[
+                SimpleNamespace(price=105.0, significance=15.0),
+                SimpleNamespace(price=108.0, significance=12.0),
+            ],
+            ssl_pools=[SimpleNamespace(price=98.0, significance=10.0)],
+            orderbook={"bids": [[100.0, 100.0]], "asks": [[100.05, 100.0]]},
+        )
+        flow = SimpleNamespace(direction="long", conviction=0.75, cvd_trend=0.60)
+        ict = SimpleNamespace(
+            structure_15m="bullish",
+            structure_4h="bullish",
+            dealing_range_pd=0.20,
+        )
+
+        decision = qm.evaluate_post_sweep_quant(
+            action="continue",
+            side="long",
+            rev_score=80.0,
+            cont_score=287.0,
+            displacement_atr=0.10,
+            cisd=True,
+            ote=False,
+            phase="DISPLACEMENT",
+            price=100.0,
+            atr=1.0,
+            snap=snap,
+            flow=flow,
+            ict=ict,
+        )
+
+        self.assertTrue(decision.accept)
+
     def test_target_surface_uses_posterior_without_lottery_tp(self):
         from strategy.expected_utility import build_target_surface
 
