@@ -341,7 +341,7 @@ def _format_thinking_terminal_industry(
         f"tick {tick_flow:+.2f} | CVD {cvd_trend:+.2f} | OB {ob_imbalance:+.2f}",
         f"target {_target_summary(primary_target)}",
         f"liquidity BSL {nearest_bsl_atr:.1f} ATR | SSL {nearest_ssl_atr:.1f} ATR | sweeps {recent_sweep_count}",
-        f"ICT AMD {amd_phase or '-'} / {amd_bias or '-'} | 5m {structure_5m or '-'} | killzone {kill_zone or '-'}",
+        f"Struct AMD {amd_phase or '-'} / {amd_bias or '-'} | 5m {structure_5m or '-'} | killzone {kill_zone or '-'}",
     ]
     if tracking_info:
         rows.append(
@@ -666,7 +666,7 @@ def format_thinking_terminal(
         f"   Sweeps(5m)={recent_sweep_count}",
     ]
     if ict_parts:
-        lines.append(f"  ICT   {' │ '.join(ict_parts)}")
+        lines.append(f"  Struct {' │ '.join(ict_parts)}")
     if tracking_info:
         d = tracking_info.get("direction","?").upper()
         t = tracking_info.get("target","?")
@@ -678,7 +678,7 @@ def format_thinking_terminal(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. TELEGRAM: /thinking
+# 3. TELEGRAM: /thinking / compact posterior view
 # ═════════════════════════════════════════════════════════════════════════════
 
 def format_thinking_telegram(
@@ -720,7 +720,7 @@ def format_thinking_telegram(
     zone   = "DISCOUNT" if in_discount else ("PREMIUM" if in_premium else "EQUILIBRIUM")
 
     lines = [
-        f"<b>🧠 THINKING  •  ${price:,.2f}</b>",
+        f"<b>🧠 POSTERIOR SNAPSHOT  •  ${price:,.2f}</b>",
         f"<code>{si} {_esc(engine_state):<12}  ATR ${atr:.1f} ({atr_pctile:.0%})</code>",
     ]
 
@@ -733,14 +733,13 @@ def format_thinking_telegram(
     # Flow
     lines += [
         "",
-        f"<b>⚡ Order Flow</b>",
+        f"<b>⚡ Microstructure Features</b>",
         f"  Direction   <b>{_esc((flow_direction or 'neutral').upper())}</b>  [{_esc(fc_bar)}] {fc_dir}  {flow_conviction:+.2f}",
         f"  Tick {tick_flow:+.2f}   Streak {tick_streak}   CVD {cvd_trend:+.2f}   OB {ob_imbalance:+.2f}",
     ]
-    thresh_delta = abs(flow_conviction) - 0.55
-    gate_str = (f"✅ +{thresh_delta:.2f} above threshold" if thresh_delta >= 0
-                else f"⛔ {thresh_delta:.2f} below threshold")
-    lines.append(f"  Gate  {gate_str}")
+    # Microstructure is a feature vector, not a standalone gate.
+    evidence = min(1.0, abs(flow_conviction))
+    lines.append(f"  Evidence weight  {evidence:.2f}  (posterior input, not a hard gate)")
 
     # Liquidity
     lines += ["", "<b>💧 Liquidity</b>"]
@@ -789,7 +788,7 @@ def format_thinking_telegram(
                 pass
 
     # ICT
-    lines += ["", "<b>🏛 ICT Context</b>"]
+    lines += ["", "<b>🏛 Structure / AMD / PD Features</b>"]
     if amd_phase:
         lines.append(f"  AMD  <b>{_esc(amd_phase)}</b>  {_esc(amd_bias or 'neutral')}  conf={amd_confidence:.2f}")
     lines.append(f"  Zone {_esc(zone)}  ·  5m {_esc(structure_5m or '?')}  ·  15m {_esc(structure_15m or '?')}")
@@ -818,15 +817,15 @@ def format_thinking_telegram(
 
     # Verdict
     verdicts = {
-        "TRACKING":   "Building conviction — flow sustained toward pool",
-        "READY":      "⚡ Entry imminent — conviction met",
-        "POST_SWEEP": "Evaluating: reverse, continue, or wait?",
+        "TRACKING":   "Collecting observations for posterior acceptance",
+        "READY":      "Posterior/EV accepted — execution safety pending",
+        "POST_SWEEP": "Evaluating posterior: reverse, continue, or reject",
         "IN_POSITION":"Managing active trade",
     }
     verdict = verdicts.get(engine_state) or (
-        "Waiting for directional flow" if abs(flow_conviction) < 0.3 else
+        "Waiting for a positive expected-value auction" if abs(flow_conviction) < 0.3 else
         "Flow present — no pool in range" if not primary_target else
-        "Monitoring flow alignment with target"
+        "Monitoring observations and target utility"
     )
     lines += ["", f"<b>💬 Verdict</b>", f"  {_esc(verdict)}"]
     return "\n".join(lines)
@@ -928,7 +927,7 @@ def format_flow_telegram(
     arrow  = "▲ BUY" if dir_up else ("▼ SELL" if dir_dn else "─ NEUTRAL")
 
     lines = [
-        f"<b>⚡ Order Flow  •  ${price:,.2f}</b>",
+        f"<b>⚡ Microstructure Features  •  ${price:,.2f}</b>",
         f"<b>{_esc((flow_direction or 'neutral').upper())}</b>  [{_esc(fc_bar)}] {arrow}  {flow_conviction:+.2f}",
         "",
         "<b>Components</b>",
@@ -962,10 +961,10 @@ def format_flow_telegram(
 
     lines += [
         "",
-        "<b>Entry Gates</b>",
-        f"  {'✅' if conv_ok else '⛔'} Conviction ≥ 0.55   ({abs(flow_conviction):.2f})",
-        f"  {'✅' if cvd_ok  else '⛔'} CVD agrees",
-        f"  {'✅' if tick_ok else '⛔'} Sustained ≥ 3 ticks  ({tick_streak})",
+        "<b>Posterior Inputs</b>",
+        f"  Microstructure evidence {abs(flow_conviction):.2f}  (not a hard gate)",
+        f"  CVD alignment {'supportive' if cvd_ok else 'mixed/weak'}",
+        f"  Tick persistence {tick_streak} ticks",
     ]
     return "\n".join(lines)
 
@@ -1133,7 +1132,7 @@ def format_entry_alert_v9(
 
     lines.append(f"  Flow {flow_conviction:+.2f}  ·  CVD {cvd_trend:+.2f}")
     if ict_validation:
-        lines.append(f"  ICT  {_esc(ict_validation)}")
+        lines.append(f"  Struct {_esc(ict_validation)}")
     if kill_zone:
         lines.append(f"  🔥 Session  {_esc(kill_zone.upper())}")
     return "\n".join(lines)

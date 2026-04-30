@@ -10,7 +10,7 @@ Public API (imported by strategy layer):
   format_periodic_report()           — institutional dashboard
   format_direction_hunt_alert()      — liquidity-draw telemetry only
   format_post_sweep_verdict()        — quant posterior auction decision
-  format_conviction_block_alert()    — safety/advisory diagnostic
+  format_conviction_block_alert()    — advisory/safety diagnostic
   format_pool_gate_alert()           — liquidity-path exit/reversal telemetry
   format_liquidity_trail_update()    — adaptive exit / stop update
   install_global_telegram_log_handler()
@@ -820,9 +820,9 @@ def _pd(pd: float) -> str:
 #   format_periodic_report, format_direction_hunt_alert,
 #   format_post_sweep_verdict, format_conviction_block_alert, and
 #   format_liquidity_trail_update. They were silently shadowed by the
-#   later v9.1 industry-grade definitions (Python last-`def`-wins),
+#   later QuantPosterior/adaptive-exit definitions (Python last-`def`-wins),
 #   so they were dead code and have been removed. The live versions
-#   are below in the v9.1 INDUSTRY-GRADE TELEGRAM TEMPLATES section.
+#   are below in the QuantPosterior/adaptive-exit Telegram templates section.
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -999,7 +999,7 @@ def install_global_telegram_log_handler(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# v9.1 — INDUSTRY-GRADE TELEGRAM TEMPLATES
+# QuantPosterior / adaptive-exit Telegram templates
 # ══════════════════════════════════════════════════════════════════════════
 # These templates are used by quant_strategy.py and the controller for the
 # user-facing high-frequency notifications (entry, exit, trail, gate veto).
@@ -1153,7 +1153,7 @@ def format_trail_advance(
     """
     Adaptive exit advance alert. Compact — fires often; reports the stop move and legacy R fields only for analytics compatibility.
 
-        🔒 TRAIL ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION (1.20R)
+        🔒 TRAIL ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION
         ─────────────────────────
         SL    $77,520.00 → $77,540.00   locked +0.20R
         FIB   0.500   anchor 15m @ $77,420.00
@@ -1419,7 +1419,7 @@ def format_periodic_report(
     n_bsl_pools:         int   = 0,
     n_ssl_pools:         int   = 0,
     primary_target_str:  str   = "-",
-    flow_conviction:     float = 0.0,
+    flow_feature_score:     float = 0.0,
     flow_direction:      str   = "",
     amd_phase:           str   = "UNKNOWN",
     session:             str   = "REGULAR",
@@ -1504,7 +1504,7 @@ def format_periodic_report(
         lines.append(f"<code>PS      {_esc(str(action).upper()):<9} {_esc(str(direction).upper()):<6} {conf:>5.0%} phase {_esc(phase)}</code>")
 
     lines += [_tg_section("\U0001f6a6", "Posterior / Execution")]
-    lines.append(f"<code>SESSION {'PASS' if session else 'WAIT':<6}  FLOW {'PASS' if abs(flow_conviction) >= 0.20 else 'WAIT':<6}  HTF {'PASS' if htf_bias and htf_bias.lower() != 'mixed' else 'WAIT':<6}</code>")
+    lines.append(f"<code>FEATURES session={_esc(session or '-'):>8}  flow={float(flow_conviction or 0):+5.2f}  htf={_esc(htf_bias or 'mixed'):>8}</code>")
 
     if position:
         side = str(position.get("side") or "?").upper()
@@ -1669,7 +1669,7 @@ def format_conviction_block_alert(
     allow_reasons = _kw.get("allow_reasons") or []
     deficit = max(0.0, float(required_score or 0.0) - score)
     lines = [
-        f"🛡️ <b>SAFETY / ADVISORY BLOCK</b>  <code>{_esc(str(side).upper())}</code>",
+        f"🛡️ <b>SAFETY / ADVISORY NOTICE</b>  <code>{_esc(str(side).upper())}</code>",
         _TG_RULE,
         f"<code>SCORE   {score:>6.2f} / {float(required_score or 0):>5.2f}   need +{deficit:.2f}   [{_tg_bar(score / max(required_score, 0.01))}]</code>",
     ]
@@ -1740,7 +1740,7 @@ def format_liquidity_trail_update(
         _TG_RULE,
         f"<code>SL      {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
         f"<code>R       live {float(r_multiple or 0):+6.2f}R   lock {locked:+8.1f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",
-        f"<code>ANCHOR  {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}   fib {fib_ratio if fib_ratio is not None else '-':>8}</code>",
+        f"<code>ANCHOR  {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}   anchor_ratio {fib_ratio if fib_ratio is not None else '-':>8}</code>",
         f"<code>MARK    {_tg_price(current_price):>14}   ENTRY {_tg_price(entry_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
     ]
     if swing_low is not None or swing_high is not None:

@@ -97,7 +97,7 @@ def _repair_mojibake(text: str) -> str:
             text = text.replace(bad, good)
     return text
 
-# ── v9 display engine (optional) ─────────────────────────────────────────────
+# ── display engine (optional) ─────────────────────────────────────────────
 try:
     from strategy.v9_display import (
         format_thinking_telegram, format_pools_telegram,
@@ -416,18 +416,16 @@ class TelegramBotController:
         )
 
     # ================================================================
-    # /thinking  ← CORE COMMAND — quant posterior execution stack
+    # /thinking  ← CORE COMMAND — QuantPosterior decision console
     # ================================================================
 
     def _cmd_thinking(self) -> str:
         """
-        Live institutional decision stack:
+        Live mathematical decision console.
 
-          LAYER 1 — Market state       feed reliability, volatility, session
-          LAYER 2 — Liquidity state    active BSL/SSL + sweep archive
-          LAYER 3 — Posterior model    P(edge), EV, uncertainty, SPRT barrier
-          LAYER 4 — Execution audit    SL/TP eligibility, sizing, liquidation
-          LAYER 5 — Adaptive exit      EAE, true net BE, stop survival
+        This command intentionally avoids the old filter-stack view.
+        It shows the current authority flow:
+            market observations -> posterior/EV -> target surface -> safety/execution -> adaptive exit
         """
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
@@ -438,503 +436,247 @@ class TelegramBotController:
             strat = bot_instance.strategy
             dm    = bot_instance.data_manager
             rm    = bot_instance.risk_manager
-
             if not strat or not dm or not rm:
                 return "Components not ready."
 
-            price   = dm.get_last_price()
-            now     = time.time()
-            now_ms  = int(now * 1000)
-            atr     = strat._atr_5m.atr
-            ict     = strat._ict
-            pos     = strat._pos
-            sig     = strat._last_sig
-
-            lines = [f"<b>🧠 QUANT POSTERIOR STACK @ ${price:,.2f}</b>"]
-            try:
-                rel = dm.get_feed_reliability() if hasattr(dm, 'get_feed_reliability') else (dm.get_secondary_status() if hasattr(dm, 'get_secondary_status') else {})
-                mode = _esc(str(rel.get('mode', 'single')).upper())
-                srcs = int(rel.get('sources', 1) or 1)
-                mw = float(rel.get('microstructure_weight', 1.0) or 1.0)
-                note = _esc(str(rel.get('note', '')))
-                lines.append(f"\n<b>━━ LAYER 0: DATA RELIABILITY</b>")
-                lines.append(f"  Feed: <b>{mode}</b> | sources={srcs} | microstructure weight={mw:.2f}")
-                if note:
-                    lines.append(f"  → {note}")
-            except Exception:
-                pass
-
-            # ══════════════════════════════════════════════════════════
-            # LAYER 1 — LIQUIDITY MAP
-            # Markets move from pool to pool. Which pool are we targeting?
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 1: LIQUIDITY STATE</b>")
-
-            liq_map = getattr(strat, '_liq_map', None)
-            if liq_map is not None:
+            def _sf(v, default=0.0):
                 try:
-                    snap    = liq_map.get_snapshot(price, atr)
-                    summary = liq_map.get_status_summary(price, atr)
+                    x = float(v)
+                    return x if x == x else default
+                except Exception:
+                    return default
 
-                    # BSL pools above price
-                    # BUG-FIX: snap.bsl_pools contains PoolTarget objects.
-                    # Price lives at p.pool.price, not p.price.
-                    # priority_score→p.significance, touch_count→p.pool.touches,
-                    # timeframe→p.pool.timeframe, fresh→pool status check.
-                    bsl_near = [p for p in snap.bsl_pools if p.pool.price > price][:4]
-                    ssl_near = [p for p in snap.ssl_pools if p.pool.price < price][:4]
-                    bsl_near_sorted = sorted(bsl_near, key=lambda p: p.pool.price)
-                    ssl_near_sorted = sorted(ssl_near, key=lambda p: p.pool.price, reverse=True)
+            def _bar(v, width=12):
+                v = max(0.0, min(1.0, _sf(v)))
+                n = int(round(v * width))
+                return "█" * n + "░" * (width - n)
 
-                    lines.append("  <b>BSL (Buy-side above)</b>")
-                    for p in bsl_near_sorted:
-                        dist_atr = (p.pool.price - price) / max(atr, 1)
-                        score    = p.significance
-                        touches  = p.pool.touches
-                        tf       = p.pool.timeframe
-                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
-                                    else "♻️")
-                        lines.append(
-                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
-                            f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
+            def _signed_bar(v, width=10):
+                v = max(-1.0, min(1.0, _sf(v)))
+                n = int(round(abs(v) * width))
+                arrow = "▲" if v > 0.05 else ("▼" if v < -0.05 else "─")
+                return f"{'█' * n}{'░' * (width - n)} {arrow} {v:+.2f}"
 
-                    lines.append("  <b>SSL (Sell-side below)</b>")
-                    for p in ssl_near_sorted:
-                        dist_atr = (price - p.pool.price) / max(atr, 1)
-                        score    = p.significance
-                        touches  = p.pool.touches
-                        tf       = p.pool.timeframe
-                        fresh    = ("✅" if p.pool.status.value not in ('SWEPT', 'CONSUMED')
-                                    else "♻️")
-                        lines.append(
-                            f"    ${p.pool.price:,.1f}  dist={dist_atr:.1f}ATR  "
-                            f"x{touches}  [{tf}]  {fresh}  score={score:.2f}")
+            price = _sf(dm.get_last_price())
+            now   = time.time()
+            atr   = _sf(getattr(getattr(strat, '_atr_5m', None), 'atr', 0.0))
+            atr   = atr if atr > 0 else 1.0
+            pos   = getattr(strat, '_pos', None)
+            ict   = getattr(strat, '_ict', None)
+            entry = getattr(strat, '_entry_engine', None)
+            liq_map = getattr(strat, '_liq_map', None)
+            engine_state = str(getattr(entry, 'state', getattr(strat, '_state', 'SCANNING')))
+            if hasattr(getattr(entry, 'state', None), 'value'):
+                engine_state = str(entry.state.value)
 
-                    # Primary target
-                    # BUG-FIX C17-C19: PoolTarget has no .level_type or .price.
-                    # Correct paths: pt.pool.side.value, pt.pool.price, pt.significance.
-                    pt = snap.primary_target
-                    if pt:
-                        direction = "BSL ▲" if pt.pool.side.value == "BSL" else "SSL ▼"
-                        pt_score  = pt.significance
-                        lines.append(
-                            f"\n  🎯 <b>Primary target: {direction} @ ${pt.pool.price:,.1f}"
-                            f"  (score={pt_score:.2f})</b>")
-                    else:
-                        lines.append("\n  ─ No high-priority target pool identified")
+            lines = [
+                f"<b>🧠 QUANT DECISION CONSOLE @ ${price:,.2f}</b>",
+                "<code>Authority: observations → posterior/EV → target surface → safety/execution → adaptive exit</code>",
+            ]
 
-                    # Recent sweeps
-                    # BUG-FIX C20-C23: SweepResult has no sweep_timestamp, level_type,
-                    # price, or displacement_confirmed. Correct attrs: detected_at (seconds),
-                    # pool.side.value, pool.price, quality (use ≥0.5 as displacement proxy).
-                    if snap.recent_sweeps:
-                        lines.append(f"  🌊 Recent sweeps: {len(snap.recent_sweeps)}")
-                        for sw in snap.recent_sweeps[-2:]:
-                            age_m = (now - sw.detected_at) / 60.0
-                            disp  = "DISP✓" if sw.quality >= 0.5 else "weak"
-                            lines.append(
-                                f"    {sw.pool.side.value} ${sw.pool.price:,.1f}"
-                                f"  [{disp}]  {age_m:.0f}m ago")
-                except Exception as _le:
-                    lines.append(f"  LiqMap error: {_le}")
-            else:
-                lines.append("  ⏳ Liquidity map not available")
-
-            # ══════════════════════════════════════════════════════════
-            # LAYER 2 — FLOW DIRECTION (primary gate)
-            # Is CVD divergence + OB delta + tick aggression driving
-            # toward the highest-priority pool?
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 2: MICROSTRUCTURE FEATURES</b>")
-
-            tick_flow    = strat._tick_eng.get_signal() if strat._tick_eng else 0.0
-            cvd_trend    = strat._cvd.get_trend_signal() if strat._cvd else 0.0
-            cvd_div      = 0.0
+            # Data reliability
             try:
-                cvd_div = strat._cvd.get_divergence_signal(dm.get_candles("1m", limit=60))
+                rel = dm.get_feed_reliability() if hasattr(dm, 'get_feed_reliability') else (dm.get_data_quality() if hasattr(dm, 'get_data_quality') else {})
+            except Exception:
+                rel = {}
+            mode = str(rel.get('mode', 'single')).upper()
+            sources = int(rel.get('sources', 1) or 1)
+            mw = _sf(rel.get('microstructure_weight', 1.0), 1.0)
+            note = str(rel.get('note', ''))
+            lines += [
+                "",
+                "<b>DATA QUALITY</b>",
+                f"  Feed <b>{_esc(mode)}</b> | sources={sources} | microstructure confidence={mw:.2f}",
+            ]
+            if note:
+                lines.append(f"  {_esc(note)}")
+
+            # Market state features
+            try:
+                amd = getattr(ict, '_amd', None)
+                phase = getattr(amd, 'phase', '') or getattr(ict, 'amd_phase', '') or '-'
+                bias = getattr(amd, 'bias', '') or getattr(ict, 'amd_bias', '') or '-'
+                amd_conf = _sf(getattr(amd, 'confidence', 0.0))
+                pd = _sf(getattr(ict, '_pd_percentile', getattr(ict, 'dealing_range_pd', 0.5)), 0.5)
+                s15 = getattr(ict, '_structure_15m', getattr(ict, 'structure_15m', '-'))
+                s4h = getattr(ict, '_structure_4h', getattr(ict, 'structure_4h', '-'))
+            except Exception:
+                phase, bias, amd_conf, pd, s15, s4h = '-', '-', 0.0, 0.5, '-', '-'
+            session = ''
+            try:
+                session = str(getattr(strat, '_current_session', '') or getattr(getattr(strat, '_conviction_filter', None), 'session', '') or '')
+            except Exception:
+                session = ''
+            zone = "deep discount" if pd <= 0.25 else ("discount" if pd < 0.45 else ("premium" if pd > 0.55 else "equilibrium"))
+            lines += [
+                "",
+                "<b>MARKET STATE VECTOR</b>",
+                f"  ATR5m ${atr:.1f} | session {_esc(session or '-')} | PD {pd:.2f} ({_esc(zone)})",
+                f"  AMD {_esc(phase)} / {_esc(bias)} conf={amd_conf:.2f}",
+                f"  Structure 15m={_esc(s15)} | 4H={_esc(s4h)}",
+            ]
+
+            # Microstructure observations: features only, no gate language.
+            tick_flow = _sf(strat._tick_eng.get_signal()) if getattr(strat, '_tick_eng', None) else 0.0
+            cvd_trend = _sf(strat._cvd.get_trend_signal()) if getattr(strat, '_cvd', None) else 0.0
+            cvd_div = 0.0
+            try:
+                cvd_div = _sf(strat._cvd.get_divergence_signal(dm.get_candles('1m', limit=60))) if getattr(strat, '_cvd', None) else 0.0
             except Exception:
                 pass
-
             ob_imbalance = 0.0
             try:
                 ob = dm.get_orderbook()
-                if ob and ob.get("bids") and ob.get("asks"):
-                    bv = sum(float(b[1]) for b in ob["bids"][:10])
-                    av = sum(float(a[1]) for a in ob["asks"][:10])
-                    total_vol = bv + av
-                    if total_vol > 0:
-                        ob_imbalance = (bv - av) / total_vol
+                bids, asks = (ob or {}).get('bids', []), (ob or {}).get('asks', [])
+                bv = sum(float(b[1]) for b in bids[:10])
+                av = sum(float(a[1]) for a in asks[:10])
+                ob_imbalance = (bv - av) / (bv + av) if (bv + av) > 0 else 0.0
             except Exception:
                 pass
+            micro = 0.35 * tick_flow + 0.35 * cvd_trend + 0.20 * cvd_div + 0.10 * ob_imbalance
+            lines += [
+                "",
+                "<b>MICROSTRUCTURE OBSERVATIONS</b>",
+                f"  Combined {_signed_bar(micro)}",
+                f"  Tick {_signed_bar(tick_flow, 8)} | CVD trend {_signed_bar(cvd_trend, 8)}",
+                f"  CVD div {_signed_bar(cvd_div, 8)} | OB imbalance {_signed_bar(ob_imbalance, 8)}",
+            ]
 
-            streak     = getattr(strat, '_flow_streak_count_v2', 0)
-            streak_dir = getattr(strat, '_flow_streak_dir_v2', "")
-
-            def _flow_bar(v, w=8):
-                h = w // 2
-                f = min(int(abs(v) * h + 0.5), h)
-                return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
-                    else ("░" * (h - f) + "█" * f + "·" * h)
-
-            def _fl(label, val):
-                arrow = "▲" if val > 0.1 else ("▼" if val < -0.1 else "─")
-                return f"  {label:<12} {_flow_bar(val)} {arrow} {val:+.3f}"
-
-            lines.append(_fl("CVD div",    cvd_div))
-            lines.append(_fl("OB delta",   ob_imbalance))
-            lines.append(_fl("Tick aggr",  tick_flow))
-            lines.append(_fl("CVD trend",  cvd_trend))
-
-            # Flow conviction: weighted average of the three primary detectors
-            signals     = [cvd_div * 0.40, ob_imbalance * 0.35, tick_flow * 0.25]
-            conviction  = sum(signals)
-            flow_dir    = "long" if conviction > 0.20 else ("short" if conviction < -0.20 else "")
-
-            # Is flow toward the target pool?
-            # BUG-FIX C24: Reuse the pt already fetched from the earlier snapshot
-            # rather than calling get_snapshot() a third time.  PoolTarget has no
-            # .level_type attribute — the correct path is .pool.side.value.
-            # Note: pt may already be set from the Layer 1 section above; if the
-            # liq_map block raised an exception pt remains None from the init below.
-            pt = None
-            if liq_map is not None:
-                try:
-                    pt = liq_map.get_snapshot(price, atr).primary_target
-                except Exception:
-                    pass
-
-            toward_pool = False
-            if pt is not None and flow_dir:
-                if pt.pool.side.value == "BSL" and flow_dir == "long":
-                    toward_pool = True
-                elif pt.pool.side.value == "SSL" and flow_dir == "short":
-                    toward_pool = True
-
-            flow_gate_str = (
-                f"✅ TOWARD {'BSL ▲' if flow_dir == 'long' else 'SSL ▼'}  conv={conviction:+.3f}"
-                if toward_pool else
-                f"❌ NOT toward pool  conv={conviction:+.3f}  dir={flow_dir or 'neutral'}"
-            )
-            lines.append(f"\n  {flow_gate_str}")
-            if streak > 1:
-                lines.append(f"  Streak: {streak} ticks {streak_dir}")
-
-            # ══════════════════════════════════════════════════════════
-            # LAYER 3 — ICT SECONDARY VALIDATION
-            # AMD phase, OB/FVG alignment, premium/discount zone
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 3: STRUCTURE / AMD / PD FEATURES</b>")
-
-            if ict and ict._initialized:
-                # AMD phase
-                try:
-                    amd       = ict._amd
-                    amd_phase = amd.phase
-                    amd_conf  = amd.confidence
-                    amd_bias  = amd.bias
-                    amd_icons = {"DISTRIBUTION": "🎯", "MANIPULATION": "⚡",
-                                 "REACCUMULATION": "🔄", "REDISTRIBUTION": "🔄",
-                                 "ACCUMULATION": "💤"}
-                    amd_icon  = amd_icons.get(amd_phase, "❓")
-                    bias_icon = ("🔴" if amd_bias == "bearish"
-                                 else ("🟢" if amd_bias == "bullish" else "⚪"))
-
-                    # Is AMD phase compatible with flow direction?
-                    amd_compat = True
-                    amd_note   = ""
-                    if flow_dir == "long" and amd_bias == "bearish" and amd_conf >= 0.75:
-                        amd_compat = False
-                        amd_note   = "  ⚠️ AMD bearish (high conf) vs long flow"
-                    elif flow_dir == "short" and amd_bias == "bullish" and amd_conf >= 0.75:
-                        amd_compat = False
-                        amd_note   = "  ⚠️ AMD bullish (high conf) vs short flow"
-
-                    lines.append(
-                        f"  {amd_icon} AMD: <b>{_esc(amd_phase)}</b>  "
-                        f"{bias_icon}{_esc(amd_bias)}  conf={amd_conf:.2f}  "
-                        f"{'✅' if amd_compat else '❌'} feature-compatible")
-                    if amd_note:
-                        lines.append(amd_note)
-                except Exception as _ae:
-                    lines.append(f"  AMD: error — {_ae}")
-
-                # OB/FVG in path toward target pool
-                try:
-                    long_c  = ict.get_confluence("long",  price, now_ms, atr)
-                    short_c = ict.get_confluence("short", price, now_ms, atr)
-                    active_c = long_c if flow_dir == "long" else (short_c if flow_dir == "short" else long_c)
-                    lines.append(
-                        f"  ICT confluence ({flow_dir or 'n/a'}): Σ={active_c.total:.2f}  "
-                        f"OB={active_c.ob_score:.2f}  FVG={active_c.fvg_score:.2f}  "
-                        f"Sweep={active_c.sweep_score:.2f}  KZ={active_c.session_score:.2f}")
-                    if active_c.details:
-                        lines.append(f"  → {_esc(active_c.details)}")
-                except Exception:
-                    pass
-
-                # Premium / discount zone + dealing range
-                mtf_in_disc  = getattr(sig, 'in_discount', False)
-                mtf_in_prem  = getattr(sig, 'in_premium',  False)
-                zone_str     = ("💰 DISCOUNT" if mtf_in_disc
-                                else ("💸 PREMIUM" if mtf_in_prem else "〰️ EQUILIBRIUM"))
-                lines.append(f"  Price zone: {zone_str}")
-
-                # Dealing range position
-                _dr = getattr(ict, '_dealing_range', None)
-                if _dr:
-                    _pd = getattr(_dr, 'current_pd', 0.5)
-                    _pd_label = ("DEEP DISC" if _pd < 0.25 else
-                                 "DISCOUNT" if _pd < 0.40 else
-                                 "EQ" if _pd < 0.60 else
-                                 "PREMIUM" if _pd < 0.75 else "DEEP PREM")
-                    lines.append(f"  Dealing range: {_pd_label} ({_pd:.0%})  "
-                                 f"[${_dr.low:,.0f}–${_dr.high:,.0f}]")
-
-                # HTF structure
-                _htf_parts = []
-                _tf = getattr(ict, '_tf', {})
-                for _tfk in ("1d", "4h", "1h", "15m", "5m"):
-                    _tfs = _tf.get(_tfk)
-                    if _tfs:
-                        _trend = getattr(_tfs, 'trend', 'ranging')
-                        _icon = "🟢" if _trend == "bullish" else ("🔴" if _trend == "bearish" else "⚪")
-                        _htf_parts.append(f"{_icon}{_tfk}:{_trend[:4]}")
-                if _htf_parts:
-                    lines.append(f"  MTF: {' | '.join(_htf_parts)}")
-            else:
-                lines.append("  ⏳ ICT engine initialising")
-
-            # ══════════════════════════════════════════════════════════
-            # LAYER 4 — POSTERIOR / EXECUTION AUDIT
-            # Posterior decision, SL/TP eligibility, sizing, liquidation
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ LAYER 4: POSTERIOR / EXECUTION AUDIT</b>")
-
-            sweep = getattr(strat, '_active_sweep_setup', None)
-            entry_engine = getattr(strat, '_entry_engine', None)
-            engine_state = getattr(entry_engine, 'state', 'SCANNING') if entry_engine else 'SCANNING'
-
-            lines.append(f"  Engine: <b>{_esc(engine_state)}</b>")
-
-            # Expected-utility target surface (new master TP logic).
+            # Liquidity observations
+            snap = None
             try:
-                surf = getattr(strat, '_last_target_surface', None)
-                if surf is not None and getattr(surf, 'candidates', None):
-                    lines.append("  <b>Target surface</b>: probability × payoff − risk − cost")
-                    best = getattr(surf, 'best', None)
-                    terminal = getattr(surf, 'terminal', None)
-                    if best is not None:
-                        lines.append(f"    ✅ Best: {_esc(best.compact())}")
-                    if terminal is not None and terminal is not best:
-                        lines.append(f"    🏁 Runner: {_esc(terminal.compact())}")
-                    for c in list(getattr(surf, 'candidates', []) or [])[:3]:
-                        lines.append(f"    • {_esc(c.compact())}")
-            except Exception as _tse:
-                lines.append(f"  Target-surface diagnostics error: {_esc(_tse)}")
-
-            # Institutional TP/SL pool-plan diagnostics.  This answers the
-            # operator question: "BSL/SSL is visible, so why was it not selected?"
-            # The rows come from liquidity_pool_selector's hard gates — no gate is
-            # weakened for display.
-            try:
-                plan = getattr(entry_engine, 'pool_plan_info', None) if entry_engine else None
-                if callable(plan):
-                    plan = plan()
-                if isinstance(plan, dict):
-                    age_s = now - float(plan.get('ts', 0.0) or 0.0)
-                    if age_s <= 300:
-                        role = _esc(plan.get('role', 'POOL'))
-                        side = _esc(str(plan.get('side', '?')).upper())
-                        summary = _esc(plan.get('summary', ''))
-                        lines.append(f"  <b>{role} eligibility audit</b> ({side}, {age_s:.0f}s ago)")
-                        if summary:
-                            lines.append(f"  → {summary}")
-                        rows = plan.get('candidates') or []
-                        for r in rows[:5]:
-                            if not isinstance(r, dict):
-                                continue
-                            mark = '✅' if r.get('selected') else ('🟡' if r.get('eligible') else '⛔')
-                            ps = _esc(r.get('pool_side', ''))
-                            tf = _esc(r.get('timeframe', ''))
-                            px = float(r.get('pool_price') or 0.0)
-                            rr = float(r.get('rr') or 0.0)
-                            ev = float(r.get('ev') or 0.0)
-                            reason = _esc(r.get('reason', ''))
-                            if role == 'TP':
-                                tp_px = float(r.get('tp_price') or 0.0)
-                                lines.append(
-                                    f"    {mark} {ps} ${px:,.1f} [{tf}] → TP ${tp_px:,.1f} "
-                                    f"RR={rr:.2f} EV={ev:.3f} — {reason}")
-                            else:
-                                sl_px = float(r.get('sl_price') or 0.0)
-                                q = float(r.get('quality') or 0.0)
-                                lines.append(
-                                    f"    {mark} {ps} ${px:,.1f} [{tf}] → SL ${sl_px:,.1f} "
-                                    f"Q={q:.2f} — {reason}")
-            except Exception as _pe:
-                lines.append(f"  Pool-plan diagnostics error: {_esc(_pe)}")
-
-            if sweep is not None:
-                age_m   = (now_ms - sweep.setup_time_ms) / 60_000
-                in_ote  = sweep.ote_entry_zone_low <= price <= sweep.ote_entry_zone_high
-                s_icon  = "🟢" if sweep.status == "OTE_READY" else "🔵"
-                lines.append(
-                    f"  {s_icon} Sweep setup: <b>{sweep.side.upper()}</b>  "
-                    f"status={_esc(sweep.status)}  quality={sweep.quality_score():.2f}  age={age_m:.0f}m")
-                lines.append(
-                    f"  Sweep: ${sweep.sweep_price:,.0f}  "
-                    f"OTE zone: [${sweep.ote_entry_zone_low:,.0f}–${sweep.ote_entry_zone_high:,.0f}]")
-                if in_ote:
-                    lines.append("  ✅ Price IN OTE zone — limit entry eligible")
-                    # SL info
-                    lines.append(f"  SL (ICT): wick ${sweep.sl_sweep_candle:,.0f}")
-                else:
-                    # BUG-FIX C31: Operator precedence in the original expression caused
-                    # both sides to use the wrong zone edge.  For a LONG setup price must
-                    # rise to the OTE LOW (discount zone entry); for SHORT, drop to HIGH.
-                    if sweep.side == "long":
-                        dist = max(0.0, sweep.ote_entry_zone_low - price)
-                    else:
-                        dist = max(0.0, price - sweep.ote_entry_zone_high)
-                    lines.append(f"  ⏳ {dist:.0f}pts to OTE")
-
-                # TP = opposing pool
-                if sweep.delivery_target:
-                    lines.append(f"  TP (pool): ${sweep.delivery_target:,.0f}")
-                else:
-                    lines.append("  TP: awaiting opposing pool identification")
-
-                # FVG / OB in OTE
-                extras = []
-                if getattr(sweep, 'has_fvg_in_ote', False): extras.append("FVG✓")
-                if getattr(sweep, 'has_ob_in_ote',  False): extras.append("OB✓")
-                if extras:
-                    lines.append(f"  ICT in OTE: {' '.join(extras)}")
+                snap = liq_map.get_snapshot(price, atr) if liq_map is not None else None
+            except Exception as e:
+                lines.append(f"  Liquidity snapshot error: {_esc(e)}")
+            lines += ["", "<b>LIQUIDITY OBSERVATIONS</b>"]
+            if snap is not None:
+                bsl = sorted([p for p in getattr(snap, 'bsl_pools', []) if getattr(getattr(p, 'pool', p), 'price', 0) > price], key=lambda p: p.pool.price)[:3]
+                ssl = sorted([p for p in getattr(snap, 'ssl_pools', []) if getattr(getattr(p, 'pool', p), 'price', 0) < price], key=lambda p: p.pool.price, reverse=True)[:3]
+                pt = getattr(snap, 'primary_target', None)
+                if pt:
+                    try:
+                        lines.append(f"  Primary draw: <b>{_esc(pt.pool.side.value)} ${pt.pool.price:,.1f}</b> sig={_sf(getattr(pt, 'significance', 0.0)):.2f}")
+                    except Exception:
+                        pass
+                if bsl:
+                    lines.append("  BSL candidates")
+                    for p in bsl:
+                        lines.append(f"    ${p.pool.price:,.1f} d={(p.pool.price-price)/atr:.1f}ATR sig={_sf(getattr(p,'significance',0.0)):.2f} tf={_esc(p.pool.timeframe)}")
+                if ssl:
+                    lines.append("  SSL candidates")
+                    for p in ssl:
+                        lines.append(f"    ${p.pool.price:,.1f} d={(price-p.pool.price)/atr:.1f}ATR sig={_sf(getattr(p,'significance',0.0)):.2f} tf={_esc(p.pool.timeframe)}")
+                sweeps = list(getattr(snap, 'recent_sweeps', []) or [])[-3:]
+                if sweeps:
+                    lines.append("  Recent sweeps")
+                    for sw in sweeps:
+                        try:
+                            age = (now - float(sw.detected_at)) / 60.0
+                            lines.append(f"    {sw.pool.side.value} ${sw.pool.price:,.1f} q={_sf(sw.quality):.2f} age={age:.1f}m")
+                        except Exception:
+                            pass
             else:
-                lines.append("  ─ No active sweep setup")
-                lines.append("  Waiting for pool sweep + displacement confirmation")
+                lines.append("  Liquidity map not ready")
 
-            # Risk gate
+            # Posterior auction state
+            sa = getattr(entry, '_last_sweep_analysis', None) if entry is not None else None
+            lines += ["", "<b>POSTERIOR AUCTION MODEL</b>"]
+            if sa:
+                p_edge = _sf(sa.get('quant_posterior', sa.get('posterior', 0.0)))
+                qev = _sf(sa.get('quant_ev', sa.get('ev', 0.0)))
+                comp = sa.get('quant_components', {}) or {}
+                rev = _sf(sa.get('rev_score', 0.0))
+                cont = _sf(sa.get('cont_score', 0.0))
+                disp = _sf(sa.get('displacement_atr', 0.0))
+                cisd = bool(sa.get('cisd', False))
+                ote = bool(sa.get('ote', False))
+                lines.append(f"  Sweep {str(sa.get('sweep_side','?')).upper()} @ ${_sf(sa.get('sweep_price',0.0)):,.1f} q={_sf(sa.get('sweep_quality',0.0)):.2f}")
+                lines.append(f"  P(edge) {_bar(p_edge)} {p_edge:.3f} | EV {qev:+.3f}R")
+                lines.append(f"  Evidence: reverse={rev:.0f} continue={cont:.0f} disp={disp:.2f}ATR CISD={'yes' if cisd else 'no'} pullback={'yes' if ote else 'no'}")
+                if isinstance(comp, dict) and comp:
+                    show = []
+                    for k in ('edge', 'displacement', 'structure', 'flow', 'uncertainty', 'toxicity'):
+                        if k in comp:
+                            show.append(f"{k}={_sf(comp[k]):+.2f}")
+                    if show:
+                        lines.append("  Components: " + _esc(' | '.join(show)))
+            else:
+                lines.append("  No active posterior auction yet. Waiting for a fresh sweep and live evidence.")
+
+            # Expected-utility target surface
+            surf = getattr(strat, '_last_target_surface', None)
+            lines += ["", "<b>EXPECTED-UTILITY TARGET SURFACE</b>"]
+            if surf is not None:
+                best = getattr(surf, 'best', None)
+                terminal = getattr(surf, 'terminal', None)
+                runner = _sf(getattr(surf, 'runner_fraction', 0.0))
+                if best:
+                    lines.append(f"  Selected: <b>${best.price:,.1f}</b> p={best.probability:.3f} EV={best.expected_value_r:+.3f} U={best.utility:+.3f} RR={best.rr:.2f}")
+                else:
+                    lines.append("  Selected: none — no positive-utility live target")
+                if terminal and terminal is not best:
+                    lines.append(f"  Runner objective: ${terminal.price:,.1f} p={terminal.probability:.3f} U={terminal.utility:+.3f} runner={runner:.0%}")
+                cands = list(getattr(surf, 'candidates', []) or [])[:3]
+                for i, c in enumerate(cands, 1):
+                    lines.append(f"    {i}. ${c.price:,.1f} {c.role} p={c.probability:.3f} EV={c.expected_value_r:+.3f} U={c.utility:+.3f} d={c.distance_atr:.1f}ATR")
+            else:
+                lines.append("  No target surface built yet. It appears after a QuantPosterior-approved signal.")
+
+            # Execution safety and position/adaptive exit
             can_ok, risk_reason = rm.can_trade()
-            lines.append(
-                f"\n  {'✅' if can_ok else '🚫'} Risk gate: "
-                + (f"OPEN" if can_ok else f"BLOCKED — {_esc(risk_reason)}"))
+            cooldown_sec = _sf(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180.0), 180.0)
+            cd_rem = max(0.0, cooldown_sec - (now - _sf(getattr(strat, '_last_exit_time', 0.0))))
+            lines += ["", "<b>EXECUTION SAFETY</b>"]
+            lines.append(f"  Account/risk: {'PASS' if can_ok else 'BLOCK'}" + ("" if can_ok else f" — {_esc(risk_reason)}"))
+            lines.append(f"  Post-exit cooldown: {'ready' if cd_rem <= 0 else f'{cd_rem:.0f}s'}")
+            sig = getattr(strat, '_last_sig', None)
+            if sig is not None:
+                try:
+                    lines.append(f"  Last signal: {_esc(str(getattr(sig,'side','')).upper())} entry=${_sf(getattr(sig,'entry_price',0.0)):,.1f} SL=${_sf(getattr(sig,'sl_price',0.0)):,.1f} TP=${_sf(getattr(sig,'tp_price',0.0)):,.1f}")
+                except Exception:
+                    pass
 
-            cooldown_sec = float(getattr(cfg, 'QUANT_COOLDOWN_SEC', 180))
-            last_exit    = getattr(strat, '_last_exit_time', 0)
-            cd_rem       = max(0.0, cooldown_sec - (now - last_exit))
-            lines.append(
-                f"  {'✅' if cd_rem == 0 else '⏳'} Cooldown: "
-                + (f"{cd_rem:.0f}s remaining" if cd_rem > 0 else "ready"))
-
-            # ══════════════════════════════════════════════════════════
-            # LAYER 5 — TRAIL / POST-SWEEP ENGINE
-            # BOS swing → CHoCH tighten → 15m structure
-            # ══════════════════════════════════════════════════════════
-            try:
-                from strategy.quant_strategy import PositionPhase
-            except ImportError:
-                from quant_strategy import PositionPhase
-            lines.append("\n<b>━━ LAYER 5: TRAIL / POST-SWEEP ENGINE</b>")
-
-            if pos.phase == PositionPhase.ACTIVE:
-                profit_pts  = (pos.entry_price - price if pos.side == "short"
-                               else price - pos.entry_price)
-                init_dist   = pos.initial_sl_dist if pos.initial_sl_dist > 1e-10 else atr
-                tier_r      = max(profit_pts, pos.peak_profit) / init_dist
-
-                be_r   = float(getattr(cfg, 'QUANT_TRAIL_BE_R',        0.3))
-                lock_r = float(getattr(cfg, 'QUANT_TRAIL_LOCK_R',       0.8))
-                aggr_r = float(getattr(cfg, 'QUANT_TRAIL_AGGRESSIVE_R', 1.5))
-
-                if   tier_r < be_r:   phase_lbl = f"⬜ HANDS OFF (&lt;{be_r:.1f}R) — no trail yet"
-                elif tier_r < lock_r: phase_lbl = f"🟡 BOS SWING TRAIL ({be_r:.1f}→{lock_r:.1f}R)"
-                elif tier_r < aggr_r: phase_lbl = f"🟠 CHoCH TIGHTEN ({lock_r:.1f}→{aggr_r:.1f}R)"
-                else:                 phase_lbl = f"🟢 15m STRUCTURE TRAIL (&gt;{aggr_r:.1f}R)"
-
-                lines.append(f"  {pos.side.upper()}  {phase_lbl}")
-                lines.append(
-                    f"  Entry ${pos.entry_price:,.2f}  "
-                    f"SL ${pos.sl_price:,.2f}  "
-                    f"TP ${pos.tp_price:,.2f}  ({tier_r:.2f}R)")
-
-                # SL distance in ATR
-                sl_dist_atr = abs(price - pos.sl_price) / max(atr, 1)
-                tp_dist_atr = abs(pos.tp_price - price) / max(atr, 1)
-                lines.append(f"  SL dist: {sl_dist_atr:.1f}ATR  |  TP dist: {tp_dist_atr:.1f}ATR")
-
-                # Progress bar
-                total_move = abs(pos.tp_price - pos.entry_price)
-                if total_move > 0:
-                    prog = min(1.0, max(0, abs(price - pos.entry_price) / total_move))
-                    if profit_pts < 0: prog = 0
-                    bar = "█" * int(prog * 16) + "░" * (16 - int(prog * 16))
-                    lines.append(f"  [{bar}] {prog*100:.0f}%→TP")
-
+            lines += ["", "<b>ADAPTIVE EXIT STATE</b>"]
+            phase = getattr(pos, 'phase', None)
+            phase_val = str(getattr(phase, 'value', phase))
+            if 'ACTIVE' in phase_val.upper():
+                side = str(getattr(pos, 'side', '')).upper()
+                entry_px = _sf(getattr(pos, 'entry_price', 0.0))
+                sl_px = _sf(getattr(pos, 'sl_price', 0.0))
+                tp_px = _sf(getattr(pos, 'tp_price', 0.0))
+                mfe = _sf(getattr(pos, 'peak_profit', 0.0))
+                mae = _sf(getattr(pos, 'peak_adverse', 0.0))
+                live_pts = (price - entry_px) if side == 'LONG' else (entry_px - price)
+                lines.append(f"  Active {side} entry=${entry_px:,.1f} live={live_pts:+.1f}pts MFE={mfe:.1f} MAE={mae:.1f}")
+                lines.append(f"  Protective SL=${sl_px:,.1f} | exchange TP=${tp_px:,.1f}")
+                try:
+                    tr = getattr(strat, '_last_trail_reason', '') or getattr(strat, '_last_trail_action', '')
+                    if tr:
+                        lines.append(f"  Last exit decision: {_esc(tr)}")
+                except Exception:
+                    pass
             else:
-                lines.append("  ─ No active position")
+                lines.append("  No active position. Exit controller idle.")
 
-                # Show sweep analysis if in POST_SWEEP
-                entry_eng = getattr(strat, '_entry_engine', None)
-                if entry_eng:
-                    _sa = getattr(entry_eng, '_last_sweep_analysis', None)
-                    if _sa and engine_state == "POST_SWEEP":
-                        rs = _sa.get('rev_score', 0)
-                        cs = _sa.get('cont_score', 0)
-                        rr = _sa.get('rev_reasons', [])
-                        cr = _sa.get('cont_reasons', [])
-                        sw_side = _sa.get('sweep_side', '?')
-                        sw_price = _sa.get('sweep_price', 0)
-                        sw_qual = _sa.get('sweep_quality', 0)
-                        gap = abs(rs - cs)
-
-                        winner = ("REVERSAL" if rs >= 45 and gap >= 10 else
-                                  ("CONTINUATION" if cs >= 40 and gap >= 10 else "WAIT"))
-                        bar_total = max(rs + cs, 1)
-                        rev_pct = int(rs / bar_total * 16)
-                        cont_pct = 16 - rev_pct
-                        score_bar = "◀" + "█" * rev_pct + "░" * cont_pct + "▶"
-
-                        lines.append(f"\n  🌊 <b>SWEEP ANALYSIS</b> ({sw_side} @ ${sw_price:,.0f} q={sw_qual:.0%})")
-                        lines.append(f"  {score_bar}")
-                        lines.append(f"  REV={rs:.0f}: {', '.join(_esc(r) for r in rr[:3])}")
-                        lines.append(f"  CONT={cs:.0f}: {', '.join(_esc(r) for r in cr[:3])}")
-                        lines.append(f"  → <b>{winner}</b> (rev{'≥' if rs>=45 else '<'}45 gap={gap:.0f})")
-                    elif toward_pool:
-                        lines.append(f"  Scanning for sweep entry toward {'BSL' if flow_dir == 'long' else 'SSL'}...")
-                    else:
-                        lines.append("  Waiting for flow to align with pool direction")
-                else:
-                    lines.append("  Entry engine not available")
-
-            # ══════════════════════════════════════════════════════════
-            # VERDICT
-            # ══════════════════════════════════════════════════════════
-            lines.append("\n<b>━━ VERDICT</b>")
-            if pos.phase == PositionPhase.ACTIVE:
-                lines.append("  📍 Position ACTIVE — managing via adaptive exit controller")
-            elif toward_pool and sweep is not None and sweep.status == "OTE_READY" and can_ok and cd_rem == 0:
-                lines.append("  🎯 <b>ALL LAYERS GREEN — entry eligible at OTE</b>")
-            elif toward_pool and sweep is None:
-                lines.append("  ⏳ Flow confirmed → awaiting sweep + displacement")
-            elif not toward_pool:
-                lines.append("  👀 Watching — flow not yet toward target pool")
+            lines += ["", "<b>DECISION READOUT</b>"]
+            state_u = engine_state.upper()
+            if 'ACTIVE' in phase_val.upper():
+                lines.append("  Managing open risk through adaptive exit controller.")
+            elif surf is not None and getattr(surf, 'has_positive_edge', False) and can_ok and cd_rem <= 0:
+                lines.append("  Positive target surface exists; execution waits only for live posterior/safety alignment.")
+            elif sa and _sf(sa.get('quant_posterior', 0.0)) > 0:
+                lines.append("  Posterior auction is live; waiting for sufficient EV/uncertainty-adjusted acceptance.")
+            elif 'POST_SWEEP' in state_u:
+                lines.append("  Sweep observed; collecting evidence for posterior acceptance or rejection.")
             else:
-                missing = []
-                if not toward_pool:    missing.append("Flow not toward pool")
-                if sweep is None:      missing.append("No sweep setup")
-                if not can_ok:         missing.append(f"Risk: {_esc(risk_reason)}")
-                if cd_rem > 0:         missing.append(f"Cooldown {cd_rem:.0f}s")
-                lines.append("  👀 <b>Watching</b> — blocked by:")
-                for m in missing:
-                    lines.append(f"    • {m}")
+                lines.append("  Scanning. No executable posterior auction currently active.")
 
             self.send_message("\n".join(lines))
             return None
 
         except Exception as e:
             logger.error(f"Thinking error: {e}", exc_info=True)
-            return f"❌ Thinking error: {e}"
+            return f"❌ Thinking error: {_esc(e)}"
 
     # ================================================================
     # /pools
@@ -955,7 +697,7 @@ class TelegramBotController:
             atr   = strat._atr_5m.atr
 
             if not hasattr(strat, '_liq_map') or strat._liq_map is None:
-                return "Liquidity map not available (v9 engine not active)."
+                return "Liquidity map not available (display engine not active)."
 
             snap    = strat._liq_map.get_snapshot(price, atr)
             summary = strat._liq_map.get_status_summary(price, atr)
@@ -1083,12 +825,12 @@ class TelegramBotController:
                 return ("·" * h + "█" * f + "░" * (h - f)) if v >= 0 \
                     else ("░" * (h - f) + "█" * f + "·" * h)
 
-            lines = [f"<b>📊 Flow Direction @ ${price:,.2f}</b>"]
+            lines = [f"<b>📊 Microstructure Feature Vector @ ${price:,.2f}</b>"]
             lines.append(f"\n  {'CVD div':<14} {bar(cvd_div)} {cvd_div:+.3f}")
             lines.append(f"  {'OB delta':<14} {bar(ob_imbalance)} {ob_imbalance:+.3f}")
             lines.append(f"  {'Tick aggression':<14} {bar(tick_flow)} {tick_flow:+.3f}")
             lines.append(f"  {'CVD trend':<14} {bar(cvd_trend)} {cvd_trend:+.3f}")
-            lines.append(f"\n  Conviction: <b>{conviction:+.3f}</b>  → {direction}")
+            lines.append(f"\n  Feature score: <b>{conviction:+.3f}</b>  → {direction}  (posterior input, not an entry gate)")
             if streak > 1:
                 lines.append(f"  Streak: {streak} ticks {streak_dir}")
 
@@ -1118,7 +860,7 @@ class TelegramBotController:
             return f"❌ Status error: {e}"
 
     # ================================================================
-    # /structures  (ICT secondary layer)
+    # /structures  (structure/AMD/PD posterior features)
     # ================================================================
 
     def _cmd_structures(self) -> str:
@@ -1136,11 +878,11 @@ class TelegramBotController:
             ict    = getattr(strat, '_ict', None)
 
             if ict is None:
-                return "❌ ICT engine not available."
+                return "❌ Structure engine not available."
             if not ict._initialized:
                 nb = len(list(ict.order_blocks_bull))
                 ns = len(list(ict.order_blocks_bear))
-                return (f"⏳ ICT engine warming up...\n"
+                return (f"⏳ Structure engine warming up...\n"
                         f"Detected so far: {nb}🟢 {ns}🔴 OBs\n"
                         f"Need ≥10 candles + 5s update cycle.")
 
@@ -1153,7 +895,7 @@ class TelegramBotController:
             kz_s    = f" [{kz}]" if kz else ""
 
             lines = [
-                f"🏛️ <b>ICT Structures (secondary) @ ${price:,.1f}</b>",
+                f"🏛️ <b>Structure / AMD / PD Features @ ${price:,.1f}</b>",
                 f"<i>AMD phase, OB/FVG alignment, P/D zone — confirms pool flow</i>",
                 f"Session: {_esc(sess)}{_esc(kz_s)}  |  ATR(5m): ${atr_v:.1f}",
                 (f"OBs: {c['ob_bull']}🟢 {c['ob_bear']}🔴  "
@@ -1204,7 +946,7 @@ class TelegramBotController:
 
             long_c  = ict.get_confluence("long",  price, now_ms, atr_v)
             short_c = ict.get_confluence("short", price, now_ms, atr_v)
-            lines.append("\n<b>Confluence Scores (ICT secondary)</b>")
+            lines.append("\n<b>Posterior feature confluence</b>")
             lines.append(
                 f"  LONG  Σ={long_c.total:.2f}  "
                 f"OB={long_c.ob_score:.2f}  FVG={long_c.fvg_score:.2f}  "
@@ -1473,8 +1215,8 @@ class TelegramBotController:
                 margin_pct = t.get('margin_pnl_pct', 0.0)
 
                 if   reason == "tp_hit":       label = "🎯 TP (pool sweep)"
-                elif reason == "trail_sl_hit": label = "🔒 TRAIL (ICT struct)"
-                elif reason == "sl_hit":       label = "🛑 SL (ICT struct)"
+                elif reason == "trail_sl_hit": label = "🔒 ADAPTIVE TRAIL"
+                elif reason == "sl_hit":       label = "🛑 PROTECTIVE SL"
                 else:                          label = f"🚪 {reason[:8]}"
 
                 result    = "✅" if is_win else "❌"
@@ -1561,7 +1303,7 @@ class TelegramBotController:
         lines.append(f"Total trades: {total}  WR: <b>{wr_all:.0f}%</b>\n")
 
         # By ICT tier
-        lines.append("<b>By ICT Tier</b>")
+        lines.append("<b>By Setup / Structure Class</b>")
         tier_groups: dict = {}
         for t in history:
             k = t.get('ict_tier', '') or 'none'
@@ -1618,7 +1360,7 @@ class TelegramBotController:
 
         Shows (all Bayesian-estimated; min 5 real samples per dimension):
           • Overall WR with Wilson CI, G-Ratio, avg analytic R, IC score
-          • Per ICT Tier WR + avg PnL + geometry (G-ratio, entry efficiency)
+          • Setup-class WR + avg PnL + geometry (G-ratio, entry efficiency)
           • Per AMD Phase WR + SL efficiency + entry efficiency + avg R
           • Per Session WR + avg PnL (London / NY / Asia / Kill-zone)
           • SL Causation breakdown (WICK_SWEEP / BOS_BREAK / AMD_FLIP / …)
