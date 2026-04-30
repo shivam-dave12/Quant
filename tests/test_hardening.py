@@ -220,6 +220,133 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(high.best.expected_value_r, low.best.expected_value_r)
         self.assertEqual(high.best.role, "external")
 
+    def test_initial_sl_rounding_moves_loss_side_only(self):
+        from execution.order_manager import OrderManager
+        from strategy.quant_strategy import _round_initial_sl_to_tick
+
+        om = object.__new__(OrderManager)
+        tick = om._active_tick_size()
+        raw = 100.26
+
+        sell_stop = om._round_stop_trigger_to_tick("SELL", raw)
+        buy_stop = om._round_stop_trigger_to_tick("BUY", raw)
+
+        self.assertLessEqual(sell_stop, raw)
+        self.assertGreaterEqual(buy_stop, raw)
+        self.assertAlmostEqual(sell_stop / tick, round(sell_stop / tick))
+        self.assertAlmostEqual(buy_stop / tick, round(buy_stop / tick))
+        self.assertLessEqual(_round_initial_sl_to_tick("long", raw), raw)
+        self.assertGreaterEqual(_round_initial_sl_to_tick("short", raw), raw)
+
+    def test_sl_selector_ignores_swept_or_consumed_protective_pools(self):
+        from strategy.liquidity_pool_selector import select_sl_with_report
+
+        swept_pool = SimpleNamespace(
+            price=98.0, side="SSL", timeframe="15m", status="SWEPT",
+            touches=1, ob_aligned=True, fvg_aligned=True,
+        )
+        active_pool = SimpleNamespace(
+            price=97.5, side="SSL", timeframe="15m", status="ACTIVE",
+            touches=1, ob_aligned=False, fvg_aligned=False,
+        )
+        swept_target = SimpleNamespace(
+            pool=swept_pool, significance=50.0, distance_atr=2.0, tf_sources=["15m"],
+        )
+        active_target = SimpleNamespace(
+            pool=active_pool, significance=2.0, distance_atr=2.5, tf_sources=["15m"],
+        )
+        snap = SimpleNamespace(ssl_pools=[swept_target, active_target], bsl_pools=[])
+
+        sl_price, target, pick, report = select_sl_with_report(
+            snap=snap, side="long", entry=100.0, atr=1.0,
+            invalidation_price=98.8,
+        )
+
+        self.assertIs(target, active_target)
+        self.assertIsNotNone(pick)
+        self.assertLess(sl_price, active_pool.price)
+        self.assertIn("selected", report.summary)
+
+    def test_tp_selector_ignores_swept_pool_in_actual_scoring(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        swept_pool = SimpleNamespace(
+            price=110.0, side="BSL", timeframe="15m", status="SWEPT",
+            touches=1, ob_aligned=True, fvg_aligned=True,
+        )
+        active_pool = SimpleNamespace(
+            price=106.0, side="BSL", timeframe="15m", status="ACTIVE",
+            touches=1, ob_aligned=False, fvg_aligned=False,
+        )
+        swept_target = SimpleNamespace(
+            pool=swept_pool, significance=50.0, distance_atr=10.0,
+            direction="long", tf_sources=["15m"],
+        )
+        active_target = SimpleNamespace(
+            pool=active_pool, significance=3.0, distance_atr=6.0,
+            direction="long", tf_sources=["15m"],
+        )
+        snap = SimpleNamespace(bsl_pools=[swept_target, active_target], ssl_pools=[])
+
+        tp_price, target, score, report = select_tp_with_report(
+            snap=snap, side="long", entry=100.0, sl=98.0, atr=1.0,
+            min_rr=1.5,
+        )
+
+        self.assertIs(target, active_target)
+        self.assertIsNotNone(score)
+        self.assertLess(tp_price, active_pool.price)
+        self.assertIn("selected", report.summary)
+
+    def test_expected_utility_tp_is_buffered_before_liquidity_pool(self):
+        from strategy.expected_utility import build_target_surface
+
+        pool = SimpleNamespace(
+            price=108.0, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=8.0,
+        )
+        target = SimpleNamespace(pool=pool, distance_atr=8.0, direction="long")
+        snap = SimpleNamespace(bsl_pools=[target], ssl_pools=[], feed_reliability=0.95)
+
+        surface = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, posterior_prob=0.90, tick_size=0.5,
+        )
+
+        self.assertIsNotNone(surface.best)
+        self.assertLess(surface.best.price, pool.price)
+        self.assertGreater(surface.best.price, 100.0)
+        self.assertTrue(any("tp_buffer" in n for n in surface.best.notes))
+
+    def test_expected_utility_ignores_archived_targets(self):
+        from strategy.expected_utility import build_target_surface
+        from strategy.liquidity_map import PoolStatus
+
+        swept_pool = SimpleNamespace(
+            price=108.0, side="BSL", timeframe="15m", status=PoolStatus.CONSUMED,
+            significance=50.0,
+        )
+        active_pool = SimpleNamespace(
+            price=106.0, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=5.0,
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[
+                SimpleNamespace(pool=swept_pool, distance_atr=8.0, direction="long"),
+                SimpleNamespace(pool=active_pool, distance_atr=6.0, direction="long"),
+            ],
+            ssl_pools=[],
+            feed_reliability=0.95,
+        )
+
+        surface = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, posterior_prob=0.90, tick_size=0.5,
+        )
+
+        self.assertIsNotNone(surface.best)
+        self.assertIs(surface.best.pool_ref.pool, active_pool)
+
 
 if __name__ == "__main__":
     unittest.main()

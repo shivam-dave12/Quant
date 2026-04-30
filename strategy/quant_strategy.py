@@ -522,6 +522,14 @@ def _round_to_tick(price: float) -> float:
     return round(round(price / tick) * tick, 10) if tick > 0 else price
 
 
+def _round_initial_sl_to_tick(pos_side: str, price: float) -> float:
+    """Round an initial loss-side SL away from entry, never toward it."""
+    tick = max(QCfg.TICK_SIZE(), 1e-10)
+    if pos_side == "long":
+        return round(math.floor(price / tick) * tick, 10)
+    return round(math.ceil(price / tick) * tick, 10)
+
+
 def _round_to_tick_protective(pos_side: str, price: float) -> float:
     """Directionally round a stop/BE level so it remains truly protective.
 
@@ -2997,7 +3005,11 @@ class QuantStrategy:
                             continue
                         protective = ((side == 'long' and sp < entry) or
                                       (side == 'short' and sp > entry))
-                        if protective:
+                        preserves_initial_breathing = (
+                            (side == 'long' and sp <= raw_sl + tick * 0.5) or
+                            (side == 'short' and sp >= raw_sl - tick * 0.5)
+                        )
+                        if protective and preserves_initial_breathing:
                             stop_candidates.append(c)
                             if abs(sp - raw_sl) <= max(tick * 2.0, 1e-9) or getattr(c, 'role', '') == 'existing':
                                 raw_stop_candidate = c
@@ -3051,6 +3063,7 @@ class QuantStrategy:
                     snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
                     fee_bps=fee_bps, slippage_bps=slip_bps,
                     posterior_prob=posterior_prob,
+                    tick_size=tick,
                 )
                 best = getattr(surf, 'best', None)
                 if best is None:
@@ -5775,6 +5788,7 @@ class QuantStrategy:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
+        _exec_entry_ref = limit_px if limit_px > 0 else price
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
         # SL/TP computation does not depend on position size — it uses price, ATR,
@@ -5790,12 +5804,12 @@ class QuantStrategy:
         _force_tp = getattr(self, '_force_tp', None)
         _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
-            _fsl = _round_to_tick(_force_sl)
+            _fsl = _round_initial_sl_to_tick(side, _force_sl)
             _ftp = _round_to_tick(_force_tp)
             _dir_ok = False
-            if side == "long" and _fsl < price and _ftp > price:
+            if side == "long" and _fsl < _exec_entry_ref and _ftp > _exec_entry_ref:
                 _dir_ok = True
-            elif side == "short" and _fsl > price and _ftp < price:
+            elif side == "short" and _fsl > _exec_entry_ref and _ftp < _exec_entry_ref:
                 _dir_ok = True
             if _dir_ok:
                 sl_price = _fsl
@@ -5816,9 +5830,9 @@ class QuantStrategy:
             # Force levels active; fee/slippage expectancy is a hard execution gate.
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
-                    _tp_dist = abs(tp_price - price)
+                    _tp_dist = abs(tp_price - _exec_entry_ref)
                     _min_tp = self._fee_engine.min_required_tp_move(
-                        price=price, atr=atr,
+                        price=_exec_entry_ref, atr=atr,
                         atr_percentile=self._atr_5m.get_percentile(),
                         use_maker_entry=use_maker,
                         signal_confidence=signal_confidence)
@@ -5836,17 +5850,17 @@ class QuantStrategy:
                 self._last_tp_gate_rejection = time.time()
             return
 
-        sd = abs(price - sl_price)
-        td = abs(price - tp_price)
+        sd = abs(_exec_entry_ref - sl_price)
+        td = abs(_exec_entry_ref - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        _liq_entry_ref = limit_px if limit_px > 0 else price
+        planned_sl_dist = sd
         _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-            side, _liq_entry_ref, sl_price)
+            side, _exec_entry_ref, sl_price)
         if not _liq_ok:
             logger.warning(
                 f"Entry rejected by liquidation guard: {side.upper()} "
-                f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
+                f"entry=${_exec_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
@@ -5858,7 +5872,7 @@ class QuantStrategy:
         # Now that sl_price is known, size from dollar risk / actual SL distance.
         # The institutional decision multiplier is applied on top of that base.
         qty = self._compute_quantity(
-            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
+            risk_manager, _exec_entry_ref, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info
         )
         if qty is None or qty < QCfg.MIN_QTY():
@@ -5872,7 +5886,7 @@ class QuantStrategy:
         if (getattr(sig, 'vwap_price', 0.0) or 0.0) <= 0:
             _sig_diag = "posterior/target-surface execution"
         logger.info(
-            f"ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"ENTERING {side.upper()} @ ${_exec_entry_ref:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
             f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
@@ -5995,6 +6009,35 @@ class QuantStrategy:
         # ── Place SL/TP (or retrieve bracket child order IDs) ───────────────────
         exit_side = "sell" if side == "long" else "buy"
 
+        def _post_fill_breathing_sl(current_sl: float):
+            """Keep fill-to-SL distance from collapsing after maker execution."""
+            try:
+                actual_dist = abs(float(fill_price) - float(current_sl))
+                tick_gap = max(QCfg.TICK_SIZE(), 1e-9)
+                if planned_sl_dist <= 0 or actual_dist + tick_gap >= planned_sl_dist:
+                    return current_sl, False, ""
+                repaired = (
+                    fill_price - planned_sl_dist
+                    if side == "long"
+                    else fill_price + planned_sl_dist
+                )
+                repaired = _round_initial_sl_to_tick(side, repaired)
+                if side == "long" and repaired >= current_sl - tick_gap * 0.5:
+                    return current_sl, False, ""
+                if side == "short" and repaired <= current_sl + tick_gap * 0.5:
+                    return current_sl, False, ""
+                ok, _liq_px2, _guard2, why = self._sl_liquidation_sanity(
+                    side, fill_price, repaired)
+                if not ok:
+                    return current_sl, False, why
+                reason = (
+                    f"fill-distance {actual_dist:.2f} < planned {planned_sl_dist:.2f}; "
+                    f"SL {current_sl:.2f}->{repaired:.2f}"
+                )
+                return repaired, True, reason
+            except Exception as _breath_e:
+                return current_sl, False, str(_breath_e)
+
         if is_bracket:
             # Delta bracket: SL and TP were embedded in the entry order.
             # Delta auto-created the child SL/TP orders on fill.
@@ -6010,6 +6053,38 @@ class QuantStrategy:
                 tp_price = btp
             sl_data = {"order_id": sl_order_id_raw} if sl_order_id_raw else None
             tp_data = {"order_id": tp_order_id_raw} if tp_order_id_raw else None
+            _repair_sl, _repair_needed, _repair_reason = _post_fill_breathing_sl(sl_price)
+            if _repair_needed and sl_order_id_raw:
+                logger.info(f"Post-fill SL breathing repair: {_repair_reason}")
+                _repair_res = order_manager.replace_stop_loss(
+                    existing_sl_order_id = sl_order_id_raw,
+                    side                 = exit_side,
+                    quantity             = qty,
+                    new_trigger_price    = _repair_sl,
+                    old_trigger_price    = sl_price,
+                    current_price        = fill_price,
+                )
+                if _repair_res is None:
+                    logger.warning("Post-fill SL repair found SL already gone; reconcile will resolve")
+                    self._last_reconcile_time = 0.0
+                    return
+                if isinstance(_repair_res, dict) and _repair_res.get("error") == "UNPROTECTED":
+                    logger.error("Post-fill SL repair left position unprotected; flattening immediately")
+                    order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+                    self._last_exit_time = time.time()
+                    return
+                if isinstance(_repair_res, dict) and not _repair_res.get("error"):
+                    sl_order_id_raw = _repair_res.get("order_id", sl_order_id_raw)
+                    sl_price = _repair_sl
+                    sl_data = {"order_id": sl_order_id_raw}
+                    logger.info(f"Post-fill SL breathing repair armed @ ${sl_price:,.2f}")
+                else:
+                    logger.warning(
+                        f"Post-fill SL breathing repair skipped; existing SL remains live: {_repair_res}")
+            elif _repair_needed:
+                logger.warning(
+                    f"Post-fill SL breathing repair pending; bracket child SL id unavailable: "
+                    f"{_repair_reason}")
             if sl_order_id_raw:
                 logger.info(f"✅ Bracket SL order: {sl_order_id_raw} @ ${sl_price:,.2f}")
             if tp_order_id_raw:
@@ -6020,6 +6095,10 @@ class QuantStrategy:
                     "trailing SL may not work. Check open orders manually.")
         else:
             # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
+            _repair_sl, _repair_needed, _repair_reason = _post_fill_breathing_sl(sl_price)
+            if _repair_needed:
+                logger.info(f"Post-fill SL breathing repair before stop placement: {_repair_reason}")
+                sl_price = _repair_sl
             sweep = order_manager.cancel_symbol_conditionals()
             if sweep:
                 # v4.6 BUG FIX #3: Wait for exchange to process cancellations
