@@ -3036,10 +3036,21 @@ class QuantStrategy:
                               (side == 'short' and sp > entry))
                 if not protective:
                     continue
+                posterior_prob = 0.0
+                try:
+                    posterior_prob = float(
+                        getattr(signal, "posterior_prob", 0.0)
+                        or getattr(signal, "posterior", 0.0)
+                        or (getattr(self._entry_engine, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
+                        or 0.0
+                    )
+                except Exception:
+                    posterior_prob = 0.0
                 surf = build_target_surface(
                     side=side, entry=entry, stop=sp, atr=atr_f,
                     snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
                     fee_bps=fee_bps, slippage_bps=slip_bps,
+                    posterior_prob=posterior_prob,
                 )
                 best = getattr(surf, 'best', None)
                 if best is None:
@@ -3087,9 +3098,9 @@ class QuantStrategy:
 
             if changed_sl or changed_tp:
                 logger.info(
-                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR | raw SL=$%.1f TP=$%.1f RR=%.2f",
+                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
                     chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
-                    raw_sl, raw_tp, old_rr,
+                    posterior_prob, raw_sl, raw_tp, old_rr,
                 )
             else:
                 logger.debug(

@@ -184,6 +184,42 @@ class HardeningTests(unittest.TestCase):
         self.assertFalse(QuantStrategy._conviction_reject_is_account_safety(safe_quality_result))
         self.assertTrue(QuantStrategy._conviction_reject_is_account_safety(safety_result))
 
+    def test_target_surface_uses_posterior_without_lottery_tp(self):
+        from strategy.expected_utility import build_target_surface
+
+        target = SimpleNamespace(
+            price=104.0,
+            timeframe="15m",
+            significance=12.0,
+            side="BSL",
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[target],
+            ssl_pools=[],
+            feed_reliability=0.90,
+        )
+        flow = SimpleNamespace(tick_flow=0.30, cvd_trend=0.35)
+        ict = SimpleNamespace(
+            structure_15m="bullish",
+            structure_4h="bullish",
+            dealing_range_pd=0.30,
+        )
+
+        low = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.0,
+        )
+        high = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+        )
+
+        self.assertIsNotNone(low.best)
+        self.assertIsNotNone(high.best)
+        self.assertGreater(high.best.probability, low.best.probability)
+        self.assertGreater(high.best.expected_value_r, low.best.expected_value_r)
+        self.assertEqual(high.best.role, "external")
+
 
 if __name__ == "__main__":
     unittest.main()
