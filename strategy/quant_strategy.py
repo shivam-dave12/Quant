@@ -55,14 +55,15 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
-    from strategy.expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier
+    from strategy.expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier, estimate_stop_survival_floor_atr
 except Exception:  # pragma: no cover - standalone tests
     try:
-        from expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier  # type: ignore
+        from expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier, estimate_stop_survival_floor_atr  # type: ignore
     except Exception:
         build_target_surface = None  # type: ignore
         build_stop_surface = None  # type: ignore
         expected_utility_size_multiplier = None  # type: ignore
+        estimate_stop_survival_floor_atr = None  # type: ignore
 
 # -- Liquidity-first sweep/posterior entry engine -----------------------------
 try:
@@ -3046,11 +3047,22 @@ class QuantStrategy:
                     )
                 except Exception:
                     posterior_prob = 0.0
+                survival_floor_atr = 0.0
+                try:
+                    if estimate_stop_survival_floor_atr is not None:
+                        survival_floor_atr = float(estimate_stop_survival_floor_atr(
+                            side=side, snapshot=liq_snapshot, flow=flow_state,
+                            ict=ict_ctx, posterior_prob=posterior_prob,
+                            role=self._signal_entry_type_value(signal),
+                        ))
+                except Exception:
+                    survival_floor_atr = 0.0
                 surf = build_target_surface(
                     side=side, entry=entry, stop=sp, atr=atr_f,
                     snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
                     fee_bps=fee_bps, slippage_bps=slip_bps,
                     posterior_prob=posterior_prob,
+                    min_effective_risk_atr=survival_floor_atr,
                 )
                 best = getattr(surf, 'best', None)
                 if best is None:
@@ -3060,23 +3072,66 @@ class QuantStrategy:
                 ev_r = float(getattr(best, 'expected_value_r', -9.0) or -9.0)
                 rr = float(getattr(best, 'rr', 0.0) or 0.0)
                 risk_atr = abs(entry - sp) / atr_f
+                effective_risk_atr = float(getattr(best, 'effective_risk_atr', risk_atr) or risk_atr)
+                survival_floor_atr = float(getattr(best, 'survival_floor_atr', survival_floor_atr) or survival_floor_atr)
+                tight_shortfall = max(survival_floor_atr - risk_atr, 0.0)
+                tight_penalty = 0.90 * min(tight_shortfall / max(survival_floor_atr, 1e-9), 1.0)
                 joint = (
                     target_u
                     + 0.16 * stop_u
-                    + 0.035 * min(rr, 3.2)
-                    - 0.075 * max(risk_atr - 2.6, 0.0)
+                    + 0.030 * min(rr, 3.2)
+                    - 0.075 * max(effective_risk_atr - 2.6, 0.0)
+                    - tight_penalty
                     - (0.35 if ev_r <= 0.0 else 0.0)
                 )
-                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr))
+                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr, effective_risk_atr, survival_floor_atr, tight_penalty))
 
             if not pair_rows:
                 return
 
             pair_rows.sort(key=lambda r: r[0], reverse=True)
-            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr = pair_rows[0]
-            self._last_target_surface = chosen_surface
+            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr, effective_risk_atr, survival_floor_atr, tight_penalty = pair_rows[0]
 
             chosen_sl = float(getattr(chosen_stop, 'price', raw_sl) or raw_sl)
+            # If the mathematically best pair is inside expected adverse excursion,
+            # do not route that fragile stop. Project it to the thesis-survival
+            # boundary and reprice the target surface. This aligns initial SL with
+            # the exit engine's hands-off EAE logic and removes inflated R:R.
+            if survival_floor_atr > 0.0 and risk_atr + 1e-9 < survival_floor_atr:
+                projected_sl = (entry - survival_floor_atr * atr_f) if side == 'long' else (entry + survival_floor_atr * atr_f)
+                try:
+                    if side == 'long':
+                        projected_sl = math.floor(projected_sl / max(tick, 1e-9)) * tick
+                    else:
+                        projected_sl = math.ceil(projected_sl / max(tick, 1e-9)) * tick
+                except Exception:
+                    pass
+                if ((side == 'long' and projected_sl < entry) or
+                        (side == 'short' and projected_sl > entry)):
+                    repro_surface = build_target_surface(
+                        side=side, entry=entry, stop=projected_sl, atr=atr_f,
+                        snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                        fee_bps=fee_bps, slippage_bps=slip_bps,
+                        posterior_prob=posterior_prob,
+                        min_effective_risk_atr=survival_floor_atr,
+                    )
+                    repro_best = getattr(repro_surface, 'best', None)
+                    if repro_best is not None:
+                        logger.info(
+                            "SL survival projection: $%.1f -> $%.1f (actual %.2fATR < EAE %.2fATR); repriced target=%s",
+                            chosen_sl, projected_sl, risk_atr, survival_floor_atr, repro_best.compact(),
+                        )
+                        chosen_sl = projected_sl
+                        chosen_surface = repro_surface
+                        chosen_target = repro_best
+                        target_u = float(getattr(repro_best, 'full_position_utility', getattr(repro_best, 'utility', target_u)) or target_u)
+                        ev_r = float(getattr(repro_best, 'expected_value_r', ev_r) or ev_r)
+                        risk_atr = abs(entry - chosen_sl) / atr_f
+                        effective_risk_atr = max(effective_risk_atr, risk_atr)
+                        tight_penalty = 0.0
+                        joint = target_u + 0.16 * stop_u + 0.030 * min(float(getattr(repro_best, 'rr', 0.0) or 0.0), 3.2) - 0.075 * max(effective_risk_atr - 2.6, 0.0) - (0.35 if ev_r <= 0.0 else 0.0)
+
+            self._last_target_surface = chosen_surface
             chosen_tp = float(getattr(chosen_target, 'price', raw_tp) or raw_tp)
             old_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
             new_rr = abs(chosen_tp - entry) / max(abs(entry - chosen_sl), 1e-9)
@@ -3098,9 +3153,9 @@ class QuantStrategy:
 
             if changed_sl or changed_tp:
                 logger.info(
-                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
+                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR effective=%.2fATR eae=%.2fATR tightPenalty=%.2f posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
                     chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
-                    posterior_prob, raw_sl, raw_tp, old_rr,
+                    effective_risk_atr, survival_floor_atr, tight_penalty, posterior_prob, raw_sl, raw_tp, old_rr,
                 )
             else:
                 logger.debug(

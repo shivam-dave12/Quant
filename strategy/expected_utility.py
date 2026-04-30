@@ -177,6 +177,43 @@ def _market_terms(side: str, flow: Any, ict: Any) -> Tuple[float, float, float, 
     return of_align, htf, pd_affinity, uncertainty
 
 
+
+def estimate_stop_survival_floor_atr(*, side: str, snapshot: Any = None,
+                                     flow: Any = None, ict: Any = None,
+                                     posterior_prob: float = 0.0,
+                                     role: str = "entry") -> float:
+    """Estimate the minimum adverse-excursion envelope an entry stop must survive.
+
+    This is not a fixed ATR parameter. It is a continuous market-state estimate
+    derived from microstructure alignment, HTF agreement, dealing-range fit,
+    feed reliability, and posterior confidence. It prevents the optimiser from
+    using a very tight stop as a denominator trick that creates unrealistic R:R.
+    """
+    try:
+        side = (side or "").lower()
+        of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
+        reliability = _feed_reliability(snapshot)
+        p = clamp(float(posterior_prob or 0.0), 0.0, 0.999)
+        posterior_relief = 0.10 * clamp((p - 0.60) / 0.35, 0.0, 1.0)
+        flow_conflict = max(-of_align, 0.0)
+        htf_conflict = max(-htf, 0.0)
+        pd_conflict = max(-pd_affinity, 0.0)
+        floor = (
+            0.52
+            + 0.34 * uncertainty
+            + 0.16 * (1.0 - reliability)
+            + 0.14 * flow_conflict
+            + 0.10 * htf_conflict
+            + 0.06 * pd_conflict
+            - posterior_relief
+        )
+        if "continuation" in str(role or "").lower():
+            floor += 0.08
+        return clamp(floor, 0.50, 1.35)
+    except Exception:
+        return 0.62
+
+
 @dataclass
 class StopUtility:
     price: float
@@ -232,6 +269,9 @@ class TargetUtility:
     role: str
     pool_tf_rank: int = 0
     pool_significance: float = 0.0
+    actual_risk_atr: float = 0.0
+    effective_risk_atr: float = 0.0
+    survival_floor_atr: float = 0.0
     notes: List[str] = field(default_factory=list)
     pool_ref: Any = None
 
@@ -351,7 +391,8 @@ def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, ro
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
                          fee_bps: float = 8.0, slippage_bps: float = 2.0,
-                         posterior_prob: float = 0.0) -> TargetSurface:
+                         posterior_prob: float = 0.0,
+                         min_effective_risk_atr: float = 0.0) -> TargetSurface:
     side = (side or "").lower()
     entry = float(entry or 0.0)
     stop = float(stop or 0.0)
@@ -362,8 +403,18 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
 
     of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
     reliability = _feed_reliability(snapshot)
+    survival_floor_atr = max(
+        float(min_effective_risk_atr or 0.0),
+        estimate_stop_survival_floor_atr(
+            side=side, snapshot=snapshot, flow=flow, ict=ict,
+            posterior_prob=posterior_prob, role="entry",
+        ),
+    )
+    effective_risk = max(risk, survival_floor_atr * atr)
+    actual_risk_atr = risk / atr
+    effective_risk_atr = effective_risk / atr
     cost_points = entry * ((float(fee_bps) + float(slippage_bps)) / 10_000.0)
-    cost_r = cost_points / max(risk, _EPS)
+    cost_r = cost_points / max(effective_risk, _EPS)
 
     cands: List[TargetUtility] = []
     pools = _get_pools_for_side(snapshot, side)
@@ -377,7 +428,7 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         if side == "short" and px >= entry:
             continue
         dist = abs(px - entry)
-        rr = dist / max(risk, _EPS)
+        rr = dist / max(effective_risk, _EPS)
         dist_atr = dist / atr
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
@@ -446,7 +497,9 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
 
         path_risk = clamp((1.0 - gauntlet_penalty) + 0.40 * uncertainty + 0.20 * max(-of_align, 0.0)
                           + (0.030 * dist_atr if role == "terminal" else 0.008 * dist_atr), 0.0, 3.0)
-        loss_r = 1.0 + 0.38 * uncertainty + 0.26 * path_risk
+        tight_stop_shortfall = clamp((survival_floor_atr - actual_risk_atr) / max(survival_floor_atr, _EPS), 0.0, 1.0)
+        path_risk = clamp(path_risk + 0.55 * tight_stop_shortfall, 0.0, 3.0)
+        loss_r = 1.0 + 0.38 * uncertainty + 0.26 * path_risk + 0.28 * tight_stop_shortfall
         payoff_r = rr
         ev_r = p_hit * payoff_r - (1.0 - p_hit) * loss_r - cost_r
 
@@ -472,11 +525,13 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             f"sig={sig:.1f}", f"tf={tf_rank}", f"reach={reach_decay:.2f}",
             f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
             f"cap={distance_cap:.3f}", f"pathP={p_path:.3f}", f"auctionP={auction_p:.3f}",
+            f"actualRisk={actual_risk_atr:.2f}ATR", f"effectiveRisk={effective_risk_atr:.2f}ATR",
+            f"eaeFloor={survival_floor_atr:.2f}ATR",
         ]
         cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,
-                                   path_risk, role, tf_rank, sig, notes, target))
+                                   path_risk, role, tf_rank, sig, actual_risk_atr, effective_risk_atr, survival_floor_atr, notes, target))
 
     # Executable TP: full-position utility. Runner objective: runner utility.
     cands.sort(key=lambda x: x.full_position_utility, reverse=True)
@@ -491,7 +546,9 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         runner_fraction = clamp(0.10 + 0.22 * base - 0.18 * uncertainty, 0.0, 0.35)
 
     notes = [f"of={of_align:+.2f}", f"htf={htf:+.2f}", f"pd={pd_affinity:+.2f}",
-             f"U={uncertainty:.2f}", f"costR={cost_r:.3f}", f"feed={reliability:.2f}"]
+             f"U={uncertainty:.2f}", f"costR={cost_r:.3f}", f"feed={reliability:.2f}",
+             f"actualRisk={actual_risk_atr:.2f}ATR", f"effectiveRisk={effective_risk_atr:.2f}ATR",
+             f"eaeFloor={survival_floor_atr:.2f}ATR"]
     return TargetSurface(side, entry, stop, risk, best, terminal, cands, runner_fraction, notes)
 
 

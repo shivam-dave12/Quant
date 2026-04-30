@@ -221,5 +221,48 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(high.best.role, "external")
 
 
+    def test_tight_stop_uses_effective_eae_risk(self):
+        from strategy.expected_utility import build_target_surface, estimate_stop_survival_floor_atr
+
+        target = SimpleNamespace(
+            price=110.0,
+            timeframe="15m",
+            significance=14.0,
+            side="BSL",
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[target],
+            ssl_pools=[],
+            feed_reliability=0.82,
+        )
+        flow = SimpleNamespace(tick_flow=0.10, cvd_trend=0.10)
+        ict = SimpleNamespace(
+            structure_15m="ranging",
+            structure_4h="bullish",
+            dealing_range_pd=0.35,
+        )
+        floor = estimate_stop_survival_floor_atr(
+            side="long", snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+        )
+        tight = build_target_surface(
+            side="long", entry=100.0, stop=99.70, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+        )
+        normal = build_target_surface(
+            side="long", entry=100.0, stop=98.50, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+        )
+
+        self.assertIsNotNone(tight.best)
+        self.assertIsNotNone(normal.best)
+        self.assertGreater(floor, 0.50)
+        self.assertLess(tight.best.actual_risk_atr, tight.best.survival_floor_atr)
+        self.assertGreaterEqual(tight.best.effective_risk_atr, tight.best.survival_floor_atr)
+        # The tight stop must not manufacture unrealistic R:R from a tiny denominator.
+        self.assertLess(tight.best.rr, (110.0 - 100.0) / 0.30)
+        self.assertLessEqual(tight.best.rr, normal.best.rr * 2.5)
+
+
+
 if __name__ == "__main__":
     unittest.main()
