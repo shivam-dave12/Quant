@@ -1092,28 +1092,17 @@ class EntryEngine:
         self._sweep_quality_hist[tf].append(float(sweep.quality))
         required_quality = self._tf_quality_threshold(tf)
         if sweep.quality < required_quality:
-            # EE-4 FIX: register the rejected sweep in _processed_sweeps so
-            # _collect_sweeps() doesn't re-present it every 250ms for the full
-            # 60s detection window. 60s hold matches the detection window
-            # exactly — expires at the same time the sweep naturally ages out.
-            _reject_key = self._sweep_key(sweep)
-            self._processed_sweeps[_reject_key] = now + 60.0
-            # FIX-TF-QUALITY-LOG: surface the rejection so "no trades" sessions
-            # are diagnosable without a custom debug patch.
-            # SPAM-FIX 2026-04-26: was logger.warning -> Telegram-flooded the
-            # operator (113×/session in production logs) and crowded out
-            # genuinely actionable warnings via TelegramLogHandler. This is a
-            # routine, low-quality-pool gate rejection — INFO is the right
-            # level. Diagnosability is preserved in quant_bot.log; the line
-            # is also belt-and-braces matched in notifier._TELEGRAM_SUPPRESS_PATTERNS
-            # so no future log-handler regression can re-flood Telegram with it.
+            # Dynamic architecture: low-TF / low-quality sweeps are not hard
+            # vetoed. They continue into the posterior auction with naturally
+            # weaker sweep-quality evidence, so the market context can still
+            # rescue a valid rare setup. The processed-sweep registry below
+            # still prevents duplicate evaluation loops.
             logger.info(
-                f"SWEEP REJECTED (tf_quality): {sweep.pool.side.value} "
+                f"SWEEP QUALITY IMPAIRED [tf_quality]: {sweep.pool.side.value} "
                 f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
-                f"required={required_quality:.2f} tf={tf} "
-                f"→ locked 60s"
+                f"reference={required_quality:.2f} tf={tf} "
+                f"→ continuing with reduced evidence weight"
             )
-            return
 
         # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
         # registry THE MOMENT we commit to evaluating it.  This is the earliest
@@ -1527,7 +1516,7 @@ class EntryEngine:
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
             logger.info(
-                f"🎯 SWEEP VERDICT: REVERSAL {rev_dir.upper()} [{phase}] "
+                f"🧠 POSTERIOR ACCEPTED: REVERSAL {rev_dir.upper()} [{phase}] "
                 f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}")
             return PostSweepDecision(
                 action="reverse", direction=rev_dir, confidence=conf,
@@ -1556,7 +1545,7 @@ class EntryEngine:
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
             logger.info(
-                f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}")
+                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}")
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
                 confidence=min(1.0, cont_total / 90.0),
@@ -2093,7 +2082,7 @@ class EntryEngine:
         rr = abs(tp - price) / risk
         if rr < _MIN_RR_RATIO:
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
                 f"side={side} sweep=${sweep.pool.price:.1f} "
                 f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
             self._post_sweep = None
@@ -2111,7 +2100,7 @@ class EntryEngine:
             reason=f"{decision.reason}{cisd}{disp}",
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🎯 SIGNAL: REVERSAL {side.upper()} | "
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
         # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
         # Previously only _post_sweep was cleared here; the engine remained in
@@ -2226,7 +2215,7 @@ class EntryEngine:
 
         if rr < _MIN_RR_RATIO:
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2240,7 +2229,7 @@ class EntryEngine:
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🎯 SIGNAL: CONTINUATION {side.upper()} R:R={rr:.1f}")
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
         # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
         # Transition to SCANNING immediately without nulling self._signal.
         self._post_sweep = None

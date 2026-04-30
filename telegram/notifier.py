@@ -875,7 +875,9 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     #
     # 1. SWEEP REJECTED (tf_quality): 113 instances/session. Routine gate
     #    rejection. Source-downgraded to INFO; this is belt-and-braces.
-    "SWEEP REJECTED (tf_quality):",
+    "SWEEP QUALITY IMPAIRED [tf_quality]:",
+    "SWEEP DEFERRED [tf_quality]:",
+    "SWEEP REJECTED (tf_quality):",  # legacy suppression
     # 2. Telegram API HTTP errors on getUpdates: when Telegram itself
     #    rate-limits the bot, the WARN was being routed BACK into the
     #    Telegram queue, amplifying the burst. Source-downgraded to

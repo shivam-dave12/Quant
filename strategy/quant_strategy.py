@@ -5568,7 +5568,7 @@ class QuantStrategy:
                             if _br_bits:
                                 _bits.append("bridge:" + ",".join(_br_bits))
                         if _bits:
-                            parts.append(f"SkipSweep=[{' '.join(_bits)}]")
+                            parts.append(f"SweepState=[deferred:{' '.join(_bits)}]")
                 except Exception:
                     pass
 
