@@ -590,6 +590,84 @@ class HardeningTests(unittest.TestCase):
         self.assertIn("pullback", info["reason"])
         self.assertTrue(engine._is_processed(sweep, now + 1.0))
 
+    def test_refined_entry_uses_adaptive_pullback_requirement(self):
+        from strategy.entry_engine import (
+            EntryEngine,
+            EntrySignal,
+            EntryType,
+            ICTContext,
+            OrderFlowState,
+        )
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        target = SimpleNamespace(pool=SimpleNamespace(price=104.0, side="BSL"))
+        pool = SimpleNamespace(
+            price=101.40,
+            side=PoolSide.SSL,
+            timeframe="15m",
+            significance=12.0,
+        )
+        sweep = SimpleNamespace(
+            pool=pool,
+            detected_at=now - 30.0,
+            direction="long",
+            wick_extreme=101.45,
+        )
+        signal = EntrySignal(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=102.0,
+            sl_price=101.10,
+            tp_price=104.0,
+            rr_ratio=2.0,
+            target_pool=target,
+            sweep_result=sweep,
+            conviction=0.88,
+            reason="accepted posterior but route deferred",
+        )
+
+        self.assertTrue(engine.arm_refine_watch_from_signal(signal, "target deferred", now=now))
+        pending = engine._pending_refined
+        pending.created_at = now - 600.0
+        pending.expires_at = now + 300.0
+        engine._last_sweep_analysis = {"quality_score": 0.86, "quant_posterior": 0.84}
+        engine._push_sl_behind_pools = lambda sl, *args, **kwargs: sl
+        engine._sl_structural_bounds = lambda *args, **kwargs: (0.05, 5.0)
+        engine._apply_institutional_sl_envelope = (
+            lambda *args, **kwargs: (args[4], "ok")
+        )
+        engine._sl_before_liquidation = lambda *args, **kwargs: True
+        engine._find_tp = lambda *args, **kwargs: (104.0, target)
+
+        snap = SimpleNamespace(bsl_pools=[target], ssl_pools=[], feed_reliability=0.95)
+        flow = OrderFlowState(tick_flow=0.65, cvd_trend=0.55)
+        ict = ICTContext(
+            amd_phase="REACCUMULATION",
+            amd_bias="bullish",
+            amd_confidence=0.80,
+            dealing_range_pd=0.25,
+            structure_15m="bullish",
+            structure_4h="bullish",
+            kill_zone="LONDON",
+        )
+
+        engine._evaluate_pending_refined_entry(
+            snap=snap,
+            flow=flow,
+            ict=ict,
+            price=101.80,
+            atr=1.0,
+            now=now,
+        )
+
+        refined = engine.get_signal()
+        self.assertIsNotNone(refined)
+        self.assertLess(102.0 - 101.80, 0.25)
+        self.assertLess(pending.last_pullback_required_atr, 0.25)
+        self.assertIn("REFINED_PULLBACK", refined.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

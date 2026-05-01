@@ -188,6 +188,42 @@ class MarketProfile:
             v *= 1.10
         return max(0.35, min(v, base * 1.25))
 
+    def refined_pullback_min(self, base: float, *, watch_age_ratio: float = 0.0,
+                             risk_compression: float = 0.0,
+                             quality_score: float = 1.0) -> float:
+        """Adaptive pullback requirement for a deferred sweep thesis.
+
+        A refined entry is already backed by a previously accepted sweep auction.
+        The pullback threshold should still prevent chasing, but it should not be
+        a fixed ATR tripwire when trend alignment, elapsed watch time, and risk
+        compression show the route has materially improved.
+        """
+        b = max(float(base), 0.01)
+        age = max(0.0, min(1.0, float(watch_age_ratio)))
+        compression = max(0.0, min(1.0, float(risk_compression)))
+        quality = max(0.0, min(1.0, float(quality_score)))
+
+        v = b * self.selectivity
+        if self.volatility == "compressed":
+            v *= 0.88
+        elif self.volatility == "expanded":
+            v *= 1.03
+        elif self.volatility == "stress":
+            v *= 1.05
+
+        if self.structure == "trend" and self.htf_alignment > 0.30:
+            v *= 0.82
+        if self.flow_side != "neutral" and self.htf_alignment > 0.20:
+            v *= 0.90
+
+        relief = 0.30 * age
+        relief += 0.50 * min(compression, 0.50)
+        relief += 0.22 * max(0.0, quality - 0.65)
+        relief = max(0.0, min(0.48, relief))
+
+        floor = max(0.10, b * 0.45)
+        return max(floor, min(v * (1.0 - relief), b * 1.35))
+
     def flow_opposition_threshold(self, base: float) -> float:
         v = float(base)
         if self.flow_abs > 0.55:

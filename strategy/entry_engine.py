@@ -402,6 +402,10 @@ class _PendingRefinedEntry:
     attempts: int = 0
     last_eval_at: float = 0.0
     last_reason: str = "waiting for refined pullback"
+    last_pullback_atr: float = 0.0
+    last_pullback_required_atr: float = 0.0
+    last_risk_compression: float = 0.0
+    last_quality_score: float = 0.0
 
     @property
     def side(self) -> str:
@@ -857,6 +861,10 @@ class EntryEngine:
                 "age_sec": max(0.0, time.time() - p.created_at),
                 "expires_in": max(0.0, p.expires_at - time.time()),
                 "attempts": p.attempts,
+                "pullback_atr": p.last_pullback_atr,
+                "required_pullback_atr": p.last_pullback_required_atr,
+                "risk_compression": p.last_risk_compression,
+                "quality_score": p.last_quality_score,
             }
         return None
 
@@ -2213,14 +2221,50 @@ class EntryEngine:
                 return
 
         # Need a real pullback against the trade from the original generated
-        # signal.  This avoids re-firing the same oversized entry immediately.
+        # signal.  This avoids re-firing the same oversized entry immediately,
+        # but the requirement is adaptive: a high-quality, aligned thesis that
+        # has already compressed risk should not die on a fixed 0.25 ATR number.
         initial_entry = float(sig.entry_price or price)
         pullback = (initial_entry - price) if side == "long" else (price - initial_entry)
-        min_pullback = max(atr * _REFINE_MIN_PULLBACK_ATR, 1e-9)
+        pullback_atr = pullback / max(atr, 1e-9)
+        watch_span = max(p.expires_at - p.created_at, 1e-9)
+        watch_age_ratio = max(0.0, min(1.0, (now - p.created_at) / watch_span))
+        risk_compression = 0.0
+        if original_sl > 0 and p.initial_risk > 1e-9:
+            risk_compression = 1.0 - (abs(price - original_sl) / p.initial_risk)
+        risk_compression = max(0.0, min(1.0, risk_compression))
+        quality_score = float(getattr(sig, "conviction", 0.0) or 0.0)
+        try:
+            quality_score = max(
+                quality_score,
+                float((self._last_sweep_analysis or {}).get("quality_score", 0.0) or 0.0),
+                float((self._last_sweep_analysis or {}).get("quant_posterior", 0.0) or 0.0),
+            )
+        except Exception:
+            pass
+        quality_score = max(0.0, min(1.0, quality_score))
+        profile = self._market_profile(snap, flow, ict, price, atr, side)
+        if hasattr(profile, "refined_pullback_min"):
+            min_pullback_atr = profile.refined_pullback_min(
+                _REFINE_MIN_PULLBACK_ATR,
+                watch_age_ratio=watch_age_ratio,
+                risk_compression=risk_compression,
+                quality_score=quality_score,
+            )
+        else:
+            min_pullback_atr = _REFINE_MIN_PULLBACK_ATR
+        p.last_pullback_atr = max(0.0, pullback_atr)
+        p.last_pullback_required_atr = float(min_pullback_atr)
+        p.last_risk_compression = risk_compression
+        p.last_quality_score = quality_score
+        min_pullback = max(atr * min_pullback_atr, 1e-9)
         if pullback < min_pullback:
             p.last_reason = (
-                f"waiting refined pullback: {pullback/max(atr,1e-9):.2f}ATR"
-                f"<{_REFINE_MIN_PULLBACK_ATR:.2f}ATR")
+                f"waiting refined pullback: {pullback_atr:.2f}ATR"
+                f"<{min_pullback_atr:.2f}ATR adaptive "
+                f"(base={_REFINE_MIN_PULLBACK_ATR:.2f}, "
+                f"age={watch_age_ratio:.0%}, risk_compression={risk_compression:.0%}, "
+                f"quality={quality_score:.2f})")
             return
 
         # Approximate initial-risk improvement against the original catastrophe
