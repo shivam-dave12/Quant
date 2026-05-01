@@ -522,14 +522,6 @@ def _round_to_tick(price: float) -> float:
     return round(round(price / tick) * tick, 10) if tick > 0 else price
 
 
-def _round_initial_sl_to_tick(pos_side: str, price: float) -> float:
-    """Round an initial loss-side SL away from entry, never toward it."""
-    tick = max(QCfg.TICK_SIZE(), 1e-10)
-    if pos_side == "long":
-        return round(math.floor(price / tick) * tick, 10)
-    return round(math.ceil(price / tick) * tick, 10)
-
-
 def _round_to_tick_protective(pos_side: str, price: float) -> float:
     """Directionally round a stop/BE level so it remains truly protective.
 
@@ -2945,65 +2937,6 @@ class QuantStrategy:
             return "signal safety validation error"
         return ""
 
-    @staticmethod
-    def _pool_gate_hard_invalidation(gate, *, pos_side: str = "",
-                                     entry: float = 0.0, price: float = 0.0,
-                                     atr: float = 0.0, peak_profit: float = 0.0,
-                                     min_conf: float = 0.70) -> bool:
-        """True only for proved invalidation, not routine counter-flow pullback."""
-        try:
-            conf = float(getattr(gate, "confidence", 0.0) or 0.0)
-        except Exception:
-            conf = 0.0
-        reason = str(getattr(gate, "reason", "") or "").upper()
-        if not (
-            conf >= float(min_conf)
-            and "FLOW_REVERSED" in reason
-            and "COUNTER_BOS" in reason
-        ):
-            return False
-
-        side = str(pos_side or "").lower()
-        if side not in ("long", "short") or entry <= 0 or price <= 0 or atr <= 0:
-            return False
-
-        a = max(float(atr or 0.0), 1e-9)
-        profit = (float(price) - float(entry)) if side == "long" else (float(entry) - float(price))
-        peak = max(float(peak_profit or 0.0), profit, 0.0)
-        entry_break_atr = float(getattr(config, "POOL_GATE_INVALIDATION_ENTRY_BREAK_ATR", 0.08))
-        entry_broken = (
-            (side == "long" and float(price) <= float(entry) - entry_break_atr * a) or
-            (side == "short" and float(price) >= float(entry) + entry_break_atr * a)
-        )
-        if entry_broken:
-            return True
-
-        min_delivery_atr = float(getattr(config, "POOL_GATE_INVALIDATION_MIN_DELIVERY_ATR", 0.75))
-        min_giveback = float(getattr(config, "POOL_GATE_INVALIDATION_GIVEBACK_FRAC", 0.55))
-        if peak <= 1e-9 or peak / a < min_delivery_atr:
-            return False
-        giveback = (peak - max(profit, 0.0)) / max(peak, 1e-9)
-        return giveback >= min_giveback and profit >= 0.10 * a
-
-    @staticmethod
-    def _trail_crossed_stop_requires_market_exit(pos_side: str, entry: float,
-                                                 price: float, atr: float,
-                                                 phase: str, reason: str) -> bool:
-        """Damage-control rule for a protective stop that is no longer executable."""
-        side = str(pos_side or "").lower()
-        if side not in ("long", "short"):
-            return False
-        a = max(float(atr or 0.0), 1e-9)
-        profit = (float(price) - float(entry)) if side == "long" else (float(entry) - float(price))
-        phase_reason = f"{phase} {reason}".upper()
-        hard_structure = any(tok in phase_reason for tok in (
-            "COUNTER_BOS", "BE_LOCK", "DELIVERY_LOCK", "PROFIT_DEFENSE",
-            "POOL-GATE", "POOL_GATE", "STRUCTURE INVALIDATED",
-        ))
-        min_profit_atr = float(getattr(
-            config, "TRAIL_NON_EXECUTABLE_EXIT_MIN_PROFIT_ATR", 0.25))
-        return hard_structure and profit >= min_profit_atr * a
-
     def _apply_expected_utility_target_surface(self, signal, liq_snapshot, flow_state,
                                                ict_ctx, price: float, atr: float) -> None:
         """Jointly optimise executable SL/TP from live utility surfaces.
@@ -3023,7 +2956,6 @@ class QuantStrategy:
         if build_target_surface is None:
             return
         try:
-            self._last_target_surface = None
             entry = float(getattr(signal, "entry_price", price) or price)
             raw_sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
             raw_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
@@ -3065,11 +2997,7 @@ class QuantStrategy:
                             continue
                         protective = ((side == 'long' and sp < entry) or
                                       (side == 'short' and sp > entry))
-                        preserves_initial_breathing = (
-                            (side == 'long' and sp <= raw_sl + tick * 0.5) or
-                            (side == 'short' and sp >= raw_sl - tick * 0.5)
-                        )
-                        if protective and preserves_initial_breathing:
+                        if protective:
                             stop_candidates.append(c)
                             if abs(sp - raw_sl) <= max(tick * 2.0, 1e-9) or getattr(c, 'role', '') == 'existing':
                                 raw_stop_candidate = c
@@ -3100,10 +3028,6 @@ class QuantStrategy:
             stop_candidates = sorted(unique.values(), key=lambda x: float(getattr(x, 'utility', -9.0)), reverse=True)[:7]
 
             pair_rows = []
-            class _NoExecutableTargetSurface:
-                has_positive_edge = False
-                best = None
-
             for sc in stop_candidates:
                 sp = float(getattr(sc, 'price', 0.0) or 0.0)
                 if sp <= 0:
@@ -3127,7 +3051,6 @@ class QuantStrategy:
                     snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
                     fee_bps=fee_bps, slippage_bps=slip_bps,
                     posterior_prob=posterior_prob,
-                    tick_size=tick,
                 )
                 best = getattr(surf, 'best', None)
                 if best is None:
@@ -3147,7 +3070,6 @@ class QuantStrategy:
                 pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr))
 
             if not pair_rows:
-                setattr(signal, "target_surface", _NoExecutableTargetSurface())
                 return
 
             pair_rows.sort(key=lambda r: r[0], reverse=True)
@@ -3526,16 +3448,15 @@ class QuantStrategy:
 
         # Institutional execution audit.
         #
-        # High-hit-rate mode is intentionally selective. Mechanical safety always
-        # blocks; incomplete delivery proof can also pause routing so weak
-        # theses do not survive merely because their theoretical R:R is large.
+        # Dynamic institutional mode: style/quality observations never become
+        # hidden alpha vetoes. They are converted into size, grade and operator
+        # attribution. Only mechanical safety defects can block routing: broken
+        # levels, liquidation-danger geometry, or non-protective order placement.
         threshold = float(getattr(
             config, "INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE",
             getattr(config, "INSTITUTIONAL_MIN_DECISION_SCORE", 0.66 if is_sweep else 0.72),
         ))
         min_target_realism = float(getattr(config, "INSTITUTIONAL_TARGET_REALISM_REFERENCE", 0.52))
-        strict_quality = bool(getattr(config, "INSTITUTIONAL_STRICT_QUALITY_GATES", False) or
-                              getattr(config, "INSTITUTIONAL_HIGH_HIT_RATE_PROFILE", False))
 
         safety_rejects = []
         quality_advisories = []
@@ -3576,21 +3497,11 @@ class QuantStrategy:
                 f"decision_score {score:.2f} below reference {threshold:.2f}"
             )
 
-        strict_rejects = []
-        if strict_quality:
-            strict_rejects.extend(quality_advisories[:4])
-            if tp_atr > 6.0 and rr > 4.0 and target_realism < 0.85:
-                strict_rejects.append(
-                    f"full-position TP too distant for hit-rate profile: TP={tp_atr:.2f}ATR RR={rr:.2f}"
-                )
-
-        allowed = not safety_rejects and not strict_rejects
+        allowed = not safety_rejects
         if advisory_rejects:
             allows.append("advisory: " + " | ".join(advisory_rejects[:3]))
-        if quality_advisories and not strict_quality:
+        if quality_advisories:
             allows.append("dynamic_quality_penalty: " + " | ".join(quality_advisories[:3]))
-        elif strict_rejects:
-            allows.append("strict_quality_gate: " + " | ".join(strict_rejects[:3]))
 
         if score >= 0.82 and rr >= 2.5 and target_realism >= 0.72:
             grade = "S"
@@ -3620,7 +3531,7 @@ class QuantStrategy:
                 size_mult = self._bounded(size_mult * expected_utility_size_multiplier(_surf, _posterior), 0.20, 1.18)
         except Exception:
             pass
-        if safety_rejects or strict_rejects:
+        if safety_rejects:
             size_mult = 0.0
 
         allows.append(
@@ -3632,7 +3543,7 @@ class QuantStrategy:
             score=score,
             grade=grade,
             size_mult=size_mult,
-            reject_reasons=safety_rejects + strict_rejects,
+            reject_reasons=safety_rejects,
             allow_reasons=allows,
             rr=rr,
             sl_atr=sl_atr,
@@ -5354,7 +5265,7 @@ class QuantStrategy:
             if not _inst_decision.allowed:
                 reject_str = " | ".join(_inst_decision.reject_reasons[:3])
                 logger.info(
-                    f"Institutional audit paused routing {signal.side.upper()} "
+                    f"Safety audit paused routing {signal.side.upper()} "
                     f"{signal.entry_type.value}: score={_inst_decision.score:.2f} "
                     f"RR={_inst_decision.rr:.2f} target={_inst_decision.target_realism:.2f} | "
                     f"{reject_str}")
@@ -5864,7 +5775,6 @@ class QuantStrategy:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
-        _exec_entry_ref = limit_px if limit_px > 0 else price
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
         # SL/TP computation does not depend on position size — it uses price, ATR,
@@ -5880,12 +5790,12 @@ class QuantStrategy:
         _force_tp = getattr(self, '_force_tp', None)
         _using_force_levels = False
         if _force_sl is not None and _force_tp is not None and _force_sl > 0 and _force_tp > 0:
-            _fsl = _round_initial_sl_to_tick(side, _force_sl)
+            _fsl = _round_to_tick(_force_sl)
             _ftp = _round_to_tick(_force_tp)
             _dir_ok = False
-            if side == "long" and _fsl < _exec_entry_ref and _ftp > _exec_entry_ref:
+            if side == "long" and _fsl < price and _ftp > price:
                 _dir_ok = True
-            elif side == "short" and _fsl > _exec_entry_ref and _ftp < _exec_entry_ref:
+            elif side == "short" and _fsl > price and _ftp < price:
                 _dir_ok = True
             if _dir_ok:
                 sl_price = _fsl
@@ -5906,9 +5816,9 @@ class QuantStrategy:
             # Force levels active; fee/slippage expectancy is a hard execution gate.
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
-                    _tp_dist = abs(tp_price - _exec_entry_ref)
+                    _tp_dist = abs(tp_price - price)
                     _min_tp = self._fee_engine.min_required_tp_move(
-                        price=_exec_entry_ref, atr=atr,
+                        price=price, atr=atr,
                         atr_percentile=self._atr_5m.get_percentile(),
                         use_maker_entry=use_maker,
                         signal_confidence=signal_confidence)
@@ -5926,17 +5836,17 @@ class QuantStrategy:
                 self._last_tp_gate_rejection = time.time()
             return
 
-        sd = abs(_exec_entry_ref - sl_price)
-        td = abs(_exec_entry_ref - tp_price)
+        sd = abs(price - sl_price)
+        td = abs(price - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        planned_sl_dist = sd
+        _liq_entry_ref = limit_px if limit_px > 0 else price
         _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-            side, _exec_entry_ref, sl_price)
+            side, _liq_entry_ref, sl_price)
         if not _liq_ok:
             logger.warning(
                 f"Entry rejected by liquidation guard: {side.upper()} "
-                f"entry=${_exec_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
+                f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
             with self._lock:
                 self._last_tp_gate_rejection = time.time()
             return
@@ -5948,7 +5858,7 @@ class QuantStrategy:
         # Now that sl_price is known, size from dollar risk / actual SL distance.
         # The institutional decision multiplier is applied on top of that base.
         qty = self._compute_quantity(
-            risk_manager, _exec_entry_ref, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
+            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info
         )
         if qty is None or qty < QCfg.MIN_QTY():
@@ -5962,7 +5872,7 @@ class QuantStrategy:
         if (getattr(sig, 'vwap_price', 0.0) or 0.0) <= 0:
             _sig_diag = "posterior/target-surface execution"
         logger.info(
-            f"ENTERING {side.upper()} @ ${_exec_entry_ref:,.2f} | qty={qty} | "
+            f"ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
             f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
@@ -6085,35 +5995,6 @@ class QuantStrategy:
         # ── Place SL/TP (or retrieve bracket child order IDs) ───────────────────
         exit_side = "sell" if side == "long" else "buy"
 
-        def _post_fill_breathing_sl(current_sl: float):
-            """Keep fill-to-SL distance from collapsing after maker execution."""
-            try:
-                actual_dist = abs(float(fill_price) - float(current_sl))
-                tick_gap = max(QCfg.TICK_SIZE(), 1e-9)
-                if planned_sl_dist <= 0 or actual_dist + tick_gap >= planned_sl_dist:
-                    return current_sl, False, ""
-                repaired = (
-                    fill_price - planned_sl_dist
-                    if side == "long"
-                    else fill_price + planned_sl_dist
-                )
-                repaired = _round_initial_sl_to_tick(side, repaired)
-                if side == "long" and repaired >= current_sl - tick_gap * 0.5:
-                    return current_sl, False, ""
-                if side == "short" and repaired <= current_sl + tick_gap * 0.5:
-                    return current_sl, False, ""
-                ok, _liq_px2, _guard2, why = self._sl_liquidation_sanity(
-                    side, fill_price, repaired)
-                if not ok:
-                    return current_sl, False, why
-                reason = (
-                    f"fill-distance {actual_dist:.2f} < planned {planned_sl_dist:.2f}; "
-                    f"SL {current_sl:.2f}->{repaired:.2f}"
-                )
-                return repaired, True, reason
-            except Exception as _breath_e:
-                return current_sl, False, str(_breath_e)
-
         if is_bracket:
             # Delta bracket: SL and TP were embedded in the entry order.
             # Delta auto-created the child SL/TP orders on fill.
@@ -6129,38 +6010,6 @@ class QuantStrategy:
                 tp_price = btp
             sl_data = {"order_id": sl_order_id_raw} if sl_order_id_raw else None
             tp_data = {"order_id": tp_order_id_raw} if tp_order_id_raw else None
-            _repair_sl, _repair_needed, _repair_reason = _post_fill_breathing_sl(sl_price)
-            if _repair_needed and sl_order_id_raw:
-                logger.info(f"Post-fill SL breathing repair: {_repair_reason}")
-                _repair_res = order_manager.replace_stop_loss(
-                    existing_sl_order_id = sl_order_id_raw,
-                    side                 = exit_side,
-                    quantity             = qty,
-                    new_trigger_price    = _repair_sl,
-                    old_trigger_price    = sl_price,
-                    current_price        = fill_price,
-                )
-                if _repair_res is None:
-                    logger.warning("Post-fill SL repair found SL already gone; reconcile will resolve")
-                    self._last_reconcile_time = 0.0
-                    return
-                if isinstance(_repair_res, dict) and _repair_res.get("error") == "UNPROTECTED":
-                    logger.error("Post-fill SL repair left position unprotected; flattening immediately")
-                    order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-                    self._last_exit_time = time.time()
-                    return
-                if isinstance(_repair_res, dict) and not _repair_res.get("error"):
-                    sl_order_id_raw = _repair_res.get("order_id", sl_order_id_raw)
-                    sl_price = _repair_sl
-                    sl_data = {"order_id": sl_order_id_raw}
-                    logger.info(f"Post-fill SL breathing repair armed @ ${sl_price:,.2f}")
-                else:
-                    logger.warning(
-                        f"Post-fill SL breathing repair skipped; existing SL remains live: {_repair_res}")
-            elif _repair_needed:
-                logger.warning(
-                    f"Post-fill SL breathing repair pending; bracket child SL id unavailable: "
-                    f"{_repair_reason}")
             if sl_order_id_raw:
                 logger.info(f"✅ Bracket SL order: {sl_order_id_raw} @ ${sl_price:,.2f}")
             if tp_order_id_raw:
@@ -6171,10 +6020,6 @@ class QuantStrategy:
                     "trailing SL may not work. Check open orders manually.")
         else:
             # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
-            _repair_sl, _repair_needed, _repair_reason = _post_fill_breathing_sl(sl_price)
-            if _repair_needed:
-                logger.info(f"Post-fill SL breathing repair before stop placement: {_repair_reason}")
-                sl_price = _repair_sl
             sweep = order_manager.cancel_symbol_conditionals()
             if sweep:
                 # v4.6 BUG FIX #3: Wait for exchange to process cancellations
@@ -6586,8 +6431,13 @@ class QuantStrategy:
                     liq_snapshot = _gate_liq_snap,
                 )
                 if _gate is not None and _gate.action == "reverse":
-                    # Pool-gate reverse is a warning first; only proved invalidation closes.
-                    # Routine counter-flow migrates protection and leaves the bracket live.
+                    # BUG-3 FIX: pool_hit_gate "reverse" must NEVER close the
+                    # position.  The gate fires every tick once AMD flips contra
+                    # — exiting on each tick would fire multiple exits and leave
+                    # the bot flat at a suboptimal price.  Instead: migrate SL
+                    # to breakeven (capital protection) and send a Telegram
+                    # awareness alert.  The existing SL/TP bracket remains live
+                    # and manages the exit when the market decides.
                     # BUG-SPAM FIX: reason embeds FLOW_REVERSED(flow=-0.83)
                     # which changes every tick → key never matched → fired
                     # every tick.  Use only stable trade-identity fields;
@@ -6595,15 +6445,6 @@ class QuantStrategy:
                     _gate_key = (
                         f"{pos.side}:{round(pos.entry_price, 1)}:"
                         f"{round(getattr(_gate, 'confidence', 0.0), 1)}"
-                    )
-                    _hard_pg_exit = self._pool_gate_hard_invalidation(
-                        _gate,
-                        pos_side=pos.side,
-                        entry=pos.entry_price,
-                        price=price,
-                        atr=self._atr_5m.atr if self._atr_5m else 0.0,
-                        peak_profit=float(getattr(pos, 'peak_profit', 0.0) or 0.0),
-                        min_conf=float(getattr(config, "POOL_GATE_INVALIDATION_EXIT_CONF", 0.70)),
                     )
                     _gate_notice_due = (
                         _gate_key != pos.pool_gate_reverse_notice_key or
@@ -6616,39 +6457,14 @@ class QuantStrategy:
                         # Downgraded WARNING→INFO: send_telegram_message() below
                         # already delivers the Telegram alert.  WARNING level would
                         # cause TelegramLogHandler to send a second duplicate message.
-                        if _hard_pg_exit:
-                            logger.warning(
-                                f"POOL-GATE structural invalidation: reduce-only exit. "
-                                f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
-                        else:
-                            logger.info(
-                                f"POOL-GATE reverse signal: no exit taken; "
-                                f"existing bracket remains live. "
-                                f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
+                        logger.info(
+                            f"POOL-GATE reverse signal: no exit taken; "
+                            f"existing bracket remains live. "
+                            f"conf={_gate.confidence:.2f} | {_gate.reason[:100]}")
                     else:
                         logger.debug(
                             f"POOL-GATE reverse held: conf={_gate.confidence:.2f} | "
                             f"{_gate.reason[:100]}")
-
-                    if _hard_pg_exit:
-                        with self._lock:
-                            pos.pool_gate_reverse_regime_key = _gate_key
-                            pos.pool_gate_reverse_signaled_at = now
-                            pos.pool_gate_reverse_attempts += 1
-                        _pg_reason = (
-                            "pool_gate_structural_invalidation: "
-                            f"conf={_gate.confidence:.2f} {_gate.reason[:160]}"
-                        )
-                        try:
-                            send_telegram_message(
-                                f"<b>POOL-GATE STRUCTURE INVALIDATED</b>\n"
-                                f"Action: reduce-only market exit\n"
-                                f"Side: <b>{pos.side.upper()}</b> | Mark: <b>${price:,.2f}</b>\n"
-                                f"Evidence: {_gate.reason[:180]}")
-                        except Exception:
-                            pass
-                        self._exit_trade(order_manager, price, _pg_reason)
-                        return
 
                     _be_tick  = _round_to_tick(
                         _calc_be_price(pos.side, pos.entry_price,
@@ -7365,31 +7181,6 @@ class QuantStrategy:
             (pos.side == "short" and _new_liq_sl <= price + _tick_gap)
         )
         if _invalid_stop:
-            _trail_phase = str(getattr(_liq_result, 'phase', '') or '')
-            _trail_reason = str(getattr(_liq_result, 'reason', '') or '')
-            if self._trail_crossed_stop_requires_market_exit(
-                    pos.side, pos.entry_price, price, atr, _trail_phase, _trail_reason):
-                logger.warning(
-                    f"InstitutionalTrail damage-control exit: computed {pos.side.upper()} "
-                    f"protective stop ${_new_liq_sl:,.1f} is already crossed at "
-                    f"${price:,.1f}; flattening instead of waiting for the original SL. "
-                    f"phase={_trail_phase} | {_trail_reason[:120]}")
-                try:
-                    send_telegram_message(
-                        f"<b>TRAIL DAMAGE-CONTROL EXIT</b>\n"
-                        f"Computed stop already crossed, so no valid stop-order can protect it.\n"
-                        f"Action: reduce-only market exit\n"
-                        f"Mark: <b>${price:,.2f}</b> | Intended SL: <b>${_new_liq_sl:,.2f}</b>\n"
-                        f"Phase: <code>{_trail_phase}</code>")
-                except Exception:
-                    pass
-                self._exit_trade(
-                    order_manager,
-                    price,
-                    f"trail_non_executable_damage_control: phase={_trail_phase} "
-                    f"intended_sl={_new_liq_sl:.1f} reason={_trail_reason[:120]}",
-                )
-                return True
             if now - self._last_trail_block_log >= 30.0:
                 self._last_trail_block_log = now
                 _verb = "SELL below" if pos.side == "long" else "BUY above"

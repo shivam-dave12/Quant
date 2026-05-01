@@ -38,7 +38,6 @@ classes so the OrderManager logic never branches on exchange type.
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from collections import deque
@@ -724,30 +723,12 @@ class OrderManager:
         rounded = round(float(price) / tick) * tick
         return round(rounded, 8)
 
-    def _round_stop_trigger_to_tick(self, api_side: str, trigger_price: float) -> float:
-        """Round stop triggers away from the entry, never toward it.
-
-        SELL stops protect longs, so floor to the next valid tick. BUY stops
-        protect shorts, so ceil to the next valid tick. Nearest-tick rounding can
-        silently tighten an initial SL by half a tick.
-        """
-        tick = max(self._active_tick_size(), 1e-9)
-        price = float(trigger_price)
-        side = str(api_side or "").upper()
-        if side == "SELL":
-            rounded = math.floor(price / tick) * tick
-        elif side == "BUY":
-            rounded = math.ceil(price / tick) * tick
-        else:
-            rounded = round(price / tick) * tick
-        return round(rounded, 8)
-
     def _sl_limit_price(self, api_side: str, trigger_price: float) -> float:
         tick = self._active_tick_size()
         offset_ticks = int(getattr(config, "SL_LIMIT_OFFSET_TICKS", 20))
         limit_offset = offset_ticks * tick
         raw = trigger_price + limit_offset if api_side == "BUY" else trigger_price - limit_offset
-        return self._round_stop_trigger_to_tick(api_side, raw)
+        return self._round_price_to_tick(raw)
 
     def _validate_stop_trigger(self, api_side: str, trigger_price: float,
                                current_price: Optional[float]) -> Optional[str]:
@@ -1189,12 +1170,6 @@ class OrderManager:
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
-        entry_side = str(side or "").lower()
-        sl_api_side = "SELL" if entry_side in ("long", "buy") else "BUY"
-        limit_price = self._round_price_to_tick(limit_price)
-        sl_price = self._round_stop_trigger_to_tick(sl_api_side, sl_price)
-        tp_price = self._round_price_to_tick(tp_price)
-
         logger.info(
             f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
             f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
@@ -1370,7 +1345,6 @@ class OrderManager:
         """
         try:
             api_side = self._normalize_side(side)
-            trigger_price = self._round_stop_trigger_to_tick(api_side, trigger_price)
 
             # Initialise limit_price to None; only assigned when use_limit=True.
             # BUG-UNBOUND-LIMIT-PRICE FIX: the original code never initialised
@@ -1486,7 +1460,7 @@ class OrderManager:
           {"error": "<other>"} — SL was NOT touched; current SL still live.
         """
         api_side = self._normalize_side(side)
-        new_trigger_price = self._round_stop_trigger_to_tick(api_side, new_trigger_price)
+        new_trigger_price = self._round_price_to_tick(new_trigger_price)
         invalid_reason = self._validate_stop_trigger(api_side, new_trigger_price, current_price)
         if invalid_reason:
             logger.warning("SL replace rejected before REST: %s", invalid_reason)

@@ -73,10 +73,10 @@ TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
-# High-hit-rate profile: quality observations can pause routing when delivery
-# proof is incomplete. This favors fewer, cleaner executions over frequency.
-INSTITUTIONAL_HIGH_HIT_RATE_PROFILE = True
-INSTITUTIONAL_STRICT_QUALITY_GATES = True
+# Style/quality signals are never hidden alpha vetoes. They are continuous
+# references used for score, size multiplier, expected utility, and attribution.
+# Only mechanical account/exchange safety can stop routing.
+INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
@@ -84,7 +84,6 @@ INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
-ENTRY_MIN_DYNAMIC_QUALITY_SCORE    = 0.58
 ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
 ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
@@ -423,12 +422,11 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
 # ── Institutional Dynamic Entry Quality References ───────────────────────────
-# These are adaptive scoring references. In high-hit-rate mode, incomplete
-# delivery proof pauses routing instead of expressing a weak thesis at tiny size.
+# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
+# signal quality and size; posterior/EV still owns trade expression.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
-ENTRY_MIN_DYNAMIC_QUALITY_SCORE          = 0.58
 ENTRY_REQUIRE_CISD_OR_OTE                = True
 ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
 ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
@@ -491,14 +489,6 @@ TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR = 0.25
 PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR = 2.50
 PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.78
 PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.35
-POOL_GATE_INVALIDATION_EXIT_CONF = 0.70
-POOL_GATE_INVALIDATION_ENTRY_BREAK_ATR = 0.08
-POOL_GATE_INVALIDATION_MIN_DELIVERY_ATR = 0.75
-POOL_GATE_INVALIDATION_GIVEBACK_FRAC = 0.55
-TRAIL_NON_EXECUTABLE_EXIT_MIN_PROFIT_ATR = 0.25
-TARGET_FULL_TP_MIN_DELIVERY_ATR = 1.15
-TARGET_FULL_TP_MIN_RR = 1.35
-TARGET_FULL_TP_MIN_COST_MULT = 4.0
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
