@@ -27,6 +27,15 @@ from typing import Any, List, Optional, Tuple
 
 _EPS = 1e-12
 
+try:
+    import config as _cfg
+except Exception:  # pragma: no cover
+    _cfg = None  # type: ignore
+
+_MIN_EXECUTABLE_TP_ATR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_DELIVERY_ATR", 1.15))
+_MIN_EXECUTABLE_TP_RR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_RR", 1.35))
+_MIN_EXECUTABLE_TP_COST_MULT = float(getattr(_cfg, "TARGET_FULL_TP_MIN_COST_MULT", 4.0))
+
 
 def clamp(x: float, lo: float, hi: float) -> float:
     try:
@@ -107,13 +116,29 @@ def _pool_side(obj: Any) -> str:
     return side
 
 
+def _pool_status(obj: Any) -> str:
+    p = _pool(obj)
+    try:
+        v = getattr(p, "status", "")
+        if hasattr(v, "value"):
+            return str(v.value).upper()
+        s = str(v).upper()
+        return s.rsplit(".", 1)[-1]
+    except Exception:
+        return ""
+
+
+def _is_live_pool(obj: Any) -> bool:
+    return _pool_status(obj) not in ("SWEPT", "CONSUMED")
+
+
 def _get_pools_for_side(snapshot: Any, trade_side: str) -> List[Any]:
     if snapshot is None:
         return []
     trade_side = (trade_side or "").lower()
     attr = "bsl_pools" if trade_side == "long" else "ssl_pools"
     try:
-        return list(getattr(snapshot, attr, []) or [])
+        return [p for p in list(getattr(snapshot, attr, []) or []) if _is_live_pool(p)]
     except Exception:
         return []
 
@@ -124,7 +149,7 @@ def _protective_pools(snapshot: Any, trade_side: str) -> List[Any]:
     trade_side = (trade_side or "").lower()
     attr = "ssl_pools" if trade_side == "long" else "bsl_pools"
     try:
-        return list(getattr(snapshot, attr, []) or [])
+        return [p for p in list(getattr(snapshot, attr, []) or []) if _is_live_pool(p)]
     except Exception:
         return []
 
@@ -348,10 +373,37 @@ def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, ro
     return clamp(cap, 0.0015, 0.92)
 
 
+def _executable_tp_before_pool(*, side: str, entry: float, pool_price: float,
+                               atr: float, dist_atr: float, uncertainty: float,
+                               reliability: float, tf_term: float,
+                               cost_points: float, tick_size: float) -> Tuple[float, float]:
+    """Return a take-profit trigger before the liquidity pool, not at it."""
+    buffer_atr = clamp(
+        0.07
+        + 0.028 * min(max(dist_atr, 0.0), 12.0)
+        + 0.055 * uncertainty
+        + 0.035 * (1.0 - reliability)
+        - 0.018 * tf_term,
+        0.08,
+        0.55,
+    )
+    buffer = max(float(tick_size) * 2.0, atr * buffer_atr, cost_points * 0.40)
+    if side == "long":
+        tp = pool_price - buffer
+        if tp <= entry:
+            return 0.0, buffer
+        return tp, buffer
+    tp = pool_price + buffer
+    if tp >= entry:
+        return 0.0, buffer
+    return tp, buffer
+
+
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
                          fee_bps: float = 8.0, slippage_bps: float = 2.0,
-                         posterior_prob: float = 0.0) -> TargetSurface:
+                         posterior_prob: float = 0.0,
+                         tick_size: float = 0.5) -> TargetSurface:
     side = (side or "").lower()
     entry = float(entry or 0.0)
     stop = float(stop or 0.0)
@@ -377,12 +429,35 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         if side == "short" and px >= entry:
             continue
         dist = abs(px - entry)
-        rr = dist / max(risk, _EPS)
         dist_atr = dist / atr
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
         sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
         tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
+        exec_tp, tp_buffer = _executable_tp_before_pool(
+            side=side,
+            entry=entry,
+            pool_price=px,
+            atr=atr,
+            dist_atr=dist_atr,
+            uncertainty=uncertainty,
+            reliability=reliability,
+            tf_term=tf_term,
+            cost_points=cost_points,
+            tick_size=max(float(tick_size or 0.5), _EPS),
+        )
+        if exec_tp <= 0:
+            continue
+        reward = abs(exec_tp - entry)
+        rr = reward / max(risk, _EPS)
+        executable_dist_atr = reward / atr
+        min_reward = max(
+            _MIN_EXECUTABLE_TP_ATR * atr,
+            _MIN_EXECUTABLE_TP_COST_MULT * cost_points,
+            max(float(tick_size or 0.5), _EPS) * 4.0,
+        )
+        if reward < min_reward or rr < _MIN_EXECUTABLE_TP_RR:
+            continue
 
         lo, hi = min(entry, px), max(entry, px)
         opp_hits = 0
@@ -454,9 +529,32 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         # second hard probability model.  Concavity is still applied, but as a
         # drag against excessive R:R rather than as a duplicate loss term.
         concavity_drag = 0.035 * max(payoff_r - 3.0, 0.0) ** 1.15
+        hit_rate_floor = clamp(
+            0.46
+            + 0.030 * max(payoff_r - 2.0, 0.0)
+            + 0.018 * max(executable_dist_atr - 3.0, 0.0)
+            + 0.060 * uncertainty
+            + 0.040 * (1.0 - reliability),
+            0.46,
+            0.72,
+        )
+        hit_rate_shortfall = max(hit_rate_floor - p_hit, 0.0)
+        hit_rate_drag = 0.42 * hit_rate_shortfall
+        if role == "external":
+            # External pools can be excellent runner objectives, but a full-size
+            # exchange TP must pay for the lower realised hit-rate of long paths.
+            # This prevents high R:R from overpowering executable probability.
+            hit_rate_drag += (
+                0.82 * hit_rate_shortfall
+                + 0.060 * max(payoff_r - 3.0, 0.0) ** 1.20
+                + 0.040 * max(executable_dist_atr - 4.0, 0.0)
+                + 0.120 * max(payoff_r - 3.0, 0.0) ** 1.55
+                + 0.050 * max(payoff_r - 4.5, 0.0) * max(executable_dist_atr - 4.0, 0.0)
+            )
         full_position_utility = (
             ev_r
             - concavity_drag
+            - hit_rate_drag
             - 0.12 * uncertainty
             - 0.070 * path_risk
         )
@@ -473,7 +571,10 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
             f"cap={distance_cap:.3f}", f"pathP={p_path:.3f}", f"auctionP={auction_p:.3f}",
         ]
-        cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,
+        notes.append(f"anchor={px:,.1f}")
+        notes.append(f"tp_buffer={tp_buffer/atr:.2f}ATR")
+        notes.append(f"hit_floor={hit_rate_floor:.3f}")
+        cands.append(TargetUtility(exec_tp, side, rr, executable_dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,
                                    path_risk, role, tf_rank, sig, notes, target))

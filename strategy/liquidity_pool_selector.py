@@ -284,6 +284,11 @@ def _pool_status(pool: Any) -> str:
     return _enum_value(_safe(pool, "status", ""), "")
 
 
+def _is_live_pool(pool: Any) -> bool:
+    status = str(_pool_status(pool)).upper()
+    return status not in ("SWEPT", "CONSUMED")
+
+
 def _pool_side(pool: Any) -> str:
     return _enum_value(_safe(pool, "side", ""), "")
 
@@ -499,6 +504,8 @@ def _gauntlet_penalty(
     threshold = candidate_sig * _GAUNTLET_SIG_THRESHOLD
     n = 0
     for opp in opposing:
+        if not _is_live_pool(_safe(opp, "pool", None)):
+            continue
         opp_price = float(_safe(opp.pool, "price", 0.0))
         if opp_price <= lo or opp_price >= hi:
             continue
@@ -645,6 +652,8 @@ def score_tp_pools(
             pool = target.pool
             dist_atr = float(_safe(target, "distance_atr", 0.0))
             pool_price = float(_safe(pool, "price", 0.0))
+            if not _is_live_pool(pool):
+                continue
 
             # Reach gates. Too-close remains a hard veto because fees/slippage
             # and BE migration consume the whole move. Too-far is NOT a hard
@@ -809,8 +818,15 @@ def score_sl_pool(
 
     candidates = [t for t in candidates
                   if _safe(t, "significance", 0.0) >= _SL_MIN_SIGNIFICANCE]
+    candidates = [
+        t for t in candidates
+        if str(_pool_status(_safe(t, "pool", None))).upper()
+        not in ("SWEPT", "CONSUMED")
+    ]
     if not candidates:
         return None
+
+    inv_ref = float(inv_price)
 
     # Score each candidate.
     scored: List[Tuple[float, Any]] = []
@@ -819,6 +835,11 @@ def score_sl_pool(
         struct = _structural_bonus(t.pool)
         fresh  = _freshness_bonus(t.pool)
         touch  = _touch_penalty(t.pool)
+        pool_price = float(_safe(t.pool, "price", 0.0))
+        entry_distance = abs(float(entry) - pool_price) / max(float(atr), 1e-9)
+        beyond_invalidation = abs(pool_price - inv_ref) / max(float(atr), 1e-9)
+        invalidation_proximity = math.exp(-max(beyond_invalidation, 0.0) / 1.75)
+        capital_drag = math.exp(-max(entry_distance - 2.50, 0.0) / 3.50)
 
         # SL pools benefit from being ALIGNED with HTF on the OPPOSING side
         # (i.e. for a LONG, an SSL pool aligned with bullish HTF means
@@ -826,7 +847,11 @@ def score_sl_pool(
         # handles this — for a long-side trade looking at SSL pools, it
         # returns 1.0 (no bonus) which is correct: we don't WANT bias here,
         # we want raw structural strength. We therefore neutralise htf_m.
-        score = sig * struct * fresh * touch
+        score = (
+            sig * struct * fresh * touch
+            * (0.45 + 0.55 * invalidation_proximity)
+            * capital_drag
+        )
         scored.append((score, t))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -904,6 +929,15 @@ def diagnose_tp_pools(
         return report
 
     now_ts = now or time.time()
+    selector_profile = build_market_profile(
+        price=entry,
+        atr=atr,
+        liq_snapshot=snap,
+        ict=ict,
+        side=side,
+        session=session,
+    )
+    effective_min_rr = selector_profile.min_rr(float(min_rr))
     rows: List[PoolCandidateDiagnostic] = []
     accepted: List[Tuple[float, PoolCandidateDiagnostic]] = []
 
@@ -942,8 +976,8 @@ def diagnose_tp_pools(
 
             row.reward = abs(row.tp_price - entry)
             row.rr = row.reward / risk
-            if row.rr < float(min_rr):
-                row.reason = f"R:R {row.rr:.2f} < required {float(min_rr):.2f}"
+            if row.rr < effective_min_rr:
+                row.reason = f"R:R {row.rr:.2f} < required {effective_min_rr:.2f}"
                 rows.append(row); continue
 
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
@@ -963,7 +997,7 @@ def diagnose_tp_pools(
             )
             row.confluence = confluence
             utility, comps = _target_utility(raw_prob, row.rr, float(min_rr), row.distance_atr, row.reward, be_move)
-            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf)
+            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf) * selector_profile.target_reach_penalty(row.distance_atr, tf)
             utility *= reach_mult
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
@@ -1070,7 +1104,16 @@ def diagnose_sl_pool(
             struct = _structural_bonus(target.pool)
             fresh = _freshness_bonus(target.pool)
             touch = _touch_penalty(target.pool)
-            score = sig * struct * fresh * touch
+            pool_price = float(_safe(target.pool, "price", 0.0))
+            entry_distance = abs(float(entry) - pool_price) / max(float(atr), 1e-9)
+            beyond_invalidation = abs(pool_price - float(inv_price)) / max(float(atr), 1e-9)
+            invalidation_proximity = math.exp(-max(beyond_invalidation, 0.0) / 1.75)
+            capital_drag = math.exp(-max(entry_distance - 2.50, 0.0) / 3.50)
+            score = (
+                sig * struct * fresh * touch
+                * (0.45 + 0.55 * invalidation_proximity)
+                * capital_drag
+            )
             quality = min(score / 10.0, 1.0)
             buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
             buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
@@ -1081,7 +1124,11 @@ def diagnose_sl_pool(
             row.ev = score
             row.eligible = True
             row.reason = "eligible protective SL pool"
-            row.notes = [f"score={score:.2f}"]
+            row.notes = [
+                f"score={score:.2f}",
+                f"beyond_inval={beyond_invalidation:.2f}ATR",
+                f"capital_drag={capital_drag:.2f}",
+            ]
             candidates.append((score, row, target))
             rows.append(row)
         except Exception as e:

@@ -358,6 +358,31 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         0.72,
     )
 
+    raw_displacement = max(float(displacement_atr or 0.0), 0.0)
+    has_structural_proof = bool(cisd or ote)
+    raw_disp_floor = clamp(
+        0.30
+        + 0.20 * st.regime_uncertainty
+        + 0.12 * st.toxicity
+        + (0.05 if action == "reverse" else 0.0)
+        + (0.05 if phase_u == "DISPLACEMENT" else 0.0),
+        0.28,
+        0.72,
+    )
+    if not has_structural_proof and raw_displacement < raw_disp_floor:
+        reason = (
+            f"REJECT raw auction proof: disp={raw_displacement:.2f}ATR<{raw_disp_floor:.2f}ATR "
+            f"without CISD/OTE edge={score_edge:+.2f} transformedInfo={auction_information:.3f} "
+            f"floor={dynamic_evidence_floor:.3f} | {st.compact()}"
+        )
+        return QuantDecision(False, 0.0, 0.0, -1.0, -99.0, st.regime_uncertainty, reason,
+                             {"score_edge": score_edge, "disp_info": disp_info,
+                              "structural": structural, "evidence_mass": auction_information,
+                              "evidence_floor": dynamic_evidence_floor,
+                              "raw_displacement": raw_displacement,
+                              "raw_displacement_floor": raw_disp_floor,
+                              **cal0})
+
     if auction_information < dynamic_evidence_floor:
         reason = (
             f"REJECT null auction: info={auction_information:.3f}<dynFloor={dynamic_evidence_floor:.3f} "
