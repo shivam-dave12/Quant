@@ -406,6 +406,8 @@ class _PendingRefinedEntry:
     last_pullback_required_atr: float = 0.0
     last_risk_compression: float = 0.0
     last_quality_score: float = 0.0
+    last_status_log_at: float = 0.0
+    last_status_reason: str = ""
 
     @property
     def side(self) -> str:
@@ -919,6 +921,39 @@ class EntryEngine:
                                    if v > now}
 
     # ── Internal: flow EWMA (continuous-time) ─────────────────────────
+
+    def _mark_refine_wait(
+        self,
+        pending: _PendingRefinedEntry,
+        reason: str,
+        now: float,
+        price: float,
+        atr: float,
+    ) -> None:
+        """Store and throttle refined-entry wait diagnostics."""
+        pending.last_reason = reason
+        reason_key = reason.split(":", 1)[0][:80]
+        if (reason_key == pending.last_status_reason
+                and now - pending.last_status_log_at < 30.0):
+            return
+        pending.last_status_reason = reason_key
+        pending.last_status_log_at = now
+        sig = pending.original
+        logger.info(
+            "EntryEngine refine watch waiting: %s %s @ $%.1f | %s | "
+            "pullback=%.2f/%.2fATR risk_compression=%.0f%% quality=%.2f "
+            "attempts=%d expires_in=%.0fs",
+            str(getattr(sig, "entry_type", "")).split(".")[-1],
+            str(getattr(sig, "side", "") or "").upper(),
+            float(price or 0.0),
+            reason,
+            float(getattr(pending, "last_pullback_atr", 0.0) or 0.0),
+            float(getattr(pending, "last_pullback_required_atr", 0.0) or 0.0),
+            100.0 * float(getattr(pending, "last_risk_compression", 0.0) or 0.0),
+            float(getattr(pending, "last_quality_score", 0.0) or 0.0),
+            int(getattr(pending, "attempts", 0) or 0),
+            max(0.0, float(getattr(pending, "expires_at", now) or now) - now),
+        )
 
     def _update_flow_ewma(self, flow: OrderFlowState, now: float) -> None:
         dt = now - self._flow_ewma_last_update if self._flow_ewma_last_update > 0 else 0.25
@@ -2265,12 +2300,12 @@ class EntryEngine:
         p.last_quality_score = quality_score
         min_pullback = max(atr * min_pullback_atr, 1e-9)
         if pullback < min_pullback:
-            p.last_reason = (
+            self._mark_refine_wait(p, (
                 f"waiting refined pullback: {pullback_atr:.2f}ATR"
                 f"<{min_pullback_atr:.2f}ATR adaptive "
                 f"(base={_REFINE_MIN_PULLBACK_ATR:.2f}, "
                 f"age={watch_age_ratio:.0%}, risk_compression={risk_compression:.0%}, "
-                f"quality={quality_score:.2f})")
+                f"quality={quality_score:.2f})"), now, price, atr)
             return
 
         # Approximate initial-risk improvement against the original catastrophe
@@ -2278,9 +2313,10 @@ class EntryEngine:
         if original_sl > 0 and p.initial_risk > 0:
             est_risk = abs(price - original_sl)
             if est_risk > p.initial_risk * _REFINE_RISK_IMPROVE:
-                p.last_reason = (
+                self._mark_refine_wait(p, (
                     f"waiting risk compression: {est_risk:.1f}pts > "
-                    f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+                    f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts"),
+                    now, price, atr)
                 return
 
         if p.attempts >= max(1, _REFINE_MAX_ATTEMPTS):
@@ -2298,7 +2334,8 @@ class EntryEngine:
             sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         if not self._sl_is_protective(side, sl, price):
-            p.last_reason = "refined SL non-protective at current price"
+            self._mark_refine_wait(p, "refined SL non-protective at current price",
+                                   now, price, atr)
             return
 
         min_risk, _max_risk = self._sl_structural_bounds(
@@ -2314,25 +2351,32 @@ class EntryEngine:
         sl, sl_reason = self._apply_institutional_sl_envelope(
             snap, side, price, atr, sl, sweep.wick_extreme, "refined")
         if sl is None:
-            p.last_reason = f"refined SL envelope blocked: {sl_reason}"
+            self._mark_refine_wait(p, f"refined SL envelope blocked: {sl_reason}",
+                                   now, price, atr)
             return
         if not self._sl_before_liquidation(side, sl, price):
-            p.last_reason = "refined SL breaches liquidation guard"
+            self._mark_refine_wait(p, "refined SL breaches liquidation guard",
+                                   now, price, atr)
             return
         risk = abs(price - sl)
         if p.initial_risk > 0 and risk > p.initial_risk * _REFINE_RISK_IMPROVE:
-            p.last_reason = (
+            self._mark_refine_wait(p, (
                 f"refined risk still wide: {risk:.1f}pts > "
-                f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+                f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts"),
+                now, price, atr)
             return
 
         tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
         if tp is None or target is None:
-            p.last_reason = f"refined TP unavailable: {self._last_pool_plan_summary()}"
+            self._mark_refine_wait(
+                p, f"refined TP unavailable: {self._last_pool_plan_summary()}",
+                now, price, atr)
             return
         rr = abs(tp - price) / max(risk, 1e-10)
         if rr < _MIN_RR_RATIO:
-            p.last_reason = f"refined R:R {rr:.2f} < min {_MIN_RR_RATIO:.2f}"
+            self._mark_refine_wait(
+                p, f"refined R:R {rr:.2f} < min {_MIN_RR_RATIO:.2f}",
+                now, price, atr)
             return
 
         self._signal = EntrySignal(

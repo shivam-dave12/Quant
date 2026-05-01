@@ -5731,7 +5731,7 @@ class QuantStrategy:
                 if isinstance(_defer, dict):
                     _age = time.time() - float(_defer.get('ts', 0.0) or 0.0)
                     _cooldown = float(_defer.get('cooldown', 0.0) or 0.0)
-                    if 0.0 <= _age <= max(180.0, _cooldown + 30.0):
+                    if 0.0 <= _age <= max(30.0, _cooldown + 30.0):
                         _why = str(_defer.get('reason', ''))[:90]
                         _side = str(_defer.get('side', '') or '').upper()
                         _typ = str(_defer.get('entry_type', '') or '')
