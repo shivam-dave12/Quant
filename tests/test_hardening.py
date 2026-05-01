@@ -980,6 +980,166 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(pending.last_direct_pullback_atr, 0.0)
         self.assertIn("risk compression", pending.last_reason)
 
+    def test_fresh_opposite_sweep_supersedes_mature_post_sweep(self):
+        from strategy.entry_engine import EntryEngine, ICTContext, OrderFlowState
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        old_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=100.0, side=PoolSide.BSL, timeframe="15m"),
+            detected_at=now - 300.0,
+            direction="short",
+            wick_extreme=102.0,
+            quality=0.55,
+        )
+        new_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=97.0, side=PoolSide.SSL, timeframe="15m"),
+            detected_at=now,
+            direction="long",
+            wick_extreme=94.8,
+            quality=0.96,
+        )
+        ict = ICTContext(amd_phase="ACCUMULATION", amd_bias="bullish")
+        flow = OrderFlowState(tick_flow=0.80, cvd_trend=0.70)
+
+        engine._enter_post_sweep(
+            old_sweep,
+            SimpleNamespace(recent_sweeps=[], bsl_pools=[], ssl_pools=[]),
+            flow,
+            ict,
+            price=99.0,
+            atr=1.0,
+            now=now - 300.0,
+        )
+        engine._last_sweep_analysis = {"rev_score": 32.0, "cont_score": 18.0}
+
+        engine.update(
+            liq_snapshot=SimpleNamespace(
+                recent_sweeps=[new_sweep],
+                bsl_pools=[],
+                ssl_pools=[],
+            ),
+            flow_state=flow,
+            ict_ctx=ict,
+            price=98.0,
+            atr=1.0,
+            now=now,
+        )
+
+        self.assertEqual(engine.state, "POST_SWEEP")
+        self.assertIs(engine._post_sweep.sweep, new_sweep)
+        self.assertIsNone(engine._pending_refined)
+
+    def test_fresh_opposite_sweep_supersedes_refine_watch(self):
+        from strategy.entry_engine import (
+            EntryEngine,
+            EntrySignal,
+            EntryType,
+            ICTContext,
+            OrderFlowState,
+        )
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        old_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=101.0, side=PoolSide.BSL, timeframe="15m"),
+            detected_at=now - 180.0,
+            direction="short",
+            wick_extreme=103.0,
+            quality=0.70,
+        )
+        signal = EntrySignal(
+            side="short",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=100.0,
+            sl_price=103.0,
+            tp_price=94.0,
+            rr_ratio=2.0,
+            target_pool=None,
+            sweep_result=old_sweep,
+            conviction=0.82,
+            reason="accepted posterior but route deferred",
+        )
+        self.assertTrue(engine.arm_refine_watch_from_signal(signal, "target deferred", now=now - 120.0))
+
+        new_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=97.0, side=PoolSide.SSL, timeframe="15m"),
+            detected_at=now,
+            direction="long",
+            wick_extreme=94.7,
+            quality=0.94,
+        )
+        flow = OrderFlowState(tick_flow=0.75, cvd_trend=0.65)
+        ict = ICTContext(amd_phase="ACCUMULATION", amd_bias="bullish")
+
+        engine.update(
+            liq_snapshot=SimpleNamespace(
+                recent_sweeps=[new_sweep],
+                bsl_pools=[],
+                ssl_pools=[],
+            ),
+            flow_state=flow,
+            ict_ctx=ict,
+            price=98.0,
+            atr=1.0,
+            now=now,
+        )
+
+        self.assertEqual(engine.state, "POST_SWEEP")
+        self.assertIs(engine._post_sweep.sweep, new_sweep)
+        self.assertIsNone(engine._pending_refined)
+
+    def test_weak_same_side_sweep_does_not_supersede_active_post_sweep(self):
+        from strategy.entry_engine import EntryEngine, ICTContext, OrderFlowState
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        old_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=100.0, side=PoolSide.BSL, timeframe="15m"),
+            detected_at=now - 5.0,
+            direction="short",
+            wick_extreme=103.0,
+            quality=0.92,
+        )
+        weak_sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=99.8, side=PoolSide.BSL, timeframe="1m"),
+            detected_at=now,
+            direction="short",
+            wick_extreme=100.1,
+            quality=0.21,
+        )
+        flow = OrderFlowState(tick_flow=-0.70, cvd_trend=-0.60)
+        ict = ICTContext(amd_phase="DISTRIBUTION", amd_bias="bearish")
+
+        engine._enter_post_sweep(
+            old_sweep,
+            SimpleNamespace(recent_sweeps=[], bsl_pools=[], ssl_pools=[]),
+            flow,
+            ict,
+            price=99.0,
+            atr=1.0,
+            now=now,
+        )
+
+        engine.update(
+            liq_snapshot=SimpleNamespace(
+                recent_sweeps=[weak_sweep],
+                bsl_pools=[],
+                ssl_pools=[],
+            ),
+            flow_state=flow,
+            ict_ctx=ict,
+            price=98.8,
+            atr=1.0,
+            now=now + 1.0,
+        )
+
+        self.assertEqual(engine.state, "POST_SWEEP")
+        self.assertIs(engine._post_sweep.sweep, old_sweep)
+
     def test_refine_watch_reprices_during_active_post_sweep(self):
         from strategy.entry_engine import (
             EngineState,

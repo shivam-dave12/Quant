@@ -448,6 +448,16 @@ class _RefinePullbackMeasure:
     mode: str
 
 
+@dataclass
+class _SweepArbitrationDecision:
+    """Decision for a fresh sweep competing with an active thesis."""
+    action: str
+    candidate: Optional[SweepResult]
+    candidate_score: float
+    incumbent_score: float
+    reason: str
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRY ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -506,6 +516,8 @@ class EntryEngine:
         self._last_accept_log_ts: float = 0.0
         self._last_quant_wait_log_key: tuple = ()
         self._last_quant_wait_log_ts: float = 0.0
+        self._last_sweep_arbitration_log_key: tuple = ()
+        self._last_sweep_arbitration_log_ts: float = 0.0
 
         # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
         # After a verdict fires, _handle_reversal/_handle_continuation previously
@@ -589,6 +601,18 @@ class EntryEngine:
 
         # ── Check for sweeps ──────────────────────────────────────────
         new_sweeps = self._collect_sweeps(liq_snapshot, ict_ctx, now, atr)
+        arbitration = self._arbitrate_fresh_sweeps(
+            new_sweeps, liq_snapshot, flow_state, ict_ctx, price, atr, now)
+        if arbitration is not None:
+            self._log_sweep_arbitration(arbitration, now)
+            if arbitration.action == "SUPERSEDE" and arbitration.candidate is not None:
+                self._pending_refined = None
+                self._post_sweep = None
+                ict_event = self._find_ict_event(arbitration.candidate, ict_ctx, atr)
+                self._enter_post_sweep(
+                    arbitration.candidate, liq_snapshot, flow_state,
+                    ict_ctx, price, atr, now, ict_event)
+                return
 
         # Reprice a confirmed sweep thesis after a downstream routeability
         # rejection whenever the engine is not routing/holding a live position.
@@ -1077,6 +1101,194 @@ class EntryEngine:
         return 1.0
 
     # ── Internal: collect sweeps from both systems ────────────────────
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _sweep_direction(sweep) -> str:
+        direction = str(getattr(sweep, "direction", "") or "").lower()
+        if direction in ("long", "short"):
+            return direction
+        side = getattr(getattr(sweep, "pool", None), "side", "")
+        side_value = str(getattr(side, "value", side) or "").upper()
+        if side_value == "BSL":
+            return "short"
+        if side_value == "SSL":
+            return "long"
+        return ""
+
+    @staticmethod
+    def _tf_weight(tf: str) -> float:
+        return {
+            "1m": 0.46,
+            "3m": 0.50,
+            "5m": 0.56,
+            "15m": 0.72,
+            "30m": 0.78,
+            "1h": 0.86,
+            "4h": 0.96,
+            "1d": 1.00,
+        }.get(str(tf or "").lower(), 0.62)
+
+    def _sweep_arbitration_score(self, sweep, flow, ict, now: float, atr: float) -> float:
+        """Institutional conflict score for a fresh sweep competing with a thesis."""
+        direction = self._sweep_direction(sweep)
+        side_sign = 1.0 if direction == "long" else (-1.0 if direction == "short" else 0.0)
+        pool = getattr(sweep, "pool", None)
+        pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+        wick = float(getattr(sweep, "wick_extreme", pool_price) or pool_price)
+        atr_safe = max(float(atr or 0.0), 1e-9)
+        displacement_q = self._clamp01(abs(wick - pool_price) / (1.50 * atr_safe))
+        quality_q = self._clamp01(getattr(sweep, "quality", 0.0) or 0.0)
+        age_sec = max(0.0, now - float(getattr(sweep, "detected_at", now) or now))
+        recency_q = math.exp(-age_sec / 90.0)
+        tf_q = self._tf_weight(getattr(pool, "timeframe", ""))
+        flow_q = self._clamp01(
+            0.50 + 0.50 * side_sign * float(getattr(flow, "conviction", 0.0) or 0.0)
+        )
+        amd_q = self._clamp01((self._amd_modifier(ict, direction) - 0.60) / 0.50)
+        return self._clamp01(
+            0.34 * quality_q
+            + 0.20 * displacement_q
+            + 0.16 * recency_q
+            + 0.14 * tf_q
+            + 0.10 * flow_q
+            + 0.06 * amd_q
+        )
+
+    def _incumbent_arbitration_context(self, flow, ict, now: float, atr: float) -> tuple[str, str, float, float]:
+        """Return (kind, direction, score, age_ratio) for the active thesis."""
+        if self._post_sweep is not None:
+            ps = self._post_sweep
+            direction = self._sweep_direction(ps.sweep)
+            base = self._sweep_arbitration_score(ps.sweep, flow, ict, now, atr)
+            age_ratio = self._clamp01((now - float(ps.entered_at or now)) / max(_CISD_MAX_WAIT_SEC, 1.0))
+            try:
+                analysis = self._last_sweep_analysis or {}
+                evidence_q = max(
+                    float(analysis.get("rev_score", 0.0) or 0.0),
+                    float(analysis.get("cont_score", 0.0) or 0.0),
+                ) / 100.0
+            except Exception:
+                evidence_q = 0.0
+            score = self._clamp01(0.70 * base + 0.30 * self._clamp01(evidence_q) - 0.18 * age_ratio)
+            return "post_sweep", direction, score, age_ratio
+
+        if self._pending_refined is not None:
+            p = self._pending_refined
+            direction = str(getattr(p.original, "side", "") or "").lower()
+            span = max(float(p.expires_at - p.created_at), 1.0)
+            age_ratio = self._clamp01((now - p.created_at) / span)
+            score = (
+                0.30 * self._clamp01(getattr(p.original, "conviction", 0.0) or 0.0)
+                + 0.22 * self._clamp01(p.last_delivery_atr / max(_REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR, 1e-9))
+                + 0.20 * self._clamp01(p.last_pullback_atr / max(p.last_pullback_required_atr, _REFINE_MIN_PULLBACK_ATR, 1e-9))
+                + 0.18 * self._clamp01(p.last_risk_compression)
+                + 0.10 * (1.0 - age_ratio)
+            )
+            return "refine_watch", direction, min(0.74, self._clamp01(score)), age_ratio
+
+        return "", "", 0.0, 0.0
+
+    def _arbitrate_fresh_sweeps(
+        self,
+        sweeps: List[SweepResult],
+        snap,
+        flow,
+        ict,
+        price: float,
+        atr: float,
+        now: float,
+    ) -> Optional[_SweepArbitrationDecision]:
+        if not sweeps or self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            return None
+        if self._post_sweep is None and self._pending_refined is None:
+            return None
+
+        ranked = sorted(
+            ((self._sweep_arbitration_score(s, flow, ict, now, atr), s) for s in sweeps),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        candidate_score, candidate = ranked[0]
+        inc_kind, inc_dir, inc_score, inc_age = self._incumbent_arbitration_context(flow, ict, now, atr)
+        cand_dir = self._sweep_direction(candidate)
+        if not inc_kind or not cand_dir or not inc_dir:
+            return None
+
+        same_side = cand_dir == inc_dir
+        mature_or_refine = inc_kind == "refine_watch" or inc_age >= 0.62
+
+        if not same_side:
+            min_score = 0.50 if mature_or_refine else 0.62
+            required_edge = -0.02 if mature_or_refine else 0.08
+            if candidate_score >= min_score and candidate_score >= inc_score + required_edge:
+                return _SweepArbitrationDecision(
+                    "SUPERSEDE", candidate, candidate_score, inc_score,
+                    f"opposite sweep invalidates {inc_kind} ({cand_dir} vs {inc_dir})"
+                )
+            return _SweepArbitrationDecision(
+                "SUPPRESS", candidate, candidate_score, inc_score,
+                f"opposite sweep not strong enough ({cand_dir} vs {inc_dir})"
+            )
+
+        if candidate_score >= max(0.62, inc_score + 0.12):
+            return _SweepArbitrationDecision(
+                "SUPERSEDE", candidate, candidate_score, inc_score,
+                f"same-side sweep is materially stronger than {inc_kind}"
+            )
+        if candidate_score >= max(0.45, inc_score - 0.05):
+            try:
+                key = self._sweep_key(candidate)
+                self._processed_sweeps[key] = max(self._processed_sweeps.get(key, 0.0), now + 45.0)
+            except Exception:
+                pass
+            return _SweepArbitrationDecision(
+                "MERGE", candidate, candidate_score, inc_score,
+                f"same-side sweep supports incumbent {inc_kind}"
+            )
+        return _SweepArbitrationDecision(
+            "SUPPRESS", candidate, candidate_score, inc_score,
+            f"same-side sweep weaker than incumbent {inc_kind}"
+        )
+
+    def _log_sweep_arbitration(self, decision: _SweepArbitrationDecision, now: float) -> None:
+        candidate = decision.candidate
+        try:
+            key = (
+                decision.action,
+                self._sweep_key(candidate) if candidate is not None else (),
+                round(decision.candidate_score, 2),
+                round(decision.incumbent_score, 2),
+            )
+        except Exception:
+            key = (decision.action, decision.reason)
+        if (
+            decision.action != "SUPERSEDE"
+            and key == self._last_sweep_arbitration_log_key
+            and now - self._last_sweep_arbitration_log_ts < 30.0
+        ):
+            return
+        self._last_sweep_arbitration_log_key = key
+        self._last_sweep_arbitration_log_ts = now
+        pool = getattr(candidate, "pool", None)
+        pool_side = getattr(getattr(pool, "side", ""), "value", getattr(pool, "side", "?"))
+        msg = (
+            f"SWEEP_ARBITRATION[{decision.action}]: "
+            f"{self._sweep_direction(candidate).upper() if candidate is not None else '?'} "
+            f"{pool_side} ${float(getattr(pool, 'price', 0.0) or 0.0):,.1f} "
+            f"candidate={decision.candidate_score:.2f} incumbent={decision.incumbent_score:.2f} "
+            f"| {decision.reason}"
+        )
+        if decision.action == "SUPERSEDE":
+            logger.info(msg)
+        else:
+            logger.debug(msg)
 
     def _collect_sweeps(self, snap, ict_ctx, now, atr) -> List[SweepResult]:
         """Merge LiquidityMap sweeps + ICT engine sweeps into one list.
