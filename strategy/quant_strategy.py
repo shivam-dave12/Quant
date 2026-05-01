@@ -55,14 +55,21 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
-    from strategy.expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier
+    from strategy.expected_utility import build_target_surface, expected_utility_size_multiplier
 except Exception:  # pragma: no cover - standalone tests
     try:
-        from expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier  # type: ignore
+        from expected_utility import build_target_surface, expected_utility_size_multiplier  # type: ignore
     except Exception:
         build_target_surface = None  # type: ignore
-        build_stop_surface = None  # type: ignore
         expected_utility_size_multiplier = None  # type: ignore
+
+try:
+    from strategy.quantitative_models import GLOBAL_QUANT_CALIBRATOR
+except Exception:  # pragma: no cover - standalone tests
+    try:
+        from quantitative_models import GLOBAL_QUANT_CALIBRATOR  # type: ignore
+    except Exception:
+        GLOBAL_QUANT_CALIBRATOR = None  # type: ignore
 
 # -- Liquidity-first sweep/posterior entry engine -----------------------------
 try:
@@ -2411,6 +2418,9 @@ class PositionState:
     # Previously deviation_atr was stored under "htf_15m" key — all HTF analytics were wrong.
     entry_htf_15m: float = 0.0
     entry_htf_4h:  float = 0.0
+    quant_posterior: float = 0.0
+    quant_ev: float = 0.0
+    quant_components: Dict[str, float] = field(default_factory=dict)
     # PostTradeAgent MAE tracking: exact Maximum Adverse Excursion in points.
     # Updated every trail tick so set_exit_context() can use the true value
     # rather than the SL-distance approximation.
@@ -2939,19 +2949,12 @@ class QuantStrategy:
 
     def _apply_expected_utility_target_surface(self, signal, liq_snapshot, flow_state,
                                                ict_ctx, price: float, atr: float) -> None:
-        """Jointly optimise executable SL/TP from live utility surfaces.
+        """Attach expected-utility context without rewriting execution levels.
 
-        v7 fix: the previous implementation optimised StopSurface first and
-        TargetSurface second. That is mathematically greedy: a high-quality but
-        wider stop can destroy executable target utility after the fact. An
-        institutional router must choose the best *pair* of invalidation stop
-        and executable target, then apply both together.
-
-        EntryEngine still supplies raw observation levels. This method evaluates:
-            existing/raw stop + target surface
-            top StopSurface candidates + target surface for each stop
-        and selects the pair with the best joint utility, while keeping terminal
-        objectives as runner metadata only.
+        EntryEngine owns executable TP/SL because it has already selected the
+        institutional invalidation and liquidity target.  The utility surface is
+        advisory only: it can annotate edge, sizing, and runner metadata, but it
+        must never synthesize a tighter stop or replace the chosen TP.
         """
         if build_target_surface is None:
             return
@@ -2965,7 +2968,6 @@ class QuantStrategy:
             side = str(getattr(signal, "side", "") or "").lower()
             if side not in ("long", "short"):
                 return
-            tick = float(QCfg.TICK_SIZE()) if 'QCfg' in globals() else 0.5
             atr_f = max(float(atr or 0.0), 1e-9)
 
             fee_bps = 8.0
@@ -2978,137 +2980,42 @@ class QuantStrategy:
             except Exception:
                 pass
 
-            stop_surface = None
-            raw_stop_candidate = None
-            if 'build_stop_surface' in globals() and build_stop_surface is not None:
-                stop_surface = build_stop_surface(
-                    side=side, entry=entry, current_stop=raw_sl, atr=atr_f,
-                    snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
-                    tick_size=tick,
+            posterior_prob = 0.0
+            try:
+                posterior_prob = float(
+                    getattr(signal, "posterior_prob", 0.0)
+                    or getattr(signal, "posterior", 0.0)
+                    or (getattr(self._entry_engine, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
+                    or 0.0
                 )
-                self._last_stop_surface = stop_surface
-
-            stop_candidates = []
-            if stop_surface is not None:
-                for c in (getattr(stop_surface, 'candidates', []) or []):
-                    try:
-                        sp = float(getattr(c, 'price', 0.0) or 0.0)
-                        if sp <= 0:
-                            continue
-                        protective = ((side == 'long' and sp < entry) or
-                                      (side == 'short' and sp > entry))
-                        if protective:
-                            stop_candidates.append(c)
-                            if abs(sp - raw_sl) <= max(tick * 2.0, 1e-9) or getattr(c, 'role', '') == 'existing':
-                                raw_stop_candidate = c
-                    except Exception:
-                        continue
-
-            if raw_stop_candidate is None:
-                class _RawStop:
-                    price = raw_sl
-                    utility = 0.0
-                    role = 'existing'
-                    def compact(self):
-                        return f"existing SL=${raw_sl:,.1f}"
-                raw_stop_candidate = _RawStop()
-                stop_candidates.insert(0, raw_stop_candidate)
-            elif raw_stop_candidate not in stop_candidates:
-                stop_candidates.insert(0, raw_stop_candidate)
-
-            unique = {}
-            for c in stop_candidates:
-                try:
-                    k = round(float(getattr(c, 'price', 0.0)) / max(tick, 1e-9))
-                    prev = unique.get(k)
-                    if prev is None or float(getattr(c, 'utility', -9.0)) > float(getattr(prev, 'utility', -9.0)):
-                        unique[k] = c
-                except Exception:
-                    continue
-            stop_candidates = sorted(unique.values(), key=lambda x: float(getattr(x, 'utility', -9.0)), reverse=True)[:7]
-
-            pair_rows = []
-            for sc in stop_candidates:
-                sp = float(getattr(sc, 'price', 0.0) or 0.0)
-                if sp <= 0:
-                    continue
-                protective = ((side == 'long' and sp < entry) or
-                              (side == 'short' and sp > entry))
-                if not protective:
-                    continue
+            except Exception:
                 posterior_prob = 0.0
-                try:
-                    posterior_prob = float(
-                        getattr(signal, "posterior_prob", 0.0)
-                        or getattr(signal, "posterior", 0.0)
-                        or (getattr(self._entry_engine, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
-                        or 0.0
-                    )
-                except Exception:
-                    posterior_prob = 0.0
-                surf = build_target_surface(
-                    side=side, entry=entry, stop=sp, atr=atr_f,
-                    snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
-                    fee_bps=fee_bps, slippage_bps=slip_bps,
-                    posterior_prob=posterior_prob,
-                )
-                best = getattr(surf, 'best', None)
-                if best is None:
-                    continue
-                stop_u = float(getattr(sc, 'utility', 0.0) or 0.0)
-                target_u = float(getattr(best, 'full_position_utility', getattr(best, 'utility', -9.0)) or -9.0)
-                ev_r = float(getattr(best, 'expected_value_r', -9.0) or -9.0)
-                rr = float(getattr(best, 'rr', 0.0) or 0.0)
-                risk_atr = abs(entry - sp) / atr_f
-                joint = (
-                    target_u
-                    + 0.16 * stop_u
-                    + 0.035 * min(rr, 3.2)
-                    - 0.075 * max(risk_atr - 2.6, 0.0)
-                    - (0.35 if ev_r <= 0.0 else 0.0)
-                )
-                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr))
 
-            if not pair_rows:
-                return
-
-            pair_rows.sort(key=lambda r: r[0], reverse=True)
-            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr = pair_rows[0]
+            chosen_surface = build_target_surface(
+                side=side, entry=entry, stop=raw_sl, atr=atr_f,
+                snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                fee_bps=fee_bps, slippage_bps=slip_bps,
+                posterior_prob=posterior_prob,
+            )
             self._last_target_surface = chosen_surface
-
-            chosen_sl = float(getattr(chosen_stop, 'price', raw_sl) or raw_sl)
-            chosen_tp = float(getattr(chosen_target, 'price', raw_tp) or raw_tp)
-            old_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
-            new_rr = abs(chosen_tp - entry) / max(abs(entry - chosen_sl), 1e-9)
-
-            changed_sl = abs(chosen_sl - raw_sl) >= max(tick * 2.0, 1e-9)
-            changed_tp = abs(chosen_tp - raw_tp) >= max(tick * 2.0, 1e-9)
-            if changed_sl:
-                setattr(signal, "sl_price", chosen_sl)
-            if changed_tp:
-                setattr(signal, "tp_price", chosen_tp)
-                setattr(signal, "target_pool", getattr(chosen_target, 'pool_ref', getattr(signal, 'target_pool', None)))
-            setattr(signal, "rr_ratio", new_rr)
             setattr(signal, "target_surface", chosen_surface)
-            setattr(signal, "stop_surface", stop_surface)
+
+            self._last_stop_surface = None
+            setattr(signal, "stop_surface", None)
 
             if getattr(chosen_surface, 'terminal', None) is not None:
                 setattr(signal, "terminal_runner_price", chosen_surface.terminal.price)
                 setattr(signal, "runner_fraction", chosen_surface.runner_fraction)
 
-            if changed_sl or changed_tp:
-                logger.info(
-                    "JointSurface selected executable SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
-                    chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
-                    posterior_prob, raw_sl, raw_tp, old_rr,
-                )
-            else:
-                logger.debug(
-                    "JointSurface kept raw SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f target=%s",
-                    raw_sl, raw_tp, old_rr, joint, chosen_target.compact(),
-                )
+            best = getattr(chosen_surface, 'best', None)
+            raw_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
+            logger.debug(
+                "TargetSurface advisory only: kept institutional SL/TP SL=$%.1f TP=$%.1f RR=%.2f posterior=%.3f | best=%s",
+                raw_sl, raw_tp, raw_rr, posterior_prob,
+                best.compact() if best is not None else "none",
+            )
         except Exception as e:
-            logger.debug(f"Expected-utility joint SL/TP optimisation error: {e}")
+            logger.debug(f"Expected-utility advisory annotation error: {e}")
 
     def _defer_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
         try:
@@ -6074,6 +5981,16 @@ class QuantStrategy:
         except Exception:
             entry_vol = 0.0
 
+        try:
+            _sa_entry = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+            _quant_components = dict(_sa_entry.get("quant_components", {}) or {})
+            _quant_posterior = float(_sa_entry.get("quant_posterior", 0.0) or 0.0)
+            _quant_ev = float(_sa_entry.get("quant_ev", 0.0) or 0.0)
+        except Exception:
+            _quant_components = {}
+            _quant_posterior = 0.0
+            _quant_ev = 0.0
+
         # ── Update position state ─────────────────────────────────────────────────
         self._pos = PositionState(
             phase           = PositionPhase.ACTIVE,
@@ -6099,6 +6016,9 @@ class QuantStrategy:
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
             entry_htf_15m   = self._htf.trend_15m,
             entry_htf_4h    = self._htf.trend_4h,
+            quant_posterior = _quant_posterior,
+            quant_ev        = _quant_ev,
+            quant_components = _quant_components,
         )
         # ── Reconcile safety: discard any in-flight reconcile data ────────────────
         self._reconcile_data        = None
@@ -6302,10 +6222,10 @@ class QuantStrategy:
             f"\n<b>Execution</b>\n"
             f"Entry: <b>${fill_price:,.2f}</b>   Qty: <code>{qty:.6f} BTC</code>\n"
             f"Risk:  <code>${dollar_risk:.2f}</code>   Payoff/Risk: <code>1:{rr_a:.2f}</code>\n"
-            f"\n<b>Optimised Stop Surface</b>\n"
+            f"\n<b>Institutional Stop</b>\n"
             f"SL: <b>${sl_price:,.2f}</b>  ({sl_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
             f"<code>{_sl_model}</code>\n"
-            f"\n<b>Expected-Utility Target Surface</b>\n"
+            f"\n<b>Expected-Utility Target Advisory</b>\n"
             f"TP: <b>${tp_price:,.2f}</b>  ({tp_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
             f"<code>{_tp_model}</code>\n"
             f"<code>{_runner_model}</code>\n"
@@ -7899,6 +7819,23 @@ class QuantStrategy:
         is_win = pnl > 0
         if is_win:
             self._winning_trades += 1
+        try:
+            _q_init = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
+            _q_entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            _q_exit = float(exit_price or 0.0)
+            if _q_init > 1e-10 and _q_entry > 0 and _q_exit > 0:
+                _q_r = ((_q_exit - _q_entry) if getattr(pos, "side", "") == "long"
+                        else (_q_entry - _q_exit)) / _q_init
+            else:
+                _q_r = 1.0 if is_win else -1.0
+            if GLOBAL_QUANT_CALIBRATOR is not None:
+                GLOBAL_QUANT_CALIBRATOR.record_trade_outcome(
+                    getattr(pos, "quant_components", {}) or {},
+                    pnl,
+                    achieved_r=_q_r,
+                )
+        except Exception as _q_cal_e:
+            logger.debug(f"QuantCalibrator.record_trade_outcome error: {_q_cal_e}")
         self._risk_gate.record_trade_result(pnl)
 
         # ── ISSUE-4 FIX: Advisory/Safety Model — session quality tracking ──────────
@@ -7965,6 +7902,8 @@ class QuantStrategy:
             # entry_htf_15m and entry_htf_4h are set in _enter_trade from self._htf.
             "htf_15m":      round(getattr(pos, 'entry_htf_15m', 0.0), 3),
             "htf_4h":       round(getattr(pos, 'entry_htf_4h',  0.0), 3),
+            "quant_posterior": round(getattr(pos, 'quant_posterior', 0.0), 4),
+            "quant_ev":     round(getattr(pos, 'quant_ev', 0.0), 4),
             "vwap_dev_atr": (round(pos.entry_signal.deviation_atr, 3)
                              if pos.entry_signal else 0.0),
             "adx":          (round(pos.entry_signal.adx, 1)

@@ -1546,7 +1546,8 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
-            conf = max(qd.posterior, min(1.0, rev_total / 90.0))
+            score_conf = min(1.0, rev_total / 90.0)
+            conf = 0.78 * qd.posterior + 0.22 * score_conf
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
             self._log_posterior_accept_once(
@@ -1588,7 +1589,7 @@ class EntryEngine:
             )
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
-                confidence=min(1.0, cont_total / 90.0),
+                confidence=0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0),
                 next_target=cont_target,
                 reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
                        f"[{phase}] {' + '.join(cont_r[:5])}")

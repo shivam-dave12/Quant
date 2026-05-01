@@ -4,7 +4,9 @@ expected_utility.py — institutional target/stop/sizing math
 
 Decision principle
 ------------------
-Levels are observations; executable TP/SL are optimisation outputs.
+Levels are observations; executable TP/SL are selected by the institutional
+entry engine.  These utility surfaces are advisory context for edge, sizing,
+and runner attribution; they must not replace exchange bracket levels.
 
 This module builds two continuous surfaces:
   1. StopSurface: where the thesis is statistically invalidated with enough

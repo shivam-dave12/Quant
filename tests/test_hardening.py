@@ -220,6 +220,146 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(high.best.expected_value_r, low.best.expected_value_r)
         self.assertEqual(high.best.role, "external")
 
+    def test_expected_utility_surface_does_not_rewrite_institutional_levels(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._entry_engine = SimpleNamespace(
+            _last_sweep_analysis={"quant_posterior": 0.869}
+        )
+
+        entry = 78143.0
+        raw_sl = 78554.9
+        raw_tp = 76491.3
+        raw_rr = abs(raw_tp - entry) / abs(entry - raw_sl)
+        atr = 159.6
+        signal = SimpleNamespace(
+            side="short",
+            entry_price=entry,
+            sl_price=raw_sl,
+            tp_price=raw_tp,
+            rr_ratio=raw_rr,
+            posterior_prob=0.869,
+        )
+
+        def pool_target(price, side, timeframe, significance):
+            pool = SimpleNamespace(
+                price=price,
+                side=side,
+                timeframe=timeframe,
+                significance=significance,
+                htf_count=3,
+                touches=4,
+                status="ACTIVE",
+            )
+            return SimpleNamespace(
+                pool=pool,
+                distance_atr=abs(price - entry) / atr,
+            )
+
+        snap = SimpleNamespace(
+            bsl_pools=[
+                pool_target(78145.0, "BSL", "5m", 18.0),
+                pool_target(78232.0, "BSL", "1h", 14.0),
+            ],
+            ssl_pools=[
+                pool_target(76833.5, "SSL", "1h", 20.0),
+                pool_target(raw_tp, "SSL", "15m", 14.0),
+            ],
+            feed_reliability=0.90,
+        )
+        flow = SimpleNamespace(tick_flow=-0.30, cvd_trend=-0.36)
+        ict = SimpleNamespace(
+            structure_15m="bearish",
+            structure_4h="bearish",
+            dealing_range_pd=0.60,
+        )
+
+        strategy._apply_expected_utility_target_surface(
+            signal, snap, flow, ict, entry, atr
+        )
+
+        self.assertAlmostEqual(signal.sl_price, raw_sl)
+        self.assertAlmostEqual(signal.tp_price, raw_tp)
+        self.assertAlmostEqual(signal.rr_ratio, raw_rr)
+        self.assertIsNone(signal.stop_surface)
+        self.assertIsNotNone(signal.target_surface)
+
+    def test_quant_posterior_learns_from_closed_trade_outcomes(self):
+        from strategy import quantitative_models as qm
+
+        old_calibrator = qm.GLOBAL_QUANT_CALIBRATOR
+        qm.GLOBAL_QUANT_CALIBRATOR = qm.AdaptiveQuantCalibrator()
+        try:
+            def pool(price, side):
+                return SimpleNamespace(
+                    pool=SimpleNamespace(
+                        price=price,
+                        side=side,
+                        timeframe="15m",
+                        significance=18.0,
+                    )
+                )
+
+            snap = SimpleNamespace(
+                bsl_pools=[pool(106.0, "BSL")],
+                ssl_pools=[pool(94.0, "SSL")],
+                feed_reliability=0.90,
+            )
+            flow = SimpleNamespace(
+                direction="short",
+                conviction=0.62,
+                cvd_trend=-0.55,
+            )
+            ict = SimpleNamespace(
+                structure_15m="bearish",
+                structure_4h="bearish",
+                dealing_range_pd=0.72,
+            )
+
+            base = qm.evaluate_post_sweep_quant(
+                action="reverse",
+                side="short",
+                rev_score=100.0,
+                cont_score=12.0,
+                displacement_atr=1.80,
+                cisd=True,
+                ote=True,
+                phase="CISD",
+                price=100.0,
+                atr=1.0,
+                snap=snap,
+                flow=flow,
+                ict=ict,
+            )
+            for _ in range(40):
+                qm.GLOBAL_QUANT_CALIBRATOR.record_trade_outcome(
+                    base.components,
+                    pnl=-1.0,
+                    achieved_r=-1.0,
+                )
+            learned = qm.evaluate_post_sweep_quant(
+                action="reverse",
+                side="short",
+                rev_score=100.0,
+                cont_score=12.0,
+                displacement_atr=1.80,
+                cisd=True,
+                ote=True,
+                phase="CISD",
+                price=100.0,
+                atr=1.0,
+                snap=snap,
+                flow=flow,
+                ict=ict,
+            )
+
+            self.assertGreaterEqual(learned.components["outcome_n"], 40.0)
+            self.assertLess(learned.posterior, base.posterior)
+        finally:
+            qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
+
 
 if __name__ == "__main__":
     unittest.main()

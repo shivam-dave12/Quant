@@ -4,8 +4,8 @@ quantitative_models.py — Adaptive quantitative decision/risk models
 
 This module is the strategy layer's mathematical core. It intentionally avoids
 "level reached → trade" or fixed threshold behaviour. Every decision is mapped
-through a live state vector, online distribution estimates and uncertainty-
-adjusted posterior/EV barriers.
+through a live state vector, online distribution estimates, empirical outcome
+calibration and uncertainty-adjusted posterior/EV barriers.
 
 Important design rule:
     Legacy scores (rev/cont counters, pool quality, flow conviction) are only
@@ -162,12 +162,34 @@ class EWMStat:
         return clamp((float(x) - self.mean) / math.sqrt(max(self.var, 1e-9)), -5.0, 5.0)
 
 
+@dataclass
+class BayesianOutcomeBucket:
+    """Beta-Bernoulli outcome calibration for a recurring entry context."""
+
+    alpha: float = 8.0
+    beta: float = 8.0
+    r_ewma: float = 0.0
+    n: int = 0
+
+    @property
+    def mean(self) -> float:
+        return clamp(self.alpha / max(self.alpha + self.beta, _EPS), 0.02, 0.98)
+
+    def update(self, win: bool, achieved_r: float) -> None:
+        self.alpha += 1.0 if win else 0.0
+        self.beta += 0.0 if win else 1.0
+        r = clamp(float(achieved_r or 0.0), -3.0, 6.0)
+        self.r_ewma = r if self.n <= 0 else 0.92 * self.r_ewma + 0.08 * r
+        self.n += 1
+
+
 class AdaptiveQuantCalibrator:
     """Shared online calibration state.
 
-    The model updates on every evaluated setup. It does not learn PnL labels here
-    because that belongs in a separate post-trade trainer, but it does adapt its
-    acceptance barriers to the distribution of market evidence being observed.
+    The model updates on every evaluated setup and lightly calibrates future
+    posteriors with closed-trade outcomes from similar contexts. The empirical
+    component is Bayesian-shrunk so a handful of trades cannot overpower the
+    live auction math.
     """
 
     def __init__(self) -> None:
@@ -176,19 +198,80 @@ class AdaptiveQuantCalibrator:
         self.evidence_q = EWMQuantile(0.62, 0.42)
         self.disp_stat = EWMStat(0.80)
         self.eae_q = EWMQuantile(0.65, 1.20)
+        self.outcome_buckets: Dict[Tuple[int, int, int, int, int, int], BayesianOutcomeBucket] = {}
 
-    def update_entry(self, posterior: float, evidence: float, displacement_atr: float) -> Dict[str, float]:
+    @staticmethod
+    def _band(x: float, c1: float, c2: float) -> int:
+        x = float(x or 0.0)
+        if x < c1:
+            return 0
+        if x < c2:
+            return 1
+        return 2
+
+    def _outcome_key(self, components: Dict[str, float]) -> Tuple[int, int, int, int, int, int]:
+        return (
+            int(round(float(components.get("action_code", 0.0) or 0.0))),
+            int(round(float(components.get("phase_code", 0.0) or 0.0))),
+            self._band(float(components.get("evidence_mass", 0.0) or 0.0), 0.45, 0.72),
+            self._band(float(components.get("uncertainty", 0.5) or 0.5), 0.33, 0.66),
+            self._band(float(components.get("toxicity", 0.0) or 0.0), 0.25, 0.55),
+            self._band(float(components.get("htf_alignment", 0.0) or 0.0) + 1.0, 0.80, 1.20),
+        )
+
+    def observe_setup(self, evidence: float, displacement_atr: float) -> Dict[str, float]:
         with self._lock:
-            p_q = self.posterior_q.update(clamp(posterior, 0.0, 1.0))
             e_q = self.evidence_q.update(clamp(evidence, 0.0, 1.0))
             self.disp_stat.update(max(displacement_atr, 0.0))
             return {
-                "posterior_q": p_q,
+                "posterior_q": self.posterior_q.value,
                 "evidence_q": e_q,
                 "disp_mu": self.disp_stat.mean,
                 "disp_sigma": math.sqrt(max(self.disp_stat.var, 1e-9)),
                 "ready": 1.0 if (self.posterior_q.ready and self.evidence_q.ready) else 0.0,
             }
+
+    def observe_decision(self, posterior: float, evidence: float, displacement_atr: float) -> Dict[str, float]:
+        with self._lock:
+            p_q = self.posterior_q.update(clamp(posterior, 0.0, 1.0))
+            return {
+                "posterior_q": p_q,
+                "evidence_q": self.evidence_q.value,
+                "disp_mu": self.disp_stat.mean,
+                "disp_sigma": math.sqrt(max(self.disp_stat.var, 1e-9)),
+                "ready": 1.0 if (self.posterior_q.ready and self.evidence_q.ready) else 0.0,
+            }
+
+    def outcome_prior(self, components: Dict[str, float]) -> Dict[str, float]:
+        with self._lock:
+            key = self._outcome_key(components or {})
+            bucket = self.outcome_buckets.get(key)
+            if bucket is None:
+                return {
+                    "outcome_p": 0.50,
+                    "outcome_n": 0.0,
+                    "outcome_r": 0.0,
+                    "outcome_weight": 0.0,
+                }
+            n = float(bucket.n)
+            weight = clamp((n / (n + 28.0)) * 0.38, 0.0, 0.38)
+            return {
+                "outcome_p": bucket.mean,
+                "outcome_n": n,
+                "outcome_r": bucket.r_ewma,
+                "outcome_weight": weight,
+            }
+
+    def record_trade_outcome(self, components: Dict[str, float], pnl: float, achieved_r: float = 0.0) -> None:
+        if not components:
+            return
+        with self._lock:
+            key = self._outcome_key(components)
+            bucket = self.outcome_buckets.get(key)
+            if bucket is None:
+                bucket = BayesianOutcomeBucket()
+                self.outcome_buckets[key] = bucket
+            bucket.update(float(pnl or 0.0) > 0.0, float(achieved_r or 0.0))
 
     def update_eae(self, eae_atr: float) -> float:
         with self._lock:
@@ -330,6 +413,8 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     action = (action or "").lower()
     side = (side or "").lower()
     phase_u = (phase or "").upper()
+    action_code = 1.0 if action == "reverse" else 2.0
+    phase_code = float({"DISPLACEMENT": 1, "CISD": 2, "OTE": 3, "MATURE": 4}.get(phase_u, 0))
     st = build_state_vector(side=side, price=price, atr=atr, snap=snap, flow=flow, ict=ict)
 
     chosen = float(rev_score if action == "reverse" else cont_score)
@@ -351,7 +436,7 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     # No-auction guard: a strong counter alone is not evidence. This is a
     # mathematical null-model guard, not a hand-entered threshold; it uses live
     # distribution estimates plus uncertainty.
-    cal0 = GLOBAL_QUANT_CALIBRATOR.update_entry(0.5, auction_information, max(displacement_atr, 0.0))
+    cal0 = GLOBAL_QUANT_CALIBRATOR.observe_setup(auction_information, max(displacement_atr, 0.0))
     dynamic_evidence_floor = clamp(
         max(0.18, cal0["evidence_q"] * (0.82 + 0.28 * st.regime_uncertainty)),
         0.16,
@@ -366,7 +451,10 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         return QuantDecision(False, 0.0, 0.0, -1.0, -99.0, st.regime_uncertainty, reason,
                              {"score_edge": score_edge, "disp_info": disp_info,
                               "structural": structural, "evidence_mass": auction_information,
-                              "evidence_floor": dynamic_evidence_floor, **cal0})
+                              "evidence_floor": dynamic_evidence_floor,
+                              "action_code": action_code, "phase_code": phase_code,
+                              "uncertainty": st.regime_uncertainty, "toxicity": st.toxicity,
+                              "htf_alignment": st.htf_alignment, **cal0})
 
     if action == "continue":
         flow_term = 0.70 * st.orderflow_alignment + 0.55 * st.cvd_alignment + 0.45 * st.htf_alignment
@@ -379,19 +467,49 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     pd_term = 0.30 * st.dealing_range_affinity
     cost_penalty = 0.45 * st.spread_cost_atr + 0.70 * st.toxicity
     uncertainty_penalty = (0.70 + 0.25 * (phase_u == "DISPLACEMENT")) * st.regime_uncertainty
+    evidence_consensus = clamp(
+        0.36 * auction_information
+        + 0.22 * max(score_edge, 0.0)
+        + 0.18 * max(flow_term, 0.0)
+        + 0.12 * max(st.htf_alignment, 0.0)
+        + 0.12 * st.liquidity_quality
+        - 0.25 * st.toxicity,
+        0.0,
+        1.0,
+    )
+    independence = clamp(0.52 + 0.48 * evidence_consensus - 0.30 * st.toxicity, 0.32, 1.0)
 
     base_prior = clamp(0.42 + 0.06 * st.liquidity_quality + 0.04 * max(st.htf_alignment, 0.0) - 0.06 * st.toxicity, 0.25, 0.65)
     z = (
         logit(base_prior)
-        + 1.25 * score_edge
-        + 1.35 * structure_term
-        + 0.78 * flow_term
+        + 1.25 * score_edge * independence
+        + 1.35 * structure_term * (0.72 + 0.28 * auction_information)
+        + 0.78 * flow_term * (0.70 + 0.30 * evidence_consensus)
         + liq_term
         + pd_term
+        + 0.45 * evidence_consensus
         - cost_penalty
         - uncertainty_penalty
     )
     posterior = sigmoid(z)
+
+    components_seed = {
+        "score_edge": score_edge, "disp_info": disp_info,
+        "structural": structural, "flow_term": flow_term,
+        "liq_term": liq_term, "pd_term": pd_term,
+        "cost_penalty": cost_penalty, "evidence_floor": dynamic_evidence_floor,
+        "evidence_mass": auction_information, "evidence_consensus": evidence_consensus,
+        "independence": independence, "action_code": action_code, "phase_code": phase_code,
+        "uncertainty": st.regime_uncertainty, "toxicity": st.toxicity,
+        "htf_alignment": st.htf_alignment,
+    }
+    outcome = GLOBAL_QUANT_CALIBRATOR.outcome_prior(components_seed)
+    outcome_w = float(outcome.get("outcome_weight", 0.0) or 0.0)
+    if outcome_w > 0.0:
+        posterior = sigmoid(
+            (1.0 - outcome_w) * logit(posterior)
+            + outcome_w * logit(float(outcome.get("outcome_p", 0.50) or 0.50))
+        )
 
     # EV in normalized risk units. Loss burden widens under uncertainty/toxicity;
     # reward is capped by liquidity quality and alignment. Far TP/RR cannot rescue
@@ -400,7 +518,7 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
     loss_proxy = 1.00 + 0.65 * st.regime_uncertainty + 0.45 * st.toxicity
     ev = posterior * reward_proxy - (1.0 - posterior) * loss_proxy - 0.12 * st.spread_cost_atr
 
-    cal = GLOBAL_QUANT_CALIBRATOR.update_entry(posterior, auction_information, max(displacement_atr, 0.0))
+    cal = GLOBAL_QUANT_CALIBRATOR.observe_decision(posterior, auction_information, max(displacement_atr, 0.0))
     calibrated_p = cal["posterior_q"] if cal["ready"] else 0.66
     min_p = clamp(max(calibrated_p, 0.52 + 0.20 * st.regime_uncertainty + 0.05 * st.toxicity), 0.54, 0.88)
 
@@ -422,15 +540,16 @@ def evaluate_post_sweep_quant(*, action: str, side: str, rev_score: float, cont_
         ("ACCEPT" if accept else "REJECT")
         + f" quant posterior auction: info={auction_information:.2f}/{dynamic_evidence_floor:.2f} "
           f"edge={score_edge:+.2f} disp={disp_info:.2f} struct={structural:.2f} "
-          f"flow={flow_term:+.2f} EV={ev:+.3f} LLR={llr:.2f}/{dynamic_llr_barrier:.2f} | {st.compact()}"
+          f"cons={evidence_consensus:.2f} flow={flow_term:+.2f} "
+          f"learned={float(outcome.get('outcome_p', 0.5)):.2f}/{float(outcome.get('outcome_n', 0.0)):.0f} "
+          f"EV={ev:+.3f} LLR={llr:.2f}/{dynamic_llr_barrier:.2f} | {st.compact()}"
     )
     return QuantDecision(accept, posterior, min_p, ev, llr, st.regime_uncertainty, reason,
-                         {"score_edge": score_edge, "disp_info": disp_info,
-                          "structural": structural, "flow_term": flow_term,
-                          "liq_term": liq_term, "pd_term": pd_term,
-                          "cost_penalty": cost_penalty, "evidence_floor": dynamic_evidence_floor,
-                          "evidence_mass": auction_information, "llr_barrier": dynamic_llr_barrier,
-                          **cal})
+                         {**components_seed, "llr_barrier": dynamic_llr_barrier,
+                          "outcome_p": float(outcome.get("outcome_p", 0.50) or 0.50),
+                          "outcome_n": float(outcome.get("outcome_n", 0.0) or 0.0),
+                          "outcome_r": float(outcome.get("outcome_r", 0.0) or 0.0),
+                          "outcome_weight": outcome_w, **cal})
 
 
 def adaptive_trailing_stop(*, side: str, price: float, entry_price: float, current_sl: float,
