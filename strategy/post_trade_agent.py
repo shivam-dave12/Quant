@@ -6,7 +6,7 @@ v2.0 — Full rewrite with industry-grade metrics and Bayesian adaptive engine.
 ARCHITECTURE
 ────────────
 Each closed trade is analysed across five structural dimensions using metrics
-from institutional risk management — NOT retail lagging indicators.
+from institutional risk management — NOT lagging indicators.
 
 DIMENSION 1 — EXIT GEOMETRY (MAE / MFE / R-multiples)
   Maximum Adverse Excursion (MAE)  : furthest price moved against us (in points)
@@ -689,7 +689,7 @@ class PostTradeAgent:
       4. Dimension stats (per AMD phase, ICT tier, regime, session, mode)
       5. Adaptive params (Bayesian Beta updating → SL/TP/tier size adjustments)
 
-    No retail logic. No lagging indicators. Pure ICT institutional mechanics.
+    No lagging-indicator shortcuts. No lagging indicators. Pure ICT institutional mechanics.
     Thread-safe: all mutation is performed on the calling thread (main strategy thread).
     """
 
@@ -729,7 +729,7 @@ class PostTradeAgent:
 
         # ── IC Circuit-Breaker state ────────────────────────────────────────────
         # Persistent across trades; reset only on explicit unblock.
-        self._ic_gate_blocked:      bool  = False   # True → strategy must not open new entries
+        self._ic_gate_blocked:      bool  = False   # True → strategy should reduce exposure until edge recovers
         self._ic_gate_blocked_at:   float = 0.0     # time.time() when gate was tripped
         self._ic_gate_reason:       str   = ""      # human-readable trip reason
         self._ic_gate_trades_at_block: int = 0      # len(records) when gate was tripped
@@ -910,7 +910,7 @@ class PostTradeAgent:
 
     def set_ic_gate_notifier(self, notifier: Any) -> None:
         """
-        Register a callable(str) used to push Telegram alerts when the IC gate
+        Register a callable(str) used to push Telegram alerts when the IC exposure lens
         trips or recovers.  Called by quant_strategy.__init__ after instantiation:
 
             self._post_trade_agent.set_ic_gate_notifier(send_telegram_message)
@@ -924,8 +924,8 @@ class PostTradeAgent:
 
         Returns
         -------
-        (blocked, reason)
-            blocked  — True if the IC gate is currently tripped and entries should
+        (impaired, reason)
+            impaired — True if the IC lens is currently tripped and exposure should
                        be suppressed.
             reason   — Human-readable string suitable for a warning log / Telegram.
 
@@ -955,19 +955,19 @@ class PostTradeAgent:
         if time_ok and trades_ok and ic_ok:
             self._ic_gate_blocked = False
             recovery_msg = (
-                f"✅ <b>IC GATE UNBLOCKED</b>\n"
+                f"✅ <b>IC EXPOSURE LENS RECOVERED</b>\n"
                 f"IC recovered to {current_ic:+.3f} after {int(age_sec)}s / "
                 f"{trades_since} new trades since block.\n"
                 f"New entries are now permitted."
             )
             logger.warning(
-                "IC gate UNBLOCKED — IC=%.3f age=%.0fs trades_since=%d",
+                "IC exposure lens UNBLOCKED — IC=%.3f age=%.0fs trades_since=%d",
                 current_ic, age_sec, trades_since,
             )
             self._emit_insight(
                 dimension="IC_SIGNAL",
                 severity="INFO",
-                message=f"IC gate unblocked — IC recovered to {current_ic:+.3f}",
+                message=f"IC exposure lens unrecovered — IC recovered to {current_ic:+.3f}",
                 recommendation="Monitor for continued positive IC before scaling back up.",
                 confidence=min(0.85, current_ic + 0.5),
             )
@@ -978,7 +978,7 @@ class PostTradeAgent:
                     pass
             return False, ""
 
-        # Still blocked — build a fresh reason string for the caller's log
+        # Still impaired — build a fresh reason string for the caller's log
         parts = []
         if not time_ok:
             parts.append(f"{int(_IC_GATE_MIN_BLOCK_SEC - age_sec)}s until min-duration expires")
@@ -986,22 +986,22 @@ class PostTradeAgent:
             parts.append(f"{_IC_GATE_UNBLOCK_TRADES - trades_since} more trades needed")
         if not ic_ok:
             parts.append(f"IC={current_ic:+.3f} still below recovery threshold {_IC_GATE_UNBLOCK_IC:+.2f}")
-        return True, f"IC gate active: {'; '.join(parts)}"
+        return True, f"IC exposure lens active: {'; '.join(parts)}"
 
     def clear_ic_gate(self, operator: str = "operator") -> None:
         """
-        Manual operator override — clears the IC gate unconditionally.
+        Manual operator override — clears the IC exposure lens unconditionally.
         Intended for use from the Telegram /watchdog_unfreeze or /ic_clear command.
         """
         if not self._ic_gate_blocked:
             return
         self._ic_gate_blocked = False
         msg = (
-            f"✅ <b>IC GATE MANUALLY CLEARED</b> by {operator}\n"
+            f"✅ <b>IC EXPOSURE LENS MANUALLY CLEARED</b> by {operator}\n"
             f"Prior reason: {self._ic_gate_reason}\n"
             f"New entries permitted. Monitor IC closely."
         )
-        logger.warning("IC gate cleared manually by %s", operator)
+        logger.warning("IC exposure lens cleared manually by %s", operator)
         if self._ic_gate_notifier is not None:
             try:
                 self._ic_gate_notifier(msg)
@@ -1907,7 +1907,7 @@ class PostTradeAgent:
                     confidence=min(0.90, abs(ic) * 3.0),
                 )
 
-                # ── Trip the circuit-breaker if not already blocked ──────────
+                # ── Trip the IC exposure lens if not already blocked ──────────
                 if not self._ic_gate_blocked:
                     self._ic_gate_blocked       = True
                     self._ic_gate_blocked_at    = time.time()
@@ -1918,7 +1918,7 @@ class PostTradeAgent:
                     self._ic_gate_trades_at_block = len(self.records)
 
                     trip_msg = (
-                        f"🛑 <b>IC GATE TRIPPED — entries blocked</b>\n"
+                        f"🛑 <b>IC EXPOSURE LENS TRIPPED — exposure impaired</b>\n"
                         f"Information Coefficient: <b>{ic:+.3f}</b>  "
                         f"(t={ic_t:.2f}, n={ic_n})\n"
                         f"Signals are statistically <b>inversely predictive</b>.\n"
@@ -1928,7 +1928,7 @@ class PostTradeAgent:
                         f"Use /ic_clear to override manually after investigation."
                     )
                     logger.critical(
-                        "IC gate TRIPPED — IC=%.3f t=%.2f n=%d; entries blocked",
+                        "IC exposure lens TRIPPED — IC=%.3f t=%.2f n=%d; exposure impaired",
                         ic, ic_t, ic_n,
                     )
                     if self._ic_gate_notifier is not None:

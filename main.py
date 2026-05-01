@@ -57,13 +57,13 @@ _MOJIBAKE_RUN = re.compile(
     r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
 )
 _MOJIBAKE_DIRECT = {
-    "ðŸŽ¯": "🎯", "ðŸ§­": "🧭", "ðŸ“Š": "📊", "ðŸ’°": "💰",
-    "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
-    "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
-    "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
-    "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â³": "⏳",
-    "â‰ˆ": "≈", "Â±": "±", "Ã—": "×", "Ïƒ": "σ",
-    "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+    "🎯": "🎯", "🧭": "🧭", "📊": "📊", "💰": "💰",
+    "🔒": "🔒", "🔄": "🔄", "🔱": "🔱", "🚨": "🚨",
+    "💀": "💀", "💥": "💥", "✅": "✅", "❌": "❌",
+    "❌": "❌", "⚠️": "⚠️", "⚠️": "⚠️", "⏱️": "⏱️",
+    "⏱️": "⏱️", "⏱️": "⏱️", "⏱️": "⏱️", "⏳": "⏳",
+    "≈": "≈", "±": "±", "×": "×", "σ": "σ",
+    "⬜": "⬜", "░": "░", "█": "█",
 }
 
 
@@ -122,7 +122,35 @@ class ISTFormatter(logging.Formatter):
 _ANSI_LOG_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+_LOG_LAYER_RULES = (
+    ("WATCHDOG", "🛡", ("watchdog",)),
+    ("TELEGRAM", "✉", ("telegram",)),
+    ("EXECUTION", "⚙", ("execution", "order_manager", "router")),
+    ("RISK", "⚖", ("risk", "risk_manager")),
+    ("MARKET-DATA", "📡", ("data_manager", "websocket", "market_aggregator", "exchanges")),
+    ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "liquidity_trail")),
+    ("POSTERIOR", "🧠", ("quant_strategy", "quantitative_models", "expected_utility")),
+    ("STRUCTURE", "🏛", ("ict_engine", "direction_engine", "conviction_filter", "market_intelligence")),
+    ("RUNTIME", "▶", ("main", "__main__")),
+)
+
+
+def _architecture_layer(logger_name: str, message: str = "") -> tuple[str, str]:
+    needle = f"{logger_name} {message}".lower()
+    for label, icon, markers in _LOG_LAYER_RULES:
+        if any(marker in needle for marker in markers):
+            return label, icon
+    return "SYSTEM", "•"
+
+
 class TerminalFormatter(ISTFormatter):
+    """Architecture-aware terminal formatter.
+
+    The live console should read like the actual bot architecture:
+    DATA → LIQUIDITY → POSTERIOR/EV → RISK/EXECUTION → ADAPTIVE EXIT.
+    It does not expose old generation labels or static gate names.
+    """
+
     _LEVEL_COLOR = {
         logging.DEBUG: "\033[2m",
         logging.INFO: "\033[96m",
@@ -140,8 +168,22 @@ class TerminalFormatter(ISTFormatter):
         dt = datetime.fromtimestamp(record.created, tz=IST)
         return f"{dt.strftime('%H:%M:%S')}.{int(record.msecs):03d}"
 
+    @staticmethod
+    def _normalise_message(msg: str) -> str:
+        msg = _repair_mojibake(msg)
+        replacements = {
+                        "mechanical guard": "mechanical stop",
+            "mechanical guard": "mechanical stop",
+            "blocked by": "paused by",
+            "gate blocked": "safety-paused",
+            "Institutional unified gate blocked": "Dynamic audit paused",
+        }
+        for old, new in replacements.items():
+            msg = msg.replace(old, new)
+        return msg
+
     def format(self, record):
-        msg = _repair_mojibake(record.getMessage())
+        msg = self._normalise_message(record.getMessage())
         if not self._enable_color:
             msg = _ANSI_LOG_RE.sub("", msg)
         visible = _ANSI_LOG_RE.sub("", msg).lstrip()
@@ -151,12 +193,11 @@ class TerminalFormatter(ISTFormatter):
         level = record.levelname[:4].ljust(4)
         color = self._LEVEL_COLOR.get(record.levelno, "") if self._enable_color else ""
         reset = self._RESET if color else ""
-        module = record.name.rsplit(".", 1)[-1]
-        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {module:<18} | "
+        layer, icon = _architecture_layer(record.name, msg)
+        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {icon} {layer:<12} | "
         if record.exc_info:
             msg = f"{msg}\n{self.formatException(record.exc_info)}"
         return prefix + msg.replace("\n", "\n" + " " * len(_ANSI_LOG_RE.sub("", prefix)))
-
 
 class TerminalBurstFilter(logging.Filter):
     """Suppress repeated tick-level terminal messages while keeping file logs intact."""
@@ -196,7 +237,7 @@ class TerminalBurstFilter(logging.Filter):
             return True
 
 
-_ist_fmt = ISTFormatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_ist_fmt = ISTFormatter(fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 _term_fmt = TerminalFormatter(
     enable_color=(
         bool(getattr(sys.stdout, "isatty", lambda: False)())
@@ -222,12 +263,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── v9 display engine (optional) ─────────────────────────────────────────────
+# ── institutional display engine (optional) ─────────────────────────────────────────────
 try:
-    from strategy.v9_display import format_heartbeat as _fmt_hb
-    _V9_DISPLAY = True
+    from strategy.display_engine import format_heartbeat as _fmt_hb
+    _DISPLAY_ENGINE = True
 except ImportError:
-    _V9_DISPLAY = False
+    _DISPLAY_ENGINE = False
 
 # ── Global exception hooks ────────────────────────────────────────────────────
 
@@ -445,7 +486,7 @@ class QuantBot:
     def _start_watchdog(self) -> None:
         if build_default_watchdog is None:
             logger.error("Full watchdog unavailable: build_default_watchdog import failed")
-            send_telegram_message("âš ï¸ <b>WATCHDOG UNAVAILABLE</b>\nImport failed; fallback stale-tick logger only.")
+            send_telegram_message("⚠️ <b>WATCHDOG UNAVAILABLE</b>\nImport failed; fallback stale-tick logger only.")
             return
         if self.watchdog is not None:
             return
@@ -465,7 +506,7 @@ class QuantBot:
             self.watchdog = None
             logger.exception("Full watchdog failed to start")
             send_telegram_message(
-                f"âš ï¸ <b>WATCHDOG START FAILED</b>\n<code>{e}</code>\nFallback stale-tick logger only.")
+                f"⚠️ <b>WATCHDOG START FAILED</b>\n<code>{e}</code>\nFallback stale-tick logger only.")
 
     def start(self) -> bool:
         try:
@@ -575,8 +616,8 @@ class QuantBot:
         feed  = "dual" if agg.get("alive") else "single"
         exch  = self.execution_router.active_exchange.upper() if self.execution_router else "?"
 
-        # ── v9.0 display engine ───────────────────────────────────────────────
-        if _V9_DISPLAY and self.strategy:
+        # ── institutional display engine ───────────────────────────────────────────────
+        if _DISPLAY_ENGINE and self.strategy:
             strat         = self.strategy
             engine_state  = "SCANNING"
             tracking_info = None

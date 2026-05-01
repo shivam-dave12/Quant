@@ -102,7 +102,7 @@ class _RateLimiter:
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 
-# Also keep a module-level alias for legacy imports (quant_strategy does
+# Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
 class GlobalRateLimiter:
     """Legacy shim — routes to the active exchange limiter."""
@@ -331,28 +331,18 @@ class _DeltaAdapter:
         return None
 
     def extract_filled_qty(self, order_data: Dict) -> float:
-        """Return filled quantity in BTC units.
-
-        Delta reports order sizes/fills in integer contracts.  The strategy
-        invariant is BTC quantity everywhere above this adapter, so convert at
-        the boundary exactly like normalise_position() does.
-        """
-        q_contracts = 0.0
-        for f in ("filled_size", "executed_qty", "filled_qty", "size_filled", "size"):
+        """Return filled quantity in BTC units, never raw Delta contracts."""
+        _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
+        for f in ("filled_size", "executed_qty", "size"):
             v = order_data.get(f)
             if v:
                 try:
-                    q_contracts = float(v)
-                    if q_contracts > 0:
-                        break
+                    contracts = abs(float(v))
+                    if contracts > 0:
+                        return contracts * _cv
                 except (ValueError, TypeError):
                     pass
-        if q_contracts <= 0:
-            return 0.0
-        cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
-        if cv <= 0:
-            cv = 0.001
-        return q_contracts * cv
+        return 0.0
 
     def place_order(self, side: str, order_type: str, quantity: float,
                     price: Optional[float] = None,
@@ -381,6 +371,9 @@ class _DeltaAdapter:
             return {"_raw": resp, "_sc": sc, "_error": True}
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
+        result["quantity"] = float(quantity)
+        result["size_btc"] = float(quantity)
+        result["size_contracts"] = int(contracts)
         return result
 
     def place_bracket_limit_entry(self, side: str, quantity: float,
@@ -668,7 +661,7 @@ class OrderManager:
         else:
             self._adapter = _CoinSwitchAdapter(api)
 
-        self.api            = api         # kept for legacy access
+        self.api            = api         # kept for compatibility access
         self._exchange_name = exch
         self._orders_lock   = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
@@ -701,7 +694,7 @@ class OrderManager:
         # (always delta, since it's created second) won, so GlobalRateLimiter
         # always pointed at the delta limiter even when CoinSwitch was the active
         # exchange — silently applying the wrong rate-limit interval to all calls.
-        # The single-OM legacy path (no router) can call GlobalRateLimiter.set_active()
+        # The single-OM compatibility path (no router) can call GlobalRateLimiter.set_active()
         # explicitly after construction if needed.
 
         logger.info(f"✅ OrderManager initialised (exchange={exch})")
@@ -1004,12 +997,8 @@ class OrderManager:
                     f"below min {min_qty} — treating as flat")
                 return None
             if ex_side not in ("LONG", "SHORT"):
-                # Best-effort inference from signed size if available.
-                # Delta normalise_position() returns size as absolute BTC and
-                # size_signed as directional BTC.  Inferring from size alone
-                # turns unknown shorts into longs, which is unsafe in the
-                # emergency flatten path.
-                _signed = float(ex_pos.get("size_signed", ex_pos.get("size", 0)) or 0)
+                # Best-effort inference from signed size if available
+                _signed = float(ex_pos.get("size", 0) or 0)
                 if _signed > 0:
                     ex_side = "LONG"
                 elif _signed < 0:

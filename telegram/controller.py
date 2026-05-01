@@ -20,7 +20,7 @@ All command handlers reflect the QuantPosterior authority model:
   /setexchange — Switch execution exchange (delta|coinswitch)
   /set <key> <val> — Live-adjust config
   /resetrisk  — Clear consecutive-loss lockout
-  /huntstatus — Liquidity hunt engine status
+  /huntstatus — Liquidity-draw telemetry only
   /help       — Show commands
 """
 
@@ -47,13 +47,13 @@ _MOJIBAKE_RUN = re.compile(
     r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
 )
 _MOJIBAKE_DIRECT = {
-    "ðŸŽ¯": "🎯", "ðŸ§­": "🧭", "ðŸ“Š": "📊", "ðŸ’°": "💰",
-    "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
-    "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
-    "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
-    "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â³": "⏳",
-    "â‰ˆ": "≈", "Â±": "±", "Ã—": "×", "Ïƒ": "σ",
-    "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+    "🎯": "🎯", "🧭": "🧭", "📊": "📊", "💰": "💰",
+    "🔒": "🔒", "🔄": "🔄", "🔱": "🔱", "🚨": "🚨",
+    "💀": "💀", "💥": "💥", "✅": "✅", "❌": "❌",
+    "❌": "❌", "⚠️": "⚠️", "⚠️": "⚠️", "⏱️": "⏱️",
+    "⏱️": "⏱️", "⏱️": "⏱️", "⏱️": "⏱️", "⏳": "⏳",
+    "≈": "≈", "±": "±", "×": "×", "σ": "σ",
+    "⬜": "⬜", "░": "░", "█": "█",
 }
 
 
@@ -99,14 +99,14 @@ def _repair_mojibake(text: str) -> str:
 
 # ── display engine (optional) ─────────────────────────────────────────────
 try:
-    from strategy.v9_display import (
+    from strategy.display_engine import (
         format_thinking_telegram, format_pools_telegram,
-        format_flow_telegram, format_status_report_v9,
-        format_periodic_report_v9, HELP_TEXT as V9_HELP,
+        format_flow_telegram, format_status_report_display,
+        format_periodic_report_display, HELP_TEXT as DISPLAY_HELP,
     )
-    _V9_DISPLAY = True
+    _DISPLAY_ENGINE = True
 except ImportError:
-    _V9_DISPLAY = False
+    _DISPLAY_ENGINE = False
 
 
 def _esc(s) -> str:
@@ -716,7 +716,7 @@ class TelegramBotController:
             snap    = strat._liq_map.get_snapshot(price, atr)
             summary = strat._liq_map.get_status_summary(price, atr)
 
-            if _V9_DISPLAY:
+            if _DISPLAY_ENGINE:
                 msg = format_pools_telegram(
                     price=price, atr=atr,
                     bsl_pools=snap.bsl_pools, ssl_pools=snap.ssl_pools,
@@ -822,7 +822,7 @@ class TelegramBotController:
             conviction = sum(signals)
             direction  = "long ▲" if conviction > 0.20 else ("short ▼" if conviction < -0.20 else "neutral")
 
-            if _V9_DISPLAY:
+            if _DISPLAY_ENGINE:
                 msg = format_flow_telegram(
                     price=price, tick_flow=tick_flow,
                     cvd_trend=cvd_trend, cvd_divergence=cvd_div,
@@ -1478,7 +1478,7 @@ class TelegramBotController:
     # ================================================================
 
     def _cmd_huntstatus(self) -> str:
-        if _V9_DISPLAY:
+        if _DISPLAY_ENGINE:
             return self._cmd_pools()
 
         global bot_instance, bot_running
@@ -1510,7 +1510,7 @@ class TelegramBotController:
         }
         s_icon = state_icons.get(st["state"], "❓")
 
-        lines = [f"<b>🎣 Liquidity Hunt Engine</b>"]
+        lines = [f"<b>🎣 Liquidity-Draw Telemetry</b>", "<i>Telemetry only — execution authority is QuantPosterior + safety audit.</i>"]
         lines.append(f"Price: ${price:,.2f}  ATR: ${atr:.1f}")
         lines.append(f"\n<b>State:</b> {s_icon} {st['state']}")
 
@@ -1531,12 +1531,12 @@ class TelegramBotController:
         lines.append(f"  Score: {st['score_ema']:+.3f}  raw: {st['raw_score']:+.3f}")
 
         if st.get("signal_ready"):
-            lines.append(f"\n<b>🎯 SIGNAL READY</b>")
+            lines.append(f"\n<b>🎯 Telemetry event detected</b>")
             lines.append(f"  Side:  <b>{(st['signal_side'] or '?').upper()}</b>")
             lines.append(f"  SL:    ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
             lines.append(f"  R:R:   1:{st['signal_rr']:.2f}")
         else:
-            lines.append("\n  No pending signal.")
+            lines.append("\n  No executable posterior auction currently active.")
 
         return "\n".join(lines)
 
@@ -1814,16 +1814,8 @@ class TelegramBotController:
                     prev_dp = rm.daily_pnl
                     rm.consecutive_losses = 0
                     if reset_daily:
-                        rm.daily_pnl = 0.0
-                        # Preserve RiskManager's bounded deque invariant.
-                        # Replacing it with [] breaks maxlen/backpressure and
-                        # downstream assumptions while not failing immediately.
-                        try:
-                            rm.daily_trades.clear()
-                        except Exception:
-                            from collections import deque
-                            rm.daily_trades = deque(maxlen=getattr(rm, "max_daily_trades", 10) + 10)
-                        rm._last_loss_time = 0.0
+                        rm.daily_pnl    = 0.0
+                        rm.daily_trades = []
                 detail = f"consec_losses {prev_cl}→0"
                 if reset_daily:
                     detail += f" | daily_pnl ${prev_dp:+.2f}→$0.00 | daily_trades cleared"

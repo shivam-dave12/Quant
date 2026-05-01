@@ -1,30 +1,42 @@
-"""CoinSwitch Pro Futures Socket.IO WebSocket adapter.
-
-Normalises all public-stream callbacks before they enter the trading system.
-Callbacks are retained across reconnects; reconnect only re-emits server-side
-subscriptions.
 """
+exchanges/coinswitch/websocket.py — CoinSwitch Futures WebSocket
+================================================================
+Production-grade Socket.IO client with auto-reconnect and
+full auto-resubscription after reconnect. Callbacks survive
+every reconnect cycle; no data blindness after disconnect.
+
+Normalises all incoming data to canonical dicts before delivery:
+  orderbook → {"bids": [[p,q],...], "asks": [[p,q],...], "timestamp": float}
+  trade     → {"price": f, "quantity": f, "side": "buy"|"sell", "timestamp": f}
+  candle    → {"t": ms, "o": f, "h": f, "l": f, "c": f, "v": f, "x": bool, "i": str}
+"""
+
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 import socketio
+from datetime import datetime
+
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 logger = logging.getLogger(__name__)
 
 
 class CoinSwitchWebSocket:
-    BASE_URL = "https://ws.coinswitch.co"
-    HANDSHAKE_PATH = "/pro/realtime-rates-socket/futures/exchange_2"
-    NAMESPACE = "/exchange_2"
+    """Production-grade Socket.IO WebSocket for CoinSwitch Pro Futures."""
 
-    _EV_ORDERBOOK = "FETCH_ORDER_BOOK_CS_PRO"
-    _EV_CANDLESTICK = "FETCH_CANDLESTICK_CS_PRO"
-    _EV_TRADES = "FETCH_TRADES_CS_PRO"
+    BASE_URL       = "https://ws.coinswitch.co"
+    HANDSHAKE_PATH = "/pro/realtime-rates-socket/futures/exchange_2"
+    NAMESPACE      = "/exchange_2"
+
+    _EV_ORDERBOOK    = "FETCH_ORDER_BOOK_CS_PRO"
+    _EV_CANDLESTICK  = "FETCH_CANDLESTICK_CS_PRO"
+    _EV_TRADES       = "FETCH_TRADES_CS_PRO"
+    _EV_TICKER       = "FETCH_TICKER_INFO_CS_PRO"
 
     def __init__(self) -> None:
         self.sio = socketio.Client(
@@ -33,39 +45,38 @@ class CoinSwitchWebSocket:
             reconnection_delay=1,
             reconnection_delay_max=30,
         )
-        self.is_connected = False
-        self._last_message_time: Optional[datetime] = None
-        self._lock = threading.RLock()
-        self._subs_lock = threading.RLock()
-        self._ob_callbacks: List[Callable] = []
-        self._tr_callbacks: List[Callable] = []
-        self._can_callbacks: Dict[str, List[Callable]] = {}
-        self._subs: Dict[str, list] = {"orderbook": [], "trades": [], "candlestick": []}
-        self._setup_handlers()
 
-    @staticmethod
-    def _norm_levels(raw) -> list:
-        out = []
-        for lvl in raw or []:
-            try:
-                if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
-                    px, qty = float(lvl[0]), float(lvl[1])
-                elif isinstance(lvl, dict):
-                    px = float(lvl.get("limit_price") or lvl.get("price") or lvl.get("p") or 0)
-                    qty = float(lvl.get("size") or lvl.get("quantity") or lvl.get("q") or lvl.get("depth") or 0)
-                else:
-                    continue
-                if px > 0:
-                    out.append([px, max(qty, 0.0)])
-            except Exception:
-                continue
-        return out
+        self.is_connected          = False
+        self._stop_event           = threading.Event()
+        self._last_message_time:   Optional[datetime] = None
+        self._connection_failures  = 0
+
+        # Callback lists — interval-keyed for candles
+        self._lock                           = threading.RLock()
+        self._ob_callbacks:  List[Callable]  = []
+        self._tr_callbacks:  List[Callable]  = []
+        self._can_callbacks: Dict[str, List[Callable]] = {}
+
+        # Persistent subscription registry for auto-resubscribe
+        self._subs_lock = threading.RLock()
+        self._subs: Dict[str, list] = {
+            "orderbook":    [],
+            "candlestick":  [],
+            "trades":       [],
+        }
+
+        self._setup_handlers()
+        logger.info("CoinSwitchWebSocket initialised")
+
+    # ── Internal: event handlers ──────────────────────────────────────────────
 
     def _setup_handlers(self) -> None:
+
         @self.sio.event(namespace=self.NAMESPACE)
         def connect():
             self.is_connected = True
-            self._last_message_time = datetime.now(timezone.utc)
+            self._connection_failures = 0
+            self._last_message_time = datetime.now()
             logger.info("CoinSwitch WS connected")
             self._resubscribe_all()
 
@@ -76,60 +87,73 @@ class CoinSwitchWebSocket:
 
         @self.sio.event(namespace=self.NAMESPACE)
         def connect_error(data):
-            logger.error("CoinSwitch WS connect_error: %s", data)
+            self._connection_failures += 1
+            logger.error(f"CoinSwitch WS connect_error (#{self._connection_failures}): {data}")
 
         @self.sio.on(self._EV_ORDERBOOK, namespace=self.NAMESPACE)
         def on_orderbook(data):
             try:
+                self._last_message_time = datetime.now()
                 if not isinstance(data, dict):
                     return
-                self._last_message_time = datetime.now(timezone.utc)
-                msg = {
-                    "bids": self._norm_levels(data.get("bids", data.get("b", []))),
-                    "asks": self._norm_levels(data.get("asks", data.get("a", []))),
+                bids = data.get("bids", data.get("b", []))
+                asks = data.get("asks", data.get("a", []))
+                if not bids and not asks:
+                    return
+                normalised = {
+                    "bids":      bids,
+                    "asks":      asks,
                     "timestamp": time.time(),
                 }
-                if not msg["bids"] and not msg["asks"]:
-                    return
                 with self._lock:
-                    callbacks = list(self._ob_callbacks)
-                for cb in callbacks:
-                    try: cb(msg)
-                    except Exception as exc: logger.error("CoinSwitch OB callback error: %s", exc)
-            except Exception as exc:
-                logger.error("CoinSwitch OB handler error: %s", exc)
+                    cbs = list(self._ob_callbacks)
+                for cb in cbs:
+                    try:
+                        cb(normalised)
+                    except Exception as e:
+                        logger.error(f"OB callback error: {e}")
+            except Exception as e:
+                logger.error(f"OB handler error: {e}")
 
         @self.sio.on(self._EV_TRADES, namespace=self.NAMESPACE)
         def on_trade(data):
             try:
-                if not isinstance(data, dict):
+                self._last_message_time = datetime.now()
+                if not isinstance(data, dict) or "p" not in data:
                     return
-                self._last_message_time = datetime.now(timezone.utc)
-                px = float(data.get("price") or data.get("p") or 0)
-                qty = float(data.get("quantity") or data.get("q") or data.get("size") or 0)
-                if px <= 0:
-                    return
-                side_raw = str(data.get("side") or "").lower()
-                side = "buy" if side_raw == "buy" else "sell" if side_raw == "sell" else ("sell" if data.get("m") else "buy")
-                msg = {"price": px, "quantity": max(qty, 0.0), "side": side, "timestamp": time.time()}
+                normalised = {
+                    "price":     float(data["p"]),
+                    "quantity":  float(data.get("q", 0)),
+                    "side":      "sell" if data.get("m") else "buy",
+                    "timestamp": time.time(),
+                }
                 with self._lock:
-                    callbacks = list(self._tr_callbacks)
-                for cb in callbacks:
-                    try: cb(msg)
-                    except Exception as exc: logger.error("CoinSwitch trade callback error: %s", exc)
-            except Exception as exc:
-                logger.error("CoinSwitch trade handler error: %s", exc)
+                    cbs = list(self._tr_callbacks)
+                for cb in cbs:
+                    try:
+                        cb(normalised)
+                    except Exception as e:
+                        logger.error(f"Trade callback error: {e}")
+            except Exception as e:
+                logger.error(f"Trade handler error: {e}")
 
         @self.sio.on(self._EV_CANDLESTICK, namespace=self.NAMESPACE)
         def on_candle(data):
             try:
-                if not isinstance(data, dict) or "success" in data:
+                self._last_message_time = datetime.now()
+                if not isinstance(data, dict):
+                    return
+                if "success" in data:   # subscription confirmation
                     return
                 if "o" not in data or "t" not in data:
                     return
-                self._last_message_time = datetime.now(timezone.utc)
                 interval_key = str(data.get("i", ""))
-                msg = {
+                with self._lock:
+                    cbs = list(self._can_callbacks.get(interval_key, []))
+                if not cbs:
+                    return
+                # Normalise to canonical candle dict
+                normalised = {
                     "t": int(data["t"]),
                     "o": float(data.get("o", 0)),
                     "h": float(data.get("h", 0)),
@@ -139,27 +163,85 @@ class CoinSwitchWebSocket:
                     "x": bool(data.get("x", False)),
                     "i": interval_key,
                 }
-                with self._lock:
-                    callbacks = list(self._can_callbacks.get(interval_key, []))
-                for cb in callbacks:
-                    try: cb(msg)
-                    except Exception as exc: logger.error("CoinSwitch candle callback error: %s", exc)
-            except Exception as exc:
-                logger.error("CoinSwitch candle handler error: %s", exc)
+                for cb in cbs:
+                    try:
+                        cb(normalised)
+                    except Exception as e:
+                        logger.error(f"Candle callback error (i={interval_key}): {e}")
+            except Exception as e:
+                logger.error(f"Candle handler error: {e}")
 
     def _resubscribe_all(self) -> None:
+        """
+        Re-register all subscriptions after a reconnect.
+
+        BUG-CS-WS-1 FIX — lock ordering:
+          Previously this method acquired (_subs_lock → _lock) while the
+          public subscribe_* methods acquire (_lock → _subs_lock). That is
+          a classic AB-BA deadlock. Fix: ALL paths that touch both locks
+          must use the same order. We standardise on (_lock → _subs_lock)
+          everywhere; _resubscribe_all now follows that order.
+
+        BUG-CS-WS-2 FIX — don't wipe callbacks:
+          The old code cleared _ob_callbacks / _tr_callbacks / _can_callbacks
+          completely before re-adding only those recorded in _subs. That
+          briefly exposed an empty-callback state to in-flight handlers,
+          and silently dropped any subscription recorded outside _subs.
+          New behaviour: re-emit the subscription requests; leave the
+          callback registry untouched. The callbacks themselves survive
+          reconnect because they live in the Python object — only the
+          server-side subscription needs to be re-established.
+        """
+        # Snapshot subs atomically so we emit without holding the lock
+        # (socket.io emit can block; holding locks around it is dangerous).
         with self._lock:
             with self._subs_lock:
-                subs = {k: list(v) for k, v in self._subs.items()}
-        for sub in subs["orderbook"]:
-            self.sio.emit(self._EV_ORDERBOOK, {"event": "subscribe", "pair": sub["pair"]}, namespace=self.NAMESPACE)
-        for sub in subs["trades"]:
-            self.sio.emit(self._EV_TRADES, {"event": "subscribe", "pair": sub["pair"]}, namespace=self.NAMESPACE)
-        for sub in subs["candlestick"]:
-            self.sio.emit(self._EV_CANDLESTICK, {"event": "subscribe", "pair": sub["pair"]}, namespace=self.NAMESPACE)
+                ob_subs  = list(self._subs["orderbook"])
+                cd_subs  = list(self._subs["candlestick"])
+                tr_subs  = list(self._subs["trades"])
+
+        logger.info(
+            f"CoinSwitch WS: resubscribing "
+            f"{len(ob_subs)} OB, {len(cd_subs)} candles, {len(tr_subs)} trades"
+        )
+
+        for sub in ob_subs:
+            try:
+                self.sio.emit(
+                    self._EV_ORDERBOOK,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe OB {sub.get('pair')}: {e}")
+
+        for sub in cd_subs:
+            try:
+                self.sio.emit(
+                    self._EV_CANDLESTICK,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe candle {sub.get('pair')}: {e}")
+
+        for sub in tr_subs:
+            try:
+                self.sio.emit(
+                    self._EV_TRADES,
+                    {"event": "subscribe", "pair": sub["pair"]},
+                    namespace=self.NAMESPACE,
+                )
+            except Exception as e:
+                logger.error(f"Resubscribe trades {sub.get('pair')}: {e}")
+
+        logger.info("CoinSwitch WS: resubscription requests sent")
+
+    # ── Public interface ──────────────────────────────────────────────────────
 
     def connect(self, timeout: int = 30) -> bool:
         try:
+            logger.info(f"CoinSwitch WS: connecting to {self.BASE_URL}...")
             self.sio.connect(
                 url=self.BASE_URL,
                 namespaces=[self.NAMESPACE],
@@ -169,56 +251,59 @@ class CoinSwitchWebSocket:
                 wait_timeout=timeout,
             )
             return self.is_connected
-        except Exception as exc:
-            logger.error("CoinSwitch WS connect error: %s", exc, exc_info=True)
+        except Exception as e:
+            logger.error(f"CoinSwitch WS connect error: {e}", exc_info=True)
             return False
 
     def disconnect(self) -> None:
         try:
+            self._stop_event.set()
             if self.sio.connected:
                 self.sio.disconnect()
-        finally:
-            self.is_connected = False
+        except Exception as e:
+            logger.error(f"CoinSwitch WS disconnect error: {e}")
 
     def is_healthy(self, timeout_seconds: int = 35) -> bool:
         if not self.is_connected:
             return False
         if self._last_message_time is None:
             return True
-        return (datetime.now(timezone.utc) - self._last_message_time).total_seconds() <= timeout_seconds
+        delta = (datetime.now() - self._last_message_time).total_seconds()
+        return delta < timeout_seconds
 
-    def subscribe_orderbook(self, symbol: str, callback: Callable, depth: int = 20) -> None:
-        pair = str(symbol).upper()
+    def subscribe_orderbook(self, symbol: str, callback: Callable,
+                            depth: int = 20) -> None:
         with self._lock:
-            self._ob_callbacks.append(callback)
-            with self._subs_lock:
-                if not any(s.get("pair") == pair for s in self._subs["orderbook"]):
-                    self._subs["orderbook"].append({"pair": pair})
-        if self.is_connected:
-            self.sio.emit(self._EV_ORDERBOOK, {"event": "subscribe", "pair": pair}, namespace=self.NAMESPACE)
+            if callback not in self._ob_callbacks:
+                self._ob_callbacks.append(callback)
+        with self._subs_lock:
+            if not any(s["pair"] == symbol for s in self._subs["orderbook"]):
+                self._subs["orderbook"].append({"pair": symbol, "callback": callback})
+        self.sio.emit(self._EV_ORDERBOOK, {"event": "subscribe", "pair": symbol},
+                      namespace=self.NAMESPACE)
 
     def subscribe_trades(self, symbol: str, callback: Callable) -> None:
-        pair = str(symbol).upper()
         with self._lock:
-            self._tr_callbacks.append(callback)
-            with self._subs_lock:
-                if not any(s.get("pair") == pair for s in self._subs["trades"]):
-                    self._subs["trades"].append({"pair": pair})
-        if self.is_connected:
-            self.sio.emit(self._EV_TRADES, {"event": "subscribe", "pair": pair}, namespace=self.NAMESPACE)
+            if callback not in self._tr_callbacks:
+                self._tr_callbacks.append(callback)
+        with self._subs_lock:
+            if not any(s["pair"] == symbol for s in self._subs["trades"]):
+                self._subs["trades"].append({"pair": symbol, "callback": callback})
+        self.sio.emit(self._EV_TRADES, {"event": "subscribe", "pair": symbol},
+                      namespace=self.NAMESPACE)
 
-    def subscribe_candlestick(self, symbol: str, interval: int, callback: Callable) -> None:
-        pair = str(symbol).upper()
-        interval_key = str(interval)
+    def subscribe_candlestick(self, symbol: str, interval: int,
+                              callback: Callable) -> None:
+        pair = f"{symbol}_{interval}"
+        ikey = str(interval)
         with self._lock:
-            self._can_callbacks.setdefault(interval_key, []).append(callback)
-            with self._subs_lock:
-                marker = {"pair": pair, "interval": interval_key}
-                if marker not in self._subs["candlestick"]:
-                    self._subs["candlestick"].append(marker)
-        if self.is_connected:
-            self.sio.emit(self._EV_CANDLESTICK, {"event": "subscribe", "pair": pair}, namespace=self.NAMESPACE)
-
-    # Abstract-interface alias.
-    def subscribe_candles(self, symbol: str, interval: int, callback: Callable) -> None:
-        self.subscribe_candlestick(symbol, interval, callback)
+            self._can_callbacks.setdefault(ikey, [])
+            if callback not in self._can_callbacks[ikey]:
+                self._can_callbacks[ikey].append(callback)
+        with self._subs_lock:
+            if not any(s["pair"] == pair for s in self._subs["candlestick"]):
+                self._subs["candlestick"].append({
+                    "pair": pair, "interval": interval, "callback": callback
+                })
+        self.sio.emit(self._EV_CANDLESTICK, {"event": "subscribe", "pair": pair},
+                      namespace=self.NAMESPACE)

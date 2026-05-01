@@ -1,1 +1,1 @@
-"""CoinSwitch exchange adapter package."""
+"""Local package marker for the institutional quant bot."""

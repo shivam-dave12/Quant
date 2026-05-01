@@ -18,8 +18,8 @@ WHY REWRITE:
 
 INSTITUTIONAL CONVICTION MODEL v3.1:
 
-  HARD INSTITUTIONAL VETOES plus weighted factor scoring.
-  Poor values reduce the score; missing structure or sub-minimum product blocks.
+  DYNAMIC INSTITUTIONAL ATTRIBUTION plus weighted factor scoring.
+  Poor values reduce score and size attribution; only account safety can block routing.
 
   WEIGHTED FACTORS (scored 0-1, weighted sum must pass threshold):
     1. Pool significance quality        0.20
@@ -115,7 +115,7 @@ _TF_RANK: Dict[str, int] = {
 }
 
 # ── Session quality ───────────────────────────────────────────────────────────
-# No session is hard-blocked here. Crypto markets run 24/7; liquidity hunts,
+# No session is alpha-vetoed here. Crypto markets run 24/7; liquidity hunts,
 # AMD cycles, HTF structure, displacement, and CISD are all equally valid on
 # a Saturday or during Asia/off-hours. What changes is the absence of a named
 # (London open / NY open).  We model that as a moderate score reduction rather
@@ -133,7 +133,7 @@ _SESSION_SCORE: Dict[str, float] = {
 }
 
 # ── AMD phase scores ──────────────────────────────────────────────────────────
-# All phases scored, none hard-blocked. ACCUMULATION = 0.40 (low but allowed
+# All phases scored, none alpha-vetoed. ACCUMULATION = 0.40 (low but allowed
 # because AMD phase detection lags actual sweeps).
 _AMD_PHASE_SCORE: Dict[str, float] = {
     "MANIPULATION":   1.00,   # The sweep — prime entry zone
@@ -170,7 +170,7 @@ class ConvictionResult:
     rr_ratio:          float              = 0.0
     pool_tf:           str                = ""
     pool_sig:          float              = 0.0
-    blocked_by_timing: bool               = False
+    paced_by_timing: bool               = False
 
 
 @dataclass
@@ -233,9 +233,9 @@ class ConvictionFilter:
         Evaluate advisory/safety attribution for a potential entry.
 
         Architecture:
-          1. Hard mandatory gates (any fail = immediate rejection)
-          2. Factor scoring (always runs, produces real score)
-          3. Session timing gates (checked last so score is always populated)
+          1. Mechanical account/risk circuit checks only
+          2. Factor scoring always runs and produces attribution
+          3. Weak quality degrades score/size; it does not alpha-veto
 
         sweep_wick_price (FIX-OTE-REVERSAL): The wick extreme of the sweep candle.
           For reversal entries this is the correct Fibonacci anchor for OTE scoring.
@@ -259,31 +259,32 @@ class ConvictionFilter:
         dr_long_max_pd, dr_short_min_pd = profile.dealing_range_bounds(
             DR_LONG_MAX_PD, DR_SHORT_MIN_PD)
 
-        hard_rejects: List[str] = []
+        quality_flags: List[str] = []
         allows:  List[str] = []
         allows.append(f"MARKET_PROFILE={profile.compact()}")
 
         # ══════════════════════════════════════════════════════════════════
-        # SESSION TIMING GATE — checked FIRST so that blocked_by_timing is
+        # SESSION / ACCOUNT PACING LENS — checked FIRST so that paced_by_timing is
         # never conflated with a real factor-score failure.  The score field
-        # is 0.0 on timing blocks (no factor scoring ran), which makes
+        # is 0.0 on timing/account pauses (no factor scoring ran), which makes
         # Telegram alerts unambiguous: score=0.00 + INTERVAL reason = pacing,
         # not an ICT quality failure.
         # Bug #22 fix: previously this ran AFTER factor scoring, so the alert
-        # showed e.g. score=0.78 with a timing-block reason — operators read
-        # that as "high-quality trade was blocked" when the real cause was the
+        # showed e.g. score=0.78 with a timing/account reason — operators read
+        # that as "high-quality trade was mechanically paused" when the real cause was the
         # 300s pacing interval.
         # ══════════════════════════════════════════════════════════════════
         timing_block = self._check_session_limits(now, session, live_balance=live_balance)
+        timing_safety_block = False
         if timing_block:
             logger.debug(
-                f"ConvictionFilter TIMING_BLOCK (pre-score): {timing_block}")
-            return ConvictionResult(
-                allowed=False, score=0.0, factors=factors,
-                reject_reasons=[timing_block],
-                allow_reasons=[], rr_ratio=0.0,
-                pool_tf="", pool_sig=0.0,
-                blocked_by_timing=True)
+                f"ConvictionFilter timing/risk advisory: {timing_block}")
+            rejects.append(timing_block)
+            allows.append(f"TIMING_OR_RISK_ADVISORY={timing_block}")
+            _tb_u = timing_block.upper()
+            timing_safety_block = any(tok in _tb_u for tok in (
+                "CIRCUIT_BREAKER", "DRAWDOWN", "LOSS LIMIT", "HALT", "KILL"
+            ))
 
         # ── Extract pool info ──────────────────────────────────────────────
         pool_price, pool_tf, pool_sig, pool_htf_count = \
@@ -310,30 +311,30 @@ class ConvictionFilter:
         _is_reversal_type = "reversal" in entry_type_l
 
         # ══════════════════════════════════════════════════════════════════
-        # MANDATORY HARD GATES — any failure = immediate rejection
+        # DYNAMIC QUALITY ATTRIBUTION — no alpha alpha vetoes
         # ══════════════════════════════════════════════════════════════════
 
-        # ── GATE 1: Pool timeframe — hard minimum plus attribution score ────
+        # ── LENS 1: Pool timeframe — dynamic attribution score ────
         # Pool TF rank feeds directly into _rank_bonus in Factor 1 scoring:
         #   rank 1 (1m) → _rank_bonus = 0.25   (very low contribution)
         #   rank 2 (5m) → _rank_bonus = 0.50   (moderate)
         #   rank 3 (15m)→ _rank_bonus = 0.75   (good)
         #   rank 4 (1h+)→ _rank_bonus = 1.00   (excellent)
-        # Low-rank pools are hard vetoed, while still scored for attribution.
+        # Low-rank pools are scored/penalised for attribution; not an alpha veto.
         if effective_rank < pool_min_tf_rank:
-            hard_rejects.append(
+            quality_flags.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) "
                 f"rank={effective_rank} < required {pool_min_tf_rank}")
             rejects.append(
                 f"POOL_TF_LOW: {pool_tf}(htfx{pool_htf_count}) rank={effective_rank} "
-                f"— hard institutional veto; scored for attribution")
+                f"— dynamic quality penalty; scored for attribution")
             # Falls through to factor scoring.
 
-# ── GATE 2: Dealing range — score factor plus data-availability veto ──
+# ── LENS 2: Dealing range — continuous score factor ──
         # The dealing range P/D position is incorporated as a score factor, and
-        # missing structural range data is an institutional hard veto:
+        # missing structural range data is penalised and logged:
         #
-        #   For APPROACH entries:  discount = good zone to buy (score bonus)
+        #   For APPROACH entries: discount = good zone to buy (score bonus)
         #   For REVERSAL entries:  premium SSL sweep = false move down, LONG is correct
         #                          (dealing range gate is irrelevant / inverted)
         #   For CONTINUATION:      scoring reflects the directional bias naturally
@@ -343,7 +344,7 @@ class ConvictionFilter:
         dr_pd, dr_data_available = self._get_dealing_range_pd(
             price, ict_engine, liq_snapshot)
         if not dr_data_available:
-            hard_rejects.append("DEALING_RANGE_MISSING: no structural P/D range")
+            quality_flags.append("DEALING_RANGE_MISSING: no structural P/D range")
             logger.debug(
                 "DEALING_RANGE: no structural data yet — scoring with neutral 0.50")
         _pd_label = ("PREMIUM" if dr_pd > 0.60 else
@@ -352,10 +353,10 @@ class ConvictionFilter:
             f"DEALING_RANGE: {_pd_label}({dr_pd:.2f}) {entry_type} — data-driven scoring only")
         factors.dealing_range_ok = dr_data_available
 
-        # ── GATE 3: R:R — score modifier plus hard minimum ─────────
-        # R:R below minimum vetoes the trade and reduces the pool_sig_score.
+        # ── LENS 3: R:R — score modifier and expectancy attribution ─────────
+        # R:R below reference reduces the pool_sig_score.
         # Rationale: attribution still records low-R:R quality, but live
-        # execution requires both structural confirmation and minimum expectancy.
+        # exposure should scale with structural confirmation and expectancy.
         #
         # R:R score modifier applied to pool_sig_score (aligned with min_rr=1.2):
         #   R:R >= 2.5  → +0.10 bonus
@@ -368,38 +369,37 @@ class ConvictionFilter:
                   -0.10 if rr >= 0.8 else
                   -0.20)
         if rr < 0.8:
-            hard_rejects.append(f"RR_HARD: {rr:.2f} < {min_rr:.1f}")
+            quality_flags.append(f"RR_LOW_EXPECTANCY: {rr:.2f} < {min_rr:.1f}")
             rejects.append(f"RR_VERY_LOW: {rr:.2f} — score penalty applied")
         elif rr < min_rr:
-            hard_rejects.append(f"RR_HARD: {rr:.2f} < {min_rr:.1f}")
+            quality_flags.append(f"RR_LOW_EXPECTANCY: {rr:.2f} < {min_rr:.1f}")
             rejects.append(f"RR_LOW: {rr:.2f} < {min_rr:.1f} — minor score penalty")
 
-# ── GATE 4: Session scoring (fully data-driven — NO hard block) ────
-        # All sessions are scored, none are hard-blocked.
+# ── GATE 4: Session scoring (fully data-driven — NO mechanical guard) ────
+        # All sessions are scored, none are alpha-vetoed.
         # ASIA: 0.60, OFF_HOURS: 0.75, WEEKEND: 0.80, LONDON/NY: 1.00.
         sess_key = self._resolve_session(session, ict_engine)
 
-        # ── GATE 5: AMD phase — fully data-driven (NO hard block) ──────────
+        # ── GATE 5: AMD phase — fully data-driven (NO mechanical guard) ──────────
         # AMD=ACCUMULATION receives an amd_score near 0.00 in _score_amd(),
-        # making it nearly impossible to clear the overall conviction threshold.
-        # No phase is ever unconditionally vetoed — the score gates the trade.
+        # making it a weak attribution input unless live sweep evidence is strong.
+        # No phase is ever unconditionally vetoed; the score informs exposure.
         # Exceptional displacement + CISD + OTE can still clear the bar even
         # during ACCUMULATION (e.g. AMD phase lag during a live sweep).
         amd_phase = self._get_amd_phase(ict_engine)
-        # No hard block. amd_phase is passed to _score_amd() below.
+        # No mechanical guard. amd_phase is passed to _score_amd() below.
         
-        # ── Gate 6: Approach entries — hard veto until sweep confirmation ─────
+        # ── Gate 6: Approach entries — dynamic penalty until sweep confirmation ─────
         # Approach entries score very low on displacement (0.20) and CISD (0.10)
         # because no sweep/wick/structural confirmation exists yet. The resulting
-        # score is retained for attribution, but live execution is vetoed until
-        # sweep confirmation exists.
+        # score is retained for attribution, but live execution is controlled by posterior/EV and sizing.
         if is_approach:
-            hard_rejects.append("APPROACH_HARD: pre-sweep setup is not executable")
+            quality_flags.append("APPROACH_PRE_SWEEP: pre-sweep setup is not executable")
             rejects.append("APPROACH: pre-sweep — expect very low displacement/CISD scores")
             # Falls through to factor scoring (no early return).
 
         if _is_reversal_type and sweep_wick_price <= 0:
-            hard_rejects.append("REVERSAL_WICK_MISSING: cannot anchor OTE to sweep wick")
+            quality_flags.append("REVERSAL_WICK_MISSING: cannot anchor OTE to sweep wick")
 
         _requires_measured_displacement = (
             _is_reversal_type
@@ -407,7 +407,7 @@ class ConvictionFilter:
             or "displacement" in entry_type_l
         )
         if _requires_measured_displacement and measured_displacement_atr <= 0:
-            hard_rejects.append(
+            quality_flags.append(
                 "DISPLACEMENT_MISSING: no measured post-sweep displacement")
 
         # ══════════════════════════════════════════════════════════════════
@@ -483,16 +483,15 @@ class ConvictionFilter:
         else:
             allows.append(f"OTE={factors.ote_score:.2f} DR={_pd_label}({dr_pd:.2f})")
 
-        # ── Institutional hard product gates ──────────────────────────────
+        # ── Institutional product quality penalties ───────────────────────
         # R:R and pool quality are not enough. Live execution needs proof that
         # auction delivery changed: real displacement plus either CISD, OTE
-        # retest, or exceptional displacement. This removes retail entries that
-        # chase the first post-sweep push with DISP≈0 and no accepted structure.
+        # retest, or exceptional displacement. This penalises low-quality first-push chases with DISP≈0 and no accepted structure.
         _entry_disp_min = disp_body_atr
         _entry_strong_disp = max(disp_body_atr * 1.45, 1.20)
         if _requires_measured_displacement and measured_displacement_atr < _entry_disp_min:
-            hard_rejects.append(
-                f"DISPLACEMENT_HARD: {measured_displacement_atr:.2f}ATR < {_entry_disp_min:.2f}ATR")
+            quality_flags.append(
+                f"DISPLACEMENT_WEAK_DYNAMIC: {measured_displacement_atr:.2f}ATR < {_entry_disp_min:.2f}ATR")
         if _requires_measured_displacement:
             _has_delivery_proof = (
                 factors.cisd_score >= 0.60 or
@@ -500,29 +499,33 @@ class ConvictionFilter:
                 measured_displacement_atr >= _entry_strong_disp
             )
             if not _has_delivery_proof:
-                hard_rejects.append(
+                quality_flags.append(
                     "DELIVERY_PROOF_MISSING: need CISD, OTE/retest, or strong displacement")
 
         if "continuation" in entry_type_l:
             if factors.cisd_score < 0.60 and measured_displacement_atr < _entry_strong_disp:
-                hard_rejects.append(
+                quality_flags.append(
                     "CONTINUATION_PROOF_MISSING: continuation needs BOS/CISD or strong acceptance")
 
         if dr_data_available:
             if trade_side == "long" and dr_pd > dr_long_max_pd and measured_displacement_atr < _entry_strong_disp:
-                hard_rejects.append(f"DR_HARD: long at premium PD={dr_pd:.2f}")
+                quality_flags.append(f"DR_CONTRA_DYNAMIC: long at premium PD={dr_pd:.2f}")
             if trade_side == "short" and dr_pd < dr_short_min_pd and measured_displacement_atr < _entry_strong_disp:
-                hard_rejects.append(f"DR_HARD: short at discount PD={dr_pd:.2f}")
+                quality_flags.append(f"DR_CONTRA_DYNAMIC: short at discount PD={dr_pd:.2f}")
 
+        # Score AMD before using it in product-quality attribution. Earlier
+        # builds checked the default 0.0 here and produced false AMD penalties.
+        factors.amd_score = self._score_amd(trade_side, ict_engine)
         if factors.amd_score < 0.18 and measured_displacement_atr < _entry_strong_disp:
-            hard_rejects.append(f"AMD_HARD: contra/unclear AMD score={factors.amd_score:.2f}")
+            quality_flags.append(f"AMD_CONTRA_DYNAMIC: contra/unclear AMD score={factors.amd_score:.2f}")
 
         # ── Factor 5: Session quality (weight 0.10) ───────────────────────
         factors.session_score = _SESSION_SCORE.get(sess_key, 0.40)
         allows.append(f"SESSION={sess_key}({factors.session_score:.2f})")
 
         # ── Factor 6: AMD alignment (weight 0.05) ─────────────────────────
-        factors.amd_score = self._score_amd(trade_side, ict_engine)
+        if factors.amd_score <= 0.0:
+            factors.amd_score = self._score_amd(trade_side, ict_engine)
         if factors.amd_score >= 0.80:
             allows.append(f"AMD={factors.amd_score:.2f}✅")
 
@@ -537,7 +540,7 @@ class ConvictionFilter:
         )
         score = round(score, 4)
 
-        # ── Score gate ─────────────────────────────────────────────────────
+        # ── Score reference ─────────────────────────────────────────────────────
         score_passed = score >= required_score
         core_product = min(
             factors.pool_sig_score,
@@ -561,17 +564,29 @@ class ConvictionFilter:
                 f"sess={factors.session_score:.2f} "
                 f"amd={factors.amd_score:.2f}]")
 
-        # ── Final decision ─────────────────────────────────────────────────
-        if hard_rejects:
-            rejects.extend(hard_rejects)
-        allowed = score_passed and product_passed and not hard_rejects
+        # ── Final advisory/exposure decision ──────────────────────────────────────────
+        # ConvictionFilter is an attribution/sizing lens, not an alpha veto.
+        # Score/product/quality failures are surfaced as diagnostics. Only
+        # explicit account/session circuit-breaker conditions remain non-routable.
+        if quality_flags:
+            rejects.extend(quality_flags)
+
+        safety_reason_blob = " | ".join(rejects).upper()
+        safety_block = timing_safety_block or any(tok in safety_reason_blob for tok in (
+            "CIRCUIT_BREAKER", "DRAWDOWN_CIRCUIT", "LOSS LIMIT", "KILL", "HALT"
+        ))
+        allowed = not safety_block
         if allowed:
             logger.debug(
-                f"Conviction gate PASS ({score:.3f}) | {' | '.join(allows[:5])}")
+                f"Conviction advisory PASS ({score:.3f}) | {' | '.join(allows[:5])}")
+        else:
+            logger.info(
+                f"Conviction safety circuit active ({score:.3f}) | {' | '.join(rejects[:3])}")
         return ConvictionResult(
             allowed=allowed, score=score, factors=factors,
             reject_reasons=rejects, allow_reasons=allows,
-            rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig)
+            rr_ratio=rr, pool_tf=pool_tf, pool_sig=pool_sig,
+            paced_by_timing=bool(timing_block))
 
     # ─────────────────────────────────────────────────────────────────────
     # SESSION MANAGEMENT
@@ -746,11 +761,11 @@ class ConvictionFilter:
 
         Returns (pd, data_available) where data_available=False means the 0.50
         value is a pure fallback (no structural data) and the caller MUST skip
-        GATE 2 rather than hard-blocking both directions simultaneously.
+        P/D directional attribution rather than alpha-vetoing both directions simultaneously.
 
         Bug #13 fix: the previous version returned bare 0.50 when data was absent,
-        causing GATE 2 to block ALL entries at startup (0.50 > 0.45 → LONG blocked;
-        0.50 < 0.55 → SHORT blocked).  The equilibrium fallback is only meaningful
+        causing P/D lens to falsely penalise both directions at startup (0.50 > 0.45 → LONG penalised;
+        0.50 < 0.55 → SHORT penalised).  The equilibrium fallback is only meaningful
         when there is genuine structural data placing price at equilibrium.
         """
         # Priority 1: ICT engine dealing range (computed from multi-TF candles)
@@ -779,7 +794,7 @@ class ConvictionFilter:
                     return (price - nearest_ssl) / rng, True
 
         # No structural data available — return sentinel 0.50 with data_available=False.
-        # Caller MUST skip GATE 2 in this state.
+        # Caller MUST skip directional P/D attribution in this state.
         return 0.50, False
 
     @staticmethod
@@ -1061,7 +1076,7 @@ class ConvictionFilter:
 
         WEEKEND is checked FIRST in every source so it is never masked by a
         partial string match against NY / LONDON / ASIA. This keeps session
-        scoring accurate without turning any session label into a hard veto.
+        scoring accurate without turning any session label into a alpha veto.
         """
         sources = [session_hint]
         if ict_engine is not None:

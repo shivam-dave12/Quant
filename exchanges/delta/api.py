@@ -1,5 +1,5 @@
 """
-delta_api.py â€” Delta Exchange Futures REST API Plugin
+delta_api.py — Delta Exchange Futures REST API Plugin
 ======================================================
 Production-grade REST API client for Delta Exchange.
 
@@ -15,7 +15,7 @@ Authentication: HMAC-SHA256 over (method + timestamp + path + query + body)
 Base URL: https://api.delta.exchange (can be overridden for testnet)
 
 Drop-in replacement for futures_api.py. Keeps the same public method names
-(place_order, cancel_order, get_positions, get_balance, get_klines, â€¦)
+(place_order, cancel_order, get_positions, get_balance, get_klines, …)
 so order_manager.py, data_manager.py, and risk_manager.py need only
 minimal config changes.
 """
@@ -32,25 +32,21 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-try:
-    from dotenv import load_dotenv
-except ImportError:  # optional in hardened/test environments
-    def load_dotenv(*args, **kwargs):
-        return False
+from dotenv import load_dotenv
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 DELTA_LIVE_URL    = "https://api.india.delta.exchange"   # Delta India (delta.exchange)
 DELTA_TESTNET_URL = "https://cdn-ind.testnet.deltaex.org" # Delta India Testnet (demo.delta.exchange)
 
-# NOTE: https://api.delta.exchange is Delta GLOBAL â€” a completely separate platform
+# NOTE: https://api.delta.exchange is Delta GLOBAL — a completely separate platform
 # with separate accounts and API keys. Do NOT use that URL if your account is on
 # delta.exchange (India). Using the wrong URL will cause invalid_api_key errors.
 
@@ -59,7 +55,7 @@ _OPEN_STATUSES   = {"open", "pending"}
 _FILLED_STATUSES = {"closed", "filled"}
 _CANCELLED_STATUSES = {"cancelled"}
 
-# Candle resolution map: minutes â†’ resolution string accepted by Delta
+# Candle resolution map: minutes → resolution string accepted by Delta
 # Official Delta API resolution strings: must use "1m","5m","15m" etc (NOT "1","5","15")
 # Confirmed from API docs: /v2/history/candles?resolution=5m&symbol=BTCUSD&start=...&end=...
 _RESOLUTION_MAP: Dict[int, str] = {
@@ -78,9 +74,9 @@ _RESOLUTION_MAP: Dict[int, str] = {
 }
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _ts_s() -> int:
     """Current UTC timestamp in SECONDS (Delta Exchange requires seconds)."""
@@ -101,9 +97,9 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN CLIENT
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DeltaAPI:
     """
@@ -111,14 +107,14 @@ class DeltaAPI:
 
     Constructor
     -----------
-    api_key    : str  â€” Delta API key (or env DELTA_API_KEY)
-    secret_key : str  â€” Delta API secret (or env DELTA_SECRET_KEY)
-    testnet    : bool â€” Use testnet endpoint (default False)
-    timeout    : int  â€” HTTP request timeout seconds (default 10)
+    api_key    : str  — Delta API key (or env DELTA_API_KEY)
+    secret_key : str  — Delta API secret (or env DELTA_SECRET_KEY)
+    testnet    : bool — Use testnet endpoint (default False)
+    timeout    : int  — HTTP request timeout seconds (default 10)
 
     All public methods return a plain dict:
-      â€¢ success: {"success": True,  "result": <payload>, "error": None}
-      â€¢ failure: {"success": False, "result": None, "error": "<msg>",
+      • success: {"success": True,  "result": <payload>, "error": None}
+      • failure: {"success": False, "result": None, "error": "<msg>",
                   "status_code": <int>}
 
     The "_raw" variants return the full response dict unchanged.
@@ -129,7 +125,7 @@ class DeltaAPI:
         api_key:    Optional[str] = None,
         secret_key: Optional[str] = None,
         testnet:    bool          = False,
-        timeout:    int           = 10,  # was 30s â€” 30s Ã— retries = multi-min main-thread freeze
+        timeout:    int           = 10,  # was 30s — 30s × retries = multi-min main-thread freeze
     ):
         self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
         self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")
@@ -138,8 +134,8 @@ class DeltaAPI:
         self._session   = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
-        # Clock skew compensation (in SECONDS â€” Delta timestamps are seconds).
-        # Delta's tolerance: Â±5 seconds from server time.
+        # Clock skew compensation (in SECONDS — Delta timestamps are seconds).
+        # Delta's tolerance: ±5 seconds from server time.
         # Only needed if your system clock is badly out of sync.
         # Calibrated automatically on first expired_signature error.
         self._time_offset_s:    int  = 0
@@ -152,7 +148,7 @@ class DeltaAPI:
                 "Set DELTA_API_KEY and DELTA_SECRET_KEY in .env or pass explicitly."
             )
         logger.info(
-            f"DeltaAPI initialized â€” endpoint: {self.base_url} "
+            f"DeltaAPI initialized — endpoint: {self.base_url} "
             f"(testnet={testnet})"
         )
 
@@ -174,7 +170,7 @@ class DeltaAPI:
           method + timestamp + path + query_string + payload
 
         Where:
-          - timestamp  = str(int(time.time()))  â€” SECONDS, not milliseconds
+          - timestamp  = str(int(time.time()))  — SECONDS, not milliseconds
           - query_string includes the '?' prefix when present: '?product_id=1&state=open'
           - payload    = JSON body string for POST/DELETE, empty string for GET
 
@@ -230,13 +226,13 @@ class DeltaAPI:
                 self._time_offset_s    = offset
                 self._clock_calibrated = True
                 logger.warning(
-                    f"â±ï¸  Clock skew: local={local_s}s server={server_s}s "
-                    f"â†’ offset={offset:+d}s. "
+                    f"⏱️  Clock skew: local={local_s}s server={server_s}s "
+                    f"→ offset={offset:+d}s. "
                     f"All future signatures will subtract {offset}s from local time."
                 )
                 return True
             else:
-                logger.info(f"Clock skew {offset}s is within tolerance â€” no offset applied")
+                logger.info(f"Clock skew {offset}s is within tolerance — no offset applied")
         except Exception as e:
             logger.debug(f"Clock calibration error: {e}")
         return False
@@ -293,7 +289,7 @@ class DeltaAPI:
             )
 
             if resp.status_code == 429:
-                logger.warning("âš ï¸ Delta 429 rate limit hit â€” consider slowing down")
+                logger.warning("⚠️ Delta 429 rate limit hit — consider slowing down")
 
             try:
                 data = resp.json()
@@ -315,7 +311,7 @@ class DeltaAPI:
                     "status_code": resp.status_code,
                 }
 
-            # â”€â”€ 401 expired_signature â€” calibrate clock and retry once â”€â”€â”€â”€â”€â”€â”€
+            # ── 401 expired_signature — calibrate clock and retry once ───────
             if resp.status_code == 401 and _retry_clock:
                 err_code = ""
                 try:
@@ -325,7 +321,7 @@ class DeltaAPI:
                 if err_code == "expired_signature":
                     calibrated = self._calibrate_clock(data)
                     if calibrated:
-                        logger.info(f"Retrying {method} {path} with corrected timestampâ€¦")
+                        logger.info(f"Retrying {method} {path} with corrected timestamp…")
                         return self._request(method, path, params=params, body=body, _retry_clock=False)
 
             # HTTP error
@@ -375,10 +371,10 @@ class DeltaAPI:
 
         Delta India does not expose a dedicated /v2/time endpoint.
         Server time is read from the ticker's 'timestamp' field which is in
-        MICROSECONDS (confirmed from live data: 1773718411081120 Âµs = 1773718411 s).
+        MICROSECONDS (confirmed from live data: 1773718411081120 µs = 1773718411 s).
 
         Note: the official docs show a simplified example (1609459200) which looks
-        like seconds â€” but live data shows 16-digit values confirming microseconds.
+        like seconds — but live data shows 16-digit values confirming microseconds.
         """
         for sym in ("BTCUSD", "ETHUSD"):
             try:
@@ -417,12 +413,12 @@ class DeltaAPI:
         }
 
     def get_assets(self) -> Dict:
-        """GET /v2/assets â€” list all assets (no auth required)."""
+        """GET /v2/assets — list all assets (no auth required)."""
         return self._get("/v2/assets")
 
     def get_products(self, contract_types: Optional[List[str]] = None) -> Dict:
         """
-        GET /v2/products â€” all tradeable products.
+        GET /v2/products — all tradeable products.
 
         contract_types: e.g. ["perpetual_futures", "futures", "options"]
         """
@@ -432,16 +428,16 @@ class DeltaAPI:
         return self._get("/v2/products", params=params)
 
     def get_product(self, symbol: str) -> Dict:
-        """GET /v2/products/{symbol} â€” single product spec."""
+        """GET /v2/products/{symbol} — single product spec."""
         return self._get(f"/v2/products/{symbol}")
 
     # =========================================================================
-    # MARKET DATA â€” PUBLIC (no auth required)
+    # MARKET DATA — PUBLIC (no auth required)
     # =========================================================================
 
     def get_ticker(self, symbol: str) -> Dict:
         """
-        GET /v2/tickers/{symbol} â€” best bid/ask, last price, OI, funding rate.
+        GET /v2/tickers/{symbol} — best bid/ask, last price, OI, funding rate.
 
         Also auto-caches product_id from the response to avoid separate
         /v2/products calls in order placement.
@@ -455,7 +451,7 @@ class DeltaAPI:
         return resp
 
     def get_tickers(self, contract_types: Optional[List[str]] = None) -> Dict:
-        """GET /v2/tickers â€” all tickers optionally filtered by contract type."""
+        """GET /v2/tickers — all tickers optionally filtered by contract type."""
         params: Dict[str, Any] = {}
         if contract_types:
             params["contract_types"] = ",".join(contract_types)
@@ -463,7 +459,7 @@ class DeltaAPI:
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> Dict:
         """
-        GET /v2/l2orderbook/{symbol} â€” Level 2 orderbook.
+        GET /v2/l2orderbook/{symbol} — Level 2 orderbook.
 
         Returns normalised {"bids": [[price, size], ...], "asks": [...]}
         compatible with the rest of the bot's orderbook interface.
@@ -498,7 +494,7 @@ class DeltaAPI:
         return resp
 
     def get_recent_trades(self, symbol: str) -> Dict:
-        """GET /v2/trades/{symbol} â€” recent public trades."""
+        """GET /v2/trades/{symbol} — recent public trades."""
         return self._get(f"/v2/trades/{symbol}")
 
     def get_candles(
@@ -510,11 +506,11 @@ class DeltaAPI:
         limit:      int = 200,
     ) -> Dict:
         """
-        GET /v2/history/candles â€” OHLCV candle history.
+        GET /v2/history/candles — OHLCV candle history.
 
         resolution: candle size in minutes (1, 3, 5, 15, 30, 60, 120, 240, 360,
                     720, 1440, 10080)
-        start_time / end_time: Unix MILLISECONDS â€” this function converts to
+        start_time / end_time: Unix MILLISECONDS — this function converts to
                     seconds internally (Delta API requires seconds). Callers
                     must pass milliseconds so the interface is consistent with
                     every other timestamp in the bot.
@@ -550,7 +546,7 @@ class DeltaAPI:
         for c in raw:
             try:
                 candles.append({
-                    "t": int(c["time"]) * 1000,          # s â†’ ms
+                    "t": int(c["time"]) * 1000,          # s → ms
                     "o": _safe_float(c.get("open")),
                     "h": _safe_float(c.get("high")),
                     "l": _safe_float(c.get("low")),
@@ -564,35 +560,35 @@ class DeltaAPI:
         return resp
 
     def get_funding_rate(self, symbol: str) -> Dict:
-        """GET /v2/funding_rate/{symbol} â€” current and predicted funding rate."""
+        """GET /v2/funding_rate/{symbol} — current and predicted funding rate."""
         return self._get(f"/v2/funding_rate/{symbol}")
 
     def get_mark_price(self, symbol: str) -> Dict:
-        """GET /v2/mark_price/{symbol} â€” current mark price."""
+        """GET /v2/mark_price/{symbol} — current mark price."""
         return self._get(f"/v2/mark_price/{symbol}")
 
     def get_index_price(self, symbol: str) -> Dict:
-        """GET /v2/index_price/{symbol} â€” current index price."""
+        """GET /v2/index_price/{symbol} — current index price."""
         return self._get(f"/v2/index_price/{symbol}")
 
     def get_settlement_history(self, symbol: str, page_size: int = 50) -> Dict:
-        """GET /v2/settlement_history/{symbol} â€” historical settlements."""
+        """GET /v2/settlement_history/{symbol} — historical settlements."""
         return self._get(
             f"/v2/settlement_history/{symbol}",
             params={"page_size": page_size},
         )
 
     def get_spot_price(self, symbol: str) -> Dict:
-        """GET /v2/spot_price/{symbol} â€” underlying spot price."""
+        """GET /v2/spot_price/{symbol} — underlying spot price."""
         return self._get(f"/v2/spot_price/{symbol}")
 
     # =========================================================================
-    # ACCOUNT â€” WALLET & BALANCES
+    # ACCOUNT — WALLET & BALANCES
     # =========================================================================
 
     def get_wallet_balances(self, asset_id: Optional[int] = None) -> Dict:
         """
-        GET /v2/wallet/balances â€” all wallet balances, optionally filtered.
+        GET /v2/wallet/balances — all wallet balances, optionally filtered.
 
         Returns raw Delta response; normalised balances available via get_balance().
         """
@@ -603,7 +599,7 @@ class DeltaAPI:
 
     def get_balance(self, currency: str = "USD") -> Dict:
         """
-        Normalised balance fetch. Delta India perpetuals are USD-settled â€” use "USD" not "USDT".
+        Normalised balance fetch. Delta India perpetuals are USD-settled — use "USD" not "USDT".
 
         Returns:
             {"available": float, "locked": float, "currency": str}  on success
@@ -611,7 +607,7 @@ class DeltaAPI:
 
         NOTE: If you receive available=$0.00 and you have funds, this means
         authentication failed (clock skew or wrong credentials).
-        Check logs for â±ï¸ clock calibration messages and 401 errors.
+        Check logs for ⏱️ clock calibration messages and 401 errors.
         """
         result = {"available": 0.0, "locked": 0.0, "currency": currency}
 
@@ -624,13 +620,13 @@ class DeltaAPI:
                 err = resp.get("error", "unknown")
                 if sc == 401:
                     logger.error(
-                        f"âŒ Balance auth failed (401: {err}). "
+                        f"❌ Balance auth failed (401: {err}). "
                         f"Check DELTA_API_KEY / DELTA_SECRET_KEY and clock sync. "
                         f"Clock offset: {self._time_offset_s}s "
                         f"(calibrated={self._clock_calibrated})"
                     )
                 else:
-                    logger.error(f"âŒ Balance fetch failed ({sc}): {err}")
+                    logger.error(f"❌ Balance fetch failed ({sc}): {err}")
                 return {**result, "error": f"auth_failed: {err}"}
 
             balances = resp.get("result", [])
@@ -655,7 +651,7 @@ class DeltaAPI:
                     )
                     locked = max(0.0, total_bal - available)
                     logger.info(
-                        f"âœ… Balance {currency}: available=${available:.2f} "
+                        f"✅ Balance {currency}: available=${available:.2f} "
                         f"locked=${locked:.2f} total=${total_bal:.2f}"
                     )
                     return {
@@ -664,17 +660,17 @@ class DeltaAPI:
                         "currency":  currency,
                     }
 
-            # Currency not found in balances â€” list what we got
+            # Currency not found in balances — list what we got
             found = [
                 (b.get("asset_symbol") or b.get("currency", "?")).upper()
                 for b in balances
             ]
             logger.warning(
-                f"âš ï¸  {currency} not found in wallet balances. "
+                f"⚠️  {currency} not found in wallet balances. "
                 f"Found: {found}. "
                 f"Total balance entries: {len(balances)}"
             )
-            return {**result, "error": f"{currency} not found â€” found: {found}"}
+            return {**result, "error": f"{currency} not found — found: {found}"}
 
         except Exception as e:
             logger.error(f"Balance exception: {e}", exc_info=True)
@@ -689,7 +685,7 @@ class DeltaAPI:
         before:           Optional[str]  = None,
     ) -> Dict:
         """
-        GET /v2/wallet/transactions â€” funding, commissions, realised PnL, etc.
+        GET /v2/wallet/transactions — funding, commissions, realised PnL, etc.
 
         transaction_type options: commission, pnl, deposit, withdrawal,
                                   realized_pnl, transfer, funding, liquidation
@@ -707,7 +703,7 @@ class DeltaAPI:
 
     def get_portfolio_margin(self, body: Optional[Dict] = None) -> Dict:
         """
-        GET /v2/wallet/portfolio_margin â€” portfolio margin details.
+        GET /v2/wallet/portfolio_margin — portfolio margin details.
         Optionally pass body to simulate a new position's margin impact.
         """
         if body:
@@ -725,7 +721,7 @@ class DeltaAPI:
         state:          Optional[str] = None,
     ) -> Dict:
         """
-        GET /v2/positions/margined â€” all open margined positions.
+        GET /v2/positions/margined — all open margined positions.
 
         state: "open" | "closed"
         """
@@ -789,7 +785,7 @@ class DeltaAPI:
 
     def close_position(self, product_id: int, size: Optional[float] = None) -> Dict:
         """
-        POST /v2/positions/close â€” close an open position (whole or partial).
+        POST /v2/positions/close — close an open position (whole or partial).
         """
         body: Dict[str, Any] = {"product_id": product_id}
         if size is not None:
@@ -798,7 +794,7 @@ class DeltaAPI:
 
     def add_margin(self, product_id: int, delta_margin: float) -> Dict:
         """
-        POST /v2/positions/change_margin â€” add or reduce position margin.
+        POST /v2/positions/change_margin — add or reduce position margin.
 
         delta_margin: positive = add, negative = reduce
         """
@@ -807,7 +803,7 @@ class DeltaAPI:
 
     def set_auto_topup(self, product_id: int, enabled: bool) -> Dict:
         """
-        PUT /v2/positions/auto_topup â€” enable/disable auto margin top-up.
+        PUT /v2/positions/auto_topup — enable/disable auto margin top-up.
         """
         body = {"product_id": product_id, "auto_topup": enabled}
         return self._put("/v2/positions/auto_topup", body=body)
@@ -825,7 +821,7 @@ class DeltaAPI:
     ) -> Dict:
         """
         POST /v2/products/{product_id}/orders/leverage
-        product_id is a PATH parameter per official docs â€” NOT a body field.
+        product_id is a PATH parameter per official docs — NOT a body field.
         """
         _pid = product_id
         if _pid is None and symbol:
@@ -833,11 +829,11 @@ class DeltaAPI:
         if _pid is None:
             return {"success": False, "result": None,
                     "error": f"product_id not found for symbol={symbol}", "status_code": 0}
-        # API doc requires integer, NOT a string â€” "10" causes bad_schema error
+        # API doc requires integer, NOT a string — "10" causes bad_schema error
         return self._post(f"/v2/products/{_pid}/orders/leverage", body={"leverage": int(leverage)})
 
     def get_leverage(self, product_id: int) -> Dict:
-        """GET /v2/products/{id}/orders/leverage â€” current leverage for a product."""
+        """GET /v2/products/{id}/orders/leverage — current leverage for a product."""
         return self._get(f"/v2/products/{product_id}/orders/leverage")
 
     # =========================================================================
@@ -850,13 +846,13 @@ class DeltaAPI:
         margin_mode: str,   # "isolated" | "cross"
     ) -> Dict:
         """
-        POST /v2/products/margin_mode â€” switch between isolated and cross margin.
+        POST /v2/products/margin_mode — switch between isolated and cross margin.
         """
-        # Official docs: PUT /v2/users/margin_mode â€” no product_id in body
+        # Official docs: PUT /v2/users/margin_mode — no product_id in body
         return self._put("/v2/users/margin_mode", body={"margin_mode": margin_mode})
 
     # =========================================================================
-    # ORDERS â€” PLACE
+    # ORDERS — PLACE
     # =========================================================================
 
     def place_order(
@@ -881,7 +877,7 @@ class DeltaAPI:
         trigger_price:  Optional[float]   = None,   # alias for stop_price
         quantity:       Optional[float]   = None,   # alias for size
         price:          Optional[float]   = None,   # alias for limit_price
-        # â”€â”€ Delta stop/TP conditional order fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Delta stop/TP conditional order fields ────────────────────────────
         # stop_order_type: "stop_loss_order" | "take_profit_order"
         # When present this field is included directly in the request body.
         # Delta Exchange uses it to distinguish SL vs TP conditional orders
@@ -891,7 +887,7 @@ class DeltaAPI:
         isomorphic_slippage_check: Optional[bool] = None,
     ) -> Dict:
         """
-        POST /v2/orders â€” place a new order.
+        POST /v2/orders — place a new order.
 
         Normalised interface compatible with existing bot code.
         Returns {"success": True, "result": {"order_id": ..., ...}} on success.
@@ -936,7 +932,7 @@ class DeltaAPI:
 
         # post_only and time_in_force are ONLY valid on limit-type orders.
         # Delta returns bad_schema if either field is present on stop_market_order
-        # or take_profit_market_order â€” even with value False/"gtc".
+        # or take_profit_market_order — even with value False/"gtc".
         # stop_limit_order and take_profit_limit_order still accept both fields.
         _CONDITIONAL_MARKET_TYPES = {"stop_market_order", "take_profit_market_order"}
         if _otype not in _CONDITIONAL_MARKET_TYPES:
@@ -957,7 +953,7 @@ class DeltaAPI:
             body["trailing_stop_delta"] = str(trailing_stop_delta)
         if mmp:
             body["mmp"] = True
-        # â”€â”€ Conditional order type (stop-loss / take-profit classifier) â”€â”€â”€â”€â”€â”€
+        # ── Conditional order type (stop-loss / take-profit classifier) ──────
         # Delta Exchange uses stop_order_type to differentiate SL from TP
         # when both share order_type=market_order + stop_price.
         # Values: "stop_loss_order" | "take_profit_order"
@@ -1083,7 +1079,7 @@ class DeltaAPI:
         """
         Bracket order: entry + automatic SL + TP in one request.
 
-        Delta supports native bracket orders â€” more efficient than
+        Delta supports native bracket orders — more efficient than
         placing three separate orders.
         """
         return self.place_order(
@@ -1108,7 +1104,7 @@ class DeltaAPI:
         product_id:           Optional[int] = None,
     ) -> Dict:
         """
-        Trailing stop order â€” stop price trails by trailing_stop_delta USD.
+        Trailing stop order — stop price trails by trailing_stop_delta USD.
         """
         return self.place_order(
             symbol               = symbol,
@@ -1121,34 +1117,34 @@ class DeltaAPI:
         )
 
     # =========================================================================
-    # ORDERS â€” BATCH
+    # ORDERS — BATCH
     # =========================================================================
 
     def batch_create_orders(self, orders: List[Dict]) -> Dict:
         """
-        POST /v2/orders/batch â€” create up to 10 orders in a single request.
+        POST /v2/orders/batch — create up to 10 orders in a single request.
         Each element in `orders` is a dict matching place_order() body params.
         """
         return self._post("/v2/orders/batch", body={"orders": orders})
 
     def batch_cancel_orders(self, order_ids: List[str]) -> Dict:
-        """DELETE /v2/orders/batch â€” cancel multiple orders."""
+        """DELETE /v2/orders/batch — cancel multiple orders."""
         return self._delete("/v2/orders/batch", body={"ids": order_ids})
 
     def batch_edit_orders(self, edits: List[Dict]) -> Dict:
         """
-        PUT /v2/orders/batch â€” edit multiple orders.
+        PUT /v2/orders/batch — edit multiple orders.
         Each element: {"id": <order_id>, "limit_price": ..., "size": ...}
         """
         return self._put("/v2/orders/batch", body={"orders": edits})
 
     # =========================================================================
-    # ORDERS â€” QUERY & CANCEL
+    # ORDERS — QUERY & CANCEL
     # =========================================================================
 
     def get_order(self, order_id: str, exchange: str = "") -> Dict:
         """
-        GET /v2/orders/{id} â€” fetch a single order.
+        GET /v2/orders/{id} — fetch a single order.
 
         Compatible with existing bot interface:
             api.get_order(order_id)
@@ -1174,7 +1170,7 @@ class DeltaAPI:
         exchange:   str           = "",
     ) -> Dict:
         """
-        GET /v2/orders â€” all open orders, optionally filtered.
+        GET /v2/orders — all open orders, optionally filtered.
 
         Returns normalised list compatible with order_manager.py:
           [{"order_id": str, "type": str, "trigger_price": float, ...}, ...]
@@ -1200,7 +1196,7 @@ class DeltaAPI:
             otype_raw  = str(o.get("order_type", "")).lower()
             stop_otype = str(o.get("stop_order_type", "")).lower()
             # Bracket child orders arrive with order_type="market_order" for BOTH
-            # the SL and TP legs â€” stop_order_type is the only distinguishing field.
+            # the SL and TP legs — stop_order_type is the only distinguishing field.
             # Check it first so bracket children are correctly labelled instead of
             # both being mapped to "MARKET".
             _stop_otype_map = {
@@ -1235,10 +1231,10 @@ class DeltaAPI:
     def cancel_order(self, order_id: str, product_id: Optional[int] = None,
                      exchange: str = "") -> Dict:
         """
-        DELETE /v2/orders â€” cancel a single order.
+        DELETE /v2/orders — cancel a single order.
 
         API doc: id goes in the REQUEST BODY as "id", NOT in the URL path.
-        DELETE /v2/orders/{id} returns 404 Not Found â€” correct endpoint has no id suffix.
+        DELETE /v2/orders/{id} returns 404 Not Found — correct endpoint has no id suffix.
         product_id is required in the body per the official API schema.
 
         Body: {"id": <int>, "product_id": <int>}
@@ -1257,7 +1253,7 @@ class DeltaAPI:
         if _pid:
             body["product_id"] = int(_pid)
 
-        # Endpoint: DELETE /v2/orders (NO id suffix â€” id is in the body)
+        # Endpoint: DELETE /v2/orders (NO id suffix — id is in the body)
         return self._delete("/v2/orders", body=body)
 
     def cancel_all_orders(
@@ -1267,7 +1263,7 @@ class DeltaAPI:
         exchange:   str           = "",
     ) -> Dict:
         """
-        DELETE /v2/orders/all â€” cancel all open orders (optionally filtered).
+        DELETE /v2/orders/all — cancel all open orders (optionally filtered).
 
         Compatible with existing bot interface:
             api.cancel_all_orders(exchange=..., symbol=...)
@@ -1290,18 +1286,18 @@ class DeltaAPI:
         product_id:  Optional[int]   = None,
     ) -> Dict:
         """
-        PUT /v2/orders â€” atomically edit stop_price (and limit_price) of a stop order.
+        PUT /v2/orders — atomically edit stop_price (and limit_price) of a stop order.
 
         API doc (EditOrderRequest schema):
           {"id": <int>, "product_id": <int>, "stop_price": "56000",
            "limit_price": "55000", "size": <int>, ...}
 
         Key facts confirmed from API doc:
-          - Endpoint: PUT /v2/orders (NO id in URL â€” id goes in BODY)
+          - Endpoint: PUT /v2/orders (NO id in URL — id goes in BODY)
           - product_id REQUIRED in body (without it: bad_schema)
           - stop_price editable for stop-market AND stop-limit orders
           - limit_price editable for stop-limit orders (used together with stop_price)
-          - Atomic: no cancel+replace needed â€” no unprotected window
+          - Atomic: no cancel+replace needed — no unprotected window
 
         Used by order_manager.replace_stop_loss for trailing SL updates.
         For stop-limit trailing SLs, both stop_price and limit_price are sent together
@@ -1319,7 +1315,7 @@ class DeltaAPI:
 
         body: Dict[str, Any] = {"id": int(order_id)}   # id in BODY, not URL path
         if _pid:
-            body["product_id"] = int(_pid)              # required â€” without it: bad_schema
+            body["product_id"] = int(_pid)              # required — without it: bad_schema
         if size is not None:
             body["size"] = int(size)
         if limit_price is not None:
@@ -1349,7 +1345,7 @@ class DeltaAPI:
         after:      Optional[str] = None,
         before:     Optional[str] = None,
     ) -> Dict:
-        """GET /v2/orders/history â€” paginated order history."""
+        """GET /v2/orders/history — paginated order history."""
         params: Dict[str, Any] = {"page_size": page_size}
         if product_id:
             params["product_id"] = product_id
@@ -1369,7 +1365,7 @@ class DeltaAPI:
         product_id: Optional[int] = None,
         page_size:  int           = 50,
     ) -> Dict:
-        """GET /v2/fills â€” trade fill history."""
+        """GET /v2/fills — trade fill history."""
         params: Dict[str, Any] = {"page_size": page_size}
         if product_id:
             # API docs: parameter is 'product_ids' (plural, comma-separated)
@@ -1381,7 +1377,7 @@ class DeltaAPI:
         return self._get("/v2/fills", params=params)
 
     # =========================================================================
-    # UTILITY â€” product ID cache
+    # UTILITY — product ID cache
     # =========================================================================
 
 
@@ -1390,14 +1386,14 @@ class DeltaAPI:
         Resolve a symbol string to Delta's internal integer product_id.
 
         Strategy (fastest-first):
-          1. Cache hit â€” return immediately
-          2. Alias normalisation â€” BTCUSDT â†’ BTCUSD (Delta India perpetual naming)
-          3. Ticker shortcut â€” GET /v2/tickers/{symbol} returns product_id directly
-          4. Full product scan â€” GET /v2/products fallback
+          1. Cache hit — return immediately
+          2. Alias normalisation — BTCUSDT → BTCUSD (Delta India perpetual naming)
+          3. Ticker shortcut — GET /v2/tickers/{symbol} returns product_id directly
+          4. Full product scan — GET /v2/products fallback
 
         Results are cached in-memory for the lifetime of the instance.
         """
-        # â”€â”€ Normalise common aliases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Normalise common aliases ──────────────────────────────────────────
         _ALIASES = {
             "BTCUSDT":  "BTCUSD",
             "ETHUSDT":  "ETHUSD",
@@ -1409,24 +1405,24 @@ class DeltaAPI:
         }
         sym_upper = _ALIASES.get(symbol.upper(), symbol.upper())
 
-        # â”€â”€ Cache hit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Cache hit ─────────────────────────────────────────────────────────
         if sym_upper in self._product_id_cache:
             return self._product_id_cache[sym_upper]
         # Also check original in case it was cached under original name
         if symbol.upper() in self._product_id_cache:
             return self._product_id_cache[symbol.upper()]
 
-        # â”€â”€ Ticker shortcut (fastest â€” single REST call, returns product_id) â”€
+        # ── Ticker shortcut (fastest — single REST call, returns product_id) ─
         ticker_resp = self.get_ticker(sym_upper)
         if ticker_resp.get("success"):
             raw = ticker_resp.get("result", {})
             pid = raw.get("product_id") if isinstance(raw, dict) else None
             if pid:
                 self._product_id_cache[sym_upper] = int(pid)
-                logger.info(f"product_id resolved via ticker: {sym_upper} â†’ {pid}")
+                logger.info(f"product_id resolved via ticker: {sym_upper} → {pid}")
                 return int(pid)
 
-        # â”€â”€ Full product scan fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Full product scan fallback ────────────────────────────────────────
         resp = self.get_products()
         if not resp["success"]:
             logger.warning(f"Cannot resolve product_id for {symbol}: {resp.get('error')}")
@@ -1448,7 +1444,7 @@ class DeltaAPI:
             self._product_id_cache[p_sym]  = int(pid)
             self._product_id_cache[p_name] = int(pid)
             if p_sym == sym_upper or p_name == sym_upper:
-                logger.info(f"product_id resolved via product scan: {sym_upper} â†’ {pid}")
+                logger.info(f"product_id resolved via product scan: {sym_upper} → {pid}")
                 return int(pid)
 
         logger.warning(f"product_id not found for symbol '{symbol}' (tried as '{sym_upper}')")
@@ -1496,17 +1492,17 @@ class DeltaAPI:
         """
         ok = True
 
-        # â”€â”€ Server time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Server time ────────────────────────────────────────────────────────
         t = self.get_server_time()
         if t["success"] and t.get("result"):
             r    = t["result"]
             ts_s = r.get("server_time_s", 0)
             ts_u = r.get("server_time_us", 0)
-            logger.info(f"âœ… Server time: {ts_s}s (unix) â€” {ts_u}Âµs raw")
+            logger.info(f"✅ Server time: {ts_s}s (unix) — {ts_u}µs raw")
         else:
-            logger.warning(f"âš ï¸  Server time unavailable: {t.get('error')}")
+            logger.warning(f"⚠️  Server time unavailable: {t.get('error')}")
 
-        # â”€â”€ Ticker: public, also caches product_id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Ticker: public, also caches product_id ─────────────────────────────
         ticker = self.get_ticker(symbol)
         if ticker["success"]:
             r    = ticker.get("result") or {}   # guard against None
@@ -1515,47 +1511,47 @@ class DeltaAPI:
             cval = r.get("contract_value", "?")
             tick = r.get("tick_size", "?")
             logger.info(
-                f"âœ… Ticker {symbol}: last={last}  product_id={pid}  "
+                f"✅ Ticker {symbol}: last={last}  product_id={pid}  "
                 f"contract_value={cval}  tick_size={tick}"
             )
             if pid and symbol.upper() not in self._product_id_cache:
                 self._product_id_cache[symbol.upper()] = int(pid)
-                logger.info(f"âœ… Cached product_id {pid} for {symbol}")
+                logger.info(f"✅ Cached product_id {pid} for {symbol}")
         else:
-            logger.error(f"âŒ Ticker failed: {ticker.get('error')}")
+            logger.error(f"❌ Ticker failed: {ticker.get('error')}")
             ok = False
 
-        # â”€â”€ Balance: private, confirms auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Balance: private, confirms auth ────────────────────────────────────
         bal = self.get_balance("USD")
         if "error" not in bal:
             logger.info(
-                f"âœ… Balance: available=${bal.get('available', 0):.2f}  "
+                f"✅ Balance: available=${bal.get('available', 0):.2f}  "
                 f"locked=${bal.get('locked', 0):.2f} USDT"
             )
         else:
-            logger.error(f"âŒ Balance failed: {bal.get('error')}")
+            logger.error(f"❌ Balance failed: {bal.get('error')}")
             ok = False
 
-        # â”€â”€ Product ID â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Product ID ─────────────────────────────────────────────────────────
         pid_cached = self._product_id_cache.get(symbol.upper())
         if pid_cached:
-            logger.info(f"âœ… Product ID for {symbol}: {pid_cached}")
+            logger.info(f"✅ Product ID for {symbol}: {pid_cached}")
         else:
             pid_r = self._symbol_to_product_id(symbol)
             if pid_r:
-                logger.info(f"âœ… Product ID for {symbol}: {pid_r} (from /v2/products)")
+                logger.info(f"✅ Product ID for {symbol}: {pid_r} (from /v2/products)")
             else:
-                logger.warning(f"âš ï¸  Product ID not resolved for {symbol}")
+                logger.warning(f"⚠️  Product ID not resolved for {symbol}")
 
-        # â”€â”€ Clock summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Clock summary ──────────────────────────────────────────────────────
         if self._clock_calibrated:
             logger.info(
-                f"â±ï¸  Clock calibration: {self._time_offset_s:+d}s offset applied."
+                f"⏱️  Clock calibration: {self._time_offset_s:+d}s offset applied."
             )
         else:
-            logger.info("â±ï¸  Clock: no skew detected.")
+            logger.info("⏱️  Clock: no skew detected.")
 
         return ok
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────

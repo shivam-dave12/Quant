@@ -348,36 +348,10 @@ def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, ro
     return clamp(cap, 0.0015, 0.92)
 
 
-def _executable_tp_before_pool(side: str, entry: float, pool_px: float, atr: float,
-                               tf_term: float, reliability: float,
-                               uncertainty: float) -> float:
-    """Place full-position TP before the liquidity pool, not on the stop cluster.
-
-    The pool price is the objective, but an executable reduce-only TP should be
-    buffered in front of it.  This improves fill probability and avoids the
-    retail failure mode of asking the exchange to fill exactly at the stop-run
-    magnet.
-    """
-    raw_dist = abs(float(pool_px) - float(entry))
-    if raw_dist <= 0:
-        return float(pool_px)
-
-    # Continuous buffer: enough to front-run the pool, smaller for clean feeds
-    # and high reliability, larger in uncertain/thin conditions.
-    dist_atr = raw_dist / max(float(atr), _EPS)
-    buffer_atr = clamp(
-        0.045 + 0.030 * uncertainty + 0.018 * max(0.0, 1.0 - reliability) + 0.012 * min(dist_atr, 6.0),
-        0.035,
-        0.220 + 0.060 * tf_term,
-    )
-    buffer = min(raw_dist * 0.45, max(atr * buffer_atr, _EPS))
-
-    return (pool_px - buffer) if side == "long" else (pool_px + buffer)
-
-
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
-                         fee_bps: float = 8.0, slippage_bps: float = 2.0) -> TargetSurface:
+                         fee_bps: float = 8.0, slippage_bps: float = 2.0,
+                         posterior_prob: float = 0.0) -> TargetSurface:
     side = (side or "").lower()
     entry = float(entry or 0.0)
     stop = float(stop or 0.0)
@@ -402,26 +376,15 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             continue
         if side == "short" and px >= entry:
             continue
-        raw_px = px
+        dist = abs(px - entry)
+        rr = dist / max(risk, _EPS)
+        dist_atr = dist / atr
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
         sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
         tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
 
-        # Use an executable TP buffered before the liquidity pool.  The raw pool
-        # remains the objective/reference, but payoff/RR must be based on the
-        # actual reduce-only order price.
-        px = _executable_tp_before_pool(side, entry, raw_px, atr, tf_term, reliability, uncertainty)
-        if side == "long" and px <= entry:
-            continue
-        if side == "short" and px >= entry:
-            continue
-
-        dist = abs(px - entry)
-        rr = dist / max(risk, _EPS)
-        dist_atr = dist / atr
-
-        lo, hi = min(entry, raw_px), max(entry, raw_px)
+        lo, hi = min(entry, px), max(entry, px)
         opp_hits = 0
         opp_sig_sum = 0.0
         for op in opposing:
@@ -447,23 +410,55 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             + math.log(max(gauntlet_penalty, 1e-6))
         )
         p_base = sigmoid(z) * reliability
-        p_hit = clamp(min(p_base, _target_distance_cap(dist_atr, tf_term, reliability, role)), 0.001, 0.975)
+        distance_cap = _target_distance_cap(dist_atr, tf_term, reliability, role)
+        p_path = clamp(min(p_base, distance_cap), 0.001, 0.975)
 
-        path_risk = clamp((1.0 - gauntlet_penalty) + 0.48 * uncertainty + 0.24 * max(-of_align, 0.0)
-                          + (0.030 * dist_atr if role == "terminal" else 0.010 * dist_atr), 0.0, 3.0)
-        loss_r = 1.0 + 0.48 * uncertainty + 0.34 * path_risk
+        # v8: fuse target-path probability with the already-accepted auction
+        # posterior.  The old surface ignored the posterior completely, so a
+        # 85-92% accepted post-sweep auction could be re-priced as a 35-45%
+        # target event purely from static pool distance.  That made the SL/TP
+        # layer contradict the alpha layer and defer valid institutional
+        # auctions.  We keep terminal objectives conservative, but for internal
+        # and external liquidity objectives the posterior is a live observation
+        # of delivery intent and must be part of executable TP probability.
+        auction_p = clamp(float(posterior_prob or 0.0), 0.001, 0.999)
+        if auction_p > 0.01 and role != "terminal":
+            auction_edge = clamp((auction_p - 0.50) / 0.50, 0.0, 1.0)
+            distance_decay_for_fusion = math.exp(-dist_atr / (7.0 + 2.5 * tf_term + reliability))
+            fusion_weight = clamp(
+                (0.22 + 0.30 * auction_edge + 0.16 * (1.0 - uncertainty)
+                 + 0.08 * sig_term + 0.06 * gauntlet_penalty)
+                * distance_decay_for_fusion,
+                0.0, 0.68,
+            )
+            fused_p = p_path + fusion_weight * max(auction_p - p_path, 0.0)
+            # Distance cap is a soft prior, not a hard veto, once the auction
+            # posterior is already accepted.  Only part of the excess above cap
+            # is admitted; this prevents lottery distant targets while allowing
+            # nearer executable pools to inherit live auction evidence.
+            if fused_p > distance_cap:
+                p_hit = distance_cap + 0.65 * (fused_p - distance_cap)
+            else:
+                p_hit = fused_p
+            p_hit = clamp(max(p_path, p_hit), 0.001, 0.975)
+        else:
+            p_hit = p_path
+
+        path_risk = clamp((1.0 - gauntlet_penalty) + 0.40 * uncertainty + 0.20 * max(-of_align, 0.0)
+                          + (0.030 * dist_atr if role == "terminal" else 0.008 * dist_atr), 0.0, 3.0)
+        loss_r = 1.0 + 0.38 * uncertainty + 0.26 * path_risk
         payoff_r = rr
         ev_r = p_hit * payoff_r - (1.0 - p_hit) * loss_r - cost_r
 
-        # Full-position utility is deliberately concave in payoff and harsher
-        # for terminal objectives. This prevents lottery TP replacing sane TP.
-        concave_payoff = math.log1p(max(payoff_r, 0.0)) / math.log(2.0)
+        # Full-position utility is the executable risk-adjusted EV, not a
+        # second hard probability model.  Concavity is still applied, but as a
+        # drag against excessive R:R rather than as a duplicate loss term.
+        concavity_drag = 0.035 * max(payoff_r - 3.0, 0.0) ** 1.15
         full_position_utility = (
-            p_hit * concave_payoff
-            - (1.0 - p_hit) * loss_r
-            - cost_r
-            - 0.18 * uncertainty
-            - 0.10 * path_risk
+            ev_r
+            - concavity_drag
+            - 0.12 * uncertainty
+            - 0.070 * path_risk
         )
         if role == "terminal":
             terminal_drag = 0.35 + 0.030 * dist_atr + 0.25 * uncertainty
@@ -475,8 +470,8 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         utility = full_position_utility
         notes = [
             f"sig={sig:.1f}", f"tf={tf_rank}", f"reach={reach_decay:.2f}",
-            f"raw_pool={raw_px:.1f}", f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
-            f"cap={_target_distance_cap(dist_atr, tf_term, reliability, role):.3f}",
+            f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
+            f"cap={distance_cap:.3f}", f"pathP={p_path:.3f}", f"auctionP={auction_p:.3f}",
         ]
         cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,

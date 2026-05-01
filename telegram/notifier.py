@@ -10,7 +10,7 @@ Public API (imported by strategy layer):
   format_periodic_report()           — institutional dashboard
   format_direction_hunt_alert()      — liquidity-draw telemetry only
   format_post_sweep_verdict()        — quant posterior auction decision
-  format_conviction_block_alert()    — advisory/safety diagnostic
+  format_conviction_advisory_alert() — dynamic advisory/sizing diagnostic
   format_pool_gate_alert()           — liquidity-path exit/reversal telemetry
   format_liquidity_trail_update()    — adaptive exit / stop update
   install_global_telegram_log_handler()
@@ -42,13 +42,13 @@ _MOJIBAKE_RUN = re.compile(
     r"\u2010-\u201f\u2020-\u2026\u2030\u2039\u203a\u20ac\u2122]+"
 )
 _MOJIBAKE_DIRECT = {
-    "ðŸŽ¯": "🎯", "ðŸ§­": "🧭", "ðŸ“Š": "📊", "ðŸ’°": "💰",
-    "ðŸ”’": "🔒", "ðŸ”„": "🔄", "ðŸ”±": "🔱", "ðŸš¨": "🚨",
-    "ðŸ’€": "💀", "ðŸ’¥": "💥", "âœ…": "✅", "âŒ": "❌",
-    "âŒ": "❌", "âš ï¸": "⚠️", "âš ï¸": "⚠️", "â±ï¸": "⏱️",
-    "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â±ï¸": "⏱️", "â³": "⏳",
-    "â‰ˆ": "≈", "Â±": "±", "Ã—": "×", "Ïƒ": "σ",
-    "â¬œ": "⬜", "â–‘": "░", "â–ˆ": "█",
+    "🎯": "🎯", "🧭": "🧭", "📊": "📊", "💰": "💰",
+    "🔒": "🔒", "🔄": "🔄", "🔱": "🔱", "🚨": "🚨",
+    "💀": "💀", "💥": "💥", "✅": "✅", "❌": "❌",
+    "❌": "❌", "⚠️": "⚠️", "⚠️": "⚠️", "⏱️": "⏱️",
+    "⏱️": "⏱️", "⏱️": "⏱️", "⏱️": "⏱️", "⏳": "⏳",
+    "≈": "≈", "±": "±", "×": "×", "σ": "σ",
+    "⬜": "⬜", "░": "░", "█": "█",
 }
 
 
@@ -176,7 +176,7 @@ def _classify_priority(message: str) -> int:
     if any(tag in upper for tag in (
         "ENTRY", "EXIT", "POOL-GATE", "TRADE OPEN", "TRADE CLOSED",
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
-        "POST-EXIT GATE", "IC GATE",
+        "POST-EXIT IMPAIRMENT", "IC EXPOSURE LENS",
         "LIQUIDITY PATH GATE", "SAFETY / ADVISORY BLOCK", "ADAPTIVE EXIT", "LIQUIDITY DRAW",
         "QUANT POSTERIOR DECISION",
     )):
@@ -185,17 +185,18 @@ def _classify_priority(message: str) -> int:
 
 
 def _shed_routine_for_room() -> bool:
-    """Drop one ROUTINE queue item while preserving PriorityQueue heap order."""
-    import heapq
-
+    """When the queue is full, drop one ROUTINE item to free a slot.
+    Returns True if a slot was freed."""
     global _dropped_routine
+    # PriorityQueue doesn't expose internals safely; we approximate by
+    # iterating its internal heap under its mutex. This is best-effort:
+    # we accept that we may not always find a routine to evict.
     try:
         with _send_queue.mutex:  # type: ignore[attr-defined]
             heap = _send_queue.queue  # type: ignore[attr-defined]
             for i, item in enumerate(heap):
                 if item[0] >= PRIO_ROUTINE:
                     heap.pop(i)
-                    heapq.heapify(heap)
                     _dropped_routine += 1
                     return True
     except Exception:
@@ -817,7 +818,7 @@ def _pd(pd: float) -> str:
 # NOTE 2026-04-26 (cleanup):
 #   This region used to hold the original first definitions of
 #   format_periodic_report, format_direction_hunt_alert,
-#   format_post_sweep_verdict, format_conviction_block_alert, and
+#   format_post_sweep_verdict, format_conviction_advisory_alert, and
 #   format_liquidity_trail_update. They were silently shadowed by the
 #   later QuantPosterior/adaptive-exit definitions (Python last-`def`-wins),
 #   so they were dead code and have been removed. The live versions
@@ -874,7 +875,9 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     #
     # 1. SWEEP REJECTED (tf_quality): 113 instances/session. Routine gate
     #    rejection. Source-downgraded to INFO; this is belt-and-braces.
-    "SWEEP REJECTED (tf_quality):",
+    "SWEEP QUALITY IMPAIRED [tf_quality]:",
+    "SWEEP DEFERRED [tf_quality]:",
+    "SWEEP REJECTED (tf_quality):",  # legacy suppression
     # 2. Telegram API HTTP errors on getUpdates: when Telegram itself
     #    rate-limits the bot, the WARN was being routed BACK into the
     #    Telegram queue, amplifying the burst. Source-downgraded to
@@ -904,8 +907,8 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     "FibTrail dispatch blocked:",
     # 7. Circuit-breaker steady state. The breaker trip/clear messages are
     #    actionable; the per-entry "still frozen" state is local telemetry.
-    "Entries blocked: watchdog circuit breaker is engaged",
-    "Entries still blocked by watchdog circuit breaker",
+    "Entries paused: watchdog circuit breaker is engaged",
+    "Entries still paused by watchdog circuit breaker",
 ]
 _TELEGRAM_SUPPRESS_LOCK = threading.Lock()
 
@@ -1001,7 +1004,7 @@ def install_global_telegram_log_handler(
 # QuantPosterior / adaptive-exit Telegram templates
 # ══════════════════════════════════════════════════════════════════════════
 # These templates are used by quant_strategy.py and the controller for the
-# user-facing high-frequency notifications (entry, exit, trail, gate veto).
+# user-facing high-frequency notifications (entry, exit, trail, dynamic impairment).
 #
 # Design rules:
 #   1. Lead with the fact (side / price / outcome) — user must know the
@@ -1015,7 +1018,7 @@ def install_global_telegram_log_handler(
 #   format_entry_alert(...)
 #   format_exit_alert(...)
 #   format_trail_advance(...)
-#   format_gate_block_alert(...)
+#   format_post_exit_impairment_alert(...)
 #   format_status_card(...)              — replaces verbose periodic_report
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1055,6 +1058,7 @@ def format_entry_alert(
     reason:      str = "",
     session:     str = "",
     flow_conv:   float = 0.0,
+    **_kw: Any,
 ) -> str:
     """
     Industry-grade entry alert. Single screen, monospace columns.
@@ -1072,6 +1076,11 @@ def format_entry_alert(
 
     flow_glyph = "▲" if flow_conv > 0.05 else ("▼" if flow_conv < -0.05 else "·")
 
+    size_mult = _kw.get("size_mult", _kw.get("institutional_size_mult", None))
+    posterior = _kw.get("posterior", _kw.get("probability", None))
+    ev = _kw.get("expected_value", _kw.get("ev", None))
+    target_realism = _kw.get("target_realism", None)
+
     rows = [
         f"{head_emoji} <b>{_esc(arr)} {_esc(side_u)}</b>  "
         f"<code>{_fmt_price(entry)}</code>"
@@ -1081,6 +1090,13 @@ def format_entry_alert(
         f"<code>TP  {_fmt_price(tp):<14}</code>  ({tp_atr:.1f} ATR)   R:R 1:{rr:.2f}",
         f"<code>QTY {qty:<14.4f}</code>  flow {_esc(flow_glyph)} {flow_conv:+.2f}",
     ]
+    if size_mult is not None or posterior is not None or ev is not None or target_realism is not None:
+        rows.append(
+            f"<code>AUDIT  size {_tg_num(size_mult if size_mult is not None else 1.0, 2):>5}x"
+            f"   P(edge) {_tg_num(posterior, 2):>5}"
+            f"   EV {_tg_num(ev, 3):>7}"
+            f"   target {_tg_num(target_realism, 2):>5}</code>"
+        )
     if session:
         rows.append(f"<code>SESS {_esc(session.upper())}</code>")
     if reason:
@@ -1150,7 +1166,7 @@ def format_trail_advance(
     fib_ratio:     Optional[float] = None,
 ) -> str:
     """
-    Adaptive exit advance alert. Compact — fires often; reports the stop move and legacy R fields only for analytics compatibility.
+    Adaptive exit advance alert. Compact — fires often; reports the stop move and historical R fields only for analytics compatibility.
 
         🔒 TRAIL ↑ LONG   $77,540.00   TRUE_NET_BE / EAE_PROTECTION
         ─────────────────────────
@@ -1180,7 +1196,7 @@ def format_trail_advance(
     return "\n".join(rows)
 
 
-def format_gate_block_alert(
+def format_post_exit_impairment_alert(
     side:        str,
     lens:        str,
     detail:      str,
@@ -1188,10 +1204,9 @@ def format_gate_block_alert(
     consec_loss: int = 0,
 ) -> str:
     """
-    Post-Exit Gate veto. Throttled by quant_strategy (30s/lens) so this
-    fires at most once per minute per lens.
+    Post-exit exposure impairment card. Throttled by quant_strategy so repeated hostile lenses do not spam operators.
 
-        🚫 POST-EXIT GATE
+        ⚖ POST-EXIT IMPAIRMENT
         Side    SHORT
         Lens    SIDE_FLIP_DISTANCE
         Why     only 0.42 ATR from SL — need ≥1.5 ATR
@@ -1199,12 +1214,12 @@ def format_gate_block_alert(
     """
     streak = f"   <i>({consec_loss}L streak)</i>" if consec_loss > 0 else ""
     return (
-        "🚫 <b>POST-EXIT GATE</b>\n"
+        "⚖️ <b>POST-EXIT IMPAIRMENT</b>\n"
         "<code>──────────────────────────────</code>\n"
         f"<code>SIDE   {_esc(side.upper())}</code>\n"
         f"<code>LENS   {_esc(lens)}</code>\n"
         f"<i>{_esc(detail[:200])}</i>\n"
-        f"<code>RETRY  in {retry_in:.0f}s</code>{streak}"
+        f"<code>RECHECK in {retry_in:.0f}s</code>{streak}"
     )
 
 
@@ -1446,13 +1461,14 @@ def format_periodic_report(
 ) -> str:
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M IST")
     kz = "KZ ON" if in_killzone else "KZ off"
+    flow_conviction = float(flow_feature_score or 0.0)
     flow_side = (flow_direction or "neutral").upper()
     flow_icon = _tg_arrow(flow_conviction, flow_direction)
     pd_label = _pd(float(dealing_range_pd or 0.5))
     pnl_icon = "\U0001f7e2" if float(daily_pnl or 0) >= 0 else "\U0001f534"
 
     lines = [
-        f"\U0001f4ca <b>DELTA STATUS</b>  <code>{_esc(now_ist)}</code>",
+        f"\U0001f4ca <b>INSTITUTIONAL STATUS</b>  <code>{_esc(now_ist)}</code>",
         _TG_RULE,
         f"<code>BTC     {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
         f"<code>BAL     {_tg_price(balance):>14}   TRD {int(total_trades):>4}   WR {float(win_rate or 0):>5.1f}%</code>",
@@ -1502,8 +1518,18 @@ def format_periodic_report(
         phase = _tg_get(direction_ps_analysis, "phase", "-")
         lines.append(f"<code>PS      {_esc(str(action).upper()):<9} {_esc(str(direction).upper()):<6} {conf:>5.0%} phase {_esc(phase)}</code>")
 
-    lines += [_tg_section("\U0001f6a6", "Posterior / Execution")]
+    lines += [_tg_section("\U0001f9e0", "Posterior / Execution")]
     lines.append(f"<code>FEATURES session={_esc(session or '-'):>8}  flow={float(flow_conviction or 0):+5.2f}  htf={_esc(htf_bias or 'mixed'):>8}</code>")
+    _posterior = _kw.get("posterior", _kw.get("probability", None))
+    _ev = _kw.get("expected_value", _kw.get("ev", None))
+    _size_mult = _kw.get("size_mult", _kw.get("institutional_size_mult", None))
+    _audit_grade = _kw.get("audit_grade", _kw.get("grade", ""))
+    if _posterior is not None or _ev is not None or _size_mult is not None or _audit_grade:
+        lines.append(
+            f"<code>AUDIT   grade={_esc(_audit_grade or '-'):>3}   "
+            f"P(edge)={_tg_num(_posterior, 2):>5}   EV={_tg_num(_ev, 3):>7}   "
+            f"size={_tg_num(_size_mult if _size_mult is not None else 1.0, 2):>5}x</code>"
+        )
 
     if position:
         side = str(position.get("side") or "?").upper()
@@ -1654,7 +1680,7 @@ def format_pool_gate_alert(
     return _tg_limit(lines)
 
 
-def format_conviction_block_alert(
+def format_conviction_advisory_alert(
     side:           str,
     factor_scores:  Optional[Dict[str, float]] = None,
     weighted_total: Optional[float] = None,
@@ -1668,9 +1694,9 @@ def format_conviction_block_alert(
     allow_reasons = _kw.get("allow_reasons") or []
     deficit = max(0.0, float(required_score or 0.0) - score)
     lines = [
-        f"🛡️ <b>SAFETY / ADVISORY NOTICE</b>  <code>{_esc(str(side).upper())}</code>",
+        f"🛡️ <b>DYNAMIC ADVISORY STACK</b>  <code>{_esc(str(side).upper())}</code>",
         _TG_RULE,
-        f"<code>SCORE   {score:>6.2f} / {float(required_score or 0):>5.2f}   need +{deficit:.2f}   [{_tg_bar(score / max(required_score, 0.01))}]</code>",
+        f"<code>SCORE   {score:>6.2f} / {float(required_score or 0):>5.2f}   gap +{deficit:.2f}   [{_tg_bar(score / max(required_score, 0.01))}]</code>",
     ]
     if _kw.get("entry_price") or _kw.get("sl_price") or _kw.get("tp_price"):
         lines.append(
@@ -1685,7 +1711,7 @@ def format_conviction_block_alert(
                 fval = 0.0
             lines.append(f"<code>{_esc(str(name))[:18]:<18} {fval:+6.2f} [{_tg_bar(fval)}]</code>")
     if reject_reasons:
-        lines.append(_tg_section("\u26d4", "Reject Reasons"))
+        lines.append(_tg_section("\u26d4", "Safety / Quality Notes"))
         for item in reject_reasons[:6]:
             lines.append(f"<i>{_esc(str(item)[:220])}</i>")
     if allow_reasons:
@@ -1753,6 +1779,24 @@ def format_liquidity_trail_update(
     return _tg_limit(lines)
 
 
+
+def _telegram_arch_layer(logger_name: str, message: str = "") -> tuple[str, str]:
+    text = f"{logger_name} {message}".lower()
+    rules = (
+        ("WATCHDOG", "🛡", ("watchdog",)),
+        ("TELEGRAM", "✉", ("telegram",)),
+        ("EXECUTION", "⚙", ("execution", "order_manager", "router")),
+        ("RISK", "⚖", ("risk", "risk_manager")),
+        ("MARKET-DATA", "📡", ("data_manager", "websocket", "market_aggregator", "exchanges")),
+        ("LIQUIDITY", "💧", ("liquidity_map", "liquidity_pool", "liquidity_trail")),
+        ("POSTERIOR", "🧠", ("quant_strategy", "quantitative_models", "expected_utility")),
+        ("STRUCTURE", "🏛", ("ict_engine", "direction_engine", "conviction_filter", "market_intelligence")),
+    )
+    for label, icon, markers in rules:
+        if any(m in text for m in markers):
+            return label, icon
+    return "SYSTEM", "•"
+
 def format_log_alert(level: str, logger_name: str, message: str) -> str:
     level_u = (level or "WARNING").upper()
     icon = {
@@ -1762,10 +1806,12 @@ def format_log_alert(level: str, logger_name: str, message: str) -> str:
     }.get(level_u, "\U0001f4dd")
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M:%S IST")
     clean = _repair_mojibake(str(message or "")).strip()
+    layer, layer_icon = _telegram_arch_layer(logger_name or "", clean)
     lines = [
-        f"{icon} <b>LOG { _esc(level_u) }</b>  <code>{_esc(now_ist)}</code>",
+        f"{icon} <b>{_esc(level_u)} · {layer_icon} {_esc(layer)}</b>  <code>{_esc(now_ist)}</code>",
         _TG_RULE,
         f"<code>SRC     {_esc((logger_name or '-')[-32:])}</code>",
         f"<pre>{_esc(clean[:1800])}</pre>",
     ]
     return _tg_limit(lines, max_chars=2200)
+

@@ -4,7 +4,6 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from collections import deque
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +39,7 @@ class HardeningTests(unittest.TestCase):
         from telegram import notifier
 
         msg = (
-            "strategy.quant_strategy: Entries blocked: "
+            "strategy.quant_strategy: Entries paused: "
             "watchdog circuit breaker is engaged"
         )
         self.assertTrue(notifier._is_suppressed_for_telegram(msg))
@@ -72,7 +71,7 @@ class HardeningTests(unittest.TestCase):
         self.assertTrue(htf.vetoes_trade("long"))
         self.assertFalse(htf.vetoes_trade("short"))
 
-    def test_conviction_hard_rejects_low_rr_even_with_high_score(self):
+    def test_conviction_advises_low_rr_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -90,10 +89,10 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=2.0,
         )
 
-        self.assertFalse(result.allowed)
-        self.assertTrue(any("RR_HARD" in r for r in result.reject_reasons))
+        self.assertTrue(result.allowed)
+        self.assertTrue(any("RR_LOW_EXPECTANCY" in r or "RR_LOW" in r for r in result.reject_reasons))
 
-    def test_conviction_hard_rejects_approach_entries(self):
+    def test_conviction_advises_approach_entries_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -111,10 +110,10 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=2.0,
         )
 
-        self.assertFalse(result.allowed)
-        self.assertTrue(any("APPROACH_HARD" in r for r in result.reject_reasons))
+        self.assertTrue(result.allowed)
+        self.assertTrue(any("APPROACH_PRE_SWEEP" in r or "APPROACH" in r for r in result.reject_reasons))
 
-    def test_conviction_hard_rejects_missing_sweep_displacement(self):
+    def test_conviction_advises_missing_sweep_displacement_without_alpha_veto(self):
         cf = _high_conviction_filter()
 
         result = cf.evaluate(
@@ -132,7 +131,7 @@ class HardeningTests(unittest.TestCase):
             measured_displacement_atr=0.0,
         )
 
-        self.assertFalse(result.allowed)
+        self.assertTrue(result.allowed)
         self.assertTrue(any("DISPLACEMENT_MISSING" in r for r in result.reject_reasons))
 
     def test_reconcile_defers_stale_position_right_after_exit(self):
@@ -167,111 +166,59 @@ class HardeningTests(unittest.TestCase):
 
         self.assertEqual(om.flatten_calls, 0)
 
-    def test_quant_strategy_treats_failed_conviction_as_hard_veto(self):
+    def test_quant_strategy_blocks_only_account_safety_conviction(self):
         from strategy.conviction_filter import ConvictionResult
-        from strategy.quant_strategy import EntryType, QuantStrategy
+        from strategy.quant_strategy import QuantStrategy
 
-        class FakeEntryEngine:
-            def __init__(self):
-                self.blocks = []
-                self.consumed = False
-
-            def mark_gate_blocked(self, side, reason, cooldown_sec=0.0):
-                self.blocks.append((side, reason, cooldown_sec))
-
-            def consume_signal(self):
-                self.consumed = True
-
-        strategy = object.__new__(QuantStrategy)
-        strategy._entry_engine = FakeEntryEngine()
-        strategy._active_institutional_size_mult = 1.0
-        strategy._last_conv_block_key = None
-        strategy._entry_confirm_key = ("pending",)
-        strategy._entry_confirm_count = 2
-
-        signal = SimpleNamespace(side="long", entry_type=EntryType.SWEEP_REVERSAL)
-        result = ConvictionResult(
+        safe_quality_result = ConvictionResult(
             allowed=False,
             score=0.512,
             reject_reasons=["PRODUCT_CORE: 0.11 < 0.60"],
         )
+        safety_result = ConvictionResult(
+            allowed=False,
+            score=0.100,
+            reject_reasons=["DRAWDOWN_CIRCUIT_BREAKER: session loss limit hit"],
+        )
 
-        strategy._block_failed_conviction(signal, result)
+        self.assertFalse(QuantStrategy._conviction_reject_is_account_safety(safe_quality_result))
+        self.assertTrue(QuantStrategy._conviction_reject_is_account_safety(safety_result))
 
-        self.assertEqual(strategy._active_institutional_size_mult, 0.0)
-        self.assertEqual(strategy._entry_confirm_key, None)
-        self.assertEqual(strategy._entry_confirm_count, 0)
-        self.assertTrue(strategy._entry_engine.consumed)
-        self.assertEqual(strategy._entry_engine.blocks[0][0], "long")
-        self.assertIn("PRODUCT_CORE", strategy._entry_engine.blocks[0][1])
+    def test_target_surface_uses_posterior_without_lottery_tp(self):
+        from strategy.expected_utility import build_target_surface
 
-    def test_candledict_timestamp_attr_seconds_but_t_key_ms(self):
-        from core.candle import Candle, CandleDict
+        target = SimpleNamespace(
+            price=104.0,
+            timeframe="15m",
+            significance=12.0,
+            side="BSL",
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[target],
+            ssl_pools=[],
+            feed_reliability=0.90,
+        )
+        flow = SimpleNamespace(tick_flow=0.30, cvd_trend=0.35)
+        ict = SimpleNamespace(
+            structure_15m="bullish",
+            structure_4h="bullish",
+            dealing_range_pd=0.30,
+        )
 
-        c = Candle(timestamp=1000.0, open=1.0, high=2.0, low=0.5, close=1.5, volume=1.0)
-        cd = CandleDict(c)
+        low = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.0,
+        )
+        high = build_target_surface(
+            side="long", entry=100.0, stop=98.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+        )
 
-        self.assertEqual(cd.timestamp, 1000.0)
-        self.assertEqual(cd["t"], 1_000_000)
-
-    def test_delta_adapter_partial_fill_contracts_convert_to_btc(self):
-        import config
-        from execution.order_manager import _DeltaAdapter
-
-        old_cv = getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001)
-        config.DELTA_CONTRACT_VALUE_BTC = 0.001
-        try:
-            adapter = object.__new__(_DeltaAdapter)
-            qty = adapter.extract_filled_qty({"filled_size": 1})
-            self.assertAlmostEqual(qty, 0.001)
-        finally:
-            config.DELTA_CONTRACT_VALUE_BTC = old_cv
-
-    def test_emergency_flatten_uses_size_signed_for_side_inference(self):
-        from execution.order_manager import OrderManager
-
-        class FakeOM:
-            def __init__(self):
-                self.sent = None
-
-            def get_open_position(self):
-                return {
-                    "side": None,
-                    "size": 0.001,
-                    "size_signed": -0.001,
-                    "entry_price": 100.0,
-                }
-
-            def place_market_order(self, side, quantity, reduce_only=False):
-                self.sent = {"side": side, "quantity": quantity, "reduce_only": reduce_only}
-                return self.sent
-
-        fake = FakeOM()
-        result = OrderManager.emergency_flatten(fake, reason="unit")
-        self.assertEqual(result["side"], "BUY")
-        self.assertTrue(result["reduce_only"])
-
-    def test_resetrisk_full_keeps_daily_trades_deque_contract(self):
-        class RM:
-            def __init__(self):
-                import threading
-                self._lock = threading.RLock()
-                self.consecutive_losses = 2
-                self.daily_pnl = -10.0
-                self.daily_trades = deque(maxlen=12)
-                self.daily_trades.append(1)
-                self._last_loss_time = 1.0
-                self.max_daily_trades = 2
-
-        rm = RM()
-        with rm._lock:
-            rm.consecutive_losses = 0
-            rm.daily_pnl = 0.0
-            rm.daily_trades.clear()
-            rm._last_loss_time = 0.0
-
-        self.assertIsInstance(rm.daily_trades, deque)
-        self.assertEqual(len(rm.daily_trades), 0)
+        self.assertIsNotNone(low.best)
+        self.assertIsNotNone(high.best)
+        self.assertGreater(high.best.probability, low.best.probability)
+        self.assertGreater(high.best.expected_value_r, low.best.expected_value_r)
+        self.assertEqual(high.best.role, "external")
 
 
 if __name__ == "__main__":

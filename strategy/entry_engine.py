@@ -68,6 +68,18 @@ except ImportError:
     )
 
 
+
+
+try:
+    import config as _entry_cfg
+except Exception:  # pragma: no cover
+    _entry_cfg = None  # type: ignore
+
+def _entry_cfg_value(name: str, default):
+    if _entry_cfg is None:
+        return default
+    return getattr(_entry_cfg, name, default)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -82,14 +94,14 @@ _FLOW_EWMA_ADAPTIVE_CAP  = 0.40
 # Pool targeting
 _MAX_TARGET_ATR        = 8.0
 _MIN_TARGET_ATR        = 0.25
-_MIN_POOL_SIGNIFICANCE = 1.0   # allow lower significance pools
+_MIN_POOL_SIGNIFICANCE = float(_entry_cfg_value("ENTRY_MIN_POOL_SIGNIFICANCE", 1.25))
 
 # Sweep quality
-_MIN_SWEEP_QUALITY = 0.15    # lower sweep quality threshold
+_MIN_SWEEP_QUALITY = float(_entry_cfg_value("ENTRY_MIN_SWEEP_QUALITY", 0.20))
 
 # Timing
 _CISD_MAX_WAIT_SEC   = 360
-_ENTRY_COOLDOWN_SEC  = 10.0   # faster re-entry
+_ENTRY_COOLDOWN_SEC  = float(_entry_cfg_value("ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC", 10.0))
 
 # SL / TP
 try:
@@ -101,12 +113,7 @@ _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
 _CONT_SL_BUFFER_ATR = 0.40
-# The safety buffer is a soft execution-quality cushion, not a hard extra
-# minimum R:R cliff.  A setup at 2.18R should not be rejected solely because
-# MIN_RR=2.0 and a fixed +0.20 buffer was added.  Hard rejection remains at
-# MIN_RR, with a small numerical tolerance for tick rounding and fee buffers.
-_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.05)) if '_cfg' in globals() else 0.05
-_TP_RR_TOLERANCE     = float(getattr(_cfg, "ENTRY_TP_RR_TOLERANCE", 0.03)) if '_cfg' in globals() else 0.03
+_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
 _TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
 
 try:
@@ -161,9 +168,9 @@ except Exception:
     _PS_PHASE_MATURE       = 360.0
 
 # Post-Sweep evidence thresholds.
-# Institutional mode: scoring can surface context, but execution requires
-# hard acceptance gates below. Thresholds are deliberately selective; the bot
-# should miss weak noise rather than manufacture trades.
+# Institutional mode: the posterior/EV calculation decides whether a sweep
+# auction is worth expressing. Quality diagnostics below are continuous;
+# they reduce confidence/sizing instead of becoming hidden pass/fail filters.
 _PS_THRESHOLD_EARLY  = 62.0
 _PS_THRESHOLD_NORMAL = 52.0
 _PS_THRESHOLD_MATURE = 45.0
@@ -178,11 +185,12 @@ _PS_OTE_FIB_LOW     = 0.50
 _PS_OTE_FIB_HIGH    = 0.786
 _PS_NEUTRAL_TICK_DECAY = 0.98
 
-# Hard entry-quality gates loaded from config. These do not decide direction;
-# they decide whether a direction is EXECUTABLE by institutional standards.
+# Dynamic entry-quality references loaded from config.
+# Kept backward-compatible with older config names, but these are references
+# for scoring/penalty, not hard alpha vetoes.
 try:
     import config as _entry_gate_cfg
-    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))
+    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
     _ENTRY_STRONG_DISP_ATR   = float(getattr(_entry_gate_cfg, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
     _ENTRY_REQUIRE_CISD_OR_OTE = bool(getattr(_entry_gate_cfg, "ENTRY_REQUIRE_CISD_OR_OTE", True))
     _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = float(getattr(_entry_gate_cfg, "ENTRY_MAX_CHASE_ATR_WITHOUT_OTE", 1.15))
@@ -307,6 +315,9 @@ class ICTContext:
     nearest_ob_price_short: float = 0.0
     kill_zone:              str   = ""
     ict_sweeps:             list  = field(default_factory=list)
+    direction_hint:            str   = ""
+    direction_hint_side:       str   = ""
+    direction_hint_confidence: float = 0.0
 
     @property
     def session_quality(self) -> str:
@@ -439,11 +450,20 @@ class EntryEngine:
         # before any structural evidence can accumulate.
         #
         # _gate_blocked_until: epoch timestamp after which signal generation is
-        #   allowed again. Set by mark_gate_blocked() called from quant_strategy.
+        #   allowed again. Set by mark_signal_deferred() called from quant_strategy.
         # _gate_block_key: (side, reason_prefix) dedup so a DIFFERENT gate reason
         #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
         self._gate_blocked_until: float = 0.0
         self._gate_block_key: tuple = ()
+
+        # Local-log dedup for posterior acceptance during cooldown/deferred states.
+        # QuantStrategy may defer a candidate after target/stop utility surfaces
+        # abstain. While that cooldown is alive, the evidence model should keep
+        # observing the auction, but it must not print "POSTERIOR ACCEPTED" every
+        # tick because routing is intentionally held.
+        self._suppress_posterior_accept_log: bool = False
+        self._last_accept_log_key: tuple = ()
+        self._last_accept_log_ts: float = 0.0
 
         # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
         # After a verdict fires, _handle_reversal/_handle_continuation previously
@@ -459,7 +479,7 @@ class EntryEngine:
         #                  (detected_at differs) is never suppressed by a stale entry
         #
         # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
-        # window PLUS the 45s gate-block cooldown with 15s margin.
+        # window PLUS the 45s deferral cooldown with 15s margin.
         #
         # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
         # must survive a state reset so the same sweep cannot sneak back in.
@@ -712,46 +732,28 @@ class EntryEngine:
         if self._state not in (EngineState.SCANNING, EngineState.IN_POSITION):
             self._reset(time.time())
 
-    def mark_gate_blocked(self, side: str, reason_prefix: str,
-                           cooldown_sec: float = 45.0) -> None:
-        """
-        BUG-B2 FIX: Called by quant_strategy when unified_entry_gate OR
-        conviction_filter blocks a signal from an active POST_SWEEP state.
+    def mark_signal_deferred(self, side: str, reason_prefix: str,
+                             cooldown_sec: float = 45.0) -> None:
+        """Defer the same executable thesis after an abstention/safety pause.
 
-        Suppresses signal generation for `cooldown_sec` seconds so the evaluation
-        pipeline does not busy-loop at 4 Hz generating and immediately discarding
-        the identical signal.
-
-        cooldown_sec:
-          45s — shorter than the evidence decay period (92% decay / tick) so that
-          genuine structural changes (new CISD, BOS, OTE) can fire a fresh signal.
-          Long enough to prevent tick-level noise from re-triggering a blocked setup.
-
-        When the block key CHANGES (different side or different gate reason prefix)
-        the gate is immediately lifted — a new signal from a different pool or with a
-        different reason is evaluated fresh. Only identical signals are suppressed.
-
-        BUG-3 FIX (GATE-ORPHAN): After the BUG-2 (STATE-DANGLE) fix, state
-        transitions to SCANNING before quant_strategy calls mark_gate_blocked().
-        The _gate_blocked_until field is only consulted in POST_SWEEP state, so it
-        becomes a no-op in SCANNING. The processed-sweep registry is the correct
-        suppression layer — extend the registered sweep's expiry here so it cannot
-        re-enter within the gate-block cooldown window. self._signal is still set
-        at the time this is called (quant_strategy calls mark_gate_blocked() BEFORE
-        consume_signal()) so sweep_result is available for the key lookup.
+        This is not an alpha mechanical guard. QuantStrategy calls this after the
+        posterior/EV stack abstains, after mechanical safety pauses routing, or
+        after account/exchange risk says not to route. The goal is to prevent a
+        4 Hz busy-loop from re-emitting the identical thesis while allowing a
+        genuinely changed sweep context to reprice immediately.
         """
         new_key = (side, reason_prefix[:40])
-        # If the block key changes, reset immediately (different signal context)
+        # If the deferral key changes, reset immediately (different signal context)
         if new_key != self._gate_block_key:
             self._gate_block_key = new_key
             self._gate_blocked_until = time.time() + cooldown_sec
         else:
-            # Same block reason — extend the cooldown from NOW
+            # Same abstention/safety reason — extend the cooldown from NOW
             self._gate_blocked_until = max(
                 self._gate_blocked_until, time.time() + cooldown_sec)
 
-        # BUG-3 FIX: Extend processed-sweep registry expiry for the sweep that
-        # generated this blocked signal.  This is the correct suppression point
+        # Extend processed-sweep registry expiry for the sweep that
+        # generated this deferred signal. This is the correct suppression point
         # after the state-dangle fix — _gate_blocked_until only works in POST_SWEEP.
         if (self._signal is not None
                 and hasattr(self._signal, 'sweep_result')
@@ -761,6 +763,12 @@ class EntryEngine:
                 self._processed_sweeps.get(key, 0.0),
                 time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
             )
+
+    def mark_gate_blocked(self, side: str, reason_prefix: str,
+                          cooldown_sec: float = 45.0) -> None:
+        """Compatibility alias for older callers. Live code uses mark_signal_deferred()."""
+        self.mark_signal_deferred(side, reason_prefix, cooldown_sec)
+
 
     def on_position_closed(self) -> None:
         self._active_signal = None
@@ -901,7 +909,7 @@ class EntryEngine:
         BUG-1 FIX (SWEEP-LOOP): Both LiquidityMap and ICT-bridge sweeps are now
         filtered against _processed_sweeps before being returned.  A sweep that has
         already driven a verdict (regardless of whether the resulting signal was
-        consumed or blocked) will not be re-presented until its 120s hold expires.
+        consumed or deferred) will not be re-presented until its 120s hold expires.
         """
         # ── Sweep collection diagnostics ──────────────────────────────────
         # Track every reason a sweep is rejected so upstream logs show why
@@ -1004,7 +1012,7 @@ class EntryEngine:
 
             # Expose bridge rejections via state-level counters (read by the
             # diagnostic THINK log in quant_strategy — also picked up by the
-            # mark_gate_blocked telemetry).
+            # mark_signal_deferred telemetry).
             if _bridge_stale or _bridge_low_q or _bridge_proc:
                 self._last_bridge_skip = {
                     "stale":       _bridge_stale,
@@ -1093,37 +1101,24 @@ class EntryEngine:
         self._sweep_quality_hist[tf].append(float(sweep.quality))
         required_quality = self._tf_quality_threshold(tf)
         if sweep.quality < required_quality:
-            # EE-4 FIX: register the rejected sweep in _processed_sweeps so
-            # _collect_sweeps() doesn't re-present it every 250ms for the full
-            # 60s detection window. 60s hold matches the detection window
-            # exactly — expires at the same time the sweep naturally ages out.
-            _reject_key = self._sweep_key(sweep)
-            self._processed_sweeps[_reject_key] = now + 60.0
-            # FIX-TF-QUALITY-LOG: surface the rejection so "no trades" sessions
-            # are diagnosable without a custom debug patch.
-            # SPAM-FIX 2026-04-26: was logger.warning -> Telegram-flooded the
-            # operator (113×/session in production logs) and crowded out
-            # genuinely actionable warnings via TelegramLogHandler. This is a
-            # routine, low-quality-pool gate rejection — INFO is the right
-            # level. Diagnosability is preserved in quant_bot.log; the line
-            # is also belt-and-braces matched in notifier._TELEGRAM_SUPPRESS_PATTERNS
-            # so no future log-handler regression can re-flood Telegram with it.
+            # Dynamic architecture: low-TF / low-quality sweeps are not hard
+            # vetoed. They continue into the posterior auction with naturally
+            # weaker sweep-quality evidence, so the market context can still
+            # rescue a valid rare setup. The processed-sweep registry below
+            # still prevents duplicate evaluation loops.
             logger.info(
-                f"SWEEP REJECTED (tf_quality): {sweep.pool.side.value} "
+                f"SWEEP QUALITY IMPAIRED [tf_quality]: {sweep.pool.side.value} "
                 f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
-                f"required={required_quality:.2f} tf={tf} "
-                f"→ locked 60s"
+                f"reference={required_quality:.2f} tf={tf} "
+                f"→ continuing with reduced evidence weight"
             )
-            return
 
         # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
         # registry THE MOMENT we commit to evaluating it.  This is the earliest
         # possible registration point — before any evidence accumulation — so that
         # _collect_sweeps() cannot find and re-present the same sweep on any
-        # subsequent tick, regardless of how the evaluation resolves (verdict, gate
-        # block, timeout, or early rejection inside _handle_reversal/continuation).
-        # Expiry = now + 120s:  outlasts the 60s detection window + 45s gate-block
-        # cooldown + 15s margin.
+        # subsequent tick, regardless of how the evaluation resolves (verdict, deferral, timeout, or early rejection inside _handle_reversal/continuation).
+        # Expiry = now + 120s:  outlasts the 60s detection window + 45s deferral cooldown + 15s margin.
         _reg_key = self._sweep_key(sweep)
         self._processed_sweeps[_reg_key] = now + 120.0
 
@@ -1158,13 +1153,13 @@ class EntryEngine:
             self._reset(now)
             return
 
-        # BUG-B2 FIX: Respect gate-block cooldown.
-        # If a gate (unified or conviction) blocked the last signal from this
+        # BUG-B2 FIX: Respect deferral cooldown.
+        # If a posterior/EV/safety audit deferred the last signal from this
         # post-sweep state, suppress signal generation until the cooldown expires.
         # Evidence accumulation and logging continue normally — only the final
         # signal SET is gated. This prevents the 4 Hz busy-loop where the same
         # signal is generated and immediately discarded hundreds of times.
-        _gate_suppressed = (now < self._gate_blocked_until)
+        _defer_suppressed = (now < self._gate_blocked_until)
 
         ps.tick_count += 1
         ps.highest_since = max(ps.highest_since, price)
@@ -1213,15 +1208,22 @@ class EntryEngine:
                 logger.info(f"POST_SWEEP: OTE ZONE ({retrace:.1%})")
             ps.ote_holding = in_ote
 
-        # Evaluate evidence
-        decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+        # Evaluate evidence. If a prior candidate was deferred by the
+        # target/stop utility surfaces, keep updating evidence but suppress
+        # repeated "POSTERIOR ACCEPTED" lines. The auction is being monitored;
+        # it is not routeable until the cooldown expires.
+        self._suppress_posterior_accept_log = bool(_defer_suppressed)
+        try:
+            decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+        finally:
+            self._suppress_posterior_accept_log = False
 
-        # BUG-B2 FIX: If gate-blocked, allow evidence to accumulate but do not
+        # BUG-B2 FIX: If deferred, allow evidence to accumulate but do not
         # present a new signal yet. Log remaining cooldown at debug level.
-        if _gate_suppressed:
+        if _defer_suppressed:
             remaining = self._gate_blocked_until - now
             logger.debug(
-                f"POST_SWEEP: gate-block cooldown {remaining:.0f}s remaining — "
+                f"POST_SWEEP: deferral cooldown {remaining:.0f}s remaining — "
                 f"evidence accumulating (rev={self._last_sweep_analysis.get('rev_score',0):.0f} "
                 f"cont={self._last_sweep_analysis.get('cont_score',0):.0f})")
             return
@@ -1244,7 +1246,7 @@ class EntryEngine:
                         atr: float = 0.0, side: str = ""):
         """Live adaptive profile used by every entry decision.
 
-        This keeps the entry engine from behaving as a fixed-threshold retail
+        This keeps the entry engine from behaving as a fixed-threshold static
         rule-set. Thresholds are still bounded by config priors, but actual
         acceptance depends on ATR state, liquidity density, HTF structure,
         AMD phase, flow, spread/session context and pool quality.
@@ -1262,6 +1264,24 @@ class EntryEngine:
             profile = build_market_profile(price=price, atr=atr)
         self._last_market_profile = profile
         return profile
+
+    def _log_posterior_accept_once(self, key: tuple, message: str, now: float) -> None:
+        """Emit posterior-acceptance telemetry only when it is actionable.
+
+        Acceptance can remain true for many ticks while the market sits in the
+        same post-sweep auction. Repeating the same line every 250-500ms makes
+        the operator surface noisy and can hide real execution diagnostics.
+        We log once per action/side/phase/sweep, then only again after 30s.
+        When a target/stop-surface deferral is active, the acceptance is held and
+        should not be logged as route-ready.
+        """
+        if getattr(self, "_suppress_posterior_accept_log", False):
+            return
+        if key == self._last_accept_log_key and (now - self._last_accept_log_ts) < 30.0:
+            return
+        self._last_accept_log_key = key
+        self._last_accept_log_ts = now
+        logger.info(message)
 
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep
@@ -1356,6 +1376,17 @@ class EntryEngine:
             opp = self._find_opposing_target(rev_dir, snap, price, atr)
 
         # ── DYNAMIC FACTORS (per-tick) ────────────────────────────────
+
+        # DirectionEngine hint
+        hint = (getattr(ict, 'direction_hint', '') or '').lower()
+        hint_side = (getattr(ict, 'direction_hint_side', '') or '').lower()
+        hint_conf = float(getattr(ict, 'direction_hint_confidence', 0.0) or 0.0)
+        if hint and hint_conf >= 0.30:
+            pts = round(20.0 * hint_conf, 1)
+            if hint == "reverse" and hint_side == rev_dir:
+                rev_d += pts; rev_r.append(f"DIR_REVERSE({hint_conf:.0%})")
+            elif hint == "continue" and hint_side == cont_dir:
+                cont_d += pts; cont_r.append(f"DIR_CONTINUE({hint_conf:.0%})")
 
         # Live displacement
         if ps.max_displacement >= disp_strong_atr:
@@ -1514,13 +1545,16 @@ class EntryEngine:
             if not gate_ok:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
-                    reason=f"HARD_GATE_WAIT: {gate_reason}")
+                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             conf = max(qd.posterior, min(1.0, rev_total / 90.0))
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
-            logger.info(
-                f"🎯 SWEEP VERDICT: REVERSAL {rev_dir.upper()} [{phase}] "
-                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}")
+            self._log_posterior_accept_once(
+                ("reverse", rev_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
+                f"🧠 POSTERIOR ACCEPTED: REVERSAL {rev_dir.upper()} [{phase}] "
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}",
+                now,
+            )
             return PostSweepDecision(
                 action="reverse", direction=rev_dir, confidence=conf,
                 next_target=opp,
@@ -1545,10 +1579,13 @@ class EntryEngine:
             if not gate_ok:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
-                    reason=f"HARD_GATE_WAIT: {gate_reason}")
+                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
-            logger.info(
-                f"🎯 SWEEP VERDICT: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}")
+            self._log_posterior_accept_once(
+                ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
+                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
+                now,
+            )
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
                 confidence=min(1.0, cont_total / 90.0),
@@ -1645,7 +1682,7 @@ class EntryEngine:
         if self._sl_is_protective(side, sl, price):
             return False
         logger.info(
-            f"ENTRY REJECTED (invalid SL): side={side} entry=${price:.1f} "
+            f"CANDIDATE DEFERRED [invalid_sl]: side={side} entry=${price:.1f} "
             f"sl=${sl:.1f} sweep=${sweep_price:.1f} reason={reason}")
         self._post_sweep = None
         self._reset(now)
@@ -1723,13 +1760,14 @@ class EntryEngine:
         self, ps, action: str, side: str, snap, flow, ict,
         price: float, atr: float, now: float, phase: str
     ) -> tuple[bool, str]:
-        """Dynamic market-aware execution gate before signal construction.
+        """Dynamic market-aware execution diagnostics before signal construction.
 
-        The evidence model can identify a plausible narrative; this gate decides
-        whether that narrative is executable. It blocks retail-style conditions:
-        weak/zero displacement, chasing after the move, continuation without
-        failed-reclaim/acceptance, contra HTF without strong delivery, and flow
-        pressing against the trade. Thresholds are adaptive via MarketProfile.
+        This layer no longer vetoes sweep decisions. The quantitative
+        posterior/EV model already decides whether a post-sweep auction has
+        positive executable edge. The quality gate now converts institutional
+        observations into a continuous quality score and audit trail so weak
+        conditions reduce confidence/position size downstream instead of creating
+        a hidden low-quality veto.
         """
         profile = self._market_profile(snap, flow, ict, price, atr, side)
         a = max(float(atr or 0.0), 1e-9)
@@ -1750,65 +1788,85 @@ class EntryEngine:
         action_l = str(action or "").lower()
         side_l = str(side or "").lower()
 
-        # 1) No executable auction without accepted delivery or structural proof.
+        score = 1.0
+        notes = []
+
+        # 1) Delivery/structure proof. Weak proof is a size/confidence penalty.
         if disp < min_disp and not (cisd or ote):
-            return False, (
-                f"dynamic_delivery_missing: DISP={disp:.2f}ATR < "
-                f"{min_disp:.2f}ATR and no CISD/OTE | {profile.compact()}"
+            miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
+            score *= max(0.45, 1.0 - 0.38 * miss)
+            notes.append(
+                f"delivery_weak DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
             )
 
-        # 2) Chasing after displacement is only allowed if structure confirms.
+        # 2) Chase distance. Far-from-sweep entries need more quality.
         if dist_from_sweep_atr > chase_limit and not (cisd or ote):
-            return False, (
-                f"chase_block: entry {dist_from_sweep_atr:.2f}ATR from sweep "
-                f"> dynamic limit {chase_limit:.2f}ATR without CISD/OTE | {profile.compact()}"
+            over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
+            score *= max(0.45, 1.0 - 0.25 * over)
+            notes.append(
+                f"chase_extended {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
             )
 
-        # 3) Flow/CVD hard opposition.
+        # 3) Flow/CVD opposition becomes a regime penalty.
         flow_dir = str(getattr(flow, "direction", "") or "").lower()
         flow_conv = abs(float(getattr(flow, "conviction", 0.0) or 0.0))
         cvd = float(getattr(flow, "cvd_trend", 0.0) or 0.0)
         if flow_dir and flow_dir != side_l and flow_conv >= opp_flow:
-            return False, (
-                f"flow_hard_contra: {flow_dir} {flow_conv:.2f} >= "
-                f"{opp_flow:.2f} against {side_l} | {profile.compact()}"
-            )
+            excess = min(1.0, (flow_conv - opp_flow) / max(1.0 - opp_flow, 1e-9))
+            score *= max(0.50, 1.0 - 0.25 * excess)
+            notes.append(f"flow_contra {flow_dir}={flow_conv:.2f}")
         if side_l == "long" and cvd <= -opp_cvd:
-            return False, f"cvd_hard_contra: {cvd:.2f} <= -{opp_cvd:.2f} | {profile.compact()}"
+            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
+            score *= max(0.52, 1.0 - 0.22 * excess)
+            notes.append(f"cvd_contra {cvd:.2f}")
         if side_l == "short" and cvd >= opp_cvd:
-            return False, f"cvd_hard_contra: {cvd:.2f} >= {opp_cvd:.2f} | {profile.compact()}"
+            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
+            score *= max(0.52, 1.0 - 0.22 * excess)
+            notes.append(f"cvd_contra {cvd:.2f}")
 
-        # 4) Continuation must prove acceptance/failed reclaim; no plain momentum continuation.
+        # 4) Continuation needs acceptance, but lack of proof reduces quality.
         if action_l == "continue":
             accepted = disp >= profile.displacement_min(_ENTRY_CONT_MIN_ACCEPT_ATR)
             if not (accepted and (cisd or disp >= strong_disp or ote)):
-                return False, (
-                    f"continuation_acceptance_missing: DISP={disp:.2f}ATR "
-                    f"need acceptance/CISD/retest strong={strong_disp:.2f} | {profile.compact()}"
+                score *= 0.62
+                notes.append(
+                    f"continuation_acceptance_soft DISP={disp:.2f}ATR strong={strong_disp:.2f}"
                 )
 
-        # 5) Reversal in wrong premium/discount is allowed only with strong proof.
+        # 5) Premium/discount mismatch is a penalty unless strong proof exists.
         pd = float(getattr(ict, "dealing_range_pd", 0.5) or 0.5)
         dr_long_max, dr_short_min = profile.dealing_range_bounds(
             _ENTRY_REVERSAL_PD_LONG_MAX, _ENTRY_REVERSAL_PD_SHORT_MIN)
         if action_l == "reverse" and disp < strong_disp:
             if side_l == "long" and pd > dr_long_max and not (cisd and ote):
-                return False, f"pd_contra_long: PD={pd:.2f}>{dr_long_max:.2f} without strong proof | {profile.compact()}"
+                score *= 0.70
+                notes.append(f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}")
             if side_l == "short" and pd < dr_short_min and not (cisd and ote):
-                return False, f"pd_contra_short: PD={pd:.2f}<{dr_short_min:.2f} without strong proof | {profile.compact()}"
+                score *= 0.70
+                notes.append(f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}")
 
-        # 6) HTF contra requires stronger delivery; avoids retail fade trades.
+        # 6) HTF contra trades are not prohibited; they require lower exposure.
         s15 = str(getattr(ict, "structure_15m", "") or "").lower()
         s4h = str(getattr(ict, "structure_4h", "") or "").lower()
         htf_bull = ("bull" in s15) + ("bull" in s4h)
         htf_bear = ("bear" in s15) + ("bear" in s4h)
         if disp < strong_disp:
             if side_l == "long" and htf_bear >= 2:
-                return False, f"htf_contra_long: 15m/4h bearish and DISP<{strong_disp:.2f}ATR | {profile.compact()}"
+                score *= 0.68
+                notes.append(f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}")
             if side_l == "short" and htf_bull >= 2:
-                return False, f"htf_contra_short: 15m/4h bullish and DISP<{strong_disp:.2f}ATR | {profile.compact()}"
+                score *= 0.68
+                notes.append(f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}")
 
-        return True, f"dynamic_entry_gate_pass | {profile.compact()}"
+        score = max(0.20, min(1.0, score))
+        try:
+            self._last_sweep_analysis["quality_score"] = score
+            self._last_sweep_analysis["quality_notes"] = notes[:8]
+        except Exception:
+            pass
+
+        note = " | ".join(notes[:4]) if notes else "clean"
+        return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
 
     def _evaluate_pending_refined_entry(
         self, snap, flow, ict, price: float, atr: float, now: float
@@ -1981,7 +2039,7 @@ class EntryEngine:
 
         if risk < 1e-10:
             logger.info(
-                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -2012,7 +2070,7 @@ class EntryEngine:
             snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
         if sl is None:
             logger.info(
-                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
                 f"sweep=${sweep.pool.price:.1f}")
             if "liquidation" in str(sl_reason).lower() or "search window" in str(self._last_pool_plan_summary()).lower():
                 self._arm_refine_watch_from_rejected_sweep(
@@ -2033,7 +2091,7 @@ class EntryEngine:
 
         if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._arm_refine_watch_from_rejected_sweep(
                 sweep=sweep,
@@ -2054,7 +2112,7 @@ class EntryEngine:
         tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
         if tp is None:
             logger.info(
-                f"ENTRY REJECTED (no liquidity TP): side={side} "
+                f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
                 f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
                 f"| {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2064,7 +2122,7 @@ class EntryEngine:
         rr = abs(tp - price) / risk
         if rr < _MIN_RR_RATIO:
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
                 f"side={side} sweep=${sweep.pool.price:.1f} "
                 f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
             self._post_sweep = None
@@ -2082,7 +2140,7 @@ class EntryEngine:
             reason=f"{decision.reason}{cisd}{disp}",
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🎯 SIGNAL: REVERSAL {side.upper()} | "
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
         # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
         # Previously only _post_sweep was cleared here; the engine remained in
@@ -2123,7 +2181,7 @@ class EntryEngine:
 
         if risk < 1e-10:
             logger.info(
-                f"ENTRY REJECTED (SL zero): side={side} sweep=${sweep.pool.price:.1f}")
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
             return
@@ -2148,7 +2206,7 @@ class EntryEngine:
             snap, side, price, atr, sl, sweep.pool.price, "continuation")
         if sl is None:
             logger.info(
-                f"ENTRY REJECTED (SL envelope): {sl_reason} side={side} "
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
                 f"sweep=${sweep.pool.price:.1f}")
             self._post_sweep = None
             self._reset(now)
@@ -2162,7 +2220,7 @@ class EntryEngine:
         # ── Liquidation guard ─────────────────────────────────────────────
         if not self._sl_before_liquidation(side, sl, price):
             logger.info(
-                f"ENTRY REJECTED (SL beyond liquidation guard): side={side} "
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
                 f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
             self._arm_refine_watch_from_rejected_sweep(
                 sweep=sweep,
@@ -2178,7 +2236,7 @@ class EntryEngine:
 
         # Continuation TP is re-selected through the same EV-ranked pool selector
         # as reversal entries.  The DirectionEngine's next_target is a directional
-        # hint, not an execution TP.  This prevents "visible pool = TP" retail
+        # hint, not an execution TP.  This prevents "visible pool = TP" shortcut
         # shortcuts and forces every continuation target through R:R, probability,
         # gauntlet, freshness, and execution-cost gates.
         tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
@@ -2188,7 +2246,7 @@ class EntryEngine:
         else:
             rr = reward / risk if risk > 1e-10 else 0.0
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R/TP): initial_rr={rr:.2f} < institutional TP gate "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: initial_rr={rr:.2f} < institutional TP gate "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2197,7 +2255,7 @@ class EntryEngine:
 
         if rr < _MIN_RR_RATIO:
             logger.info(
-                f"⚠️ ENTRY REJECTED (R:R): rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2211,7 +2269,7 @@ class EntryEngine:
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🎯 SIGNAL: CONTINUATION {side.upper()} R:R={rr:.1f}")
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
         # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
         # Transition to SCANNING immediately without nulling self._signal.
         self._post_sweep = None
@@ -2236,13 +2294,7 @@ class EntryEngine:
                 "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
-        # Hard gate remains the desk minimum R:R.  Do not add the safety
-        # cushion to min_rr as a cliff; that created false rejects such as
-        # 2.18R < 2.20R even when posterior/EV were strong.  The cushion is
-        # consumed by selector scoring/cost gates; the hard selector threshold
-        # allows a small tick-rounding tolerance.
-        required_rr = max(float(min_rr), _MIN_RR_RATIO)
-        selector_min_rr = max(1.0, required_rr - _TP_RR_TOLERANCE)
+        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         try:
             from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:
@@ -2253,30 +2305,21 @@ class EntryEngine:
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
         if _sel_tp is None:
-            # Last-resort compatibility path.  This should not be used in the
-            # shipped package, but keeps direct single-file runs from breaking.
-            try:
-                from strategy.liquidity_pool_selector import select_tp as _legacy_sel_tp
-            except ImportError:
-                from liquidity_pool_selector import select_tp as _legacy_sel_tp   # type: ignore
-            tp_price, target, score = _legacy_sel_tp(
-                snap=snap, side=side, entry=price, sl=sl, atr=atr,
-                ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=selector_min_rr,
-            )
             report = {
                 "role": "TP", "side": side, "entry": price, "atr": atr,
-                "summary": "legacy selector path used; detailed diagnostics unavailable",
+                "summary": "liquidity selector unavailable; abstaining from target selection",
                 "selected": None, "candidates": [],
             }
-        else:
-            tp_price, target, score, report_obj = _sel_tp(
-                snap=snap, side=side, entry=price, sl=sl, atr=atr,
-                ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=selector_min_rr,
-                now=time.time(),
-            )
-            report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
+            self._record_pool_report(report)
+            return None, None
+
+        tp_price, target, score, report_obj = _sel_tp(
+            snap=snap, side=side, entry=price, sl=sl, atr=atr,
+            ict=getattr(self, "_ict", None), htf=_htf_ref,
+            min_rr=required_rr,
+            now=time.time(),
+        )
+        report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
 
         self._record_pool_report(report)
         if tp_price is None or target is None:
@@ -2337,17 +2380,12 @@ class EntryEngine:
 
         _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
         if _sel_sl is None:
-            try:
-                from strategy.liquidity_pool_selector import select_sl as _legacy_sel_sl
-            except ImportError:
-                from liquidity_pool_selector import select_sl as _legacy_sel_sl   # type: ignore
-            return _legacy_sel_sl(
-                snap=snap, side=side, entry=entry, atr=atr,
-                ict=ict if ict is not None else getattr(self, "_ict", None),
-                htf=_htf_ref,
-                invalidation_price=invalidation_price,
-                max_buffer_atr=max_buffer_atr,
-            )
+            self._record_pool_report({
+                "role": "SL", "side": side, "entry": entry, "atr": atr,
+                "summary": "liquidity selector unavailable; abstaining from stop selection",
+                "selected": None, "candidates": [],
+            })
+            return None, None
 
         sl_price, target, pick, report_obj = _sel_sl(
             snap=snap, side=side, entry=entry, atr=atr,

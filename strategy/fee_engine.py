@@ -294,7 +294,7 @@ class ProfitFloorModel:
         Default cap: 2.0×ATR (a generous but achievable TP distance).
         """
         if price <= 0:
-            return float("inf")     # genuine bad data — hard-block always correct
+            return float("inf")     # genuine bad data — mechanical guard always correct
         if atr <= 0:
             # FE-4 FIX: during ATR warmup (first ~14 candles after boot), return
             # a conservative floor of 2 × rt_cost_price rather than 0.0. A zero

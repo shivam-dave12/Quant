@@ -73,10 +73,6 @@ class RiskManager:
         self.available_balance     = 0.0
         self.balance_cache_time    = 0.0
         self.balance_cache_ttl     = config.BALANCE_CACHE_TTL_SEC
-        # Institutional daily loss accounting uses day-opening equity as the
-        # denominator.  Current balance drifts after losses and makes the daily
-        # percentage gate inconsistent with the strategy DailyRiskGate.
-        self._daily_open_balance  = 0.0
         self._balance_fetch_in_progress = False
         self._balance_fetch_started_at = 0.0
 
@@ -178,8 +174,6 @@ class RiskManager:
                 if self.initial_balance == 0.0:
                     self.initial_balance = total
                     logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
-                if self._daily_open_balance == 0.0 and total > 0:
-                    self._daily_open_balance = total
 
             return {"available": available, "total": total, "cached": False}
 
@@ -249,6 +243,17 @@ class RiskManager:
                 remaining = int(cooldown - (now - _last_loss))
                 return False, f"Loss cooldown: {remaining}s remaining"
 
+            # RISK-HARDENING: bootstrap balance before gate checks.
+            # A zero current_balance disables percentage drawdown gates; fetch once
+            # before the first trade so daily-loss and drawdown checks are live.
+            if self.current_balance <= 0 and self.api is not None:
+                try:
+                    bal = self.get_available_balance()
+                    if isinstance(bal, dict) and bal.get("error"):
+                        return False, f"Balance unavailable: {bal.get('error')}"
+                except Exception as _bal_gate_err:
+                    return False, f"Balance unavailable: {_bal_gate_err}"
+
             # ── Daily trade limit ─────────────────────────────────────────────
             if len(self.daily_trades) >= self.max_daily_trades:
                 return False, f"Daily trade limit ({self.max_daily_trades})"
@@ -258,9 +263,8 @@ class RiskManager:
                 return False, f"Daily loss limit hit (${abs(self.daily_pnl):.2f})"
 
             # ── Daily loss limit (% of balance) ──────────────────────────────
-            daily_equity = self._daily_open_balance or self.current_balance
-            if daily_equity > 0:
-                daily_loss_pct = abs(self.daily_pnl) / daily_equity * 100
+            if self.current_balance > 0:
+                daily_loss_pct = abs(self.daily_pnl) / self.current_balance * 100
                 max_daily_pct  = getattr(config, "MAX_DAILY_LOSS_PCT", 5.0)
                 if self.daily_pnl < 0 and daily_loss_pct >= max_daily_pct:
                     return False, (f"Daily loss % limit hit "
@@ -421,7 +425,6 @@ class RiskManager:
         self.daily_trades.clear()
         self.daily_pnl          = 0.0
         self.consecutive_losses = 0
-        self._daily_open_balance = self.current_balance if self.current_balance > 0 else self.initial_balance
         self._last_reset_date   = today
         self._pending_reset     = False
 
