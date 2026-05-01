@@ -91,6 +91,24 @@ ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
 IC_IMPAIRMENT_SIZE_MULT            = 0.35
 POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
 
+# Adaptive exit contracts allow a trade without a positive fixed-TP surface only
+# when the trail itself is priced as executable edge. This is not a trail-only
+# fallback: it requires fast proof of delivery, true-BE/profit-lock, and a
+# failed-delivery exit before the full structural SL becomes the default outcome.
+ENTRY_ADAPTIVE_EXIT_ENABLED             = True
+ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_PROB = 0.72
+ENTRY_ADAPTIVE_EXIT_MIN_EV_R            = 0.08
+ENTRY_ADAPTIVE_EXIT_MIN_UTILITY         = 0.04
+ENTRY_ADAPTIVE_EXIT_MIN_CAPTURE_R       = 0.45
+ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_ATR  = 0.55
+ENTRY_ADAPTIVE_EXIT_MAX_ACTIVATION_ATR  = 1.55
+ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_R    = 0.35
+ENTRY_ADAPTIVE_EXIT_MIN_COST_MULT       = 1.20
+ENTRY_ADAPTIVE_EXIT_MAX_RISK_ATR        = 5.25
+ENTRY_ADAPTIVE_EXIT_TIME_STOP_SEC       = 300.0
+ENTRY_ADAPTIVE_EXIT_MIN_MFE_ATR         = 0.35
+ENTRY_ADAPTIVE_EXIT_MAX_NO_PROOF_LOSS_ATR = 0.35
+
 
 # ── Order execution ───────────────────────────────────────────────────────────
 TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1

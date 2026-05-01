@@ -16,8 +16,8 @@ Decision ownership:
   DirectionEngine: hunt telemetry only; no executable direction injection.
 
 SL/TP:
-  SL must be a protective invalidation level; TP must be live liquidity selected
-  by probability-adjusted payoff after costs.
+  SL must be a protective invalidation level. Exit approval must come from either
+  a positive fixed TP surface or a separately priced adaptive exit contract.
 """
 
 from __future__ import annotations
@@ -55,13 +55,24 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
-    from strategy.expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier
+    from strategy.expected_utility import (
+        build_target_surface,
+        build_stop_surface,
+        build_adaptive_exit_contract,
+        expected_utility_size_multiplier,
+    )
 except Exception:  # pragma: no cover - standalone tests
     try:
-        from expected_utility import build_target_surface, build_stop_surface, expected_utility_size_multiplier  # type: ignore
+        from expected_utility import (  # type: ignore
+            build_target_surface,
+            build_stop_surface,
+            build_adaptive_exit_contract,
+            expected_utility_size_multiplier,
+        )
     except Exception:
         build_target_surface = None  # type: ignore
         build_stop_surface = None  # type: ignore
+        build_adaptive_exit_contract = None  # type: ignore
         expected_utility_size_multiplier = None  # type: ignore
 
 # -- Liquidity-first sweep/posterior entry engine -----------------------------
@@ -2430,6 +2441,15 @@ class PositionState:
     pool_gate_reverse_notice_key:  str = ""
     profit_defense_last_action_at: float = 0.0
     profit_defense_last_notice_at: float = 0.0
+    adaptive_exit_mode: str = ""
+    adaptive_exit_activation_price: float = 0.0
+    adaptive_exit_activation_atr: float = 0.0
+    adaptive_exit_activation_r: float = 0.0
+    adaptive_exit_timeout_sec: float = 0.0
+    adaptive_exit_min_mfe_atr: float = 0.0
+    adaptive_exit_max_no_proof_loss_atr: float = 0.0
+    adaptive_exit_activated: bool = False
+    adaptive_exit_notice_at: float = 0.0
     # Exact manual/profit-defense exit accounting. When the strategy closes
     # with a reduce-only market order (not an exchange SL/TP child), the fired
     # order id must be tracked so PnL is booked from the actual fill instead of
@@ -3130,12 +3150,44 @@ class QuantStrategy:
                     tick_size=tick,
                 )
                 best = getattr(surf, 'best', None)
-                if best is None:
+                fixed_edge = bool(
+                    best is not None
+                    and float(getattr(best, 'full_position_utility', 0.0) or 0.0) > 0.0
+                    and float(getattr(best, 'expected_value_r', 0.0) or 0.0) > 0.0
+                )
+                is_raw_stop = (
+                    abs(sp - raw_sl) <= max(tick * 2.0, 1e-9)
+                    or str(getattr(sc, 'role', '') or '') == 'existing'
+                )
+                if (not fixed_edge and is_raw_stop
+                        and 'build_adaptive_exit_contract' in globals()
+                        and build_adaptive_exit_contract is not None):
+                    try:
+                        adaptive = build_adaptive_exit_contract(
+                            side=side, entry=entry, stop=sp, atr=atr_f,
+                            snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                            fee_bps=fee_bps, slippage_bps=slip_bps,
+                            posterior_prob=posterior_prob,
+                            tick_size=tick,
+                            protective_tp=raw_tp,
+                        )
+                        if adaptive is not None:
+                            setattr(surf, "adaptive_exit", adaptive)
+                    except Exception as _ax_e:
+                        logger.debug(f"Adaptive exit contract pricing error: {_ax_e}")
+                adaptive = getattr(surf, 'adaptive_exit', None)
+                adaptive_edge = bool(adaptive is not None and getattr(adaptive, 'executable', False))
+                if best is None and not adaptive_edge:
                     continue
                 stop_u = float(getattr(sc, 'utility', 0.0) or 0.0)
-                target_u = float(getattr(best, 'full_position_utility', getattr(best, 'utility', -9.0)) or -9.0)
-                ev_r = float(getattr(best, 'expected_value_r', -9.0) or -9.0)
-                rr = float(getattr(best, 'rr', 0.0) or 0.0)
+                if adaptive_edge and not fixed_edge:
+                    target_u = float(getattr(adaptive, 'utility', 0.0) or 0.0)
+                    ev_r = float(getattr(adaptive, 'expected_value_r', 0.0) or 0.0)
+                    rr = float(getattr(adaptive, 'expected_capture_r', 0.0) or 0.0)
+                else:
+                    target_u = float(getattr(best, 'full_position_utility', getattr(best, 'utility', -9.0)) or -9.0)
+                    ev_r = float(getattr(best, 'expected_value_r', -9.0) or -9.0)
+                    rr = float(getattr(best, 'rr', 0.0) or 0.0)
                 risk_atr = abs(entry - sp) / atr_f
                 joint = (
                     target_u
@@ -3144,18 +3196,20 @@ class QuantStrategy:
                     - 0.075 * max(risk_atr - 2.6, 0.0)
                     - (0.35 if ev_r <= 0.0 else 0.0)
                 )
-                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr))
+                if adaptive_edge and not fixed_edge:
+                    joint += 0.05 * float(getattr(adaptive, 'activation_probability', 0.0) or 0.0)
+                pair_rows.append((joint, sc, surf, best, stop_u, target_u, ev_r, risk_atr, adaptive_edge and not fixed_edge))
 
             if not pair_rows:
                 setattr(signal, "target_surface", _NoExecutableTargetSurface())
                 return
 
             pair_rows.sort(key=lambda r: r[0], reverse=True)
-            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr = pair_rows[0]
+            joint, chosen_stop, chosen_surface, chosen_target, stop_u, target_u, ev_r, risk_atr, using_adaptive_exit = pair_rows[0]
             self._last_target_surface = chosen_surface
 
             chosen_sl = float(getattr(chosen_stop, 'price', raw_sl) or raw_sl)
-            chosen_tp = float(getattr(chosen_target, 'price', raw_tp) or raw_tp)
+            chosen_tp = raw_tp if using_adaptive_exit else float(getattr(chosen_target, 'price', raw_tp) or raw_tp)
             old_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
             new_rr = abs(chosen_tp - entry) / max(abs(entry - chosen_sl), 1e-9)
 
@@ -3168,17 +3222,19 @@ class QuantStrategy:
             setattr(signal, "stop_surface", stop_surface)
             positive_edge = bool(getattr(chosen_surface, "has_positive_edge", False))
             if not positive_edge:
+                _adaptive = getattr(chosen_surface, 'adaptive_exit', None)
+                _adaptive_note = f" adaptive={_adaptive.compact()}" if _adaptive is not None else ""
                 logger.info(
                     "JointSurface candidate is NON-EXECUTABLE; keeping raw SL/TP: "
                     "candidate SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f "
-                    "EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
+                    "EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f%s | raw SL=$%.1f TP=$%.1f RR=%.2f",
                     chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
-                    posterior_prob, raw_sl, raw_tp, old_rr,
+                    posterior_prob, _adaptive_note, raw_sl, raw_tp, old_rr,
                 )
                 return
 
             changed_sl = abs(chosen_sl - raw_sl) >= max(tick * 2.0, 1e-9)
-            changed_tp = abs(chosen_tp - raw_tp) >= max(tick * 2.0, 1e-9)
+            changed_tp = (not using_adaptive_exit) and abs(chosen_tp - raw_tp) >= max(tick * 2.0, 1e-9)
             if changed_sl:
                 setattr(signal, "sl_price", chosen_sl)
             if changed_tp:
@@ -3196,10 +3252,18 @@ class QuantStrategy:
                     chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
                     posterior_prob, raw_sl, raw_tp, old_rr,
                 )
+            elif using_adaptive_exit:
+                logger.info(
+                    "AdaptiveExitContract selected; keeping raw protective SL/TP while trail contract prices the exit: "
+                    "%s | raw SL=$%.1f TP=$%.1f RR=%.2f posterior=%.3f",
+                    chosen_surface.adaptive_exit.compact(),
+                    raw_sl, raw_tp, old_rr, posterior_prob,
+                )
             else:
+                _target_compact = chosen_target.compact() if chosen_target is not None else "adaptive_exit"
                 logger.debug(
                     "JointSurface kept raw SL/TP: SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f target=%s",
-                    raw_sl, raw_tp, old_rr, joint, chosen_target.compact(),
+                    raw_sl, raw_tp, old_rr, joint, _target_compact,
                 )
         except Exception as e:
             logger.debug(f"Expected-utility joint SL/TP optimisation error: {e}")
@@ -3432,6 +3496,15 @@ class QuantStrategy:
         rr = tp_dist / max(sl_dist, 1e-9)
         sl_atr = sl_dist / max(float(atr or 0.0), 1e-9)
         tp_atr = tp_dist / max(float(atr or 0.0), 1e-9)
+        _surf_for_contract = getattr(signal, "target_surface", None) or getattr(self, "_last_target_surface", None)
+        _adaptive_contract = getattr(_surf_for_contract, "adaptive_exit", None) if _surf_for_contract is not None else None
+        _adaptive_exit = bool(_adaptive_contract is not None and getattr(_adaptive_contract, "executable", False))
+        effective_rr = rr
+        if _adaptive_exit:
+            effective_rr = max(
+                float(getattr(_adaptive_contract, "expected_capture_r", 0.0) or 0.0),
+                float(getattr(_adaptive_contract, "activation_r", 0.0) or 0.0),
+            )
 
         liq_ok, liq_price, liq_guard, liq_reason = self._sl_liquidation_sanity(side, entry, sl)
         if not liq_ok:
@@ -3448,8 +3521,18 @@ class QuantStrategy:
         if side == "short" and tp >= entry:
             rejects.append("short TP is not below entry")
 
-        target_realism, target_allows, target_rejects = self._target_pool_realism(
-            signal, liq_snapshot, side, entry, tp, sl, atr)
+        if _adaptive_exit:
+            _p_act = float(getattr(_adaptive_contract, "activation_probability", 0.0) or 0.0)
+            _cap_r = float(getattr(_adaptive_contract, "expected_capture_r", 0.0) or 0.0)
+            target_realism = self._bounded(0.24 + 0.66 * _p_act + 0.10 * min(_cap_r / 1.25, 1.0))
+            target_allows = [
+                "adaptive exit contract executable: "
+                + str(getattr(_adaptive_contract, "compact", lambda: "adaptive")())
+            ]
+            target_rejects = []
+        else:
+            target_realism, target_allows, target_rejects = self._target_pool_realism(
+                signal, liq_snapshot, side, entry, tp, sl, atr)
         allows.extend(target_allows)
         rejects.extend(target_rejects)
 
@@ -3458,7 +3541,7 @@ class QuantStrategy:
         conviction = self._bounded(float(getattr(signal, "conviction", 0.0) or 0.0))
         is_sweep = etype in (EntryType.SWEEP_REVERSAL.value, EntryType.SWEEP_CONTINUATION.value)
         if is_sweep:
-            event_q = self._bounded(0.38 + 0.30 * quality + 0.22 * conviction + 0.10 * min(rr / 4.0, 1.0))
+            event_q = self._bounded(0.38 + 0.30 * quality + 0.22 * conviction + 0.10 * min(effective_rr / 4.0, 1.0))
         else:
             event_q = self._bounded(0.35 + 0.25 * conviction + 0.20 * target_realism)
 
@@ -3542,7 +3625,7 @@ class QuantStrategy:
             risk_q = 1.0
         else:
             risk_q = max(0.55, 1.0 - (sl_atr - 5.0) / 10.0)
-        if rr >= 3.0 and target_realism >= 0.70:
+        if effective_rr >= 3.0 and target_realism >= 0.70:
             risk_q = max(risk_q, 0.78)
         risk_q = self._bounded(risk_q)
 
@@ -3556,8 +3639,8 @@ class QuantStrategy:
             + 0.05 * pd_q
             + 0.05 * amd_q
         )
-        if rr >= 3.0 and target_realism >= 0.65:
-            score += min((rr - 3.0) * 0.025, 0.10)
+        if effective_rr >= 3.0 and target_realism >= 0.65:
+            score += min((effective_rr - 3.0) * 0.025, 0.10)
         score = self._bounded(score)
 
         # Institutional execution audit.
@@ -3615,7 +3698,7 @@ class QuantStrategy:
         strict_rejects = []
         if strict_quality:
             strict_rejects.extend(quality_advisories[:4])
-            if tp_atr > 6.0 and rr > 4.0 and target_realism < 0.85:
+            if (not _adaptive_exit) and tp_atr > 6.0 and rr > 4.0 and target_realism < 0.85:
                 strict_rejects.append(
                     f"full-position TP too distant for hit-rate profile: TP={tp_atr:.2f}ATR RR={rr:.2f}"
                 )
@@ -3628,7 +3711,7 @@ class QuantStrategy:
         elif strict_rejects:
             allows.append("strict_quality_gate: " + " | ".join(strict_rejects[:3]))
 
-        if score >= 0.82 and rr >= 2.5 and target_realism >= 0.72:
+        if score >= 0.82 and effective_rr >= 2.5 and target_realism >= 0.72:
             grade = "S"
         elif score >= 0.70 and target_realism >= 0.60:
             grade = "A"
@@ -3642,10 +3725,10 @@ class QuantStrategy:
         # but non-malformed thesis becomes tiny, not impossible.
         base_size = 0.62 + (score - threshold) * 0.85
         realism_adj = 0.65 + 0.70 * max(0.0, min(1.0, target_realism))
-        rr_adj = 0.85 + min(max(rr - 1.2, 0.0), 3.0) * 0.06
+        rr_adj = 0.85 + min(max(effective_rr - 1.2, 0.0), 3.0) * 0.06
         quality_penalty_mult = max(0.35, 1.0 - quality_gap)
         size_mult = self._bounded(base_size * realism_adj * rr_adj * quality_penalty_mult, 0.25, 1.15)
-        if rr >= 3.0 and target_realism >= 0.75:
+        if effective_rr >= 3.0 and target_realism >= 0.75:
             size_mult = min(1.18, size_mult + 0.05)
         try:
             _surf = getattr(signal, "target_surface", None) or getattr(self, "_last_target_surface", None)
@@ -3661,7 +3744,8 @@ class QuantStrategy:
 
         allows.append(
             f"audit_score={score:.2f} grade={grade} RR={rr:.2f} "
-            f"SL={sl_atr:.2f}ATR TP={tp_atr:.2f}ATR size_mult={size_mult:.2f}"
+            f"effectiveRR={effective_rr:.2f} SL={sl_atr:.2f}ATR "
+            f"TP={tp_atr:.2f}ATR size_mult={size_mult:.2f}"
         )
         return InstitutionalDecision(
             allowed=allowed,
@@ -6295,6 +6379,19 @@ class QuantStrategy:
             entry_vol = 0.0
 
         # ── Update position state ─────────────────────────────────────────────────
+        _adaptive_contract = None
+        try:
+            _entry_signal_contract = getattr(self, '_last_entry_signal', None)
+            _ts_contract = getattr(_entry_signal_contract, 'target_surface', None)
+            _adaptive_contract = (
+                getattr(_ts_contract, 'adaptive_exit', None)
+                if _ts_contract is not None else None
+            )
+            if _adaptive_contract is not None and not getattr(_adaptive_contract, 'executable', False):
+                _adaptive_contract = None
+        except Exception:
+            _adaptive_contract = None
+
         self._pos = PositionState(
             phase           = PositionPhase.ACTIVE,
             side            = side,
@@ -6316,6 +6413,34 @@ class QuantStrategy:
             entry_fee_paid  = entry_fee_paid,     # v8.1: exact from Delta paid_commission
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
             entry_session   = entry_session,
+            adaptive_exit_mode = (
+                str(getattr(_adaptive_contract, 'mode', '') or '')
+                if _adaptive_contract is not None else ""
+            ),
+            adaptive_exit_activation_price = (
+                float(getattr(_adaptive_contract, 'activation_price', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
+            adaptive_exit_activation_atr = (
+                float(getattr(_adaptive_contract, 'activation_atr', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
+            adaptive_exit_activation_r = (
+                float(getattr(_adaptive_contract, 'activation_r', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
+            adaptive_exit_timeout_sec = (
+                float(getattr(_adaptive_contract, 'time_stop_sec', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
+            adaptive_exit_min_mfe_atr = (
+                float(getattr(_adaptive_contract, 'min_mfe_atr', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
+            adaptive_exit_max_no_proof_loss_atr = (
+                float(getattr(_adaptive_contract, 'max_no_proof_loss_atr', 0.0) or 0.0)
+                if _adaptive_contract is not None else 0.0
+            ),
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
             entry_htf_15m   = self._htf.trend_15m,
             entry_htf_4h    = self._htf.trend_4h,
@@ -6485,13 +6610,18 @@ class QuantStrategy:
         _ss = getattr(self, '_last_stop_surface', None)
         _best_t = getattr(_ts, 'best', None) if _ts is not None else None
         _term_t = getattr(_ts, 'terminal', None) if _ts is not None else None
+        _adaptive_t = getattr(_ts, 'adaptive_exit', None) if _ts is not None else None
         _best_s = getattr(_ss, 'best', None) if _ss is not None else None
         _runner_frac = float(getattr(_ts, 'runner_fraction', 0.0) or 0.0) if _ts is not None else 0.0
         _tp_model = (
-            f"executable p={getattr(_best_t,'probability',0.0):.3f} "
-            f"fullU={getattr(_best_t,'full_position_utility',getattr(_best_t,'utility',0.0)):+.3f} "
-            f"role={getattr(_best_t,'role','-')}"
-            if _best_t is not None else "not available"
+            _adaptive_t.compact()
+            if _adaptive_t is not None and getattr(_adaptive_t, 'executable', False)
+            else (
+                f"executable p={getattr(_best_t,'probability',0.0):.3f} "
+                f"fullU={getattr(_best_t,'full_position_utility',getattr(_best_t,'utility',0.0)):+.3f} "
+                f"role={getattr(_best_t,'role','-')}"
+                if _best_t is not None else "not available"
+            )
         )
         _runner_model = (
             f"runner ${getattr(_term_t,'price',0.0):,.1f} "
@@ -6539,9 +6669,152 @@ class QuantStrategy:
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
         )
 
+    def _refresh_position_excursions(self, pos: 'PositionState', price: float) -> None:
+        try:
+            profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+        except Exception:
+            return
+        with self._lock:
+            if profit > pos.peak_profit:
+                pos.peak_profit = profit
+            adverse = max(0.0, -profit)
+            if adverse > pos.peak_adverse:
+                pos.peak_adverse = adverse
+            if pos.side == "long":
+                if price > pos.peak_price_abs:
+                    pos.peak_price_abs = price
+            elif pos.side == "short":
+                if pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs:
+                    pos.peak_price_abs = price
+
+    def _adaptive_exit_contract_guard(self, order_manager, price: float,
+                                      atr: float, now: float) -> bool:
+        """Proof/fail management for an AdaptiveExitContract position."""
+        pos = self._pos
+        mode = str(getattr(pos, "adaptive_exit_mode", "") or "")
+        if not mode or atr <= 1e-10 or pos.entry_price <= 0.0:
+            return False
+
+        profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+        mfe = max(float(getattr(pos, "peak_profit", 0.0) or 0.0), profit, 0.0)
+        mfe_atr = mfe / max(atr, 1e-9)
+        hold_sec = now - float(getattr(pos, "entry_time", now) or now)
+        activation_atr = float(getattr(pos, "adaptive_exit_activation_atr", 0.0) or 0.0)
+        activation_price = float(getattr(pos, "adaptive_exit_activation_price", 0.0) or 0.0)
+        activated_by_price = (
+            activation_price > 0.0 and (
+                (pos.side == "long" and price >= activation_price) or
+                (pos.side == "short" and price <= activation_price)
+            )
+        )
+        activated_by_mfe = activation_atr > 0.0 and mfe_atr >= activation_atr
+
+        if not getattr(pos, "adaptive_exit_activated", False) and (activated_by_price or activated_by_mfe):
+            with self._lock:
+                pos.adaptive_exit_activated = True
+                pos.adaptive_exit_notice_at = now
+            logger.info(
+                "AdaptiveExitContract proof reached: %s %s delivery=%.2fATR "
+                "activation=%.2fATR price=$%.1f -> attempt true-BE/profit lock",
+                pos.side.upper(), mode, mfe_atr, activation_atr, price,
+            )
+            if pos.sl_order_id:
+                desired = _round_to_tick(_calc_be_price(
+                    pos.side, pos.entry_price, atr, pos=pos))
+                desired = _safe_be_migration_price(pos.side, desired, price, atr)
+                improves = (
+                    desired is not None and (
+                        (pos.side == "long" and desired > pos.sl_price + max(QCfg.TICK_SIZE(), 0.1)) or
+                        (pos.side == "short" and desired < pos.sl_price - max(QCfg.TICK_SIZE(), 0.1))
+                    )
+                )
+                if improves:
+                    exit_side = "sell" if pos.side == "long" else "buy"
+                    result = order_manager.replace_stop_loss(
+                        existing_sl_order_id=pos.sl_order_id,
+                        side=exit_side,
+                        quantity=pos.quantity,
+                        new_trigger_price=desired,
+                        old_trigger_price=pos.sl_price,
+                        current_price=price,
+                    )
+                    if result is None:
+                        self._record_exchange_exit(None)
+                        return True
+                    if isinstance(result, dict) and result.get("error") == "UNPROTECTED":
+                        logger.critical("AdaptiveExitContract BE lock left position unprotected; flattening")
+                        try:
+                            if hasattr(order_manager, "emergency_flatten"):
+                                order_manager.emergency_flatten(reason="adaptive_exit_unprotected")
+                            else:
+                                order_manager.place_market_order(
+                                    side=exit_side, quantity=pos.quantity, reduce_only=True)
+                        finally:
+                            with self._lock:
+                                if self._pos.phase == PositionPhase.ACTIVE:
+                                    self._pos.phase = PositionPhase.EXITING
+                                    self._exiting_since = time.time()
+                        return True
+                    if isinstance(result, dict) and not result.get("error"):
+                        with self._lock:
+                            pos.sl_price = desired
+                            pos.sl_order_id = result.get("order_id") or pos.sl_order_id
+                            pos.be_ratchet_applied = True
+                            pos.trail_active = True
+                            self.current_sl_price = desired
+                        logger.info(
+                            "AdaptiveExitContract true-BE lock armed @ $%.1f; "
+                            "runner now managed by liquidity trail",
+                            desired,
+                        )
+
+        if getattr(pos, "adaptive_exit_activated", False):
+            return False
+
+        timeout = float(getattr(pos, "adaptive_exit_timeout_sec", 0.0) or
+                        getattr(config, "ENTRY_ADAPTIVE_EXIT_TIME_STOP_SEC", 300.0))
+        min_mfe_atr = float(getattr(pos, "adaptive_exit_min_mfe_atr", 0.0) or
+                            getattr(config, "ENTRY_ADAPTIVE_EXIT_MIN_MFE_ATR", 0.35))
+        max_loss_atr = float(getattr(pos, "adaptive_exit_max_no_proof_loss_atr", 0.0) or
+                             getattr(config, "ENTRY_ADAPTIVE_EXIT_MAX_NO_PROOF_LOSS_ATR", 0.35))
+        failed_delivery = hold_sec >= timeout and mfe_atr < min_mfe_atr and profit <= 0.05 * atr
+        no_proof_loss = hold_sec >= max(timeout * 0.45, 60.0) and profit <= -max_loss_atr * atr
+        if failed_delivery or no_proof_loss:
+            reason = (
+                "adaptive_exit_failed_delivery: "
+                f"hold={hold_sec:.0f}s MFE={mfe_atr:.2f}ATR "
+                f"profit={profit/atr:+.2f}ATR activation={activation_atr:.2f}ATR"
+            )
+            logger.info("AdaptiveExitContract proof failed; flattening before full SL: %s", reason)
+            try:
+                send_telegram_message(
+                    f"<b>ADAPTIVE EXIT PROOF FAILED</b>\n"
+                    f"Action: reduce-only market exit\n"
+                    f"Side: <b>{pos.side.upper()}</b> | Mark: <b>${price:,.2f}</b>\n"
+                    f"MFE: <b>{mfe_atr:.2f}ATR</b> | Hold: <b>{hold_sec:.0f}s</b>\n"
+                    f"Reason: <code>{reason}</code>")
+            except Exception:
+                pass
+            self._exit_trade(order_manager, price, reason)
+            return True
+
+        if now - float(getattr(pos, "adaptive_exit_notice_at", 0.0) or 0.0) >= 90.0:
+            with self._lock:
+                pos.adaptive_exit_notice_at = now
+            logger.info(
+                "AdaptiveExitContract waiting for proof: delivery=%.2fATR/%.2fATR "
+                "hold=%.0fs/%.0fs profit=%+.2fATR",
+                mfe_atr, activation_atr, hold_sec, timeout, profit / max(atr, 1e-9),
+            )
+        return False
+
     def _manage_active(self, data_manager, order_manager, now):
         pos = self._pos; price = data_manager.get_last_price()
         if price < 1.0: return
+        atr_now = self._atr_5m.atr if self._atr_5m else 0.0
+        self._refresh_position_excursions(pos, price)
+        if self._adaptive_exit_contract_guard(order_manager, price, atr_now, now):
+            return
 
         # ── Conditionally compute signals — only when trade mode consumes them ──
         # Bug #7/#19 fix: _compute_signals() runs all five signal engines (VWAP,

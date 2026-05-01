@@ -35,6 +35,19 @@ except Exception:  # pragma: no cover
 _MIN_EXECUTABLE_TP_ATR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_DELIVERY_ATR", 1.15))
 _MIN_EXECUTABLE_TP_RR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_RR", 1.35))
 _MIN_EXECUTABLE_TP_COST_MULT = float(getattr(_cfg, "TARGET_FULL_TP_MIN_COST_MULT", 4.0))
+_ADAPTIVE_EXIT_ENABLED = bool(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_ENABLED", True))
+_ADAPTIVE_EXIT_MIN_ACTIVATION_PROB = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_PROB", 0.72))
+_ADAPTIVE_EXIT_MIN_EV_R = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_EV_R", 0.08))
+_ADAPTIVE_EXIT_MIN_UTILITY = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_UTILITY", 0.04))
+_ADAPTIVE_EXIT_MIN_CAPTURE_R = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_CAPTURE_R", 0.45))
+_ADAPTIVE_EXIT_MIN_ACTIVATION_ATR = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_ATR", 0.55))
+_ADAPTIVE_EXIT_MAX_ACTIVATION_ATR = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MAX_ACTIVATION_ATR", 1.55))
+_ADAPTIVE_EXIT_MIN_ACTIVATION_R = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_ACTIVATION_R", 0.35))
+_ADAPTIVE_EXIT_MIN_COST_MULT = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_COST_MULT", 1.20))
+_ADAPTIVE_EXIT_MAX_RISK_ATR = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MAX_RISK_ATR", 5.25))
+_ADAPTIVE_EXIT_TIME_STOP_SEC = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_TIME_STOP_SEC", 300.0))
+_ADAPTIVE_EXIT_MIN_MFE_ATR = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MIN_MFE_ATR", 0.35))
+_ADAPTIVE_EXIT_MAX_NO_PROOF_LOSS_ATR = float(getattr(_cfg, "ENTRY_ADAPTIVE_EXIT_MAX_NO_PROOF_LOSS_ATR", 0.35))
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -269,6 +282,42 @@ class TargetUtility:
 
 
 @dataclass
+class AdaptiveExitContract:
+    """Positive-edge trail contract used only when fixed TP is not executable."""
+
+    mode: str
+    activation_price: float
+    activation_atr: float
+    activation_r: float
+    activation_probability: float
+    expected_capture_r: float
+    expected_value_r: float
+    utility: float
+    time_stop_sec: float
+    min_mfe_atr: float
+    max_no_proof_loss_atr: float
+    protective_tp: float = 0.0
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def executable(self) -> bool:
+        return (
+            self.activation_probability >= _ADAPTIVE_EXIT_MIN_ACTIVATION_PROB
+            and self.expected_capture_r >= _ADAPTIVE_EXIT_MIN_CAPTURE_R
+            and self.expected_value_r >= _ADAPTIVE_EXIT_MIN_EV_R
+            and self.utility >= _ADAPTIVE_EXIT_MIN_UTILITY
+        )
+
+    def compact(self) -> str:
+        return (
+            f"{self.mode} activate=${self.activation_price:,.1f} "
+            f"{self.activation_atr:.2f}ATR/{self.activation_r:.2f}R "
+            f"p={self.activation_probability:.3f} capture={self.expected_capture_r:.2f}R "
+            f"EV={self.expected_value_r:+.3f} U={self.utility:+.3f}"
+        )
+
+
+@dataclass
 class TargetSurface:
     side: str
     entry: float
@@ -279,16 +328,25 @@ class TargetSurface:
     candidates: List[TargetUtility]
     runner_fraction: float
     notes: List[str] = field(default_factory=list)
+    adaptive_exit: Optional[AdaptiveExitContract] = None
 
     @property
     def has_positive_edge(self) -> bool:
-        return bool(self.best and self.best.full_position_utility > 0.0 and self.best.expected_value_r > 0.0)
+        fixed_edge = bool(
+            self.best and self.best.full_position_utility > 0.0 and self.best.expected_value_r > 0.0
+        )
+        adaptive_edge = bool(self.adaptive_exit and self.adaptive_exit.executable)
+        return fixed_edge or adaptive_edge
 
     def compact(self, limit: int = 3) -> str:
         rows = [c.compact() for c in self.candidates[:limit]]
         best = self.best.compact() if self.best else "none"
         term = self.terminal.compact() if self.terminal else "none"
-        return f"best={best}; runner={term}; runner_frac={self.runner_fraction:.0%}; " + " | ".join(rows)
+        adaptive = self.adaptive_exit.compact() if self.adaptive_exit else "none"
+        return (
+            f"best={best}; runner={term}; adaptive={adaptive}; "
+            f"runner_frac={self.runner_fraction:.0%}; " + " | ".join(rows)
+        )
 
 
 def build_stop_surface(*, side: str, entry: float, current_stop: float, atr: float,
@@ -596,10 +654,184 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
     return TargetSurface(side, entry, stop, risk, best, terminal, cands, runner_fraction, notes)
 
 
+def build_adaptive_exit_contract(*, side: str, entry: float, stop: float, atr: float,
+                                 snapshot: Any, flow: Any = None, ict: Any = None,
+                                 fee_bps: float = 8.0, slippage_bps: float = 2.0,
+                                 posterior_prob: float = 0.0,
+                                 tick_size: float = 0.5,
+                                 protective_tp: float = 0.0) -> Optional[AdaptiveExitContract]:
+    """Price a trail-managed exit as its own executable contract.
+
+    This is deliberately stricter than "enter and trail".  It only approves a
+    trade when the model expects price to reach a proof-of-delivery barrier
+    before the structural stop, with enough expected capture after true
+    breakeven/profit-lock to pay for the stop-first tail.
+    """
+    if not _ADAPTIVE_EXIT_ENABLED:
+        return None
+    side = (side or "").lower()
+    entry = float(entry or 0.0)
+    stop = float(stop or 0.0)
+    atr = max(float(atr or 0.0), _EPS)
+    risk = abs(entry - stop)
+    if side not in ("long", "short") or entry <= 0.0 or stop <= 0.0 or risk <= 0.0:
+        return None
+    if (side == "long" and stop >= entry) or (side == "short" and stop <= entry):
+        return None
+
+    risk_atr = risk / atr
+    if risk_atr > _ADAPTIVE_EXIT_MAX_RISK_ATR:
+        return None
+
+    of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
+    reliability = _feed_reliability(snapshot)
+    posterior = clamp(float(posterior_prob or 0.0), 0.001, 0.999)
+    tick = max(float(tick_size or 0.5), _EPS)
+    cost_points = entry * ((float(fee_bps) + float(slippage_bps)) / 10_000.0)
+    cost_r = cost_points / max(risk, _EPS)
+
+    support_sig = 0.0
+    support_tf = 1
+    support_hits = 0
+    activation_ref_atr = clamp(
+        0.66
+        + 0.30 * uncertainty
+        + 0.10 * max(risk_atr - 2.2, 0.0)
+        - 0.10 * max(of_align, 0.0)
+        - 0.06 * max(htf, 0.0),
+        _ADAPTIVE_EXIT_MIN_ACTIVATION_ATR,
+        _ADAPTIVE_EXIT_MAX_ACTIVATION_ATR,
+    )
+    activation_points = max(
+        activation_ref_atr * atr,
+        risk * _ADAPTIVE_EXIT_MIN_ACTIVATION_R,
+        cost_points * _ADAPTIVE_EXIT_MIN_COST_MULT,
+        tick * 8.0,
+    )
+    activation_atr = activation_points / atr
+    if activation_atr > _ADAPTIVE_EXIT_MAX_ACTIVATION_ATR * 1.25:
+        return None
+
+    activation_price = entry + activation_points if side == "long" else entry - activation_points
+    activation_r = activation_points / max(risk, _EPS)
+
+    lo, hi = sorted((entry, activation_price))
+    for target in _get_pools_for_side(snapshot, side):
+        px = _pool_price(target)
+        if px <= 0.0:
+            continue
+        # Liquidity just beyond the activation barrier still supports delivery,
+        # because the trail proof is designed to fire before the pool itself.
+        near_barrier = (
+            (side == "long" and entry < px <= activation_price + 0.75 * atr) or
+            (side == "short" and activation_price - 0.75 * atr <= px < entry)
+        )
+        if lo < px < hi or near_barrier:
+            support_hits += 1
+            support_sig += max(_pool_sig(target), 0.0)
+            support_tf = max(support_tf, _pool_tf_rank(target))
+
+    sig_term = clamp(math.log1p(support_sig) / math.log(30.0), 0.0, 1.0)
+    tf_term = clamp((support_tf - 1) / 5.0, 0.0, 1.0)
+    support_score = clamp(0.58 * sig_term + 0.42 * tf_term, 0.0, 1.0)
+
+    # First-passage style approximation: high posterior and aligned flow raise
+    # the chance of reaching the proof barrier before the structural stop; wide
+    # activation, uncertainty, and poor feed quality lower it.
+    z_activate = (
+        -1.34
+        + 2.85 * (posterior - 0.50)
+        + 0.76 * max(of_align, 0.0)
+        + 0.54 * max(htf, 0.0)
+        + 0.34 * max(pd_affinity, 0.0)
+        + 0.42 * support_score
+        + 0.38 * reliability
+        - 0.48 * uncertainty
+        - 0.34 * activation_atr
+        - 0.08 * max(risk_atr - 3.0, 0.0)
+    )
+    p_activate = clamp(sigmoid(z_activate), 0.001, 0.985)
+
+    p_follow = clamp(
+        0.18
+        + 0.52 * posterior
+        + 0.16 * max(of_align, 0.0)
+        + 0.12 * max(htf, 0.0)
+        + 0.12 * support_score
+        + 0.08 * reliability
+        - 0.20 * uncertainty
+        - 0.04 * max(activation_atr - 1.0, 0.0),
+        0.02,
+        0.88,
+    )
+    lock_r = clamp(0.06 + 0.28 * activation_r - cost_r, 0.02, 0.34)
+    trail_capture_r = clamp(
+        0.42 * activation_r
+        + 1.18 * p_follow
+        + 0.34 * support_score
+        + 0.15 * max(htf, 0.0)
+        - 0.24 * uncertainty,
+        0.0,
+        2.40,
+    )
+    expected_capture_r = lock_r + p_follow * trail_capture_r
+    loss_r = 1.0 + 0.30 * uncertainty + 0.14 * max(risk_atr - 2.8, 0.0) + cost_r
+    ev_r = p_activate * expected_capture_r - (1.0 - p_activate) * loss_r - cost_r
+    variance_drag = (
+        0.11 * (1.0 - p_activate)
+        + 0.09 * uncertainty
+        + 0.035 * max(risk_atr - 3.2, 0.0)
+        + 0.020 * max(activation_atr - 1.0, 0.0)
+    )
+    utility = ev_r - variance_drag + 0.055 * support_score
+
+    notes = [
+        f"posterior={posterior:.3f}",
+        f"of={of_align:+.2f}",
+        f"htf={htf:+.2f}",
+        f"U={uncertainty:.2f}",
+        f"feed={reliability:.2f}",
+        f"support={support_hits}/{support_sig:.1f}",
+        f"costR={cost_r:.3f}",
+        "trail_requires_delivery_proof",
+    ]
+    contract = AdaptiveExitContract(
+        mode="ADAPTIVE_TRAIL_CONTRACT",
+        activation_price=activation_price,
+        activation_atr=activation_atr,
+        activation_r=activation_r,
+        activation_probability=p_activate,
+        expected_capture_r=expected_capture_r,
+        expected_value_r=ev_r,
+        utility=utility,
+        time_stop_sec=_ADAPTIVE_EXIT_TIME_STOP_SEC,
+        min_mfe_atr=_ADAPTIVE_EXIT_MIN_MFE_ATR,
+        max_no_proof_loss_atr=_ADAPTIVE_EXIT_MAX_NO_PROOF_LOSS_ATR,
+        protective_tp=float(protective_tp or 0.0),
+        notes=notes,
+    )
+    return contract if contract.executable else None
+
+
 def expected_utility_size_multiplier(surface: Optional[TargetSurface], posterior: float = 0.0) -> float:
     """Bounded fractional-Kelly style size scaler after alpha acceptance."""
     if not surface or not surface.best:
+        contract = getattr(surface, "adaptive_exit", None) if surface is not None else None
+        if contract is not None and getattr(contract, "executable", False):
+            b = max(float(getattr(contract, "expected_capture_r", 0.0) or 0.0), _EPS)
+            p = clamp(float(getattr(contract, "activation_probability", 0.0) or 0.0), 0.001, 0.999)
+            kelly = (b * p - (1.0 - p)) / b
+            raw = 0.48 + 0.42 * clamp(kelly, -0.35, 0.75) + 0.12 * clamp(contract.utility, -1.0, 1.0)
+            return clamp(raw, 0.28, 0.88)
         return 0.70
+    fixed_edge = bool(surface.best.full_position_utility > 0.0 and surface.best.expected_value_r > 0.0)
+    contract = getattr(surface, "adaptive_exit", None)
+    if not fixed_edge and contract is not None and getattr(contract, "executable", False):
+        b = max(float(getattr(contract, "expected_capture_r", 0.0) or 0.0), _EPS)
+        p = clamp(float(getattr(contract, "activation_probability", 0.0) or 0.0), 0.001, 0.999)
+        kelly = (b * p - (1.0 - p)) / b
+        raw = 0.48 + 0.42 * clamp(kelly, -0.35, 0.75) + 0.12 * clamp(contract.utility, -1.0, 1.0)
+        return clamp(raw, 0.28, 0.88)
     b = max(surface.best.payoff_r, _EPS)
     p = clamp(float(posterior or surface.best.probability), 0.001, 0.999)
     q = 1.0 - p

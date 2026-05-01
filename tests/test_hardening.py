@@ -706,6 +706,148 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(surface.best.rr, 4.0)
         self.assertFalse(surface.has_positive_edge)
 
+    def test_adaptive_exit_contract_requires_positive_delivery_edge(self):
+        from strategy.expected_utility import build_adaptive_exit_contract
+
+        far_pool = SimpleNamespace(
+            price=108.0, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=8.0,
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[SimpleNamespace(pool=far_pool, distance_atr=8.0, direction="long")],
+            ssl_pools=[],
+            feed_reliability=0.95,
+        )
+        flow = SimpleNamespace(tick_flow=0.65, cvd_trend=0.60)
+        ict = SimpleNamespace(
+            structure_15m="bullish",
+            structure_4h="bullish",
+            dealing_range_pd=0.25,
+        )
+
+        weak = build_adaptive_exit_contract(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.65,
+            tick_size=0.01, protective_tp=108.0,
+        )
+        strong = build_adaptive_exit_contract(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+            tick_size=0.01, protective_tp=108.0,
+        )
+
+        self.assertIsNone(weak)
+        self.assertIsNotNone(strong)
+        self.assertTrue(strong.executable)
+        self.assertGreaterEqual(strong.activation_probability, 0.72)
+        self.assertGreater(strong.expected_value_r, 0.0)
+
+    def test_target_surface_can_be_executable_by_adaptive_contract_only(self):
+        from strategy.expected_utility import build_adaptive_exit_contract, build_target_surface
+
+        far_pool = SimpleNamespace(
+            price=108.0, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=8.0,
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[SimpleNamespace(pool=far_pool, distance_atr=8.0, direction="long")],
+            ssl_pools=[],
+            feed_reliability=0.95,
+        )
+        flow = SimpleNamespace(tick_flow=0.65, cvd_trend=0.60)
+        ict = SimpleNamespace(structure_15m="bullish", structure_4h="bullish", dealing_range_pd=0.25)
+
+        surface = build_target_surface(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+            tick_size=0.01,
+        )
+        self.assertFalse(surface.has_positive_edge)
+
+        surface.adaptive_exit = build_adaptive_exit_contract(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, flow=flow, ict=ict, posterior_prob=0.90,
+            tick_size=0.01, protective_tp=108.0,
+        )
+
+        self.assertTrue(surface.has_positive_edge)
+
+    def test_adaptive_exit_guard_locks_be_after_delivery_proof(self):
+        import threading
+        from strategy.quant_strategy import PositionPhase, PositionState, QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._lock = threading.RLock()
+        strategy._fee_engine = None
+        strategy.current_sl_price = 99.0
+        strategy._record_exchange_exit = lambda *args, **kwargs: None
+        strategy._pos = PositionState(
+            phase=PositionPhase.ACTIVE,
+            side="long",
+            quantity=1.0,
+            entry_price=100.0,
+            sl_price=99.0,
+            sl_order_id="sl-1",
+            entry_time=time.time(),
+            initial_sl_dist=1.0,
+            adaptive_exit_mode="ADAPTIVE_TRAIL_CONTRACT",
+            adaptive_exit_activation_price=100.60,
+            adaptive_exit_activation_atr=0.60,
+            adaptive_exit_timeout_sec=300.0,
+            adaptive_exit_min_mfe_atr=0.35,
+            adaptive_exit_max_no_proof_loss_atr=0.35,
+        )
+
+        class FakeOrderManager:
+            def __init__(self):
+                self.replacements = []
+
+            def replace_stop_loss(self, **kwargs):
+                self.replacements.append(kwargs)
+                return {"order_id": "sl-2"}
+
+        om = FakeOrderManager()
+        strategy._refresh_position_excursions(strategy._pos, 101.70)
+        exited = strategy._adaptive_exit_contract_guard(om, 101.70, 1.0, time.time())
+
+        self.assertFalse(exited)
+        self.assertTrue(strategy._pos.adaptive_exit_activated)
+        self.assertTrue(om.replacements)
+        self.assertGreater(strategy._pos.sl_price, 100.0)
+
+    def test_adaptive_exit_guard_flattens_failed_delivery_before_full_sl(self):
+        import threading
+        from strategy.quant_strategy import PositionPhase, PositionState, QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._lock = threading.RLock()
+        strategy._fee_engine = None
+        exits = []
+        strategy._exit_trade = lambda om, price, reason: exits.append((price, reason))
+        strategy._pos = PositionState(
+            phase=PositionPhase.ACTIVE,
+            side="long",
+            quantity=1.0,
+            entry_price=100.0,
+            sl_price=99.0,
+            sl_order_id="sl-1",
+            entry_time=time.time() - 360.0,
+            initial_sl_dist=1.0,
+            peak_profit=0.10,
+            adaptive_exit_mode="ADAPTIVE_TRAIL_CONTRACT",
+            adaptive_exit_activation_price=100.60,
+            adaptive_exit_activation_atr=0.60,
+            adaptive_exit_timeout_sec=300.0,
+            adaptive_exit_min_mfe_atr=0.35,
+            adaptive_exit_max_no_proof_loss_atr=0.35,
+        )
+
+        exited = strategy._adaptive_exit_contract_guard(SimpleNamespace(), 99.95, 1.0, time.time())
+
+        self.assertTrue(exited)
+        self.assertTrue(exits)
+        self.assertIn("adaptive_exit_failed_delivery", exits[0][1])
+
     def test_hard_pool_gate_invalidation_is_actionable(self):
         from strategy.quant_strategy import QuantStrategy
 
