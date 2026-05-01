@@ -562,14 +562,20 @@ class EntryEngine:
         # ── Check for sweeps ──────────────────────────────────────────
         new_sweeps = self._collect_sweeps(liq_snapshot, ict_ctx, now, atr)
 
-        # Reprice a confirmed sweep thesis after a pre-order sizing/margin
-        # rejection only when price has pulled back into a better execution zone.
-        if (self._state == EngineState.SCANNING
+        # Reprice a confirmed sweep thesis after a downstream routeability
+        # rejection whenever the engine is not routing/holding a live position.
+        # A new POST_SWEEP auction must not starve an already accepted thesis:
+        # the refined watch still rebuilds SL/TP from current structure and must
+        # pass every normal execution gate before it can emit a signal.
+        if (self._state in (EngineState.SCANNING, EngineState.POST_SWEEP)
                 and self._pending_refined is not None
                 and self._signal is None):
             self._evaluate_pending_refined_entry(
                 liq_snapshot, flow_state, ict_ctx, price, atr, now)
             if self._signal is not None:
+                self._post_sweep = None
+                self._state = EngineState.SCANNING
+                self._state_entered = now
                 return
 
         if (new_sweeps

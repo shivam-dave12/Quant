@@ -668,6 +668,78 @@ class HardeningTests(unittest.TestCase):
         self.assertLess(pending.last_pullback_required_atr, 0.25)
         self.assertIn("REFINED_PULLBACK", refined.reason)
 
+    def test_refine_watch_reprices_during_active_post_sweep(self):
+        from strategy.entry_engine import (
+            EngineState,
+            EntryEngine,
+            EntrySignal,
+            EntryType,
+            ICTContext,
+            OrderFlowState,
+        )
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        pool = SimpleNamespace(price=100.0, side=PoolSide.SSL, timeframe="1m")
+        sweep = SimpleNamespace(
+            pool=pool,
+            detected_at=now - 10.0,
+            direction="long",
+            wick_extreme=99.4,
+        )
+        original = EntrySignal(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=101.0,
+            sl_price=99.0,
+            tp_price=105.0,
+            rr_ratio=2.0,
+            target_pool=None,
+            sweep_result=sweep,
+            conviction=0.80,
+            reason="accepted thesis deferred by target surface",
+        )
+        self.assertTrue(engine.arm_refine_watch_from_signal(original, "target deferred", now=now))
+        engine._state = EngineState.POST_SWEEP
+        engine._post_sweep = SimpleNamespace(sweep=sweep)
+
+        calls = []
+
+        def emit_refined(*args, **kwargs):
+            calls.append(True)
+            engine._signal = EntrySignal(
+                side="long",
+                entry_type=EntryType.SWEEP_REVERSAL,
+                entry_price=100.7,
+                sl_price=99.1,
+                tp_price=105.0,
+                rr_ratio=2.6,
+                target_pool=None,
+                sweep_result=sweep,
+                conviction=0.82,
+                reason="REFINED_PULLBACK",
+            )
+
+        engine._evaluate_pending_refined_entry = emit_refined
+        engine.update(
+            liq_snapshot=SimpleNamespace(
+                bsl_pools=[],
+                ssl_pools=[],
+                recent_sweeps=[],
+            ),
+            flow_state=OrderFlowState(tick_flow=0.35, cvd_trend=0.30),
+            ict_ctx=ICTContext(),
+            price=100.7,
+            atr=1.0,
+            now=now + 10.0,
+        )
+
+        self.assertTrue(calls)
+        self.assertIsNotNone(engine.get_signal())
+        self.assertEqual(engine.state, "SCANNING")
+        self.assertIsNone(engine._post_sweep)
+
 
 if __name__ == "__main__":
     unittest.main()
