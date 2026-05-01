@@ -1691,6 +1691,91 @@ class EntryEngine:
 
     # ── Sweep entry handlers ──────────────────────────────────────────
 
+    def _current_quant_posterior(self) -> float:
+        try:
+            return max(0.0, min(0.95, float(
+                (getattr(self, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
+            )))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _tf_rank_for_stop_geometry(tf: str) -> int:
+        return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}.get(str(tf).lower(), 2)
+
+    def _dominant_institutional_tp_reward(self, snap, side: str, entry: float, atr: float) -> float:
+        """Approximate reward to the strongest real TP-side liquidity pool."""
+        if snap is None or atr <= 0:
+            return 0.0
+        pools = list(getattr(snap, "bsl_pools", []) or []) if side == "long" else list(getattr(snap, "ssl_pools", []) or [])
+        best_score = 0.0
+        best_reward = 0.0
+        for target in pools:
+            try:
+                pool = getattr(target, "pool", target)
+                status = str(getattr(pool, "status", "") or "").upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+                if side == "long" and pool_price <= entry:
+                    continue
+                if side == "short" and pool_price >= entry:
+                    continue
+                dist_atr = float(getattr(target, "distance_atr", 0.0) or 0.0)
+                if dist_atr <= 0.0:
+                    dist_atr = abs(pool_price - entry) / max(atr, 1e-9)
+                if dist_atr < 0.25:
+                    continue
+                buf = max(0.10, min(0.50, 0.10 + 0.05 * dist_atr)) * atr
+                tp_price = pool_price - buf if side == "long" else pool_price + buf
+                if side == "long" and tp_price <= entry:
+                    continue
+                if side == "short" and tp_price >= entry:
+                    continue
+                reward = abs(tp_price - entry)
+                sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+                tf_rank = self._tf_rank_for_stop_geometry(str(getattr(pool, "timeframe", "5m") or "5m"))
+                score = reward * (1.0 + min(sig, 25.0) / 25.0) * (1.0 + 0.08 * tf_rank)
+                score /= (1.0 + max(0.0, dist_atr - 6.0) * 0.08)
+                if score > best_score:
+                    best_score = score
+                    best_reward = reward
+            except Exception:
+                continue
+        return best_reward
+
+    @staticmethod
+    def _accepts_pool_stop_geometry(
+        current_risk: float,
+        pool_risk: float,
+        target_reward: float,
+        posterior_prob: float,
+        pool_quality: float,
+    ) -> tuple[bool, str]:
+        """Decide whether a farther protective pool earns the extra risk."""
+        if current_risk <= 0.0 or pool_risk <= current_risk:
+            return True, "pool does not widen risk"
+
+        expansion = pool_risk / max(current_risk, 1e-9)
+        current_rr = target_reward / max(current_risk, 1e-9) if target_reward > 0.0 else 0.0
+        pool_rr = target_reward / max(pool_risk, 1e-9) if target_reward > 0.0 else 0.0
+        p = max(0.0, min(0.95, posterior_prob))
+        ev_floor = 1.20
+        if p > 0.0:
+            ev_floor = max(0.75, min(1.50, ((1.0 - p) / max(p, 1e-9)) + 0.35))
+
+        if target_reward > 0.0 and current_rr >= ev_floor and pool_rr < ev_floor:
+            return False, f"pool SL drops TP geometry {current_rr:.2f}R->{pool_rr:.2f}R below EV floor {ev_floor:.2f}R"
+
+        quality_hurdle = min(
+            0.92,
+            0.42 + 0.11 * max(0.0, expansion - 1.0) + 0.08 * max(0.0, current_rr - pool_rr),
+        )
+        if expansion > 1.35 and pool_quality < quality_hurdle:
+            return False, f"pool SL risk expansion {expansion:.2f}x needs quality {quality_hurdle:.2f}, got {pool_quality:.2f}"
+
+        return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
+
     def _apply_institutional_sl_envelope(
         self,
         snap,
@@ -1734,13 +1819,27 @@ class EntryEngine:
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
             if pool_risk > risk and pool_risk <= max_risk:
-                sl = pool_sl
-                risk = pool_risk
-                details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                logger.debug(
-                    "SL envelope %s: anchored to protective pool at $%.1f "
-                    "(risk %.2fATR; %s)",
-                    label, sl, risk / max(atr, 1e-10), details)
+                target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
+                pool_quality = float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)
+                accept_pool, geometry_reason = self._accepts_pool_stop_geometry(
+                    risk,
+                    pool_risk,
+                    target_reward,
+                    self._current_quant_posterior(),
+                    pool_quality,
+                )
+                if accept_pool:
+                    sl = pool_sl
+                    risk = pool_risk
+                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                    logger.debug(
+                        "SL envelope %s: anchored to protective pool at $%.1f "
+                        "(risk %.2fATR; %s; %s)",
+                        label, sl, risk / max(atr, 1e-10), details, geometry_reason)
+                else:
+                    logger.info(
+                        "SL envelope %s: ignored protective pool $%.1f (%s)",
+                        label, pool_sl, geometry_reason)
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
@@ -1988,8 +2087,9 @@ class EntryEngine:
             p.last_reason = f"refined TP unavailable: {self._last_pool_plan_summary()}"
             return
         rr = abs(tp - price) / max(risk, 1e-10)
-        if rr < _MIN_RR_RATIO:
-            p.last_reason = f"refined R:R {rr:.2f} < min {_MIN_RR_RATIO:.2f}"
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
+            p.last_reason = f"refined R:R {rr:.2f} < institutional floor {rr_floor:.2f}"
             return
 
         self._signal = EntrySignal(
@@ -2121,9 +2221,10 @@ class EntryEngine:
             return
 
         rr = abs(tp - price) / risk
-        if rr < _MIN_RR_RATIO:
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
             logger.info(
-                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
                 f"side={side} sweep=${sweep.pool.price:.1f} "
                 f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
             self._post_sweep = None
@@ -2254,9 +2355,10 @@ class EntryEngine:
             self._reset(now)
             return
 
-        if rr < _MIN_RR_RATIO:
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
             logger.info(
-                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < min={_MIN_RR_RATIO} "
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
             self._post_sweep = None
@@ -2296,6 +2398,7 @@ class EntryEngine:
             return None, None
 
         required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+        posterior_prob = self._current_quant_posterior()
         try:
             from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:
@@ -2318,6 +2421,7 @@ class EntryEngine:
             snap=snap, side=side, entry=price, sl=sl, atr=atr,
             ict=getattr(self, "_ict", None), htf=_htf_ref,
             min_rr=required_rr,
+            posterior_prob=posterior_prob,
             now=time.time(),
         )
         report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
@@ -2436,6 +2540,20 @@ class EntryEngine:
             return str(self._last_pool_plan.get("summary") or "pool diagnostics unavailable")
         except Exception:
             return "pool diagnostics unavailable"
+
+    def _last_selected_tp_rr_floor(self, fallback: float) -> float:
+        try:
+            if not isinstance(self._last_pool_plan, dict):
+                return float(fallback)
+            if str(self._last_pool_plan.get("role", "")).upper() != "TP":
+                return float(fallback)
+            selected = self._last_pool_plan.get("selected") or {}
+            if not isinstance(selected, dict):
+                return float(fallback)
+            floor = float(selected.get("required_rr", fallback) or fallback)
+            return max(0.50, min(float(fallback), floor))
+        except Exception:
+            return float(fallback)
 
     def _format_pool_plan(self, report: Any, max_rows: int = 4) -> str:
         """Compact one-line audit text for logs."""

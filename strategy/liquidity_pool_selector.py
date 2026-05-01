@@ -271,6 +271,10 @@ def _safe(obj: Any, attr: str, default=0.0):
         return default
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(value)))
+
+
 def _enum_value(v: Any, default: str = "") -> str:
     try:
         if hasattr(v, "value"):
@@ -568,6 +572,56 @@ def _breakeven_move(entry: float, atr: float) -> float:
     return max(entry * fee_rate * 2.0, 0.0) + 0.18 * max(atr, 0.0)
 
 
+def _posterior_delivery_probability(
+    raw_prob: float,
+    posterior_prob: float,
+    confluence: float,
+    gauntlet_mult: float,
+    reach_mult: float,
+) -> float:
+    """Blend setup posterior with the pool's own delivery probability."""
+    pool_prob = _clamp(raw_prob, 0.01, 0.95)
+    pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
+    pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
+    pool_prob *= math.sqrt(_clamp(reach_mult, 0.05, 1.25))
+    pool_prob = _clamp(pool_prob, 0.01, 0.95)
+
+    posterior = _clamp(posterior_prob, 0.0, 0.95)
+    if posterior <= 0.0:
+        return pool_prob
+    return _clamp(math.sqrt(pool_prob * posterior), 0.01, 0.93)
+
+
+def _institutional_rr_floor(
+    static_min_rr: float,
+    posterior_prob: float,
+    raw_prob: float,
+    confluence: float,
+    gauntlet_mult: float,
+    reach_mult: float,
+    risk: float,
+    be_move: float,
+) -> Tuple[float, float, float]:
+    """Return (required_rr, delivery_probability, cost_r).
+
+    With no accepted setup posterior, preserve the legacy static floor. Once a
+    posterior exists, the pool is judged by positive expected value:
+        p * R - (1 - p) - cost_r >= 0
+    The floor is still capped by the configured floor, so strong math can
+    rescue real liquidity targets without inventing synthetic objectives.
+    """
+    static_floor = max(0.01, float(static_min_rr))
+    posterior = _clamp(posterior_prob, 0.0, 0.95)
+    if posterior <= 0.0:
+        return static_floor, _clamp(raw_prob, 0.01, 0.95), 0.0
+
+    delivery_p = _posterior_delivery_probability(
+        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
+    cost_r = _clamp(0.50 * float(be_move) / max(float(risk), 1e-9), 0.0, 0.35)
+    ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+    return min(static_floor, max(0.75, ev_floor)), delivery_p, cost_r
+
+
 def _target_utility(raw_prob: float, rr: float, min_rr: float,
                     distance_atr: float, reward: float,
                     be_move: float) -> Tuple[float, Dict[str, float]]:
@@ -609,6 +663,7 @@ def score_tp_pools(
     min_rr:  float = 2.0,
     now:     Optional[float] = None,
     session: str = "",
+    posterior_prob: float = 0.0,
 ) -> List[PoolScore]:
     """
     Score every candidate TP pool. Returns PoolScore[], sorted by EV desc.
@@ -670,8 +725,6 @@ def score_tp_pools(
 
             reward = abs(tp_price - entry)
             rr = reward / risk
-            if rr < effective_min_rr:
-                continue
 
             # ─── EV components ────────────────────────────────────────────
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
@@ -689,16 +742,28 @@ def score_tp_pools(
                 * _touch_penalty(pool)
             )
 
-            utility, utility_components = _target_utility(
-                raw_prob, rr, effective_min_rr, dist_atr, reward, be_move)
             reach_mult = _terminal_reach_multiplier(dist_atr, tf) * selector_profile.target_reach_penalty(dist_atr, tf)
-            utility *= reach_mult
-            utility_components["reach_mult"] = reach_mult
-            utility_components["max_reach_atr"] = max_reach
 
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
+            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+                effective_min_rr,
+                posterior_prob,
+                raw_prob,
+                confluence,
+                gauntlet_mult,
+                reach_mult,
+                risk,
+                be_move,
+            )
+            if rr < rr_floor:
+                continue
+            utility, utility_components = _target_utility(
+                raw_prob, rr, rr_floor, dist_atr, reward, be_move)
+            utility *= reach_mult
+            utility_components["reach_mult"] = reach_mult
+            utility_components["max_reach_atr"] = max_reach
 
             # EV. The scaling here is intentional:
             #   - probability dominates (multiplicative base).
@@ -716,6 +781,8 @@ def score_tp_pools(
                     f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
+            elif rr_floor < effective_min_rr - 1e-9:
+                reasons.append(f"EV RR floor {rr_floor:.2f}")
             if utility_components["be_quality"] < 0.75:
                 reasons.append("thin post-BE room")
             if _safe(pool, "ob_aligned", False):
@@ -745,6 +812,10 @@ def score_tp_pools(
                     "be_move":     utility_components["be_move"],
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
+                    "rr_floor":    rr_floor,
+                    "delivery_prob": delivery_prob,
+                    "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
+                    "cost_r":      cost_r,
                 },
                 reasons      = reasons,
             ))
@@ -876,6 +947,7 @@ def diagnose_tp_pools(
     now:     Optional[float] = None,
     session: str = "",
     limit:   int = 8,
+    posterior_prob: float = 0.0,
 ) -> PoolSelectionReport:
     """Return a TP candidate audit table without weakening any gate.
 
@@ -904,11 +976,20 @@ def diagnose_tp_pools(
         return report
 
     now_ts = now or time.time()
+    selector_profile = build_market_profile(
+        price=entry,
+        atr=atr,
+        liq_snapshot=snap,
+        ict=ict,
+        side=side,
+        session=session,
+    )
+    effective_min_rr = selector_profile.min_rr(float(min_rr))
     rows: List[PoolCandidateDiagnostic] = []
     accepted: List[Tuple[float, PoolCandidateDiagnostic]] = []
 
     for target in pools:
-        row = _candidate_base("TP", side, target, entry, atr, risk, float(min_rr), be_move)
+        row = _candidate_base("TP", side, target, entry, atr, risk, effective_min_rr, be_move)
         try:
             pool = target.pool
             pool_price = float(_safe(pool, "price", 0.0))
@@ -942,9 +1023,6 @@ def diagnose_tp_pools(
 
             row.reward = abs(row.tp_price - entry)
             row.rr = row.reward / risk
-            if row.rr < float(min_rr):
-                row.reason = f"R:R {row.rr:.2f} < required {float(min_rr):.2f}"
-                rows.append(row); continue
 
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
             row.sweep_prob = norm_prob
@@ -962,11 +1040,28 @@ def diagnose_tp_pools(
                 * _touch_penalty(pool)
             )
             row.confluence = confluence
-            utility, comps = _target_utility(raw_prob, row.rr, float(min_rr), row.distance_atr, row.reward, be_move)
-            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf)
-            utility *= reach_mult
+            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf) * selector_profile.target_reach_penalty(row.distance_atr, tf)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
+            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+                effective_min_rr,
+                posterior_prob,
+                raw_prob,
+                confluence,
+                gauntlet_mult,
+                reach_mult,
+                risk,
+                be_move,
+            )
+            row.required_rr = rr_floor
+            if row.rr < rr_floor:
+                row.reason = (
+                    f"R:R {row.rr:.2f} < EV floor {rr_floor:.2f} "
+                    f"(static {effective_min_rr:.2f}, p={delivery_prob:.2f}, cost={cost_r:.2f}R)"
+                )
+                rows.append(row); continue
+            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             row.eligible = True
             row.reason = "eligible; EV-ranked candidate"
@@ -974,6 +1069,8 @@ def diagnose_tp_pools(
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
+            if rr_floor < effective_min_rr - 1e-9:
+                row.notes.append(f"EV RR floor {rr_floor:.2f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
             accepted.append((row.ev, row))
@@ -1108,11 +1205,17 @@ def diagnose_sl_pool(
 def select_tp_with_report(
     snap, side: str, entry: float, sl: float, atr: float,
     ict: Any = None, htf: Any = None, min_rr: float = 2.0,
-    now: Optional[float] = None, session: str = "",
+    now: Optional[float] = None, session: str = "", posterior_prob: float = 0.0,
 ) -> Tuple[Optional[float], Optional[Any], Optional[PoolScore], PoolSelectionReport]:
     """select_tp() plus a full rejection/selection report."""
-    report = diagnose_tp_pools(snap, side, entry, sl, atr, ict, htf, min_rr, now, session)
-    scores = score_tp_pools(snap, side, entry, sl, atr, ict, htf, min_rr, now, session)
+    report = diagnose_tp_pools(
+        snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
+        posterior_prob=posterior_prob,
+    )
+    scores = score_tp_pools(
+        snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
+        posterior_prob=posterior_prob,
+    )
     if not scores:
         return None, None, None, report
     best = scores[0]
@@ -1141,12 +1244,15 @@ def select_sl_with_report(
 def select_tp(
     snap, side: str, entry: float, sl: float, atr: float,
     ict: Any = None, htf: Any = None, min_rr: float = 2.0,
-    now: Optional[float] = None, session: str = "",
+    now: Optional[float] = None, session: str = "", posterior_prob: float = 0.0,
 ) -> Tuple[Optional[float], Optional[Any], Optional[PoolScore]]:
     """
     One-call TP selection. Returns (tp_price, target, score) or (None, None, None).
     """
-    scores = score_tp_pools(snap, side, entry, sl, atr, ict, htf, min_rr, now, session)
+    scores = score_tp_pools(
+        snap, side, entry, sl, atr, ict, htf, min_rr, now, session,
+        posterior_prob=posterior_prob,
+    )
     if not scores:
         return None, None, None
     best = scores[0]

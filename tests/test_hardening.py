@@ -360,6 +360,68 @@ class HardeningTests(unittest.TestCase):
         finally:
             qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
 
+    def test_tp_selector_uses_ev_floor_for_real_institutional_liquidity(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        entry = 78645.0
+        sl = 78005.1
+        atr = 196.8
+        pool = SimpleNamespace(
+            price=79443.2,
+            timeframe="1d",
+            side="BSL",
+            significance=14.0,
+            htf_count=3,
+            touches=2,
+            status="ACTIVE",
+        )
+        target = SimpleNamespace(
+            pool=pool,
+            distance_atr=abs(pool.price - entry) / atr,
+            significance=14.0,
+        )
+        snap = SimpleNamespace(bsl_pools=[target], ssl_pools=[], feed_reliability=0.90)
+
+        tp, selected_target, score, report = select_tp_with_report(
+            snap=snap,
+            side="long",
+            entry=entry,
+            sl=sl,
+            atr=atr,
+            min_rr=2.20,
+            posterior_prob=0.862,
+            now=0,
+        )
+
+        self.assertIsNotNone(tp)
+        self.assertIs(selected_target, target)
+        self.assertLess(score.rr, 2.20)
+        payload = report.as_dict()
+        self.assertLess(payload["selected"]["required_rr"], 2.20)
+        self.assertIn("EV RR floor", " ".join(payload["selected"]["notes"]))
+
+    def test_low_quality_sl_pool_cannot_destroy_real_tp_geometry(self):
+        from strategy.entry_engine import EntryEngine
+
+        ok, reason = EntryEngine._accepts_pool_stop_geometry(
+            current_risk=142.0,
+            pool_risk=639.9,
+            target_reward=738.6,
+            posterior_prob=0.862,
+            pool_quality=0.47,
+        )
+        self.assertFalse(ok)
+        self.assertIn("risk expansion", reason)
+
+        ok, _reason = EntryEngine._accepts_pool_stop_geometry(
+            current_risk=142.0,
+            pool_risk=639.9,
+            target_reward=738.6,
+            posterior_prob=0.862,
+            pool_quality=0.95,
+        )
+        self.assertTrue(ok)
+
 
 if __name__ == "__main__":
     unittest.main()
