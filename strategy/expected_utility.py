@@ -27,6 +27,15 @@ from typing import Any, List, Optional, Tuple
 
 _EPS = 1e-12
 
+try:
+    import config as _cfg
+except Exception:  # pragma: no cover
+    _cfg = None  # type: ignore
+
+_MIN_EXECUTABLE_TP_ATR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_DELIVERY_ATR", 1.15))
+_MIN_EXECUTABLE_TP_RR = float(getattr(_cfg, "TARGET_FULL_TP_MIN_RR", 1.35))
+_MIN_EXECUTABLE_TP_COST_MULT = float(getattr(_cfg, "TARGET_FULL_TP_MIN_COST_MULT", 4.0))
+
 
 def clamp(x: float, lo: float, hi: float) -> float:
     try:
@@ -442,6 +451,13 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         reward = abs(exec_tp - entry)
         rr = reward / max(risk, _EPS)
         executable_dist_atr = reward / atr
+        min_reward = max(
+            _MIN_EXECUTABLE_TP_ATR * atr,
+            _MIN_EXECUTABLE_TP_COST_MULT * cost_points,
+            max(float(tick_size or 0.5), _EPS) * 4.0,
+        )
+        if reward < min_reward or rr < _MIN_EXECUTABLE_TP_RR:
+            continue
 
         lo, hi = min(entry, px), max(entry, px)
         opp_hits = 0
@@ -513,9 +529,32 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         # second hard probability model.  Concavity is still applied, but as a
         # drag against excessive R:R rather than as a duplicate loss term.
         concavity_drag = 0.035 * max(payoff_r - 3.0, 0.0) ** 1.15
+        hit_rate_floor = clamp(
+            0.46
+            + 0.030 * max(payoff_r - 2.0, 0.0)
+            + 0.018 * max(executable_dist_atr - 3.0, 0.0)
+            + 0.060 * uncertainty
+            + 0.040 * (1.0 - reliability),
+            0.46,
+            0.72,
+        )
+        hit_rate_shortfall = max(hit_rate_floor - p_hit, 0.0)
+        hit_rate_drag = 0.42 * hit_rate_shortfall
+        if role == "external":
+            # External pools can be excellent runner objectives, but a full-size
+            # exchange TP must pay for the lower realised hit-rate of long paths.
+            # This prevents high R:R from overpowering executable probability.
+            hit_rate_drag += (
+                0.82 * hit_rate_shortfall
+                + 0.060 * max(payoff_r - 3.0, 0.0) ** 1.20
+                + 0.040 * max(executable_dist_atr - 4.0, 0.0)
+                + 0.120 * max(payoff_r - 3.0, 0.0) ** 1.55
+                + 0.050 * max(payoff_r - 4.5, 0.0) * max(executable_dist_atr - 4.0, 0.0)
+            )
         full_position_utility = (
             ev_r
             - concavity_drag
+            - hit_rate_drag
             - 0.12 * uncertainty
             - 0.070 * path_risk
         )
@@ -534,6 +573,7 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         ]
         notes.append(f"anchor={px:,.1f}")
         notes.append(f"tp_buffer={tp_buffer/atr:.2f}ATR")
+        notes.append(f"hit_floor={hit_rate_floor:.3f}")
         cands.append(TargetUtility(exec_tp, side, rr, executable_dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,

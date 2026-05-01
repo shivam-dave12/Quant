@@ -202,6 +202,8 @@ try:
     _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
     _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
     _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
+    _ENTRY_HIGH_HIT_RATE_PROFILE = bool(getattr(_entry_gate_cfg, "INSTITUTIONAL_HIGH_HIT_RATE_PROFILE", True))
+    _ENTRY_MIN_DYNAMIC_QUALITY_SCORE = float(getattr(_entry_gate_cfg, "ENTRY_MIN_DYNAMIC_QUALITY_SCORE", 0.58))
 except Exception:
     _ENTRY_HARD_MIN_DISP_ATR = 0.75
     _ENTRY_STRONG_DISP_ATR   = 1.25
@@ -215,6 +217,8 @@ except Exception:
     _ENTRY_CVD_HARD_OPPOSE  = 0.30
     _ENTRY_HTF_CONTRA_VETO = True
     _ENTRY_GATE_LOG_SEC = 12.0
+    _ENTRY_HIGH_HIT_RATE_PROFILE = True
+    _ENTRY_MIN_DYNAMIC_QUALITY_SCORE = 0.58
 
 
 # HTF TP escalation
@@ -1968,6 +1972,7 @@ class EntryEngine:
 
         score = 1.0
         notes = []
+        hard_waits = []
 
         # 1) Delivery/structure proof. Weak proof is a size/confidence penalty.
         if disp < min_disp and not (cisd or ote):
@@ -1976,6 +1981,18 @@ class EntryEngine:
             notes.append(
                 f"delivery_weak DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
             )
+            hard_waits.append(
+                f"delivery proof weak: DISP={disp:.2f}ATR<{min_disp:.2f}ATR without CISD/OTE"
+            )
+        elif disp < min_disp and not (cisd and ote):
+            miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
+            score *= max(0.62, 1.0 - 0.22 * miss)
+            notes.append(
+                f"delivery_incomplete DISP={disp:.2f}ATR<{min_disp:.2f}ATR needs CISD+OTE"
+            )
+            hard_waits.append(
+                f"incomplete delivery confluence: DISP={disp:.2f}ATR<{min_disp:.2f}ATR and CISD+OTE not both present"
+            )
 
         # 2) Chase distance. Far-from-sweep entries need more quality.
         if dist_from_sweep_atr > chase_limit and not (cisd or ote):
@@ -1983,6 +2000,9 @@ class EntryEngine:
             score *= max(0.45, 1.0 - 0.25 * over)
             notes.append(
                 f"chase_extended {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
+            )
+            hard_waits.append(
+                f"extended chase {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR without CISD/OTE"
             )
 
         # 3) Flow/CVD opposition becomes a regime penalty.
@@ -2009,6 +2029,9 @@ class EntryEngine:
                 score *= 0.62
                 notes.append(
                     f"continuation_acceptance_soft DISP={disp:.2f}ATR strong={strong_disp:.2f}"
+                )
+                hard_waits.append(
+                    f"continuation lacks accepted delivery: DISP={disp:.2f}ATR strong={strong_disp:.2f}"
                 )
 
         # 5) Premium/discount mismatch is a penalty unless strong proof exists.
@@ -2044,6 +2067,17 @@ class EntryEngine:
             pass
 
         note = " | ".join(notes[:4]) if notes else "clean"
+        if _ENTRY_HIGH_HIT_RATE_PROFILE:
+            if score < _ENTRY_MIN_DYNAMIC_QUALITY_SCORE:
+                hard_waits.append(
+                    f"quality score {score:.2f}<{_ENTRY_MIN_DYNAMIC_QUALITY_SCORE:.2f}"
+                )
+            if hard_waits:
+                return False, (
+                    f"institutional_quality_wait score={score:.2f}: "
+                    + " | ".join(hard_waits[:3])
+                    + f" | {profile.compact()}"
+                )
         return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
 
     def _evaluate_pending_refined_entry(

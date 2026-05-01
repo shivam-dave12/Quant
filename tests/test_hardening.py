@@ -464,6 +464,88 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNotNone(surface.best)
         self.assertIs(surface.best.pool_ref.pool, active_pool)
 
+    def test_far_external_target_is_runner_not_full_position_edge(self):
+        from strategy.expected_utility import build_target_surface
+
+        far_pool = SimpleNamespace(
+            price=108.0, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=8.0,
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[SimpleNamespace(pool=far_pool, distance_atr=8.0, direction="long")],
+            ssl_pools=[],
+            feed_reliability=0.95,
+        )
+
+        surface = build_target_surface(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, posterior_prob=0.90, tick_size=0.5,
+        )
+
+        self.assertIsNotNone(surface.best)
+        self.assertEqual(surface.best.role, "external")
+        self.assertGreater(surface.best.rr, 4.0)
+        self.assertFalse(surface.has_positive_edge)
+
+    def test_hard_pool_gate_invalidation_is_actionable(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        gate = SimpleNamespace(
+            confidence=0.80,
+            reason="FLOW_REVERSED(flow=+0.49) + COUNTER_BOS - structure invalidated",
+        )
+
+        self.assertFalse(
+            QuantStrategy._pool_gate_hard_invalidation(
+                gate, pos_side="long", entry=100.0, price=100.2,
+                atr=1.0, peak_profit=0.4,
+            )
+        )
+        self.assertTrue(
+            QuantStrategy._pool_gate_hard_invalidation(
+                gate, pos_side="long", entry=100.0, price=99.8,
+                atr=1.0, peak_profit=0.9,
+            )
+        )
+
+    def test_crossed_counter_bos_trail_uses_market_damage_control(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        self.assertTrue(
+            QuantStrategy._trail_crossed_stop_requires_market_exit(
+                "short", entry=100.0, price=96.0, atr=10.0,
+                phase="COUNTER_BOS",
+                reason="[COUNTER_BOS_OVERRIDE] SL -> BE",
+            )
+        )
+        self.assertFalse(
+            QuantStrategy._trail_crossed_stop_requires_market_exit(
+                "short", entry=100.0, price=99.0, atr=10.0,
+                phase="HOLD",
+                reason="routine breathing room",
+            )
+        )
+
+    def test_target_surface_rejects_noise_sized_full_tp(self):
+        from strategy.expected_utility import build_target_surface
+
+        tiny_pool = SimpleNamespace(
+            price=100.9, side="BSL", timeframe="15m", status="ACTIVE",
+            significance=20.0,
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[tiny_pool],
+            ssl_pools=[],
+            feed_reliability=0.98,
+        )
+
+        surface = build_target_surface(
+            side="long", entry=100.0, stop=99.0, atr=1.0,
+            snapshot=snap, posterior_prob=0.95, tick_size=0.5,
+        )
+
+        self.assertIsNone(surface.best)
+
 
 if __name__ == "__main__":
     unittest.main()
