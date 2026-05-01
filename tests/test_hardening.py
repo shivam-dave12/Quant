@@ -881,11 +881,104 @@ class HardeningTests(unittest.TestCase):
             now=now,
         )
 
+        self.assertIsNone(engine.get_signal())
+        self.assertEqual(pending.last_pullback_mode, "awaiting_delivery")
+        self.assertGreater(pending.last_direct_pullback_atr, 0.0)
+        self.assertEqual(pending.last_pullback_atr, 0.0)
+
+        engine._evaluate_pending_refined_entry(
+            snap=snap,
+            flow=flow,
+            ict=ict,
+            price=102.50,
+            atr=1.0,
+            now=now + 10.0,
+        )
+
+        self.assertIsNone(engine.get_signal())
+        self.assertEqual(pending.last_pullback_mode, "delivery_retrace")
+        self.assertGreaterEqual(pending.last_delivery_atr, 0.20)
+        self.assertEqual(pending.last_pullback_atr, 0.0)
+
+        engine._evaluate_pending_refined_entry(
+            snap=snap,
+            flow=flow,
+            ict=ict,
+            price=101.80,
+            atr=1.0,
+            now=now + 20.0,
+        )
+
         refined = engine.get_signal()
         self.assertIsNotNone(refined)
         self.assertLess(102.0 - 101.80, 0.25)
         self.assertLess(pending.last_pullback_required_atr, 0.25)
+        self.assertEqual(pending.last_pullback_mode, "delivery_retrace")
         self.assertIn("REFINED_PULLBACK", refined.reason)
+
+    def test_short_refine_watch_uses_delivered_extreme_retrace_only(self):
+        from strategy.entry_engine import (
+            EntryEngine,
+            EntrySignal,
+            EntryType,
+            ICTContext,
+            OrderFlowState,
+        )
+        from strategy.liquidity_map import PoolSide
+
+        engine = EntryEngine()
+        now = time.time()
+        sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=101.0, side=PoolSide.BSL, timeframe="15m"),
+            detected_at=now - 30.0,
+            direction="short",
+            wick_extreme=103.2,
+        )
+        signal = EntrySignal(
+            side="short",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=100.0,
+            sl_price=103.0,
+            tp_price=94.0,
+            rr_ratio=2.0,
+            target_pool=None,
+            sweep_result=sweep,
+            conviction=0.90,
+            reason="accepted posterior but route deferred",
+        )
+
+        self.assertTrue(engine.arm_refine_watch_from_signal(signal, "target deferred", now=now))
+        pending = engine._pending_refined
+        pending.created_at = now - 60.0
+        pending.expires_at = now + 300.0
+
+        snap = SimpleNamespace(bsl_pools=[], ssl_pools=[], feed_reliability=0.95)
+        flow = OrderFlowState(tick_flow=-0.45, cvd_trend=-0.35)
+        ict = ICTContext(amd_phase="DISTRIBUTION", amd_bias="bearish", structure_15m="bearish")
+
+        engine._evaluate_pending_refined_entry(
+            snap=snap,
+            flow=flow,
+            ict=ict,
+            price=99.0,
+            atr=1.0,
+            now=now,
+        )
+        engine._evaluate_pending_refined_entry(
+            snap=snap,
+            flow=flow,
+            ict=ict,
+            price=99.4,
+            atr=1.0,
+            now=now + 10.0,
+        )
+
+        self.assertIsNone(engine.get_signal())
+        self.assertEqual(pending.last_pullback_mode, "delivery_retrace")
+        self.assertAlmostEqual(pending.last_delivery_atr, 1.0, places=6)
+        self.assertAlmostEqual(pending.last_pullback_atr, 0.4, places=6)
+        self.assertEqual(pending.last_direct_pullback_atr, 0.0)
+        self.assertIn("risk compression", pending.last_reason)
 
     def test_refine_watch_reprices_during_active_post_sweep(self):
         from strategy.entry_engine import (

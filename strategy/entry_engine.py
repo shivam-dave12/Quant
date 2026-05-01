@@ -407,10 +407,11 @@ class _PendingRefinedEntry:
     last_reason: str = "waiting for refined pullback"
     last_pullback_atr: float = 0.0
     last_pullback_required_atr: float = 0.0
-    # Pullback must be measured from the best post-sweep delivery extreme, not
-    # only from the original rejected entry. Without this a SHORT that first
-    # delivers lower and then retraces up still prints 0.00ATR until price trades
-    # above the original entry, which hides real pullback/risk-compression state.
+    # Institutional refine-watch sequence:
+    #   1. wait for favorable post-sweep delivery from the rejected entry;
+    #   2. measure retrace only from that delivered extreme;
+    #   3. require risk compression before emitting a new executable signal.
+    # Direct movement from the original rejected entry is diagnostic only.
     best_favorable_price: float = 0.0
     last_delivery_atr: float = 0.0
     last_extreme_pullback_atr: float = 0.0
@@ -432,6 +433,19 @@ class _PendingRefinedEntry:
     @property
     def initial_risk(self) -> float:
         return abs(float(self.original.entry_price) - float(self.original.sl_price))
+
+
+@dataclass
+class _RefinePullbackMeasure:
+    """Delivery/retrace measurement for a pending refined entry."""
+    delivery: float
+    retrace: float
+    direct: float
+    delivery_atr: float
+    retrace_atr: float
+    direct_atr: float
+    delivery_confirmed: bool
+    mode: str
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -884,8 +898,10 @@ class EntryEngine:
                 "pullback_atr": p.last_pullback_atr,
                 "required_pullback_atr": p.last_pullback_required_atr,
                 "delivery_atr": p.last_delivery_atr,
+                "retrace_pullback_atr": p.last_extreme_pullback_atr,
                 "extreme_pullback_atr": p.last_extreme_pullback_atr,
                 "direct_pullback_atr": p.last_direct_pullback_atr,
+                "pullback_method": p.last_pullback_mode,
                 "pullback_mode": p.last_pullback_mode,
                 "risk_compression": p.last_risk_compression,
                 "quality_score": p.last_quality_score,
@@ -957,7 +973,7 @@ class EntryEngine:
         sig = pending.original
         logger.info(
             "EntryEngine refine watch waiting: %s %s @ $%.1f | %s | "
-            "pullback=%.2f/%.2fATR mode=%s direct=%.2fATR retrace=%.2fATR "
+            "retrace=%.2f/%.2fATR method=%s direct_diag=%.2fATR "
             "delivery=%.2fATR risk_compression=%.0f%% quality=%.2f "
             "attempts=%d expires_in=%.0fs",
             str(getattr(sig, "entry_type", "")).split(".")[-1],
@@ -968,7 +984,6 @@ class EntryEngine:
             float(getattr(pending, "last_pullback_required_atr", 0.0) or 0.0),
             str(getattr(pending, "last_pullback_mode", "") or "n/a"),
             float(getattr(pending, "last_direct_pullback_atr", 0.0) or 0.0),
-            float(getattr(pending, "last_extreme_pullback_atr", 0.0) or 0.0),
             float(getattr(pending, "last_delivery_atr", 0.0) or 0.0),
             100.0 * float(getattr(pending, "last_risk_compression", 0.0) or 0.0),
             float(getattr(pending, "last_quality_score", 0.0) or 0.0),
@@ -989,6 +1004,51 @@ class EntryEngine:
         boost = min(abs(flow.conviction), 1.0)
         alpha = min(alpha * (1.0 + boost), _FLOW_EWMA_ADAPTIVE_CAP)
         self._flow_ewma = alpha * signed + (1.0 - alpha) * self._flow_ewma
+
+    def _measure_refine_delivery_retrace(
+        self,
+        pending: _PendingRefinedEntry,
+        side: str,
+        initial_entry: float,
+        price: float,
+        atr: float,
+    ) -> _RefinePullbackMeasure:
+        """Measure refine-watch pullback using one executable method.
+
+        Refined entries are allowed only after the auction first delivers in
+        the thesis direction and then retraces from that delivered extreme.
+        The old direct-entry pullback remains a diagnostic field because it is
+        useful for explaining risk compression, but it must not trigger entry.
+        """
+        atr_safe = max(float(atr or 0.0), 1e-9)
+        if pending.best_favorable_price <= 0.0:
+            pending.best_favorable_price = initial_entry
+
+        if side == "long":
+            if price > pending.best_favorable_price:
+                pending.best_favorable_price = price
+            delivery = max(0.0, pending.best_favorable_price - initial_entry)
+            retrace = max(0.0, pending.best_favorable_price - price)
+            direct = max(0.0, initial_entry - price)
+        else:
+            if price < pending.best_favorable_price:
+                pending.best_favorable_price = price
+            delivery = max(0.0, initial_entry - pending.best_favorable_price)
+            retrace = max(0.0, price - pending.best_favorable_price)
+            direct = max(0.0, price - initial_entry)
+
+        delivery_atr = delivery / atr_safe
+        delivery_confirmed = delivery_atr >= max(0.0, _REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR)
+        return _RefinePullbackMeasure(
+            delivery=delivery,
+            retrace=retrace if delivery_confirmed else 0.0,
+            direct=direct,
+            delivery_atr=delivery_atr,
+            retrace_atr=(retrace / atr_safe) if delivery_confirmed else 0.0,
+            direct_atr=direct / atr_safe,
+            delivery_confirmed=delivery_confirmed,
+            mode="delivery_retrace" if delivery_confirmed else "awaiting_delivery",
+        )
 
     def _ewma_dir(self) -> str:
         if self._flow_ewma > _FLOW_CONV_THRESHOLD * 0.4:  return "long"
@@ -2282,53 +2342,12 @@ class EntryEngine:
                 self._pending_refined = None
                 return
 
-        # Need a real pullback against the trade from the original generated
-        # signal.  This avoids re-firing the same oversized entry immediately,
-        # but the requirement is adaptive: a high-quality, aligned thesis that
-        # has already compressed risk should not die on a fixed 0.25 ATR number.
+        # Refine-watch has one executable pullback method: favorable delivery
+        # from the rejected entry first, then retrace from that delivered
+        # extreme. Direct adverse movement from the original entry is only
+        # diagnostic; it must not trigger a refined signal by itself.
         initial_entry = float(sig.entry_price or price)
-
-        # Pullback measurement has two valid institutional paths:
-        #   1) direct adverse pullback from the original rejected entry;
-        #   2) retracement from the best favourable post-sweep delivery extreme.
-        #
-        # The old code only used path (1):
-        #     LONG  -> initial_entry - price
-        #     SHORT -> price - initial_entry
-        # That made a real SHORT pullback from e.g. 76,923 -> 76,985 print as
-        # 0.00ATR while price stayed below the original rejected entry.
-        if p.best_favorable_price <= 0.0:
-            p.best_favorable_price = initial_entry
-
-        if side == "long":
-            # Favourable delivery is up; pullback is down from the delivered high.
-            if price > p.best_favorable_price:
-                p.best_favorable_price = price
-            direct_pullback = max(0.0, initial_entry - price)
-            delivered = max(0.0, p.best_favorable_price - initial_entry)
-            extreme_pullback = max(0.0, p.best_favorable_price - price)
-        else:
-            # Favourable delivery is down; pullback is up from the delivered low.
-            if price < p.best_favorable_price:
-                p.best_favorable_price = price
-            direct_pullback = max(0.0, price - initial_entry)
-            delivered = max(0.0, initial_entry - p.best_favorable_price)
-            extreme_pullback = max(0.0, price - p.best_favorable_price)
-
-        direct_pullback_atr = direct_pullback / max(atr, 1e-9)
-        delivery_atr = delivered / max(atr, 1e-9)
-        extreme_pullback_atr = extreme_pullback / max(atr, 1e-9)
-        min_delivery_for_extreme_pullback = max(0.0, _REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR)
-        use_extreme_pullback = delivery_atr >= min_delivery_for_extreme_pullback
-
-        if use_extreme_pullback and extreme_pullback > direct_pullback:
-            pullback = extreme_pullback
-            pullback_mode = "post_delivery_retrace"
-        else:
-            pullback = direct_pullback
-            pullback_mode = "direct_entry_pullback"
-
-        pullback_atr = pullback / max(atr, 1e-9)
+        pb = self._measure_refine_delivery_retrace(p, side, initial_entry, price, atr)
         watch_span = max(p.expires_at - p.created_at, 1e-9)
         watch_age_ratio = max(0.0, min(1.0, (now - p.created_at) / watch_span))
         risk_compression = 0.0
@@ -2355,21 +2374,31 @@ class EntryEngine:
             )
         else:
             min_pullback_atr = _REFINE_MIN_PULLBACK_ATR
-        p.last_pullback_atr = max(0.0, pullback_atr)
+        p.last_pullback_atr = max(0.0, pb.retrace_atr)
         p.last_pullback_required_atr = float(min_pullback_atr)
-        p.last_direct_pullback_atr = max(0.0, direct_pullback_atr)
-        p.last_extreme_pullback_atr = max(0.0, extreme_pullback_atr)
-        p.last_delivery_atr = max(0.0, delivery_atr)
-        p.last_pullback_mode = pullback_mode
+        p.last_direct_pullback_atr = max(0.0, pb.direct_atr)
+        p.last_extreme_pullback_atr = max(0.0, pb.retrace_atr)
+        p.last_delivery_atr = max(0.0, pb.delivery_atr)
+        p.last_pullback_mode = pb.mode
         p.last_risk_compression = risk_compression
         p.last_quality_score = quality_score
         min_pullback = max(atr * min_pullback_atr, 1e-9)
-        if pullback < min_pullback:
+
+        if not pb.delivery_confirmed:
             self._mark_refine_wait(p, (
-                f"waiting refined pullback: {pullback_atr:.2f}ATR"
+                f"waiting favorable delivery before retrace: {pb.delivery_atr:.2f}ATR"
+                f"<{_REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR:.2f}ATR "
+                f"(method=delivery_retrace, direct_diagnostic={pb.direct_atr:.2f}ATR, "
+                f"age={watch_age_ratio:.0%}, quality={quality_score:.2f})"),
+                now, price, atr)
+            return
+
+        if pb.retrace < min_pullback:
+            self._mark_refine_wait(p, (
+                f"waiting delivery retrace: {pb.retrace_atr:.2f}ATR"
                 f"<{min_pullback_atr:.2f}ATR adaptive "
-                f"(mode={pullback_mode}, delivery={delivery_atr:.2f}ATR, "
-                f"direct={direct_pullback_atr:.2f}ATR, retrace={extreme_pullback_atr:.2f}ATR, "
+                f"(method=delivery_retrace, delivery={pb.delivery_atr:.2f}ATR, "
+                f"direct_diagnostic={pb.direct_atr:.2f}ATR, "
                 f"base={_REFINE_MIN_PULLBACK_ATR:.2f}, "
                 f"age={watch_age_ratio:.0%}, risk_compression={risk_compression:.0%}, "
                 f"quality={quality_score:.2f})"), now, price, atr)
@@ -2381,8 +2410,9 @@ class EntryEngine:
             est_risk = abs(price - original_sl)
             if est_risk > p.initial_risk * _REFINE_RISK_IMPROVE:
                 self._mark_refine_wait(p, (
-                    f"waiting risk compression: {est_risk:.1f}pts > "
-                    f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts"),
+                    f"waiting risk compression after retrace: current_risk={est_risk:.1f}pts "
+                    f"> max_allowed={p.initial_risk * _REFINE_RISK_IMPROVE:.1f}pts "
+                    f"({_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts)"),
                     now, price, atr)
                 return
 
@@ -2458,14 +2488,15 @@ class EntryEngine:
             conviction=max(float(getattr(sig, "conviction", 0.0) or 0.0), 0.55),
             reason=(f"{sig.reason} | REFINED_PULLBACK "
                     f"risk {p.initial_risk:.1f}->{risk:.1f}pts "
-                    f"pullback={pullback/max(atr,1e-9):.2f}ATR"),
+                    f"delivery={pb.delivery_atr:.2f}ATR "
+                    f"retrace={pb.retrace_atr:.2f}ATR"),
             ict_validation=self._ict_summary(ict, side),
         )
         logger.info(
             "🎯 REFINED SWING ENTRY: %s @ $%.1f | SL=$%.1f TP=$%.1f "
-            "R:R=%.2f risk %.1f->%.1fpts pullback=%.2fATR attempts=%d",
+            "R:R=%.2f risk %.1f->%.1fpts delivery=%.2fATR retrace=%.2fATR attempts=%d",
             side.upper(), price, sl, tp, rr, p.initial_risk, risk,
-            pullback / max(atr, 1e-9), p.attempts,
+            pb.delivery_atr, pb.retrace_atr, p.attempts,
         )
         self._pending_refined = None
 
