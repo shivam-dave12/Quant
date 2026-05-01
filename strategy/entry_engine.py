@@ -146,6 +146,8 @@ try:
     _REFINE_MIN_PULLBACK_ATR = float(getattr(_ref_cfg, "ENTRY_REFINE_MIN_PULLBACK_ATR", 0.25))
     _REFINE_RISK_IMPROVE    = float(getattr(_ref_cfg, "ENTRY_REFINE_RISK_IMPROVE_RATIO", 0.82))
     _REFINE_SL_ROOM_ATR      = float(getattr(_ref_cfg, "ENTRY_REFINE_SL_ROOM_ATR", 0.20))
+    _REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR = float(getattr(
+        _ref_cfg, "ENTRY_REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR", 0.20))
 except Exception:
     _REFINE_ENABLED          = True
     _REFINE_TTL_SEC          = 20 * 60.0
@@ -154,6 +156,7 @@ except Exception:
     _REFINE_MIN_PULLBACK_ATR = 0.25
     _REFINE_RISK_IMPROVE    = 0.82
     _REFINE_SL_ROOM_ATR      = 0.20
+    _REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR = 0.20
 
 # Post-Sweep phases (seconds after sweep)
 # MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
@@ -404,6 +407,15 @@ class _PendingRefinedEntry:
     last_reason: str = "waiting for refined pullback"
     last_pullback_atr: float = 0.0
     last_pullback_required_atr: float = 0.0
+    # Pullback must be measured from the best post-sweep delivery extreme, not
+    # only from the original rejected entry. Without this a SHORT that first
+    # delivers lower and then retraces up still prints 0.00ATR until price trades
+    # above the original entry, which hides real pullback/risk-compression state.
+    best_favorable_price: float = 0.0
+    last_delivery_atr: float = 0.0
+    last_extreme_pullback_atr: float = 0.0
+    last_direct_pullback_atr: float = 0.0
+    last_pullback_mode: str = ""
     last_risk_compression: float = 0.0
     last_quality_score: float = 0.0
     last_status_log_at: float = 0.0
@@ -871,6 +883,10 @@ class EntryEngine:
                 "attempts": p.attempts,
                 "pullback_atr": p.last_pullback_atr,
                 "required_pullback_atr": p.last_pullback_required_atr,
+                "delivery_atr": p.last_delivery_atr,
+                "extreme_pullback_atr": p.last_extreme_pullback_atr,
+                "direct_pullback_atr": p.last_direct_pullback_atr,
+                "pullback_mode": p.last_pullback_mode,
                 "risk_compression": p.last_risk_compression,
                 "quality_score": p.last_quality_score,
             }
@@ -941,7 +957,8 @@ class EntryEngine:
         sig = pending.original
         logger.info(
             "EntryEngine refine watch waiting: %s %s @ $%.1f | %s | "
-            "pullback=%.2f/%.2fATR risk_compression=%.0f%% quality=%.2f "
+            "pullback=%.2f/%.2fATR mode=%s direct=%.2fATR retrace=%.2fATR "
+            "delivery=%.2fATR risk_compression=%.0f%% quality=%.2f "
             "attempts=%d expires_in=%.0fs",
             str(getattr(sig, "entry_type", "")).split(".")[-1],
             str(getattr(sig, "side", "") or "").upper(),
@@ -949,6 +966,10 @@ class EntryEngine:
             reason,
             float(getattr(pending, "last_pullback_atr", 0.0) or 0.0),
             float(getattr(pending, "last_pullback_required_atr", 0.0) or 0.0),
+            str(getattr(pending, "last_pullback_mode", "") or "n/a"),
+            float(getattr(pending, "last_direct_pullback_atr", 0.0) or 0.0),
+            float(getattr(pending, "last_extreme_pullback_atr", 0.0) or 0.0),
+            float(getattr(pending, "last_delivery_atr", 0.0) or 0.0),
             100.0 * float(getattr(pending, "last_risk_compression", 0.0) or 0.0),
             float(getattr(pending, "last_quality_score", 0.0) or 0.0),
             int(getattr(pending, "attempts", 0) or 0),
@@ -2266,7 +2287,47 @@ class EntryEngine:
         # but the requirement is adaptive: a high-quality, aligned thesis that
         # has already compressed risk should not die on a fixed 0.25 ATR number.
         initial_entry = float(sig.entry_price or price)
-        pullback = (initial_entry - price) if side == "long" else (price - initial_entry)
+
+        # Pullback measurement has two valid institutional paths:
+        #   1) direct adverse pullback from the original rejected entry;
+        #   2) retracement from the best favourable post-sweep delivery extreme.
+        #
+        # The old code only used path (1):
+        #     LONG  -> initial_entry - price
+        #     SHORT -> price - initial_entry
+        # That made a real SHORT pullback from e.g. 76,923 -> 76,985 print as
+        # 0.00ATR while price stayed below the original rejected entry.
+        if p.best_favorable_price <= 0.0:
+            p.best_favorable_price = initial_entry
+
+        if side == "long":
+            # Favourable delivery is up; pullback is down from the delivered high.
+            if price > p.best_favorable_price:
+                p.best_favorable_price = price
+            direct_pullback = max(0.0, initial_entry - price)
+            delivered = max(0.0, p.best_favorable_price - initial_entry)
+            extreme_pullback = max(0.0, p.best_favorable_price - price)
+        else:
+            # Favourable delivery is down; pullback is up from the delivered low.
+            if price < p.best_favorable_price:
+                p.best_favorable_price = price
+            direct_pullback = max(0.0, price - initial_entry)
+            delivered = max(0.0, initial_entry - p.best_favorable_price)
+            extreme_pullback = max(0.0, price - p.best_favorable_price)
+
+        direct_pullback_atr = direct_pullback / max(atr, 1e-9)
+        delivery_atr = delivered / max(atr, 1e-9)
+        extreme_pullback_atr = extreme_pullback / max(atr, 1e-9)
+        min_delivery_for_extreme_pullback = max(0.0, _REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR)
+        use_extreme_pullback = delivery_atr >= min_delivery_for_extreme_pullback
+
+        if use_extreme_pullback and extreme_pullback > direct_pullback:
+            pullback = extreme_pullback
+            pullback_mode = "post_delivery_retrace"
+        else:
+            pullback = direct_pullback
+            pullback_mode = "direct_entry_pullback"
+
         pullback_atr = pullback / max(atr, 1e-9)
         watch_span = max(p.expires_at - p.created_at, 1e-9)
         watch_age_ratio = max(0.0, min(1.0, (now - p.created_at) / watch_span))
@@ -2296,6 +2357,10 @@ class EntryEngine:
             min_pullback_atr = _REFINE_MIN_PULLBACK_ATR
         p.last_pullback_atr = max(0.0, pullback_atr)
         p.last_pullback_required_atr = float(min_pullback_atr)
+        p.last_direct_pullback_atr = max(0.0, direct_pullback_atr)
+        p.last_extreme_pullback_atr = max(0.0, extreme_pullback_atr)
+        p.last_delivery_atr = max(0.0, delivery_atr)
+        p.last_pullback_mode = pullback_mode
         p.last_risk_compression = risk_compression
         p.last_quality_score = quality_score
         min_pullback = max(atr * min_pullback_atr, 1e-9)
@@ -2303,7 +2368,9 @@ class EntryEngine:
             self._mark_refine_wait(p, (
                 f"waiting refined pullback: {pullback_atr:.2f}ATR"
                 f"<{min_pullback_atr:.2f}ATR adaptive "
-                f"(base={_REFINE_MIN_PULLBACK_ATR:.2f}, "
+                f"(mode={pullback_mode}, delivery={delivery_atr:.2f}ATR, "
+                f"direct={direct_pullback_atr:.2f}ATR, retrace={extreme_pullback_atr:.2f}ATR, "
+                f"base={_REFINE_MIN_PULLBACK_ATR:.2f}, "
                 f"age={watch_age_ratio:.0%}, risk_compression={risk_compression:.0%}, "
                 f"quality={quality_score:.2f})"), now, price, atr)
             return

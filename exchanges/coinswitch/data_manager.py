@@ -88,6 +88,7 @@ class CoinSwitchDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
 
@@ -341,11 +342,14 @@ class CoinSwitchDataManager:
                     "bids": data.get("bids", []),
                     "asks": data.get("asks", []),
                 }
+                now_ts = time.time()
+                self._last_orderbook_update_time = now_ts
                 bids = self._orderbook["bids"]
                 asks = self._orderbook["asks"]
                 if bids and asks:
                     try:
                         self._last_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                        self._last_price_update_time = now_ts
                     except Exception:
                         pass
                 self.stats.record_orderbook()
@@ -377,7 +381,7 @@ class CoinSwitchDataManager:
                         "price":     price,
                         "quantity":  qty,
                         "side":      side,
-                        "timestamp": time.time(),
+                        "timestamp": self._last_orderbook_update_time or time.time(),
                     })
                     if self._strategy_ref is not None:
                         _callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
@@ -437,7 +441,7 @@ class CoinSwitchDataManager:
 
     def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
         if self._last_price_update_time == 0:
-            return True
+            return False
         return (time.time() - self._last_price_update_time) < max_stale_seconds
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:

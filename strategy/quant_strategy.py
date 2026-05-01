@@ -2442,7 +2442,7 @@ class PositionState:
     def is_active(self): return self.phase == PositionPhase.ACTIVE
     def is_flat(self): return self.phase == PositionPhase.FLAT
     def to_dict(self):
-        return {"side": self.side, "quantity": self.quantity,
+        return {"phase": self.phase.name, "side": self.side, "quantity": self.quantity,
                 "entry_price": self.entry_price,
                 "sl_price": self.sl_price, "tp_price": self.tp_price}
 
@@ -3159,6 +3159,24 @@ class QuantStrategy:
             old_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
             new_rr = abs(chosen_tp - entry) / max(abs(entry - chosen_sl), 1e-9)
 
+            # Do not overwrite the executable signal with a negative-edge
+            # utility-surface candidate. The old flow mutated SL/TP first and
+            # only then deferred on has_positive_edge=False. That polluted
+            # refine-watch with the surface's wider/low-utility stop/target
+            # instead of preserving the raw sweep thesis that EntryEngine built.
+            setattr(signal, "target_surface", chosen_surface)
+            setattr(signal, "stop_surface", stop_surface)
+            positive_edge = bool(getattr(chosen_surface, "has_positive_edge", False))
+            if not positive_edge:
+                logger.info(
+                    "JointSurface candidate is NON-EXECUTABLE; keeping raw SL/TP: "
+                    "candidate SL=$%.1f TP=$%.1f RR=%.2f joint=%+.3f targetU=%+.3f "
+                    "EV=%+.3f stopU=%+.3f risk=%.2fATR posterior=%.3f | raw SL=$%.1f TP=$%.1f RR=%.2f",
+                    chosen_sl, chosen_tp, new_rr, joint, target_u, ev_r, stop_u, risk_atr,
+                    posterior_prob, raw_sl, raw_tp, old_rr,
+                )
+                return
+
             changed_sl = abs(chosen_sl - raw_sl) >= max(tick * 2.0, 1e-9)
             changed_tp = abs(chosen_tp - raw_tp) >= max(tick * 2.0, 1e-9)
             if changed_sl:
@@ -3167,8 +3185,6 @@ class QuantStrategy:
                 setattr(signal, "tp_price", chosen_tp)
                 setattr(signal, "target_pool", getattr(chosen_target, 'pool_ref', getattr(signal, 'target_pool', None)))
             setattr(signal, "rr_ratio", new_rr)
-            setattr(signal, "target_surface", chosen_surface)
-            setattr(signal, "stop_surface", stop_surface)
 
             if getattr(chosen_surface, 'terminal', None) is not None:
                 setattr(signal, "terminal_runner_price", chosen_surface.terminal.price)
@@ -3477,10 +3493,20 @@ class QuantStrategy:
             direction_q = self._bounded(0.45 + (0.55 * hint_conf if hint_side == side else -0.40 * hint_conf))
             if hint_side != side and hint_conf >= 0.65:
                 rejects.append(f"post-sweep engine favours {hint_side} ({hint_conf:.2f})")
-        elif hunt_side:
+        elif hunt_side and not is_sweep:
             direction_q = self._bounded(0.52 + (0.42 * hunt_conf if hunt_side == side else -0.35 * hunt_conf))
-            if hunt_side != side and hunt_conf >= 0.55 and not is_sweep:
+            if hunt_side != side and hunt_conf >= 0.55:
                 rejects.append(f"DirectionEngine draw favours {hunt_side} ({hunt_conf:.2f})")
+        elif hunt_side and is_sweep:
+            # DirectionEngine hunt prediction is pre-sweep telemetry. A sweep
+            # entry already has a concrete auction event, so hunt telemetry must
+            # not penalise or approve the executable route. This removes the
+            # apparent mixed-signal path where low-confidence BSL_HUNT/bullish
+            # telemetry affected a SHORT sweep-reversal decision score.
+            direction_q = 0.55
+            allows.append(
+                f"DirectionEngine hunt telemetry ignored for sweep route decision ({hunt_side} {hunt_conf:.2f})"
+            )
         else:
             direction_q = 0.55
 
@@ -4748,7 +4774,7 @@ class QuantStrategy:
                     self._dir_engine_last_log_key = _de_log_key
                     self._dir_engine_last_log_ts  = now
                     logger.info(
-                        f"🧭 DIR_TELEMETRY: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"🧭 DIR_TELEMETRY[OBS_ONLY]: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} "
                         f"delivery={_hunt.delivery_direction} "
                         f"raw={_hunt.raw_score:+.3f} "
@@ -4756,7 +4782,7 @@ class QuantStrategy:
                         f"| {_hunt.reason[:100]}")
                 else:
                     logger.debug(
-                        f"🧭 DIR_TELEMETRY: hunt={_hunt.predicted or 'NEUTRAL'} "
+                        f"🧭 DIR_TELEMETRY[OBS_ONLY]: hunt={_hunt.predicted or 'NEUTRAL'} "
                         f"conf={_hunt.confidence:.2f} raw={_hunt.raw_score:+.3f} "
                         f"BSL={_hunt.bsl_score:.2f} SSL={_hunt.ssl_score:.2f} "
                         f"| {_hunt.reason[:100]}")

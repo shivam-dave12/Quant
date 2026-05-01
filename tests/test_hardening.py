@@ -61,6 +61,225 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(router.emergency_flatten(reason="unit_test"), {"ok": True})
         self.assertEqual(om.calls[0][1]["reason"], "unit_test")
 
+    def test_pending_entry_display_does_not_render_zero_position(self):
+        from strategy.display_engine import format_heartbeat
+
+        rendered = format_heartbeat(
+            price=77000.0,
+            feed="dual",
+            exchange="delta",
+            position={
+                "phase": "ENTERING",
+                "side": "",
+                "quantity": 0.0,
+                "entry_price": 0.0,
+                "sl_price": 0.0,
+                "tp_price": 0.0,
+            },
+            engine_state="ENTERING",
+            tracking_info=None,
+            primary_target=None,
+            nearest_bsl_atr=1.0,
+            nearest_ssl_atr=1.0,
+            recent_sweep_count=0,
+            total_trades=0,
+            total_pnl=0.0,
+            atr=100.0,
+        )
+
+        self.assertIn("pending entry", rendered)
+        self.assertNotIn("qty 0.000000", rendered)
+        self.assertNotIn("initial payoff/risk", rendered)
+
+    def test_position_state_exposes_phase_for_operator_surfaces(self):
+        from strategy.quant_strategy import PositionPhase, PositionState
+
+        pos = PositionState(phase=PositionPhase.ENTERING)
+
+        self.assertEqual(pos.to_dict()["phase"], "ENTERING")
+
+    def test_market_aggregator_switch_requires_fresh_secondary_and_restores_taps(self):
+        from aggregator.market_aggregator import MarketAggregator
+
+        class FakeCoinSwitchDataManager:
+            def __init__(self, fresh=True):
+                self.is_ready = True
+                self.fresh = fresh
+                self.registered = []
+                self.trades = []
+
+            def _on_trade(self, data):
+                self.trades.append(data)
+
+            def is_price_fresh(self, max_age_seconds=90.0):
+                return self.fresh
+
+            def register_strategy(self, strategy):
+                self.registered.append(strategy)
+
+            def get_last_price(self):
+                return 100.0
+
+        class FakeDeltaDataManager(FakeCoinSwitchDataManager):
+            pass
+
+        primary = FakeCoinSwitchDataManager(fresh=True)
+        secondary = FakeDeltaDataManager(fresh=False)
+        aggregator = MarketAggregator(primary, secondary)
+
+        ok, msg = aggregator.can_switch_primary("delta")
+        self.assertFalse(ok)
+        self.assertIn("not fresh", msg)
+        self.assertTrue(getattr(secondary, "_agg_trade_tap_installed", False))
+
+        secondary.fresh = True
+        strategy = object()
+        ok, msg = aggregator.switch_primary("delta", strategy=strategy)
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(aggregator.primary_exchange, "delta")
+        self.assertEqual(secondary.registered[-1], strategy)
+        self.assertFalse(getattr(secondary, "_agg_trade_tap_installed", False))
+        self.assertTrue(getattr(primary, "_agg_trade_tap_installed", False))
+
+    def test_market_aggregator_stale_secondary_degrades_reliability(self):
+        from aggregator.market_aggregator import MarketAggregator
+
+        class FakeCoinSwitchDataManager:
+            is_ready = True
+
+            def __init__(self):
+                self.trades = []
+
+            def _on_trade(self, data):
+                self.trades.append(data)
+
+            def is_price_fresh(self, max_age_seconds=90.0):
+                return True
+
+            def get_last_price(self):
+                return 100.0
+
+        class FakeDeltaDataManager(FakeCoinSwitchDataManager):
+            pass
+
+        aggregator = MarketAggregator(FakeCoinSwitchDataManager(), FakeDeltaDataManager())
+        aggregator._secondary_alive = True
+        aggregator._secondary_last_trade_ts = time.time() - aggregator._feed_stale_sec - 1.0
+
+        reliability = aggregator.get_feed_reliability()
+
+        self.assertEqual(reliability["mode"], "single")
+        self.assertEqual(reliability["sources"], 1)
+        self.assertFalse(reliability["secondary_alive"])
+        self.assertLess(reliability["microstructure_weight"], 1.0)
+
+    def test_coinswitch_price_fresh_waits_for_live_orderbook_mid(self):
+        import threading
+        from exchanges.coinswitch.data_manager import CoinSwitchDataManager
+
+        dm = object.__new__(CoinSwitchDataManager)
+        dm._lock = threading.RLock()
+        dm._last_price = 0.0
+        dm._last_price_update_time = 0.0
+        dm._last_orderbook_update_time = 0.0
+        dm._orderbook = {"bids": [], "asks": []}
+        dm.stats = SimpleNamespace(record_orderbook=lambda: None)
+
+        self.assertFalse(dm.is_price_fresh(90.0))
+
+        dm._on_orderbook({"bids": [["100", "1"]], "asks": [["102", "1"]]})
+
+        self.assertEqual(dm.get_last_price(), 101.0)
+        self.assertTrue(dm.is_price_fresh(90.0))
+
+    def test_delta_market_conditional_order_excludes_limit_only_fields(self):
+        from exchanges.delta.api import DeltaAPI
+
+        api = object.__new__(DeltaAPI)
+        captured = {}
+        api._symbol_to_product_id = lambda symbol: 27
+
+        def fake_post(path, body):
+            captured["path"] = path
+            captured["body"] = dict(body)
+            return {"success": True, "result": {"id": "abc", "size": body["size"], "state": "open"}}
+
+        api._post = fake_post
+        resp = api.place_order(
+            symbol="BTCUSD",
+            side="sell",
+            quantity=1,
+            order_type="stop_market",
+            stop_price=76000.0,
+            reduce_only=True,
+            post_only=True,
+            time_in_force="ioc",
+            stop_order_type="stop_loss_order",
+        )
+
+        self.assertTrue(resp["success"])
+        self.assertEqual(captured["path"], "/v2/orders")
+        self.assertEqual(captured["body"]["order_type"], "stop_market_order")
+        self.assertEqual(captured["body"]["stop_order_type"], "stop_loss_order")
+        self.assertNotIn("post_only", captured["body"])
+        self.assertNotIn("time_in_force", captured["body"])
+
+    def test_watchdog_circuit_breaker_requires_operator_clear_by_default(self):
+        from watchdog import CircuitBreaker, HealActionLog
+
+        strategy = SimpleNamespace(watchdog_trading_frozen=False)
+        breaker = CircuitBreaker(
+            strategy,
+            HealActionLog(os.devnull),
+            open_duration_sec=0.01,
+            auto_half_open_enabled=False,
+        )
+
+        breaker.trip("unit test")
+        breaker._engaged_at = time.time() - 10.0
+
+        self.assertTrue(breaker.engaged)
+        self.assertTrue(strategy.watchdog_trading_frozen)
+
+        breaker.clear("unit_test")
+
+        self.assertFalse(breaker.engaged)
+        self.assertFalse(strategy.watchdog_trading_frozen)
+
+    def test_telegram_queue_shedding_reheapifies_priority_queue(self):
+        import heapq
+        import queue
+        from telegram import notifier
+
+        old_queue = notifier._send_queue
+        old_dropped = notifier._dropped_routine
+        try:
+            notifier._send_queue = queue.PriorityQueue(maxsize=10)
+            for item in (
+                (notifier.PRIO_CRITICAL, 1, "critical"),
+                (notifier.PRIO_IMPORTANT, 2, "important"),
+                (notifier.PRIO_ROUTINE, 3, "routine-a"),
+                (notifier.PRIO_ROUTINE, 4, "routine-b"),
+            ):
+                notifier._send_queue.put_nowait(item)
+
+            self.assertTrue(notifier._shed_routine_for_room())
+
+            with notifier._send_queue.mutex:
+                heap = list(notifier._send_queue.queue)
+            for idx, item in enumerate(heap):
+                left = 2 * idx + 1
+                right = left + 1
+                if left < len(heap):
+                    self.assertLessEqual(item, heap[left])
+                if right < len(heap):
+                    self.assertLessEqual(item, heap[right])
+            self.assertEqual(heapq.nsmallest(1, heap)[0][0], notifier.PRIO_CRITICAL)
+        finally:
+            notifier._send_queue = old_queue
+            notifier._dropped_routine = old_dropped
+
     def test_htf_veto_is_not_unconditionally_disabled(self):
         from strategy.quant_strategy import HTFTrendFilter
 

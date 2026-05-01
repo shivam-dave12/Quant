@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import html as _html_lib
 import logging
+import heapq
 import queue as _queue_mod
 import re
 import sys
@@ -197,6 +198,12 @@ def _shed_routine_for_room() -> bool:
             for i, item in enumerate(heap):
                 if item[0] >= PRIO_ROUTINE:
                     heap.pop(i)
+                    heapq.heapify(heap)
+                    try:
+                        _send_queue.unfinished_tasks = max(0, _send_queue.unfinished_tasks - 1)
+                        _send_queue.not_full.notify()
+                    except Exception:
+                        pass
                     _dropped_routine += 1
                     return True
     except Exception:
@@ -359,12 +366,20 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
                 send_text = message[:4000]
                 if parse_mode == "HTML":
                     send_text = _sanitize_html(send_text)
-                _req.post(url, json={
+                resp = _req.post(url, json={
                     "chat_id":                  telegram_config.TELEGRAM_CHAT_ID,
                     "text":                     send_text,
                     "parse_mode":               parse_mode,
                     "disable_web_page_preview": True,
                 }, timeout=10)
+                if resp.status_code == 400 and parse_mode == "HTML":
+                    plain = re.sub(r"<[^>]*>", "", send_text, flags=re.DOTALL)
+                    plain = _html_lib.unescape(plain)
+                    _req.post(url, json={
+                        "chat_id": telegram_config.TELEGRAM_CHAT_ID,
+                        "text": plain[:4000],
+                        "disable_web_page_preview": True,
+                    }, timeout=10)
             except Exception as _ce:
                 logger.error("Critical Telegram send failed: %s", _ce)
         t = threading.Thread(target=_send_critical_now, daemon=True,

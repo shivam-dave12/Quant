@@ -1862,7 +1862,36 @@ class TelegramBotController:
             return "❌ Execution router not available."
 
         strategy = getattr(bot_instance, "strategy", None)
+        data_manager = getattr(bot_instance, "data_manager", None)
+        old_exchange = getattr(router, "active_exchange", getattr(config, "EXECUTION_EXCHANGE", ""))
+
+        # Institutional invariant: execution venue and primary market-data venue
+        # must stay aligned. Otherwise SL/TP/spread/liquidity checks read one
+        # venue while orders route to another.
+        if data_manager is not None and hasattr(data_manager, "can_switch_primary"):
+            ok_data, data_msg = data_manager.can_switch_primary(target)
+            if not ok_data:
+                return (
+                    f"❌ Cannot switch execution to <b>{_esc(target.upper())}</b>.\n"
+                    f"Reason: {_esc(data_msg)}"
+                )
+
         success, message = router.switch(target, strategy=strategy)
+
+        if success and data_manager is not None and hasattr(data_manager, "switch_primary"):
+            ok_data, data_msg = data_manager.switch_primary(target, strategy=strategy)
+            if not ok_data:
+                try:
+                    router.switch(old_exchange, strategy=strategy, force=True)
+                    config.EXECUTION_EXCHANGE = old_exchange
+                    rollback = f"\n✅ Rolled execution back to {old_exchange.upper()}"
+                except Exception as rb_e:
+                    rollback = f"\n🚨 Rollback failed: {rb_e}"
+                return (
+                    f"{message}\n\n🚨 <b>DATA PRIMARY SWITCH FAILED</b>\n"
+                    f"{_esc(data_msg)}{rollback}"
+                )
+            message += f"\n📡 {_esc(data_msg)}"
 
         if success and bot_instance.order_manager:
             try:

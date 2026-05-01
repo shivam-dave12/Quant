@@ -227,6 +227,8 @@ AGG_PRIMARY_WEIGHT   = 0.55
 AGG_SECONDARY_WEIGHT = 0.45
 AGG_OB_DEPTH_LEVELS  = 10
 AGG_TRADE_WINDOW_SEC = 30.0
+# Maximum age for a secondary feed before its microstructure is discounted.
+AGG_FEED_STALE_SEC   = 12.0
 
 # ── Quant Strategy ────────────────────────────────────────────────────────────
 QUANT_MARGIN_PCT               = 0.20
@@ -445,6 +447,10 @@ ENTRY_REFINE_TTL_SEC                     = 20 * 60.0
 ENTRY_REFINE_MIN_RETRY_SEC               = 8.0
 ENTRY_REFINE_MAX_ATTEMPTS                = 18
 ENTRY_REFINE_MIN_PULLBACK_ATR            = 0.25
+# Minimum favourable delivery before a refine-watch pullback can be measured
+# from the delivered extreme. This fixes false 0.00ATR readouts after a move
+# delivers first, then retraces without crossing the original rejected entry.
+ENTRY_REFINE_MIN_DELIVERY_BEFORE_PULLBACK_ATR = 0.20
 ENTRY_REFINE_RISK_IMPROVE_RATIO          = 0.82
 ENTRY_REFINE_SL_ROOM_ATR                 = 0.20
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
@@ -510,6 +516,13 @@ TARGET_FULL_TP_MIN_COST_MULT = 4.0
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10
+
+# ── Watchdog circuit breaker ────────────────────────────────────────────────
+# Institutional default: a CRITICAL watchdog trip requires explicit operator
+# acknowledgement. Auto half-open can be enabled only if you intentionally want
+# timed probe entries after a freeze.
+WATCHDOG_AUTO_HALF_OPEN = False
+WATCHDOG_HALF_OPEN_SEC  = 300.0
 
 # ── Compatibility alias ───────────────────────────────────────────────────────
 EXCHANGE = COINSWITCH_EXCHANGE

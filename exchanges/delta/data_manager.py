@@ -78,6 +78,7 @@ class DeltaDataManager:
 
         self._last_price:             float = 0.0
         self._last_price_update_time: float = 0.0
+        self._last_orderbook_update_time: float = 0.0
         self._orderbook:              Dict  = {"bids": [], "asks": []}
         self._recent_trades:          deque = deque(maxlen=500)
 
@@ -620,11 +621,13 @@ class DeltaDataManager:
                     "bids": self._normalise_ob_side(raw_bids),
                     "asks": self._normalise_ob_side(raw_asks),
                 }
+                now_ts = time.time()
+                self._last_orderbook_update_time = now_ts
                 bids, asks = self._orderbook["bids"], self._orderbook["asks"]
                 if bids and asks:
                     try:
                         self._last_price = (bids[0][0] + asks[0][0]) / 2.0
-                        self._last_price_update_time = time.time()
+                        self._last_price_update_time = now_ts
                     except Exception:
                         pass
                 self.stats.record_orderbook()
@@ -632,36 +635,40 @@ class DeltaDataManager:
             logger.debug(f"Delta OB callback: {e}")
 
     def _on_trade(self, data: Dict) -> None:
+        # Match CoinSwitchDataManager: never call strategy while holding the
+        # data-manager lock. The strategy can call back into get_candles(),
+        # get_orderbook(), etc.; doing that under this lock creates a classic
+        # cross-thread freeze path that the watchdog then has to repair.
         try:
+            price = qty = 0.0
+            side = "buy"
+            callback = None
             with self._lock:
-                # Delta public trades channel uses "price"/"size"/"side" fields.
-                # "p"/"q"/"m" is the aggregated ticker format — different channel.
-                # Support both formats defensively.
                 price = float(data.get("price") or data.get("p") or 0)
-                qty   = float(data.get("size")  or data.get("q") or 0)
+                qty = float(data.get("size") or data.get("quantity") or data.get("q") or 0)
                 side_raw = data.get("side", "")
                 if side_raw:
                     side = "buy" if str(side_raw).lower() == "buy" else "sell"
                 else:
-                    # Fallback: "m" = True means buyer was maker = sell aggressor
                     side = "sell" if bool(data.get("m")) else "buy"
                 if price > 0:
+                    now_ts = time.time()
                     self._last_price = price
-                    self._last_price_update_time = time.time()
+                    self._last_price_update_time = now_ts
                     self._recent_trades.append({
-                        "price":     price,
-                        "quantity":  qty,
-                        "side":      side,
-                        "timestamp": time.time(),
+                        "price": price,
+                        "quantity": qty,
+                        "side": side,
+                        "timestamp": now_ts,
                     })
                     if self._strategy_ref is not None:
-                        try:
-                            on_rt = getattr(self._strategy_ref, "_on_realtime_trade", None)
-                            if on_rt:
-                                on_rt(price, qty, side)
-                        except Exception:
-                            pass
+                        callback = getattr(self._strategy_ref, "_on_realtime_trade", None)
                 self.stats.record_trade()
+            if callback is not None and price > 0:
+                try:
+                    callback(price, qty, side)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"Delta trade callback: {e}")
 
@@ -706,7 +713,7 @@ class DeltaDataManager:
             return {
                 "bids": list(self._orderbook.get("bids", [])),
                 "asks": list(self._orderbook.get("asks", [])),
-                "timestamp": time.time(),
+                "timestamp": self._last_orderbook_update_time or time.time(),
             }
 
     def get_recent_trades_raw(self) -> List[Dict]:

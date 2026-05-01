@@ -587,13 +587,15 @@ class CircuitBreaker:
                  notifier: Optional[Callable[[str], Any]] = None,
                  runaway_heal_threshold: int = 15,
                  runaway_window_sec: float = 300.0,
-                 open_duration_sec: float = 300.0):
+                 open_duration_sec: float = 300.0,
+                 auto_half_open_enabled: bool = False):
         self._strategy = strategy
         self._heal_log = heal_log
         self._notify = notifier
         self._runaway_n = int(runaway_heal_threshold)
         self._runaway_window = float(runaway_window_sec)
         self._open_duration = float(open_duration_sec)
+        self._auto_half_open_enabled = bool(auto_half_open_enabled)
         self._engaged = False
         self._engaged_at: Optional[float] = None
         self._reason: Optional[str] = None
@@ -621,7 +623,8 @@ class CircuitBreaker:
 
     def _maybe_half_open(self) -> None:
         with self._lock:
-            if (not self._engaged or self._engaged_at is None or
+            if (not self._auto_half_open_enabled or not self._engaged or
+                    self._engaged_at is None or
                     _now() - self._engaged_at < self._open_duration):
                 return
             prev_reason = self._reason
@@ -2631,7 +2634,11 @@ class Watchdog:
             risk_manager=risk_manager, dump_dir=forensic_dir,
         )
         self._breaker = CircuitBreaker(
-            strategy=strategy, heal_log=self._heal_log, notifier=notifier,
+            strategy=strategy,
+            heal_log=self._heal_log,
+            notifier=notifier,
+            open_duration_sec=float(getattr(config_module, "WATCHDOG_HALF_OPEN_SEC", 300.0)),
+            auto_half_open_enabled=bool(getattr(config_module, "WATCHDOG_AUTO_HALF_OPEN", False)),
         )
 
         self._checks: List[HealthCheck] = []

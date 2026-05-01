@@ -72,6 +72,46 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _dm_exchange_key(dm) -> str:
+    """Infer the venue key from a data-manager instance without importing concrete classes."""
+    name = type(dm).__name__.lower() if dm is not None else ""
+    if "delta" in name:
+        return "delta"
+    if "coinswitch" in name or "coin_switch" in name:
+        return "coinswitch"
+    return name or "unknown"
+
+
+def _stats_last_update_ts(dm) -> float:
+    try:
+        stats = getattr(dm, "stats", None)
+        last = stats.get_last_update() if stats is not None else None
+        if last is None:
+            return 0.0
+        return float(last.timestamp())
+    except Exception:
+        return 0.0
+
+
+def _dm_is_fresh(dm, max_age_sec: float) -> bool:
+    if dm is None:
+        return False
+    try:
+        if hasattr(dm, "is_ready") and not bool(getattr(dm, "is_ready", False)):
+            return False
+    except Exception:
+        return False
+    try:
+        if hasattr(dm, "is_price_fresh") and not bool(dm.is_price_fresh(max_age_sec)):
+            return False
+    except Exception:
+        return False
+    last_stats_ts = _stats_last_update_ts(dm)
+    if last_stats_ts > 0 and time.time() - last_stats_ts > max_age_sec:
+        return False
+    return True
+
+
 def _norm_levels(raw_levels: list) -> list:
     """
     Normalise orderbook levels to [[price, qty], ...] format.
@@ -123,8 +163,11 @@ class MarketAggregator:
         self._w_sec = float(getattr(config, "AGG_SECONDARY_WEIGHT", 0.45))
         self._ob_depth = int(getattr(config, "AGG_OB_DEPTH_LEVELS", 10))
 
-        # Secondary availability flag — auto-detected
+        # Secondary availability flag — auto-detected. Freshness is evaluated
+        # continuously; this flag alone is never enough to trust secondary flow.
         self._secondary_alive = False
+        self._secondary_last_trade_ts = 0.0
+        self._feed_stale_sec = float(getattr(config, "AGG_FEED_STALE_SEC", 12.0))
 
         # Install a tap on the secondary trade stream to merge into our deque
         if self._secondary is not None:
@@ -149,7 +192,13 @@ class MarketAggregator:
         # BUG-AGG-1 FIX: guard against secondary DM that doesn't expose _on_trade.
         # Without this, a secondary DM that lacks the method crashes the entire
         # aggregator at construction time with AttributeError.
-        original_on_trade = getattr(secondary, '_on_trade', None)
+        if getattr(secondary, "_agg_trade_tap_installed", False):
+            logger.debug("Secondary DM trade tap already installed — skipping duplicate wrap")
+            return
+
+        original_on_trade = getattr(secondary, "_agg_original_on_trade", None)
+        if original_on_trade is None:
+            original_on_trade = getattr(secondary, '_on_trade', None)
         if original_on_trade is None:
             logger.warning(
                 f"Secondary DM {type(secondary).__name__} has no _on_trade — "
@@ -179,18 +228,38 @@ class MarketAggregator:
                     side = "sell" if data.get("m") else "buy"
                 if price > 0:
                     with agg_ref._lock:
+                        ts = time.time()
                         agg_ref._merged_trades.append({
                             "price":     price,
                             "quantity":  qty,
                             "side":      side,
-                            "timestamp": time.time(),
+                            "timestamp": ts,
                             "source":    "secondary",
                         })
                         agg_ref._secondary_alive = True
+                        agg_ref._secondary_last_trade_ts = ts
             except Exception:
                 pass
 
         secondary._on_trade = tapped_on_trade
+        try:
+            setattr(secondary, "_agg_original_on_trade", original_on_trade)
+            setattr(secondary, "_agg_trade_tap_installed", True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _remove_trade_tap(dm) -> None:
+        """Restore a data manager's native trade callback when it becomes primary."""
+        if dm is None:
+            return
+        try:
+            original = getattr(dm, "_agg_original_on_trade", None)
+            if original is not None and getattr(dm, "_agg_trade_tap_installed", False):
+                dm._on_trade = original
+                setattr(dm, "_agg_trade_tap_installed", False)
+        except Exception:
+            pass
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -216,7 +285,16 @@ class MarketAggregator:
         t1 = threading.Thread(target=start_primary,   daemon=True)
         t2 = threading.Thread(target=start_secondary, daemon=True)
         t1.start(); t2.start()
-        t1.join(); t2.join()
+        start_timeout = float(getattr(config, "AGG_START_JOIN_TIMEOUT_SEC", 90.0))
+        t1.join(start_timeout)
+        t2.join(min(start_timeout, 20.0))
+
+        if t1.is_alive():
+            logger.error("❌ Primary DM start did not return within %.0fs", start_timeout)
+            return False
+        if t2.is_alive():
+            logger.warning("⚠️ Secondary DM start still running — continuing primary-only until it becomes fresh")
+            self._secondary_alive = False
 
         if not primary_ok[0]:
             logger.error("❌ Primary DM failed to start — cannot trade")
@@ -276,6 +354,7 @@ class MarketAggregator:
             )
             # Swap: secondary becomes primary for candle reads
             self._primary, self._secondary = self._secondary, self._primary
+            self._remove_trade_tap(self._primary)
             self._secondary_alive = True
             # BUG-AGG-2 FIX: after promoting secondary to primary, re-register
             # the strategy on the new primary so its _on_trade fires callbacks.
@@ -322,6 +401,60 @@ class MarketAggregator:
         # Secondary does NOT register strategy — we don't want double
         # on_realtime_trade calls.  The tap above handles secondary trades.
 
+    @property
+    def primary_exchange(self) -> str:
+        return _dm_exchange_key(self._primary)
+
+    @property
+    def secondary_exchange(self) -> str:
+        return _dm_exchange_key(self._secondary) if self._secondary is not None else "none"
+
+    def can_switch_primary(self, target_exchange: str) -> tuple[bool, str]:
+        """Return whether market-data primary can be aligned to execution."""
+        target = str(target_exchange or "").strip().lower()
+        if target == self.primary_exchange:
+            return True, f"data primary already {target}"
+        if self._secondary is None or target != self.secondary_exchange:
+            return False, (
+                f"data feed for {target or '?'} is not available; configured primary="
+                f"{self.primary_exchange}, secondary={self.secondary_exchange}"
+            )
+        if not _dm_is_fresh(self._secondary, self._feed_stale_sec):
+            return False, f"{target} data feed is not fresh/ready; refusing execution-data mismatch"
+        return True, f"data primary can switch to {target}"
+
+    def switch_primary(self, target_exchange: str, strategy=None) -> tuple[bool, str]:
+        """Atomically align the candle/orderbook primary with execution exchange."""
+        ok, msg = self.can_switch_primary(target_exchange)
+        if not ok:
+            return False, msg
+        target = str(target_exchange or "").strip().lower()
+        if target == self.primary_exchange:
+            return True, msg
+        with self._lock:
+            old_primary = self.primary_exchange
+            self._primary, self._secondary = self._secondary, self._primary
+            self._remove_trade_tap(self._primary)
+            self._secondary_alive = _dm_is_fresh(self._secondary, self._feed_stale_sec)
+            self._secondary_last_trade_ts = 0.0
+        strat = strategy if strategy is not None else self._strategy_ref
+        if strat is not None:
+            try:
+                self._primary.register_strategy(strat)
+                self._strategy_ref = strat
+            except Exception as e:
+                logger.error("Failed to register strategy after data primary switch: %s", e)
+                return False, f"strategy registration failed after data switch: {e}"
+        try:
+            if self._secondary is not None:
+                # The old primary is now secondary. Reset the tap marker only on that
+                # object if it was never tapped; otherwise avoid duplicate wrapping.
+                self._install_secondary_trade_tap()
+        except Exception as e:
+            logger.warning("Secondary trade tap after primary switch failed: %s", e)
+        logger.info("✅ MarketAggregator primary switched: %s → %s", old_primary, target)
+        return True, f"market-data primary switched {old_primary} → {target}"
+
     # ── Candles — primary exchange only ──────────────────────────────────────
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
@@ -346,31 +479,41 @@ class MarketAggregator:
         return p_price
 
     def get_feed_reliability(self) -> Dict:
-        """
-        Return data-quality metadata consumed by operator UI and strategy.
+        """Return data-quality metadata consumed by operator UI and strategy.
 
         Reliability is not an alpha signal. It is a confidence multiplier for
-        microstructure features. When the secondary feed is unavailable, CVD/OB
-        information remains usable but must be treated as single-venue evidence.
+        microstructure features. Secondary flow is trusted only while it is
+        fresh; a disconnected/stale secondary automatically degrades to single
+        source so CVD/OB cannot remain falsely "dual".
         """
-        primary_ready = bool(getattr(self._primary, "is_ready", False))
+        primary_ready = _dm_is_fresh(self._primary, self._feed_stale_sec)
         secondary_configured = self._secondary is not None
         secondary_ready = bool(
-            secondary_configured and self._secondary_alive
-            and getattr(self._secondary, "is_ready", True)
+            secondary_configured
+            and self._secondary_alive
+            and _dm_is_fresh(self._secondary, self._feed_stale_sec)
         )
+        if self._secondary_last_trade_ts > 0 and time.time() - self._secondary_last_trade_ts > self._feed_stale_sec:
+            secondary_ready = False
+            self._secondary_alive = False
         sources = 1 + int(secondary_ready)
         microstructure_weight = 1.0 if secondary_ready else 0.62
         return {
             "primary_ready": primary_ready,
+            "primary_exchange": self.primary_exchange,
+            "secondary_exchange": self.secondary_exchange,
             "secondary_configured": secondary_configured,
             "secondary_alive": secondary_ready,
+            "secondary_last_trade_age_sec": (
+                time.time() - self._secondary_last_trade_ts if self._secondary_last_trade_ts > 0 else None
+            ),
+            "stale_after_sec": self._feed_stale_sec,
             "sources": sources,
             "microstructure_weight": microstructure_weight,
             "mode": "dual" if secondary_ready else "single",
             "note": (
                 "dual-feed microstructure" if secondary_ready
-                else "single-feed microstructure; posterior should discount CVD/OB"
+                else "single/fresh-primary microstructure; posterior should discount CVD/OB"
             ),
         }
 
@@ -404,7 +547,8 @@ class MarketAggregator:
             "_feed_reliability": self.get_feed_reliability(),
         }
 
-        if self._secondary is None or not self._secondary_alive:
+        reliability = self.get_feed_reliability()
+        if self._secondary is None or not reliability.get("secondary_alive", False):
             return primary_book
 
         try:
@@ -431,9 +575,13 @@ class MarketAggregator:
         institutional order show up twice (they ARE two separate fills).
         Trades are sorted newest-last for compatibility with strategy code.
         """
-        p_trades = self._primary.get_recent_trades_raw()
+        try:
+            p_trades = list(self._primary.get_recent_trades_raw() or [])
+        except Exception:
+            p_trades = []
 
-        if self._secondary is None or not self._secondary_alive:
+        reliability = self.get_feed_reliability()
+        if self._secondary is None or not reliability.get("secondary_alive", False):
             return p_trades
 
         with self._lock:

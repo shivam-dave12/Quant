@@ -861,7 +861,7 @@ class DeltaAPI:
         side:           str,           # "buy" | "sell"
         order_type:     str,           # "limit_order" | "market_order" | "stop_market_order" |
                                        # "stop_limit_order" | "take_profit_market_order" | "take_profit_limit_order"
-        size:           float,
+        size:           float              = 0.0,
         limit_price:    Optional[float]   = None,
         stop_price:     Optional[float]   = None,
         reduce_only:    bool              = False,
@@ -931,11 +931,11 @@ class DeltaAPI:
         }
 
         # post_only and time_in_force are ONLY valid on limit-type orders.
-        # Delta returns bad_schema if either field is present on stop_market_order
-        # or take_profit_market_order — even with value False/"gtc".
-        # stop_limit_order and take_profit_limit_order still accept both fields.
-        _CONDITIONAL_MARKET_TYPES = {"stop_market_order", "take_profit_market_order"}
-        if _otype not in _CONDITIONAL_MARKET_TYPES:
+        # They must not be sent on market_order, including conditional
+        # market_order + stop_order_type used for standalone SL/TP. Sending
+        # them there creates intermittent Delta bad_schema rejections.
+        _LIMIT_TYPES = {"limit_order", "stop_limit_order", "take_profit_limit_order"}
+        if _otype in _LIMIT_TYPES:
             body["post_only"]     = post_only
             body["time_in_force"] = time_in_force
 

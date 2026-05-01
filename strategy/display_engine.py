@@ -208,8 +208,19 @@ def _format_heartbeat_industry(
     market_profile: Optional[Dict] = None,
 ) -> str:
     rows: List[str] = []
+    position_phase = str((position or {}).get("phase", "") or "").upper()
+    position_qty = _safe_float((position or {}).get("quantity", 0.0))
+    position_entry = _safe_float((position or {}).get("entry_price", 0.0))
+    active_position = bool(
+        position
+        and position_phase in ("", "ACTIVE")
+        and position_qty > 0.0
+        and position_entry > 0.0
+    )
+    pending_entry = bool(position and position_phase == "ENTERING")
+
     side_color = C.BCYN
-    if position:
+    if active_position:
         side_color = C.BGRN if str(position.get("side", "")).lower() == "long" else C.BRED
     state_color = C.BGRN if engine_state in ("READY", "IN_POSITION") else C.BCYN
     kz = _c("KILLZONE", C.BYLW, C.BOLD) if kill_zone else _c("off-kz", C.DIM)
@@ -274,12 +285,12 @@ def _format_heartbeat_industry(
         rows.append(f"sweep {sweep_side} @ {_price(sweep_px)} | REV {rev:.1f} vs CONT {cont:.1f} | {winner}")
 
     rows.append("")
-    if position:
+    if active_position:
         side = str(position.get("side", "?")).upper()
-        entry = _safe_float(position.get("entry_price", 0.0))
+        entry = position_entry
         sl = _safe_float(position.get("sl_price", 0.0))
         tp = _safe_float(position.get("tp_price", 0.0))
-        qty = _safe_float(position.get("quantity", 0.0))
+        qty = position_qty
         init_sl = _safe_float(position.get("initial_sl_dist", abs(entry - sl)), abs(entry - sl))
         move = (price - entry) if side == "LONG" else (entry - price)
         r_now = move / init_sl if init_sl > 1e-10 else 0.0
@@ -303,6 +314,8 @@ def _format_heartbeat_industry(
             f"unrealized {_c(f'${upnl:+,.2f}' if qty else f'{upnl:+,.1f} pts', _pnl_color(upnl))} | "
             f"R {_c(f'{r_now:+.2f}', _pnl_color(r_now))} | to-target [{_c(_term_progress(prog, 20), C.BGRN)}] {prog:.0%}"
         )
+    elif pending_entry:
+        rows.append(f"{_term_section('position')} pending entry | awaiting exchange fill")
     else:
         rows.append(f"{_term_section('position')} flat | scanning with no synthetic fallback levels")
 

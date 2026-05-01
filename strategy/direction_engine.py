@@ -2179,10 +2179,9 @@ HOW TO WIRE direction_engine.py v2.0 INTO quant_strategy.py
 3. POST-SWEEP EVALUATION  (Step 6c — AFTER liq_map.update())
 
     Runs every tick while DirectionEngine has an open PostSweepState.
-    The verdict is written into ict_ctx.direction_hint* BEFORE
-    entry_engine.update() is called so that the entry engine's
-    _evaluate_post_sweep_accumulative() can consume it as a dynamic
-    weighting factor (up to +20 pts at full confidence).
+    DirectionEngine output is observer telemetry until quant_strategy derives
+    a real post-sweep decision from fresh structure/order-flow. Hunt telemetry
+    must not be written into EntryEngine context as an executable route bias.
 
     if self._dir_engine.in_post_sweep:
         _ps_decision = self._dir_engine.evaluate_sweep(
@@ -2195,20 +2194,20 @@ HOW TO WIRE direction_engine.py v2.0 INTO quant_strategy.py
             liq_snapshot = liq_snapshot,   # FIX-3: current tick's fresh snapshot
         )
         if _ps_decision.action in ("reverse", "continue"):
-            ict_ctx.direction_hint            = _ps_decision.action
-            ict_ctx.direction_hint_side       = _ps_decision.direction
-            ict_ctx.direction_hint_confidence = _ps_decision.confidence
+            quant_strategy may map this confirmed post-sweep decision into
+            ict_ctx.direction_hint* for the current tick only.
         else:
             # "wait" — clear stale hint so entry_engine doesn't act on it
             ict_ctx.direction_hint            = ""
             ict_ctx.direction_hint_side       = ""
             ict_ctx.direction_hint_confidence = 0.0
 
-    # IMPORTANT: Call entry_engine.update() AFTER writing ict_ctx.direction_hint
+    # IMPORTANT: Call entry_engine.update() only after clearing stale telemetry
+    # or writing a confirmed post-sweep hint.
     self._entry_engine.update(
         liq_snapshot=liq_snapshot,
         flow_state=flow_state,
-        ict_ctx=ict_ctx,         # direction_hint* fields now populated
+        ict_ctx=ict_ctx,
         price=price, atr=atr, now=now,
         ...
     )
@@ -2251,13 +2250,12 @@ HOW TO WIRE direction_engine.py v2.0 INTO quant_strategy.py
             f"DISP={_analysis.get('displacement_atr',0):.2f}ATR "
             f"OTE={'✓' if _analysis.get('ote') else '✗'}")
 
-DIRECTION HINT FLOW (data path):
+DIRECTION TELEMETRY FLOW (data path):
   DirectionEngine.evaluate_sweep()
     → PostSweepDecision(action, direction, confidence)
-    → quant_strategy writes to ict_ctx.direction_hint / _side / _confidence
-    → entry_engine._evaluate_post_sweep_accumulative() reads ict_ctx
-    → adds up to +20 pts × confidence to the matching side's delta
-    → pushes entry_engine's accumulated total over its threshold faster
+    → quant_strategy logs DIR_TELEMETRY[OBS_ONLY]
+    → sweep-entry scoring ignores hunt telemetry unless there is a real
+      post-sweep hint from the current sweep state
 
 FIELD MAPPING:
   PostSweepDecision.direction == "long"  → ict_ctx.direction_hint_side = "long"
