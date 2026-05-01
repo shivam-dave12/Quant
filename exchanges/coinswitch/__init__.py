@@ -1,1 +1,1 @@
-
+"""CoinSwitch exchange adapter package."""

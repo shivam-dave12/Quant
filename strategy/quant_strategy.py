@@ -3331,16 +3331,13 @@ class QuantStrategy:
         if is_sweep and event_q >= 0.70:
             flow_q = max(flow_q, 0.40)
 
-        hint_side = str(getattr(ict_ctx, "direction_hint_side", "") or "").lower()
-        hint_conf = float(getattr(ict_ctx, "direction_hint_confidence", 0.0) or 0.0)
+        # DirectionEngine is telemetry only. Executable direction quality comes
+        # from the quantitative posterior plus live hunt context; no post-sweep
+        # hint can inject alpha or veto a posterior-approved trade.
         hunt = getattr(self, "_last_hunt_prediction", None)
         hunt_side = self._hunt_delivery_side(hunt)
         hunt_conf = float(getattr(hunt, "confidence", 0.0) or 0.0) if hunt else 0.0
-        if hint_side:
-            direction_q = self._bounded(0.45 + (0.55 * hint_conf if hint_side == side else -0.40 * hint_conf))
-            if hint_side != side and hint_conf >= 0.65:
-                rejects.append(f"post-sweep engine favours {hint_side} ({hint_conf:.2f})")
-        elif hunt_side:
+        if hunt_side:
             direction_q = self._bounded(0.52 + (0.42 * hunt_conf if hunt_side == side else -0.35 * hunt_conf))
             if hunt_side != side and hunt_conf >= 0.55 and not is_sweep:
                 rejects.append(f"DirectionEngine draw favours {hunt_side} ({hunt_conf:.2f})")
@@ -4205,24 +4202,22 @@ class QuantStrategy:
         _is_sweep_rev = (hasattr(signal, 'entry_type')
                          and signal.entry_type is not None
                          and 'REVERSAL' in str(signal.entry_type).upper())
-        _has_ps_hint = (ict_ctx.direction_hint == "reverse"
-                        and ict_ctx.direction_hint_confidence >= 0.40)
 
         if amd_phase == "ACCUMULATION":
-            if _is_sweep_rev or _has_ps_hint:
+            if _is_sweep_rev:
                 advisories.append(f"AMD=ACCUM sweep-reversal (phase lag expected, scoring handles it)")
             else:
-                advisories.append(f"AMD=ACCUM non-reversal Ã¢â‚¬â€ low amd_score will penalise conviction")
+                advisories.append(f"AMD=ACCUM non-reversal — low amd_score will penalise conviction")
 
         if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
             bias_contra = (
                 (signal.side == "long"  and "bear" in amd_bias) or
                 (signal.side == "short" and "bull" in amd_bias)
             )
-            if bias_contra and not _has_ps_hint:
+            if bias_contra:
                 advisories.append(
                     f"AMD_ADVISORY: MANIP bias={amd_bias} conf={amd_conf:.2f} "
-                    f"vs {signal.side} Ã¢â‚¬â€ contra-AMD, conviction will penalise")
+                    f"vs {signal.side} — contra-AMD, conviction will penalise")
 
         # Ã¢â€â‚¬Ã¢â€â‚¬ AMD lag override for fresh sweeps Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         # (Already applied to ict_ctx.amd_phase in _evaluate_entry; repeated
@@ -4231,23 +4226,21 @@ class QuantStrategy:
         # Ã¢â€â‚¬Ã¢â€â‚¬ Direction Engine context Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if self._dir_engine is not None:
             try:
-                _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
-                if not _ps_agrees:
-                    _hunt = getattr(self._dir_engine, '_last_hunt', None)
-                    if _hunt is not None and hasattr(_hunt, 'delivery_direction'):
-                        _del_dir   = getattr(_hunt, 'delivery_direction', '')
-                        _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
-                        if _hunt_conf >= 0.60:
-                            agrees = (
-                                (signal.side == "long"  and _del_dir == "bullish") or
-                                (signal.side == "short" and _del_dir == "bearish") or
-                                _del_dir in ("", "neutral", None)
-                            )
-                            if not agrees:
-                                advisories.append(
-                                    f"DIR_ADVISORY: hunt delivery={_del_dir} "
-                                    f"conf={_hunt_conf:.2f} vs {signal.side} "
-                                    f"(not blocking Ã¢â‚¬â€ conviction_filter weights flow)")
+                _hunt = getattr(self._dir_engine, '_last_hunt', None)
+                if _hunt is not None and hasattr(_hunt, 'delivery_direction'):
+                    _del_dir   = getattr(_hunt, 'delivery_direction', '')
+                    _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
+                    if _hunt_conf >= 0.60:
+                        agrees = (
+                            (signal.side == "long"  and _del_dir == "bullish") or
+                            (signal.side == "short" and _del_dir == "bearish") or
+                            _del_dir in ("", "neutral", None)
+                        )
+                        if not agrees:
+                            advisories.append(
+                                f"DIR_ADVISORY: hunt delivery={_del_dir} "
+                                f"conf={_hunt_conf:.2f} vs {signal.side} "
+                                f"(telemetry only; not blocking)")
             except Exception:
                 pass
 
@@ -5060,10 +5053,6 @@ class QuantStrategy:
                         logger.debug(
                             f"DirectionEngine telemetry wait: "
                             f"{str(getattr(_ps_decision, 'reason', ''))[:120]}")
-                # Clear stale hint fields for backward-compatible ICTContext users.
-                ict_ctx.direction_hint = ""
-                ict_ctx.direction_hint_side = ""
-                ict_ctx.direction_hint_confidence = 0.0
             except Exception as _pse:
                 logger.debug(f"DirectionEngine.evaluate_sweep telemetry error: {_pse}")
 
@@ -5358,7 +5347,23 @@ class QuantStrategy:
                 _sweep_present = signal.entry_type in (
                     EntryType.SWEEP_REVERSAL, EntryType.SWEEP_CONTINUATION,
                 )
+
+                # Feed the post-exit gate real auction proof.  A hard-coded
+                # False makes the gate reject valid sweep setups unless another
+                # lens happens to pass.  Prefer the EntryEngine's last sweep
+                # analysis and fall back to signal metadata where available.
                 _displacement_present = False
+                try:
+                    _sa = getattr(getattr(self, "_entry_engine", None), "_last_sweep_analysis", {}) or {}
+                    _disp_atr = float(
+                        _sa.get("displacement_atr",
+                                _sa.get("measured_displacement_atr",
+                                        getattr(signal, "displacement_atr", 0.0))) or 0.0
+                    )
+                    _disp_min = float(getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))
+                    _displacement_present = _disp_atr >= _disp_min
+                except Exception:
+                    _displacement_present = False
 
                 _gate_ctx = GateContext(
                     now=now,

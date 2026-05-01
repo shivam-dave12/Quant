@@ -24,6 +24,17 @@ from exchanges.delta.websocket import DeltaWebSocket
 logger = logging.getLogger(__name__)
 
 
+def _delta_contracts_to_btc(size_contracts: float) -> float:
+    """Normalise Delta contract quantity to BTC exposure for strategy math."""
+    cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
+    if cv <= 0:
+        cv = 0.001
+    try:
+        return float(size_contracts) * cv
+    except Exception:
+        return 0.0
+
+
 class StreamStats:
     def __init__(self):
         self._last_update: Optional[datetime] = None
@@ -599,11 +610,15 @@ class DeltaDataManager:
         for lvl in (raw or []):
             try:
                 if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
-                    result.append([float(lvl[0]), float(lvl[1])])
+                    px = float(lvl[0])
+                    qty = _delta_contracts_to_btc(float(lvl[1]))
+                    if px > 0:
+                        result.append([px, qty])
                 elif isinstance(lvl, dict):
                     px  = float(lvl.get("limit_price") or lvl.get("price") or 0)
-                    qty = float(lvl.get("size") or lvl.get("quantity") or
-                                lvl.get("depth") or 0)
+                    raw_qty = float(lvl.get("size") or lvl.get("quantity") or
+                                    lvl.get("depth") or 0)
+                    qty = _delta_contracts_to_btc(raw_qty)
                     if px > 0:
                         result.append([px, qty])
             except Exception:
@@ -638,7 +653,8 @@ class DeltaDataManager:
                 # "p"/"q"/"m" is the aggregated ticker format — different channel.
                 # Support both formats defensively.
                 price = float(data.get("price") or data.get("p") or 0)
-                qty   = float(data.get("size")  or data.get("q") or 0)
+                raw_qty = float(data.get("size")  or data.get("q") or 0)
+                qty   = _delta_contracts_to_btc(raw_qty)
                 side_raw = data.get("side", "")
                 if side_raw:
                     side = "buy" if str(side_raw).lower() == "buy" else "sell"
@@ -717,7 +733,14 @@ class DeltaDataManager:
             return False
         return (time.time() - self._last_price_update_time) < max_stale_seconds
 
-    def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+    def get_candles(self, timeframe: str = "5m", limit: int = 100,
+                    closed_only: bool = True) -> List[Dict]:
+        """Return canonical candles.
+
+        By default this honors the BaseDataManager contract and excludes the
+        currently forming bar.  Live/heartbeat callers can pass closed_only=False.
+        ICT/ATR/structure code should use closed candles only.
+        """
         tf_map = {
             "1m": self._candles_1m, "5m": self._candles_5m,
             "15m": self._candles_15m, "1h": self._candles_1h,
@@ -727,17 +750,33 @@ class DeltaDataManager:
         src = tf_map.get(label, self._candles_5m)
         with self._lock:
             candles = list(src)
+            forming_ms = self._forming_ts.get({
+                "1m": "1", "5m": "5", "15m": "15",
+                "1h": "60", "4h": "240", "1d": "1440",
+            }.get(label, label))
 
         if candles:
             latest_age = time.time() - float(candles[-1].timestamp)
             if latest_age > self._candle_stale_threshold(label):
                 self._schedule_stale_candle_refresh(label, latest_age)
 
+        if closed_only and candles and forming_ms is not None:
+            try:
+                if int(candles[-1].timestamp * 1000) == int(forming_ms):
+                    candles = candles[:-1]
+            except Exception:
+                pass
+
+        selected = candles[-limit:] if limit else candles
         return [
             {"t": int(c.timestamp * 1000), "o": c.open, "h": c.high,
              "l": c.low, "c": c.close, "v": c.volume}
-            for c in candles[-limit:]
+            for c in selected
         ]
+
+    def get_live_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+        """Explicit live/forming candle accessor for display-only use."""
+        return self.get_candles(timeframe=timeframe, limit=limit, closed_only=False)
 
     def get_volume_delta(self, lookback_seconds: float = 60.0) -> Dict:
         with self._lock:

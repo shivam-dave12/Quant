@@ -88,6 +88,15 @@ class CandleDict:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
+
+        # Preserve the Candle dataclass contract:
+        #   candle.timestamp  -> Unix seconds
+        #   candle["t"]       -> epoch milliseconds for dict-style strategy code
+        # The previous shim mapped .timestamp through ["t"], silently returning
+        # milliseconds and breaking comparisons with time.time().
+        if name == "timestamp":
+            return self._candle.timestamp
+
         if name in self._ATTR_MAP:
             return self[self._ATTR_MAP[name]]
         return getattr(self._candle, name)

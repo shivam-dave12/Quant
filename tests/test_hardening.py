@@ -4,6 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from collections import deque
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -203,6 +204,74 @@ class HardeningTests(unittest.TestCase):
         self.assertTrue(strategy._entry_engine.consumed)
         self.assertEqual(strategy._entry_engine.blocks[0][0], "long")
         self.assertIn("PRODUCT_CORE", strategy._entry_engine.blocks[0][1])
+
+    def test_candledict_timestamp_attr_seconds_but_t_key_ms(self):
+        from core.candle import Candle, CandleDict
+
+        c = Candle(timestamp=1000.0, open=1.0, high=2.0, low=0.5, close=1.5, volume=1.0)
+        cd = CandleDict(c)
+
+        self.assertEqual(cd.timestamp, 1000.0)
+        self.assertEqual(cd["t"], 1_000_000)
+
+    def test_delta_adapter_partial_fill_contracts_convert_to_btc(self):
+        import config
+        from execution.order_manager import _DeltaAdapter
+
+        old_cv = getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001)
+        config.DELTA_CONTRACT_VALUE_BTC = 0.001
+        try:
+            adapter = object.__new__(_DeltaAdapter)
+            qty = adapter.extract_filled_qty({"filled_size": 1})
+            self.assertAlmostEqual(qty, 0.001)
+        finally:
+            config.DELTA_CONTRACT_VALUE_BTC = old_cv
+
+    def test_emergency_flatten_uses_size_signed_for_side_inference(self):
+        from execution.order_manager import OrderManager
+
+        class FakeOM:
+            def __init__(self):
+                self.sent = None
+
+            def get_open_position(self):
+                return {
+                    "side": None,
+                    "size": 0.001,
+                    "size_signed": -0.001,
+                    "entry_price": 100.0,
+                }
+
+            def place_market_order(self, side, quantity, reduce_only=False):
+                self.sent = {"side": side, "quantity": quantity, "reduce_only": reduce_only}
+                return self.sent
+
+        fake = FakeOM()
+        result = OrderManager.emergency_flatten(fake, reason="unit")
+        self.assertEqual(result["side"], "BUY")
+        self.assertTrue(result["reduce_only"])
+
+    def test_resetrisk_full_keeps_daily_trades_deque_contract(self):
+        class RM:
+            def __init__(self):
+                import threading
+                self._lock = threading.RLock()
+                self.consecutive_losses = 2
+                self.daily_pnl = -10.0
+                self.daily_trades = deque(maxlen=12)
+                self.daily_trades.append(1)
+                self._last_loss_time = 1.0
+                self.max_daily_trades = 2
+
+        rm = RM()
+        with rm._lock:
+            rm.consecutive_losses = 0
+            rm.daily_pnl = 0.0
+            rm.daily_trades.clear()
+            rm._last_loss_time = 0.0
+
+        self.assertIsInstance(rm.daily_trades, deque)
+        self.assertEqual(len(rm.daily_trades), 0)
 
 
 if __name__ == "__main__":

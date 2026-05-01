@@ -44,11 +44,27 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket          # pip install websocket-client
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional in hardened/test environments
+    def load_dotenv(*args, **kwargs):
+        return False
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+import config
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def _delta_contracts_to_btc(size_contracts: float) -> float:
+    """Normalise Delta contract quantity to BTC exposure for all downstream math."""
+    cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
+    if cv <= 0:
+        cv = 0.001
+    try:
+        return float(size_contracts) * cv
+    except Exception:
+        return 0.0
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -567,21 +583,18 @@ class DeltaWebSocket:
                 s = (lvl.get("size")  or lvl.get("quantity") or
                      lvl.get("qty")   or lvl.get("q") or 0)
                 p_f = float(p) if p else 0.0
-                s_f = float(s) if s else 0.0
+                s_f = _delta_contracts_to_btc(float(s) if s else 0.0)
                 if p_f > 0:
-                    # BUG-DWS-1 FIX: return native floats, not strings.
-                    # Returning str(p_f) forced every consumer (market_aggregator,
-                    # fee_engine, orderbook engine) to silently re-cast on every
-                    # orderbook update â€” adding per-tick overhead and masking type
-                    # errors. All other exchanges already produce float pairs.
+                    # Return native floats in strategy units: [price, BTC qty].
+                    # Delta raw size is contracts, not BTC.
                     return [p_f, s_f]
                 # price == 0 â†’ level deletion message; no useful data
                 return None
             elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 p_f = float(lvl[0]) if lvl[0] else 0.0
-                s_f = float(lvl[1]) if lvl[1] else 0.0
+                s_f = _delta_contracts_to_btc(float(lvl[1]) if lvl[1] else 0.0)
                 if p_f > 0:
-                    return [p_f, s_f]  # BUG-DWS-1 FIX: native floats
+                    return [p_f, s_f]  # native floats in BTC qty units
                 return None
             return None
 
@@ -610,7 +623,8 @@ class DeltaWebSocket:
         Output: {"p": price, "q": qty, "m": is_buyer_maker, "s": symbol, "T": ts_ms}
         """
         price = float(data.get("price", data.get("p", 0)) or 0)
-        size  = float(data.get("size",  data.get("q", 0)) or 0)
+        size_contracts = float(data.get("size",  data.get("q", 0)) or 0)
+        size  = _delta_contracts_to_btc(size_contracts)
         side  = str(data.get("side", "buy")).lower()
 
         # Delta: side = "buy"/"sell" from the aggressor's perspective

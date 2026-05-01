@@ -348,6 +348,33 @@ def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, ro
     return clamp(cap, 0.0015, 0.92)
 
 
+def _executable_tp_before_pool(side: str, entry: float, pool_px: float, atr: float,
+                               tf_term: float, reliability: float,
+                               uncertainty: float) -> float:
+    """Place full-position TP before the liquidity pool, not on the stop cluster.
+
+    The pool price is the objective, but an executable reduce-only TP should be
+    buffered in front of it.  This improves fill probability and avoids the
+    retail failure mode of asking the exchange to fill exactly at the stop-run
+    magnet.
+    """
+    raw_dist = abs(float(pool_px) - float(entry))
+    if raw_dist <= 0:
+        return float(pool_px)
+
+    # Continuous buffer: enough to front-run the pool, smaller for clean feeds
+    # and high reliability, larger in uncertain/thin conditions.
+    dist_atr = raw_dist / max(float(atr), _EPS)
+    buffer_atr = clamp(
+        0.045 + 0.030 * uncertainty + 0.018 * max(0.0, 1.0 - reliability) + 0.012 * min(dist_atr, 6.0),
+        0.035,
+        0.220 + 0.060 * tf_term,
+    )
+    buffer = min(raw_dist * 0.45, max(atr * buffer_atr, _EPS))
+
+    return (pool_px - buffer) if side == "long" else (pool_px + buffer)
+
+
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
                          fee_bps: float = 8.0, slippage_bps: float = 2.0) -> TargetSurface:
@@ -375,15 +402,26 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             continue
         if side == "short" and px >= entry:
             continue
-        dist = abs(px - entry)
-        rr = dist / max(risk, _EPS)
-        dist_atr = dist / atr
+        raw_px = px
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
         sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
         tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
 
-        lo, hi = min(entry, px), max(entry, px)
+        # Use an executable TP buffered before the liquidity pool.  The raw pool
+        # remains the objective/reference, but payoff/RR must be based on the
+        # actual reduce-only order price.
+        px = _executable_tp_before_pool(side, entry, raw_px, atr, tf_term, reliability, uncertainty)
+        if side == "long" and px <= entry:
+            continue
+        if side == "short" and px >= entry:
+            continue
+
+        dist = abs(px - entry)
+        rr = dist / max(risk, _EPS)
+        dist_atr = dist / atr
+
+        lo, hi = min(entry, raw_px), max(entry, raw_px)
         opp_hits = 0
         opp_sig_sum = 0.0
         for op in opposing:
@@ -437,7 +475,7 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         utility = full_position_utility
         notes = [
             f"sig={sig:.1f}", f"tf={tf_rank}", f"reach={reach_decay:.2f}",
-            f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
+            f"raw_pool={raw_px:.1f}", f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
             f"cap={_target_distance_cap(dist_atr, tf_term, reliability, role):.3f}",
         ]
         cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,

@@ -72,6 +72,16 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _delta_contracts_to_btc(size_contracts: float) -> float:
+    cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
+    if cv <= 0:
+        cv = 0.001
+    try:
+        return float(size_contracts) * cv
+    except Exception:
+        return 0.0
+
+
 def _norm_levels(raw_levels: list) -> list:
     """
     Normalise orderbook levels to [[price, qty], ...] format.
@@ -125,6 +135,8 @@ class MarketAggregator:
 
         # Secondary availability flag — auto-detected
         self._secondary_alive = False
+        self._primary_is_delta = "Delta" in type(primary_dm).__name__
+        self._secondary_is_delta = secondary_dm is not None and "Delta" in type(secondary_dm).__name__
 
         # Install a tap on the secondary trade stream to merge into our deque
         if self._secondary is not None:
@@ -170,8 +182,11 @@ class MarketAggregator:
                 # always returned None for Delta → qty=0 for all secondary
                 # trades → CVD magnitude from secondary permanently zeroed.
                 # Fix: mirror the key-priority order used in DeltaDataManager._on_trade.
-                qty   = float(data.get("size") or data.get("quantity") or
-                              data.get("q") or 0)
+                raw_qty = float(data.get("size") or data.get("quantity") or
+                                data.get("q") or 0)
+                # Delta emits contract counts; all merged microstructure math is
+                # in BTC units so CVD/tick-flow is comparable across venues.
+                qty = _delta_contracts_to_btc(raw_qty) if agg_ref._secondary_is_delta else raw_qty
                 side_raw = data.get("side") or ""
                 side = "buy" if str(side_raw).lower() == "buy" else "sell"
                 if not side_raw:

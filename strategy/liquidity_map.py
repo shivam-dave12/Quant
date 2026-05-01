@@ -1477,7 +1477,19 @@ class LiquidityMap:
                         for tf_key, fvg_list in ict_engine._fvgs.items():
                             for fvg in fvg_list:
                                 try:
-                                    fvg_mid = (float(fvg.high) + float(fvg.low)) / 2.0
+                                    # ICTEngine.FairValueGap exposes bottom/top
+                                    # and midpoint; older code used high/low, so
+                                    # FVG confluence silently never fired.
+                                    midpoint = getattr(fvg, "midpoint", None)
+                                    if midpoint is not None:
+                                        fvg_mid = float(midpoint)
+                                    else:
+                                        top = getattr(fvg, "top", getattr(fvg, "high", None))
+                                        bottom = getattr(fvg, "bottom", getattr(fvg, "low", None))
+                                        if top is None or bottom is None:
+                                            continue
+                                        fvg_mid = (float(top) + float(bottom)) / 2.0
+
                                     if pool.side == PoolSide.BSL:
                                         if price < fvg_mid < pool.price:
                                             pool.fvg_aligned = True

@@ -331,14 +331,28 @@ class _DeltaAdapter:
         return None
 
     def extract_filled_qty(self, order_data: Dict) -> float:
-        for f in ("filled_size", "executed_qty", "size"):
+        """Return filled quantity in BTC units.
+
+        Delta reports order sizes/fills in integer contracts.  The strategy
+        invariant is BTC quantity everywhere above this adapter, so convert at
+        the boundary exactly like normalise_position() does.
+        """
+        q_contracts = 0.0
+        for f in ("filled_size", "executed_qty", "filled_qty", "size_filled", "size"):
             v = order_data.get(f)
             if v:
                 try:
-                    q = float(v)
-                    if q > 0: return q
-                except (ValueError, TypeError): pass
-        return 0.0
+                    q_contracts = float(v)
+                    if q_contracts > 0:
+                        break
+                except (ValueError, TypeError):
+                    pass
+        if q_contracts <= 0:
+            return 0.0
+        cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
+        if cv <= 0:
+            cv = 0.001
+        return q_contracts * cv
 
     def place_order(self, side: str, order_type: str, quantity: float,
                     price: Optional[float] = None,
@@ -990,8 +1004,12 @@ class OrderManager:
                     f"below min {min_qty} — treating as flat")
                 return None
             if ex_side not in ("LONG", "SHORT"):
-                # Best-effort inference from signed size if available
-                _signed = float(ex_pos.get("size", 0) or 0)
+                # Best-effort inference from signed size if available.
+                # Delta normalise_position() returns size as absolute BTC and
+                # size_signed as directional BTC.  Inferring from size alone
+                # turns unknown shorts into longs, which is unsafe in the
+                # emergency flatten path.
+                _signed = float(ex_pos.get("size_signed", ex_pos.get("size", 0)) or 0)
                 if _signed > 0:
                     ex_side = "LONG"
                 elif _signed < 0:

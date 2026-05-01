@@ -185,18 +185,17 @@ def _classify_priority(message: str) -> int:
 
 
 def _shed_routine_for_room() -> bool:
-    """When the queue is full, drop one ROUTINE item to free a slot.
-    Returns True if a slot was freed."""
+    """Drop one ROUTINE queue item while preserving PriorityQueue heap order."""
+    import heapq
+
     global _dropped_routine
-    # PriorityQueue doesn't expose internals safely; we approximate by
-    # iterating its internal heap under its mutex. This is best-effort:
-    # we accept that we may not always find a routine to evict.
     try:
         with _send_queue.mutex:  # type: ignore[attr-defined]
             heap = _send_queue.queue  # type: ignore[attr-defined]
             for i, item in enumerate(heap):
                 if item[0] >= PRIO_ROUTINE:
                     heap.pop(i)
+                    heapq.heapify(heap)
                     _dropped_routine += 1
                     return True
     except Exception:

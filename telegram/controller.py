@@ -1814,8 +1814,16 @@ class TelegramBotController:
                     prev_dp = rm.daily_pnl
                     rm.consecutive_losses = 0
                     if reset_daily:
-                        rm.daily_pnl    = 0.0
-                        rm.daily_trades = []
+                        rm.daily_pnl = 0.0
+                        # Preserve RiskManager's bounded deque invariant.
+                        # Replacing it with [] breaks maxlen/backpressure and
+                        # downstream assumptions while not failing immediately.
+                        try:
+                            rm.daily_trades.clear()
+                        except Exception:
+                            from collections import deque
+                            rm.daily_trades = deque(maxlen=getattr(rm, "max_daily_trades", 10) + 10)
+                        rm._last_loss_time = 0.0
                 detail = f"consec_losses {prev_cl}→0"
                 if reset_daily:
                     detail += f" | daily_pnl ${prev_dp:+.2f}→$0.00 | daily_trades cleared"

@@ -32,7 +32,11 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional in hardened/test environments
+    def load_dotenv(*args, **kwargs):
+        return False
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 
 load_dotenv()

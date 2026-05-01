@@ -101,7 +101,12 @@ _SL_BUFFER_ATR      = 0.35
 _TP_BUFFER_ATR      = 0.08
 _REV_SL_BUFFER_ATR  = 0.35
 _CONT_SL_BUFFER_ATR = 0.40
-_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
+# The safety buffer is a soft execution-quality cushion, not a hard extra
+# minimum R:R cliff.  A setup at 2.18R should not be rejected solely because
+# MIN_RR=2.0 and a fixed +0.20 buffer was added.  Hard rejection remains at
+# MIN_RR, with a small numerical tolerance for tick rounding and fee buffers.
+_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.05)) if '_cfg' in globals() else 0.05
+_TP_RR_TOLERANCE     = float(getattr(_cfg, "ENTRY_TP_RR_TOLERANCE", 0.03)) if '_cfg' in globals() else 0.03
 _TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
 
 try:
@@ -302,9 +307,6 @@ class ICTContext:
     nearest_ob_price_short: float = 0.0
     kill_zone:              str   = ""
     ict_sweeps:             list  = field(default_factory=list)
-    direction_hint:            str   = ""
-    direction_hint_side:       str   = ""
-    direction_hint_confidence: float = 0.0
 
     @property
     def session_quality(self) -> str:
@@ -1355,17 +1357,6 @@ class EntryEngine:
 
         # ── DYNAMIC FACTORS (per-tick) ────────────────────────────────
 
-        # DirectionEngine hint
-        hint = (getattr(ict, 'direction_hint', '') or '').lower()
-        hint_side = (getattr(ict, 'direction_hint_side', '') or '').lower()
-        hint_conf = float(getattr(ict, 'direction_hint_confidence', 0.0) or 0.0)
-        if hint and hint_conf >= 0.30:
-            pts = round(20.0 * hint_conf, 1)
-            if hint == "reverse" and hint_side == rev_dir:
-                rev_d += pts; rev_r.append(f"DIR_REVERSE({hint_conf:.0%})")
-            elif hint == "continue" and hint_side == cont_dir:
-                cont_d += pts; cont_r.append(f"DIR_CONTINUE({hint_conf:.0%})")
-
         # Live displacement
         if ps.max_displacement >= disp_strong_atr:
             rev_d += 10.0; rev_r.append(f"DISP {ps.max_displacement:.1f}ATR")
@@ -2245,7 +2236,13 @@ class EntryEngine:
                 "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
-        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+        # Hard gate remains the desk minimum R:R.  Do not add the safety
+        # cushion to min_rr as a cliff; that created false rejects such as
+        # 2.18R < 2.20R even when posterior/EV were strong.  The cushion is
+        # consumed by selector scoring/cost gates; the hard selector threshold
+        # allows a small tick-rounding tolerance.
+        required_rr = max(float(min_rr), _MIN_RR_RATIO)
+        selector_min_rr = max(1.0, required_rr - _TP_RR_TOLERANCE)
         try:
             from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:
@@ -2265,7 +2262,7 @@ class EntryEngine:
             tp_price, target, score = _legacy_sel_tp(
                 snap=snap, side=side, entry=price, sl=sl, atr=atr,
                 ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=required_rr,
+                min_rr=selector_min_rr,
             )
             report = {
                 "role": "TP", "side": side, "entry": price, "atr": atr,
@@ -2276,7 +2273,7 @@ class EntryEngine:
             tp_price, target, score, report_obj = _sel_tp(
                 snap=snap, side=side, entry=price, sl=sl, atr=atr,
                 ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=required_rr,
+                min_rr=selector_min_rr,
                 now=time.time(),
             )
             report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
