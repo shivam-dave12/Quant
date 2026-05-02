@@ -160,6 +160,11 @@ DELTA_COMMISSION_RATE        = 0.00050
 DELTA_COMMISSION_RATE_MAKER  = -0.00020
 # Stop/SL exits are treated as taker risk-exits for true net breakeven.
 STOP_EXIT_COMMISSION_RATE   = 0.00055
+# Fee burden is priced as an execution-cost surface, not a retail filter.
+# Above SOFT_MAX the bot cuts allocation; above NO_ALLOC the unit economics are
+# negative per unit of risk, so the allocator returns no capital.
+FEE_TO_RISK_SOFT_MAX        = 0.35
+FEE_TO_RISK_NO_ALLOC        = 0.75
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 GLOBAL_API_MIN_INTERVAL  = 3.0
@@ -489,6 +494,12 @@ TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR = 0.25
 PROFIT_DEFENSE_FAILED_DELIVERY_MIN_MFE_ATR = 2.50
 PROFIT_DEFENSE_FAILED_DELIVERY_GIVEBACK_FRAC = 0.78
 PROFIT_DEFENSE_MIN_NET_ATR_TO_EXIT = 0.35
+
+# Payoff-quality floor for structural trail updates. BE/counter-BOS protection is
+# still allowed immediately; this only stops "profit locks" that would book a
+# fee-dragged scratch instead of a meaningful institutional win.
+PAYOFF_TRAIL_MIN_NET_R = 0.50
+PAYOFF_TRAIL_MIN_COST_MULT = 0.75
 
 # ── CHoCH expiry ──────────────────────────────────────────────────────────────
 QUANT_CHOCH_EXPIRY_BARS = 10

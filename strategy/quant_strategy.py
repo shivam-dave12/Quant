@@ -3008,10 +3008,13 @@ class QuantStrategy:
                 setattr(signal, "runner_fraction", chosen_surface.runner_fraction)
 
             best = getattr(chosen_surface, 'best', None)
+            selected = self._selected_target_utility(chosen_surface, signal, atr_f)
+            setattr(signal, "selected_target_utility", selected)
             raw_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
             logger.debug(
-                "TargetSurface advisory only: kept institutional SL/TP SL=$%.1f TP=$%.1f RR=%.2f posterior=%.3f | best=%s",
+                "TargetSurface audit: kept institutional SL/TP SL=$%.1f TP=$%.1f RR=%.2f posterior=%.3f | selected=%s | best=%s",
                 raw_sl, raw_tp, raw_rr, posterior_prob,
+                selected.compact() if selected is not None else "unpriced",
                 best.compact() if best is not None else "none",
             )
         except Exception as e:
@@ -3098,6 +3101,51 @@ class QuantStrategy:
             logger.debug(
                 f"Conviction advisory only [{str(getattr(signal, 'side', '') or '').upper()}] "
                 f"score={score:.3f} | {reason_str}")
+
+    def _conviction_allocation_multiplier(self, conv_result) -> float:
+        """Convert advisory conviction diagnostics into exposure, not vetoes."""
+        if conv_result is None:
+            return 1.0
+        if not bool(getattr(conv_result, "allowed", True)):
+            return 0.0 if self._conviction_reject_is_account_safety(conv_result) else 0.35
+
+        score = self._bounded(float(getattr(conv_result, "score", 0.0) or 0.0))
+        required = max(float(getattr(config, "CONVICTION_MIN_SCORE", 0.74) or 0.74), 1e-9)
+        mult = self._bounded(0.48 + 0.58 * min(score / required, 1.25), 0.25, 1.12)
+
+        factors = getattr(conv_result, "factors", None)
+        try:
+            core = min(
+                self._bounded(float(getattr(factors, "pool_sig_score", 0.0) or 0.0)),
+                self._bounded(float(getattr(factors, "displacement_score", 0.0) or 0.0)),
+                self._bounded(float(getattr(factors, "cisd_score", 0.0) or 0.0)),
+            )
+            core_ref = max(float(getattr(config, "CONVICTION_PRODUCT_MIN_CORE", 0.68) or 0.68), 1e-9)
+            if core < core_ref:
+                mult *= self._bounded(0.42 + 0.58 * (core / core_ref), 0.35, 1.0)
+        except Exception:
+            pass
+
+        reasons = " | ".join(
+            str(r) for r in (getattr(conv_result, "reject_reasons", None) or [])
+        ).upper()
+        penalties = (
+            ("ENTRY_CAP", 0.30),
+            ("INTERVAL", 0.55),
+            ("PRODUCT_CORE", 0.62),
+            ("DELIVERY_PROOF_MISSING", 0.72),
+            ("DISPLACEMENT_MISSING", 0.72),
+            ("DISPLACEMENT_WEAK", 0.78),
+            ("RR_VERY_LOW", 0.60),
+            ("RR_LOW", 0.78),
+            ("AMD_CONTRA", 0.82),
+            ("DR_CONTRA", 0.86),
+        )
+        for token, penalty in penalties:
+            if token in reasons:
+                mult *= penalty
+
+        return self._bounded(mult, 0.0, 1.12)
 
     @staticmethod
     def _bounded(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -3218,6 +3266,49 @@ class QuantStrategy:
             f"target_realism={realism:.2f} tf={pool_tf or '?'} sig={significance:.1f}"
         )
         return realism, reasons, rejects
+
+    def _selected_target_utility(self, surface, signal, atr: float):
+        """Return utility row matching the TP actually selected by EntryEngine."""
+        if surface is None:
+            return None
+        candidates = list(getattr(surface, "candidates", []) or [])
+        if not candidates:
+            return None
+
+        anchors = []
+        try:
+            raw_tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
+            if raw_tp > 0:
+                anchors.append(raw_tp)
+        except Exception:
+            pass
+        try:
+            target = getattr(signal, "target_pool", None)
+            pool = getattr(target, "pool", None)
+            pool_px = float(getattr(pool, "price", 0.0) or 0.0)
+            if pool_px > 0:
+                anchors.append(pool_px)
+        except Exception:
+            pass
+        if not anchors:
+            return None
+
+        entry = float(getattr(surface, "entry", 0.0) or 0.0)
+        reward = max(abs(max(anchors, key=lambda x: abs(x - entry)) - entry), 0.0)
+        tol = max(float(atr or 0.0) * 0.75, reward * 0.18, QCfg.TICK_SIZE() * 8.0)
+        best = None
+        best_diff = float("inf")
+        for cand in candidates:
+            px = float(getattr(cand, "price", 0.0) or 0.0)
+            if px <= 0:
+                continue
+            diff = min(abs(px - anchor) for anchor in anchors)
+            if diff < best_diff:
+                best = cand
+                best_diff = diff
+        if best is not None and best_diff <= tol:
+            return best
+        return None
 
     def _institutional_decision_matrix(self, signal, ict_ctx, flow_state,
                                        liq_snapshot, price: float,
@@ -5118,6 +5209,20 @@ class QuantStrategy:
         if signal is not None:
             self._apply_expected_utility_target_surface(signal, liq_snapshot, flow_state, ict_ctx, price, atr)
             _surf_after = getattr(signal, 'target_surface', getattr(self, '_last_target_surface', None))
+            _selected_target_u = getattr(signal, "selected_target_utility", None)
+            if _surf_after is not None and (
+                    _selected_target_u is None
+                    or float(getattr(_selected_target_u, "full_position_utility", 0.0) or 0.0) <= 0.0
+                    or float(getattr(_selected_target_u, "expected_value_r", 0.0) or 0.0) <= 0.0):
+                _why = (
+                    f"selected TP has no positive executable utility; "
+                    f"selected={_selected_target_u.compact()}"
+                    if _selected_target_u is not None else
+                    "selected TP is not priced on executable liquidity surface"
+                )
+                logger.info(f"TargetSurface deferred {signal.side.upper()} {signal.entry_type.value}: {_why}")
+                self._defer_entry_signal(signal, _why, cooldown_sec=45.0)
+                return
             if _surf_after is not None and not getattr(_surf_after, 'has_positive_edge', False):
                 _best = getattr(_surf_after, 'best', None)
                 _why = (f"no positive executable target utility; best={_best.compact()}" if _best is not None
@@ -5197,7 +5302,7 @@ class QuantStrategy:
                 return
 
             logger.info(
-                f"ENTRY THESIS APPROVED BY POSTERIOR/EV: {signal.entry_type.value} {signal.side.upper()} "
+                f"ENTRY THESIS PRICED BY POSTERIOR/EV: {signal.entry_type.value} {signal.side.upper()} "
                 f"@ ${signal.entry_price:,.1f} | "
                 f"SL=${signal.sl_price:,.1f} TP=${signal.tp_price:,.1f} "
                 f"R:R={signal.rr_ratio:.1f} | {signal.reason}")
@@ -5306,9 +5411,50 @@ class QuantStrategy:
                         self._block_failed_conviction(signal, _conv_result)
                         return
                     self._log_conviction_advisory(signal, _conv_result)
+                _conv_alloc_mult = self._conviction_allocation_multiplier(_conv_result)
+                self._active_institutional_size_mult = self._bounded(
+                    float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
+                    * _conv_alloc_mult,
+                    0.0,
+                    1.18,
+                )
+                if _conv_alloc_mult < 0.98:
+                    logger.info(
+                        "Conviction allocation lens [%s] score=%.3f size_mult=%.2f",
+                        str(getattr(signal, "side", "") or "").upper(),
+                        float(getattr(_conv_result, "score", 0.0) or 0.0),
+                        _conv_alloc_mult,
+                    )
 
             _min_sig = self._last_sig if self._last_sig is not None else SignalBreakdown()
             _min_sig.atr = atr
+            try:
+                _min_sig.amd_phase = str(getattr(ict_ctx, "amd_phase", "") or _min_sig.amd_phase or "")
+                _min_sig.amd_bias = str(getattr(ict_ctx, "amd_bias", "") or _min_sig.amd_bias or "neutral")
+                _min_sig.amd_conf = float(getattr(ict_ctx, "amd_confidence", 0.0) or _min_sig.amd_conf or 0.0)
+                _min_sig.in_discount = bool(getattr(ict_ctx, "in_discount", False))
+                _min_sig.in_premium = bool(getattr(ict_ctx, "in_premium", False))
+                _min_sig.ict_details = str(getattr(signal, "ict_validation", "") or _min_sig.ict_details or "")
+                _inst_ctx = getattr(self, "_last_institutional_decision", None)
+                _target_ctx = self._bounded(float(getattr(_inst_ctx, "target_realism", 0.0) or 0.0))
+                _score_ctx = self._bounded(float(getattr(_inst_ctx, "score", 0.0) or 0.0))
+                _conv_ctx = self._bounded(abs(float(getattr(signal, "conviction", 0.0) or 0.0)))
+                _pd_ctx = 0.0
+                _pd = float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)
+                if signal.side == "long":
+                    _pd_ctx = self._bounded(1.0 - _pd)
+                elif signal.side == "short":
+                    _pd_ctx = self._bounded(_pd)
+                _entry_ict = self._bounded(
+                    0.40 * _score_ctx + 0.25 * _target_ctx + 0.20 * _conv_ctx + 0.15 * _pd_ctx
+                )
+                _min_sig.ict_total = max(float(getattr(_min_sig, "ict_total", 0.0) or 0.0), _entry_ict)
+                _sa_ctx = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+                setattr(_min_sig, "entry_displacement_atr", float(_sa_ctx.get("displacement_atr", 0.0) or 0.0))
+                setattr(_min_sig, "entry_cisd", bool(_sa_ctx.get("cisd", False)))
+                setattr(_min_sig, "entry_ote", bool(_sa_ctx.get("ote", False)))
+            except Exception as _ctx_e:
+                logger.debug(f"Entry context stamp error: {_ctx_e}")
 
             self._force_sl = signal.sl_price
             self._force_tp = signal.tp_price
@@ -6900,6 +7046,65 @@ class QuantStrategy:
         self._exit_trade(order_manager, price, reason)
         return True
 
+    def _trail_payoff_lock_ok(self, pos, new_sl: float, atr: float,
+                              phase: str) -> Tuple[bool, str]:
+        """Require structural profit locks to improve payoff, not just win rate."""
+        phase_u = str(phase or "").upper()
+        if phase_u in {"BE_LOCK", "COUNTER_BOS"}:
+            return True, "risk-defense lock"
+
+        side = str(getattr(pos, "side", "") or "").lower()
+        if side not in {"long", "short"}:
+            return True, "missing side context"
+
+        try:
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            current_sl = float(getattr(pos, "sl_price", 0.0) or 0.0)
+            proposed_sl = float(new_sl or 0.0)
+            atr_f = max(float(atr or 0.0), 1e-9)
+        except Exception:
+            return True, "invalid payoff context"
+
+        if entry <= 0.0 or proposed_sl <= 0.0:
+            return True, "incomplete payoff context"
+
+        init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0)
+        if init_dist <= 1e-10 and current_sl > 0.0:
+            init_dist = abs(entry - current_sl)
+        if init_dist <= 1e-10:
+            return True, "missing initial risk context"
+
+        true_be = _calc_be_price(side, entry, atr_f, pos=pos)
+        cost_buffer_pts = abs(true_be - entry)
+        if side == "long":
+            net_lock_pts = proposed_sl - true_be
+            gross_lock_pts = proposed_sl - entry
+        else:
+            net_lock_pts = true_be - proposed_sl
+            gross_lock_pts = entry - proposed_sl
+
+        min_net_r = max(0.0, float(getattr(config, "PAYOFF_TRAIL_MIN_NET_R", 0.50)))
+        min_cost_mult = max(0.0, float(getattr(config, "PAYOFF_TRAIL_MIN_COST_MULT", 0.75)))
+        tick_floor = max(QCfg.TICK_SIZE() * 2.0, 1e-9)
+        required_pts = max(min_net_r * init_dist,
+                           min_cost_mult * cost_buffer_pts,
+                           tick_floor)
+        net_r = net_lock_pts / init_dist if init_dist > 1e-10 else 0.0
+        req_r = required_pts / init_dist if init_dist > 1e-10 else 0.0
+
+        if gross_lock_pts <= 0.0:
+            return False, (
+                f"no positive gross lock: gross={gross_lock_pts:.1f}pts "
+                f"trueBE=${true_be:,.1f}")
+        if net_lock_pts + max(QCfg.TICK_SIZE(), 1e-9) < required_pts:
+            return False, (
+                f"net_lock={net_lock_pts:.1f}pts/{net_r:.2f}R < "
+                f"required={required_pts:.1f}pts/{req_r:.2f}R "
+                f"(cost_buf={cost_buffer_pts:.1f}pts trueBE=${true_be:,.1f})")
+        return True, (
+            f"net_lock={net_lock_pts:.1f}pts/{net_r:.2f}R >= "
+            f"required={required_pts:.1f}pts/{req_r:.2f}R")
+
     def _update_trailing_sl(self, order_manager, data_manager, price, now) -> bool:
         """Institutional trail v5.0 — 5-feature upgrade (OB/Breaker priority,
         AMD-phase adaptive buffer, 4H/1H HTF cascade, liq pool ceiling,
@@ -7108,6 +7313,17 @@ class QuantStrategy:
                     f"InstitutionalTrail dispatch blocked: {pos.side.upper()} protective "
                     f"stop ${_new_liq_sl:,.1f} is not executable at market "
                     f"${price:,.1f}; requires {_verb} market. No REST retry.")
+            return False
+        _payoff_ok, _payoff_reason = self._trail_payoff_lock_ok(
+            pos, _new_liq_sl, atr, _liq_result.phase)
+        if not _payoff_ok:
+            pos.consecutive_trail_holds += 1
+            if now - self._last_trail_block_log >= 30.0:
+                self._last_trail_block_log = now
+                logger.info(
+                    f"InstitutionalTrail PAYOFF_HOLD [{_liq_result.phase}] "
+                    f"SL=${_new_liq_sl:,.1f} current=${pos.sl_price:,.1f} | "
+                    f"{_payoff_reason}")
             return False
         logger.info(
             f"🏦 InstitutionalTrail [{_liq_result.phase}] "
@@ -7613,6 +7829,18 @@ class QuantStrategy:
             getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
             and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
         )
+        exit_fee_is_exact = fee_paid > 0.0
+        if not exit_fee_is_exact and fill_price > 0 and getattr(pos, "quantity", 0.0) > 0:
+            if exit_type in ("sl", "trail_sl", "manual_exit"):
+                exit_rate = float(getattr(
+                    _cfg_x,
+                    "STOP_EXIT_COMMISSION_RATE",
+                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050) if _is_delta else QCfg.COMMISSION_RATE(),
+                ))
+                fee_paid = fill_price * pos.quantity * abs(exit_rate)
+                logger.info(
+                    f"Exit fee fallback: exchange returned $0.0000 for {exit_reason}; "
+                    f"using estimated taker fee ${fee_paid:.4f}")
 
         gross = gross_pnl_usd(
             pos.side,
@@ -7642,7 +7870,8 @@ class QuantStrategy:
                 entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
                               if _is_delta else QCfg.COMMISSION_RATE())
             entry_fee = pos.entry_price * pos.quantity * entry_rate
-        exit_fee  = fee_paid   # EXACT from Delta paid_commission
+        exit_fee  = fee_paid
+        _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
 
         pnl = gross - entry_fee - exit_fee
 
@@ -7650,16 +7879,16 @@ class QuantStrategy:
         fee_breakdown: Dict = {
             "gross_pnl":  round(gross, 4),
             "entry_fee":  round(entry_fee, 4),
-            "exit_fee":   round(exit_fee, 4),    # exact from paid_commission
+            "exit_fee":   round(exit_fee, 4),
             "total_fees": round(entry_fee + exit_fee, 4),
             "net_pnl":    round(pnl, 4),
-            "exact_fees": entry_fee_is_exact,  # True = both sides exact
+            "exact_fees": entry_fee_is_exact and exit_fee_is_exact,
         }
 
         logger.info(
             f"📊 Exit price=${fill_price:,.2f} reason={exit_reason} "
             f"entry=${pos.entry_price:,.2f} gross=${gross:+.4f} "
-            f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}(exact) "
+            f"entry_fee=${entry_fee:.4f}({_entry_tag}) exit_fee=${exit_fee:.4f}({_exit_tag}) "
             f"net=${pnl:+.4f}"
         )
 
@@ -7753,7 +7982,7 @@ class QuantStrategy:
             f"Exit:     <b>${fill_price:,.2f}</b>  ({'+' if raw_pts>=0 else ''}{raw_pts:.1f} pts)\n"
             f"Gross:    ${gross:+.4f}\n"
             f"Fees:     ${entry_fee + exit_fee:.4f} "
-            f"(exit exact ${exit_fee:.4f} + entry {_entry_tag} ${entry_fee:.4f})\n"
+            f"(exit {_exit_tag} ${exit_fee:.4f} + entry {_entry_tag} ${entry_fee:.4f})\n"
             f"PnL:      <b>${pnl:+.2f} USDT</b>  ({_exit_margin_pct:+.1f}% on ${_exit_margin_used:.2f} margin)\n"
             f"R:        {achieved_r:+.2f}R  (planned 1:{planned_rr:.2f}R)\n"
             f"MFE:      {mfe_r:.2f}R  |  Hold: {hold_min:.1f}m\n"
@@ -8271,6 +8500,33 @@ class QuantStrategy:
             )
             return None
 
+        # Unit economics: if round-trip fees consume too much of one R, sizing
+        # down does not repair expectancy because fees and stop risk both scale
+        # with quantity. This is allocation math, not a checklist filter.
+        fee_to_risk = (price * _taker_rate * 2.0) / max(sl_dist, 1e-9)
+        fee_soft = float(getattr(config, "FEE_TO_RISK_SOFT_MAX", 0.35))
+        fee_no_alloc = max(
+            fee_soft + 1e-6,
+            float(getattr(config, "FEE_TO_RISK_NO_ALLOC", 0.75)),
+        )
+        fee_drag_mult = 1.0
+        if fee_to_risk >= fee_no_alloc:
+            logger.info(
+                f"No allocation: fee-to-risk={fee_to_risk:.2f}R "
+                f">= {fee_no_alloc:.2f}R | price=${price:,.1f} "
+                f"SL-dist={sl_dist:.1f}pts")
+            return None
+        if fee_to_risk > fee_soft:
+            fee_drag_mult = max(
+                0.20,
+                1.0 - ((fee_to_risk - fee_soft) / (fee_no_alloc - fee_soft)) * 0.80,
+            )
+            total_mult *= fee_drag_mult
+            logger.info(
+                f"Execution-cost allocation haircut: fee_to_risk={fee_to_risk:.2f}R "
+                f"soft={fee_soft:.2f} no_alloc={fee_no_alloc:.2f} "
+                f"size_mult*={fee_drag_mult:.2f}")
+
         # ── Risk-based sizing (CRIT-1 fix) ────────────────────────────────────
         # risk_pct: fraction of balance to risk per trade (e.g. 0.006 = 0.6%)
         risk_pct     = float(_cfg("RISK_PER_TRADE", 0.006))
@@ -8343,10 +8599,11 @@ class QuantStrategy:
             f"✅ Sizing [risk_based] | RISK_PCT={risk_pct:.3%} | "
             f"tier={ict_tier or 'none'} "
             f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
-            f"a={amd_mod:+.2f} i={inst_mult:.2f}) | "
+            f"a={amd_mod:+.2f} i={inst_mult:.2f} fee={fee_drag_mult:.2f}) | "
             f"target_risk=${risk_capital:.2f} raw_qty={qty_raw:.4f} | "
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
-            f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} | "
+            f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
+            f"({fee_to_risk:.2f}R) | "
             f"headroom=${available - margin_used - actual_fees:.2f} | qty={qty}"
         )
         return qty

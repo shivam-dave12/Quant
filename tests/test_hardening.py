@@ -285,6 +285,151 @@ class HardeningTests(unittest.TestCase):
         self.assertAlmostEqual(signal.rr_ratio, raw_rr)
         self.assertIsNone(signal.stop_surface)
         self.assertIsNotNone(signal.target_surface)
+        self.assertIsNotNone(signal.selected_target_utility)
+
+    def test_selected_tp_must_have_positive_executable_utility(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._entry_engine = SimpleNamespace(
+            _last_sweep_analysis={"quant_posterior": 0.55}
+        )
+
+        signal = SimpleNamespace(
+            side="long",
+            entry_price=100.0,
+            sl_price=99.0,
+            tp_price=140.0,
+            rr_ratio=40.0,
+            posterior_prob=0.55,
+            target_pool=SimpleNamespace(pool=SimpleNamespace(price=140.0)),
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[
+                SimpleNamespace(price=104.0, side="BSL", timeframe="15m", significance=16.0),
+                SimpleNamespace(price=140.0, side="BSL", timeframe="15m", significance=1.0),
+            ],
+            ssl_pools=[],
+            feed_reliability=0.80,
+        )
+        flow = SimpleNamespace(tick_flow=0.05, cvd_trend=0.02)
+        ict = SimpleNamespace(
+            structure_15m="mixed",
+            structure_4h="mixed",
+            dealing_range_pd=0.50,
+        )
+
+        strategy._apply_expected_utility_target_surface(
+            signal, snap, flow, ict, 100.0, 1.0
+        )
+
+        self.assertIsNotNone(signal.selected_target_utility)
+        self.assertLessEqual(signal.selected_target_utility.full_position_utility, 0.0)
+
+    def test_fee_to_risk_can_return_no_allocation(self):
+        from strategy.quant_strategy import QuantStrategy, SignalBreakdown
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 250.0, "total": 250.0}
+
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=78212.8,
+            sig=SignalBreakdown(composite=0.80, amd_conf=0.80),
+            ict_tier="S",
+            sl_price=78158.3,
+            prefetched_bal_info={"available": 250.0, "total": 250.0},
+        )
+
+        self.assertIsNone(qty)
+
+    def test_conviction_entry_cap_becomes_allocation_haircut(self):
+        from strategy.conviction_filter import ConvictionFactors, ConvictionResult
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        result = ConvictionResult(
+            allowed=True,
+            score=0.82,
+            factors=ConvictionFactors(
+                pool_sig_score=0.80,
+                displacement_score=0.76,
+                cisd_score=0.72,
+                ote_score=0.60,
+                session_score=1.00,
+                amd_score=0.70,
+            ),
+            reject_reasons=["ENTRY_CAP: 3/3 entries exhausted this session."],
+        )
+
+        mult = strategy._conviction_allocation_multiplier(result)
+
+        self.assertGreater(mult, 0.0)
+        self.assertLess(mult, 0.50)
+
+    def test_structural_trail_rejects_fee_dragged_micro_winner(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        pos = SimpleNamespace(
+            side="long",
+            entry_price=100.0,
+            sl_price=98.0,
+            initial_sl_dist=2.0,
+            quantity=1.0,
+            entry_fee_paid=0.0,
+        )
+
+        ok, reason = strategy._trail_payoff_lock_ok(
+            pos, new_sl=100.6, atr=1.0, phase="DELIVERY_LOCK")
+
+        self.assertFalse(ok)
+        self.assertIn("net_lock", reason)
+
+    def test_breakeven_trail_remains_allowed_for_loss_reduction(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        pos = SimpleNamespace(
+            side="long",
+            entry_price=100.0,
+            sl_price=98.0,
+            initial_sl_dist=2.0,
+            quantity=1.0,
+            entry_fee_paid=0.0,
+        )
+
+        ok, reason = strategy._trail_payoff_lock_ok(
+            pos, new_sl=100.5, atr=1.0, phase="BE_LOCK")
+
+        self.assertTrue(ok)
+        self.assertIn("risk-defense", reason)
+
+    def test_structural_trail_accepts_meaningful_net_payoff_lock(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        pos = SimpleNamespace(
+            side="long",
+            entry_price=100.0,
+            sl_price=98.0,
+            initial_sl_dist=2.0,
+            quantity=1.0,
+            entry_fee_paid=0.0,
+        )
+
+        ok, reason = strategy._trail_payoff_lock_ok(
+            pos, new_sl=101.6, atr=1.0, phase="STRUCTURAL")
+
+        self.assertTrue(ok, reason)
 
     def test_quant_posterior_learns_from_closed_trade_outcomes(self):
         from strategy import quantitative_models as qm

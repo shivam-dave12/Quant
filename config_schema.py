@@ -328,6 +328,18 @@ class TrailConfig(BaseModel):
         ge=0.5,
         le=10.0,
     )
+    PAYOFF_TRAIL_MIN_NET_R: float = Field(
+        default_factory=lambda: _c("PAYOFF_TRAIL_MIN_NET_R", 0.50),
+        ge=0.0,
+        le=5.0,
+        description="Minimum net R beyond true breakeven before a structural profit-lock trail can dispatch.",
+    )
+    PAYOFF_TRAIL_MIN_COST_MULT: float = Field(
+        default_factory=lambda: _c("PAYOFF_TRAIL_MIN_COST_MULT", 0.75),
+        ge=0.0,
+        le=5.0,
+        description="Minimum net lock as a multiple of estimated round-trip cost buffer.",
+    )
 
     @model_validator(mode="after")
     def trail_tier_ordering(self) -> "TrailConfig":
@@ -393,6 +405,16 @@ class ExecutionConfig(BaseModel):
         default_factory=lambda: _c("COMMISSION_RATE_MAKER", 0.00020),
         ge=-0.001,  # negative = maker rebate
         le=0.01,
+    )
+    FEE_TO_RISK_SOFT_MAX: float = Field(
+        default_factory=lambda: _c("FEE_TO_RISK_SOFT_MAX", 0.35),
+        ge=0.0,
+        le=2.0,
+    )
+    FEE_TO_RISK_NO_ALLOC: float = Field(
+        default_factory=lambda: _c("FEE_TO_RISK_NO_ALLOC", 0.75),
+        ge=0.0,
+        le=3.0,
     )
 
 
