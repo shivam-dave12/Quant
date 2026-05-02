@@ -350,6 +350,76 @@ class HardeningTests(unittest.TestCase):
         )
 
         self.assertIsNone(qty)
+        ctx = strategy._last_execution_viability
+        self.assertGreater(ctx["min_viable_sl_dist"], ctx["current_sl_dist"])
+        self.assertGreater(ctx["geometry_gap_pts"], 0.0)
+        self.assertFalse(bool(ctx["allocation_allowed"]))
+
+    def test_positive_net_utility_can_size_high_fee_geometry_with_haircut(self):
+        from strategy.quant_strategy import QuantStrategy, SignalBreakdown
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 250.0, "total": 250.0}
+
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=78212.8,
+            sig=SignalBreakdown(composite=0.80, amd_conf=0.80),
+            ict_tier="S",
+            sl_price=78158.3,
+            tp_price=79212.8,
+            side="long",
+            use_maker_entry=False,
+            posterior_prob=0.75,
+            prefetched_bal_info={"available": 250.0, "total": 250.0},
+        )
+
+        self.assertIsNotNone(qty)
+        self.assertGreater(strategy._last_execution_viability["expected_net_utility_r"], 0.0)
+
+    def test_execution_viability_context_arms_refine_watch_math(self):
+        from strategy.entry_engine import EntryEngine, EntrySignal, EntryType
+
+        engine = EntryEngine()
+        sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=100.0, side=SimpleNamespace(value="SSL")),
+            detected_at=123.0,
+        )
+        signal = EntrySignal(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=100.0,
+            sl_price=99.0,
+            tp_price=103.0,
+            rr_ratio=3.0,
+            target_pool=SimpleNamespace(),
+            sweep_result=sweep,
+            conviction=0.70,
+        )
+        ctx = {
+            "min_viable_sl_dist": 2.4,
+            "geometry_gap_pts": 1.4,
+            "required_entry_price": 101.4,
+            "required_sl_price": 97.6,
+            "fee_to_risk": 1.80,
+            "fee_no_alloc": 0.75,
+            "expected_net_utility_r": -0.25,
+        }
+
+        engine.mark_pre_order_rejected(signal, execution_context=ctx)
+        pending = engine._pending_refined
+
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.min_viable_risk, 2.4)
+        self.assertIn("execution geometry invalid", pending.last_reason)
 
     def test_conviction_entry_cap_becomes_allocation_haircut(self):
         from strategy.conviction_filter import ConvictionFactors, ConvictionResult

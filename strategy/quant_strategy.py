@@ -2387,6 +2387,57 @@ class InstitutionalDecision:
     liquidation_price: float = 0.0
     liquidation_guard: float = 0.0
 
+
+@dataclass
+class ExecutionViability:
+    route: str
+    side: str
+    price: float
+    sl_price: float
+    tp_price: float
+    current_sl_dist: float
+    reward_dist: float
+    round_trip_cost_pts: float
+    round_trip_cost_bps: float
+    fee_to_risk: float
+    fee_soft: float
+    fee_no_alloc: float
+    min_viable_sl_dist: float
+    geometry_gap_pts: float
+    required_sl_price: float
+    required_entry_price: float
+    posterior_prob: float
+    net_win_r: float
+    net_loss_r: float
+    expected_net_utility_r: float
+    utility_known: bool
+    allocation_allowed: bool
+    reason: str
+
+    def as_refine_context(self) -> Dict[str, object]:
+        return {
+            "route": self.route,
+            "side": self.side,
+            "price": self.price,
+            "sl_price": self.sl_price,
+            "tp_price": self.tp_price,
+            "current_sl_dist": self.current_sl_dist,
+            "reward_dist": self.reward_dist,
+            "round_trip_cost_pts": self.round_trip_cost_pts,
+            "round_trip_cost_bps": self.round_trip_cost_bps,
+            "fee_to_risk": self.fee_to_risk,
+            "fee_no_alloc": self.fee_no_alloc,
+            "min_viable_sl_dist": self.min_viable_sl_dist,
+            "geometry_gap_pts": self.geometry_gap_pts,
+            "required_sl_price": self.required_sl_price,
+            "required_entry_price": self.required_entry_price,
+            "posterior_prob": self.posterior_prob,
+            "expected_net_utility_r": self.expected_net_utility_r,
+            "utility_known": float(self.utility_known),
+            "allocation_allowed": float(self.allocation_allowed),
+            "reason": self.reason,
+        }
+
 # POSITION STATE
 # ═══════════════════════════════════════════════════════════════
 class PositionPhase(Enum):
@@ -2604,6 +2655,7 @@ class QuantStrategy:
         # normal post-exit cooldown, because no trade existed.
         self._last_tp_gate_rejection = 0.0
         self._tp_gate_rejection_mode = ""   # "reversion" | "momentum" | "trend" for per-mode logging
+        self._last_execution_viability = None
         self._last_pos_sync = 0.0; self._last_exit_sync = 0.0; self._exiting_since = 0.0
         self._entering_since = 0.0  # timestamp when ENTERING phase started (watchdog)
         # BUG 2 FIX: timestamp when the limit ENTRY order actually hit the exchange.
@@ -3964,6 +4016,7 @@ class QuantStrategy:
                                 self._entry_engine.mark_pre_order_rejected(
                                     getattr(self, '_last_entry_signal', None),
                                     cooldown_sec=float(getattr(config, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)),
+                                    execution_context=getattr(self, '_last_execution_viability', None),
                                 )
                         except Exception as _pre_gate_e:
                             logger.debug(f"EntryEngine pre-order rejection mark failed: {_pre_gate_e}")
@@ -5707,6 +5760,7 @@ class QuantStrategy:
         making a second call adds latency with no benefit (balance cannot change
         between the two calls — no position is open at this point).
         """
+        self._last_execution_viability = None
         price = data_manager.get_last_price()
         if price < 1.0: return
         atr = self._atr_5m.atr
@@ -5910,9 +5964,42 @@ class QuantStrategy:
         # ── FIX Bug-B STEP 2: Size using actual SL distance ──────────────────────
         # Now that sl_price is known, size from dollar risk / actual SL distance.
         # The institutional decision multiplier is applied on top of that base.
+        exec_posterior = None
+        try:
+            sweep_analysis = getattr(getattr(self, "_entry_engine", None), "_last_sweep_analysis", {}) or {}
+            qp = float(sweep_analysis.get("quant_posterior", 0.0) or 0.0)
+            if qp > 0.0:
+                exec_posterior = qp
+        except Exception:
+            exec_posterior = None
+        if exec_posterior is None:
+            exec_posterior = max(
+                float(getattr(getattr(self, "_last_entry_signal", None), "conviction", 0.0) or 0.0),
+                float(signal_confidence or 0.0),
+            )
+            if exec_posterior <= 0.0:
+                exec_posterior = None
+
+        if not use_maker:
+            taker_v = self._execution_viability_model(
+                side=side, price=price, sl_price=sl_price, tp_price=tp_price,
+                use_maker_entry=False, posterior_prob=exec_posterior)
+            maker_v = self._execution_viability_model(
+                side=side, price=price, sl_price=sl_price, tp_price=tp_price,
+                use_maker_entry=True, posterior_prob=exec_posterior)
+            if not taker_v.allocation_allowed and maker_v.allocation_allowed:
+                use_maker = True
+                logger.info(
+                    f"Execution route repriced: taker invalid "
+                    f"(fee_to_risk={taker_v.fee_to_risk:.2f}R, "
+                    f"EU={taker_v.expected_net_utility_r:.2f}R) -> maker "
+                    f"(fee_to_risk={maker_v.fee_to_risk:.2f}R, "
+                    f"EU={maker_v.expected_net_utility_r:.2f}R)")
+
         qty = self._compute_quantity(
             risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
-            prefetched_bal_info=bal_info
+            prefetched_bal_info=bal_info, side=side, tp_price=tp_price,
+            use_maker_entry=use_maker, posterior_prob=exec_posterior
         )
         if qty is None or qty < QCfg.MIN_QTY():
             # No order was sent. Treat as a pre-order rejection, not a trade
@@ -8371,11 +8458,133 @@ class QuantStrategy:
 
         logger.info("Position closed — FLAT")
 
+    def _roundtrip_cost_points(self, price: float, use_maker_entry: bool) -> Tuple[float, float]:
+        fee_engine = getattr(self, "_fee_engine", None)
+        if fee_engine is not None and hasattr(fee_engine, "effective_roundtrip_cost_bps"):
+            try:
+                bps = float(fee_engine.effective_roundtrip_cost_bps(use_maker_entry=use_maker_entry))
+                if math.isfinite(bps) and bps >= 0.0:
+                    return price * bps / 10_000.0, bps
+            except Exception:
+                pass
+
+        if use_maker_entry:
+            entry_rate = float(getattr(
+                config, "DELTA_COMMISSION_RATE_MAKER",
+                getattr(config, "COMMISSION_RATE_MAKER", 0.00020),
+            ))
+        else:
+            entry_rate = float(getattr(
+                config, "DELTA_COMMISSION_RATE",
+                getattr(config, "COMMISSION_RATE", 0.00055),
+            ))
+        bps = max(0.0, (entry_rate + _stop_exit_fee_rate()) * 10_000.0)
+        return price * bps / 10_000.0, bps
+
+    def _execution_viability_model(
+        self,
+        *,
+        side: str,
+        price: float,
+        sl_price: float,
+        tp_price: float = 0.0,
+        use_maker_entry: bool = True,
+        posterior_prob: Optional[float] = None,
+    ) -> ExecutionViability:
+        side_l = str(side or "").lower()
+        route = "maker" if use_maker_entry else "taker"
+        price_f = max(float(price or 0.0), 0.0)
+        sl_f = max(float(sl_price or 0.0), 0.0)
+        tp_f = max(float(tp_price or 0.0), 0.0)
+        sl_dist = abs(price_f - sl_f) if price_f > 0 and sl_f > 0 else 0.0
+        reward = abs(tp_f - price_f) if price_f > 0 and tp_f > 0 else 0.0
+
+        rt_cost_pts, rt_cost_bps = self._roundtrip_cost_points(price_f, use_maker_entry)
+        fee_soft = float(getattr(config, "FEE_TO_RISK_SOFT_MAX", 0.35))
+        fee_no_alloc = max(
+            fee_soft + 1e-6,
+            float(getattr(config, "FEE_TO_RISK_NO_ALLOC", 0.75)),
+        )
+        fee_to_risk = rt_cost_pts / max(sl_dist, 1e-9)
+        min_viable_sl_dist = rt_cost_pts / max(fee_no_alloc, 1e-9)
+        geometry_gap = max(0.0, min_viable_sl_dist - sl_dist)
+
+        if side_l == "long":
+            required_sl = price_f - min_viable_sl_dist
+            required_entry = sl_f + min_viable_sl_dist
+        elif side_l == "short":
+            required_sl = price_f + min_viable_sl_dist
+            required_entry = sl_f - min_viable_sl_dist
+        else:
+            required_sl = 0.0
+            required_entry = 0.0
+
+        utility_known = False
+        posterior = 0.0
+        net_win_r = 0.0
+        net_loss_r = 0.0
+        expected_utility = 0.0
+        if posterior_prob is not None and reward > 0.0 and sl_dist > 1e-9:
+            try:
+                posterior = max(0.01, min(0.99, float(posterior_prob)))
+                utility_known = True
+                net_win_r = (reward - rt_cost_pts) / sl_dist
+                net_loss_r = (sl_dist + rt_cost_pts) / sl_dist
+                expected_utility = posterior * net_win_r - (1.0 - posterior) * net_loss_r
+            except Exception:
+                utility_known = False
+
+        allocation_allowed = (
+            fee_to_risk < fee_no_alloc or
+            (utility_known and expected_utility > 0.0)
+        )
+        if fee_to_risk >= fee_no_alloc and not allocation_allowed:
+            reason = (
+                "current execution geometry has negative unit economics; "
+                "keep thesis only for repricing"
+            )
+        elif fee_to_risk >= fee_no_alloc:
+            reason = "high fee drag offset by positive net utility; allocate with haircut"
+        elif fee_to_risk > fee_soft:
+            reason = "fee drag above soft band; allocate with execution haircut"
+        else:
+            reason = "execution geometry viable"
+
+        return ExecutionViability(
+            route=route,
+            side=side_l,
+            price=price_f,
+            sl_price=sl_f,
+            tp_price=tp_f,
+            current_sl_dist=sl_dist,
+            reward_dist=reward,
+            round_trip_cost_pts=rt_cost_pts,
+            round_trip_cost_bps=rt_cost_bps,
+            fee_to_risk=fee_to_risk,
+            fee_soft=fee_soft,
+            fee_no_alloc=fee_no_alloc,
+            min_viable_sl_dist=min_viable_sl_dist,
+            geometry_gap_pts=geometry_gap,
+            required_sl_price=required_sl,
+            required_entry_price=required_entry,
+            posterior_prob=posterior,
+            net_win_r=net_win_r,
+            net_loss_r=net_loss_r,
+            expected_net_utility_r=expected_utility,
+            utility_known=utility_known,
+            allocation_allowed=allocation_allowed,
+            reason=reason,
+        )
+
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,
                            ict_tier: str = "",
                            sl_price: Optional[float] = None,
-                           prefetched_bal_info: dict = None) -> Optional[float]:
+                           prefetched_bal_info: dict = None,
+                           side: str = "",
+                           tp_price: float = 0.0,
+                           use_maker_entry: bool = False,
+                           posterior_prob: Optional[float] = None) -> Optional[float]:
         """
         Risk-calibrated position sizing — sweep-posterior (CRIT-1 fix).
 
@@ -8500,22 +8709,43 @@ class QuantStrategy:
             )
             return None
 
-        # Unit economics: if round-trip fees consume too much of one R, sizing
-        # down does not repair expectancy because fees and stop risk both scale
-        # with quantity. This is allocation math, not a checklist filter.
-        fee_to_risk = (price * _taker_rate * 2.0) / max(sl_dist, 1e-9)
-        fee_soft = float(getattr(config, "FEE_TO_RISK_SOFT_MAX", 0.35))
-        fee_no_alloc = max(
-            fee_soft + 1e-6,
-            float(getattr(config, "FEE_TO_RISK_NO_ALLOC", 0.75)),
+        exec_side = side or str(getattr(getattr(self, "_last_entry_signal", None), "side", "") or "")
+        viability = self._execution_viability_model(
+            side=exec_side,
+            price=price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            use_maker_entry=use_maker_entry,
+            posterior_prob=posterior_prob,
         )
+        self._last_execution_viability = viability.as_refine_context()
+        fee_to_risk = viability.fee_to_risk
+        fee_soft = viability.fee_soft
+        fee_no_alloc = viability.fee_no_alloc
         fee_drag_mult = 1.0
+
+        if not viability.allocation_allowed:
+            eu = (
+                f" EU={viability.expected_net_utility_r:.2f}R"
+                if viability.utility_known else " EU=unknown"
+            )
+            logger.info(
+                f"No allocation: execution geometry invalid | route={viability.route} "
+                f"fee_to_risk={fee_to_risk:.2f}R >= {fee_no_alloc:.2f}R | "
+                f"rt_cost={viability.round_trip_cost_pts:.1f}pts "
+                f"SL-dist={sl_dist:.1f}pts required={viability.min_viable_sl_dist:.1f}pts "
+                f"gap={viability.geometry_gap_pts:.1f}pts | "
+                f"repricing: structural_SL=${viability.required_sl_price:,.1f} "
+                f"or entry=${viability.required_entry_price:,.1f}{eu}")
+            return None
+
         if fee_to_risk >= fee_no_alloc:
             logger.info(
-                f"No allocation: fee-to-risk={fee_to_risk:.2f}R "
-                f">= {fee_no_alloc:.2f}R | price=${price:,.1f} "
-                f"SL-dist={sl_dist:.1f}pts")
-            return None
+                f"Execution-cost high-fee geometry accepted by net utility | "
+                f"route={viability.route} fee_to_risk={fee_to_risk:.2f}R "
+                f"EU={viability.expected_net_utility_r:.2f}R "
+                f"net_win={viability.net_win_r:.2f}R net_loss={viability.net_loss_r:.2f}R")
+
         if fee_to_risk > fee_soft:
             fee_drag_mult = max(
                 0.20,
@@ -8587,7 +8817,7 @@ class QuantStrategy:
         dollar_risk   = sl_dist * qty
         risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
         margin_used   = qty * price / QCfg.LEVERAGE()
-        actual_fees   = qty * price * _taker_rate * 2.0   # worst-case round-trip
+        actual_fees   = qty * viability.round_trip_cost_pts
         if dollar_risk > max_risk_cap:
             logger.warning(
                 f"Sizing rejected: exchange min lot would over-risk account | "

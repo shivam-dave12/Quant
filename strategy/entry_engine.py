@@ -394,6 +394,11 @@ class _PendingRefinedEntry:
     attempts: int = 0
     last_eval_at: float = 0.0
     last_reason: str = "waiting for refined pullback"
+    min_viable_risk: float = 0.0
+    execution_gap: float = 0.0
+    required_entry_price: float = 0.0
+    required_sl_price: float = 0.0
+    execution_context: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def side(self) -> str:
@@ -605,7 +610,8 @@ class EntryEngine:
         self._signal = None
 
     def mark_pre_order_rejected(self, signal: Optional[EntrySignal] = None,
-                                cooldown_sec: float = 30.0) -> None:
+                                cooldown_sec: float = 30.0,
+                                execution_context: Optional[Dict[str, Any]] = None) -> None:
         """Shorten the processed-sweep lock after a no-order rejection.
 
         Sizing, fee-floor, liquidation, and margin-envelope failures occur before
@@ -633,20 +639,44 @@ class EntryEngine:
                     and sweep is not None
                     and getattr(sig, 'entry_type', None) == EntryType.SWEEP_REVERSAL
                     and float(getattr(sig, 'rr_ratio', 0.0) or 0.0) >= max(_MIN_RR_RATIO, 2.0)):
+                ctx = execution_context if isinstance(execution_context, dict) else {}
+                min_viable = float(ctx.get("min_viable_sl_dist", 0.0) or 0.0)
+                gap = float(ctx.get("geometry_gap_pts", 0.0) or 0.0)
+                req_entry = float(ctx.get("required_entry_price", 0.0) or 0.0)
+                req_sl = float(ctx.get("required_sl_price", 0.0) or 0.0)
+                fee_r = float(ctx.get("fee_to_risk", 0.0) or 0.0)
+                no_alloc = float(ctx.get("fee_no_alloc", 0.0) or 0.0)
+                eu = float(ctx.get("expected_net_utility_r", 0.0) or 0.0)
+                if min_viable > 0.0 and gap > 0.0:
+                    refine_reason = (
+                        f"execution geometry invalid: fee_to_risk={fee_r:.2f}R"
+                        f">={no_alloc:.2f}R required_risk={min_viable:.1f}pts "
+                        f"gap={gap:.1f}pts EU={eu:.2f}R"
+                    )
+                else:
+                    refine_reason = "pre-order rejection; wait for raid-origin pullback"
                 self._pending_refined = _PendingRefinedEntry(
                     original=sig,
                     created_at=now,
                     expires_at=now + max(60.0, _REFINE_TTL_SEC),
-                    reason="pre-order rejection; wait for raid-origin pullback",
+                    reason=refine_reason,
+                    last_reason=refine_reason,
+                    min_viable_risk=min_viable,
+                    execution_gap=gap,
+                    required_entry_price=req_entry,
+                    required_sl_price=req_sl,
+                    execution_context=ctx,
                 )
                 logger.info(
-                    "EntryEngine refine watch armed: %s %s sweep $%.1f -> terminal TP $%.1f for %.0fs (risk %.1f pts)",
+                    "EntryEngine refine watch armed: %s %s sweep $%.1f -> terminal TP $%.1f for %.0fs (risk %.1f pts, required %.1f pts, gap %.1f pts)",
                     str(getattr(sig, 'entry_type', '')).split('.')[-1],
                     str(getattr(sig, 'side', '')).upper(),
                     float(getattr(getattr(sweep, 'pool', None), 'price', 0.0) or 0.0),
                     float(getattr(sig, 'tp_price', 0.0) or 0.0),
                     max(0.0, self._pending_refined.expires_at - now),
                     self._pending_refined.initial_risk,
+                    min_viable,
+                    gap,
                 )
         except Exception as e:
             logger.debug(f"mark_pre_order_rejected failed: {e}")
@@ -804,6 +834,8 @@ class EntryEngine:
                 "age_sec": max(0.0, time.time() - p.created_at),
                 "expires_in": max(0.0, p.expires_at - time.time()),
                 "attempts": p.attempts,
+                "required_risk": p.min_viable_risk,
+                "execution_gap": p.execution_gap,
             }
         return None
 
@@ -2018,26 +2050,38 @@ class EntryEngine:
                 self._pending_refined = None
                 return
 
-        # Need a real pullback against the trade from the original generated
-        # signal.  This avoids re-firing the same oversized entry immediately.
+        needs_risk_expansion = (
+            float(getattr(p, "min_viable_risk", 0.0) or 0.0) >
+            p.initial_risk + max(atr * 0.02, 1e-9)
+        )
+
+        # Fee-dominated rejects need execution geometry to expand; oversized
+        # risk rejects need the original pullback/compression path.
         initial_entry = float(sig.entry_price or price)
         pullback = (initial_entry - price) if side == "long" else (price - initial_entry)
-        min_pullback = max(atr * _REFINE_MIN_PULLBACK_ATR, 1e-9)
-        if pullback < min_pullback:
-            p.last_reason = (
-                f"waiting refined pullback: {pullback/max(atr,1e-9):.2f}ATR"
-                f"<{_REFINE_MIN_PULLBACK_ATR:.2f}ATR")
-            return
-
-        # Approximate initial-risk improvement against the original catastrophe
-        # stop before spending CPU on full pool diagnostics.
-        if original_sl > 0 and p.initial_risk > 0:
+        if needs_risk_expansion and original_sl > 0:
             est_risk = abs(price - original_sl)
-            if est_risk > p.initial_risk * _REFINE_RISK_IMPROVE:
+            if est_risk < p.min_viable_risk:
                 p.last_reason = (
-                    f"waiting risk compression: {est_risk:.1f}pts > "
-                    f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+                    f"waiting execution geometry: risk {est_risk:.1f}pts < "
+                    f"required {p.min_viable_risk:.1f}pts "
+                    f"(gap {p.min_viable_risk - est_risk:.1f}pts)")
                 return
+        else:
+            min_pullback = max(atr * _REFINE_MIN_PULLBACK_ATR, 1e-9)
+            if pullback < min_pullback:
+                p.last_reason = (
+                    f"waiting refined pullback: {pullback/max(atr,1e-9):.2f}ATR"
+                    f"<{_REFINE_MIN_PULLBACK_ATR:.2f}ATR")
+                return
+
+            if original_sl > 0 and p.initial_risk > 0:
+                est_risk = abs(price - original_sl)
+                if est_risk > p.initial_risk * _REFINE_RISK_IMPROVE:
+                    p.last_reason = (
+                        f"waiting risk compression: {est_risk:.1f}pts > "
+                        f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+                    return
 
         if p.attempts >= max(1, _REFINE_MAX_ATTEMPTS):
             logger.info("EntryEngine refine watch max attempts reached: %s", p.last_reason)
@@ -2076,7 +2120,14 @@ class EntryEngine:
             p.last_reason = "refined SL breaches liquidation guard"
             return
         risk = abs(price - sl)
-        if p.initial_risk > 0 and risk > p.initial_risk * _REFINE_RISK_IMPROVE:
+        if p.min_viable_risk > 0.0 and risk < p.min_viable_risk:
+            p.last_reason = (
+                f"refined fee geometry still tight: risk {risk:.1f}pts < "
+                f"required {p.min_viable_risk:.1f}pts")
+            return
+        if (not needs_risk_expansion
+                and p.initial_risk > 0
+                and risk > p.initial_risk * _REFINE_RISK_IMPROVE):
             p.last_reason = (
                 f"refined risk still wide: {risk:.1f}pts > "
                 f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
