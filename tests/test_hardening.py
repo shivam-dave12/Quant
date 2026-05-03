@@ -426,6 +426,76 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(ctx["min_viable_sl_dist"], ctx["current_sl_dist"])
         self.assertFalse(bool(ctx["allocation_allowed"]))
 
+    def test_position_sizing_floors_lot_without_overrisking_budget(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 1000.0, "total": 1000.0}
+
+        price = 10000.0
+        sl_dist = 5.0 / 0.00175
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=price,
+            sig=None,
+            ict_tier="S",
+            sl_price=price - sl_dist,
+            tp_price=price + 6000.0,
+            side="long",
+            use_maker_entry=True,
+            posterior_prob=0.75,
+            prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+        )
+
+        self.assertEqual(qty, 0.001)
+        self.assertLessEqual(qty * sl_dist, 1000.0 * 0.005 + 1e-9)
+
+    def test_position_sizing_interprets_legacy_percent_style_risk(self):
+        import config
+        from strategy.quant_strategy import QuantStrategy
+
+        old_risk = config.RISK_PER_TRADE
+        config.RISK_PER_TRADE = 0.5
+        try:
+            strategy = object.__new__(QuantStrategy)
+            strategy._fee_engine = None
+            strategy._post_trade_agent = None
+            strategy._active_institutional_size_mult = 1.0
+            strategy._active_ic_size_mult = 1.0
+            strategy._active_post_exit_size_mult = 1.0
+
+            class FakeRisk:
+                def get_available_balance(self):
+                    return {"available": 1000.0, "total": 1000.0}
+
+            with self.assertLogs("strategy.quant_strategy", level="WARNING") as logs:
+                qty = strategy._compute_quantity(
+                    FakeRisk(),
+                    price=10000.0,
+                    sig=None,
+                    ict_tier="S",
+                    sl_price=9000.0,
+                    tp_price=12000.0,
+                    side="long",
+                    use_maker_entry=True,
+                    posterior_prob=0.75,
+                    prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+                )
+
+            self.assertEqual(qty, 0.005)
+            self.assertLessEqual(qty * 1000.0, 5.0 + 1e-9)
+            self.assertIn("looks percent-style", "\n".join(logs.output))
+        finally:
+            config.RISK_PER_TRADE = old_risk
+
     def test_execution_geometry_repair_uses_structural_sl(self):
         from strategy.quant_strategy import QuantStrategy
 

@@ -8774,7 +8774,18 @@ class QuantStrategy:
             logger.warning(f"_compute_quantity: sl_dist={sl_dist:.2f} too small — aborting")
             return None
 
-        step = QCfg.LOT_STEP()
+        configured_step = max(float(QCfg.LOT_STEP()), 1e-12)
+        step = configured_step
+        try:
+            if "delta" in QCfg.EXCHANGE().lower():
+                contract_step = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.0) or 0.0)
+                if contract_step > 0.0:
+                    step = max(configured_step, contract_step)
+        except Exception:
+            pass
+        min_qty = max(float(QCfg.MIN_QTY()), step)
+        max_qty = max(min_qty, float(QCfg.MAX_QTY()))
+        leverage = max(float(QCfg.LEVERAGE()), 1.0)
 
         # ── Tier multiplier ───────────────────────────────────────────────────
         _tier_base = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
@@ -8824,41 +8835,23 @@ class QuantStrategy:
                 f"MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f}"
             )
             return None
-        _bal_usage_pct = float(_cfg("BALANCE_USAGE_PERCENTAGE", 60.0))
+        _bal_usage_pct = float(_cfg(
+            "MAX_ENTRY_MARGIN_USAGE_PCT",
+            _cfg("BALANCE_USAGE_PERCENTAGE", 60.0),
+        ))
         _bal_usage_frac = max(0.01, min(1.0, _bal_usage_pct / 100.0))
 
         # ── BUG 3 FIX: commission reserve ─────────────────────────────────────
-        # Delta rejects orders with `insufficient_commission` when available
-        # balance minus required margin leaves less than the maker+taker round-
-        # trip commission.  The old guard only compared margin to available
-        # and consumed 99 % of balance as margin, leaving 1 % for commission
-        # on a position that needs ~2.5-3 % of balance just to cover the exit
-        # taker fee.  This silently wasted bracket-order REST calls.
-        #
         # Reserve: we charge an aggressive 2× the live taker rate (entry taker
         # worst-case + exit taker) plus a 15 % safety margin for slippage
         # variance.  For a $446 notional at COMMISSION_RATE=0.00055 this
         # reserves ~$0.56 — enough to clear Delta's internal commission check
         # with room to spare.  On a 30× leveraged account this represents <1 %
         # of the margin, a negligible position-size reduction for the safety.
-        _taker_rate = float(_cfg("COMMISSION_RATE", 0.00055))
-        _fee_reserve = price * _taker_rate * 2.0 * 1.15   # qty multiplied in next
         # We don't know qty yet, but we can compute a conservative reserve
         # from the max possible qty given available:
         #   max_notional ≈ available × leverage (all balance as margin)
         #   fee_reserve  ≈ max_notional × taker_rate × 2 × 1.15
-        _max_allowed_margin_raw = available * _bal_usage_frac
-        _max_notional_headroom = _max_allowed_margin_raw * float(QCfg.LEVERAGE())
-        _fee_budget = _max_notional_headroom * _taker_rate * 2.0 * 1.15
-        available_after_fees = max(0.0, available - _fee_budget)
-        if available_after_fees < QCfg.MIN_MARGIN_USDT():
-            logger.warning(
-                f"_compute_quantity: available after fee reserve "
-                f"${available_after_fees:.2f} < MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f} "
-                f"(raw_avail=${available:.2f} fee_budget=${_fee_budget:.2f})"
-            )
-            return None
-
         exec_side = side or str(getattr(getattr(self, "_last_entry_signal", None), "side", "") or "")
         viability = self._execution_viability_model(
             side=exec_side,
@@ -8902,34 +8895,82 @@ class QuantStrategy:
 
         # ── Risk-based sizing (CRIT-1 fix) ────────────────────────────────────
         # risk_pct: fraction of balance to risk per trade (e.g. 0.006 = 0.6%)
-        risk_pct     = float(_cfg("RISK_PER_TRADE", 0.006))
-        # Base risk capital on balance-after-fee-reserve so we don't over-size
-        # into a commission-rejection zone.
-        risk_capital = available_after_fees * risk_pct * total_mult
-        qty_raw      = risk_capital / sl_dist
-        max_allowed_margin = available_after_fees * _bal_usage_frac
-        max_risk_cap = max(risk_capital * 1.15, available_after_fees * risk_pct * 1.15)
+        raw_risk_pct = float(_cfg("RISK_PER_TRADE", 0.006))
+        if not math.isfinite(raw_risk_pct) or raw_risk_pct <= 0.0:
+            logger.warning(f"Sizing rejected: invalid RISK_PER_TRADE={raw_risk_pct!r}")
+            return None
+        if raw_risk_pct > 0.05:
+            if raw_risk_pct <= 5.0:
+                logger.warning(
+                    f"RISK_PER_TRADE={raw_risk_pct:.4f} looks percent-style; "
+                    f"interpreting as {raw_risk_pct / 100.0:.3%}")
+                risk_pct = raw_risk_pct / 100.0
+            else:
+                logger.warning(
+                    f"RISK_PER_TRADE={raw_risk_pct:.4f} exceeds 5% hard cap; "
+                    "clamping to 5.000%")
+                risk_pct = 0.05
+        else:
+            risk_pct = raw_risk_pct
+
+        cash_budget = available * _bal_usage_frac
+        taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
+        reserve_fee_per_btc = max(
+            float(viability.round_trip_cost_pts),
+            price * taker_rate * 2.0 * 1.15,
+        )
+        margin_per_btc = price / leverage
+        cash_per_btc = margin_per_btc + reserve_fee_per_btc
+        max_qty_cash = math.floor((cash_budget / max(cash_per_btc, 1e-12)) / step) * step
+        max_qty_margin = math.floor(((cash_budget * leverage / price) / step)) * step
+        executable_qty_cap = round(max(0.0, min(max_qty, max_qty_cash, max_qty_margin)), 8)
+        if executable_qty_cap < min_qty:
+            logger.warning(
+                f"Sizing rejected: cash/lot envelope below minimum | "
+                f"cap_qty={executable_qty_cap:.8f} min_qty={min_qty:.8f} "
+                f"cash_budget=${cash_budget:.2f} step={step:.8f}")
+            return None
+
+        risk_capital = available * risk_pct * total_mult
+        qty_raw = risk_capital / sl_dist
+        max_allowed_margin = cash_budget
+        max_risk_cap = max(risk_capital * 1.15, available * risk_pct * 1.15)
 
         # ── Lot-step + hard limits ────────────────────────────────────────────
-        def _lot(q: float) -> float:
-            return round(max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), q)), 8)
+        def _floor_step(q: float) -> float:
+            return round(math.floor(max(q, 0.0) / step + 1e-12) * step, 8)
 
-        floor_qty = math.floor(qty_raw / step) * step
-        ceil_qty = math.ceil(qty_raw / step) * step
-        candidates = {_lot(floor_qty), _lot(ceil_qty), _lot(QCfg.MIN_QTY())}
-        valid_qty = []
+        candidates = {
+            _floor_step(qty_raw),
+            _floor_step(executable_qty_cap),
+            round(min_qty, 8),
+        }
+        primary_qty = []
+        min_lot_exception = []
         for cand in candidates:
-            cand_margin = cand * price / QCfg.LEVERAGE()
+            if cand < min_qty - 1e-12 or cand > executable_qty_cap + 1e-12:
+                continue
+            cand_margin = cand * price / leverage
+            cand_fee_reserve = cand * reserve_fee_per_btc
             cand_risk = cand * sl_dist
-            if cand_margin <= max_allowed_margin and cand_risk <= max_risk_cap:
-                valid_qty.append(cand)
-        if not valid_qty:
+            cash_need = cand_margin + cand_fee_reserve
+            if cand_margin > max_allowed_margin + 1e-9 or cash_need > cash_budget + 1e-9:
+                continue
+            if cand_risk <= risk_capital + 1e-9:
+                primary_qty.append(cand)
+            elif abs(cand - min_qty) <= 1e-12 and cand_risk <= max_risk_cap:
+                min_lot_exception.append(cand)
+        if primary_qty:
+            qty = max(primary_qty)
+        elif min_lot_exception:
+            qty = min_lot_exception[0]
+        else:
             logger.warning(
                 f"Sizing rejected: no exchange lot fits risk/margin envelope | "
                 f"raw_qty={qty_raw:.6f} target_risk=${risk_capital:.2f} "
-                f"hard_cap=${max_risk_cap:.2f} margin_cap=${max_allowed_margin:.2f}")
+                f"hard_cap=${max_risk_cap:.2f} cash_budget=${cash_budget:.2f} "
+                f"step={step:.8f}")
             return None
-        qty = min(valid_qty, key=lambda q: (abs((q * sl_dist) - risk_capital), -q))
 
         # ── Margin guard: notional must not exceed BALANCE_USAGE_PERCENTAGE ─
         # Bug #1 fix: the old guard compared required_margin against
@@ -8938,28 +8979,30 @@ class QuantStrategy:
         # cap means the bot should never commit more than 60% of available
         # funds as margin on any single trade — the remaining 40% stays liquid
         # for commission, funding, and drawdown headroom.
-        required_margin = qty * price / QCfg.LEVERAGE()
+        required_margin = qty * price / leverage
+        required_cash = required_margin + qty * reserve_fee_per_btc
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
                 f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
-                f"({_bal_usage_pct:.0f}% of ${available_after_fees:.2f} after fees) "
+                f"({_bal_usage_pct:.0f}% of ${available:.2f}) "
                 f"— scaling down"
             )
-            max_qty = math.floor(
-                (max_allowed_margin * QCfg.LEVERAGE() / price) / step
-            ) * step
-            qty = max(QCfg.MIN_QTY(), min(QCfg.MAX_QTY(), round(max_qty, 8)))
-            if qty < QCfg.MIN_QTY():
-                return None
+            return None
 
-        if qty < QCfg.MIN_QTY():
+        if required_cash > cash_budget + 1e-9:
+            logger.warning(
+                f"Sizing guard: margin+fees ${required_cash:.2f} > "
+                f"cash budget ${cash_budget:.2f}")
+            return None
+
+        if qty < min_qty:
             return None
 
         # ── Dollar-risk verification ──────────────────────────────────────────
         dollar_risk   = sl_dist * qty
         risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
-        margin_used   = qty * price / QCfg.LEVERAGE()
+        margin_used   = qty * price / leverage
         actual_fees   = qty * viability.round_trip_cost_pts
         if dollar_risk > max_risk_cap:
             logger.warning(
@@ -8977,7 +9020,8 @@ class QuantStrategy:
             f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
             f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
             f"({fee_to_risk:.2f}R) | "
-            f"headroom=${available - margin_used - actual_fees:.2f} | qty={qty}"
+            f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
+            f"headroom=${available - required_cash:.2f} | qty={qty}"
         )
         return qty
 
