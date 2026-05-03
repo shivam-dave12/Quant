@@ -840,6 +840,57 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(payload["selected"]["pool_price"], far.pool.price)
         self.assertIn("payoff-adjusted EV", payload["selected"]["reason"])
 
+    def test_tp_selector_rejects_zero_probability_terminal_lottery(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        entry = 78127.9
+        sl = 78236.6
+        atr = 34.3
+        pool = SimpleNamespace(
+            price=74886.7,
+            timeframe="1d",
+            side="SSL",
+            significance=14.0,
+            htf_count=3,
+            touches=1,
+            status="ACTIVE",
+            created_at=0,
+            ob_aligned=False,
+            fvg_aligned=False,
+        )
+        target = SimpleNamespace(
+            pool=pool,
+            distance_atr=abs(pool.price - entry) / atr,
+            significance=14.0,
+            direction="short",
+            tf_sources=["1d"],
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[],
+            ssl_pools=[target],
+            feed_reliability=0.90,
+        )
+
+        tp, selected_target, score, report = select_tp_with_report(
+            snap=snap,
+            side="short",
+            entry=entry,
+            sl=sl,
+            atr=atr,
+            min_rr=2.20,
+            posterior_prob=0.916,
+            now=0,
+        )
+
+        self.assertIsNone(tp)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(score)
+        payload = report.as_dict()
+        self.assertIsNone(payload["selected"])
+        candidate = payload["candidates"][0]
+        self.assertGreater(candidate["required_rr"], 100.0)
+        self.assertIn("payoff floor", candidate["reason"])
+
     def test_low_quality_sl_pool_cannot_destroy_real_tp_geometry(self):
         from strategy.entry_engine import EntryEngine
 

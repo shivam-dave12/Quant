@@ -5273,16 +5273,14 @@ class QuantStrategy:
                     if _selected_target_u is not None else
                     "selected TP is not priced on executable liquidity surface"
                 )
-                logger.info(f"TargetSurface deferred {signal.side.upper()} {signal.entry_type.value}: {_why}")
-                self._defer_entry_signal(signal, _why, cooldown_sec=45.0)
-                return
+                setattr(signal, "target_surface_advisory", _why)
+                logger.info(f"TargetSurface advisory {signal.side.upper()} {signal.entry_type.value}: {_why}")
             if _surf_after is not None and not getattr(_surf_after, 'has_positive_edge', False):
                 _best = getattr(_surf_after, 'best', None)
                 _why = (f"no positive executable target utility; best={_best.compact()}" if _best is not None
                         else "no executable target surface")
-                logger.info(f"TargetSurface deferred {signal.side.upper()} {signal.entry_type.value}: {_why}")
-                self._defer_entry_signal(signal, _why, cooldown_sec=45.0)
-                return
+                setattr(signal, "target_surface_advisory", _why)
+                logger.info(f"TargetSurface advisory {signal.side.upper()} {signal.entry_type.value}: {_why}")
             inst_veto = self._institutional_signal_veto(signal, price, atr, ict_ctx)
             if inst_veto:
                 veto_key = (
@@ -5732,9 +5730,21 @@ class QuantStrategy:
                     _age = time.time() - float(_pool_plan.get('ts', 0.0) or 0.0)
                     if _age <= 300:
                         _role = _pool_plan.get('role', 'POOL')
-                        _summary = str(_pool_plan.get('summary', ''))[:120]
-                        if _summary:
-                            parts.append(f"{_role}Plan={_summary}")
+                        _plan_side = str(_pool_plan.get('side', '') or '').lower()
+                        _target_side = ""
+                        try:
+                            _target_side = str(getattr(getattr(liq_snapshot, 'primary_target', None), 'direction', '') or '').lower()
+                        except Exception:
+                            _target_side = ""
+                        _stale_side = (
+                            str(_role).upper() == "TP"
+                            and _target_side in ("long", "short")
+                            and _plan_side not in ("", _target_side)
+                        )
+                        if not _stale_side:
+                            _summary = str(_pool_plan.get('summary', ''))[:120]
+                            if _summary:
+                                parts.append(f"{_role}Plan={_summary}")
             except Exception:
                 pass
 

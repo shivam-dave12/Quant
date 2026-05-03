@@ -164,6 +164,7 @@ _TERMINAL_REACH_FLOOR    = 0.05   # never zero out a valid terminal objective
 _TP_DURABLE_RR_FLOOR     = 1.35
 _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
+_TP_DELIVERY_PROB_FLOOR  = 1e-6
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -586,16 +587,16 @@ def _posterior_delivery_probability(
     reach_mult: float,
 ) -> float:
     """Blend setup posterior with the pool's own delivery probability."""
-    pool_prob = _clamp(raw_prob, 0.01, 0.95)
+    pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
     pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
     pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
     pool_prob *= math.sqrt(_clamp(reach_mult, 0.05, 1.25))
-    pool_prob = _clamp(pool_prob, 0.01, 0.95)
+    pool_prob = _clamp(pool_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
 
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
         return pool_prob
-    return _clamp(math.sqrt(pool_prob * posterior), 0.01, 0.93)
+    return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
 
 def _institutional_rr_floor(
@@ -623,13 +624,16 @@ def _institutional_rr_floor(
         _TP_DURABLE_RR_FLOOR,
         _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
     )
+    cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
-        return max(static_floor, durable_floor), _clamp(raw_prob, 0.01, 0.95), 0.0
+        delivery_p = _posterior_delivery_probability(
+            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
+        ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
 
     delivery_p = _posterior_delivery_probability(
         raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
-    cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
     posterior_floor = max(durable_floor, ev_floor)
     return posterior_floor, delivery_p, cost_r
