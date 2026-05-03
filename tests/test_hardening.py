@@ -355,7 +355,7 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(ctx["geometry_gap_pts"], 0.0)
         self.assertFalse(bool(ctx["allocation_allowed"]))
 
-    def test_positive_net_utility_can_size_high_fee_geometry_with_haircut(self):
+    def test_positive_net_utility_cannot_override_no_alloc_geometry(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
 
         strategy = object.__new__(QuantStrategy)
@@ -382,8 +382,49 @@ class HardeningTests(unittest.TestCase):
             prefetched_bal_info={"available": 250.0, "total": 250.0},
         )
 
-        self.assertIsNotNone(qty)
+        self.assertIsNone(qty)
         self.assertGreater(strategy._last_execution_viability["expected_net_utility_r"], 0.0)
+        self.assertFalse(bool(strategy._last_execution_viability["allocation_allowed"]))
+
+    def test_log_case_maker_high_fee_geometry_is_refine_only(self):
+        from strategy.quant_strategy import QuantStrategy, SignalBreakdown
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeFeeEngine:
+            def effective_roundtrip_cost_bps(self, use_maker_entry=True):
+                return 9.3 if use_maker_entry else 12.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 250.0, "total": 250.0}
+
+        strategy._fee_engine = FakeFeeEngine()
+
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=78599.8,
+            sig=SignalBreakdown(composite=0.80, amd_conf=0.80),
+            ict_tier="S",
+            sl_price=78553.0,
+            tp_price=78858.5,
+            side="long",
+            use_maker_entry=True,
+            posterior_prob=0.75,
+            prefetched_bal_info={"available": 250.0, "total": 250.0},
+        )
+
+        ctx = strategy._last_execution_viability
+        self.assertIsNone(qty)
+        self.assertEqual(ctx["route"], "maker")
+        self.assertGreater(ctx["fee_to_risk"], 1.0)
+        self.assertGreater(ctx["expected_net_utility_r"], 0.0)
+        self.assertGreater(ctx["min_viable_sl_dist"], ctx["current_sl_dist"])
+        self.assertFalse(bool(ctx["allocation_allowed"]))
 
     def test_execution_viability_context_arms_refine_watch_math(self):
         from strategy.entry_engine import EntryEngine, EntrySignal, EntryType

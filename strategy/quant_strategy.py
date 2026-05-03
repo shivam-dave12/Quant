@@ -8534,17 +8534,12 @@ class QuantStrategy:
             except Exception:
                 utility_known = False
 
-        allocation_allowed = (
-            fee_to_risk < fee_no_alloc or
-            (utility_known and expected_utility > 0.0)
-        )
-        if fee_to_risk >= fee_no_alloc and not allocation_allowed:
+        allocation_allowed = fee_to_risk < fee_no_alloc
+        if fee_to_risk >= fee_no_alloc:
             reason = (
-                "current execution geometry has negative unit economics; "
+                "current execution geometry exceeds maximum cost per unit risk; "
                 "keep thesis only for repricing"
             )
-        elif fee_to_risk >= fee_no_alloc:
-            reason = "high fee drag offset by positive net utility; allocate with haircut"
         elif fee_to_risk > fee_soft:
             reason = "fee drag above soft band; allocate with execution haircut"
         else:
@@ -8738,13 +8733,6 @@ class QuantStrategy:
                 f"repricing: structural_SL=${viability.required_sl_price:,.1f} "
                 f"or entry=${viability.required_entry_price:,.1f}{eu}")
             return None
-
-        if fee_to_risk >= fee_no_alloc:
-            logger.info(
-                f"Execution-cost high-fee geometry accepted by net utility | "
-                f"route={viability.route} fee_to_risk={fee_to_risk:.2f}R "
-                f"EU={viability.expected_net_utility_r:.2f}R "
-                f"net_win={viability.net_win_r:.2f}R net_loss={viability.net_loss_r:.2f}R")
 
         if fee_to_risk > fee_soft:
             fee_drag_mult = max(
