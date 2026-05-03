@@ -5881,6 +5881,7 @@ class QuantStrategy:
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
+        entry_ref = limit_px if limit_px > 0 else price
         logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
@@ -5900,9 +5901,9 @@ class QuantStrategy:
             _fsl = _round_to_tick(_force_sl)
             _ftp = _round_to_tick(_force_tp)
             _dir_ok = False
-            if side == "long" and _fsl < price and _ftp > price:
+            if side == "long" and _fsl < entry_ref and _ftp > entry_ref:
                 _dir_ok = True
-            elif side == "short" and _fsl > price and _ftp < price:
+            elif side == "short" and _fsl > entry_ref and _ftp < entry_ref:
                 _dir_ok = True
             if _dir_ok:
                 sl_price = _fsl
@@ -5923,9 +5924,9 @@ class QuantStrategy:
             # Force levels active; fee/slippage expectancy is a hard execution gate.
             if self._fee_engine is not None and self._fee_engine.is_warmed_up():
                 try:
-                    _tp_dist = abs(tp_price - price)
+                    _tp_dist = abs(tp_price - entry_ref)
                     _min_tp = self._fee_engine.min_required_tp_move(
-                        price=price, atr=atr,
+                        price=entry_ref, atr=atr,
                         atr_percentile=self._atr_5m.get_percentile(),
                         use_maker_entry=use_maker,
                         signal_confidence=signal_confidence)
@@ -5943,11 +5944,11 @@ class QuantStrategy:
                 self._last_tp_gate_rejection = time.time()
             return
 
-        sd = abs(price - sl_price)
-        td = abs(price - tp_price)
+        sd = abs(entry_ref - sl_price)
+        td = abs(entry_ref - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        _liq_entry_ref = limit_px if limit_px > 0 else price
+        _liq_entry_ref = entry_ref
         _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
             side, _liq_entry_ref, sl_price)
         if not _liq_ok:
@@ -5982,10 +5983,10 @@ class QuantStrategy:
 
         if not use_maker:
             taker_v = self._execution_viability_model(
-                side=side, price=price, sl_price=sl_price, tp_price=tp_price,
+                side=side, price=entry_ref, sl_price=sl_price, tp_price=tp_price,
                 use_maker_entry=False, posterior_prob=exec_posterior)
             maker_v = self._execution_viability_model(
-                side=side, price=price, sl_price=sl_price, tp_price=tp_price,
+                side=side, price=entry_ref, sl_price=sl_price, tp_price=tp_price,
                 use_maker_entry=True, posterior_prob=exec_posterior)
             if not taker_v.allocation_allowed and maker_v.allocation_allowed:
                 use_maker = True
@@ -5996,8 +5997,23 @@ class QuantStrategy:
                     f"(fee_to_risk={maker_v.fee_to_risk:.2f}R, "
                     f"EU={maker_v.expected_net_utility_r:.2f}R)")
 
+        sl_price, tp_price, _geometry_repaired = self._repair_execution_geometry(
+            side=side,
+            entry_price=entry_ref,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            atr=atr,
+            use_maker_entry=use_maker,
+            posterior_prob=exec_posterior,
+        )
+        sd = abs(entry_ref - sl_price)
+        td = abs(entry_ref - tp_price)
+        if sd < 1e-10:
+            return
+        rr = td / sd
+
         qty = self._compute_quantity(
-            risk_manager, price, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
+            risk_manager, entry_ref, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info, side=side, tp_price=tp_price,
             use_maker_entry=use_maker, posterior_prob=exec_posterior
         )
@@ -6012,7 +6028,7 @@ class QuantStrategy:
         if (getattr(sig, 'vwap_price', 0.0) or 0.0) <= 0:
             _sig_diag = "posterior/target-surface execution"
         logger.info(
-            f"ENTERING {side.upper()} @ ${price:,.2f} | qty={qty} | "
+            f"ENTERING {side.upper()} @ ${entry_ref:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
             f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
@@ -8570,6 +8586,135 @@ class QuantStrategy:
             allocation_allowed=allocation_allowed,
             reason=reason,
         )
+
+    def _repair_execution_geometry(
+        self,
+        *,
+        side: str,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        atr: float,
+        use_maker_entry: bool,
+        posterior_prob: Optional[float],
+    ) -> Tuple[float, float, bool]:
+        """Try to express a valid thesis with real structural levels."""
+        viability = self._execution_viability_model(
+            side=side,
+            price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            use_maker_entry=use_maker_entry,
+            posterior_prob=posterior_prob,
+        )
+        self._last_execution_viability = viability.as_refine_context()
+        if viability.allocation_allowed:
+            return sl_price, tp_price, False
+
+        entry_engine = getattr(self, "_entry_engine", None)
+        if entry_engine is None:
+            return sl_price, tp_price, False
+
+        snap = getattr(entry_engine, "_last_liq_snapshot", None)
+        if snap is None and getattr(self, "_liq_map", None) is not None:
+            try:
+                snap = self._liq_map.get_snapshot(entry_price, atr)
+            except Exception:
+                snap = None
+        if snap is None:
+            logger.info(
+                "Execution geometry repair waiting: no liquidity snapshot | "
+                "fee_to_risk=%.2fR required=%.1fpts current=%.1fpts",
+                viability.fee_to_risk,
+                viability.min_viable_sl_dist,
+                viability.current_sl_dist,
+            )
+            return sl_price, tp_price, False
+
+        signal = getattr(self, "_last_entry_signal", None)
+        sweep = getattr(signal, "sweep_result", None)
+        invalidation = float(getattr(sweep, "wick_extreme", 0.0) or 0.0)
+        if invalidation <= 0.0:
+            invalidation = sl_price
+
+        try:
+            repaired_sl, sl_reason = entry_engine._apply_institutional_sl_envelope(
+                snap,
+                side,
+                entry_price,
+                atr,
+                sl_price,
+                invalidation,
+                "execution-repair",
+                min_risk=viability.min_viable_sl_dist,
+            )
+        except Exception as exc:
+            logger.debug("Execution geometry repair failed: %s", exc)
+            return sl_price, tp_price, False
+
+        if repaired_sl is None or repaired_sl <= 0.0:
+            logger.info(
+                "Execution geometry repair waiting: %s | fee_to_risk=%.2fR "
+                "required=%.1fpts current=%.1fpts",
+                sl_reason,
+                viability.fee_to_risk,
+                viability.min_viable_sl_dist,
+                viability.current_sl_dist,
+            )
+            return sl_price, tp_price, False
+
+        repaired_tp = tp_price
+        repaired_risk = abs(entry_price - repaired_sl)
+        current_rr = abs(repaired_tp - entry_price) / max(repaired_risk, 1e-9)
+        rr_floor = QCfg.MIN_RR_RATIO()
+        try:
+            rr_floor = float(entry_engine._last_selected_tp_rr_floor(rr_floor))
+        except Exception:
+            pass
+        if current_rr < rr_floor:
+            try:
+                new_tp, new_target = entry_engine._find_tp(
+                    snap, side, entry_price, atr, repaired_sl, QCfg.MIN_RR_RATIO())
+                if new_tp is not None and new_target is not None:
+                    repaired_tp = float(new_tp)
+            except Exception as exc:
+                logger.debug("Execution geometry TP repair failed: %s", exc)
+        if side == "long" and not (repaired_sl < entry_price < repaired_tp):
+            return sl_price, tp_price, False
+        if side == "short" and not (repaired_sl > entry_price > repaired_tp):
+            return sl_price, tp_price, False
+
+        repaired_v = self._execution_viability_model(
+            side=side,
+            price=entry_price,
+            sl_price=repaired_sl,
+            tp_price=repaired_tp,
+            use_maker_entry=use_maker_entry,
+            posterior_prob=posterior_prob,
+        )
+        self._last_execution_viability = repaired_v.as_refine_context()
+        if not repaired_v.allocation_allowed:
+            return sl_price, tp_price, False
+        if repaired_v.utility_known and repaired_v.expected_net_utility_r <= 0.0:
+            logger.info(
+                "Execution geometry repair rejected: repaired net utility %.2fR <= 0",
+                repaired_v.expected_net_utility_r,
+            )
+            return sl_price, tp_price, False
+
+        logger.info(
+            "Execution geometry repaired with structural SL | route=%s "
+            "fee_to_risk %.2fR->%.2fR risk %.1f->%.1fpts SL $%.1f->$%.1f TP=$%.1f",
+            repaired_v.route,
+            viability.fee_to_risk,
+            repaired_v.fee_to_risk,
+            viability.current_sl_dist,
+            repaired_v.current_sl_dist,
+            sl_price,
+            repaired_sl,
+            repaired_tp,
+        )
+        return repaired_sl, repaired_tp, True
 
     def _compute_quantity(self, risk_manager, price,
                            sig: Optional[SignalBreakdown] = None,

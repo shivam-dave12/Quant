@@ -1817,6 +1817,7 @@ class EntryEngine:
         structural_sl: float,
         invalidation_price: float,
         label: str,
+        min_risk: float = 0.0,
     ):
         """
         Build the executable stop from structural invalidation, live noise,
@@ -1824,6 +1825,7 @@ class EntryEngine:
         """
         if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
             return None, "non-protective structural SL"
+        min_risk = max(0.0, float(min_risk or 0.0))
 
         _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
         max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
@@ -1847,6 +1849,7 @@ class EntryEngine:
             ict=getattr(self, "_ict", None),
             invalidation_price=invalidation_price,
             max_buffer_atr=2.0,
+            min_risk=min_risk,
         )
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
@@ -1880,6 +1883,8 @@ class EntryEngine:
             return None, "SL crossed market after liquidity push"
         if not self._sl_before_liquidation(side, sl, price):
             return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
+        if min_risk > 0.0 and risk < min_risk:
+            return None, f"no structural SL meeting execution risk {risk:.1f}pts < {min_risk:.1f}pts"
         if risk > abs(price - structural_sl) + 1e-9:
             logger.info(
                 "SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, noise floor %.2fATR)",
@@ -2059,15 +2064,7 @@ class EntryEngine:
         # risk rejects need the original pullback/compression path.
         initial_entry = float(sig.entry_price or price)
         pullback = (initial_entry - price) if side == "long" else (price - initial_entry)
-        if needs_risk_expansion and original_sl > 0:
-            est_risk = abs(price - original_sl)
-            if est_risk < p.min_viable_risk:
-                p.last_reason = (
-                    f"waiting execution geometry: risk {est_risk:.1f}pts < "
-                    f"required {p.min_viable_risk:.1f}pts "
-                    f"(gap {p.min_viable_risk - est_risk:.1f}pts)")
-                return
-        else:
+        if not needs_risk_expansion:
             min_pullback = max(atr * _REFINE_MIN_PULLBACK_ATR, 1e-9)
             if pullback < min_pullback:
                 p.last_reason = (
@@ -2112,9 +2109,13 @@ class EntryEngine:
             sl = self._push_sl_behind_pools(sl, side, price, atr)
 
         sl, sl_reason = self._apply_institutional_sl_envelope(
-            snap, side, price, atr, sl, sweep.wick_extreme, "refined")
+            snap, side, price, atr, sl, sweep.wick_extreme, "refined",
+            min_risk=p.min_viable_risk if needs_risk_expansion else 0.0)
         if sl is None:
-            p.last_reason = f"refined SL envelope blocked: {sl_reason}"
+            if needs_risk_expansion:
+                p.last_reason = f"waiting structural execution geometry: {sl_reason}"
+            else:
+                p.last_reason = f"refined SL envelope blocked: {sl_reason}"
             return
         if not self._sl_before_liquidation(side, sl, price):
             p.last_reason = "refined SL breaches liquidation guard"
@@ -2516,7 +2517,8 @@ class EntryEngine:
         return tp_price, target
 
     def _find_sl_pool(self, snap, side, entry, atr, ict=None,
-                       invalidation_price=None, max_buffer_atr=2.0):
+                       invalidation_price=None, max_buffer_atr=2.0,
+                       min_risk: float = 0.0):
         """
         Anchor SL to the highest-significance protective pool just past
         structural invalidation, with a quality-scaled buffer beyond it.
@@ -2550,6 +2552,7 @@ class EntryEngine:
             invalidation_price=invalidation_price,
             max_buffer_atr=max_buffer_atr,
             now=time.time(),
+            min_risk=min_risk,
         )
         report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
         self._record_pool_report(report)

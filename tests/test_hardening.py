@@ -426,6 +426,83 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(ctx["min_viable_sl_dist"], ctx["current_sl_dist"])
         self.assertFalse(bool(ctx["allocation_allowed"]))
 
+    def test_execution_geometry_repair_uses_structural_sl(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._liq_map = None
+        strategy._last_entry_signal = SimpleNamespace(sweep_result=SimpleNamespace(wick_extreme=78552.8))
+
+        class FakeFeeEngine:
+            def effective_roundtrip_cost_bps(self, use_maker_entry=True):
+                return 9.3
+
+        class FakeEntryEngine:
+            _last_liq_snapshot = SimpleNamespace()
+
+            def _apply_institutional_sl_envelope(self, snap, side, price, atr, structural_sl,
+                                                 invalidation_price, label, min_risk=0.0):
+                return price - 120.0, "ok"
+
+            def _last_selected_tp_rr_floor(self, floor):
+                return floor
+
+            def _find_tp(self, *args, **kwargs):
+                return None, None
+
+        strategy._fee_engine = FakeFeeEngine()
+        strategy._entry_engine = FakeEntryEngine()
+
+        sl, tp, repaired = strategy._repair_execution_geometry(
+            side="long",
+            entry_price=78599.8,
+            sl_price=78553.0,
+            tp_price=78858.5,
+            atr=67.6,
+            use_maker_entry=True,
+            posterior_prob=0.75,
+        )
+
+        self.assertTrue(repaired)
+        self.assertEqual(sl, 78479.8)
+        self.assertEqual(tp, 78858.5)
+        self.assertTrue(bool(strategy._last_execution_viability["allocation_allowed"]))
+
+    def test_sl_pool_selector_honors_execution_min_risk(self):
+        from strategy.liquidity_pool_selector import score_sl_pool
+
+        def target(price, significance):
+            return SimpleNamespace(
+                pool=SimpleNamespace(
+                    price=price,
+                    status="DETECTED",
+                    timeframe="5m",
+                    touches=1,
+                    ob_aligned=False,
+                    fvg_aligned=False,
+                ),
+                significance=significance,
+                distance_atr=abs(100.0 - price),
+                tf_sources=["5m"],
+            )
+
+        snap = SimpleNamespace(
+            ssl_pools=[target(99.5, 7.0), target(97.0, 4.0)],
+            bsl_pools=[],
+        )
+
+        pick = score_sl_pool(
+            snap,
+            side="long",
+            entry=100.0,
+            atr=1.0,
+            invalidation_price=99.8,
+            min_risk=2.0,
+        )
+
+        self.assertIsNotNone(pick)
+        self.assertEqual(pick.target.pool.price, 97.0)
+
     def test_execution_viability_context_arms_refine_watch_math(self):
         from strategy.entry_engine import EntryEngine, EntrySignal, EntryType
 
@@ -461,6 +538,59 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(pending.min_viable_risk, 2.4)
         self.assertIn("execution geometry invalid", pending.last_reason)
+
+    def test_fee_refine_does_not_wait_for_chase_to_expand_risk(self):
+        from strategy.entry_engine import EntryEngine, EntrySignal, EntryType
+
+        engine = EntryEngine()
+        sweep = SimpleNamespace(
+            pool=SimpleNamespace(price=99.8, side=SimpleNamespace(value="SSL")),
+            wick_extreme=99.6,
+            detected_at=123.0,
+        )
+        signal = EntrySignal(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=101.0,
+            sl_price=99.8,
+            tp_price=105.0,
+            rr_ratio=3.3,
+            target_pool=SimpleNamespace(pool=SimpleNamespace(price=105.0)),
+            sweep_result=sweep,
+            conviction=0.75,
+            reason="unit",
+        )
+        engine.mark_pre_order_rejected(
+            signal,
+            execution_context={
+                "min_viable_sl_dist": 2.4,
+                "geometry_gap_pts": 1.2,
+                "required_entry_price": 102.2,
+                "required_sl_price": 98.6,
+                "fee_to_risk": 1.2,
+                "fee_no_alloc": 0.75,
+            },
+        )
+
+        engine._regime_sl_mult = lambda: 1.0
+        engine._push_sl_behind_pools = lambda sl, side, price, atr: sl
+        engine._sl_structural_bounds = lambda *args, **kwargs: (0.0, 100.0)
+        engine._sl_before_liquidation = lambda *args, **kwargs: True
+        engine._apply_institutional_sl_envelope = (
+            lambda snap, side, price, atr, sl, inval, label, min_risk=0.0:
+                (price - min_risk - 0.2, "ok")
+        )
+        engine._find_tp = lambda *args, **kwargs: (107.0, SimpleNamespace(pool=SimpleNamespace(price=107.0)))
+        engine._last_selected_tp_rr_floor = lambda floor: floor
+        engine._ict_summary = lambda *args, **kwargs: "unit"
+
+        engine._evaluate_pending_refined_entry(
+            SimpleNamespace(), SimpleNamespace(), SimpleNamespace(),
+            price=101.0, atr=1.0, now=time.time() + 2.0)
+
+        self.assertIsNotNone(engine._signal)
+        self.assertLess(engine._signal.sl_price, 99.0)
+        self.assertIsNone(engine._pending_refined)
 
     def test_conviction_entry_cap_becomes_allocation_haircut(self):
         from strategy.conviction_filter import ConvictionFactors, ConvictionResult

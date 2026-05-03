@@ -841,6 +841,7 @@ def score_sl_pool(
     invalidation_price:  Optional[float] = None,
     max_buffer_atr:      float = 2.0,
     now:                 Optional[float] = None,
+    min_risk:            float = 0.0,
 ) -> Optional[SLPoolPick]:
     """
     Pick the best PROTECTIVE pool just past the structural invalidation
@@ -883,8 +884,10 @@ def score_sl_pool(
     if not candidates:
         return None
 
+    min_risk = max(0.0, float(min_risk or 0.0))
+
     # Score each candidate.
-    scored: List[Tuple[float, Any]] = []
+    scored: List[Tuple[float, Any, float, float, float]] = []
     for t in candidates:
         sig = float(_safe(t, "significance", 0.0))
         struct = _structural_bonus(t.pool)
@@ -898,22 +901,26 @@ def score_sl_pool(
         # returns 1.0 (no bonus) which is correct: we don't WANT bias here,
         # we want raw structural strength. We therefore neutralise htf_m.
         score = sig * struct * fresh * touch
-        scored.append((score, t))
+        quality = min(score / 10.0, 1.0)
+        buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
+        buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
+        pool_price = float(_safe(t.pool, "price", 0.0))
+        sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+        if min_risk > 0.0 and abs(entry - sl_price) < min_risk:
+            continue
+        scored.append((score, t, sl_price, buffer_atr, quality))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_target = scored[0]
+    if not scored:
+        return None
+    best_score, best_target, sl_price, buffer_atr, quality = scored[0]
 
     # Quality on a [0, 1] scale: a score of ~10 is institutional-grade.
-    quality = min(best_score / 10.0, 1.0)
 
     # Quality-scaled buffer:
     #   high quality (1.0) → smallest buffer (BASE)
     #   low quality (0.0)  → maximum buffer (BASE + scale × MAX)
-    buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-    buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
 
-    pool_price = float(_safe(best_target.pool, "price", 0.0))
-    sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
 
     reasons: List[str] = [f"score={best_score:.2f}", f"sig={float(_safe(best_target, 'significance', 0.0)):.1f}"]
     if _safe(best_target.pool, "ob_aligned", False):
@@ -1110,6 +1117,7 @@ def diagnose_sl_pool(
     max_buffer_atr: float = 2.0,
     now: Optional[float] = None,
     limit: int = 8,
+    min_risk: float = 0.0,
 ) -> PoolSelectionReport:
     """Return an SL protective-pool audit table without relaxing SL rules."""
     report = PoolSelectionReport(role="SL", side=side, entry=float(entry), atr=float(atr))
@@ -1120,6 +1128,7 @@ def diagnose_sl_pool(
         report.summary = "ATR unavailable"
         return report
 
+    min_risk = max(0.0, float(min_risk or 0.0))
     rows: List[PoolCandidateDiagnostic] = []
     candidates: List[Tuple[float, PoolCandidateDiagnostic, Any]] = []
 
@@ -1176,6 +1185,9 @@ def diagnose_sl_pool(
             row.buffer_atr = buffer_atr
             row.quality = quality
             row.ev = score
+            if min_risk > 0.0 and abs(entry - row.sl_price) < min_risk:
+                row.reason = f"risk {abs(entry - row.sl_price):.1f}pts < required {min_risk:.1f}pts"
+                rows.append(row); continue
             row.eligible = True
             row.reason = "eligible protective SL pool"
             row.notes = [f"score={score:.2f}"]
@@ -1228,10 +1240,15 @@ def select_sl_with_report(
     invalidation_price: Optional[float] = None,
     max_buffer_atr: float = 2.0,
     now: Optional[float] = None,
+    min_risk: float = 0.0,
 ) -> Tuple[Optional[float], Optional[Any], Optional[SLPoolPick], PoolSelectionReport]:
     """select_sl() plus a full protective-pool report."""
-    report = diagnose_sl_pool(snap, side, entry, atr, ict, htf, invalidation_price, max_buffer_atr, now)
-    pick = score_sl_pool(snap, side, entry, atr, ict, htf, invalidation_price, max_buffer_atr, now)
+    report = diagnose_sl_pool(
+        snap, side, entry, atr, ict, htf, invalidation_price,
+        max_buffer_atr, now, min_risk=min_risk)
+    pick = score_sl_pool(
+        snap, side, entry, atr, ict, htf, invalidation_price,
+        max_buffer_atr, now, min_risk=min_risk)
     if pick is None:
         return None, None, None, report
     return pick.sl_price, pick.target, pick, report
@@ -1265,12 +1282,14 @@ def select_sl(
     invalidation_price: Optional[float] = None,
     max_buffer_atr: float = 2.0,
     now: Optional[float] = None,
+    min_risk: float = 0.0,
 ) -> Tuple[Optional[float], Optional[Any], Optional[SLPoolPick]]:
     """
     One-call SL selection. Returns (sl_price, target, pick) or (None, None, None).
     """
     pick = score_sl_pool(snap, side, entry, atr, ict, htf,
-                         invalidation_price, max_buffer_atr, now)
+                         invalidation_price, max_buffer_atr, now,
+                         min_risk=min_risk)
     if pick is None:
         return None, None, None
     return pick.sl_price, pick.target, pick
