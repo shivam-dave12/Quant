@@ -231,7 +231,11 @@ class PoolCandidateDiagnostic:
     reward:        float = 0.0
     risk:          float = 0.0
     sweep_prob:    float = 0.0
+    delivery_prob: float = 0.0
+    required_delivery_prob: float = 0.0
+    cost_r:        float = 0.0
     ev:            float = 0.0
+    selection_ev:  float = 0.0
     confluence:    float = 1.0
     gauntlet_n:    int   = 0
     be_move:       float = 0.0
@@ -282,6 +286,11 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
 
 
+def _required_delivery_probability(rr: float, cost_r: float) -> float:
+    """Break-even hit probability for a TP at ``rr`` after execution cost."""
+    return _clamp((1.0 + max(float(cost_r), 0.0)) / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
+
+
 def _enum_value(v: Any, default: str = "") -> str:
     try:
         if hasattr(v, "value"):
@@ -329,9 +338,26 @@ def _candidate_base(role: str, side: str, target: Any, entry: float, atr: float,
 
 
 def _sort_report_candidates(rows: List[PoolCandidateDiagnostic], limit: int = 8) -> List[PoolCandidateDiagnostic]:
-    def _key(r: PoolCandidateDiagnostic):
-        return (0 if r.selected else 1 if r.eligible else 2, -r.ev, -r.rr, r.distance_atr)
-    return sorted(rows, key=_key)[:max(1, int(limit))]
+    return sorted(rows, key=_candidate_report_priority, reverse=True)[:max(1, int(limit))]
+
+
+def _candidate_report_priority(r: PoolCandidateDiagnostic) -> float:
+    if r.selected:
+        return 1_000_000.0 + max(r.selection_ev, r.ev)
+    if r.eligible:
+        return 100_000.0 + max(r.selection_ev, r.ev)
+
+    req_p = r.required_delivery_prob
+    if req_p <= 0.0 and r.rr > 0.0:
+        req_p = _required_delivery_probability(r.rr, r.cost_r)
+    delivery = max(r.delivery_prob, r.sweep_prob, 0.0)
+    p_fit = _clamp(delivery / max(req_p, 1e-9), 0.0, 2.0)
+
+    rr_floor = r.required_rr if r.required_rr > 0.0 else 1.0
+    rr_fit = _clamp(r.rr / max(rr_floor, 1e-9), 0.0, 2.0)
+    proximity = 1.0 / (1.0 + max(r.distance_atr, 0.0) / 8.0)
+
+    return 0.55 * p_fit + 0.30 * rr_fit + 0.15 * proximity
 
 
 def _hour_utc(now: Optional[float]) -> int:
@@ -656,6 +682,30 @@ def _tp_selection_value(ev: float, rr: float, rr_floor: float,
     return float(ev) * payoff_frontier * delivery_span
 
 
+def _tp_payoff_rejection_reason(
+    rr: float,
+    rr_floor: float,
+    static_floor: float,
+    delivery_prob: float,
+    required_delivery_prob: float,
+    cost_r: float,
+    terminal_target: bool,
+) -> str:
+    if delivery_prob + 1e-9 < required_delivery_prob:
+        reason = (
+            f"delivery probability {delivery_prob:.4f} < required {required_delivery_prob:.4f} "
+            f"for RR {rr:.2f} (static {static_floor:.2f}, cost={cost_r:.2f}R, "
+            f"payoff floor {rr_floor:.2f})"
+        )
+        if terminal_target:
+            reason += "; terminal runner context, not full-position TP"
+        return reason
+    return (
+        f"R:R {rr:.2f} < payoff floor {rr_floor:.2f} "
+        f"(static {static_floor:.2f}, p={delivery_prob:.4f}, cost={cost_r:.2f}R)"
+    )
+
+
 def _target_utility(raw_prob: float, rr: float, min_rr: float,
                     distance_atr: float, reward: float,
                     be_move: float) -> Tuple[float, Dict[str, float]]:
@@ -791,6 +841,7 @@ def score_tp_pools(
                 risk,
                 be_move,
             )
+            required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
@@ -850,6 +901,7 @@ def score_tp_pools(
                     "significance": sig,
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
+                    "required_delivery_prob": required_delivery_prob,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                 },
@@ -1104,16 +1156,25 @@ def diagnose_tp_pools(
                 be_move,
             )
             row.required_rr = rr_floor
+            row.delivery_prob = delivery_prob
+            row.cost_r = cost_r
+            row.required_delivery_prob = _required_delivery_probability(row.rr, cost_r)
             if row.rr < rr_floor:
-                row.reason = (
-                    f"R:R {row.rr:.2f} < payoff floor {rr_floor:.2f} "
-                    f"(static {effective_min_rr:.2f}, p={delivery_prob:.2f}, cost={cost_r:.2f}R)"
+                row.reason = _tp_payoff_rejection_reason(
+                    row.rr,
+                    rr_floor,
+                    effective_min_rr,
+                    delivery_prob,
+                    row.required_delivery_prob,
+                    cost_r,
+                    terminal_target,
                 )
                 rows.append(row); continue
             utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
+            row.selection_ev = selection_ev
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
@@ -1143,7 +1204,7 @@ def diagnose_tp_pools(
     else:
         if rows:
             # Surface the most relevant rejection, not just "no TP".
-            best_reject = sorted(rows, key=lambda r: (-r.rr, r.distance_atr))[0]
+            best_reject = max(rows, key=_candidate_report_priority)
             report.summary = f"no eligible TP pool; best visible pool rejected: {best_reject.reason}"
         else:
             report.summary = "no TP candidates found"

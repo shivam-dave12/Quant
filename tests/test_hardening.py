@@ -889,7 +889,65 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(payload["selected"])
         candidate = payload["candidates"][0]
         self.assertGreater(candidate["required_rr"], 100.0)
-        self.assertIn("payoff floor", candidate["reason"])
+        self.assertIn("delivery probability", candidate["reason"])
+        self.assertGreater(candidate["required_delivery_prob"], candidate["delivery_prob"])
+
+    def test_tp_audit_prioritizes_executable_near_reject_over_lottery_rr(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        now = 1_700_000_000
+        entry = 78340.0
+        sl = 78506.8
+        atr = 51.3
+
+        def target(price, timeframe, significance):
+            pool = SimpleNamespace(
+                price=price,
+                timeframe=timeframe,
+                side="SSL",
+                significance=significance,
+                htf_count=3,
+                touches=1,
+                status="DETECTED",
+                created_at=now,
+                ob_aligned=False,
+                fvg_aligned=False,
+            )
+            return SimpleNamespace(
+                pool=pool,
+                distance_atr=abs(price - entry) / atr,
+                significance=significance,
+                direction="short",
+                tf_sources=[timeframe],
+            )
+
+        near = target(78078.75, "15m", 12.3)
+        far = target(73675.0, "1d", 16.0)
+        snap = SimpleNamespace(
+            bsl_pools=[],
+            ssl_pools=[far, near],
+            feed_reliability=0.90,
+        )
+
+        tp, selected_target, score, report = select_tp_with_report(
+            snap=snap,
+            side="short",
+            entry=entry,
+            sl=sl,
+            atr=atr,
+            min_rr=2.20,
+            posterior_prob=0.834,
+            now=now,
+        )
+
+        self.assertIsNone(tp)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(score)
+        payload = report.as_dict()
+        self.assertEqual(payload["candidates"][0]["pool_price"], near.pool.price)
+        self.assertIn("delivery probability", payload["summary"])
+        self.assertIn("RR 1.46", payload["summary"])
+        self.assertLess(payload["candidates"][0]["required_delivery_prob"], 1.0)
 
     def test_low_quality_sl_pool_cannot_destroy_real_tp_geometry(self):
         from strategy.entry_engine import EntryEngine
