@@ -746,7 +746,7 @@ class HardeningTests(unittest.TestCase):
         finally:
             qm.GLOBAL_QUANT_CALIBRATOR = old_calibrator
 
-    def test_tp_selector_uses_ev_floor_for_real_institutional_liquidity(self):
+    def test_tp_selector_rejects_sub_loss_final_tp_geometry(self):
         from strategy.liquidity_pool_selector import select_tp_with_report
 
         entry = 78645.0
@@ -779,12 +779,66 @@ class HardeningTests(unittest.TestCase):
             now=0,
         )
 
-        self.assertIsNotNone(tp)
-        self.assertIs(selected_target, target)
-        self.assertLess(score.rr, 2.20)
+        self.assertIsNone(tp)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(score)
         payload = report.as_dict()
-        self.assertLess(payload["selected"]["required_rr"], 2.20)
-        self.assertIn("EV RR floor", " ".join(payload["selected"]["notes"]))
+        self.assertIsNone(payload["selected"])
+        self.assertGreaterEqual(payload["candidates"][0]["required_rr"], 1.35)
+        self.assertIn("payoff floor", payload["candidates"][0]["reason"])
+
+    def test_tp_selector_prefers_durable_liquidity_over_near_payoff(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        now = 1_700_000_000
+
+        def target(price, timeframe, significance):
+            pool = SimpleNamespace(
+                price=price,
+                timeframe=timeframe,
+                side="BSL",
+                significance=significance,
+                htf_count=3,
+                touches=1,
+                status="DETECTED",
+                created_at=now,
+                ob_aligned=False,
+                fvg_aligned=False,
+            )
+            return SimpleNamespace(
+                pool=pool,
+                distance_atr=abs(price - 100.0),
+                significance=significance,
+                direction="long",
+                tf_sources=[timeframe],
+            )
+
+        near = target(103.4, "15m", 22.0)
+        far = target(108.0, "4h", 14.0)
+        snap = SimpleNamespace(
+            bsl_pools=[near, far],
+            ssl_pools=[],
+            feed_reliability=0.90,
+        )
+
+        tp, selected_target, score, report = select_tp_with_report(
+            snap=snap,
+            side="long",
+            entry=100.0,
+            sl=98.0,
+            atr=1.0,
+            min_rr=2.20,
+            posterior_prob=0.88,
+            now=now,
+        )
+
+        self.assertIsNotNone(tp)
+        self.assertIs(selected_target, far)
+        self.assertGreater(score.rr, 3.0)
+        self.assertGreater(score.components["selection_ev"], score.ev)
+        payload = report.as_dict()
+        self.assertEqual(payload["selected"]["pool_price"], far.pool.price)
+        self.assertIn("payoff-adjusted EV", payload["selected"]["reason"])
 
     def test_low_quality_sl_pool_cannot_destroy_real_tp_geometry(self):
         from strategy.entry_engine import EntryEngine

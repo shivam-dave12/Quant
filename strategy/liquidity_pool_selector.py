@@ -159,6 +159,12 @@ _TERMINAL_TP_MIN_TF_RANK = 3      # 15m+ can be used as terminal delivery object
 _TERMINAL_TP_MIN_SIG     = 3.0    # lower-TF distant pools need real significance
 _TERMINAL_REACH_FLOOR    = 0.05   # never zero out a valid terminal objective
 
+# Final TP payoff geometry. A high posterior can relax the static R:R prior,
+# but it cannot turn a BE-adjacent pool into a full-position institutional TP.
+_TP_DURABLE_RR_FLOOR     = 1.35
+_TP_MIN_BE_MOVE_MULT     = 1.80
+_TP_TERMINAL_PROFILE_FLOOR = 0.55
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -607,19 +613,43 @@ def _institutional_rr_floor(
     With no accepted setup posterior, preserve the legacy static floor. Once a
     posterior exists, the pool is judged by positive expected value:
         p * R - (1 - p) - cost_r >= 0
-    The floor is still capped by the configured floor, so strong math can
-    rescue real liquidity targets without inventing synthetic objectives.
+    The static floor can be relaxed by observed auction posterior, but only
+    down to a durable payoff floor. If costs consume too much of the risk box,
+    the floor expands above the static prior instead of approving a micro-win.
     """
     static_floor = max(0.01, float(static_min_rr))
+    risk_f = max(float(risk), 1e-9)
+    durable_floor = max(
+        _TP_DURABLE_RR_FLOOR,
+        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
+    )
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
-        return static_floor, _clamp(raw_prob, 0.01, 0.95), 0.0
+        return max(static_floor, durable_floor), _clamp(raw_prob, 0.01, 0.95), 0.0
 
     delivery_p = _posterior_delivery_probability(
         raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
-    cost_r = _clamp(0.50 * float(be_move) / max(float(risk), 1e-9), 0.0, 0.35)
+    cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-    return min(static_floor, max(0.75, ev_floor)), delivery_p, cost_r
+    posterior_floor = max(durable_floor, ev_floor)
+    return posterior_floor, delivery_p, cost_r
+
+
+def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
+                         terminal_target: bool) -> float:
+    mtf_reach = _terminal_reach_multiplier(distance_atr, tf)
+    profile_reach = selector_profile.target_reach_penalty(distance_atr, tf)
+    if terminal_target:
+        profile_reach = max(profile_reach, _TP_TERMINAL_PROFILE_FLOOR)
+    return mtf_reach * profile_reach
+
+
+def _tp_selection_value(ev: float, rr: float, rr_floor: float,
+                        distance_atr: float) -> float:
+    surplus_r = max(float(rr) - float(rr_floor), 0.0)
+    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
+    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
+    return float(ev) * payoff_frontier * delivery_span
 
 
 def _target_utility(raw_prob: float, rr: float, min_rr: float,
@@ -742,7 +772,7 @@ def score_tp_pools(
                 * _touch_penalty(pool)
             )
 
-            reach_mult = _terminal_reach_multiplier(dist_atr, tf) * selector_profile.target_reach_penalty(dist_atr, tf)
+            reach_mult = _tp_reach_multiplier(dist_atr, tf, selector_profile, terminal_target)
 
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
@@ -770,6 +800,7 @@ def score_tp_pools(
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
+            selection_ev = _tp_selection_value(ev, rr, rr_floor, dist_atr)
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -782,7 +813,7 @@ def score_tp_pools(
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
-                reasons.append(f"EV RR floor {rr_floor:.2f}")
+                reasons.append(f"payoff RR floor {rr_floor:.2f}")
             if utility_components["be_quality"] < 0.75:
                 reasons.append("thin post-BE room")
             if _safe(pool, "ob_aligned", False):
@@ -809,6 +840,7 @@ def score_tp_pools(
                     "distance_quality": utility_components["distance_quality"],
                     "reach_mult":  utility_components.get("reach_mult", 1.0),
                     "max_reach_atr": utility_components.get("max_reach_atr", max_reach),
+                    "selection_ev": selection_ev,
                     "be_move":     utility_components["be_move"],
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
@@ -823,7 +855,14 @@ def score_tp_pools(
             logger.debug("score_tp_pools: skipping target due to %s", e)
             continue
 
-    out.sort(key=lambda p: p.ev, reverse=True)
+    out.sort(
+        key=lambda p: (
+            float(p.components.get("selection_ev", p.ev)),
+            p.ev,
+            p.rr,
+        ),
+        reverse=True,
+    )
     return out
 
 
@@ -1047,7 +1086,7 @@ def diagnose_tp_pools(
                 * _touch_penalty(pool)
             )
             row.confluence = confluence
-            reach_mult = _terminal_reach_multiplier(row.distance_atr, tf) * selector_profile.target_reach_penalty(row.distance_atr, tf)
+            reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
@@ -1063,24 +1102,27 @@ def diagnose_tp_pools(
             row.required_rr = rr_floor
             if row.rr < rr_floor:
                 row.reason = (
-                    f"R:R {row.rr:.2f} < EV floor {rr_floor:.2f} "
+                    f"R:R {row.rr:.2f} < payoff floor {rr_floor:.2f} "
                     f"(static {effective_min_rr:.2f}, p={delivery_prob:.2f}, cost={cost_r:.2f}R)"
                 )
                 rows.append(row); continue
             utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
+            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
             row.eligible = True
-            row.reason = "eligible; EV-ranked candidate"
+            row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
-                row.notes.append(f"EV RR floor {rr_floor:.2f}")
+                row.notes.append(f"payoff RR floor {rr_floor:.2f}")
+            if selection_ev > row.ev + 1e-12:
+                row.notes.append(f"frontierEV={selection_ev:.3f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
-            accepted.append((row.ev, row))
+            accepted.append((selection_ev, row))
             rows.append(row)
         except Exception as e:
             row.reason = f"diagnostic error: {e}"
@@ -1090,7 +1132,7 @@ def diagnose_tp_pools(
     if accepted:
         selected = accepted[0][1]
         selected.selected = True
-        selected.reason = "selected by EV after all institutional gates"
+        selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
         report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
                           f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
