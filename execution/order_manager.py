@@ -458,6 +458,7 @@ class _DeltaAdapter:
         self.limiter.wait()
         resp = self.api.edit_order(
             order_id    = order_id,
+            product_id  = self._get_product_id(),
             stop_price  = new_stop_price,
             limit_price = new_limit_price,   # None for stop-market, float for stop-limit
         )
@@ -754,6 +755,32 @@ class OrderManager:
         raise ValueError(f"Invalid side '{side}'")
 
     def _active_tick_size(self) -> float:
+        """Return the executable tick size for the active contract.
+
+        Multi-asset Delta products do not share BTC's tick size.  Using the
+        global config tick silently corrupts stop-limit offsets and trail
+        replacement prices on PAXG/SLVON/xStock contracts.
+        """
+        try:
+            tick = float(getattr(self._adapter, "tick_size", 0.0) or 0.0)
+            if tick > 0:
+                return tick
+        except Exception:
+            pass
+        try:
+            inst = getattr(self, "instrument", None)
+            by_ex = getattr(inst, "by_exchange", {}) or {}
+            # Keys may be ExchangeName enums or strings depending on construction.
+            for key, ei in by_ex.items():
+                try:
+                    if str(key).lower().endswith("delta") or str(key).lower() == "delta":
+                        tick = float(getattr(ei, "tick_size", 0.0) or 0.0)
+                        if tick > 0:
+                            return tick
+                except Exception:
+                    continue
+        except Exception:
+            pass
         getter = getattr(config, "get_tick_size", None)
         if callable(getter):
             return float(getter())
@@ -1544,7 +1571,7 @@ class OrderManager:
                     # True exit: order is gone and WE didn't cancel it.
                     logger.info(
                         f"SL {existing_sl_order_id[:10]}… gone (404) "
-                        f"— not in self-cancelled set → exit confirmed")
+                        f"— not in self-cancelled set → exit confirmation required")
                     return None
                 else:
                     logger.warning(

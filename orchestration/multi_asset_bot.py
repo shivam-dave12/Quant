@@ -316,6 +316,197 @@ class MultiAssetQuantBot:
                 lines.append(f"⚪ {esc(aid)} — {esc(reason)}")
         return "\n".join(lines)
 
+
+    # ---------------------------------------------------------------------
+    # Institutional command-center reports used by Telegram commands.
+    # These replace the old BTC-era single-strategy /pnl /position /equity
+    # views.  They aggregate all asset desks under the central portfolio
+    # manager while preserving per-contract detail.
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _esc(x: Any) -> str:
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    @staticmethod
+    def _fmt_money(v: float, n: int = 2) -> str:
+        try:
+            return f"${float(v):+,.{n}f}"
+        except Exception:
+            return "$+0.00"
+
+    @staticmethod
+    def _fmt_price(v: float) -> str:
+        try:
+            f = float(v or 0.0)
+            if abs(f) >= 1000: return f"${f:,.2f}"
+            if abs(f) >= 100: return f"${f:,.2f}"
+            if abs(f) >= 1: return f"${f:,.4f}"
+            return f"${f:,.6f}"
+        except Exception:
+            return "$0.00"
+
+    def _ctx_position_metrics(self, ctx: AssetContext) -> Dict[str, Any]:
+        inst = ctx.instrument
+        pos = ctx.strategy.get_position()
+        px = 0.0
+        try: px = float(ctx.data_manager.get_last_price() or 0.0)
+        except Exception: pass
+        pol = active_policy(inst)
+        out: Dict[str, Any] = {
+            "asset": inst.asset_id, "symbol": inst.display_symbol,
+            "venue": inst.primary_exchange.value.upper(), "class": pol.asset_class,
+            "price": px, "position": pos, "upnl": 0.0, "r": 0.0,
+            "mfe_r": 0.0, "hold_min": 0.0, "state": ctx.phase_name,
+            "trail_active": False, "sl": 0.0, "tp": 0.0, "entry": 0.0,
+            "qty": 0.0, "side": "", "policy": pol,
+        }
+        if not pos:
+            return out
+        try:
+            side = str(pos.side or "").upper()
+            entry = float(pos.entry_price or 0.0)
+            qty = float(pos.quantity or 0.0)
+            move_pts = (px - entry) if side == "LONG" else (entry - px)
+            upnl = move_pts * qty
+            init_dist = float(pos.initial_sl_dist or 0.0) or abs(entry - float(pos.sl_price or 0.0))
+            r_now = move_pts / init_dist if init_dist > 1e-10 else 0.0
+            mfe_r = float(pos.peak_profit or 0.0) / init_dist if init_dist > 1e-10 else 0.0
+            hold_m = (time.time() - float(pos.entry_time or time.time())) / 60.0
+            out.update({
+                "side": side, "entry": entry, "qty": qty, "upnl": upnl, "r": r_now,
+                "mfe_r": mfe_r, "hold_min": hold_m, "sl": float(pos.sl_price or 0.0),
+                "tp": float(pos.tp_price or 0.0), "trail_active": bool(getattr(pos, "trail_active", False)),
+                "trade_mode": getattr(pos, "trade_mode", ""), "entry_id": getattr(pos, "entry_order_id", ""),
+                "sl_id": getattr(pos, "sl_order_id", ""), "tp_id": getattr(pos, "tp_order_id", ""),
+            })
+        except Exception:
+            pass
+        return out
+
+    def _all_trade_records(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for ctx in self.contexts:
+            try:
+                for t in list(getattr(ctx.strategy, "_trade_history", [])):
+                    r = dict(t)
+                    r.setdefault("asset", ctx.instrument.asset_id)
+                    r.setdefault("symbol", ctx.instrument.display_symbol)
+                    r.setdefault("venue", ctx.instrument.primary_exchange.value.upper())
+                    rows.append(r)
+            except Exception:
+                continue
+        return rows
+
+    def format_portfolio_pnl_report(self) -> str:
+        rows = [self._ctx_position_metrics(c) for c in self.contexts]
+        open_rows = [r for r in rows if r.get("position")]
+        trades = self._all_trade_records()
+        total_realised = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
+        total_upnl = sum(float(r.get("upnl", 0.0) or 0.0) for r in open_rows)
+        wins = sum(1 for t in trades if t.get("is_win"))
+        total = len(trades)
+        wr = (wins / total * 100.0) if total else 0.0
+        icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
+        lines = [
+            f"{icon} <b>PORTFOLIO PnL COMMAND CENTER</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"<code>OPEN   {len(open_rows):>2}/{self.guard.max_open_positions:<2}   UPNL {self._fmt_money(total_upnl):>12}   REAL {self._fmt_money(total_realised):>12}</code>",
+            f"<code>TRADES {total:>4}   WR {wr:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
+        ]
+        if open_rows:
+            lines.append("\n<b>Live exposure by desk</b>")
+            for r in sorted(open_rows, key=lambda x: str(x.get("asset"))):
+                trail = "TRAIL" if r.get("trail_active") else "INIT"
+                lines.append(
+                    f"<code>{self._esc(r['asset']):<6} {self._esc(r['side']):<5} {self._fmt_money(r['upnl']):>11} "
+                    f"R {float(r['r']):+5.2f} MFE {float(r['mfe_r']):>4.2f} {trail:<5}</code>"
+                )
+                lines.append(
+                    f"<code>       px {self._fmt_price(r['price']):>12} entry {self._fmt_price(r['entry']):>12} SL {self._fmt_price(r['sl']):>12}</code>"
+                )
+        if trades:
+            lines.append("\n<b>Recent realised trades</b>")
+            for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-6:][::-1]:
+                pnl = float(t.get("pnl", 0.0) or 0.0)
+                ok = "✅" if pnl >= 0 else "❌"
+                lines.append(
+                    f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} {self._fmt_money(pnl):>11} "
+                    f"{self._esc(str(t.get('reason',''))[:12]):<12}</code>"
+                )
+        return "\n".join(lines)
+
+    def format_portfolio_position_report(self) -> str:
+        rows = [self._ctx_position_metrics(c) for c in self.contexts]
+        lines = ["🏛 <b>PORTFOLIO POSITIONS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        open_rows = [r for r in rows if r.get("position")]
+        if not open_rows:
+            lines.append("No live positions. Scanner desks remain active.")
+        for r in open_rows:
+            pol = r["policy"]
+            lines.append(
+                f"\n<b>{self._esc(r['asset'])}</b>  <code>{self._esc(r['venue'])}:{self._esc(r['symbol'])}</code> · {self._esc(pol.asset_class)}"
+            )
+            lines.append(
+                f"<code>{self._esc(r['side']):<5} qty {float(r['qty']):.6f}   R {float(r['r']):+.2f}   MFE {float(r['mfe_r']):.2f}   hold {float(r['hold_min']):.0f}m</code>"
+            )
+            lines.append(
+                f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  UPNL {self._fmt_money(r['upnl']):>11}</code>"
+            )
+            lines.append(
+                f"<code>SL    {self._fmt_price(r['sl']):>12}  TP {self._fmt_price(r['tp']):>12}  TRAIL {'ON' if r.get('trail_active') else 'WATCH'}</code>"
+            )
+            if r.get("sl_id") or r.get("tp_id"):
+                lines.append(f"<code>BRKT  SL {str(r.get('sl_id') or '-')[:8]}…  TP {str(r.get('tp_id') or '-')[:8]}…</code>")
+        lines.append("\n<b>Scanner desks</b>")
+        for r in rows:
+            if r.get("position"):
+                continue
+            lines.append(f"<code>{self._esc(r['asset']):<6} {self._esc(r['symbol']):<12} {self._esc(r['state']):<10} px {self._fmt_price(r['price'])}</code>")
+        return "\n".join(lines)
+
+    def format_portfolio_equity_report(self) -> str:
+        lines = ["💼 <b>PORTFOLIO EQUITY / BUDGET</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        raw_total = raw_avail = 0.0
+        got = False
+        for ctx in self.contexts[:1]:
+            try:
+                bal = ctx.risk_manager.get_available_balance() or {}
+                raw_avail = float(bal.get("available_raw", bal.get("available", 0.0)) or 0.0)
+                raw_total = float(bal.get("total_raw", bal.get("total", raw_avail)) or raw_avail)
+                got = True
+            except Exception:
+                pass
+        if got:
+            lines.append(f"<code>ACCOUNT available {self._fmt_price(raw_avail):>12}  total {self._fmt_price(raw_total):>12}</code>")
+        lines.append(f"<code>SLOTS   used {self.guard.count_open(self.contexts):>2}/{self.guard.max_open_positions:<2}  mode {self._esc(self.guard.budget_mode)}</code>")
+        for ctx in self.contexts:
+            try:
+                bal = ctx.risk_manager.get_available_balance() or {}
+                pol = active_policy(ctx.instrument)
+                lines.append(
+                    f"<code>{self._esc(ctx.instrument.asset_id):<6} cash {self._fmt_price(float(bal.get('available',0) or 0)):>10} "
+                    f"riskbase {self._fmt_price(float(bal.get('risk_total',0) or 0)):>10} lev {pol.leverage:>2}x margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f}</code>"
+                )
+            except Exception:
+                continue
+        return "\n".join(lines)
+
+    def format_portfolio_trades_report(self) -> str:
+        trades = self._all_trade_records()
+        lines = ["📋 <b>PORTFOLIO TRADE TAPE</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        if not trades:
+            return "\n".join(lines + ["No closed trades recorded yet."])
+        for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-12:][::-1]:
+            pnl = float(t.get("pnl", 0.0) or 0.0)
+            ok = "✅" if pnl >= 0 else "❌"
+            lines.append(
+                f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} "
+                f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}→{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
+                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f}</code>"
+            )
+            lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
+        return "\n".join(lines)
+
     def initialize(self) -> bool:
         try:
             logger.info("=" * 92)

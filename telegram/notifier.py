@@ -1235,6 +1235,7 @@ def format_exit_alert(
     hold_min:    float,
     fees:        float = 0.0,
     qty:         float = 0.0,
+    **_kw: Any,
 ) -> str:
     """
     Industry-grade exit alert. Outcome icon leads.
@@ -1256,18 +1257,20 @@ def format_exit_alert(
 
     pts_realised = (exit_price - entry) if side_u == "LONG" else (entry - exit_price)
 
+    inst = _kw.get("instrument") or _tg_current_instrument()
+    asset = getattr(inst, "asset_id", _kw.get("asset", "ASSET")) if inst is not None else _kw.get("asset", "ASSET")
+    symbol = getattr(inst, "display_symbol", _kw.get("symbol", "-")) if inst is not None else _kw.get("symbol", "-")
+    venue = getattr(getattr(inst, "primary_exchange", None), "value", _kw.get("venue", "")) if inst is not None else _kw.get("venue", "")
     rows = [
-        f"{head_icon} <b>EXIT {_esc(side_u)}</b>  "
-        f"<code>{_fmt_price(exit_price)}</code>"
-        f"   {_esc(reason_label)}",
+        f"{head_icon} <b>PORTFOLIO EXIT</b>  <code>{_esc(str(asset))}</code>",
+        f"<code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code> · {_esc(reason_label)}",
         "<code>──────────────────────────────</code>",
-        (f"<b>PNL {_fpnl(pnl)}</b>"
-         f"   <code>{r_realised:+.2f}R</code>   MFE {mfe_r:.2f}R"),
-        (f"<code>HOLD {hold_min:5.0f}m   FEE ${fees:.4f}</code>"
-         + (f"   QTY {qty:.4f}" if qty > 0 else "")),
-        f"<code>{_fmt_price(entry)} → {_fmt_price(exit_price)}</code>"
-        f"   <i>{_fpts(pts_realised)}</i>",
+        (f"<code>{_esc(side_u):<5} entry {_fmt_price(entry):>12} → exit {_fmt_price(exit_price):>12}</code>"),
+        (f"<b>PNL {_fpnl(pnl)}</b>   <code>R {r_realised:+.2f}   MFE {mfe_r:.2f}   pts {pts_realised:+.2f}</code>"),
+        (f"<code>QTY {qty:.6f}   FEE ${fees:.4f}   HOLD {hold_min:.1f}m</code>"),
     ]
+    if _kw.get("portfolio_pnl") is not None or _kw.get("portfolio_open") is not None:
+        rows.append(f"<code>PORT   realised {_fpnl(float(_kw.get('portfolio_pnl', 0) or 0))}   open {int(_kw.get('portfolio_open', 0) or 0)}</code>")
     return "\n".join(rows)
 
 
@@ -1884,12 +1887,16 @@ def format_liquidity_trail_update(
         tags.append("anchor swept")
     if htf_aligned is not None:
         tags.append("HTF aligned" if htf_aligned else "HTF mixed")
+    inst = _tg_current_instrument()
+    asset = getattr(inst, "asset_id", "ASSET") if inst is not None else "ASSET"
+    symbol = getattr(inst, "display_symbol", "-") if inst is not None else "-"
+    venue = getattr(getattr(inst, "primary_exchange", None), "value", "") if inst is not None else ""
     lines = [
-        f"🔒 <b>ADAPTIVE EXIT STOP UPDATE</b>  <code>{_esc(side_u)}</code>",
+        f"🔒 <b>PORTFOLIO TRAIL UPDATE</b>  <code>{_esc(str(asset))}</code> <code>{_esc(str(venue).upper())}:{_esc(str(symbol))}</code>",
         _TG_RULE,
-        f"<code>SL      {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
-        f"<code>R       live {float(r_multiple or 0):+6.2f}R   lock {locked:+8.1f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",
-        f"<code>ANCHOR  {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}   anchor_ratio {fib_ratio if fib_ratio is not None else '-':>8}</code>",
+        f"<code>{_esc(side_u):<5} SL {_tg_price(new_sl):>14}   phase {_esc(phase or '-')}</code>",
+        f"<code>R       live {float(r_multiple or 0):+6.2f}R   locked {locked:+8.2f} pts ({locked_atr:+.2f}A)   move {_tg_num(move, 1):>8} pts</code>",
+        f"<code>ANCHOR  {_esc(anchor_tf or '-'):>4} @ {_tg_price(anchor_price):>13}   sig {float(anchor_sig or 0):.1f}   ratio {fib_ratio if fib_ratio is not None else '-':>8}</code>",
         f"<code>MARK    {_tg_price(current_price):>14}   ENTRY {_tg_price(entry_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
     ]
     if swing_low is not None or swing_high is not None:
