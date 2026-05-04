@@ -86,8 +86,20 @@ class InstrumentPolicy:
     cvd_window: int
     notes: str = ""
 
+    @property
+    def evaluation_interval_sec(self) -> float:
+        """Backward-compatible alias used by orchestration/Telegram code.
+
+        v9 renamed the per-instrument scan cadence to ``loop_interval_sec``.
+        Some v10 notification paths still referenced the old field name.
+        Keep this alias so command-center/startup messages cannot crash the bot.
+        """
+        return float(self.loop_interval_sec)
+
     def asdict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["evaluation_interval_sec"] = self.evaluation_interval_sec
+        return d
 
 
 def _cap_leverage(inst: Optional[TradableInstrument], default: int) -> int:

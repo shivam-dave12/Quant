@@ -48,3 +48,12 @@ class AssetNotificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupMessagePolicyAliasTest(unittest.TestCase):
+    def test_instrument_policy_exposes_evaluation_interval_alias(self):
+        from core.market_policy import build_instrument_policy
+        pol = build_instrument_policy(None)
+        self.assertTrue(hasattr(pol, "evaluation_interval_sec"))
+        self.assertEqual(pol.evaluation_interval_sec, pol.loop_interval_sec)
+        self.assertIn("evaluation_interval_sec", pol.asdict())
