@@ -33,6 +33,7 @@ import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.
 import config
 from core.pnl import gross_pnl_usd
 from core.instruments import current_instrument, instrument_scope
+from core.market_policy import policy_value, active_policy
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
 try:
@@ -199,7 +200,7 @@ class QCfg:
             pass
         return base
     @staticmethod
-    def MARGIN_PCT() -> float: return float(_cfg("QUANT_MARGIN_PCT", 0.20))
+    def MARGIN_PCT() -> float: return float(policy_value("margin_pct", _cfg("QUANT_MARGIN_PCT", 0.20)))
     @staticmethod
     def LOT_STEP() -> float:
         inst = current_instrument()
@@ -216,7 +217,7 @@ class QCfg:
         if inst is not None and inst.max_qty > 0: return float(inst.max_qty)
         return float(_cfg("MAX_POSITION_SIZE", 1.0))
     @staticmethod
-    def MIN_MARGIN_USDT() -> float: return float(_cfg("MIN_MARGIN_PER_TRADE", 1.0))
+    def MIN_MARGIN_USDT() -> float: return float(policy_value("min_margin_usd", _cfg("MIN_MARGIN_PER_TRADE", 1.0)))
     @staticmethod
     def COMMISSION_RATE() -> float: return float(_cfg("COMMISSION_RATE", 0.00055))
     @staticmethod
@@ -228,7 +229,7 @@ class QCfg:
             return float(getter())
         return float(_cfg("TICK_SIZE", 0.1))
     @staticmethod
-    def SLIPPAGE_TOL() -> float: return float(_cfg("QUANT_SLIPPAGE_TOLERANCE", 0.0005))
+    def SLIPPAGE_TOL() -> float: return float(policy_value("slippage_tolerance", _cfg("QUANT_SLIPPAGE_TOLERANCE", 0.0005)))
     @staticmethod
     def VWAP_ENTRY_ATR_MULT() -> float: return float(_cfg("QUANT_VWAP_ENTRY_ATR_MULT", 1.2))
     @staticmethod
@@ -244,7 +245,7 @@ class QCfg:
     @staticmethod
     def SL_BUFFER_ATR_MULT() -> float:
         return _adaptive_param_value(
-            "sl_buffer_atr", _cfg("QUANT_SL_BUFFER_ATR_MULT", 0.4), 0.05, 5.0)
+            "sl_buffer_atr", policy_value("sl_buffer_atr_mult", _cfg("QUANT_SL_BUFFER_ATR_MULT", 0.4)), 0.05, 5.0)
     @staticmethod
     def TP_VWAP_FRACTION() -> float: return float(_cfg("QUANT_TP_VWAP_FRACTION", 0.50))
     @staticmethod
@@ -260,7 +261,7 @@ class QCfg:
     @staticmethod
     def TRAIL_VOL_DECAY_MULT() -> float: return float(_cfg("QUANT_TRAIL_VOL_DECAY_MULT", 0.6))
     @staticmethod
-    def MIN_RR_RATIO() -> float: return float(_cfg("MIN_RISK_REWARD_RATIO", 2.0))
+    def MIN_RR_RATIO() -> float: return float(policy_value("min_rr", _cfg("MIN_RISK_REWARD_RATIO", 2.0)))
     @staticmethod
     def ATR_PERIOD() -> int: return int(_cfg("SL_ATR_PERIOD", 14))
     @staticmethod
@@ -276,35 +277,35 @@ class QCfg:
         backward compat only — it is NOT used in any trail logic."""
         return int(_cfg("TRAILING_SL_CHECK_INTERVAL", 10))
     @staticmethod
-    def TRAIL_MIN_MOVE_ATR() -> float: return float(_cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08))
+    def TRAIL_MIN_MOVE_ATR() -> float: return float(policy_value("trail_min_move_atr", _cfg("SL_MIN_IMPROVEMENT_ATR_MULT", 0.08)))
     @staticmethod
-    def CVD_WINDOW() -> int: return int(_cfg("QUANT_CVD_WINDOW", 20))
+    def CVD_WINDOW() -> int: return int(policy_value("cvd_window", _cfg("QUANT_CVD_WINDOW", 20)))
     @staticmethod
     def CVD_HIST_MULT() -> int: return int(_cfg("QUANT_CVD_HIST_MULT", 15))
     @staticmethod
-    def VWAP_WINDOW() -> int: return int(_cfg("QUANT_VWAP_WINDOW", 50))
+    def VWAP_WINDOW() -> int: return int(policy_value("vwap_window", _cfg("QUANT_VWAP_WINDOW", 50)))
     @staticmethod
     def EMA_FAST() -> int: return int(_cfg("QUANT_EMA_FAST", 8))
     @staticmethod
     def EMA_SLOW() -> int: return int(_cfg("QUANT_EMA_SLOW", 21))
     @staticmethod
-    def MIN_1M_BARS() -> int: return int(_cfg("MIN_CANDLES_1M", 80))
+    def MIN_1M_BARS() -> int: return int(policy_value("min_1m_bars", _cfg("MIN_CANDLES_1M", 80)))
     @staticmethod
-    def MIN_5M_BARS() -> int: return int(_cfg("MIN_CANDLES_5M", 60))
+    def MIN_5M_BARS() -> int: return int(policy_value("min_5m_bars", _cfg("MIN_CANDLES_5M", 60)))
     @staticmethod
     def ATR_PCTILE_WINDOW() -> int: return int(_cfg("QUANT_ATR_PCTILE_WINDOW", 100))
     @staticmethod
-    def ATR_MIN_PCTILE() -> float: return float(_cfg("QUANT_ATR_MIN_PCTILE", 0.05))
+    def ATR_MIN_PCTILE() -> float: return float(policy_value("atr_min_pctile", _cfg("QUANT_ATR_MIN_PCTILE", 0.05)))
     @staticmethod
-    def ATR_MAX_PCTILE() -> float: return float(_cfg("QUANT_ATR_MAX_PCTILE", 0.97))
+    def ATR_MAX_PCTILE() -> float: return float(policy_value("atr_max_pctile", _cfg("QUANT_ATR_MAX_PCTILE", 0.97)))
     @staticmethod
-    def MAX_HOLD_SEC() -> int: return int(_cfg("QUANT_MAX_HOLD_SEC", 2400))
+    def MAX_HOLD_SEC() -> int: return int(policy_value("max_hold_sec", _cfg("QUANT_MAX_HOLD_SEC", 2400)))
     @staticmethod
-    def COOLDOWN_SEC() -> int: return int(_cfg("QUANT_COOLDOWN_SEC", 300))
+    def COOLDOWN_SEC() -> int: return int(policy_value("cooldown_sec", _cfg("QUANT_COOLDOWN_SEC", 300)))
     @staticmethod
-    def LOSS_LOCKOUT_SEC() -> int: return int(_cfg("QUANT_LOSS_LOCKOUT_SEC", 5400))
+    def LOSS_LOCKOUT_SEC() -> int: return int(policy_value("loss_lockout_sec", _cfg("QUANT_LOSS_LOCKOUT_SEC", 5400)))
     @staticmethod
-    def TICK_EVAL_SEC() -> float: return float(_cfg("ENTRY_EVALUATION_INTERVAL_SECONDS", 1))
+    def TICK_EVAL_SEC() -> float: return float(policy_value("tick_eval_sec", _cfg("ENTRY_EVALUATION_INTERVAL_SECONDS", 1)))
     @staticmethod
     def POS_SYNC_SEC() -> float: return float(_cfg("QUANT_POS_SYNC_SEC", 30))
     @staticmethod
@@ -328,14 +329,14 @@ class QCfg:
     @staticmethod
     def HTF_VETO_STRENGTH() -> float: return float(_cfg("QUANT_HTF_VETO_STRENGTH", 0.70))
     @staticmethod
-    def OB_DEPTH_LEVELS() -> int: return int(_cfg("QUANT_OB_DEPTH_LEVELS", 5))
+    def OB_DEPTH_LEVELS() -> int: return int(policy_value("ob_depth_levels", _cfg("QUANT_OB_DEPTH_LEVELS", 5)))
     @staticmethod
     def OB_HIST_LEN() -> int: return int(_cfg("QUANT_OB_HIST_LEN", 60))
     @staticmethod
-    def TICK_AGG_WINDOW_SEC() -> float: return float(_cfg("QUANT_TICK_AGG_WINDOW_SEC", 30.0))
+    def TICK_AGG_WINDOW_SEC() -> float: return float(policy_value("tick_agg_window_sec", _cfg("QUANT_TICK_AGG_WINDOW_SEC", 30.0)))
     # ── New v4.1 accessors ──────────────────────────────────────
     @staticmethod
-    def TP_MAX_RR() -> float: return float(_cfg("QUANT_TP_MAX_RR", 3.5))
+    def TP_MAX_RR() -> float: return float(policy_value("max_rr", _cfg("QUANT_TP_MAX_RR", 3.5)))
     @staticmethod
     def SL_SWING_DENSITY_WINDOW() -> float: return float(_cfg("QUANT_SL_SWING_DENSITY_WINDOW", 0.30))
     @staticmethod
@@ -2860,13 +2861,54 @@ class QuantStrategy:
             self._post_trade_agent, "set_ic_gate_notifier"
         ):
             try:
-                self._post_trade_agent.set_ic_gate_notifier(send_telegram_message)
+                self._post_trade_agent.set_ic_gate_notifier(lambda m, **kw: self._send_telegram(m, event_type="post_trade", **kw))
             except Exception:
                 pass
 
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
         self._log_init()
+
+    def _telegram_context(self) -> dict:
+        """Runtime context attached to every asset-specific Telegram alert."""
+        try:
+            p = getattr(self, "_pos", None)
+            phase = getattr(getattr(p, "phase", None), "name", "UNKNOWN")
+            price = float(getattr(self, "_last_known_price", 0.0) or 0.0)
+            ctx = {
+                "state": phase,
+                "price": price if price > 0 else None,
+                "leverage": QCfg.LEVERAGE(),
+            }
+            if p is not None and not getattr(p, "is_flat", lambda: True)():
+                ctx.update({
+                    "position_side": getattr(p, "side", ""),
+                    "entry": getattr(p, "entry_price", 0.0),
+                    "sl": getattr(p, "sl_price", 0.0),
+                    "tp": getattr(p, "tp_price", 0.0),
+                    "qty": getattr(p, "quantity", 0.0),
+                })
+            return ctx
+        except Exception:
+            return {}
+
+    def _send_telegram(self, message: str, parse_mode: str = "HTML", *, event_type: str = None, **kwargs) -> bool:
+        """Asset-aware Telegram send wrapper for this strategy instance."""
+        try:
+            ctx = self._telegram_context()
+            extra_ctx = kwargs.pop("context", None)
+            if isinstance(extra_ctx, dict):
+                ctx.update(extra_ctx)
+            return send_telegram_message(
+                message,
+                parse_mode=parse_mode,
+                instrument=getattr(self, "_instrument", None),
+                event_type=event_type,
+                context=ctx,
+                **kwargs,
+            )
+        except Exception:
+            return send_telegram_message(message, parse_mode=parse_mode)
 
     def _log_init(self):
         logger.info("=" * 72)
@@ -3887,7 +3929,7 @@ class QuantStrategy:
         except Exception:
             pass
         try:
-            send_telegram_message(
+            self._send_telegram(
                 f"⚠️ <b>ENTRY ENGINE SELF-RECOVERY</b>\n"
                 f"State: {state_name} for {age_sec:.0f}s\n"
                 f"Reconcile latches cleared; next tick will re-evaluate state."
@@ -4030,7 +4072,7 @@ class QuantStrategy:
                         self._finalise_exit()
                 else:
                     logger.warning("⚠️ EXITING stuck >120s — recording PnL then force-finalising")
-                    send_telegram_message(
+                    self._send_telegram(
                         "⚠️ <b>EXITING TIMEOUT</b>\n"
                         "Stuck in EXITING phase for >120s.\n"
                         "Recording PnL=0 (unconfirmed) and resetting to FLAT.\n"
@@ -4083,7 +4125,7 @@ class QuantStrategy:
                             f"⚠️ ENTERING watchdog [{_stage}]: >{int(_limit)}s "
                             f"elapsed={_elapsed:.0f}s without fill — forcing FLAT "
                             f"(check exchange for orphaned position)")
-                        send_telegram_message(
+                        self._send_telegram(
                             f"⚠️ <b>ENTERING TIMEOUT</b>\n"
                             f"Stage: {_stage}  elapsed={_elapsed:.0f}s  limit={int(_limit)}s\n"
                             f"State reset to FLAT.\n"
@@ -4905,7 +4947,7 @@ class QuantStrategy:
                                 _htf_b  = str(getattr(self._htf, 'htf_bias', '') or '') if self._htf else ''
                             except Exception:
                                 pass
-                        send_telegram_message(format_direction_hunt_alert(
+                        self._send_telegram(format_direction_hunt_alert(
                             predicted           = _hunt.predicted,
                             confidence          = _hunt.confidence,
                             delivery_direction  = _hunt.delivery_direction,
@@ -6679,7 +6721,7 @@ class QuantStrategy:
         except Exception:
             pass
         _sep = "━━━━━━━━━━━━━━━━━━━━"
-        send_telegram_message(
+        self._send_telegram(
             f"{'🟢' if side == 'long' else '🔴'} <b>{side.upper()} OPENED</b>  <code>{_et_label}</code>\n"
             f"{_sep}\n"
             f"<b>Decision</b>\n"
@@ -6863,7 +6905,7 @@ class QuantStrategy:
                         with self._lock:
                             pos.pool_gate_reverse_notice_key = _gate_key
                             pos.pool_gate_reverse_notice_at = now
-                        # Downgraded WARNING→INFO: send_telegram_message() below
+                        # Downgraded WARNING→INFO: self._send_telegram() below
                         # already delivers the Telegram alert.  WARNING level would
                         # cause TelegramLogHandler to send a second duplicate message.
                         logger.info(
@@ -6973,7 +7015,7 @@ class QuantStrategy:
                                 logger.info(
                                     f"🔒 POOL-GATE REVERSE → SL migrated to BE "
                                     f"${_safe_be_tick:,.2f} (no exit; bracket manages)")
-                                send_telegram_message(
+                                self._send_telegram(
                                     f"⚠️ <b>POOL-GATE: STRUCTURAL REVERSAL SIGNAL</b>\n"
                                     f"Pool hit with contra AMD flow — <b>no exit taken</b>\n"
                                     f"SL migrated to breakeven: <b>${_safe_be_tick:,.2f}</b>\n"
@@ -6990,7 +7032,7 @@ class QuantStrategy:
                         # Send awareness-only alert so operator can see the signal.
                         try:
                             from telegram.notifier import format_pool_gate_alert
-                            send_telegram_message(format_pool_gate_alert(
+                            self._send_telegram(format_pool_gate_alert(
                                 action        = "hold",
                                 confidence    = _gate.confidence,
                                 reason        = f"[REVERSE signal — no exit] {_gate.reason}",
@@ -7002,7 +7044,7 @@ class QuantStrategy:
                                 atr           = self._atr_5m.atr if self._atr_5m else 0.0,
                             ))
                         except Exception:
-                            send_telegram_message(
+                            self._send_telegram(
                                 f"⚠️ <b>POOL-GATE: REVERSE SIGNAL (no exit)</b>\n"
                                 f"SL already at/beyond BE — bracket manages\n"
                                 f"Conf: {_gate.confidence:.0%} | {_gate.reason[:150]}")
@@ -7386,7 +7428,7 @@ class QuantStrategy:
                   f"({', '.join(reason_bits)})")
         logger.info("🛡️ PROFIT DEFENSE EXIT — %s", reason)
         try:
-            send_telegram_message(
+            self._send_telegram(
                 f"🛡️ <b>PROFIT DEFENSE EXIT</b>\n"
                 f"MFE: <b>{mfe_atr:.2f}ATR</b> | Giveback: <b>{giveback:.0%}</b>\n"
                 f"True BE: <b>${true_be:,.2f}</b> | Mark: <b>${price:,.2f}</b>\n"
@@ -7731,7 +7773,7 @@ class QuantStrategy:
                 logger.critical(
                     "💀 TRAIL: SL replace returned UNPROTECTED — "
                     "position has no stop-loss on exchange. Emergency-flattening.")
-                send_telegram_message(
+                self._send_telegram(
                     "🚨 <b>UNPROTECTED POSITION</b>\n"
                     "SL could not be moved or restored.\n"
                     "Emergency-flattening at market.")
@@ -7794,9 +7836,8 @@ class QuantStrategy:
             setattr(self, _trail_tg_key, now)
             try:
                 from telegram.notifier import format_liquidity_trail_update
-                from telegram.notifier import send_telegram_message as _stm
                 _a = _liq_result.anchor
-                _stm(format_liquidity_trail_update(
+                self._send_telegram(format_liquidity_trail_update(
                     side          = pos.side,
                     new_sl        = _new_liq_sl,
                     anchor_price  = (_a.price if _a else pos.entry_price),
@@ -7875,7 +7916,7 @@ class QuantStrategy:
         planned_rr   = tp_dist / init_sl_dist if init_sl_dist > 1e-10 else 0.0
         result_icon  = "✅" if pnl_est > 0 else "❌"
 
-        send_telegram_message(
+        self._send_telegram(
             f"🚪 <b>CLOSING POSITION — {reason.upper()}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
@@ -8074,7 +8115,7 @@ class QuantStrategy:
                 logger.warning(
                     f"⚠️ EXIT CONFIRMED via position check (order state unavailable). "
                     f"Estimated PnL from best available price ${_last_price:,.2f}: ${_approx_pnl:.2f}")
-                send_telegram_message(
+                self._send_telegram(
                     f"⚠️ <b>EXIT CONFIRMED (position fallback)</b>\n"
                     f"Individual order state unavailable but position is FLAT.\n"
                     f"Approx PnL: ${_approx_pnl:.2f}\n"
@@ -8100,7 +8141,7 @@ class QuantStrategy:
                 logger.critical(
                     "💀 EXIT UNCONFIRMED but exchange position is STILL OPEN — "
                     "refusing to record phantom FLAT. Triggering emergency flatten.")
-                send_telegram_message(
+                self._send_telegram(
                     "🚨 <b>EXIT UNCONFIRMED + EXCHANGE STILL OPEN</b>\n"
                     "Emergency-flattening to force a known-flat state.\n"
                     f"Entry: ${pos.entry_price:,.2f} | Side: {pos.side.upper()}")
@@ -8130,7 +8171,7 @@ class QuantStrategy:
                 f"⚠️ EXIT UNCONFIRMED after {len(_retry_delays)+1} attempts — closing FLAT with pnl=0. "
                 f"SL order={_sl_disp} TP order={_tp_disp}"
             )
-            send_telegram_message(
+            self._send_telegram(
                 f"⚠️ <b>EXIT UNCONFIRMED</b>\n"
                 f"Exchange did not confirm after {len(_retry_delays)+1} attempts ({sum(_retry_delays)+0:.0f}s).\n"
                 f"PnL recorded as $0.00 — verify on Delta dashboard.\n"
@@ -8325,7 +8366,7 @@ class QuantStrategy:
         except Exception:
             pass
 
-        send_telegram_message(
+        self._send_telegram(
             f"{result_icon} <b>{result_color} — {result_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Side:     {pos.side.upper()} [{pos.trade_mode.upper()}]\n"
@@ -8522,7 +8563,7 @@ class QuantStrategy:
                         from strategy.post_trade_agent import format_trade_analysis_alert
                         _last_rec = self._post_trade_agent.records[-1]
                         _wr       = self._post_trade_agent._stats_overall.bayes.mean
-                        send_telegram_message(format_trade_analysis_alert(
+                        self._send_telegram(format_trade_analysis_alert(
                             _last_rec, _wr,
                             agent=self._post_trade_agent,
                         ))
@@ -8531,7 +8572,7 @@ class QuantStrategy:
                             from post_trade_agent import format_trade_analysis_alert
                             _last_rec = self._post_trade_agent.records[-1]
                             _wr       = self._post_trade_agent._stats_overall.bayes.mean
-                            send_telegram_message(format_trade_analysis_alert(
+                            self._send_telegram(format_trade_analysis_alert(
                                 _last_rec, _wr,
                                 agent=self._post_trade_agent,
                             ))
@@ -9057,9 +9098,13 @@ class QuantStrategy:
         ic_mult = float(getattr(self, "_active_ic_size_mult", 1.0) or 1.0)
         post_exit_mult = float(getattr(self, "_active_post_exit_size_mult", 1.0) or 1.0)
         spread_cost_mult = float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0)
+        try:
+            policy_risk_mult = float(policy_value("risk_multiplier", 1.0))
+        except Exception:
+            policy_risk_mult = 1.0
         total_mult = max(
-            0.10,
-            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult * spread_cost_mult),
+            0.05,
+            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult * spread_cost_mult * policy_risk_mult),
         )
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────
@@ -9669,6 +9714,7 @@ class QuantStrategy:
             # DirectionEngine state
             direction_hunt=direction_hunt,
             direction_ps_analysis=direction_ps_analysis,
+            instrument=getattr(self, "_instrument", None),
         )
 
     # ─── RECONCILIATION (unchanged logic, fixed PnL) ───
@@ -9809,7 +9855,7 @@ class QuantStrategy:
             # Reset duplicate guards for the newly adopted position
             self._exit_completed = False
             logger.warning(f"⚡ RECONCILE: adopted {iside.upper()} @ ${ex_entry:,.2f}")
-            send_telegram_message(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
+            self._send_telegram(f"⚡ <b>POSITION ADOPTED</b>\nSide: {iside.upper()} | Size: {ex_size}\nEntry: ${ex_entry:,.2f} | uPnL: ${ex_upnl:+.2f}")
 
             # ── FIX-ADOPT-ENGINE: Wire all per-position stateful engines at adoption.
             # ─────────────────────────────────────────────────────────────────────────

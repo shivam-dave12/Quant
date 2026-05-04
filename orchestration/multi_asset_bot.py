@@ -28,6 +28,8 @@ from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 from risk.risk_manager import RiskManager
+from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
+from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
 
@@ -65,7 +67,7 @@ class AssetContext:
             return False
 
 
-class PortfolioGuard:
+class _LegacyPortfolioGuard:
     """
     Account-level exposure coordinator.
 
@@ -174,7 +176,7 @@ class PortfolioGuard:
         return adjusted
 
 
-class PortfolioRiskManager(RiskManager):
+class _LegacyPortfolioRiskManager(RiskManager):
     """RiskManager wrapper that exposes a per-contract balance slice."""
     def __init__(self, shared_api=None, *, allocator: Callable[[Optional[AssetContext], List[AssetContext], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]], context_getter: Callable[[], Optional[AssetContext]], contexts_getter: Callable[[], List[AssetContext]]):
         super().__init__(shared_api=shared_api)
@@ -197,7 +199,7 @@ class MultiAssetQuantBot:
     def __init__(self) -> None:
         self.running = False
         self.contexts: List[AssetContext] = []
-        self.guard = PortfolioGuard()
+        self.guard = PortfolioManager()
         self.discovery_report: Optional[DiscoveryReport] = None
         self.registry: Optional[InstrumentRegistry] = None
         self.trading_enabled = True
@@ -303,7 +305,11 @@ class MultiAssetQuantBot:
                 budget_txt = "slot=n/a"
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
             lev_txt = f" · lev≤{inst.max_leverage:g}x" if getattr(inst, "max_leverage", 0.0) else ""
-            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt}")
+            try:
+                pol_txt = self.guard.report_line(ctx)
+            except Exception:
+                pol_txt = "policy=n/a"
+            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt} · {esc(pol_txt)}")
         if self.discovery_report and self.discovery_report.unavailable:
             lines.append("\n<b>Unavailable:</b>")
             for aid, reason in self.discovery_report.unavailable.items():
@@ -373,6 +379,7 @@ class MultiAssetQuantBot:
             allocator=self.guard.allocate_balance,
             context_getter=lambda: ctx_holder.get("ctx"),
             contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
+            manager=self.guard,
         )
         strategy = QuantStrategy(router, instrument=inst)
         data.register_strategy(strategy)
@@ -380,33 +387,50 @@ class MultiAssetQuantBot:
         ctx_holder["ctx"] = ctx
         return ctx
 
+    def _start_one_context(self, ctx: AssetContext) -> bool:
+        inst = ctx.instrument
+        try:
+            with instrument_scope(inst):
+                logger.info("▶️ Starting %s [%s/%s] | %s", inst.asset_id, inst.primary_exchange.value, inst.display_symbol, self.guard.report_line(ctx))
+                target_lev = self._instrument_leverage(inst)
+                effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
+                max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
+                logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
+                if not ctx.data_manager.start():
+                    logger.error("%s data stream start failed", inst.asset_id)
+                    return False
+                ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
+                ctx.ready = bool(ready)
+                if not ready:
+                    logger.error("%s data manager not ready", inst.asset_id)
+                    return False
+                venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+                logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
+                return True
+        except Exception:
+            logger.exception("%s start failed", inst.asset_id)
+            return False
+
     def start(self) -> bool:
         if not self.contexts:
             logger.error("No contexts initialised")
             return False
-        ok_any = False
+        parallelism = max(1, int(getattr(config, "SCANNER_START_PARALLELISM", 4)))
+        ok_flags: Dict[str, bool] = {}
+        sem = threading.Semaphore(parallelism)
+        threads = []
+
+        def _runner(c: AssetContext):
+            with sem:
+                ok_flags[c.instrument.asset_id] = self._start_one_context(c)
+
         for ctx in self.contexts:
-            inst = ctx.instrument
-            try:
-                with instrument_scope(inst):
-                    logger.info("▶️ Starting %s [%s/%s]", inst.asset_id, inst.primary_exchange.value, inst.display_symbol)
-                    target_lev = self._instrument_leverage(inst)
-                    effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
-                    max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
-                    logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
-                    if not ctx.data_manager.start():
-                        logger.error("%s data stream start failed", inst.asset_id)
-                        continue
-                    ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
-                    ctx.ready = bool(ready)
-                    if not ready:
-                        logger.error("%s data manager not ready", inst.asset_id)
-                        continue
-                    ok_any = True
-                    venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
-                    logger.info("✅ %s ready @ %.4f | venues=%s", inst.asset_id, ctx.data_manager.get_last_price(), venues)
-            except Exception:
-                logger.exception("%s start failed", inst.asset_id)
+            t = threading.Thread(target=_runner, args=(ctx,), name=f"asset-start-{ctx.instrument.asset_id}", daemon=True)
+            t.start(); threads.append(t)
+        for t in threads:
+            t.join()
+
+        ok_any = any(ok_flags.values())
         if not ok_any:
             return False
         self.running = True
@@ -416,18 +440,19 @@ class MultiAssetQuantBot:
         return True
 
     def _startup_message(self) -> str:
-        lines = ["⚡ <b>MULTI-ASSET INSTITUTIONAL BOT STARTED</b>", ""]
-        lines.append("<b>Execution universe:</b>")
+        lines = ["🏛 <b>PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
+        lines.append("<b>Execution universe — asset-scoped strategy desks:</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
             lev = self._instrument_leverage(inst)
-            lines.append(f"• <b>{inst.asset_id}</b> — primary {inst.primary_exchange.value.upper()} {inst.display_symbol}; venues: {venues}; leverage target {lev}x")
+            pol = active_policy(inst)
+            lines.append(f"• <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {pol.evaluation_interval_sec:.2f}s")
         lines.append("")
         lines.append("<b>Portfolio rules:</b>")
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
-        lines.append(f"• Balance allocation: {self.guard.budget_mode}; each contract receives a slot-scoped balance before BTC-style sizing")
+        lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
         lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
         lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
         return "\n".join(lines)
@@ -439,6 +464,9 @@ class MultiAssetQuantBot:
                 now_ms = int(time.time() * 1000)
                 for ctx in list(self.contexts):
                     if not ctx.ready:
+                        continue
+                    interval = self.guard.evaluation_interval(ctx)
+                    if not ctx.has_position and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:
                         continue
                     allowed, reason = self.guard.can_evaluate_entry(ctx, self.contexts)
                     if not allowed and not ctx.has_position:
@@ -489,9 +517,10 @@ class MultiAssetQuantBot:
             state = ctx.phase_name if pos else "SCANNING"
             with instrument_scope(inst):
                 logger.info(
-                    "ANALYSIS_TICK asset=%s primary=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d",
+                    "ANALYSIS_TICK asset=%s primary=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d %s",
                     inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
                     state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                    self.guard.report_line(ctx),
                 )
         except Exception as e:
             logger.debug("analysis audit failed for %s: %s", ctx.instrument.asset_id, e)
@@ -547,3 +576,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# Backward-compatible test/import alias. Runtime uses PortfolioManager.
+PortfolioGuard = PortfolioManager

@@ -277,8 +277,10 @@ class InstrumentRegistry:
         try:
             if hasattr(api, "get_instrument_info"):
                 rows = _unwrap_list(api.get_instrument_info(exchange="EXCHANGE_2"))
-            if not rows and hasattr(api, "get_futures_tickers"):
-                rows = _unwrap_list(api.get_futures_tickers(exchange="EXCHANGE_2"))
+            # CoinSwitch ticker endpoint requires an explicit symbol; never call
+            # the generic ticker URL because it returns 422 "Input symbol is missing"
+            # and wastes startup time.  Missing all-instrument rows are handled by
+            # _augment_coinswitch_from_requested(), which probes exact symbols.
         except Exception as e:
             logger.warning("CoinSwitch instrument discovery failed: %s", e, exc_info=True)
             rows = []

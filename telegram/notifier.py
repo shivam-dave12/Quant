@@ -334,7 +334,122 @@ def _ensure_worker_started() -> None:
         _worker_started = True
 
 
-def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
+
+
+# ======================================================================
+# MULTI-ASSET TELEGRAM CONTEXT ENRICHMENT
+# ======================================================================
+
+def _tg_current_instrument():
+    try:
+        from core.instruments import current_instrument
+        return current_instrument()
+    except Exception:
+        return None
+
+
+def _tg_asset_policy(inst):
+    try:
+        from core.market_policy import active_policy
+        return active_policy(inst)
+    except Exception:
+        return None
+
+
+def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str, Any]] = None) -> str:
+    """Build an institutional asset-specific Telegram header.
+
+    This is intentionally centralised so legacy BTC-era messages can still be
+    sent by strategy code while Telegram always receives the correct contract,
+    venue, policy, phase and portfolio context.
+    """
+    inst = inst or _tg_current_instrument()
+    if inst is None:
+        return ""
+    context = context or {}
+    try:
+        asset = _esc(getattr(inst, "asset_id", "ASSET"))
+        name = _esc(getattr(inst, "display_name", asset))
+        primary = getattr(inst, "primary_exchange", None)
+        primary_name = _esc(getattr(primary, "value", str(primary or "-")).upper())
+        symbol = _esc(getattr(inst, "display_symbol", getattr(inst, "execution_symbol", "-")))
+        asset_class = _esc(getattr(getattr(inst, "asset_class", ""), "value", str(getattr(inst, "asset_class", ""))).upper())
+        venues = []
+        for ex, ei in getattr(inst, "by_exchange", {}).items():
+            try:
+                venues.append(f"{getattr(ex,'value',str(ex)).upper()}:{getattr(ei,'display_symbol',getattr(ei,'symbol','-'))}")
+            except Exception:
+                continue
+        venue_txt = _esc(", ".join(venues) if venues else f"{primary_name}:{symbol}")
+        pol = _tg_asset_policy(inst)
+        lev = getattr(pol, "leverage", None) or context.get("leverage") or getattr(inst, "max_leverage", 0) or "-"
+        margin = getattr(pol, "margin_pct", None)
+        risk_mult = getattr(pol, "risk_multiplier", None)
+        cadence = getattr(pol, "evaluation_interval_sec", None)
+        state = _esc(str(context.get("state") or context.get("phase") or "-").upper())
+        price = context.get("price")
+        slots = context.get("slots") or context.get("portfolio_slots") or ""
+        event = _esc(str(event_type or context.get("event_type") or "STRATEGY").upper().replace("_", " "))
+        line1 = f"🏛 <b>{event}</b>  <code>{asset}</code> <i>{name}</i>"
+        line2 = f"<code>{primary_name}:{symbol}</code> · {asset_class} · venues <code>{venue_txt}</code>"
+        bits = []
+        if lev != "-":
+            try: bits.append(f"lev {float(lev):g}x")
+            except Exception: bits.append(f"lev {lev}")
+        if margin is not None:
+            try: bits.append(f"margin {float(margin):.0%}")
+            except Exception: pass
+        if risk_mult is not None:
+            try: bits.append(f"risk×{float(risk_mult):.2f}")
+            except Exception: pass
+        if cadence is not None:
+            try: bits.append(f"cadence {float(cadence):.2f}s")
+            except Exception: pass
+        if state and state != "-": bits.append(f"state {state}")
+        if price is not None:
+            try: bits.append(f"px {_tg_price(float(price))}")
+            except Exception: pass
+        if slots: bits.append(f"slots {slots}")
+        line3 = "<code>" + _esc(" | ".join(bits)) + "</code>" if bits else ""
+        return "\n".join([x for x in (line1, line2, line3, _TG_RULE) if x])
+    except Exception:
+        return ""
+
+
+def _tg_message_already_asset_scoped(message: str) -> bool:
+    m = str(message or "")[:240]
+    return ("<b>ASSET" in m or "🏛 <b>" in m or "MULTI-ASSET" in m or "EXECUTION UNIVERSE" in m)
+
+
+def _tg_infer_event_type(message: str) -> str:
+    m = str(message or "").upper()
+    if "BRACKET" in m or "ENTRY" in m or "POSITION OPEN" in m:
+        return "EXECUTION"
+    if "TRAIL" in m or "SL" in m or "STOP" in m:
+        return "RISK / TRAIL"
+    if "EXIT" in m or "PNL" in m or "TP HIT" in m:
+        return "EXIT"
+    if "POSTERIOR" in m or "P(EDGE)" in m or "EV=" in m:
+        return "POSTERIOR"
+    if "LIQUIDITY" in m or "SWEEP" in m or "POOL" in m:
+        return "LIQUIDITY"
+    if "STATUS" in m or "THINK" in m:
+        return "STATUS"
+    return "ASSET EVENT"
+
+
+def _tg_enrich_asset_message(message: str, *, instrument=None, event_type: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> str:
+    inst = instrument or _tg_current_instrument()
+    if inst is None:
+        return message
+    if _tg_message_already_asset_scoped(message):
+        return message
+    header = _tg_asset_header(inst, event_type or _tg_infer_event_type(message), context=context)
+    if not header:
+        return message
+    return f"{header}\n{message}"
+
+def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=None, event_type: Optional[str] = None, context: Optional[Dict[str, Any]] = None, enrich: bool = True) -> bool:
     """Enqueue a Telegram message for async delivery.  Never blocks the caller.
 
     Bug #36 fix: critical messages (UNPROTECTED, CRASH, KILLSWITCH, etc.) are
@@ -346,6 +461,11 @@ def send_telegram_message(message: str, parse_mode: str = "HTML") -> bool:
     if not telegram_config.TELEGRAM_ENABLED:
         return False
     message = _repair_mojibake(str(message))
+    if enrich:
+        try:
+            message = _tg_enrich_asset_message(message, instrument=instrument, event_type=event_type, context=context)
+        except Exception:
+            pass
     _ensure_worker_started()
 
     # Check if this message is critical and should bypass the queue
@@ -1467,10 +1587,14 @@ def format_periodic_report(
     pd_label = _pd(float(dealing_range_pd or 0.5))
     pnl_icon = "\U0001f7e2" if float(daily_pnl or 0) >= 0 else "\U0001f534"
 
+    _inst = _kw.get("instrument", None) or _tg_current_instrument()
+    _asset = getattr(_inst, "asset_id", "BTC") if _inst is not None else "BTC"
+    _symbol = getattr(_inst, "display_symbol", _asset) if _inst is not None else _asset
     lines = [
         f"\U0001f4ca <b>INSTITUTIONAL STATUS</b>  <code>{_esc(now_ist)}</code>",
         _TG_RULE,
-        f"<code>BTC     {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
+        f"<code>{_esc(str(_asset)):<7} {_tg_price(current_price):>14}   ATR {_tg_num(atr, 1):>7}</code>",
+        f"<code>SYMBOL  {_esc(str(_symbol)):<14}</code>",
         f"<code>BAL     {_tg_price(balance):>14}   TRD {int(total_trades):>4}   WR {float(win_rate or 0):>5.1f}%</code>",
         f"{pnl_icon} <code>DAY     {_tg_pnl(daily_pnl):>14}   ALL {_tg_pnl(total_pnl):>14}</code>",
         f"<code>STATE   {_esc((bot_state or 'SCANNING').upper()):<14} {_esc((session or '-').upper()):<10} {kz}</code>",
