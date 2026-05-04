@@ -1307,81 +1307,138 @@ class OrderManager:
                     "TAKE_PROFIT", "TAKE_PROFIT_ORDER",
                 }
 
+                expected_pid = None
+                try:
+                    expected_pid = self._adapter._get_product_id() if hasattr(self._adapter, "_get_product_id") else None
+                except Exception:
+                    expected_pid = None
+                expected_symbol = str(getattr(self._adapter, "symbol", self.symbol) or self.symbol).upper()
+                expected_exit_side = "BUY" if self._normalize_side(side) == "SELL" else "SELL"
+                tick_tol = max(
+                    float(self._active_tick_size() or 0.0) * float(getattr(config, "DELTA_BRACKET_CHILD_PRICE_TOL_TICKS", 6.0)),
+                    1e-9,
+                )
+                pct_tol = float(getattr(config, "DELTA_BRACKET_CHILD_PRICE_TOL_PCT", 0.0025))
+
+                def _raw_of(o):
+                    return (o.get("raw") or o.get("_raw") or {}) if isinstance(o, dict) else {}
+
+                def _order_pid(o):
+                    raw = _raw_of(o)
+                    prod = raw.get("product") if isinstance(raw.get("product"), dict) else {}
+                    return (o.get("product_id") or raw.get("product_id") or prod.get("id"))
+
+                def _order_symbol(o):
+                    raw = _raw_of(o)
+                    prod = raw.get("product") if isinstance(raw.get("product"), dict) else {}
+                    return str(o.get("product_symbol") or raw.get("product_symbol") or raw.get("symbol") or prod.get("symbol") or "").upper()
+
+                def _price_ok(actual: float, expected: float) -> bool:
+                    if expected <= 0:
+                        return False
+                    if actual <= 0:
+                        return True
+                    return abs(actual - expected) <= max(tick_tol, abs(expected) * pct_tol)
+
+                def _belongs_to_this_product(o) -> bool:
+                    pid = _order_pid(o)
+                    if expected_pid is not None and pid not in (None, ""):
+                        try:
+                            if int(pid) != int(expected_pid):
+                                return False
+                        except Exception:
+                            return False
+                    sym = _order_symbol(o)
+                    if sym and expected_symbol and sym != expected_symbol:
+                        return False
+                    return True
+
                 def _parse_children(open_ords):
-                    """Return (sl_oid, sl_trig, tp_oid, tp_trig) from an open-orders list."""
+                    """Return only SL/TP children that belong to this product and price plan.
+
+                    Multi-asset safety invariant: never adopt open SL/TP orders from
+                    another contract.  The pre-v13 code parsed the first STOP/TAKE
+                    orders in the account; a COIN entry adopted BTC child orders near
+                    $79k, leaving COIN effectively unprotected.
+                    """
                     _sl_o = _tp_o = ""
                     _sl_t = _tp_t = 0.0
+                    rejected = []
                     for o in (open_ords or []):
+                        raw = _raw_of(o)
                         raw_type = str(
                             o.get("type") or
-                            (o.get("raw") or {}).get("order_type") or
-                            (o.get("raw") or {}).get("stop_order_type") or ""
+                            raw.get("order_type") or
+                            raw.get("stop_order_type") or ""
                         )
-                        ot   = raw_type.upper().replace(" ", "_").replace("-", "_")
-                        trig = float(o.get("trigger_price") or
-                                     (o.get("raw") or {}).get("stop_price") or 0)
-                        oid  = o.get("order_id", "")
+                        ot = raw_type.upper().replace(" ", "_").replace("-", "_")
+                        try:
+                            trig = float(o.get("trigger_price") or raw.get("stop_price") or 0)
+                        except Exception:
+                            trig = 0.0
+                        oid = str(o.get("order_id", "") or raw.get("id", ""))
+                        side_o = str(o.get("side") or raw.get("side") or "").upper()
                         is_sl = (ot in _SL_TYPES or ("STOP" in ot and "PROFIT" not in ot and "TAKE" not in ot))
                         is_tp = (ot in _TP_TYPES or ("PROFIT" in ot or "TAKE_PROFIT" in ot))
-                        if is_sl and not _sl_o and oid:
-                            _sl_o = oid; _sl_t = trig
-                        elif is_tp and not _tp_o and oid:
-                            _tp_o = oid; _tp_t = trig
+                        if not (is_sl or is_tp) or not oid:
+                            continue
+                        if not _belongs_to_this_product(o):
+                            rejected.append((oid[:8], ot, trig, "product_mismatch", _order_symbol(o), _order_pid(o)))
+                            continue
+                        if side_o and expected_exit_side and side_o != expected_exit_side:
+                            rejected.append((oid[:8], ot, trig, "side_mismatch", side_o, expected_exit_side))
+                            continue
+                        if is_sl and not _price_ok(trig, sl_price):
+                            rejected.append((oid[:8], ot, trig, "sl_price_mismatch", sl_price, expected_symbol))
+                            continue
+                        if is_tp and not _price_ok(trig, tp_price):
+                            rejected.append((oid[:8], ot, trig, "tp_price_mismatch", tp_price, expected_symbol))
+                            continue
+                        if is_sl and not _sl_o:
+                            _sl_o = oid; _sl_t = trig or float(sl_price)
+                        elif is_tp and not _tp_o:
+                            _tp_o = oid; _tp_t = trig or float(tp_price)
+                    if rejected:
+                        logger.warning(f"Bracket child reject audit: {rejected[:8]}")
                     return _sl_o, _sl_t, _tp_o, _tp_t
 
-                # Fast path: 2 attempts x 1.5s = 3s max — covers >95% of cases
-                for _fast in range(2):
-                    time.sleep(1.5)
-                    open_ords = self.get_open_orders()
-                    raw_types = [(o.get("order_id","?")[:8], o.get("type","?")) for o in (open_ords or [])]
-                    logger.info(f"Bracket child query (fast {_fast+1}/2) — open orders: {raw_types}")
+                verify_timeout = max(3.0, float(getattr(config, "DELTA_BRACKET_CHILD_VERIFY_TIMEOUT_SEC", 18.0)))
+                verify_deadline = time.time() + verify_timeout
+                attempt = 0
+                while time.time() < verify_deadline and not (sl_oid and tp_oid):
+                    time.sleep(1.5 if attempt < 2 else 2.5)
+                    attempt += 1
+                    open_ords = self.get_open_orders(symbol=expected_symbol)
+                    raw_types = [
+                        (str(o.get("order_id", "?"))[:8], o.get("type", "?"), o.get("product_symbol") or (_raw_of(o).get("product_symbol") or ""), o.get("trigger_price", 0))
+                        for o in (open_ords or [])
+                    ]
+                    logger.info(f"Bracket child query ({attempt}) — open orders: {raw_types}")
                     sl_oid, sl_trig, tp_oid, tp_trig = _parse_children(open_ords)
                     if sl_oid and tp_oid:
-                        logger.info(f"Bracket children found on fast attempt {_fast+1}")
+                        logger.info(f"Bracket children verified on attempt {attempt}")
                         break
 
-                # Slow path: background thread resolves within 90s if still missing
-                if not (sl_oid and tp_oid):
-                    _captured_order_id = order_id
-                    _captured_om       = self
-
-                    def _bg_child_resolve():
-                        deadline = time.time() + 90.0
-                        attempt  = 0
-                        while time.time() < deadline:
-                            time.sleep(3.0 + min(attempt, 5) * 2.0)
-                            attempt += 1
-                            try:
-                                ords = _captured_om.get_open_orders()
-                                _s, _st, _t, _tt = _parse_children(ords)
-                                if _s and _t:
-                                    logger.info(
-                                        f"Bracket child bg-resolve: SL={_s[:8]}\u2026 TP={_t[:8]}\u2026 "
-                                        f"(attempt {attempt})")
-                                    if not hasattr(_captured_om, "_pending_bracket_children"):
-                                        _captured_om._pending_bracket_children = {}
-                                    _captured_om._pending_bracket_children[_captured_order_id] = {
-                                        "sl_order_id": _s, "sl_price": _st,
-                                        "tp_order_id": _t, "tp_price": _tt,
-                                    }
-                                    return
-                            except Exception as _e:
-                                logger.debug(f"Bracket child bg-resolve error: {_e}")
-                        logger.warning(
-                            f"Bracket child bg-resolve: children not found within 90s "
-                            f"for order {_captured_order_id[:8]}\u2026 — reconcile will recover SL/TP")
-
-                    import threading as _threading
-                    _threading.Thread(target=_bg_child_resolve, daemon=True).start()
-
+                data["bracket_child_verified"] = bool(sl_oid and tp_oid)
                 data["bracket_sl_order_id"] = sl_oid
                 data["bracket_tp_order_id"] = tp_oid
-                data["bracket_sl_price"]    = sl_trig
-                data["bracket_tp_price"]    = tp_trig
+                data["bracket_sl_price"] = sl_trig
+                data["bracket_tp_price"] = tp_trig
                 if sl_oid:
                     logger.info(f"  Bracket SL order: {sl_oid} @ ${sl_trig:.2f}")
                 if tp_oid:
                     logger.info(f"  Bracket TP order: {tp_oid} @ ${tp_trig:.2f}")
+                if not (sl_oid and tp_oid):
+                    data["_bracket_children_missing"] = True
+                    data["_expected_sl_price"] = float(sl_price)
+                    data["_expected_tp_price"] = float(tp_price)
+                    data["_expected_product_id"] = expected_pid
+                    data["_expected_symbol"] = expected_symbol
+                    logger.error(
+                        f"CRITICAL: Delta bracket fill {order_id[:8]}… on {expected_symbol} "
+                        f"has no verified matching SL+TP children within {verify_timeout:.0f}s; "
+                        f"expected SL=${sl_price:.2f} TP=${tp_price:.2f}. Strategy must flatten/alert."
+                    )
                 return data
 
             if status == "CANCELLED":
@@ -1850,10 +1907,36 @@ class OrderManager:
                 try: px   = float(o.get("price") or o.get("limit_price") or 0)
                 except (ValueError, TypeError): px = 0.0
                 status = str(o.get("status") or o.get("state") or "").upper()
+                # Preserve product identity through the normalisation layer.
+                # Bracket child reconciliation is product-strict in multi-asset mode.
+                raw_inner = o.get("_raw") or o.get("raw") or {}
+                prod_inner = raw_inner.get("product") if isinstance(raw_inner.get("product"), dict) else {}
+                prod_id = o.get("product_id") or raw_inner.get("product_id") or prod_inner.get("id")
+                prod_sym = str(o.get("product_symbol") or raw_inner.get("product_symbol") or raw_inner.get("symbol") or prod_inner.get("symbol") or "").upper()
+                # Product-strict filtering for Delta multi-asset order books.
+                # If identity fields are present and do not match this manager,
+                # drop the order here so child resolution cannot borrow another
+                # contract's SL/TP.  If identity fields are absent, keep it and
+                # let the caller perform price/side checks as a secondary guard.
+                try:
+                    expected_pid = self._adapter._get_product_id() if hasattr(self._adapter, "_get_product_id") else None
+                except Exception:
+                    expected_pid = None
+                expected_sym = str(getattr(self._adapter, "symbol", self.symbol) or self.symbol).upper()
+                if prod_id not in (None, "") and expected_pid is not None:
+                    try:
+                        if int(prod_id) != int(expected_pid):
+                            continue
+                    except Exception:
+                        continue
+                if prod_sym and expected_sym and prod_sym != expected_sym:
+                    continue
                 if oid:
                     result.append({"order_id": oid, "type": otype, "side": side,
                                    "quantity": qty, "trigger_price": trig,
-                                   "price": px, "status": status, "raw": o})
+                                   "price": px, "status": status,
+                                   "product_id": prod_id, "product_symbol": prod_sym,
+                                   "raw": o})
             return result
         except Exception as e:
             err_str = str(e)

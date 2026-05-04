@@ -1262,7 +1262,7 @@ HELP_TEXT = (
     "/balance      — Wallet balance\n"
     "/pause        — Pause trading (keep monitoring)\n"
     "/resume       — Resume trading\n"
-    "/trail [on|off|auto] — Adaptive exit override\n"
+    "/trail [on|off|auto] [asset] — Trailing SL control (default OFF)\n"
     "/config       — Show config values\n"
     "/set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
     "/setexchange &lt;delta|coinswitch&gt; — Switch exchange\n"

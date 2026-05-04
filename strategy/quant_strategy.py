@@ -265,7 +265,7 @@ class QCfg:
     @staticmethod
     def ATR_PERIOD() -> int: return int(_cfg("SL_ATR_PERIOD", 14))
     @staticmethod
-    def TRAIL_ENABLED() -> bool: return bool(_cfg("QUANT_TRAIL_ENABLED", True))
+    def TRAIL_ENABLED() -> bool: return bool(_cfg("QUANT_TRAIL_ENABLED", False))
     @staticmethod
     def TRAIL_BE_R() -> float: return float(_cfg("QUANT_TRAIL_BE_R", 0.3))
     @staticmethod
@@ -3744,18 +3744,21 @@ class QuantStrategy:
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
-        """v4.3: Telegram command to override trailing SL on/off, even mid-position.
-        None = use config default, True = force on, False = force off."""
+        """Telegram/operator control for SL trailing.
+
+        None  = use config default (QUANT_TRAIL_ENABLED; v14 default is OFF)
+        True  = enable liquidity/structure SL trailing for this strategy desk
+        False = disable SL trailing for this strategy desk
+
+        Disabling trailing never cancels the exchange-attached bracket SL/TP. It
+        only prevents the bot from moving/replacing the SL. This is intentional:
+        users can run fixed-bracket exits by default and turn trailing on only
+        when they explicitly command it from Telegram.
+        """
         with self._lock:
-            if enabled is False and self._pos.is_active():
-                self._pos.trail_override = None
-                logger.warning(
-                    "Trail override OFF ignored while position is active; "
-                    "protective management remains on")
-                return False
             self._pos.trail_override = enabled
             if enabled is None:
-                logger.info("Trail override cleared → using config default")
+                logger.info("Trail override cleared → using config default (%s)", "ON" if QCfg.TRAIL_ENABLED() else "OFF")
             else:
                 logger.info(f"Trail override set → {'ENABLED' if enabled else 'DISABLED'}")
 
@@ -6355,6 +6358,60 @@ class QuantStrategy:
         if filled_qty > 0 and filled_qty != qty:
             logger.info(f"⚠️ Partial fill: {filled_qty:.4f} of {qty:.4f} — using filled qty")
             qty = filled_qty
+
+        # ── v13 HARD PROTECTION INVARIANT ─────────────────────────────────────────
+        # A Delta bracket order can be filled while child SL/TP orders are still
+        # not visible.  In single-BTC mode the old code tolerated this, but in
+        # multi-asset mode that is unsafe: the open-orders response can include
+        # other products' SL/TP children.  If the exact product's child SL+TP are
+        # not verified near the intended prices, flatten immediately and alert.
+        if is_bracket and _delta_requires_native_bracket and (
+            entry_data.get("_bracket_children_missing") or not entry_data.get("bracket_child_verified", False)
+        ):
+            _inst = getattr(self, "_instrument", None)
+            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
+            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
+            _exit_side = "sell" if side == "long" else "buy"
+            _msg = (
+                f"🚨 <b>PROTECTION FAILURE — POSITION FLATTENED</b>\n"
+                f"<b>{_asset}</b> · DELTA:{_sym} · {side.upper()}\n"
+                f"Entry order filled but verified bracket children were not found on the same product.\n"
+                f"Expected SL <code>${sl_price:,.2f}</code> · TP <code>${tp_price:,.2f}</code>\n"
+                f"Entry <code>${fill_price:,.2f}</code> · Qty <code>{qty:.8g}</code>\n"
+                f"Action: reduce-only market {_exit_side.upper()} submitted; entries cooled down."
+            )
+            logger.critical(
+                f"[{_asset}|DELTA:{_sym}] PROTECTION FAILURE: verified bracket SL/TP missing; "
+                f"flattening immediately entry_order={entry_data.get('order_id')} "
+                f"expected_sl={sl_price} expected_tp={tp_price} qty={qty}"
+            )
+            try:
+                self._send_telegram(_msg, event_type="protection_failure")
+            except Exception:
+                try: send_telegram_message(_msg)
+                except Exception: pass
+            try:
+                flatten = order_manager.place_market_order(side=_exit_side, quantity=qty, reduce_only=True)
+                if not flatten:
+                    logger.critical(f"[{_asset}|DELTA:{_sym}] EMERGENCY FLATTEN FAILED after bracket protection failure")
+                    self._send_telegram(
+                        f"🚨 <b>EMERGENCY FLATTEN FAILED</b>\n<b>{_asset}</b> · DELTA:{_sym}\nManual action required immediately.",
+                        event_type="protection_failure",
+                    )
+                else:
+                    logger.critical(f"[{_asset}|DELTA:{_sym}] Emergency flatten submitted after bracket protection failure: {flatten}")
+            except Exception as _pf_e:
+                logger.critical(f"[{_asset}|DELTA:{_sym}] EMERGENCY FLATTEN EXCEPTION after protection failure: {_pf_e}", exc_info=True)
+                try:
+                    self._send_telegram(
+                        f"🚨 <b>EMERGENCY FLATTEN EXCEPTION</b>\n<b>{_asset}</b> · DELTA:{_sym}\n<code>{str(_pf_e)[:400]}</code>",
+                        event_type="protection_failure",
+                    )
+                except Exception: pass
+            self._last_exit_time = time.time()
+            self._entry_order_placed_at = 0.0
+            self._entering_since = 0.0
+            return
 
         # ── Record slippage for fee engine (PATCH 5f) ─────────────────────────────
         if self._fee_engine is not None:

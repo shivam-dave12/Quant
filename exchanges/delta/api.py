@@ -1215,6 +1215,22 @@ class DeltaAPI:
                 _stop_otype_map.get(stop_otype)
                 or otype_map.get(otype_raw, otype_raw.upper())
             )
+            # Preserve product identity.  This is mandatory in a multi-asset
+            # bot: Delta can return all open orders even when a product filter is
+            # requested, and bracket child IDs must never be adopted from another
+            # product.  The order manager performs a second defensive filter.
+            _pid = (
+                o.get("product_id")
+                or ((o.get("product") or {}) if isinstance(o.get("product"), dict) else {}).get("id")
+                or product_id
+            )
+            _psym = (
+                o.get("product_symbol")
+                or o.get("symbol")
+                or ((o.get("product") or {}) if isinstance(o.get("product"), dict) else {}).get("symbol")
+                or symbol
+                or ""
+            )
             normalised.append({
                 "order_id":      str(o.get("id", "")),
                 "type":          mapped_type,
@@ -1223,6 +1239,8 @@ class DeltaAPI:
                 "size":          _safe_float(o.get("size", 0)),
                 "side":          str(o.get("side", "")),
                 "status":        str(o.get("state", "")),
+                "product_id":    int(_pid) if str(_pid or "").isdigit() else _pid,
+                "product_symbol": str(_psym or "").upper(),
                 "_raw":          o,
             })
         resp["result"] = normalised

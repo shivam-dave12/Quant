@@ -407,7 +407,7 @@ class TelegramBotController:
             "⚙️ <b>CONTROL</b>\n"
             "  /start · /stop — Start/stop bot\n"
             "  /pause · /resume — Pause trading (keep monitoring)\n"
-            "  /trail [on|off|auto] — Adaptive exit override\n"
+            "  /trail [on|off|auto] [asset] — Trailing SL control (default OFF)\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
             "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
@@ -1638,40 +1638,62 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance: return "Bot not running."
-        strat = bot_instance.strategy
-        if not strat: return "Strategy not ready."
-        arg = (args or "").strip().lower()
-        if arg in ("on", "enable", "1", "true", "yes"):
+        if not bot_instance:
+            return "Bot not running."
+
+        raw = (args or "").strip()
+        parts = raw.split()
+        action_words = {"on", "enable", "enabled", "1", "true", "yes", "off", "disable", "disabled", "0", "false", "no", "auto", "default", "reset"}
+        action = "status"
+        asset = None
+        for part in parts:
+            low = part.lower()
+            if low in action_words and action == "status":
+                action = low
+            else:
+                asset = part.upper()
+        if parts and action == "status" and parts[0].lower() not in action_words:
+            asset = parts[0].upper()
+
+        # Multi-asset portfolio command center path.
+        if hasattr(bot_instance, "set_trailing_override") and hasattr(bot_instance, "format_trailing_control_report"):
+            if action in ("on", "enable", "enabled", "1", "true", "yes"):
+                res = bot_instance.set_trailing_override(True, asset)
+                return bot_instance.format_trailing_control_report(res)
+            if action in ("off", "disable", "disabled", "0", "false", "no"):
+                res = bot_instance.set_trailing_override(False, asset)
+                return bot_instance.format_trailing_control_report(res)
+            if action in ("auto", "default", "reset"):
+                res = bot_instance.set_trailing_override(None, asset)
+                return bot_instance.format_trailing_control_report(res)
+            return bot_instance.format_trailing_control_report()
+
+        # Single-asset fallback.
+        strat = getattr(bot_instance, "strategy", None)
+        if not strat:
+            return "Strategy not ready."
+        if action in ("on", "enable", "enabled", "1", "true", "yes"):
             strat.set_trail_override(True)
             return (
                 "🔒 <b>Trailing SL: FORCED ON</b>\n"
                 "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                "Will advance SL per phase logic regardless of config flag."
+                "Will advance SL only after explicit operator enable."
             )
-        elif arg in ("off", "disable", "0", "false", "no"):
-            changed = strat.set_trail_override(False)
-            if changed is False:
-                return (
-                    "Trailing SL remains ON for the active position.\n"
-                    "Protective management cannot be disabled mid-trade; "
-                    "use /pause to stop new entries."
-                )
+        if action in ("off", "disable", "disabled", "0", "false", "no"):
+            strat.set_trail_override(False)
             return (
                 "🔓 <b>Trailing SL: FORCED OFF</b>\n"
-                "SL will remain at initial structural level.\n"
-                "Exit will be via TP fill, SL hit, or max-hold timeout."
+                "Exchange bracket SL/TP remains live; bot will not move SL."
             )
-        else:
+        if action in ("auto", "default", "reset"):
             strat.set_trail_override(None)
-            enabled = strat.get_trail_enabled()
-            default_txt = "ON" if enabled else "OFF"
-            return (
-                f"🔄 <b>Trailing SL: AUTO</b>\n"
-                f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
-            )
+        enabled = strat.get_trail_enabled()
+        default_txt = "ON" if enabled else "OFF"
+        return (
+            f"🛡 <b>Trailing SL</b>\n"
+            f"Current effective state: <b>{default_txt}</b>\n"
+            f"Default is OFF unless explicitly enabled with <code>/trail on</code>."
+        )
 
     # ================================================================
     # /config
@@ -1715,7 +1737,7 @@ class TelegramBotController:
             f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
             "<b>Exit Controller  (adaptive EAE / liquidity / true net BE)</b>",
-            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
+            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',False)}",
             f"  Hands off: delivery inside expected adverse excursion — structural SL trusted",
             f"  BE lock: true net BE only after structure/delivery proof",
             f"  Structural: accepted swings/liquidity anchors",

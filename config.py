@@ -256,7 +256,7 @@ QUANT_OB_WALL_DEPTH            = 20
 QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
-QUANT_TRAIL_ENABLED            = True
+QUANT_TRAIL_ENABLED            = False     # default OFF; enable explicitly via Telegram /trail on
 QUANT_TRAIL_BE_R               = 1.00     # BE lock at 1.0R
 QUANT_TRAIL_LOCK_R             = 1.00     # Fib trail begins after BE checkpoint
 QUANT_TRAIL_AGGRESSIVE_R       = 3.50     # aggressive trail at 3.5R
@@ -663,3 +663,12 @@ POLICY_EQUITY_MAX_RR = 5.0
 POLICY_EQUITY_MAX_HOLD_SEC = 5400
 POLICY_EQUITY_COOLDOWN_SEC = 180
 POLICY_EQUITY_SL_BUFFER_ATR = 0.55
+
+# v13 multi-asset protection invariants
+# A Delta bracket fill is not considered safe until the bot verifies the SL and
+# TP children belong to the SAME product and are near the intended SL/TP prices.
+DELTA_BRACKET_CHILD_VERIFY_TIMEOUT_SEC = 18.0
+DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
+DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
+DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
+TELEGRAM_ALERT_PROTECTION_FAILURE = True

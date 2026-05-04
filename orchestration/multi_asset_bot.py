@@ -316,6 +316,91 @@ class MultiAssetQuantBot:
                 lines.append(f"⚪ {esc(aid)} — {esc(reason)}")
         return "\n".join(lines)
 
+    def _match_trail_contexts(self, asset_filter: Optional[str] = None) -> List[AssetContext]:
+        if not asset_filter:
+            return list(self.contexts)
+        needle = str(asset_filter).strip().upper()
+        out: List[AssetContext] = []
+        for ctx in self.contexts:
+            inst = ctx.instrument
+            symbols = {
+                str(inst.asset_id).upper(),
+                str(inst.display_symbol).upper(),
+                str(getattr(inst, "canonical_symbol", "") or "").upper(),
+            }
+            try:
+                symbols.update(str(ei.display_symbol).upper() for ei in inst.by_exchange.values())
+            except Exception:
+                pass
+            if needle in symbols:
+                out.append(ctx)
+        return out
+
+    def set_trailing_override(self, enabled: Optional[bool], asset_filter: Optional[str] = None) -> Dict[str, Any]:
+        """Portfolio-level Telegram control for SL trailing.
+
+        Default trailing is OFF. This method lets the operator enable/disable
+        trailing globally or for one asset desk without touching initial bracket
+        SL/TP protection.
+        """
+        targets = self._match_trail_contexts(asset_filter)
+        changed: List[str] = []
+        failed: List[str] = []
+        for ctx in targets:
+            try:
+                ctx.strategy.set_trail_override(enabled)
+                changed.append(ctx.instrument.asset_id)
+            except Exception as exc:
+                failed.append(f"{ctx.instrument.asset_id}:{exc}")
+        return {
+            "changed": changed,
+            "failed": failed,
+            "target": asset_filter or "ALL",
+            "enabled": enabled,
+        }
+
+    def format_trailing_control_report(self, result: Optional[Dict[str, Any]] = None) -> str:
+        def state_label(ctx: AssetContext) -> str:
+            try:
+                override = getattr(getattr(ctx.strategy, "_pos", None), "trail_override", None)
+                enabled = bool(ctx.strategy.get_trail_enabled())
+            except Exception:
+                override = None
+                enabled = False
+            if override is True:
+                mode = "FORCED ON"
+            elif override is False:
+                mode = "FORCED OFF"
+            else:
+                mode = "DEFAULT"
+            return f"{mode} / {'ON' if enabled else 'OFF'}"
+
+        lines = ["🛡 <b>TRAILING SL CONTROL</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines.append("Default: <b>OFF</b>. Bracket SL/TP remains active; only SL movement is disabled until /trail on.")
+        if result is not None:
+            enabled = result.get("enabled")
+            if enabled is True:
+                act = "ENABLED"
+            elif enabled is False:
+                act = "DISABLED"
+            else:
+                act = "RESET TO DEFAULT"
+            target = self._esc(result.get("target", "ALL"))
+            changed = ", ".join(result.get("changed") or []) or "none"
+            lines.append(f"\n<b>Command:</b> {act} · target {target}")
+            lines.append(f"<code>changed: {self._esc(changed)}</code>")
+            if result.get("failed"):
+                lines.append(f"<code>failed: {self._esc(', '.join(result['failed']))}</code>")
+        lines.append("\n<b>Desks</b>")
+        for ctx in self.contexts:
+            pos = ctx.strategy.get_position()
+            pos_txt = "LIVE" if pos else ("READY" if ctx.ready else "WARMUP")
+            lines.append(
+                f"<code>{self._esc(ctx.instrument.asset_id):<6} {self._esc(ctx.instrument.primary_exchange.value.upper()+':'+ctx.instrument.display_symbol):<18} "
+                f"trail {self._esc(state_label(ctx)):<16} {pos_txt}</code>"
+            )
+        lines.append("\n<code>/trail on</code> enables all desks · <code>/trail on COIN</code> enables one desk · <code>/trail off</code> disables movement again.")
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------------
     # Institutional command-center reports used by Telegram commands.

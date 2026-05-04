@@ -399,7 +399,7 @@ class HardeningTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
-    def test_trail_off_is_ignored_while_position_active(self):
+    def test_trail_off_can_disable_sl_movement_while_position_active(self):
         import threading
         from strategy.quant_strategy import QuantStrategy
 
@@ -412,8 +412,8 @@ class HardeningTests(unittest.TestCase):
 
         changed = strategy.set_trail_override(False)
 
-        self.assertFalse(changed)
-        self.assertIsNone(strategy._pos.trail_override)
+        self.assertTrue(changed)
+        self.assertFalse(strategy._pos.trail_override)
 
     def test_fee_to_risk_can_return_no_allocation(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
