@@ -561,6 +561,7 @@ MULTI_ASSET_ENABLED = True
 SCANNER_MAX_ACTIVE_INSTRUMENTS = 8
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
+SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
 # Portfolio slots: the bot may hold multiple contracts at once, but each
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view

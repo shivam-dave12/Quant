@@ -116,7 +116,7 @@ class DeltaDataManager:
             else:
                 logger.warning(f"Delta product_id not resolved for {symbol}")
 
-            logger.info("Delta DM: starting WebSocket...")
+            logger.info(f"Delta DM[{symbol}]: starting WebSocket...")
             self.ws = DeltaWebSocket(
                 api_key    = config.DELTA_API_KEY,
                 secret_key = config.DELTA_SECRET_KEY,
@@ -137,14 +137,14 @@ class DeltaDataManager:
                 self.ws.subscribe_account(          callback=self._on_account_update)
 
             if not self.ws.connect(timeout=30):
-                logger.error("❌ Delta WS connection failed")
+                logger.error(f"❌ Delta WS connection failed for {symbol}")
                 return False
 
             self.is_streaming = True
-            logger.info("✅ Delta WS streams started")
+            logger.info(f"✅ Delta WS streams started for {symbol}")
 
             # REST warmup
-            logger.info("Delta DM: starting REST warmup...")
+            logger.info(f"Delta DM[{symbol}]: starting REST warmup...")
             for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
@@ -172,11 +172,11 @@ class DeltaDataManager:
                         self._forming_ts[tf_key] = int(last_c.timestamp * 1000)
 
             self._warmup_complete = True
-            logger.info("✅ Delta REST warmup complete")
+            logger.info(f"✅ Delta REST warmup complete for {symbol}")
 
             self.is_ready = self._check_minimum_data()
             logger.info(
-                f"Delta DM ready={self.is_ready} "
+                f"Delta DM[{self.symbol}] ready={self.is_ready} "
                 f"(1m={len(self._candles_1m)} 5m={len(self._candles_5m)} "
                 f"15m={len(self._candles_15m)} 4h={len(self._candles_4h)})"
             )
@@ -261,7 +261,7 @@ class DeltaDataManager:
                 )
 
                 if not resp.get("success"):
-                    logger.warning(f"Delta warmup {label} attempt {attempt}: "
+                    logger.warning(f"Delta warmup {symbol} {label} attempt {attempt}: "
                                    f"{resp.get('error')}")
                     if attempt <= retries:
                         time.sleep(2.0)
@@ -292,14 +292,14 @@ class DeltaDataManager:
                         continue
 
                 if seeded > 0:
-                    logger.info(f"Delta warmup {label}: {seeded} candles")
+                    logger.info(f"Delta warmup {symbol} {label}: {seeded} candles")
                     return
                 else:
                     if attempt <= retries:
                         time.sleep(2.0)
 
             except Exception as e:
-                logger.error(f"Delta warmup {label} attempt {attempt}: {e}")
+                logger.error(f"Delta warmup {symbol} {label} attempt {attempt}: {e}")
                 if attempt <= retries:
                     time.sleep(2.0)
 

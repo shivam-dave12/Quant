@@ -116,11 +116,11 @@ class CoinSwitchDataManager:
             self.is_ready = self.is_streaming = False
             symbol = self.ws_symbol
 
-            logger.info("CoinSwitch DM: starting WebSocket...")
+            logger.info(f"CoinSwitch DM[{symbol}]: starting WebSocket...")
             self.ws = CoinSwitchWebSocket()
 
             if not self.ws.connect(timeout=30):
-                logger.error("❌ CoinSwitch WS failed to connect")
+                logger.error(f"❌ CoinSwitch WS failed to connect for {symbol}")
                 return False
 
             # Subscribe all streams
@@ -134,20 +134,20 @@ class CoinSwitchDataManager:
                 self.ws.subscribe_candlestick(symbol, interval=iv_int, callback=cb)
 
             self.is_streaming = True
-            logger.info("✅ CoinSwitch WS streams subscribed")
+            logger.info(f"✅ CoinSwitch WS streams subscribed for {symbol}")
 
             # REST warmup (rate-limited)
-            logger.info("CoinSwitch DM: REST warmup starting (3.5s between calls)...")
+            logger.info(f"CoinSwitch DM[{self.symbol}]: REST warmup starting (3.5s between calls)...")
             for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
 
             self._warmup_complete = True
-            logger.info("✅ CoinSwitch REST warmup complete")
+            logger.info(f"✅ CoinSwitch REST warmup complete for {self.symbol}")
 
             self.is_ready = self._check_minimum_data()
             logger.info(
-                f"CoinSwitch DM ready={self.is_ready} "
+                f"CoinSwitch DM[{self.symbol}] ready={self.is_ready} "
                 f"(1m={len(self._candles_1m)} 5m={len(self._candles_5m)} "
                 f"15m={len(self._candles_15m)} 4h={len(self._candles_4h)})"
             )
@@ -225,7 +225,7 @@ class CoinSwitchDataManager:
                 )
 
                 if not isinstance(resp, dict) or resp.get("error"):
-                    logger.warning(f"CoinSwitch warmup {label} attempt {attempt}: "
+                    logger.warning(f"CoinSwitch warmup {self.symbol} {label} attempt {attempt}: "
                                    f"{resp.get('error', 'unexpected response')}")
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
@@ -233,7 +233,7 @@ class CoinSwitchDataManager:
 
                 data = resp.get("data", [])
                 if not data:
-                    logger.warning(f"CoinSwitch warmup {label}: no data")
+                    logger.warning(f"CoinSwitch warmup {self.symbol} {label}: no data")
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
                     continue
@@ -260,14 +260,14 @@ class CoinSwitchDataManager:
                         continue
 
                 if seeded > 0:
-                    logger.info(f"CoinSwitch warmup {label}: {seeded} candles")
+                    logger.info(f"CoinSwitch warmup {self.symbol} {label}: {seeded} candles")
                     return
                 else:
                     if attempt <= retries:
                         time.sleep(self._WARMUP_SLEEP)
 
             except Exception as e:
-                logger.error(f"CoinSwitch warmup {label} attempt {attempt}: {e}")
+                logger.error(f"CoinSwitch warmup {self.symbol} {label} attempt {attempt}: {e}")
                 if attempt <= retries:
                     time.sleep(self._WARMUP_SLEEP)
 

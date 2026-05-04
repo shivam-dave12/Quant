@@ -44,6 +44,7 @@ class AssetContext:
     last_tick_time: float = 0.0
     last_report_sec: float = 0.0
     last_heartbeat_sec: float = 0.0
+    last_analysis_sec: float = 0.0
     ready: bool = False
 
     @property
@@ -332,21 +333,22 @@ class MultiAssetQuantBot:
         for ctx in self.contexts:
             inst = ctx.instrument
             try:
-                logger.info("▶️ Starting %s [%s/%s]", inst.asset_id, inst.primary_exchange.value, inst.display_symbol)
-                try:
-                    ctx.execution_router.set_leverage(int(config.LEVERAGE))
-                except Exception as e:
-                    logger.warning("%s leverage set failed/non-fatal: %s", inst.asset_id, e)
-                if not ctx.data_manager.start():
-                    logger.error("%s data stream start failed", inst.asset_id)
-                    continue
-                ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
-                ctx.ready = bool(ready)
-                if not ready:
-                    logger.error("%s data manager not ready", inst.asset_id)
-                    continue
-                ok_any = True
-                logger.info("✅ %s ready @ %.4f", inst.asset_id, ctx.data_manager.get_last_price())
+                with instrument_scope(inst):
+                    logger.info("▶️ Starting %s [%s/%s]", inst.asset_id, inst.primary_exchange.value, inst.display_symbol)
+                    try:
+                        ctx.execution_router.set_leverage(int(config.LEVERAGE))
+                    except Exception as e:
+                        logger.warning("%s leverage set failed/non-fatal: %s", inst.asset_id, e)
+                    if not ctx.data_manager.start():
+                        logger.error("%s data stream start failed", inst.asset_id)
+                        continue
+                    ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
+                    ctx.ready = bool(ready)
+                    if not ready:
+                        logger.error("%s data manager not ready", inst.asset_id)
+                        continue
+                    ok_any = True
+                    logger.info("✅ %s ready @ %.4f", inst.asset_id, ctx.data_manager.get_last_price())
             except Exception:
                 logger.exception("%s start failed", inst.asset_id)
         if not ok_any:
@@ -393,6 +395,7 @@ class MultiAssetQuantBot:
                     ctx.last_tick_time = time.time()
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
+                    self._maybe_analysis_audit(ctx, dt_ms)
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
@@ -406,7 +409,34 @@ class MultiAssetQuantBot:
         now = time.time()
         if now - ctx.last_heartbeat_sec >= interval:
             ctx.last_heartbeat_sec = now
-            logger.info("%s | %s", ctx.instrument.asset_id, msg)
+            with instrument_scope(ctx.instrument):
+                logger.info("%s | %s", ctx.instrument.asset_id, msg)
+
+    def _maybe_analysis_audit(self, ctx: AssetContext, dt_ms: float) -> None:
+        """Per-contract proof-of-analysis log.
+
+        This is deliberately separate from strategy internals.  It shows the
+        scanner is actually stepping every active contract, even when the
+        contract has no sweep or posterior event to report.
+        """
+        now = time.time()
+        interval = float(getattr(config, "SCANNER_ASSET_ANALYSIS_LOG_SEC", 15.0))
+        if interval <= 0 or now - ctx.last_analysis_sec < interval:
+            return
+        ctx.last_analysis_sec = now
+        try:
+            inst = ctx.instrument
+            price = ctx.data_manager.get_last_price()
+            pos = ctx.strategy.get_position()
+            state = ctx.phase_name if pos else "SCANNING"
+            with instrument_scope(inst):
+                logger.info(
+                    "ANALYSIS_TICK asset=%s primary=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d",
+                    inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
+                    state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                )
+        except Exception as e:
+            logger.debug("analysis audit failed for %s: %s", ctx.instrument.asset_id, e)
 
     def _maybe_asset_heartbeat(self, ctx: AssetContext) -> None:
         now = time.time()
@@ -417,10 +447,11 @@ class MultiAssetQuantBot:
             price = ctx.data_manager.get_last_price()
             pos = ctx.strategy.get_position()
             state = "IN_POSITION" if pos else "SCANNING"
-            logger.info("%s %s %s | price %.4f | %s | open=%d/%d",
-                        ctx.instrument.asset_id, ctx.instrument.primary_exchange.value.upper(),
-                        ctx.instrument.display_symbol, price, state,
-                        self.guard.count_open(self.contexts), self.guard.max_open_positions)
+            with instrument_scope(ctx.instrument):
+                logger.info("%s %s %s | price %.4f | %s | open=%d/%d",
+                            ctx.instrument.asset_id, ctx.instrument.primary_exchange.value.upper(),
+                            ctx.instrument.display_symbol, price, state,
+                            self.guard.count_open(self.contexts), self.guard.max_open_positions)
         except Exception as e:
             logger.debug("heartbeat failed for %s: %s", ctx.instrument.asset_id, e)
 

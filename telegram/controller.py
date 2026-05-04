@@ -2385,8 +2385,20 @@ class TelegramBotController:
             _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
             if _root not in sys.path:
                 sys.path.insert(0, _root)
-            from main import QuantBot
-            bot_instance = QuantBot()
+            # Import main for the production logging bootstrap even when Telegram
+            # starts the multi-asset runner directly.  The old path imported
+            # QuantBot from main, so logging was initialised as a side effect;
+            # without this, multi-asset Telegram starts used controller-only logs.
+            import main as _main_logging_bootstrap  # noqa: F401
+            import config as _cfg
+            if bool(getattr(_cfg, "MULTI_ASSET_ENABLED", True)):
+                from orchestration.multi_asset_bot import MultiAssetQuantBot
+                logger.info("Telegram /start selected MultiAssetQuantBot (MULTI_ASSET_ENABLED=True)")
+                bot_instance = MultiAssetQuantBot()
+            else:
+                from main import QuantBot
+                logger.info("Telegram /start selected single-symbol QuantBot (MULTI_ASSET_ENABLED=False)")
+                bot_instance = QuantBot()
             if not bot_instance.initialize():
                 self.send_message("❌ Bot init failed. Check logs.")
                 bot_running = False

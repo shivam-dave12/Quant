@@ -18,6 +18,20 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _instrument_label() -> tuple[str, str]:
+    """Return (short label, title suffix) from the active instrument scope."""
+    try:
+        from core.instruments import current_instrument
+        inst = current_instrument()
+        if inst is None:
+            return "", ""
+        short = f"{inst.asset_id} {inst.primary_exchange.value.upper()} {inst.display_symbol}"
+        title = f"{inst.asset_id} / {inst.primary_exchange.value.upper()}:{inst.display_symbol}"
+        return short, title
+    except Exception:
+        return "", ""
+
 try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
@@ -208,6 +222,7 @@ def _format_heartbeat_industry(
     market_profile: Optional[Dict] = None,
 ) -> str:
     rows: List[str] = []
+    instrument_short, instrument_title = _instrument_label()
     side_color = C.BCYN
     if position:
         side_color = C.BGRN if str(position.get("side", "")).lower() == "long" else C.BRED
@@ -220,8 +235,9 @@ def _format_heartbeat_industry(
         "premium" if dealing_range_pd < 0.75 else "deep-premium"
     )
 
+    symbol_part = f"symbol {_c(instrument_short, C.BOLD, C.BMAG)} | " if instrument_short else ""
     rows.append(
-        f"{_term_section('market')} {_c(_price(price), C.BOLD, side_color)}  "
+        f"{_term_section('market')} {symbol_part}{_c(_price(price), C.BOLD, side_color)}  "
         f"feed {feed or '-'} | exchange {exchange or '-'} | ATR {_c(f'${atr:,.1f}' if atr else '-', C.YLW)}"
     )
     rows.append(
@@ -310,7 +326,8 @@ def _format_heartbeat_industry(
         f"{_term_section('performance')} trades {total_trades} | session PnL "
         f"{_c(_price(total_pnl), _pnl_color(total_pnl))}"
     )
-    return _term_box("DELTA LIQUIDITY ENGINE", rows)
+    box_title = f"{instrument_title} LIQUIDITY ENGINE" if instrument_title else "DELTA LIQUIDITY ENGINE"
+    return _term_box(box_title, rows)
 
 
 def _format_thinking_terminal_industry(
@@ -333,8 +350,10 @@ def _format_thinking_terminal_industry(
     atr: float = 0.0,
 ) -> str:
     flow_col = C.BGRN if flow_conviction > 0.05 else (C.BRED if flow_conviction < -0.05 else C.DIM)
+    instrument_short, instrument_title = _instrument_label()
+    prefix = f"symbol {_c(instrument_short, C.BOLD, C.BMAG)} | " if instrument_short else ""
     rows = [
-        f"price {_c(_price(price), C.BCYN, C.BOLD)} | ATR {_c(f'${atr:,.1f}' if atr else '-', C.YLW)} | "
+        f"{prefix}price {_c(_price(price), C.BCYN, C.BOLD)} | ATR {_c(f'${atr:,.1f}' if atr else '-', C.YLW)} | "
         f"state {_c(engine_state or 'SCANNING', C.BOLD, C.BCYN)} | {_c(_ist_now(), C.DIM)}",
         f"flow {_c((flow_direction or 'neutral').upper(), C.BOLD, flow_col)} "
         f"[{_c(_term_progress(min(1.0, abs(flow_conviction)), 18), flow_col)}] {flow_conviction:+.2f} | "
@@ -348,7 +367,8 @@ def _format_thinking_terminal_industry(
             f"tracking {str(tracking_info.get('direction', '?')).upper()} -> "
             f"{tracking_info.get('target', '?')} | ticks {tracking_info.get('flow_ticks', 0)}"
         )
-    return _term_box("ENGINE THINKING", rows, width=92, accent=C.BCYN)
+    title = f"{instrument_title} ENGINE THINKING" if instrument_title else "ENGINE THINKING"
+    return _term_box(title, rows, width=92, accent=C.BCYN)
 
 
 def format_heartbeat(

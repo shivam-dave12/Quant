@@ -143,6 +143,26 @@ def _architecture_layer(logger_name: str, message: str = "") -> tuple[str, str]:
     return "SYSTEM", "•"
 
 
+def _current_asset_log_prefix() -> str:
+    """Return per-contract log prefix for multi-asset scoped strategy logs."""
+    try:
+        from core.instruments import current_instrument
+        inst = current_instrument()
+        if inst is None:
+            return ""
+        return f"[{inst.asset_id}|{inst.primary_exchange.value.upper()}:{inst.display_symbol}] "
+    except Exception:
+        return ""
+
+
+class AssetContextFilter(logging.Filter):
+    """Inject stable per-contract metadata into every log record."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "asset_ctx"):
+            record.asset_ctx = _current_asset_log_prefix()
+        return True
+
+
 class TerminalFormatter(ISTFormatter):
     """Architecture-aware terminal formatter.
 
@@ -194,7 +214,8 @@ class TerminalFormatter(ISTFormatter):
         color = self._LEVEL_COLOR.get(record.levelno, "") if self._enable_color else ""
         reset = self._RESET if color else ""
         layer, icon = _architecture_layer(record.name, msg)
-        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {icon} {layer:<12} | "
+        asset_ctx = getattr(record, "asset_ctx", "") or ""
+        prefix = f"{self.formatTime(record)} | {color}{level}{reset} | {icon} {layer:<12} | {asset_ctx}"
         if record.exc_info:
             msg = f"{msg}\n{self.formatException(record.exc_info)}"
         return prefix + msg.replace("\n", "\n" + " " * len(_ANSI_LOG_RE.sub("", prefix)))
@@ -237,7 +258,7 @@ class TerminalBurstFilter(logging.Filter):
             return True
 
 
-_ist_fmt = ISTFormatter(fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+_ist_fmt = ISTFormatter(fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(asset_ctx)s%(message)s")
 _term_fmt = TerminalFormatter(
     enable_color=(
         bool(getattr(sys.stdout, "isatty", lambda: False)())
@@ -248,12 +269,14 @@ _term_fmt = TerminalFormatter(
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
 _file_handler.setFormatter(_ist_fmt)
+_file_handler.addFilter(AssetContextFilter())
 
 _stream_handler = logging.StreamHandler(
     stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     if hasattr(sys.stdout, "buffer") else sys.stdout
 )
 _stream_handler.setFormatter(_term_fmt)
+_stream_handler.addFilter(AssetContextFilter())
 _stream_handler.addFilter(TerminalBurstFilter())
 
 logging.basicConfig(
