@@ -59,6 +59,42 @@ def _unwrap_list(resp) -> List[dict]:
     return []
 
 
+def _unwrap_one(resp) -> Optional[dict]:
+    """Return one market-data row from mixed exchange response shapes."""
+    rows = _unwrap_list(resp)
+    if rows:
+        return rows[0]
+    if isinstance(resp, dict):
+        data = resp.get("result", resp.get("data"))
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _ordered_aliases(intent: AssetIntent) -> List[str]:
+    """Preserve config priority; sets are unsafe for choosing among PAXG/XAUT etc."""
+    raw = [intent.asset_id, intent.display_name, *list(intent.aliases or ())]
+    out: List[str] = []
+    seen = set()
+    for x in raw:
+        n = normalise_symbol(str(x))
+        if n and n not in seen:
+            out.append(n); seen.add(n)
+    return out
+
+
+def _row_symbol(row: dict) -> str:
+    for k in ("symbol", "s", "m", "market", "pair", "product_symbol", "instrument", "instrument_name"):
+        v = row.get(k)
+        if v:
+            return str(v).upper()
+    # Common CoinSwitch nested payloads: {"exchange": "EXCHANGE_2", "data": {"BTCUSDT": {...}}}
+    for k, v in row.items():
+        if isinstance(v, dict) and normalise_symbol(str(k)).endswith(("USDT", "USD", "INR")):
+            return str(k).upper()
+    return ""
+
+
 @dataclass
 class DiscoveryReport:
     requested: List[AssetIntent] = field(default_factory=list)
@@ -132,6 +168,14 @@ class InstrumentRegistry:
                     _safe_float(p.get("lot_size")),
                     _safe_float(p.get("size_increment")),
                 )
+                specs = p.get("product_specs") if isinstance(p.get("product_specs"), dict) else {}
+                max_lev = first_positive(
+                    _safe_float(p.get("max_leverage")),
+                    _safe_float(p.get("maximum_leverage")),
+                    _safe_float(p.get("leverage")),
+                    _safe_float(specs.get("max_leverage")),
+                    _safe_float(specs.get("maximum_leverage")),
+                )
                 ei = ExchangeInstrument(
                     exchange=ExchangeName.DELTA,
                     symbol=sym,
@@ -149,6 +193,7 @@ class InstrumentRegistry:
                     min_qty=first_positive(_safe_float(p.get("min_size")), _safe_float(p.get("minimum_order_size"))),
                     max_qty=_safe_float(p.get("max_size")),
                     contract_value_btc=_safe_float(p.get("contract_value")),
+                    max_leverage=max_lev,
                     raw=p,
                 )
                 out[normalise_symbol(sym)] = ei
@@ -171,7 +216,7 @@ class InstrumentRegistry:
             logger.warning("CoinSwitch instrument discovery failed: %s", e, exc_info=True)
             rows = []
         for r in rows:
-            sym = str(r.get("symbol") or r.get("m") or r.get("market") or r.get("pair") or "").upper()
+            sym = _row_symbol(r)
             if not sym:
                 continue
             rest_sym = normalise_symbol(sym)
@@ -197,11 +242,75 @@ class InstrumentRegistry:
                 lot_step=first_positive(_safe_float(r.get("lot_size")), _safe_float(r.get("quantity_precision"))),
                 min_qty=first_positive(_safe_float(r.get("min_qty")), _safe_float(r.get("minQuantity")), _safe_float(r.get("min_size"))),
                 max_qty=first_positive(_safe_float(r.get("max_qty")), _safe_float(r.get("maxQuantity"))),
+                max_leverage=first_positive(_safe_float(r.get("max_leverage")), _safe_float(r.get("leverage")), _safe_float(r.get("maxLeverage"))),
                 raw=r,
             )
             out[normalise_symbol(rest_sym)] = ei
             out[normalise_symbol(ws_sym)] = ei
         self.coinswitch = out
+        return out
+
+    def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
+        """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
+
+        CoinSwitch docs expose per-symbol futures ticker/orderbook/klines endpoints.
+        Some accounts return only a small instrument_info subset, so BTCUSDT can be
+        tradable even when the all-instrument response is incomplete.  This is not
+        synthetic: a symbol is added only after CoinSwitch replies successfully for
+        that exact symbol.
+        """
+        if api is None:
+            return out
+        seen = set(out.keys())
+        for intent in intents:
+            # CoinSwitch is crypto futures only in the current API/page. Do not
+            # probe commodities, indices or equity-token aliases there.
+            if intent.asset_class != AssetClass.CRYPTO:
+                continue
+            candidates: List[str] = []
+            for a in _ordered_aliases(intent):
+                if a.endswith("USDT"):
+                    candidates.append(a)
+            base = normalise_symbol(intent.asset_id)
+            if base and f"{base}USDT" not in candidates:
+                candidates.append(f"{base}USDT")
+            for sym in candidates:
+                if sym in seen:
+                    continue
+                try:
+                    fn = getattr(api, "get_futures_ticker", None) or getattr(api, "get_ticker", None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        resp = fn(symbol=sym, exchange="EXCHANGE_2")
+                    except TypeError:
+                        resp = fn(sym)
+                    row = _unwrap_one(resp)
+                    if not row or str(row.get("error") or ""):
+                        continue
+                    # Require some live-market field so a generic error wrapper cannot activate it.
+                    if not any(k in row for k in ("symbol", "last_price", "mark_price", "best_bid", "best_ask", "funding_rate", "open_interest")):
+                        continue
+                    rest_sym = normalise_symbol(row.get("symbol") or sym)
+                    ws_sym = slash_symbol(rest_sym)
+                    base2, quote = rest_sym, ""
+                    for q in ("USDT", "USD", "INR"):
+                        if rest_sym.endswith(q):
+                            base2, quote = rest_sym[:-len(q)], q
+                            break
+                    ei = ExchangeInstrument(
+                        exchange=ExchangeName.COINSWITCH, symbol=rest_sym, ws_symbol=ws_sym,
+                        display_symbol=ws_sym, asset_id=normalise_symbol(base2),
+                        asset_class=AssetClass.CRYPTO, quote_asset=quote, base_asset=base2,
+                        contract_type="perpetual_futures", status="active", raw=row,
+                    )
+                    out[normalise_symbol(rest_sym)] = ei
+                    out[normalise_symbol(ws_sym)] = ei
+                    seen.add(normalise_symbol(rest_sym)); seen.add(normalise_symbol(ws_sym))
+                    logger.info("CoinSwitch live ticker validated: %s", rest_sym)
+                    break
+                except Exception as e:
+                    logger.debug("CoinSwitch live validation failed for %s: %s", sym, e)
         return out
 
     # ──────────────────────────────────────────────────────────────────────
@@ -212,13 +321,14 @@ class InstrumentRegistry:
         intents = configured_asset_intents(requested)
         delta = self.load_delta(delta_api)
         coins = self.load_coinswitch(coinswitch_api)
+        coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
         self.report = DiscoveryReport(requested=intents, raw_counts={
             "delta": len(delta), "coinswitch": len({id(v) for v in coins.values()})
         })
 
         matched: List[TradableInstrument] = []
         for intent in sorted(intents, key=lambda x: x.priority):
-            aliases = intent.alias_set()
+            aliases = _ordered_aliases(intent)
             by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
             dmatch = self._match_one(delta, aliases)
             cmatch = self._match_one(coins, aliases)
@@ -245,13 +355,14 @@ class InstrumentRegistry:
         self.report.matched = matched[:max(1, int(max_active))]
         return self.report
 
-    def _match_one(self, catalog: Dict[str, ExchangeInstrument], aliases: set[str]) -> Optional[ExchangeInstrument]:
-        # exact match first
-        for a in aliases:
+    def _match_one(self, catalog: Dict[str, ExchangeInstrument], aliases) -> Optional[ExchangeInstrument]:
+        # exact match first, preserving configured alias priority
+        alias_list = list(aliases)
+        for a in alias_list:
             if a in catalog:
                 return catalog[a]
-        # then containment, but avoid accidental tiny strings
-        aliases2 = [a for a in aliases if len(a) >= 3]
+        # then exact display/base matches, but avoid accidental tiny strings
+        aliases2 = [a for a in alias_list if len(a) >= 3]
         for key, inst in catalog.items():
             ndisp = normalise_symbol(inst.display_symbol)
             nbase = normalise_symbol(inst.base_asset)
@@ -278,5 +389,6 @@ class InstrumentRegistry:
             min_qty=inst.min_qty,
             max_qty=inst.max_qty,
             contract_value_btc=inst.contract_value_btc,
+            max_leverage=inst.max_leverage,
             raw=inst.raw,
         )

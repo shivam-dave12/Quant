@@ -63,6 +63,7 @@ class ExchangeInstrument:
     min_qty: float = 0.0
     max_qty: float = 0.0
     contract_value_btc: float = 0.0
+    max_leverage: float = 0.0
     raw: Dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -113,6 +114,13 @@ class TradableInstrument:
     def max_qty(self) -> float:
         return first_positive(self.primary.max_qty, 0.0)
 
+    @property
+    def max_leverage(self) -> float:
+        vals = [first_positive(ei.max_leverage, 0.0) for ei in self.by_exchange.values()]
+        vals = [v for v in vals if v > 0]
+        primary = first_positive(self.primary.max_leverage, 0.0)
+        return primary if primary > 0 else (max(vals) if vals else 0.0)
+
 
 _CURRENT_INSTRUMENT: contextvars.ContextVar[Optional[TradableInstrument]] = (
     contextvars.ContextVar("current_tradable_instrument", default=None)
@@ -156,34 +164,40 @@ def first_positive(*values: float) -> float:
 
 
 def default_asset_intents() -> List[AssetIntent]:
-    """Requested markets. Aliases are discovery hints only, not execution symbols."""
+    """Requested markets. Aliases are discovery hints only, not execution symbols.
+
+    IMPORTANT:
+    * SPXUSD on Delta is SPX6900 crypto, not the S&P 500 index. It is
+      intentionally NOT an alias for SPX_INDEX.
+    * xStock products are tokenized/RWA derivatives, not direct shares. They
+      are listed separately by their actual Delta symbols (AAPLXUSD, etc.).
+    """
     return [
         AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO,
                     ("BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD", "BTC"), priority=0),
         AssetIntent("OIL", "Crude Oil / WTI", AssetClass.COMMODITY,
-                    ("OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSDT", "WTIUSDT"), priority=10),
-        AssetIntent("GOLD", "Gold", AssetClass.COMMODITY,
-                    ("GOLD", "XAU", "XAUUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT"), priority=11),
-        AssetIntent("SILVER", "Silver", AssetClass.COMMODITY,
-                    ("SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"), priority=12),
-        AssetIntent("SPX", "S&P 500 / SPX", AssetClass.INDEX,
-                    ("SPX", "SP500", "S&P500", "US500", "SPXUSD", "SP500USDT"), priority=20),
-        AssetIntent("AAPL", "Apple Inc.", AssetClass.EQUITY,
-                    ("AAPL", "AAPLUSD", "AAPLUSDT"), priority=30),
-        AssetIntent("MSFT", "Microsoft Corp.", AssetClass.EQUITY,
-                    ("MSFT", "MSFTUSD", "MSFTUSDT"), priority=31),
-        AssetIntent("NVDA", "NVIDIA Corp.", AssetClass.EQUITY,
-                    ("NVDA", "NVDAUSD", "NVDAUSDT"), priority=32),
-        AssetIntent("TSLA", "Tesla Inc.", AssetClass.EQUITY,
-                    ("TSLA", "TSLAUSD", "TSLAUSDT"), priority=33),
-        AssetIntent("AMZN", "Amazon.com Inc.", AssetClass.EQUITY,
-                    ("AMZN", "AMZNUSD", "AMZNUSDT"), priority=34),
-        AssetIntent("META", "Meta Platforms Inc.", AssetClass.EQUITY,
-                    ("META", "METAUSD", "METAUSDT"), priority=35),
-        AssetIntent("GOOGL", "Alphabet Inc.", AssetClass.EQUITY,
-                    ("GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"), priority=36),
+                    ("OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"), priority=10),
+        AssetIntent("GOLD", "Gold token derivatives", AssetClass.COMMODITY,
+                    ("PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"), priority=11),
+        AssetIntent("SILVER", "Silver token derivatives", AssetClass.COMMODITY,
+                    ("SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"), priority=12),
+        AssetIntent("SPX_INDEX", "S&P 500 index", AssetClass.INDEX,
+                    ("SPX500USD", "US500", "SP500", "S&P500"), priority=20),
+        AssetIntent("AAPL", "Apple xStock token derivative", AssetClass.EQUITY,
+                    ("AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"), priority=30),
+        AssetIntent("MSFT", "Microsoft xStock token derivative", AssetClass.EQUITY,
+                    ("MSFTXUSD", "MSFTX", "MSFT", "MSFTUSD", "MSFTUSDT"), priority=31),
+        AssetIntent("NVDA", "NVIDIA xStock token derivative", AssetClass.EQUITY,
+                    ("NVDAXUSD", "NVDAX", "NVDA", "NVDAUSD", "NVDAUSDT"), priority=32),
+        AssetIntent("TSLA", "Tesla xStock token derivative", AssetClass.EQUITY,
+                    ("TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"), priority=33),
+        AssetIntent("AMZN", "Amazon xStock token derivative", AssetClass.EQUITY,
+                    ("AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"), priority=34),
+        AssetIntent("META", "Meta xStock token derivative", AssetClass.EQUITY,
+                    ("METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"), priority=35),
+        AssetIntent("GOOGL", "Alphabet xStock token derivative", AssetClass.EQUITY,
+                    ("GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"), priority=36),
     ]
-
 
 def configured_asset_intents(raw: Iterable[dict] | None = None) -> List[AssetIntent]:
     if not raw:

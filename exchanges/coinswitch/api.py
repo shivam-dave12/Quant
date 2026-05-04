@@ -450,10 +450,24 @@ class FuturesAPI:
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-asset discovery helpers (live endpoints only; no synthetic symbols)
 # ─────────────────────────────────────────────────────────────────────────────
-def _futures_api_get_futures_tickers(self, exchange: str = "EXCHANGE_2") -> Dict:
-    """Return all futures tickers when the endpoint is available."""
+def _futures_api_get_futures_ticker(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
+    """Return one confirmed futures ticker from CoinSwitch.
+
+    CoinSwitch's documented ticker endpoint is per-symbol.  The multi-asset
+    registry uses this as a live validation probe before enabling CoinSwitch as
+    a secondary/execution venue for a contract.
+    """
     endpoint = "/trade/api/v2/futures/ticker"
-    return self._make_request("GET", endpoint, params={"exchange": exchange}, payload=None)
+    return self._make_request("GET", endpoint, params={"exchange": exchange, "symbol": symbol}, payload=None)
+
+
+def _futures_api_get_futures_tickers(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
+    """Return futures ticker(s) when available; symbol is preferred by docs."""
+    endpoint = "/trade/api/v2/futures/ticker"
+    params = {"exchange": exchange}
+    if symbol:
+        params["symbol"] = symbol
+    return self._make_request("GET", endpoint, params=params, payload=None)
 
 
 def _futures_api_get_futures_instruments(self, exchange: str = "EXCHANGE_2") -> Dict:
@@ -462,6 +476,7 @@ def _futures_api_get_futures_instruments(self, exchange: str = "EXCHANGE_2") -> 
 
 
 try:
+    FuturesAPI.get_futures_ticker = _futures_api_get_futures_ticker
     FuturesAPI.get_futures_tickers = _futures_api_get_futures_tickers
     FuturesAPI.get_futures_instruments = _futures_api_get_futures_instruments
 except NameError:

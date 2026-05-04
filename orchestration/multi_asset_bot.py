@@ -154,8 +154,21 @@ class PortfolioGuard:
         adjusted["portfolio_budget_mode"] = self.budget_mode
         adjusted["portfolio_slot_count"] = slot_count
         adjusted["portfolio_slot_available"] = slot_available
+        adjusted["portfolio_slot_equity"] = slot_equity
         adjusted["portfolio_reserved_slots"] = self.count_open(contexts or [])
         adjusted["portfolio_max_slots"] = self.max_open_positions
+
+        # Sizing v5.1 separation:
+        #   • available/total above are the slot-scoped cash view used for
+        #     margin and fee-cap checks;
+        #   • risk_available/risk_total keep the portfolio equity base used for
+        #     dollar-risk sizing.  Without this separation, BTC min lot gets
+        #     rejected on small accounts because the risk target is divided by
+        #     the number of portfolio slots before the exchange lot floor is
+        #     considered.  PortfolioGuard still limits total concurrent slots;
+        #     QuantStrategy still limits actual cash/margin by the slot view.
+        adjusted["risk_available"] = raw_available
+        adjusted["risk_total"] = raw_total
         if ctx is not None:
             adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
         return adjusted
@@ -199,6 +212,14 @@ class MultiAssetQuantBot:
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
         return delta_api, cs_api
+
+
+    def _instrument_leverage(self, inst: TradableInstrument) -> int:
+        configured = max(1, int(getattr(config, "LEVERAGE", 1)))
+        max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0)
+        if max_lev > 0:
+            return max(1, min(configured, int(max_lev)))
+        return configured
 
 
     def _active_context(self) -> Optional[AssetContext]:
@@ -248,7 +269,9 @@ class MultiAssetQuantBot:
                 budget_txt = f"slot=${budget:,.2f} raw=${raw:,.2f}"
             except Exception:
                 budget_txt = "slot=n/a"
-            lines.append(f"• <b>{esc(inst.asset_id)}</b> {esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}")
+            venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+            lev_txt = f" · lev≤{inst.max_leverage:g}x" if getattr(inst, "max_leverage", 0.0) else ""
+            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt}")
         if self.discovery_report and self.discovery_report.unavailable:
             lines.append("\n<b>Unavailable:</b>")
             for aid, reason in self.discovery_report.unavailable.items():
@@ -335,10 +358,13 @@ class MultiAssetQuantBot:
             try:
                 with instrument_scope(inst):
                     logger.info("▶️ Starting %s [%s/%s]", inst.asset_id, inst.primary_exchange.value, inst.display_symbol)
+                    target_lev = self._instrument_leverage(inst)
                     try:
-                        ctx.execution_router.set_leverage(int(config.LEVERAGE))
+                        res = ctx.execution_router.set_leverage(target_lev)
+                        max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
+                        logger.info("%s leverage target=%sx%s", inst.asset_id, target_lev, max_txt)
                     except Exception as e:
-                        logger.warning("%s leverage set failed/non-fatal: %s", inst.asset_id, e)
+                        logger.warning("%s leverage set failed/non-fatal target=%sx: %s", inst.asset_id, target_lev, e)
                     if not ctx.data_manager.start():
                         logger.error("%s data stream start failed", inst.asset_id)
                         continue
@@ -348,7 +374,8 @@ class MultiAssetQuantBot:
                         logger.error("%s data manager not ready", inst.asset_id)
                         continue
                     ok_any = True
-                    logger.info("✅ %s ready @ %.4f", inst.asset_id, ctx.data_manager.get_last_price())
+                    venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+                    logger.info("✅ %s ready @ %.4f | venues=%s", inst.asset_id, ctx.data_manager.get_last_price(), venues)
             except Exception:
                 logger.exception("%s start failed", inst.asset_id)
         if not ok_any:
@@ -364,13 +391,15 @@ class MultiAssetQuantBot:
         lines.append("<b>Execution universe:</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
-            lines.append(f"• <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()} {inst.display_symbol}")
+            venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+            lev = self._instrument_leverage(inst)
+            lines.append(f"• <b>{inst.asset_id}</b> — primary {inst.primary_exchange.value.upper()} {inst.display_symbol}; venues: {venues}; leverage target {lev}x")
         lines.append("")
         lines.append("<b>Portfolio rules:</b>")
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; each contract receives a slot-scoped balance before BTC-style sizing")
-        lines.append("• Live exchange products only; unavailable OIL/GOLD/SILVER/SPX/stocks are skipped")
+        lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
         lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
         return "\n".join(lines)
 

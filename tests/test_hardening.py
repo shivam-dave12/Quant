@@ -584,6 +584,52 @@ class HardeningTests(unittest.TestCase):
         finally:
             config.RISK_PER_TRADE = old_risk
 
+    def test_portfolio_scoped_sizing_uses_portfolio_risk_base_and_slot_cash_cap(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {
+                    "available": 51.21,
+                    "total": 51.21,
+                    "available_raw": 204.86,
+                    "total_raw": 204.86,
+                    "risk_available": 204.86,
+                    "risk_total": 204.86,
+                    "portfolio_scoped": True,
+                    "portfolio_slot_count": 4,
+                }
+
+        price = 78980.0
+        sl_dist = 526.0
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=price,
+            sig=None,
+            ict_tier="",
+            sl_price=price - sl_dist,
+            tp_price=price + 2000.0,
+            side="long",
+            use_maker_entry=True,
+            posterior_prob=0.80,
+            prefetched_bal_info=FakeRisk().get_available_balance(),
+        )
+
+        # BTC's 0.001 minimum lot risks ~$0.53 here.  That is above the
+        # confidence-haircut target, but still inside the raw 0.5% portfolio
+        # risk cap and inside the slot cash/margin envelope, so it is valid.
+        self.assertEqual(qty, 0.001)
+        self.assertLessEqual(qty * sl_dist, 204.86 * 0.005 * 1.15 + 1e-9)
+        required_margin = qty * price / 40.0
+        self.assertLessEqual(required_margin, 51.21 * 0.60 + 1e-9)
+
     def test_position_sizing_rejects_min_lot_above_haircut_risk_budget(self):
         from strategy.quant_strategy import QuantStrategy
 

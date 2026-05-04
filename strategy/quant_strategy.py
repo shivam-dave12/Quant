@@ -188,7 +188,16 @@ class QCfg:
         inst = current_instrument()
         return str(inst.primary_exchange.value if inst is not None else getattr(config, "EXCHANGE", getattr(config, "EXECUTION_EXCHANGE", "delta")))
     @staticmethod
-    def LEVERAGE() -> int: return int(_cfg("LEVERAGE", 30))
+    def LEVERAGE() -> int:
+        base = max(1, int(_cfg("LEVERAGE", 30)))
+        inst = current_instrument()
+        try:
+            max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0) if inst is not None else 0.0
+            if max_lev > 0:
+                return max(1, min(base, int(max_lev)))
+        except Exception:
+            pass
+        return base
     @staticmethod
     def MARGIN_PCT() -> float: return float(_cfg("QUANT_MARGIN_PCT", 0.20))
     @staticmethod
@@ -2860,7 +2869,11 @@ class QuantStrategy:
     def _log_init(self):
         logger.info("=" * 72)
         logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
-        logger.info(f"   {QCfg.SYMBOL()} | {QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
+        with instrument_scope(getattr(self, "_instrument", None)):
+            _inst = getattr(self, "_instrument", None)
+            _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
+            _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
+            logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
@@ -8927,7 +8940,24 @@ class QuantStrategy:
         if bal is None:
             logger.warning("_compute_quantity: get_available_balance returned None")
             return None
+        # In multi-asset mode `available` is intentionally slot-scoped and is
+        # used for cash/margin/fee caps.  Dollar-risk sizing must use the
+        # portfolio risk base carried by PortfolioRiskManager; otherwise BTC's
+        # exchange lot floor becomes untradeable on small accounts once the
+        # balance is split across slots.  In single-asset mode this falls back
+        # to the original behaviour: risk base == available.
         available = float(bal.get("available", 0.0))
+        portfolio_scoped = bool(bal.get("portfolio_scoped", False))
+        try:
+            risk_available = float(
+                bal.get("risk_available",
+                        bal.get("total_raw" if portfolio_scoped else "available", available))
+                or 0.0
+            )
+        except Exception:
+            risk_available = available
+        if not math.isfinite(risk_available) or risk_available <= 0.0:
+            risk_available = available
         if available < QCfg.MIN_MARGIN_USDT():
             logger.warning(
                 f"_compute_quantity: available ${available:.2f} < "
@@ -9030,10 +9060,24 @@ class QuantStrategy:
                 f"cash_budget=${cash_budget:.2f} step={step:.8f}")
             return None
 
-        risk_capital = available * risk_pct * total_mult
+        target_risk_base = risk_available if portfolio_scoped else available
+        risk_capital = target_risk_base * risk_pct * total_mult
         qty_raw = risk_capital / sl_dist
         max_allowed_margin = cash_budget
-        max_risk_cap = risk_capital * 1.15
+        # Non-portfolio behaviour is unchanged: the confidence-adjusted target
+        # risk is also the hard cap (plus small tolerance).  Portfolio-scoped
+        # sizing gets one additional institutional rule: an exchange minimum lot
+        # may be accepted when it is above the confidence-haircut target but
+        # still inside the raw per-position portfolio risk cap.  This fixes the
+        # BTC 0.001 minimum-lot rejection without allowing runaway size.
+        min_lot_risk_mult = float(_cfg("PORTFOLIO_MIN_LOT_MAX_RISK_MULT", 1.15))
+        if portfolio_scoped:
+            max_risk_cap = max(
+                risk_capital * 1.15,
+                target_risk_base * risk_pct * max(1.0, min_lot_risk_mult),
+            )
+        else:
+            max_risk_cap = risk_capital * 1.15
 
         # ── Lot-step + hard limits ────────────────────────────────────────────
         def _floor_step(q: float) -> float:
@@ -9068,6 +9112,7 @@ class QuantStrategy:
                 f"Sizing rejected: no exchange lot fits risk/margin envelope | "
                 f"raw_qty={qty_raw:.6f} target_risk=${risk_capital:.2f} "
                 f"hard_cap=${max_risk_cap:.2f} cash_budget=${cash_budget:.2f} "
+                f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} "
                 f"step={step:.8f}")
             return None
 
@@ -9100,14 +9145,16 @@ class QuantStrategy:
 
         # ── Dollar-risk verification ──────────────────────────────────────────
         dollar_risk   = sl_dist * qty
-        risk_pct_act  = dollar_risk / available * 100.0 if available > 0 else 0.0
+        risk_pct_act  = dollar_risk / target_risk_base * 100.0 if target_risk_base > 0 else 0.0
+        slot_risk_pct = dollar_risk / available * 100.0 if available > 0 else 0.0
         margin_used   = qty * price / leverage
         actual_fees   = qty * viability.round_trip_cost_pts
         if dollar_risk > max_risk_cap:
             logger.warning(
                 f"Sizing rejected: exchange min lot would over-risk account | "
                 f"qty={qty} SL-dist={sl_dist:.1f}pts risk=${dollar_risk:.2f} "
-                f"cap=${max_risk_cap:.2f} ({risk_pct_act:.2f}% of ${available:.2f})")
+                f"cap=${max_risk_cap:.2f} ({risk_pct_act:.2f}% of risk_base ${target_risk_base:.2f}; "
+                f"{slot_risk_pct:.2f}% of slot ${available:.2f})")
             return None
 
         logger.info(
@@ -9116,10 +9163,12 @@ class QuantStrategy:
             f"mult={total_mult:.2f} (t={tier_mult:.2f} c={comp_mod:+.2f} "
             f"a={amd_mod:+.2f} i={inst_mult:.2f} fee={fee_drag_mult:.2f}) | "
             f"target_risk=${risk_capital:.2f} raw_qty={qty_raw:.4f} | "
-            f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} ({risk_pct_act:.2f}%) | "
+            f"SL-dist={sl_dist:.1f}pts | $risk=${dollar_risk:.2f} "
+            f"({risk_pct_act:.2f}% risk-base; {slot_risk_pct:.2f}% slot) | "
             f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
             f"({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
+            f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} | "
             f"headroom=${available - required_cash:.2f} | qty={qty}"
         )
         return qty

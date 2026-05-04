@@ -570,20 +570,32 @@ PORTFOLIO_MAX_OPEN_POSITIONS = 4
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
+# In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
+# portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
+# order is inside the portfolio risk cap but above the confidence-haircut target.
+PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
+PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.
 MULTI_ASSET_REQUESTS = [
     {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD"], "priority": 0},
-    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSDT", "WTIUSDT"], "priority": 10},
-    {"asset_id": "GOLD", "display_name": "Gold", "asset_class": "commodity", "aliases": ["GOLD", "XAU", "XAUUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT"], "priority": 11},
-    {"asset_id": "SILVER", "display_name": "Silver", "asset_class": "commodity", "aliases": ["SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
-    {"asset_id": "SPX", "display_name": "S&P 500 / SPX", "asset_class": "index", "aliases": ["SPX", "SP500", "S&P500", "US500", "SPXUSD", "SP500USDT"], "priority": 20},
-    {"asset_id": "AAPL", "display_name": "Apple Inc.", "asset_class": "equity", "aliases": ["AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
-    {"asset_id": "MSFT", "display_name": "Microsoft Corp.", "asset_class": "equity", "aliases": ["MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
-    {"asset_id": "NVDA", "display_name": "NVIDIA Corp.", "asset_class": "equity", "aliases": ["NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
-    {"asset_id": "TSLA", "display_name": "Tesla Inc.", "asset_class": "equity", "aliases": ["TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
-    {"asset_id": "AMZN", "display_name": "Amazon.com Inc.", "asset_class": "equity", "aliases": ["AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
-    {"asset_id": "META", "display_name": "Meta Platforms Inc.", "asset_class": "equity", "aliases": ["META", "METAUSD", "METAUSDT"], "priority": 35},
-    {"asset_id": "GOOGL", "display_name": "Alphabet Inc.", "asset_class": "equity", "aliases": ["GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 36},
+
+    # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
+    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
+    {"asset_id": "GOLD", "display_name": "Gold token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"], "priority": 11},
+    {"asset_id": "SILVER", "display_name": "Silver token derivatives", "asset_class": "commodity", "aliases": ["SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
+
+    # Important: Delta SPXUSD is SPX6900 crypto, NOT S&P 500. Do not alias it here.
+    {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
+
+    # Delta US equity exposure is through xStock/RWA token perpetuals, not direct shares.
+    {"asset_id": "AAPL", "display_name": "Apple xStock token derivative", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
+    {"asset_id": "MSFT", "display_name": "Microsoft xStock token derivative", "asset_class": "equity", "aliases": ["MSFTXUSD", "MSFTX", "MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
+    {"asset_id": "NVDA", "display_name": "NVIDIA xStock token derivative", "asset_class": "equity", "aliases": ["NVDAXUSD", "NVDAX", "NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
+    {"asset_id": "TSLA", "display_name": "Tesla xStock token derivative", "asset_class": "equity", "aliases": ["TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
+    {"asset_id": "AMZN", "display_name": "Amazon xStock token derivative", "asset_class": "equity", "aliases": ["AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
+    {"asset_id": "META", "display_name": "Meta xStock token derivative", "asset_class": "equity", "aliases": ["METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"], "priority": 35},
+    {"asset_id": "GOOGL", "display_name": "Alphabet xStock token derivative", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 36},
 ]
+

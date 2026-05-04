@@ -56,6 +56,8 @@ class MultiAssetPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(scoped["available"], 25.0)
         self.assertAlmostEqual(scoped["total"], 25.0)
         self.assertAlmostEqual(scoped["available_raw"], 100.0)
+        self.assertAlmostEqual(scoped["risk_available"], 100.0)
+        self.assertAlmostEqual(scoped["risk_total"], 100.0)
 
 
 if __name__ == "__main__":
