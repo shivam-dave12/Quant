@@ -47,6 +47,7 @@ from typing import Dict, Optional, Tuple
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from core.instruments import ExchangeName
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +124,16 @@ class GlobalRateLimiter:
 class _CoinSwitchAdapter:
     """Normalises CoinSwitch API responses to canonical dicts."""
 
-    def __init__(self, api) -> None:
+    def __init__(self, api, exchange_instrument=None) -> None:
         self.api     = api
         self.limiter = _CS_LIMITER
-        self.symbol  = config.COINSWITCH_SYMBOL
+        self.exchange_instrument = exchange_instrument
+        self.symbol  = (exchange_instrument.symbol if exchange_instrument is not None else config.COINSWITCH_SYMBOL)
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.exchange_id = config.COINSWITCH_EXCHANGE
 
     def extract_order_id(self, resp: Dict) -> Optional[str]:
@@ -244,7 +251,7 @@ class _CoinSwitchAdapter:
             if not isinstance(pos, dict):
                 continue
             sym = str(pos.get("symbol", "")).upper()
-            if config.COINSWITCH_SYMBOL.upper() not in sym:
+            if self.symbol.upper() not in sym.replace("/", ""):
                 continue
             size = 0.0
             for f in ("size", "quantity", "position_size", "net_quantity"):
@@ -279,11 +286,17 @@ class _CoinSwitchAdapter:
 class _DeltaAdapter:
     """Normalises Delta Exchange API responses to canonical dicts."""
 
-    def __init__(self, api) -> None:
+    def __init__(self, api, exchange_instrument=None) -> None:
         self.api      = api
         self.limiter  = _DELTA_LIMITER
-        self.symbol   = getattr(config, 'DELTA_SYMBOL', 'BTCUSD')
-        self._pid_cache: Optional[int] = None
+        self.exchange_instrument = exchange_instrument
+        self.symbol   = (exchange_instrument.symbol if exchange_instrument is not None else getattr(config, 'DELTA_SYMBOL', 'BTCUSD'))
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self._pid_cache: Optional[int] = getattr(exchange_instrument, "product_id", None) if exchange_instrument is not None else None
 
     def _get_product_id(self) -> Optional[int]:
         if self._pid_cache:
@@ -577,7 +590,7 @@ class _DeltaAdapter:
         else:
             positions = []
 
-        delta_sym = getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper()
+        delta_sym = self.symbol.upper()
         _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
         if _cv <= 0:
             _cv = 0.001
@@ -654,15 +667,25 @@ class OrderManager:
     _MAX_401_RETRIES   = 2     # was 3 — auth errors rarely fix themselves
     _401_RETRY_DELAY   = 1.0   # was 2.0
 
-    def __init__(self, api, exchange_name: str = "coinswitch") -> None:
+    def __init__(self, api, exchange_name: str = "coinswitch", instrument=None) -> None:
         exch = exchange_name.lower()
+        self.instrument = instrument
+        exchange_instrument = None
+        if instrument is not None and hasattr(instrument, "by_exchange"):
+            try:
+                ex_key = ExchangeName(exch)
+                exchange_instrument = instrument.by_exchange.get(ex_key)
+            except Exception:
+                exchange_instrument = None
         if exch == "delta":
-            self._adapter = _DeltaAdapter(api)
+            self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
         else:
-            self._adapter = _CoinSwitchAdapter(api)
+            self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
 
         self.api            = api         # kept for compatibility access
         self._exchange_name = exch
+        self.symbol         = self._adapter.symbol
+        self.display_symbol = getattr(self._adapter, "display_symbol", self.symbol)
         self._orders_lock   = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
         # BUG-1 FIX: plain list grew forever — swap to deque so memory is bounded.
@@ -697,7 +720,7 @@ class OrderManager:
         # The single-OM compatibility path (no router) can call GlobalRateLimiter.set_active()
         # explicitly after construction if needed.
 
-        logger.info(f"✅ OrderManager initialised (exchange={exch})")
+        logger.info(f"✅ OrderManager initialised (exchange={exch}, symbol={self.symbol})")
 
     @property
     def limiter(self) -> _RateLimiter:
@@ -1798,7 +1821,7 @@ class OrderManager:
             return None
 
     def cancel_symbol_conditionals(self, symbol: str = None) -> Dict[str, CancelResult]:
-        sym    = symbol or getattr(config, "SYMBOL", "BTCUSDT")
+        sym    = symbol or self._adapter.symbol
         orders = self.get_open_orders(symbol=sym)
         if orders is None:
             return {}

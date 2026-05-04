@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
+from core.instruments import ExchangeName
 from core.candle import Candle, wrap_candles
 from exchanges.coinswitch.api import FuturesAPI
 from exchanges.coinswitch.websocket import CoinSwitchWebSocket
@@ -71,7 +72,14 @@ class CoinSwitchDataManager:
     # CoinSwitch hard rate limit between REST calls
     _WARMUP_SLEEP = 3.5
 
-    def __init__(self) -> None:
+    def __init__(self, instrument=None) -> None:
+        self.instrument = instrument
+        self.exchange_instrument = (instrument.by_exchange.get(ExchangeName.COINSWITCH)
+                                    if instrument is not None and hasattr(instrument, "by_exchange") else None)
+        self.symbol = (self.exchange_instrument.symbol if self.exchange_instrument is not None
+                       else config.COINSWITCH_SYMBOL)
+        self.ws_symbol = (self.exchange_instrument.ws_symbol if self.exchange_instrument is not None
+                          else self.symbol)
         self.api = FuturesAPI(
             api_key    = config.COINSWITCH_API_KEY,
             secret_key = config.COINSWITCH_SECRET_KEY,
@@ -99,14 +107,14 @@ class CoinSwitchDataManager:
         self.is_ready      = False
         self.is_streaming  = False
 
-        logger.info("CoinSwitchDataManager initialised")
+        logger.info(f"CoinSwitchDataManager initialised ({self.symbol})")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
         try:
             self.is_ready = self.is_streaming = False
-            symbol = config.COINSWITCH_SYMBOL
+            symbol = self.ws_symbol
 
             logger.info("CoinSwitch DM: starting WebSocket...")
             self.ws = CoinSwitchWebSocket()
@@ -207,7 +215,7 @@ class CoinSwitchDataManager:
                     method   = "GET",
                     endpoint = "/trade/api/v2/futures/klines",
                     params   = {
-                        "symbol":     config.COINSWITCH_SYMBOL,
+                        "symbol":     self.symbol,
                         "exchange":   config.COINSWITCH_EXCHANGE,
                         "interval":   interval_str,
                         "start_time": start_ms,

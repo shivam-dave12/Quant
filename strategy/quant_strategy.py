@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Tuple
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
 from core.pnl import gross_pnl_usd
+from core.instruments import current_instrument, instrument_scope
 from telegram.notifier import send_telegram_message
 from execution.order_manager import CancelResult
 try:
@@ -179,25 +180,40 @@ def _adaptive_param_value(name: str, default: float,
 
 class QCfg:
     @staticmethod
-    def SYMBOL() -> str: return str(config.SYMBOL)
+    def SYMBOL() -> str:
+        inst = current_instrument()
+        return str(inst.display_symbol if inst is not None else config.SYMBOL)
     @staticmethod
-    def EXCHANGE() -> str: return str(config.EXCHANGE)
+    def EXCHANGE() -> str:
+        inst = current_instrument()
+        return str(inst.primary_exchange.value if inst is not None else getattr(config, "EXCHANGE", getattr(config, "EXECUTION_EXCHANGE", "delta")))
     @staticmethod
     def LEVERAGE() -> int: return int(_cfg("LEVERAGE", 30))
     @staticmethod
     def MARGIN_PCT() -> float: return float(_cfg("QUANT_MARGIN_PCT", 0.20))
     @staticmethod
-    def LOT_STEP() -> float: return float(_cfg("LOT_STEP_SIZE", 0.001))
+    def LOT_STEP() -> float:
+        inst = current_instrument()
+        if inst is not None and inst.lot_step > 0: return float(inst.lot_step)
+        return float(_cfg("LOT_STEP_SIZE", 0.001))
     @staticmethod
-    def MIN_QTY() -> float: return float(_cfg("MIN_POSITION_SIZE", 0.001))
+    def MIN_QTY() -> float:
+        inst = current_instrument()
+        if inst is not None and inst.min_qty > 0: return float(inst.min_qty)
+        return float(_cfg("MIN_POSITION_SIZE", 0.001))
     @staticmethod
-    def MAX_QTY() -> float: return float(_cfg("MAX_POSITION_SIZE", 1.0))
+    def MAX_QTY() -> float:
+        inst = current_instrument()
+        if inst is not None and inst.max_qty > 0: return float(inst.max_qty)
+        return float(_cfg("MAX_POSITION_SIZE", 1.0))
     @staticmethod
     def MIN_MARGIN_USDT() -> float: return float(_cfg("MIN_MARGIN_PER_TRADE", 1.0))
     @staticmethod
     def COMMISSION_RATE() -> float: return float(_cfg("COMMISSION_RATE", 0.00055))
     @staticmethod
     def TICK_SIZE() -> float:
+        inst = current_instrument()
+        if inst is not None and inst.tick_size > 0: return float(inst.tick_size)
         getter = getattr(config, "get_tick_size", None)
         if callable(getter):
             return float(getter())
@@ -2604,7 +2620,9 @@ class DailyRiskGate:
 # MAIN STRATEGY CLASS
 # ═══════════════════════════════════════════════════════════════
 class QuantStrategy:
-    def __init__(self, order_manager=None):
+    def __init__(self, order_manager=None, instrument=None):
+        self._instrument = instrument
+        self._asset_id = getattr(instrument, "asset_id", getattr(config, "SYMBOL", "BTCUSDT"))
         self._om = order_manager; self._lock = threading.RLock()
         self._vwap = VWAPEngine(); self._cvd = CVDEngine()
         self._ob_eng = OrderbookEngine(); self._tick_eng = TickFlowEngine()
@@ -3776,6 +3794,10 @@ class QuantStrategy:
             pass
 
     def on_tick(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
+        with instrument_scope(getattr(self, "_instrument", None)):
+            return self._on_tick_scoped(data_manager, order_manager, risk_manager, timestamp_ms)
+
+    def _on_tick_scoped(self, data_manager, order_manager, risk_manager, timestamp_ms: int) -> None:
         # ── Bug 1 fix: locked section is non-blocking — only state reads/writes.
         # All exchange API calls (_sync_position, _evaluate_entry, _manage_active,
         # _finalise_exit) happen AFTER the lock is released so trailing-SL
@@ -4015,16 +4037,17 @@ class QuantStrategy:
         _entry_now     = entry_now   # captured for the thread closure
 
         def _bg():
-            try:
+            with instrument_scope(getattr(self, "_instrument", None)):
+              try:
                 self._enter_trade(_dm, _om, _rm, side, sig, mode=mode,
                                   ict_tier=ict_tier,
                                   prefetched_bal_info=_bal,
                                   entry_now=_entry_now)
-            except Exception as _e:
+              except Exception as _e:
                 logger.error(
                     f"_enter_trade background thread error ({mode}/{side}): {_e}",
                     exc_info=True)
-            finally:
+              finally:
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
                         # Distinguish pre-trade gate rejection (no order placed)
@@ -6981,7 +7004,8 @@ class QuantStrategy:
                             return
 
                         def _bg_trail():
-                            try:
+                            with instrument_scope(getattr(self, "_instrument", None)):
+                              try:
                                 live_price = _snap_dm.get_last_price()
                                 live_now   = time.time()
                                 if live_price < 1.0:
@@ -6989,9 +7013,9 @@ class QuantStrategy:
                                 moved = self._update_trailing_sl(_snap_om, _snap_dm, live_price, live_now)
                                 if moved:
                                     self._last_trail_rest_time = time.time()
-                            except Exception as _te:
+                              except Exception as _te:
                                 logger.error("Trail background error: %s", _te, exc_info=True)
-                            finally:
+                              finally:
                                 self._trail_in_progress = False
                                 self._trail_started_at = 0.0
 

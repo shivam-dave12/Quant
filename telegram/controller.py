@@ -258,6 +258,7 @@ class TelegramBotController:
                 {"command": "start",       "description": "Start trading bot"},
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
+                {"command": "assets",      "description": "Multi-asset scanner universe"},
                 {"command": "thinking",    "description": "posterior EV / uncertainty / execution audit"},
                 {"command": "position",    "description": "Current position + adaptive exit"},
                 {"command": "pnl",         "description": "Quick PnL snapshot"},
@@ -306,7 +307,7 @@ class TelegramBotController:
     def _normalize_command(self, text: str) -> tuple:
         t = (text or "").strip()
         bare_cmds = {
-            "start", "stop", "status", "thinking", "pools", "flow",
+            "start", "stop", "status", "assets", "thinking", "pools", "flow",
             "structures", "position", "trades", "stats", "config",
             "pause", "resume", "balance", "trail", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
@@ -333,6 +334,7 @@ class TelegramBotController:
             elif cmd == "/start":               return self._cmd_start()
             elif cmd == "/stop":                return self._cmd_stop()
             elif cmd == "/status":              return self._cmd_status()
+            elif cmd == "/assets":              return self._cmd_assets()
             elif cmd == "/thinking":            return self._cmd_thinking()
             elif cmd == "/pools":               return self._cmd_pools()
             elif cmd == "/flow":                return self._cmd_flow()
@@ -416,6 +418,16 @@ class TelegramBotController:
         )
 
     # ================================================================
+
+    def _cmd_assets(self) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_assets_report", None)
+        if callable(fn):
+            return fn()
+        return "Single-asset mode active. Use /status for the current BTCUSD scanner."
+
     # /thinking  ← CORE COMMAND — QuantPosterior decision console
     # ================================================================
 

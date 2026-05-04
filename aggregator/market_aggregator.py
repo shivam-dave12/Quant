@@ -106,7 +106,9 @@ class MarketAggregator:
         self,
         primary_dm,    # CoinSwitchDataManager | DeltaDataManager
         secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
+        instrument=None,
     ) -> None:
+        self.instrument = instrument
         self._primary   = primary_dm
         self._secondary = secondary_dm
 
@@ -132,6 +134,7 @@ class MarketAggregator:
 
         logger.info(
             f"MarketAggregator initialised "
+            f"[{getattr(instrument, 'asset_id', 'legacy')}] "
             f"(primary={type(primary_dm).__name__} "
             f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__})"
         )

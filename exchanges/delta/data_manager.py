@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
+from core.instruments import ExchangeName
 from core.candle import Candle
 from exchanges.delta.api    import DeltaAPI
 from exchanges.delta.websocket import DeltaWebSocket
@@ -60,7 +61,14 @@ class DeltaDataManager:
 
     _WARMUP_SLEEP = float(getattr(config, "DELTA_API_MIN_INTERVAL", 0.25))
 
-    def __init__(self) -> None:
+    def __init__(self, instrument=None) -> None:
+        self.instrument = instrument
+        self.exchange_instrument = (instrument.by_exchange.get(ExchangeName.DELTA)
+                                    if instrument is not None and hasattr(instrument, "by_exchange") else None)
+        self.symbol = (self.exchange_instrument.symbol if self.exchange_instrument is not None
+                       else getattr(config, "DELTA_SYMBOL", "BTCUSD"))
+        self.ws_symbol = (self.exchange_instrument.ws_symbol if self.exchange_instrument is not None
+                          else self.symbol)
         self.api = DeltaAPI(
             api_key    = config.DELTA_API_KEY,
             secret_key = config.DELTA_SECRET_KEY,
@@ -92,14 +100,14 @@ class DeltaDataManager:
         self.is_streaming  = False
         self._product_id:  Optional[int] = None
 
-        logger.info("DeltaDataManager initialised")
+        logger.info(f"DeltaDataManager initialised ({self.symbol})")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
         try:
             self.is_ready = self.is_streaming = False
-            symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+            symbol = self.symbol
 
             # Prefetch product ID
             self._product_id = self.api.get_product_id(symbol)
@@ -237,7 +245,7 @@ class DeltaDataManager:
         interval_min, default_limit, deque_attr = cfg
         limit  = limit or default_limit
         target: deque = getattr(self, deque_attr)
-        symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+        symbol = self.symbol
 
         for attempt in range(1, retries + 2):
             try:
@@ -360,7 +368,7 @@ class DeltaDataManager:
 
         interval_min, default_limit, deque_attr = cfg
         limit = limit or min(default_limit, 300)
-        symbol = getattr(config, "DELTA_SYMBOL", "BTCUSD")
+        symbol = self.symbol
         candles: List[Candle] = []
         latest_age = -1.0
 

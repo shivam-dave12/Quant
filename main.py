@@ -992,7 +992,11 @@ class QuantBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    bot = QuantBot()
+    if bool(getattr(config, "MULTI_ASSET_ENABLED", True)):
+        from orchestration.multi_asset_bot import MultiAssetQuantBot
+        bot = MultiAssetQuantBot()
+    else:
+        bot = QuantBot()
 
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):

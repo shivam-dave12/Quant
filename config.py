@@ -551,3 +551,38 @@ MI_ENABLE_DYNAMIC_ENTRY_GATES = True
 MI_ENABLE_DYNAMIC_CONVICTION_GATES = True
 MI_ENABLE_DYNAMIC_TRAILING_GATES = True
 MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-ASSET LIVE CATALOG SCANNER
+# ─────────────────────────────────────────────────────────────────────────────
+# The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
+# catalogs and activates only contracts actually returned by the exchange.
+MULTI_ASSET_ENABLED = True
+SCANNER_MAX_ACTIVE_INSTRUMENTS = 8
+SCANNER_TICK_SLEEP_SEC = 0.25
+SCANNER_ASSET_HEARTBEAT_SEC = 60.0
+# Portfolio slots: the bot may hold multiple contracts at once, but each
+# contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
+# risk model is preserved by giving each contract a slot-scoped balance view
+# before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
+PORTFOLIO_MAX_OPEN_POSITIONS = 4
+PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
+PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
+
+# Requested universe.  Commodity/index/equity entries are discovery requests;
+# if neither exchange lists them, they remain unavailable and are not traded.
+MULTI_ASSET_REQUESTS = [
+    {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD"], "priority": 0},
+    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSDT", "WTIUSDT"], "priority": 10},
+    {"asset_id": "GOLD", "display_name": "Gold", "asset_class": "commodity", "aliases": ["GOLD", "XAU", "XAUUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT"], "priority": 11},
+    {"asset_id": "SILVER", "display_name": "Silver", "asset_class": "commodity", "aliases": ["SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
+    {"asset_id": "SPX", "display_name": "S&P 500 / SPX", "asset_class": "index", "aliases": ["SPX", "SP500", "S&P500", "US500", "SPXUSD", "SP500USDT"], "priority": 20},
+    {"asset_id": "AAPL", "display_name": "Apple Inc.", "asset_class": "equity", "aliases": ["AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
+    {"asset_id": "MSFT", "display_name": "Microsoft Corp.", "asset_class": "equity", "aliases": ["MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
+    {"asset_id": "NVDA", "display_name": "NVIDIA Corp.", "asset_class": "equity", "aliases": ["NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
+    {"asset_id": "TSLA", "display_name": "Tesla Inc.", "asset_class": "equity", "aliases": ["TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
+    {"asset_id": "AMZN", "display_name": "Amazon.com Inc.", "asset_class": "equity", "aliases": ["AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
+    {"asset_id": "META", "display_name": "Meta Platforms Inc.", "asset_class": "equity", "aliases": ["META", "METAUSD", "METAUSDT"], "priority": 35},
+    {"asset_id": "GOOGL", "display_name": "Alphabet Inc.", "asset_class": "equity", "aliases": ["GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 36},
+]

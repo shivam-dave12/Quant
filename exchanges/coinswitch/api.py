@@ -446,3 +446,23 @@ class FuturesAPI:
             }
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-asset discovery helpers (live endpoints only; no synthetic symbols)
+# ─────────────────────────────────────────────────────────────────────────────
+def _futures_api_get_futures_tickers(self, exchange: str = "EXCHANGE_2") -> Dict:
+    """Return all futures tickers when the endpoint is available."""
+    endpoint = "/trade/api/v2/futures/ticker"
+    return self._make_request("GET", endpoint, params={"exchange": exchange}, payload=None)
+
+
+def _futures_api_get_futures_instruments(self, exchange: str = "EXCHANGE_2") -> Dict:
+    """Alias around instrument_info for the instrument registry."""
+    return self.get_instrument_info(exchange=exchange)
+
+
+try:
+    FuturesAPI.get_futures_tickers = _futures_api_get_futures_tickers
+    FuturesAPI.get_futures_instruments = _futures_api_get_futures_instruments
+except NameError:
+    pass
