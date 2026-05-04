@@ -2796,6 +2796,8 @@ class QuantStrategy:
         self._active_institutional_size_mult = 1.0
         self._active_ic_size_mult = 1.0
         self._active_post_exit_size_mult = 1.0
+        self._active_spread_cost_mult = 1.0
+        self._last_spread_gate_context = {}
 
         # ── Post-Trade Analysis Agent (v2.0) ──────────────────────────────────
         # Five-dimension institutional analysis: exit geometry (MAE/MFE/G-ratio/
@@ -3726,24 +3728,32 @@ class QuantStrategy:
 
     def _spread_atr_gate(self, data_manager) -> tuple:
         """
-        Reject entries when the live bid-ask spread is too large relative to ATR.
+        Live spread/ATR gate with asset-class-aware calibration.
 
-        BUG FIX: Previously called self._fee_engine._spread.median_bps() which
-        returns a hardcoded FEE_SPREAD_DEFAULT_BPS=2.0 sentinel whenever fewer
-        than 5 samples have been collected. On startup the tracker is empty, so
-        every tick returned 2.0 bps (13× the real BTC spread of ~0.15 bps),
-        blocking all entries with ratio=0.468 > 0.30 indefinitely.
+        The original hard gate used one BTC-calibrated threshold for every
+        product: spread/ATR <= QUANT_MAX_SPREAD_ATR_RATIO.  That is valid for
+        BTC/major crypto books, but it is wrong for tokenised xStock/RWA
+        contracts.  xStocks often quote in coarse ticks and a normal 1-4 tick
+        spread can be larger than the current 5m ATR during quiet US-market
+        windows.  A single 0.50 spread/ATR cap therefore blocks the entire
+        equity universe even when the actual spread is only ~10-20 bps.
 
-        Fix: compute the live spread directly from the current orderbook at
-        evaluation time. The fee engine's rolling tracker continues updating
-        independently for round-trip cost estimation — it is not used here.
-
-        Also adds a 60s log throttle to suppress repeated identical messages.
+        v8 policy:
+          • Crypto keeps the strict BTC-style hard gate.
+          • Equity / commodity token contracts use a dual hard gate:
+              block only when BOTH spread/ATR and spread-bps are excessive.
+            Otherwise the trade is allowed to proceed to the execution-cost / EV
+            model, with a spread-cost size haircut.
+          • Ratio is computed from the actual live spread dollars divided by
+            ATR dollars.  We no longer reconstruct the spread from last_price;
+            midpoint is the correct reference for bid/ask cost.
         """
         try:
-            atr   = self._atr_5m.atr
-            price = data_manager.get_last_price()
-            if atr < 1e-10 or price < 1.0:
+            self._active_spread_cost_mult = 1.0
+            self._last_spread_gate_context = {}
+
+            atr = float(getattr(self._atr_5m, "atr", 0.0) or 0.0)
+            if atr < 1e-10:
                 return True, 0.0
 
             # ── Live bid/ask from current orderbook ───────────────────────────
@@ -3754,8 +3764,10 @@ class QuantStrategy:
                 return True, 0.0
 
             def _get_px(lvl) -> float:
-                if isinstance(lvl, (list, tuple)): return float(lvl[0])
-                if isinstance(lvl, dict):           return float(lvl.get("limit_price") or lvl.get("price") or 0)
+                if isinstance(lvl, (list, tuple)):
+                    return float(lvl[0])
+                if isinstance(lvl, dict):
+                    return float(lvl.get("limit_price") or lvl.get("price") or 0)
                 return 0.0
 
             bid = _get_px(bids[0])
@@ -3764,26 +3776,103 @@ class QuantStrategy:
                 return True, 0.0
 
             mid        = (bid + ask) / 2.0
-            spread_bps = (ask - bid) / mid * 10_000.0
             spread_usd = ask - bid
+            spread_bps = (spread_usd / mid) * 10_000.0 if mid > 0 else 0.0
+            ratio      = spread_usd / atr
 
-            # ── Ratio: spread-dollars / ATR-dollars ───────────────────────────
-            ratio     = (spread_bps / 10_000.0 * price) / atr
-            max_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO", 0.30))
+            inst = getattr(self, "_instrument", None) or current_instrument()
+            asset_class = str(getattr(getattr(inst, "asset_class", ""), "value", getattr(inst, "asset_class", "")) or "").lower()
+            asset_id = str(getattr(inst, "asset_id", getattr(self, "_asset_id", "")) or "").upper()
+            tick_size = 0.0
+            try:
+                tick_size = float(getattr(inst, "tick_size", 0.0) or QCfg.TICK_SIZE() or 0.0)
+            except Exception:
+                tick_size = 0.0
+            spread_ticks = (spread_usd / tick_size) if tick_size > 0 else 0.0
 
-            if ratio > max_ratio:
-                # Throttle: log at most once per 60 s to avoid tick-level spam
-                _now = time.time()
+            # BTC/global defaults remain strict.  Non-crypto contracts get
+            # calibrated bps caps so the gate rejects genuinely broken/wide
+            # books, not normal tokenised-equity tick geometry.
+            if asset_class == "equity":
+                soft_ratio = float(getattr(config, "QUANT_SPREAD_SOFT_ATR_RATIO_EQUITY", 0.50))
+                hard_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO_EQUITY", 4.00))
+                hard_bps   = float(getattr(config, "QUANT_MAX_SPREAD_BPS_EQUITY", 35.0))
+                hard_ticks = float(getattr(config, "QUANT_MAX_SPREAD_TICKS_EQUITY", 8.0))
+            elif asset_class in ("commodity", "index"):
+                soft_ratio = float(getattr(config, "QUANT_SPREAD_SOFT_ATR_RATIO_COMMODITY", 0.50))
+                hard_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO_COMMODITY", 2.00))
+                hard_bps   = float(getattr(config, "QUANT_MAX_SPREAD_BPS_COMMODITY", 45.0))
+                hard_ticks = float(getattr(config, "QUANT_MAX_SPREAD_TICKS_COMMODITY", 10.0))
+            else:
+                soft_ratio = float(getattr(config, "QUANT_SPREAD_SOFT_ATR_RATIO_CRYPTO", 0.30))
+                hard_ratio = float(getattr(config, "QUANT_MAX_SPREAD_ATR_RATIO", 0.50))
+                hard_bps   = float(getattr(config, "QUANT_MAX_SPREAD_BPS_CRYPTO", 12.0))
+                hard_ticks = float(getattr(config, "QUANT_MAX_SPREAD_TICKS_CRYPTO", 10.0))
+
+            # Size haircut above soft ratio.  This is an allocation impairment,
+            # not an alpha veto.  The later execution-viability model still
+            # checks fee-to-risk and EV using actual SL/TP geometry.
+            if ratio > soft_ratio and hard_ratio > soft_ratio:
+                severity = min(1.0, max(0.0, (ratio - soft_ratio) / (hard_ratio - soft_ratio)))
+                self._active_spread_cost_mult = max(
+                    float(getattr(config, "QUANT_SPREAD_MIN_SIZE_MULT", 0.35)),
+                    1.0 - severity * float(getattr(config, "QUANT_SPREAD_SIZE_HAIRCUT_MAX", 0.55)),
+                )
+            else:
+                self._active_spread_cost_mult = 1.0
+
+            # For non-crypto, hard-block only when spread is bad on at least two
+            # orthogonal dimensions.  A high ratio caused by tiny ATR alone is
+            # not enough; it becomes a size haircut instead.
+            if asset_class in ("equity", "commodity", "index"):
+                hard_fail = (
+                    (ratio > hard_ratio and spread_bps > hard_bps)
+                    or (spread_ticks > hard_ticks and spread_bps > hard_bps)
+                )
+            else:
+                hard_fail = (ratio > hard_ratio) or (spread_bps > hard_bps and ratio > soft_ratio)
+
+            self._last_spread_gate_context = {
+                "asset_id": asset_id,
+                "asset_class": asset_class or "unknown",
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread": spread_usd,
+                "spread_bps": spread_bps,
+                "spread_atr": ratio,
+                "spread_ticks": spread_ticks,
+                "atr": atr,
+                "soft_ratio": soft_ratio,
+                "hard_ratio": hard_ratio,
+                "hard_bps": hard_bps,
+                "size_mult": float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0),
+                "hard_fail": bool(hard_fail),
+            }
+
+            _now = time.time()
+            if hard_fail:
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
                     logger.info(
-                        f"⛔ Spread/ATR gate: {ratio:.3f} > {max_ratio} "
-                        f"(spread={spread_bps:.2f}bps / ${spread_usd:.2f}, "
-                        f"ATR=${atr:.1f}) — too expensive")
+                        f"⛔ Spread/ATR gate [{asset_class or 'unknown'}]: "
+                        f"ratio={ratio:.3f}>{hard_ratio:.2f} spread={spread_bps:.2f}bps "
+                        f"ticks={spread_ticks:.1f}>{hard_ticks:.1f} ATR=${atr:.4f} "
+                        f"spread=${spread_usd:.4f} — hard block")
                 return False, ratio
+
+            if ratio > soft_ratio:
+                if _now - getattr(self, "_last_spread_gate_soft_log", 0.0) >= 60.0:
+                    self._last_spread_gate_soft_log = _now
+                    logger.info(
+                        f"⚖ Spread cost impairment [{asset_class or 'unknown'}]: "
+                        f"ratio={ratio:.3f}>{soft_ratio:.2f} spread={spread_bps:.2f}bps "
+                        f"ticks={spread_ticks:.1f} ATR=${atr:.4f} spread=${spread_usd:.4f} "
+                        f"size_mult={self._active_spread_cost_mult:.2f}")
 
             return True, ratio
         except Exception:
+            self._active_spread_cost_mult = 1.0
             return True, 0.0
 
     def _on_entry_engine_self_recovery(self, state_name: str, age_sec: float) -> None:
@@ -8967,9 +9056,10 @@ class QuantStrategy:
         inst_mult = float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
         ic_mult = float(getattr(self, "_active_ic_size_mult", 1.0) or 1.0)
         post_exit_mult = float(getattr(self, "_active_post_exit_size_mult", 1.0) or 1.0)
+        spread_cost_mult = float(getattr(self, "_active_spread_cost_mult", 1.0) or 1.0)
         total_mult = max(
             0.10,
-            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult),
+            min(1.15, (tier_mult + comp_mod + amd_mod) * inst_mult * ic_mult * post_exit_mult * spread_cost_mult),
         )
 
         # ── Available balance (reuse prefetched — SIG-8 fix) ─────────────────

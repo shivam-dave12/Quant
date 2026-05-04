@@ -341,7 +341,24 @@ QUANT_TREND_TP_ATR_MULT        = 2.5
 QUANT_TREND_COMPOSITE_MIN      = 0.35
 QUANT_TREND_CONFIRM_TICKS      = 3
 QUANT_TREND_CHANDELIER_N       = 1.5
-QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # more spread tolerance
+QUANT_MAX_SPREAD_ATR_RATIO     = 0.50     # crypto/BTC hard spread/ATR cap
+# Asset-aware spread gate (v8): xStock/RWA products have coarse tick geometry;
+# a normal 1-4 tick spread can exceed the current 5m ATR in quiet windows.
+# These caps hard-block genuinely broken books while converting normal wide
+# tokenised-equity spreads into allocation haircuts handled by sizing/EV.
+QUANT_SPREAD_SOFT_ATR_RATIO_CRYPTO    = 0.30
+QUANT_MAX_SPREAD_BPS_CRYPTO           = 12.0
+QUANT_MAX_SPREAD_TICKS_CRYPTO         = 10.0
+QUANT_SPREAD_SOFT_ATR_RATIO_EQUITY    = 0.50
+QUANT_MAX_SPREAD_ATR_RATIO_EQUITY     = 4.00
+QUANT_MAX_SPREAD_BPS_EQUITY           = 35.0
+QUANT_MAX_SPREAD_TICKS_EQUITY         = 8.0
+QUANT_SPREAD_SOFT_ATR_RATIO_COMMODITY = 0.50
+QUANT_MAX_SPREAD_ATR_RATIO_COMMODITY  = 2.00
+QUANT_MAX_SPREAD_BPS_COMMODITY        = 45.0
+QUANT_MAX_SPREAD_TICKS_COMMODITY      = 10.0
+QUANT_SPREAD_MIN_SIZE_MULT            = 0.35
+QUANT_SPREAD_SIZE_HAIRCUT_MAX         = 0.55
 QUANT_REVERSION_MIN_RR         = 2.0      # single authoritative R:R floor
 QUANT_REVERSION_MAX_RR         = 5.0
 QUANT_TREND_MIN_RR             = 2.0
