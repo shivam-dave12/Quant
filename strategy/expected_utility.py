@@ -501,8 +501,14 @@ def expected_utility_size_multiplier(surface: Optional[TargetSurface], posterior
     """Bounded fractional-Kelly style size scaler after alpha acceptance."""
     if not surface or not surface.best:
         return 0.70
+    if not surface.has_positive_edge:
+        return 0.0
     b = max(surface.best.payoff_r, _EPS)
-    p = clamp(float(posterior or surface.best.probability), 0.001, 0.999)
+    target_p = clamp(float(surface.best.probability or 0.0), 0.001, 0.999)
+    auction_p = clamp(float(posterior or 0.0), 0.001, 0.999)
+    p = target_p
+    if surface.best.role != "terminal" and surface.best.full_position_utility > 0.0:
+        p = clamp(0.72 * target_p + 0.28 * auction_p, 0.001, 0.999)
     q = 1.0 - p
     kelly = (b * p - q) / b
     edge = clamp(surface.best.full_position_utility, -2.0, 3.0)

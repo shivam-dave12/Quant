@@ -496,7 +496,6 @@ class LiquidityTrailEngine:
             "15m": candles_15m or [],
             "1h":  candles_1h  or [],
         }
-
         # Counter-BOS re-arm after meaningful delivered movement.
         # This is delivery-based, not R-based: once the market has moved beyond
         # expected noise, a fresh counter-BOS is a new information event and can
@@ -544,7 +543,8 @@ class LiquidityTrailEngine:
             ict_engine, now_)
         be_gate_ok, be_gate_reason = self._structural_be_gate(
             pos_side, price, entry_price, atr, r_multiple,
-            early_momentum_gate, ict_engine, liq_snapshot, now_)
+            early_momentum_gate, ict_engine, liq_snapshot, now_,
+            peak_profit=peak_profit)
         if not be_gate_ok and hold_reason is not None:
             hold_reason.append(f"BE_WAIT_STRUCT: {be_gate_reason}")
 
@@ -758,6 +758,7 @@ class LiquidityTrailEngine:
     def _structural_be_gate(
         pos_side: str, price: float, entry_price: float, atr: float,
         r_multiple: float, momentum_gate: str, ict_engine, liq_snapshot, now: float,
+        peak_profit: float = 0.0,
     ) -> Tuple[bool, str]:
         """
         Allow a BE/protection lock only after the trade has delivered structure.
@@ -767,8 +768,10 @@ class LiquidityTrailEngine:
         a fresh aligned BOS, or enough delivery beyond a live opposing pool.
         """
         profit = (price - entry_price) if pos_side == "long" else (entry_price - price)
-        if profit <= max(0.75 * atr, 1e-9):
-            return False, f"delivery={profit/atr:.2f}ATR<0.75ATR"
+        delivered = max(float(peak_profit or 0.0), profit, 0.0)
+        delivered_atr = delivered / max(atr, 1e-9)
+        if delivered <= max(0.75 * atr, 1e-9):
+            return False, f"delivery={delivered_atr:.2f}ATR<0.75ATR"
 
         if momentum_gate != "NONE":
             return True, f"structural_delivery={momentum_gate}"
@@ -791,22 +794,23 @@ class LiquidityTrailEngine:
         # Liquidity delivery is volatility/structure based, not R based.
         # A wide initial SL should not delay protection if price has already
         # travelled through a meaningful institutional pool.
-        if liq_snapshot is not None and (profit / max(atr, 1e-9)) >= 1.00:
+        delivery_price = entry_price + delivered if pos_side == "long" else entry_price - delivered
+        if liq_snapshot is not None and delivered_atr >= 1.00:
             try:
                 opp_pools = (getattr(liq_snapshot, "bsl_pools", []) if pos_side == "long"
                              else getattr(liq_snapshot, "ssl_pools", []))
-                delivered = []
+                delivered_pools = []
                 for pt in (opp_pools or []):
                     pool = getattr(pt, "pool", pt)
                     pp = float(getattr(pool, "price", 0.0) or 0.0)
                     if pp <= 0:
                         continue
-                    if pos_side == "long" and entry_price < pp < price:
-                        delivered.append(pt)
-                    if pos_side == "short" and price < pp < entry_price:
-                        delivered.append(pt)
-                if delivered:
-                    best = max(delivered, key=lambda p: float(
+                    if pos_side == "long" and entry_price < pp < delivery_price:
+                        delivered_pools.append(pt)
+                    if pos_side == "short" and delivery_price < pp < entry_price:
+                        delivered_pools.append(pt)
+                if delivered_pools:
+                    best = max(delivered_pools, key=lambda p: float(
                         p.adjusted_sig() if hasattr(p, "adjusted_sig")
                         else getattr(p, "significance", 0.0) or 0.0
                     ))

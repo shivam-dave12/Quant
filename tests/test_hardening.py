@@ -327,6 +327,94 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNotNone(signal.selected_target_utility)
         self.assertLessEqual(signal.selected_target_utility.full_position_utility, 0.0)
 
+    def test_no_positive_target_utility_blocks_execution_allocation(self):
+        from strategy.quant_strategy import EntryType, QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._htf = SimpleNamespace(trend_15m=0.0, trend_4h=0.0)
+        strategy._last_hunt_prediction = None
+        strategy._entry_engine = SimpleNamespace(
+            _last_sweep_analysis={
+                "displacement_atr": 1.50,
+                "cisd": True,
+                "ote": False,
+            }
+        )
+        bad_target = SimpleNamespace(
+            full_position_utility=-0.40,
+            expected_value_r=-0.10,
+            compact=lambda: "terminal p=0.01 fullU=-0.40",
+        )
+        signal = SimpleNamespace(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=100.0,
+            sl_price=98.0,
+            tp_price=140.0,
+            target_pool=SimpleNamespace(
+                pool=SimpleNamespace(price=140.0, timeframe="15m", side="BSL"),
+                significance=10.0,
+                distance_atr=40.0,
+            ),
+            sweep_result=SimpleNamespace(quality=0.90),
+            conviction=0.90,
+            selected_target_utility=bad_target,
+            target_surface=SimpleNamespace(has_positive_edge=False, best=bad_target),
+        )
+        ict = SimpleNamespace(
+            direction_hint_side="",
+            direction_hint_confidence=0.0,
+            dealing_range_pd=0.25,
+            amd_phase="MANIPULATION",
+            amd_bias="bullish",
+            amd_confidence=0.90,
+        )
+        flow = SimpleNamespace(tick_flow=0.30, cvd_trend=0.30)
+
+        decision = strategy._institutional_decision_matrix(
+            signal, ict, flow, None, price=100.0, atr=1.0)
+
+        self.assertFalse(decision.allowed)
+        self.assertTrue(any("executable utility" in r for r in decision.reject_reasons))
+
+    def test_expected_utility_negative_surface_has_no_size_allocation(self):
+        from strategy.expected_utility import expected_utility_size_multiplier
+
+        surface = SimpleNamespace(
+            has_positive_edge=False,
+            best=SimpleNamespace(payoff_r=12.0, probability=0.02, full_position_utility=-1.0),
+            runner_fraction=0.0,
+        )
+
+        self.assertEqual(expected_utility_size_multiplier(surface, posterior=0.95), 0.0)
+
+    def test_structural_be_gate_uses_peak_delivery_not_retraced_mark(self):
+        from strategy.liquidity_trail import LiquidityTrailEngine
+
+        ok, reason = LiquidityTrailEngine._structural_be_gate(
+            "short", price=100.40, entry_price=101.00, atr=1.0,
+            r_multiple=0.0, momentum_gate="CVD", ict_engine=None,
+            liq_snapshot=None, now=time.time(), peak_profit=1.00,
+        )
+
+        self.assertTrue(ok, reason)
+
+    def test_trail_off_is_ignored_while_position_active(self):
+        import threading
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._lock = threading.RLock()
+        strategy._pos = SimpleNamespace(
+            trail_override=True,
+            is_active=lambda: True,
+        )
+
+        changed = strategy.set_trail_override(False)
+
+        self.assertFalse(changed)
+        self.assertIsNone(strategy._pos.trail_override)
+
     def test_fee_to_risk_can_return_no_allocation(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
 
@@ -495,6 +583,37 @@ class HardeningTests(unittest.TestCase):
             self.assertIn("looks percent-style", "\n".join(logs.output))
         finally:
             config.RISK_PER_TRADE = old_risk
+
+    def test_position_sizing_rejects_min_lot_above_haircut_risk_budget(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 0.01
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 1000.0, "total": 1000.0}
+
+        with self.assertLogs("strategy.quant_strategy", level="WARNING") as logs:
+            qty = strategy._compute_quantity(
+                FakeRisk(),
+                price=10000.0,
+                sig=None,
+                ict_tier="",
+                sl_price=9000.0,
+                tp_price=12000.0,
+                side="long",
+                use_maker_entry=True,
+                posterior_prob=0.75,
+                prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+            )
+
+        self.assertIsNone(qty)
+        self.assertIn("no exchange lot fits risk/margin envelope", "\n".join(logs.output))
 
     def test_execution_geometry_repair_uses_structural_sl(self):
         from strategy.quant_strategy import QuantStrategy

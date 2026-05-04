@@ -1632,7 +1632,13 @@ class TelegramBotController:
                 "Will advance SL per phase logic regardless of config flag."
             )
         elif arg in ("off", "disable", "0", "false", "no"):
-            strat.set_trail_override(False)
+            changed = strat.set_trail_override(False)
+            if changed is False:
+                return (
+                    "Trailing SL remains ON for the active position.\n"
+                    "Protective management cannot be disabled mid-trade; "
+                    "use /pause to stop new entries."
+                )
             return (
                 "🔓 <b>Trailing SL: FORCED OFF</b>\n"
                 "SL will remain at initial structural level.\n"

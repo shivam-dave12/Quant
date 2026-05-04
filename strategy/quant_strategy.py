@@ -3073,6 +3073,20 @@ class QuantStrategy:
             logger.debug(f"Expected-utility advisory annotation error: {e}")
 
     def _defer_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
+        reason_l = str(reason or "").lower()
+        if ("executable utility" in reason_l or "target surface" in reason_l):
+            try:
+                if hasattr(self._entry_engine, "mark_pre_order_rejected"):
+                    self._entry_engine.mark_pre_order_rejected(
+                        signal,
+                        cooldown_sec=float(cooldown_sec),
+                        execution_context={
+                            "target_utility_invalid": True,
+                            "reason": str(reason or "")[:160],
+                        },
+                    )
+            except Exception as e:
+                logger.debug(f"Entry utility-refine arm error: {e}")
         try:
             if hasattr(self._entry_engine, "mark_signal_deferred"):
                 self._entry_engine.mark_signal_deferred(
@@ -3362,6 +3376,24 @@ class QuantStrategy:
             return best
         return None
 
+    def _target_utility_reject_reason(self, signal) -> str:
+        surface = getattr(signal, "target_surface", None) or getattr(self, "_last_target_surface", None)
+        if surface is None:
+            return ""
+        selected = getattr(signal, "selected_target_utility", None)
+        if selected is None:
+            return "selected TP is not priced on executable target surface"
+        full_u = float(getattr(selected, "full_position_utility", 0.0) or 0.0)
+        ev_r = float(getattr(selected, "expected_value_r", 0.0) or 0.0)
+        if full_u <= 0.0 or ev_r <= 0.0:
+            compact = selected.compact() if hasattr(selected, "compact") else str(selected)
+            return f"selected TP has no positive executable utility: {compact}"
+        if not getattr(surface, "has_positive_edge", False):
+            best = getattr(surface, "best", None)
+            compact = best.compact() if best is not None and hasattr(best, "compact") else "none"
+            return f"no positive executable target utility: best={compact}"
+        return ""
+
     def _institutional_decision_matrix(self, signal, ict_ctx, flow_state,
                                        liq_snapshot, price: float,
                                        atr: float) -> InstitutionalDecision:
@@ -3398,6 +3430,9 @@ class QuantStrategy:
             signal, liq_snapshot, side, entry, tp, sl, atr)
         allows.extend(target_allows)
         rejects.extend(target_rejects)
+        target_utility_reject = self._target_utility_reject_reason(signal)
+        if target_utility_reject:
+            rejects.append(target_utility_reject)
 
         sweep = getattr(signal, "sweep_result", None)
         quality = float(getattr(sweep, "quality", 0.0) or 0.0)
@@ -3516,6 +3551,8 @@ class QuantStrategy:
             "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
             "TP IS NOT", "SL IS NOT", "NON-PROTECTIVE",
             "INVALID", "NON-POSITIVE", "CROSSED",
+            "NO POSITIVE EXECUTABLE UTILITY", "EXECUTABLE TARGET UTILITY",
+            "EXECUTABLE TARGET SURFACE",
         )
         quality_tokens = (
             "DISPLACEMENT", "NO CISD/OTE/STRONG DISPLACEMENT",
@@ -3635,11 +3672,19 @@ class QuantStrategy:
         """v4.3: Telegram command to override trailing SL on/off, even mid-position.
         None = use config default, True = force on, False = force off."""
         with self._lock:
+            if enabled is False and self._pos.is_active():
+                self._pos.trail_override = None
+                logger.warning(
+                    "Trail override OFF ignored while position is active; "
+                    "protective management remains on")
+                return False
             self._pos.trail_override = enabled
             if enabled is None:
                 logger.info("Trail override cleared → using config default")
             else:
                 logger.info(f"Trail override set → {'ENABLED' if enabled else 'DISABLED'}")
+
+        return True
 
     def get_trail_enabled(self) -> bool:
         """Check if trailing is enabled considering override."""
@@ -6498,9 +6543,32 @@ class QuantStrategy:
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
         )
 
+    def _observe_position_extremes(self, pos, price: float) -> tuple:
+        profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+        new_extreme = False
+        with self._lock:
+            if profit > pos.peak_profit + 1e-9:
+                pos.peak_profit = profit
+                new_extreme = True
+
+            adverse = max(0.0, -profit)
+            if adverse > pos.peak_adverse:
+                pos.peak_adverse = adverse
+
+            if pos.side == "long":
+                if pos.peak_price_abs < 1e-10 or price > pos.peak_price_abs:
+                    pos.peak_price_abs = price
+                    new_extreme = True
+            else:
+                if pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs:
+                    pos.peak_price_abs = price
+                    new_extreme = True
+        return profit, new_extreme
+
     def _manage_active(self, data_manager, order_manager, now):
         pos = self._pos; price = data_manager.get_last_price()
         if price < 1.0: return
+        _, _observed_new_extreme = self._observe_position_extremes(pos, price)
 
         # ── Conditionally compute signals — only when trade mode consumes them ──
         # Bug #7/#19 fix: _compute_signals() runs all five signal engines (VWAP,
@@ -6838,11 +6906,7 @@ class QuantStrategy:
         if self.get_trail_enabled():
             # ── Step 1: Detect structure change or new price extreme ──────
             _structure_changed = self._detect_structure_change(data_manager, price, pos, now)
-            _new_extreme = False
-            if pos.side == "long" and price > pos.peak_price_abs:
-                _new_extreme = True
-            elif pos.side == "short" and (pos.peak_price_abs < 1e-10 or price < pos.peak_price_abs):
-                _new_extreme = True
+            _new_extreme = bool(_observed_new_extreme)
 
             # Also trigger on significant price moves (>0.15 ATR since last trail check)
             _atr_now = self._atr_5m.atr if self._atr_5m else 0.0
@@ -6904,6 +6968,17 @@ class QuantStrategy:
                         _snap_dm  = data_manager
                         _snap_px  = price
                         _snap_now = now
+                        if _new_extreme:
+                            try:
+                                moved = self._update_trailing_sl(_snap_om, _snap_dm, _snap_px, _snap_now)
+                                if moved:
+                                    self._last_trail_rest_time = time.time()
+                            except Exception as _te:
+                                logger.error("Trail immediate-extreme error: %s", _te, exc_info=True)
+                            finally:
+                                self._trail_in_progress = False
+                                self._trail_started_at = 0.0
+                            return
 
                         def _bg_trail():
                             try:
@@ -8934,7 +9009,7 @@ class QuantStrategy:
         risk_capital = available * risk_pct * total_mult
         qty_raw = risk_capital / sl_dist
         max_allowed_margin = cash_budget
-        max_risk_cap = max(risk_capital * 1.15, available * risk_pct * 1.15)
+        max_risk_cap = risk_capital * 1.15
 
         # ── Lot-step + hard limits ────────────────────────────────────────────
         def _floor_step(q: float) -> float:
