@@ -103,6 +103,12 @@ TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
 LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
 REQUEST_TIMEOUT                  = 30
+# Delta multi-asset protection policy: every Delta entry must use native bracket
+# placement (entry + SL + TP in one exchange transaction). If bracket placement
+# fails, the strategy aborts the entry instead of falling back to naked limit
+# + standalone conditionals. CoinSwitch still uses standalone SL/TP because it
+# has no Delta-style native bracket endpoint.
+DELTA_REQUIRE_NATIVE_BRACKET      = True
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
 READY_TIMEOUT_SEC    = 120.0
@@ -558,7 +564,7 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
 # catalogs and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
-SCANNER_MAX_ACTIVE_INSTRUMENTS = 8
+SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
@@ -588,6 +594,9 @@ MULTI_ASSET_REQUESTS = [
 
     # Important: Delta SPXUSD is SPX6900 crypto, NOT S&P 500. Do not alias it here.
     {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
+    # xStock index/ETF-like token derivatives visible in Delta's market table.
+    {"asset_id": "SPY", "display_name": "SP500 xStock token derivative", "asset_class": "equity", "aliases": ["SPYXUSD", "SPYX", "SPY", "SPYUSD", "SPYUSDT"], "priority": 21},
+    {"asset_id": "QQQ", "display_name": "Nasdaq xStock token derivative", "asset_class": "equity", "aliases": ["QQQXUSD", "QQQX", "QQQ", "QQQUSD", "QQQUSDT"], "priority": 22},
 
     # Delta US equity exposure is through xStock/RWA token perpetuals, not direct shares.
     {"asset_id": "AAPL", "display_name": "Apple xStock token derivative", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
@@ -596,6 +605,8 @@ MULTI_ASSET_REQUESTS = [
     {"asset_id": "TSLA", "display_name": "Tesla xStock token derivative", "asset_class": "equity", "aliases": ["TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
     {"asset_id": "AMZN", "display_name": "Amazon xStock token derivative", "asset_class": "equity", "aliases": ["AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
     {"asset_id": "META", "display_name": "Meta xStock token derivative", "asset_class": "equity", "aliases": ["METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"], "priority": 35},
-    {"asset_id": "GOOGL", "display_name": "Alphabet xStock token derivative", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 36},
+    {"asset_id": "COIN", "display_name": "Coinbase xStock token derivative", "asset_class": "equity", "aliases": ["COINXUSD", "COINX", "COIN", "COINUSD", "COINUSDT"], "priority": 36},
+    {"asset_id": "CRCL", "display_name": "Circle xStock token derivative", "asset_class": "equity", "aliases": ["CRCLXUSD", "CRCLX", "CRCL", "CRCLUSD", "CRCLUSDT"], "priority": 37},
+    {"asset_id": "GOOGL", "display_name": "Alphabet xStock token derivative", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 38},
 ]
 

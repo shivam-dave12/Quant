@@ -296,7 +296,28 @@ class _DeltaAdapter:
         self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.contract_value = float(getattr(exchange_instrument, "contract_value_btc", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        # BTCUSD uses config.DELTA_CONTRACT_VALUE_BTC (0.001 BTC/contract).
+        # xStock/RWA contracts must not inherit the BTC conversion. If Delta's
+        # product row omits contract_value, fall back to integer contracts.
+        asset_class = str(getattr(exchange_instrument, "asset_class", "") or "").lower() if exchange_instrument is not None else ""
+        if self.contract_value <= 0:
+            self.contract_value = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
+            if asset_class in ("assetclass.equity", "equity", "assetclass.commodity", "commodity", "assetclass.index", "index"):
+                self.contract_value = 1.0
         self._pid_cache: Optional[int] = getattr(exchange_instrument, "product_id", None) if exchange_instrument is not None else None
+
+    def _qty_to_contracts(self, quantity: float) -> int:
+        cv = float(self.contract_value or 0.0)
+        if cv <= 0:
+            cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
+        return max(1, round(float(quantity) / cv)) if cv > 0 else max(1, int(round(float(quantity))))
+
+    def _contracts_to_qty(self, contracts: float) -> float:
+        cv = float(self.contract_value or 0.0)
+        if cv <= 0:
+            cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
+        return abs(float(contracts)) * cv
 
     def _get_product_id(self) -> Optional[int]:
         if self._pid_cache:
@@ -344,15 +365,14 @@ class _DeltaAdapter:
         return None
 
     def extract_filled_qty(self, order_data: Dict) -> float:
-        """Return filled quantity in BTC units, never raw Delta contracts."""
-        _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001) or 0.001)
+        """Return filled quantity in strategy units, never raw Delta contracts."""
         for f in ("filled_size", "executed_qty", "size"):
             v = order_data.get(f)
             if v:
                 try:
                     contracts = abs(float(v))
                     if contracts > 0:
-                        return contracts * _cv
+                        return self._contracts_to_qty(contracts)
                 except (ValueError, TypeError):
                     pass
         return 0.0
@@ -364,10 +384,10 @@ class _DeltaAdapter:
                     stop_order_type: Optional[str] = None) -> Optional[Dict]:
         self.limiter.wait()
         # symbol is the primary key; Delta API resolves product_id internally
-        # Convert BTC quantity → integer contracts
-        # Delta India inverse perpetual: 1 contract = DELTA_CONTRACT_VALUE_BTC BTC
-        _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
-        contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
+        # Convert strategy quantity → integer Delta contracts. Per-instrument
+        # contract_value is mandatory here; BTC's 0.001 convention must not leak
+        # into xStock/RWA products.
+        contracts = self._qty_to_contracts(quantity)
         resp = self.api.place_order(
             symbol          = self.symbol,
             side            = side.lower(),
@@ -396,8 +416,7 @@ class _DeltaAdapter:
         # Bracket limit order: entry + SL + TP in a single Delta API call.
         # Avoids bad_schema from separate stop/take-profit order placement.
         self.limiter.wait()
-        _cv = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.001))
-        contracts = max(1, round(quantity / _cv)) if _cv > 0 else int(quantity)
+        contracts = self._qty_to_contracts(quantity)
         resp = self.api.place_order(
             symbol                    = self.symbol,
             side                      = side.lower(),
@@ -591,9 +610,6 @@ class _DeltaAdapter:
             positions = []
 
         delta_sym = self.symbol.upper()
-        _cv = float(getattr(config, 'DELTA_CONTRACT_VALUE_BTC', 0.001))
-        if _cv <= 0:
-            _cv = 0.001
 
         for pos in positions:
             if not isinstance(pos, dict): continue
@@ -613,9 +629,11 @@ class _DeltaAdapter:
                         if size_contracts_raw > 0: break
                     except (ValueError, TypeError): pass
 
-            # CONVERT: contracts → BTC (strategy-layer unit).
-            size_btc        = size_contracts_raw * _cv
-            signed_size_btc = signed_contracts   * _cv
+            # CONVERT: contracts → strategy-layer quantity using this product's
+            # contract value. For BTC this is BTC units; for xStocks/RWA it is
+            # integer/contract units unless Delta provides a different value.
+            size_btc        = self._contracts_to_qty(size_contracts_raw)
+            signed_size_btc = signed_contracts * float(self.contract_value or 1.0)
 
             side = None
             if size_btc > 0:

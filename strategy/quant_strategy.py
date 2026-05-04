@@ -6143,6 +6143,25 @@ class QuantStrategy:
 
         limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
         is_bracket = False
+
+        # v7 multi-asset protection policy:
+        # Every Delta contract (BTC, metals, xStocks, indices/RWA tokens) must use
+        # the same native bracket methodology: entry + SL + TP in one Delta order.
+        # If the bracket endpoint rejects the order for a non-BTC contract, do NOT
+        # fall back to a naked entry followed by standalone SL/TP. That fallback can
+        # leave the position temporarily unprotected and behaves differently from BTC.
+        # CoinSwitch has no Delta-native bracket endpoint, so only CoinSwitch uses the
+        # old fill-then-place-standalone-conditionals path.
+        _active_exchange = str(
+            getattr(order_manager, "active_exchange", None)
+            or getattr(order_manager, "_exchange_name", "")
+            or ""
+        ).lower()
+        _delta_requires_native_bracket = (
+            _active_exchange == "delta" and
+            bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
+        )
+
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
             limit_price=limit_px,
@@ -6151,9 +6170,19 @@ class QuantStrategy:
             on_order_placed=_on_order_placed,
         )
         if entry_data is not None:
-            is_bracket = entry_data.get("bracket_order", False)
+            is_bracket = bool(entry_data.get("bracket_order", False))
+        elif _delta_requires_native_bracket:
+            logger.error(
+                "❌ Delta native bracket entry failed — refusing non-bracket fallback "
+                "so the position is not opened without exchange-attached TP/SL. "
+                f"side={side} qty={qty} entry=${limit_px:,.2f} "
+                f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
+            )
+            self._last_exit_time = time.time()
+            return
         else:
-            # Fallback: standard limit entry (CoinSwitch, or bracket unavailable)
+            # CoinSwitch / non-Delta path: standard limit entry, then protected
+            # standalone SL/TP after fill because native bracket is unavailable.
             entry_data = order_manager.place_limit_entry(
                 side=side, quantity=qty,
                 limit_price=limit_px,
@@ -6165,6 +6194,14 @@ class QuantStrategy:
         if not entry_data:
             logger.error("❌ Entry order failed")
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
+            return
+
+        if _delta_requires_native_bracket and not is_bracket:
+            logger.error(
+                "❌ Delta entry returned without bracket_order=True — refusing to "
+                "treat it as an active position because TP/SL are not exchange-attached."
+            )
+            self._last_exit_time = time.time()
             return
 
         # ── Extract fill price ────────────────────────────────────────────────────

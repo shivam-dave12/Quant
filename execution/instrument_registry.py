@@ -36,6 +36,54 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 
+def _deep_first_float(obj, names) -> float:
+    """Find the first positive numeric field in a nested exchange payload."""
+    names_l = {str(n).lower() for n in names}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in names_l:
+                f = _safe_float(v)
+                if f > 0:
+                    return f
+        for v in obj.values():
+            f = _deep_first_float(v, names_l)
+            if f > 0:
+                return f
+    elif isinstance(obj, list):
+        for v in obj:
+            f = _deep_first_float(v, names_l)
+            if f > 0:
+                return f
+    return 0.0
+
+
+def _market_key_like(value: str) -> bool:
+    n = normalise_symbol(str(value))
+    if len(n) < 5:
+        return False
+    return n.endswith(("USDT", "USD", "INR"))
+
+
+def _asset_default_max_leverage(asset_class: AssetClass) -> float:
+    # Conservative fallback when the product row omits max_leverage.
+    # Delta xStock/RWA contracts displayed in the UI are 25x; BTC remains governed
+    # by the actual product row/config.  These are caps, not trade triggers.
+    if asset_class == AssetClass.EQUITY:
+        return 25.0
+    if asset_class in (AssetClass.COMMODITY, AssetClass.INDEX):
+        return 25.0
+    return 0.0
+
+
+def _asset_default_step(asset_class: AssetClass, symbol: str) -> float:
+    # Do not let BTC's 0.001 contract convention leak into xStock/RWA contracts.
+    # If Delta omits size/contract_value fields, non-crypto token contracts are
+    # treated as integer-contract products until the live product row says otherwise.
+    if asset_class in (AssetClass.EQUITY, AssetClass.COMMODITY, AssetClass.INDEX):
+        return 1.0
+    return 0.0
+
+
 def _unwrap_list(resp) -> List[dict]:
     if not isinstance(resp, dict):
         return []
@@ -47,11 +95,15 @@ def _unwrap_list(resp) -> List[dict]:
             v = data.get(key)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # Some CoinSwitch endpoints return {exchange: {symbol: specs}}
+        # Some CoinSwitch endpoints return {exchange: {symbol: specs}}.
+        # Guard this strictly: ticker payloads also contain dicts with fields such
+        # as lowPrice24h/highPrice24h. Those field names are NOT symbols.
         rows: List[dict] = []
         for ex_val in data.values():
             if isinstance(ex_val, dict):
                 for sym, spec in ex_val.items():
+                    if not _market_key_like(sym):
+                        continue
                     row = dict(spec) if isinstance(spec, dict) else {}
                     row.setdefault("symbol", sym)
                     rows.append(row)
@@ -163,10 +215,23 @@ class InstrumentRegistry:
                     _safe_float(p.get("price_increment")),
                     _safe_float(p.get("minimum_tick_size")),
                 )
+                # Derive asset class before sizing/leverage defaults. Delta
+                # xStock symbols end in XUSD (AAPLXUSD, NVDAXUSD, ...); tokenised
+                # commodity contracts are explicitly requested via their aliases.
+                inferred_class = AssetClass.CRYPTO
+                nsym = normalise_symbol(sym)
+                if nsym.endswith("XUSD") or nsym in {"SPYXUSD", "QQQXUSD", "CRCLXUSD", "COINXUSD"}:
+                    inferred_class = AssetClass.EQUITY
+                elif nsym in {"PAXGUSD", "XAUTUSD", "SLVONUSD"}:
+                    inferred_class = AssetClass.COMMODITY
+
                 step = first_positive(
                     _safe_float(p.get("contract_value")),
                     _safe_float(p.get("lot_size")),
                     _safe_float(p.get("size_increment")),
+                    _safe_float(p.get("contract_unit")),
+                    _safe_float(p.get("min_size")),
+                    _asset_default_step(inferred_class, sym),
                 )
                 specs = p.get("product_specs") if isinstance(p.get("product_specs"), dict) else {}
                 max_lev = first_positive(
@@ -175,6 +240,8 @@ class InstrumentRegistry:
                     _safe_float(p.get("leverage")),
                     _safe_float(specs.get("max_leverage")),
                     _safe_float(specs.get("maximum_leverage")),
+                    _deep_first_float(p, ("max_leverage", "maximum_leverage", "maxLeverage")),
+                    _asset_default_max_leverage(inferred_class),
                 )
                 ei = ExchangeInstrument(
                     exchange=ExchangeName.DELTA,
@@ -182,7 +249,7 @@ class InstrumentRegistry:
                     ws_symbol=sym,
                     display_symbol=sym,
                     asset_id=normalise_symbol(base or sym),
-                    asset_class=AssetClass.CRYPTO,
+                    asset_class=inferred_class,
                     product_id=_safe_int(p.get("id") or p.get("product_id"), 0) or None,
                     quote_asset=quote,
                     base_asset=base,
@@ -289,9 +356,15 @@ class InstrumentRegistry:
                     if not row or str(row.get("error") or ""):
                         continue
                     # Require some live-market field so a generic error wrapper cannot activate it.
-                    if not any(k in row for k in ("symbol", "last_price", "mark_price", "best_bid", "best_ask", "funding_rate", "open_interest")):
+                    if not any(k in row for k in ("symbol", "last_price", "lastPrice", "mark_price", "markPrice", "best_bid", "bestBid", "best_ask", "bestAsk", "funding_rate", "fundingRate", "open_interest", "openInterest")):
                         continue
-                    rest_sym = normalise_symbol(row.get("symbol") or sym)
+                    returned_symbol = normalise_symbol(row.get("symbol") or row.get("s") or row.get("pair") or sym)
+                    # Exact-symbol validation: never let ticker field names like LOWPRICE24H
+                    # become activated instruments.
+                    if returned_symbol and returned_symbol != normalise_symbol(sym):
+                        logger.debug("CoinSwitch ticker returned %s while validating %s — ignoring", returned_symbol, sym)
+                        continue
+                    rest_sym = normalise_symbol(sym)
                     ws_sym = slash_symbol(rest_sym)
                     base2, quote = rest_sym, ""
                     for q in ("USDT", "USD", "INR"):

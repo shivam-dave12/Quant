@@ -217,9 +217,41 @@ class MultiAssetQuantBot:
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
         configured = max(1, int(getattr(config, "LEVERAGE", 1)))
         max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0)
+        if max_lev <= 0:
+            # Conservative fallback caps when an exchange product row omits the
+            # leverage field. Delta xStock UI contracts are 25x; do not send 40x
+            # just because BTC uses 40x.
+            ac = str(getattr(inst, "asset_class", "") or "").lower()
+            if "equity" in ac or "commodity" in ac or "index" in ac:
+                max_lev = 25.0
         if max_lev > 0:
             return max(1, min(configured, int(max_lev)))
         return configured
+
+    def _set_leverage_with_backoff(self, ctx: AssetContext, target: int) -> int:
+        """Set leverage, downgrading if Delta rejects max_leverage_exceeded."""
+        attempts = [int(target)]
+        for v in (25, 20, 10, 5, 3, 2, 1):
+            if v < attempts[-1] and v not in attempts:
+                attempts.append(v)
+        last_err = ""
+        for lev in attempts:
+            try:
+                res = ctx.execution_router.set_leverage(lev)
+                ok = isinstance(res, dict) and bool(res.get("success", True)) and not res.get("_error")
+                err = str((res or {}).get("error", "") if isinstance(res, dict) else "")
+                last_err = err or str(res)[:160]
+                if ok and "max_leverage_exceeded" not in err:
+                    return int(lev)
+                if "max_leverage_exceeded" not in last_err:
+                    break
+                logger.warning("%s leverage %sx rejected by exchange: %s — trying lower", ctx.instrument.asset_id, lev, last_err)
+            except Exception as e:
+                last_err = str(e)
+                if "max_leverage_exceeded" not in last_err:
+                    break
+        logger.warning("%s leverage set not confirmed; continuing data-only until order route validates. last=%s", ctx.instrument.asset_id, last_err)
+        return max(1, int(attempts[-1]))
 
 
     def _active_context(self) -> Optional[AssetContext]:
@@ -359,12 +391,9 @@ class MultiAssetQuantBot:
                 with instrument_scope(inst):
                     logger.info("▶️ Starting %s [%s/%s]", inst.asset_id, inst.primary_exchange.value, inst.display_symbol)
                     target_lev = self._instrument_leverage(inst)
-                    try:
-                        res = ctx.execution_router.set_leverage(target_lev)
-                        max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
-                        logger.info("%s leverage target=%sx%s", inst.asset_id, target_lev, max_txt)
-                    except Exception as e:
-                        logger.warning("%s leverage set failed/non-fatal target=%sx: %s", inst.asset_id, target_lev, e)
+                    effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
+                    max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
+                    logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
                     if not ctx.data_manager.start():
                         logger.error("%s data stream start failed", inst.asset_id)
                         continue

@@ -416,6 +416,10 @@ class ExecutionConfig(BaseModel):
         ge=0.0,
         le=3.0,
     )
+    DELTA_REQUIRE_NATIVE_BRACKET: bool = Field(
+        default_factory=lambda: _c("DELTA_REQUIRE_NATIVE_BRACKET", True),
+        description="If true, Delta entries must use native bracket orders and cannot fall back to naked limit + standalone exits.",
+    )
 
 
 # ---------------------------------------------------------------------------

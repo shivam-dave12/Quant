@@ -183,6 +183,12 @@ def default_asset_intents() -> List[AssetIntent]:
                     ("SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"), priority=12),
         AssetIntent("SPX_INDEX", "S&P 500 index", AssetClass.INDEX,
                     ("SPX500USD", "US500", "SP500", "S&P500"), priority=20),
+        # Delta UI lists SPYXUSD/QQQXUSD as xStock token perpetuals. These are
+        # tokenised derivatives, not the direct S&P/Nasdaq index futures.
+        AssetIntent("SPY", "SP500 xStock token derivative", AssetClass.EQUITY,
+                    ("SPYXUSD", "SPYX", "SPY", "SPYUSD", "SPYUSDT"), priority=21),
+        AssetIntent("QQQ", "Nasdaq xStock token derivative", AssetClass.EQUITY,
+                    ("QQQXUSD", "QQQX", "QQQ", "QQQUSD", "QQQUSDT"), priority=22),
         AssetIntent("AAPL", "Apple xStock token derivative", AssetClass.EQUITY,
                     ("AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"), priority=30),
         AssetIntent("MSFT", "Microsoft xStock token derivative", AssetClass.EQUITY,
@@ -195,8 +201,12 @@ def default_asset_intents() -> List[AssetIntent]:
                     ("AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"), priority=34),
         AssetIntent("META", "Meta xStock token derivative", AssetClass.EQUITY,
                     ("METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"), priority=35),
+        AssetIntent("COIN", "Coinbase xStock token derivative", AssetClass.EQUITY,
+                    ("COINXUSD", "COINX", "COIN", "COINUSD", "COINUSDT"), priority=36),
+        AssetIntent("CRCL", "Circle xStock token derivative", AssetClass.EQUITY,
+                    ("CRCLXUSD", "CRCLX", "CRCL", "CRCLUSDT", "CRCLUSD"), priority=37),
         AssetIntent("GOOGL", "Alphabet xStock token derivative", AssetClass.EQUITY,
-                    ("GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"), priority=36),
+                    ("GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"), priority=38),
     ]
 
 def configured_asset_intents(raw: Iterable[dict] | None = None) -> List[AssetIntent]:
