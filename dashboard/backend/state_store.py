@@ -256,9 +256,9 @@ class DashboardState:
                 self.mode = str(event.get("mode", self.mode))
                 self.source = str(event.get("source", self.source))
                 return
-            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:
+            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch"}:
                 self._update_asset(event)
-                if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:
+                if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch"}:
                     self._add_decision(event)
                 return
             if etype in {"position_opened", "position_update", "bracket_update", "trail_update"}:

@@ -491,6 +491,99 @@ class MultiAssetQuantBot:
                 continue
         return "\n".join(lines)
 
+
+    def format_portfolio_status_report(self) -> str:
+        lines = ["🏛 <b>MULTI-ASSET BOT STATUS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines.append(f"Running: {'YES' if self.running else 'NO'} · Trading: {'ENABLED' if self.trading_enabled else 'PAUSED'}")
+        if self.trading_pause_reason:
+            lines.append(f"Pause reason: {self._esc(self.trading_pause_reason)}")
+        lines.append(f"Slots: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Universe: {len(self.contexts)}")
+        for ctx in self.contexts:
+            px = 0.0
+            try:
+                px = float(ctx.data_manager.get_last_price() or 0.0)
+            except Exception:
+                pass
+            pos = ctx.strategy.get_position()
+            state = ctx.phase_name if pos else ("READY" if ctx.ready else "WARMUP")
+            lines.append(
+                f"<code>{self._esc(ctx.instrument.asset_id):<6} "
+                f"{self._esc(ctx.instrument.primary_exchange.value.upper()+':'+ctx.instrument.display_symbol):<18} "
+                f"{self._esc(state):<9} px {self._fmt_price(px):>12}</code>"
+            )
+        return "\n".join(lines)
+
+    def format_portfolio_market_report(self) -> str:
+        lines = ["📊 <b>PORTFOLIO MARKET SNAPSHOT</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        for ctx in self.contexts:
+            inst = ctx.instrument
+            px = atr = 0.0
+            try:
+                px = float(ctx.data_manager.get_last_price() or 0.0)
+            except Exception:
+                pass
+            try:
+                atr = float(getattr(getattr(ctx.strategy, "_atr_5m", None), "atr", 0.0) or 0.0)
+            except Exception:
+                pass
+            bsl = ssl = "-"
+            try:
+                liq = getattr(ctx.strategy, "_liq_map", None)
+                if liq and px > 0 and atr > 0:
+                    snap = liq.get_snapshot(px, atr)
+                    if getattr(snap, "bsl_pools", None):
+                        t = min(snap.bsl_pools, key=lambda x: x.distance_atr)
+                        bsl = f"${t.pool.price:,.2f}/{t.distance_atr:.1f}A"
+                    if getattr(snap, "ssl_pools", None):
+                        t = min(snap.ssl_pools, key=lambda x: x.distance_atr)
+                        ssl = f"${t.pool.price:,.2f}/{t.distance_atr:.1f}A"
+            except Exception:
+                pass
+            lines.append(
+                f"<code>{self._esc(inst.asset_id):<6} px {self._fmt_price(px):>12} "
+                f"ATR {atr:>8.4f} BSL {self._esc(bsl):>15} SSL {self._esc(ssl):>15}</code>"
+            )
+        return "\n".join(lines)
+
+    def format_portfolio_risk_report(self) -> str:
+        lines = ["🛡 <b>PORTFOLIO RISK</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        lines.append(f"Slots used: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Budget {self._esc(self.guard.budget_mode)}")
+        for ctx in self.contexts:
+            try:
+                can, reason = ctx.risk_manager.can_trade()
+            except Exception as e:
+                can, reason = False, str(e)
+            pol = active_policy(ctx.instrument)
+            pos = ctx.strategy.get_position()
+            status = "LIVE" if pos else ("OPEN" if can else "LOCK")
+            lines.append(
+                f"<code>{self._esc(ctx.instrument.asset_id):<6} {status:<5} lev {pol.leverage:>2}x "
+                f"margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f} · {self._esc(reason)[:70]}</code>"
+            )
+        return "\n".join(lines)
+
+    def format_portfolio_sl_tp_report(self) -> str:
+        rows = [self._ctx_position_metrics(c) for c in self.contexts]
+        open_rows = [r for r in rows if r.get("position")]
+        lines = ["🛑 <b>PORTFOLIO SL / TP</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        if not open_rows:
+            lines.append("No live positions.")
+        for r in sorted(open_rows, key=lambda x: str(x.get("asset"))):
+            side = self._esc(r.get("side", ""))
+            trail = "ON" if r.get("trail_active") else "OFF/INIT"
+            lines.append(f"\n<b>{self._esc(r['asset'])}</b> <code>{self._esc(r['venue'])}:{self._esc(r['symbol'])}</code> {side}")
+            lines.append(
+                f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  "
+                f"R {float(r['r']):+5.2f}</code>"
+            )
+            lines.append(
+                f"<code>SL    {self._fmt_price(r['sl']):>12}  TP {self._fmt_price(r['tp']):>12}  "
+                f"TRAIL {trail}</code>"
+            )
+            if r.get("sl_id") or r.get("tp_id"):
+                lines.append(f"<code>ORDERS SL {str(r.get('sl_id') or '-')[:10]}… TP {str(r.get('tp_id') or '-')[:10]}…</code>")
+        return "\n".join(lines)
+
     def format_portfolio_trades_report(self) -> str:
         trades = self._all_trade_records()
         lines = ["📋 <b>PORTFOLIO TRADE TAPE</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]

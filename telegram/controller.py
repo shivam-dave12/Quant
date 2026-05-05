@@ -714,6 +714,9 @@ class TelegramBotController:
         if not bot_running or not bot_instance:
             return "Bot not running."
         try:
+            fn = getattr(bot_instance, "format_portfolio_status_report", None)
+            if callable(fn):
+                return fn()
             strat = bot_instance.strategy
             dm    = bot_instance.data_manager
             if not strat or not dm:
@@ -2146,6 +2149,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_market_report", None)
+        if callable(fn):
+            return fn()
         strat = bot_instance.strategy
         dm    = bot_instance.data_manager
         if not strat or not dm:
@@ -2228,6 +2234,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_risk_report", None)
+        if callable(fn):
+            return fn()
 
         strat = bot_instance.strategy
         rm    = bot_instance.risk_manager
@@ -2336,6 +2345,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_sl_tp_report", None)
+        if callable(fn):
+            return fn()
 
         strat = bot_instance.strategy
         dm = bot_instance.data_manager

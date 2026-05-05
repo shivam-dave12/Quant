@@ -1052,7 +1052,7 @@ class LiquidityTrailEngine:
 
         reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
                   f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
         return LiquidityTrailResult(new_sl=candidate_sl, anchor=None, reason=reason,
                                     phase="DELIVERY_LOCK", r_multiple=0.0)
 
@@ -1128,7 +1128,7 @@ class LiquidityTrailEngine:
         )
         if gate_tag:
             reason = f"{reason}{gate_tag}"
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
         return LiquidityTrailResult(
             new_sl=be_price, anchor=None, reason=reason,
             phase="BE_LOCK", r_multiple=r_multiple)
@@ -2144,7 +2144,7 @@ class LiquidityTrailEngine:
             f"gate={momentum_gate} "
             f"→ SL=${new_sl:,.1f} (+{improvement:.1f}pts)"
         )
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
 
         return LiquidityTrailResult(
             new_sl=new_sl, anchor=anchor, reason=reason, phase=phase,

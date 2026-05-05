@@ -27,7 +27,10 @@ ENTER = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].
 ACTIVE = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ACTIVE (?P<side>LONG|SHORT).*@ \$(?P<price>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+).*TP=\$(?P<tp>[0-9,\.]+)")
 BRACKET_SL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket SL order:.*@ \$(?P<sl>[0-9,\.]+)")
 BRACKET_TP = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket TP order:.*@ \$(?P<tp>[0-9,\.]+)")
-TRAIL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:InstitutionalTrail|TRAIL|SL replaced|SL edited).*?(?:SL|trigger)=?\$?(?P<sl>[0-9,\.]+)?", re.I)
+TRAIL_APPLIED = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:EXCHANGE_APPLIED.*?new=\$?(?P<sl_new>[0-9,\.]+)|(?:SL edited in-place|SL replaced).*?(?:SL|trigger|stop)=?\$?(?P<sl>[0-9,\.]+))", re.I)
+TRAIL_DISPATCH = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*SL dispatch.*?trigger=\$?(?P<sl>[0-9,\.]+).*", re.I)
+TRAIL_PROPOSAL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Trail(?: PROPOSAL)?[: ]+\[(?P<phase>[^\]]+)\].*?→ SL=\$(?P<sl>[0-9,\.]+).*", re.I)
+TRAIL_HOLD = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:Trail HOLD|PAYOFF_HOLD).*?SL=\$(?P<sl>[0-9,\.]+).*", re.I)
 EXIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*EXIT.*?(?P<side>LONG|SHORT)?.*PNL.*?\$?(?P<pnl>[\-+0-9\.]+)", re.I)
 PRICE_ANY = re.compile(r"price[= ](?P<price>[0-9]+(?:\.[0-9]+)?)")
 
@@ -91,8 +94,18 @@ def parse(line: str) -> Optional[dict[str, Any]]:
         ev = base_ctx(m); ev.update({"type": "bracket_update", "sl": fnum(m.group('sl')), "bracket": "SL_VERIFIED"}); return ev
     if m := BRACKET_TP.search(s):
         ev = base_ctx(m); ev.update({"type": "bracket_update", "tp": fnum(m.group('tp')), "bracket": "TP_VERIFIED"}); return ev
-    if m := TRAIL.search(s):
-        ev = base_ctx(m); ev.update({"type": "trail_update", "trailing": "ON", "sl": fnum(m.group('sl')) if m.group('sl') else None, "message": s}); return ev
+    # Important: liquidity_trail.py logs many CANDIDATE/PROPOSAL/HOLD lines.
+    # Those are analytics, not exchange edits. Only dispatch/applied/edit/replaced
+    # logs are allowed to mutate the dashboard position SL.
+    if m := TRAIL_APPLIED.search(s):
+        sl_raw = m.groupdict().get("sl_new") or m.groupdict().get("sl")
+        ev = base_ctx(m); ev.update({"type": "trail_update", "trailing": "ON", "sl": fnum(sl_raw) if sl_raw else None, "message": s, "phase": "TRAIL_EXCHANGE_APPLIED"}); return ev
+    if m := TRAIL_DISPATCH.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_dispatch", "phase": "TRAIL_DISPATCHED", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
+    if m := TRAIL_HOLD.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_hold", "phase": "TRAIL_HOLD", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
+    if m := TRAIL_PROPOSAL.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_proposal", "phase": f"TRAIL_PROPOSAL_{m.group('phase')}", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
     if m := EXIT.search(s):
         ev = base_ctx(m); ev.update({"type": "position_closed", "side": m.group('side') or '', "pnl": fnum(m.group('pnl')), "reason": s}); return ev
     if any(x in s for x in ["ERRO", "ERROR", "Traceback", "NameError", "TypeError", "AttributeError"]):

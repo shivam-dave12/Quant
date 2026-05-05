@@ -2910,6 +2910,17 @@ class QuantStrategy:
         except Exception:
             return send_telegram_message(message, parse_mode=parse_mode)
 
+    def _quantity_display(self, qty: float) -> str:
+        """Human-readable quantity with correct unit per active instrument."""
+        try:
+            inst = getattr(self, "_instrument", None)
+            asset_id = str(getattr(inst, "asset_id", "") or "").upper()
+            if asset_id == "BTC":
+                return f"{float(qty):.6f} BTC"
+            return f"{float(qty):.6f} contracts"
+        except Exception:
+            return f"{float(qty):.6f} units"
+
     def _log_init(self):
         logger.info("=" * 72)
         logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
@@ -7870,7 +7881,9 @@ class QuantStrategy:
             logger.warning(f"InstitutionalTrail: SL replace failed ({err}) — keeping current SL")
             return False
 
-        # Success — update position state under lock
+        # Success — update position state under lock.  Capture the old trigger
+        # before mutation so dashboard/Telegram can show the real exchange edit.
+        _old_sl_before_apply = float(getattr(pos, "sl_price", 0.0) or 0.0)
         with self._lock:
             self._pos.sl_price = _new_liq_sl
             _new_oid = (_lt_result or {}).get("order_id")
@@ -7883,6 +7896,10 @@ class QuantStrategy:
                 logger.info("✅ Institutional trail now active")
             if _liq_result.phase == "BE_LOCK":
                 self._pos.be_ratchet_applied = True
+        logger.info(
+            f"✅ InstitutionalTrail EXCHANGE_APPLIED old=${_old_sl_before_apply:,.2f} "
+            f"new=${_new_liq_sl:,.2f} order={getattr(self._pos, 'sl_order_id', '')} "
+            f"phase={_liq_result.phase}")
 
         # Throttled Telegram update with the full v5.0 context
         _trail_tg_key = "_liq_trail_tg_last"
@@ -8377,6 +8394,8 @@ class QuantStrategy:
                     quantity     = pos.quantity,
                     reason       = exit_reason,
                     pnl_override = pnl,
+                    instrument   = getattr(self, "_instrument", None),
+                    leverage     = QCfg.LEVERAGE(),
                 )
         except Exception as _rm_rec_e:
             logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")

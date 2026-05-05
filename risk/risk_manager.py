@@ -317,6 +317,8 @@ class RiskManager:
         quantity:      float,
         reason:        str,
         pnl_override:  float = None,
+        instrument     = None,
+        leverage:      float = None,
     ):
         """
         Record a completed trade.
@@ -347,12 +349,19 @@ class RiskManager:
             if pnl_override is not None:
                 pnl = float(pnl_override)
             else:
-                _is_inverse = str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
+                try:
+                    _asset_id = str(getattr(instrument, "asset_id", "") or "").upper()
+                except Exception:
+                    _asset_id = ""
+                _is_inverse = (
+                    str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
+                    and _asset_id == "BTC"
+                )
                 gross_pnl = gross_pnl_usd(
                     side=side,
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    quantity_btc=quantity,
+                    quantity_units=quantity,
                     inverse=_is_inverse,
                 )
 
@@ -368,8 +377,15 @@ class RiskManager:
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            margin_used       = notional_at_entry / config.LEVERAGE if config.LEVERAGE > 0 else notional_at_entry
+            lev = float(leverage if leverage is not None else getattr(config, "LEVERAGE", 1) or 1)
+            margin_used       = notional_at_entry / lev if lev > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
+            try:
+                asset_id = str(getattr(instrument, "asset_id", "") or "").upper()
+                asset_class = str(getattr(instrument, "asset_class", "") or "").lower()
+                qty_unit = "BTC" if asset_id == "BTC" else ("contracts" if asset_class else "units")
+            except Exception:
+                qty_unit = "units"
 
             trade = TradeRecord(
                 timestamp   = time.time(),
@@ -401,7 +417,7 @@ class RiskManager:
                 f"📊 Trade recorded: {side.upper()} | "
                 f"Net P&L: ${pnl:+.2f} | "
                 f"Return on margin: {return_on_margin:+.2f}% | "
-                f"Qty: {quantity:.4f} BTC | "
+                f"Qty: {quantity:.4f} {qty_unit} | "
                 f"Total trades: {self.total_trades}"
             )
 
