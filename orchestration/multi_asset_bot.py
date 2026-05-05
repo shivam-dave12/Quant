@@ -32,7 +32,6 @@ from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManag
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
-from telemetry.dashboard_emitter import get_dashboard_emitter
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +47,6 @@ class AssetContext:
     last_report_sec: float = 0.0
     last_heartbeat_sec: float = 0.0
     last_analysis_sec: float = 0.0
-    last_dashboard_scan_sec: float = 0.0
-    last_dashboard_position_sec: float = 0.0
-    dashboard_was_position: bool = False
     ready: bool = False
 
     @property
@@ -209,8 +205,6 @@ class MultiAssetQuantBot:
         self.trading_enabled = True
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
-        self._last_dashboard_heartbeat = 0.0
-        self.dashboard = get_dashboard_emitter()
         self._lock = threading.RLock()
 
     def _build_api_clients(self):
@@ -727,8 +721,6 @@ class MultiAssetQuantBot:
         if self.discovery_report:
             send_telegram_message(self.discovery_report.telegram_html())
         send_telegram_message(self._startup_message())
-        self._dashboard_universe_event()
-        self._dashboard_heartbeat(force=True)
         return True
 
     def _startup_message(self) -> str:
@@ -776,14 +768,11 @@ class MultiAssetQuantBot:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
                     self._maybe_analysis_audit(ctx, dt_ms)
                     self._maybe_asset_heartbeat(ctx)
-                    self._maybe_dashboard_context_event(ctx, dt_ms)
-                self._dashboard_heartbeat()
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
                 break
-            except Exception as exc:
+            except Exception:
                 logger.exception("Multi-asset loop error")
-                self.dashboard.alert(severity="critical", title="Multi-asset loop error", message=str(exc))
                 time.sleep(1.0)
         self.running = False
 
@@ -838,135 +827,6 @@ class MultiAssetQuantBot:
         except Exception as e:
             logger.debug("heartbeat failed for %s: %s", ctx.instrument.asset_id, e)
 
-    def _dashboard_heartbeat(self, force: bool = False) -> None:
-        now = time.time()
-        interval = float(getattr(config, "DASHBOARD_HEARTBEAT_SEC", 5.0))
-        if not force and now - self._last_dashboard_heartbeat < interval:
-            return
-        self._last_dashboard_heartbeat = now
-        try:
-            trades = self._all_trade_records()
-            total_realized = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
-            self.dashboard.heartbeat(
-                mode="live" if self.trading_enabled else "paused",
-                environment="aws",
-                max_positions=self.guard.max_open_positions,
-                total_realized=total_realized,
-                notes=self.trading_pause_reason or "multi-asset scanner online",
-            )
-        except Exception as exc:
-            logger.debug("dashboard heartbeat failed: %s", exc)
-
-    def _dashboard_universe_event(self) -> None:
-        try:
-            active = [f"{c.instrument.asset_id}:{c.instrument.primary_exchange.value.upper()}:{c.instrument.display_symbol}" for c in self.contexts]
-            self.dashboard.alert(
-                severity="info",
-                title="Execution universe online",
-                message=", ".join(active),
-            )
-        except Exception as exc:
-            logger.debug("dashboard universe event failed: %s", exc)
-
-    def _position_dashboard_payload(self, ctx: AssetContext) -> Dict[str, Any]:
-        inst = ctx.instrument
-        pos = ctx.strategy.get_position()
-        price = 0.0
-        try:
-            price = float(ctx.data_manager.get_last_price() or 0.0)
-        except Exception:
-            pass
-        payload: Dict[str, Any] = {
-            "asset": inst.asset_id,
-            "symbol": inst.display_symbol,
-            "venue": inst.primary_exchange.value.upper(),
-            "price": price,
-            "state": ctx.phase_name,
-        }
-        if not pos:
-            return payload
-        try:
-            side = str(pos.side or "").upper()
-            entry = float(pos.entry_price or 0.0)
-            qty = float(pos.quantity or 0.0)
-            sl = float(pos.sl_price or 0.0)
-            tp = float(pos.tp_price or 0.0)
-            move_pts = (price - entry) if side == "LONG" else (entry - price)
-            init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0) or abs(entry - sl)
-            payload.update({
-                "side": side,
-                "qty": qty,
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "upnl": move_pts * qty,
-                "achieved_r": move_pts / init_dist if init_dist > 1e-10 else 0.0,
-                "mfe_r": float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0,
-                "trailing": "ON" if bool(getattr(pos, "trail_active", False) or ctx.strategy.get_trail_enabled()) else "OFF",
-                "opened_at": float(getattr(pos, "entry_time", time.time()) or time.time()),
-            })
-        except Exception as exc:
-            logger.debug("dashboard position payload failed for %s: %s", inst.asset_id, exc)
-        return payload
-
-    def _maybe_dashboard_context_event(self, ctx: AssetContext, dt_ms: float) -> None:
-        now = time.time()
-        try:
-            pos = ctx.strategy.get_position()
-            if pos:
-                interval = float(getattr(config, "DASHBOARD_POSITION_UPDATE_SEC", 2.0))
-                if not ctx.dashboard_was_position:
-                    self.dashboard.position_opened(**self._position_dashboard_payload(ctx))
-                    ctx.dashboard_was_position = True
-                    ctx.last_dashboard_position_sec = now
-                elif now - ctx.last_dashboard_position_sec >= interval:
-                    self.dashboard.position_update(**self._position_dashboard_payload(ctx))
-                    ctx.last_dashboard_position_sec = now
-                return
-
-            if ctx.dashboard_was_position:
-                payload = self._position_dashboard_payload(ctx)
-                last_trade = None
-                try:
-                    hist = list(getattr(ctx.strategy, "_trade_history", []) or [])
-                    last_trade = hist[-1] if hist else None
-                except Exception:
-                    last_trade = None
-                if isinstance(last_trade, dict):
-                    payload.update({
-                        "entry": float(last_trade.get("entry", 0.0) or 0.0),
-                        "exit": float(last_trade.get("exit", payload.get("price", 0.0)) or payload.get("price", 0.0)),
-                        "pnl": float(last_trade.get("pnl", 0.0) or 0.0),
-                        "achieved_r": float(last_trade.get("r", last_trade.get("achieved_r", 0.0)) or 0.0),
-                        "reason": str(last_trade.get("reason", "closed")),
-                        "side": str(last_trade.get("side", "")).upper(),
-                    })
-                self.dashboard.position_closed(**payload)
-                ctx.dashboard_was_position = False
-
-            scan_interval = float(getattr(config, "DASHBOARD_SCAN_UPDATE_SEC", 5.0))
-            if now - ctx.last_dashboard_scan_sec >= scan_interval:
-                ctx.last_dashboard_scan_sec = now
-                inst = ctx.instrument
-                price = 0.0
-                try:
-                    price = float(ctx.data_manager.get_last_price() or 0.0)
-                except Exception:
-                    pass
-                spread_ctx = getattr(ctx.strategy, "_last_spread_gate_context", {}) or {}
-                self.dashboard.scan_update(
-                    asset=inst.asset_id,
-                    symbol=inst.display_symbol,
-                    venue=inst.primary_exchange.value.upper(),
-                    phase="SCANNING" if ctx.ready else "WARMUP",
-                    price=price,
-                    spread_bps=float(spread_ctx.get("spread_bps", 0.0) or 0.0),
-                    atr=float(spread_ctx.get("atr", 0.0) or 0.0),
-                    reason=f"eval_ms={dt_ms:.1f}; slots={self.guard.count_open(self.contexts)}/{self.guard.max_open_positions}",
-                )
-        except Exception as exc:
-            logger.debug("dashboard context event failed for %s: %s", ctx.instrument.asset_id, exc)
-
     def stop(self) -> None:
         logger.info("Stopping multi-asset bot...")
         self.running = False
@@ -976,7 +836,6 @@ class MultiAssetQuantBot:
             except Exception:
                 pass
         send_telegram_message("🛑 <b>MULTI-ASSET INSTITUTIONAL BOT STOPPED</b>")
-        self.dashboard.alert(severity="warning", title="Bot stopped", message="Multi-asset bot stopped")
 
 
 def main() -> None:
