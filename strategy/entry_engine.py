@@ -1,0 +1,2981 @@
+"""
+entry_engine.py — Institutional Sweep Entry Engine
+====================================================
+Architecture:
+  Price moves from pool to pool. Smart money sweeps stops, then delivers
+  the opposite direction. This engine ONLY enters on confirmed events:
+
+  1. SWEEP REVERSAL     — Pool swept + displacement + CISD → enter reversal
+  2. SWEEP CONTINUATION — Pool swept + flow continues → ride the flow
+
+  NO approach entries. NO standalone momentum entries. Institutions do not front-run
+  the sweep; every entry must be tied to a confirmed liquidity sweep.
+
+State Machine:
+  SCANNING    → monitors for liquidity sweeps only
+  POST_SWEEP  → 4-phase accumulative evidence model after sweep detected
+  ENTERING    → entry placed, waiting for fill
+  IN_POSITION → position live, managed by quant_strategy.py
+
+Post-Sweep Phases:
+  DISPLACEMENT (0-45s)  → expect strong rejection from sweep level
+  CISD (45-120s)        → expect CHoCH/BOS confirming reversal
+  OTE (120-240s)        → expect retrace to 50%-78.6% Fibonacci zone
+  MATURE (240-360s)     → relaxed thresholds, final chance
+
+Evidence Model:
+  Static factors (scored once): AMD, sweep quality, dealing range, pool sig
+  Dynamic factors (per-tick with decay): flow, CVD, CISD, OTE, displacement
+  Decision: static_base + accumulated_dynamic >= phase-adjusted threshold
+
+Exports (consumed by quant_strategy.py):
+  EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
+  EntryType, ICTSweepEvent
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+try:
+    from strategy.quantitative_models import evaluate_post_sweep_quant
+except Exception:  # pragma: no cover
+    from quantitative_models import evaluate_post_sweep_quant  # type: ignore
+
+
+try:
+    from strategy.market_intelligence import build_market_profile, MarketProfile
+except Exception:  # pragma: no cover - standalone tests
+    from market_intelligence import build_market_profile, MarketProfile  # type: ignore
+
+try:
+    from strategy.liquidity_map import (
+        LiquidityMap, LiquidityMapSnapshot, PoolTarget, SweepResult,
+        PoolStatus, PoolSide, TF_HIERARCHY,
+    )
+except ImportError:
+    from liquidity_map import (
+        LiquidityMap, LiquidityMapSnapshot, PoolTarget, SweepResult,
+        PoolStatus, PoolSide, TF_HIERARCHY,
+    )
+
+
+
+
+try:
+    import config as _entry_cfg
+except Exception:  # pragma: no cover
+    _entry_cfg = None  # type: ignore
+
+def _entry_cfg_value(name: str, default):
+    if _entry_cfg is None:
+        return default
+    return getattr(_entry_cfg, name, default)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Flow thresholds
+_FLOW_CONV_THRESHOLD     = 0.40
+_FLOW_CVD_AGREE_MIN      = 0.15
+_FLOW_SUSTAINED_TICKS    = 2
+_FLOW_EWMA_ALPHA_PER_SEC = 0.648    # at dt=0.25s → alpha=0.15
+_FLOW_EWMA_ADAPTIVE_CAP  = 0.40
+
+# Pool targeting
+_MAX_TARGET_ATR        = 8.0
+_MIN_TARGET_ATR        = 0.25
+_MIN_POOL_SIGNIFICANCE = float(_entry_cfg_value("ENTRY_MIN_POOL_SIGNIFICANCE", 1.25))
+
+# Sweep quality
+_MIN_SWEEP_QUALITY = float(_entry_cfg_value("ENTRY_MIN_SWEEP_QUALITY", 0.20))
+
+# Timing
+_CISD_MAX_WAIT_SEC   = 360
+_ENTRY_COOLDOWN_SEC  = float(_entry_cfg_value("ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC", 10.0))
+
+# SL / TP
+try:
+    import config as _cfg
+    _MIN_RR_RATIO = float(getattr(_cfg, "MIN_RISK_REWARD_RATIO", 1.5))
+except Exception:
+    _MIN_RR_RATIO = 1.5
+_SL_BUFFER_ATR      = 0.35
+_TP_BUFFER_ATR      = 0.08
+_REV_SL_BUFFER_ATR  = 0.35
+_CONT_SL_BUFFER_ATR = 0.40
+_TP_RR_SAFETY_BUFFER = float(getattr(_cfg, "ENTRY_TP_RR_SAFETY_BUFFER", 0.20)) if '_cfg' in globals() else 0.20
+_TP_MIN_NET_ATR      = float(getattr(_cfg, "ENTRY_TP_MIN_NET_ATR", 0.20)) if '_cfg' in globals() else 0.20
+
+try:
+    import config as _sl_cfg
+    # Institutional SL geometry: structure first, ATR noise floor second,
+    # liquidation guard last. Wide stops are allowed when structure requires it.
+    _SL_MIN_ATR_MULT     = float(getattr(_sl_cfg, "SL_MIN_ATR_MULT", 0.20))
+    # Wick structural clearance — SL must extend this fraction of wick_depth
+    # PAST the wick tip, anchoring it to the actual structural level:
+    _SL_WICK_CLEARANCE   = float(getattr(_sl_cfg, "SL_SWEEP_WICK_CLEARANCE_MULT", 0.10))
+    # Regime-adaptation slope: regime_mult = 0.60 + slope × atr_pctile
+    # p=0 (low-vol) → mult=0.60 tight; p=0.5 → 1.00 normal; p=1.0 → 1.40 wide:
+    _SL_REGIME_SLOPE     = float(getattr(_sl_cfg, "SL_REGIME_BUFF_SLOPE", 0.80))
+except Exception:
+    _SL_MIN_ATR_MULT     = 0.20
+    _SL_WICK_CLEARANCE   = 0.10
+    _SL_REGIME_SLOPE     = 0.80
+
+# Institutional entry-refinement after pre-order rejections.
+try:
+    import config as _ref_cfg
+    _REFINE_ENABLED          = bool(getattr(_ref_cfg, "ENTRY_REFINE_AFTER_SIZE_REJECT", True))
+    _REFINE_TTL_SEC          = float(getattr(_ref_cfg, "ENTRY_REFINE_TTL_SEC", 20 * 60.0))
+    _REFINE_MIN_RETRY_SEC    = float(getattr(_ref_cfg, "ENTRY_REFINE_MIN_RETRY_SEC", 8.0))
+    _REFINE_MAX_ATTEMPTS     = int(getattr(_ref_cfg, "ENTRY_REFINE_MAX_ATTEMPTS", 18))
+    _REFINE_MIN_PULLBACK_ATR = float(getattr(_ref_cfg, "ENTRY_REFINE_MIN_PULLBACK_ATR", 0.25))
+    _REFINE_RISK_IMPROVE    = float(getattr(_ref_cfg, "ENTRY_REFINE_RISK_IMPROVE_RATIO", 0.82))
+    _REFINE_SL_ROOM_ATR      = float(getattr(_ref_cfg, "ENTRY_REFINE_SL_ROOM_ATR", 0.20))
+except Exception:
+    _REFINE_ENABLED          = True
+    _REFINE_TTL_SEC          = 20 * 60.0
+    _REFINE_MIN_RETRY_SEC    = 8.0
+    _REFINE_MAX_ATTEMPTS     = 18
+    _REFINE_MIN_PULLBACK_ATR = 0.25
+    _REFINE_RISK_IMPROVE    = 0.82
+    _REFINE_SL_ROOM_ATR      = 0.20
+
+# Post-Sweep phases (seconds after sweep)
+# MOD-11 FIX: Previously hardcoded. Now loaded from config so operators can
+# tune phase windows for different market conditions (trending vs ranging)
+# without a code deploy. Fallbacks preserve original production values.
+try:
+    import config as _ecfg
+    _PS_PHASE_DISPLACEMENT = float(getattr(_ecfg, 'PS_PHASE_DISPLACEMENT_SEC', 45.0))
+    _PS_PHASE_CISD         = float(getattr(_ecfg, 'PS_PHASE_CISD_SEC',         120.0))
+    _PS_PHASE_OTE          = float(getattr(_ecfg, 'PS_PHASE_OTE_SEC',          240.0))
+    _PS_PHASE_MATURE       = float(getattr(_ecfg, 'PS_PHASE_MATURE_SEC',       360.0))
+except Exception:
+    _PS_PHASE_DISPLACEMENT = 45.0
+    _PS_PHASE_CISD         = 120.0
+    _PS_PHASE_OTE          = 240.0
+    _PS_PHASE_MATURE       = 360.0
+
+# Post-Sweep evidence thresholds.
+# Institutional mode: the posterior/EV calculation decides whether a sweep
+# auction is worth expressing. Quality diagnostics below are continuous;
+# they reduce confidence/sizing instead of becoming hidden pass/fail filters.
+_PS_THRESHOLD_EARLY  = 62.0
+_PS_THRESHOLD_NORMAL = 52.0
+_PS_THRESHOLD_MATURE = 45.0
+_PS_GAP_MIN          = 14.0
+_PS_DISP_MULT        = 1.15
+_PS_MATURE_MULT      = 0.80
+
+# Displacement requirements
+_PS_DISP_MIN_ATR    = 0.55
+_PS_DISP_STRONG_ATR = 1.25
+_PS_OTE_FIB_LOW     = 0.50
+_PS_OTE_FIB_HIGH    = 0.786
+_PS_NEUTRAL_TICK_DECAY = 0.98
+
+# Dynamic entry-quality references loaded from config.
+# Kept backward-compatible with older config names, but these are references
+# for scoring/penalty, not hard alpha vetoes.
+try:
+    import config as _entry_gate_cfg
+    _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
+    _ENTRY_STRONG_DISP_ATR   = float(getattr(_entry_gate_cfg, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
+    _ENTRY_REQUIRE_CISD_OR_OTE = bool(getattr(_entry_gate_cfg, "ENTRY_REQUIRE_CISD_OR_OTE", True))
+    _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = float(getattr(_entry_gate_cfg, "ENTRY_MAX_CHASE_ATR_WITHOUT_OTE", 1.15))
+    _ENTRY_REVERSAL_PD_LONG_MAX  = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_LONG_MAX", 0.62))
+    _ENTRY_REVERSAL_PD_SHORT_MIN = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38))
+    _ENTRY_CONT_MIN_ACCEPT_ATR = float(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
+    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = bool(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS", True))
+    _ENTRY_FLOW_HARD_OPPOSE = float(getattr(_entry_gate_cfg, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40))
+    _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
+    _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
+    _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
+except Exception:
+    _ENTRY_HARD_MIN_DISP_ATR = 0.75
+    _ENTRY_STRONG_DISP_ATR   = 1.25
+    _ENTRY_REQUIRE_CISD_OR_OTE = True
+    _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = 1.15
+    _ENTRY_REVERSAL_PD_LONG_MAX  = 0.62
+    _ENTRY_REVERSAL_PD_SHORT_MIN = 0.38
+    _ENTRY_CONT_MIN_ACCEPT_ATR = 0.55
+    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = True
+    _ENTRY_FLOW_HARD_OPPOSE = 0.40
+    _ENTRY_CVD_HARD_OPPOSE  = 0.30
+    _ENTRY_HTF_CONTRA_VETO = True
+    _ENTRY_GATE_LOG_SEC = 12.0
+
+
+# HTF TP escalation
+_HTF_TP_TIMEFRAMES   = ('1h', '4h', '1d')
+_HTF_TP_MAX_ATR      = 30.0
+_HTF_TP_MIN_HTF_COUNT = 2
+
+# AMD modifiers (never block — only size)
+_AMD_ALIGNED_BONUS    = 1.10
+_AMD_MANIP_CONTRA     = 0.60
+_AMD_DIST_CONTRA      = 0.80
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EngineState(Enum):
+    SCANNING    = auto()
+    TRACKING    = auto()   # kept for interface compat — unused in sweep-only mode
+    READY       = auto()   # kept for interface compat — unused in sweep-only mode
+    ENTERING    = auto()
+    IN_POSITION = auto()
+    POST_SWEEP  = auto()
+
+
+class EntryType(Enum):
+    PRE_SWEEP_APPROACH    = "APPROACH"      # disabled — kept for compat
+    SWEEP_REVERSAL        = "REVERSAL"
+    SWEEP_CONTINUATION    = "CONTINUATION"
+
+
+@dataclass
+class OrderFlowState:
+    tick_flow:        float = 0.0
+    cvd_trend:        float = 0.0
+    cvd_divergence:   float = 0.0
+    ob_imbalance:     float = 0.0
+    tick_streak:      int   = 0
+    streak_direction: str   = ""
+
+    @property
+    def conviction(self) -> float:
+        signals = [self.tick_flow, self.cvd_trend]
+        if abs(self.ob_imbalance) > 0.1:
+            signals.append(self.ob_imbalance * 0.5)
+        return sum(signals) / len(signals)
+
+    @property
+    def direction(self) -> str:
+        c = self.conviction
+        if c > _FLOW_CONV_THRESHOLD * 0.5:
+            return "long"
+        elif c < -_FLOW_CONV_THRESHOLD * 0.5:
+            return "short"
+        return ""
+
+    @property
+    def is_sustained(self) -> bool:
+        return (self.tick_streak >= _FLOW_SUSTAINED_TICKS
+                and self.streak_direction == self.direction)
+
+    @property
+    def cvd_agrees(self) -> bool:
+        d = self.direction
+        if d == "long":  return self.cvd_trend > _FLOW_CVD_AGREE_MIN
+        if d == "short": return self.cvd_trend < -_FLOW_CVD_AGREE_MIN
+        return False
+
+
+@dataclass
+class ICTSweepEvent:
+    pool_price:     float
+    pool_type:      str       # "BSL" or "SSL"
+    sweep_ts:       int       # ms epoch
+    displacement:   bool
+    disp_score:     float
+    wick_reject:    bool
+    candle_high:    float
+    candle_low:     float
+    candle_close:   float
+
+
+@dataclass
+class ICTContext:
+    amd_phase:              str   = ""
+    amd_bias:               str   = ""
+    amd_confidence:         float = 0.0
+    in_premium:             bool  = False
+    in_discount:            bool  = False
+    dealing_range_pd:       float = 0.5
+    structure_5m:           str   = ""
+    structure_15m:          str   = ""
+    structure_4h:           str   = ""
+    bos_5m:                 str   = ""
+    choch_5m:               str   = ""
+    nearest_ob_price:       float = 0.0
+    nearest_ob_price_short: float = 0.0
+    kill_zone:              str   = ""
+    ict_sweeps:             list  = field(default_factory=list)
+    direction_hint:            str   = ""
+    direction_hint_side:       str   = ""
+    direction_hint_confidence: float = 0.0
+
+    @property
+    def session_quality(self) -> str:
+        kz = (self.kill_zone or "").lower()
+        if "london" in kz or "ny" in kz: return "prime"
+        if "asia" in kz:                 return "fair"
+        return "off_session"
+
+
+@dataclass
+class EntrySignal:
+    side:           str
+    entry_type:     EntryType
+    entry_price:    float
+    sl_price:       float
+    tp_price:       float
+    rr_ratio:       float
+    target_pool:    PoolTarget
+    sweep_result:   Optional[SweepResult] = None
+    conviction:     float = 0.0
+    reason:         str   = ""
+    ict_validation: str   = ""
+    created_at:     float = field(default_factory=time.time)
+
+
+@dataclass
+class PostSweepDecision:
+    action:      str
+    direction:   str
+    confidence:  float
+    next_target: Optional[PoolTarget] = None
+    reason:      str                  = ""
+
+
+# ── Internal state ────────────────────────────────────────────────────────
+
+@dataclass
+class _PostSweepState:
+    sweep:              SweepResult
+    entered_at:         float
+    initial_flow:       float = 0.0
+    initial_flow_dir:   str   = ""
+    rev_evidence:       float = 0.0
+    cont_evidence:      float = 0.0
+    peak_rev:           float = 0.0
+    peak_cont:          float = 0.0
+    tick_count:         int   = 0
+    cisd_detected:      bool  = False
+    cisd_timestamp:     float = 0.0
+    cisd_type:          str   = ""
+    max_displacement:   float = 0.0
+    displacement_dir:   str   = ""
+    disp_velocity:      float = 0.0
+    ote_reached:        bool  = False
+    ote_timestamp:      float = 0.0
+    ote_holding:        bool  = False
+    highest_since:      float = 0.0
+    lowest_since:       float = float('inf')
+    rev_flow_ticks:     int   = 0
+    cont_flow_ticks:    int   = 0
+    ict_sweep_event:    Optional[ICTSweepEvent] = None
+    static_scored:      bool  = False
+    static_rev_base:    float = 0.0
+    static_cont_base:   float = 0.0
+
+
+@dataclass
+class _PendingRefinedEntry:
+    """A confirmed sweep thesis waiting for a better executable entry."""
+    original: EntrySignal
+    created_at: float
+    expires_at: float
+    reason: str = "pre_order_reject"
+    attempts: int = 0
+    last_eval_at: float = 0.0
+    last_reason: str = "waiting for refined pullback"
+    min_viable_risk: float = 0.0
+    execution_gap: float = 0.0
+    required_entry_price: float = 0.0
+    required_sl_price: float = 0.0
+    execution_context: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def side(self) -> str:
+        return self.original.side
+
+    @property
+    def sweep(self) -> Optional[SweepResult]:
+        return self.original.sweep_result
+
+    @property
+    def initial_risk(self) -> float:
+        return abs(float(self.original.entry_price) - float(self.original.sl_price))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENTRY ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EntryEngine:
+    """Institutional sweep-only entry engine."""
+
+    def __init__(self, on_self_recovery=None) -> None:
+        self._state          = EngineState.SCANNING
+        self._state_entered  = time.time()
+        self._on_self_recovery = on_self_recovery
+        self._signal:        Optional[EntrySignal]     = None
+        self._post_sweep:    Optional[_PostSweepState] = None
+        self._last_entry_at  = 0.0
+        self._last_sweep_analysis: Dict = {}
+        self._last_liq_snapshot = None
+        self._last_market_profile = None
+
+        # Flow EWMA
+        self._flow_ewma             = 0.0
+        self._flow_ewma_last_update = 0.0
+
+        # Sweep tracking
+        self._last_sweep_reversal_dir  = ""
+        self._last_sweep_reversal_time = 0.0
+
+
+        # Compat stubs for TRACKING/READY (unused in sweep-only mode)
+        self._tracking = None
+        self._proximity_confirms = 0
+        self._proximity_target   = None
+        self._proximity_side     = ""
+
+        # BUG-B2 FIX: Gate-block cooldown (POST_SWEEP signals)
+        # When unified_entry_gate or conviction_filter blocks a signal from the
+        # active POST_SWEEP state, the post_sweep evidence model remains alive and
+        # will regenerate the identical signal on the next tick (250ms later).
+        # Without this guard, the bot enters a busy-loop: generate → block → consume
+        # → generate → block, cycling at 4 Hz and exhausting every pool evaluation
+        # before any structural evidence can accumulate.
+        #
+        # _gate_blocked_until: epoch timestamp after which signal generation is
+        #   allowed again. Set by mark_signal_deferred() called from quant_strategy.
+        # _gate_block_key: (side, reason_prefix) dedup so a DIFFERENT gate reason
+        #   (e.g. AMD changed from ACCUMULATION to MANIPULATION) does not wait.
+        self._gate_blocked_until: float = 0.0
+        self._gate_block_key: tuple = ()
+
+        # Local-log dedup for posterior acceptance during cooldown/deferred states.
+        # QuantStrategy may defer a candidate after target/stop utility surfaces
+        # abstain. While that cooldown is alive, the evidence model should keep
+        # observing the auction, but it must not print "POSTERIOR ACCEPTED" every
+        # tick because routing is intentionally held.
+        self._suppress_posterior_accept_log: bool = False
+        self._last_accept_log_key: tuple = ()
+        self._last_accept_log_ts: float = 0.0
+
+        # BUG-1 FIX: Processed-sweeps registry (SWEEP-LOOP root cause).
+        # After a verdict fires, _handle_reversal/_handle_continuation previously
+        # cleared _post_sweep but did NOT record the sweep as processed.  On the
+        # next SCANNING tick _collect_sweeps() found the same sweep (still within
+        # the 60s window) and re-entered POST_SWEEP — looping every ~5s for up to
+        # 60s per sweep.
+        #
+        # Key schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
+        #   pool_price   — rounded to dollar to absorb tick-level float noise
+        #   pool_side    — "BSL" or "SSL" — different sides at same price are distinct
+        #   detected_at  — rounded to second; ensures a NEW sweep at the same level
+        #                  (detected_at differs) is never suppressed by a stale entry
+        #
+        # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
+        # window PLUS the 45s deferral cooldown with 15s margin.
+        #
+        # _processed_sweeps is intentionally NOT cleared on _reset() — a cooldown
+        # must survive a state reset so the same sweep cannot sneak back in.
+        # force_reset() clears it fully when the operator demands a hard reset.
+        self._processed_sweeps: Dict[tuple, float] = {}
+
+        # ── Diagnostic: sweep-rejection counters ──────────────────────────
+        # Populated by _collect_sweeps() on every tick. Read by the strategy's
+        # THINK log to surface WHY the engine is not transitioning out of
+        # SCANNING (silent rejection is the observability bug that made the
+        # 4-hour "no trades" session impossible to diagnose from logs alone).
+        # {"stale": int, "low_quality": int, "processed": int}
+        self._last_liq_skip:    Optional[Dict[str, int]] = None
+        self._last_bridge_skip: Optional[Dict[str, int]] = None
+        self._sweep_quality_hist = defaultdict(lambda: deque(maxlen=200))
+
+        # Institutional TP/SL pool-plan diagnostics.  These reports are updated
+        # every time the engine evaluates pool-based TP/SL selection.  They are
+        # intentionally retained across _reset(), so after an entry rejection the
+        # Telegram /thinking command can still show WHY visible BSL/SSL pools
+        # were not selected.
+        self._last_pool_plan: Optional[Dict[str, Any]] = None
+
+        # Signal handed to quant_strategy for execution. Used when a pre-order
+        # rejection happens before any order reaches the exchange, so the exact
+        # sweep lock can be shortened instead of held for the full 120 seconds.
+        self._active_signal: Optional[EntrySignal] = None
+
+        # Confirmed sweep thesis awaiting a refined/pullback entry after a
+        # pre-order sizing/margin rejection.
+        self._pending_refined: Optional[_PendingRefinedEntry] = None
+
+        # ATR-percentile rank [0,1] updated by quant_strategy each tick via
+        # set_atr_pctile().  Drives _regime_sl_mult() so SL buffers scale with
+        # the current volatility regime: tight in low-vol, wide in high-vol.
+        # Default 0.5 = normal regime (regime_mult=1.0) until live data arrives.
+        self._atr_pctile: float = 0.5
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def set_atr_pctile(self, pctile: float) -> None:
+        """Update current ATR percentile rank [0, 1] from quant_strategy.
+
+        Called each tick alongside live ATR so SL buffers adapt to the volatility
+        regime without a config redeploy. Same interface as ICTTrailManager.
+        """
+        self._atr_pctile = max(0.0, min(1.0, pctile))
+
+    def update(
+        self,
+        liq_snapshot: LiquidityMapSnapshot,
+        flow_state:   OrderFlowState,
+        ict_ctx:      ICTContext,
+        price:        float,
+        atr:          float,
+        now:          float,
+        candles_1m:   Optional[List[Dict]] = None,
+        candles_5m:   Optional[List[Dict]] = None,
+    ) -> None:
+        if atr < 1e-10:
+            return
+
+        self._last_liq_snapshot = liq_snapshot
+        self._update_flow_ewma(flow_state, now)
+
+        # ── Check for sweeps ──────────────────────────────────────────
+        new_sweeps = self._collect_sweeps(liq_snapshot, ict_ctx, now, atr)
+
+        # Reprice a confirmed sweep thesis after a pre-order sizing/margin
+        # rejection only when price has pulled back into a better execution zone.
+        if (self._state == EngineState.SCANNING
+                and self._pending_refined is not None
+                and self._signal is None):
+            self._evaluate_pending_refined_entry(
+                liq_snapshot, flow_state, ict_ctx, price, atr, now)
+            if self._signal is not None:
+                return
+
+        if (new_sweeps
+                and self._state not in (EngineState.IN_POSITION,
+                                        EngineState.ENTERING,
+                                        EngineState.POST_SWEEP)):
+            best = max(new_sweeps, key=lambda s: s.quality)
+            ict_event = self._find_ict_event(best, ict_ctx, atr)
+            self._enter_post_sweep(best, liq_snapshot, flow_state,
+                                   ict_ctx, price, atr, now, ict_event)
+            return
+
+        # ── State dispatch ────────────────────────────────────────────
+        if self._state == EngineState.SCANNING:
+            self._do_scanning(liq_snapshot, flow_state, ict_ctx,
+                              price, atr, now, candles_1m, candles_5m)
+        elif self._state == EngineState.POST_SWEEP:
+            self._do_post_sweep(liq_snapshot, flow_state, ict_ctx,
+                                price, atr, now)
+        elif self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            stuck_limit = 120.0 if self._state == EngineState.ENTERING else 14400.0
+            if now - self._state_entered > stuck_limit:
+                logger.warning(
+                    f"Engine SELF-RECOVERY: stuck in {self._state.name} "
+                    f"for {now - self._state_entered:.0f}s")
+                if self._on_self_recovery is not None:
+                    try:
+                        self._on_self_recovery(self._state.name, now - self._state_entered)
+                    except Exception as e:
+                        logger.debug(f"EntryEngine self-recovery callback failed: {e}")
+                self._reset(now)
+
+    def get_signal(self) -> Optional[EntrySignal]:
+        return self._signal
+
+    def consume_signal(self) -> Optional[EntrySignal]:
+        sig = self._signal
+        self._signal = None
+        return sig
+
+    def on_entry_placed(self, signal: Optional[EntrySignal] = None) -> None:
+        """Called by quant_strategy when a trade order is about to be sent."""
+        self._state = EngineState.ENTERING
+        self._state_entered = time.time()
+        self._last_entry_at = time.time()
+        self._active_signal = signal
+        self._signal = None
+
+    def mark_pre_order_rejected(self, signal: Optional[EntrySignal] = None,
+                                cooldown_sec: float = 30.0,
+                                execution_context: Optional[Dict[str, Any]] = None) -> None:
+        """Shorten the processed-sweep lock after a no-order rejection.
+
+        Sizing, fee-floor, liquidation, and margin-envelope failures occur before
+        an order reaches the exchange. Keep a short anti-spam lock, but allow the
+        same sweep to be reconsidered if price/SL distance changes enough to make
+        the setup executable.
+        """
+        sig = signal or self._active_signal
+        try:
+            sweep = getattr(sig, 'sweep_result', None) if sig is not None else None
+            if sweep is None:
+                return
+            now = time.time()
+            key = self._sweep_key(sweep)
+            old_exp = self._processed_sweeps.get(key, 0.0)
+            new_exp = now + max(5.0, float(cooldown_sec))
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+            logger.info(
+                f"EntryEngine pre-order rejection: sweep lock shortened "
+                f"to {int(self._processed_sweeps[key] - now)}s for "
+                f"{sweep.pool.side.value} ${sweep.pool.price:,.1f}")
+
+            if (_REFINE_ENABLED
+                    and sig is not None
+                    and sweep is not None
+                    and getattr(sig, 'entry_type', None) == EntryType.SWEEP_REVERSAL
+                    and float(getattr(sig, 'rr_ratio', 0.0) or 0.0) >= max(_MIN_RR_RATIO, 2.0)):
+                ctx = execution_context if isinstance(execution_context, dict) else {}
+                min_viable = float(ctx.get("min_viable_sl_dist", 0.0) or 0.0)
+                gap = float(ctx.get("geometry_gap_pts", 0.0) or 0.0)
+                req_entry = float(ctx.get("required_entry_price", 0.0) or 0.0)
+                req_sl = float(ctx.get("required_sl_price", 0.0) or 0.0)
+                fee_r = float(ctx.get("fee_to_risk", 0.0) or 0.0)
+                no_alloc = float(ctx.get("fee_no_alloc", 0.0) or 0.0)
+                eu = float(ctx.get("expected_net_utility_r", 0.0) or 0.0)
+                if min_viable > 0.0 and gap > 0.0:
+                    refine_reason = (
+                        f"execution geometry invalid: fee_to_risk={fee_r:.2f}R"
+                        f">={no_alloc:.2f}R required_risk={min_viable:.1f}pts "
+                        f"gap={gap:.1f}pts EU={eu:.2f}R"
+                    )
+                else:
+                    refine_reason = "pre-order rejection; wait for raid-origin pullback"
+                self._pending_refined = _PendingRefinedEntry(
+                    original=sig,
+                    created_at=now,
+                    expires_at=now + max(60.0, _REFINE_TTL_SEC),
+                    reason=refine_reason,
+                    last_reason=refine_reason,
+                    min_viable_risk=min_viable,
+                    execution_gap=gap,
+                    required_entry_price=req_entry,
+                    required_sl_price=req_sl,
+                    execution_context=ctx,
+                )
+                logger.info(
+                    "EntryEngine refine watch armed: %s %s sweep $%.1f -> terminal TP $%.1f for %.0fs (risk %.1f pts, required %.1f pts, gap %.1f pts)",
+                    str(getattr(sig, 'entry_type', '')).split('.')[-1],
+                    str(getattr(sig, 'side', '')).upper(),
+                    float(getattr(getattr(sweep, 'pool', None), 'price', 0.0) or 0.0),
+                    float(getattr(sig, 'tp_price', 0.0) or 0.0),
+                    max(0.0, self._pending_refined.expires_at - now),
+                    self._pending_refined.initial_risk,
+                    min_viable,
+                    gap,
+                )
+        except Exception as e:
+            logger.debug(f"mark_pre_order_rejected failed: {e}")
+
+
+    def _arm_refine_watch_from_rejected_sweep(
+        self,
+        sweep: Optional[SweepResult],
+        side: str,
+        entry_price: float,
+        structural_sl: float,
+        reason: str,
+        now: float,
+        target_pool: Optional[PoolTarget] = None,
+        tp_price: float = 0.0,
+    ) -> None:
+        """Keep a valid sweep thesis alive when the first entry is unexecutable.
+
+        This is deliberately *not* a shortcut entry. It only preserves the thesis
+        after an institutional sweep verdict when the current price is too far
+        from true invalidation, so the SL would breach liquidation/margin guards.
+        The pending watch must later rebuild SL/TP from live structure and pass
+        all normal gates before it can emit a signal.
+        """
+        if not _REFINE_ENABLED or sweep is None:
+            return
+        side = str(side or "").lower()
+        if side not in ("long", "short"):
+            return
+        try:
+            entry_price = float(entry_price or 0.0)
+            structural_sl = float(structural_sl or 0.0)
+            if entry_price <= 0 or structural_sl <= 0:
+                return
+            if not self._sl_is_protective(side, structural_sl, entry_price):
+                return
+            cooldown = float(getattr(_cfg, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)) if '_cfg' in globals() else 30.0
+            key = self._sweep_key(sweep)
+            old_exp = self._processed_sweeps.get(key, 0.0)
+            new_exp = now + max(5.0, cooldown)
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+
+            sig = EntrySignal(
+                side=side,
+                entry_type=EntryType.SWEEP_REVERSAL,
+                entry_price=entry_price,
+                sl_price=structural_sl,
+                tp_price=float(tp_price or 0.0),
+                rr_ratio=0.0,
+                target_pool=target_pool,
+                sweep_result=sweep,
+                conviction=0.55,
+                reason=f"REJECTED_SWEEP_REFINE: {reason}",
+                ict_validation="pending_refine",
+            )
+            self._pending_refined = _PendingRefinedEntry(
+                original=sig,
+                created_at=now,
+                expires_at=now + max(60.0, _REFINE_TTL_SEC),
+                reason=f"{reason}; wait for raid-origin pullback",
+            )
+            logger.info(
+                "EntryEngine refine watch armed after SL/risk rejection: %s sweep $%.1f side=%s initial_entry=$%.1f structural_sl=$%.1f reason=%s",
+                getattr(getattr(sweep, 'pool', None), 'timeframe', '?'),
+                float(getattr(getattr(sweep, 'pool', None), 'price', 0.0) or 0.0),
+                side.upper(), entry_price, structural_sl, reason,
+            )
+        except Exception as e:
+            logger.debug(f"_arm_refine_watch_from_rejected_sweep failed: {e}")
+
+    def on_entry_failed(self) -> None:
+        if self._state in (EngineState.ENTERING, EngineState.IN_POSITION):
+            self._reset(time.time())
+        self._active_signal = None
+
+    def on_position_opened(self) -> None:
+        self._state = EngineState.IN_POSITION
+        self._state_entered = time.time()
+
+    def on_entry_cancelled(self) -> None:
+        self._post_sweep = None
+        self._last_entry_at = time.time()
+        if self._state not in (EngineState.SCANNING, EngineState.IN_POSITION):
+            self._reset(time.time())
+
+    def mark_signal_deferred(self, side: str, reason_prefix: str,
+                             cooldown_sec: float = 45.0) -> None:
+        """Defer the same executable thesis after an abstention/safety pause.
+
+        This is not an alpha mechanical guard. QuantStrategy calls this after the
+        posterior/EV stack abstains, after mechanical safety pauses routing, or
+        after account/exchange risk says not to route. The goal is to prevent a
+        4 Hz busy-loop from re-emitting the identical thesis while allowing a
+        genuinely changed sweep context to reprice immediately.
+        """
+        new_key = (side, reason_prefix[:40])
+        # If the deferral key changes, reset immediately (different signal context)
+        if new_key != self._gate_block_key:
+            self._gate_block_key = new_key
+            self._gate_blocked_until = time.time() + cooldown_sec
+        else:
+            # Same abstention/safety reason — extend the cooldown from NOW
+            self._gate_blocked_until = max(
+                self._gate_blocked_until, time.time() + cooldown_sec)
+
+        # Extend processed-sweep registry expiry for the sweep that
+        # generated this deferred signal. This is the correct suppression point
+        # after the state-dangle fix — _gate_blocked_until only works in POST_SWEEP.
+        if (self._signal is not None
+                and hasattr(self._signal, 'sweep_result')
+                and self._signal.sweep_result is not None):
+            key = self._sweep_key(self._signal.sweep_result)
+            self._processed_sweeps[key] = max(
+                self._processed_sweeps.get(key, 0.0),
+                time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
+            )
+
+    def mark_gate_blocked(self, side: str, reason_prefix: str,
+                          cooldown_sec: float = 45.0) -> None:
+        """Compatibility alias for older callers. Live code uses mark_signal_deferred()."""
+        self.mark_signal_deferred(side, reason_prefix, cooldown_sec)
+
+
+    def on_position_closed(self) -> None:
+        self._active_signal = None
+        self._pending_refined = None
+        self._reset(time.time())
+
+    def force_reset(self) -> None:
+        self._reset(time.time())
+        self._pending_refined = None
+        self._flow_ewma = 0.0
+        self._flow_ewma_last_update = 0.0
+        # BUG-5 FIX: Hard operator reset — clear processed-sweep registry fully.
+        # Normal _reset() intentionally keeps entries so a cooldown survives a
+        # state transition. force_reset() is called explicitly by the operator
+        # and must guarantee a completely clean slate.
+        self._processed_sweeps.clear()
+
+    @property
+    def state(self) -> str:
+        return self._state.name
+
+    @property
+    def tracking_info(self) -> Optional[Dict]:
+        """Current non-position tracking state for THINK/status displays."""
+        if self._pending_refined is not None:
+            p = self._pending_refined
+            sig = p.original
+            return {
+                "mode": "REFINE",
+                "direction": sig.side,
+                "target": f"${float(sig.tp_price):,.0f}",
+                "reason": p.last_reason,
+                "age_sec": max(0.0, time.time() - p.created_at),
+                "expires_in": max(0.0, p.expires_at - time.time()),
+                "attempts": p.attempts,
+                "required_risk": p.min_viable_risk,
+                "execution_gap": p.execution_gap,
+            }
+        return None
+
+    @property
+    def scan_skip_info(self) -> Optional[Dict[str, Dict[str, int]]]:
+        """
+        Last-tick sweep-rejection counters from _collect_sweeps().
+
+        Returns:
+          None if both paths produced sweeps (nothing to report), else a dict:
+            {
+              "liq":    {"stale": n, "low_quality": n, "processed": n},   # or absent
+              "bridge": {"stale": n, "low_quality": n, "processed": n,
+                         "ict_sweeps": n},                                # or absent
+            }
+
+        Used by quant_strategy's THINK log to surface WHY SCANNING isn't
+        advancing. Silent rejection previously made "no trades" impossible
+        to distinguish from "broken pipeline".
+        """
+        out = {}
+        if self._last_liq_skip:
+            out["liq"] = dict(self._last_liq_skip)
+        if self._last_bridge_skip:
+            out["bridge"] = dict(self._last_bridge_skip)
+        return out if out else None
+
+    @property
+    def pool_plan_info(self) -> Optional[Dict[str, Any]]:
+        """Last TP/SL candidate report for /thinking and rejection logs."""
+        return dict(self._last_pool_plan) if isinstance(self._last_pool_plan, dict) else None
+
+    # ── Internal: reset ───────────────────────────────────────────────
+
+    def _reset(self, now: float) -> None:
+        self._state = EngineState.SCANNING
+        self._state_entered = now
+        self._signal = None
+        self._tracking = None
+        self._post_sweep = None
+        # BUG-2 / BUG-1: Purge EXPIRED processed-sweep entries only.
+        # Active entries (expiry > now) must survive the state reset so the same
+        # sweep cannot sneak back in during its 120s hold window.  force_reset()
+        # clears the registry fully when an operator hard-reset is required.
+        self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items()
+                                   if v > now}
+
+    # ── Internal: flow EWMA (continuous-time) ─────────────────────────
+
+    def _update_flow_ewma(self, flow: OrderFlowState, now: float) -> None:
+        dt = now - self._flow_ewma_last_update if self._flow_ewma_last_update > 0 else 0.25
+        self._flow_ewma_last_update = now
+
+        if   flow.direction == "long":  signed = abs(flow.conviction)
+        elif flow.direction == "short": signed = -abs(flow.conviction)
+        else: signed = 0.0
+
+        dt_clamped = min(dt, 2.0)
+        alpha = 1.0 - math.exp(-_FLOW_EWMA_ALPHA_PER_SEC * dt_clamped)
+        boost = min(abs(flow.conviction), 1.0)
+        alpha = min(alpha * (1.0 + boost), _FLOW_EWMA_ADAPTIVE_CAP)
+        self._flow_ewma = alpha * signed + (1.0 - alpha) * self._flow_ewma
+
+    def _ewma_dir(self) -> str:
+        if self._flow_ewma > _FLOW_CONV_THRESHOLD * 0.4:  return "long"
+        if self._flow_ewma < -_FLOW_CONV_THRESHOLD * 0.4: return "short"
+        return ""
+
+    # ── Internal: AMD modifier ────────────────────────────────────────
+
+    @staticmethod
+    def _amd_modifier(ict: ICTContext, direction: str) -> float:
+        """AMD conviction modifier ∈ [0.60, 1.10]. Never blocks."""
+        phase = (ict.amd_phase or "").upper()
+        bias  = (ict.amd_bias or "").lower()
+        if not phase or not bias or bias == "neutral":
+            return 1.0
+
+        aligned = ((direction == "long" and bias == "bullish") or
+                   (direction == "short" and bias == "bearish"))
+        contra  = ((direction == "long" and bias == "bearish") or
+                   (direction == "short" and bias == "bullish"))
+
+        if aligned: return _AMD_ALIGNED_BONUS
+        if not contra: return 1.0
+        if phase == "MANIPULATION":               return _AMD_MANIP_CONTRA
+        if phase in ("DISTRIBUTION", "REDISTRIBUTION"): return _AMD_DIST_CONTRA
+        return 1.0
+
+    # ── Internal: collect sweeps from both systems ────────────────────
+
+    def _collect_sweeps(self, snap, ict_ctx, now, atr) -> List[SweepResult]:
+        """Merge LiquidityMap sweeps + ICT engine sweeps into one list.
+
+        BUG-A4 FIX: Window extended from 10s to 60s.
+        LiquidityMap.check_sweeps() fires on CLOSED 5m candles, meaning a sweep
+        detected at bar close will have detected_at ≈ close_time. The entry engine
+        runs every ~250ms. In practice, ICT engine update latency + multi-TF candle
+        fetching means check_sweeps() may fire 15-30s after the actual sweep candle
+        closed. With a 10s window the sweep is ALREADY stale before entry_engine.update()
+        even runs. 60s gives a full 5m bar worth of tolerance.
+
+        BUG-1 FIX (SWEEP-LOOP): Both LiquidityMap and ICT-bridge sweeps are now
+        filtered against _processed_sweeps before being returned.  A sweep that has
+        already driven a verdict (regardless of whether the resulting signal was
+        consumed or deferred) will not be re-presented until its 120s hold expires.
+        """
+        # ── Sweep collection diagnostics ──────────────────────────────────
+        # Track every reason a sweep is rejected so upstream logs show why
+        # SCANNING isn't transitioning. Silent rejection makes "no trades"
+        # indistinguishable from "broken pipeline".
+        _skipped_stale       = 0
+        _skipped_low_quality = 0
+        _skipped_processed   = 0
+
+        sweeps = []
+        for s in (snap.recent_sweeps or []):
+            if s.detected_at <= now - 60.0:
+                _skipped_stale += 1
+                continue
+            if s.quality < _MIN_SWEEP_QUALITY:
+                _skipped_low_quality += 1
+                continue
+            if self._is_processed(s, now):
+                _skipped_processed += 1
+                continue
+            sweeps.append(s)
+
+        if (not sweeps
+                and self._state not in (EngineState.POST_SWEEP,
+                                        EngineState.IN_POSITION,
+                                        EngineState.ENTERING)
+                and hasattr(ict_ctx, 'ict_sweeps') and ict_ctx.ict_sweeps):
+
+            # ── FIX (entry-engine-bridge-stale): widen ICT-bridge age window
+            # ────────────────────────────────────────────────────────────
+            # Original window was 30s. ICT sweeps are detected at the close
+            # of 5m bars; the entry engine runs every 250ms. With a 30s
+            # window the bridge only covers the first 10% of each 5m bar's
+            # duration — most ticks see a stale sweep and silently drop it.
+            # This is consistent with the LiquidityMap path above (60s) and
+            # with the _notified_sweeps prune window in quant_strategy
+            # (60s cutoff for the direction-engine dedup set).
+            #
+            # Additional grace: if the sweep happened IN THE CURRENT 5m
+            # bar (bar start <= sweep_ts < bar close), extend the window
+            # to (bar_close + 60s) so a sweep at bar-open still reaches
+            # the entry engine for the full 5min + grace. The processed
+            # sweeps registry (_sweep_key keyed on detected_at rounded to
+            # seconds, 120s hold after enter_post_sweep) handles dedup —
+            # widening the detection window does not reintroduce sweep-
+            # loop reprocessing.
+            _base_age_limit = int(now * 1000) - 60_000
+            # Beginning of the current 5-minute bar (UTC-based)
+            _cur_5m_start_ms = int(now // 300.0) * 300_000
+            # Accept a sweep if EITHER it's within 60s of now OR it was
+            # detected in the current or previous 5m bar (+60s grace).
+            _bar_age_limit = _cur_5m_start_ms - 300_000  # start of previous 5m bar
+
+            _bridge_stale = 0
+            _bridge_low_q = 0
+            _bridge_proc  = 0
+
+            for ev in ict_ctx.ict_sweeps:
+                if ev.sweep_ts < _base_age_limit and ev.sweep_ts < _bar_age_limit:
+                    _bridge_stale += 1
+                    continue
+                side = PoolSide.BSL if ev.pool_type == "BSL" else PoolSide.SSL
+                direction = "short" if ev.pool_type == "BSL" else "long"
+                wick = ev.candle_high if ev.pool_type == "BSL" else ev.candle_low
+                quality = min(1.0, 0.35 + 0.35 * ev.disp_score
+                              + (0.15 if ev.wick_reject else 0.0))
+                if quality < _MIN_SWEEP_QUALITY:
+                    _bridge_low_q += 1
+                    continue
+
+                # Still check _processed_sweeps — widened window MUST not
+                # reintroduce sweep-loop reprocessing. The registry key is
+                # seconds-rounded, so legitimate re-sweeps at the same price
+                # with a different detected_at are still admitted.
+                _bridge_key = (round(ev.pool_price, 0), side.value,
+                               round(ev.sweep_ts / 1000.0, 0))
+                if self._processed_sweeps.get(_bridge_key, 0.0) > now:
+                    _bridge_proc += 1
+                    continue
+
+                pool = type('SynthPool', (), {
+                    'price': ev.pool_price, 'side': side,
+                    'timeframe': '5m', 'status': PoolStatus.SWEPT,
+                    'significance': 3.0, 'ob_aligned': False,
+                    'fvg_aligned': False, 'htf_count': 0,
+                    'is_tradeable': False, 'sweep_wick': wick,
+                })()
+
+                sweeps.append(SweepResult(
+                    pool=pool, sweep_candle_idx=0,
+                    wick_extreme=wick, rejection_pct=ev.disp_score,
+                    volume_ratio=1.0, quality=quality,
+                    direction=direction,
+                    detected_at=ev.sweep_ts / 1000.0,
+                ))
+                logger.info(
+                    f"🔗 ICT SWEEP BRIDGED: {ev.pool_type} "
+                    f"${ev.pool_price:,.1f} quality={quality:.2f} "
+                    f"age={int((now*1000 - ev.sweep_ts)/1000)}s")
+
+            # Expose bridge rejections via state-level counters (read by the
+            # diagnostic THINK log in quant_strategy — also picked up by the
+            # mark_signal_deferred telemetry).
+            if _bridge_stale or _bridge_low_q or _bridge_proc:
+                self._last_bridge_skip = {
+                    "stale":       _bridge_stale,
+                    "low_quality": _bridge_low_q,
+                    "processed":   _bridge_proc,
+                    "ict_sweeps":  len(ict_ctx.ict_sweeps),
+                }
+            else:
+                self._last_bridge_skip = None
+
+        # Expose LiquidityMap-path rejections too.
+        if _skipped_stale or _skipped_low_quality or _skipped_processed:
+            self._last_liq_skip = {
+                "stale":       _skipped_stale,
+                "low_quality": _skipped_low_quality,
+                "processed":   _skipped_processed,
+            }
+        else:
+            self._last_liq_skip = None
+
+        return sweeps
+
+    @staticmethod
+    def _sweep_key(sweep: SweepResult) -> tuple:
+        """
+        Canonical key for the processed-sweeps registry.
+        Schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
+          pool_price  — dollar-rounded to absorb tick-level float noise
+          pool_side   — "BSL"/"SSL" — same price, different sides are distinct
+          detected_at — second-rounded; a genuinely NEW sweep at the same level
+                        (with a different detected_at) is never suppressed
+        """
+        return (
+            round(sweep.pool.price, 0),
+            sweep.pool.side.value,
+            round(sweep.detected_at, 0),
+        )
+
+    def _is_processed(self, sweep: SweepResult, now: float) -> bool:
+        """Return True if sweep is within its processed-sweep hold window."""
+        return self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now
+
+    def invalidate_sweep_locks(self, reason: str = "regime_change") -> int:
+        """Clear processed sweep locks when the market regime materially changes."""
+        n = len(self._processed_sweeps)
+        self._processed_sweeps.clear()
+        self._gate_blocked_until = 0.0
+        self._gate_block_key = ()
+        if n:
+            logger.info(f"EntryEngine sweep locks invalidated ({n}) reason={reason}")
+        return n
+
+    def _tf_quality_threshold(self, tf: str) -> float:
+        """Adaptive TF-quality gate based on recent accepted/rejected sweep quality."""
+        bootstrap = {'1m': 0.35, '5m': 0.30, '15m': 0.24, '4h': 0.20, '1h': 0.22, '1d': 0.18}
+        hist = list(self._sweep_quality_hist[tf])
+        if len(hist) < 30:
+            return bootstrap.get(tf, 0.25)
+        hist.sort()
+        # Keep roughly the top 40% of each timeframe's own quality distribution.
+        idx = min(len(hist) - 1, max(0, int(len(hist) * 0.60)))
+        dynamic = hist[idx]
+        return max(0.18, min(0.55, dynamic))
+
+    def _find_ict_event(self, sweep, ict_ctx, atr) -> Optional[ICTSweepEvent]:
+        for ev in (getattr(ict_ctx, 'ict_sweeps', None) or []):
+            if abs(ev.pool_price - sweep.pool.price) < atr * 0.1:
+                return ev
+        return None
+
+    # ── State: SCANNING ───────────────────────────────────────────────
+
+    def _do_scanning(self, snap, flow, ict, price, atr, now,
+                     candles_1m, candles_5m) -> None:
+        """Sweep-only mode: scanning is handled by _collect_sweeps() in update()."""
+        return
+
+    # ═══════════════════════════════════════════════════════════════════
+    # POST-SWEEP PIPELINE    # ═══════════════════════════════════════════════════════════════════
+    # POST-SWEEP PIPELINE
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _enter_post_sweep(self, sweep, snap, flow, ict, price, atr, now,
+                          ict_event=None) -> None:
+        tf = getattr(sweep.pool, 'timeframe', '5m')
+        self._sweep_quality_hist[tf].append(float(sweep.quality))
+        required_quality = self._tf_quality_threshold(tf)
+        if sweep.quality < required_quality:
+            # Dynamic architecture: low-TF / low-quality sweeps are not hard
+            # vetoed. They continue into the posterior auction with naturally
+            # weaker sweep-quality evidence, so the market context can still
+            # rescue a valid rare setup. The processed-sweep registry below
+            # still prevents duplicate evaluation loops.
+            logger.info(
+                f"SWEEP QUALITY IMPAIRED [tf_quality]: {sweep.pool.side.value} "
+                f"${sweep.pool.price:,.1f} quality={sweep.quality:.3f} "
+                f"reference={required_quality:.2f} tf={tf} "
+                f"→ continuing with reduced evidence weight"
+            )
+
+        # BUG-1 FIX (SWEEP-LOOP): Register this sweep in the processed-sweeps
+        # registry THE MOMENT we commit to evaluating it.  This is the earliest
+        # possible registration point — before any evidence accumulation — so that
+        # _collect_sweeps() cannot find and re-present the same sweep on any
+        # subsequent tick, regardless of how the evaluation resolves (verdict, deferral, timeout, or early rejection inside _handle_reversal/continuation).
+        # Expiry = now + 120s:  outlasts the 60s detection window + 45s deferral cooldown + 15s margin.
+        _reg_key = self._sweep_key(sweep)
+        self._processed_sweeps[_reg_key] = now + 120.0
+
+        self._post_sweep = _PostSweepState(
+            sweep=sweep, entered_at=now,
+            initial_flow=flow.conviction, initial_flow_dir=flow.direction,
+            highest_since=price, lowest_since=float('inf'),
+            ict_sweep_event=ict_event,
+        )
+        self._state = EngineState.POST_SWEEP
+        self._state_entered = now
+        self._signal = None
+
+        src = "ICT-BRIDGE" if ict_event else "LIQ-MAP"
+        logger.info(
+            f"🎯 POST-SWEEP ENTERED [{src}]: {sweep.pool.side.value} "
+            f"${sweep.pool.price:,.1f} quality={sweep.quality:.2f} "
+            f"wick=${sweep.wick_extreme:,.1f}")
+
+    def _do_post_sweep(self, snap, flow, ict, price, atr, now) -> None:
+        ps = self._post_sweep
+        if ps is None:
+            self._state = EngineState.SCANNING
+            return
+
+        elapsed = now - ps.entered_at
+        if elapsed < 10.0:
+            return
+        if elapsed > _CISD_MAX_WAIT_SEC:
+            logger.info(f"POST_SWEEP: timeout {elapsed:.0f}s")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        # BUG-B2 FIX: Respect deferral cooldown.
+        # If a posterior/EV/safety audit deferred the last signal from this
+        # post-sweep state, suppress signal generation until the cooldown expires.
+        # Evidence accumulation and logging continue normally — only the final
+        # signal SET is gated. This prevents the 4 Hz busy-loop where the same
+        # signal is generated and immediately discarded hundreds of times.
+        _defer_suppressed = (now < self._gate_blocked_until)
+
+        ps.tick_count += 1
+        ps.highest_since = max(ps.highest_since, price)
+        ps.lowest_since = min(ps.lowest_since, price)
+
+        sweep_price = ps.sweep.pool.price
+        rev_dir = ps.sweep.direction
+
+        # Displacement tracking
+        if rev_dir == "long":
+            max_disp = (ps.highest_since - sweep_price) / max(atr, 1e-10)
+        else:
+            max_disp = (sweep_price - ps.lowest_since) / max(atr, 1e-10)
+        if max_disp > ps.max_displacement:
+            ps.max_displacement = max_disp
+
+        # CISD detection
+        if not ps.cisd_detected:
+            rev_struct = "bearish" if rev_dir == "short" else "bullish"
+            choch = getattr(ict, 'choch_5m', '') or ''
+            bos = getattr(ict, 'bos_5m', '') or ''
+            if choch == rev_struct:
+                ps.cisd_detected = True
+                ps.cisd_timestamp = now
+                ps.cisd_type = "choch"
+                logger.info(f"POST_SWEEP: CISD CONFIRMED (CHoCH {rev_struct})")
+            elif bos == rev_struct:
+                ps.cisd_detected = True
+                ps.cisd_timestamp = now
+                ps.cisd_type = "bos"
+                logger.info(f"POST_SWEEP: CISD CONFIRMED (BOS {rev_struct})")
+
+        # OTE zone tracking
+        if ps.max_displacement >= _PS_DISP_MIN_ATR:
+            if rev_dir == "long":
+                swing_range = abs(ps.highest_since - sweep_price)
+                retrace = (ps.highest_since - price) / max(swing_range, 1e-10)
+            else:
+                swing_range = abs(sweep_price - ps.lowest_since)
+                retrace = (price - ps.lowest_since) / max(swing_range, 1e-10)
+
+            in_ote = _PS_OTE_FIB_LOW <= retrace <= _PS_OTE_FIB_HIGH
+            if in_ote and not ps.ote_reached:
+                ps.ote_reached = True
+                ps.ote_timestamp = now
+                logger.info(f"POST_SWEEP: OTE ZONE ({retrace:.1%})")
+            ps.ote_holding = in_ote
+
+        # Evaluate evidence. If a prior candidate was deferred by the
+        # target/stop utility surfaces, keep updating evidence but suppress
+        # repeated "POSTERIOR ACCEPTED" lines. The auction is being monitored;
+        # it is not routeable until the cooldown expires.
+        self._suppress_posterior_accept_log = bool(_defer_suppressed)
+        try:
+            decision = self._evaluate_evidence(ps, snap, flow, ict, price, atr, now)
+        finally:
+            self._suppress_posterior_accept_log = False
+
+        # BUG-B2 FIX: If deferred, allow evidence to accumulate but do not
+        # present a new signal yet. Log remaining cooldown at debug level.
+        if _defer_suppressed:
+            remaining = self._gate_blocked_until - now
+            logger.debug(
+                f"POST_SWEEP: deferral cooldown {remaining:.0f}s remaining — "
+                f"evidence accumulating (rev={self._last_sweep_analysis.get('rev_score',0):.0f} "
+                f"cont={self._last_sweep_analysis.get('cont_score',0):.0f})")
+            return
+
+        if decision.action == "reverse":
+            self._handle_reversal(ps.sweep, decision, snap, flow, ict, price, atr, now)
+            # Bug #18 fix: _handle_reversal sets self._post_sweep = None and
+            # calls self._reset(now).  Without an explicit return here the method
+            # falls through to the next tick, creating a window where
+            # self._state == POST_SWEEP but self._post_sweep is None.  Any new
+            # sweep arriving in that window is silently dropped by the state guard.
+            return
+        elif decision.action == "continue":
+            self._handle_continuation(ps.sweep, decision, snap, flow, ict, price, atr, now)
+            # Same one-tick window fix as above.
+            return
+
+
+    def _market_profile(self, snap=None, flow=None, ict=None, price: float = 0.0,
+                        atr: float = 0.0, side: str = ""):
+        """Live adaptive profile used by every entry decision.
+
+        This keeps the entry engine from behaving as a fixed-threshold static
+        rule-set. Thresholds are still bounded by config priors, but actual
+        acceptance depends on ATR state, liquidity density, HTF structure,
+        AMD phase, flow, spread/session context and pool quality.
+        """
+        try:
+            profile = build_market_profile(
+                price=price,
+                atr=atr,
+                snap=snap,
+                ict=ict,
+                flow=flow,
+                side=side,
+            )
+        except Exception:
+            profile = build_market_profile(price=price, atr=atr)
+        self._last_market_profile = profile
+        return profile
+
+    def _log_posterior_accept_once(self, key: tuple, message: str, now: float) -> None:
+        """Emit posterior-acceptance telemetry only when it is actionable.
+
+        Acceptance can remain true for many ticks while the market sits in the
+        same post-sweep auction. Repeating the same line every 250-500ms makes
+        the operator surface noisy and can hide real execution diagnostics.
+        We log once per action/side/phase/sweep, then only again after 30s.
+        When a target/stop-surface deferral is active, the acceptance is held and
+        should not be logged as route-ready.
+        """
+        if getattr(self, "_suppress_posterior_accept_log", False):
+            return
+        if key == self._last_accept_log_key and (now - self._last_accept_log_ts) < 30.0:
+            return
+        self._last_accept_log_key = key
+        self._last_accept_log_ts = now
+        logger.info(message)
+
+    def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
+        sweep = ps.sweep
+        rev_dir = sweep.direction
+        cont_dir = "short" if rev_dir == "long" else "long"
+        elapsed = now - ps.entered_at
+        profile = self._market_profile(snap, flow, ict, price, atr, rev_dir)
+
+        # Phase and thresholds
+        if elapsed < _PS_PHASE_DISPLACEMENT:
+            phase, mult, base_thr = "DISPLACEMENT", _PS_DISP_MULT, _PS_THRESHOLD_EARLY
+        elif elapsed < _PS_PHASE_CISD:
+            phase, mult, base_thr = "CISD", 1.0, _PS_THRESHOLD_NORMAL
+        elif elapsed < _PS_PHASE_OTE:
+            phase, mult, base_thr = "OTE", 1.0, _PS_THRESHOLD_NORMAL
+        else:
+            phase, mult, base_thr = "MATURE", _PS_MATURE_MULT, _PS_THRESHOLD_MATURE
+
+        base_thr = profile.entry_score_threshold(base_thr)
+        gap_min = profile.evidence_gap(_PS_GAP_MIN)
+        disp_min_atr = profile.displacement_min(_PS_DISP_MIN_ATR)
+        disp_strong_atr = profile.strong_displacement(_PS_DISP_STRONG_ATR)
+
+        rev_d = 0.0
+        cont_d = 0.0
+        rev_r: List[str] = []
+        cont_r: List[str] = []
+
+        # ── STATIC FACTORS (scored once) ──────────────────────────────
+        if not ps.static_scored:
+            s_rev, s_cont = 0.0, 0.0
+
+            # AMD phase
+            amd_phase = (ict.amd_phase or "").upper()
+            amd_bias = (ict.amd_bias or "").lower()
+            amd_conf = max(ict.amd_confidence, 0.5)
+
+            if amd_phase == "MANIPULATION":
+                bsl_bear = (sweep.pool.side == PoolSide.BSL and amd_bias == "bearish")
+                ssl_bull = (sweep.pool.side == PoolSide.SSL and amd_bias == "bullish")
+                bsl_bull = (sweep.pool.side == PoolSide.BSL and amd_bias == "bullish")
+                ssl_bear = (sweep.pool.side == PoolSide.SSL and amd_bias == "bearish")
+
+                if bsl_bear or ssl_bull:
+                    s_rev += 22.0 * amd_conf
+                    rev_r.append(f"AMD aligned {amd_bias} ({amd_conf:.0%})")
+                elif bsl_bull or ssl_bear:
+                    s_rev -= 18.0 * amd_conf
+                    s_cont += 10.8 * amd_conf
+                    rev_r.append(f"AMD CONTRA {amd_bias} ({amd_conf:.0%})")
+                    logger.info(
+                        f"POST_SWEEP: AMD CONTRA — {sweep.pool.side.value} "
+                        f"swept but bias={amd_bias} conf={amd_conf:.0%}")
+
+            elif amd_phase in ("DISTRIBUTION", "REDISTRIBUTION"):
+                s_cont += 20.0 * amd_conf
+                cont_r.append(f"AMD DIST ({amd_conf:.0%})")
+            elif amd_phase in ("ACCUMULATION", "REACCUMULATION"):
+                s_rev += 12.0 * max(amd_conf, 0.4)
+                rev_r.append(f"AMD ACCUM ({amd_conf:.0%})")
+
+            # Sweep quality
+            if   sweep.quality >= 0.70: s_rev += 12.0
+            elif sweep.quality >= 0.50: s_rev += 7.0
+            elif sweep.quality >= 0.35: s_rev += 3.0
+
+            # Dealing range
+            pd = float(getattr(ict, 'dealing_range_pd', 0.5) or 0.5)
+            if rev_dir == "short":
+                if pd >= 0.65: s_rev += 7.0; rev_r.append(f"PREMIUM ({pd:.0%})")
+                elif pd >= 0.50: s_rev += 3.0
+                else: s_cont += 6.0
+            else:
+                if pd <= 0.35: s_rev += 7.0; rev_r.append(f"DISCOUNT ({pd:.0%})")
+                elif pd <= 0.50: s_rev += 3.0
+                else: s_cont += 6.0
+
+            # Target quality
+            opp = self._find_opposing_target(rev_dir, snap, price, atr)
+            if opp and opp.significance >= _MIN_POOL_SIGNIFICANCE:
+                s_rev += min(5.0, opp.significance * 0.5)
+
+            # Session
+            kz = (ict.kill_zone or "").lower()
+            if "london" in kz: s_rev += 3.0
+            elif "ny" in kz: s_rev += 2.0
+
+            ps.static_rev_base = s_rev
+            ps.static_cont_base = s_cont
+            ps.static_scored = True
+        else:
+            opp = self._find_opposing_target(rev_dir, snap, price, atr)
+
+        # ── DYNAMIC FACTORS (per-tick) ────────────────────────────────
+
+        # DirectionEngine hint
+        hint = (getattr(ict, 'direction_hint', '') or '').lower()
+        hint_side = (getattr(ict, 'direction_hint_side', '') or '').lower()
+        hint_conf = float(getattr(ict, 'direction_hint_confidence', 0.0) or 0.0)
+        if hint and hint_conf >= 0.30:
+            pts = round(20.0 * hint_conf, 1)
+            if hint == "reverse" and hint_side == rev_dir:
+                rev_d += pts; rev_r.append(f"DIR_REVERSE({hint_conf:.0%})")
+            elif hint == "continue" and hint_side == cont_dir:
+                cont_d += pts; cont_r.append(f"DIR_CONTINUE({hint_conf:.0%})")
+
+        # Live displacement
+        if ps.max_displacement >= disp_strong_atr:
+            rev_d += 10.0; rev_r.append(f"DISP {ps.max_displacement:.1f}ATR")
+        elif ps.max_displacement >= disp_min_atr:
+            rev_d += 5.0
+        elif ps.max_displacement < 0.2 and elapsed > 15.0:
+            cont_d += 6.0; cont_r.append("NO DISP")
+
+        # CISD
+        if ps.cisd_detected:
+            fresh = max(0.5, 1.0 - (now - ps.cisd_timestamp) / 120.0)
+            rev_d += 15.0 * fresh; rev_r.append(f"CISD {ps.cisd_type} ({fresh:.0%})")
+
+        # OTE
+        if ps.ote_reached:
+            if ps.ote_holding:
+                rev_d += 12.0; rev_r.append("IN OTE")
+            else:
+                rev_d += 6.0
+
+        # Flow
+        if flow.direction == rev_dir and abs(flow.conviction) >= 0.40:
+            rev_d += 8.0; rev_r.append(f"FLOW +{flow.conviction:+.2f}")
+            ps.rev_flow_ticks += 1
+        elif flow.direction == rev_dir:
+            rev_d += 4.0; ps.rev_flow_ticks += 1
+        elif flow.direction and flow.direction != rev_dir:
+            cont_d += 8.0; cont_r.append(f"FLOW cont {flow.conviction:+.2f}")
+            ps.cont_flow_ticks += 1
+
+        # EWMA
+        ewma_rev = ((rev_dir == "long" and self._flow_ewma > 0.10) or
+                     (rev_dir == "short" and self._flow_ewma < -0.10))
+        if ewma_rev: rev_d += 5.0
+        elif ((rev_dir == "long" and self._flow_ewma < -0.15) or
+              (rev_dir == "short" and self._flow_ewma > 0.15)):
+            cont_d += 5.0
+
+        # CVD
+        cvd = flow.cvd_trend
+        if (rev_dir == "short" and cvd < -0.30) or (rev_dir == "long" and cvd > 0.30):
+            rev_d += 8.0; rev_r.append(f"CVD {cvd:+.2f}")
+        elif (rev_dir == "short" and cvd < 0) or (rev_dir == "long" and cvd > 0):
+            rev_d += 3.0
+        else:
+            cont_d += 4.0
+
+        # 5m structure
+        choch = getattr(ict, 'choch_5m', '') or ''
+        bos = getattr(ict, 'bos_5m', '') or ''
+        rev_struct = "bearish" if rev_dir == "short" else "bullish"
+        if choch == rev_struct: rev_d += 10.0; rev_r.append("CHoCH")
+        cont_struct = "bullish" if cont_dir == "long" else "bearish"
+        if bos == cont_struct: cont_d += 10.0; cont_r.append("BOS cont")
+
+        # 15m structure
+        s15 = getattr(ict, 'structure_15m', '') or ''
+        if s15 == rev_struct: rev_d += 6.0
+
+        # Sustained flow bonus
+        if ps.rev_flow_ticks >= 5: rev_d += 4.0
+        if ps.cont_flow_ticks >= 5: cont_d += 4.0
+
+        # Cross-sweep decay
+        current_type = sweep.pool.side.value
+        entered_ms = int(ps.entered_at * 1000)
+        for ev in (getattr(ict, 'ict_sweeps', None) or []):
+            if (ev.pool_type != current_type
+                    and ev.sweep_ts > entered_ms
+                    and now * 1000 - ev.sweep_ts < 90_000):
+                ps.rev_evidence *= 0.55
+                cont_d += 10.0
+                cont_r.append(f"CROSS-SWEEP {ev.pool_type}")
+                break
+
+        # ── Accumulate with decay ─────────────────────────────────────
+        decay = 0.92
+        if rev_d > 0 and cont_d > 0:
+            ps.rev_evidence *= decay
+            ps.cont_evidence *= decay
+            ps.rev_evidence += rev_d
+            ps.cont_evidence += cont_d
+        elif rev_d > 0:
+            ps.rev_evidence += rev_d
+            ps.cont_evidence *= decay
+        elif cont_d > 0:
+            ps.cont_evidence += cont_d
+            ps.rev_evidence *= decay
+        else:
+            ps.rev_evidence *= _PS_NEUTRAL_TICK_DECAY
+            ps.cont_evidence *= _PS_NEUTRAL_TICK_DECAY
+
+        rev_total = max(ps.static_rev_base + ps.rev_evidence, 0.0)
+        cont_total = max(ps.static_cont_base + ps.cont_evidence, 0.0)
+        ps.peak_rev = max(ps.peak_rev, rev_total)
+        ps.peak_cont = max(ps.peak_cont, cont_total)
+        gap = abs(rev_total - cont_total)
+
+        # KEY-SYNC FIX: notifier.py reads "reversal_score", "continuation_score",
+        # "reversal_reasons", "continuation_reasons", "sweep_side", "sweep_price",
+        # "sweep_quality". The original dict used different short-form keys so every
+        # .get() in notifier returned 0 / [] / "?" → permanently showed REV:0 CONT:0
+        # UNDECIDED with "? @ $0.0" regardless of actual evidence scores.
+        #
+        # quant_strategy reads the short-form keys ("rev_score", "cont_score") in
+        # several places — keep both so neither caller breaks.
+        self._last_sweep_analysis = {
+            # Short-form keys — consumed by quant_strategy internal logic
+            "rev_score":   rev_total,
+            "cont_score":  cont_total,
+            "rev_reasons": rev_r,
+            "cont_reasons": cont_r,
+            # Long-form keys — consumed by notifier.py format_periodic_report()
+            "reversal_score":        rev_total,
+            "continuation_score":    cont_total,
+            "reversal_reasons":      rev_r,
+            "continuation_reasons":  cont_r,
+            # Sweep identity fields (were entirely absent — caused "? @ $0.0")
+            "sweep_side":    sweep.pool.side.value,   # "BSL" or "SSL"
+            "sweep_price":   sweep.pool.price,         # pool price that was swept
+            "sweep_quality": sweep.quality,            # sweep quality [0,1]
+            # Context fields
+            "phase":            phase,
+            "cisd":             ps.cisd_detected,
+            "displacement_atr": ps.max_displacement,
+            "ote":              ps.ote_reached,
+            "market_profile":   profile.as_dict() if hasattr(profile, "as_dict") else {},
+        }
+
+        threshold = base_thr * mult
+        if ps.tick_count == 1 or ps.tick_count % 10 == 0:
+            logger.info(
+                f"POST_SWEEP [{phase}] tick={ps.tick_count} "
+                f"rev={rev_total:.0f} cont={cont_total:.0f} "
+                f"(need {threshold:.0f}, gap>={gap_min:.0f}) "
+                f"CISD={'✓' if ps.cisd_detected else '✗'} "
+                f"DISP={ps.max_displacement:.1f}ATR "
+                f"OTE={'✓' if ps.ote_reached else '✗'}")
+
+        if rev_total >= threshold and gap >= gap_min:
+            qd = evaluate_post_sweep_quant(
+                action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
+                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
+                snap=snap, flow=flow, ict=ict)
+            self._last_sweep_analysis["quant_posterior"] = qd.posterior
+            self._last_sweep_analysis["quant_ev"] = qd.expected_value
+            self._last_sweep_analysis["quant_components"] = qd.components
+            if not qd.accept:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"QUANT_WAIT reverse: {qd.compact()}")
+            gate_ok, gate_reason = self._institutional_entry_quality_gate(
+                ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
+            if not gate_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
+            score_conf = min(1.0, rev_total / 90.0)
+            conf = 0.78 * qd.posterior + 0.22 * score_conf
+            if ps.cisd_detected: conf = min(1.0, conf + 0.05)
+            if ps.ote_reached: conf = min(1.0, conf + 0.03)
+            self._log_posterior_accept_once(
+                ("reverse", rev_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
+                f"🧠 POSTERIOR ACCEPTED: REVERSAL {rev_dir.upper()} [{phase}] "
+                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}",
+                now,
+            )
+            return PostSweepDecision(
+                action="reverse", direction=rev_dir, confidence=conf,
+                next_target=opp,
+                reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] "
+                       f"[{phase}] {' + '.join(rev_r[:5])}")
+
+        elif cont_total >= threshold * 0.9 and gap >= gap_min:
+            qd = evaluate_post_sweep_quant(
+                action="continue", side=cont_dir, rev_score=rev_total, cont_score=cont_total,
+                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
+                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
+                snap=snap, flow=flow, ict=ict)
+            self._last_sweep_analysis["quant_posterior"] = qd.posterior
+            self._last_sweep_analysis["quant_ev"] = qd.expected_value
+            self._last_sweep_analysis["quant_components"] = qd.components
+            if not qd.accept:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"QUANT_WAIT continue: {qd.compact()}")
+            gate_ok, gate_reason = self._institutional_entry_quality_gate(
+                ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
+            if not gate_ok:
+                return PostSweepDecision(
+                    action="wait", direction="", confidence=0.0,
+                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
+            cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
+            self._log_posterior_accept_once(
+                ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
+                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
+                now,
+            )
+            return PostSweepDecision(
+                action="continue", direction=cont_dir,
+                confidence=0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0),
+                next_target=cont_target,
+                reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
+                       f"[{phase}] {' + '.join(cont_r[:5])}")
+
+        return PostSweepDecision(action="wait", direction="", confidence=0.0,
+                                  reason=f"WAIT [{rev_total:.0f}v{cont_total:.0f}]")
+
+    # ── Internal: regime-adaptive SL helpers ────────────────────────
+
+    def _regime_sl_mult(self) -> float:
+        """SL buffer multiplier scaled by current ATR-percentile regime.
+
+        Derived from set_atr_pctile() (updated each tick by quant_strategy).
+        Defaults to 1.0 (no adjustment) until live percentile data is supplied.
+
+        Formula: 0.60 + _SL_REGIME_SLOPE * atr_pctile
+          Low-vol  (p=0.0) → 0.60  tight buffers, market is compressed
+          Normal   (p=0.5) → 1.00  standard buffers
+          High-vol (p=1.0) → 1.40  wide buffers, bars have large wicks
+        """
+        return 0.60 + _SL_REGIME_SLOPE * self._atr_pctile
+
+    def _sl_structural_bounds(self, wick_extreme: float, pool_price: float,
+                               side: str, price: float, atr: float
+                               ) -> tuple:
+        """Return (min_risk, max_risk) for a sweep SL anchored to the wick.
+
+        min_risk: entry-to-wick distance plus the larger of wick-depth
+                  clearance and ATR noise clearance. Both ensure the SL is past
+                  the wick and outside spread noise.
+        max_risk: distance to the liquidation guard. Wide structural stops are
+                  allowed when risk-based sizing can scale down; they are rejected
+                  only if they would sit beyond the exchange liquidation buffer.
+        """
+        wick_depth  = abs(wick_extreme - pool_price)
+        # Minimum clearance: SL must clear at least this far beyond the wick tip
+        wick_clear  = max(wick_depth * _SL_WICK_CLEARANCE, atr * _SL_MIN_ATR_MULT)
+        # Minimum risk from current entry price (clamp to entry-to-wick distance)
+        entry_to_wick = abs(price - wick_extreme)
+        min_risk = entry_to_wick + wick_clear   # total risk = entry→wick + clearance
+        _liq, _guard, liq_room = self._liquidation_guard(side, price)
+        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
+        return min_risk, max_risk
+
+    @staticmethod
+    def _sl_is_protective(side: str, sl: float, price: float) -> bool:
+        """Protective stop must be on the loss side of live price."""
+        if sl <= 0 or price <= 0:
+            return False
+        if side == "long":
+            return sl < price
+        if side == "short":
+            return sl > price
+        return False
+
+    @staticmethod
+    def _liquidation_guard(side: str, entry: float) -> tuple:
+        try:
+            import config as _liq_cfg
+            leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+            maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
+            liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
+        except Exception:
+            leverage = 1.0
+            maint_margin = 0.005
+            liq_buffer = 0.005
+        entry = float(entry or 0.0)
+        if entry <= 0:
+            return 0.0, 0.0, 0.0
+        liq_move = max((1.0 / leverage) - maint_margin, 0.001)
+        if side == "long":
+            liq_price = entry * (1.0 - liq_move)
+            guard = liq_price * (1.0 + liq_buffer)
+            return liq_price, guard, max(entry - guard, 0.0)
+        liq_price = entry * (1.0 + liq_move)
+        guard = liq_price * (1.0 - liq_buffer)
+        return liq_price, guard, max(guard - entry, 0.0)
+
+    def _sl_before_liquidation(self, side: str, sl: float, price: float) -> bool:
+        if not self._sl_is_protective(side, sl, price):
+            return False
+        _liq, guard, room = self._liquidation_guard(side, price)
+        if room <= 0:
+            return False
+        if side == "long":
+            return sl > guard
+        return sl < guard
+
+    def _reject_bad_sl(self, side: str, sl: float, price: float,
+                       sweep_price: float, now: float, reason: str) -> bool:
+        if self._sl_is_protective(side, sl, price):
+            return False
+        logger.info(
+            f"CANDIDATE DEFERRED [invalid_sl]: side={side} entry=${price:.1f} "
+            f"sl=${sl:.1f} sweep=${sweep_price:.1f} reason={reason}")
+        self._post_sweep = None
+        self._reset(now)
+        return True
+
+    # ── Sweep entry handlers ──────────────────────────────────────────
+
+    def _current_quant_posterior(self) -> float:
+        try:
+            return max(0.0, min(0.95, float(
+                (getattr(self, "_last_sweep_analysis", {}) or {}).get("quant_posterior", 0.0)
+            )))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _tf_rank_for_stop_geometry(tf: str) -> int:
+        return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}.get(str(tf).lower(), 2)
+
+    def _dominant_institutional_tp_reward(self, snap, side: str, entry: float, atr: float) -> float:
+        """Approximate reward to the strongest real TP-side liquidity pool."""
+        if snap is None or atr <= 0:
+            return 0.0
+        pools = list(getattr(snap, "bsl_pools", []) or []) if side == "long" else list(getattr(snap, "ssl_pools", []) or [])
+        best_score = 0.0
+        best_reward = 0.0
+        for target in pools:
+            try:
+                pool = getattr(target, "pool", target)
+                status = str(getattr(pool, "status", "") or "").upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+                if side == "long" and pool_price <= entry:
+                    continue
+                if side == "short" and pool_price >= entry:
+                    continue
+                dist_atr = float(getattr(target, "distance_atr", 0.0) or 0.0)
+                if dist_atr <= 0.0:
+                    dist_atr = abs(pool_price - entry) / max(atr, 1e-9)
+                if dist_atr < 0.25:
+                    continue
+                buf = max(0.10, min(0.50, 0.10 + 0.05 * dist_atr)) * atr
+                tp_price = pool_price - buf if side == "long" else pool_price + buf
+                if side == "long" and tp_price <= entry:
+                    continue
+                if side == "short" and tp_price >= entry:
+                    continue
+                reward = abs(tp_price - entry)
+                sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+                tf_rank = self._tf_rank_for_stop_geometry(str(getattr(pool, "timeframe", "5m") or "5m"))
+                score = reward * (1.0 + min(sig, 25.0) / 25.0) * (1.0 + 0.08 * tf_rank)
+                score /= (1.0 + max(0.0, dist_atr - 6.0) * 0.08)
+                if score > best_score:
+                    best_score = score
+                    best_reward = reward
+            except Exception:
+                continue
+        return best_reward
+
+    @staticmethod
+    def _accepts_pool_stop_geometry(
+        current_risk: float,
+        pool_risk: float,
+        target_reward: float,
+        posterior_prob: float,
+        pool_quality: float,
+    ) -> tuple[bool, str]:
+        """Decide whether a farther protective pool earns the extra risk.
+
+        This method is intentionally no longer allowed to choose a tighter
+        stop just because a wider, liquidity-safe stop reduces R:R or makes
+        fees look expensive.  If the market requires clearing a protective
+        pool, the correct institutional action is to skip/reprice the trade,
+        not to place the stop in front of the liquidity.
+        """
+        if current_risk <= 0.0 or pool_risk <= current_risk:
+            return True, "pool does not widen risk"
+
+        expansion = pool_risk / max(current_risk, 1e-9)
+        current_rr = target_reward / max(current_risk, 1e-9) if target_reward > 0.0 else 0.0
+        pool_rr = target_reward / max(pool_risk, 1e-9) if target_reward > 0.0 else 0.0
+        p = max(0.0, min(0.95, posterior_prob))
+        ev_floor = 1.20
+        if p > 0.0:
+            ev_floor = max(0.75, min(1.50, ((1.0 - p) / max(p, 1e-9)) + 0.35))
+
+        if target_reward > 0.0 and current_rr >= ev_floor and pool_rr < ev_floor:
+            return False, f"pool SL drops TP geometry {current_rr:.2f}R->{pool_rr:.2f}R below EV floor {ev_floor:.2f}R"
+
+        quality_hurdle = min(
+            0.92,
+            0.42 + 0.11 * max(0.0, expansion - 1.0) + 0.08 * max(0.0, current_rr - pool_rr),
+        )
+        if expansion > 1.35 and pool_quality < quality_hurdle:
+            return False, f"pool SL risk expansion {expansion:.2f}x needs quality {quality_hurdle:.2f}, got {pool_quality:.2f}"
+
+        return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
+
+    @staticmethod
+    def _target_pool_price(target) -> float:
+        try:
+            pool = getattr(target, "pool", target)
+            return float(getattr(pool, "price", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _target_pool_significance(target) -> float:
+        try:
+            pool = getattr(target, "pool", target)
+            return float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _target_pool_status(target) -> str:
+        try:
+            pool = getattr(target, "pool", target)
+            return str(getattr(pool, "status", "") or "").upper()
+        except Exception:
+            return ""
+
+    def _first_uncovered_protective_pool(self, snap, side: str, entry: float, sl: float, atr: float):
+        """Return the nearest significant protective pool that the proposed SL fails to clear.
+
+        For a LONG, SSL below entry must be cleared by the SL.  For a SHORT,
+        BSL above entry must be cleared by the SL.  If the proposed stop sits
+        between entry and that pool, it is liquidity, not protection.
+        """
+        if snap is None or atr <= 0.0 or entry <= 0.0 or sl <= 0.0:
+            return None
+        try:
+            import config as _sl_inv_cfg
+            min_sig = float(getattr(_sl_inv_cfg, "SL_PROTECTIVE_MIN_SIGNIFICANCE", 1.5))
+            search_atr = float(getattr(_sl_inv_cfg, "SL_PROTECTIVE_SEARCH_ATR", 5.0))
+        except Exception:
+            min_sig, search_atr = 1.5, 5.0
+        pools = list(getattr(snap, "ssl_pools", []) or []) if side == "long" else list(getattr(snap, "bsl_pools", []) or [])
+        candidates = []
+        for target in pools:
+            status = self._target_pool_status(target)
+            if status in ("SWEPT", "CONSUMED"):
+                continue
+            px = self._target_pool_price(target)
+            if px <= 0.0:
+                continue
+            sig = self._target_pool_significance(target)
+            if sig < min_sig:
+                continue
+            dist_atr = abs(entry - px) / max(atr, 1e-9)
+            if dist_atr > search_atr:
+                continue
+            if side == "long":
+                # proposed SL is above / in front of SSL, so the pool would be swept before the SL is structurally protected
+                if px < entry and sl > px:
+                    candidates.append((abs(entry - px), px, target))
+            else:
+                # proposed SL is below / in front of BSL
+                if px > entry and sl < px:
+                    candidates.append((abs(entry - px), px, target))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][2]
+
+    def _apply_institutional_sl_envelope(
+        self,
+        snap,
+        side: str,
+        price: float,
+        atr: float,
+        structural_sl: float,
+        invalidation_price: float,
+        label: str,
+        min_risk: float = 0.0,
+    ):
+        """
+        Build the executable stop from structural invalidation, live noise,
+        and protective liquidity. Returns (sl, reason).
+        """
+        if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
+            return None, "non-protective structural SL"
+        min_risk = max(0.0, float(min_risk or 0.0))
+
+        _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
+        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
+        sl = structural_sl
+        risk = abs(price - sl)
+        invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
+        try:
+            import config as _sl_floor_cfg
+            _survival_min = float(getattr(_sl_floor_cfg, "SL_MIN_SURVIVAL_RISK_ATR", 0.85))
+        except Exception:
+            _survival_min = 0.85
+        noise_floor = max(
+            atr * (0.45 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0)),
+            atr * _survival_min,
+            invalidation_gap + atr * 0.28,
+        )
+
+        if risk < noise_floor:
+            sl = price - noise_floor if side == "long" else price + noise_floor
+            risk = abs(price - sl)
+
+        pool_sl, _pool_target, pool_pick = self._find_sl_pool(
+            snap=snap,
+            side=side,
+            entry=price,
+            atr=atr,
+            ict=getattr(self, "_ict", None),
+            invalidation_price=invalidation_price,
+            max_buffer_atr=2.0,
+            min_risk=min_risk,
+        )
+        if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
+            pool_risk = abs(price - pool_sl)
+            if pool_risk > risk and pool_risk <= max_risk:
+                target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
+                pool_quality = float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)
+                accept_pool, geometry_reason = self._accepts_pool_stop_geometry(
+                    risk,
+                    pool_risk,
+                    target_reward,
+                    self._current_quant_posterior(),
+                    pool_quality,
+                )
+                if accept_pool:
+                    sl = pool_sl
+                    risk = pool_risk
+                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                    logger.info(
+                        "SL envelope %s: anchored behind protective pool at $%.1f "
+                        "(risk %.2fATR; %s; %s)",
+                        label, sl, risk / max(atr, 1e-10), details, geometry_reason)
+                else:
+                    return None, (
+                        f"protective liquidity requires SL ${pool_sl:.1f}, but execution geometry is non-viable: "
+                        f"{geometry_reason}; trade must reprice/abstain, not place SL in front of liquidity"
+                    )
+            elif pool_risk > max_risk:
+                return None, (
+                    f"protective liquidity requires SL ${pool_sl:.1f}, beyond liquidation/venue risk room; "
+                    "trade must abstain"
+                )
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        risk = abs(price - sl)
+
+        uncovered = self._first_uncovered_protective_pool(snap, side, price, sl, atr)
+        if uncovered is not None:
+            pool_px = self._target_pool_price(uncovered)
+            pool_sig = self._target_pool_significance(uncovered)
+            try:
+                import config as _sl_inv_cfg
+                clear_atr = float(getattr(_sl_inv_cfg, "SL_LIQUIDITY_CLEARANCE_ATR", 0.75))
+            except Exception:
+                clear_atr = 0.75
+            required_sl = pool_px - clear_atr * atr if side == "long" else pool_px + clear_atr * atr
+            return None, (
+                f"SL ${sl:.1f} is in front of protective liquidity pool ${pool_px:.1f} "
+                f"(sig={pool_sig:.1f}); required structural SL ${required_sl:.1f}; "
+                "trade must reprice/abstain"
+            )
+
+        if not self._sl_is_protective(side, sl, price):
+            return None, "SL crossed market after liquidity push"
+        if not self._sl_before_liquidation(side, sl, price):
+            return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
+        if min_risk > 0.0 and risk < min_risk:
+            return None, f"no structural SL meeting execution risk {risk:.1f}pts < {min_risk:.1f}pts"
+        if risk > abs(price - structural_sl) + 1e-9:
+            logger.info(
+                "SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, noise floor %.2fATR)",
+                label, structural_sl, sl, risk / max(atr, 1e-10),
+                noise_floor / max(atr, 1e-10))
+        return sl, "ok"
+
+
+    def _institutional_entry_quality_gate(
+        self, ps, action: str, side: str, snap, flow, ict,
+        price: float, atr: float, now: float, phase: str
+    ) -> tuple[bool, str]:
+        """Dynamic market-aware execution diagnostics before signal construction.
+
+        This layer no longer vetoes sweep decisions. The quantitative
+        posterior/EV model already decides whether a post-sweep auction has
+        positive executable edge. The quality gate now converts institutional
+        observations into a continuous quality score and audit trail so weak
+        conditions reduce confidence/position size downstream instead of creating
+        a hidden low-quality veto.
+        """
+        profile = self._market_profile(snap, flow, ict, price, atr, side)
+        a = max(float(atr or 0.0), 1e-9)
+        sweep = getattr(ps, "sweep", None)
+        pool = getattr(sweep, "pool", None)
+        pool_price = float(getattr(pool, "price", price) or price)
+        dist_from_sweep_atr = abs(float(price) - pool_price) / a
+
+        min_disp = profile.displacement_min(_ENTRY_HARD_MIN_DISP_ATR)
+        strong_disp = profile.strong_displacement(_ENTRY_STRONG_DISP_ATR)
+        chase_limit = profile.chase_limit(_ENTRY_MAX_CHASE_ATR_WITHOUT_OTE)
+        opp_flow = profile.flow_opposition_threshold(_ENTRY_FLOW_HARD_OPPOSE)
+        opp_cvd = profile.flow_opposition_threshold(_ENTRY_CVD_HARD_OPPOSE)
+
+        disp = float(getattr(ps, "max_displacement", 0.0) or 0.0)
+        cisd = bool(getattr(ps, "cisd_detected", False))
+        ote = bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False))
+        action_l = str(action or "").lower()
+        side_l = str(side or "").lower()
+
+        score = 1.0
+        notes = []
+
+        # 1) Delivery/structure proof. Weak proof is a size/confidence penalty.
+        if disp < min_disp and not (cisd or ote):
+            miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
+            score *= max(0.45, 1.0 - 0.38 * miss)
+            notes.append(
+                f"delivery_weak DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
+            )
+
+        # 2) Chase distance. Far-from-sweep entries need more quality.
+        if dist_from_sweep_atr > chase_limit and not (cisd or ote):
+            over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
+            score *= max(0.45, 1.0 - 0.25 * over)
+            notes.append(
+                f"chase_extended {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
+            )
+
+        # 3) Flow/CVD opposition becomes a regime penalty.
+        flow_dir = str(getattr(flow, "direction", "") or "").lower()
+        flow_conv = abs(float(getattr(flow, "conviction", 0.0) or 0.0))
+        cvd = float(getattr(flow, "cvd_trend", 0.0) or 0.0)
+        if flow_dir and flow_dir != side_l and flow_conv >= opp_flow:
+            excess = min(1.0, (flow_conv - opp_flow) / max(1.0 - opp_flow, 1e-9))
+            score *= max(0.50, 1.0 - 0.25 * excess)
+            notes.append(f"flow_contra {flow_dir}={flow_conv:.2f}")
+        if side_l == "long" and cvd <= -opp_cvd:
+            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
+            score *= max(0.52, 1.0 - 0.22 * excess)
+            notes.append(f"cvd_contra {cvd:.2f}")
+        if side_l == "short" and cvd >= opp_cvd:
+            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
+            score *= max(0.52, 1.0 - 0.22 * excess)
+            notes.append(f"cvd_contra {cvd:.2f}")
+
+        # 4) Continuation needs acceptance, but lack of proof reduces quality.
+        if action_l == "continue":
+            accepted = disp >= profile.displacement_min(_ENTRY_CONT_MIN_ACCEPT_ATR)
+            if not (accepted and (cisd or disp >= strong_disp or ote)):
+                score *= 0.62
+                notes.append(
+                    f"continuation_acceptance_soft DISP={disp:.2f}ATR strong={strong_disp:.2f}"
+                )
+
+        # 5) Premium/discount mismatch is a penalty unless strong proof exists.
+        pd = float(getattr(ict, "dealing_range_pd", 0.5) or 0.5)
+        dr_long_max, dr_short_min = profile.dealing_range_bounds(
+            _ENTRY_REVERSAL_PD_LONG_MAX, _ENTRY_REVERSAL_PD_SHORT_MIN)
+        if action_l == "reverse" and disp < strong_disp:
+            if side_l == "long" and pd > dr_long_max and not (cisd and ote):
+                score *= 0.70
+                notes.append(f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}")
+            if side_l == "short" and pd < dr_short_min and not (cisd and ote):
+                score *= 0.70
+                notes.append(f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}")
+
+        # 6) HTF contra trades are not prohibited; they require lower exposure.
+        s15 = str(getattr(ict, "structure_15m", "") or "").lower()
+        s4h = str(getattr(ict, "structure_4h", "") or "").lower()
+        htf_bull = ("bull" in s15) + ("bull" in s4h)
+        htf_bear = ("bear" in s15) + ("bear" in s4h)
+        if disp < strong_disp:
+            if side_l == "long" and htf_bear >= 2:
+                score *= 0.68
+                notes.append(f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}")
+            if side_l == "short" and htf_bull >= 2:
+                score *= 0.68
+                notes.append(f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}")
+
+        score = max(0.20, min(1.0, score))
+        try:
+            self._last_sweep_analysis["quality_score"] = score
+            self._last_sweep_analysis["quality_notes"] = notes[:8]
+        except Exception:
+            pass
+
+        note = " | ".join(notes[:4]) if notes else "clean"
+        return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
+
+    def _evaluate_pending_refined_entry(
+        self, snap, flow, ict, price: float, atr: float, now: float
+    ) -> None:
+        """Reprice a confirmed sweep thesis after a pre-order rejection.
+
+        Institutional intent: if the first post-sweep signal is valid but
+        untradeable for account/exchange sizing because the stop distance is too
+        wide, keep the thesis alive and wait for the market to retrace toward the
+        raid origin.  The retry still runs full SL/TP pool selection and R:R
+        gates.  No synthetic TP, no nearest-pool shortcut, no min-lot override.
+        """
+        p = self._pending_refined
+        if p is None:
+            return
+        if now >= p.expires_at:
+            logger.info("EntryEngine refine watch expired: %s", p.last_reason)
+            self._pending_refined = None
+            return
+        if now - p.last_eval_at < max(1.0, _REFINE_MIN_RETRY_SEC):
+            return
+        p.last_eval_at = now
+
+        sig = p.original
+        sweep = p.sweep
+        if sweep is None:
+            p.last_reason = "original sweep unavailable"
+            self._pending_refined = None
+            return
+        side = str(sig.side or "").lower()
+        if side not in ("long", "short"):
+            p.last_reason = "invalid side"
+            self._pending_refined = None
+            return
+
+        # If price reaches the original catastrophe stop zone before a refined
+        # entry, the sweep thesis has been invalidated.  Do not keep chasing.
+        original_sl = float(sig.sl_price or 0.0)
+        if original_sl > 0:
+            room = max(atr * _REFINE_SL_ROOM_ATR, 1e-9)
+            if side == "long" and price <= original_sl + room:
+                p.last_reason = f"invalidated before refined entry: price <= SL+{_REFINE_SL_ROOM_ATR:.2f}ATR"
+                logger.info("EntryEngine refine watch cancelled: %s", p.last_reason)
+                self._pending_refined = None
+                return
+            if side == "short" and price >= original_sl - room:
+                p.last_reason = f"invalidated before refined entry: price >= SL-{_REFINE_SL_ROOM_ATR:.2f}ATR"
+                logger.info("EntryEngine refine watch cancelled: %s", p.last_reason)
+                self._pending_refined = None
+                return
+
+        needs_risk_expansion = (
+            float(getattr(p, "min_viable_risk", 0.0) or 0.0) >
+            p.initial_risk + max(atr * 0.02, 1e-9)
+        )
+
+        # Fee-dominated rejects need execution geometry to expand; oversized
+        # risk rejects need the original pullback/compression path.
+        initial_entry = float(sig.entry_price or price)
+        pullback = (initial_entry - price) if side == "long" else (price - initial_entry)
+        if not needs_risk_expansion:
+            min_pullback = max(atr * _REFINE_MIN_PULLBACK_ATR, 1e-9)
+            if pullback < min_pullback:
+                p.last_reason = (
+                    f"waiting refined pullback: {pullback/max(atr,1e-9):.2f}ATR"
+                    f"<{_REFINE_MIN_PULLBACK_ATR:.2f}ATR")
+                return
+
+            if original_sl > 0 and p.initial_risk > 0:
+                est_risk = abs(price - original_sl)
+                if est_risk > p.initial_risk * _REFINE_RISK_IMPROVE:
+                    p.last_reason = (
+                        f"waiting risk compression: {est_risk:.1f}pts > "
+                        f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+                    return
+
+        if p.attempts >= max(1, _REFINE_MAX_ATTEMPTS):
+            logger.info("EntryEngine refine watch max attempts reached: %s", p.last_reason)
+            self._pending_refined = None
+            return
+        p.attempts += 1
+
+        # Rebuild the reversal stop from current price using the same structural
+        # envelope as the original entry path.
+        regime_mult = self._regime_sl_mult()
+        if side == "long":
+            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
+        else:
+            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            p.last_reason = "refined SL non-protective at current price"
+            return
+
+        min_risk, _max_risk = self._sl_structural_bounds(
+            sweep.wick_extreme, sweep.pool.price, side, price, atr)
+        risk = abs(price - sl)
+        if risk < min_risk:
+            wick_clear = max(
+                abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
+                atr * _SL_MIN_ATR_MULT)
+            sl = sweep.wick_extreme - wick_clear if side == "long" else sweep.wick_extreme + wick_clear
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+
+        sl, sl_reason = self._apply_institutional_sl_envelope(
+            snap, side, price, atr, sl, sweep.wick_extreme, "refined",
+            min_risk=p.min_viable_risk if needs_risk_expansion else 0.0)
+        if sl is None:
+            if needs_risk_expansion:
+                p.last_reason = f"waiting structural execution geometry: {sl_reason}"
+            else:
+                p.last_reason = f"refined SL envelope blocked: {sl_reason}"
+            return
+        if not self._sl_before_liquidation(side, sl, price):
+            p.last_reason = "refined SL breaches liquidation guard"
+            return
+        risk = abs(price - sl)
+        if p.min_viable_risk > 0.0 and risk < p.min_viable_risk:
+            p.last_reason = (
+                f"refined fee geometry still tight: risk {risk:.1f}pts < "
+                f"required {p.min_viable_risk:.1f}pts")
+            return
+        if (not needs_risk_expansion
+                and p.initial_risk > 0
+                and risk > p.initial_risk * _REFINE_RISK_IMPROVE):
+            p.last_reason = (
+                f"refined risk still wide: {risk:.1f}pts > "
+                f"{_REFINE_RISK_IMPROVE:.0%} of initial {p.initial_risk:.1f}pts")
+            return
+
+        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        if tp is None or target is None:
+            p.last_reason = f"refined TP unavailable: {self._last_pool_plan_summary()}"
+            return
+        rr = abs(tp - price) / max(risk, 1e-10)
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
+            p.last_reason = f"refined R:R {rr:.2f} < institutional floor {rr_floor:.2f}"
+            return
+
+        self._signal = EntrySignal(
+            side=side,
+            entry_type=sig.entry_type,
+            entry_price=price,
+            sl_price=sl,
+            tp_price=tp,
+            rr_ratio=rr,
+            target_pool=target,
+            sweep_result=sweep,
+            conviction=max(float(getattr(sig, "conviction", 0.0) or 0.0), 0.55),
+            reason=(f"{sig.reason} | REFINED_PULLBACK "
+                    f"risk {p.initial_risk:.1f}->{risk:.1f}pts "
+                    f"pullback={pullback/max(atr,1e-9):.2f}ATR"),
+            ict_validation=self._ict_summary(ict, side),
+        )
+        logger.info(
+            "🎯 REFINED SWING ENTRY: %s @ $%.1f | SL=$%.1f TP=$%.1f "
+            "R:R=%.2f risk %.1f->%.1fpts pullback=%.2fATR attempts=%d",
+            side.upper(), price, sl, tp, rr, p.initial_risk, risk,
+            pullback / max(atr, 1e-9), p.attempts,
+        )
+        self._pending_refined = None
+
+    def _handle_reversal(self, sweep, decision, snap, flow, ict,
+                          price, atr, now) -> None:
+        side = decision.direction
+        ps = self._post_sweep
+
+        # ── SL: structural placement behind sweep wick (ICT methodology) ──
+        # The wick extreme IS the engineered stop-hunt level. SL goes behind it.
+        # If price revisits the wick, the sweep narrative is invalidated.
+        #
+        # Buffer scales with ATR-regime: compressed vol → tight buffer, expanded
+        # vol → wider buffer (regime_mult: 0.60 low-vol → 1.40 high-vol).
+        regime_mult = self._regime_sl_mult()
+        if side == "long":
+            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
+        else:
+            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
+            return
+        risk = abs(price - sl)
+        _initial_structural_sl = sl
+
+        if risk < 1e-10:
+            logger.info(
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        # ── Structural floor: SL must clear the wick tip ──────────────────
+        # Enforce: SL is placed at minimum max(wick_depth * CLEARANCE, 0.20 ATR)
+        # PAST the wick extreme. This anchors SL to the structural level, not an
+        # arbitrary price-ratio floor that ignores market structure entirely.
+        min_risk, max_risk = self._sl_structural_bounds(
+            sweep.wick_extreme, sweep.pool.price, side, price, atr)
+
+        if risk < min_risk:
+            wick_clear = max(
+                abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
+                atr * _SL_MIN_ATR_MULT)
+            if side == "long":
+                sl = sweep.wick_extreme - wick_clear
+            else:
+                sl = sweep.wick_extreme + wick_clear
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+            logger.debug(
+                f"SL anchored to wick: risk={risk:.1f}pts ({risk/atr:.2f}x ATR) "
+                f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
+
+        # ── Institutional SL envelope ─────────────────────────────────────
+        sl, sl_reason = self._apply_institutional_sl_envelope(
+            snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
+        if sl is None:
+            logger.info(
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f}")
+            if "liquidation" in str(sl_reason).lower() or "search window" in str(self._last_pool_plan_summary()).lower():
+                self._arm_refine_watch_from_rejected_sweep(
+                    sweep=sweep,
+                    side=side,
+                    entry_price=price,
+                    structural_sl=_initial_structural_sl,
+                    reason=sl_reason,
+                    now=now,
+                )
+            self._post_sweep = None
+            self._reset(now)
+            return
+        risk = abs(price - sl)
+
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal structural stop wrong-side"):
+            return
+
+        if not self._sl_before_liquidation(side, sl, price):
+            logger.info(
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
+                f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason="SL beyond liquidation guard",
+                now=now,
+            )
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        self._last_sweep_reversal_dir = side
+        self._last_sweep_reversal_time = now
+
+        # TP: pool → HTF → 2R (only if CISD)
+        tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        if tp is None:
+            logger.info(
+                f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
+                f"| {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        rr = abs(tp - price) / risk
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
+            logger.info(
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
+                f"side={side} sweep=${sweep.pool.price:.1f} "
+                f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        disp = f" DISP={ps.max_displacement:.1f}ATR" if ps else ""
+        cisd = f" CISD={ps.cisd_type}" if ps and ps.cisd_detected else ""
+
+        self._signal = EntrySignal(
+            side=side, entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
+            target_pool=target, sweep_result=sweep,
+            conviction=decision.confidence,
+            reason=f"{decision.reason}{cisd}{disp}",
+            ict_validation=self._ict_summary(ict, side),
+        )
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
+                    f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
+        # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
+        # Previously only _post_sweep was cleared here; the engine remained in
+        # POST_SWEEP for one more tick before _do_post_sweep() noticed ps is None
+        # and transitioned. That one-tick gap was a second re-entry vector.
+        # We cannot call _reset(now) here because it would null self._signal.
+        # Instead, manually perform the non-destructive parts of _reset():
+        self._post_sweep = None
+        self._state = EngineState.SCANNING
+        self._state_entered = now
+
+    def _handle_continuation(self, sweep, decision, snap, flow, ict,
+                              price, atr, now) -> None:
+        side = decision.direction
+        target = decision.next_target
+        if target is None:
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        # ── SL: structural placement behind swept pool level ─────────────
+        # Continuation thesis: price is now moving AWAY from the pool in sweep
+        # direction. If price returns to the pool level, the continuation is
+        # invalidated. SL goes behind pool price with a regime-adaptive buffer.
+        regime_mult = self._regime_sl_mult()
+        if side == "long":
+            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR * regime_mult
+        else:
+            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR * regime_mult
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+
+        tp_buf = atr * 0.35
+        tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf
+
+        risk = abs(price - sl)
+        reward = abs(tp - price)
+
+        if risk < 1e-10:
+            logger.info(
+                f"CANDIDATE DEFERRED [zero_sl_risk]: side={side} sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        # ── Structural floor: pool clearance ─────────────────────────────
+        # SL must extend at least _SL_MIN_ATR_MULT * ATR from entry (noise floor).
+        # For continuation, the pool is the structural anchor — not the wick.
+        pool_clearance = atr * _SL_MIN_ATR_MULT
+        if risk < pool_clearance:
+            if side == "long":
+                sl = sweep.pool.price - pool_clearance
+            else:
+                sl = sweep.pool.price + pool_clearance
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
+            risk = abs(price - sl)
+            reward = abs(tp - price)
+            logger.debug(
+                f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
+                f"({risk/atr:.2f}x ATR) side={side}")
+
+        sl, sl_reason = self._apply_institutional_sl_envelope(
+            snap, side, price, atr, sl, sweep.pool.price, "continuation")
+        if sl is None:
+            logger.info(
+                f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+        risk = abs(price - sl)
+        reward = abs(tp - price)
+
+        if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "continuation structural stop wrong-side"):
+            return
+
+        # ── Liquidation guard ─────────────────────────────────────────────
+        if not self._sl_before_liquidation(side, sl, price):
+            logger.info(
+                f"CANDIDATE DEFERRED [liquidation_guard]: side={side} "
+                f"entry=${price:.1f} sl=${sl:.1f} sweep=${sweep.pool.price:.1f}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason="SL beyond liquidation guard",
+                now=now,
+            )
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        # Continuation TP is re-selected through the same EV-ranked pool selector
+        # as reversal entries.  The DirectionEngine's next_target is a directional
+        # hint, not an execution TP.  This prevents "visible pool = TP" shortcut
+        # shortcuts and forces every continuation target through R:R, probability,
+        # gauntlet, freshness, and execution-cost gates.
+        tp2, target2 = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
+        if tp2 is not None:
+            tp, target = tp2, target2
+            rr = abs(tp - price) / risk
+        else:
+            rr = reward / risk if risk > 1e-10 else 0.0
+            logger.info(
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: initial_rr={rr:.2f} < institutional TP gate "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
+                f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        rr_floor = self._last_selected_tp_rr_floor(_MIN_RR_RATIO)
+        if rr < rr_floor:
+            logger.info(
+                f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
+                f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
+        self._signal = EntrySignal(
+            side=side, entry_type=EntryType.SWEEP_CONTINUATION,
+            entry_price=price, sl_price=sl, tp_price=tp, rr_ratio=rr,
+            target_pool=target, sweep_result=sweep,
+            conviction=decision.confidence, reason=decision.reason,
+            ict_validation=self._ict_summary(ict, side),
+        )
+        logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
+        # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
+        # Transition to SCANNING immediately without nulling self._signal.
+        self._post_sweep = None
+        self._state = EngineState.SCANNING
+        self._state_entered = now
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _find_tp(self, snap, side, price, atr, sl, min_rr):
+        """Find TP via EV-ranked institutional liquidity selection + audit report.
+
+        The selector is intentionally strict: a visible BSL/SSL must still pass
+        side, active-status, reach, R:R, probability, gauntlet, and execution-cost
+        gates.  The important upgrade here is observability: every rejected pool
+        is retained in self._last_pool_plan so logs and /thinking explain WHY the
+        visible pool was not used.
+        """
+        risk = abs(price - sl)
+        if risk < 1e-10:
+            self._record_pool_report({
+                "role": "TP", "side": side, "entry": price, "atr": atr,
+                "summary": "invalid risk: entry and SL overlap", "candidates": []})
+            return None, None
+
+        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+        posterior_prob = self._current_quant_posterior()
+        try:
+            from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
+        except ImportError:
+            try:
+                from liquidity_pool_selector import select_tp_with_report as _sel_tp   # type: ignore
+            except ImportError:
+                _sel_tp = None
+
+        _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
+        if _sel_tp is None:
+            report = {
+                "role": "TP", "side": side, "entry": price, "atr": atr,
+                "summary": "liquidity selector unavailable; abstaining from target selection",
+                "selected": None, "candidates": [],
+            }
+            self._record_pool_report(report)
+            return None, None
+
+        tp_price, target, score, report_obj = _sel_tp(
+            snap=snap, side=side, entry=price, sl=sl, atr=atr,
+            ict=getattr(self, "_ict", None), htf=_htf_ref,
+            min_rr=required_rr,
+            posterior_prob=posterior_prob,
+            now=time.time(),
+        )
+        report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
+
+        self._record_pool_report(report)
+        if tp_price is None or target is None:
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
+            return None, None
+
+        # Strategy-level BE gate: TP must clear round-trip fees + slippage.
+        min_net_move = max(
+            atr * _TP_MIN_NET_ATR,
+            self._estimated_entry_be_move(price, atr),
+        )
+        net_move = abs(tp_price - price)
+        if net_move < min_net_move:
+            report = dict(report or {})
+            report["strategy_gate"] = (
+                f"selected TP failed execution-cost gate: net_move={net_move:.1f} "
+                f"< required={min_net_move:.1f}")
+            # Mark selected row as rejected by strategy-level cost gate, while
+            # preserving the selector's EV result.
+            selected = report.get("selected") or {}
+            if isinstance(selected, dict):
+                selected["eligible"] = False
+                selected["selected"] = False
+                selected["reason"] = report["strategy_gate"]
+                report["selected"] = selected
+            report["summary"] = report["strategy_gate"]
+            self._record_pool_report(report)
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
+            return None, None
+
+        if score is not None:
+            logger.info(
+                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
+                tp_price, score.distance_atr, score.rr,
+                score.sweep_prob, score.ev, score.gauntlet_n,
+                ", ".join(score.reasons) if score.reasons else "institutional gates passed",
+            )
+        return tp_price, target
+
+    def _find_sl_pool(self, snap, side, entry, atr, ict=None,
+                       invalidation_price=None, max_buffer_atr=2.0,
+                       min_risk: float = 0.0):
+        """
+        Anchor SL to the highest-significance protective pool just past
+        structural invalidation, with a quality-scaled buffer beyond it.
+
+        Also records a full SL candidate audit report.  A visible pool is not
+        automatically usable as SL: it must be on the protective side, beyond
+        invalidation, active/unswept, inside the SL search window, and above the
+        institutional significance floor.
+        """
+        try:
+            from strategy.liquidity_pool_selector import select_sl_with_report as _sel_sl
+        except ImportError:
+            try:
+                from liquidity_pool_selector import select_sl_with_report as _sel_sl   # type: ignore
+            except ImportError:
+                _sel_sl = None
+
+        _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
+        if _sel_sl is None:
+            self._record_pool_report({
+                "role": "SL", "side": side, "entry": entry, "atr": atr,
+                "summary": "liquidity selector unavailable; abstaining from stop selection",
+                "selected": None, "candidates": [],
+            })
+            return None, None
+
+        sl_price, target, pick, report_obj = _sel_sl(
+            snap=snap, side=side, entry=entry, atr=atr,
+            ict=ict if ict is not None else getattr(self, "_ict", None),
+            htf=_htf_ref,
+            invalidation_price=invalidation_price,
+            max_buffer_atr=max_buffer_atr,
+            now=time.time(),
+            min_risk=min_risk,
+        )
+        report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
+        self._record_pool_report(report)
+        if sl_price is None or target is None:
+            logger.info("RAW_SL_AUDIT: %s", self._format_pool_plan(report))
+        else:
+            try:
+                logger.info(
+                    "RAW_SL_ANCHOR: anchor=$%.1f sl=$%.1f quality=%.2f buffer=%.2fATR (%s)",
+                    float(getattr(target.pool, "price", 0.0)), float(sl_price),
+                    float(getattr(pick, "quality", 0.0) if pick is not None else 0.0),
+                    float(getattr(pick, "buffer_atr", 0.0) if pick is not None else 0.0),
+                    ", ".join(getattr(pick, "reasons", []) or ["protective gates passed"]),
+                )
+            except Exception:
+                pass
+        return sl_price, target, pick
+
+    def _record_pool_report(self, report: Any) -> None:
+        """Store a pool-selection report for /thinking without raising."""
+        try:
+            if report is None:
+                return
+            if hasattr(report, "as_dict"):
+                payload = report.as_dict()
+            elif isinstance(report, dict):
+                payload = dict(report)
+            else:
+                payload = {"summary": str(report), "candidates": []}
+            payload["ts"] = time.time()
+            self._last_pool_plan = payload
+        except Exception:
+            self._last_pool_plan = None
+
+    def _last_pool_plan_summary(self) -> str:
+        try:
+            if not isinstance(self._last_pool_plan, dict):
+                return "pool diagnostics unavailable"
+            return str(self._last_pool_plan.get("summary") or "pool diagnostics unavailable")
+        except Exception:
+            return "pool diagnostics unavailable"
+
+    def _last_selected_tp_rr_floor(self, fallback: float) -> float:
+        try:
+            if not isinstance(self._last_pool_plan, dict):
+                return float(fallback)
+            if str(self._last_pool_plan.get("role", "")).upper() != "TP":
+                return float(fallback)
+            selected = self._last_pool_plan.get("selected") or {}
+            if not isinstance(selected, dict):
+                return float(fallback)
+            floor = float(selected.get("required_rr", fallback) or fallback)
+            return max(0.50, min(float(fallback), floor))
+        except Exception:
+            return float(fallback)
+
+    def _format_pool_plan(self, report: Any, max_rows: int = 4) -> str:
+        """Compact one-line audit text for logs."""
+        try:
+            if hasattr(report, "as_dict"):
+                report = report.as_dict()
+            if not isinstance(report, dict):
+                return str(report)
+            role = report.get("role", "POOL")
+            side = str(report.get("side", "?")).upper()
+            summary = report.get("summary", "")
+            rows = report.get("candidates") or []
+            bits = [f"{role}/{side}: {summary}"]
+            for r in rows[:max_rows]:
+                if not isinstance(r, dict):
+                    continue
+                px = float(r.get("pool_price") or 0.0)
+                tf = r.get("timeframe", "")
+                ps = r.get("pool_side", "")
+                rr = float(r.get("rr") or 0.0)
+                ev = float(r.get("ev") or 0.0)
+                reason = r.get("reason", "")
+                notes = r.get("notes") or []
+                if isinstance(notes, list) and notes:
+                    reason = f"{reason} ({', '.join(map(str, notes[:3]))})"
+                mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
+                bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
+            return " | ".join(bits)
+        except Exception as e:
+            return f"pool audit format error: {e}"
+
+    def _find_opposing_target(self, direction, snap, price, atr):
+        # EE-3 FIX: previously capped at _MAX_TARGET_ATR (8.0 ATR), which
+        # rejected HTF pools at 10-30 ATR that are the real institutional
+        # targets. The caller uses the returned pool for TP computation
+        # and for quality scoring — both benefit from HTF reach. Callers
+        # that need a proximity filter still apply their own distance gate.
+        pools = snap.bsl_pools if direction == "long" else snap.ssl_pools
+        reachable = [t for t in pools
+                     if t.distance_atr <= _HTF_TP_MAX_ATR
+                     and t.significance >= _MIN_POOL_SIGNIFICANCE * 0.5]
+        if not reachable:
+            return None
+        return max(reachable, key=lambda t: self._pool_draw_score(t, 1.0, 1.0))
+
+    @staticmethod
+    def _estimated_entry_be_move(price: float, atr: float) -> float:
+        """Conservative pre-fill BE move: round-trip fees plus slippage reserve."""
+        try:
+            import config as _cfg_be
+            maker = abs(float(getattr(_cfg_be, "COMMISSION_RATE_MAKER", 0.0002)))
+            taker = abs(float(getattr(_cfg_be, "COMMISSION_RATE", 0.00055)))
+            rate = max(maker, min(taker, 0.00035))
+        except Exception:
+            rate = 0.00035
+        return price * rate * 2.0 + 0.12 * atr
+
+    @staticmethod
+    def _pool_draw_score(target: PoolTarget, rr: float, required_rr: float) -> float:
+        """Institutional liquidity draw score; not nearest-only, not significance-only."""
+        dist = max(float(target.distance_atr or 0.0), 1e-9)
+        sig = max(float(target.adjusted_sig()), 0.01)
+        pool = target.pool
+        tf_rank = TF_HIERARCHY.get(getattr(pool, "timeframe", "1m"), 1)
+        tf_mult = 1.0 + 0.08 * max(tf_rank - 2, 0)
+        htf_mult = 1.0 + 0.10 * max(float(getattr(pool, "htf_count", 0) or 0), 0.0)
+        struct_mult = 1.0
+        if getattr(pool, "ob_aligned", False):
+            struct_mult += 0.18
+        if getattr(pool, "fvg_aligned", False):
+            struct_mult += 0.10
+        confluence_mult = 1.0 + 0.06 * max(len(getattr(target, "tf_sources", []) or []) - 1, 0)
+
+        near_penalty = 1.0 - math.exp(-dist / 0.80)
+        far_decay = math.exp(-dist / 18.0)
+        distance_draw = near_penalty * far_decay
+        rr_quality = 1.0 + min(max(rr - required_rr, 0.0), 3.0) * 0.18
+        return sig * tf_mult * htf_mult * struct_mult * confluence_mult * distance_draw * rr_quality
+
+    def _compute_sl(self, ict, side, price, atr):
+        """ICT Order Block-based SL for momentum/displacement entries.
+
+        Placement priority:
+          1. Nearest OB on the entry side (structural anchor — tightest valid SL)
+        Validation:
+          - OB SL must clear live noise.
+          - OB SL must remain before the exchange liquidation guard.
+        """
+        if ict is None:
+            return None
+
+        if side == "long":
+            ob = ict.nearest_ob_price
+        else:
+            ob = getattr(ict, 'nearest_ob_price_short', 0.0) or 0.0
+
+        sl = None
+        if ob > 0:
+            if side == "long" and ob < price:
+                sl = ob - atr * 0.20
+            elif side == "short" and ob > price:
+                sl = ob + atr * 0.20
+
+        if sl is not None:
+            ob_risk = abs(price - sl)
+            if ob_risk < atr * _SL_MIN_ATR_MULT or not self._sl_before_liquidation(side, sl, price):
+                sl = None
+
+        if sl is None:
+            return None
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            return None
+        risk = abs(price - sl)
+
+        # Hard floor: noise minimum
+        if risk < atr * _SL_MIN_ATR_MULT:
+            return None
+
+        if not self._sl_before_liquidation(side, sl, price):
+            return None
+        return sl
+
+    def _push_sl_behind_pools(self, sl, side, price, atr):
+        """Push SL behind nearby liquidity pools.
+
+        EE-6 FIX: cap the total push distance to _SL_PUSH_MAX_ATR from the
+        starting SL so a large `snap.bsl_pools` list with one outlier pool
+        far from price cannot shift SL to an unrealistic distance.
+        """
+        snap = self._last_liq_snapshot
+        if snap is None:
+            return sl
+        try:
+            import config as _sl_survival_cfg
+            _SL_PUSH_MAX_ATR = float(getattr(_sl_survival_cfg, "SL_PUSH_MAX_ATR", 4.0))
+            _SL_CLEAR_ATR = float(getattr(_sl_survival_cfg, "SL_LIQUIDITY_CLEARANCE_ATR", 0.75))
+        except Exception:
+            _SL_PUSH_MAX_ATR = 4.0
+            _SL_CLEAR_ATR = 0.75
+        # Stops must clear the liquidity cluster, not sit on it.  0.75 ATR is
+        # the default survival band; crowded/high-significance pools are already
+        # expanded by the selector before this final guard.
+        sl_origin = sl
+        buf = max(0.75 * atr, _SL_CLEAR_ATR * atr)
+        if side == "long":
+            for t in snap.ssl_pools:
+                if sl < t.pool.price < price:
+                    candidate = t.pool.price - buf
+                    # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
+                    # below the original SL.
+                    if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = min(sl, candidate)
+        else:
+            for t in snap.bsl_pools:
+                if price < t.pool.price < sl:
+                    candidate = t.pool.price + buf
+                    if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = max(sl, candidate)
+        return sl
+
+    @staticmethod
+    def _ict_summary(ict, side):
+        parts = []
+        if ict.amd_phase: parts.append(f"AMD={ict.amd_phase}")
+        if ict.amd_bias: parts.append(f"bias={ict.amd_bias}")
+        if ict.in_discount: parts.append("DISCOUNT")
+        elif ict.in_premium: parts.append("PREMIUM")
+        if ict.structure_5m: parts.append(f"5m={ict.structure_5m}")
+        if ict.kill_zone: parts.append(f"KZ={ict.kill_zone}")
+        return " | ".join(parts) if parts else "no ICT"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAIL MANAGER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ICTTrailManager:
+    """Trailing stop using ICT structures."""
+
+    def __init__(self) -> None:
+        self._sl = 0.0
+        self._entry = 0.0
+        self._side = ""
+        self._bos_count = 0
+        self._choch = False
+
+    def initialize(self, side, entry_price, initial_sl):
+        self._side = side
+        self._entry = entry_price
+        self._sl = initial_sl
+        self._bos_count = 0
+        self._choch = False
+
+    def compute(self, ict_ctx, price, atr, candles_5m,
+                candles_15m=None):
+        if not self._side or atr < 1e-10:
+            return None
+
+        if ict_ctx.bos_5m:
+            expected = "bullish" if self._side == "long" else "bearish"
+            if ict_ctx.bos_5m == expected:
+                self._bos_count += 1
+
+        if ict_ctx.choch_5m:
+            against = "bearish" if self._side == "long" else "bullish"
+            if ict_ctx.choch_5m == against:
+                self._choch = True
+
+        new_sl = self._structural_sl(candles_5m, candles_15m, atr)
+        if new_sl is None:
+            return None
+        if self._side == "long" and new_sl <= self._sl:
+            return None
+        if self._side == "short" and new_sl >= self._sl:
+            return None
+
+        self._sl = new_sl
+        return new_sl
+
+    def _structural_sl(self, c5m, c15m, atr):
+        try:
+            from strategy.liquidity_map import _find_swing_highs, _find_swing_lows
+        except ImportError:
+            from liquidity_map import _find_swing_highs, _find_swing_lows
+
+        # Bug #9 fix: CHoCH buffer raised from 0.05 ATR to 0.20 ATR.
+        # At BTC ATR=$265, 0.05 ATR = $13 — smaller than a typical 5m wick.
+        # ICT methodology requires SL placement BEHIND the structural level with
+        # enough buffer to survive normal market noise.  0.20 ATR ≈ $53, which
+        # comfortably clears the intrabar rejection range on 5m bars without
+        # giving up structural accuracy.  Configurable via ENTRY_CHOCH_SL_BUFFER_ATR.
+        try:
+            import config as _ee_cfg
+            _CHOCH_SL_BUFFER = float(getattr(_ee_cfg, 'ENTRY_CHOCH_SL_BUFFER_ATR', 0.20))
+        except Exception:
+            _CHOCH_SL_BUFFER = 0.20
+        buf_mult = _CHOCH_SL_BUFFER if self._choch else (0.10 if self._bos_count >= 2 else _SL_BUFFER_ATR)
+        buf = atr * buf_mult
+
+        if c15m and len(c15m) >= 12:
+            if self._side == "long":
+                lows = _find_swing_lows(c15m, lookback=3)
+                if lows: return lows[-1][1] - buf
+            else:
+                highs = _find_swing_highs(c15m, lookback=3)
+                if highs: return highs[-1][1] + buf
+
+        if c5m and len(c5m) >= 12:
+            if self._side == "long":
+                lows = _find_swing_lows(c5m, lookback=4)
+                if lows: return lows[-1][1] - buf
+            else:
+                highs = _find_swing_highs(c5m, lookback=4)
+                if highs: return highs[-1][1] + buf
+        return None
+
+    @property
+    def current_sl(self):
+        return self._sl
+
+    @property
+    def phase_info(self):
+        p = [f"BOS×{self._bos_count}"]
+        if self._choch: p.append("CHoCH")
+        return " ".join(p)
