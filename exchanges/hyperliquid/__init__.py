@@ -1,1 +1,0 @@
-"""Hyperliquid exchange adapter package."""
