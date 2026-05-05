@@ -674,3 +674,15 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Institutional stop-survival geometry
+# SL must not sit at an obvious liquidity pool.  For long positions the stop
+# must clear the nearest SSL by this ATR buffer; for shorts it must clear BSL.
+# This is intentionally wider than the old 0.20–0.30 ATR retail-style pool
+# offset so stops sit beyond the sweep zone, not inside the liquidity cluster.
+SL_LIQUIDITY_CLEARANCE_ATR = 0.75
+SL_LIQUIDITY_CROWDED_TOUCH_ATR = 0.08
+SL_LIQUIDITY_HIGH_SIG_ATR = 0.025
+SL_PUSH_MAX_ATR = 4.0
+SL_MIN_SURVIVAL_RISK_ATR = 0.85

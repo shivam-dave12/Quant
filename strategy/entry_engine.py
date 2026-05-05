@@ -1832,8 +1832,14 @@ class EntryEngine:
         sl = structural_sl
         risk = abs(price - sl)
         invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
+        try:
+            import config as _sl_floor_cfg
+            _survival_min = float(getattr(_sl_floor_cfg, "SL_MIN_SURVIVAL_RISK_ATR", 0.85))
+        except Exception:
+            _survival_min = 0.85
         noise_floor = max(
             atr * (0.45 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0)),
+            atr * _survival_min,
             invalidation_gap + atr * 0.28,
         )
 
@@ -2742,9 +2748,18 @@ class EntryEngine:
         snap = self._last_liq_snapshot
         if snap is None:
             return sl
-        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
+        try:
+            import config as _sl_survival_cfg
+            _SL_PUSH_MAX_ATR = float(getattr(_sl_survival_cfg, "SL_PUSH_MAX_ATR", 4.0))
+            _SL_CLEAR_ATR = float(getattr(_sl_survival_cfg, "SL_LIQUIDITY_CLEARANCE_ATR", 0.75))
+        except Exception:
+            _SL_PUSH_MAX_ATR = 4.0
+            _SL_CLEAR_ATR = 0.75
+        # Stops must clear the liquidity cluster, not sit on it.  0.75 ATR is
+        # the default survival band; crowded/high-significance pools are already
+        # expanded by the selector before this final guard.
         sl_origin = sl
-        buf = 0.25 * atr
+        buf = max(0.75 * atr, _SL_CLEAR_ATR * atr)
         if side == "long":
             for t in snap.ssl_pools:
                 if sl < t.pool.price < price:
