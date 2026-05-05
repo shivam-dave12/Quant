@@ -7,7 +7,7 @@ BOTH exchanges while sourcing candles exclusively from the primary.
 Architecture
 ------------
                 ┌──────────────────┐     ┌──────────────────┐
-                │  CoinSwitchDM    │     │    DeltaDM       │
+                │  HyperliquidDM    │     │    DeltaDM       │
                 │  (data manager)  │     │  (data manager)  │
                 └───────┬──────────┘     └────────┬─────────┘
                         │  orderbook                │  orderbook
@@ -99,13 +99,13 @@ def _norm_levels(raw_levels: list) -> list:
 class MarketAggregator:
     """
     Unified data manager facade consumed by QuantStrategy.
-    Implements the same interface as CoinSwitchDataManager / DeltaDataManager.
+    Implements the same interface as HyperliquidDataManager / DeltaDataManager.
     """
 
     def __init__(
         self,
-        primary_dm,    # CoinSwitchDataManager | DeltaDataManager
-        secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
+        primary_dm,    # HyperliquidDataManager | DeltaDataManager
+        secondary_dm,  # DeltaDataManager | HyperliquidDataManager | None
         instrument=None,
     ) -> None:
         self.instrument = instrument
@@ -391,7 +391,7 @@ class MarketAggregator:
         Return the executable primary venue book.
 
         Cross-venue synthetic depth is useful for diagnostics, but it is not an
-        executable book: merging CoinSwitch and Delta levels can invent liquidity
+        executable book: merging Hyperliquid and Delta levels can invent liquidity
         that cannot be hit by a single Delta order. Consumers that route orders,
         compute spread, or validate stop placement must see the primary book.
         The secondary book is attached under `_secondary_book` as a side-channel
@@ -426,48 +426,61 @@ class MarketAggregator:
     # ── Trades — merged from both exchanges ──────────────────────────────────
 
     def get_recent_trades_raw(self) -> List[Dict]:
-        """
-        Return the merged, time-ordered trade stream from both exchanges.
-
-        Primary trades + secondary tap = ~2× the tick data for CVD/tick-flow.
-        Deduplication is by source tag so cross-exchange fills of the same
-        institutional order show up twice (they ARE two separate fills).
-        Trades are sorted newest-last for compatibility with strategy code.
-        """
-        p_trades = self._primary.get_recent_trades_raw()
-
+        """Return a time-ordered trade stream without cross-venue volume inflation."""
+        p_raw = self._primary.get_recent_trades_raw()
+        p_trades = []
+        for t in p_raw or []:
+            d = dict(t)
+            d.setdefault("source", "primary")
+            d.setdefault("venue", type(self._primary).__name__)
+            try: d["raw_quantity"] = float(d.get("quantity", 0.0) or 0.0)
+            except Exception: d["raw_quantity"] = 0.0
+            p_trades.append(d)
         if self._secondary is None or not self._secondary_alive:
-            return p_trades
-
+            return p_trades[-400:]
         with self._lock:
-            s_trades = list(self._merged_trades)
-
-        # Merge and sort by timestamp, keep last 400
-        all_trades = p_trades + [t for t in s_trades if t.get("source") == "secondary"]
-        all_trades.sort(key=lambda t: t.get("timestamp", 0))
-        return all_trades[-400:]
+            s_trades = [dict(t) for t in list(self._merged_trades) if t.get("source") == "secondary"]
+        def _total(rows):
+            out=0.0
+            for x in rows:
+                try: out += max(0.0, float(x.get("quantity", 0.0) or 0.0))
+                except Exception: pass
+            return out
+        p_total = _total(p_trades); s_total = _total(s_trades)
+        w_primary = float(getattr(config, "AGG_PRIMARY_TRADE_WEIGHT", 0.65))
+        w_secondary = float(getattr(config, "AGG_SECONDARY_TRADE_WEIGHT", 0.35))
+        ref_total = p_total if p_total > 0 else s_total
+        p_scale = w_primary if p_total > 0 else 0.0
+        s_scale = (ref_total * w_secondary / s_total) if s_total > 0 and ref_total > 0 else 0.0
+        out=[]
+        for d in p_trades:
+            raw_q=d.get("raw_quantity", d.get("quantity",0.0))
+            try: d["quantity"] = max(0.0, float(raw_q)) * p_scale
+            except Exception: d["quantity"] = 0.0
+            d["normalised_quantity"] = d["quantity"]; d["venue_weight"] = p_scale; out.append(d)
+        for d in s_trades:
+            try: raw_q=max(0.0, float(d.get("quantity",0.0) or 0.0))
+            except Exception: raw_q=0.0
+            d["raw_quantity"] = raw_q; d["quantity"] = raw_q * s_scale
+            d["normalised_quantity"] = d["quantity"]; d["venue_weight"] = s_scale; out.append(d)
+        out.sort(key=lambda t: t.get("timestamp",0)); return out[-400:]
 
     # ── Supplementary helpers (forwarded to primary) ──────────────────────────
 
     def get_volume_delta(self, lookback_seconds: float = 60.0) -> Dict:
-        """CVD from the merged trade stream."""
-        merged = self.get_recent_trades_raw()
-        cutoff = time.time() - lookback_seconds
-        buy_vol  = sum(t["quantity"] for t in merged
-                       if t.get("timestamp", 0) >= cutoff and t.get("side") == "buy")
-        sell_vol = sum(t["quantity"] for t in merged
-                       if t.get("timestamp", 0) >= cutoff and t.get("side") == "sell")
-        total = buy_vol + sell_vol
-        reliability = self.get_feed_reliability()
-        return {
-            "buy_volume":  buy_vol,
-            "sell_volume": sell_vol,
-            "delta":       buy_vol - sell_vol,
-            "delta_pct":   (buy_vol - sell_vol) / total if total > 0 else 0.0,
-            "sources":     reliability.get("sources", 1),
-            "microstructure_weight": reliability.get("microstructure_weight", 1.0),
-            "reliability": reliability,
-        }
+        """Venue-normalised CVD. Delta+Hyperliquid raw volume is never summed."""
+        merged = self.get_recent_trades_raw(); cutoff = time.time() - lookback_seconds
+        rows = [t for t in merged if t.get("timestamp", 0) >= cutoff]
+        buy_vol = sum(float(t.get("quantity",0) or 0) for t in rows if t.get("side") == "buy")
+        sell_vol = sum(float(t.get("quantity",0) or 0) for t in rows if t.get("side") == "sell")
+        raw_by_source={}
+        for t in rows:
+            src=str(t.get("source") or "primary"); raw_by_source.setdefault(src,{"buy":0.0,"sell":0.0})
+            q=float(t.get("raw_quantity", t.get("quantity",0)) or 0)
+            if t.get("side") == "buy": raw_by_source[src]["buy"] += q
+            elif t.get("side") == "sell": raw_by_source[src]["sell"] += q
+        total=buy_vol+sell_vol; reliability=self.get_feed_reliability()
+        return {"buy_volume":buy_vol,"sell_volume":sell_vol,"delta":buy_vol-sell_vol,"delta_pct":(buy_vol-sell_vol)/total if total>0 else 0.0,"sources":reliability.get("sources",1),"microstructure_weight":reliability.get("microstructure_weight",1.0),"reliability":reliability,"venue_normalized":True,"raw_by_source":raw_by_source}
 
     @property
     def ws(self):

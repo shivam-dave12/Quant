@@ -17,7 +17,7 @@ All command handlers reflect the QuantPosterior authority model:
   /trail      — Adaptive exit override on/off/auto
   /config     — Show current config values
   /killswitch — Emergency: close all positions + cancel orders
-  /setexchange — Switch execution exchange (delta|coinswitch)
+  /setexchange — Switch execution exchange (delta|hyperliquid)
   /set <key> <val> — Live-adjust config
   /resetrisk  — Clear consecutive-loss lockout
   /huntstatus — Liquidity-draw telemetry only
@@ -410,7 +410,7 @@ class TelegramBotController:
             "  /trail [on|off|auto] [asset] — Trailing SL control (default OFF)\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
-            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
+            "  /setexchange &lt;delta|hyperliquid&gt; — Switch execution\n\n"
             "🚨 <b>EMERGENCY</b>\n"
             "  /killswitch — Close positions + cancel all\n"
             "  /resetrisk [full] — Clear risk lockout\n"
@@ -1887,7 +1887,7 @@ class TelegramBotController:
             return (
                 f"Current execution exchange: <b>{active.upper()}</b>\n\n"
                 f"Usage: /setexchange &lt;exchange&gt;\n"
-                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
+                f"Valid values: <code>delta</code>, <code>hyperliquid</code>\n\n"
                 f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
             )
 

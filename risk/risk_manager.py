@@ -88,7 +88,7 @@ class RiskManager:
         self._position_is_open: bool = False
         self._pending_reset:    bool = False
 
-        # Shared API (CoinSwitchAPI, DeltaAPI, or ExecutionRouter)
+        # Shared API (HyperliquidAPI, DeltaAPI, or ExecutionRouter)
         if shared_api is not None:
             self.api = shared_api
         else:

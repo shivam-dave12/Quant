@@ -6289,7 +6289,7 @@ class QuantStrategy:
         # ── Place entry ────────────────────────────────────────────────────────────
         # Delta: bracket limit order (entry + SL + TP in one API call).
         #   Avoids bad_schema from separate stop/take-profit order placement.
-        # CoinSwitch: standard limit entry, SL/TP placed separately after fill.
+        # Hyperliquid: standard limit entry, SL/TP placed separately after fill.
         #
         # BUG 2 FIX: on_order_placed callback captures the exact moment the
         # limit order hits the exchange (REST 200 OK returned an order_id).
@@ -6312,7 +6312,7 @@ class QuantStrategy:
         # If the bracket endpoint rejects the order for a non-BTC contract, do NOT
         # fall back to a naked entry followed by standalone SL/TP. That fallback can
         # leave the position temporarily unprotected and behaves differently from BTC.
-        # CoinSwitch has no Delta-native bracket endpoint, so only CoinSwitch uses the
+        # Hyperliquid has no Delta-native bracket endpoint, so only Hyperliquid uses the
         # old fill-then-place-standalone-conditionals path.
         _active_exchange = str(
             getattr(order_manager, "active_exchange", None)
@@ -6354,7 +6354,7 @@ class QuantStrategy:
             self._last_exit_time = time.time()
             return
         else:
-            # CoinSwitch / non-Delta path: standard limit entry, then protected
+            # Hyperliquid / non-Delta path: standard limit entry, then protected
             # standalone SL/TP after fill because native bracket is unavailable.
             entry_data = order_manager.place_limit_entry(
                 side=side, quantity=qty,
@@ -6553,7 +6553,7 @@ class QuantStrategy:
                     "⚠️ Bracket child order IDs not found after fill — "
                     "trailing SL may not work. Check open orders manually.")
         else:
-            # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
+            # Hyperliquid (and non-bracket) path: place SL/TP as separate orders
             sweep = order_manager.cancel_symbol_conditionals()
             if sweep:
                 # v4.6 BUG FIX #3: Wait for exchange to process cancellations
@@ -8370,7 +8370,7 @@ class QuantStrategy:
         else:
             fill_type  = getattr(pos, "entry_fill_type", "taker")
             # FIX Bug-A: use exchange-specific maker rate.
-            # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
+            # Delta maker = rebate (negative); Hyperliquid maker = positive cost.
             if fill_type == "maker":
                 if _is_delta:
                     entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
@@ -8783,8 +8783,8 @@ class QuantStrategy:
         if hasattr(self, '_dir_engine') and self._dir_engine is not None:
             try:
                 self._dir_engine.clear_sweep()
-            except Exception as _cs_e:
-                logger.debug(f"DirectionEngine.clear_sweep() error (non-fatal): {_cs_e}")
+            except Exception as _clear_sweep_error:
+                logger.debug(f"DirectionEngine.clear_sweep() error (non-fatal): {_clear_sweep_error}")
 
         # CRITICAL: do NOT reset _pnl_recorded_for or _exit_completed here.
         # These guards must persist until a new position opens (in _enter_trade).
@@ -9490,19 +9490,19 @@ class QuantStrategy:
         We use the exact inverse formula for correctness, but the linear approximation
         is included as a sanity check in debug logs.
 
-        Both Delta and CoinSwitch paths now produce identical results for small moves
+        Both Delta and Hyperliquid paths now produce identical results for small moves
         because the inverse-perp formula converges to linear.
 
         Fee basis: notional is measured at entry price (standard industry practice).
         """
         # Uses the module-level `config` import — no per-call import overhead.
-        _is_delta = (getattr(config, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
+        _is_delta = (getattr(config, 'EXECUTION_EXCHANGE', 'hyperliquid').lower() == 'delta'
                      and getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
 
         # FIX Bug-A: use exchange-specific fee rates.
-        # Delta maker rate is NEGATIVE (rebate = -0.02%); CoinSwitch maker rate is
+        # Delta maker rate is NEGATIVE (rebate = -0.02%); Hyperliquid maker rate is
         # positive (0.02%).  The old code always read COMMISSION_RATE_MAKER from config
-        # which is set to the CoinSwitch value (+0.00020), costing Delta maker entries
+        # which is set to the Hyperliquid value (+0.00020), costing Delta maker entries
         # 0.04% of notional instead of receiving the rebate.
         if entry_fill_type == "maker":
             if _is_delta:
@@ -9854,7 +9854,7 @@ class QuantStrategy:
 
         # FIX (CRITICAL-6): prefer the adapter's BTC-unit fields. The Delta
         # adapter now returns size in BTC (converted from contracts) and
-        # size_signed preserving direction. CoinSwitch adapter returns
+        # size_signed preserving direction. Hyperliquid adapter returns
         # size in BTC natively. Either way, we want BTC here.
         ex_size     = abs(float(ex_pos.get("size", 0.0)))
         ex_size_raw = float(ex_pos.get("size_signed",
@@ -9885,7 +9885,7 @@ class QuantStrategy:
                 )
                 return
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
-            # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
+            # Guard: Hyperliquid sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
             if ex_entry < 1.0:
                 logger.warning(

@@ -18,28 +18,25 @@ class FakeDelta:
         ]}
 
 
-class FakeCoinSwitch:
-    def get_instrument_info(self, exchange="EXCHANGE_2"):
-        # Simulate incomplete all-instrument response. BTC should still be validated live.
-        return {"data": []}
+class FakeHyperliquid:
+    def get_meta(self):
+        return {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]}
 
-    def get_futures_ticker(self, symbol, exchange="EXCHANGE_2"):
-        if symbol.upper() == "BTCUSDT":
-            return {"data": {"symbol": "BTCUSDT", "last_price": "79000", "funding_rate": "0.001"}}
-        return {"error": "not found"}
+    def get_all_mids(self):
+        return {"BTC": "79000"}
 
 
 class InstrumentRegistryV4Tests(unittest.TestCase):
-    def test_coinswitch_secondary_is_added_by_live_symbol_validation(self):
+    def test_hyperliquid_secondary_is_added_by_live_symbol_validation(self):
         intents = [AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO, ("BTCUSD", "BTCUSDT"), priority=0)]
         reg = InstrumentRegistry(execution_preference="delta")
-        report = reg.discover(FakeDelta(), FakeCoinSwitch(), requested=[{
+        report = reg.discover(FakeDelta(), FakeHyperliquid(), requested=[{
             "asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT"], "priority": 0
         }])
         btc = report.matched[0]
         self.assertIn(ExchangeName.DELTA, btc.by_exchange)
-        self.assertIn(ExchangeName.COINSWITCH, btc.by_exchange)
-        self.assertEqual(btc.by_exchange[ExchangeName.COINSWITCH].symbol, "BTCUSDT")
+        self.assertIn(ExchangeName.HYPERLIQUID, btc.by_exchange)
+        self.assertEqual(btc.by_exchange[ExchangeName.HYPERLIQUID].symbol, "BTC")
 
     def test_spxusd_is_not_used_for_s_and_p_500_index(self):
         reg = InstrumentRegistry(execution_preference="delta")
@@ -57,13 +54,13 @@ class InstrumentRegistryV4Tests(unittest.TestCase):
         self.assertEqual(report.matched[0].primary.symbol, "AAPLXUSD")
         self.assertEqual(report.matched[0].max_leverage, 25)
 
-    def test_coinswitch_ticker_field_names_are_not_symbols(self):
+    def test_hyperliquid_ticker_field_names_are_not_symbols(self):
         reg = InstrumentRegistry(execution_preference="delta")
-        rows = reg._augment_coinswitch_from_requested({}, FakeCoinSwitch(), [
+        rows = reg._augment_hyperliquid_from_requested({}, FakeHyperliquid(), [
             AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO, ("BTCUSDT",), priority=0)
         ])
+        self.assertIn("BTC", rows)
         self.assertIn("BTCUSDT", rows)
-        self.assertNotIn("LOWPRICE24H", rows)
 
     def test_xstock_screenshot_symbols_match(self):
         reg = InstrumentRegistry(execution_preference="delta")

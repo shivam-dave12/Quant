@@ -1,7 +1,7 @@
 """
 exchanges/delta/data_manager.py — Delta Exchange Data Manager
 =============================================================
-Implements the same public interface as CoinSwitchDataManager.
+Implements the same public interface as HyperliquidDataManager.
 Uses DeltaAPI for REST warmup (0.25s sleep) and DeltaWebSocket for streams.
 Product ID prefetched at startup.
 """
@@ -47,7 +47,7 @@ class StreamStats:
 class DeltaDataManager:
     """
     Delta Exchange data manager.
-    Same public interface as CoinSwitchDataManager.
+    Same public interface as HyperliquidDataManager.
     """
 
     _WARMUP_CONFIG = {

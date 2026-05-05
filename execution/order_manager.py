@@ -2,7 +2,7 @@
 execution/order_manager.py — Exchange-Agnostic Order Manager
 =============================================================
 Single OrderManager class that works with any exchange API adapter
-(CoinSwitchAPI or DeltaAPI) via constructor injection.
+(HyperliquidAPI or DeltaAPI) via constructor injection.
 
 The ExecutionRouter (router.py) instantiates one of each and routes
 all calls to the active one.  Switching exchanges at runtime is a
@@ -11,24 +11,24 @@ router concern — the OrderManager itself is stateless re: exchange choice.
 Key differences handled per-exchange
 --------------------------------------
   Response parsing:
-    CoinSwitch → success in resp["data"]["order_id"]
+    Hyperliquid → success in resp["data"]["order_id"]
     Delta      → success in resp["result"]["id"]  (when resp["success"]==True)
 
   Order types:
-    CoinSwitch → "STOP_MARKET", "TAKE_PROFIT_MARKET"
+    Hyperliquid → "STOP_MARKET", "TAKE_PROFIT_MARKET"
     Delta      → "stop_loss_order", "take_profit_order"  (bracket legs)
                  OR "STOP_LOSS_MARKET", "TAKE_PROFIT_MARKET" on stop endpoint
 
   Rate limiting:
-    CoinSwitch → 3.0 s minimum between any calls
+    Hyperliquid → 3.0 s minimum between any calls
     Delta      → 0.25 s minimum
 
   Leverage:
-    CoinSwitch → set_leverage(symbol, exchange, leverage)
+    Hyperliquid → set_leverage(symbol, exchange, leverage)
     Delta      → set_leverage(product_id, leverage)
 
   Quantity units:
-    CoinSwitch → float BTC
+    Hyperliquid → float BTC
     Delta      → int contracts (1 contract = DELTA_CONTRACT_VALUE_BTC BTC)
 
 All exchange-specific behaviour is encapsulated in the _Adapter inner
@@ -100,14 +100,14 @@ class _RateLimiter:
 
 
 # Global limiters — one per exchange (shared across all OrderManager instances)
-_CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
+_HYPERLIQUID_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
 class GlobalRateLimiter:
     """Legacy shim — routes to the active exchange limiter."""
-    _active = _CS_LIMITER
+    _active = _HYPERLIQUID_LIMITER
 
     @classmethod
     def wait(cls): cls._active.wait()
@@ -121,20 +121,20 @@ class GlobalRateLimiter:
 
 # ── Exchange adapters — encapsulate wire-format differences ──────────────────
 
-class _CoinSwitchAdapter:
-    """Normalises CoinSwitch API responses to canonical dicts."""
+class _HyperliquidAdapter:
+    """Normalises Hyperliquid API responses to canonical dicts."""
 
     def __init__(self, api, exchange_instrument=None) -> None:
         self.api     = api
-        self.limiter = _CS_LIMITER
+        self.limiter = _HYPERLIQUID_LIMITER
         self.exchange_instrument = exchange_instrument
-        self.symbol  = (exchange_instrument.symbol if exchange_instrument is not None else config.COINSWITCH_SYMBOL)
+        self.symbol  = (exchange_instrument.symbol if exchange_instrument is not None else config.HYPERLIQUID_SYMBOL)
         self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
         self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
-        self.exchange_id = config.COINSWITCH_EXCHANGE
+        self.exchange_id = config.HYPERLIQUID_EXCHANGE
 
     def extract_order_id(self, resp: Dict) -> Optional[str]:
         if not isinstance(resp, dict):
@@ -245,7 +245,7 @@ class _CoinSwitchAdapter:
         )
 
     def normalise_position(self, raw) -> Optional[Dict]:
-        """Turn CoinSwitch position response into a canonical dict."""
+        """Turn Hyperliquid position response into a canonical dict."""
         positions = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
         for pos in positions:
             if not isinstance(pos, dict):
@@ -678,7 +678,7 @@ class _DeltaAdapter:
 class OrderManager:
     """
     Exchange-agnostic order manager.
-    Inject a CoinSwitchAPI or DeltaAPI; this class handles the rest.
+    Inject a HyperliquidAPI or DeltaAPI; this class handles the rest.
     """
 
     _MAX_RETRIES       = 2     # was 3 — 3 attempts × 30s timeout = 90s minimum block
@@ -686,7 +686,7 @@ class OrderManager:
     _MAX_401_RETRIES   = 2     # was 3 — auth errors rarely fix themselves
     _401_RETRY_DELAY   = 1.0   # was 2.0
 
-    def __init__(self, api, exchange_name: str = "coinswitch", instrument=None) -> None:
+    def __init__(self, api, exchange_name: str = "hyperliquid", instrument=None) -> None:
         exch = exchange_name.lower()
         self.instrument = instrument
         exchange_instrument = None
@@ -699,7 +699,7 @@ class OrderManager:
         if exch == "delta":
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
         else:
-            self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
+            self._adapter = _HyperliquidAdapter(api, exchange_instrument=exchange_instrument)
 
         self.api            = api         # kept for compatibility access
         self._exchange_name = exch
@@ -734,7 +734,7 @@ class OrderManager:
         # pointing GlobalRateLimiter at whichever exchange is currently active.
         # Calling set_active() here caused a race: the last OM constructed
         # (always delta, since it's created second) won, so GlobalRateLimiter
-        # always pointed at the delta limiter even when CoinSwitch was the active
+        # always pointed at the delta limiter even when Hyperliquid was the active
         # exchange — silently applying the wrong rate-limit interval to all calls.
         # The single-OM compatibility path (no router) can call GlobalRateLimiter.set_active()
         # explicitly after construction if needed.
@@ -1568,7 +1568,7 @@ class OrderManager:
              caller must NOT treat this as "exit confirmed" — it is an
              UNPROTECTED state that must be emergency-flattened.
 
-          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit
+          2. CANCEL + REPLACE fallback — for Hyperliquid or irrecoverable edit
              failures. Places a stop-limit order.
 
              CRITICAL INVARIANT: if the cancel succeeds but the replace fails,
@@ -1642,7 +1642,7 @@ class OrderManager:
                         "order_id": existing_sl_order_id,
                     }
 
-            # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
+            # ── Path 2: Cancel + Replace (Hyperliquid / edit failure fallback) ─
             cancelled_old = False
             if existing_sl_order_id:
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
@@ -1786,7 +1786,7 @@ class OrderManager:
                 return CancelResult.FAILED
 
             # Determine if the cancel API call itself succeeded.
-            # CoinSwitch: success = no "error" key in response body.
+            # Hyperliquid: success = no "error" key in response body.
             # Delta:       success = resp["success"] == True.
             # Both can return {} on success (empty body = 200 OK).
             has_error   = bool(resp.get("error"))
@@ -1798,7 +1798,7 @@ class OrderManager:
             elif has_success is False:
                 api_succeeded = False
             else:
-                # No "success" key (CoinSwitch style) — no error = success
+                # No "success" key (Hyperliquid style) — no error = success
                 api_succeeded = not has_error and sc not in (400, 401, 403, 404, 422)
 
             if sc == 404:
@@ -2015,7 +2015,7 @@ class OrderManager:
             "fee_paid":   float, — paid_commission from Delta (exact USD)
           }
 
-        CoinSwitch: query_order_exact not available → confirmed=False always.
+        Hyperliquid: query_order_exact not available → confirmed=False always.
         All exceptions caught at DEBUG — exit flow is never disrupted.
         """
         _UNCONFIRMED: Dict = {

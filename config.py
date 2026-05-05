@@ -21,13 +21,15 @@ EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
 DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
-COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
-COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
+HYPERLIQUID_API_KEY        = os.getenv("HYPERLIQUID_API_KEY",    "")  # optional; public market-data works without it
+HYPERLIQUID_SECRET_KEY     = os.getenv("HYPERLIQUID_SECRET_KEY", "") # optional; execution intentionally disabled in this build
+HYPERLIQUID_TESTNET        = os.getenv("HYPERLIQUID_TESTNET", "false").lower() == "true"
+HYPERLIQUID_ENABLED        = os.getenv("HYPERLIQUID_ENABLED", "true").lower() == "true"
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY:
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY or COINSWITCH_API_KEY.")
+if not DELTA_API_KEY:
+    raise ValueError("No Delta execution credentials in .env. Set DELTA_API_KEY and DELTA_SECRET_KEY. Hyperliquid is public secondary data only in this build.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -35,8 +37,17 @@ LEVERAGE                 = 40
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
-COINSWITCH_SYMBOL        = "BTCUSDT"
-COINSWITCH_EXCHANGE      = "EXCHANGE_2"
+HYPERLIQUID_SYMBOL        = "BTC"
+
+# v20 Hyperliquid / HIP-3 discovery controls
+HYPERLIQUID_ENABLE_HIP3_DISCOVERY = True
+HYPERLIQUID_HIP3_DEXS = ["xyz"]
+HYPERLIQUID_EXECUTION_ENABLED = False  # no fake execution without signed adapter
+AGG_PRIMARY_TRADE_WEIGHT = 0.65
+AGG_SECONDARY_TRADE_WEIGHT = 0.35
+AGG_MAX_SECONDARY_PRICE_DISLOCATION_BPS = 35.0
+
+HYPERLIQUID_EXCHANGE      = "hyperliquid"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BALANCE_USAGE_PERCENTAGE = 60
@@ -56,7 +67,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.01    # 1% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -94,7 +105,7 @@ POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
 # ── Order execution ───────────────────────────────────────────────────────────
 TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
 TICK_SIZE_DELTA                  = 0.5
-TICK_SIZE_COINSWITCH             = 0.1
+TICK_SIZE_HYPERLIQUID             = 0.1
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -106,8 +117,8 @@ REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
 # fails, the strategy aborts the entry instead of falling back to naked limit
-# + standalone conditionals. CoinSwitch still uses standalone SL/TP because it
-# has no Delta-style native bracket endpoint.
+# + standalone conditionals. Hyperliquid still uses standalone SL/TP because it
+# is data-only here; Delta remains the protected bracket execution venue.
 DELTA_REQUIRE_NATIVE_BRACKET      = True
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
@@ -190,8 +201,8 @@ def get_tick_size(exchange: str | None = None) -> float:
     ex = (exchange or EXECUTION_EXCHANGE or "").lower()
     if ex == "delta":
         return float(TICK_SIZE_DELTA)
-    if ex == "coinswitch":
-        return float(TICK_SIZE_COINSWITCH)
+    if ex == "hyperliquid":
+        return float(TICK_SIZE_HYPERLIQUID)
     return float(TICK_SIZE)
 
 
@@ -256,7 +267,7 @@ QUANT_OB_WALL_DEPTH            = 20
 QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
-QUANT_TRAIL_ENABLED            = True      # v15 enabled-default build; Telegram /trail off can disable
+QUANT_TRAIL_ENABLED            = False     # default OFF; enable explicitly via Telegram /trail on
 QUANT_TRAIL_BE_R               = 1.00     # BE lock at 1.0R
 QUANT_TRAIL_LOCK_R             = 1.00     # Fib trail begins after BE checkpoint
 QUANT_TRAIL_AGGRESSIVE_R       = 3.50     # aggressive trail at 3.5R
@@ -530,7 +541,7 @@ PAYOFF_TRAIL_MIN_COST_MULT = 0.75
 QUANT_CHOCH_EXPIRY_BARS = 10
 
 # ── Compatibility alias ───────────────────────────────────────────────────────
-EXCHANGE = COINSWITCH_EXCHANGE
+EXCHANGE = HYPERLIQUID_EXCHANGE
 
 validate_config()
 
@@ -580,10 +591,10 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # ─────────────────────────────────────────────────────────────────────────────
 # MULTI-ASSET LIVE CATALOG SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
-# The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
+# The scanner does NOT trade aliases.  It queries Delta/Hyperliquid live product
 # catalogs and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
-SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
+SCANNER_MAX_ACTIVE_INSTRUMENTS = 24
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
@@ -604,29 +615,30 @@ PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.
 MULTI_ASSET_REQUESTS = [
-    {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD"], "priority": 0},
-
-    # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
-    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
-    {"asset_id": "GOLD", "display_name": "Gold token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"], "priority": 11},
-    {"asset_id": "SILVER", "display_name": "Silver token derivatives", "asset_class": "commodity", "aliases": ["SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
-
-    # Important: Delta SPXUSD is SPX6900 crypto, NOT S&P 500. Do not alias it here.
-    {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
-    # xStock index/ETF-like token derivatives visible in Delta's market table.
-    {"asset_id": "SPY", "display_name": "SP500 xStock token derivative", "asset_class": "equity", "aliases": ["SPYXUSD", "SPYX", "SPY", "SPYUSD", "SPYUSDT"], "priority": 21},
-    {"asset_id": "QQQ", "display_name": "Nasdaq xStock token derivative", "asset_class": "equity", "aliases": ["QQQXUSD", "QQQX", "QQQ", "QQQUSD", "QQQUSDT"], "priority": 22},
-
-    # Delta US equity exposure is through xStock/RWA token perpetuals, not direct shares.
-    {"asset_id": "AAPL", "display_name": "Apple xStock token derivative", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
-    {"asset_id": "MSFT", "display_name": "Microsoft xStock token derivative", "asset_class": "equity", "aliases": ["MSFTXUSD", "MSFTX", "MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
-    {"asset_id": "NVDA", "display_name": "NVIDIA xStock token derivative", "asset_class": "equity", "aliases": ["NVDAXUSD", "NVDAX", "NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
-    {"asset_id": "TSLA", "display_name": "Tesla xStock token derivative", "asset_class": "equity", "aliases": ["TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
-    {"asset_id": "AMZN", "display_name": "Amazon xStock token derivative", "asset_class": "equity", "aliases": ["AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
-    {"asset_id": "META", "display_name": "Meta xStock token derivative", "asset_class": "equity", "aliases": ["METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"], "priority": 35},
-    {"asset_id": "COIN", "display_name": "Coinbase xStock token derivative", "asset_class": "equity", "aliases": ["COINXUSD", "COINX", "COIN", "COINUSD", "COINUSDT"], "priority": 36},
-    {"asset_id": "CRCL", "display_name": "Circle xStock token derivative", "asset_class": "equity", "aliases": ["CRCLXUSD", "CRCLX", "CRCL", "CRCLUSD", "CRCLUSDT"], "priority": 37},
-    {"asset_id": "GOOGL", "display_name": "Alphabet xStock token derivative", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 38},
+    {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD", "BTC"], "priority": 0},
+    {"asset_id": "ETH", "display_name": "Ethereum", "asset_class": "crypto", "aliases": ["ETHUSD", "ETHUSDT", "ETH/USDT", "ETH"], "priority": 1},
+    {"asset_id": "SOL", "display_name": "Solana", "asset_class": "crypto", "aliases": ["SOLUSD", "SOLUSDT", "SOL/USDT", "SOL"], "priority": 2},
+    {"asset_id": "HYPE", "display_name": "Hyperliquid", "asset_class": "crypto", "aliases": ["HYPE", "HYPEUSD", "HYPEUSDT"], "priority": 3},
+    {"asset_id": "XRP", "display_name": "XRP", "asset_class": "crypto", "aliases": ["XRP", "XRPUSD", "XRPUSDT"], "priority": 4},
+    {"asset_id": "DOGE", "display_name": "Dogecoin", "asset_class": "crypto", "aliases": ["DOGE", "DOGEUSD", "DOGEUSDT"], "priority": 5},
+    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["xyz:CL", "CL", "CL-USDC", "WTI", "USOIL", "OIL", "CRUDEOIL"], "priority": 10},
+    {"asset_id": "GOLD", "display_name": "Gold", "asset_class": "commodity", "aliases": ["PAXGUSD", "XAUTUSD", "xyz:GOLD", "GOLD", "GOLD-USDC", "XAU", "XAUUSD"], "priority": 11},
+    {"asset_id": "SILVER", "display_name": "Silver", "asset_class": "commodity", "aliases": ["SLVONUSD", "xyz:SILVER", "SILVER", "SILVER-USDC", "XAG", "XAGUSD", "SLV"], "priority": 12},
+    {"asset_id": "COPPER", "display_name": "Copper", "asset_class": "commodity", "aliases": ["xyz:COPPER", "COPPER", "HG"], "priority": 13},
+    {"asset_id": "NATGAS", "display_name": "Natural Gas", "asset_class": "commodity", "aliases": ["xyz:NATGAS", "NATGAS", "NG", "NATURALGAS"], "priority": 14},
+    {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["xyz:SPX", "xyz:SP500", "SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
+    {"asset_id": "XYZ100", "display_name": "XYZ100 / Nasdaq-style index", "asset_class": "index", "aliases": ["xyz:XYZ100", "XYZ100", "NDX", "NASDAQ100"], "priority": 21},
+    {"asset_id": "SPY", "display_name": "SPY / S&P ETF exposure", "asset_class": "equity", "aliases": ["SPYXUSD", "SPYX", "SPY", "xyz:SPY", "SPYUSD", "SPYUSDT"], "priority": 22},
+    {"asset_id": "QQQ", "display_name": "QQQ / Nasdaq ETF exposure", "asset_class": "equity", "aliases": ["QQQXUSD", "QQQX", "QQQ", "xyz:QQQ", "QQQUSD", "QQQUSDT"], "priority": 23},
+    {"asset_id": "AAPL", "display_name": "Apple", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPLX", "AAPL", "xyz:AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
+    {"asset_id": "MSFT", "display_name": "Microsoft", "asset_class": "equity", "aliases": ["MSFTXUSD", "MSFTX", "MSFT", "xyz:MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
+    {"asset_id": "NVDA", "display_name": "NVIDIA", "asset_class": "equity", "aliases": ["NVDAXUSD", "NVDAX", "NVDA", "xyz:NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
+    {"asset_id": "TSLA", "display_name": "Tesla", "asset_class": "equity", "aliases": ["TSLAXUSD", "TSLAX", "TSLA", "xyz:TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
+    {"asset_id": "AMZN", "display_name": "Amazon", "asset_class": "equity", "aliases": ["AMZNXUSD", "AMZNX", "AMZN", "xyz:AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
+    {"asset_id": "META", "display_name": "Meta", "asset_class": "equity", "aliases": ["METAXUSD", "METAX", "META", "xyz:META", "METAUSD", "METAUSDT"], "priority": 35},
+    {"asset_id": "GOOGL", "display_name": "Alphabet", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "xyz:GOOGL", "xyz:GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 36},
+    {"asset_id": "COIN", "display_name": "Coinbase", "asset_class": "equity", "aliases": ["COINXUSD", "COINX", "COIN", "xyz:COIN", "COINUSD", "COINUSDT"], "priority": 37},
+    {"asset_id": "CRCL", "display_name": "Circle", "asset_class": "equity", "aliases": ["CRCLXUSD", "CRCLX", "CRCL", "xyz:CRCL", "CRCLUSDT", "CRCLUSD"], "priority": 38},
 ]
 
 

@@ -23,8 +23,8 @@ from core.instruments import ExchangeName, TradableInstrument, instrument_scope
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
-from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
-from exchanges.coinswitch.data_manager import CoinSwitchDataManager
+from exchanges.hyperliquid.api import FuturesAPI as HyperliquidAPI
+from exchanges.hyperliquid.data_manager import HyperliquidDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 from risk.risk_manager import RiskManager
@@ -209,11 +209,11 @@ class MultiAssetQuantBot:
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
-        has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
+        has_hl = bool(getattr(config, "HYPERLIQUID_ENABLED", True))
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
-        cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
-        return delta_api, cs_api
+        hl_api = HyperliquidAPI(config.HYPERLIQUID_API_KEY, config.HYPERLIQUID_SECRET_KEY, testnet=getattr(config, "HYPERLIQUID_TESTNET", False)) if has_hl else None
+        return delta_api, hl_api
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -606,11 +606,11 @@ class MultiAssetQuantBot:
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
-            delta_api, cs_api = self._build_api_clients()
+            delta_api, hl_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
-                coinswitch_api=cs_api,
+                hyperliquid_api=hl_api,
                 requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
@@ -622,7 +622,7 @@ class MultiAssetQuantBot:
                 return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api, cs_api)
+                ctx = self._build_asset_context(inst, delta_api, hl_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
@@ -634,24 +634,24 @@ class MultiAssetQuantBot:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
+    def _build_asset_context(self, inst: TradableInstrument, delta_api, hl_api) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
-        cs_om = None
+        hl_om = None
         delta_om = None
-        if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
-            cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
+        if ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api is not None:
+            hl_om = OrderManager(hl_api, exchange_name="hyperliquid", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-        if not cs_om and not delta_om:
+        if not hl_om and not delta_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, default=primary_ex.value)
+        router = ExecutionRouter(hyperliquid_om=hl_om, delta_om=delta_om, default=primary_ex.value)
 
         if primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
-            secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
+            secondary_dm = HyperliquidDataManager(instrument=inst) if ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api else None
         else:
-            primary_dm = CoinSwitchDataManager(instrument=inst)
+            primary_dm = HyperliquidDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
         data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst)
 
