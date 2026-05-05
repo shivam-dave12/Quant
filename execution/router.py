@@ -86,6 +86,19 @@ class ExecutionRouter:
         with self._lock:
             return self._active_key
 
+    def available_exchanges(self) -> list[str]:
+        """Configured execution managers for this instrument context."""
+        with self._lock:
+            return list(self._managers.keys())
+
+    def has_exchange(self, exchange: str) -> bool:
+        try:
+            key = Exchange.from_str(exchange).value
+        except Exception:
+            return False
+        with self._lock:
+            return key in self._managers
+
     @property
     def api(self):
         """Legacy: strategy accesses order_manager.api directly."""

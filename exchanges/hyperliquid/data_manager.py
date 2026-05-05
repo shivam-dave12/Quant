@@ -24,21 +24,36 @@ class StreamStats:
 class HyperliquidDataManager:
     _WARMUP_CONFIG={"1m":("1m",1,200,"_candles_1m"),"5m":("5m",5,200,"_candles_5m"),"15m":("15m",15,200,"_candles_15m"),"1h":("1h",60,100,"_candles_1h"),"4h":("4h",240,50,"_candles_4h"),"1d":("1d",1440,30,"_candles_1d")}
     _WARMUP_SLEEP=0.10
+    _WS_LOCK=threading.RLock(); _WS_ACTIVE=0
+    @classmethod
+    def _reserve_ws_slot(cls):
+        max_ws=max(0,int(getattr(config,"HYPERLIQUID_MAX_WS_CONNECTIONS",6)))
+        with cls._WS_LOCK:
+            if cls._WS_ACTIVE>=max_ws: return False
+            cls._WS_ACTIVE+=1; return True
+    @classmethod
+    def _release_ws_slot(cls):
+        with cls._WS_LOCK: cls._WS_ACTIVE=max(0,cls._WS_ACTIVE-1)
     def __init__(self,instrument=None):
         self.instrument=instrument; self.exchange_instrument=(instrument.by_exchange.get(ExchangeName.HYPERLIQUID) if instrument is not None and hasattr(instrument,"by_exchange") else None)
         self.symbol=(self.exchange_instrument.symbol if self.exchange_instrument is not None else getattr(config,"HYPERLIQUID_SYMBOL","BTC")); self.ws_symbol=(self.exchange_instrument.ws_symbol if self.exchange_instrument is not None else self.symbol)
         self.dex=(self.exchange_instrument.raw or {}).get("dex") if self.exchange_instrument is not None else None
         self.api=HyperliquidAPI(); self.ws=None; self.stats=StreamStats(); self._lock=threading.RLock(); self._recent_trades=deque(maxlen=500); self._orderbook={"bids":[],"asks":[]}; self._last_price=0.0; self._last_price_update_time=0.0; self._forming_ts={}; self._warmup_complete=False; self._strategy_ref=None; self.is_ready=False; self.is_streaming=False
-        self._candles_1m=deque(maxlen=2000); self._candles_5m=deque(maxlen=1200); self._candles_15m=deque(maxlen=800); self._candles_1h=deque(maxlen=500); self._candles_4h=deque(maxlen=400); self._candles_1d=deque(maxlen=100)
+        self._ws_reserved=False; self._candles_1m=deque(maxlen=2000); self._candles_5m=deque(maxlen=1200); self._candles_15m=deque(maxlen=800); self._candles_1h=deque(maxlen=500); self._candles_4h=deque(maxlen=400); self._candles_1d=deque(maxlen=100)
         logger.info("HyperliquidDataManager initialised (%s)", self.symbol)
     def start(self):
         try:
-            self.is_ready=self.is_streaming=False; coin=self.ws_symbol; logger.info("Hyperliquid DM[%s]: starting WebSocket...",coin); self.ws=HyperliquidWebSocket()
-            if self.ws.connect(timeout=20):
-                self.ws.subscribe_orderbook(coin,self._on_orderbook); self.ws.subscribe_trades(coin,self._on_trade)
-                for label,(interval,_,_,_) in self._WARMUP_CONFIG.items(): self.ws.subscribe_candlestick(coin, interval=interval, callback=self._make_candle_cb(label))
-                self.is_streaming=True; logger.info("✅ Hyperliquid WS streams subscribed for %s",coin)
-            else: logger.warning("Hyperliquid WS failed for %s; REST warmup only",coin)
+            self.is_ready=self.is_streaming=False; coin=self.ws_symbol
+            if bool(getattr(config,"HYPERLIQUID_SECONDARY_WS_ENABLED",True)) and self._reserve_ws_slot():
+                self._ws_reserved=True; logger.info("Hyperliquid DM[%s]: starting WebSocket...",coin); self.ws=HyperliquidWebSocket()
+                if self.ws.connect(timeout=20):
+                    self.ws.subscribe_orderbook(coin,self._on_orderbook); self.ws.subscribe_trades(coin,self._on_trade)
+                    for label,(interval,_,_,_) in self._WARMUP_CONFIG.items(): self.ws.subscribe_candlestick(coin, interval=interval, callback=self._make_candle_cb(label))
+                    self.is_streaming=True; logger.info("✅ Hyperliquid WS streams subscribed for %s",coin)
+                else:
+                    logger.warning("Hyperliquid WS failed for %s; REST warmup only",coin); self._release_ws_slot(); self._ws_reserved=False
+            else:
+                logger.info("Hyperliquid DM[%s]: REST-only secondary mode (WS cap or disabled)", coin)
             for tf in ("1m","5m","15m","1h","4h","1d"): self._warmup_klines(tf); time.sleep(self._WARMUP_SLEEP)
             self._warmup_complete=True; self._seed_orderbook_from_rest(); self.is_ready=self._check_minimum_data(); logger.info("Hyperliquid DM[%s] ready=%s (1m=%d 5m=%d 15m=%d 4h=%d)",self.symbol,self.is_ready,len(self._candles_1m),len(self._candles_5m),len(self._candles_15m),len(self._candles_4h)); return bool(self.is_ready)
         except Exception as e: logger.error("Hyperliquid DM start error: %s",e,exc_info=True); self.is_ready=self.is_streaming=False; return False
@@ -47,6 +62,7 @@ class HyperliquidDataManager:
         try:
             if self.ws: self.ws.disconnect()
         except Exception: pass
+        if getattr(self,"_ws_reserved",False): self._release_ws_slot(); self._ws_reserved=False
         logger.info("Hyperliquid DM stopped")
     def restart_streams(self): self.stop(); time.sleep(1.0); return self.start()
     def register_strategy(self,strategy): self._strategy_ref=strategy

@@ -282,6 +282,145 @@ class MultiAssetQuantBot:
     def risk_manager(self):
         c = self._active_context(); return c.risk_manager if c else None
 
+    def execution_exchange_summary(self) -> Dict[str, Any]:
+        """Portfolio-wide execution venue state.
+
+        Multi-asset desks can have different venue availability.  This method is
+        used by Telegram so `/setexchange` never reports a single BTC-era state.
+        """
+        rows = []
+        counts: Dict[str, int] = {}
+        for ctx in self.contexts:
+            router = ctx.execution_router
+            active = getattr(router, "active_exchange", "?")
+            counts[active] = counts.get(active, 0) + 1
+            try:
+                available = router.available_exchanges()
+            except Exception:
+                available = []
+            rows.append({
+                "asset": ctx.instrument.asset_id,
+                "symbol": ctx.instrument.display_symbol,
+                "active": active,
+                "available": available,
+                "has_position": ctx.has_position,
+            })
+        return {"counts": counts, "rows": rows}
+
+    def format_execution_exchange_report(self) -> str:
+        """Operator report for `/setexchange` with no args."""
+        esc = self._esc
+        summary = self.execution_exchange_summary()
+        counts = summary.get("counts", {})
+        lines = ["🏛 <b>PORTFOLIO EXECUTION VENUE</b>", ""]
+        if counts:
+            lines.append("Active desks: " + ", ".join(f"{esc(k.upper())}={v}" for k, v in sorted(counts.items())))
+        else:
+            lines.append("No active execution desks.")
+        lines.append("")
+        lines.append("<b>Per-asset execution routers:</b>")
+        for r in summary.get("rows", []):
+            av = "/".join(str(x).upper() for x in r.get("available", [])) or "none"
+            pos = " position" if r.get("has_position") else ""
+            lines.append(
+                f"• <b>{esc(r.get('asset','?'))}</b> {esc(r.get('symbol','?'))} "
+                f"active=<code>{esc(str(r.get('active','?')).upper())}</code> "
+                f"available=<code>{esc(av)}</code>{pos}"
+            )
+        lines.append("")
+        lines.append("Usage: <code>/setexchange delta</code> or <code>/setexchange hyperliquid</code>")
+        lines.append("Note: market data can be dual-feed while execution remains locked to the executable venue.")
+        return "\n".join(lines)
+
+    def set_execution_exchange(self, target: str, *, force: bool = False) -> Dict[str, Any]:
+        """Switch execution venue portfolio-wide when safe.
+
+        This intentionally does NOT switch only the first/active BTC context.  A
+        runtime execution venue switch must be portfolio-aware and must not allow
+        Delta-derived executable geometry to be routed to Hyperliquid unless that
+        venue has a real signed execution adapter and the context router contains
+        an enabled Hyperliquid OrderManager.
+        """
+        from core.types import Exchange
+        try:
+            target_key = Exchange.from_str(target).value
+        except ValueError as exc:
+            return {"ok": False, "message": f"❌ {self._esc(str(exc))}", "switched": [], "failed": []}
+
+        # v20/v21 Hyperliquid is discovery + secondary data unless a future
+        # signed execution adapter explicitly enables it.  Do not pretend a
+        # public Info API client can execute protected trades.
+        if target_key == "hyperliquid" and not bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False)):
+            return {
+                "ok": False,
+                "message": (
+                    "❌ <b>Hyperliquid execution is disabled in this build.</b>\n"
+                    "Hyperliquid is active as secondary market-data / HIP-3 discovery only.\n"
+                    "Execution remains on Delta because Hyperliquid signed orders, reduce-only exits, "
+                    "bracket-equivalent protection and emergency flatten are not enabled."
+                ),
+                "switched": [],
+                "failed": ["hyperliquid_execution_disabled"],
+            }
+
+        open_ctx = [c for c in self.contexts if c.has_position]
+        if open_ctx and not force:
+            details = ", ".join(f"{c.instrument.asset_id}:{c.phase_name}" for c in open_ctx[:8])
+            return {
+                "ok": False,
+                "message": (
+                    "❌ Cannot switch portfolio execution while positions/orders are reserved.\n"
+                    f"Open/reserved: <code>{self._esc(details)}</code>\n"
+                    "Close/flatten first, then retry."
+                ),
+                "switched": [],
+                "failed": ["positions_open"],
+            }
+
+        switched = []
+        skipped = []
+        failed = []
+        for ctx in self.contexts:
+            router = ctx.execution_router
+            try:
+                available = router.available_exchanges()
+            except Exception:
+                available = []
+            if target_key not in available:
+                skipped.append(f"{ctx.instrument.asset_id}:not_configured")
+                continue
+            ok, msg = router.switch(target_key, strategy=ctx.strategy, force=force)
+            if ok:
+                switched.append(ctx.instrument.asset_id)
+            else:
+                failed.append(f"{ctx.instrument.asset_id}:{msg}")
+
+        if not switched:
+            sample = "; ".join((failed or skipped)[:4])
+            return {
+                "ok": False,
+                "message": (
+                    f"❌ No asset desk switched to <b>{self._esc(target_key.upper())}</b>.\n"
+                    f"Reason: <code>{self._esc(sample or 'target venue unavailable')}</code>"
+                ),
+                "switched": switched,
+                "failed": failed,
+                "skipped": skipped,
+            }
+
+        config.EXECUTION_EXCHANGE = target_key
+        return {
+            "ok": not failed,
+            "message": (
+                f"✅ <b>Portfolio execution switched to {self._esc(target_key.upper())}</b>\n"
+                f"Switched desks: <code>{self._esc(', '.join(switched))}</code>\n"
+                f"Skipped: {len(skipped)} · Failed: {len(failed)}"
+            ),
+            "switched": switched,
+            "failed": failed,
+            "skipped": skipped,
+        }
+
     def format_assets_report(self) -> str:
         def esc(x):
             return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -638,8 +777,20 @@ class MultiAssetQuantBot:
         primary_ex = inst.primary_exchange
         hl_om = None
         delta_om = None
-        if ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api is not None:
-            hl_om = OrderManager(hl_api, exchange_name="hyperliquid", instrument=inst)
+        # Hyperliquid public data/discovery is not the same as executable order
+        # routing.  Build a Hyperliquid OrderManager only when a signed execution
+        # adapter is explicitly enabled; otherwise /setexchange hyperliquid would
+        # appear configured but fail at balance/order time.
+        hl_exec_enabled = bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False))
+        if ExchangeName.HYPERLIQUID in inst.by_exchange and hl_api is not None and hl_exec_enabled:
+            try:
+                api_exec_enabled = bool(getattr(hl_api, "execution_enabled", lambda: False)())
+            except Exception:
+                api_exec_enabled = False
+            if api_exec_enabled:
+                hl_om = OrderManager(hl_api, exchange_name="hyperliquid", instrument=inst)
+            else:
+                logger.warning("%s Hyperliquid execution requested but API adapter is data-only; not configuring execution router", inst.asset_id)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
         if not hl_om and not delta_om:

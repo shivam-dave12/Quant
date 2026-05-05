@@ -1882,23 +1882,39 @@ class TelegramBotController:
     def _cmd_setexchange(self, args: str) -> str:
         global bot_instance, bot_running
 
+        target = args.strip().lower()
+
+        # Multi-asset bot: never use the legacy first-context router directly.
+        # Runtime execution venue state is portfolio-scoped, and a partial switch
+        # of only BTC is operationally dangerous.
+        if bot_running and bot_instance is not None:
+            if hasattr(bot_instance, "format_execution_exchange_report") and not target:
+                return bot_instance.format_execution_exchange_report()
+            if hasattr(bot_instance, "set_execution_exchange") and target:
+                res = bot_instance.set_execution_exchange(target)
+                return str(res.get("message") or res)
+
         if not args:
             active = getattr(config, "EXECUTION_EXCHANGE", "?")
             return (
                 f"Current execution exchange: <b>{active.upper()}</b>\n\n"
                 f"Usage: /setexchange &lt;exchange&gt;\n"
                 f"Valid values: <code>delta</code>, <code>hyperliquid</code>\n\n"
-                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
+                f"<i>In multi-asset mode this command switches the portfolio, not a single BTC router.</i>"
             )
-
-        target = args.strip().lower()
 
         if not bot_running or bot_instance is None:
             try:
                 from core.types import Exchange
-                Exchange.from_str(target)
-                config.EXECUTION_EXCHANGE = Exchange.from_str(target).value
-                return (f"✅ Execution exchange set to <b>{target.upper()}</b> "
+                ex = Exchange.from_str(target)
+                if ex.value == "hyperliquid" and not bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False)):
+                    return (
+                        "❌ <b>Hyperliquid execution is disabled in this build.</b>\n"
+                        "Hyperliquid can still be used for discovery/secondary data. "
+                        "Delta remains the execution venue until signed Hyperliquid execution is implemented/enabled."
+                    )
+                config.EXECUTION_EXCHANGE = ex.value
+                return (f"✅ Execution exchange set to <b>{ex.value.upper()}</b> "
                         f"(bot not running — takes effect on next start)")
             except ValueError:
                 return f"❌ Unknown exchange: <code>{target}</code>"
