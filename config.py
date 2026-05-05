@@ -56,7 +56,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
+RISK_PER_TRADE           = 0.01    # 1% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -686,3 +686,7 @@ SL_LIQUIDITY_CROWDED_TOUCH_ATR = 0.08
 SL_LIQUIDITY_HIGH_SIG_ATR = 0.025
 SL_PUSH_MAX_ATR = 4.0
 SL_MIN_SURVIVAL_RISK_ATR = 0.85
+
+# Structural stop invariant: never place initial SL in front of obvious protective liquidity.
+SL_PROTECTIVE_MIN_SIGNIFICANCE = 1.5
+SL_PROTECTIVE_SEARCH_ATR = 5.0
