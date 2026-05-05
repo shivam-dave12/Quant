@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Portfolio Command Center</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Portfolio Command Center</h1>
+        <p id="subtitle">Local dashboard for your trading bot</p>
+      </div>
+      <div class="status-cluster">
+        <div class="pill" id="botStatus">OFFLINE</div>
+        <div class="pill" id="clock">--</div>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card summary">
+        <h2>System</h2>
+        <div class="summary-grid" id="summaryGrid"></div>
+      </section>
+
+      <section class="card positions">
+        <div class="card-header"><h2>Live Positions</h2><span id="positionsCount">0</span></div>
+        <div id="positionsList" class="stack"></div>
+      </section>
+
+      <section class="card scanners">
+        <div class="card-header"><h2>Scanner Desks</h2><span id="scannersCount">0</span></div>
+        <div id="scannersList" class="stack"></div>
+      </section>
+
+      <section class="card alerts">
+        <div class="card-header"><h2>Alerts</h2><span id="alertsCount">0</span></div>
+        <div id="alertsList" class="stack"></div>
+      </section>
+
+      <section class="card trades">
+        <div class="card-header"><h2>Trade Tape</h2><span id="tradesCount">0</span></div>
+        <div id="tradesList" class="stack"></div>
+      </section>
+
+      <section class="card tape">
+        <div class="card-header"><h2>Event Tape</h2><span id="eventsCount">0</span></div>
+        <div id="eventsList" class="stack"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

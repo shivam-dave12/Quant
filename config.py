@@ -690,3 +690,12 @@ SL_MIN_SURVIVAL_RISK_ATR = 0.85
 # Structural stop invariant: never place initial SL in front of obvious protective liquidity.
 SL_PROTECTIVE_MIN_SIGNIFICANCE = 1.5
 SL_PROTECTIVE_SEARCH_ATR = 5.0
+
+# ── Local visual dashboard telemetry ────────────────────────────────────────
+# Run dashboard/backend/run.py on the AWS host, then enable this bridge.
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000").rstrip("/")
+DASHBOARD_EVENT_TIMEOUT_SEC = float(os.getenv("DASHBOARD_EVENT_TIMEOUT_SEC", "1.5"))
+DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5.0"))
+DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5.0"))
+DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "2.0"))
