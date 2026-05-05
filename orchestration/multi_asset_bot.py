@@ -32,6 +32,10 @@ from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManag
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
+try:
+    from telemetry.dashboard_emitter import DashboardEmitter
+except Exception:
+    DashboardEmitter = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +210,7 @@ class MultiAssetQuantBot:
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
+        self.dashboard = DashboardEmitter.from_config() if DashboardEmitter is not None else None
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -396,6 +401,68 @@ class MultiAssetQuantBot:
             except Exception:
                 continue
         return rows
+
+    def _match_trail_contexts(self, asset_filter: Optional[str] = None) -> List[AssetContext]:
+        if not asset_filter:
+            return list(self.contexts)
+        needle = str(asset_filter).strip().upper()
+        out: List[AssetContext] = []
+        for ctx in self.contexts:
+            inst = ctx.instrument
+            symbols = {str(inst.asset_id).upper(), str(inst.display_symbol).upper()}
+            try:
+                symbols.update(str(ei.display_symbol).upper() for ei in inst.by_exchange.values())
+            except Exception:
+                pass
+            if needle in symbols:
+                out.append(ctx)
+        return out
+
+    def set_trailing_override(self, enabled: Optional[bool], asset_filter: Optional[str] = None) -> Dict[str, Any]:
+        targets = self._match_trail_contexts(asset_filter)
+        changed: List[str] = []
+        failed: List[str] = []
+        for ctx in targets:
+            try:
+                ctx.strategy.set_trail_override(enabled)
+                changed.append(ctx.instrument.asset_id)
+            except Exception as exc:
+                failed.append(f"{ctx.instrument.asset_id}:{exc}")
+        self._dash_emit({
+            "type": "alert" if failed else "tail_status",
+            "severity": "warning" if failed else "info",
+            "asset": asset_filter or "PORTFOLIO",
+            "venue": "LOCAL",
+            "symbol": "TRAIL",
+            "title": "Trailing override changed",
+            "message": f"enabled={enabled} target={asset_filter or 'ALL'} changed={changed} failed={failed}",
+            "health": "WARN" if failed else "OK",
+        }, critical=bool(failed))
+        return {"changed": changed, "failed": failed, "target": asset_filter or "ALL", "enabled": enabled}
+
+    def format_trailing_control_report(self, result: Optional[Dict[str, Any]] = None) -> str:
+        lines = ["🛡 <b>PORTFOLIO TRAILING CONTROL</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+        if result is not None:
+            enabled = result.get("enabled")
+            act = "ON" if enabled is True else ("OFF" if enabled is False else "CONFIG DEFAULT")
+            lines.append(f"Command: <b>{self._esc(act)}</b> target <code>{self._esc(result.get('target','ALL'))}</code>")
+            lines.append(f"Changed: <code>{self._esc(', '.join(result.get('changed') or []) or 'none')}</code>")
+            if result.get("failed"):
+                lines.append(f"Failed: <code>{self._esc(', '.join(result.get('failed') or []))}</code>")
+        for ctx in self.contexts:
+            try:
+                override = getattr(getattr(ctx.strategy, "_pos", None), "trail_override", None)
+                effective = bool(ctx.strategy.get_trail_enabled())
+            except Exception:
+                override = None; effective = False
+            mode = "FORCED_ON" if override is True else ("FORCED_OFF" if override is False else "DEFAULT")
+            pos = "LIVE" if ctx.has_position else ("READY" if ctx.ready else "WARMUP")
+            lines.append(f"<code>{self._esc(ctx.instrument.asset_id):<6} {self._esc(ctx.instrument.display_symbol):<12} {pos:<7} trail {'ON' if effective else 'OFF'} ({mode})</code>")
+        lines.append("\nUse <code>/trail on</code>, <code>/trail off</code>, <code>/trail on SILVER</code>, or <code>/trail auto</code>.")
+        return "\n".join(lines)
+
+    def format_portfolio_balance_report(self) -> str:
+        return self.format_portfolio_equity_report()
 
     def format_portfolio_pnl_report(self) -> str:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
@@ -600,6 +667,124 @@ class MultiAssetQuantBot:
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
         return "\n".join(lines)
 
+    def _dash_emit(self, event: Dict[str, Any], *, critical: bool = False) -> None:
+        try:
+            if self.dashboard is not None:
+                self.dashboard.emit(event, critical=critical)
+        except Exception:
+            # Dashboard must never affect trading or strategy runtime.
+            pass
+
+    def _dash_universe(self) -> None:
+        if not self.dashboard:
+            return
+        try:
+            if self.discovery_report:
+                for inst in self.discovery_report.matched:
+                    self._dash_emit({
+                        "type": "catalog_asset",
+                        "asset": inst.asset_id,
+                        "venue": inst.primary_exchange.value.upper(),
+                        "symbol": inst.display_symbol,
+                        "primary": inst.primary_exchange.value.upper(),
+                        "last_reason": ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items()),
+                        "health": "OK",
+                    })
+            for ctx in self.contexts:
+                inst = ctx.instrument
+                pol = active_policy(inst)
+                self._dash_emit({
+                    "type": "market_data",
+                    "asset": inst.asset_id,
+                    "venue": inst.primary_exchange.value.upper(),
+                    "symbol": inst.display_symbol,
+                    "primary": inst.primary_exchange.value.upper(),
+                    "data_status": "CONTEXT_BUILT",
+                    "policy": pol.asset_class,
+                    "leverage": f"{pol.leverage}x",
+                    "margin": f"{pol.margin_pct:.0%}",
+                    "risk_mult": pol.risk_multiplier,
+                    "health": "OK",
+                })
+        except Exception:
+            pass
+
+    def _dash_heartbeat(self) -> None:
+        self._dash_emit({
+            "type": "heartbeat",
+            "mode": "live" if self.trading_enabled else "paused",
+            "source": "direct",
+            "max_positions": self.guard.max_open_positions,
+            "open_positions": self.guard.count_open(self.contexts),
+            "message": "multi-asset bot heartbeat",
+        })
+
+    def _dash_context(self, ctx: AssetContext, *, dt_ms: float = 0.0, force: bool = False) -> None:
+        if not self.dashboard:
+            return
+        now = time.time()
+        interval = float(getattr(config, "DASHBOARD_POSITION_UPDATE_SEC", 1.0)) if ctx.has_position else float(getattr(config, "DASHBOARD_SCAN_UPDATE_SEC", 5.0))
+        last = getattr(ctx, "last_dashboard_sec", 0.0)
+        if not force and interval > 0 and now - last < interval:
+            return
+        setattr(ctx, "last_dashboard_sec", now)
+        inst = ctx.instrument
+        pol = active_policy(inst)
+        try:
+            price = float(ctx.data_manager.get_last_price() or 0.0)
+        except Exception:
+            price = 0.0
+        pos = ctx.strategy.get_position()
+        state = ctx.phase_name if pos else ("READY" if ctx.ready else "WARMUP")
+        base = {
+            "asset": inst.asset_id,
+            "venue": inst.primary_exchange.value.upper(),
+            "symbol": inst.display_symbol,
+            "price": price,
+            "state": state,
+            "phase": state,
+            "open_positions": self.guard.count_open(self.contexts),
+            "max_positions": self.guard.max_open_positions,
+            "policy": pol.asset_class,
+            "leverage": f"{pol.leverage}x",
+            "margin": f"{pol.margin_pct:.0%}",
+            "risk_mult": pol.risk_multiplier,
+            "health": "OK",
+        }
+        try:
+            atr = float(getattr(getattr(ctx.strategy, "_atr_5m", None), "atr", 0.0) or 0.0)
+            if atr > 0:
+                base["atr"] = atr
+        except Exception:
+            pass
+        self._dash_emit({"type": "scan", **base})
+        if pos:
+            try:
+                side = str(getattr(pos, "side", "")).upper()
+                entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+                move = (price - entry) if side == "LONG" else (entry - price)
+                upnl = move * qty
+                init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0) or abs(entry - float(getattr(pos, "sl_price", 0.0) or 0.0))
+                r_now = move / init_dist if init_dist > 1e-10 else 0.0
+                mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
+                self._dash_emit({
+                    "type": "position_update",
+                    **base,
+                    "side": side,
+                    "qty": qty,
+                    "entry": entry,
+                    "sl": float(getattr(pos, "sl_price", 0.0) or 0.0),
+                    "tp": float(getattr(pos, "tp_price", 0.0) or 0.0),
+                    "upnl": upnl,
+                    "r": r_now,
+                    "mfe_r": mfe_r,
+                    "trailing": "ON" if bool(getattr(pos, "trail_active", False)) else "WATCH",
+                    "bracket": "SLTP" if (getattr(pos, "sl_order_id", "") or getattr(pos, "tp_order_id", "")) else "UNKNOWN",
+                })
+            except Exception:
+                pass
+
     def initialize(self) -> bool:
         try:
             logger.info("=" * 92)
@@ -629,6 +814,7 @@ class MultiAssetQuantBot:
                 logger.error("No asset contexts could be built.")
                 return False
             logger.info("✅ Built %d isolated strategy contexts", len(self.contexts))
+            self._dash_universe()
             return True
         except Exception:
             logger.exception("MultiAssetQuantBot initialisation failed")
@@ -718,6 +904,8 @@ class MultiAssetQuantBot:
         if not ok_any:
             return False
         self.running = True
+        self._dash_universe()
+        self._dash_heartbeat()
         if self.discovery_report:
             send_telegram_message(self.discovery_report.telegram_html())
         send_telegram_message(self._startup_message())
@@ -767,6 +955,7 @@ class MultiAssetQuantBot:
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
                     self._maybe_analysis_audit(ctx, dt_ms)
+                    self._dash_context(ctx, dt_ms=dt_ms)
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
@@ -815,6 +1004,7 @@ class MultiAssetQuantBot:
         if now - ctx.last_heartbeat_sec < float(getattr(config, "SCANNER_ASSET_HEARTBEAT_SEC", 60.0)):
             return
         ctx.last_heartbeat_sec = now
+        self._dash_heartbeat()
         try:
             price = ctx.data_manager.get_last_price()
             pos = ctx.strategy.get_position()

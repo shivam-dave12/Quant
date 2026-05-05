@@ -5,6 +5,10 @@ from dataclasses import asdict, dataclass, field
 from threading import RLock
 from time import time
 from typing import Any, Deque, Dict, List, Optional
+try:
+    from core.redaction import redact_sensitive
+except Exception:
+    def redact_sensitive(x): return x
 
 MAX_POINTS = 2500
 MAX_EVENTS = 4000
@@ -241,7 +245,7 @@ class DashboardState:
 
     def apply(self, event: dict[str, Any]) -> None:
         with self._lock:
-            event = dict(event)
+            event = redact_sensitive(dict(event))
             event.setdefault("ts", time())
             event.setdefault("type", "event")
             etype = str(event.get("type", "event"))
@@ -256,7 +260,7 @@ class DashboardState:
                 self.mode = str(event.get("mode", self.mode))
                 self.source = str(event.get("source", self.source))
                 return
-            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch"}:
+            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch", "tail_status"}:
                 self._update_asset(event)
                 if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch"}:
                     self._add_decision(event)

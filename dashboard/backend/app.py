@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from state_store import DashboardState
 
@@ -19,6 +19,7 @@ state = DashboardState()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class EventPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
     type: str = Field(default="event")
     ts: Optional[float] = None
     asset: Optional[str] = None
@@ -69,6 +70,11 @@ class EventPayload(BaseModel):
     last_decision: Optional[str] = None
     exit: Optional[float] = None
     pnl: Optional[float] = None
+    rr: Optional[float] = None
+    setup_quality: Optional[float] = None
+    log_path: Optional[str] = None
+    ingested_lines: Optional[int] = None
+    parsed_events: Optional[int] = None
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:

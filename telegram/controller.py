@@ -1569,6 +1569,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_balance_report", None) or getattr(bot_instance, "format_portfolio_equity_report", None)
+        if callable(fn):
+            return fn()
         rm = bot_instance.risk_manager
         if not rm:
             return "Risk manager not ready."
@@ -1641,40 +1644,42 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance: return "Bot not running."
-        strat = bot_instance.strategy
-        if not strat: return "Strategy not ready."
-        arg = (args or "").strip().lower()
-        if arg in ("on", "enable", "1", "true", "yes"):
+        if not bot_instance:
+            return "Bot not running."
+        raw = (args or "").strip()
+        parts = raw.split()
+        action_words = {"on", "enable", "enabled", "1", "true", "yes", "off", "disable", "disabled", "0", "false", "no", "auto", "default", "reset"}
+        action = "status"
+        asset = None
+        for part in parts:
+            low = part.lower()
+            if low in action_words and action == "status":
+                action = low
+            else:
+                asset = part.upper()
+        if parts and action == "status" and parts[0].lower() not in action_words:
+            asset = parts[0].upper()
+        if hasattr(bot_instance, "set_trailing_override") and hasattr(bot_instance, "format_trailing_control_report"):
+            if action in ("on", "enable", "enabled", "1", "true", "yes"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(True, asset))
+            if action in ("off", "disable", "disabled", "0", "false", "no"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(False, asset))
+            if action in ("auto", "default", "reset"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(None, asset))
+            return bot_instance.format_trailing_control_report()
+
+        strat = getattr(bot_instance, "strategy", None)
+        if not strat:
+            return "Strategy not ready."
+        if action in ("on", "enable", "enabled", "1", "true", "yes"):
             strat.set_trail_override(True)
-            return (
-                "🔒 <b>Trailing SL: FORCED ON</b>\n"
-                "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                "Will advance SL per phase logic regardless of config flag."
-            )
-        elif arg in ("off", "disable", "0", "false", "no"):
-            changed = strat.set_trail_override(False)
-            if changed is False:
-                return (
-                    "Trailing SL remains ON for the active position.\n"
-                    "Protective management cannot be disabled mid-trade; "
-                    "use /pause to stop new entries."
-                )
-            return (
-                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
-                "SL will remain at initial structural level.\n"
-                "Exit will be via TP fill, SL hit, or max-hold timeout."
-            )
-        else:
+            return "🔒 <b>Trailing SL: FORCED ON</b>"
+        if action in ("off", "disable", "disabled", "0", "false", "no"):
+            strat.set_trail_override(False)
+            return "🔓 <b>Trailing SL: FORCED OFF</b>"
+        if action in ("auto", "default", "reset"):
             strat.set_trail_override(None)
-            enabled = strat.get_trail_enabled()
-            default_txt = "ON" if enabled else "OFF"
-            return (
-                f"🔄 <b>Trailing SL: AUTO</b>\n"
-                f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
-            )
+        return f"🛡 <b>Trailing SL</b> effective={'ON' if strat.get_trail_enabled() else 'OFF'}"
 
     # ================================================================
     # /config

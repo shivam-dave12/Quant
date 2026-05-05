@@ -672,3 +672,13 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
+
+# Dashboard telemetry: non-blocking direct feed to local dashboard backend.
+# If the dashboard is offline, events are dropped; trading is never blocked.
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000")
+DASHBOARD_QUEUE_MAX = int(os.getenv("DASHBOARD_QUEUE_MAX", "2000"))
+DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
+DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
+DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
+DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))

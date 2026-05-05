@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+try:
+    from core.redaction import redact_sensitive
+except Exception:
+    def redact_sensitive(x): return x
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 CTX = re.compile(r"\[(?P<asset>[A-Z0-9_\-]+)\|(?P<venue>[A-Z]+):(?P<symbol>[A-Z0-9_:\-]+)\]")
@@ -25,6 +29,7 @@ SLANCHOR = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)
 SLENV = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*SL envelope (?P<phase>[^:]+): (?P<body>.*)")
 ENTER = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ENTERING (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+) TP=\$(?P<tp>[0-9,\.]+)")
 ACTIVE = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ACTIVE (?P<side>LONG|SHORT).*@ \$(?P<price>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+).*TP=\$(?P<tp>[0-9,\.]+)")
+ADOPT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RECONCILE: adopted (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+)")
 BRACKET_SL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket SL order:.*@ \$(?P<sl>[0-9,\.]+)")
 BRACKET_TP = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket TP order:.*@ \$(?P<tp>[0-9,\.]+)")
 TRAIL_APPLIED = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:EXCHANGE_APPLIED.*?new=\$?(?P<sl_new>[0-9,\.]+)|(?:SL edited in-place|SL replaced).*?(?:SL|trigger|stop)=?\$?(?P<sl>[0-9,\.]+))", re.I)
@@ -48,7 +53,7 @@ def clean(line: str) -> str:
         line = obj.get("log", line)
     except Exception:
         pass
-    return ANSI.sub("", line).strip()
+    return str(redact_sensitive(ANSI.sub("", line).strip()))
 
 
 def base_ctx(m) -> dict[str, Any]:
@@ -90,6 +95,8 @@ def parse(line: str) -> Optional[dict[str, Any]]:
         ev = base_ctx(m); ev.update({"type": "position_opened", "side": m.group('side'), "entry": fnum(m.group('entry')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "state": "ENTERING", "bracket": "PENDING"}); return ev
     if m := ACTIVE.search(s):
         ev = base_ctx(m); ev.update({"type": "position_update", "side": m.group('side'), "price": fnum(m.group('price')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "state": "ACTIVE", "bracket": "VERIFIED"}); return ev
+    if m := ADOPT.search(s):
+        ev = base_ctx(m); ev.update({"type": "position_update", "side": m.group('side'), "entry": fnum(m.group('entry')), "price": fnum(m.group('entry')), "state": "ACTIVE", "bracket": "ADOPTED", "last_reason": "exchange position adopted by reconcile", "message": s}); return ev
     if m := BRACKET_SL.search(s):
         ev = base_ctx(m); ev.update({"type": "bracket_update", "sl": fnum(m.group('sl')), "bracket": "SL_VERIFIED"}); return ev
     if m := BRACKET_TP.search(s):
@@ -123,6 +130,7 @@ class Poster:
     def __init__(self, url: str) -> None:
         self.url = url.rstrip('/')
     def post(self, ev: dict[str, Any]) -> None:
+        ev = redact_sensitive(dict(ev))
         ev.setdefault('source', 'log-tail')
         ev.setdefault('ts', time.time())
         try:
