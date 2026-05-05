@@ -405,8 +405,6 @@ class _DeltaAdapter:
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
         result["quantity"] = float(quantity)
-        result["size_strategy_units"] = float(quantity)
-        # Backward-compatible alias for older strategy paths; do not use in new code.
         result["size_btc"] = float(quantity)
         result["size_contracts"] = int(contracts)
         return result
@@ -574,11 +572,11 @@ class _DeltaAdapter:
         Turn Delta position response into a canonical dict.
 
         CRITICAL UNIT-CONSISTENCY CONTRACT:
-          The strategy's PositionState stores quantity in strategy units.
-          BTC uses BTC units via contract_value=0.001.  xStock/RWA/commodity
-          contracts use the instrument contract value, defaulting to 1.0 when
-          Delta omits it.  This adapter is the only boundary that translates
-          strategy units to/from raw Delta contracts.
+          The strategy's PositionState stores quantity in BTC units
+          (`pos.quantity = 0.001` means 0.001 BTC). On entry, the strategy
+          writes `pos.quantity = qty_btc` directly, and this adapter's
+          place_order converts that to `size = round(qty_btc / _cv)` integer
+          contracts before sending to Delta.
 
           RECONCILE PATH BUG (pre-fix):
           Delta's position endpoint returns `size` in **contracts**, not BTC.
@@ -595,12 +593,13 @@ class _DeltaAdapter:
             - position size logs showing 1.0 when actual was 0.001
 
           FIX:
-          Convert contracts → strategy units at the adapter boundary.  All callers
-          downstream of normalise_position see the same unit used at entry.
+          Convert contracts → BTC at the adapter boundary. All callers
+          downstream of normalise_position see size in BTC units, matching
+          the entry-side invariant.
 
           Invariant established by this fix:
-            Every `pos.quantity` in the strategy is in strategy units.
-            Every `size` argument to adapter.place_order is in strategy units.
+            Every `pos.quantity` in the strategy is in BTC units.
+            Every `size` argument to adapter.place_order is in BTC units.
             The adapter is the sole place that translates to/from contracts.
         """
         if isinstance(raw, dict):
@@ -615,24 +614,9 @@ class _DeltaAdapter:
 
         for pos in positions:
             if not isinstance(pos, dict): continue
-            prod = pos.get("product") if isinstance(pos.get("product"), dict) else {}
-            sym = str(pos.get("product_symbol", pos.get("symbol", prod.get("symbol", "")))).upper()
-            pid = pos.get("product_id") or prod.get("id")
-            expected_pid = self._get_product_id()
-            if sym:
-                if delta_sym not in sym and sym not in delta_sym:
-                    continue
-            elif expected_pid is not None and pid not in (None, ""):
-                try:
-                    if int(pid) != int(expected_pid):
-                        continue
-                except Exception:
-                    continue
-            else:
-                # Multi-asset safety: do not adopt a position if Delta omitted
-                # both product symbol and product id.  The old empty-symbol check
-                # could match every adapter because "" is contained in all symbols.
-                continue
+            sym = str(pos.get("product_symbol",
+                     pos.get("symbol", ""))).upper()
+            if delta_sym not in sym and sym not in delta_sym: continue
 
             # Read raw contract size from Delta's response.
             size_contracts_raw = 0.0
@@ -677,9 +661,8 @@ class _DeltaAdapter:
 
             return {
                 "side":           side,
-                "size":           size_btc,          # strategy units (converted)
-                "size_strategy_units": size_btc,
-                "size_signed":    signed_size_btc,   # signed strategy units (for side-disamb.)
+                "size":           size_btc,          # BTC units (converted)
+                "size_signed":    signed_size_btc,   # signed BTC (for side-disamb.)
                 "size_contracts": size_contracts_raw,# raw contracts (for diagnostics)
                 "entry_price":    entry,
                 "unrealized_pnl": upnl,

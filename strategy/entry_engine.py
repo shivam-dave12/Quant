@@ -1784,14 +1784,7 @@ class EntryEngine:
         posterior_prob: float,
         pool_quality: float,
     ) -> tuple[bool, str]:
-        """Decide whether a farther protective pool earns the extra risk.
-
-        This method is intentionally no longer allowed to choose a tighter
-        stop just because a wider, liquidity-safe stop reduces R:R or makes
-        fees look expensive.  If the market requires clearing a protective
-        pool, the correct institutional action is to skip/reprice the trade,
-        not to place the stop in front of the liquidity.
-        """
+        """Decide whether a farther protective pool earns the extra risk."""
         if current_risk <= 0.0 or pool_risk <= current_risk:
             return True, "pool does not widen risk"
 
@@ -1814,73 +1807,6 @@ class EntryEngine:
             return False, f"pool SL risk expansion {expansion:.2f}x needs quality {quality_hurdle:.2f}, got {pool_quality:.2f}"
 
         return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
-
-    @staticmethod
-    def _target_pool_price(target) -> float:
-        try:
-            pool = getattr(target, "pool", target)
-            return float(getattr(pool, "price", 0.0) or 0.0)
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _target_pool_significance(target) -> float:
-        try:
-            pool = getattr(target, "pool", target)
-            return float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _target_pool_status(target) -> str:
-        try:
-            pool = getattr(target, "pool", target)
-            return str(getattr(pool, "status", "") or "").upper()
-        except Exception:
-            return ""
-
-    def _first_uncovered_protective_pool(self, snap, side: str, entry: float, sl: float, atr: float):
-        """Return the nearest significant protective pool that the proposed SL fails to clear.
-
-        For a LONG, SSL below entry must be cleared by the SL.  For a SHORT,
-        BSL above entry must be cleared by the SL.  If the proposed stop sits
-        between entry and that pool, it is liquidity, not protection.
-        """
-        if snap is None or atr <= 0.0 or entry <= 0.0 or sl <= 0.0:
-            return None
-        try:
-            import config as _sl_inv_cfg
-            min_sig = float(getattr(_sl_inv_cfg, "SL_PROTECTIVE_MIN_SIGNIFICANCE", 1.5))
-            search_atr = float(getattr(_sl_inv_cfg, "SL_PROTECTIVE_SEARCH_ATR", 5.0))
-        except Exception:
-            min_sig, search_atr = 1.5, 5.0
-        pools = list(getattr(snap, "ssl_pools", []) or []) if side == "long" else list(getattr(snap, "bsl_pools", []) or [])
-        candidates = []
-        for target in pools:
-            status = self._target_pool_status(target)
-            if status in ("SWEPT", "CONSUMED"):
-                continue
-            px = self._target_pool_price(target)
-            if px <= 0.0:
-                continue
-            sig = self._target_pool_significance(target)
-            if sig < min_sig:
-                continue
-            dist_atr = abs(entry - px) / max(atr, 1e-9)
-            if dist_atr > search_atr:
-                continue
-            if side == "long":
-                # proposed SL is above / in front of SSL, so the pool would be swept before the SL is structurally protected
-                if px < entry and sl > px:
-                    candidates.append((abs(entry - px), px, target))
-            else:
-                # proposed SL is below / in front of BSL
-                if px > entry and sl < px:
-                    candidates.append((abs(entry - px), px, target))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][2]
 
     def _apply_institutional_sl_envelope(
         self,
@@ -1906,14 +1832,8 @@ class EntryEngine:
         sl = structural_sl
         risk = abs(price - sl)
         invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
-        try:
-            import config as _sl_floor_cfg
-            _survival_min = float(getattr(_sl_floor_cfg, "SL_MIN_SURVIVAL_RISK_ATR", 0.85))
-        except Exception:
-            _survival_min = 0.85
         noise_floor = max(
             atr * (0.45 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0)),
-            atr * _survival_min,
             invalidation_gap + atr * 0.28,
         )
 
@@ -1947,39 +1867,17 @@ class EntryEngine:
                     sl = pool_sl
                     risk = pool_risk
                     details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                    logger.info(
-                        "SL envelope %s: anchored behind protective pool at $%.1f "
+                    logger.debug(
+                        "SL envelope %s: anchored to protective pool at $%.1f "
                         "(risk %.2fATR; %s; %s)",
                         label, sl, risk / max(atr, 1e-10), details, geometry_reason)
                 else:
-                    return None, (
-                        f"protective liquidity requires SL ${pool_sl:.1f}, but execution geometry is non-viable: "
-                        f"{geometry_reason}; trade must reprice/abstain, not place SL in front of liquidity"
-                    )
-            elif pool_risk > max_risk:
-                return None, (
-                    f"protective liquidity requires SL ${pool_sl:.1f}, beyond liquidation/venue risk room; "
-                    "trade must abstain"
-                )
+                    logger.info(
+                        "SL envelope %s: ignored protective pool $%.1f (%s)",
+                        label, pool_sl, geometry_reason)
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
-
-        uncovered = self._first_uncovered_protective_pool(snap, side, price, sl, atr)
-        if uncovered is not None:
-            pool_px = self._target_pool_price(uncovered)
-            pool_sig = self._target_pool_significance(uncovered)
-            try:
-                import config as _sl_inv_cfg
-                clear_atr = float(getattr(_sl_inv_cfg, "SL_LIQUIDITY_CLEARANCE_ATR", 0.75))
-            except Exception:
-                clear_atr = 0.75
-            required_sl = pool_px - clear_atr * atr if side == "long" else pool_px + clear_atr * atr
-            return None, (
-                f"SL ${sl:.1f} is in front of protective liquidity pool ${pool_px:.1f} "
-                f"(sig={pool_sig:.1f}); required structural SL ${required_sl:.1f}; "
-                "trade must reprice/abstain"
-            )
 
         if not self._sl_is_protective(side, sl, price):
             return None, "SL crossed market after liquidity push"
@@ -2844,18 +2742,9 @@ class EntryEngine:
         snap = self._last_liq_snapshot
         if snap is None:
             return sl
-        try:
-            import config as _sl_survival_cfg
-            _SL_PUSH_MAX_ATR = float(getattr(_sl_survival_cfg, "SL_PUSH_MAX_ATR", 4.0))
-            _SL_CLEAR_ATR = float(getattr(_sl_survival_cfg, "SL_LIQUIDITY_CLEARANCE_ATR", 0.75))
-        except Exception:
-            _SL_PUSH_MAX_ATR = 4.0
-            _SL_CLEAR_ATR = 0.75
-        # Stops must clear the liquidity cluster, not sit on it.  0.75 ATR is
-        # the default survival band; crowded/high-significance pools are already
-        # expanded by the selector before this final guard.
+        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
         sl_origin = sl
-        buf = max(0.75 * atr, _SL_CLEAR_ATR * atr)
+        buf = 0.25 * atr
         if side == "long":
             for t in snap.ssl_pools:
                 if sl < t.pool.price < price:

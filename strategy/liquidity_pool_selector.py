@@ -134,9 +134,9 @@ _GAUNTLET_PENALTY_PER   = 0.18  # -18% per qualifying gauntlet pool
 _GAUNTLET_PENALTY_MAX   = 0.55  # but never wipe more than 55% of EV
 
 # SL pool selector tunables.
-_SL_BUFFER_BASE_ATR        = 0.70  # institutional minimum buffer beyond pool price
-_SL_BUFFER_MAX_ATR         = 1.50  # ceiling on buffer; avoids stops sitting in liquidity
-_SL_BUFFER_QUALITY_SCALE   = 0.35  # inverse-scale add-on; base remains wide enough to survive sweeps
+_SL_BUFFER_BASE_ATR        = 0.18  # minimum buffer beyond pool price
+_SL_BUFFER_MAX_ATR         = 0.55  # ceiling on buffer
+_SL_BUFFER_QUALITY_SCALE   = 0.40  # inverse-scale: high quality → smaller buffer
 _SL_SEARCH_WINDOW_ATR      = 4.0   # max distance to look for a protective pool
 _SL_MIN_BEYOND_INVAL_ATR   = 0.05  # protective pool must be at least this far past invalidation
 _SL_MIN_SIGNIFICANCE       = 1.5   # don't anchor SL to garbage pools
@@ -997,18 +997,8 @@ def score_sl_pool(
         # we want raw structural strength. We therefore neutralise htf_m.
         score = sig * struct * fresh * touch
         quality = min(score / 10.0, 1.0)
-
-        # Institutional stop-survival buffer.
-        # The old model made high-quality pools use the thinnest buffer, which
-        # placed the stop right where liquidity is obvious and therefore where
-        # the next stop-run is likely to print.  A strong/crowded pool is not a
-        # place to hide a stop; the stop must clear the sweep zone behind it.
-        touches = int(_safe(t.pool, "touches", 1) or 1)
-        crowding_atr = min(max(touches - 2, 0) * 0.08, 0.32)
-        high_sig_atr = min(max(sig - 5.0, 0.0) * 0.025, 0.25)
-        weak_pool_atr = (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-        buffer_atr = _SL_BUFFER_BASE_ATR + weak_pool_atr + crowding_atr + high_sig_atr
-        buffer_atr = min(max(buffer_atr, _SL_BUFFER_BASE_ATR), _SL_BUFFER_MAX_ATR, max_buffer_atr)
+        buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
+        buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
         pool_price = float(_safe(t.pool, "price", 0.0))
         sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
         if min_risk > 0.0 and abs(entry - sl_price) < min_risk:

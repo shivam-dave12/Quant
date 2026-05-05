@@ -120,7 +120,7 @@ class DashboardState:
         self.last_heartbeat = 0.0
         self.bot_online = False
         self.mode = "unknown"
-        self.source = "log-tail"
+        self.source = "none"
         self.assets: Dict[str, AssetState] = {}
         self.positions: Dict[str, PositionState] = {}
         self.alerts: Deque[AlertState] = deque(maxlen=MAX_ALERTS)
@@ -214,20 +214,48 @@ class DashboardState:
             out.append({"asset": a.asset, "score": round(score, 2), "state": a.state, "phase": a.phase, "price": a.price, "spread_bps": a.spread_bps, "posterior": max(a.posterior, a.confidence), "ev": a.ev})
         return sorted(out, key=lambda x: x["score"], reverse=True)
 
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            now = time()
+            online_age = now - self.last_heartbeat if self.last_heartbeat else None
+            return {
+                "bot_online": bool(self.bot_online),
+                "source": self.source,
+                "last_heartbeat": self.last_heartbeat,
+                "heartbeat_age_sec": online_age,
+                "ingested_lines": self.ingested_lines,
+                "parsed_events": self.parsed_events,
+                "assets": len(self.assets),
+                "positions": len(self.positions),
+                "alerts": len(self.alerts),
+                "expected_inputs": [
+                    "direct telemetry: DASHBOARD_ENABLED=true and DASHBOARD_URL points to this backend",
+                    "fallback log tail: trading-dashboard-tail service posts /api/events and /api/ingested-line",
+                ],
+                "status": "OK" if self.last_heartbeat and online_age is not None and online_age < 25 else "NO_HEARTBEAT",
+                "probable_root_cause": (
+                    "No direct telemetry or log-tail heartbeat received. Check bot env DASHBOARD_URL/DASHBOARD_ENABLED or systemctl status trading-dashboard-tail."
+                    if not self.last_heartbeat else "Heartbeat exists; check parsed_events/assets if no cards are visible."
+                ),
+            }
+
     def apply(self, event: dict[str, Any]) -> None:
         with self._lock:
             event = dict(event)
             event.setdefault("ts", time())
             event.setdefault("type", "event")
             etype = str(event.get("type", "event"))
+            # Count every structured event including heartbeat.  The old dashboard
+            # returned before appending heartbeat, so a running tail/direct emitter
+            # could still display parsed_events=0 and look dead.
+            self.events.appendleft(event)
+            self.parsed_events += 1
             if etype == "heartbeat":
                 self.last_heartbeat = float(event.get("ts", time()))
                 self.bot_online = True
                 self.mode = str(event.get("mode", self.mode))
                 self.source = str(event.get("source", self.source))
                 return
-            self.events.appendleft(event)
-            self.parsed_events += 1
             if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:
                 self._update_asset(event)
                 if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:

@@ -399,7 +399,7 @@ class HardeningTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
-    def test_trail_off_can_disable_sl_movement_while_position_active(self):
+    def test_trail_off_is_ignored_while_position_active(self):
         import threading
         from strategy.quant_strategy import QuantStrategy
 
@@ -412,8 +412,8 @@ class HardeningTests(unittest.TestCase):
 
         changed = strategy.set_trail_override(False)
 
-        self.assertTrue(changed)
-        self.assertFalse(strategy._pos.trail_override)
+        self.assertFalse(changed)
+        self.assertIsNone(strategy._pos.trail_override)
 
     def test_fee_to_risk_can_return_no_allocation(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
@@ -543,12 +543,8 @@ class HardeningTests(unittest.TestCase):
             prefetched_bal_info={"available": 1000.0, "total": 1000.0},
         )
 
-        import config
-        risk_pct = float(config.RISK_PER_TRADE)
-        if risk_pct > 0.05:
-            risk_pct = risk_pct / 100.0 if risk_pct <= 5.0 else 0.05
-        self.assertGreaterEqual(qty, 0.001)
-        self.assertLessEqual(qty * sl_dist, 1000.0 * risk_pct * 1.15 + 1e-9)
+        self.assertEqual(qty, 0.001)
+        self.assertLessEqual(qty * sl_dist, 1000.0 * 0.005 + 1e-9)
 
     def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config

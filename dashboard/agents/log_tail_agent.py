@@ -125,23 +125,67 @@ class Poster:
 
 def run(path: Path, dashboard: str, from_start: bool) -> None:
     poster = Poster(dashboard)
-    poster.post({"type":"heartbeat", "mode":"live", "source":"log-tail-v3"})
+    lines = 0
+    parsed = 0
+    last_hb = 0.0
+    last_status = 0.0
+
+    def send_status(reason: str = "running") -> None:
+        poster.post({
+            "type": "heartbeat",
+            "mode": "live",
+            "source": "log-tail-v23",
+            "message": reason,
+            "log_path": str(path),
+            "ingested_lines": lines,
+            "parsed_events": parsed,
+        })
+        poster.post({
+            "type": "tail_status",
+            "asset": "DASHBOARD",
+            "venue": "LOCAL",
+            "symbol": "LOGTAIL",
+            "phase": "RUNNING",
+            "message": f"{reason}; log={path}; lines={lines}; parsed={parsed}",
+            "health": "OK",
+        })
+
+    if not path.exists():
+        poster.post({
+            "type": "error",
+            "severity": "critical",
+            "title": "Dashboard log-tail path missing",
+            "message": f"Log path does not exist: {path}",
+            "source": "log-tail-v23",
+        })
+        while True:
+            poster.post({"type": "heartbeat", "mode": "error", "source": "log-tail-v23", "message": f"missing log path {path}"})
+            time.sleep(5)
+
+    send_status("starting")
     with path.open('r', encoding='utf-8', errors='ignore') as f:
         if not from_start:
+            # Tail only new lines by default.  Installer uses --from-start so a
+            # restarted dashboard is populated immediately.
             f.seek(0, 2)
-        last_hb = 0.0
         while True:
             line = f.readline()
             now = time.time()
             if not line:
                 if now - last_hb > 2:
-                    poster.post({"type":"heartbeat", "mode":"live", "source":"log-tail-v3"}); last_hb = now
+                    send_status("waiting for new log lines")
+                    last_hb = now
                 time.sleep(0.5)
                 continue
+            lines += 1
             poster.note_line()
             ev = parse(line)
             if ev:
+                parsed += 1
                 poster.post(ev)
+            if now - last_status > 10:
+                send_status("parsing")
+                last_status = now
 
 
 if __name__ == '__main__':

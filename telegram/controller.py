@@ -407,7 +407,7 @@ class TelegramBotController:
             "⚙️ <b>CONTROL</b>\n"
             "  /start · /stop — Start/stop bot\n"
             "  /pause · /resume — Pause trading (keep monitoring)\n"
-            "  /trail [on|off|auto] [asset] — Trailing SL control (default OFF)\n"
+            "  /trail [on|off|auto] — Adaptive exit override\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
             "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
@@ -426,7 +426,7 @@ class TelegramBotController:
         fn = getattr(bot_instance, "format_assets_report", None)
         if callable(fn):
             return fn()
-        return "Single-asset mode active. Use /status for the current scanner."
+        return "Single-asset mode active. Use /status for the current BTCUSD scanner."
 
     # /thinking  ← CORE COMMAND — QuantPosterior decision console
     # ================================================================
@@ -1182,7 +1182,7 @@ class TelegramBotController:
             f"<b>💰 LEVELS</b>\n"
             f"Entry:   ${entry:,.2f}\n"
             f"Current: ${price:,.2f}  ({current_r:+.2f}R)\n"
-            f"{_upnl_icon} uPnL:  ${upnl:+,.2f}  |  Qty: {qty:.4f}\n"
+            f"{_upnl_icon} uPnL:  ${upnl:+,.2f}  |  Qty: {qty:.4f} BTC\n"
             f"SL:      ${sl:,.2f}  (dist: ${current_sl_dist:.0f} / {current_sl_dist/max(atr,1):.2f}ATR)\n"
             f"TP:      ${tp:,.2f}{_pool_tp_src}{pool_tp_note}\n"
             f"R:R planned: 1:{planned_rr:.2f}  |  Hold: {hold_min:.1f}m\n"
@@ -1638,62 +1638,40 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-
-        raw = (args or "").strip()
-        parts = raw.split()
-        action_words = {"on", "enable", "enabled", "1", "true", "yes", "off", "disable", "disabled", "0", "false", "no", "auto", "default", "reset"}
-        action = "status"
-        asset = None
-        for part in parts:
-            low = part.lower()
-            if low in action_words and action == "status":
-                action = low
-            else:
-                asset = part.upper()
-        if parts and action == "status" and parts[0].lower() not in action_words:
-            asset = parts[0].upper()
-
-        # Multi-asset portfolio command center path.
-        if hasattr(bot_instance, "set_trailing_override") and hasattr(bot_instance, "format_trailing_control_report"):
-            if action in ("on", "enable", "enabled", "1", "true", "yes"):
-                res = bot_instance.set_trailing_override(True, asset)
-                return bot_instance.format_trailing_control_report(res)
-            if action in ("off", "disable", "disabled", "0", "false", "no"):
-                res = bot_instance.set_trailing_override(False, asset)
-                return bot_instance.format_trailing_control_report(res)
-            if action in ("auto", "default", "reset"):
-                res = bot_instance.set_trailing_override(None, asset)
-                return bot_instance.format_trailing_control_report(res)
-            return bot_instance.format_trailing_control_report()
-
-        # Single-asset fallback.
-        strat = getattr(bot_instance, "strategy", None)
-        if not strat:
-            return "Strategy not ready."
-        if action in ("on", "enable", "enabled", "1", "true", "yes"):
+        if not bot_instance: return "Bot not running."
+        strat = bot_instance.strategy
+        if not strat: return "Strategy not ready."
+        arg = (args or "").strip().lower()
+        if arg in ("on", "enable", "1", "true", "yes"):
             strat.set_trail_override(True)
             return (
                 "🔒 <b>Trailing SL: FORCED ON</b>\n"
                 "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                "Will advance SL only after explicit operator enable."
+                "Will advance SL per phase logic regardless of config flag."
             )
-        if action in ("off", "disable", "disabled", "0", "false", "no"):
-            strat.set_trail_override(False)
+        elif arg in ("off", "disable", "0", "false", "no"):
+            changed = strat.set_trail_override(False)
+            if changed is False:
+                return (
+                    "Trailing SL remains ON for the active position.\n"
+                    "Protective management cannot be disabled mid-trade; "
+                    "use /pause to stop new entries."
+                )
             return (
                 "🔓 <b>Trailing SL: FORCED OFF</b>\n"
-                "Exchange bracket SL/TP remains live; bot will not move SL."
+                "SL will remain at initial structural level.\n"
+                "Exit will be via TP fill, SL hit, or max-hold timeout."
             )
-        if action in ("auto", "default", "reset"):
+        else:
             strat.set_trail_override(None)
-        enabled = strat.get_trail_enabled()
-        default_txt = "ON" if enabled else "OFF"
-        return (
-            f"🛡 <b>Trailing SL</b>\n"
-            f"Current effective state: <b>{default_txt}</b>\n"
-            f"Default is OFF unless explicitly enabled with <code>/trail on</code>."
-        )
+            enabled = strat.get_trail_enabled()
+            default_txt = "ON" if enabled else "OFF"
+            return (
+                f"🔄 <b>Trailing SL: AUTO</b>\n"
+                f"Using config default: <b>{default_txt}</b>\n"
+                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
+                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
+            )
 
     # ================================================================
     # /config
@@ -1720,7 +1698,7 @@ class TelegramBotController:
             # Old display showed QUANT_MARGIN_PCT (deprecated) and a wrong 0.60 fallback.
             f"  Risk/trade:   <b>{getattr(cfg,'RISK_PER_TRADE',0.006)*100:.2f}%</b> of balance",
             f"  Min margin:   ${getattr(cfg,'MIN_MARGIN_PER_TRADE',1.0):.2f} USDT",
-            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',0.5)} strategy units",
+            f"  Max position: {getattr(cfg,'MAX_POSITION_SIZE',0.5)} BTC",
             "",
             "<b>Entry</b>",
             f"  Confirm ticks: {getattr(cfg,'QUANT_CONFIRM_TICKS',2)}",
@@ -1737,7 +1715,7 @@ class TelegramBotController:
             f"  Max drawdown:     {getattr(cfg,'MAX_DRAWDOWN_PCT',15.0):.1f}%",
             "",
             "<b>Exit Controller  (adaptive EAE / liquidity / true net BE)</b>",
-            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',False)}",
+            f"  Enabled:      {getattr(cfg,'QUANT_TRAIL_ENABLED',True)}",
             f"  Hands off: delivery inside expected adverse excursion — structural SL trusted",
             f"  BE lock: true net BE only after structure/delivery proof",
             f"  Structural: accepted swings/liquidity anchors",
@@ -1778,7 +1756,7 @@ class TelegramBotController:
                     qty        = float(pos["size"])
                     resp       = om.place_market_order(side=close_side, quantity=qty, reduce_only=True)
                     if resp:
-                        results.append(f"✅ Closed {pos_side} ({qty})")
+                        results.append(f"✅ Closed {pos_side} ({qty} BTC)")
                     else:
                         results.append(f"⚠️ Close order returned None")
                 else:

@@ -4,7 +4,7 @@ orchestration/multi_asset_bot.py — portfolio scanner for confirmed instruments
 
 One strategy instance per tradable instrument.  Every instrument has its own data
 manager, execution router, risk ledger, strategy state, liquidity map and trail
-state.  PortfolioManager enforces account-level exposure so the scanner can watch
+state.  PortfolioGuard enforces account-level exposure so the scanner can watch
 multiple contracts without stacking correlated risk blindly.
 """
 from __future__ import annotations
@@ -32,7 +32,6 @@ from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManag
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
-from telemetry.dashboard_emitter import DashboardEmitter, instrument_fields, policy_fields, position_fields
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +67,134 @@ class AssetContext:
             return False
 
 
+class _LegacyPortfolioGuard:
+    """
+    Account-level exposure coordinator.
+
+    It does not judge alpha.  It only enforces portfolio mechanics:
+      • many contracts may trade simultaneously, up to the configured slot cap;
+      • one reserved slot per contract (ENTERING/ACTIVE/EXITING all count);
+      • each contract sees a portfolio-adjusted balance slice before the existing
+        BTC-style risk/margin sizing runs inside QuantStrategy.
+    """
+    def __init__(self) -> None:
+        self.max_open_positions = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_POSITIONS", 4)))
+        self.max_same_class = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS", self.max_open_positions)))
+        self.max_per_contract = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_CONTRACT", 1)))
+        self.budget_mode = str(getattr(config, "PORTFOLIO_BUDGET_MODE", "equal_slots")).lower()
+        self._lock = threading.RLock()
+
+    def reserved_contexts(self, contexts: List[AssetContext]) -> List[AssetContext]:
+        return [c for c in contexts if c.has_position]
+
+    def count_open(self, contexts: List[AssetContext]) -> int:
+        return len(self.reserved_contexts(contexts))
+
+    def can_evaluate_entry(self, ctx: AssetContext, contexts: List[AssetContext]) -> tuple[bool, str]:
+        with self._lock:
+            reserved_ctx = self.reserved_contexts(contexts)
+
+            # One position slot per contract.  Existing slot is allowed only for
+            # management/exits/trailing; a second entry cannot be opened by this
+            # context because QuantStrategy remains non-FLAT.
+            if ctx.has_position:
+                return True, f"{ctx.phase_name.lower()} position management"
+
+            same_contract = [c for c in reserved_ctx if c.instrument.asset_id == ctx.instrument.asset_id]
+            if len(same_contract) >= self.max_per_contract:
+                return False, f"contract slot occupied {ctx.instrument.asset_id} {len(same_contract)}/{self.max_per_contract}"
+
+            if len(reserved_ctx) >= self.max_open_positions:
+                return False, f"portfolio exposure cap {len(reserved_ctx)}/{self.max_open_positions}"
+
+            same_class = [c for c in reserved_ctx if c.instrument.asset_class == ctx.instrument.asset_class]
+            if len(same_class) >= self.max_same_class:
+                return False, f"asset-class exposure cap {ctx.instrument.asset_class.value} {len(same_class)}/{self.max_same_class}"
+
+            return True, "portfolio slot available"
+
+    def allocate_balance(self, ctx: Optional[AssetContext], contexts: List[AssetContext], raw_balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Return a balance view scoped to one contract's portfolio slot.
+
+        QuantStrategy already applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE
+        to whatever `available` it receives.  Therefore the institutional way to
+        preserve the current BTC sizing semantics across multiple simultaneous
+        contracts is to give each contract an account-equity slice, not the full
+        account equity.  With 4 slots and 60% balance usage, each contract may use
+        about 15% of total equity as margin; all 4 together remain around the old
+        60% portfolio envelope.
+        """
+        if raw_balance is None:
+            return None
+        if not isinstance(raw_balance, dict):
+            return raw_balance
+
+        try:
+            raw_available = max(0.0, float(raw_balance.get("available", 0.0) or 0.0))
+            raw_total = max(0.0, float(raw_balance.get("total", raw_available) or raw_available))
+        except Exception:
+            return raw_balance
+
+        # Slot count is the configured maximum, not current open count.  That
+        # prevents the first signal of the day from consuming the whole account
+        # just because other contracts have not fired yet.
+        configured_slots = max(1, self.max_open_positions)
+        active_universe = max(1, len(contexts or []))
+        slot_count = min(configured_slots, active_universe) if self.budget_mode in {"active_equal_slots", "active_slots"} else configured_slots
+
+        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
+        slot_available = min(slot_equity, raw_available)
+
+        # If the account has less free cash than one nominal slot, use the real
+        # exchange-available cash.  Never fabricate availability.
+        adjusted = dict(raw_balance)
+        adjusted["available_raw"] = raw_available
+        adjusted["total_raw"] = raw_total
+        adjusted["available"] = max(0.0, slot_available)
+        adjusted["total"] = max(0.0, slot_equity)
+        adjusted["portfolio_scoped"] = True
+        adjusted["portfolio_budget_mode"] = self.budget_mode
+        adjusted["portfolio_slot_count"] = slot_count
+        adjusted["portfolio_slot_available"] = slot_available
+        adjusted["portfolio_slot_equity"] = slot_equity
+        adjusted["portfolio_reserved_slots"] = self.count_open(contexts or [])
+        adjusted["portfolio_max_slots"] = self.max_open_positions
+
+        # Sizing v5.1 separation:
+        #   • available/total above are the slot-scoped cash view used for
+        #     margin and fee-cap checks;
+        #   • risk_available/risk_total keep the portfolio equity base used for
+        #     dollar-risk sizing.  Without this separation, BTC min lot gets
+        #     rejected on small accounts because the risk target is divided by
+        #     the number of portfolio slots before the exchange lot floor is
+        #     considered.  PortfolioGuard still limits total concurrent slots;
+        #     QuantStrategy still limits actual cash/margin by the slot view.
+        adjusted["risk_available"] = raw_available
+        adjusted["risk_total"] = raw_total
+        if ctx is not None:
+            adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
+        return adjusted
+
+
+class _LegacyPortfolioRiskManager(RiskManager):
+    """RiskManager wrapper that exposes a per-contract balance slice."""
+    def __init__(self, shared_api=None, *, allocator: Callable[[Optional[AssetContext], List[AssetContext], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]], context_getter: Callable[[], Optional[AssetContext]], contexts_getter: Callable[[], List[AssetContext]]):
+        super().__init__(shared_api=shared_api)
+        self._portfolio_allocator = allocator
+        self._portfolio_context_getter = context_getter
+        self._portfolio_contexts_getter = contexts_getter
+
+    def get_available_balance(self) -> Optional[Dict]:
+        raw = super().get_available_balance()
+        try:
+            ctx = self._portfolio_context_getter()
+            contexts = self._portfolio_contexts_getter()
+            return self._portfolio_allocator(ctx, contexts, raw)
+        except Exception:
+            logger.exception("Portfolio balance allocation failed; using raw exchange balance")
+            return raw
+
+
 class MultiAssetQuantBot:
     def __init__(self) -> None:
         self.running = False
@@ -79,8 +206,6 @@ class MultiAssetQuantBot:
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
-        self.dashboard = DashboardEmitter.from_config()
-        self._last_dashboard_heartbeat = 0.0
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
@@ -191,99 +316,6 @@ class MultiAssetQuantBot:
                 lines.append(f"⚪ {esc(aid)} — {esc(reason)}")
         return "\n".join(lines)
 
-    def _match_trail_contexts(self, asset_filter: Optional[str] = None) -> List[AssetContext]:
-        if not asset_filter:
-            return list(self.contexts)
-        needle = str(asset_filter).strip().upper()
-        out: List[AssetContext] = []
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            symbols = {
-                str(inst.asset_id).upper(),
-                str(inst.display_symbol).upper(),
-                str(getattr(inst, "canonical_symbol", "") or "").upper(),
-            }
-            try:
-                symbols.update(str(ei.display_symbol).upper() for ei in inst.by_exchange.values())
-            except Exception:
-                pass
-            if needle in symbols:
-                out.append(ctx)
-        return out
-
-    def set_trailing_override(self, enabled: Optional[bool], asset_filter: Optional[str] = None) -> Dict[str, Any]:
-        """Portfolio-level Telegram control for SL trailing.
-
-        Default trailing is OFF. This method lets the operator enable/disable
-        trailing globally or for one asset desk without touching initial bracket
-        SL/TP protection.
-        """
-        targets = self._match_trail_contexts(asset_filter)
-        changed: List[str] = []
-        failed: List[str] = []
-        for ctx in targets:
-            try:
-                ctx.strategy.set_trail_override(enabled)
-                changed.append(ctx.instrument.asset_id)
-            except Exception as exc:
-                failed.append(f"{ctx.instrument.asset_id}:{exc}")
-        return {
-            "changed": changed,
-            "failed": failed,
-            "target": asset_filter or "ALL",
-            "enabled": enabled,
-        }
-
-    def format_trailing_control_report(self, result: Optional[Dict[str, Any]] = None) -> str:
-        def state_label(ctx: AssetContext) -> str:
-            try:
-                override = getattr(getattr(ctx.strategy, "_pos", None), "trail_override", None)
-                enabled = bool(ctx.strategy.get_trail_enabled())
-            except Exception:
-                override = None
-                enabled = False
-            if override is True:
-                mode = "FORCED ON"
-            elif override is False:
-                mode = "FORCED OFF"
-            else:
-                mode = "DEFAULT"
-            return f"{mode} / {'ON' if enabled else 'OFF'}"
-
-        lines = ["🛡 <b>TRAILING SL CONTROL</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        try:
-            import config as _cfg
-            _default_on = bool(getattr(_cfg, "QUANT_TRAIL_ENABLED", False))
-        except Exception:
-            _default_on = False
-        if _default_on:
-            lines.append("Default: <b>ON</b>. Telegram <code>/trail off</code> disables SL movement; bracket SL/TP remains active.")
-        else:
-            lines.append("Default: <b>OFF</b>. Bracket SL/TP remains active; only SL movement is disabled until <code>/trail on</code>.")
-        if result is not None:
-            enabled = result.get("enabled")
-            if enabled is True:
-                act = "ENABLED"
-            elif enabled is False:
-                act = "DISABLED"
-            else:
-                act = "RESET TO DEFAULT"
-            target = self._esc(result.get("target", "ALL"))
-            changed = ", ".join(result.get("changed") or []) or "none"
-            lines.append(f"\n<b>Command:</b> {act} · target {target}")
-            lines.append(f"<code>changed: {self._esc(changed)}</code>")
-            if result.get("failed"):
-                lines.append(f"<code>failed: {self._esc(', '.join(result['failed']))}</code>")
-        lines.append("\n<b>Desks</b>")
-        for ctx in self.contexts:
-            pos = ctx.strategy.get_position()
-            pos_txt = "LIVE" if pos else ("READY" if ctx.ready else "WARMUP")
-            lines.append(
-                f"<code>{self._esc(ctx.instrument.asset_id):<6} {self._esc(ctx.instrument.primary_exchange.value.upper()+':'+ctx.instrument.display_symbol):<18} "
-                f"trail {self._esc(state_label(ctx)):<16} {pos_txt}</code>"
-            )
-        lines.append("\n<code>/trail on</code> enables all desks · <code>/trail on COIN</code> enables one desk · <code>/trail off</code> disables movement again.")
-        return "\n".join(lines)
 
     # ---------------------------------------------------------------------
     # Institutional command-center reports used by Telegram commands.
@@ -475,67 +507,6 @@ class MultiAssetQuantBot:
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
         return "\n".join(lines)
 
-    def _dashboard_emit(self, event: Dict[str, Any]) -> None:
-        try:
-            self.dashboard.emit(event)
-        except Exception:
-            pass
-
-    def _dashboard_context_payload(self, ctx: AssetContext, event_type: str = "scan") -> Dict[str, Any]:
-        payload = position_fields(ctx)
-        payload["type"] = payload.get("type", event_type) if ctx.has_position else event_type
-        payload.setdefault("phase", ctx.phase_name if ctx.has_position else "SCANNING")
-        payload.setdefault("state", ctx.phase_name)
-        try:
-            payload["open_positions"] = self.guard.count_open(self.contexts)
-            payload["max_positions"] = self.guard.max_open_positions
-        except Exception:
-            pass
-        return payload
-
-    def _dashboard_emit_universe(self) -> None:
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            payload = {
-                "type": "catalog_asset",
-                **instrument_fields(inst),
-                **policy_fields(inst),
-                "state": "DISCOVERED",
-                "phase": "WARMUP",
-                "primary": inst.primary_exchange.value.upper(),
-                "secondary": ",".join(ex.value.upper() for ex in inst.by_exchange.keys() if ex != inst.primary_exchange),
-                "max_positions": self.guard.max_open_positions,
-            }
-            self._dashboard_emit(payload)
-
-    def _dashboard_heartbeat(self, force: bool = False) -> None:
-        now = time.time()
-        interval = float(getattr(config, "DASHBOARD_HEARTBEAT_SEC", 5.0))
-        if not force and now - self._last_dashboard_heartbeat < interval:
-            return
-        self._last_dashboard_heartbeat = now
-        self._dashboard_emit({
-            "type": "heartbeat",
-            "mode": "live" if self.trading_enabled else "paused",
-            "source": "direct",
-            "open_positions": self.guard.count_open(self.contexts),
-            "max_positions": self.guard.max_open_positions,
-            "message": self.trading_pause_reason or "multi-asset bot running",
-        })
-
-    def _dashboard_emit_position_or_scan(self, ctx: AssetContext, *, force: bool = False) -> None:
-        now = time.time()
-        interval = float(getattr(config, "DASHBOARD_POSITION_UPDATE_SEC", 1.0) if ctx.has_position else getattr(config, "DASHBOARD_SCAN_UPDATE_SEC", 5.0))
-        marker = getattr(ctx, "_last_dashboard_emit", 0.0)
-        if not force and now - marker < interval:
-            return
-        try:
-            setattr(ctx, "_last_dashboard_emit", now)
-        except Exception:
-            pass
-        ev_type = "position_update" if ctx.has_position else "scan"
-        self._dashboard_emit(self._dashboard_context_payload(ctx, ev_type))
-
     def initialize(self) -> bool:
         try:
             logger.info("=" * 92)
@@ -565,10 +536,6 @@ class MultiAssetQuantBot:
                 logger.error("No asset contexts could be built.")
                 return False
             logger.info("✅ Built %d isolated strategy contexts", len(self.contexts))
-            # Emit the universe immediately after context construction so the
-            # dashboard shows all asset desks even before websockets finish warmup.
-            # This is telemetry-only and cannot affect strategy/execution logic.
-            self._dashboard_emit_universe()
             return True
         except Exception:
             logger.exception("MultiAssetQuantBot initialisation failed")
@@ -630,7 +597,6 @@ class MultiAssetQuantBot:
                     return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
-                self._dashboard_emit({"type":"market_data", **instrument_fields(inst), **policy_fields(inst), "phase":"READY", "state":"READY", "price":ctx.data_manager.get_last_price(), "data_status":"OK", "health":"OK"})
                 return True
         except Exception:
             logger.exception("%s start failed", inst.asset_id)
@@ -662,7 +628,6 @@ class MultiAssetQuantBot:
         if self.discovery_report:
             send_telegram_message(self.discovery_report.telegram_html())
         send_telegram_message(self._startup_message())
-        self._dashboard_heartbeat(force=True)
         return True
 
     def _startup_message(self) -> str:
@@ -681,7 +646,7 @@ class MultiAssetQuantBot:
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
         lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
-        lines.append("• Alpha remains posterior/EV based; PortfolioManager only controls exposure mechanics")
+        lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
         return "\n".join(lines)
 
     def run(self) -> None:
@@ -709,14 +674,12 @@ class MultiAssetQuantBot:
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
                     self._maybe_analysis_audit(ctx, dt_ms)
-                    self._dashboard_emit_position_or_scan(ctx)
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
                 break
-            except Exception as _loop_e:
+            except Exception:
                 logger.exception("Multi-asset loop error")
-                self._dashboard_emit({"type":"alert", "severity":"critical", "title":"Multi-asset loop error", "message":str(_loop_e)[:500]})
                 time.sleep(1.0)
         self.running = False
 
@@ -779,7 +742,6 @@ class MultiAssetQuantBot:
                 ctx.data_manager.stop()
             except Exception:
                 pass
-        self._dashboard_emit({"type":"heartbeat", "mode":"stopped", "source":"direct", "message":"multi-asset bot stopped"})
         send_telegram_message("🛑 <b>MULTI-ASSET INSTITUTIONAL BOT STOPPED</b>")
 
 

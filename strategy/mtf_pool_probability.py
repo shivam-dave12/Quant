@@ -584,7 +584,7 @@ def get_mtf_pool_forecast(
     Full forecast for display / Telegram reporting.
 
     Exposes per-pool breakdown, top BSL/SSL candidates, and session context.
-    Use in display_engine.py or controller.py for the /thinking command.
+    Use in v9_display.py or controller.py for the /thinking command.
     """
     now_ = now if now > 1e6 else time.time()
     return _mtf_engine.compute(

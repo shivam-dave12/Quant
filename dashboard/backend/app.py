@@ -75,6 +75,11 @@ def health() -> dict[str, Any]:
     snap = state.snapshot()
     return {"ok": True, "dashboard": "v20", "ts": snap["ts"], "bot_online": snap["system"]["bot_online"], "assets": snap["system"]["assets"], "events": snap["system"]["event_count"]}
 
+
+@app.get("/api/diagnostics")
+def diagnostics() -> dict[str, Any]:
+    return state.diagnostics()
+
 @app.get("/api/state")
 def get_state(asset: Optional[str] = None) -> dict[str, Any]:
     return state.snapshot(asset=asset)

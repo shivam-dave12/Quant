@@ -56,7 +56,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.01    # 1% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -256,7 +256,7 @@ QUANT_OB_WALL_DEPTH            = 20
 QUANT_OB_WALL_MULT             = 2.5
 QUANT_TRAIL_SWING_BARS         = 5
 QUANT_TRAIL_VOL_DECAY_MULT     = 0.6
-QUANT_TRAIL_ENABLED            = True      # v15 enabled-default build; Telegram /trail off can disable
+QUANT_TRAIL_ENABLED            = True
 QUANT_TRAIL_BE_R               = 1.00     # BE lock at 1.0R
 QUANT_TRAIL_LOCK_R             = 1.00     # Fib trail begins after BE checkpoint
 QUANT_TRAIL_AGGRESSIVE_R       = 3.50     # aggressive trail at 3.5R
@@ -351,10 +351,8 @@ QUANT_MAX_SPREAD_BPS_CRYPTO           = 12.0
 QUANT_MAX_SPREAD_TICKS_CRYPTO         = 10.0
 QUANT_SPREAD_SOFT_ATR_RATIO_EQUITY    = 0.50
 QUANT_MAX_SPREAD_ATR_RATIO_EQUITY     = 4.00
-QUANT_MAX_SPREAD_BPS_EQUITY           = 75.0   # v15: hard failure only; normal xStock width becomes size/EV impairment
-QUANT_MAX_SPREAD_TICKS_EQUITY         = 100.0  # v15: do not hard-block solely due coarse tokenised-equity tick geometry
-QUANT_CRITICAL_SPREAD_BPS_EQUITY      = 150.0  # stale/broken book emergency cap
-QUANT_CRITICAL_SPREAD_TICKS_EQUITY    = 250.0
+QUANT_MAX_SPREAD_BPS_EQUITY           = 35.0
+QUANT_MAX_SPREAD_TICKS_EQUITY         = 8.0
 QUANT_SPREAD_SOFT_ATR_RATIO_COMMODITY = 0.50
 QUANT_MAX_SPREAD_ATR_RATIO_COMMODITY  = 2.00
 QUANT_MAX_SPREAD_BPS_COMMODITY        = 45.0
@@ -674,32 +672,3 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Institutional stop-survival geometry
-# SL must not sit at an obvious liquidity pool.  For long positions the stop
-# must clear the nearest SSL by this ATR buffer; for shorts it must clear BSL.
-# This is intentionally wider than the old 0.20–0.30 ATR retail-style pool
-# offset so stops sit beyond the sweep zone, not inside the liquidity cluster.
-SL_LIQUIDITY_CLEARANCE_ATR = 0.75
-SL_LIQUIDITY_CROWDED_TOUCH_ATR = 0.08
-SL_LIQUIDITY_HIGH_SIG_ATR = 0.025
-SL_PUSH_MAX_ATR = 4.0
-SL_MIN_SURVIVAL_RISK_ATR = 0.85
-
-# Structural stop invariant: never place initial SL in front of obvious protective liquidity.
-SL_PROTECTIVE_MIN_SIGNIFICANCE = 1.5
-SL_PROTECTIVE_SEARCH_ATR = 5.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Integrated dashboard telemetry
-# Emits structured, non-blocking telemetry directly to the local dashboard.
-# This does not participate in alpha/risk/execution decisions.
-DASHBOARD_ENABLED = True
-DASHBOARD_URL = "http://127.0.0.1:8000"
-DASHBOARD_TIMEOUT_SEC = 0.25
-DASHBOARD_QUEUE_MAX = 2000
-DASHBOARD_HEARTBEAT_SEC = 5.0
-DASHBOARD_SCAN_UPDATE_SEC = 5.0
-DASHBOARD_POSITION_UPDATE_SEC = 1.0

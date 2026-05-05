@@ -35,7 +35,6 @@ from core.pnl import gross_pnl_usd
 from core.instruments import current_instrument, instrument_scope
 from core.market_policy import policy_value, active_policy
 from telegram.notifier import send_telegram_message
-from telemetry.dashboard_emitter import DashboardEmitter, instrument_fields, policy_fields
 from execution.order_manager import CancelResult
 try:
     from strategy.ict_engine import ICTEngine, ICTConfluence
@@ -266,7 +265,7 @@ class QCfg:
     @staticmethod
     def ATR_PERIOD() -> int: return int(_cfg("SL_ATR_PERIOD", 14))
     @staticmethod
-    def TRAIL_ENABLED() -> bool: return bool(_cfg("QUANT_TRAIL_ENABLED", False))
+    def TRAIL_ENABLED() -> bool: return bool(_cfg("QUANT_TRAIL_ENABLED", True))
     @staticmethod
     def TRAIL_BE_R() -> float: return float(_cfg("QUANT_TRAIL_BE_R", 0.3))
     @staticmethod
@@ -609,11 +608,11 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
       paid_commission field (stored on PositionState.entry_fee_paid since v8.1).
 
     FORMULA:
-      fee_per_unit = exact_entry_fee / qty   if exact fee available (v8.1+)
+      fee_per_btc  = exact_entry_fee / qty   if exact fee available (v8.1+)
                    = entry_price × COMMISSION_RATE × 2   otherwise
       slippage_buf = 0.12 × ATR   (half-spread estimate; tighter than old 0.15,
                                    wider than old 0.10 — a calibrated middle ground)
-      be_price     = entry_price ± (fee_per_unit + slippage_buf)
+      be_price     = entry_price ± (fee_per_btc + slippage_buf)
 
     EXACT FEE:
       Delta's paid_commission is the actual taker/maker fee in USD for the entry
@@ -633,7 +632,7 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
     # MOD-5 FIX: Use the module-level `config` import instead of importing
     # inside the function on every call. Python caches imports, but repeated
     # function-level imports confuse profilers and signal sloppy architecture.
-    # ── Fee per strategy unit ─────────────────────────────────────────────────
+    # ── Fee per BTC ──────────────────────────────────────────────────────────
     _exact_fee = 0.0
     _qty       = 0.0
     if pos is not None:
@@ -643,27 +642,27 @@ def _calc_be_price(pos_side: str, entry_price: float, atr: float,
     if _exact_fee > 1e-6 and _qty > 1e-10:
         # Exact round-trip cost: entry paid_commission (exact) + estimated exit
         # fee (same rate applied symmetrically — we don't have the exit fee yet).
-        _entry_fee_per_unit = _exact_fee / _qty
+        _entry_fee_per_btc = _exact_fee / _qty
         # Estimate exit fee using config commission rate.
-        # BUG FIX: the old formula derived _exit_fee_rate = entry_fee_per_unit / price
-        # which is simply the entry commission rate, making _fee_per_unit = 2 ×
-        # entry_fee_per_unit — the exit leg was double-counted, yielding a BE price
+        # BUG FIX: the old formula derived _exit_fee_rate = entry_fee_per_btc / price
+        # which is simply the entry commission rate, making _fee_per_btc = 2 ×
+        # entry_fee_per_btc — the exit leg was double-counted, yielding a BE price
         # that was too far from entry and causing premature "too close" rejections.
         _exit_rate     = _stop_exit_fee_rate()
-        _fee_per_unit   = _entry_fee_per_unit + entry_price * _exit_rate
+        _fee_per_btc   = _entry_fee_per_btc + entry_price * _exit_rate
     else:
         # Fallback: bilateral estimate with stop/taker exit leg.
         _entry_rate  = float(getattr(config, 'COMMISSION_RATE', 0.00055))
         _exit_rate   = _stop_exit_fee_rate()
-        _fee_per_unit = entry_price * (_entry_rate + _exit_rate)
+        _fee_per_btc = entry_price * (_entry_rate + _exit_rate)
 
     # ── Slippage allowance ───────────────────────────────────────────────────
     # 0.12 ATR: tighter than the old 0.15 used in counter-BOS (that was overly
     # conservative) and wider than the 0.10 used in display (that was too tight).
-    # At $255 ATR this is $30.6 — covers normal half-spread/impact for the active instrument.
+    # At $255 ATR this is $30.6 — covers a normal half-spread on BTC perps.
     _slippage_buf = 0.12 * atr
 
-    _buf = _fee_per_unit + _slippage_buf
+    _buf = _fee_per_btc + _slippage_buf
     raw_be = entry_price + _buf if pos_side == "long" else entry_price - _buf
     return _round_to_tick_protective(pos_side, raw_be)
 
@@ -2868,38 +2867,7 @@ class QuantStrategy:
 
         self._last_unified_gate_key = None
         self._last_unified_gate_ts  = 0.0
-        self._dashboard = DashboardEmitter.from_config()
         self._log_init()
-
-    def _dashboard_base(self) -> Dict[str, Any]:
-        try:
-            inst = getattr(self, "_instrument", None)
-            return {**instrument_fields(inst), **policy_fields(inst)}
-        except Exception:
-            return {}
-
-    def _contract_qty_label(self, qty: float) -> str:
-        """Human label for strategy quantity without assuming BTC units.
-
-        BTC inverse products use BTC-sized quantity.  xStock/RWA/commodity
-        products use contract/token units.  This affects display only.
-        """
-        try:
-            inst = getattr(self, "_instrument", None)
-            ac = str(getattr(getattr(inst, "asset_class", ""), "value", getattr(inst, "asset_class", "")) or "").lower()
-            sym = str(getattr(inst, "display_symbol", getattr(inst, "symbol", "")) or "")
-            asset = str(getattr(inst, "asset_id", "") or "")
-            unit = "BTC" if ac == "crypto" and ("BTC" in sym.upper() or asset.upper() == "BTC") else "contracts"
-            return f"{float(qty or 0.0):.6f} {unit}"
-        except Exception:
-            return f"{float(qty or 0.0):.6f}"
-
-    def _dashboard_emit(self, event: Dict[str, Any]) -> None:
-        try:
-            payload = {**self._dashboard_base(), **dict(event or {})}
-            self._dashboard.emit(payload)
-        except Exception:
-            pass
 
     def _telegram_context(self) -> dict:
         """Runtime context attached to every asset-specific Telegram alert."""
@@ -2941,25 +2909,6 @@ class QuantStrategy:
             )
         except Exception:
             return send_telegram_message(message, parse_mode=parse_mode)
-
-    def _send_operator_alert(self, title: str, body: str, *, event_type: str = "operator_alert", critical: bool = True) -> bool:
-        """Send an asset-scoped operational alert and never fail the caller.
-
-        Used for protection/fill/bracket/data-path failures.  These alerts are
-        deliberately not hidden behind routine report throttles because an
-        institutional operator must know when a trade was refused, unprotected,
-        flattened, or when data quality is degraded.
-        """
-        try:
-            prefix = "🚨" if critical else "⚠️"
-            msg = f"{prefix} <b>{title}</b>\n{body}"
-            self._dashboard_emit({"type": event_type or "alert", "severity": "critical" if critical else "warning", "title": title, "message": body})
-            return self._send_telegram(msg, event_type=event_type)
-        except Exception:
-            try:
-                return send_telegram_message(f"{title}\n{body}")
-            except Exception:
-                return False
 
     def _log_init(self):
         logger.info("=" * 72)
@@ -3199,22 +3148,6 @@ class QuantStrategy:
             logger.debug(f"Expected-utility advisory annotation error: {e}")
 
     def _defer_entry_signal(self, signal, reason: str, cooldown_sec: float = 30.0) -> None:
-        # Direct dashboard telemetry for strategy-level deferrals.  This is
-        # observation only; it does not change entry/risk/execution decisions.
-        try:
-            self._dashboard_emit({
-                "type": "candidate_deferred",
-                "side": str(getattr(signal, "side", "") or "").upper(),
-                "phase": str(getattr(getattr(signal, "entry_type", ""), "value", getattr(signal, "entry_type", "")) or ""),
-                "entry": float(getattr(signal, "entry_price", 0.0) or 0.0),
-                "sl": float(getattr(signal, "sl_price", 0.0) or 0.0),
-                "tp": float(getattr(signal, "tp_price", 0.0) or 0.0),
-                "rr": float(getattr(signal, "rr_ratio", 0.0) or 0.0),
-                "reason": str(reason or "")[:700],
-                "cooldown_sec": float(cooldown_sec or 0.0),
-            })
-        except Exception:
-            pass
         reason_l = str(reason or "").lower()
         if ("executable utility" in reason_l or "target surface" in reason_l):
             try:
@@ -3811,21 +3744,18 @@ class QuantStrategy:
             logger.info("♻️ Strategy engines soft-reset after stream restart (ATR values preserved)")
 
     def set_trail_override(self, enabled: Optional[bool]):
-        """Telegram/operator control for SL trailing.
-
-        None  = use config default (QUANT_TRAIL_ENABLED; v14 default is OFF)
-        True  = enable liquidity/structure SL trailing for this strategy desk
-        False = disable SL trailing for this strategy desk
-
-        Disabling trailing never cancels the exchange-attached bracket SL/TP. It
-        only prevents the bot from moving/replacing the SL. This is intentional:
-        users can run fixed-bracket exits by default and turn trailing on only
-        when they explicitly command it from Telegram.
-        """
+        """v4.3: Telegram command to override trailing SL on/off, even mid-position.
+        None = use config default, True = force on, False = force off."""
         with self._lock:
+            if enabled is False and self._pos.is_active():
+                self._pos.trail_override = None
+                logger.warning(
+                    "Trail override OFF ignored while position is active; "
+                    "protective management remains on")
+                return False
             self._pos.trail_override = enabled
             if enabled is None:
-                logger.info("Trail override cleared → using config default (%s)", "ON" if QCfg.TRAIL_ENABLED() else "OFF")
+                logger.info("Trail override cleared → using config default")
             else:
                 logger.info(f"Trail override set → {'ENABLED' if enabled else 'DISABLED'}")
 
@@ -3933,20 +3863,13 @@ class QuantStrategy:
             else:
                 self._active_spread_cost_mult = 1.0
 
-            # v15 institutional cost gate:
-            # Do NOT hard-veto tokenised equities merely because the book has many
-            # ticks.  xStock contracts can quote with coarse/tiny tick geometry, so
-            # tick count alone is a venue microstructure cost, not an alpha veto.
-            # Hard block only when the orderbook is expensive in volatility space
-            # AND expensive in absolute execution-cost space, or when the book is
-            # clearly stale/broken by extreme bps/tick limits. Otherwise convert the
-            # cost into an EV/size impairment and let the portfolio manager decide.
+            # For non-crypto, hard-block only when spread is bad on at least two
+            # orthogonal dimensions.  A high ratio caused by tiny ATR alone is
+            # not enough; it becomes a size haircut instead.
             if asset_class in ("equity", "commodity", "index"):
-                critical_bps = float(getattr(config, "QUANT_CRITICAL_SPREAD_BPS_EQUITY", hard_bps * 3.0)) if asset_class == "equity" else hard_bps * 3.0
-                critical_ticks = float(getattr(config, "QUANT_CRITICAL_SPREAD_TICKS_EQUITY", hard_ticks * 3.0)) if asset_class == "equity" else hard_ticks * 3.0
                 hard_fail = (
-                    (ratio > hard_ratio and (spread_bps > hard_bps or spread_ticks > hard_ticks))
-                    or (spread_bps > critical_bps and spread_ticks > critical_ticks and ratio > soft_ratio)
+                    (ratio > hard_ratio and spread_bps > hard_bps)
+                    or (spread_ticks > hard_ticks and spread_bps > hard_bps)
                 )
             else:
                 hard_fail = (ratio > hard_ratio) or (spread_bps > hard_bps and ratio > soft_ratio)
@@ -3973,14 +3896,11 @@ class QuantStrategy:
             if hard_fail:
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
-                    _why = []
-                    if ratio > hard_ratio: _why.append(f"ratio {ratio:.3f}>{hard_ratio:.2f}")
-                    if spread_bps > hard_bps: _why.append(f"bps {spread_bps:.2f}>{hard_bps:.2f}")
-                    if spread_ticks > hard_ticks: _why.append(f"ticks {spread_ticks:.1f}>{hard_ticks:.1f}")
                     logger.info(
-                        f"⛔ Spread execution-quality hard block [{asset_class or 'unknown'}]: "
-                        f"{', '.join(_why) or 'critical spread'} | ATR=${atr:.4f} "
-                        f"spread=${spread_usd:.4f} ({spread_bps:.2f}bps, {spread_ticks:.1f} ticks)")
+                        f"⛔ Spread/ATR gate [{asset_class or 'unknown'}]: "
+                        f"ratio={ratio:.3f}>{hard_ratio:.2f} spread={spread_bps:.2f}bps "
+                        f"ticks={spread_ticks:.1f}>{hard_ticks:.1f} ATR=${atr:.4f} "
+                        f"spread=${spread_usd:.4f} — hard block")
                 return False, ratio
 
             if ratio > soft_ratio:
@@ -5894,16 +5814,6 @@ class QuantStrategy:
                 f"ENTRY CANDIDATE APPROVED: {signal.entry_type.value} {signal.side.upper()} "
                 f"@ ${signal.entry_price:,.1f} | SL=${signal.sl_price:,.1f} "
                 f"TP=${signal.tp_price:,.1f} R:R={signal.rr_ratio:.1f}")
-            self._dashboard_emit({
-                "type": "candidate_approved",
-                "side": signal.side.upper(),
-                "phase": str(getattr(signal.entry_type, "value", signal.entry_type)),
-                "entry": float(signal.entry_price or 0.0),
-                "sl": float(signal.sl_price or 0.0),
-                "tp": float(signal.tp_price or 0.0),
-                "rr": float(signal.rr_ratio or 0.0),
-                "reason": str(getattr(signal, "reason", ""))[:500],
-            })
             self._last_entry_signal = signal
 
             # Mark the entry engine before the background thread starts. If the
@@ -6393,23 +6303,12 @@ class QuantStrategy:
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
         elif _delta_requires_native_bracket:
-            _inst = getattr(self, "_instrument", None)
-            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
-            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-            _body = (
-                f"<b>{_asset}</b> · DELTA:{_sym} · {side.upper()}\n"
-                f"Native Delta bracket was not accepted/filled, so the bot refused a naked entry.\n"
-                f"Qty <code>{qty:.8g}</code> · Entry <code>${limit_px:,.2f}</code>\n"
-                f"Expected SL <code>${sl_price:,.2f}</code> · TP <code>${tp_price:,.2f}</code>\n"
-                f"Action: no position opened; desk cooled down."
-            )
             logger.error(
                 "❌ Delta native bracket entry failed — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
                 f"side={side} qty={qty} entry=${limit_px:,.2f} "
                 f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
             )
-            self._send_operator_alert("BRACKET ENTRY REFUSED — NO NAKED FALLBACK", _body, event_type="protection_failure", critical=True)
             self._last_exit_time = time.time()
             return
         else:
@@ -6425,20 +6324,6 @@ class QuantStrategy:
 
         if not entry_data:
             logger.error("❌ Entry order failed")
-            _inst = getattr(self, "_instrument", None)
-            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
-            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-            self._send_operator_alert(
-                "ENTRY ORDER FAILED",
-                (
-                    f"<b>{_asset}</b> · {str(_active_exchange or 'exchange').upper()}:{_sym}\n"
-                    f"Side {side.upper()} · Qty <code>{qty:.8g}</code> · Entry <code>${limit_px:,.2f}</code>\n"
-                    f"Expected SL <code>${sl_price:,.2f}</code> · TP <code>${tp_price:,.2f}</code>\n"
-                    f"Action: no position opened; desk cooled down."
-                ),
-                event_type="execution_failure",
-                critical=True,
-            )
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
             return
 
@@ -6446,15 +6331,6 @@ class QuantStrategy:
             logger.error(
                 "❌ Delta entry returned without bracket_order=True — refusing to "
                 "treat it as an active position because TP/SL are not exchange-attached."
-            )
-            _inst = getattr(self, "_instrument", None)
-            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
-            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-            self._send_operator_alert(
-                "UNPROTECTED DELTA ENTRY REJECTED",
-                f"<b>{_asset}</b> · DELTA:{_sym}\nDelta response did not confirm bracket_order=True. Bot refused to activate the position.",
-                event_type="protection_failure",
-                critical=True,
             )
             self._last_exit_time = time.time()
             return
@@ -6610,17 +6486,7 @@ class QuantStrategy:
             if not sl_order_id_raw or not tp_order_id_raw:
                 logger.warning(
                     "⚠️ Bracket child order IDs not found after fill — "
-                    "strategy will not assume full exchange protection.")
-                try:
-                    self._send_operator_alert(
-                        "BRACKET CHILD IDS INCOMPLETE",
-                        f"{getattr(self, '_asset_id', QCfg.SYMBOL())} {side.upper()} fill has incomplete bracket child IDs. "
-                        f"SL id present={bool(sl_order_id_raw)} TP id present={bool(tp_order_id_raw)}.",
-                        event_type="protection_failure",
-                        critical=True,
-                    )
-                except Exception:
-                    pass
+                    "trailing SL may not work. Check open orders manually.")
         else:
             # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
             sweep = order_manager.cancel_symbol_conditionals()
@@ -6916,7 +6782,7 @@ class QuantStrategy:
             f"Posterior: <code>{_posterior}</code>\n"
             f"Reason: <code>{_entry_reason[:180]}</code>\n"
             f"\n<b>Execution</b>\n"
-            f"Entry: <b>${fill_price:,.2f}</b>   Qty: <code>{self._contract_qty_label(qty)}</code>\n"
+            f"Entry: <b>${fill_price:,.2f}</b>   Qty: <code>{qty:.6f} BTC</code>\n"
             f"Risk:  <code>${dollar_risk:.2f}</code>   Payoff/Risk: <code>1:{rr_a:.2f}</code>\n"
             f"\n<b>Institutional Stop</b>\n"
             f"SL: <b>${sl_price:,.2f}</b>  ({sl_dist_pts/max(self._atr_5m.atr,1):.2f} ATR)\n"
@@ -6934,22 +6800,6 @@ class QuantStrategy:
             f"✅ ACTIVE {side.upper()} [{mode}] @ ${fill_price:,.2f} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} | R:R=1:{rr_a:.2f}"
         )
-        self._dashboard_emit({
-            "type": "position_opened",
-            "side": side.upper(),
-            "state": "ACTIVE",
-            "phase": mode,
-            "entry": float(fill_price or 0.0),
-            "price": float(fill_price or 0.0),
-            "sl": float(sl_price or 0.0),
-            "tp": float(tp_price or 0.0),
-            "qty": float(qty or 0.0),
-            "r": 0.0,
-            "mfe_r": 0.0,
-            "trailing": "ON" if self.get_trail_enabled() else "OFF",
-            "bracket": "VERIFIED" if is_bracket else "STANDALONE",
-            "reason": str(_entry_reason)[:500],
-        })
 
     def _observe_position_extremes(self, pos, price: float) -> tuple:
         profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
@@ -8442,7 +8292,7 @@ class QuantStrategy:
             pos.side,
             pos.entry_price,
             fill_price,
-            quantity_units=pos.quantity,
+            pos.quantity,
             inverse=bool(_is_delta and fill_price > 0),
         )
 
@@ -8527,8 +8377,6 @@ class QuantStrategy:
                     quantity     = pos.quantity,
                     reason       = exit_reason,
                     pnl_override = pnl,
-                    instrument   = getattr(self, "_instrument", None),
-                    leverage     = QCfg.LEVERAGE(),
                 )
         except Exception as _rm_rec_e:
             logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")
@@ -9226,7 +9074,7 @@ class QuantStrategy:
         FORMULA (industry standard):
           sl_dist      = |price − sl_price|                         (points)
           risk_capital = available_balance × RISK_PER_TRADE         (USD at risk)
-          qty_raw      = risk_capital × total_mult / sl_dist        (strategy quantity units)
+          qty_raw      = risk_capital × total_mult / sl_dist        (BTC)
 
         This guarantees a fixed dollar loss at SL regardless of SL distance.
         A 50-point SL and a 500-point SL both risk exactly RISK_PER_TRADE × balance.
@@ -9262,14 +9110,7 @@ class QuantStrategy:
         configured_step = max(float(QCfg.LOT_STEP()), 1e-12)
         step = configured_step
         try:
-            inst = getattr(self, "_instrument", None) or current_instrument()
-            asset_id = str(getattr(inst, "asset_id", "") or "").upper()
-            sym = str(getattr(inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL()).upper()
-            ac = str(getattr(getattr(inst, "asset_class", ""), "value", getattr(inst, "asset_class", "")) or "").lower()
-            # Only BTC inverse products should inherit DELTA_CONTRACT_VALUE_BTC.
-            # xStock/RWA/commodity contracts use instrument lot_step; applying the
-            # BTC step globally can silently distort small non-BTC product sizing.
-            if "delta" in QCfg.EXCHANGE().lower() and ac == "crypto" and (asset_id == "BTC" or "BTC" in sym):
+            if "delta" in QCfg.EXCHANGE().lower():
                 contract_step = float(getattr(config, "DELTA_CONTRACT_VALUE_BTC", 0.0) or 0.0)
                 if contract_step > 0.0:
                     step = max(configured_step, contract_step)
@@ -9429,13 +9270,13 @@ class QuantStrategy:
 
         cash_budget = available * _bal_usage_frac
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
-        reserve_fee_per_unit = max(
+        reserve_fee_per_btc = max(
             float(viability.round_trip_cost_pts),
             price * taker_rate * 2.0 * 1.15,
         )
-        margin_per_unit = price / leverage
-        cash_per_unit = margin_per_unit + reserve_fee_per_unit
-        max_qty_cash = math.floor((cash_budget / max(cash_per_unit, 1e-12)) / step) * step
+        margin_per_btc = price / leverage
+        cash_per_btc = margin_per_btc + reserve_fee_per_btc
+        max_qty_cash = math.floor((cash_budget / max(cash_per_btc, 1e-12)) / step) * step
         max_qty_margin = math.floor(((cash_budget * leverage / price) / step)) * step
         executable_qty_cap = round(max(0.0, min(max_qty, max_qty_cash, max_qty_margin)), 8)
         if executable_qty_cap < min_qty:
@@ -9479,7 +9320,7 @@ class QuantStrategy:
             if cand < min_qty - 1e-12 or cand > executable_qty_cap + 1e-12:
                 continue
             cand_margin = cand * price / leverage
-            cand_fee_reserve = cand * reserve_fee_per_unit
+            cand_fee_reserve = cand * reserve_fee_per_btc
             cand_risk = cand * sl_dist
             cash_need = cand_margin + cand_fee_reserve
             if cand_margin > max_allowed_margin + 1e-9 or cash_need > cash_budget + 1e-9:
@@ -9509,7 +9350,7 @@ class QuantStrategy:
         # funds as margin on any single trade — the remaining 40% stays liquid
         # for commission, funding, and drawdown headroom.
         required_margin = qty * price / leverage
-        required_cash = required_margin + qty * reserve_fee_per_unit
+        required_cash = required_margin + qty * reserve_fee_per_btc
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
@@ -9616,7 +9457,7 @@ class QuantStrategy:
             pos.side,
             pos.entry_price,
             exit_price,
-            quantity_units=pos.quantity,
+            pos.quantity,
             inverse=bool(_is_delta),
         )
         entry_fee = pos.entry_price * pos.quantity * entry_rate
@@ -10138,20 +9979,6 @@ class QuantStrategy:
                     f"💀 Adopted {iside.upper()} has NO stop-loss on exchange — "
                     f"emergency-flattening to prevent unbounded loss.")
                 try:
-                    _inst = getattr(self, "_instrument", None)
-                    _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
-                    _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-                    self._send_operator_alert(
-                        "ADOPTED POSITION HAS NO EXCHANGE SL",
-                        f"<b>{_asset}</b> · {_sym} · {iside.upper()}\n"
-                        f"Exchange position exists but no product-matched stop-loss was found.\n"
-                        f"Action: emergency reduce-only flatten submitted.",
-                        event_type="protection_failure",
-                        critical=True,
-                    )
-                except Exception:
-                    pass
-                try:
                     if hasattr(order_manager, "emergency_flatten"):
                         order_manager.emergency_flatten(reason="adopted_unprotected")
                     else:
@@ -10163,23 +9990,6 @@ class QuantStrategy:
                         )
                 except Exception as _ef_e:
                     logger.error(f"emergency_flatten raised: {_ef_e}", exc_info=True)
-            elif tp_oid is None:
-                logger.warning(
-                    f"⚠️ Adopted {iside.upper()} has SL but NO take-profit order — "
-                    f"position is loss-protected but target management requires operator attention.")
-                try:
-                    _inst = getattr(self, "_instrument", None)
-                    _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
-                    _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-                    self._send_operator_alert(
-                        "ADOPTED POSITION MISSING TP",
-                        f"<b>{_asset}</b> · {_sym} · {iside.upper()}\n"
-                        f"Exchange SL exists, but no product-matched TP was found. Dashboard/Telegram will mark target protection incomplete.",
-                        event_type="execution_warning",
-                        critical=False,
-                    )
-                except Exception:
-                    pass
             return
         if phase==PositionPhase.ACTIVE and ex_size<QCfg.MIN_QTY():
             logger.info("📡 Reconcile: exchange FLAT → TP/SL fired")

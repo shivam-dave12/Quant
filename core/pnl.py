@@ -1,51 +1,31 @@
-"""Authoritative PnL formulas shared by strategy and risk accounting.
-
-Quantity is expressed in the strategy/execution unit for the active contract:
-BTC exposure for BTC inverse products, contract/share units for xStocks/RWA/
-commodities, or whatever the exchange adapter normalises to.  Do not hardcode
-BTC in accounting labels; the adapter owns contract translation.
-"""
+"""Authoritative PnL formulas shared by strategy and risk accounting."""
 
 from __future__ import annotations
 
-from typing import Optional
 
-
-def _qty(quantity_units: Optional[float] = None, quantity_btc: Optional[float] = None) -> float:
-    # ``quantity_btc`` is accepted for old call sites/tests, but the accounting
-    # engine is unit-generic.  New code should pass quantity_units.
-    if quantity_units is None:
-        quantity_units = quantity_btc
-    if quantity_units is None:
-        raise ValueError("quantity_units is required")
-    return float(quantity_units)
-
-
-def linear_pnl_usd(side: str, entry_price: float, exit_price: float,
-                   quantity_units: Optional[float] = None,
-                   quantity_btc: Optional[float] = None) -> float:
-    qty = _qty(quantity_units, quantity_btc)
+def linear_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_btc: float) -> float:
     side_u = str(side).upper()
     if side_u == "LONG":
-        return (float(exit_price) - float(entry_price)) * qty
+        return (float(exit_price) - float(entry_price)) * float(quantity_btc)
     if side_u == "SHORT":
-        return (float(entry_price) - float(exit_price)) * qty
+        return (float(entry_price) - float(exit_price)) * float(quantity_btc)
     raise ValueError(f"invalid side: {side!r}")
 
 
-def inverse_pnl_usd(side: str, entry_price: float, exit_price: float,
-                    quantity_units: Optional[float] = None,
-                    quantity_btc: Optional[float] = None) -> float:
+def inverse_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_btc: float) -> float:
     """
-    USD PnL for BTCUSD inverse exposure when strategy quantity is BTC exposure.
+    USD PnL for BTCUSD inverse exposure when order quantity is tracked in BTC.
 
-    For Delta BTCUSD, the adapter converts raw contracts into BTC exposure before
-    this function is called.  For non-BTC Delta products, callers should pass
-    inverse=False; the linear function uses the same quantity unit as execution.
+    The BTC-settled inverse formula converts back to USD at exit. With quantity
+    represented as BTC exposure at entry, the USD result is:
+      LONG  = qty * entry * (1/entry - 1/exit) * exit
+      SHORT = qty * entry * (1/exit - 1/entry) * exit
+    which simplifies to the same USD delta as linear BTC exposure, but keeping
+    this function explicit prevents the common missing-*exit_price bug.
     """
     entry = float(entry_price)
     exit_ = float(exit_price)
-    qty = _qty(quantity_units, quantity_btc)
+    qty = float(quantity_btc)
     if entry <= 0 or exit_ <= 0:
         raise ValueError("entry_price and exit_price must be positive")
     side_u = str(side).upper()
@@ -57,10 +37,7 @@ def inverse_pnl_usd(side: str, entry_price: float, exit_price: float,
 
 
 def gross_pnl_usd(side: str, entry_price: float, exit_price: float,
-                  quantity_units: Optional[float] = None,
-                  inverse: bool = False,
-                  quantity_btc: Optional[float] = None) -> float:
-    qty = _qty(quantity_units, quantity_btc)
+                  quantity_btc: float, inverse: bool = False) -> float:
     if inverse:
-        return inverse_pnl_usd(side, entry_price, exit_price, quantity_units=qty)
-    return linear_pnl_usd(side, entry_price, exit_price, quantity_units=qty)
+        return inverse_pnl_usd(side, entry_price, exit_price, quantity_btc)
+    return linear_pnl_usd(side, entry_price, exit_price, quantity_btc)

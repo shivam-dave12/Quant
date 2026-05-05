@@ -317,8 +317,6 @@ class RiskManager:
         quantity:      float,
         reason:        str,
         pnl_override:  float = None,
-        instrument     = None,
-        leverage:      float = None,
     ):
         """
         Record a completed trade.
@@ -354,7 +352,7 @@ class RiskManager:
                     side=side,
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    quantity_units=quantity,
+                    quantity_btc=quantity,
                     inverse=_is_inverse,
                 )
 
@@ -370,28 +368,8 @@ class RiskManager:
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            # Use instrument/current policy leverage when provided.  Falling back
-            # to config.LEVERAGE is only for old single-symbol callers.
-            lev = float(leverage) if leverage is not None else float(getattr(config, "LEVERAGE", 1.0) or 1.0)
-            if lev <= 0:
-                lev = 1.0
-            margin_used       = notional_at_entry / lev if lev > 0 else notional_at_entry
+            margin_used       = notional_at_entry / config.LEVERAGE if config.LEVERAGE > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
-
-            def _qty_unit_label() -> str:
-                try:
-                    ac = str(getattr(getattr(instrument, "asset_class", ""), "value", getattr(instrument, "asset_class", "")) or "").lower()
-                    asset = str(getattr(instrument, "asset_id", "") or "").upper()
-                    sym = str(getattr(instrument, "display_symbol", "") or "").upper()
-                    if ac == "crypto" and (asset == "BTC" or "BTC" in sym):
-                        return "BTC"
-                    if ac in ("equity", "commodity", "index"):
-                        return "contracts"
-                except Exception:
-                    pass
-                return "units"
-
-            qty_unit = _qty_unit_label()
 
             trade = TradeRecord(
                 timestamp   = time.time(),
@@ -423,8 +401,7 @@ class RiskManager:
                 f"📊 Trade recorded: {side.upper()} | "
                 f"Net P&L: ${pnl:+.2f} | "
                 f"Return on margin: {return_on_margin:+.2f}% | "
-                f"Qty: {quantity:.4f} {qty_unit} | "
-                f"Lev: {lev:g}x | "
+                f"Qty: {quantity:.4f} BTC | "
                 f"Total trades: {self.total_trades}"
             )
 
