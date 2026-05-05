@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Institutional Portfolio Command Center V3</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">INSTITUTIONAL MULTI-ASSET COMMAND CENTER</div>
+        <h1>Portfolio Dashboard V3</h1>
+        <p>Sidecar monitor. No strategy, execution, risk or MarketAggregator logic is modified.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn">Refresh</button>
+        <button id="toggleThemeBtn">Theme</button>
+        <div class="pill" id="botStatus">OFFLINE</div>
+      </div>
+    </header>
+
+    <section class="kpis" id="kpiGrid"></section>
+
+    <section class="workspace">
+      <aside class="left-panel card">
+        <div class="section-title">
+          <h2>Asset Desks</h2>
+          <input id="assetSearch" placeholder="Search asset..." />
+        </div>
+        <div id="heatmap" class="heatmap"></div>
+        <div id="assetList" class="asset-list"></div>
+      </aside>
+
+      <main class="main-panel">
+        <section class="chart-grid">
+          <div class="card chart-card">
+            <div class="section-title"><h2>Portfolio PnL</h2><span id="pnlMeta"></span></div>
+            <canvas id="pnlChart" height="180"></canvas>
+          </div>
+          <div class="card chart-card">
+            <div class="section-title"><h2 id="assetChartTitle">Selected Asset Price</h2><select id="assetSelect"></select></div>
+            <canvas id="priceChart" height="180"></canvas>
+          </div>
+          <div class="card chart-card">
+            <div class="section-title"><h2>Spread / Execution Cost</h2><span>bps + ATR ratio</span></div>
+            <canvas id="spreadChart" height="180"></canvas>
+          </div>
+          <div class="card chart-card">
+            <div class="section-title"><h2>Posterior / EV</h2><span>edge monitor</span></div>
+            <canvas id="posteriorChart" height="180"></canvas>
+          </div>
+        </section>
+
+        <section class="lower-grid">
+          <div class="card">
+            <div class="section-title"><h2>Live Positions</h2><span id="positionsCount">0</span></div>
+            <div id="positionsList" class="stack"></div>
+          </div>
+          <div class="card">
+            <div class="section-title"><h2>Decision Feed</h2><span id="decisionsCount">0</span></div>
+            <div id="decisionFeed" class="stack tall"></div>
+          </div>
+          <div class="card">
+            <div class="section-title"><h2>Alerts</h2><span id="alertsCount">0</span></div>
+            <div id="alertsList" class="stack tall"></div>
+          </div>
+          <div class="card">
+            <div class="section-title"><h2>Event Tape</h2><span id="eventsCount">0</span></div>
+            <div id="eventsList" class="stack tall"></div>
+          </div>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
+  <aside id="assetDrawer" class="drawer hidden">
+    <div class="drawer-header">
+      <div><div class="eyebrow">ASSET DEEP DIVE</div><h2 id="drawerTitle">Asset</h2></div>
+      <button id="drawerClose">×</button>
+    </div>
+    <div id="drawerBody" class="drawer-body"></div>
+  </aside>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

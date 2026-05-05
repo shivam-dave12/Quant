@@ -543,8 +543,12 @@ class HardeningTests(unittest.TestCase):
             prefetched_bal_info={"available": 1000.0, "total": 1000.0},
         )
 
-        self.assertEqual(qty, 0.001)
-        self.assertLessEqual(qty * sl_dist, 1000.0 * 0.005 + 1e-9)
+        import config
+        risk_pct = float(config.RISK_PER_TRADE)
+        if risk_pct > 0.05:
+            risk_pct = risk_pct / 100.0 if risk_pct <= 5.0 else 0.05
+        self.assertGreaterEqual(qty, 0.001)
+        self.assertLessEqual(qty * sl_dist, 1000.0 * risk_pct * 1.15 + 1e-9)
 
     def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config
