@@ -249,11 +249,11 @@ class DeltaWebSocket:
 
         def _on_error(ws, error):
             self._connection_failures += 1
-            _msg = f"DeltaWebSocket error (failure #{self._connection_failures}): {error}"
-        if self._connection_failures < 3:
-            logger.warning(_msg)
-        else:
-            logger.error(_msg)
+            msg = f"DeltaWebSocket error (failure #{self._connection_failures}): {error}"
+            if self._connection_failures < 3:
+                logger.warning(msg)
+            else:
+                logger.error(msg)
 
         def _on_close(ws, close_status_code, close_msg):
             self.is_connected = False
