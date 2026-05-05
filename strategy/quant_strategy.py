@@ -2910,6 +2910,24 @@ class QuantStrategy:
         except Exception:
             return send_telegram_message(message, parse_mode=parse_mode)
 
+    def _send_operator_alert(self, title: str, body: str, *, event_type: str = "operator_alert", critical: bool = True) -> bool:
+        """Send an asset-scoped operational alert and never fail the caller.
+
+        Used for protection/fill/bracket/data-path failures.  These alerts are
+        deliberately not hidden behind routine report throttles because an
+        institutional operator must know when a trade was refused, unprotected,
+        flattened, or when data quality is degraded.
+        """
+        try:
+            prefix = "🚨" if critical else "⚠️"
+            msg = f"{prefix} <b>{title}</b>\n{body}"
+            return self._send_telegram(msg, event_type=event_type)
+        except Exception:
+            try:
+                return send_telegram_message(f"{title}\n{body}")
+            except Exception:
+                return False
+
     def _log_init(self):
         logger.info("=" * 72)
         logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
@@ -3866,13 +3884,20 @@ class QuantStrategy:
             else:
                 self._active_spread_cost_mult = 1.0
 
-            # For non-crypto, hard-block only when spread is bad on at least two
-            # orthogonal dimensions.  A high ratio caused by tiny ATR alone is
-            # not enough; it becomes a size haircut instead.
+            # v15 institutional cost gate:
+            # Do NOT hard-veto tokenised equities merely because the book has many
+            # ticks.  xStock contracts can quote with coarse/tiny tick geometry, so
+            # tick count alone is a venue microstructure cost, not an alpha veto.
+            # Hard block only when the orderbook is expensive in volatility space
+            # AND expensive in absolute execution-cost space, or when the book is
+            # clearly stale/broken by extreme bps/tick limits. Otherwise convert the
+            # cost into an EV/size impairment and let the portfolio manager decide.
             if asset_class in ("equity", "commodity", "index"):
+                critical_bps = float(getattr(config, "QUANT_CRITICAL_SPREAD_BPS_EQUITY", hard_bps * 3.0)) if asset_class == "equity" else hard_bps * 3.0
+                critical_ticks = float(getattr(config, "QUANT_CRITICAL_SPREAD_TICKS_EQUITY", hard_ticks * 3.0)) if asset_class == "equity" else hard_ticks * 3.0
                 hard_fail = (
-                    (ratio > hard_ratio and spread_bps > hard_bps)
-                    or (spread_ticks > hard_ticks and spread_bps > hard_bps)
+                    (ratio > hard_ratio and (spread_bps > hard_bps or spread_ticks > hard_ticks))
+                    or (spread_bps > critical_bps and spread_ticks > critical_ticks and ratio > soft_ratio)
                 )
             else:
                 hard_fail = (ratio > hard_ratio) or (spread_bps > hard_bps and ratio > soft_ratio)
@@ -3899,11 +3924,14 @@ class QuantStrategy:
             if hard_fail:
                 if _now - getattr(self, "_last_spread_gate_warn", 0.0) >= 60.0:
                     self._last_spread_gate_warn = _now
+                    _why = []
+                    if ratio > hard_ratio: _why.append(f"ratio {ratio:.3f}>{hard_ratio:.2f}")
+                    if spread_bps > hard_bps: _why.append(f"bps {spread_bps:.2f}>{hard_bps:.2f}")
+                    if spread_ticks > hard_ticks: _why.append(f"ticks {spread_ticks:.1f}>{hard_ticks:.1f}")
                     logger.info(
-                        f"⛔ Spread/ATR gate [{asset_class or 'unknown'}]: "
-                        f"ratio={ratio:.3f}>{hard_ratio:.2f} spread={spread_bps:.2f}bps "
-                        f"ticks={spread_ticks:.1f}>{hard_ticks:.1f} ATR=${atr:.4f} "
-                        f"spread=${spread_usd:.4f} — hard block")
+                        f"⛔ Spread execution-quality hard block [{asset_class or 'unknown'}]: "
+                        f"{', '.join(_why) or 'critical spread'} | ATR=${atr:.4f} "
+                        f"spread=${spread_usd:.4f} ({spread_bps:.2f}bps, {spread_ticks:.1f} ticks)")
                 return False, ratio
 
             if ratio > soft_ratio:
@@ -6306,12 +6334,23 @@ class QuantStrategy:
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
         elif _delta_requires_native_bracket:
+            _inst = getattr(self, "_instrument", None)
+            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
+            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
+            _body = (
+                f"<b>{_asset}</b> · DELTA:{_sym} · {side.upper()}\n"
+                f"Native Delta bracket was not accepted/filled, so the bot refused a naked entry.\n"
+                f"Qty <code>{qty:.8g}</code> · Entry <code>${limit_px:,.2f}</code>\n"
+                f"Expected SL <code>${sl_price:,.2f}</code> · TP <code>${tp_price:,.2f}</code>\n"
+                f"Action: no position opened; desk cooled down."
+            )
             logger.error(
                 "❌ Delta native bracket entry failed — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
                 f"side={side} qty={qty} entry=${limit_px:,.2f} "
                 f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
             )
+            self._send_operator_alert("BRACKET ENTRY REFUSED — NO NAKED FALLBACK", _body, event_type="protection_failure", critical=True)
             self._last_exit_time = time.time()
             return
         else:
@@ -6327,6 +6366,20 @@ class QuantStrategy:
 
         if not entry_data:
             logger.error("❌ Entry order failed")
+            _inst = getattr(self, "_instrument", None)
+            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
+            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
+            self._send_operator_alert(
+                "ENTRY ORDER FAILED",
+                (
+                    f"<b>{_asset}</b> · {str(_active_exchange or 'exchange').upper()}:{_sym}\n"
+                    f"Side {side.upper()} · Qty <code>{qty:.8g}</code> · Entry <code>${limit_px:,.2f}</code>\n"
+                    f"Expected SL <code>${sl_price:,.2f}</code> · TP <code>${tp_price:,.2f}</code>\n"
+                    f"Action: no position opened; desk cooled down."
+                ),
+                event_type="execution_failure",
+                critical=True,
+            )
             self._last_exit_time = time.time()  # engage cooldown — prevents hammer-retrying
             return
 
@@ -6334,6 +6387,15 @@ class QuantStrategy:
             logger.error(
                 "❌ Delta entry returned without bracket_order=True — refusing to "
                 "treat it as an active position because TP/SL are not exchange-attached."
+            )
+            _inst = getattr(self, "_instrument", None)
+            _asset = str(getattr(_inst, "asset_id", getattr(self, "_asset_id", QCfg.SYMBOL())) or "").upper()
+            _sym = str(getattr(_inst, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
+            self._send_operator_alert(
+                "UNPROTECTED DELTA ENTRY REJECTED",
+                f"<b>{_asset}</b> · DELTA:{_sym}\nDelta response did not confirm bracket_order=True. Bot refused to activate the position.",
+                event_type="protection_failure",
+                critical=True,
             )
             self._last_exit_time = time.time()
             return

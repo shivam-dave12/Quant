@@ -376,7 +376,15 @@ class MultiAssetQuantBot:
             return f"{mode} / {'ON' if enabled else 'OFF'}"
 
         lines = ["🛡 <b>TRAILING SL CONTROL</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        lines.append("Default: <b>OFF</b>. Bracket SL/TP remains active; only SL movement is disabled until /trail on.")
+        try:
+            import config as _cfg
+            _default_on = bool(getattr(_cfg, "QUANT_TRAIL_ENABLED", False))
+        except Exception:
+            _default_on = False
+        if _default_on:
+            lines.append("Default: <b>ON</b>. Telegram <code>/trail off</code> disables SL movement; bracket SL/TP remains active.")
+        else:
+            lines.append("Default: <b>OFF</b>. Bracket SL/TP remains active; only SL movement is disabled until <code>/trail on</code>.")
         if result is not None:
             enabled = result.get("enabled")
             if enabled is True:

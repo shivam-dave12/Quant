@@ -418,7 +418,15 @@ class DeltaDataManager:
                         time.sleep(1.0)
 
             if not candles:
-                logger.error(f"Delta REST refresh {label}: no usable candles returned")
+                # v15: transient REST gaps are common during Delta reconnects and
+                # across low-liquidity tokenized-equity contracts.  Keep the last
+                # good candle buffer and rate-limit the warning; readiness/ATR
+                # guards prevent trading on an empty/stale buffer.
+                _now = time.time()
+                _key = f"_last_no_usable_{label}"
+                if _now - float(getattr(self, _key, 0.0) or 0.0) > 300.0:
+                    setattr(self, _key, _now)
+                    logger.warning(f"Delta REST refresh {label}: no usable candles returned; keeping last good buffer")
                 return
 
             with self._lock:
