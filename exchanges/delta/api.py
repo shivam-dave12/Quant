@@ -872,7 +872,7 @@ class DeltaAPI:
         bracket_take_profit_price:  Optional[float] = None,
         trailing_stop_delta:        Optional[float] = None,
         mmp:            bool              = False,   # market maker protection
-        exchange:       str               = "",      # kept for Hyperliquid compat
+        exchange:       str               = "",      # kept for CoinSwitch compat
         product_id:     Optional[int]     = None,
         trigger_price:  Optional[float]   = None,   # alias for stop_price
         quantity:       Optional[float]   = None,   # alias for size
@@ -892,7 +892,7 @@ class DeltaAPI:
         Normalised interface compatible with existing bot code.
         Returns {"success": True, "result": {"order_id": ..., ...}} on success.
         """
-        # Alias resolution (compat with Hyperliquid interface)
+        # Alias resolution (compat with CoinSwitch interface)
         _size  = size or quantity or 0.0
         _price = limit_price or price
         _stop  = stop_price or trigger_price

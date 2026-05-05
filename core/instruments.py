@@ -4,7 +4,7 @@ core/instruments.py — live-exchange instrument model and symbol context
 
 No symbol in this module is treated as executable by itself.  Alias lists are
 only search keys used to match the live product catalogs returned by Delta and
-Hyperliquid.  An instrument becomes tradeable only when the exchange confirms it
+CoinSwitch.  An instrument becomes tradeable only when the exchange confirms it
 through its own product/instrument endpoint.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ class AssetClass(str, Enum):
 
 class ExchangeName(str, Enum):
     DELTA = "delta"
-    HYPERLIQUID = "hyperliquid"
+    COINSWITCH = "coinswitch"
 
 
 @dataclass(frozen=True)

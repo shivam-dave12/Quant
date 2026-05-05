@@ -3,14 +3,13 @@ execution/instrument_registry.py — live catalog discovery and filtering
 ======================================================================
 
 The registry never creates synthetic executable contracts.  It reads Delta's
-/v2/products and Hyperliquid's futures instrument/ticker endpoints, normalises
+/v2/products and CoinSwitch's futures instrument/ticker endpoints, normalises
 only contracts returned by the exchange, and then matches requested asset
 intents against those confirmed symbols.
 """
 from __future__ import annotations
 
 import logging
-import config
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -85,15 +84,6 @@ def _asset_default_step(asset_class: AssetClass, symbol: str) -> float:
     return 0.0
 
 
-
-
-def _infer_hyper_asset_class(symbol: str) -> AssetClass:
-    coin = str(symbol).split(":", 1)[-1].upper().replace("-USDC", "").replace("USDC", "")
-    if coin in {"GOLD", "SILVER", "CL", "WTI", "OIL", "COPPER", "NATGAS", "NG", "PLATINUM", "PALLADIUM", "BRENTOIL", "CORN", "WHEAT"}: return AssetClass.COMMODITY
-    if coin in {"SPX", "SP500", "XYZ100", "NDX", "NASDAQ100", "US500"}: return AssetClass.INDEX
-    if coin in {"AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG", "COIN", "CRCL", "SPY", "QQQ", "MRVL", "XLE"}: return AssetClass.EQUITY
-    return AssetClass.CRYPTO
-
 def _unwrap_list(resp) -> List[dict]:
     if not isinstance(resp, dict):
         return []
@@ -105,7 +95,7 @@ def _unwrap_list(resp) -> List[dict]:
             v = data.get(key)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # Some Hyperliquid endpoints return {exchange: {symbol: specs}}.
+        # Some CoinSwitch endpoints return {exchange: {symbol: specs}}.
         # Guard this strictly: ticker payloads also contain dicts with fields such
         # as lowPrice24h/highPrice24h. Those field names are NOT symbols.
         rows: List[dict] = []
@@ -150,6 +140,7 @@ def _row_symbol(row: dict) -> str:
         v = row.get(k)
         if v:
             return str(v).upper()
+    # Common CoinSwitch nested payloads: {"exchange": "EXCHANGE_2", "data": {"BTCUSDT": {...}}}
     for k, v in row.items():
         if isinstance(v, dict) and normalise_symbol(str(k)).endswith(("USDT", "USD", "INR")):
             return str(k).upper()
@@ -200,7 +191,7 @@ class InstrumentRegistry:
         except Exception:
             self.execution_preference = ExchangeName.DELTA
         self.delta: Dict[str, ExchangeInstrument] = {}
-        self.hyperliquid: Dict[str, ExchangeInstrument] = {}
+        self.coinswitch: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -278,81 +269,136 @@ class InstrumentRegistry:
         self.delta = out
         return out
 
-    def load_hyperliquid(self, api) -> Dict[str, ExchangeInstrument]:
+    def load_coinswitch(self, api) -> Dict[str, ExchangeInstrument]:
         out: Dict[str, ExchangeInstrument] = {}
-        if api is None: return out
-        def add_row(r: dict, idx: int, dex: str = "") -> None:
-            if not isinstance(r, dict): return
-            name = str(r.get("name") or r.get("coin") or r.get("symbol") or "").upper()
-            if not name: return
-            dex_clean = str(dex or r.get("dex") or "").lower().strip()
-            symbol = f"{dex_clean}:{name}" if dex_clean and ":" not in name else name
-            asset_class = _infer_hyper_asset_class(symbol)
-            max_lev = first_positive(_safe_float(r.get("maxLeverage")), _safe_float(r.get("max_leverage")), 25.0 if asset_class != AssetClass.CRYPTO else 50.0)
-            sz_dec = _safe_int(r.get("szDecimals"), 4); lot_step = 10 ** (-max(0, min(sz_dec, 8)))
-            ei = ExchangeInstrument(exchange=ExchangeName.HYPERLIQUID, symbol=symbol, ws_symbol=symbol, display_symbol=f"{symbol}-PERP", asset_id=normalise_symbol(name), asset_class=asset_class, quote_asset="USDC", base_asset=name, contract_type="perpetual_futures", status=str(r.get("state") or r.get("status") or "active"), tick_size=_safe_float(r.get("tickSize")), lot_step=lot_step, min_qty=lot_step, max_qty=0.0, max_leverage=max_lev, raw={**r, "universe_index": idx, "dex": dex_clean, "execution_enabled": bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False))})
-            keys={normalise_symbol(name), normalise_symbol(symbol), normalise_symbol(f"{name}USD"), normalise_symbol(f"{name}USDC"), normalise_symbol(f"{name}USDT"), normalise_symbol(f"{name}/USDC")}
-            if name == "CL": keys.update({"OIL","WTI","USOIL","CRUDEOIL"})
-            elif name == "SPX": keys.update({"SPXINDEX","SP500","US500","SPX500USD"})
-            elif name == "XYZ100": keys.update({"NDX","NASDAQ100","QQQ"})
-            for key in {k for k in keys if k}: out[key] = ei
-        try:
-            meta = api.get_meta() if hasattr(api,"get_meta") else {}; rows = meta.get("universe", []) if isinstance(meta, dict) else []
-            for idx,r in enumerate(rows): add_row(r, idx, dex="")
-        except Exception as e: logger.warning("Hyperliquid native meta discovery failed: %s", e, exc_info=True)
-        if bool(getattr(config, "HYPERLIQUID_ENABLE_HIP3_DISCOVERY", True)):
-            for dex in list(getattr(config, "HYPERLIQUID_HIP3_DEXS", ["xyz"])):
-                try:
-                    meta = api.get_meta(dex=dex) if hasattr(api,"get_meta") else {}; rows = meta.get("universe", []) if isinstance(meta, dict) else []
-                    for idx,r in enumerate(rows): add_row(r, idx, dex=str(dex).lower())
-                    if rows: logger.info("Hyperliquid HIP-3 dex %s discovery: %d markets", dex, len(rows))
-                except Exception as e: logger.debug("Hyperliquid HIP-3 dex %s discovery failed: %s", dex, e)
-        self.hyperliquid = out
-        return out
-
-    def _augment_hyperliquid_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
         if api is None:
             return out
+        rows: List[dict] = []
         try:
-            mids = api.get_all_mids() if hasattr(api, "get_all_mids") else {}
+            if hasattr(api, "get_instrument_info"):
+                rows = _unwrap_list(api.get_instrument_info(exchange="EXCHANGE_2"))
+            # CoinSwitch ticker endpoint requires an explicit symbol; never call
+            # the generic ticker URL because it returns 422 "Input symbol is missing"
+            # and wastes startup time.  Missing all-instrument rows are handled by
+            # _augment_coinswitch_from_requested(), which probes exact symbols.
         except Exception as e:
-            logger.debug("Hyperliquid allMids validation unavailable: %s", e)
-            mids = {}
-        if not isinstance(mids, dict) or not mids:
-            return out
-        for intent in intents:
-            candidate_coins: List[str] = []
-            for a in _ordered_aliases(intent):
-                c = str(a).upper()
-                for quote in ("USDT", "USDC", "USD"):
-                    if c.endswith(quote) and len(c) > len(quote):
-                        c = c[:-len(quote)]
-                        break
-                if c and c not in candidate_coins:
-                    candidate_coins.append(c)
-            for coin in candidate_coins:
-                if coin not in mids:
-                    continue
-                if normalise_symbol(coin) in out:
+            logger.warning("CoinSwitch instrument discovery failed: %s", e, exc_info=True)
+            rows = []
+        for r in rows:
+            sym = _row_symbol(r)
+            if not sym:
+                continue
+            rest_sym = normalise_symbol(sym)
+            ws_sym = slash_symbol(sym)
+            base = rest_sym
+            quote = ""
+            for q in ("USDT", "USD", "INR"):
+                if rest_sym.endswith(q):
+                    base, quote = rest_sym[:-len(q)], q
                     break
-                ei = ExchangeInstrument(exchange=ExchangeName.HYPERLIQUID, symbol=coin, ws_symbol=coin, display_symbol=f"{coin}-PERP", asset_id=normalise_symbol(coin), asset_class=AssetClass.CRYPTO, quote_asset="USDC", base_asset=coin, contract_type="perpetual_futures", status="active", lot_step=0.0001, min_qty=0.0001, max_leverage=50.0, raw={"mid": mids.get(coin), "source": "allMids"})
-                for key in {normalise_symbol(coin), normalise_symbol(f"{coin}USD"), normalise_symbol(f"{coin}USDC"), normalise_symbol(f"{coin}USDT")}:
-                    out[key] = ei
-                logger.info("Hyperliquid live market validated: %s", coin)
-                break
+            ei = ExchangeInstrument(
+                exchange=ExchangeName.COINSWITCH,
+                symbol=rest_sym,
+                ws_symbol=ws_sym,
+                display_symbol=ws_sym,
+                asset_id=normalise_symbol(base or rest_sym),
+                asset_class=AssetClass.CRYPTO,
+                quote_asset=quote,
+                base_asset=base,
+                contract_type=str(r.get("contract_type") or r.get("type") or "perpetual_futures"),
+                status=str(r.get("status") or r.get("state") or "active"),
+                tick_size=first_positive(_safe_float(r.get("tick_size")), _safe_float(r.get("quote_precision"))),
+                lot_step=first_positive(_safe_float(r.get("lot_size")), _safe_float(r.get("quantity_precision"))),
+                min_qty=first_positive(_safe_float(r.get("min_qty")), _safe_float(r.get("minQuantity")), _safe_float(r.get("min_size"))),
+                max_qty=first_positive(_safe_float(r.get("max_qty")), _safe_float(r.get("maxQuantity"))),
+                max_leverage=first_positive(_safe_float(r.get("max_leverage")), _safe_float(r.get("leverage")), _safe_float(r.get("maxLeverage"))),
+                raw=r,
+            )
+            out[normalise_symbol(rest_sym)] = ei
+            out[normalise_symbol(ws_sym)] = ei
+        self.coinswitch = out
+        return out
+
+    def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
+        """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
+
+        CoinSwitch docs expose per-symbol futures ticker/orderbook/klines endpoints.
+        Some accounts return only a small instrument_info subset, so BTCUSDT can be
+        tradable even when the all-instrument response is incomplete.  This is not
+        synthetic: a symbol is added only after CoinSwitch replies successfully for
+        that exact symbol.
+        """
+        if api is None:
+            return out
+        seen = set(out.keys())
+        for intent in intents:
+            # CoinSwitch is crypto futures only in the current API/page. Do not
+            # probe commodities, indices or equity-token aliases there.
+            if intent.asset_class != AssetClass.CRYPTO:
+                continue
+            candidates: List[str] = []
+            for a in _ordered_aliases(intent):
+                if a.endswith("USDT"):
+                    candidates.append(a)
+            base = normalise_symbol(intent.asset_id)
+            if base and f"{base}USDT" not in candidates:
+                candidates.append(f"{base}USDT")
+            for sym in candidates:
+                if sym in seen:
+                    continue
+                try:
+                    fn = getattr(api, "get_futures_ticker", None) or getattr(api, "get_ticker", None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        resp = fn(symbol=sym, exchange="EXCHANGE_2")
+                    except TypeError:
+                        resp = fn(sym)
+                    row = _unwrap_one(resp)
+                    if not row or str(row.get("error") or ""):
+                        continue
+                    # Require some live-market field so a generic error wrapper cannot activate it.
+                    if not any(k in row for k in ("symbol", "last_price", "lastPrice", "mark_price", "markPrice", "best_bid", "bestBid", "best_ask", "bestAsk", "funding_rate", "fundingRate", "open_interest", "openInterest")):
+                        continue
+                    returned_symbol = normalise_symbol(row.get("symbol") or row.get("s") or row.get("pair") or sym)
+                    # Exact-symbol validation: never let ticker field names like LOWPRICE24H
+                    # become activated instruments.
+                    if returned_symbol and returned_symbol != normalise_symbol(sym):
+                        logger.debug("CoinSwitch ticker returned %s while validating %s — ignoring", returned_symbol, sym)
+                        continue
+                    rest_sym = normalise_symbol(sym)
+                    ws_sym = slash_symbol(rest_sym)
+                    base2, quote = rest_sym, ""
+                    for q in ("USDT", "USD", "INR"):
+                        if rest_sym.endswith(q):
+                            base2, quote = rest_sym[:-len(q)], q
+                            break
+                    ei = ExchangeInstrument(
+                        exchange=ExchangeName.COINSWITCH, symbol=rest_sym, ws_symbol=ws_sym,
+                        display_symbol=ws_sym, asset_id=normalise_symbol(base2),
+                        asset_class=AssetClass.CRYPTO, quote_asset=quote, base_asset=base2,
+                        contract_type="perpetual_futures", status="active", raw=row,
+                    )
+                    out[normalise_symbol(rest_sym)] = ei
+                    out[normalise_symbol(ws_sym)] = ei
+                    seen.add(normalise_symbol(rest_sym)); seen.add(normalise_symbol(ws_sym))
+                    logger.info("CoinSwitch live ticker validated: %s", rest_sym)
+                    break
+                except Exception as e:
+                    logger.debug("CoinSwitch live validation failed for %s: %s", sym, e)
         return out
 
     # ──────────────────────────────────────────────────────────────────────
     # Matching
     # ──────────────────────────────────────────────────────────────────────
-    def discover(self, delta_api=None, hyperliquid_api=None, requested=None,
+    def discover(self, delta_api=None, coinswitch_api=None, requested=None,
                  max_active: int = 12, require_primary: bool = True) -> DiscoveryReport:
         intents = configured_asset_intents(requested)
         delta = self.load_delta(delta_api)
-        hl = self.load_hyperliquid(hyperliquid_api)
-        hl = self._augment_hyperliquid_from_requested(hl, hyperliquid_api, intents)
+        coins = self.load_coinswitch(coinswitch_api)
+        coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
         self.report = DiscoveryReport(requested=intents, raw_counts={
-            "delta": len(delta), "hyperliquid": len({id(v) for v in hl.values()})
+            "delta": len(delta), "coinswitch": len({id(v) for v in coins.values()})
         })
 
         matched: List[TradableInstrument] = []
@@ -360,18 +406,13 @@ class InstrumentRegistry:
             aliases = _ordered_aliases(intent)
             by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
             dmatch = self._match_one(delta, aliases)
-            hmatch = self._match_one(hl, aliases)
+            cmatch = self._match_one(coins, aliases)
             if dmatch is not None:
                 by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
-            if hmatch is not None:
-                h_retag = self._retag(hmatch, intent)
-                if dmatch is not None or bool(getattr(config, "HYPERLIQUID_EXECUTION_ENABLED", False)):
-                    by_ex[ExchangeName.HYPERLIQUID] = h_retag
-                else:
-                    self.report.unavailable[intent.asset_id] = "present on Hyperliquid/HIP-3 but Hyperliquid execution is disabled; not traded"
-                    continue
+            if cmatch is not None:
+                by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
             if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/Hyperliquid catalog; not traded"
+                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch catalog; not traded"
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:

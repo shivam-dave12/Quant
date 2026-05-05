@@ -28,7 +28,7 @@ Exchange routing:
   - Data-quality/reliability is exposed so the strategy can discount single-feed
     or stale secondary signals instead of treating them as full confidence.
   - ExecutionRouter owns both OrderManagers and routes to the active exchange.
-  - /setexchange <delta|hyperliquid> switches execution at runtime, blocked while
+  - /setexchange <delta|coinswitch> switches execution at runtime, blocked while
     a position is open.
 """
 
@@ -328,8 +328,8 @@ def _log_thread_exception(args):
 threading.excepthook = _log_thread_exception
 
 # ── Deferred imports ──────────────────────────────────────────────────────────
-from exchanges.hyperliquid.api          import FuturesAPI  as HyperliquidAPI
-from exchanges.hyperliquid.data_manager import HyperliquidDataManager
+from exchanges.coinswitch.api          import FuturesAPI  as CoinSwitchAPI
+from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api               import DeltaAPI
 from exchanges.delta.data_manager      import DeltaDataManager
 from aggregator.market_aggregator      import MarketAggregator
@@ -414,22 +414,21 @@ class QuantBot:
             logger.info("=" * 80)
 
             has_delta      = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
-            has_hyperliquid = bool(getattr(config, "HYPERLIQUID_ENABLED", True))
+            has_coinswitch = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
 
             logger.info(f"Exchanges configured — Delta: {has_delta} | "
-                        f"Hyperliquid: {has_hyperliquid}")
+                        f"CoinSwitch: {has_coinswitch}")
 
             # ── Build API clients ─────────────────────────────────────────────
-            hl_api    = None
+            cs_api    = None
             delta_api = None
 
-            if has_hyperliquid:
-                hl_api = HyperliquidAPI(
-                    api_key    = config.HYPERLIQUID_API_KEY,
-                    secret_key = config.HYPERLIQUID_SECRET_KEY,
-                    testnet    = getattr(config, "HYPERLIQUID_TESTNET", False),
+            if has_coinswitch:
+                cs_api = CoinSwitchAPI(
+                    api_key    = config.COINSWITCH_API_KEY,
+                    secret_key = config.COINSWITCH_SECRET_KEY,
                 )
-                logger.info("✅ Hyperliquid public market-data client ready")
+                logger.info("✅ CoinSwitch API client ready")
 
             if has_delta:
                 delta_api = DeltaAPI(
@@ -440,17 +439,17 @@ class QuantBot:
                 logger.info("✅ Delta API client ready")
 
             # ── Build OrderManagers ───────────────────────────────────────────
-            hl_om    = None
+            cs_om    = None
             delta_om = None
 
-            if hl_api:
-                hl_om = OrderManager(hl_api, exchange_name="hyperliquid")
+            if cs_api:
+                cs_om = OrderManager(cs_api, exchange_name="coinswitch")
             if delta_api:
                 delta_om = OrderManager(delta_api, exchange_name="delta")
 
             # ── Build ExecutionRouter ─────────────────────────────────────────
             self.execution_router = ExecutionRouter(
-                hyperliquid_om = hl_om,
+                coinswitch_om = cs_om,
                 delta_om      = delta_om,
                 default       = config.EXECUTION_EXCHANGE,
             )
@@ -461,17 +460,17 @@ class QuantBot:
 
             if exec_exch == "delta" and has_delta:
                 primary_dm   = DeltaDataManager()
-                secondary_dm = HyperliquidDataManager() if has_hyperliquid else None
-            elif exec_exch == "hyperliquid" and has_hyperliquid:
-                primary_dm   = HyperliquidDataManager()
+                secondary_dm = CoinSwitchDataManager() if has_coinswitch else None
+            elif exec_exch == "coinswitch" and has_coinswitch:
+                primary_dm   = CoinSwitchDataManager()
                 secondary_dm = DeltaDataManager() if has_delta else None
             elif has_delta:
                 logger.warning(f"Requested execution exchange '{exec_exch}' not configured "
                                f"— falling back to delta")
                 primary_dm   = DeltaDataManager()
-                secondary_dm = HyperliquidDataManager() if has_hyperliquid else None
+                secondary_dm = CoinSwitchDataManager() if has_coinswitch else None
             else:
-                primary_dm   = HyperliquidDataManager()
+                primary_dm   = CoinSwitchDataManager()
                 secondary_dm = None
 
             # ── Aggregator ────────────────────────────────────────────────────
@@ -614,7 +613,7 @@ class QuantBot:
                 "  💰 PnL is exchange-fill reconciled, not estimated\n\n"
                 f"📡 <b>Data feed:</b> "
                 f"{'DUAL — ' + secondary_name.upper() + ' secondary active' if dual_feed else 'SINGLE — primary only'}\n\n"
-                f"<i>/setexchange delta|hyperliquid to switch execution exchange</i>"
+                f"<i>/setexchange delta|coinswitch to switch execution exchange</i>"
             )
 
             logger.info("🚀 LIQUIDITY-FIRST QUANT BOT RUNNING")

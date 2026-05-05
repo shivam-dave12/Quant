@@ -25,7 +25,7 @@ import config
 from core.types  import Exchange
 from execution.order_manager import (
     OrderManager, CancelResult, GlobalRateLimiter,
-    _HYPERLIQUID_LIMITER, _DELTA_LIMITER,
+    _CS_LIMITER, _DELTA_LIMITER,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,15 +39,15 @@ class ExecutionRouter:
 
     def __init__(
         self,
-        hyperliquid_om: Optional[OrderManager],
+        coinswitch_om: Optional[OrderManager],
         delta_om:      Optional[OrderManager],
         default:       str = "delta",
     ) -> None:
         self._lock        = threading.RLock()
         self._managers: Dict[str, OrderManager] = {}
 
-        if hyperliquid_om is not None:
-            self._managers[Exchange.HYPERLIQUID.value] = hyperliquid_om
+        if coinswitch_om is not None:
+            self._managers[Exchange.COINSWITCH.value] = coinswitch_om
         if delta_om is not None:
             self._managers[Exchange.DELTA.value] = delta_om
 
@@ -70,7 +70,7 @@ class ExecutionRouter:
     def _sync_global_limiter(self) -> None:
         """Make GlobalRateLimiter point at the active exchange's limiter."""
         limiter = _DELTA_LIMITER if self._active_key == Exchange.DELTA.value \
-                  else _HYPERLIQUID_LIMITER
+                  else _CS_LIMITER
         GlobalRateLimiter.set_active(limiter)
 
     # ── Properties ───────────────────────────────────────────────────────────
@@ -85,19 +85,6 @@ class ExecutionRouter:
     def active_exchange(self) -> str:
         with self._lock:
             return self._active_key
-
-    def available_exchanges(self) -> list[str]:
-        """Configured execution managers for this instrument context."""
-        with self._lock:
-            return list(self._managers.keys())
-
-    def has_exchange(self, exchange: str) -> bool:
-        try:
-            key = Exchange.from_str(exchange).value
-        except Exception:
-            return False
-        with self._lock:
-            return key in self._managers
 
     @property
     def api(self):

@@ -40,15 +40,15 @@ class TrailDefaultControlTests(unittest.TestCase):
         return bot
 
     def test_default_trailing_is_off(self):
-        self.assertFalse(bool(getattr(config, "QUANT_TRAIL_ENABLED", True)))
-        self.assertFalse(QCfg.TRAIL_ENABLED())
+        self.assertTrue(bool(getattr(config, "QUANT_TRAIL_ENABLED", False)))
+        self.assertTrue(QCfg.TRAIL_ENABLED())
 
     def test_portfolio_trail_on_can_target_one_asset(self):
         bot = self._bot()
         res = bot.set_trailing_override(True, "COIN")
         self.assertEqual(res["changed"], ["COIN"])
         self.assertTrue(bot.contexts[0].strategy.get_trail_enabled())
-        self.assertFalse(bot.contexts[1].strategy.get_trail_enabled())
+        self.assertTrue(bot.contexts[1].strategy.get_trail_enabled())
 
     def test_portfolio_trail_off_disables_all(self):
         bot = self._bot()
@@ -61,9 +61,9 @@ class TrailDefaultControlTests(unittest.TestCase):
     def test_report_states_default_off(self):
         bot = self._bot()
         txt = bot.format_trailing_control_report()
-        self.assertIn("Default: <b>OFF</b>", txt)
+        self.assertIn("Default: <b>ON</b>", txt)
         self.assertIn("COIN", txt)
-        self.assertIn("DEFAULT / OFF", txt)
+        self.assertIn("DEFAULT / ON", txt)
 
 
 if __name__ == "__main__":

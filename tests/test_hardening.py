@@ -56,7 +56,7 @@ class HardeningTests(unittest.TestCase):
                 return {"ok": True}
 
         om = FakeOrderManager()
-        router = ExecutionRouter(hyperliquid_om=None, delta_om=om, default="delta")
+        router = ExecutionRouter(coinswitch_om=None, delta_om=om, default="delta")
 
         self.assertEqual(router.emergency_flatten(reason="unit_test"), {"ok": True})
         self.assertEqual(om.calls[0][1]["reason"], "unit_test")

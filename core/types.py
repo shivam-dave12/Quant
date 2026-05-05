@@ -14,17 +14,17 @@ from typing import Dict, List, Optional
 
 class Exchange(str, Enum):
     DELTA      = "delta"
-    HYPERLIQUID = "hyperliquid"
+    COINSWITCH = "coinswitch"
 
     @classmethod
     def from_str(cls, value: str) -> "Exchange":
         v = value.strip().lower()
         if v in ("delta", "dx"):
             return cls.DELTA
-        if v in ("hyperliquid", "hl", "hypercore"):
-            return cls.HYPERLIQUID
+        if v in ("coinswitch", "cs", "cs_pro"):
+            return cls.COINSWITCH
         raise ValueError(
-            f"Unknown exchange {value!r}. Valid values: 'delta', 'hyperliquid'."
+            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch'."
         )
 
 
