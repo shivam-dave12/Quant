@@ -889,6 +889,15 @@ class LiquidityTrailEngine:
         for target in pools or []:
             pool = getattr(target, "pool", target)
             try:
+                status = getattr(pool, "status", "")
+                status = str(getattr(status, "value", status)).upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                pside = str(getattr(getattr(pool, "side", ""), "value", getattr(pool, "side", ""))).upper()
+                if pos_side == "long" and pside and "SSL" not in pside:
+                    continue
+                if pos_side == "short" and pside and "BSL" not in pside:
+                    continue
                 pp = float(getattr(pool, "price", 0.0) or 0.0)
             except Exception:
                 continue

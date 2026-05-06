@@ -2483,6 +2483,29 @@ class EntryEngine:
             logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
+        # Final geometry guard: a selected target must sit beyond entry on the
+        # profit side while the stop stays protective.  This is intentionally
+        # duplicated at strategy level so a future selector change cannot leak a
+        # malformed TP/SL pair into sizing or execution.
+        if side == "long" and not (sl < price < tp_price):
+            report = dict(report or {})
+            report["strategy_gate"] = (
+                f"selected TP failed geometry gate: long requires SL < entry < TP; "
+                f"sl={sl:.2f} entry={price:.2f} tp={tp_price:.2f}")
+            report["summary"] = report["strategy_gate"]
+            self._record_pool_report(report)
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
+            return None, None
+        if side == "short" and not (sl > price > tp_price):
+            report = dict(report or {})
+            report["strategy_gate"] = (
+                f"selected TP failed geometry gate: short requires SL > entry > TP; "
+                f"sl={sl:.2f} entry={price:.2f} tp={tp_price:.2f}")
+            report["summary"] = report["strategy_gate"]
+            self._record_pool_report(report)
+            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
+            return None, None
+
         # Strategy-level BE gate: TP must clear round-trip fees + slippage.
         min_net_move = max(
             atr * _TP_MIN_NET_ATR,
@@ -2543,7 +2566,7 @@ class EntryEngine:
                 "summary": "liquidity selector unavailable; abstaining from stop selection",
                 "selected": None, "candidates": [],
             })
-            return None, None
+            return None, None, None
 
         sl_price, target, pick, report_obj = _sel_sl(
             snap=snap, side=side, entry=entry, atr=atr,
@@ -2605,7 +2628,7 @@ class EntryEngine:
             if not isinstance(selected, dict):
                 return float(fallback)
             floor = float(selected.get("required_rr", fallback) or fallback)
-            return max(0.50, min(float(fallback), floor))
+            return max(0.50, min(20.0, floor))
         except Exception:
             return float(fallback)
 

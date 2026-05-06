@@ -308,6 +308,49 @@ def _pool_side(pool: Any) -> str:
     return _enum_value(_safe(pool, "side", ""), "")
 
 
+
+
+def _pool_status_text(pool: Any) -> str:
+    """Return normalized pool status text for live-vs-archived gates."""
+    return _pool_status(pool).upper()
+
+
+def _is_live_pool(pool: Any) -> bool:
+    """Only unswept, unconsumed liquidity can anchor TP/SL execution.
+
+    Swept/consumed pools remain useful as context for adjacency and market
+    narrative, but they must never be selected as a fresh delivery target or
+    protective stop anchor.
+    """
+    status = _pool_status_text(pool)
+    return status not in ("SWEPT", "CONSUMED")
+
+
+def _is_tp_pool_side(target: Any, side: str) -> bool:
+    pool = _safe(target, "pool", None)
+    pside = _pool_side(pool).upper()
+    if not pside:
+        # Some legacy tests/adapter snapshots separate BSL/SSL by collection
+        # but omit pool.side on the object.  Accept unknown here; explicit wrong
+        # side values are still rejected below.
+        return True
+    if side == "long":
+        return "BSL" in pside
+    return "SSL" in pside
+
+
+def _is_sl_pool_side(target: Any, side: str) -> bool:
+    pool = _safe(target, "pool", None)
+    pside = _pool_side(pool).upper()
+    if not pside:
+        # Collection membership is authoritative for older snapshots that do
+        # not carry pool.side; explicit wrong side values remain hard-rejected.
+        return True
+    if side == "long":
+        return "SSL" in pside
+    return "BSL" in pside
+
+
 def _target_signature(target: Any) -> Tuple[str, float, str]:
     pool = _safe(target, "pool", None)
     return (
@@ -785,6 +828,11 @@ def score_tp_pools(
             dist_atr = float(_safe(target, "distance_atr", 0.0))
             pool_price = float(_safe(pool, "price", 0.0))
 
+            if not _is_live_pool(pool):
+                continue
+            if not _is_tp_pool_side(target, side):
+                continue
+
             # Reach gates. Too-close remains a hard veto because fees/slippage
             # and BE migration consume the whole move. Too-far is NOT a hard
             # veto: distant HTF pools are valid terminal delivery objectives,
@@ -975,7 +1023,9 @@ def score_sl_pool(
                       and (_safe(t.pool, "price", 0.0) - entry) <= _SL_SEARCH_WINDOW_ATR * atr]
 
     candidates = [t for t in candidates
-                  if _safe(t, "significance", 0.0) >= _SL_MIN_SIGNIFICANCE]
+                  if _is_live_pool(_safe(t, "pool", None))
+                  and _is_sl_pool_side(t, side)
+                  and _safe(t, "significance", 0.0) >= _SL_MIN_SIGNIFICANCE]
     if not candidates:
         return None
 
@@ -1102,6 +1152,10 @@ def diagnose_tp_pools(
 
             if status in ("SWEPT", "CONSUMED"):
                 row.reason = f"archived {status.lower()} pool; not a live target"
+                rows.append(row); continue
+            if not _is_tp_pool_side(target, side):
+                expected = "BSL" if side == "long" else "SSL"
+                row.reason = f"wrong pool side for TP; expected live {expected}"
                 rows.append(row); continue
             if row.distance_atr < 0.25:
                 row.reason = "too close: no durable delivery room after buffer/costs"
@@ -1270,6 +1324,10 @@ def diagnose_sl_pool(
             status = row.status.upper()
             if status in ("SWEPT", "CONSUMED"):
                 row.reason = f"archived {status.lower()} pool; not protective"
+                rows.append(row); continue
+            if not _is_sl_pool_side(target, side):
+                expected = "SSL" if side == "long" else "BSL"
+                row.reason = f"wrong pool side for protective SL; expected live {expected}"
                 rows.append(row); continue
             ok, why = _protects(target)
             if not ok:

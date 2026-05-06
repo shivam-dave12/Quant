@@ -25,6 +25,8 @@ SPREAD = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\]
 POSTERIOR = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*POSTERIOR ACCEPTED: (?P<side>REVERSAL|CONTINUATION)?\s*(?P<trade_side>LONG|SHORT)?.*p=(?P<p>[0-9.]+).*EV=(?P<ev>[+\-0-9.]+).*LLR=(?P<llr>[0-9.]+).*U=(?P<u>[0-9.]+)")
 THESIS = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ENTRY THESIS.* (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+) \| SL=\$(?P<sl>[0-9,\.]+) TP=\$(?P<tp>[0-9,\.]+) R:R=(?P<rr>[0-9.]+)")
 DEFERRED = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*CANDIDATE DEFERRED \[(?P<why>[^\]]+)\]: (?P<body>.*)")
+TPAUDIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RAW_TP_AUDIT:\s*(?P<body>.*)")
+QUANT_WAIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*POST-SWEEP QUANT WAIT:\s*(?P<setup>REVERSAL|CONTINUATION)?\s*(?P<side>LONG|SHORT)?.*?p=(?P<p>[0-9.]+).*?EV=(?P<ev>[+\-0-9.]+).*?LLR=(?P<llr>[+\-0-9.]+).*?U=(?P<u>[0-9.]+)\s+(?P<body>.*)")
 SLANCHOR = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RAW_SL_ANCHOR: anchor=\$(?P<anchor>[0-9,\.]+) sl=\$(?P<sl>[0-9,\.]+) quality=(?P<quality>[0-9.]+) buffer=(?P<buffer>[0-9.]+)ATR")
 SLENV = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*SL envelope (?P<phase>[^:]+): (?P<body>.*)")
 ENTER = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ENTERING (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+) TP=\$(?P<tp>[0-9,\.]+)")
@@ -87,6 +89,10 @@ def parse(line: str) -> Optional[dict[str, Any]]:
         ev = base_ctx(m); ev.update({"type": "candidate_approved", "phase": "THESIS_PRICED", "side": m.group('side'), "entry": fnum(m.group('entry')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "rr": fnum(m.group('rr')), "last_decision": s, "message": s}); return ev
     if m := DEFERRED.search(s):
         ev = base_ctx(m); body = m.group('body'); ev.update({"type": "candidate_deferred", "phase": "DEFERRED", "last_reason": f"{m.group('why')}: {body}", "reason": body, "message": s}); return ev
+    if m := TPAUDIT.search(s):
+        ev = base_ctx(m); body = m.group('body'); ev.update({"type": "tp_audit", "phase": "TP_AUDIT", "last_reason": body[:900], "reason": body, "message": s, "health": "OK"}); return ev
+    if m := QUANT_WAIT.search(s):
+        ev = base_ctx(m); body = m.group('body'); ev.update({"type": "candidate_deferred", "phase": "POST_SWEEP_QUANT_WAIT", "side": m.group('side') or "", "posterior": fnum(m.group('p')), "ev": fnum(m.group('ev')), "llr": fnum(m.group('llr')), "uncertainty": fnum(m.group('u')), "last_reason": body, "reason": body, "message": s, "health": "OK"}); return ev
     if m := SLANCHOR.search(s):
         ev = base_ctx(m); ev.update({"type": "sl_anchor", "phase": "SL_ANCHOR", "sl": fnum(m.group('sl')), "setup_quality": fnum(m.group('quality')), "last_reason": f"anchor ${m.group('anchor')} buffer {m.group('buffer')} ATR", "message": s}); return ev
     if m := SLENV.search(s):

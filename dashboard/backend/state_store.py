@@ -156,6 +156,7 @@ class DashboardState:
             if asset:
                 asset_u = asset.upper()
                 assets = [x for x in assets if x.get("asset") == asset_u]
+            metrics = self._metrics(now, total_upnl)
             return {
                 "system": {
                     "bot_online": self.bot_online,
@@ -179,6 +180,7 @@ class DashboardState:
                 "events": list(self.events),
                 "charts": self._charts(asset),
                 "heatmap": self._heatmap(),
+                "metrics": metrics,
                 "ts": now,
             }
 
@@ -218,8 +220,35 @@ class DashboardState:
             score += max(min(a.ev, 2.0), 0.0) * 20.0
             score += max(0.0, 1.0 - min(a.spread_atr, 3.0) / 3.0) * 20.0
             score += 15.0 if a.state in {"SCANNING", "POST_SWEEP", "DIRECTION"} else 5.0
+            score = max(0.0, min(100.0, score))
             out.append({"asset": a.asset, "score": round(score, 2), "state": a.state, "phase": a.phase, "price": a.price, "spread_bps": a.spread_bps, "posterior": max(a.posterior, a.confidence), "ev": a.ev})
         return sorted(out, key=lambda x: x["score"], reverse=True)
+
+    def _metrics(self, now: float, total_upnl: float) -> dict[str, Any]:
+        trade_list = list(self.trades)
+        wins = [t for t in trade_list if t.pnl > 0]
+        losses = [t for t in trade_list if t.pnl < 0]
+        gross_profit = sum(t.pnl for t in wins)
+        gross_loss = abs(sum(t.pnl for t in losses))
+        fresh_assets = sum(1 for a in self.assets.values() if now - a.last_update < 30)
+        stale_assets = max(0, len(self.assets) - fresh_assets)
+        latest_event_ts = max((float(e.get("ts", 0.0) or 0.0) for e in self.events), default=0.0)
+        best = self._heatmap()[0] if self.assets else {}
+        return {
+            "decision_count": len(self.decisions),
+            "alert_count": len(self.alerts),
+            "trade_count": len(trade_list),
+            "win_rate": (len(wins) / len(trade_list)) if trade_list else 0.0,
+            "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0),
+            "avg_r": (sum(t.r for t in trade_list) / len(trade_list)) if trade_list else 0.0,
+            "risk_heat": total_upnl + self.total_realized,
+            "fresh_assets": fresh_assets,
+            "stale_assets": stale_assets,
+            "coverage": (fresh_assets / len(self.assets)) if self.assets else 0.0,
+            "last_event_age_sec": (now - latest_event_ts) if latest_event_ts else None,
+            "best_asset": best.get("asset", ""),
+            "best_score": float(best.get("score", 0.0) or 0.0),
+        }
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:

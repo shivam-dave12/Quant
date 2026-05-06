@@ -26,8 +26,14 @@ COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY:
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY or COINSWITCH_API_KEY.")
+REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
+
+# Keep module imports/test tooling/dashboard safe without live secrets. The bot
+# runtime still refuses to trade unless a configured exchange has both key and
+# secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
+# deployment-time fail-fast check.
+if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"

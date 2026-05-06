@@ -1617,211 +1617,95 @@ class InstitutionalLevels:
                    liq_map=None,
                    tp_distance_mult: float = 1.0) -> Optional[float]:
         """
-        Initial TP placement — v7.0 INSTITUTIONAL PRIORITY.
+        Legacy-compatible TP API, now selector-only.
 
-        HIERARCHY (all candidates scored; highest wins):
-
-          TIER-S  score ≥ 7.0  Liquidity pool (LiquidityMap)
-                                The LiquidityMap has the richest multi-TF pool data.
-                                BSL above (for LONG) / SSL below (for SHORT) is
-                                WHERE price is magnetically attracted to — stop
-                                clusters draw price like gravity. This is always
-                                the PRIMARY TP in ICT methodology.
-
-          TIER-A  score ≥ 6.0  ICT swept liquidity origin
-                                After a sweep-and-reverse, price delivers back to
-                                the raid origin. Mandatory when present.
-
-          TIER-B  score ≥ 5.0  ICT structural (FVG, virgin OB, ict_engine pools)
-                                Imbalances and institutional footprints in the
-                                delivery direction.
-
-          TIER-C  score ≥ 4.0  15m swing extremes
-                                Confirmed structural swing levels.
-
-          TIER-D  score ≥ 3.5  VWAP / σ-bands
-                                Statistical reference levels.
-
-          REJECT  If NO candidate survives the R:R gate → return None.
-                  The caller must NOT enter this trade — no naked R-floor.
-
-        CRITICAL: There is NO R-floor fallback. If no structural target
-        exists that satisfies the minimum R:R, the trade is rejected.
-        Entering without a real target is guessing, not ICT.
+        Previous versions mixed liquidity pools with swing/VWAP/statistical
+        fallbacks.  That created retail-style targets whenever a true live BSL
+        or SSL delivery pool was unavailable.  Initial TP selection must now
+        come from the same institutional liquidity selector used by EntryEngine:
+        live unswept pool, correct side, buffered before liquidity, enough net
+        room after fees/slippage, dynamic RR floor, delivery probability and
+        gauntlet penalties.  If no live liquidity target qualifies, return None
+        so the trade is rejected/waited instead of inventing a synthetic TP.
         """
-        sl_dist = abs(price - sl_price)
-        if sl_dist < 1e-10:
-            return None
+        try:
+            price = float(price)
+            atr = float(atr)
+            sl_price = float(sl_price)
+            if atr <= 0.0 or abs(price - sl_price) < 1e-10:
+                return None
+            if side not in ("long", "short"):
+                return None
+            if liq_map is None:
+                logger.info(
+                    "TP STRUCTURAL REJECT: no liquidity map available; refusing VWAP/swing fallback "
+                    "(side=%s price=$%.2f)", side, price)
+                return None
 
-        _ict_now_ms  = now_ms if now_ms > 0 else int(time.time() * 1000)
-        tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
-        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR() * tp_distance_mult
-        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR() * tp_distance_mult
-        _min_rr_gate = QCfg.REVERSION_MIN_RR() * tp_distance_mult
+            snap = liq_map.get_snapshot(price, atr)
+            if snap is None:
+                logger.info(
+                    "TP STRUCTURAL REJECT: liquidity snapshot unavailable; refusing synthetic fallback "
+                    "(side=%s price=$%.2f)", side, price)
+                return None
 
-        # ── scored candidates pool ─────────────────────────────────────────────
-        scored: List[Tuple[float, float, str]] = []   # (level, score, label)
-
-        def _valid(level: float, min_dist: float = None) -> bool:
-            dist = abs(level - price)
-            lo   = min_dist if min_dist is not None else min_tp_dist
-            if dist < lo or dist > max_tp_dist:
-                return False
-            if side == "long"  and level <= price: return False
-            if side == "short" and level >= price: return False
-            return True
-
-        def add(level: float, score: float, label: str, min_dist: float = None):
-            if _valid(level, min_dist):
-                scored.append((level, score, label))
-
-        # ══ TIER-S: LiquidityMap pools (primary target — richest data) ═══════
-        # LiquidityMap tracks equal highs/lows across all TFs with clustering,
-        # HTF confluence promotion, and proximity weighting. These are the real
-        # liquidity clusters smart money hunts.
-        if liq_map is not None:
             try:
-                liq_snap = liq_map.get_snapshot(price, atr)
-                pool_list = liq_snap.bsl_pools if side == "long" else liq_snap.ssl_pools
-                for pt in pool_list:
-                    pool = pt.pool
-                    # Score = 7 + significance bonus + HTF confluence bonus
-                    # Proximity-weighted significance ensures near pools beat far ones
-                    _adj_sig = pool.proximity_adjusted_sig(pt.distance_atr)
-                    _score   = 7.0 + min(_adj_sig * 0.15, 2.0)
-                    # HTF confluence multiplier
-                    if pool.htf_count >= 2:
-                        _score += 0.5
-                    # Touch count bonus — more touches = deeper stop cluster
-                    _score += min(pool.touches * 0.1, 0.5)
-                    # Target is just BEFORE the pool (so we don't trigger the stops,
-                    # we exit into the liquidity that attracts price there)
-                    _target = pool.price - 0.05 * atr if side == "long" else pool.price + 0.05 * atr
-                    add(_target, _score, f"LIQ_POOL[{pool.timeframe}]@${pool.price:,.0f}(tc={pool.touches})")
-            except Exception as _le:
-                logger.debug(f"LiqMap TP scan error: {_le}")
+                from strategy.liquidity_pool_selector import select_tp_with_report
+            except ImportError:
+                from liquidity_pool_selector import select_tp_with_report  # type: ignore
 
-        # ══ TIER-A: ICT swept liquidity origin ═══════════════════════════════
-        # After a sweep-and-reverse, AMD delivery target is the most important level.
-        if ict_engine is not None:
+            tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
+            min_rr = float(QCfg.REVERSION_MIN_RR()) * tp_distance_mult
+            now_s = (float(now_ms) / 1000.0) if now_ms and now_ms > 1e12 else time.time()
+            tp, target, score, report = select_tp_with_report(
+                snap=snap,
+                side=side,
+                entry=price,
+                sl=sl_price,
+                atr=atr,
+                ict=ict_engine,
+                min_rr=min_rr,
+                now=now_s,
+            )
+            if tp is None or target is None:
+                summary = getattr(report, "summary", "no eligible live liquidity TP")
+                logger.info(
+                    "TP STRUCTURAL REJECT: %s (side=%s price=$%.2f SL=$%.2f)",
+                    summary, side, price, sl_price)
+                return None
+
+            tp = float(tp)
+            if side == "long" and not (sl_price < price < tp):
+                logger.info(
+                    "TP STRUCTURAL REJECT: bad long geometry sl=$%.2f entry=$%.2f tp=$%.2f",
+                    sl_price, price, tp)
+                return None
+            if side == "short" and not (sl_price > price > tp):
+                logger.info(
+                    "TP STRUCTURAL REJECT: bad short geometry sl=$%.2f entry=$%.2f tp=$%.2f",
+                    sl_price, price, tp)
+                return None
+
             try:
-                _amd = ict_engine.get_amd_state()
-                if _amd.delivery_target is not None:
-                    add(_amd.delivery_target, 6.5, "AMD_DELIVERY_TARGET")
+                pool = getattr(target, "pool", None)
+                pool_price = float(getattr(pool, "price", 0.0) or 0.0)
+                rr = abs(tp - price) / max(abs(price - sl_price), 1e-10)
+                logger.info(
+                    "🎯 TP [LIVE_LIQUIDITY_SELECTOR] $%.2f before pool=$%.2f "
+                    "R:R=1:%.2f P=%.3f EV=%.3f",
+                    tp,
+                    pool_price,
+                    rr,
+                    float(getattr(score, "sweep_prob", 0.0) if score is not None else 0.0),
+                    float(getattr(score, "ev", 0.0) if score is not None else 0.0),
+                )
             except Exception:
                 pass
-
-        # ══ TIER-B: ICT structural targets (FVGs, OBs, ict_engine pools) ════
-        if ict_engine is not None:
-            try:
-                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)
-                _ict_targets  = ict_engine.get_structural_tp_targets(
-                    side, price, atr, _ict_now_ms, _ict_min_dist, max_tp_dist,
-                    htf_only=False)
-                for _lvl, _sc, _lbl in _ict_targets:
-                    add(_lvl, 5.0 + min(_sc * 0.1, 1.5), f"ICT_{_lbl}", _ict_min_dist)
-                if _ict_targets:
-                    logger.debug(
-                        f"ICT TP pool: {len(_ict_targets)} candidates "
-                        f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
-            except Exception as _ie:
-                logger.debug(f"ICT structural TP error: {_ie}")
-
-            # ict_engine.liquidity_pools (LiquidityLevel objects from ICT engine)
-            try:
-                for pool in ict_engine.liquidity_pools:
-                    if pool.swept:
-                        continue
-                    _score = 5.5 + min(pool.touch_count * 0.25, 1.5)
-                    _tf_bonus = {"1d": 1.0, "4h": 0.5, "1h": 0.25}.get(
-                        getattr(pool, "timeframe", "5m"), 0.0)
-                    _score += _tf_bonus
-                    if side == "long" and pool.level_type == "BSL" and pool.price > price:
-                        add(pool.price - 0.05 * atr, _score,
-                            f"ICT_BSL@${pool.price:,.0f}",
-                            max(sl_dist * 1.0, atr * 0.5))
-                    elif side == "short" and pool.level_type == "SSL" and pool.price < price:
-                        add(pool.price + 0.05 * atr, _score,
-                            f"ICT_SSL@${pool.price:,.0f}",
-                            max(sl_dist * 1.0, atr * 0.5))
-            except Exception:
-                pass
-
-        # ══ TIER-C: 15m swing extremes ════════════════════════════════════════
-        if candles_15m and len(candles_15m) >= 3:
-            _lb   = min(40, len(candles_15m) - 2)
-            sh_15, sl_15 = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
-            _buf = atr * 0.08
-            if side == "long":
-                for sh in sh_15:
-                    if sh > price + min_tp_dist:
-                        add(sh - _buf, 4.0, f"15m_SWING_HIGH@${sh:,.0f}")
-            else:
-                for sl_v in sl_15:
-                    if sl_v < price - min_tp_dist:
-                        add(sl_v + _buf, 4.0, f"15m_SWING_LOW@${sl_v:,.0f}")
-
-        # ══ TIER-D: VWAP / σ-bands ════════════════════════════════════════════
-        if vwap > 0:
-            if side == "long" and vwap > price:
-                add(vwap, 3.5, "VWAP")
-                if vwap_std > 0:
-                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                        add(vwap - mult * vwap_std, sc, f"VWAP-{mult}σ")
-            elif side == "short" and vwap < price:
-                add(vwap, 3.5, "VWAP")
-                if vwap_std > 0:
-                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
-                        add(vwap + mult * vwap_std, sc, f"VWAP+{mult}σ")
-
-        # ══ TIERED SELECTION ══════════════════════════════════════════════════
-        if vwap > 0 and vwap_std > 0:
-            for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.8), (2.0, 2.5)]:
-                if side == "long":
-                    add(vwap + mult * vwap_std, sc + 0.2, f"VWAP_EXT+{mult}sigma")
-                else:
-                    add(vwap - mult * vwap_std, sc + 0.2, f"VWAP_EXT-{mult}sigma")
-
-        tp = None
-        if scored:
-            for tier_min, tier_lbl in [
-                (7.0, "LIQ_POOL"),
-                (6.0, "SWEEP_ORIGIN"),
-                (5.0, "ICT_STRUCTURAL"),
-                (4.0, "SWING_15M"),
-                (3.5, "VWAP"),
-                (0.0, "BEST_AVAILABLE"),
-            ]:
-                tier_cands = [(lvl, sc, lb) for lvl, sc, lb in scored if sc >= tier_min]
-                if not tier_cands:
-                    continue
-                # Score-first; nearest as tiebreaker within same score
-                tier_cands.sort(key=lambda x: (-x[1], abs(x[0] - price)))
-                for cand_lvl, cand_sc, cand_lb in tier_cands:
-                    rr = abs(cand_lvl - price) / max(sl_dist, 1e-10)
-                    if rr >= _min_rr_gate - 1e-9:
-                        tp = cand_lvl
-                        logger.info(
-                            f"🎯 TP [{tier_lbl}] ${tp:,.2f} ({cand_lb}) "
-                            f"score={cand_sc:.1f} "
-                            f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
-                            f"R:R=1:{rr:.2f} | {len(scored)} candidates total")
-                        break
-                    else:
-                        logger.debug(
-                            f"   TP candidate ${cand_lvl:,.1f} [{cand_lb}] "
-                            f"score={cand_sc:.1f} R:R={rr:.2f} < {_min_rr_gate:.1f} — skip")
-                if tp is not None:
-                    break
-
-        if tp is None:
-            logger.info(
-                f"TP STRUCTURAL REJECT: no valid {side.upper()} target "
-                f"(price=${price:,.2f}, SL-dist={sl_dist:.1f}pts, "
-                f"min_RR={_min_rr_gate:.1f}, candidates={len(scored)})")
+            return tp
+        except Exception as exc:
+            logger.warning("TP selector error: %s", exc)
             return None
 
-        return tp
 def _ict_find_swings_inline(candles: list, lookback: int):
     """Find swing highs and lows from a candle list."""
     if len(candles) < 3 or lookback < 1:
@@ -8002,6 +7886,35 @@ class QuantStrategy:
         # which records exact PnL and calls _finalise_exit().  The EXITING watchdog (120s)
         # is the safety net if exchange confirmation never arrives.
 
+    def _is_delta_execution(self) -> bool:
+        """Return True when this strategy is routed through Delta exchange.
+
+        This is deliberately separate from `_is_inverse_pnl_contract()`: Delta
+        can trade both BTC inverse contracts and linear/non-inverse products
+        such as xStocks/metals. Fees depend on exchange; gross PnL geometry
+        depends on contract type.
+        """
+        return str(getattr(config, "EXECUTION_EXCHANGE", "") or "").lower() == "delta"
+
+    def _is_inverse_pnl_contract(self) -> bool:
+        """Return True only for BTC inverse contracts, never for Delta xStocks/metals.
+
+        Multi-asset mode can keep config.DELTA_SYMBOL at BTCUSD while the live
+        strategy instance is managing PAXG/SLVON/xStock contracts. Using that
+        global config value made non-BTC Delta exits use BTC inverse accounting.
+        """
+        try:
+            asset_id = str(getattr(self, "_asset_id", "") or "").upper()
+            inst = getattr(self, "_instrument", None)
+            sym = str(
+                getattr(inst, "display_symbol", "")
+                or getattr(inst, "canonical_symbol", "")
+                or getattr(config, "DELTA_SYMBOL", "")
+            ).upper()
+            return self._is_delta_execution() and asset_id == "BTC" and "BTC" in sym
+        except Exception:
+            return False
+
     def _record_exchange_exit(self, ex_pos):
         """
         v5.1: Exchange-confirmed exit only. No price heuristics. No estimated fees.
@@ -8288,17 +8201,19 @@ class QuantStrategy:
 
         # ─── Step 2: PnL — exact gross from actual fill, exact exit fee ────────
         import config as _cfg_x
-        _is_delta = (
-            getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
-            and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
-        )
+        _is_delta_exchange = self._is_delta_execution()
+        _is_inverse = self._is_inverse_pnl_contract()
         exit_fee_is_exact = fee_paid > 0.0
         if not exit_fee_is_exact and fill_price > 0 and getattr(pos, "quantity", 0.0) > 0:
             if exit_type in ("sl", "trail_sl", "manual_exit"):
+                default_exit_rate = (
+                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050)
+                    if _is_delta_exchange else QCfg.COMMISSION_RATE()
+                )
                 exit_rate = float(getattr(
                     _cfg_x,
                     "STOP_EXIT_COMMISSION_RATE",
-                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050) if _is_delta else QCfg.COMMISSION_RATE(),
+                    default_exit_rate,
                 ))
                 fee_paid = fill_price * pos.quantity * abs(exit_rate)
                 logger.info(
@@ -8310,7 +8225,7 @@ class QuantStrategy:
             pos.entry_price,
             fill_price,
             pos.quantity,
-            inverse=bool(_is_delta and fill_price > 0),
+            inverse=bool(_is_inverse and fill_price > 0),
         )
 
         # Entry fee: prefer exact paid_commission captured at entry (v8.1).
@@ -8324,14 +8239,14 @@ class QuantStrategy:
             # FIX Bug-A: use exchange-specific maker rate.
             # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
             if fill_type == "maker":
-                if _is_delta:
+                if _is_delta_exchange:
                     entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
                 else:
                     entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER",
                                                QCfg.COMMISSION_RATE() * 0.40))
             else:
                 entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
-                              if _is_delta else QCfg.COMMISSION_RATE())
+                              if _is_delta_exchange else QCfg.COMMISSION_RATE())
             entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid
         _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
@@ -9445,8 +9360,7 @@ class QuantStrategy:
         )
         return qty
 
-    @staticmethod
-    def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
+    def _estimate_pnl(self, pos, exit_price, entry_fill_type="taker"):
         """
         Corrected PnL formula — v5.1.
 
@@ -9477,8 +9391,8 @@ class QuantStrategy:
         Fee basis: notional is measured at entry price (standard industry practice).
         """
         # Uses the module-level `config` import — no per-call import overhead.
-        _is_delta = (getattr(config, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
-                     and getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
+        _is_delta_exchange = self._is_delta_execution()
+        _is_inverse = self._is_inverse_pnl_contract()
 
         # FIX Bug-A: use exchange-specific fee rates.
         # Delta maker rate is NEGATIVE (rebate = -0.02%); CoinSwitch maker rate is
@@ -9486,25 +9400,26 @@ class QuantStrategy:
         # which is set to the CoinSwitch value (+0.00020), costing Delta maker entries
         # 0.04% of notional instead of receiving the rebate.
         if entry_fill_type == "maker":
-            if _is_delta:
+            if _is_delta_exchange:
                 entry_rate = float(getattr(config, "DELTA_COMMISSION_RATE_MAKER",
                                            -0.00020))   # Delta rebate (negative = income)
             else:
                 entry_rate = float(getattr(config, "COMMISSION_RATE_MAKER",
                                            QCfg.COMMISSION_RATE() * 0.40))
         else:
-            entry_rate = QCfg.COMMISSION_RATE()
+            entry_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
+                          if _is_delta_exchange else QCfg.COMMISSION_RATE())
 
         # Exit is always taker (stop or TP market order)
         exit_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
-                     if _is_delta else QCfg.COMMISSION_RATE())
+                     if _is_delta_exchange else QCfg.COMMISSION_RATE())
 
         gross = gross_pnl_usd(
             pos.side,
             pos.entry_price,
             exit_price,
             pos.quantity,
-            inverse=bool(_is_delta),
+            inverse=bool(_is_inverse),
         )
         entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = exit_price      * pos.quantity * exit_rate
@@ -9513,7 +9428,7 @@ class QuantStrategy:
         logger.debug(
             f"PnL calc: {pos.side} qty={pos.quantity} entry=${pos.entry_price:,.2f} "
             f"exit=${exit_price:,.2f} gross=${gross:.4f} fees=${entry_fee+exit_fee:.4f} "
-            f"net=${net_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
+            f"net=${net_pnl:.4f} [{'delta_inv' if _is_inverse else ('delta_linear' if _is_delta_exchange else 'linear')}]")
         return net_pnl
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
