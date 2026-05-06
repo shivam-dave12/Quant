@@ -1699,7 +1699,16 @@ class EntryEngine:
     def _liquidation_guard(side: str, entry: float) -> tuple:
         try:
             import config as _liq_cfg
-            leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+            # v70: use the active instrument policy leverage, not global BTC
+            # config.LEVERAGE.  Multi-asset contexts can run xStocks/metals at
+            # lower/effective leverage than BTC; using the BTC global here made
+            # valid structural SLs look beyond liquidation and caused false
+            # sl_envelope deferrals on non-BTC products.
+            try:
+                from core.market_policy import policy_value as _policy_value
+                leverage = max(float(_policy_value("leverage", getattr(_liq_cfg, "LEVERAGE", 1.0)) or 1.0), 1.0)
+            except Exception:
+                leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
             maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
             liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
         except Exception:

@@ -2832,6 +2832,7 @@ class QuantStrategy:
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
+            logger.info("   EntryArchitecture: v70-flow-audit-single-readiness-policy-leverage")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
@@ -4660,16 +4661,13 @@ class QuantStrategy:
                 f"floor={readiness.floor:.2f} | {readiness.reason}")
             return False, readiness.reason
 
-        try:
-            self._active_institutional_size_mult = self._bounded(
-                float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
-                * float(readiness.size_mult or 1.0),
-                0.0,
-                1.18,
-            )
-        except Exception:
-            pass
-        logger.debug(
+        # v70: do NOT multiply readiness into sizing here.
+        # _institutional_decision_matrix already prices readiness once into
+        # _inst_decision.size_mult.  Reapplying it in this final route check
+        # double-haircut good entries and makes the bot look overfiltered while
+        # still claiming the gate passed.  This function is now a route validator
+        # only; sizing remains single-application and auditable.
+        logger.info(
             f"ENTRY_READINESS PASS {str(getattr(signal, 'side', '')).upper()} "
             f"score={readiness.score:.2f} floor={readiness.floor:.2f} "
             f"size_mult={readiness.size_mult:.2f} | {readiness.reason}")
