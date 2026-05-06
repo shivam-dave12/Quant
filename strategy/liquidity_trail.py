@@ -1062,8 +1062,12 @@ class LiquidityTrailEngine:
         reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
                   f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")
         logger.info(f"Trail PROPOSAL: {reason}")
+        # v74: preserve the computed analytical R in the trail result. v73 returned
+        # r_multiple=0.0 for DELIVERY_LOCK, so logs showed R=0.00R while the stop
+        # was being advanced after 3–6ATR of delivery. That was an analytics/telemetry
+        # calculation bug and could mislead downstream dashboards.
         return LiquidityTrailResult(new_sl=candidate_sl, anchor=None, reason=reason,
-                                    phase="DELIVERY_LOCK", r_multiple=0.0)
+                                    phase="DELIVERY_LOCK", r_multiple=r_multiple)
 
     @staticmethod
     def _better_sl(pos_side: str, a: Optional[float], b: Optional[float]) -> Optional[float]:

@@ -2832,7 +2832,7 @@ class QuantStrategy:
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v73-native-bracket-fast-protected-flow")
+            logger.info("   EntryArchitecture: v74-native-bracket-fast-fee-true-flow")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
@@ -9366,7 +9366,34 @@ class QuantStrategy:
         else:
             risk_pct = raw_risk_pct
 
-        cash_budget = available * _bal_usage_frac
+        # Cash/margin envelope.  In multi-asset mode, `available` is the
+        # slot-scoped cash view.  The active instrument policy advertises a
+        # margin percentage (BTC 20%, commodities 14%, equities 12%), but v74
+        # still used only the legacy 60% slot cap.  That made the policy margin
+        # mostly telemetry and distorted cross-asset allocation.  v75 makes the
+        # executable cash budget the minimum of: free slot cash, raw account
+        # hard cap, and instrument policy margin cap.
+        try:
+            raw_available_cash = float(bal.get("available_raw", available) or available)
+            raw_total_cash = float(bal.get("total_raw", raw_available_cash) or raw_available_cash)
+        except Exception:
+            raw_available_cash = available
+            raw_total_cash = available
+        try:
+            policy_margin_pct = max(0.0, min(1.0, float(QCfg.MARGIN_PCT() or 0.0)))
+        except Exception:
+            policy_margin_pct = 0.0
+        if portfolio_scoped:
+            legacy_cash_cap = raw_available_cash * _bal_usage_frac
+            policy_cash_cap = raw_total_cash * policy_margin_pct if policy_margin_pct > 0 else legacy_cash_cap
+            cash_budget = max(0.0, min(available, raw_available_cash, legacy_cash_cap, policy_cash_cap))
+        else:
+            # Preserve single-asset legacy behaviour while still allowing the
+            # policy margin to be shown in diagnostics.
+            legacy_cash_cap = available * _bal_usage_frac
+            policy_cash_cap = legacy_cash_cap
+            cash_budget = max(0.0, legacy_cash_cap)
+
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
             float(viability.round_trip_cost_pts),
@@ -9381,11 +9408,33 @@ class QuantStrategy:
             logger.warning(
                 f"Sizing rejected: cash/lot envelope below minimum | "
                 f"cap_qty={executable_qty_cap:.8f} min_qty={min_qty:.8f} "
-                f"cash_budget=${cash_budget:.2f} step={step:.8f}")
+                f"cash_budget=${cash_budget:.2f} policy_cap=${policy_cash_cap:.2f} "
+                f"slot_cap=${available:.2f} step={step:.8f}")
             return None
 
         target_risk_base = risk_available if portfolio_scoped else available
         risk_capital = target_risk_base * risk_pct * total_mult
+
+        aggregate_remaining_risk = None
+        if portfolio_scoped:
+            try:
+                aggregate_remaining_risk = float(bal.get("portfolio_remaining_risk_cap", 0.0) or 0.0)
+                if aggregate_remaining_risk <= 1e-10:
+                    logger.warning(
+                        f"Sizing rejected: portfolio aggregate risk exhausted | "
+                        f"open_risk=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f} "
+                        f"cap=${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
+                    return None
+                if risk_capital > aggregate_remaining_risk:
+                    logger.info(
+                        f"Portfolio aggregate risk haircut: target_risk=${risk_capital:.2f} "
+                        f"-> remaining=${aggregate_remaining_risk:.2f} "
+                        f"open=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f}/"
+                        f"${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
+                    risk_capital = aggregate_remaining_risk
+            except Exception:
+                aggregate_remaining_risk = None
+
         qty_raw = risk_capital / sl_dist
         max_allowed_margin = cash_budget
         # Non-portfolio behaviour is unchanged: the confidence-adjusted target
@@ -9400,6 +9449,8 @@ class QuantStrategy:
                 risk_capital * 1.15,
                 target_risk_base * risk_pct * max(1.0, min_lot_risk_mult),
             )
+            if aggregate_remaining_risk is not None and aggregate_remaining_risk > 0.0:
+                max_risk_cap = min(max_risk_cap, aggregate_remaining_risk)
         else:
             max_risk_cap = risk_capital * 1.15
 
@@ -9452,8 +9503,8 @@ class QuantStrategy:
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
-                f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
-                f"({_bal_usage_pct:.0f}% of ${available:.2f}) "
+                f"policy/slot cash cap ${max_allowed_margin:.2f} "
+                f"(policy {policy_margin_pct:.0%}, legacy {_bal_usage_pct:.0f}%, slot ${available:.2f}) "
                 f"— scaling down"
             )
             return None
@@ -9492,8 +9543,10 @@ class QuantStrategy:
             f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
             f"({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
-            f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} | "
-            f"headroom=${available - required_cash:.2f} | qty={qty}"
+            f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} "
+            f"policy_cap=${policy_cash_cap:.2f} agg_open=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f} "
+            f"agg_rem=${aggregate_remaining_risk if aggregate_remaining_risk is not None else -1:.2f} | "
+            f"headroom=${cash_budget - required_cash:.2f} | qty={qty}"
         )
         return qty
 

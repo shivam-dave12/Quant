@@ -106,6 +106,44 @@ class PortfolioManager:
         slot_available = min(slot_equity, raw_available)
 
         pol = active_policy(getattr(ctx, 'instrument', None) if ctx is not None else None)
+
+        # Portfolio exposure truth: cash is still slot-scoped, but risk must be
+        # tracked at the account level.  The config already defined
+        # PORTFOLIO_MAX_AGGREGATE_RISK_PCT, but prior builds did not calculate
+        # or enforce open account risk.  That meant six simultaneous min-lot
+        # exceptions could silently exceed the intended portfolio risk budget.
+        open_risk_usd = 0.0
+        open_margin_used = 0.0
+        for c in list(contexts or []):
+            if c is ctx:
+                # Candidate being sized is not open yet; avoid self-counting
+                # stale ENTERING placeholders on retries.
+                continue
+            if not getattr(c, 'has_position', False):
+                continue
+            try:
+                pos = c.strategy.get_position() if getattr(c, 'strategy', None) is not None else None
+            except Exception:
+                pos = None
+            if not isinstance(pos, dict):
+                continue
+            try:
+                entry = float(pos.get('entry_price', 0.0) or 0.0)
+                qty = abs(float(pos.get('quantity', 0.0) or 0.0))
+                sl = float(pos.get('sl_price', 0.0) or 0.0)
+                if entry <= 0.0 or qty <= 0.0:
+                    continue
+                if sl > 0.0:
+                    open_risk_usd += abs(entry - sl) * qty
+                inst = getattr(c, 'instrument', None)
+                lev = float(getattr(active_policy(inst), 'leverage', 1.0) or 1.0)
+                open_margin_used += (entry * qty / lev) if lev > 0 else entry * qty
+            except Exception:
+                continue
+
+        aggregate_risk_cap = raw_total * max(0.0, float(getattr(config, 'PORTFOLIO_MAX_AGGREGATE_RISK_PCT', 3.0) or 0.0)) / 100.0
+        remaining_risk_cap = max(0.0, aggregate_risk_cap - open_risk_usd)
+
         # Margin/cash budget is slot-scoped and per-policy.  Risk-dollar base is
         # portfolio equity by default, then multiplied by the instrument policy.
         adjusted = dict(raw_balance)
@@ -115,6 +153,10 @@ class PortfolioManager:
         adjusted['total'] = max(0.0, slot_equity)
         adjusted['risk_available'] = raw_available if self.risk_budget_mode == 'portfolio_equity' else slot_available
         adjusted['risk_total'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_equity
+        adjusted['portfolio_open_risk_usd'] = round(open_risk_usd, 8)
+        adjusted['portfolio_open_margin_used'] = round(open_margin_used, 8)
+        adjusted['portfolio_aggregate_risk_cap'] = round(aggregate_risk_cap, 8)
+        adjusted['portfolio_remaining_risk_cap'] = round(remaining_risk_cap, 8)
         adjusted['portfolio_scoped'] = True
         adjusted['portfolio_budget_mode'] = self.budget_mode
         adjusted['portfolio_risk_budget_mode'] = self.risk_budget_mode
