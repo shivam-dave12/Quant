@@ -79,10 +79,10 @@ TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
-# Style/quality signals are never hidden alpha vetoes. They are continuous
-# references used for score, size multiplier, expected utility, and attribution.
-# Only mechanical account/exchange safety can stop routing.
-INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
+# Quality signals are priced into the execution decision. Mechanical defects
+# always stop routing; weak delivery/coherence must clear an adaptive quality
+# floor before an order is allowed to reach sizing/execution.
+INSTITUTIONAL_STRICT_QUALITY_GATES = True
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
@@ -90,6 +90,8 @@ INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
+ENTRY_EXECUTION_QUALITY_MIN        = 0.52
+ENTRY_CRITICAL_DEFECT_FLOOR        = 0.62
 ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
 ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
@@ -456,8 +458,9 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
 # ── Institutional Dynamic Entry Quality References ───────────────────────────
-# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
-# signal quality and size; posterior/EV still owns trade expression.
+# These are adaptive scoring references for the executable entry surface. Weak
+# structure first lowers quality/size; critical defects pause routing until the
+# market provides accepted delivery.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
@@ -471,6 +474,8 @@ ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic p
 ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
 ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
+ENTRY_EXECUTION_QUALITY_MIN              = 0.52
+ENTRY_CRITICAL_DEFECT_FLOOR              = 0.62
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
 QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15

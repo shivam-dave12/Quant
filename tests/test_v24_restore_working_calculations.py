@@ -12,11 +12,12 @@ class V24RestoreWorkingCalculationsTest(unittest.TestCase):
         self.assertNotIn('trade must reprice/abstain', src)
         self.assertNotIn('not place SL in front of liquidity', src)
 
-    def test_sl_pool_selector_uses_working_v58_buffer_model(self):
+    def test_sl_pool_selector_uses_v66_liquidity_exclusion_model(self):
         src = (ROOT / 'strategy' / 'liquidity_pool_selector.py').read_text()
-        self.assertIn('_SL_BUFFER_BASE_ATR        = 0.18', src)
-        self.assertIn('_SL_BUFFER_MAX_ATR         = 0.55', src)
-        self.assertIn('high quality → smaller buffer', src)
+        self.assertIn('_SL_BUFFER_BASE_ATR        = 0.30', src)
+        self.assertIn('_SL_BUFFER_MAX_ATR         = 1.35', src)
+        self.assertIn('stronger liquidity → wider buffer', src)
+        self.assertIn('_SL_HARD_MAX_DISTANCE_ATR  = 18.0', src)
 
     def test_trailing_default_is_on_in_this_repaired_trailing_on_build(self):
         import config

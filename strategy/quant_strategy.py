@@ -2299,6 +2299,25 @@ class InstitutionalDecision:
 
 
 @dataclass
+class EntryReadinessDecision:
+    """Institutional entry-readiness surface.
+
+    This is the single final entry-coherence decision used by both the
+    institutional matrix and unified gate. It prevents duplicate hard filters
+    from blocking valid sweep entries while still stopping malformed or
+    delivery-less trades.
+    """
+    allowed: bool
+    score: float
+    floor: float
+    size_mult: float = 1.0
+    reason: str = ""
+    hard_rejects: List[str] = field(default_factory=list)
+    penalties: List[str] = field(default_factory=list)
+    allows: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ExecutionViability:
     route: str
     side: str
@@ -3413,19 +3432,19 @@ class QuantStrategy:
         else:
             event_q = self._bounded(0.35 + 0.25 * conviction + 0.20 * target_realism)
 
-        try:
-            _sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
-            _disp_atr = float(_sa.get("displacement_atr", 0.0) or 0.0)
-            _cisd_ok = bool(_sa.get("cisd", False))
-            _ote_ok = bool(_sa.get("ote", False))
-            _min_disp = float(getattr(config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
-            _strong_disp = float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
-            if is_sweep and _disp_atr < _min_disp:
-                rejects.append(f"institutional displacement {_disp_atr:.2f}ATR < {_min_disp:.2f}ATR")
-            if is_sweep and not (_cisd_ok or _ote_ok or _disp_atr >= _strong_disp):
-                rejects.append("no CISD/OTE/strong displacement acceptance")
-        except Exception as _idm_e:
-            logger.debug(f"institutional matrix displacement check error: {_idm_e}")
+        entry_readiness = EntryReadinessDecision(True, 1.0, 0.0, 1.0, "not_applicable")
+        if is_sweep:
+            try:
+                entry_readiness = self._entry_readiness_surface(
+                    signal, ict_ctx, flow_state, liq_snapshot, price, atr)
+                allows.extend(entry_readiness.allows[:4])
+                if entry_readiness.penalties:
+                    allows.append("entry_readiness_penalty: " + " | ".join(entry_readiness.penalties[:3]))
+                if not entry_readiness.allowed:
+                    rejects.append(f"ENTRY_READINESS_BLOCK: {entry_readiness.reason}")
+                event_q = max(event_q, entry_readiness.score)
+            except Exception as _idm_e:
+                logger.debug(f"institutional entry-readiness surface error: {_idm_e}")
 
         side_sign = 1.0 if side == "long" else -1.0
         tf = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
@@ -3503,10 +3522,9 @@ class QuantStrategy:
 
         # Institutional execution audit.
         #
-        # Dynamic institutional mode: style/quality observations never become
-        # hidden alpha vetoes. They are converted into size, grade and operator
-        # attribution. Only mechanical safety defects can block routing: broken
-        # levels, liquidation-danger geometry, or non-protective order placement.
+        # Dynamic institutional mode: quality observations feed both routing
+        # integrity and sizing. Mechanical defects always block; weak delivery
+        # blocks only when it fails the adaptive execution-quality surface.
         threshold = float(getattr(
             config, "INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE",
             getattr(config, "INSTITUTIONAL_MIN_DECISION_SCORE", 0.66 if is_sweep else 0.72),
@@ -3518,16 +3536,16 @@ class QuantStrategy:
         advisory_rejects = []
 
         safety_tokens = (
-            "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
+            "ENTRY_READINESS_BLOCK", "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
             "TP IS NOT", "SL IS NOT", "NON-PROTECTIVE",
             "INVALID", "NON-POSITIVE", "CROSSED",
+            "INSIDE EXECUTION NOISE", "R:R",
             "NO POSITIVE EXECUTABLE UTILITY", "EXECUTABLE TARGET UTILITY",
             "EXECUTABLE TARGET SURFACE",
         )
         quality_tokens = (
-            "DISPLACEMENT", "NO CISD/OTE/STRONG DISPLACEMENT",
-            "INSIDE EXECUTION NOISE", "TP REACH", "R:R",
-            "POST-SWEEP ENGINE", "DIRECTIONENGINE",
+            "TP REACH", "POST-SWEEP ENGINE", "DIRECTIONENGINE",
+            "TARGET_REALISM", "DECISION_SCORE", "ENTRY_READINESS_PENALTY",
         )
 
         for _r in rejects:
@@ -3576,7 +3594,8 @@ class QuantStrategy:
         realism_adj = 0.65 + 0.70 * max(0.0, min(1.0, target_realism))
         rr_adj = 0.85 + min(max(rr - 1.2, 0.0), 3.0) * 0.06
         quality_penalty_mult = max(0.35, 1.0 - quality_gap)
-        size_mult = self._bounded(base_size * realism_adj * rr_adj * quality_penalty_mult, 0.25, 1.15)
+        readiness_mult = float(getattr(entry_readiness, "size_mult", 1.0) or 1.0)
+        size_mult = self._bounded(base_size * realism_adj * rr_adj * quality_penalty_mult * readiness_mult, 0.20, 1.15)
         if rr >= 3.0 and target_realism >= 0.75:
             size_mult = min(1.18, size_mult + 0.05)
         try:
@@ -4430,179 +4449,231 @@ class QuantStrategy:
             logger.debug("\n" + "\n".join(lines_out))
 
 
+    def _entry_readiness_surface(self, signal, ict_ctx, flow_state,
+                                 liq_snapshot, price: float, atr: float) -> EntryReadinessDecision:
+        """Single final entry-coherence surface.
+
+        Institutional entry cannot be a stack of independent retail-style vetoes.
+        The EntryEngine already prices the post-sweep auction. This method fuses
+        its evidence with live flow, MTF context, PD location, and posterior/EV
+        into one readiness score. Only true structural defects block routing;
+        borderline but coherent conditions reduce size or wait for repricing.
+        """
+        side = str(getattr(signal, "side", "") or "").lower()
+        side_sign = 1.0 if side == "long" else -1.0 if side == "short" else 0.0
+        etype = self._signal_entry_type_value(signal)
+        is_cont = "CONTINUATION" in str(etype).upper()
+        is_rev = "REVERSAL" in str(etype).upper()
+        atr_v = max(float(atr or 0.0), 1e-9)
+        profile = build_market_profile(
+            price=price, atr=atr_v, liq_snapshot=liq_snapshot,
+            ict=ict_ctx, flow=flow_state, side=side,
+        )
+        sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+
+        penalties: List[str] = []
+        hard: List[str] = []
+        allows: List[str] = []
+
+        disp = max(0.0, float(sa.get("displacement_atr", 0.0) or 0.0))
+        cisd = bool(sa.get("cisd", False))
+        ote = bool(sa.get("ote", False))
+        quality_score = max(0.0, min(1.0, float(sa.get("quality_score", 1.0) or 1.0)))
+        quality_floor = max(0.30, min(0.88, float(sa.get(
+            "quality_floor", getattr(config, "ENTRY_EXECUTION_QUALITY_MIN", 0.52)) or 0.52)))
+        critical_floor = max(quality_floor, min(0.90, float(sa.get(
+            "quality_critical_floor", getattr(config, "ENTRY_CRITICAL_DEFECT_FLOOR", 0.62)) or 0.62)))
+        rev_score = max(0.0, float(sa.get("rev_score", sa.get("reversal_score", 0.0)) or 0.0))
+        cont_score = max(0.0, float(sa.get("cont_score", sa.get("continuation_score", 0.0)) or 0.0))
+        chosen_score = cont_score if is_cont else rev_score
+        other_score = rev_score if is_cont else cont_score
+        dominance = max(0.0, chosen_score - other_score)
+        posterior = max(0.0, min(1.0, float(sa.get("quant_posterior", sa.get("posterior", 0.0)) or 0.0)))
+        quant_ev = float(sa.get("quant_ev", sa.get("expected_value", 0.0)) or 0.0)
+
+        min_disp = profile.displacement_min(float(getattr(
+            config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR",
+            getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))))
+        strong_disp = profile.strong_displacement(float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25)))
+        gap_floor = max(8.0, profile.evidence_gap(14.0))
+
+        delivery_score = max(
+            min(disp / max(strong_disp, 1e-9), 1.0),
+            0.86 if cisd else 0.0,
+            0.74 if ote else 0.0,
+        )
+        evidence_score = max(
+            min(chosen_score / 110.0, 1.0),
+            min(max(dominance, 0.0) / max(gap_floor * 3.0, 1e-9), 1.0),
+        )
+        posterior_score = max(posterior, min(max(quant_ev, 0.0) / 1.2, 1.0))
+
+        tick = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
+        cvd = float(getattr(flow_state, "cvd_trend", 0.0) or 0.0)
+        signed_flow = side_sign * (0.50 * tick + 0.50 * cvd)
+        flow_score = max(0.05, min(1.0, 0.50 + 0.50 * signed_flow))
+
+        pd = max(0.0, min(1.0, float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)))
+        pd_preference = (1.0 - pd) if side == "long" else pd if side == "short" else 0.5
+        pd_score = max(0.05, min(1.0, 0.30 + 0.70 * pd_preference))
+
+        s15 = str(getattr(ict_ctx, "structure_15m", "") or "").lower()
+        s4h = str(getattr(ict_ctx, "structure_4h", "") or "").lower()
+        htf = 0.0
+        for sctx in (s15, s4h):
+            if "bull" in sctx:
+                htf += 0.5
+            elif "bear" in sctx:
+                htf -= 0.5
+        htf *= side_sign
+        htf_score = max(0.10, min(1.0, 0.55 + 0.35 * htf))
+
+        score = (
+            0.24 * delivery_score
+            + 0.18 * evidence_score
+            + 0.17 * posterior_score
+            + 0.16 * quality_score
+            + 0.10 * flow_score
+            + 0.08 * htf_score
+            + 0.07 * pd_score
+        )
+
+        if disp >= strong_disp:
+            allows.append(f"strong_delivery DISP={disp:.2f}ATR>={strong_disp:.2f}ATR")
+        elif disp >= min_disp:
+            allows.append(f"accepted_delivery DISP={disp:.2f}ATR>={min_disp:.2f}ATR")
+        if cisd:
+            allows.append("CISD accepted")
+        if ote:
+            allows.append("OTE/retrace accepted")
+        if dominance >= gap_floor:
+            allows.append(f"evidence_dominance={dominance:.0f}>={gap_floor:.0f}")
+        if posterior > 0:
+            allows.append(f"posterior={posterior:.2f} EV={quant_ev:.2f}R")
+
+        # Critical defects: no auction delivery and no dominant posterior edge.
+        has_delivery = (disp >= min_disp) or cisd or ote
+        dominant_edge = (chosen_score >= 70.0 and dominance >= gap_floor and posterior >= 0.58)
+        if not has_delivery and not dominant_edge:
+            hard.append(
+                f"no accepted delivery: DISP={disp:.2f}ATR<{min_disp:.2f}ATR, no CISD/OTE, dominance={dominance:.0f}"
+            )
+        elif not has_delivery:
+            penalties.append("delivery not explicit; routed only by dominant posterior/evidence")
+            score *= 0.82
+
+        if quality_score < quality_floor:
+            if quality_score < critical_floor and not dominant_edge:
+                hard.append(f"entry quality {quality_score:.2f} < critical {critical_floor:.2f}")
+            else:
+                penalties.append(f"entry quality {quality_score:.2f} < floor {quality_floor:.2f}")
+                score *= max(0.70, 1.0 - (quality_floor - quality_score) * 0.55)
+
+        contra_flow = signed_flow <= -0.34
+        severe_contra_flow = signed_flow <= -0.58
+        if contra_flow:
+            penalties.append(f"contra flow tick={tick:+.2f} cvd={cvd:+.2f}")
+            score *= 0.86 if not severe_contra_flow else 0.74
+        if severe_contra_flow and disp < strong_disp and not (cisd and ote):
+            hard.append(f"severe contra flow without strong delivery tick={tick:+.2f} cvd={cvd:+.2f}")
+
+        # PD/HTF are not standalone retail vetoes; they block only when the trade
+        # lacks delivery strong enough to justify attacking that side of the range.
+        dr_long_max, dr_short_min = profile.dealing_range_bounds(
+            float(getattr(config, "ENTRY_REVERSAL_PD_LONG_MAX", 0.62)),
+            float(getattr(config, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38)),
+        )
+        pd_contra = ((side == "long" and pd > dr_long_max) or (side == "short" and pd < dr_short_min))
+        if is_rev and pd_contra:
+            penalties.append(f"PD contra pd={pd:.2f}")
+            score *= 0.90
+            if disp < strong_disp and not (cisd or ote) and not dominant_edge:
+                hard.append(f"PD contra without accepted delivery pd={pd:.2f}")
+
+        htf_contra = (side == "long" and htf <= -0.90) or (side == "short" and htf >= 0.90)
+        if htf_contra:
+            penalties.append(f"15m/4h contra htf={htf:+.2f}")
+            score *= 0.88
+            if disp < strong_disp and not (cisd or ote) and not dominant_edge:
+                hard.append(f"15m/4h contra without accepted delivery htf={htf:+.2f}")
+
+        if is_cont:
+            sweep = getattr(signal, "sweep_result", None)
+            pool = getattr(sweep, "pool", None)
+            pool_px = float(getattr(pool, "price", 0.0) or 0.0)
+            acc = 0.0
+            if pool_px > 0 and atr_v > 0:
+                acc = ((price - pool_px) / atr_v) if side == "long" else ((pool_px - price) / atr_v)
+            req = profile.displacement_min(float(getattr(config, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55)))
+            if acc < req:
+                penalties.append(f"continuation acceptance {acc:.2f}ATR < {req:.2f}ATR")
+                score *= 0.82
+                if not (disp >= strong_disp or cisd or dominant_edge):
+                    hard.append(f"continuation not accepted away from swept pool {acc:.2f}ATR<{req:.2f}ATR")
+
+        score = max(0.01, min(1.0, score))
+        floor = max(quality_floor, min(0.76, 0.52 * max(0.92, min(1.20, profile.selectivity))))
+        # A truly dominant sweep should not wait for the same threshold as a
+        # borderline auction. This avoids missing the best fast entries.
+        if dominant_edge and (disp >= min_disp or cisd or ote):
+            floor = max(0.48, floor - 0.06)
+
+        allowed = (not hard) and score >= floor
+        if not allowed and not hard and score < floor:
+            hard.append(f"readiness score {score:.2f} < floor {floor:.2f}")
+
+        size_mult = max(0.20, min(1.15, 0.62 + 0.80 * (score - floor))) if allowed else 0.0
+        if penalties:
+            size_mult *= max(0.45, 1.0 - 0.08 * min(len(penalties), 5))
+        size_mult = max(0.0, min(1.15, size_mult))
+
+        reason_bits = hard if hard else penalties if penalties else allows
+        reason = " | ".join(reason_bits[:4]) if reason_bits else "clean"
+        return EntryReadinessDecision(
+            allowed=allowed,
+            score=score,
+            floor=floor,
+            size_mult=size_mult,
+            reason=reason,
+            hard_rejects=hard[:8],
+            penalties=penalties[:8],
+            allows=allows[:8],
+        )
+
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
-        Institutional Unified Entry Gate diagnostics.
+        Final route-readiness check.
 
-        This gate logs structural coherence notes for diagnostics but does NOT
-        block any trade. Final trade permission is owned by the quantitative
-        posterior/EV model plus account/exchange safety.
-
-          QuantPosterior -> executable alpha approval
-          Risk/Safety    -> account, liquidation, margin and loss-limit veto
-          UnifiedGate    -> diagnostics for post-trade attribution
-
-        Philosophy: diagnostic layers do not veto because of style/score.
-        They provide features and attribution; the posterior model owns edge.
+        v68 change: this is no longer a second independent stack of hard gates.
+        It reuses the same entry-readiness surface as the institutional decision
+        matrix so valid fast sweeps are not blocked twice.  Critical defects
+        pause routing; coherent but imperfect entries route with reduced size.
         """
-        advisories = []   # informational only — never blocks
+        readiness = self._entry_readiness_surface(
+            signal, ict_ctx, flow_state, liq_snapshot, price, atr)
+        self._last_entry_readiness = readiness
+        if not readiness.allowed:
+            logger.info(
+                f"ENTRY_READINESS paused routing {str(getattr(signal, 'side', '')).upper()} "
+                f"{self._signal_entry_type_value(signal)}: score={readiness.score:.2f} "
+                f"floor={readiness.floor:.2f} | {readiness.reason}")
+            return False, readiness.reason
 
-        # ── AMD Phase context ───────────────────────────────────────────────
-        amd_phase = (ict_ctx.amd_phase or "").upper()
-        amd_bias  = (ict_ctx.amd_bias  or "").lower()
-        amd_conf  = ict_ctx.amd_confidence
-
-        _is_sweep_rev = (hasattr(signal, 'entry_type')
-                         and signal.entry_type is not None
-                         and 'REVERSAL' in str(signal.entry_type).upper())
-        _has_ps_hint = (ict_ctx.direction_hint == "reverse"
-                        and ict_ctx.direction_hint_confidence >= 0.40)
-
-        if amd_phase == "ACCUMULATION":
-            if _is_sweep_rev or _has_ps_hint:
-                advisories.append(f"AMD=ACCUM sweep-reversal (phase lag expected, scoring handles it)")
-            else:
-                advisories.append(f"AMD=ACCUM non-reversal — low amd_score will penalise conviction")
-
-        if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
-            bias_contra = (
-                (signal.side == "long"  and "bear" in amd_bias) or
-                (signal.side == "short" and "bull" in amd_bias)
-            )
-            if bias_contra and not _has_ps_hint:
-                advisories.append(
-                    f"AMD_ADVISORY: MANIP bias={amd_bias} conf={amd_conf:.2f} "
-                    f"vs {signal.side} — contra-AMD, conviction will penalise")
-
-        # ── AMD lag override for fresh sweeps ───────────────────────────────
-        # (Already applied to ict_ctx.amd_phase in _evaluate_entry; repeated
-        #  here for gate logging completeness only)
-
-        # ── Direction Engine context ─────────────────────────────────────────
-        if self._dir_engine is not None:
-            try:
-                _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
-                if not _ps_agrees:
-                    _hunt = getattr(self._dir_engine, '_last_hunt', None)
-                    if _hunt is not None and hasattr(_hunt, 'delivery_direction'):
-                        _del_dir   = getattr(_hunt, 'delivery_direction', '')
-                        _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
-                        if _hunt_conf >= 0.60:
-                            agrees = (
-                                (signal.side == "long"  and _del_dir == "bullish") or
-                                (signal.side == "short" and _del_dir == "bearish") or
-                                _del_dir in ("", "neutral", None)
-                            )
-                            if not agrees:
-                                advisories.append(
-                                    f"DIR_ADVISORY: hunt delivery={_del_dir} "
-                                    f"conf={_hunt_conf:.2f} vs {signal.side} "
-                                    f"(not blocking — conviction_filter weights flow)")
-            except Exception:
-                pass
-
-        # ── HTF Structure context ────────────────────────────────────────────
-        if self._ict is not None and getattr(self._ict, '_initialized', False):
-            try:
-                tf_data = getattr(self._ict, '_tf', {})
-                tf_15m  = tf_data.get("15m")
-                tf_4h   = tf_data.get("4h")
-                if tf_15m and tf_4h:
-                    t15 = str(getattr(tf_15m, 'trend', 'ranging') or 'ranging').lower()
-                    t4h = str(getattr(tf_4h,  'trend', 'ranging') or 'ranging').lower()
-                    both_bearish = (t15 == "bearish" and t4h == "bearish")
-                    both_bullish = (t15 == "bullish" and t4h == "bullish")
-                    if signal.side == "long" and both_bearish:
-                        advisories.append(
-                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bearish vs LONG "
-                            f"(not blocking — conviction_filter scores HTF via structure)")
-                    elif signal.side == "short" and both_bullish:
-                        advisories.append(
-                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bullish vs SHORT "
-                            f"(not blocking — conviction_filter scores HTF via structure)")
-            except Exception:
-                pass
-
-        # ── Order Flow context ───────────────────────────────────────────────
-        tf  = flow_state.tick_flow if flow_state else 0.0
-        cvd = flow_state.cvd_trend if flow_state else 0.0
-        flow_opposes = (
-            (signal.side == "long"  and tf < -0.35 and cvd < -0.20) or
-            (signal.side == "short" and tf >  0.35 and cvd >  0.20)
-        )
-        if flow_opposes:
-            advisories.append(
-                f"FLOW_ADVISORY: tick={tf:+.2f} cvd={cvd:+.2f} "
-                f"vs {signal.side} (scored in conviction_filter, not blocking)")
-
-        # ── Session context ──────────────────────────────────────────────────
-        session = str(getattr(ict_ctx, 'kill_zone', '') or '')
-        if not session and self._ict:
-            session = str(getattr(self._ict, '_killzone', '') or '')
-        if session.upper() == "ASIA":
-            advisories.append(
-                "SESSION_ADVISORY: ASIA — conviction_filter applies session_score=0.60 "
-                "(not blocking here)")
-
-        # ── R:R context ──────────────────────────────────────────────────────
-        if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 1.2:
-            advisories.append(
-                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 — "
-                f"conviction_filter applies R:R penalty to pool_sig_score")
-
-        # ── Dynamic institutional coherence advisories ────────────────
-        rejects = []
         try:
-            _sa = getattr(self._entry_engine, '_last_sweep_analysis', None) or {}
-            _disp = float(_sa.get('displacement_atr', 0.0) or 0.0)
-            _cisd = bool(_sa.get('cisd', False))
-            _ote  = bool(_sa.get('ote', False))
-            _min_disp = float(getattr(config, 'ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR', getattr(config, 'ENTRY_HARD_MIN_DISPLACEMENT_ATR', 0.75)))
-            _strong_disp = float(getattr(config, 'ENTRY_STRONG_DISPLACEMENT_ATR', 1.25))
-            if _disp < _min_disp:
-                rejects.append(f"displacement {_disp:.2f}ATR < {_min_disp:.2f}ATR")
-            if not (_cisd or _ote or _disp >= _strong_disp):
-                rejects.append("no CISD/OTE/strong accepted displacement")
-
-            _pd = max(0.0, min(1.0, float(getattr(ict_ctx, 'dealing_range_pd', 0.5) or 0.5)))
-            if signal.side == 'long' and _pd > float(getattr(config, 'ENTRY_REVERSAL_PD_LONG_MAX', 0.62)) and _disp < _strong_disp:
-                rejects.append(f"long from premium PD={_pd:.2f}")
-            if signal.side == 'short' and _pd < float(getattr(config, 'ENTRY_REVERSAL_PD_SHORT_MIN', 0.38)) and _disp < _strong_disp:
-                rejects.append(f"short from discount PD={_pd:.2f}")
-
-            _tick = float(getattr(flow_state, 'tick_flow', 0.0) or 0.0)
-            _cvd  = float(getattr(flow_state, 'cvd_trend', 0.0) or 0.0)
-            _ft = float(getattr(config, 'ENTRY_FLOW_HARD_OPPOSE_THRESHOLD', 0.40))
-            _ct = float(getattr(config, 'ENTRY_CVD_HARD_OPPOSE_THRESHOLD', 0.30))
-            if signal.side == 'long' and _tick < -_ft and _cvd < -_ct and _disp < _strong_disp:
-                rejects.append(f"tick/CVD oppose long {_tick:+.2f}/{_cvd:+.2f}")
-            if signal.side == 'short' and _tick > _ft and _cvd > _ct and _disp < _strong_disp:
-                rejects.append(f"tick/CVD oppose short {_tick:+.2f}/{_cvd:+.2f}")
-
-            if 'CONTINUATION' in str(getattr(signal, 'entry_type', '')).upper():
-                _sweep = getattr(signal, 'sweep_result', None)
-                _pool = getattr(_sweep, 'pool', None)
-                _px = float(getattr(_pool, 'price', 0.0) or 0.0)
-                if _px > 0 and atr > 0:
-                    _acc = ((price - _px) / atr) if signal.side == 'long' else ((_px - price) / atr)
-                    _req = float(getattr(config, 'ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR', 0.55))
-                    if _acc < _req:
-                        rejects.append(f"continuation acceptance {_acc:.2f}ATR < {_req:.2f}ATR")
-        except Exception as _uge:
-            logger.debug(f"UNIFIED_GATE dynamic advisory error: {_uge}")
-
-        if rejects:
-            advisories.append("dynamic coherence advisory: " + " | ".join(rejects[:4]))
-
-        # Log all advisories at DEBUG (not INFO — avoids log spam)
-        if advisories:
-            logger.debug(
-                f"UNIFIED_GATE [{signal.side.upper()}] advisories (not blocking): "
-                f"{' | '.join(advisories[:4])}")
-
-        # ALWAYS PASS — this layer is attribution-only
-        return True, "UNIFIED_GATE_PASS"
+            self._active_institutional_size_mult = self._bounded(
+                float(getattr(self, "_active_institutional_size_mult", 1.0) or 1.0)
+                * float(readiness.size_mult or 1.0),
+                0.0,
+                1.18,
+            )
+        except Exception:
+            pass
+        logger.debug(
+            f"ENTRY_READINESS PASS {str(getattr(signal, 'side', '')).upper()} "
+            f"score={readiness.score:.2f} floor={readiness.floor:.2f} "
+            f"size_mult={readiness.size_mult:.2f} | {readiness.reason}")
+        return True, "ENTRY_READINESS_PASS"
 
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
@@ -4983,21 +5054,9 @@ class QuantStrategy:
                     # Fallback: use 15m premium/discount
                     if tf_15m:
                         ict_ctx.dealing_range_pd = getattr(tf_15m, 'premium_discount', 0.5)
-                try:
-                    ob_sl_long = self._ict.get_ob_sl_level("long", price, atr, now_ms)
-                    if ob_sl_long:
-                        ict_ctx.nearest_ob_price = ob_sl_long
-                except Exception:
-                    pass
-                # BUG-FIX-CRITICAL: Also fetch SHORT-side OB (above price).
-                # Without this, _compute_sl in entry_engine ALWAYS returned None
-                # for shorts because nearest_ob_price was always below price.
-                try:
-                    ob_sl_short = self._ict.get_ob_sl_level("short", price, atr, now_ms)
-                    if ob_sl_short:
-                        ict_ctx.nearest_ob_price_short = ob_sl_short
-                except Exception:
-                    pass
+                # OB stop levels are intentionally not copied into ICTContext.
+                # v67 removed the legacy OB/momentum SL path; sweep entries now
+                # price stops only from sweep invalidation + MTF liquidity shield.
                 try:
                     sess = self._ict.get_amd_session_context(now_ms)
                     ict_ctx.kill_zone = sess.get("session", "")
@@ -5510,8 +5569,8 @@ class QuantStrategy:
                 if self._ict is not None:
                     _sess_str = str(getattr(self._ict, '_session', '') or '')
 
-                # Resolve sweep_pool: prefer signal.swept_pool (actual swept pool),
-                # fall back to primary_target (pool being approached).
+                # Resolve sweep_pool: prefer the actual sweep_result pool; target_pool
+                # is retained only as context for conviction attribution.
                 _conv_pool = None
                 if hasattr(signal, 'swept_pool') and signal.swept_pool is not None:
                     _conv_pool = signal.swept_pool
@@ -5520,7 +5579,7 @@ class QuantStrategy:
                 elif liq_snapshot and liq_snapshot.primary_target is not None:
                     _conv_pool = liq_snapshot.primary_target
 
-                # Entry type for approach vs reversal detection
+                # Entry type is sweep-only; this string is passed to the attribution lens.
                 _entry_type_str = (signal.entry_type.value
                                    if hasattr(signal, 'entry_type') and signal.entry_type is not None
                                    else "")

@@ -202,6 +202,8 @@ try:
     _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
     _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
     _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
+    _ENTRY_EXECUTION_QUALITY_MIN = float(getattr(_entry_gate_cfg, "ENTRY_EXECUTION_QUALITY_MIN", 0.52))
+    _ENTRY_CRITICAL_DEFECT_FLOOR = float(getattr(_entry_gate_cfg, "ENTRY_CRITICAL_DEFECT_FLOOR", 0.62))
 except Exception:
     _ENTRY_HARD_MIN_DISP_ATR = 0.75
     _ENTRY_STRONG_DISP_ATR   = 1.25
@@ -215,6 +217,8 @@ except Exception:
     _ENTRY_CVD_HARD_OPPOSE  = 0.30
     _ENTRY_HTF_CONTRA_VETO = True
     _ENTRY_GATE_LOG_SEC = 12.0
+    _ENTRY_EXECUTION_QUALITY_MIN = 0.52
+    _ENTRY_CRITICAL_DEFECT_FLOOR = 0.62
 
 
 # HTF TP escalation
@@ -311,8 +315,6 @@ class ICTContext:
     structure_4h:           str   = ""
     bos_5m:                 str   = ""
     choch_5m:               str   = ""
-    nearest_ob_price:       float = 0.0
-    nearest_ob_price_short: float = 0.0
     kill_zone:              str   = ""
     ict_sweeps:             list  = field(default_factory=list)
     direction_hint:            str   = ""
@@ -628,10 +630,18 @@ class EntryEngine:
             key = self._sweep_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
             new_exp = now + max(5.0, float(cooldown_sec))
-            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+            # If the prior lock already expired, replace it.  The previous
+            # min(old_exp, new_exp) path kept a stale timestamp and logged
+            # negative cooldowns (for example: "shortened to -222s"), which
+            # made the sweep registry look broken and could suppress/refine the
+            # wrong thesis.
+            if old_exp <= now:
+                self._processed_sweeps[key] = new_exp
+            else:
+                self._processed_sweeps[key] = min(old_exp, new_exp)
             logger.info(
                 f"EntryEngine pre-order rejection: sweep lock shortened "
-                f"to {int(self._processed_sweeps[key] - now)}s for "
+                f"to {max(0, int(self._processed_sweeps[key] - now))}s for "
                 f"{sweep.pool.side.value} ${sweep.pool.price:,.1f}")
 
             if (_REFINE_ENABLED
@@ -717,7 +727,10 @@ class EntryEngine:
             key = self._sweep_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
             new_exp = now + max(5.0, cooldown)
-            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
+            if old_exp <= now:
+                self._processed_sweeps[key] = new_exp
+            else:
+                self._processed_sweeps[key] = min(old_exp, new_exp)
 
             sig = EntrySignal(
                 side=side,
@@ -1580,6 +1593,8 @@ class EntryEngine:
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             score_conf = min(1.0, rev_total / 90.0)
             conf = 0.78 * qd.posterior + 0.22 * score_conf
+            quality_score = float(self._last_sweep_analysis.get("quality_score", 1.0) or 1.0)
+            conf *= max(0.50, min(1.0, 0.70 + 0.30 * quality_score))
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
             self._log_posterior_accept_once(
@@ -1619,9 +1634,12 @@ class EntryEngine:
                 f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
                 now,
             )
+            cont_conf = 0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0)
+            quality_score = float(self._last_sweep_analysis.get("quality_score", 1.0) or 1.0)
+            cont_conf *= max(0.50, min(1.0, 0.70 + 0.30 * quality_score))
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
-                confidence=0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0),
+                confidence=cont_conf,
                 next_target=cont_target,
                 reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
                        f"[{phase}] {' + '.join(cont_r[:5])}")
@@ -1799,11 +1817,14 @@ class EntryEngine:
         if target_reward > 0.0 and current_rr >= ev_floor and pool_rr < ev_floor:
             return False, f"pool SL drops TP geometry {current_rr:.2f}R->{pool_rr:.2f}R below EV floor {ev_floor:.2f}R"
 
+        # v66: do not over-veto a correct protective stop simply because it is
+        # farther away than the first wick buffer. Keep the EV/RR floor, but do
+        # not leave the executable SL inside/near the liquidity cluster.
         quality_hurdle = min(
-            0.92,
-            0.42 + 0.11 * max(0.0, expansion - 1.0) + 0.08 * max(0.0, current_rr - pool_rr),
+            0.78,
+            0.32 + 0.08 * max(0.0, expansion - 1.0) + 0.05 * max(0.0, current_rr - pool_rr),
         )
-        if expansion > 1.35 and pool_quality < quality_hurdle:
+        if expansion > 1.75 and pool_quality < quality_hurdle:
             return False, f"pool SL risk expansion {expansion:.2f}x needs quality {quality_hurdle:.2f}, got {pool_quality:.2f}"
 
         return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
@@ -1897,14 +1918,14 @@ class EntryEngine:
         self, ps, action: str, side: str, snap, flow, ict,
         price: float, atr: float, now: float, phase: str
     ) -> tuple[bool, str]:
-        """Dynamic market-aware execution diagnostics before signal construction.
+        """Route only structurally accepted, executable post-sweep entries.
 
-        This layer no longer vetoes sweep decisions. The quantitative
-        posterior/EV model already decides whether a post-sweep auction has
-        positive executable edge. The quality gate now converts institutional
-        observations into a continuous quality score and audit trail so weak
-        conditions reduce confidence/position size downstream instead of creating
-        a hidden low-quality veto.
+        This is not a retail yes/no filter.  It prices the post-sweep auction as
+        an execution-quality surface: delivery proof, chase distance, flow/CVD,
+        premium/discount, and multi-timeframe structure all compound into one
+        score.  If the entry lacks any real delivery acceptance, or the combined
+        quality falls below the current market-profile floor, the setup is held
+        for more evidence instead of being sent to sizing/execution.
         """
         profile = self._market_profile(snap, flow, ict, price, atr, side)
         a = max(float(atr or 0.0), 1e-9)
@@ -1927,83 +1948,127 @@ class EntryEngine:
 
         score = 1.0
         notes = []
+        critical = []
 
-        # 1) Delivery/structure proof. Weak proof is a size/confidence penalty.
-        if disp < min_disp and not (cisd or ote):
+        # 1) Delivery/structure proof.  No accepted delivery = no executable
+        # entry.  A real sweep thesis needs CISD, OTE/retrace acceptance, or a
+        # strong displacement footprint.  Raw posterior math alone is not enough.
+        accepted_delivery = (disp >= min_disp) or cisd or ote
+        if not accepted_delivery:
             miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
-            score *= max(0.45, 1.0 - 0.38 * miss)
-            notes.append(
-                f"delivery_weak DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
-            )
+            score *= max(0.38, 1.0 - 0.48 * miss)
+            msg = f"delivery_unaccepted DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
+            notes.append(msg)
+            critical.append(msg)
+        elif disp < min_disp:
+            # CISD/OTE can rescue a shallow raw displacement, but size/confidence
+            # must still be reduced because price has not travelled far enough.
+            miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
+            score *= max(0.72, 1.0 - 0.18 * miss)
+            notes.append(f"shallow_delivery_rescued DISP={disp:.2f}ATR<{min_disp:.2f}ATR via CISD/OTE")
 
-        # 2) Chase distance. Far-from-sweep entries need more quality.
-        if dist_from_sweep_atr > chase_limit and not (cisd or ote):
+        # 2) Chase distance.  Far-from-raid entries require accepted retrace or
+        # very strong displacement; otherwise the entry is paying liquidity, not
+        # harvesting it.
+        if dist_from_sweep_atr > chase_limit and not (cisd or ote or disp >= strong_disp):
             over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
-            score *= max(0.45, 1.0 - 0.25 * over)
-            notes.append(
-                f"chase_extended {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
-            )
+            score *= max(0.42, 1.0 - 0.32 * over)
+            msg = f"chase_unaccepted {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
+            notes.append(msg)
+            critical.append(msg)
+        elif dist_from_sweep_atr > chase_limit:
+            over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
+            score *= max(0.75, 1.0 - 0.12 * over)
+            notes.append(f"extended_but_accepted {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR")
 
-        # 3) Flow/CVD opposition becomes a regime penalty.
+        # 3) Flow/CVD opposition.  Severe contra flow without strong delivery is
+        # an execution-integrity defect; mild opposition is a sizing penalty.
         flow_dir = str(getattr(flow, "direction", "") or "").lower()
         flow_conv = abs(float(getattr(flow, "conviction", 0.0) or 0.0))
         cvd = float(getattr(flow, "cvd_trend", 0.0) or 0.0)
-        if flow_dir and flow_dir != side_l and flow_conv >= opp_flow:
+        flow_bad = bool(flow_dir and flow_dir != side_l and flow_conv >= opp_flow)
+        cvd_bad = ((side_l == "long" and cvd <= -opp_cvd)
+                   or (side_l == "short" and cvd >= opp_cvd))
+        if flow_bad:
             excess = min(1.0, (flow_conv - opp_flow) / max(1.0 - opp_flow, 1e-9))
-            score *= max(0.50, 1.0 - 0.25 * excess)
+            score *= max(0.55, 1.0 - 0.24 * excess)
             notes.append(f"flow_contra {flow_dir}={flow_conv:.2f}")
-        if side_l == "long" and cvd <= -opp_cvd:
+        if cvd_bad:
             excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
-            score *= max(0.52, 1.0 - 0.22 * excess)
+            score *= max(0.56, 1.0 - 0.23 * excess)
             notes.append(f"cvd_contra {cvd:.2f}")
-        if side_l == "short" and cvd >= opp_cvd:
-            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
-            score *= max(0.52, 1.0 - 0.22 * excess)
-            notes.append(f"cvd_contra {cvd:.2f}")
+        if flow_bad and cvd_bad and disp < strong_disp:
+            critical.append(f"flow_and_cvd_contra_without_strong_delivery DISP={disp:.2f}ATR<{strong_disp:.2f}ATR")
 
-        # 4) Continuation needs acceptance, but lack of proof reduces quality.
+        # 4) Continuation requires acceptance away from the swept pool.
         if action_l == "continue":
             accepted = disp >= profile.displacement_min(_ENTRY_CONT_MIN_ACCEPT_ATR)
             if not (accepted and (cisd or disp >= strong_disp or ote)):
-                score *= 0.62
-                notes.append(
-                    f"continuation_acceptance_soft DISP={disp:.2f}ATR strong={strong_disp:.2f}"
-                )
+                score *= 0.56
+                msg = f"continuation_without_acceptance DISP={disp:.2f}ATR strong={strong_disp:.2f}"
+                notes.append(msg)
+                critical.append(msg)
 
-        # 5) Premium/discount mismatch is a penalty unless strong proof exists.
+        # 5) Premium/discount mismatch.  A reversal can fight P/D only with
+        # strong delivery plus CISD/OTE; otherwise the entry is structurally late.
         pd = float(getattr(ict, "dealing_range_pd", 0.5) or 0.5)
         dr_long_max, dr_short_min = profile.dealing_range_bounds(
             _ENTRY_REVERSAL_PD_LONG_MAX, _ENTRY_REVERSAL_PD_SHORT_MIN)
         if action_l == "reverse" and disp < strong_disp:
             if side_l == "long" and pd > dr_long_max and not (cisd and ote):
-                score *= 0.70
-                notes.append(f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}")
+                score *= 0.66
+                msg = f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}"
+                notes.append(msg)
+                critical.append(msg)
             if side_l == "short" and pd < dr_short_min and not (cisd and ote):
-                score *= 0.70
-                notes.append(f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}")
+                score *= 0.66
+                msg = f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}"
+                notes.append(msg)
+                critical.append(msg)
 
-        # 6) HTF contra trades are not prohibited; they require lower exposure.
+        # 6) Multi-timeframe context.  15m + 4h alignment against the trade is
+        # routeable only when the post-sweep delivery footprint is strong.
         s15 = str(getattr(ict, "structure_15m", "") or "").lower()
         s4h = str(getattr(ict, "structure_4h", "") or "").lower()
-        htf_bull = ("bull" in s15) + ("bull" in s4h)
-        htf_bear = ("bear" in s15) + ("bear" in s4h)
+        htf_bull = int("bull" in s15) + int("bull" in s4h)
+        htf_bear = int("bear" in s15) + int("bear" in s4h)
         if disp < strong_disp:
             if side_l == "long" and htf_bear >= 2:
-                score *= 0.68
-                notes.append(f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}")
+                score *= 0.62
+                msg = f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}"
+                notes.append(msg)
+                critical.append(msg)
             if side_l == "short" and htf_bull >= 2:
-                score *= 0.68
-                notes.append(f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}")
+                score *= 0.62
+                msg = f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}"
+                notes.append(msg)
+                critical.append(msg)
 
-        score = max(0.20, min(1.0, score))
+        score = max(0.05, min(1.0, score))
+        dynamic_floor = max(0.42, min(0.76, _ENTRY_EXECUTION_QUALITY_MIN * max(0.90, min(1.20, profile.selectivity))))
+        critical_floor = max(dynamic_floor, min(0.82, _ENTRY_CRITICAL_DEFECT_FLOOR * max(0.90, min(1.18, profile.selectivity))))
+
         try:
             self._last_sweep_analysis["quality_score"] = score
+            self._last_sweep_analysis["quality_floor"] = dynamic_floor
+            self._last_sweep_analysis["quality_critical_floor"] = critical_floor
             self._last_sweep_analysis["quality_notes"] = notes[:8]
+            self._last_sweep_analysis["quality_critical"] = critical[:8]
         except Exception:
             pass
 
         note = " | ".join(notes[:4]) if notes else "clean"
-        return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
+        if critical and score < critical_floor:
+            return False, (
+                f"entry_integrity_score={score:.2f}<{critical_floor:.2f} "
+                f"critical={' ; '.join(critical[:3])} | {profile.compact()}"
+            )
+        if score < dynamic_floor:
+            return False, (
+                f"entry_quality_score={score:.2f}<{dynamic_floor:.2f} "
+                f"{note} | {profile.compact()}"
+            )
+        return True, f"entry_quality_score={score:.2f}>={dynamic_floor:.2f} {note} | {profile.compact()}"
 
     def _evaluate_pending_refined_entry(
         self, snap, flow, ict, price: float, atr: float, now: float
@@ -2327,11 +2392,12 @@ class EntryEngine:
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
-        tp_buf = atr * 0.35
-        tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf
-
+        # Continuation target is selected only by the EV-ranked liquidity
+        # selector below.  The DirectionEngine target is a directional hint,
+        # never a buffered executable TP.
+        tp = 0.0
         risk = abs(price - sl)
-        reward = abs(tp - price)
+        reward = 0.0
 
         if risk < 1e-10:
             logger.info(
@@ -2351,7 +2417,7 @@ class EntryEngine:
                 sl = sweep.pool.price + pool_clearance
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
-            reward = abs(tp - price)
+            reward = 0.0
             logger.debug(
                 f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
                 f"({risk/atr:.2f}x ATR) side={side}")
@@ -2710,81 +2776,63 @@ class EntryEngine:
         rr_quality = 1.0 + min(max(rr - required_rr, 0.0), 3.0) * 0.18
         return sig * tf_mult * htf_mult * struct_mult * confluence_mult * distance_draw * rr_quality
 
-    def _compute_sl(self, ict, side, price, atr):
-        """ICT Order Block-based SL for momentum/displacement entries.
-
-        Placement priority:
-          1. Nearest OB on the entry side (structural anchor — tightest valid SL)
-        Validation:
-          - OB SL must clear live noise.
-          - OB SL must remain before the exchange liquidation guard.
-        """
-        if ict is None:
-            return None
-
-        if side == "long":
-            ob = ict.nearest_ob_price
-        else:
-            ob = getattr(ict, 'nearest_ob_price_short', 0.0) or 0.0
-
-        sl = None
-        if ob > 0:
-            if side == "long" and ob < price:
-                sl = ob - atr * 0.20
-            elif side == "short" and ob > price:
-                sl = ob + atr * 0.20
-
-        if sl is not None:
-            ob_risk = abs(price - sl)
-            if ob_risk < atr * _SL_MIN_ATR_MULT or not self._sl_before_liquidation(side, sl, price):
-                sl = None
-
-        if sl is None:
-            return None
-
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
-        if not self._sl_is_protective(side, sl, price):
-            return None
-        risk = abs(price - sl)
-
-        # Hard floor: noise minimum
-        if risk < atr * _SL_MIN_ATR_MULT:
-            return None
-
-        if not self._sl_before_liquidation(side, sl, price):
-            return None
-        return sl
+    # Legacy OB/momentum SL builder removed in v67.  The entry engine is
+    # sweep-only; every executable stop is now built from sweep invalidation +
+    # MTF liquidity shield via _apply_institutional_sl_envelope().
 
     def _push_sl_behind_pools(self, sl, side, price, atr):
-        """Push SL behind nearby liquidity pools.
+        """Force executable SL outside all nearby protective liquidity zones.
 
-        EE-6 FIX: cap the total push distance to _SL_PUSH_MAX_ATR from the
-        starting SL so a large `snap.bsl_pools` list with one outlier pool
-        far from price cannot shift SL to an unrealistic distance.
+        A stop placed *at* SSL/BSL is just more liquidity. This method treats
+        each pool between entry and the proposed SL as a stop-cluster envelope
+        and pushes the stop beyond the far edge of that envelope. Equality is
+        included deliberately: SL == pool.price is not protected.
         """
         snap = self._last_liq_snapshot
-        if snap is None:
+        if snap is None or atr <= 0:
             return sl
-        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
-        sl_origin = sl
-        buf = 0.25 * atr
+
+        def _tf_rank(tf: str) -> int:
+            return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}.get(str(tf).lower(), 2)
+
+        def _status_usable(pool) -> bool:
+            status = str(getattr(pool, "status", "") or "").upper()
+            return status not in ("CONSUMED",)
+
+        def _pool_buffer(pool) -> float:
+            sig = float(getattr(pool, "significance", 0.0) or 0.0)
+            touches = max(1, int(getattr(pool, "touches", 1) or 1))
+            tf_rank = _tf_rank(str(getattr(pool, "timeframe", "5m") or "5m"))
+            sig_term = min(0.42, 0.045 * max(0.0, sig))
+            touch_term = min(0.24, 0.035 * max(0, touches - 2))
+            tf_term = min(0.22, 0.045 * max(0, tf_rank - 2))
+            return max(0.30, min(1.35, 0.30 + sig_term + touch_term + tf_term)) * atr
+
+        sl_origin = float(sl)
+        sl_new = float(sl)
+        max_push = 6.0 * atr
+
         if side == "long":
-            for t in snap.ssl_pools:
-                if sl < t.pool.price < price:
-                    candidate = t.pool.price - buf
-                    # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
-                    # below the original SL.
-                    if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
-                        continue
-                    sl = min(sl, candidate)
+            for t in list(getattr(snap, "ssl_pools", []) or []):
+                pool = getattr(t, "pool", t)
+                if not _status_usable(pool):
+                    continue
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if sl_new <= px < price:
+                    candidate = px - _pool_buffer(pool)
+                    if sl_origin - candidate <= max_push:
+                        sl_new = min(sl_new, candidate)
         else:
-            for t in snap.bsl_pools:
-                if price < t.pool.price < sl:
-                    candidate = t.pool.price + buf
-                    if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
-                        continue
-                    sl = max(sl, candidate)
-        return sl
+            for t in list(getattr(snap, "bsl_pools", []) or []):
+                pool = getattr(t, "pool", t)
+                if not _status_usable(pool):
+                    continue
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if price < px <= sl_new:
+                    candidate = px + _pool_buffer(pool)
+                    if candidate - sl_origin <= max_push:
+                        sl_new = max(sl_new, candidate)
+        return sl_new
 
     @staticmethod
     def _ict_summary(ict, side):
