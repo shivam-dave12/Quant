@@ -1883,7 +1883,12 @@ class EntryEngine:
         )
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
-            if pool_risk > risk and pool_risk <= max_risk:
+            if pool_risk > max_risk:
+                return None, (
+                    f"protective SL pool ${pool_sl:.1f} sits beyond liquidation guard; "
+                    "refusing executable stop inside liquidity"
+                )
+            if pool_risk > risk:
                 target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
                 pool_quality = float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)
                 accept_pool, geometry_reason = self._accepts_pool_stop_geometry(
@@ -1897,14 +1902,21 @@ class EntryEngine:
                     sl = pool_sl
                     risk = pool_risk
                     details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                    logger.debug(
-                        "SL envelope %s: anchored to protective pool at $%.1f "
+                    logger.info(
+                        "SL envelope %s: anchored behind protective liquidity at $%.1f "
                         "(risk %.2fATR; %s; %s)",
                         label, sl, risk / max(atr, 1e-10), details, geometry_reason)
                 else:
-                    logger.info(
-                        "SL envelope %s: ignored protective pool $%.1f (%s)",
-                        label, pool_sl, geometry_reason)
+                    # Institutional invariant: a protective pool is the stop-cluster /
+                    # invalidation shelf, not an optional cosmetic anchor. If the
+                    # only live all-timeframe SL shield lies beyond the proposed
+                    # structural stop and the trade cannot afford that risk, the
+                    # correct action is to wait/refine/skip — never route with an
+                    # executable stop between entry and the protective liquidity.
+                    return None, (
+                        f"protective SL pool ${pool_sl:.1f} required but {geometry_reason}; "
+                        "refusing executable stop inside liquidity"
+                    )
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
