@@ -113,7 +113,7 @@ def test_v68_single_pd_or_htf_penalty_does_not_kill_strong_delivery_entry():
     )
     assert ok, reason
     assert qs._last_entry_readiness.penalties
-    assert qs._active_institutional_size_mult < 1.0
+    assert qs._last_entry_readiness.size_mult < 1.0
 
 
 def test_v68_unified_gate_blocks_deliveryless_static_score_candidate():

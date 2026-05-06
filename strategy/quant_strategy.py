@@ -2832,7 +2832,7 @@ class QuantStrategy:
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v70-flow-audit-single-readiness-policy-leverage")
+            logger.info("   EntryArchitecture: v73-native-bracket-fast-protected-flow")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
@@ -6055,8 +6055,67 @@ class QuantStrategy:
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
+        # v73 native-bracket fast path.  Use EntryReadiness as the primary
+        # urgency signal; raw composite confidence can be low on valid reversal
+        # sweeps, which made v70/v71 wait passively as maker until timeout.
+        def _best_bid_ask_from_book():
+            try:
+                ob = data_manager.get_orderbook() or {}
+                bids = ob.get("bids", []) or []
+                asks = ob.get("asks", []) or []
+                def _px(lvl):
+                    if isinstance(lvl, (list, tuple)):
+                        return float(lvl[0] or 0.0)
+                    if isinstance(lvl, dict):
+                        return float(lvl.get("limit_price") or lvl.get("price") or 0.0)
+                    return 0.0
+                return (_px(bids[0]) if bids else 0.0, _px(asks[0]) if asks else 0.0)
+            except Exception:
+                return 0.0, 0.0
+
+        readiness = getattr(self, "_last_entry_readiness", None)
+        readiness_score = float(getattr(readiness, "score", 0.0) or 0.0)
+        readiness_floor = float(getattr(readiness, "floor", 0.0) or 0.0)
+        readiness_edge = readiness_score - readiness_floor
+        protected_cross_floor = float(getattr(config, "ENTRY_PROTECTED_CROSS_READINESS", 0.78))
+        protected_cross_edge = float(getattr(config, "ENTRY_PROTECTED_CROSS_EDGE", 0.06))
+        _require_sig_conf_for_cross = bool(getattr(config, "ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF", False))
+        _sig_conf_ok_for_cross = (
+            signal_confidence >= float(getattr(config, "ENTRY_PROTECTED_CROSS_MIN_CONF", 0.70))
+            if _require_sig_conf_for_cross else True
+        )
+        protected_cross = (
+            readiness_score >= protected_cross_floor
+            and readiness_edge >= protected_cross_edge
+            and _sig_conf_ok_for_cross
+        )
+        native_market_bracket = bool(
+            protected_cross
+            and bool(getattr(config, "DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS", True))
+        )
+        if protected_cross:
+            bid_px, ask_px = _best_bid_ask_from_book()
+            cross_ticks = max(1.0, float(getattr(config, "ENTRY_PROTECTED_CROSS_TICKS", 2.0)))
+            cross_offset = cross_ticks * tick
+            old_px = limit_px
+            if side == "long" and ask_px > 0:
+                limit_px = _round_to_tick(ask_px + cross_offset)
+                use_maker = False
+                mt_reason = (
+                    f"protected_cross_long@ask+{cross_offset:.1f}={limit_px:.1f} "
+                    f"(readiness={readiness_score:.2f}/{readiness_floor:.2f}, prior={old_px:.1f})"
+                )
+            elif side == "short" and bid_px > 0:
+                limit_px = _round_to_tick(bid_px - cross_offset)
+                use_maker = False
+                mt_reason = (
+                    f"protected_cross_short@bid-{cross_offset:.1f}={limit_px:.1f} "
+                    f"(readiness={readiness_score:.2f}/{readiness_floor:.2f}, prior={old_px:.1f})"
+                )
+
         entry_ref = limit_px if limit_px > 0 else price
-        logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
+        _route_label = "NATIVE-BRACKET-MARKET" if native_market_bracket else ("PROTECTED-CROSS/taker" if not use_maker else "LIMIT/maker")
+        logger.info(f"Entry routing: {_route_label} | {mt_reason}")
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
         # SL/TP computation does not depend on position size — it uses price, ATR,
@@ -6224,7 +6283,8 @@ class QuantStrategy:
                 f"⏱️  Entry order placed on exchange (order_id={_oid[:12]}…) "
                 f"— watchdog switched to Stage B (fill-poll)")
 
-        limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
+        base_limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
+        limit_timeout = min(base_limit_timeout, float(getattr(config, 'PROTECTED_CROSS_FILL_TIMEOUT_SEC', 12.0))) if not use_maker else base_limit_timeout
         is_bracket = False
 
         # v7 multi-asset protection policy:
@@ -6251,17 +6311,37 @@ class QuantStrategy:
             sl_price=sl_price, tp_price=tp_price,
             timeout_sec=limit_timeout,
             on_order_placed=_on_order_placed,
+            market_entry=native_market_bracket,
         )
+        if entry_data is not None and entry_data.get("_error"):
+            _reason = str(entry_data.get("_reason", "bracket_failed") or "bracket_failed")
+            if _reason == "not_filled_timeout":
+                logger.info(
+                    "⚪ Delta native bracket not filled in time — cancelled safely; "
+                    "no non-bracket fallback and no naked position. "
+                    f"side={side} qty={qty} entry=${limit_px:,.2f} "
+                    f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
+                )
+                self._last_tp_gate_rejection = time.time()
+                return
+            logger.error(
+                "❌ Delta native bracket rejected by exchange/API — refusing non-bracket fallback "
+                "so the position is not opened without exchange-attached TP/SL. "
+                f"reason={_reason} side={side} qty={qty} entry=${limit_px:,.2f} "
+                f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} raw={entry_data.get('_raw', {})}"
+            )
+            self._last_tp_gate_rejection = time.time()
+            return
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
         elif _delta_requires_native_bracket:
             logger.error(
-                "❌ Delta native bracket entry failed — refusing non-bracket fallback "
+                "❌ Delta native bracket entry failed before order placement — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
                 f"side={side} qty={qty} entry=${limit_px:,.2f} "
                 f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
             )
-            self._last_exit_time = time.time()
+            self._last_tp_gate_rejection = time.time()
             return
         else:
             # CoinSwitch / non-Delta path: standard limit entry, then protected

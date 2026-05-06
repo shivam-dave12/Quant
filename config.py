@@ -110,6 +110,16 @@ MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
 LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
+# v73: high-readiness accepted sweeps must not sit as passive maker orders.
+# Use the final EntryReadiness surface, not raw composite signal confidence, to
+# trigger fast native-bracket execution. This is still exchange-attached TP/SL.
+ENTRY_PROTECTED_CROSS_READINESS  = 0.78
+ENTRY_PROTECTED_CROSS_EDGE       = 0.06
+ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF = False
+ENTRY_PROTECTED_CROSS_MIN_CONF   = 0.70
+ENTRY_PROTECTED_CROSS_TICKS      = 2.0
+DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS = True
+PROTECTED_CROSS_FILL_TIMEOUT_SEC = 12.0
 REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
