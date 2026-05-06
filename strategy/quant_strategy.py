@@ -8547,6 +8547,25 @@ class QuantStrategy:
         # Full trade record for /trades command
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
         _fb = fee_breakdown or {}
+        _hist_notional = 0.0
+        _hist_margin_used = 0.0
+        _hist_margin_pnl_pct = 0.0
+        try:
+            _entry_px_hist = float(getattr(pos, 'entry_price', 0.0) or 0.0)
+            _qty_hist = float(getattr(pos, 'quantity', 0.0) or 0.0)
+            _lev_hist = float(QCfg.LEVERAGE() or 1.0)
+            _hist_notional = _entry_px_hist * _qty_hist
+            _hist_margin_used = _hist_notional / _lev_hist if _lev_hist > 0 else _hist_notional
+            _hist_margin_pnl_pct = (pnl / _hist_margin_used * 100.0) if _hist_margin_used > 1e-10 else 0.0
+        except Exception:
+            pass
+        try:
+            _inst_hist = getattr(self, "_instrument", None)
+            _asset_hist = str(getattr(_inst_hist, "asset_id", "") or "")
+            _symbol_hist = str(getattr(_inst_hist, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
+            _venue_hist = str(getattr(getattr(_inst_hist, "primary_exchange", None), "value", "") or "").upper()
+        except Exception:
+            _asset_hist, _symbol_hist, _venue_hist = "", QCfg.SYMBOL(), ""
         self._trade_history.append({
             # ── Core trade data ────────────────────────────────────────────
             "ts":           time.time(),
@@ -8554,10 +8573,15 @@ class QuantStrategy:
             "mode":         getattr(pos, 'trade_mode', '?'),
             "entry":        getattr(pos, 'entry_price', 0.0),
             "exit":         exit_price,
+            "asset":        _asset_hist,
+            "symbol":       _symbol_hist,
+            "venue":        _venue_hist,
             "qty":          getattr(pos, 'quantity', 0.0),
             "sl":           getattr(pos, 'sl_price', 0.0),
             "tp":           getattr(pos, 'tp_price', 0.0),
             "init_sl_dist": init_sl_dist,
+            "notional":     round(_hist_notional, 4),
+            "margin_used":  round(_hist_margin_used, 4),
             "pnl":          pnl,
             "is_win":       is_win,
             "reason":       exit_reason,
@@ -8566,7 +8590,8 @@ class QuantStrategy:
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
             # ── v6.0: Margin-based P&L % ─────────────────────────────────────
-            "margin_pnl_pct": 0.0,  # filled below
+            "margin_pnl_pct": round(_hist_margin_pnl_pct, 2),
+            "capital_result": "PROFIT" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
             # ── Fee breakdown (exact from Delta /v2/fills, estimated otherwise) ──
             "gross_pnl":    _fb.get("gross_pnl",  pnl),
             "entry_fee":    _fb.get("entry_fee",  0.0),
@@ -8670,6 +8695,8 @@ class QuantStrategy:
                     _margin_pnl_pct_final = (pnl / _margin_used_final) * 100.0
                     if self._trade_history:
                         self._trade_history[-1]["margin_pnl_pct"] = round(_margin_pnl_pct_final, 2)
+                        self._trade_history[-1]["margin_used"] = round(_margin_used_final, 4)
+                        self._trade_history[-1]["notional"] = round(_notional_f, 4)
         except Exception:
             pass
 

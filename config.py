@@ -589,15 +589,17 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 4
+PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 6
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
 # order is inside the portfolio risk cap but above the confidence-haircut target.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
+PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # six slots × 0.5% risk; aggregate account risk cap
+PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.

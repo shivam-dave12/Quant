@@ -96,6 +96,9 @@ class TradeState:
     exit: float
     pnl: float
     r: float = 0.0
+    margin_used: float = 0.0
+    margin_pnl_pct: float = 0.0
+    capital_result: str = ""
     reason: str = ""
 
 
@@ -342,7 +345,11 @@ class DashboardState:
             symbol=str(event.get("symbol", "")), venue=str(event.get("venue", "")).upper(),
             side=str(event.get("side", "")).upper(), entry=float(event.get("entry", 0.0) or 0.0),
             exit=float(event.get("exit", 0.0) or 0.0), pnl=pnl,
-            r=float(event.get("r", event.get("achieved_r", 0.0)) or 0.0), reason=str(event.get("reason", ""))))
+            r=float(event.get("r", event.get("achieved_r", 0.0)) or 0.0),
+            margin_used=float(event.get("margin_used", 0.0) or 0.0),
+            margin_pnl_pct=float(event.get("margin_pnl_pct", 0.0) or 0.0),
+            capital_result=str(event.get("capital_result", "PROFIT" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"))),
+            reason=str(event.get("reason", ""))))
 
     def _add_alert(self, event: dict[str, Any]) -> None:
         self.alerts.appendleft(AlertState(

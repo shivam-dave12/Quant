@@ -71,132 +71,6 @@ class AssetContext:
             return False
 
 
-class _LegacyPortfolioGuard:
-    """
-    Account-level exposure coordinator.
-
-    It does not judge alpha.  It only enforces portfolio mechanics:
-      • many contracts may trade simultaneously, up to the configured slot cap;
-      • one reserved slot per contract (ENTERING/ACTIVE/EXITING all count);
-      • each contract sees a portfolio-adjusted balance slice before the existing
-        BTC-style risk/margin sizing runs inside QuantStrategy.
-    """
-    def __init__(self) -> None:
-        self.max_open_positions = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_POSITIONS", 4)))
-        self.max_same_class = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS", self.max_open_positions)))
-        self.max_per_contract = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_CONTRACT", 1)))
-        self.budget_mode = str(getattr(config, "PORTFOLIO_BUDGET_MODE", "equal_slots")).lower()
-        self._lock = threading.RLock()
-
-    def reserved_contexts(self, contexts: List[AssetContext]) -> List[AssetContext]:
-        return [c for c in contexts if c.has_position]
-
-    def count_open(self, contexts: List[AssetContext]) -> int:
-        return len(self.reserved_contexts(contexts))
-
-    def can_evaluate_entry(self, ctx: AssetContext, contexts: List[AssetContext]) -> tuple[bool, str]:
-        with self._lock:
-            reserved_ctx = self.reserved_contexts(contexts)
-
-            # One position slot per contract.  Existing slot is allowed only for
-            # management/exits/trailing; a second entry cannot be opened by this
-            # context because QuantStrategy remains non-FLAT.
-            if ctx.has_position:
-                return True, f"{ctx.phase_name.lower()} position management"
-
-            same_contract = [c for c in reserved_ctx if c.instrument.asset_id == ctx.instrument.asset_id]
-            if len(same_contract) >= self.max_per_contract:
-                return False, f"contract slot occupied {ctx.instrument.asset_id} {len(same_contract)}/{self.max_per_contract}"
-
-            if len(reserved_ctx) >= self.max_open_positions:
-                return False, f"portfolio exposure cap {len(reserved_ctx)}/{self.max_open_positions}"
-
-            same_class = [c for c in reserved_ctx if c.instrument.asset_class == ctx.instrument.asset_class]
-            if len(same_class) >= self.max_same_class:
-                return False, f"asset-class exposure cap {ctx.instrument.asset_class.value} {len(same_class)}/{self.max_same_class}"
-
-            return True, "portfolio slot available"
-
-    def allocate_balance(self, ctx: Optional[AssetContext], contexts: List[AssetContext], raw_balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Return a balance view scoped to one contract's portfolio slot.
-
-        QuantStrategy already applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE
-        to whatever `available` it receives.  Therefore the institutional way to
-        preserve the current BTC sizing semantics across multiple simultaneous
-        contracts is to give each contract an account-equity slice, not the full
-        account equity.  With 4 slots and 60% balance usage, each contract may use
-        about 15% of total equity as margin; all 4 together remain around the old
-        60% portfolio envelope.
-        """
-        if raw_balance is None:
-            return None
-        if not isinstance(raw_balance, dict):
-            return raw_balance
-
-        try:
-            raw_available = max(0.0, float(raw_balance.get("available", 0.0) or 0.0))
-            raw_total = max(0.0, float(raw_balance.get("total", raw_available) or raw_available))
-        except Exception:
-            return raw_balance
-
-        # Slot count is the configured maximum, not current open count.  That
-        # prevents the first signal of the day from consuming the whole account
-        # just because other contracts have not fired yet.
-        configured_slots = max(1, self.max_open_positions)
-        active_universe = max(1, len(contexts or []))
-        slot_count = min(configured_slots, active_universe) if self.budget_mode in {"active_equal_slots", "active_slots"} else configured_slots
-
-        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
-        slot_available = min(slot_equity, raw_available)
-
-        # If the account has less free cash than one nominal slot, use the real
-        # exchange-available cash.  Never fabricate availability.
-        adjusted = dict(raw_balance)
-        adjusted["available_raw"] = raw_available
-        adjusted["total_raw"] = raw_total
-        adjusted["available"] = max(0.0, slot_available)
-        adjusted["total"] = max(0.0, slot_equity)
-        adjusted["portfolio_scoped"] = True
-        adjusted["portfolio_budget_mode"] = self.budget_mode
-        adjusted["portfolio_slot_count"] = slot_count
-        adjusted["portfolio_slot_available"] = slot_available
-        adjusted["portfolio_slot_equity"] = slot_equity
-        adjusted["portfolio_reserved_slots"] = self.count_open(contexts or [])
-        adjusted["portfolio_max_slots"] = self.max_open_positions
-
-        # Sizing v5.1 separation:
-        #   • available/total above are the slot-scoped cash view used for
-        #     margin and fee-cap checks;
-        #   • risk_available/risk_total keep the portfolio equity base used for
-        #     dollar-risk sizing.  Without this separation, BTC min lot gets
-        #     rejected on small accounts because the risk target is divided by
-        #     the number of portfolio slots before the exchange lot floor is
-        #     considered.  PortfolioGuard still limits total concurrent slots;
-        #     QuantStrategy still limits actual cash/margin by the slot view.
-        adjusted["risk_available"] = raw_available
-        adjusted["risk_total"] = raw_total
-        if ctx is not None:
-            adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
-        return adjusted
-
-
-class _LegacyPortfolioRiskManager(RiskManager):
-    """RiskManager wrapper that exposes a per-contract balance slice."""
-    def __init__(self, shared_api=None, *, allocator: Callable[[Optional[AssetContext], List[AssetContext], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]], context_getter: Callable[[], Optional[AssetContext]], contexts_getter: Callable[[], List[AssetContext]]):
-        super().__init__(shared_api=shared_api)
-        self._portfolio_allocator = allocator
-        self._portfolio_context_getter = context_getter
-        self._portfolio_contexts_getter = contexts_getter
-
-    def get_available_balance(self) -> Optional[Dict]:
-        raw = super().get_available_balance()
-        try:
-            ctx = self._portfolio_context_getter()
-            contexts = self._portfolio_contexts_getter()
-            return self._portfolio_allocator(ctx, contexts, raw)
-        except Exception:
-            logger.exception("Portfolio balance allocation failed; using raw exchange balance")
-            return raw
 
 
 class MultiAssetQuantBot:
@@ -397,6 +271,18 @@ class MultiAssetQuantBot:
                     r.setdefault("asset", ctx.instrument.asset_id)
                     r.setdefault("symbol", ctx.instrument.display_symbol)
                     r.setdefault("venue", ctx.instrument.primary_exchange.value.upper())
+                    if "timestamp" not in r and "ts" in r:
+                        r["timestamp"] = r.get("ts")
+                    if "margin_used" not in r:
+                        try:
+                            entry = float(r.get("entry", 0.0) or 0.0)
+                            qty = float(r.get("qty", 0.0) or 0.0)
+                            lev = float(active_policy(ctx.instrument).leverage or 1)
+                            r["margin_used"] = (entry * qty / lev) if lev > 0 else entry * qty
+                            pnl = float(r.get("pnl", 0.0) or 0.0)
+                            r["margin_pnl_pct"] = pnl / r["margin_used"] * 100.0 if r["margin_used"] > 1e-10 else 0.0
+                        except Exception:
+                            r["margin_used"] = 0.0
                     rows.append(r)
             except Exception:
                 continue
@@ -464,21 +350,41 @@ class MultiAssetQuantBot:
     def format_portfolio_balance_report(self) -> str:
         return self.format_portfolio_equity_report()
 
+    def _portfolio_trade_metrics(self, trades: List[Dict[str, Any]]) -> Dict[str, float]:
+        total = len(trades)
+        wins = sum(1 for t in trades if bool(t.get("is_win")))
+        total_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
+        win_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades if bool(t.get("is_win")))
+        loss_pnl = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in trades if not bool(t.get("is_win"))))
+        margin = sum(max(0.0, float(t.get("margin_used", 0.0) or 0.0)) for t in trades)
+        win_margin = sum(max(0.0, float(t.get("margin_used", 0.0) or 0.0)) for t in trades if bool(t.get("is_win")))
+        count_wr = (wins / total * 100.0) if total else 0.0
+        cap_wr = (win_margin / margin * 100.0) if margin > 1e-10 else 0.0
+        net_margin_return = (total_pnl / margin * 100.0) if margin > 1e-10 else 0.0
+        profit_factor = (win_pnl / loss_pnl) if loss_pnl > 1e-10 else (999.0 if win_pnl > 0 else 0.0)
+        return {
+            "total": float(total), "wins": float(wins), "count_wr": count_wr,
+            "capital_wr": cap_wr, "net_margin_return": net_margin_return,
+            "total_pnl": total_pnl, "total_margin": margin,
+            "profit_factor": profit_factor,
+        }
+
     def format_portfolio_pnl_report(self) -> str:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
         open_rows = [r for r in rows if r.get("position")]
         trades = self._all_trade_records()
         total_realised = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
         total_upnl = sum(float(r.get("upnl", 0.0) or 0.0) for r in open_rows)
-        wins = sum(1 for t in trades if t.get("is_win"))
-        total = len(trades)
-        wr = (wins / total * 100.0) if total else 0.0
+        m = self._portfolio_trade_metrics(trades)
+        total = int(m["total"])
         icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
+        outcome = "PROFIT" if total_realised > 0 else ("LOSS" if total_realised < 0 else "FLAT")
         lines = [
             f"{icon} <b>PORTFOLIO PnL COMMAND CENTER</b>",
             "━━━━━━━━━━━━━━━━━━━━━━━━",
             f"<code>OPEN   {len(open_rows):>2}/{self.guard.max_open_positions:<2}   UPNL {self._fmt_money(total_upnl):>12}   REAL {self._fmt_money(total_realised):>12}</code>",
-            f"<code>TRADES {total:>4}   WR {wr:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
+            f"<code>RESULT {outcome:<6} NetMargin {m['net_margin_return']:+6.2f}%  PF {m['profit_factor']:>6.2f}</code>",
+            f"<code>TRADES {total:>4}   CountWR {m['count_wr']:>5.1f}%   CapitalWR {m['capital_wr']:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
         ]
         if open_rows:
             lines.append("\n<b>Live exposure by desk</b>")
@@ -496,9 +402,11 @@ class MultiAssetQuantBot:
             for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-6:][::-1]:
                 pnl = float(t.get("pnl", 0.0) or 0.0)
                 ok = "✅" if pnl >= 0 else "❌"
+                margin = float(t.get("margin_used", 0.0) or 0.0)
+                mpct = float(t.get("margin_pnl_pct", 0.0) or 0.0)
                 lines.append(
                     f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} {self._fmt_money(pnl):>11} "
-                    f"{self._esc(str(t.get('reason',''))[:12]):<12}</code>"
+                    f"mgn ${margin:>6.2f} {mpct:+6.1f}% {self._esc(str(t.get('reason',''))[:12]):<12}</code>"
                 )
         return "\n".join(lines)
 
@@ -659,10 +567,13 @@ class MultiAssetQuantBot:
         for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-12:][::-1]:
             pnl = float(t.get("pnl", 0.0) or 0.0)
             ok = "✅" if pnl >= 0 else "❌"
+            margin = float(t.get("margin_used", 0.0) or 0.0)
+            mpct = float(t.get("margin_pnl_pct", 0.0) or 0.0)
             lines.append(
                 f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} "
                 f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}→{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
-                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f}</code>"
+                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f} "
+                f"Mgn ${margin:,.2f} {mpct:+.1f}%</code>"
             )
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
         return "\n".join(lines)
@@ -768,6 +679,14 @@ class MultiAssetQuantBot:
                 init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0) or abs(entry - float(getattr(pos, "sl_price", 0.0) or 0.0))
                 r_now = move / init_dist if init_dist > 1e-10 else 0.0
                 mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
+                notional = entry * qty if entry > 0 and qty > 0 else 0.0
+                lev_txt = str(pol.leverage).replace("x", "")
+                try:
+                    lev = float(lev_txt)
+                except Exception:
+                    lev = float(getattr(config, "LEVERAGE", 1) or 1)
+                margin_used = notional / lev if lev > 0 else notional
+                margin_pnl_pct = (upnl / margin_used * 100.0) if margin_used > 1e-10 else 0.0
                 self._dash_emit({
                     "type": "position_update",
                     **base,
@@ -779,6 +698,9 @@ class MultiAssetQuantBot:
                     "upnl": upnl,
                     "r": r_now,
                     "mfe_r": mfe_r,
+                    "notional": notional,
+                    "margin_used": margin_used,
+                    "margin_pnl_pct": margin_pnl_pct,
                     "trailing": "ON" if bool(getattr(pos, "trail_active", False)) else "WATCH",
                     "bracket": "SLTP" if (getattr(pos, "sl_order_id", "") or getattr(pos, "tp_order_id", "")) else "UNKNOWN",
                 })
