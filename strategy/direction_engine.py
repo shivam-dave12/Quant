@@ -1107,6 +1107,35 @@ class DirectionEngine:
         """
         if self._ps_state is not None:
             existing_age = now - self._ps_state.entered_at
+            active_price = float(getattr(self._ps_state, "swept_pool_price", 0.0) or 0.0)
+            active_type = str(getattr(self._ps_state, "swept_pool_type", "") or "")
+
+            # v77 runtime-flow fix: repeated notifications for the same swept
+            # liquidity cluster must not restart the post-sweep clock.  The
+            # bridge can emit the same pool again with a fresh timestamp while
+            # price is still resolving the original sweep.  Restarting here
+            # halves/carries evidence, delays CISD/OTE maturity, and makes the
+            # same entry thesis pass through the criteria surface repeatedly.
+            # Treat same-side/same-cluster events as an update to quality only.
+            cluster_tol = max(abs(float(atr or 0.0)) * 0.25, abs(active_price) * 0.0005, 1e-9)
+            same_cluster = (
+                active_type == str(pool_type or "")
+                and active_price > 0.0
+                and abs(float(swept_pool_price) - active_price) <= cluster_tol
+                and existing_age <= 360.0
+            )
+            if same_cluster:
+                self._ps_state_quality = max(self._ps_state_quality, float(quality or 0.0))
+                try:
+                    self._ps_state.quality = max(float(getattr(self._ps_state, "quality", 0.0) or 0.0), float(quality or 0.0))
+                except Exception:
+                    pass
+                logger.debug(
+                    f"DirectionEngine: duplicate same-cluster sweep {pool_type} "
+                    f"@ ${swept_pool_price:,.1f} merged into active state "
+                    f"age={existing_age:.1f}s quality={quality:.2f}")
+                return
+
             if existing_age < 15.0 and quality <= self._ps_state_quality:
                 logger.debug(
                     f"DirectionEngine: sweep {pool_type} @ ${swept_pool_price:,.1f} "

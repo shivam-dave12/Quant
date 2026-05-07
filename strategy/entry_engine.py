@@ -2206,7 +2206,6 @@ class EntryEngine:
             sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
         else:
             sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
         if not self._sl_is_protective(side, sl, price):
             p.last_reason = "refined SL non-protective at current price"
             return
@@ -2219,8 +2218,12 @@ class EntryEngine:
                 abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
                 atr * _SL_MIN_ATR_MULT)
             sl = sweep.wick_extreme - wick_clear if side == "long" else sweep.wick_extreme + wick_clear
-            sl = self._push_sl_behind_pools(sl, side, price, atr)
 
+        # Do not push behind liquidity before the envelope.  The institutional
+        # SL envelope below owns the single liquidity-aware stop pass for both
+        # the direct and refined entry paths; pre-pushing here would apply the
+        # same liquidity criterion twice and can artificially widen/refuse a
+        # valid refined entry.
         sl, sl_reason = self._apply_institutional_sl_envelope(
             snap, side, price, atr, sl, sweep.wick_extreme, "refined",
             min_risk=p.min_viable_risk if needs_risk_expansion else 0.0)
