@@ -57,6 +57,14 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
+    from core.market_policy import active_policy
+except Exception:  # pragma: no cover
+    try:
+        from market_policy import active_policy  # type: ignore
+    except Exception:  # pragma: no cover
+        active_policy = None  # type: ignore
+
+try:
     from strategy.liquidity_map import (
         LiquidityMap, LiquidityMapSnapshot, PoolTarget, SweepResult,
         PoolStatus, PoolSide, TF_HIERARCHY,
@@ -438,6 +446,17 @@ class EntryEngine:
         # Sweep tracking
         self._last_sweep_reversal_dir  = ""
         self._last_sweep_reversal_time = 0.0
+
+        # Institutional continuous-auction memory.  Direction is allowed to
+        # reverse only when the new posterior/EV materially dominates the
+        # previous thesis in the same price/value area; this prevents the bot
+        # from flipping long/short on noisy re-evaluation at the same level.
+        self._last_auction_side = ""
+        self._last_auction_price = 0.0
+        self._last_auction_ts = 0.0
+        self._last_auction_posterior = 0.0
+        self._last_auction_ev = 0.0
+        self._last_auction_llr = 0.0
 
 
         # Compat stubs for TRACKING/READY (unused in sweep-only mode)
@@ -1315,6 +1334,135 @@ class EntryEngine:
         self._last_accept_log_ts = now
         logger.info(message)
 
+    def _auction_memory_allows(self, side: str, price: float, atr: float, qd: Any, now: float) -> tuple[bool, str]:
+        """Same-auction flip control driven by posterior dominance, not a filter.
+
+        A new opposite direction at substantially the same price/value area must
+        dominate the previous thesis in posterior, EV and LLR.  This prevents the
+        observed behaviour where one 10-minute run produces a short and the next
+        run produces a long around the same price purely because the latest tick
+        changed a local score.
+        """
+        side = str(side or "").lower()
+        if not side:
+            return False, "invalid side"
+        last_side = str(getattr(self, "_last_auction_side", "") or "").lower()
+        if not last_side or last_side == side:
+            return True, "same-side/new auction"
+        a = max(float(atr or 0.0), 1e-9)
+        value_area_atr = abs(float(price or 0.0) - float(getattr(self, "_last_auction_price", 0.0) or 0.0)) / a
+        age = float(now or 0.0) - float(getattr(self, "_last_auction_ts", 0.0) or 0.0)
+        if age > 900.0 or value_area_atr > 1.10:
+            return True, "new value area"
+        p = float(getattr(qd, "posterior", 0.0) or 0.0)
+        ev = float(getattr(qd, "expected_value", 0.0) or 0.0)
+        llr = float(getattr(qd, "llr", 0.0) or 0.0)
+        old_p = float(getattr(self, "_last_auction_posterior", 0.0) or 0.0)
+        old_ev = float(getattr(self, "_last_auction_ev", 0.0) or 0.0)
+        old_llr = float(getattr(self, "_last_auction_llr", 0.0) or 0.0)
+        # Dominance is relative, not a static approval layer.  High-confidence
+        # regimes can flip faster, but weak local evidence cannot erase a fresh
+        # accepted thesis at the same value area.
+        p_edge = p - old_p
+        ev_edge = ev - old_ev
+        llr_edge = llr - old_llr
+        dominance = (p_edge >= 0.055 and ev_edge >= 0.16 and llr_edge >= 0.22)
+        return dominance, (
+            f"same-auction flip dominance pΔ={p_edge:+.3f} EVΔ={ev_edge:+.2f} "
+            f"LLRΔ={llr_edge:+.2f} age={age:.0f}s value={value_area_atr:.2f}ATR"
+        )
+
+    def _record_auction_memory(self, side: str, price: float, qd: Any, now: float) -> None:
+        try:
+            self._last_auction_side = str(side or "").lower()
+            self._last_auction_price = float(price or 0.0)
+            self._last_auction_ts = float(now or time.time())
+            self._last_auction_posterior = float(getattr(qd, "posterior", 0.0) or 0.0)
+            self._last_auction_ev = float(getattr(qd, "expected_value", 0.0) or 0.0)
+            self._last_auction_llr = float(getattr(qd, "llr", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    def _continuous_auction_decision(
+        self, ps, snap, flow, ict, price: float, atr: float, now: float,
+        phase: str, rev_dir: str, cont_dir: str, rev_total: float, cont_total: float,
+        opp: Optional[PoolTarget], rev_r: List[str], cont_r: List[str]
+    ):
+        """Resolve the post-sweep auction directly from posterior/EV.
+
+        Score thresholds, CISD and OTE are now telemetry/evidence inputs; they
+        are not the final routing switch.  The final switch is the quantitative
+        auction posterior, expected value and same-value-area dominance.
+        """
+        candidates = []
+        for action, side in (("reverse", rev_dir), ("continue", cont_dir)):
+            try:
+                qd = evaluate_post_sweep_quant(
+                    action=action, side=side,
+                    rev_score=rev_total, cont_score=cont_total,
+                    displacement_atr=float(getattr(ps, "max_displacement", 0.0) or 0.0),
+                    cisd=bool(getattr(ps, "cisd_detected", False)),
+                    ote=bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False)),
+                    phase=phase, price=price, atr=atr, snap=snap, flow=flow, ict=ict)
+                if not getattr(qd, "accept", False):
+                    continue
+                allowed, mem_reason = self._auction_memory_allows(side, price, atr, qd, now)
+                if not allowed:
+                    logger.info("POST_SWEEP: posterior flip held — %s", mem_reason)
+                    continue
+                score_side = rev_total if action == "reverse" else cont_total
+                score_other = cont_total if action == "reverse" else rev_total
+                margin = (score_side - score_other) / max(abs(score_side) + abs(score_other) + 1.0, 1.0)
+                utility = (
+                    1.80 * float(getattr(qd, "expected_value", 0.0) or 0.0)
+                    + 0.85 * float(getattr(qd, "posterior", 0.0) or 0.0)
+                    + 0.22 * float(getattr(qd, "llr", 0.0) or 0.0)
+                    + 0.30 * margin
+                )
+                candidates.append((utility, action, side, qd, mem_reason))
+            except Exception as exc:
+                logger.debug("continuous auction posterior error: %s", exc)
+        if not candidates:
+            return PostSweepDecision(action="wait", direction="", confidence=0.0,
+                                     reason="CONTINUOUS_AUCTION_WAIT")
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best = candidates[0]
+        if len(candidates) > 1 and (best[0] - candidates[1][0]) < 0.18:
+            return PostSweepDecision(
+                action="wait", direction="", confidence=0.0,
+                reason=f"CONTINUOUS_AUCTION_TIE {best[1]}={best[0]:.2f} {candidates[1][1]}={candidates[1][0]:.2f}")
+        _utility, action, side, qd, mem_reason = best
+        self._last_sweep_analysis["quant_posterior"] = qd.posterior
+        self._last_sweep_analysis["quant_ev"] = qd.expected_value
+        self._last_sweep_analysis["quant_components"] = getattr(qd, "components", {}) or {}
+        self._last_sweep_analysis["auction_resolver"] = "continuous_posterior_ev"
+        self._record_auction_memory(side, price, qd, now)
+        gate_ok, gate_reason = self._institutional_entry_quality_gate(
+            ps, action, side, snap, flow, ict, price, atr, now, phase)
+        if not gate_ok:
+            return PostSweepDecision(action="wait", direction="", confidence=0.0,
+                                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
+        score_total = rev_total if action == "reverse" else cont_total
+        other_total = cont_total if action == "reverse" else rev_total
+        score_conf = min(1.0, max(score_total, 0.0) / 90.0)
+        conf = min(1.0, 0.80 * float(getattr(qd, "posterior", 0.0) or 0.0) + 0.20 * score_conf)
+        if action == "reverse" and getattr(ps, "cisd_detected", False):
+            conf = min(1.0, conf + 0.03)
+        if action == "reverse" and getattr(ps, "ote_reached", False):
+            conf = min(1.0, conf + 0.02)
+        self._log_posterior_accept_once(
+            ("continuous", action, side, phase, round(float(getattr(getattr(ps, "sweep", None), "pool", None).price), 1), int(ps.entered_at)),
+            f"🧠 POSTERIOR ACCEPTED: {action.upper()} {side.upper()} [{phase}] "
+            f"(continuous auction resolver; {score_total:.0f} vs {other_total:.0f}) | {qd.compact()}",
+            now,
+        )
+        target = opp if action == "reverse" else self._find_opposing_target(side, snap, price, atr)
+        reasons = rev_r if action == "reverse" else cont_r
+        return PostSweepDecision(
+            action=action, direction=side, confidence=conf, next_target=target,
+            reason=f"{action.upper()} [{score_total:.0f}v{other_total:.0f}] "
+                   f"[{phase}] CONTINUOUS_POSTERIOR {' + '.join(reasons[:5])}")
+
     def _evaluate_evidence(self, ps, snap, flow, ict, price, atr, now):
         sweep = ps.sweep
         rev_dir = sweep.direction
@@ -1559,6 +1707,16 @@ class EntryEngine:
                 f"DISP={ps.max_displacement:.1f}ATR "
                 f"OTE={'✓' if ps.ote_reached else '✗'}")
 
+        # Primary institutional resolver: evaluate every post-sweep tick with
+        # Bayesian posterior/EV.  CISD/OTE/displacement are evidence features,
+        # not hard readiness gates.  The old score threshold remains only as a
+        # compatibility fallback below.
+        continuous = self._continuous_auction_decision(
+            ps, snap, flow, ict, price, atr, now, phase, rev_dir, cont_dir,
+            rev_total, cont_total, opp, rev_r, cont_r)
+        if continuous.action in ("reverse", "continue"):
+            return continuous
+
         if rev_total >= threshold and gap >= gap_min:
             qd = evaluate_post_sweep_quant(
                 action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
@@ -1679,15 +1837,32 @@ class EntryEngine:
 
     @staticmethod
     def _liquidation_guard(side: str, entry: float) -> tuple:
+        """Instrument-native liquidation guard.
+
+        The old entry engine used the global BTC leverage from config.py.  In
+        multi-asset mode that is wrong: commodities/xStocks can run with a
+        different active policy and a different exchange max leverage.  Using a
+        BTC leverage here falsely shrinks the liquidation room and turns valid
+        commodity/equity setups into `SL breaches liquidation guard` rejects.
+        """
         try:
             import config as _liq_cfg
-            leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+            base_leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
             maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
             liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
         except Exception:
-            leverage = 1.0
+            base_leverage = 1.0
             maint_margin = 0.005
             liq_buffer = 0.005
+
+        leverage = base_leverage
+        try:
+            if callable(active_policy):
+                pol = active_policy()
+                leverage = max(float(getattr(pol, "leverage", base_leverage) or base_leverage), 1.0)
+        except Exception:
+            leverage = base_leverage
+
         entry = float(entry or 0.0)
         if entry <= 0:
             return 0.0, 0.0, 0.0
@@ -1829,18 +2004,64 @@ class EntryEngine:
         min_risk = max(0.0, float(min_risk or 0.0))
 
         _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
-        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
+        max_risk = liq_room * 0.90 if liq_room > 0 else atr * 30.0
+        if max_risk <= 0.0:
+            return None, "no liquidation room for protected SL"
+
+        def _make_sl_from_risk(r: float) -> float:
+            return price - r if side == "long" else price + r
+
+        def _statistical_floor() -> tuple[float, str]:
+            # Expected-adverse-excursion style invalidation surface.  This is
+            # used when no clean protective pool exists or when the raw structural
+            # anchor would sit beyond the exchange survival boundary.
+            profile = getattr(self, "_last_market_profile", None)
+            try:
+                if profile is None:
+                    profile = self._market_profile(snap, None, None, price, atr, side)
+            except Exception:
+                profile = None
+            atr_pct = min(max(float(getattr(self, "_atr_pctile", 0.5) or 0.5), 0.0), 1.0)
+            q = self._current_quant_posterior()
+            uncertainty = float(getattr(profile, "selectivity", 1.0) or 1.0) if profile is not None else 1.0
+            breath = float(getattr(profile, "breathing_mult", 1.0) or 1.0) if profile is not None else 1.0
+            liq_density = float(getattr(profile, "liquidity_density", 1.0) or 1.0) if profile is not None else 1.0
+            adverse = atr * (0.52 + 0.45 * atr_pct + 0.18 * math.log1p(max(liq_density, 0.0))) * max(0.75, min(1.40, breath))
+            # Higher posterior allows tighter invalidation; weaker posterior
+            # forces extra adverse-excursion breathing or smaller size.
+            adverse *= max(0.78, min(1.25, 1.08 - 0.35 * q + 0.14 * uncertainty))
+            return max(adverse, min_risk, atr * _SL_MIN_ATR_MULT), (
+                f"statistical invalidation surface adverse={adverse/max(atr,1e-9):.2f}ATR "
+                f"q={q:.2f} room={max_risk/max(atr,1e-9):.2f}ATR"
+            )
+
         sl = structural_sl
         risk = abs(price - sl)
         invalidation_gap = abs(price - invalidation_price) if invalidation_price else 0.0
+        stat_floor, stat_reason = _statistical_floor()
         noise_floor = max(
             atr * (0.45 + 0.35 * min(max(self._atr_pctile, 0.0), 1.0)),
-            invalidation_gap + atr * 0.28,
+            invalidation_gap + atr * 0.18 if invalidation_gap <= max_risk else stat_floor,
+            stat_floor,
         )
 
         if risk < noise_floor:
-            sl = price - noise_floor if side == "long" else price + noise_floor
-            risk = abs(price - sl)
+            risk = noise_floor
+            sl = _make_sl_from_risk(risk)
+
+        if risk > max_risk:
+            # Structural invalidation is outside available liquidation room for
+            # the active instrument/leverage.  Do not abandon the auction solely
+            # because there is no pool anchor.  Express the maximum survivable
+            # statistical invalidation surface and let sizing shrink from the
+            # true SL distance.
+            risk = max(min(max_risk, max(stat_floor, min_risk)), min(max_risk, atr * _SL_MIN_ATR_MULT))
+            if risk <= 0.0 or risk > max_risk + 1e-9:
+                return None, f"no survival room for statistical SL ({stat_reason})"
+            sl = _make_sl_from_risk(risk)
+            logger.info(
+                "SL envelope %s: structural invalidation beyond leverage room; using %s SL=$%.1f risk=%.2fATR",
+                label, stat_reason, sl, risk / max(atr, 1e-10))
 
         pool_sl, _pool_target, pool_pick = self._find_sl_pool(
             snap=snap,
@@ -1877,13 +2098,22 @@ class EntryEngine:
                         "SL envelope %s: ignored protective pool $%.1f (%s)",
                         label, pool_sl, geometry_reason)
 
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        sl = self._push_sl_behind_pools(sl, side, price, atr, max_risk=max_risk)
         risk = abs(price - sl)
 
         if not self._sl_is_protective(side, sl, price):
             return None, "SL crossed market after liquidity push"
         if not self._sl_before_liquidation(side, sl, price):
-            return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
+            # Liquidity push exceeded exchange survival room.  Reconstruct the
+            # last valid statistical stop inside the guard rather than rejecting
+            # a valid auction because a pool envelope is untradeably far away.
+            risk = max(min(max_risk, max(stat_floor, min_risk)), min(max_risk, atr * _SL_MIN_ATR_MULT))
+            sl = _make_sl_from_risk(risk)
+            if not self._sl_before_liquidation(side, sl, price):
+                return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
+            logger.info(
+                "SL envelope %s: capped to exchange-survivable statistical surface SL=$%.1f risk=%.2fATR",
+                label, sl, risk / max(atr, 1e-10))
         if min_risk > 0.0 and risk < min_risk:
             return None, f"no structural SL meeting execution risk {risk:.1f}pts < {min_risk:.1f}pts"
         if risk > abs(price - structural_sl) + 1e-9:
@@ -2742,7 +2972,7 @@ class EntryEngine:
             return None
         return sl
 
-    def _push_sl_behind_pools(self, sl, side, price, atr):
+    def _push_sl_behind_pools(self, sl, side, price, atr, max_risk: float = 0.0):
         """Push SL outside the live protective liquidity envelope.
 
         This is not a filter and not a parameter tweak.  It is executable stop
@@ -2811,8 +3041,16 @@ class EntryEngine:
 
         def _within_push_cap(candidate):
             if side == "long":
-                return sl_origin - candidate <= _SL_PUSH_MAX_ATR * atr
-            return candidate - sl_origin <= _SL_PUSH_MAX_ATR * atr
+                pushed = sl_origin - candidate
+                total_risk = price - candidate
+            else:
+                pushed = candidate - sl_origin
+                total_risk = candidate - price
+            if pushed > _SL_PUSH_MAX_ATR * atr:
+                return False
+            if max_risk and total_risk > max_risk:
+                return False
+            return True
 
         if side == "long":
             pools = [t for t in getattr(snap, "ssl_pools", []) or [] if _active_pool(t)]

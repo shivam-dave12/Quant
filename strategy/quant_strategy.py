@@ -6309,6 +6309,48 @@ class QuantStrategy:
             bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
         )
 
+        def _maker_safe_delta_limit(px: float, depth_ticks: int = 1) -> float:
+            """Return a post-only-safe bracket entry limit for Delta.
+
+            Delta native brackets are intentionally post-only.  A valid thesis
+            should not be lost because the OTE limit is one tick through the
+            book at send time.  Reprice passively; never switch to a naked
+            taker fallback.
+            """
+            safe = float(px or price)
+            try:
+                ob = data_manager.get_orderbook() or {}
+                bids = ob.get("bids", []) or []
+                asks = ob.get("asks", []) or []
+                def _lvl_px(lvl):
+                    if isinstance(lvl, (list, tuple)):
+                        return float(lvl[0])
+                    if isinstance(lvl, dict):
+                        return float(lvl.get("limit_price") or lvl.get("price") or 0.0)
+                    return 0.0
+                best_bid = _lvl_px(bids[0]) if bids else 0.0
+                best_ask = _lvl_px(asks[0]) if asks else 0.0
+                cushion = max(1, int(depth_ticks)) * tick
+                if side == "long" and best_ask > 0.0:
+                    safe = min(safe, best_ask - cushion)
+                    if best_bid > 0.0:
+                        safe = max(safe, best_bid - cushion) if safe >= best_ask else safe
+                elif side == "short" and best_bid > 0.0:
+                    safe = max(safe, best_bid + cushion)
+                    if best_ask > 0.0:
+                        safe = min(safe, best_ask + cushion) if safe <= best_bid else safe
+            except Exception as exc:
+                logger.debug("maker-safe Delta reprice skipped: %s", exc)
+            safe = _round_to_tick(safe)
+            if safe > 0 and abs(safe - px) > max(tick * 0.5, 1e-9):
+                logger.info(
+                    "Delta maker-safe bracket reprice: %s $%.2f -> $%.2f (%d tick passive cushion)",
+                    side.upper(), px, safe, max(1, int(depth_ticks)))
+            return safe
+
+        if _delta_requires_native_bracket:
+            limit_px = _maker_safe_delta_limit(limit_px, depth_ticks=1)
+
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
             limit_price=limit_px,
@@ -6316,11 +6358,27 @@ class QuantStrategy:
             timeout_sec=limit_timeout,
             on_order_placed=_on_order_placed,
         )
+        if entry_data is None and _delta_requires_native_bracket:
+            retry_px = _maker_safe_delta_limit(limit_px, depth_ticks=2)
+            if retry_px > 0 and abs(retry_px - limit_px) >= max(tick * 0.5, 1e-9):
+                logger.warning(
+                    "Delta native bracket first attempt failed; retrying once with deeper post-only maker limit $%.2f -> $%.2f",
+                    limit_px, retry_px)
+                entry_data = order_manager.place_bracket_limit_entry(
+                    side=side, quantity=qty,
+                    limit_price=retry_px,
+                    sl_price=sl_price, tp_price=tp_price,
+                    timeout_sec=limit_timeout,
+                    on_order_placed=_on_order_placed,
+                )
+                if entry_data is not None:
+                    limit_px = retry_px
+                    entry_ref = retry_px
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
         elif _delta_requires_native_bracket:
             logger.error(
-                "❌ Delta native bracket entry failed — refusing non-bracket fallback "
+                "❌ Delta native bracket entry failed after maker-safe retry — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
                 f"side={side} qty={qty} entry=${limit_px:,.2f} "
                 f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
