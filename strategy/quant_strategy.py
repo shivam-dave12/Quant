@@ -2832,7 +2832,7 @@ class QuantStrategy:
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v78-adaptive-startup-readiness-symbol-profiled-flow")
+            logger.info("   EntryArchitecture: v74-native-bracket-fast-fee-true-flow")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
@@ -9418,36 +9418,19 @@ class QuantStrategy:
         aggregate_remaining_risk = None
         if portfolio_scoped:
             try:
-                # v76: v75 treated a missing portfolio_remaining_risk_cap as zero,
-                # which incorrectly rejected legacy/isolated tests and any risk manager
-                # that supplied portfolio_scoped=True before the new telemetry keys.
-                # Institutional default: derive the aggregate cap from risk_total and
-                # PORTFOLIO_MAX_AGGREGATE_RISK_PCT, then subtract open portfolio risk.
-                agg_cap_raw = bal.get("portfolio_aggregate_risk_cap", None)
-                if agg_cap_raw is None:
-                    try:
-                        agg_pct = float(_cfg("PORTFOLIO_MAX_AGGREGATE_RISK_PCT", 3.0)) / 100.0
-                    except Exception:
-                        agg_pct = 0.03
-                    agg_cap = max(0.0, float(bal.get("risk_total", target_risk_base) or target_risk_base) * agg_pct)
-                else:
-                    agg_cap = max(0.0, float(agg_cap_raw or 0.0))
-                open_risk = max(0.0, float(bal.get("portfolio_open_risk_usd", 0.0) or 0.0))
-                rem_raw = bal.get("portfolio_remaining_risk_cap", None)
-                if rem_raw is None:
-                    aggregate_remaining_risk = max(0.0, agg_cap - open_risk)
-                else:
-                    aggregate_remaining_risk = max(0.0, float(rem_raw or 0.0))
+                aggregate_remaining_risk = float(bal.get("portfolio_remaining_risk_cap", 0.0) or 0.0)
                 if aggregate_remaining_risk <= 1e-10:
                     logger.warning(
                         f"Sizing rejected: portfolio aggregate risk exhausted | "
-                        f"open_risk=${open_risk:.2f} cap=${agg_cap:.2f}")
+                        f"open_risk=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f} "
+                        f"cap=${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
                     return None
                 if risk_capital > aggregate_remaining_risk:
                     logger.info(
                         f"Portfolio aggregate risk haircut: target_risk=${risk_capital:.2f} "
                         f"-> remaining=${aggregate_remaining_risk:.2f} "
-                        f"open=${open_risk:.2f}/${agg_cap:.2f}")
+                        f"open=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f}/"
+                        f"${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
                     risk_capital = aggregate_remaining_risk
             except Exception:
                 aggregate_remaining_risk = None

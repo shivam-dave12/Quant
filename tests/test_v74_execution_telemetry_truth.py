@@ -7,7 +7,7 @@ from strategy.quant_strategy import QuantStrategy
 
 def test_v74_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
-    assert "v78-adaptive-startup-readiness-symbol-profiled-flow" in src
+    assert "v74-native-bracket-fast-fee-true-flow" in src
     assert "v70-flow-audit" not in src
 
 

@@ -516,24 +516,12 @@ class LiquidityTrailEngine:
             is_impr = ((pos_side == "long"  and be_price > current_sl) or
                        (pos_side == "short" and be_price < current_sl))
             if is_impr and profit > 0:
-                rounded_be = self._round_be_price(pos_side, be_price)
-                invalid_reason = self._stop_trigger_invalid_reason(pos_side, rounded_be, price)
-                if invalid_reason:
-                    # v76: do not emit a non-executable stop proposal. In the log this
-                    # caused repeated dispatch-block warnings when a counter-BOS broke
-                    # the trade after price had already crossed fee-adjusted BE.
-                    # Institutional behavior is to keep the existing exchange stop and
-                    # let the exit/risk engine handle the damaged thesis, not spam REST
-                    # retries for an impossible trigger.
-                    return self._hold(
-                        f"COUNTER_BOS_BE_NOT_EXECUTABLE: {invalid_reason}; keep existing protective stop",
-                        hold_reason, r_multiple=r_multiple)
                 logger.warning(
                     f"Trail[COUNTER_BOS_OVERRIDE]: 5m BOS against trade broke "
-                    f"entry — forcing BE ${rounded_be:,.1f}")
+                    f"entry — forcing BE ${be_price:,.1f}")
                 return LiquidityTrailResult(
-                    new_sl=rounded_be, anchor=None,
-                    reason=f"[COUNTER_BOS_OVERRIDE] SL → BE ${rounded_be:,.1f}",
+                    new_sl=self._round_be_price(pos_side, be_price), anchor=None,
+                    reason=f"[COUNTER_BOS_OVERRIDE] SL → BE ${be_price:,.1f}",
                     phase="COUNTER_BOS", r_multiple=r_multiple)
 
         # ══════════════════════════════════════════════════════════════
@@ -603,8 +591,7 @@ class LiquidityTrailEngine:
                 hold_reason=hold_reason)
             _floor_result = self._try_delivery_structure_lock(
                 pos_side, price, entry_price, current_sl, atr, delivery_atr,
-                liq_snapshot, candles_by_tf, hold_reason, r_multiple=r_multiple,
-                pos=pos, fee_engine=fee_engine,
+                liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine,
                 ict_engine=ict_engine, flow={"direction": pos_side if cvd_trend == 0 else ("long" if cvd_trend > 0 else "short"),
                                              "conviction": abs(cvd_trend), "cvd_trend": cvd_trend},
                 peak_profit=peak_profit)
@@ -637,8 +624,7 @@ class LiquidityTrailEngine:
             hold_reason=hold_reason)
         _floor_result = self._try_delivery_structure_lock(
             pos_side, price, entry_price, current_sl, atr, delivery_atr,
-            liq_snapshot, candles_by_tf, hold_reason, r_multiple=r_multiple,
-            pos=pos, fee_engine=fee_engine,
+            liq_snapshot, candles_by_tf, hold_reason, pos=pos, fee_engine=fee_engine,
             ict_engine=ict_engine, flow={"direction": pos_side if cvd_trend == 0 else ("long" if cvd_trend > 0 else "short"),
                                          "conviction": abs(cvd_trend), "cvd_trend": cvd_trend},
             peak_profit=peak_profit)
@@ -999,8 +985,7 @@ class LiquidityTrailEngine:
         self, pos_side: str, price: float, entry_price: float,
         current_sl: float, atr: float, delivery_atr: float,
         liq_snapshot, candles_by_tf: Dict[str, List[dict]],
-        hold_reason: Optional[List[str]], r_multiple: float = 0.0,
-        pos=None, fee_engine=None, ict_engine=None,
+        hold_reason: Optional[List[str]], pos=None, fee_engine=None, ict_engine=None,
         flow=None, peak_profit: float = 0.0,
     ) -> LiquidityTrailResult:
         """Protect delivered profit using confirmed structure/liquidity.
@@ -1012,13 +997,13 @@ class LiquidityTrailEngine:
         confirmed swing lows/highs, and true fee-adjusted BE.
         """
         if atr <= 1e-10:
-            return self._hold("DELIVERY_LOCK_WAIT: invalid ATR", hold_reason, r_multiple=r_multiple)
+            return self._hold("DELIVERY_LOCK_WAIT: invalid ATR", hold_reason)
 
         min_delivery_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).delivery_lock_min_mfe_atr(self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_MFE_ATR", 1.80))
         if delivery_atr < min_delivery_atr:
             return self._hold(
                 f"DELIVERY_LOCK_WAIT: delivered={delivery_atr:.2f}ATR<{min_delivery_atr:.2f}ATR",
-                hold_reason, r_multiple=r_multiple)
+                hold_reason)
 
         true_be = self._round_be_price(pos_side, self._be_price(pos_side, entry_price, atr, pos, fee_engine))
 
@@ -1042,8 +1027,7 @@ class LiquidityTrailEngine:
         candidate_sl = self._better_sl(pos_side, self._better_sl(pos_side, pool_sl, swing_sl), q_sl)
         if candidate_sl is None:
             return self._hold(
-                f"DELIVERY_LOCK_WAIT: {pool_reason}; {swing_reason}; {qtrail.reason}",
-                hold_reason, r_multiple=r_multiple)
+                f"DELIVERY_LOCK_WAIT: {pool_reason}; {swing_reason}; {qtrail.reason}", hold_reason)
 
         if q_sl is not None and abs(candidate_sl - q_sl) < 1e-9:
             source_reason = "quantEAE:" + qtrail.reason
@@ -1052,14 +1036,14 @@ class LiquidityTrailEngine:
 
         invalid_reason = self._stop_trigger_invalid_reason(pos_side, candidate_sl, price)
         if invalid_reason:
-            return self._hold(f"DELIVERY_LOCK_NOT_EXECUTABLE: {invalid_reason}", hold_reason, r_multiple=r_multiple)
+            return self._hold(f"DELIVERY_LOCK_NOT_EXECUTABLE: {invalid_reason}", hold_reason)
 
         is_impr = ((pos_side == "long" and candidate_sl > current_sl) or
                    (pos_side == "short" and candidate_sl < current_sl))
         if not is_impr:
             return self._hold(
                 f"DELIVERY_LOCK_ALREADY_BETTER: candidate=${candidate_sl:,.1f} current=${current_sl:,.1f}",
-                hold_reason, r_multiple=r_multiple)
+                hold_reason)
 
         breath_atr = build_market_profile(price=price, atr=atr, liq_snapshot=liq_snapshot, ict=ict_engine, side=pos_side).trail_breathing_atr(self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_BREATHING_ATR", 0.85))
         min_impr_atr = self._cfg_float("TRAIL_DELIVERY_LOCK_MIN_IMPROVEMENT_ATR", 0.25)
@@ -1067,13 +1051,13 @@ class LiquidityTrailEngine:
         if breathing < breath_atr:
             return self._hold(
                 f"DELIVERY_LOCK_TOO_TIGHT: breathing={breathing:.2f}ATR<{breath_atr:.2f}ATR",
-                hold_reason, r_multiple=r_multiple)
+                hold_reason)
 
         improvement = abs(candidate_sl - current_sl) / atr
         if improvement < min_impr_atr:
             return self._hold(
                 f"DELIVERY_LOCK_MICRO_MOVE: {improvement:.3f}ATR<{min_impr_atr:.2f}ATR",
-                hold_reason, r_multiple=r_multiple)
+                hold_reason)
 
         reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
                   f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")

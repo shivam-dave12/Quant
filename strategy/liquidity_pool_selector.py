@@ -60,37 +60,6 @@ try:
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
-
-try:
-    from core.market_policy import active_policy as _active_instrument_policy
-except Exception:  # pragma: no cover - standalone tests
-    _active_instrument_policy = None  # type: ignore
-
-
-def _policy_value(name: str, default: Any) -> Any:
-    try:
-        if _active_instrument_policy is None:
-            return default
-        pol = _active_instrument_policy()
-        return getattr(pol, name, default)
-    except Exception:
-        return default
-
-
-def _policy_float(name: str, default: float) -> float:
-    try:
-        v = float(_policy_value(name, default))
-        return v if math.isfinite(v) else float(default)
-    except Exception:
-        return float(default)
-
-
-def _policy_str(name: str, default: str = "") -> str:
-    try:
-        return str(_policy_value(name, default) or default)
-    except Exception:
-        return default
-
 # ────────────────────────────────────────────────────────────────────────────
 # MTF probability dependency.
 #
@@ -631,85 +600,6 @@ def _gauntlet_penalty(
     return n, 1.0 - pen
 
 
-
-
-def _same_side_path_support_lift(
-    candidate_target: Any,
-    candidate_tp_price: float,
-    pools: List[Any],
-    side: str,
-    entry: float,
-    atr: float,
-    risk: float,
-    now_ts: float,
-) -> Tuple[float, str, Dict[str, float]]:
-    """Bounded lift for staged institutional objectives.
-
-    BTC and high-beta symbols often move through a near same-side liquidity pool
-    before the deeper delivery objective.  That near pool is not necessarily the
-    final exchange TP, but it is operationally important: it gives the trail/BE
-    logic something to react to and reduces the path risk of the terminal target.
-    We score that as *support* for the deeper TP, not as permission to use a
-    weak target.  The final TP still needs positive geometry and correct side.
-    """
-    max_lift = _policy_float("tp_path_support_lift_max", 0.0)
-    if max_lift <= 0.0 or atr <= 0.0 or risk <= 0.0:
-        return 0.0, "", {}
-    style = _policy_str("target_style", "")
-    if "staged" not in style and max_lift < 0.10:
-        # Non-staged profiles keep only a tiny/no lift.
-        return 0.0, "", {}
-    lo, hi = sorted((float(entry), float(candidate_tp_price)))
-    primary_min_rr = max(0.10, _policy_float("tp_primary_objective_min_rr", 1.0))
-    best_q = 0.0
-    best_desc = ""
-    best_rr = 0.0
-    best_dist = 0.0
-    cand_pool = getattr(candidate_target, "pool", None)
-    cand_price = float(_safe(cand_pool, "price", 0.0) or 0.0)
-    for t in pools:
-        pool = _safe(t, "pool", None)
-        if pool is None or pool is cand_pool:
-            continue
-        if not _is_live_pool(pool) or not _is_tp_pool_side(t, side):
-            continue
-        px = float(_safe(pool, "price", 0.0) or 0.0)
-        if px <= lo or px >= hi:
-            continue
-        # It must be before the candidate in the profit path, not the candidate itself.
-        if abs(px - cand_price) <= max(atr * 0.05, 1e-9):
-            continue
-        dist_atr = abs(px - entry) / max(atr, 1e-9)
-        if dist_atr < 0.25:
-            continue
-        buf = _reach_buffer(dist_atr, atr)
-        primary_tp = px - buf if side == "long" else px + buf
-        if side == "long" and primary_tp <= entry:
-            continue
-        if side == "short" and primary_tp >= entry:
-            continue
-        primary_rr = abs(primary_tp - entry) / max(risk, 1e-9)
-        if primary_rr < primary_min_rr:
-            continue
-        raw_p, norm_p = _per_pool_sweep_prob(t, entry, atr, now_ts)
-        sig = max(0.0, float(_safe(t, "significance", 0.0) or 0.0))
-        tf_rank = _tf_rank(str(_safe(pool, "timeframe", "5m")))
-        q = (
-            _clamp(norm_p, 0.0, 1.0)
-            * _clamp(primary_rr / max(primary_min_rr + 0.65, 1e-9), 0.0, 1.0)
-            * _clamp(sig / 3.0, 0.25, 1.0)
-            * (1.0 + min(tf_rank, 4) * 0.035)
-        )
-        if q > best_q:
-            best_q = q
-            best_rr = primary_rr
-            best_dist = dist_atr
-            best_desc = f"path objective ${primary_tp:,.1f} {primary_rr:.2f}R {dist_atr:.1f}ATR q={q:.2f}"
-    if best_q <= 0.0:
-        return 0.0, "", {}
-    lift = max_lift * _clamp(best_q, 0.0, 1.0)
-    return lift, best_desc, {"path_support_q": best_q, "path_support_rr": best_rr, "path_support_dist_atr": best_dist}
-
 def _tf_rank(tf: str) -> int:
     return _TF_RANK.get(str(tf).lower(), 2)
 
@@ -739,7 +629,7 @@ def _terminal_reach_multiplier(distance_atr: float, tf: str) -> float:
         return 1.0
     lam = max(float(_DECAY_LAMBDA.get(str(tf), 2.0)), 1.25)
     overshoot = max(0.0, distance_atr - max_reach)
-    return max(_policy_float("tp_terminal_reach_floor", _TERMINAL_REACH_FLOOR), math.exp(-overshoot / lam))
+    return max(_TERMINAL_REACH_FLOOR, math.exp(-overshoot / lam))
 
 
 def _reach_buffer(distance_atr: float, atr: float) -> float:
@@ -771,26 +661,18 @@ def _posterior_delivery_probability(
     confluence: float,
     gauntlet_mult: float,
     reach_mult: float,
-    path_support_lift: float = 0.0,
 ) -> float:
     """Blend setup posterior with the pool's own delivery probability."""
-    floor = _policy_float("tp_min_delivery_prob_floor", _TP_DELIVERY_PROB_FLOOR)
-    pool_prob = _clamp(raw_prob, floor, 0.95)
+    pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
     pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
     pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
     pool_prob *= math.sqrt(_clamp(reach_mult, 0.05, 1.25))
-    # v77: instrument-native staged objective support.  When a nearer live
-    # objective exists between entry and a deeper runner, it can finance BE and
-    # improve the practical hit-rate of the runner.  This is a bounded delivery
-    # lift, never a free pass: wrong-side/dead/cost-invalid pools still fail.
-    pool_prob *= 1.0 + _clamp(float(path_support_lift or 0.0), 0.0, _policy_float("tp_path_support_lift_max", 0.0))
-    pool_prob = _clamp(pool_prob, floor, 0.95)
+    pool_prob = _clamp(pool_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
 
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
         return pool_prob
-    w = _clamp(_policy_float("tp_posterior_blend_weight", 0.50), 0.20, 0.80)
-    return _clamp((pool_prob ** (1.0 - w)) * (posterior ** w), floor, 0.93)
+    return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
 
 def _institutional_rr_floor(
@@ -802,7 +684,6 @@ def _institutional_rr_floor(
     reach_mult: float,
     risk: float,
     be_move: float,
-    path_support_lift: float = 0.0,
 ) -> Tuple[float, float, float]:
     """Return (required_rr, delivery_probability, cost_r).
 
@@ -816,19 +697,19 @@ def _institutional_rr_floor(
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
     durable_floor = max(
-        _policy_float("tp_durable_rr_floor", _TP_DURABLE_RR_FLOOR),
-        _policy_float("tp_be_move_mult", _TP_MIN_BE_MOVE_MULT) * max(float(be_move), 0.0) / risk_f,
+        _TP_DURABLE_RR_FLOOR,
+        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
     )
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
         delivery_p = _posterior_delivery_probability(
-            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult, path_support_lift)
+            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
         ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
         return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
 
     delivery_p = _posterior_delivery_probability(
-        raw_prob, posterior, confluence, gauntlet_mult, reach_mult, path_support_lift)
+        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
     posterior_floor = max(durable_floor, ev_floor)
     return posterior_floor, delivery_p, cost_r
@@ -839,7 +720,7 @@ def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketP
     mtf_reach = _terminal_reach_multiplier(distance_atr, tf)
     profile_reach = selector_profile.target_reach_penalty(distance_atr, tf)
     if terminal_target:
-        profile_reach = max(profile_reach, _policy_float("tp_terminal_profile_floor", _TP_TERMINAL_PROFILE_FLOOR))
+        profile_reach = max(profile_reach, _TP_TERMINAL_PROFILE_FLOOR)
     return mtf_reach * profile_reach
 
 
@@ -1005,9 +886,6 @@ def score_tp_pools(
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
-            path_lift, path_note, path_components = _same_side_path_support_lift(
-                target, tp_price, pools, side, entry, atr, risk, now_ts
-            )
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
@@ -1017,7 +895,6 @@ def score_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
-                path_lift,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
@@ -1027,10 +904,6 @@ def score_tp_pools(
             utility *= reach_mult
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
-            if path_components:
-                utility_components.update(path_components)
-            if path_lift > 0.0:
-                utility_components["path_support_lift"] = path_lift
 
             # EV. The scaling here is intentional:
             #   - probability dominates (multiplicative base).
@@ -1047,8 +920,6 @@ def score_tp_pools(
             if terminal_target:
                 reasons.append(
                     f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
-            if path_lift > 0.0 and path_note:
-                reasons.append(f"staged path support +{path_lift:.2f}: {path_note}")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
@@ -1088,10 +959,6 @@ def score_tp_pools(
                     "required_delivery_prob": required_delivery_prob,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
-                    "path_support_lift": path_lift,
-                    "path_support_q": utility_components.get("path_support_q", 0.0),
-                    "path_support_rr": utility_components.get("path_support_rr", 0.0),
-                    "path_support_dist_atr": utility_components.get("path_support_dist_atr", 0.0),
                 },
                 reasons      = reasons,
             ))
@@ -1351,9 +1218,6 @@ def diagnose_tp_pools(
             reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
-            path_lift, path_note, path_components = _same_side_path_support_lift(
-                target, row.tp_price, pools, side, entry, atr, risk, now_ts
-            )
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
@@ -1363,7 +1227,6 @@ def diagnose_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
-                path_lift,
             )
             row.required_rr = rr_floor
             row.delivery_prob = delivery_prob
@@ -1390,8 +1253,6 @@ def diagnose_tp_pools(
             row.notes = []
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
-            if path_lift > 0.0 and path_note:
-                row.notes.append(f"staged path support +{path_lift:.2f}: {path_note}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")

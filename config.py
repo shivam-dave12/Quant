@@ -62,7 +62,7 @@ REMAINDER_MIN_QTY        = 0.001
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.01    # 1% of available balance per trade
+RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -705,15 +705,3 @@ DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
 DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
 DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
 DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))
-
-# v78 institutional startup readiness: portfolio must not block for minutes
-# because one xStock has a shallow 1m REST window while 5m/15m/4h are healthy.
-READY_TIMEOUT_CRYPTO_SEC    = 45.0
-READY_TIMEOUT_COMMODITY_SEC = 30.0
-READY_TIMEOUT_EQUITY_SEC    = 12.0
-POLICY_EQUITY_READY_MIN_1M_BARS     = 40
-POLICY_EQUITY_READY_MIN_5M_BARS     = 70
-POLICY_EQUITY_READY_MIN_15M_BARS    = 70
-POLICY_COMMODITY_READY_MIN_1M_BARS  = 75
-POLICY_COMMODITY_READY_MIN_5M_BARS  = 65
-POLICY_COMMODITY_READY_MIN_15M_BARS = 65

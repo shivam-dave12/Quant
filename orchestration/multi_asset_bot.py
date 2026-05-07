@@ -779,26 +779,6 @@ class MultiAssetQuantBot:
         ctx_holder["ctx"] = ctx
         return ctx
 
-    def _ready_timeout_for_context(self, ctx: AssetContext) -> float:
-        """Bound startup waiting by desk behavior instead of one global retail gate.
-
-        A single thin xStock REST window must not freeze the whole command
-        center for minutes.  If the instrument-aware warmup is not sufficient
-        after a short grace period, that desk is disabled for the session and
-        the rest of the portfolio starts.
-        """
-        try:
-            ac = str(getattr(ctx.instrument, "asset_class", "") or "").lower()
-            if "crypto" in ac:
-                return float(getattr(config, "READY_TIMEOUT_CRYPTO_SEC", 45.0))
-            if "commodity" in ac:
-                return float(getattr(config, "READY_TIMEOUT_COMMODITY_SEC", 30.0))
-            if "equity" in ac or "index" in ac:
-                return float(getattr(config, "READY_TIMEOUT_EQUITY_SEC", 12.0))
-        except Exception:
-            pass
-        return min(float(getattr(config, "READY_TIMEOUT_SEC", 120.0)), 30.0)
-
     def _start_one_context(self, ctx: AssetContext) -> bool:
         inst = ctx.instrument
         try:
@@ -811,20 +791,10 @@ class MultiAssetQuantBot:
                 if not ctx.data_manager.start():
                     logger.error("%s data stream start failed", inst.asset_id)
                     return False
-                ready_timeout = self._ready_timeout_for_context(ctx)
-                ready = ctx.data_manager.wait_until_ready(timeout_sec=ready_timeout)
+                ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
                 ctx.ready = bool(ready)
                 if not ready:
-                    snap = {}
-                    try:
-                        snap = ctx.data_manager.readiness_snapshot()
-                    except Exception:
-                        snap = {}
-                    logger.error(
-                        "%s data manager not ready after %.0fs; desk disabled without blocking portfolio | %s",
-                        inst.asset_id, ready_timeout,
-                        ("missing=" + ",".join(snap.get("missing", []) or [])) if snap else "no readiness snapshot",
-                    )
+                    logger.error("%s data manager not ready", inst.asset_id)
                     return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
