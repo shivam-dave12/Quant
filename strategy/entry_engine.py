@@ -1852,6 +1852,71 @@ class EntryEngine:
                 continue
         return best_reward
 
+
+    def _tp_frontier_for_candidate_sl(self, snap, side: str, price: float, atr: float, sl: float, min_rr: float):
+        """Return (score, best_tp_score) for a candidate SL risk box.
+
+        This is the capital-efficiency bridge between SL and TP.  The stop is
+        not selected in isolation: a farther protective pool is only accepted
+        when the resulting risk box still leaves a positive-expectancy,
+        reachable liquidity target.  This keeps the system unified without
+        adding a new veto layer after EntryEngine.
+        """
+        try:
+            from strategy.liquidity_pool_selector import score_tp_pools as _score_tp
+        except ImportError:
+            try:
+                from liquidity_pool_selector import score_tp_pools as _score_tp  # type: ignore
+            except ImportError:
+                return 0.0, None
+        try:
+            if snap is None or atr <= 0 or abs(float(price) - float(sl)) <= 1e-10:
+                return 0.0, None
+            posterior_prob = self._current_quant_posterior()
+            if is_btc_context(self):
+                required_rr = btc_static_rr_floor(float(min_rr) + _TP_RR_SAFETY_BUFFER, posterior_prob)
+            else:
+                required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
+            _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
+            scores = _score_tp(
+                snap=snap, side=side, entry=price, sl=sl, atr=atr,
+                ict=getattr(self, "_ict", None), htf=_htf_ref,
+                min_rr=required_rr, now=time.time(),
+                posterior_prob=posterior_prob,
+            )
+            if not scores:
+                return 0.0, None
+            best = scores[0]
+            comps = getattr(best, "components", {}) or {}
+            selection_ev = float(comps.get("selection_ev", getattr(best, "ev", 0.0)) or 0.0)
+            ev_r = float(comps.get("expected_value_r", 0.0) or 0.0)
+            delivery = float(comps.get("delivery_prob", getattr(best, "sweep_prob", 0.0)) or 0.0)
+            rr = float(getattr(best, "rr", 0.0) or 0.0)
+            # One scalar for comparing SL risk boxes.  TP selector already
+            # enforced positive EV_R and delivery gates; this tie-breaker prefers
+            # robust hit-rate + payoff per unit risk, not moonshot RR.
+            frontier = max(selection_ev, 0.0) * (0.70 + 0.30 * min(max(delivery, 0.0) / 0.55, 1.35)) * (1.0 + min(max(rr - 1.0, 0.0), 3.0) * 0.05)
+            # Never let a tiny nominal frontier with barely-positive EV dominate.
+            if ev_r <= 0.0:
+                frontier *= 0.25
+            return frontier, best
+        except Exception:
+            return 0.0, None
+
+    @staticmethod
+    def _tp_score_text(score) -> str:
+        try:
+            comps = getattr(score, "components", {}) or {}
+            return (
+                f"tp=${float(getattr(score, 'tp_price', 0.0)):.1f} "
+                f"rr={float(getattr(score, 'rr', 0.0)):.2f} "
+                f"P={float(comps.get('delivery_prob', 0.0)):.3f} "
+                f"EV_R={float(comps.get('expected_value_r', 0.0)):.3f} "
+                f"frontier={float(comps.get('selection_ev', getattr(score, 'ev', 0.0))):.3f}"
+            )
+        except Exception:
+            return "tp-frontier unavailable"
+
     @staticmethod
     def _accepts_pool_stop_geometry(
         current_risk: float,
@@ -1922,16 +1987,32 @@ class EntryEngine:
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
             if pool_risk <= max_risk and pool_risk > risk:
-                sl = pool_sl
-                risk = pool_risk
-                try:
-                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                current_frontier, current_tp_score = self._tp_frontier_for_candidate_sl(
+                    snap, side, price, atr, sl, _MIN_RR_RATIO)
+                pool_frontier, pool_tp_score = self._tp_frontier_for_candidate_sl(
+                    snap, side, price, atr, pool_sl, _MIN_RR_RATIO)
+                if current_frontier > 0.0 and pool_frontier <= 0.0:
                     logger.info(
-                        "BTC SL envelope %s: v58 sweep SL expanded behind live liquidity $%.1f "
-                        "(risk %.2fATR; %s)",
-                        label, sl, risk / max(atr, 1e-10), details)
-                except Exception:
-                    pass
+                        "BTC SL envelope %s: keeping structural SL $%.1f; far liquidity anchor $%.1f "
+                        "destroys TP frontier (%s)",
+                        label, sl, pool_sl, self._tp_score_text(current_tp_score))
+                elif current_frontier > 0.0 and pool_frontier < current_frontier * 0.45:
+                    logger.info(
+                        "BTC SL envelope %s: keeping capital-efficient SL $%.1f over $%.1f; "
+                        "TP frontier %.3f -> %.3f would degrade execution quality",
+                        label, sl, pool_sl, current_frontier, pool_frontier)
+                else:
+                    sl = pool_sl
+                    risk = pool_risk
+                    try:
+                        details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                        logger.info(
+                            "BTC SL envelope %s: v58 sweep SL expanded behind live liquidity $%.1f "
+                            "(risk %.2fATR; %s; tp_frontier=%.3f %s)",
+                            label, sl, risk / max(atr, 1e-10), details,
+                            pool_frontier, self._tp_score_text(pool_tp_score))
+                    except Exception:
+                        pass
             elif pool_risk > max_risk:
                 return None, (
                     f"BTC protective SL pool ${pool_sl:.1f} beyond liquidation guard; "
@@ -2015,13 +2096,34 @@ class EntryEngine:
                     pool_quality,
                 )
                 if accept_pool:
-                    sl = pool_sl
-                    risk = pool_risk
-                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                    logger.info(
-                        "SL envelope %s: anchored behind protective liquidity at $%.1f "
-                        "(risk %.2fATR; %s; %s)",
-                        label, sl, risk / max(atr, 1e-10), details, geometry_reason)
+                    current_frontier, current_tp_score = self._tp_frontier_for_candidate_sl(
+                        snap, side, price, atr, sl, _MIN_RR_RATIO)
+                    pool_frontier, pool_tp_score = self._tp_frontier_for_candidate_sl(
+                        snap, side, price, atr, pool_sl, _MIN_RR_RATIO)
+                    # Institutional invariant: SL selection must not destroy TP
+                    # expectancy.  If the farther liquidity anchor leaves no
+                    # viable TP while the current structural envelope still has
+                    # one, the far pool becomes context/trailing information, not
+                    # the initial risk box.
+                    if current_frontier > 0.0 and pool_frontier <= 0.0:
+                        logger.info(
+                            "SL envelope %s: keeping structural SL $%.1f; far liquidity anchor $%.1f "
+                            "destroys TP frontier (%s)",
+                            label, sl, pool_sl, self._tp_score_text(current_tp_score))
+                    elif current_frontier > 0.0 and pool_frontier < current_frontier * 0.45:
+                        logger.info(
+                            "SL envelope %s: keeping capital-efficient SL $%.1f over $%.1f; "
+                            "TP frontier %.3f -> %.3f would degrade execution quality",
+                            label, sl, pool_sl, current_frontier, pool_frontier)
+                    else:
+                        sl = pool_sl
+                        risk = pool_risk
+                        details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                        logger.info(
+                            "SL envelope %s: anchored behind protective liquidity at $%.1f "
+                            "(risk %.2fATR; %s; %s; tp_frontier=%.3f %s)",
+                            label, sl, risk / max(atr, 1e-10), details, geometry_reason,
+                            pool_frontier, self._tp_score_text(pool_tp_score))
                 else:
                     # Institutional invariant: if the selected protective pool
                     # is the executable invalidation shelf, never place the SL
@@ -2860,13 +2962,21 @@ class EntryEngine:
                 tf = r.get("timeframe", "")
                 ps = r.get("pool_side", "")
                 rr = float(r.get("rr") or 0.0)
-                ev = float(r.get("ev") or 0.0)
+                frontier = float(r.get("selection_ev") or r.get("ev") or 0.0)
+                ev_r = float(r.get("expected_value_r") or 0.0)
+                p_del = float(r.get("delivery_prob") or r.get("sweep_prob") or 0.0)
+                p_req = float(r.get("required_delivery_prob") or 0.0)
                 reason = r.get("reason", "")
                 notes = r.get("notes") or []
                 if isinstance(notes, list) and notes:
                     reason = f"{reason} ({', '.join(map(str, notes[:3]))})"
                 mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
-                bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
+                if str(role).upper() == "TP":
+                    bits.append(
+                        f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} "
+                        f"P={p_del:.3f}/{p_req:.3f} EV_R={ev_r:.3f} frontier={frontier:.3f} — {reason}")
+                else:
+                    bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} frontier={frontier:.3f} — {reason}")
             return " | ".join(bits)
         except Exception as e:
             return f"pool audit format error: {e}"

@@ -1,5 +1,5 @@
 """
-QUANT STRATEGY v10.1 — QUANTITATIVE LIQUIDITY EXECUTION
+QUANT STRATEGY v10.2 — QUANTITATIVE LIQUIDITY EXECUTION
 =========================================================
 Architecture:
   LiquidityMap -> EntryEngine quantitative posterior -> execution risk -> order routing
@@ -2835,12 +2835,12 @@ class QuantStrategy:
     def _log_init(self):
         with instrument_scope(getattr(self, "_instrument", None)):
             logger.info("=" * 72)
-            logger.info("⚡ QuantStrategy v10.1 — UNIFIED INSTITUTIONAL ENTRYENGINE")
+            logger.info("⚡ QuantStrategy v10.2 — UNIFIED INSTITUTIONAL ENTRYENGINE")
             _inst = getattr(self, "_instrument", None)
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v79-unified-entryengine-liquidity-ev (base=v74-native-bracket-fast-fee-true-flow)")
+            logger.info("   EntryArchitecture: v80-unified-entryengine-tp-sl-frontier (base=v74-native-bracket-fast-fee-true-flow)")
             if is_btc_context(self):
                 logger.info("   BTCOverlay: liquidity-aware TP/SL EV model")
             entry_status = "SINGLE AUTHORITY (LiquidityMap -> EntryEngine posterior/TP/SL EV -> MechanicalRisk -> DeltaBracket)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"

@@ -1,5 +1,5 @@
 """
-liquidity_pool_selector.py — Unified institutional TP/SL selector v78
+liquidity_pool_selector.py — Unified institutional TP/SL selector v80
 ================================================================================
 Created 2026-04-26 as the dedicated pool-selection layer that joins the
 significance/proximity/structural model in liquidity_map.py with the

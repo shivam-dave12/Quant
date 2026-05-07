@@ -776,7 +776,7 @@ class MultiAssetQuantBot:
                 ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
                 ctx.ready = bool(ready)
                 if not ready:
-                    logger.error("%s data manager not ready", inst.asset_id)
+                    logger.warning("%s data manager not ready — asset will be excluded from this run", inst.asset_id)
                     return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
@@ -806,6 +806,21 @@ class MultiAssetQuantBot:
 
         ok_any = any(ok_flags.values())
         if not ok_any:
+            return False
+        failed_assets = [
+            c.instrument.asset_id for c in self.contexts
+            if not bool(ok_flags.get(c.instrument.asset_id, False))
+        ]
+        if failed_assets:
+            logger.warning(
+                "Excluding non-ready assets from active scanner: %s",
+                ", ".join(sorted(failed_assets)),
+            )
+            self.contexts = [
+                c for c in self.contexts
+                if bool(ok_flags.get(c.instrument.asset_id, False))
+            ]
+        if not self.contexts:
             return False
         self.running = True
         self._dash_universe()
