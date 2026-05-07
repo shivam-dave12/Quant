@@ -110,6 +110,12 @@ class InstrumentPolicy:
     shelf_sl_min_entry_distance_atr: float = 0.18
     late_entry_max_chase_atr: float = 2.20
     late_entry_tp_compression_rr: float = 0.35
+    # v81: old/deep sweep invalidation is only valid for the original sweep
+    # expression. If a candidate has already travelled far away and no live
+    # accepted shelf exists, the trade is missed/stale — never force a huge
+    # old-sweep stop and call it executable.
+    old_sweep_max_risk_atr: float = 8.0
+    continuation_anchor_max_risk_atr: float = 6.0
 
     @property
     def evaluation_interval_sec(self) -> float:
@@ -293,6 +299,8 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             shelf_sl_min_entry_distance_atr=0.18,
             late_entry_max_chase_atr=1.85,
             late_entry_tp_compression_rr=0.32,
+            old_sweep_max_risk_atr=7.0,
+            continuation_anchor_max_risk_atr=5.5,
             notes=(pol.notes + "; BTC predictive staged-liquidity TP/SL profile").strip("; "),
         )
 
@@ -317,6 +325,8 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             shelf_sl_min_entry_distance_atr=0.16,
             late_entry_max_chase_atr=1.95,
             late_entry_tp_compression_rr=0.28,
+            old_sweep_max_risk_atr=6.5,
+            continuation_anchor_max_risk_atr=5.0,
             notes=(pol.notes + "; metal predictive staged-displacement TP/SL profile").strip("; "),
         )
 
@@ -339,6 +349,8 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             shelf_sl_min_entry_distance_atr=0.18,
             late_entry_max_chase_atr=1.75,
             late_entry_tp_compression_rr=0.34,
+            old_sweep_max_risk_atr=5.2,
+            continuation_anchor_max_risk_atr=4.5,
             notes=(pol.notes + "; high-beta xStock predictive staged TP/SL profile").strip("; "),
         )
 
@@ -361,6 +373,8 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             shelf_sl_min_entry_distance_atr=0.20,
             late_entry_max_chase_atr=1.60,
             late_entry_tp_compression_rr=0.38,
+            old_sweep_max_risk_atr=4.8,
+            continuation_anchor_max_risk_atr=4.2,
             notes=(pol.notes + "; large-cap xStock predictive staged TP/SL profile").strip("; "),
         )
     return pol

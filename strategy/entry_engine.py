@@ -1857,7 +1857,43 @@ class EntryEngine:
             except Exception:
                 continue
         if best is None:
-            return deep, "deep-sweep invalidation; no accepted live shelf"
+            # v81: some accepted displacement entries are not between the old
+            # engineered sweep and current price anymore.  That old sweep is no
+            # longer the active intraday invalidation.  Before falling back to
+            # old-sweep anchoring, look for a live protective shelf on the actual
+            # stop side of the market.  This is not a fallback level: it must be
+            # a real BSL/SSL pool, unswept, close enough to the entry, and backed
+            # by accepted delivery.
+            for target in pools:
+                try:
+                    pool = getattr(target, "pool", target)
+                    status = str(getattr(pool, "status", "") or "").upper()
+                    if status in ("SWEPT", "CONSUMED", "ARCHIVED"):
+                        continue
+                    px = float(getattr(pool, "price", 0.0) or 0.0)
+                    if px <= 0:
+                        continue
+                    if side == "long" and not (px < entry):
+                        continue
+                    if side == "short" and not (px > entry):
+                        continue
+                    dist_atr = abs(entry - px) / max(atr, 1e-9)
+                    if dist_atr < min_entry_dist or dist_atr > max_dist:
+                        continue
+                    sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+                    if sig < min_sig and not (cisd or disp >= min_delivery * 1.35):
+                        continue
+                    tf = str(getattr(pool, "timeframe", "5m") or "5m")
+                    tf_rank = self._tf_rank_for_stop_geometry(tf)
+                    proximity = 1.0 / (1.0 + max(dist_atr - min_entry_dist, 0.0) * 0.70)
+                    score = max(sig, min_sig * 0.75) * proximity * (1.0 + min(tf_rank, 4) * 0.05)
+                    if score > best_score:
+                        best_score = score
+                        best = (px, tf, sig, dist_atr, status or "LIVE")
+                except Exception:
+                    continue
+        if best is None:
+            return deep, "deep-sweep invalidation; no accepted live protective shelf"
         px, tf, sig, dist, status = best
         return float(px), f"accepted shelf invalidation {tf} @ ${px:,.1f} sig={sig:.2f} dist={dist:.2f}ATR status={status}"
 
@@ -1908,6 +1944,42 @@ class EntryEngine:
         if best_rr < min_rr:
             return True, f"late/compressed entry: chase={chase:.2f}ATR>{max_chase:.2f}ATR nearest_tp_rr={best_rr:.2f}<{min_rr:.2f}"
         return False, f"extended but still viable: chase={chase:.2f}ATR nearest_tp_rr={best_rr:.2f}"
+
+    def _old_sweep_invalidation_block_reason(
+        self,
+        note: str,
+        side: str,
+        entry: float,
+        anchor: float,
+        atr: float,
+        label: str,
+    ) -> str:
+        """Return a reason when a candidate is relying on stale old-sweep SL.
+
+        v81 invariant: accepted post-sweep delivery may use an accepted live
+        shelf as invalidation.  If no such shelf exists and the only anchor is a
+        far old sweep, the setup is a missed/stale move.  We never convert that
+        into a giant stop just to manufacture R:R.
+        """
+        if atr <= 0:
+            return ""
+        note_l = str(note or "").lower()
+        if "accepted shelf" in note_l:
+            return ""
+        risk_atr = abs(float(entry) - float(anchor)) / max(float(atr), 1e-9)
+        cap_name = "continuation_anchor_max_risk_atr" if str(label).lower().startswith("cont") else "old_sweep_max_risk_atr"
+        cap = self._policy_float(cap_name, 6.0)
+        if risk_atr > cap:
+            return (
+                f"no accepted live shelf; old-sweep invalidation risk {risk_atr:.2f}ATR "
+                f"> {cap:.2f}ATR cap ({label}); missed/stale move, not executable"
+            )
+        # Also block when the old anchor is no longer on the protective side.
+        if str(side).lower() == "long" and not (float(anchor) < float(entry)):
+            return f"old-sweep anchor ${float(anchor):.1f} is not protective for LONG"
+        if str(side).lower() == "short" and not (float(anchor) > float(entry)):
+            return f"old-sweep anchor ${float(anchor):.1f} is not protective for SHORT"
+        return ""
 
     def _dominant_institutional_tp_reward(self, snap, side: str, entry: float, atr: float) -> float:
         """Approximate reward to the strongest real TP-side liquidity pool."""
@@ -2415,6 +2487,17 @@ class EntryEngine:
         invalidation_anchor, invalidation_note = self._accepted_structure_invalidation(
             snap, side, price, atr, sweep.wick_extreme, ps
         )
+        old_sweep_block = self._old_sweep_invalidation_block_reason(
+            invalidation_note, side, price, invalidation_anchor, atr, "reversal"
+        )
+        if old_sweep_block:
+            logger.info(
+                f"CANDIDATE DEFERRED [no_accepted_shelf]: {old_sweep_block} "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f}"
+            )
+            self._post_sweep = None
+            self._reset(now)
+            return
         if side == "long":
             sl = invalidation_anchor - atr * _REV_SL_BUFFER_ATR * regime_mult
         else:
@@ -2554,7 +2637,7 @@ class EntryEngine:
             reason=f"{decision.reason}{cisd}{disp}",
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
+        logger.info(f"🧪 STRUCTURAL CANDIDATE: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
         # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
         # Previously only _post_sweep was cleared here; the engine remained in
@@ -2575,15 +2658,33 @@ class EntryEngine:
             self._reset(now)
             return
 
-        # ── SL: structural placement behind swept pool level ─────────────
-        # Continuation thesis: price is now moving AWAY from the pool in sweep
-        # direction. If price returns to the pool level, the continuation is
-        # invalidated. SL goes behind pool price with a regime-adaptive buffer.
+        # ── SL: structural placement behind active continuation shelf ─────
+        # v81: continuation cannot blindly anchor to the old swept pool if that
+        # level is now on the wrong side of the market.  Use the swept pool only
+        # when it is still protective; otherwise require a live accepted shelf.
         regime_mult = self._regime_sl_mult()
+        anchor = float(getattr(sweep.pool, "price", 0.0) or 0.0)
+        anchor_note = "swept-pool continuation invalidation"
+        anchor_is_protective = ((side == "long" and anchor < price) or (side == "short" and anchor > price))
+        if not anchor_is_protective:
+            anchor, anchor_note = self._accepted_structure_invalidation(
+                snap, side, price, atr, float(getattr(sweep, "wick_extreme", anchor) or anchor), self._post_sweep
+            )
+        old_sweep_block = self._old_sweep_invalidation_block_reason(
+            anchor_note, side, price, anchor, atr, "continuation"
+        )
+        if old_sweep_block:
+            logger.info(
+                f"CANDIDATE DEFERRED [no_accepted_shelf]: {old_sweep_block} "
+                f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f}"
+            )
+            self._post_sweep = None
+            self._reset(now)
+            return
         if side == "long":
-            sl = sweep.pool.price - atr * _CONT_SL_BUFFER_ATR * regime_mult
+            sl = anchor - atr * _CONT_SL_BUFFER_ATR * regime_mult
         else:
-            sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR * regime_mult
+            sl = anchor + atr * _CONT_SL_BUFFER_ATR * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
@@ -2618,7 +2719,7 @@ class EntryEngine:
                 f"({risk/atr:.2f}x ATR) side={side}")
 
         sl, sl_reason = self._apply_institutional_sl_envelope(
-            snap, side, price, atr, sl, sweep.pool.price, "continuation")
+            snap, side, price, atr, sl, anchor, "continuation")
         if sl is None:
             logger.info(
                 f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
@@ -2696,7 +2797,7 @@ class EntryEngine:
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
         )
-        logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
+        logger.info(f"🧪 STRUCTURAL CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
         # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
         # Transition to SCANNING immediately without nulling self._signal.
         self._post_sweep = None
