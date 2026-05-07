@@ -1,5 +1,5 @@
 """
-QUANT STRATEGY v10.2 — QUANTITATIVE LIQUIDITY EXECUTION
+QUANT STRATEGY v10.1 — QUANTITATIVE LIQUIDITY EXECUTION
 =========================================================
 Architecture:
   LiquidityMap -> EntryEngine quantitative posterior -> execution risk -> order routing
@@ -50,12 +50,6 @@ except ImportError:
 # ── ICT Institutional Trade Engine — fully inlined; external module removed ─
 
 logger = logging.getLogger(__name__)
-
-try:
-    from strategy.btc_institutional_policy import is_btc_context, btc_static_rr_floor
-except Exception:  # pragma: no cover
-    def is_btc_context(owner=None): return False
-    def btc_static_rr_floor(static_min_rr, posterior_prob=0.0): return float(static_min_rr)
 
 try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
@@ -1623,97 +1617,211 @@ class InstitutionalLevels:
                    liq_map=None,
                    tp_distance_mult: float = 1.0) -> Optional[float]:
         """
-        Legacy-compatible TP API, now selector-only.
+        Initial TP placement — v7.0 INSTITUTIONAL PRIORITY.
 
-        Previous versions mixed liquidity pools with swing/VWAP/statistical
-        fallbacks.  That created retail-style targets whenever a true live BSL
-        or SSL delivery pool was unavailable.  Initial TP selection must now
-        come from the same institutional liquidity selector used by EntryEngine:
-        live unswept pool, correct side, buffered before liquidity, enough net
-        room after fees/slippage, dynamic RR floor, delivery probability and
-        gauntlet penalties.  If no live liquidity target qualifies, return None
-        so the trade is rejected/waited instead of inventing a synthetic TP.
+        HIERARCHY (all candidates scored; highest wins):
+
+          TIER-S  score ≥ 7.0  Liquidity pool (LiquidityMap)
+                                The LiquidityMap has the richest multi-TF pool data.
+                                BSL above (for LONG) / SSL below (for SHORT) is
+                                WHERE price is magnetically attracted to — stop
+                                clusters draw price like gravity. This is always
+                                the PRIMARY TP in ICT methodology.
+
+          TIER-A  score ≥ 6.0  ICT swept liquidity origin
+                                After a sweep-and-reverse, price delivers back to
+                                the raid origin. Mandatory when present.
+
+          TIER-B  score ≥ 5.0  ICT structural (FVG, virgin OB, ict_engine pools)
+                                Imbalances and institutional footprints in the
+                                delivery direction.
+
+          TIER-C  score ≥ 4.0  15m swing extremes
+                                Confirmed structural swing levels.
+
+          TIER-D  score ≥ 3.5  VWAP / σ-bands
+                                Statistical reference levels.
+
+          REJECT  If NO candidate survives the R:R gate → return None.
+                  The caller must NOT enter this trade — no naked R-floor.
+
+        CRITICAL: There is NO R-floor fallback. If no structural target
+        exists that satisfies the minimum R:R, the trade is rejected.
+        Entering without a real target is guessing, not ICT.
         """
-        try:
-            price = float(price)
-            atr = float(atr)
-            sl_price = float(sl_price)
-            if atr <= 0.0 or abs(price - sl_price) < 1e-10:
-                return None
-            if side not in ("long", "short"):
-                return None
-            if liq_map is None:
-                logger.info(
-                    "TP STRUCTURAL REJECT: no liquidity map available; refusing VWAP/swing fallback "
-                    "(side=%s price=$%.2f)", side, price)
-                return None
-
-            snap = liq_map.get_snapshot(price, atr)
-            if snap is None:
-                logger.info(
-                    "TP STRUCTURAL REJECT: liquidity snapshot unavailable; refusing synthetic fallback "
-                    "(side=%s price=$%.2f)", side, price)
-                return None
-
-            try:
-                from strategy.liquidity_pool_selector import select_tp_with_report
-            except ImportError:
-                from liquidity_pool_selector import select_tp_with_report  # type: ignore
-
-            tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
-            min_rr = float(QCfg.REVERSION_MIN_RR()) * tp_distance_mult
-            if is_btc_context(self):
-                min_rr = btc_static_rr_floor(min_rr, 0.0)
-            now_s = (float(now_ms) / 1000.0) if now_ms and now_ms > 1e12 else time.time()
-            tp, target, score, report = select_tp_with_report(
-                snap=snap,
-                side=side,
-                entry=price,
-                sl=sl_price,
-                atr=atr,
-                ict=ict_engine,
-                min_rr=min_rr,
-                now=now_s,
-            )
-            if tp is None or target is None:
-                summary = getattr(report, "summary", "no eligible live liquidity TP")
-                logger.info(
-                    "TP STRUCTURAL REJECT: %s (side=%s price=$%.2f SL=$%.2f)",
-                    summary, side, price, sl_price)
-                return None
-
-            tp = float(tp)
-            if side == "long" and not (sl_price < price < tp):
-                logger.info(
-                    "TP STRUCTURAL REJECT: bad long geometry sl=$%.2f entry=$%.2f tp=$%.2f",
-                    sl_price, price, tp)
-                return None
-            if side == "short" and not (sl_price > price > tp):
-                logger.info(
-                    "TP STRUCTURAL REJECT: bad short geometry sl=$%.2f entry=$%.2f tp=$%.2f",
-                    sl_price, price, tp)
-                return None
-
-            try:
-                pool = getattr(target, "pool", None)
-                pool_price = float(getattr(pool, "price", 0.0) or 0.0)
-                rr = abs(tp - price) / max(abs(price - sl_price), 1e-10)
-                logger.info(
-                    "🎯 TP [LIVE_LIQUIDITY_SELECTOR] $%.2f before pool=$%.2f "
-                    "R:R=1:%.2f P=%.3f EV=%.3f",
-                    tp,
-                    pool_price,
-                    rr,
-                    float(getattr(score, "sweep_prob", 0.0) if score is not None else 0.0),
-                    float(getattr(score, "ev", 0.0) if score is not None else 0.0),
-                )
-            except Exception:
-                pass
-            return tp
-        except Exception as exc:
-            logger.warning("TP selector error: %s", exc)
+        sl_dist = abs(price - sl_price)
+        if sl_dist < 1e-10:
             return None
 
+        _ict_now_ms  = now_ms if now_ms > 0 else int(time.time() * 1000)
+        tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
+        min_tp_dist  = sl_dist * QCfg.REVERSION_MIN_RR() * tp_distance_mult
+        max_tp_dist  = sl_dist * QCfg.REVERSION_MAX_RR() * tp_distance_mult
+        _min_rr_gate = QCfg.REVERSION_MIN_RR() * tp_distance_mult
+
+        # ── scored candidates pool ─────────────────────────────────────────────
+        scored: List[Tuple[float, float, str]] = []   # (level, score, label)
+
+        def _valid(level: float, min_dist: float = None) -> bool:
+            dist = abs(level - price)
+            lo   = min_dist if min_dist is not None else min_tp_dist
+            if dist < lo or dist > max_tp_dist:
+                return False
+            if side == "long"  and level <= price: return False
+            if side == "short" and level >= price: return False
+            return True
+
+        def add(level: float, score: float, label: str, min_dist: float = None):
+            if _valid(level, min_dist):
+                scored.append((level, score, label))
+
+        # ══ TIER-S: LiquidityMap pools (primary target — richest data) ═══════
+        # LiquidityMap tracks equal highs/lows across all TFs with clustering,
+        # HTF confluence promotion, and proximity weighting. These are the real
+        # liquidity clusters smart money hunts.
+        if liq_map is not None:
+            try:
+                liq_snap = liq_map.get_snapshot(price, atr)
+                pool_list = liq_snap.bsl_pools if side == "long" else liq_snap.ssl_pools
+                for pt in pool_list:
+                    pool = pt.pool
+                    # Score = 7 + significance bonus + HTF confluence bonus
+                    # Proximity-weighted significance ensures near pools beat far ones
+                    _adj_sig = pool.proximity_adjusted_sig(pt.distance_atr)
+                    _score   = 7.0 + min(_adj_sig * 0.15, 2.0)
+                    # HTF confluence multiplier
+                    if pool.htf_count >= 2:
+                        _score += 0.5
+                    # Touch count bonus — more touches = deeper stop cluster
+                    _score += min(pool.touches * 0.1, 0.5)
+                    # Target is just BEFORE the pool (so we don't trigger the stops,
+                    # we exit into the liquidity that attracts price there)
+                    _target = pool.price - 0.05 * atr if side == "long" else pool.price + 0.05 * atr
+                    add(_target, _score, f"LIQ_POOL[{pool.timeframe}]@${pool.price:,.0f}(tc={pool.touches})")
+            except Exception as _le:
+                logger.debug(f"LiqMap TP scan error: {_le}")
+
+        # ══ TIER-A: ICT swept liquidity origin ═══════════════════════════════
+        # After a sweep-and-reverse, AMD delivery target is the most important level.
+        if ict_engine is not None:
+            try:
+                _amd = ict_engine.get_amd_state()
+                if _amd.delivery_target is not None:
+                    add(_amd.delivery_target, 6.5, "AMD_DELIVERY_TARGET")
+            except Exception:
+                pass
+
+        # ══ TIER-B: ICT structural targets (FVGs, OBs, ict_engine pools) ════
+        if ict_engine is not None:
+            try:
+                _ict_min_dist = max(sl_dist * 1.0, atr * 0.5)
+                _ict_targets  = ict_engine.get_structural_tp_targets(
+                    side, price, atr, _ict_now_ms, _ict_min_dist, max_tp_dist,
+                    htf_only=False)
+                for _lvl, _sc, _lbl in _ict_targets:
+                    add(_lvl, 5.0 + min(_sc * 0.1, 1.5), f"ICT_{_lbl}", _ict_min_dist)
+                if _ict_targets:
+                    logger.debug(
+                        f"ICT TP pool: {len(_ict_targets)} candidates "
+                        f"[{', '.join(f'${t[0]:,.0f}(s={t[1]:.1f})' for t in _ict_targets[:3])}]")
+            except Exception as _ie:
+                logger.debug(f"ICT structural TP error: {_ie}")
+
+            # ict_engine.liquidity_pools (LiquidityLevel objects from ICT engine)
+            try:
+                for pool in ict_engine.liquidity_pools:
+                    if pool.swept:
+                        continue
+                    _score = 5.5 + min(pool.touch_count * 0.25, 1.5)
+                    _tf_bonus = {"1d": 1.0, "4h": 0.5, "1h": 0.25}.get(
+                        getattr(pool, "timeframe", "5m"), 0.0)
+                    _score += _tf_bonus
+                    if side == "long" and pool.level_type == "BSL" and pool.price > price:
+                        add(pool.price - 0.05 * atr, _score,
+                            f"ICT_BSL@${pool.price:,.0f}",
+                            max(sl_dist * 1.0, atr * 0.5))
+                    elif side == "short" and pool.level_type == "SSL" and pool.price < price:
+                        add(pool.price + 0.05 * atr, _score,
+                            f"ICT_SSL@${pool.price:,.0f}",
+                            max(sl_dist * 1.0, atr * 0.5))
+            except Exception:
+                pass
+
+        # ══ TIER-C: 15m swing extremes ════════════════════════════════════════
+        if candles_15m and len(candles_15m) >= 3:
+            _lb   = min(40, len(candles_15m) - 2)
+            sh_15, sl_15 = InstitutionalLevels.find_swing_extremes(candles_15m, _lb)
+            _buf = atr * 0.08
+            if side == "long":
+                for sh in sh_15:
+                    if sh > price + min_tp_dist:
+                        add(sh - _buf, 4.0, f"15m_SWING_HIGH@${sh:,.0f}")
+            else:
+                for sl_v in sl_15:
+                    if sl_v < price - min_tp_dist:
+                        add(sl_v + _buf, 4.0, f"15m_SWING_LOW@${sl_v:,.0f}")
+
+        # ══ TIER-D: VWAP / σ-bands ════════════════════════════════════════════
+        if vwap > 0:
+            if side == "long" and vwap > price:
+                add(vwap, 3.5, "VWAP")
+                if vwap_std > 0:
+                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                        add(vwap - mult * vwap_std, sc, f"VWAP-{mult}σ")
+            elif side == "short" and vwap < price:
+                add(vwap, 3.5, "VWAP")
+                if vwap_std > 0:
+                    for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.5)]:
+                        add(vwap + mult * vwap_std, sc, f"VWAP+{mult}σ")
+
+        # ══ TIERED SELECTION ══════════════════════════════════════════════════
+        if vwap > 0 and vwap_std > 0:
+            for mult, sc in [(0.5, 3.0), (1.0, 3.0), (1.5, 2.8), (2.0, 2.5)]:
+                if side == "long":
+                    add(vwap + mult * vwap_std, sc + 0.2, f"VWAP_EXT+{mult}sigma")
+                else:
+                    add(vwap - mult * vwap_std, sc + 0.2, f"VWAP_EXT-{mult}sigma")
+
+        tp = None
+        if scored:
+            for tier_min, tier_lbl in [
+                (7.0, "LIQ_POOL"),
+                (6.0, "SWEEP_ORIGIN"),
+                (5.0, "ICT_STRUCTURAL"),
+                (4.0, "SWING_15M"),
+                (3.5, "VWAP"),
+                (0.0, "BEST_AVAILABLE"),
+            ]:
+                tier_cands = [(lvl, sc, lb) for lvl, sc, lb in scored if sc >= tier_min]
+                if not tier_cands:
+                    continue
+                # Score-first; nearest as tiebreaker within same score
+                tier_cands.sort(key=lambda x: (-x[1], abs(x[0] - price)))
+                for cand_lvl, cand_sc, cand_lb in tier_cands:
+                    rr = abs(cand_lvl - price) / max(sl_dist, 1e-10)
+                    if rr >= _min_rr_gate - 1e-9:
+                        tp = cand_lvl
+                        logger.info(
+                            f"🎯 TP [{tier_lbl}] ${tp:,.2f} ({cand_lb}) "
+                            f"score={cand_sc:.1f} "
+                            f"dist={abs(tp-price):.1f}pts/{abs(tp-price)/max(atr,1e-10):.2f}ATR "
+                            f"R:R=1:{rr:.2f} | {len(scored)} candidates total")
+                        break
+                    else:
+                        logger.debug(
+                            f"   TP candidate ${cand_lvl:,.1f} [{cand_lb}] "
+                            f"score={cand_sc:.1f} R:R={rr:.2f} < {_min_rr_gate:.1f} — skip")
+                if tp is not None:
+                    break
+
+        if tp is None:
+            logger.info(
+                f"TP STRUCTURAL REJECT: no valid {side.upper()} target "
+                f"(price=${price:,.2f}, SL-dist={sl_dist:.1f}pts, "
+                f"min_RR={_min_rr_gate:.1f}, candidates={len(scored)})")
+            return None
+
+        return tp
 def _ict_find_swings_inline(candles: list, lookback: int):
     """Find swing highs and lows from a candle list."""
     if len(candles) < 3 or lookback < 1:
@@ -2307,25 +2415,6 @@ class InstitutionalDecision:
 
 
 @dataclass
-class EntryReadinessDecision:
-    """Institutional entry-readiness surface.
-
-    This is the single final entry-coherence decision used by both the
-    institutional matrix and unified gate. It prevents duplicate hard filters
-    from blocking valid sweep entries while still stopping malformed or
-    delivery-less trades.
-    """
-    allowed: bool
-    score: float
-    floor: float
-    size_mult: float = 1.0
-    reason: str = ""
-    hard_rejects: List[str] = field(default_factory=list)
-    penalties: List[str] = field(default_factory=list)
-    allows: List[str] = field(default_factory=list)
-
-
-@dataclass
 class ExecutionViability:
     route: str
     side: str
@@ -2821,43 +2910,29 @@ class QuantStrategy:
         except Exception:
             return send_telegram_message(message, parse_mode=parse_mode)
 
-    def _quantity_display(self, qty: float) -> str:
-        """Human-readable quantity with correct unit per active instrument."""
-        try:
-            inst = getattr(self, "_instrument", None)
-            asset_id = str(getattr(inst, "asset_id", "") or "").upper()
-            if asset_id == "BTC":
-                return f"{float(qty):.6f} BTC"
-            return f"{float(qty):.6f} contracts"
-        except Exception:
-            return f"{float(qty):.6f} units"
-
     def _log_init(self):
+        logger.info("=" * 72)
+        logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
         with instrument_scope(getattr(self, "_instrument", None)):
-            logger.info("=" * 72)
-            logger.info("⚡ QuantStrategy v10.2 — UNIFIED INSTITUTIONAL ENTRYENGINE")
             _inst = getattr(self, "_instrument", None)
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v80-unified-entryengine-tp-sl-frontier (base=v74-native-bracket-fast-fee-true-flow)")
-            if is_btc_context(self):
-                logger.info("   BTCOverlay: liquidity-aware TP/SL EV model")
-            entry_status = "SINGLE AUTHORITY (LiquidityMap -> EntryEngine posterior/TP/SL EV -> MechanicalRisk -> DeltaBracket)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
-            logger.info(f"   EntryEngine: {entry_status}")
-            liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
-            logger.info(f"   LiquidityMap: {liq_status}")
-            ict_status = "TELEMETRY/FEATURES" if self._ict else "UNAVAILABLE"
-            logger.info(f"   ICT Engine: {ict_status}")
-            dir_status = "TELEMETRY ONLY" if self._dir_engine else "UNAVAILABLE"
-            logger.info(f"   DirectionEngine: {dir_status}")
-            conv_status = "SIZE/ACCOUNT-SAFETY LENS ONLY" if self._conviction else "UNAVAILABLE"
-            logger.info(f"   ConvictionModel: {conv_status}")
-            liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
-            logger.info(f"   LiquidityTrail: {liq_trail}")
-            pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
-            logger.info(f"   PostTradeAgent: {pta_status}")
-            logger.info("=" * 72)
+        entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
+        logger.info(f"   Entry: {entry_status}")
+        liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
+        logger.info(f"   LiquidityMap: {liq_status}")
+        ict_status = "ENABLED" if self._ict else "DISABLED"
+        logger.info(f"   ICT Engine: {ict_status}")
+        dir_status = "ACTIVE" if self._dir_engine else "UNAVAILABLE"
+        logger.info(f"   DirectionEngine: {dir_status}")
+        conv_status = "ADVISORY/SAFETY" if self._conviction else "UNAVAILABLE"
+        logger.info(f"   ConvictionModel: {conv_status}")
+        liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
+        logger.info(f"   LiquidityTrail: {liq_trail}")
+        pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
+        logger.info(f"   PostTradeAgent: {pta_status}")
+        logger.info("=" * 72)
 
     def _current_entry_session(self) -> str:
         if self._ict is None:
@@ -3443,19 +3518,19 @@ class QuantStrategy:
         else:
             event_q = self._bounded(0.35 + 0.25 * conviction + 0.20 * target_realism)
 
-        entry_readiness = EntryReadinessDecision(True, 1.0, 0.0, 1.0, "not_applicable")
-        if is_sweep:
-            try:
-                entry_readiness = self._entry_readiness_surface(
-                    signal, ict_ctx, flow_state, liq_snapshot, price, atr)
-                allows.extend(entry_readiness.allows[:4])
-                if entry_readiness.penalties:
-                    allows.append("entry_readiness_penalty: " + " | ".join(entry_readiness.penalties[:3]))
-                if not entry_readiness.allowed:
-                    rejects.append(f"ENTRY_READINESS_BLOCK: {entry_readiness.reason}")
-                event_q = max(event_q, entry_readiness.score)
-            except Exception as _idm_e:
-                logger.debug(f"institutional entry-readiness surface error: {_idm_e}")
+        try:
+            _sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
+            _disp_atr = float(_sa.get("displacement_atr", 0.0) or 0.0)
+            _cisd_ok = bool(_sa.get("cisd", False))
+            _ote_ok = bool(_sa.get("ote", False))
+            _min_disp = float(getattr(config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
+            _strong_disp = float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
+            if is_sweep and _disp_atr < _min_disp:
+                rejects.append(f"institutional displacement {_disp_atr:.2f}ATR < {_min_disp:.2f}ATR")
+            if is_sweep and not (_cisd_ok or _ote_ok or _disp_atr >= _strong_disp):
+                rejects.append("no CISD/OTE/strong displacement acceptance")
+        except Exception as _idm_e:
+            logger.debug(f"institutional matrix displacement check error: {_idm_e}")
 
         side_sign = 1.0 if side == "long" else -1.0
         tf = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
@@ -3533,9 +3608,10 @@ class QuantStrategy:
 
         # Institutional execution audit.
         #
-        # Dynamic institutional mode: quality observations feed both routing
-        # integrity and sizing. Mechanical defects always block; weak delivery
-        # blocks only when it fails the adaptive execution-quality surface.
+        # Dynamic institutional mode: style/quality observations never become
+        # hidden alpha vetoes. They are converted into size, grade and operator
+        # attribution. Only mechanical safety defects can block routing: broken
+        # levels, liquidation-danger geometry, or non-protective order placement.
         threshold = float(getattr(
             config, "INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE",
             getattr(config, "INSTITUTIONAL_MIN_DECISION_SCORE", 0.66 if is_sweep else 0.72),
@@ -3547,16 +3623,16 @@ class QuantStrategy:
         advisory_rejects = []
 
         safety_tokens = (
-            "ENTRY_READINESS_BLOCK", "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
+            "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
             "TP IS NOT", "SL IS NOT", "NON-PROTECTIVE",
             "INVALID", "NON-POSITIVE", "CROSSED",
-            "INSIDE EXECUTION NOISE", "R:R",
             "NO POSITIVE EXECUTABLE UTILITY", "EXECUTABLE TARGET UTILITY",
             "EXECUTABLE TARGET SURFACE",
         )
         quality_tokens = (
-            "TP REACH", "POST-SWEEP ENGINE", "DIRECTIONENGINE",
-            "TARGET_REALISM", "DECISION_SCORE", "ENTRY_READINESS_PENALTY",
+            "DISPLACEMENT", "NO CISD/OTE/STRONG DISPLACEMENT",
+            "INSIDE EXECUTION NOISE", "TP REACH", "R:R",
+            "POST-SWEEP ENGINE", "DIRECTIONENGINE",
         )
 
         for _r in rejects:
@@ -3605,8 +3681,7 @@ class QuantStrategy:
         realism_adj = 0.65 + 0.70 * max(0.0, min(1.0, target_realism))
         rr_adj = 0.85 + min(max(rr - 1.2, 0.0), 3.0) * 0.06
         quality_penalty_mult = max(0.35, 1.0 - quality_gap)
-        readiness_mult = float(getattr(entry_readiness, "size_mult", 1.0) or 1.0)
-        size_mult = self._bounded(base_size * realism_adj * rr_adj * quality_penalty_mult * readiness_mult, 0.20, 1.15)
+        size_mult = self._bounded(base_size * realism_adj * rr_adj * quality_penalty_mult, 0.25, 1.15)
         if rr >= 3.0 and target_realism >= 0.75:
             size_mult = min(1.18, size_mult + 0.05)
         try:
@@ -3631,130 +3706,6 @@ class QuantStrategy:
             grade=grade,
             size_mult=size_mult,
             reject_reasons=safety_rejects,
-            allow_reasons=allows,
-            rr=rr,
-            sl_atr=sl_atr,
-            tp_atr=tp_atr,
-            target_realism=target_realism,
-            liquidation_price=liq_price,
-            liquidation_guard=liq_guard,
-        )
-
-    def _entry_engine_route_decision(self, signal, ict_ctx, flow_state,
-                                     liq_snapshot, price: float,
-                                     atr: float) -> InstitutionalDecision:
-        """Single route decision for the liquidity-first architecture.
-
-        EntryEngine owns the trade thesis: sweep, direction, executable entry,
-        liquidity-aware SL, liquidity TP, and R:R. This method does not re-score
-        or veto that alpha with another layer. It only blocks malformed or
-        mechanically unsafe orders and converts advisory context into sizing.
-        """
-        side = str(getattr(signal, "side", "") or "").lower()
-        entry = float(getattr(signal, "entry_price", price) or price)
-        sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
-        tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
-        rejects: List[str] = []
-        allows: List[str] = []
-
-        atr_f = max(float(atr or 0.0), 1e-9)
-        sl_dist = abs(entry - sl)
-        tp_dist = abs(tp - entry)
-        rr = tp_dist / max(sl_dist, 1e-9)
-        sl_atr = sl_dist / atr_f
-        tp_atr = tp_dist / atr_f
-
-        if side not in ("long", "short"):
-            rejects.append("invalid side")
-        if entry <= 0 or sl <= 0 or tp <= 0:
-            rejects.append("non-positive entry/SL/TP")
-        if side == "long" and not (sl < entry < tp):
-            rejects.append("long levels are not protective/orderly")
-        if side == "short" and not (tp < entry < sl):
-            rejects.append("short levels are not protective/orderly")
-
-        liq_ok, liq_price, liq_guard, liq_reason = self._sl_liquidation_sanity(side, entry, sl)
-        if not liq_ok:
-            rejects.append(liq_reason)
-        elif liq_price > 0:
-            allows.append(f"SL before liquidation guard ${liq_guard:,.1f}")
-
-        # Minimum sanity only. EntryEngine already selected the TP using the
-        # liquidity selector and configured RR floor, so do not re-run an
-        # independent target/quality veto here.
-        if rr <= 0.0:
-            rejects.append("non-positive reward/risk")
-
-        target_realism = 1.0
-        try:
-            tr, target_allows, target_rejects = self._target_pool_realism(
-                signal, liq_snapshot, side, entry, tp, sl, atr_f)
-            target_realism = self._bounded(float(tr or 0.0), 0.05, 1.0)
-            allows.extend(target_allows[:4])
-            if target_rejects:
-                allows.append("target_advisory: " + " | ".join(map(str, target_rejects[:3])))
-        except Exception as exc:
-            target_realism = 0.55
-            allows.append(f"target_advisory unavailable: {exc}")
-
-        target_utility_note = self._target_utility_reject_reason(signal)
-        if target_utility_note:
-            allows.append("target_surface_advisory: " + target_utility_note)
-
-        sweep = getattr(signal, "sweep_result", None)
-        quality = self._bounded(float(getattr(sweep, "quality", 0.0) or 0.0))
-        conviction = self._bounded(float(getattr(signal, "conviction", 0.0) or 0.0))
-        rr_quality = self._bounded(rr / 3.0, 0.0, 1.0)
-        risk_quality = 1.0
-        if sl_atr < 0.35:
-            risk_quality = 0.55 + 0.45 * max(sl_atr / 0.35, 0.0)
-        elif sl_atr > 6.0:
-            risk_quality = max(0.45, 1.0 - (sl_atr - 6.0) / 12.0)
-
-        score = self._bounded(
-            0.32 * max(quality, conviction)
-            + 0.24 * conviction
-            + 0.20 * target_realism
-            + 0.14 * rr_quality
-            + 0.10 * risk_quality
-        )
-        if rr >= 2.5 and target_realism >= 0.65:
-            score = self._bounded(score + min((rr - 2.5) * 0.03, 0.10))
-
-        if score >= 0.82 and rr >= 2.5:
-            grade = "S"
-        elif score >= 0.70:
-            grade = "A"
-        elif score >= 0.55:
-            grade = "B"
-        else:
-            grade = "C"
-
-        # Size is dynamic. Route is not. Weak-but-valid theses get smaller size,
-        # not another hidden veto.
-        size_mult = self._bounded(
-            0.38 + 0.62 * score,
-            0.20,
-            1.10,
-        )
-        if rr >= 3.0 and target_realism >= 0.70:
-            size_mult = min(1.18, size_mult + 0.08)
-        if target_utility_note:
-            size_mult = max(0.20, size_mult * 0.75)
-        if rejects:
-            size_mult = 0.0
-
-        allows.append(
-            f"entry_engine_single_source score={score:.2f} grade={grade} "
-            f"RR={rr:.2f} SL={sl_atr:.2f}ATR TP={tp_atr:.2f}ATR size_mult={size_mult:.2f}"
-        )
-
-        return InstitutionalDecision(
-            allowed=not rejects,
-            score=score,
-            grade=grade,
-            size_mult=size_mult,
-            reject_reasons=rejects,
             allow_reasons=allows,
             rr=rr,
             sl_atr=sl_atr,
@@ -4584,228 +4535,179 @@ class QuantStrategy:
             logger.debug("\n" + "\n".join(lines_out))
 
 
-    def _entry_readiness_surface(self, signal, ict_ctx, flow_state,
-                                 liq_snapshot, price: float, atr: float) -> EntryReadinessDecision:
-        """Single final entry-coherence surface.
-
-        Institutional entry cannot be a stack of independent retail-style vetoes.
-        The EntryEngine already prices the post-sweep auction. This method fuses
-        its evidence with live flow, MTF context, PD location, and posterior/EV
-        into one readiness score. Only true structural defects block routing;
-        borderline but coherent conditions reduce size or wait for repricing.
-        """
-        side = str(getattr(signal, "side", "") or "").lower()
-        side_sign = 1.0 if side == "long" else -1.0 if side == "short" else 0.0
-        etype = self._signal_entry_type_value(signal)
-        is_cont = "CONTINUATION" in str(etype).upper()
-        is_rev = "REVERSAL" in str(etype).upper()
-        atr_v = max(float(atr or 0.0), 1e-9)
-        profile = build_market_profile(
-            price=price, atr=atr_v, liq_snapshot=liq_snapshot,
-            ict=ict_ctx, flow=flow_state, side=side,
-        )
-        sa = getattr(self._entry_engine, "_last_sweep_analysis", None) or {}
-
-        penalties: List[str] = []
-        hard: List[str] = []
-        allows: List[str] = []
-
-        disp = max(0.0, float(sa.get("displacement_atr", 0.0) or 0.0))
-        cisd = bool(sa.get("cisd", False))
-        ote = bool(sa.get("ote", False))
-        quality_score = max(0.0, min(1.0, float(sa.get("quality_score", 1.0) or 1.0)))
-        quality_floor = max(0.30, min(0.88, float(sa.get(
-            "quality_floor", getattr(config, "ENTRY_EXECUTION_QUALITY_MIN", 0.52)) or 0.52)))
-        critical_floor = max(quality_floor, min(0.90, float(sa.get(
-            "quality_critical_floor", getattr(config, "ENTRY_CRITICAL_DEFECT_FLOOR", 0.62)) or 0.62)))
-        rev_score = max(0.0, float(sa.get("rev_score", sa.get("reversal_score", 0.0)) or 0.0))
-        cont_score = max(0.0, float(sa.get("cont_score", sa.get("continuation_score", 0.0)) or 0.0))
-        chosen_score = cont_score if is_cont else rev_score
-        other_score = rev_score if is_cont else cont_score
-        dominance = max(0.0, chosen_score - other_score)
-        posterior = max(0.0, min(1.0, float(sa.get("quant_posterior", sa.get("posterior", 0.0)) or 0.0)))
-        quant_ev = float(sa.get("quant_ev", sa.get("expected_value", 0.0)) or 0.0)
-
-        min_disp = profile.displacement_min(float(getattr(
-            config, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR",
-            getattr(config, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75))))
-        strong_disp = profile.strong_displacement(float(getattr(config, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25)))
-        gap_floor = max(8.0, profile.evidence_gap(14.0))
-
-        delivery_score = max(
-            min(disp / max(strong_disp, 1e-9), 1.0),
-            0.86 if cisd else 0.0,
-            0.74 if ote else 0.0,
-        )
-        evidence_score = max(
-            min(chosen_score / 110.0, 1.0),
-            min(max(dominance, 0.0) / max(gap_floor * 3.0, 1e-9), 1.0),
-        )
-        posterior_score = max(posterior, min(max(quant_ev, 0.0) / 1.2, 1.0))
-
-        tick = float(getattr(flow_state, "tick_flow", 0.0) or 0.0)
-        cvd = float(getattr(flow_state, "cvd_trend", 0.0) or 0.0)
-        signed_flow = side_sign * (0.50 * tick + 0.50 * cvd)
-        flow_score = max(0.05, min(1.0, 0.50 + 0.50 * signed_flow))
-
-        pd = max(0.0, min(1.0, float(getattr(ict_ctx, "dealing_range_pd", 0.5) or 0.5)))
-        pd_preference = (1.0 - pd) if side == "long" else pd if side == "short" else 0.5
-        pd_score = max(0.05, min(1.0, 0.30 + 0.70 * pd_preference))
-
-        s15 = str(getattr(ict_ctx, "structure_15m", "") or "").lower()
-        s4h = str(getattr(ict_ctx, "structure_4h", "") or "").lower()
-        htf = 0.0
-        for sctx in (s15, s4h):
-            if "bull" in sctx:
-                htf += 0.5
-            elif "bear" in sctx:
-                htf -= 0.5
-        htf *= side_sign
-        htf_score = max(0.10, min(1.0, 0.55 + 0.35 * htf))
-
-        score = (
-            0.24 * delivery_score
-            + 0.18 * evidence_score
-            + 0.17 * posterior_score
-            + 0.16 * quality_score
-            + 0.10 * flow_score
-            + 0.08 * htf_score
-            + 0.07 * pd_score
-        )
-
-        if disp >= strong_disp:
-            allows.append(f"strong_delivery DISP={disp:.2f}ATR>={strong_disp:.2f}ATR")
-        elif disp >= min_disp:
-            allows.append(f"accepted_delivery DISP={disp:.2f}ATR>={min_disp:.2f}ATR")
-        if cisd:
-            allows.append("CISD accepted")
-        if ote:
-            allows.append("OTE/retrace accepted")
-        if dominance >= gap_floor:
-            allows.append(f"evidence_dominance={dominance:.0f}>={gap_floor:.0f}")
-        if posterior > 0:
-            allows.append(f"posterior={posterior:.2f} EV={quant_ev:.2f}R")
-
-        # Critical defects: no auction delivery and no dominant posterior edge.
-        has_delivery = (disp >= min_disp) or cisd or ote
-        dominant_edge = (chosen_score >= 70.0 and dominance >= gap_floor and posterior >= 0.58)
-        if not has_delivery and not dominant_edge:
-            hard.append(
-                f"no accepted delivery: DISP={disp:.2f}ATR<{min_disp:.2f}ATR, no CISD/OTE, dominance={dominance:.0f}"
-            )
-        elif not has_delivery:
-            penalties.append("delivery not explicit; routed only by dominant posterior/evidence")
-            score *= 0.82
-
-        if quality_score < quality_floor:
-            if quality_score < critical_floor and not dominant_edge:
-                hard.append(f"entry quality {quality_score:.2f} < critical {critical_floor:.2f}")
-            else:
-                penalties.append(f"entry quality {quality_score:.2f} < floor {quality_floor:.2f}")
-                score *= max(0.70, 1.0 - (quality_floor - quality_score) * 0.55)
-
-        contra_flow = signed_flow <= -0.34
-        severe_contra_flow = signed_flow <= -0.58
-        if contra_flow:
-            penalties.append(f"contra flow tick={tick:+.2f} cvd={cvd:+.2f}")
-            score *= 0.86 if not severe_contra_flow else 0.74
-        if severe_contra_flow and disp < strong_disp and not (cisd and ote):
-            hard.append(f"severe contra flow without strong delivery tick={tick:+.2f} cvd={cvd:+.2f}")
-
-        # PD/HTF are not standalone retail vetoes; they block only when the trade
-        # lacks delivery strong enough to justify attacking that side of the range.
-        dr_long_max, dr_short_min = profile.dealing_range_bounds(
-            float(getattr(config, "ENTRY_REVERSAL_PD_LONG_MAX", 0.62)),
-            float(getattr(config, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38)),
-        )
-        pd_contra = ((side == "long" and pd > dr_long_max) or (side == "short" and pd < dr_short_min))
-        if is_rev and pd_contra:
-            penalties.append(f"PD contra pd={pd:.2f}")
-            score *= 0.90
-            if disp < strong_disp and not (cisd or ote) and not dominant_edge:
-                hard.append(f"PD contra without accepted delivery pd={pd:.2f}")
-
-        htf_contra = (side == "long" and htf <= -0.90) or (side == "short" and htf >= 0.90)
-        if htf_contra:
-            penalties.append(f"15m/4h contra htf={htf:+.2f}")
-            score *= 0.88
-            if disp < strong_disp and not (cisd or ote) and not dominant_edge:
-                hard.append(f"15m/4h contra without accepted delivery htf={htf:+.2f}")
-
-        if is_cont:
-            sweep = getattr(signal, "sweep_result", None)
-            pool = getattr(sweep, "pool", None)
-            pool_px = float(getattr(pool, "price", 0.0) or 0.0)
-            acc = 0.0
-            if pool_px > 0 and atr_v > 0:
-                acc = ((price - pool_px) / atr_v) if side == "long" else ((pool_px - price) / atr_v)
-            req = profile.displacement_min(float(getattr(config, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55)))
-            if acc < req:
-                penalties.append(f"continuation acceptance {acc:.2f}ATR < {req:.2f}ATR")
-                score *= 0.82
-                if not (disp >= strong_disp or cisd or dominant_edge):
-                    hard.append(f"continuation not accepted away from swept pool {acc:.2f}ATR<{req:.2f}ATR")
-
-        score = max(0.01, min(1.0, score))
-        floor = max(quality_floor, min(0.76, 0.52 * max(0.92, min(1.20, profile.selectivity))))
-        # A truly dominant sweep should not wait for the same threshold as a
-        # borderline auction. This avoids missing the best fast entries.
-        if dominant_edge and (disp >= min_disp or cisd or ote):
-            floor = max(0.48, floor - 0.06)
-
-        allowed = (not hard) and score >= floor
-        if not allowed and not hard and score < floor:
-            hard.append(f"readiness score {score:.2f} < floor {floor:.2f}")
-
-        size_mult = max(0.20, min(1.15, 0.62 + 0.80 * (score - floor))) if allowed else 0.0
-        if penalties:
-            size_mult *= max(0.45, 1.0 - 0.08 * min(len(penalties), 5))
-        size_mult = max(0.0, min(1.15, size_mult))
-
-        reason_bits = hard if hard else penalties if penalties else allows
-        reason = " | ".join(reason_bits[:4]) if reason_bits else "clean"
-        return EntryReadinessDecision(
-            allowed=allowed,
-            score=score,
-            floor=floor,
-            size_mult=size_mult,
-            reason=reason,
-            hard_rejects=hard[:8],
-            penalties=penalties[:8],
-            allows=allows[:8],
-        )
-
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
-        Final route-readiness check.
+        Institutional Unified Entry Gate diagnostics.
 
-        v68 change: this is no longer a second independent stack of hard gates.
-        It reuses the same entry-readiness surface as the institutional decision
-        matrix so valid fast sweeps are not blocked twice.  Critical defects
-        pause routing; coherent but imperfect entries route with reduced size.
+        This gate logs structural coherence notes for diagnostics but does NOT
+        block any trade. Final trade permission is owned by the quantitative
+        posterior/EV model plus account/exchange safety.
+
+          QuantPosterior -> executable alpha approval
+          Risk/Safety    -> account, liquidation, margin and loss-limit veto
+          UnifiedGate    -> diagnostics for post-trade attribution
+
+        Philosophy: diagnostic layers do not veto because of style/score.
+        They provide features and attribution; the posterior model owns edge.
         """
-        readiness = self._entry_readiness_surface(
-            signal, ict_ctx, flow_state, liq_snapshot, price, atr)
-        self._last_entry_readiness = readiness
-        if not readiness.allowed:
-            logger.info(
-                f"ENTRY_READINESS paused routing {str(getattr(signal, 'side', '')).upper()} "
-                f"{self._signal_entry_type_value(signal)}: score={readiness.score:.2f} "
-                f"floor={readiness.floor:.2f} | {readiness.reason}")
-            return False, readiness.reason
+        advisories = []   # informational only — never blocks
 
-        # v70: do NOT multiply readiness into sizing here.
-        # _institutional_decision_matrix already prices readiness once into
-        # _inst_decision.size_mult.  Reapplying it in this final route check
-        # double-haircut good entries and makes the bot look overfiltered while
-        # still claiming the gate passed.  This function is now a route validator
-        # only; sizing remains single-application and auditable.
-        logger.info(
-            f"ENTRY_READINESS PASS {str(getattr(signal, 'side', '')).upper()} "
-            f"score={readiness.score:.2f} floor={readiness.floor:.2f} "
-            f"size_mult={readiness.size_mult:.2f} | {readiness.reason}")
-        return True, "ENTRY_READINESS_PASS"
+        # ── AMD Phase context ───────────────────────────────────────────────
+        amd_phase = (ict_ctx.amd_phase or "").upper()
+        amd_bias  = (ict_ctx.amd_bias  or "").lower()
+        amd_conf  = ict_ctx.amd_confidence
+
+        _is_sweep_rev = (hasattr(signal, 'entry_type')
+                         and signal.entry_type is not None
+                         and 'REVERSAL' in str(signal.entry_type).upper())
+        _has_ps_hint = (ict_ctx.direction_hint == "reverse"
+                        and ict_ctx.direction_hint_confidence >= 0.40)
+
+        if amd_phase == "ACCUMULATION":
+            if _is_sweep_rev or _has_ps_hint:
+                advisories.append(f"AMD=ACCUM sweep-reversal (phase lag expected, scoring handles it)")
+            else:
+                advisories.append(f"AMD=ACCUM non-reversal — low amd_score will penalise conviction")
+
+        if amd_phase == "MANIPULATION" and amd_conf >= 0.65:
+            bias_contra = (
+                (signal.side == "long"  and "bear" in amd_bias) or
+                (signal.side == "short" and "bull" in amd_bias)
+            )
+            if bias_contra and not _has_ps_hint:
+                advisories.append(
+                    f"AMD_ADVISORY: MANIP bias={amd_bias} conf={amd_conf:.2f} "
+                    f"vs {signal.side} — contra-AMD, conviction will penalise")
+
+        # ── AMD lag override for fresh sweeps ───────────────────────────────
+        # (Already applied to ict_ctx.amd_phase in _evaluate_entry; repeated
+        #  here for gate logging completeness only)
+
+        # ── Direction Engine context ─────────────────────────────────────────
+        if self._dir_engine is not None:
+            try:
+                _ps_agrees = (_has_ps_hint and ict_ctx.direction_hint_side == signal.side)
+                if not _ps_agrees:
+                    _hunt = getattr(self._dir_engine, '_last_hunt', None)
+                    if _hunt is not None and hasattr(_hunt, 'delivery_direction'):
+                        _del_dir   = getattr(_hunt, 'delivery_direction', '')
+                        _hunt_conf = float(getattr(_hunt, 'confidence', 0.0))
+                        if _hunt_conf >= 0.60:
+                            agrees = (
+                                (signal.side == "long"  and _del_dir == "bullish") or
+                                (signal.side == "short" and _del_dir == "bearish") or
+                                _del_dir in ("", "neutral", None)
+                            )
+                            if not agrees:
+                                advisories.append(
+                                    f"DIR_ADVISORY: hunt delivery={_del_dir} "
+                                    f"conf={_hunt_conf:.2f} vs {signal.side} "
+                                    f"(not blocking — conviction_filter weights flow)")
+            except Exception:
+                pass
+
+        # ── HTF Structure context ────────────────────────────────────────────
+        if self._ict is not None and getattr(self._ict, '_initialized', False):
+            try:
+                tf_data = getattr(self._ict, '_tf', {})
+                tf_15m  = tf_data.get("15m")
+                tf_4h   = tf_data.get("4h")
+                if tf_15m and tf_4h:
+                    t15 = str(getattr(tf_15m, 'trend', 'ranging') or 'ranging').lower()
+                    t4h = str(getattr(tf_4h,  'trend', 'ranging') or 'ranging').lower()
+                    both_bearish = (t15 == "bearish" and t4h == "bearish")
+                    both_bullish = (t15 == "bullish" and t4h == "bullish")
+                    if signal.side == "long" and both_bearish:
+                        advisories.append(
+                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bearish vs LONG "
+                            f"(not blocking — conviction_filter scores HTF via structure)")
+                    elif signal.side == "short" and both_bullish:
+                        advisories.append(
+                            f"HTF_ADVISORY: 15m={t15} 4H={t4h} both bullish vs SHORT "
+                            f"(not blocking — conviction_filter scores HTF via structure)")
+            except Exception:
+                pass
+
+        # ── Order Flow context ───────────────────────────────────────────────
+        tf  = flow_state.tick_flow if flow_state else 0.0
+        cvd = flow_state.cvd_trend if flow_state else 0.0
+        flow_opposes = (
+            (signal.side == "long"  and tf < -0.35 and cvd < -0.20) or
+            (signal.side == "short" and tf >  0.35 and cvd >  0.20)
+        )
+        if flow_opposes:
+            advisories.append(
+                f"FLOW_ADVISORY: tick={tf:+.2f} cvd={cvd:+.2f} "
+                f"vs {signal.side} (scored in conviction_filter, not blocking)")
+
+        # ── Session context ──────────────────────────────────────────────────
+        session = str(getattr(ict_ctx, 'kill_zone', '') or '')
+        if not session and self._ict:
+            session = str(getattr(self._ict, '_killzone', '') or '')
+        if session.upper() == "ASIA":
+            advisories.append(
+                "SESSION_ADVISORY: ASIA — conviction_filter applies session_score=0.60 "
+                "(not blocking here)")
+
+        # ── R:R context ──────────────────────────────────────────────────────
+        if hasattr(signal, 'rr_ratio') and signal.rr_ratio < 1.2:
+            advisories.append(
+                f"RR_ADVISORY: {signal.rr_ratio:.1f} < 1.2 — "
+                f"conviction_filter applies R:R penalty to pool_sig_score")
+
+        # ── Dynamic institutional coherence advisories ────────────────
+        rejects = []
+        try:
+            _sa = getattr(self._entry_engine, '_last_sweep_analysis', None) or {}
+            _disp = float(_sa.get('displacement_atr', 0.0) or 0.0)
+            _cisd = bool(_sa.get('cisd', False))
+            _ote  = bool(_sa.get('ote', False))
+            _min_disp = float(getattr(config, 'ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR', getattr(config, 'ENTRY_HARD_MIN_DISPLACEMENT_ATR', 0.75)))
+            _strong_disp = float(getattr(config, 'ENTRY_STRONG_DISPLACEMENT_ATR', 1.25))
+            if _disp < _min_disp:
+                rejects.append(f"displacement {_disp:.2f}ATR < {_min_disp:.2f}ATR")
+            if not (_cisd or _ote or _disp >= _strong_disp):
+                rejects.append("no CISD/OTE/strong accepted displacement")
+
+            _pd = max(0.0, min(1.0, float(getattr(ict_ctx, 'dealing_range_pd', 0.5) or 0.5)))
+            if signal.side == 'long' and _pd > float(getattr(config, 'ENTRY_REVERSAL_PD_LONG_MAX', 0.62)) and _disp < _strong_disp:
+                rejects.append(f"long from premium PD={_pd:.2f}")
+            if signal.side == 'short' and _pd < float(getattr(config, 'ENTRY_REVERSAL_PD_SHORT_MIN', 0.38)) and _disp < _strong_disp:
+                rejects.append(f"short from discount PD={_pd:.2f}")
+
+            _tick = float(getattr(flow_state, 'tick_flow', 0.0) or 0.0)
+            _cvd  = float(getattr(flow_state, 'cvd_trend', 0.0) or 0.0)
+            _ft = float(getattr(config, 'ENTRY_FLOW_HARD_OPPOSE_THRESHOLD', 0.40))
+            _ct = float(getattr(config, 'ENTRY_CVD_HARD_OPPOSE_THRESHOLD', 0.30))
+            if signal.side == 'long' and _tick < -_ft and _cvd < -_ct and _disp < _strong_disp:
+                rejects.append(f"tick/CVD oppose long {_tick:+.2f}/{_cvd:+.2f}")
+            if signal.side == 'short' and _tick > _ft and _cvd > _ct and _disp < _strong_disp:
+                rejects.append(f"tick/CVD oppose short {_tick:+.2f}/{_cvd:+.2f}")
+
+            if 'CONTINUATION' in str(getattr(signal, 'entry_type', '')).upper():
+                _sweep = getattr(signal, 'sweep_result', None)
+                _pool = getattr(_sweep, 'pool', None)
+                _px = float(getattr(_pool, 'price', 0.0) or 0.0)
+                if _px > 0 and atr > 0:
+                    _acc = ((price - _px) / atr) if signal.side == 'long' else ((_px - price) / atr)
+                    _req = float(getattr(config, 'ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR', 0.55))
+                    if _acc < _req:
+                        rejects.append(f"continuation acceptance {_acc:.2f}ATR < {_req:.2f}ATR")
+        except Exception as _uge:
+            logger.debug(f"UNIFIED_GATE dynamic advisory error: {_uge}")
+
+        if rejects:
+            advisories.append("dynamic coherence advisory: " + " | ".join(rejects[:4]))
+
+        # Log all advisories at DEBUG (not INFO — avoids log spam)
+        if advisories:
+            logger.debug(
+                f"UNIFIED_GATE [{signal.side.upper()}] advisories (not blocking): "
+                f"{' | '.join(advisories[:4])}")
+
+        # ALWAYS PASS — this layer is attribution-only
+        return True, "UNIFIED_GATE_PASS"
 
 
     def _evaluate_entry(self, data_manager, order_manager, risk_manager, now):
@@ -5186,9 +5088,21 @@ class QuantStrategy:
                     # Fallback: use 15m premium/discount
                     if tf_15m:
                         ict_ctx.dealing_range_pd = getattr(tf_15m, 'premium_discount', 0.5)
-                # OB stop levels are intentionally not copied into ICTContext.
-                # v67 removed the removed OB/momentum SL path; sweep entries now
-                # price stops only from sweep invalidation + MTF liquidity shield.
+                try:
+                    ob_sl_long = self._ict.get_ob_sl_level("long", price, atr, now_ms)
+                    if ob_sl_long:
+                        ict_ctx.nearest_ob_price = ob_sl_long
+                except Exception:
+                    pass
+                # BUG-FIX-CRITICAL: Also fetch SHORT-side OB (above price).
+                # Without this, _compute_sl in entry_engine ALWAYS returned None
+                # for shorts because nearest_ob_price was always below price.
+                try:
+                    ob_sl_short = self._ict.get_ob_sl_level("short", price, atr, now_ms)
+                    if ob_sl_short:
+                        ict_ctx.nearest_ob_price_short = ob_sl_short
+                except Exception:
+                    pass
                 try:
                     sess = self._ict.get_amd_session_context(now_ms)
                     ict_ctx.kill_zone = sess.get("session", "")
@@ -5595,10 +5509,21 @@ class QuantStrategy:
                 self._defer_entry_signal(signal, inst_veto, cooldown_sec=30.0)
                 return
 
-            # Unified institutional route: EntryEngine is the single alpha owner.
-            # No confirm-gate, no second target-surface veto, no duplicate dynamic gate.
-            # QuantStrategy only performs account/mechanical safety and computes a
-            # size multiplier from the already-priced EntryEngine thesis.
+            required_confirms = self._entry_required_confirms(signal, atr)
+            sig_key = self._entry_signal_identity(signal, atr)
+            if sig_key == self._entry_confirm_key:
+                self._entry_confirm_count += 1
+            else:
+                self._entry_confirm_key = sig_key
+                self._entry_confirm_count = 1
+            if self._entry_confirm_count < required_confirms:
+                if now - self._last_entry_confirm_log >= 5.0:
+                    self._last_entry_confirm_log = now
+                    logger.debug(
+                        f"Entry confirm gate: {signal.side.upper()} "
+                        f"{self._entry_confirm_count}/{required_confirms}")
+                return
+
             bal_info = risk_manager.get_available_balance()
             total_bal = float((bal_info or {}).get("total", 0))
             allowed, reason = self._risk_gate.can_trade(total_bal)
@@ -5607,25 +5532,37 @@ class QuantStrategy:
                 self._defer_entry_signal(signal, reason, cooldown_sec=60.0)
                 return
 
-            _inst_decision = self._entry_engine_route_decision(
+            # Institutional decision matrix: all engines vote on one trade thesis.
+            _inst_decision = self._institutional_decision_matrix(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr)
             self._last_institutional_decision = _inst_decision
             self._active_institutional_size_mult = _inst_decision.size_mult
             if not _inst_decision.allowed:
                 reject_str = " | ".join(_inst_decision.reject_reasons[:3])
                 logger.info(
-                    f"Mechanical safety stopped routing {signal.side.upper()} "
-                    f"{signal.entry_type.value}: RR={_inst_decision.rr:.2f} "
-                    f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR | "
+                    f"Safety audit paused routing {signal.side.upper()} "
+                    f"{signal.entry_type.value}: score={_inst_decision.score:.2f} "
+                    f"RR={_inst_decision.rr:.2f} target={_inst_decision.target_realism:.2f} | "
                     f"{reject_str}")
                 self._defer_entry_signal(
-                    signal, reject_str or "mechanical route safety", cooldown_sec=30.0)
+                    signal, reject_str or "mechanical safety pause", cooldown_sec=45.0)
                 return
             logger.info(
-                f"UNIFIED ENTRYENGINE ROUTE PASS [{_inst_decision.grade}] "
-                f"RR={_inst_decision.rr:.2f} SL={_inst_decision.sl_atr:.2f}ATR "
-                f"TP={_inst_decision.tp_atr:.2f}ATR target={_inst_decision.target_realism:.2f} "
+                f"Decision audit PASS [{_inst_decision.grade}] "
+                f"score={_inst_decision.score:.2f} RR={_inst_decision.rr:.2f} "
+                f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR "
+                f"target={_inst_decision.target_realism:.2f} "
                 f"size_mult={_inst_decision.size_mult:.2f}")
+
+            _ug_ok, _ug_reason = self._unified_entry_gate(
+                signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
+            if not _ug_ok:
+                logger.info(
+                    f"Dynamic audit paused routing {signal.side.upper()} "
+                    f"{signal.entry_type.value}: {_ug_reason}")
+                self._defer_entry_signal(
+                    signal, _ug_reason or "unified institutional gate", cooldown_sec=90.0)
+                return
 
             logger.info(
                 f"ENTRY THESIS PRICED BY POSTERIOR/EV: {signal.entry_type.value} {signal.side.upper()} "
@@ -5678,8 +5615,8 @@ class QuantStrategy:
                 if self._ict is not None:
                     _sess_str = str(getattr(self._ict, '_session', '') or '')
 
-                # Resolve sweep_pool: prefer the actual sweep_result pool; target_pool
-                # is retained only as context for conviction attribution.
+                # Resolve sweep_pool: prefer signal.swept_pool (actual swept pool),
+                # fall back to primary_target (pool being approached).
                 _conv_pool = None
                 if hasattr(signal, 'swept_pool') and signal.swept_pool is not None:
                     _conv_pool = signal.swept_pool
@@ -5688,7 +5625,7 @@ class QuantStrategy:
                 elif liq_snapshot and liq_snapshot.primary_target is not None:
                     _conv_pool = liq_snapshot.primary_target
 
-                # Entry type is sweep-only; this string is passed to the attribution lens.
+                # Entry type for approach vs reversal detection
                 _entry_type_str = (signal.entry_type.value
                                    if hasattr(signal, 'entry_type') and signal.entry_type is not None
                                    else "")
@@ -6166,67 +6103,8 @@ class QuantStrategy:
             except Exception as _fe_err:
                 logger.debug(f"FeeEngine.decide_entry_type error (non-fatal): {_fe_err}")
 
-        # v73 native-bracket fast path.  Use EntryReadiness as the primary
-        # urgency signal; raw composite confidence can be low on valid reversal
-        # sweeps, which made v70/v71 wait passively as maker until timeout.
-        def _best_bid_ask_from_book():
-            try:
-                ob = data_manager.get_orderbook() or {}
-                bids = ob.get("bids", []) or []
-                asks = ob.get("asks", []) or []
-                def _px(lvl):
-                    if isinstance(lvl, (list, tuple)):
-                        return float(lvl[0] or 0.0)
-                    if isinstance(lvl, dict):
-                        return float(lvl.get("limit_price") or lvl.get("price") or 0.0)
-                    return 0.0
-                return (_px(bids[0]) if bids else 0.0, _px(asks[0]) if asks else 0.0)
-            except Exception:
-                return 0.0, 0.0
-
-        readiness = getattr(self, "_last_entry_readiness", None)
-        readiness_score = float(getattr(readiness, "score", 0.0) or 0.0)
-        readiness_floor = float(getattr(readiness, "floor", 0.0) or 0.0)
-        readiness_edge = readiness_score - readiness_floor
-        protected_cross_floor = float(getattr(config, "ENTRY_PROTECTED_CROSS_READINESS", 0.78))
-        protected_cross_edge = float(getattr(config, "ENTRY_PROTECTED_CROSS_EDGE", 0.06))
-        _require_sig_conf_for_cross = bool(getattr(config, "ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF", False))
-        _sig_conf_ok_for_cross = (
-            signal_confidence >= float(getattr(config, "ENTRY_PROTECTED_CROSS_MIN_CONF", 0.70))
-            if _require_sig_conf_for_cross else True
-        )
-        protected_cross = (
-            readiness_score >= protected_cross_floor
-            and readiness_edge >= protected_cross_edge
-            and _sig_conf_ok_for_cross
-        )
-        native_market_bracket = bool(
-            protected_cross
-            and bool(getattr(config, "DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS", True))
-        )
-        if protected_cross:
-            bid_px, ask_px = _best_bid_ask_from_book()
-            cross_ticks = max(1.0, float(getattr(config, "ENTRY_PROTECTED_CROSS_TICKS", 2.0)))
-            cross_offset = cross_ticks * tick
-            old_px = limit_px
-            if side == "long" and ask_px > 0:
-                limit_px = _round_to_tick(ask_px + cross_offset)
-                use_maker = False
-                mt_reason = (
-                    f"protected_cross_long@ask+{cross_offset:.1f}={limit_px:.1f} "
-                    f"(readiness={readiness_score:.2f}/{readiness_floor:.2f}, prior={old_px:.1f})"
-                )
-            elif side == "short" and bid_px > 0:
-                limit_px = _round_to_tick(bid_px - cross_offset)
-                use_maker = False
-                mt_reason = (
-                    f"protected_cross_short@bid-{cross_offset:.1f}={limit_px:.1f} "
-                    f"(readiness={readiness_score:.2f}/{readiness_floor:.2f}, prior={old_px:.1f})"
-                )
-
         entry_ref = limit_px if limit_px > 0 else price
-        _route_label = "NATIVE-BRACKET-MARKET" if native_market_bracket else ("PROTECTED-CROSS/taker" if not use_maker else "LIMIT/maker")
-        logger.info(f"Entry routing: {_route_label} | {mt_reason}")
+        logger.info(f"Entry routing: {'LIMIT/maker' if use_maker else 'MARKET/taker'} | {mt_reason}")
 
         # ── FIX Bug-B STEP 1: Compute SL/TP FIRST ────────────────────────────────
         # SL/TP computation does not depend on position size — it uses price, ATR,
@@ -6378,8 +6256,10 @@ class QuantStrategy:
         )
 
         # ── Place entry ────────────────────────────────────────────────────────────
-        # Delta native bracket only: entry + SL + TP in one API call.
-        # No naked-entry fallback is allowed.
+        # Delta: bracket limit order (entry + SL + TP in one API call).
+        #   Avoids bad_schema from separate stop/take-profit order placement.
+        # CoinSwitch: standard limit entry, SL/TP placed separately after fill.
+        #
         # BUG 2 FIX: on_order_placed callback captures the exact moment the
         # limit order hits the exchange (REST 200 OK returned an order_id).
         # The on_tick watchdog switches from Stage A (pre-order, 45 s tolerance)
@@ -6392,16 +6272,26 @@ class QuantStrategy:
                 f"⏱️  Entry order placed on exchange (order_id={_oid[:12]}…) "
                 f"— watchdog switched to Stage B (fill-poll)")
 
-        base_limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
-        limit_timeout = min(base_limit_timeout, float(getattr(config, 'PROTECTED_CROSS_FILL_TIMEOUT_SEC', 12.0))) if not use_maker else base_limit_timeout
+        limit_timeout = float(getattr(config, 'LIMIT_ORDER_FILL_TIMEOUT_SEC', 45.0))
         is_bracket = False
 
-        _active_exchange = "delta"
-        if not (_active_exchange == "delta"):
-            logger.critical("🚨 Delta-only invariant violation: non-Delta execution path requested")
-            self._last_exit_time = time.time()
-            return
-        _delta_requires_native_bracket = bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
+        # v7 multi-asset protection policy:
+        # Every Delta contract (BTC, metals, xStocks, indices/RWA tokens) must use
+        # the same native bracket methodology: entry + SL + TP in one Delta order.
+        # If the bracket endpoint rejects the order for a non-BTC contract, do NOT
+        # fall back to a naked entry followed by standalone SL/TP. That fallback can
+        # leave the position temporarily unprotected and behaves differently from BTC.
+        # CoinSwitch has no Delta-native bracket endpoint, so only CoinSwitch uses the
+        # old fill-then-place-standalone-conditionals path.
+        _active_exchange = str(
+            getattr(order_manager, "active_exchange", None)
+            or getattr(order_manager, "_exchange_name", "")
+            or ""
+        ).lower()
+        _delta_requires_native_bracket = (
+            _active_exchange == "delta" and
+            bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
+        )
 
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
@@ -6409,38 +6299,28 @@ class QuantStrategy:
             sl_price=sl_price, tp_price=tp_price,
             timeout_sec=limit_timeout,
             on_order_placed=_on_order_placed,
-            market_entry=native_market_bracket,
         )
-        if entry_data is not None and entry_data.get("_error"):
-            _reason = str(entry_data.get("_reason", "bracket_failed") or "bracket_failed")
-            if _reason == "not_filled_timeout":
-                logger.info(
-                    "⚪ Delta native bracket not filled in time — cancelled safely; "
-                    "no non-bracket fallback and no naked position. "
-                    f"side={side} qty={qty} entry=${limit_px:,.2f} "
-                    f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
-                )
-                self._last_tp_gate_rejection = time.time()
-                return
-            logger.error(
-                "❌ Delta native bracket rejected by exchange/API — refusing non-bracket fallback "
-                "so the position is not opened without exchange-attached TP/SL. "
-                f"reason={_reason} side={side} qty={qty} entry=${limit_px:,.2f} "
-                f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} raw={entry_data.get('_raw', {})}"
-            )
-            self._last_tp_gate_rejection = time.time()
-            return
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
-        else:
+        elif _delta_requires_native_bracket:
             logger.error(
-                "❌ Delta native bracket entry failed before order placement — refusing non-bracket fallback "
+                "❌ Delta native bracket entry failed — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
                 f"side={side} qty={qty} entry=${limit_px:,.2f} "
                 f"SL=${sl_price:,.2f} TP=${tp_price:,.2f}"
             )
-            self._last_tp_gate_rejection = time.time()
+            self._last_exit_time = time.time()
             return
+        else:
+            # CoinSwitch / non-Delta path: standard limit entry, then protected
+            # standalone SL/TP after fill because native bracket is unavailable.
+            entry_data = order_manager.place_limit_entry(
+                side=side, quantity=qty,
+                limit_price=limit_px,
+                timeout_sec=limit_timeout,
+                fallback_to_market=False,
+                on_order_placed=_on_order_placed,
+            )
 
         if not entry_data:
             logger.error("❌ Entry order failed")
@@ -6608,12 +6488,34 @@ class QuantStrategy:
                     "⚠️ Bracket child order IDs not found after fill — "
                     "trailing SL may not work. Check open orders manually.")
         else:
-            logger.critical(
-                "🚨 Delta-only invariant violation: entry filled without native bracket children; "
-                "aborting bookkeeping to avoid unmanaged SL/TP state."
-            )
-            self._last_exit_time = time.time()
-            return
+            # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
+            sweep = order_manager.cancel_symbol_conditionals()
+            if sweep:
+                # v4.6 BUG FIX #3: Wait for exchange to process cancellations
+                # Without this, old SL/TP can fire against the new position instantly
+                time.sleep(1.5)
+                filled = [
+                    oid for oid, r in sweep.items()
+                    if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)
+                ]
+                if filled:
+                    self._last_reconcile_time = 0.0
+                    return
+
+            sl_data = order_manager.place_stop_loss(
+                side=exit_side, quantity=qty, trigger_price=sl_price)
+            if not sl_data:
+                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+                self._last_exit_time = time.time()
+                return
+
+            tp_data = order_manager.place_take_profit(
+                side=exit_side, quantity=qty, trigger_price=tp_price)
+            if not tp_data:
+                order_manager.cancel_order(sl_data["order_id"])
+                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
+                self._last_exit_time = time.time()
+                return
 
         # ── Log execution cost snapshot (PATCH 5g) ────────────────────────────────
         if self._fee_engine is not None:
@@ -7968,9 +7870,7 @@ class QuantStrategy:
             logger.warning(f"InstitutionalTrail: SL replace failed ({err}) — keeping current SL")
             return False
 
-        # Success — update position state under lock.  Capture the old trigger
-        # before mutation so dashboard/Telegram can show the real exchange edit.
-        _old_sl_before_apply = float(getattr(pos, "sl_price", 0.0) or 0.0)
+        # Success — update position state under lock
         with self._lock:
             self._pos.sl_price = _new_liq_sl
             _new_oid = (_lt_result or {}).get("order_id")
@@ -7983,10 +7883,6 @@ class QuantStrategy:
                 logger.info("✅ Institutional trail now active")
             if _liq_result.phase == "BE_LOCK":
                 self._pos.be_ratchet_applied = True
-        logger.info(
-            f"✅ InstitutionalTrail EXCHANGE_APPLIED old=${_old_sl_before_apply:,.2f} "
-            f"new=${_new_liq_sl:,.2f} order={getattr(self._pos, 'sl_order_id', '')} "
-            f"phase={_liq_result.phase}")
 
         # Throttled Telegram update with the full v5.0 context
         _trail_tg_key = "_liq_trail_tg_last"
@@ -8088,35 +7984,6 @@ class QuantStrategy:
         # confirm the position is flat on the exchange and then call _record_exchange_exit,
         # which records exact PnL and calls _finalise_exit().  The EXITING watchdog (120s)
         # is the safety net if exchange confirmation never arrives.
-
-    def _is_delta_execution(self) -> bool:
-        """Return True when this strategy is routed through Delta exchange.
-
-        This is deliberately separate from `_is_inverse_pnl_contract()`: Delta
-        can trade both BTC inverse contracts and linear/non-inverse products
-        such as xStocks/metals. Fees depend on exchange; gross PnL geometry
-        depends on contract type.
-        """
-        return str(getattr(config, "EXECUTION_EXCHANGE", "") or "").lower() == "delta"
-
-    def _is_inverse_pnl_contract(self) -> bool:
-        """Return True only for BTC inverse contracts, never for Delta xStocks/metals.
-
-        Multi-asset mode can keep config.DELTA_SYMBOL at BTCUSD while the live
-        strategy instance is managing PAXG/SLVON/xStock contracts. Using that
-        global config value made non-BTC Delta exits use BTC inverse accounting.
-        """
-        try:
-            asset_id = str(getattr(self, "_asset_id", "") or "").upper()
-            inst = getattr(self, "_instrument", None)
-            sym = str(
-                getattr(inst, "display_symbol", "")
-                or getattr(inst, "canonical_symbol", "")
-                or getattr(config, "DELTA_SYMBOL", "")
-            ).upper()
-            return self._is_delta_execution() and asset_id == "BTC" and "BTC" in sym
-        except Exception:
-            return False
 
     def _record_exchange_exit(self, ex_pos):
         """
@@ -8404,19 +8271,17 @@ class QuantStrategy:
 
         # ─── Step 2: PnL — exact gross from actual fill, exact exit fee ────────
         import config as _cfg_x
-        _is_delta_exchange = self._is_delta_execution()
-        _is_inverse = self._is_inverse_pnl_contract()
+        _is_delta = (
+            getattr(_cfg_x, "EXECUTION_EXCHANGE", "").lower() == "delta"
+            and getattr(_cfg_x, "DELTA_SYMBOL", "BTCUSD").upper() == "BTCUSD"
+        )
         exit_fee_is_exact = fee_paid > 0.0
         if not exit_fee_is_exact and fill_price > 0 and getattr(pos, "quantity", 0.0) > 0:
             if exit_type in ("sl", "trail_sl", "manual_exit"):
-                default_exit_rate = (
-                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050)
-                    if _is_delta_exchange else QCfg.COMMISSION_RATE()
-                )
                 exit_rate = float(getattr(
                     _cfg_x,
                     "STOP_EXIT_COMMISSION_RATE",
-                    default_exit_rate,
+                    getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050) if _is_delta else QCfg.COMMISSION_RATE(),
                 ))
                 fee_paid = fill_price * pos.quantity * abs(exit_rate)
                 logger.info(
@@ -8428,7 +8293,7 @@ class QuantStrategy:
             pos.entry_price,
             fill_price,
             pos.quantity,
-            inverse=bool(_is_inverse and fill_price > 0),
+            inverse=bool(_is_delta and fill_price > 0),
         )
 
         # Entry fee: prefer exact paid_commission captured at entry (v8.1).
@@ -8440,11 +8305,16 @@ class QuantStrategy:
         else:
             fill_type  = getattr(pos, "entry_fill_type", "taker")
             # FIX Bug-A: use exchange-specific maker rate.
-            # Delta maker = rebate (negative); use Delta-specific maker fees.
+            # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
             if fill_type == "maker":
-                entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
+                if _is_delta:
+                    entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
+                else:
+                    entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER",
+                                               QCfg.COMMISSION_RATE() * 0.40))
             else:
-                entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
+                entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
+                              if _is_delta else QCfg.COMMISSION_RATE())
             entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid
         _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
@@ -8507,8 +8377,6 @@ class QuantStrategy:
                     quantity     = pos.quantity,
                     reason       = exit_reason,
                     pnl_override = pnl,
-                    instrument   = getattr(self, "_instrument", None),
-                    leverage     = QCfg.LEVERAGE(),
                 )
         except Exception as _rm_rec_e:
             logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")
@@ -8660,25 +8528,6 @@ class QuantStrategy:
         # Full trade record for /trades command
         init_sl_dist = getattr(pos, 'initial_sl_dist', 0.0)
         _fb = fee_breakdown or {}
-        _hist_notional = 0.0
-        _hist_margin_used = 0.0
-        _hist_margin_pnl_pct = 0.0
-        try:
-            _entry_px_hist = float(getattr(pos, 'entry_price', 0.0) or 0.0)
-            _qty_hist = float(getattr(pos, 'quantity', 0.0) or 0.0)
-            _lev_hist = float(QCfg.LEVERAGE() or 1.0)
-            _hist_notional = _entry_px_hist * _qty_hist
-            _hist_margin_used = _hist_notional / _lev_hist if _lev_hist > 0 else _hist_notional
-            _hist_margin_pnl_pct = (pnl / _hist_margin_used * 100.0) if _hist_margin_used > 1e-10 else 0.0
-        except Exception:
-            pass
-        try:
-            _inst_hist = getattr(self, "_instrument", None)
-            _asset_hist = str(getattr(_inst_hist, "asset_id", "") or "")
-            _symbol_hist = str(getattr(_inst_hist, "display_symbol", QCfg.SYMBOL()) or QCfg.SYMBOL())
-            _venue_hist = str(getattr(getattr(_inst_hist, "primary_exchange", None), "value", "") or "").upper()
-        except Exception:
-            _asset_hist, _symbol_hist, _venue_hist = "", QCfg.SYMBOL(), ""
         self._trade_history.append({
             # ── Core trade data ────────────────────────────────────────────
             "ts":           time.time(),
@@ -8686,15 +8535,10 @@ class QuantStrategy:
             "mode":         getattr(pos, 'trade_mode', '?'),
             "entry":        getattr(pos, 'entry_price', 0.0),
             "exit":         exit_price,
-            "asset":        _asset_hist,
-            "symbol":       _symbol_hist,
-            "venue":        _venue_hist,
             "qty":          getattr(pos, 'quantity', 0.0),
             "sl":           getattr(pos, 'sl_price', 0.0),
             "tp":           getattr(pos, 'tp_price', 0.0),
             "init_sl_dist": init_sl_dist,
-            "notional":     round(_hist_notional, 4),
-            "margin_used":  round(_hist_margin_used, 4),
             "pnl":          pnl,
             "is_win":       is_win,
             "reason":       exit_reason,
@@ -8703,8 +8547,7 @@ class QuantStrategy:
             "mfe_r":        (getattr(pos,'peak_profit',0.0) / init_sl_dist
                              if init_sl_dist > 1e-10 else 0.0),
             # ── v6.0: Margin-based P&L % ─────────────────────────────────────
-            "margin_pnl_pct": round(_hist_margin_pnl_pct, 2),
-            "capital_result": "PROFIT" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
+            "margin_pnl_pct": 0.0,  # filled below
             # ── Fee breakdown (exact from Delta /v2/fills, estimated otherwise) ──
             "gross_pnl":    _fb.get("gross_pnl",  pnl),
             "entry_fee":    _fb.get("entry_fee",  0.0),
@@ -8808,8 +8651,6 @@ class QuantStrategy:
                     _margin_pnl_pct_final = (pnl / _margin_used_final) * 100.0
                     if self._trade_history:
                         self._trade_history[-1]["margin_pnl_pct"] = round(_margin_pnl_pct_final, 2)
-                        self._trade_history[-1]["margin_used"] = round(_margin_used_final, 4)
-                        self._trade_history[-1]["notional"] = round(_notional_f, 4)
         except Exception:
             pass
 
@@ -9427,34 +9268,7 @@ class QuantStrategy:
         else:
             risk_pct = raw_risk_pct
 
-        # Cash/margin envelope.  In multi-asset mode, `available` is the
-        # slot-scoped cash view.  The active instrument policy advertises a
-        # margin percentage (BTC 20%, commodities 14%, equities 12%), but v74
-        # still used only the balance-usage slot cap.  That made the policy margin
-        # mostly telemetry and distorted cross-asset allocation.  v75 makes the
-        # executable cash budget the minimum of: free slot cash, raw account
-        # hard cap, and instrument policy margin cap.
-        try:
-            raw_available_cash = float(bal.get("available_raw", available) or available)
-            raw_total_cash = float(bal.get("total_raw", raw_available_cash) or raw_available_cash)
-        except Exception:
-            raw_available_cash = available
-            raw_total_cash = available
-        try:
-            policy_margin_pct = max(0.0, min(1.0, float(QCfg.MARGIN_PCT() or 0.0)))
-        except Exception:
-            policy_margin_pct = 0.0
-        if portfolio_scoped:
-            usage_cash_cap = raw_available_cash * _bal_usage_frac
-            policy_cash_cap = raw_total_cash * policy_margin_pct if policy_margin_pct > 0 else usage_cash_cap
-            cash_budget = max(0.0, min(available, raw_available_cash, usage_cash_cap, policy_cash_cap))
-        else:
-            # Preserve single-asset behaviour while still allowing the
-            # policy margin to be shown in diagnostics.
-            usage_cash_cap = available * _bal_usage_frac
-            policy_cash_cap = usage_cash_cap
-            cash_budget = max(0.0, usage_cash_cap)
-
+        cash_budget = available * _bal_usage_frac
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
             float(viability.round_trip_cost_pts),
@@ -9469,42 +9283,11 @@ class QuantStrategy:
             logger.warning(
                 f"Sizing rejected: cash/lot envelope below minimum | "
                 f"cap_qty={executable_qty_cap:.8f} min_qty={min_qty:.8f} "
-                f"cash_budget=${cash_budget:.2f} policy_cap=${policy_cash_cap:.2f} "
-                f"slot_cap=${available:.2f} step={step:.8f}")
+                f"cash_budget=${cash_budget:.2f} step={step:.8f}")
             return None
 
         target_risk_base = risk_available if portfolio_scoped else available
         risk_capital = target_risk_base * risk_pct * total_mult
-
-        aggregate_remaining_risk = None
-        if portfolio_scoped:
-            try:
-                aggregate_remaining_risk = bal.get("portfolio_remaining_risk_cap", None)
-                aggregate_cap = float(bal.get("portfolio_aggregate_risk_cap", 0.0) or 0.0)
-                open_risk = float(bal.get("portfolio_open_risk_usd", 0.0) or 0.0)
-                if aggregate_remaining_risk is None:
-                    try:
-                        agg_pct = float(_cfg("PORTFOLIO_MAX_AGGREGATE_RISK_PCT", 0.0) or 0.0) / 100.0
-                    except Exception:
-                        agg_pct = 0.0
-                    aggregate_cap = max(0.0, target_risk_base * agg_pct) if agg_pct > 0 else 0.0
-                    aggregate_remaining_risk = max(0.0, aggregate_cap - open_risk) if aggregate_cap > 0 else None
-                else:
-                    aggregate_remaining_risk = float(aggregate_remaining_risk or 0.0)
-                if aggregate_remaining_risk is not None and aggregate_remaining_risk <= 1e-10:
-                    logger.warning(
-                        f"Sizing rejected: portfolio aggregate risk exhausted | "
-                        f"open_risk=${open_risk:.2f} cap=${aggregate_cap:.2f}")
-                    return None
-                if aggregate_remaining_risk is not None and risk_capital > aggregate_remaining_risk:
-                    logger.info(
-                        f"Portfolio aggregate risk haircut: target_risk=${risk_capital:.2f} "
-                        f"-> remaining=${aggregate_remaining_risk:.2f} "
-                        f"open=${open_risk:.2f}/${aggregate_cap:.2f}")
-                    risk_capital = aggregate_remaining_risk
-            except Exception:
-                aggregate_remaining_risk = None
-
         qty_raw = risk_capital / sl_dist
         max_allowed_margin = cash_budget
         # Non-portfolio behaviour is unchanged: the confidence-adjusted target
@@ -9519,8 +9302,6 @@ class QuantStrategy:
                 risk_capital * 1.15,
                 target_risk_base * risk_pct * max(1.0, min_lot_risk_mult),
             )
-            if aggregate_remaining_risk is not None and aggregate_remaining_risk > 0.0:
-                max_risk_cap = min(max_risk_cap, aggregate_remaining_risk)
         else:
             max_risk_cap = risk_capital * 1.15
 
@@ -9573,8 +9354,8 @@ class QuantStrategy:
         if required_margin > max_allowed_margin:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
-                f"policy/slot cash cap ${max_allowed_margin:.2f} "
-                f"(policy {policy_margin_pct:.0%}, usage {_bal_usage_pct:.0f}%, slot ${available:.2f}) "
+                f"BALANCE_USAGE cap ${max_allowed_margin:.2f} "
+                f"({_bal_usage_pct:.0f}% of ${available:.2f}) "
                 f"— scaling down"
             )
             return None
@@ -9613,14 +9394,13 @@ class QuantStrategy:
             f"margin=${margin_used:.2f} | fees≈${actual_fees:.3f} "
             f"({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
-            f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} "
-            f"policy_cap=${policy_cash_cap:.2f} agg_open=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f} "
-            f"agg_rem=${aggregate_remaining_risk if aggregate_remaining_risk is not None else -1:.2f} | "
-            f"headroom=${cash_budget - required_cash:.2f} | qty={qty}"
+            f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} | "
+            f"headroom=${available - required_cash:.2f} | qty={qty}"
         )
         return qty
 
-    def _estimate_pnl(self, pos, exit_price, entry_fill_type="taker"):
+    @staticmethod
+    def _estimate_pnl(pos, exit_price, entry_fill_type="taker"):
         """
         Corrected PnL formula — v5.1.
 
@@ -9645,36 +9425,40 @@ class QuantStrategy:
         We use the exact inverse formula for correctness, but the linear approximation
         is included as a sanity check in debug logs.
 
-        Small-move PnL is reconciled consistently
+        Both Delta and CoinSwitch paths now produce identical results for small moves
         because the inverse-perp formula converges to linear.
 
         Fee basis: notional is measured at entry price (standard industry practice).
         """
         # Uses the module-level `config` import — no per-call import overhead.
-        _is_delta_exchange = self._is_delta_execution()
-        _is_inverse = self._is_inverse_pnl_contract()
+        _is_delta = (getattr(config, 'EXECUTION_EXCHANGE', 'coinswitch').lower() == 'delta'
+                     and getattr(config, 'DELTA_SYMBOL', 'BTCUSD').upper() == 'BTCUSD')
 
         # FIX Bug-A: use exchange-specific fee rates.
-        # Delta maker rate is NEGATIVE (rebate = -0.02%); use Delta-specific maker fees.
+        # Delta maker rate is NEGATIVE (rebate = -0.02%); CoinSwitch maker rate is
+        # positive (0.02%).  The old code always read COMMISSION_RATE_MAKER from config
+        # which is set to the CoinSwitch value (+0.00020), costing Delta maker entries
+        # 0.04% of notional instead of receiving the rebate.
         if entry_fill_type == "maker":
-            if _is_delta_exchange:
+            if _is_delta:
                 entry_rate = float(getattr(config, "DELTA_COMMISSION_RATE_MAKER",
                                            -0.00020))   # Delta rebate (negative = income)
             else:
                 entry_rate = float(getattr(config, "COMMISSION_RATE_MAKER",
                                            QCfg.COMMISSION_RATE() * 0.40))
         else:
-            entry_rate = float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
+            entry_rate = QCfg.COMMISSION_RATE()
 
         # Exit is always taker (stop or TP market order)
-        exit_rate = float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
+        exit_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
+                     if _is_delta else QCfg.COMMISSION_RATE())
 
         gross = gross_pnl_usd(
             pos.side,
             pos.entry_price,
             exit_price,
             pos.quantity,
-            inverse=bool(_is_inverse),
+            inverse=bool(_is_delta),
         )
         entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = exit_price      * pos.quantity * exit_rate
@@ -9683,7 +9467,7 @@ class QuantStrategy:
         logger.debug(
             f"PnL calc: {pos.side} qty={pos.quantity} entry=${pos.entry_price:,.2f} "
             f"exit=${exit_price:,.2f} gross=${gross:.4f} fees=${entry_fee+exit_fee:.4f} "
-            f"net=${net_pnl:.4f} [{'delta_inv' if _is_inverse else ('delta_linear' if _is_delta_exchange else 'linear')}]")
+            f"net=${net_pnl:.4f} [{'delta_inv' if _is_delta else 'linear'}]")
         return net_pnl
 
     def _win_rate(self): return self._winning_trades/self._total_trades if self._total_trades else 0.0
@@ -10005,7 +9789,7 @@ class QuantStrategy:
 
         # FIX (CRITICAL-6): prefer the adapter's BTC-unit fields. The Delta
         # adapter now returns size in BTC (converted from contracts) and
-        # size_signed preserving direction. Adapter returns
+        # size_signed preserving direction. CoinSwitch adapter returns
         # size in BTC natively. Either way, we want BTC here.
         ex_size     = abs(float(ex_pos.get("size", 0.0)))
         ex_size_raw = float(ex_pos.get("size_signed",
@@ -10036,7 +9820,7 @@ class QuantStrategy:
                 )
                 return
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
-            # Guard: Exchange position feed can return entry_price=0 for a position that
+            # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
             if ex_entry < 1.0:
                 logger.warning(

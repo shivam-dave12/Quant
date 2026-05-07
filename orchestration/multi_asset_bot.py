@@ -19,10 +19,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 import config
 from aggregator.market_aggregator import MarketAggregator
-from core.instruments import ExchangeName, TradableInstrument, instrument_scope, install_instrument_log_filter
+from core.instruments import ExchangeName, TradableInstrument, instrument_scope
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
+from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
+from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 from risk.risk_manager import RiskManager
@@ -30,10 +32,6 @@ from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManag
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
-try:
-    from telemetry.dashboard_emitter import DashboardEmitter
-except Exception:
-    DashboardEmitter = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +67,132 @@ class AssetContext:
             return False
 
 
+class _LegacyPortfolioGuard:
+    """
+    Account-level exposure coordinator.
+
+    It does not judge alpha.  It only enforces portfolio mechanics:
+      • many contracts may trade simultaneously, up to the configured slot cap;
+      • one reserved slot per contract (ENTERING/ACTIVE/EXITING all count);
+      • each contract sees a portfolio-adjusted balance slice before the existing
+        BTC-style risk/margin sizing runs inside QuantStrategy.
+    """
+    def __init__(self) -> None:
+        self.max_open_positions = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_POSITIONS", 4)))
+        self.max_same_class = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS", self.max_open_positions)))
+        self.max_per_contract = max(1, int(getattr(config, "PORTFOLIO_MAX_OPEN_PER_CONTRACT", 1)))
+        self.budget_mode = str(getattr(config, "PORTFOLIO_BUDGET_MODE", "equal_slots")).lower()
+        self._lock = threading.RLock()
+
+    def reserved_contexts(self, contexts: List[AssetContext]) -> List[AssetContext]:
+        return [c for c in contexts if c.has_position]
+
+    def count_open(self, contexts: List[AssetContext]) -> int:
+        return len(self.reserved_contexts(contexts))
+
+    def can_evaluate_entry(self, ctx: AssetContext, contexts: List[AssetContext]) -> tuple[bool, str]:
+        with self._lock:
+            reserved_ctx = self.reserved_contexts(contexts)
+
+            # One position slot per contract.  Existing slot is allowed only for
+            # management/exits/trailing; a second entry cannot be opened by this
+            # context because QuantStrategy remains non-FLAT.
+            if ctx.has_position:
+                return True, f"{ctx.phase_name.lower()} position management"
+
+            same_contract = [c for c in reserved_ctx if c.instrument.asset_id == ctx.instrument.asset_id]
+            if len(same_contract) >= self.max_per_contract:
+                return False, f"contract slot occupied {ctx.instrument.asset_id} {len(same_contract)}/{self.max_per_contract}"
+
+            if len(reserved_ctx) >= self.max_open_positions:
+                return False, f"portfolio exposure cap {len(reserved_ctx)}/{self.max_open_positions}"
+
+            same_class = [c for c in reserved_ctx if c.instrument.asset_class == ctx.instrument.asset_class]
+            if len(same_class) >= self.max_same_class:
+                return False, f"asset-class exposure cap {ctx.instrument.asset_class.value} {len(same_class)}/{self.max_same_class}"
+
+            return True, "portfolio slot available"
+
+    def allocate_balance(self, ctx: Optional[AssetContext], contexts: List[AssetContext], raw_balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Return a balance view scoped to one contract's portfolio slot.
+
+        QuantStrategy already applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE
+        to whatever `available` it receives.  Therefore the institutional way to
+        preserve the current BTC sizing semantics across multiple simultaneous
+        contracts is to give each contract an account-equity slice, not the full
+        account equity.  With 4 slots and 60% balance usage, each contract may use
+        about 15% of total equity as margin; all 4 together remain around the old
+        60% portfolio envelope.
+        """
+        if raw_balance is None:
+            return None
+        if not isinstance(raw_balance, dict):
+            return raw_balance
+
+        try:
+            raw_available = max(0.0, float(raw_balance.get("available", 0.0) or 0.0))
+            raw_total = max(0.0, float(raw_balance.get("total", raw_available) or raw_available))
+        except Exception:
+            return raw_balance
+
+        # Slot count is the configured maximum, not current open count.  That
+        # prevents the first signal of the day from consuming the whole account
+        # just because other contracts have not fired yet.
+        configured_slots = max(1, self.max_open_positions)
+        active_universe = max(1, len(contexts or []))
+        slot_count = min(configured_slots, active_universe) if self.budget_mode in {"active_equal_slots", "active_slots"} else configured_slots
+
+        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
+        slot_available = min(slot_equity, raw_available)
+
+        # If the account has less free cash than one nominal slot, use the real
+        # exchange-available cash.  Never fabricate availability.
+        adjusted = dict(raw_balance)
+        adjusted["available_raw"] = raw_available
+        adjusted["total_raw"] = raw_total
+        adjusted["available"] = max(0.0, slot_available)
+        adjusted["total"] = max(0.0, slot_equity)
+        adjusted["portfolio_scoped"] = True
+        adjusted["portfolio_budget_mode"] = self.budget_mode
+        adjusted["portfolio_slot_count"] = slot_count
+        adjusted["portfolio_slot_available"] = slot_available
+        adjusted["portfolio_slot_equity"] = slot_equity
+        adjusted["portfolio_reserved_slots"] = self.count_open(contexts or [])
+        adjusted["portfolio_max_slots"] = self.max_open_positions
+
+        # Sizing v5.1 separation:
+        #   • available/total above are the slot-scoped cash view used for
+        #     margin and fee-cap checks;
+        #   • risk_available/risk_total keep the portfolio equity base used for
+        #     dollar-risk sizing.  Without this separation, BTC min lot gets
+        #     rejected on small accounts because the risk target is divided by
+        #     the number of portfolio slots before the exchange lot floor is
+        #     considered.  PortfolioGuard still limits total concurrent slots;
+        #     QuantStrategy still limits actual cash/margin by the slot view.
+        adjusted["risk_available"] = raw_available
+        adjusted["risk_total"] = raw_total
+        if ctx is not None:
+            adjusted["portfolio_asset_id"] = ctx.instrument.asset_id
+        return adjusted
+
+
+class _LegacyPortfolioRiskManager(RiskManager):
+    """RiskManager wrapper that exposes a per-contract balance slice."""
+    def __init__(self, shared_api=None, *, allocator: Callable[[Optional[AssetContext], List[AssetContext], Optional[Dict[str, Any]]], Optional[Dict[str, Any]]], context_getter: Callable[[], Optional[AssetContext]], contexts_getter: Callable[[], List[AssetContext]]):
+        super().__init__(shared_api=shared_api)
+        self._portfolio_allocator = allocator
+        self._portfolio_context_getter = context_getter
+        self._portfolio_contexts_getter = contexts_getter
+
+    def get_available_balance(self) -> Optional[Dict]:
+        raw = super().get_available_balance()
+        try:
+            ctx = self._portfolio_context_getter()
+            contexts = self._portfolio_contexts_getter()
+            return self._portfolio_allocator(ctx, contexts, raw)
+        except Exception:
+            logger.exception("Portfolio balance allocation failed; using raw exchange balance")
+            return raw
 
 
 class MultiAssetQuantBot:
@@ -82,14 +206,14 @@ class MultiAssetQuantBot:
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
         self._lock = threading.RLock()
-        self.dashboard = DashboardEmitter.from_config() if DashboardEmitter is not None else None
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
+        has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
-        return delta_api
-
+        cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
+        return delta_api, cs_api
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -268,103 +392,10 @@ class MultiAssetQuantBot:
                     r.setdefault("asset", ctx.instrument.asset_id)
                     r.setdefault("symbol", ctx.instrument.display_symbol)
                     r.setdefault("venue", ctx.instrument.primary_exchange.value.upper())
-                    if "timestamp" not in r and "ts" in r:
-                        r["timestamp"] = r.get("ts")
-                    if "margin_used" not in r:
-                        try:
-                            entry = float(r.get("entry", 0.0) or 0.0)
-                            qty = float(r.get("qty", 0.0) or 0.0)
-                            lev = float(active_policy(ctx.instrument).leverage or 1)
-                            r["margin_used"] = (entry * qty / lev) if lev > 0 else entry * qty
-                            pnl = float(r.get("pnl", 0.0) or 0.0)
-                            r["margin_pnl_pct"] = pnl / r["margin_used"] * 100.0 if r["margin_used"] > 1e-10 else 0.0
-                        except Exception:
-                            r["margin_used"] = 0.0
                     rows.append(r)
             except Exception:
                 continue
         return rows
-
-    def _match_trail_contexts(self, asset_filter: Optional[str] = None) -> List[AssetContext]:
-        if not asset_filter:
-            return list(self.contexts)
-        needle = str(asset_filter).strip().upper()
-        out: List[AssetContext] = []
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            symbols = {str(inst.asset_id).upper(), str(inst.display_symbol).upper()}
-            try:
-                symbols.update(str(ei.display_symbol).upper() for ei in inst.by_exchange.values())
-            except Exception:
-                pass
-            if needle in symbols:
-                out.append(ctx)
-        return out
-
-    def set_trailing_override(self, enabled: Optional[bool], asset_filter: Optional[str] = None) -> Dict[str, Any]:
-        targets = self._match_trail_contexts(asset_filter)
-        changed: List[str] = []
-        failed: List[str] = []
-        for ctx in targets:
-            try:
-                ctx.strategy.set_trail_override(enabled)
-                changed.append(ctx.instrument.asset_id)
-            except Exception as exc:
-                failed.append(f"{ctx.instrument.asset_id}:{exc}")
-        self._dash_emit({
-            "type": "alert" if failed else "tail_status",
-            "severity": "warning" if failed else "info",
-            "asset": asset_filter or "PORTFOLIO",
-            "venue": "LOCAL",
-            "symbol": "TRAIL",
-            "title": "Trailing override changed",
-            "message": f"enabled={enabled} target={asset_filter or 'ALL'} changed={changed} failed={failed}",
-            "health": "WARN" if failed else "OK",
-        }, critical=bool(failed))
-        return {"changed": changed, "failed": failed, "target": asset_filter or "ALL", "enabled": enabled}
-
-    def format_trailing_control_report(self, result: Optional[Dict[str, Any]] = None) -> str:
-        lines = ["🛡 <b>PORTFOLIO TRAILING CONTROL</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        if result is not None:
-            enabled = result.get("enabled")
-            act = "ON" if enabled is True else ("OFF" if enabled is False else "CONFIG DEFAULT")
-            lines.append(f"Command: <b>{self._esc(act)}</b> target <code>{self._esc(result.get('target','ALL'))}</code>")
-            lines.append(f"Changed: <code>{self._esc(', '.join(result.get('changed') or []) or 'none')}</code>")
-            if result.get("failed"):
-                lines.append(f"Failed: <code>{self._esc(', '.join(result.get('failed') or []))}</code>")
-        for ctx in self.contexts:
-            try:
-                override = getattr(getattr(ctx.strategy, "_pos", None), "trail_override", None)
-                effective = bool(ctx.strategy.get_trail_enabled())
-            except Exception:
-                override = None; effective = False
-            mode = "FORCED_ON" if override is True else ("FORCED_OFF" if override is False else "DEFAULT")
-            pos = "LIVE" if ctx.has_position else ("READY" if ctx.ready else "WARMUP")
-            lines.append(f"<code>{self._esc(ctx.instrument.asset_id):<6} {self._esc(ctx.instrument.display_symbol):<12} {pos:<7} trail {'ON' if effective else 'OFF'} ({mode})</code>")
-        lines.append("\nUse <code>/trail on</code>, <code>/trail off</code>, <code>/trail on SILVER</code>, or <code>/trail auto</code>.")
-        return "\n".join(lines)
-
-    def format_portfolio_balance_report(self) -> str:
-        return self.format_portfolio_equity_report()
-
-    def _portfolio_trade_metrics(self, trades: List[Dict[str, Any]]) -> Dict[str, float]:
-        total = len(trades)
-        wins = sum(1 for t in trades if bool(t.get("is_win")))
-        total_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
-        win_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades if bool(t.get("is_win")))
-        loss_pnl = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in trades if not bool(t.get("is_win"))))
-        margin = sum(max(0.0, float(t.get("margin_used", 0.0) or 0.0)) for t in trades)
-        win_margin = sum(max(0.0, float(t.get("margin_used", 0.0) or 0.0)) for t in trades if bool(t.get("is_win")))
-        count_wr = (wins / total * 100.0) if total else 0.0
-        cap_wr = (win_margin / margin * 100.0) if margin > 1e-10 else 0.0
-        net_margin_return = (total_pnl / margin * 100.0) if margin > 1e-10 else 0.0
-        profit_factor = (win_pnl / loss_pnl) if loss_pnl > 1e-10 else (999.0 if win_pnl > 0 else 0.0)
-        return {
-            "total": float(total), "wins": float(wins), "count_wr": count_wr,
-            "capital_wr": cap_wr, "net_margin_return": net_margin_return,
-            "total_pnl": total_pnl, "total_margin": margin,
-            "profit_factor": profit_factor,
-        }
 
     def format_portfolio_pnl_report(self) -> str:
         rows = [self._ctx_position_metrics(c) for c in self.contexts]
@@ -372,16 +403,15 @@ class MultiAssetQuantBot:
         trades = self._all_trade_records()
         total_realised = sum(float(t.get("pnl", 0.0) or 0.0) for t in trades)
         total_upnl = sum(float(r.get("upnl", 0.0) or 0.0) for r in open_rows)
-        m = self._portfolio_trade_metrics(trades)
-        total = int(m["total"])
+        wins = sum(1 for t in trades if t.get("is_win"))
+        total = len(trades)
+        wr = (wins / total * 100.0) if total else 0.0
         icon = "🟢" if total_realised + total_upnl >= 0 else "🔴"
-        outcome = "PROFIT" if total_realised > 0 else ("LOSS" if total_realised < 0 else "FLAT")
         lines = [
             f"{icon} <b>PORTFOLIO PnL COMMAND CENTER</b>",
             "━━━━━━━━━━━━━━━━━━━━━━━━",
             f"<code>OPEN   {len(open_rows):>2}/{self.guard.max_open_positions:<2}   UPNL {self._fmt_money(total_upnl):>12}   REAL {self._fmt_money(total_realised):>12}</code>",
-            f"<code>RESULT {outcome:<6} NetMargin {m['net_margin_return']:+6.2f}%  PF {m['profit_factor']:>6.2f}</code>",
-            f"<code>TRADES {total:>4}   CountWR {m['count_wr']:>5.1f}%   CapitalWR {m['capital_wr']:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
+            f"<code>TRADES {total:>4}   WR {wr:>5.1f}%   BUDGET {self._esc(self.guard.budget_mode)}</code>",
         ]
         if open_rows:
             lines.append("\n<b>Live exposure by desk</b>")
@@ -399,11 +429,9 @@ class MultiAssetQuantBot:
             for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-6:][::-1]:
                 pnl = float(t.get("pnl", 0.0) or 0.0)
                 ok = "✅" if pnl >= 0 else "❌"
-                margin = float(t.get("margin_used", 0.0) or 0.0)
-                mpct = float(t.get("margin_pnl_pct", 0.0) or 0.0)
                 lines.append(
                     f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} {self._fmt_money(pnl):>11} "
-                    f"mgn ${margin:>6.2f} {mpct:+6.1f}% {self._esc(str(t.get('reason',''))[:12]):<12}</code>"
+                    f"{self._esc(str(t.get('reason',''))[:12]):<12}</code>"
                 )
         return "\n".join(lines)
 
@@ -463,99 +491,6 @@ class MultiAssetQuantBot:
                 continue
         return "\n".join(lines)
 
-
-    def format_portfolio_status_report(self) -> str:
-        lines = ["🏛 <b>MULTI-ASSET BOT STATUS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        lines.append(f"Running: {'YES' if self.running else 'NO'} · Trading: {'ENABLED' if self.trading_enabled else 'PAUSED'}")
-        if self.trading_pause_reason:
-            lines.append(f"Pause reason: {self._esc(self.trading_pause_reason)}")
-        lines.append(f"Slots: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Universe: {len(self.contexts)}")
-        for ctx in self.contexts:
-            px = 0.0
-            try:
-                px = float(ctx.data_manager.get_last_price() or 0.0)
-            except Exception:
-                pass
-            pos = ctx.strategy.get_position()
-            state = ctx.phase_name if pos else ("READY" if ctx.ready else "WARMUP")
-            lines.append(
-                f"<code>{self._esc(ctx.instrument.asset_id):<6} "
-                f"{self._esc(ctx.instrument.primary_exchange.value.upper()+':'+ctx.instrument.display_symbol):<18} "
-                f"{self._esc(state):<9} px {self._fmt_price(px):>12}</code>"
-            )
-        return "\n".join(lines)
-
-    def format_portfolio_market_report(self) -> str:
-        lines = ["📊 <b>PORTFOLIO MARKET SNAPSHOT</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            px = atr = 0.0
-            try:
-                px = float(ctx.data_manager.get_last_price() or 0.0)
-            except Exception:
-                pass
-            try:
-                atr = float(getattr(getattr(ctx.strategy, "_atr_5m", None), "atr", 0.0) or 0.0)
-            except Exception:
-                pass
-            bsl = ssl = "-"
-            try:
-                liq = getattr(ctx.strategy, "_liq_map", None)
-                if liq and px > 0 and atr > 0:
-                    snap = liq.get_snapshot(px, atr)
-                    if getattr(snap, "bsl_pools", None):
-                        t = min(snap.bsl_pools, key=lambda x: x.distance_atr)
-                        bsl = f"${t.pool.price:,.2f}/{t.distance_atr:.1f}A"
-                    if getattr(snap, "ssl_pools", None):
-                        t = min(snap.ssl_pools, key=lambda x: x.distance_atr)
-                        ssl = f"${t.pool.price:,.2f}/{t.distance_atr:.1f}A"
-            except Exception:
-                pass
-            lines.append(
-                f"<code>{self._esc(inst.asset_id):<6} px {self._fmt_price(px):>12} "
-                f"ATR {atr:>8.4f} BSL {self._esc(bsl):>15} SSL {self._esc(ssl):>15}</code>"
-            )
-        return "\n".join(lines)
-
-    def format_portfolio_risk_report(self) -> str:
-        lines = ["🛡 <b>PORTFOLIO RISK</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        lines.append(f"Slots used: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions} · Budget {self._esc(self.guard.budget_mode)}")
-        for ctx in self.contexts:
-            try:
-                can, reason = ctx.risk_manager.can_trade()
-            except Exception as e:
-                can, reason = False, str(e)
-            pol = active_policy(ctx.instrument)
-            pos = ctx.strategy.get_position()
-            status = "LIVE" if pos else ("OPEN" if can else "LOCK")
-            lines.append(
-                f"<code>{self._esc(ctx.instrument.asset_id):<6} {status:<5} lev {pol.leverage:>2}x "
-                f"margin {pol.margin_pct:.0%} risk×{pol.risk_multiplier:.2f} · {self._esc(reason)[:70]}</code>"
-            )
-        return "\n".join(lines)
-
-    def format_portfolio_sl_tp_report(self) -> str:
-        rows = [self._ctx_position_metrics(c) for c in self.contexts]
-        open_rows = [r for r in rows if r.get("position")]
-        lines = ["🛑 <b>PORTFOLIO SL / TP</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
-        if not open_rows:
-            lines.append("No live positions.")
-        for r in sorted(open_rows, key=lambda x: str(x.get("asset"))):
-            side = self._esc(r.get("side", ""))
-            trail = "ON" if r.get("trail_active") else "OFF/INIT"
-            lines.append(f"\n<b>{self._esc(r['asset'])}</b> <code>{self._esc(r['venue'])}:{self._esc(r['symbol'])}</code> {side}")
-            lines.append(
-                f"<code>ENTRY {self._fmt_price(r['entry']):>12}  PX {self._fmt_price(r['price']):>12}  "
-                f"R {float(r['r']):+5.2f}</code>"
-            )
-            lines.append(
-                f"<code>SL    {self._fmt_price(r['sl']):>12}  TP {self._fmt_price(r['tp']):>12}  "
-                f"TRAIL {trail}</code>"
-            )
-            if r.get("sl_id") or r.get("tp_id"):
-                lines.append(f"<code>ORDERS SL {str(r.get('sl_id') or '-')[:10]}… TP {str(r.get('tp_id') or '-')[:10]}…</code>")
-        return "\n".join(lines)
-
     def format_portfolio_trades_report(self) -> str:
         trades = self._all_trade_records()
         lines = ["📋 <b>PORTFOLIO TRADE TAPE</b>", "━━━━━━━━━━━━━━━━━━━━━━━━"]
@@ -564,156 +499,25 @@ class MultiAssetQuantBot:
         for t in sorted(trades, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))[-12:][::-1]:
             pnl = float(t.get("pnl", 0.0) or 0.0)
             ok = "✅" if pnl >= 0 else "❌"
-            margin = float(t.get("margin_used", 0.0) or 0.0)
-            mpct = float(t.get("margin_pnl_pct", 0.0) or 0.0)
             lines.append(
                 f"{ok} <code>{self._esc(t.get('asset','?')):<6} {self._esc(str(t.get('side','?')).upper()):<5} "
                 f"{self._fmt_price(float(t.get('entry',0) or 0)):>10}→{self._fmt_price(float(t.get('exit',0) or 0)):>10} "
-                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f} "
-                f"Mgn ${margin:,.2f} {mpct:+.1f}%</code>"
+                f"PnL {self._fmt_money(pnl):>10} R {float(t.get('r', t.get('achieved_r',0)) or 0):+5.2f}</code>"
             )
             lines.append(f"    <i>{self._esc(str(t.get('reason',''))[:80])}</i>")
         return "\n".join(lines)
-
-    def _dash_emit(self, event: Dict[str, Any], *, critical: bool = False) -> None:
-        try:
-            if self.dashboard is not None:
-                self.dashboard.emit(event, critical=critical)
-        except Exception:
-            # Dashboard must never affect trading or strategy runtime.
-            pass
-
-    def _dash_universe(self) -> None:
-        if not self.dashboard:
-            return
-        try:
-            if self.discovery_report:
-                for inst in self.discovery_report.matched:
-                    self._dash_emit({
-                        "type": "catalog_asset",
-                        "asset": inst.asset_id,
-                        "venue": inst.primary_exchange.value.upper(),
-                        "symbol": inst.display_symbol,
-                        "primary": inst.primary_exchange.value.upper(),
-                        "last_reason": ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items()),
-                        "health": "OK",
-                    })
-            for ctx in self.contexts:
-                inst = ctx.instrument
-                pol = active_policy(inst)
-                self._dash_emit({
-                    "type": "market_data",
-                    "asset": inst.asset_id,
-                    "venue": inst.primary_exchange.value.upper(),
-                    "symbol": inst.display_symbol,
-                    "primary": inst.primary_exchange.value.upper(),
-                    "data_status": "CONTEXT_BUILT",
-                    "policy": pol.asset_class,
-                    "leverage": f"{pol.leverage}x",
-                    "margin": f"{pol.margin_pct:.0%}",
-                    "risk_mult": pol.risk_multiplier,
-                    "health": "OK",
-                })
-        except Exception:
-            pass
-
-    def _dash_heartbeat(self) -> None:
-        self._dash_emit({
-            "type": "heartbeat",
-            "mode": "live" if self.trading_enabled else "paused",
-            "source": "direct",
-            "max_positions": self.guard.max_open_positions,
-            "open_positions": self.guard.count_open(self.contexts),
-            "message": "multi-asset bot heartbeat",
-        })
-
-    def _dash_context(self, ctx: AssetContext, *, dt_ms: float = 0.0, force: bool = False) -> None:
-        if not self.dashboard:
-            return
-        now = time.time()
-        interval = float(getattr(config, "DASHBOARD_POSITION_UPDATE_SEC", 1.0)) if ctx.has_position else float(getattr(config, "DASHBOARD_SCAN_UPDATE_SEC", 5.0))
-        last = getattr(ctx, "last_dashboard_sec", 0.0)
-        if not force and interval > 0 and now - last < interval:
-            return
-        setattr(ctx, "last_dashboard_sec", now)
-        inst = ctx.instrument
-        pol = active_policy(inst)
-        try:
-            price = float(ctx.data_manager.get_last_price() or 0.0)
-        except Exception:
-            price = 0.0
-        pos = ctx.strategy.get_position()
-        state = ctx.phase_name if pos else ("READY" if ctx.ready else "WARMUP")
-        base = {
-            "asset": inst.asset_id,
-            "venue": inst.primary_exchange.value.upper(),
-            "symbol": inst.display_symbol,
-            "price": price,
-            "state": state,
-            "phase": state,
-            "open_positions": self.guard.count_open(self.contexts),
-            "max_positions": self.guard.max_open_positions,
-            "policy": pol.asset_class,
-            "leverage": f"{pol.leverage}x",
-            "margin": f"{pol.margin_pct:.0%}",
-            "risk_mult": pol.risk_multiplier,
-            "health": "OK",
-        }
-        try:
-            atr = float(getattr(getattr(ctx.strategy, "_atr_5m", None), "atr", 0.0) or 0.0)
-            if atr > 0:
-                base["atr"] = atr
-        except Exception:
-            pass
-        self._dash_emit({"type": "scan", **base})
-        if pos:
-            try:
-                side = str(getattr(pos, "side", "")).upper()
-                entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
-                qty = float(getattr(pos, "quantity", 0.0) or 0.0)
-                move = (price - entry) if side == "LONG" else (entry - price)
-                upnl = move * qty
-                init_dist = float(getattr(pos, "initial_sl_dist", 0.0) or 0.0) or abs(entry - float(getattr(pos, "sl_price", 0.0) or 0.0))
-                r_now = move / init_dist if init_dist > 1e-10 else 0.0
-                mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
-                notional = entry * qty if entry > 0 and qty > 0 else 0.0
-                lev_txt = str(pol.leverage).replace("x", "")
-                try:
-                    lev = float(lev_txt)
-                except Exception:
-                    lev = float(getattr(config, "LEVERAGE", 1) or 1)
-                margin_used = notional / lev if lev > 0 else notional
-                margin_pnl_pct = (upnl / margin_used * 100.0) if margin_used > 1e-10 else 0.0
-                self._dash_emit({
-                    "type": "position_update",
-                    **base,
-                    "side": side,
-                    "qty": qty,
-                    "entry": entry,
-                    "sl": float(getattr(pos, "sl_price", 0.0) or 0.0),
-                    "tp": float(getattr(pos, "tp_price", 0.0) or 0.0),
-                    "upnl": upnl,
-                    "r": r_now,
-                    "mfe_r": mfe_r,
-                    "notional": notional,
-                    "margin_used": margin_used,
-                    "margin_pnl_pct": margin_pnl_pct,
-                    "trailing": "ON" if bool(getattr(pos, "trail_active", False)) else "WATCH",
-                    "bracket": "SLTP" if (getattr(pos, "sl_order_id", "") or getattr(pos, "tp_order_id", "")) else "UNKNOWN",
-                })
-            except Exception:
-                pass
 
     def initialize(self) -> bool:
         try:
             logger.info("=" * 92)
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
-            logger.info("   Delta live catalog only — no synthetic commodity/index/equity feeds")
+            logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
-            delta_api = self._build_api_clients()
+            delta_api, cs_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
+                coinswitch_api=cs_api,
                 requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
@@ -725,41 +529,54 @@ class MultiAssetQuantBot:
                 return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api)
+                ctx = self._build_asset_context(inst, delta_api, cs_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
                 logger.error("No asset contexts could be built.")
                 return False
             logger.info("✅ Built %d isolated strategy contexts", len(self.contexts))
-            self._dash_universe()
             return True
         except Exception:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api) -> Optional[AssetContext]:
-        with instrument_scope(inst):
-            if ExchangeName.DELTA not in inst.by_exchange or delta_api is None:
-                logger.warning("%s skipped: Delta order manager unavailable", inst.asset_id)
-                return None
+    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
+        primary_ex = inst.primary_exchange
+        cs_om = None
+        delta_om = None
+        if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
+            cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
+        if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-            router = ExecutionRouter(delta_om=delta_om)
-            data = MarketAggregator(primary_dm=DeltaDataManager(instrument=inst), secondary_dm=None, instrument=inst)
+        if not cs_om and not delta_om:
+            logger.warning("%s skipped: no executable order manager", inst.asset_id)
+            return None
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, default=primary_ex.value)
 
-            ctx_holder: Dict[str, AssetContext] = {}
-            risk = PortfolioRiskManager(
-                shared_api=router,
-                allocator=self.guard.allocate_balance,
-                context_getter=lambda: ctx_holder.get("ctx"),
-                contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
-                manager=self.guard,
-            )
-            strategy = QuantStrategy(router, instrument=inst)
-            data.register_strategy(strategy)
-            ctx = AssetContext(inst, data, router, risk, strategy)
-            ctx_holder["ctx"] = ctx
-            return ctx
+        if primary_ex == ExchangeName.DELTA:
+            primary_dm = DeltaDataManager(instrument=inst)
+            secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
+        else:
+            primary_dm = CoinSwitchDataManager(instrument=inst)
+            secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
+        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst)
+
+        # Context is created after the risk manager, so use a tiny holder to let
+        # PortfolioRiskManager resolve its owning context at call-time.
+        ctx_holder: Dict[str, AssetContext] = {}
+        risk = PortfolioRiskManager(
+            shared_api=router,
+            allocator=self.guard.allocate_balance,
+            context_getter=lambda: ctx_holder.get("ctx"),
+            contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
+            manager=self.guard,
+        )
+        strategy = QuantStrategy(router, instrument=inst)
+        data.register_strategy(strategy)
+        ctx = AssetContext(inst, data, router, risk, strategy)
+        ctx_holder["ctx"] = ctx
+        return ctx
 
     def _start_one_context(self, ctx: AssetContext) -> bool:
         inst = ctx.instrument
@@ -776,7 +593,7 @@ class MultiAssetQuantBot:
                 ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
                 ctx.ready = bool(ready)
                 if not ready:
-                    logger.warning("%s data manager not ready — asset will be excluded from this run", inst.asset_id)
+                    logger.error("%s data manager not ready", inst.asset_id)
                     return False
                 venues = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
                 logger.info("✅ %s ready @ %.4f | venues=%s | %s", inst.asset_id, ctx.data_manager.get_last_price(), venues, self.guard.report_line(ctx))
@@ -807,31 +624,14 @@ class MultiAssetQuantBot:
         ok_any = any(ok_flags.values())
         if not ok_any:
             return False
-        failed_assets = [
-            c.instrument.asset_id for c in self.contexts
-            if not bool(ok_flags.get(c.instrument.asset_id, False))
-        ]
-        if failed_assets:
-            logger.warning(
-                "Excluding non-ready assets from active scanner: %s",
-                ", ".join(sorted(failed_assets)),
-            )
-            self.contexts = [
-                c for c in self.contexts
-                if bool(ok_flags.get(c.instrument.asset_id, False))
-            ]
-        if not self.contexts:
-            return False
         self.running = True
-        self._dash_universe()
-        self._dash_heartbeat()
         if self.discovery_report:
             send_telegram_message(self.discovery_report.telegram_html())
         send_telegram_message(self._startup_message())
         return True
 
     def _startup_message(self) -> str:
-        lines = ["🏛 <b>DELTA LIQUIDITY COMMAND CENTER ONLINE</b>", ""]
+        lines = ["🏛 <b>PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
         lines.append("<b>Execution universe — asset-scoped strategy desks:</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
@@ -845,8 +645,8 @@ class MultiAssetQuantBot:
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Delta live products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
-        lines.append("• Alpha authority: EntryEngine posterior + liquidity TP/SL EV. PortfolioGuard only controls exposure mechanics.")
+        lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
+        lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
         return "\n".join(lines)
 
     def run(self) -> None:
@@ -874,7 +674,6 @@ class MultiAssetQuantBot:
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
                     self._maybe_analysis_audit(ctx, dt_ms)
-                    self._dash_context(ctx, dt_ms=dt_ms)
                     self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
@@ -923,7 +722,6 @@ class MultiAssetQuantBot:
         if now - ctx.last_heartbeat_sec < float(getattr(config, "SCANNER_ASSET_HEARTBEAT_SEC", 60.0)):
             return
         ctx.last_heartbeat_sec = now
-        self._dash_heartbeat()
         try:
             price = ctx.data_manager.get_last_price()
             pos = ctx.strategy.get_position()
@@ -948,7 +746,6 @@ class MultiAssetQuantBot:
 
 
 def main() -> None:
-    install_instrument_log_filter()
     bot = MultiAssetQuantBot()
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):

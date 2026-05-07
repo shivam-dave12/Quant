@@ -1,8 +1,38 @@
 """
-execution/order_manager.py — Delta native-bracket order manager
-===============================================================
-Delta-only execution layer.  All entries are routed through Delta contracts and
-protected with exchange-attached SL/TP whenever an entry is accepted.
+execution/order_manager.py — Exchange-Agnostic Order Manager
+=============================================================
+Single OrderManager class that works with any exchange API adapter
+(CoinSwitchAPI or DeltaAPI) via constructor injection.
+
+The ExecutionRouter (router.py) instantiates one of each and routes
+all calls to the active one.  Switching exchanges at runtime is a
+router concern — the OrderManager itself is stateless re: exchange choice.
+
+Key differences handled per-exchange
+--------------------------------------
+  Response parsing:
+    CoinSwitch → success in resp["data"]["order_id"]
+    Delta      → success in resp["result"]["id"]  (when resp["success"]==True)
+
+  Order types:
+    CoinSwitch → "STOP_MARKET", "TAKE_PROFIT_MARKET"
+    Delta      → "stop_loss_order", "take_profit_order"  (bracket legs)
+                 OR "STOP_LOSS_MARKET", "TAKE_PROFIT_MARKET" on stop endpoint
+
+  Rate limiting:
+    CoinSwitch → 3.0 s minimum between any calls
+    Delta      → 0.25 s minimum
+
+  Leverage:
+    CoinSwitch → set_leverage(symbol, exchange, leverage)
+    Delta      → set_leverage(product_id, leverage)
+
+  Quantity units:
+    CoinSwitch → float BTC
+    Delta      → int contracts (1 contract = DELTA_CONTRACT_VALUE_BTC BTC)
+
+All exchange-specific behaviour is encapsulated in the _Adapter inner
+classes so the OrderManager logic never branches on exchange type.
 """
 
 from __future__ import annotations
@@ -70,13 +100,14 @@ class _RateLimiter:
 
 
 # Global limiters — one per exchange (shared across all OrderManager instances)
+_CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
 class GlobalRateLimiter:
     """Legacy shim — routes to the active exchange limiter."""
-    _active = _DELTA_LIMITER
+    _active = _CS_LIMITER
 
     @classmethod
     def wait(cls): cls._active.wait()
@@ -89,6 +120,168 @@ class GlobalRateLimiter:
 
 
 # ── Exchange adapters — encapsulate wire-format differences ──────────────────
+
+class _CoinSwitchAdapter:
+    """Normalises CoinSwitch API responses to canonical dicts."""
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        self.api     = api
+        self.limiter = _CS_LIMITER
+        self.exchange_instrument = exchange_instrument
+        self.symbol  = (exchange_instrument.symbol if exchange_instrument is not None else config.COINSWITCH_SYMBOL)
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.exchange_id = config.COINSWITCH_EXCHANGE
+
+    def extract_order_id(self, resp: Dict) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("data")
+        if isinstance(data, dict):
+            oid = data.get("order_id") or data.get("id")
+            return str(oid) if oid else None
+        return None
+
+    def extract_status(self, order_data: Dict) -> str:
+        raw = str(order_data.get("status", "")).upper()
+        _MAP = {
+            "EXECUTED": "FILLED", "FILLED": "FILLED",
+            "COMPLETELY_FILLED": "FILLED",
+            "PARTIALLY_FILLED": "PARTIAL_FILL",
+            "PARTIALLY_EXECUTED": "PARTIAL_FILL",
+            "CANCELLED": "CANCELLED", "CANCELED": "CANCELLED",
+            "REJECTED": "CANCELLED", "EXPIRED": "CANCELLED",
+            "OPEN": "PENDING", "PENDING": "PENDING", "NEW": "PENDING",
+            "UNTRIGGERED": "PENDING", "TRIGGERED": "PENDING",
+            "ACTIVE": "PENDING", "RAISED": "PENDING",
+        }
+        return _MAP.get(raw, "UNKNOWN")
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        for f in ("avg_execution_price", "avg_price", "average_price", "price"):
+            v = order_data.get(f)
+            if v:
+                try:
+                    p = float(v)
+                    if p > 0: return p
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        for f in ("exec_quantity", "executed_qty", "filled_quantity",
+                  "executed_quantity"):
+            v = order_data.get(f)
+            if v:
+                try:
+                    q = float(v)
+                    if q > 0: return q
+                except (ValueError, TypeError):
+                    pass
+        return 0.0
+
+    def place_order(self, side: str, order_type: str, quantity: float,
+                    price: Optional[float] = None,
+                    trigger_price: Optional[float] = None,
+                    reduce_only: bool = False) -> Optional[Dict]:
+        self.limiter.wait()
+        resp = self.api.place_order(
+            symbol        = self.symbol,
+            side          = side,
+            order_type    = order_type,
+            quantity      = quantity,
+            exchange      = self.exchange_id,
+            price         = price,
+            trigger_price = trigger_price,
+            reduce_only   = reduce_only,
+        )
+        oid = self.extract_order_id(resp)
+        if not oid:
+            sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
+            return {"_raw": resp, "_sc": sc, "_error": True}
+        data = (resp.get("data") or {}) if isinstance(resp, dict) else {}
+        data["order_id"] = oid
+        return data
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        return self.api.cancel_order(order_id, exchange=self.exchange_id) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        self.limiter.wait()
+        resp = self.api.get_order(order_id, exchange=self.exchange_id)
+        if isinstance(resp, dict) and "data" in resp:
+            d = resp["data"]
+            return d.get("order", d) if isinstance(d, dict) else None
+        return None
+
+    def get_open_orders(self, symbol: str) -> Optional[list]:
+        self.limiter.wait()
+        resp = self.api.get_open_orders(exchange=self.exchange_id, symbol=symbol)
+        if not isinstance(resp, dict) or resp.get("error"):
+            return None
+        raw = resp.get("data", [])
+        return raw if isinstance(raw, list) else []
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        self.limiter.wait()
+        resp = self.api.get_positions(exchange=self.exchange_id, symbol=symbol)
+        if not isinstance(resp, dict) or resp.get("error"):
+            return None
+        return resp.get("data", {})
+
+    def get_balance(self) -> Dict:
+        return self.api.get_balance(currency="USDT")
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        self.limiter.wait()
+        return self.api.set_leverage(
+            symbol   = self.symbol,
+            exchange = self.exchange_id,
+            leverage = leverage,
+        )
+
+    def normalise_position(self, raw) -> Optional[Dict]:
+        """Turn CoinSwitch position response into a canonical dict."""
+        positions = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            sym = str(pos.get("symbol", "")).upper()
+            if self.symbol.upper() not in sym.replace("/", ""):
+                continue
+            size = 0.0
+            for f in ("size", "quantity", "position_size", "net_quantity"):
+                v = pos.get(f)
+                if v:
+                    try:
+                        size = abs(float(v))
+                        if size > 0: break
+                    except (ValueError, TypeError): pass
+            side = None
+            if size > 0:
+                rs = str(pos.get("side", pos.get("position_side", ""))).upper()
+                side = "LONG" if rs in ("BUY", "LONG") else \
+                       "SHORT" if rs in ("SELL", "SHORT") else None
+            entry = 0.0
+            for f in ("entry_price", "avg_price", "average_price"):
+                v = pos.get(f)
+                if v:
+                    try:
+                        entry = float(v)
+                        if entry > 0: break
+                    except (ValueError, TypeError): pass
+            upnl = 0.0
+            try: upnl = float(pos.get("unrealized_pnl", 0))
+            except (ValueError, TypeError): pass
+            return {"side": side, "size": size, "entry_price": entry,
+                    "unrealized_pnl": upnl, "raw": pos}
+        return {"side": None, "size": 0.0, "entry_price": 0.0,
+                "unrealized_pnl": 0.0}
+
 
 class _DeltaAdapter:
     """Normalises Delta Exchange API responses to canonical dicts."""
@@ -238,35 +431,9 @@ class _DeltaAdapter:
         oid = self.extract_order_id(resp)
         if not oid:
             sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
-            return {"_raw": resp, "_sc": sc, "_error": True, "_reason": "exchange_reject"}
+            return {"_raw": resp, "_sc": sc, "_error": True}
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
-        result["entry_order_type"] = "limit_bracket"
-        return result
-
-    def place_bracket_market_entry(self, side: str, quantity: float,
-                                   sl_price: float,
-                                   tp_price: float) -> Optional[Dict]:
-        # Native MARKET bracket: used only for high-readiness accepted sweeps.
-        # This is not a fallback and not naked exposure: Delta receives entry,
-        # bracket_stop_loss_price and bracket_take_profit_price in one request.
-        self.limiter.wait()
-        contracts = self._qty_to_contracts(quantity)
-        resp = self.api.place_order(
-            symbol                    = self.symbol,
-            side                      = side.lower(),
-            order_type                = "market",
-            size                      = contracts,
-            bracket_stop_loss_price   = float(sl_price),
-            bracket_take_profit_price = float(tp_price),
-        )
-        oid = self.extract_order_id(resp)
-        if not oid:
-            sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
-            return {"_raw": resp, "_sc": sc, "_error": True, "_reason": "exchange_reject"}
-        result = resp.get("result", {}) if isinstance(resp, dict) else {}
-        result["order_id"] = oid
-        result["entry_order_type"] = "market_bracket"
         return result
 
     def cancel_order(self, order_id: str) -> Dict:
@@ -509,38 +676,70 @@ class _DeltaAdapter:
 # ── Main OrderManager ─────────────────────────────────────────────────────────
 
 class OrderManager:
-    """Delta native-bracket order manager."""
+    """
+    Exchange-agnostic order manager.
+    Inject a CoinSwitchAPI or DeltaAPI; this class handles the rest.
+    """
 
     _MAX_RETRIES       = 2     # was 3 — 3 attempts × 30s timeout = 90s minimum block
     _RETRY_BASE_SLEEP  = 1.0   # was 3.0 — base sleep for exponential backoff
     _MAX_401_RETRIES   = 2     # was 3 — auth errors rarely fix themselves
     _401_RETRY_DELAY   = 1.0   # was 2.0
 
-    def __init__(self, api, exchange_name: str = "delta", instrument=None) -> None:
-        exch = "delta"
+    def __init__(self, api, exchange_name: str = "coinswitch", instrument=None) -> None:
+        exch = exchange_name.lower()
         self.instrument = instrument
         exchange_instrument = None
         if instrument is not None and hasattr(instrument, "by_exchange"):
             try:
-                exchange_instrument = instrument.by_exchange.get(ExchangeName.DELTA)
+                ex_key = ExchangeName(exch)
+                exchange_instrument = instrument.by_exchange.get(ex_key)
             except Exception:
                 exchange_instrument = None
-        self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
-        self.api = api
+        if exch == "delta":
+            self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
+        else:
+            self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
+
+        self.api            = api         # kept for compatibility access
         self._exchange_name = exch
-        self.symbol = self._adapter.symbol
+        self.symbol         = self._adapter.symbol
         self.display_symbol = getattr(self._adapter, "display_symbol", self.symbol)
-        self._orders_lock = threading.RLock()
+        self._orders_lock   = threading.RLock()
         self.active_orders: Dict[str, Dict] = {}
+        # BUG-1 FIX: plain list grew forever — swap to deque so memory is bounded.
+        # 1 000 entries covers well over a year of daily trading; oldest records
+        # are evicted automatically once the cap is reached.
         self.order_history: deque = deque(maxlen=1_000)
         self._rate_window_start = time.time()
         self._rate_window_count = 0
-        self._open_orders_404 = False
+        self._open_orders_404   = False
+
+        # ── FIX (third-trade bug): self-cancelled-orders tracker ──────────────
+        # When we cancel an SL ourselves (cancel+replace path), we record the
+        # order_id + timestamp here. This lets downstream code distinguish
+        # "SL was filled by the market" (exchange fired it) from
+        # "SL was cancelled by us and the replacement failed" (orphaned).
+        # A 404 on an id in this set is a GHOST, not an exit. Entries expire
+        # after _SELF_CANCEL_TTL_SEC so the dict cannot grow unbounded.
         self._self_cancelled_orders: Dict[str, float] = {}
         self._SELF_CANCEL_TTL_SEC = 120.0
+
+        # Expose for callers that do order_manager.CancelResult
         self.CancelResult = CancelResult
-        GlobalRateLimiter.set_active(_DELTA_LIMITER)
-        logger.info(f"✅ OrderManager initialised (exchange=delta, symbol={self.symbol})")
+
+        # NOTE: GlobalRateLimiter is NOT set here.
+        # When the ExecutionRouter is used (the normal code path), the router
+        # owns both OMs and calls _sync_global_limiter() after construction,
+        # pointing GlobalRateLimiter at whichever exchange is currently active.
+        # Calling set_active() here caused a race: the last OM constructed
+        # (always delta, since it's created second) won, so GlobalRateLimiter
+        # always pointed at the delta limiter even when CoinSwitch was the active
+        # exchange — silently applying the wrong rate-limit interval to all calls.
+        # The single-OM compatibility path (no router) can call GlobalRateLimiter.set_active()
+        # explicitly after construction if needed.
+
+        logger.info(f"✅ OrderManager initialised (exchange={exch}, symbol={self.symbol})")
 
     @property
     def limiter(self) -> _RateLimiter:
@@ -1020,8 +1219,7 @@ class OrderManager:
                                   sl_price: float,
                                   tp_price: float,
                                   timeout_sec: float = 45.0,
-                                  on_order_placed=None,
-                                  market_entry: bool = False) -> Optional[Dict]:
+                                  on_order_placed=None) -> Optional[Dict]:
         """
         Bracket entry for Delta: places a single limit order with embedded SL + TP.
         Polls until filled, then queries open orders to retrieve bracket child IDs.
@@ -1040,21 +1238,15 @@ class OrderManager:
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
-        mode = "MARKET" if market_entry else "LIMIT"
         logger.info(
-            f"[BRACKET/{mode}] {side.upper()} {quantity} @ ${limit_price:.2f} "
+            f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
             f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
 
-        if market_entry and hasattr(self._adapter, "place_bracket_market_entry"):
-            data = self._adapter.place_bracket_market_entry(
-                side=side, quantity=quantity, sl_price=sl_price, tp_price=tp_price,
-            )
-        else:
-            data = self._adapter.place_bracket_limit_entry(
-                side=side, quantity=quantity,
-                limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
-            )
+        data = self._adapter.place_bracket_limit_entry(
+            side=side, quantity=quantity,
+            limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
+        )
         if not data or data.get("_error"):
             sc = (data or {}).get("_sc", 0)
             raw = (data or {}).get("_raw", {})
@@ -1088,20 +1280,12 @@ class OrderManager:
 
             if status == "FILLED":
                 fill_px = float(details.get("fill_price") or limit_price)
-                # v74: preserve the actual entry mode for marketable native brackets.
-                # v73 always marked bracket fills as "maker", even when the order
-                # was submitted through place_bracket_market_entry(). That made
-                # execution-cost telemetry and any fee fallback logic understate cost
-                # for fast protected-cross entries. Native market bracket is still
-                # protected by exchange-attached SL/TP; only the fill classification
-                # changes.
-                data["fill_type"]    = "taker" if market_entry else "maker"
+                data["fill_type"]    = "maker"
                 data["fill_price"]   = fill_px
                 data["bracket_order"] = True
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
-                            f" fill_type={data['fill_type']}"
                             f" fee=${data['paid_commission']:.4f}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
@@ -1261,15 +1445,10 @@ class OrderManager:
                 logger.info(f"Bracket order {order_id[:8]}… cancelled by exchange")
                 break
 
-        # Timeout — cancel and signal caller to refine/reprice. This is a missed
-        # fill, not a bracket API failure, and must not trigger naked fallback.
+        # Timeout — cancel and signal caller to retry after cooldown
         self.cancel_order(order_id)
         logger.info(f"Bracket order timeout after {timeout_sec:.0f}s — cancelled")
-        data["_error"] = True
-        data["_reason"] = "not_filled_timeout"
-        data["_bracket_order_placed"] = True
-        data["bracket_order"] = False
-        return data
+        return None
 
     def place_stop_loss(self, side: str, quantity: float,
                         trigger_price: float,
@@ -1389,7 +1568,7 @@ class OrderManager:
              caller must NOT treat this as "exit confirmed" — it is an
              UNPROTECTED state that must be emergency-flattened.
 
-          2. CANCEL + REPLACE fallback — for irrecoverable edit
+          2. CANCEL + REPLACE fallback — for CoinSwitch or irrecoverable edit
              failures. Places a stop-limit order.
 
              CRITICAL INVARIANT: if the cancel succeeds but the replace fails,
@@ -1463,7 +1642,7 @@ class OrderManager:
                         "order_id": existing_sl_order_id,
                     }
 
-            # ── Path 2: Cancel + Replace (edit-failure fallback) ─
+            # ── Path 2: Cancel + Replace (CoinSwitch / edit failure fallback) ─
             cancelled_old = False
             if existing_sl_order_id:
                 existing_status = self.get_order_status_safe(existing_sl_order_id)
@@ -1607,7 +1786,7 @@ class OrderManager:
                 return CancelResult.FAILED
 
             # Determine if the cancel API call itself succeeded.
-            # Legacy no-success-key response handling.
+            # CoinSwitch: success = no "error" key in response body.
             # Delta:       success = resp["success"] == True.
             # Both can return {} on success (empty body = 200 OK).
             has_error   = bool(resp.get("error"))
@@ -1619,7 +1798,7 @@ class OrderManager:
             elif has_success is False:
                 api_succeeded = False
             else:
-                # No success key — no error = success
+                # No "success" key (CoinSwitch style) — no error = success
                 api_succeeded = not has_error and sc not in (400, 401, 403, 404, 422)
 
             if sc == 404:
@@ -1836,7 +2015,7 @@ class OrderManager:
             "fee_paid":   float, — paid_commission from Delta (exact USD)
           }
 
-        If exact query is unavailable, confirmed=False always.
+        CoinSwitch: query_order_exact not available → confirmed=False always.
         All exceptions caught at DEBUG — exit flow is never disrupted.
         """
         _UNCONFIRMED: Dict = {

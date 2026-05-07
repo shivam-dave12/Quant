@@ -11,7 +11,7 @@ Features:
   - Authenticated private channels (orders, positions, fills, account)
   - Public channels (orderbook L1/L2, trades, tickers, candlesticks, markprice)
   - Connection health monitoring
-  - Same public interface as generic websocket adapter for drop-in use
+  - Same public interface as CoinSwitch futures_websocket.py for drop-in use
 
 Channel reference:
   Public (no auth):

@@ -2,14 +2,14 @@
 telegram/notifier.py — Institutional Quant Telegram Notifier
 =============================================================
 Report architecture mirrors the current authority model:
-  Delta data reliability → Liquidity state → EntryEngine opportunity
-  TP/SL EV frontier → mechanical Risk/Execution → Adaptive Exit.
+  MarketAggregator reliability → Liquidity state → QuantPosterior
+  posterior/EV/uncertainty → Risk/Execution → Adaptive Exit.
 
 Public API (imported by strategy layer):
   send_telegram_message()            — async fire-and-forget delivery
   format_periodic_report()           — institutional dashboard
   format_direction_hunt_alert()      — liquidity-draw telemetry only
-  format_post_sweep_verdict()        — EntryEngine auction decision
+  format_post_sweep_verdict()        — quant posterior auction decision
   format_conviction_advisory_alert() — dynamic advisory/sizing diagnostic
   format_pool_gate_alert()           — liquidity-path exit/reversal telemetry
   format_liquidity_trail_update()    — adaptive exit / stop update
@@ -33,10 +33,6 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
-try:
-    from core.redaction import redact_sensitive
-except Exception:
-    def redact_sensitive(x): return x
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +178,7 @@ def _classify_priority(message: str) -> int:
         "POSITION ADOPTED", "WATCHDOG HEAL", "WATCHDOG CIRCUIT",
         "POST-EXIT IMPAIRMENT", "IC EXPOSURE LENS",
         "LIQUIDITY PATH GATE", "SAFETY / ADVISORY BLOCK", "ADAPTIVE EXIT", "LIQUIDITY DRAW",
-        "ENTRYENGINE OPPORTUNITY DECISION",
+        "QUANT POSTERIOR DECISION",
     )):
         return PRIO_IMPORTANT
     return PRIO_ROUTINE
@@ -245,7 +241,7 @@ def _send_worker() -> None:
             logger.error("notifier: unexpected queue item shape: %d", len(item))
             _send_queue.task_done()
             continue
-        message = _repair_mojibake(str(redact_sensitive(message)))
+        message = _repair_mojibake(str(message))
 
         for attempt in range(_MAX_RETRIES):
             gap = _MIN_INTERVAL - (time.time() - last_send_ts)
@@ -363,7 +359,7 @@ def _tg_asset_policy(inst):
 def _tg_asset_header(inst=None, event_type: str = "", context: Optional[Dict[str, Any]] = None) -> str:
     """Build an institutional asset-specific Telegram header.
 
-    This is intentionally centralised so compatibility BTC-era messages can still be
+    This is intentionally centralised so legacy BTC-era messages can still be
     sent by strategy code while Telegram always receives the correct contract,
     venue, policy, phase and portfolio context.
     """
@@ -464,7 +460,7 @@ def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=
     """
     if not telegram_config.TELEGRAM_ENABLED:
         return False
-    message = _repair_mojibake(str(redact_sensitive(message)))
+    message = _repair_mojibake(str(message))
     if enrich:
         try:
             message = _tg_enrich_asset_message(message, instrument=instrument, event_type=event_type, context=context)
@@ -1001,7 +997,7 @@ _TELEGRAM_SUPPRESS_PATTERNS: List[str] = [
     #    rejection. Source-downgraded to INFO; this is belt-and-braces.
     "SWEEP QUALITY IMPAIRED [tf_quality]:",
     "SWEEP DEFERRED [tf_quality]:",
-    "SWEEP REJECTED (tf_quality):",  # compatibility suppression
+    "SWEEP REJECTED (tf_quality):",  # legacy suppression
     # 2. Telegram API HTTP errors on getUpdates: when Telegram itself
     #    rate-limits the bot, the WARN was being routed BACK into the
     #    Telegram queue, amplifying the burst. Source-downgraded to
@@ -1763,7 +1759,7 @@ def format_post_sweep_verdict(
     if displacement_atr:
         tags.append(f"disp {float(displacement_atr):.2f}A")
     lines = [
-        f"🧠 <b>ENTRYENGINE OPPORTUNITY DECISION</b>  <code>{_esc(str(action).upper())}</code>",
+        f"🧠 <b>QUANT POSTERIOR DECISION</b>  <code>{_esc(str(action).upper())}</code>",
         _TG_RULE,
         f"<code>DIR     {_esc(str(direction).upper() or '-'):<8} [{_tg_bar(confidence)}] {float(confidence or 0):>5.0%}   phase {_esc(phase or '-')}</code>",
         f"<code>POOL    {_esc(swept_side or '-'):<8} @ {_tg_price(swept_price):>13}   mark {_tg_price(current_price):>13}</code>",

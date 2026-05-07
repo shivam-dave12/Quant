@@ -26,8 +26,7 @@ Post-Sweep Phases:
 Evidence Model:
   Static factors (scored once): AMD, sweep quality, dealing range, pool sig
   Dynamic factors (per-tick with decay): flow, CVD, CISD, OTE, displacement
-  Decision: one quantitative opportunity score from posterior EV, liquidity
-  delivery, SL efficiency and structure. No duplicated route-veto stack.
+  Decision: static_base + accumulated_dynamic >= phase-adjusted threshold
 
 Exports (consumed by quant_strategy.py):
   EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
@@ -45,13 +44,6 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
-try:
-    from strategy.btc_institutional_policy import is_btc_context, btc_static_rr_floor, btc_sl_buffer_limits
-except Exception:  # pragma: no cover
-    def is_btc_context(owner=None): return False
-    def btc_static_rr_floor(static_min_rr, posterior_prob=0.0): return float(static_min_rr)
-    def btc_sl_buffer_limits(max_buffer_atr): return float(max_buffer_atr)
 
 try:
     from strategy.quantitative_models import evaluate_post_sweep_quant
@@ -177,8 +169,8 @@ except Exception:
 
 # Post-Sweep evidence thresholds.
 # Institutional mode: the posterior/EV calculation decides whether a sweep
-# auction is worth expressing. Diagnostics below are continuous; they shape one
-# execution opportunity score instead of becoming hidden pass/fail layers.
+# auction is worth expressing. Quality diagnostics below are continuous;
+# they reduce confidence/sizing instead of becoming hidden pass/fail filters.
 _PS_THRESHOLD_EARLY  = 62.0
 _PS_THRESHOLD_NORMAL = 52.0
 _PS_THRESHOLD_MATURE = 45.0
@@ -210,8 +202,6 @@ try:
     _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
     _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
     _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
-    _ENTRY_EXECUTION_QUALITY_MIN = float(getattr(_entry_gate_cfg, "ENTRY_EXECUTION_QUALITY_MIN", 0.52))
-    _ENTRY_CRITICAL_DEFECT_FLOOR = float(getattr(_entry_gate_cfg, "ENTRY_CRITICAL_DEFECT_FLOOR", 0.62))
 except Exception:
     _ENTRY_HARD_MIN_DISP_ATR = 0.75
     _ENTRY_STRONG_DISP_ATR   = 1.25
@@ -225,8 +215,6 @@ except Exception:
     _ENTRY_CVD_HARD_OPPOSE  = 0.30
     _ENTRY_HTF_CONTRA_VETO = True
     _ENTRY_GATE_LOG_SEC = 12.0
-    _ENTRY_EXECUTION_QUALITY_MIN = 0.52
-    _ENTRY_CRITICAL_DEFECT_FLOOR = 0.62
 
 
 # HTF TP escalation
@@ -323,6 +311,8 @@ class ICTContext:
     structure_4h:           str   = ""
     bos_5m:                 str   = ""
     choch_5m:               str   = ""
+    nearest_ob_price:       float = 0.0
+    nearest_ob_price_short: float = 0.0
     kill_zone:              str   = ""
     ict_sweeps:             list  = field(default_factory=list)
     direction_hint:            str   = ""
@@ -638,18 +628,10 @@ class EntryEngine:
             key = self._sweep_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
             new_exp = now + max(5.0, float(cooldown_sec))
-            # If the prior lock already expired, replace it.  The previous
-            # min(old_exp, new_exp) path kept a stale timestamp and logged
-            # negative cooldowns (for example: "shortened to -222s"), which
-            # made the sweep registry look broken and could suppress/refine the
-            # wrong thesis.
-            if old_exp <= now:
-                self._processed_sweeps[key] = new_exp
-            else:
-                self._processed_sweeps[key] = min(old_exp, new_exp)
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
             logger.info(
                 f"EntryEngine pre-order rejection: sweep lock shortened "
-                f"to {max(0, int(self._processed_sweeps[key] - now))}s for "
+                f"to {int(self._processed_sweeps[key] - now)}s for "
                 f"{sweep.pool.side.value} ${sweep.pool.price:,.1f}")
 
             if (_REFINE_ENABLED
@@ -735,10 +717,7 @@ class EntryEngine:
             key = self._sweep_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
             new_exp = now + max(5.0, cooldown)
-            if old_exp <= now:
-                self._processed_sweeps[key] = new_exp
-            else:
-                self._processed_sweeps[key] = min(old_exp, new_exp)
+            self._processed_sweeps[key] = new_exp if old_exp <= 0.0 else min(old_exp, new_exp)
 
             sig = EntrySignal(
                 side=side,
@@ -1191,27 +1170,6 @@ class EntryEngine:
             f"${sweep.pool.price:,.1f} quality={sweep.quality:.2f} "
             f"wick=${sweep.wick_extreme:,.1f}")
 
-    def _entry_opportunity_score(self, *, qd, phase: str, evidence_score: float, opposing_score: float) -> tuple[float, str]:
-        """Single continuous opportunity score for EntryEngine authority.
-
-        This is the anti-overtrade mechanism: posterior probability, expected R,
-        evidence separation and uncertainty collapse into one frontier score. It
-        is not a separate filter stack and it does not re-check TP/SL.
-        """
-        try:
-            import config as _cfg
-            min_ev = float(getattr(_cfg, "ENTRY_OPPORTUNITY_MIN_EV_R", 0.04))
-        except Exception:
-            min_ev = 0.04
-        p = max(0.0, min(1.0, float(getattr(qd, "posterior", 0.0) or 0.0)))
-        ev = float(getattr(qd, "expected_value", 0.0) or 0.0)
-        ev_term = max(0.0, min(1.0, (ev - min_ev) / max(0.18, abs(min_ev) + 0.18)))
-        separation = max(0.0, float(evidence_score) - float(opposing_score))
-        sep_term = max(0.0, min(1.0, separation / 42.0))
-        phase_mult = {"DISPLACEMENT": 1.00, "CISD": 0.96, "OTE": 0.92, "MATURE": 0.86}.get(str(phase).upper(), 0.90)
-        score = phase_mult * (0.48 * p + 0.32 * ev_term + 0.20 * sep_term)
-        return max(0.0, min(1.0, score)), f"oppScore={score:.3f} p={p:.3f} ev={ev:+.3f}R sep={separation:.1f} phase×{phase_mult:.2f}"
-
     def _do_post_sweep(self, snap, flow, ict, price, atr, now) -> None:
         ps = self._post_sweep
         if ps is None:
@@ -1614,16 +1572,6 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"QUANT_WAIT reverse: {qd.compact()}")
-            opp_score, opp_reason = self._entry_opportunity_score(qd=qd, phase=phase, evidence_score=rev_total, opposing_score=cont_total)
-            try:
-                min_opp = float(_entry_cfg_value("ENTRY_OPPORTUNITY_MIN_SCORE", 0.58))
-            except Exception:
-                min_opp = 0.58
-            self._last_sweep_analysis["entry_opportunity_score"] = opp_score
-            self._last_sweep_analysis["entry_opportunity_reason"] = opp_reason
-            if opp_score < min_opp:
-                return PostSweepDecision(action="wait", direction="", confidence=0.0,
-                    reason=f"OPPORTUNITY_WAIT reverse: {opp_reason} < {min_opp:.2f}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
@@ -1632,8 +1580,6 @@ class EntryEngine:
                     reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
             score_conf = min(1.0, rev_total / 90.0)
             conf = 0.78 * qd.posterior + 0.22 * score_conf
-            quality_score = float(self._last_sweep_analysis.get("quality_score", 1.0) or 1.0)
-            conf *= max(0.50, min(1.0, 0.70 + 0.30 * quality_score))
             if ps.cisd_detected: conf = min(1.0, conf + 0.05)
             if ps.ote_reached: conf = min(1.0, conf + 0.03)
             self._log_posterior_accept_once(
@@ -1661,16 +1607,6 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"QUANT_WAIT continue: {qd.compact()}")
-            opp_score, opp_reason = self._entry_opportunity_score(qd=qd, phase=phase, evidence_score=cont_total, opposing_score=rev_total)
-            try:
-                min_opp = float(_entry_cfg_value("ENTRY_OPPORTUNITY_MIN_SCORE", 0.58))
-            except Exception:
-                min_opp = 0.58
-            self._last_sweep_analysis["entry_opportunity_score"] = opp_score
-            self._last_sweep_analysis["entry_opportunity_reason"] = opp_reason
-            if opp_score < min_opp:
-                return PostSweepDecision(action="wait", direction="", confidence=0.0,
-                    reason=f"OPPORTUNITY_WAIT continue: {opp_reason} < {min_opp:.2f}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
@@ -1683,12 +1619,9 @@ class EntryEngine:
                 f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
                 now,
             )
-            cont_conf = 0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0)
-            quality_score = float(self._last_sweep_analysis.get("quality_score", 1.0) or 1.0)
-            cont_conf *= max(0.50, min(1.0, 0.70 + 0.30 * quality_score))
             return PostSweepDecision(
                 action="continue", direction=cont_dir,
-                confidence=cont_conf,
+                confidence=0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0),
                 next_target=cont_target,
                 reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
                        f"[{phase}] {' + '.join(cont_r[:5])}")
@@ -1748,16 +1681,7 @@ class EntryEngine:
     def _liquidation_guard(side: str, entry: float) -> tuple:
         try:
             import config as _liq_cfg
-            # v70: use the active instrument policy leverage, not global BTC
-            # config.LEVERAGE.  Multi-asset contexts can run xStocks/metals at
-            # lower/effective leverage than BTC; using the BTC global here made
-            # valid structural SLs look beyond liquidation and caused false
-            # sl_envelope deferrals on non-BTC products.
-            try:
-                from core.market_policy import policy_value as _policy_value
-                leverage = max(float(_policy_value("leverage", getattr(_liq_cfg, "LEVERAGE", 1.0)) or 1.0), 1.0)
-            except Exception:
-                leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+            leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
             maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
             liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
         except Exception:
@@ -1852,71 +1776,6 @@ class EntryEngine:
                 continue
         return best_reward
 
-
-    def _tp_frontier_for_candidate_sl(self, snap, side: str, price: float, atr: float, sl: float, min_rr: float):
-        """Return (score, best_tp_score) for a candidate SL risk box.
-
-        This is the capital-efficiency bridge between SL and TP.  The stop is
-        not selected in isolation: a farther protective pool is only accepted
-        when the resulting risk box still leaves a positive-expectancy,
-        reachable liquidity target.  This keeps the system unified without
-        adding a new veto layer after EntryEngine.
-        """
-        try:
-            from strategy.liquidity_pool_selector import score_tp_pools as _score_tp
-        except ImportError:
-            try:
-                from liquidity_pool_selector import score_tp_pools as _score_tp  # type: ignore
-            except ImportError:
-                return 0.0, None
-        try:
-            if snap is None or atr <= 0 or abs(float(price) - float(sl)) <= 1e-10:
-                return 0.0, None
-            posterior_prob = self._current_quant_posterior()
-            if is_btc_context(self):
-                required_rr = btc_static_rr_floor(float(min_rr) + _TP_RR_SAFETY_BUFFER, posterior_prob)
-            else:
-                required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
-            _htf_ref = getattr(self, "_htf", None) or getattr(self, "htf_engine", None)
-            scores = _score_tp(
-                snap=snap, side=side, entry=price, sl=sl, atr=atr,
-                ict=getattr(self, "_ict", None), htf=_htf_ref,
-                min_rr=required_rr, now=time.time(),
-                posterior_prob=posterior_prob,
-            )
-            if not scores:
-                return 0.0, None
-            best = scores[0]
-            comps = getattr(best, "components", {}) or {}
-            selection_ev = float(comps.get("selection_ev", getattr(best, "ev", 0.0)) or 0.0)
-            ev_r = float(comps.get("expected_value_r", 0.0) or 0.0)
-            delivery = float(comps.get("delivery_prob", getattr(best, "sweep_prob", 0.0)) or 0.0)
-            rr = float(getattr(best, "rr", 0.0) or 0.0)
-            # One scalar for comparing SL risk boxes.  TP selector already
-            # enforced positive EV_R and delivery gates; this tie-breaker prefers
-            # robust hit-rate + payoff per unit risk, not moonshot RR.
-            frontier = max(selection_ev, 0.0) * (0.70 + 0.30 * min(max(delivery, 0.0) / 0.55, 1.35)) * (1.0 + min(max(rr - 1.0, 0.0), 3.0) * 0.05)
-            # Never let a tiny nominal frontier with barely-positive EV dominate.
-            if ev_r <= 0.0:
-                frontier *= 0.25
-            return frontier, best
-        except Exception:
-            return 0.0, None
-
-    @staticmethod
-    def _tp_score_text(score) -> str:
-        try:
-            comps = getattr(score, "components", {}) or {}
-            return (
-                f"tp=${float(getattr(score, 'tp_price', 0.0)):.1f} "
-                f"rr={float(getattr(score, 'rr', 0.0)):.2f} "
-                f"P={float(comps.get('delivery_prob', 0.0)):.3f} "
-                f"EV_R={float(comps.get('expected_value_r', 0.0)):.3f} "
-                f"frontier={float(comps.get('selection_ev', getattr(score, 'ev', 0.0))):.3f}"
-            )
-        except Exception:
-            return "tp-frontier unavailable"
-
     @staticmethod
     def _accepts_pool_stop_geometry(
         current_risk: float,
@@ -1940,97 +1799,14 @@ class EntryEngine:
         if target_reward > 0.0 and current_rr >= ev_floor and pool_rr < ev_floor:
             return False, f"pool SL drops TP geometry {current_rr:.2f}R->{pool_rr:.2f}R below EV floor {ev_floor:.2f}R"
 
-        # v66: do not over-veto a correct protective stop simply because it is
-        # farther away than the first wick buffer. Keep the EV/RR floor, but do
-        # not leave the executable SL inside/near the liquidity cluster.
         quality_hurdle = min(
-            0.78,
-            0.32 + 0.08 * max(0.0, expansion - 1.0) + 0.05 * max(0.0, current_rr - pool_rr),
+            0.92,
+            0.42 + 0.11 * max(0.0, expansion - 1.0) + 0.08 * max(0.0, current_rr - pool_rr),
         )
-        if expansion > 1.75 and pool_quality < quality_hurdle:
+        if expansion > 1.35 and pool_quality < quality_hurdle:
             return False, f"pool SL risk expansion {expansion:.2f}x needs quality {quality_hurdle:.2f}, got {pool_quality:.2f}"
 
         return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
-
-    def _apply_btc_v58_institutional_sl_envelope(
-        self, snap, side: str, price: float, atr: float, structural_sl: float,
-        invalidation_price: float, label: str, min_risk: float = 0.0,
-    ):
-        """BTC-only v58 structural SL with institutional liquidity exclusion."""
-        if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
-            return None, "non-protective BTC structural SL"
-        min_risk = max(0.0, float(min_risk or 0.0))
-        _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
-        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
-        sl = float(structural_sl)
-        risk = abs(float(price) - sl)
-        invalidation_gap = abs(float(price) - float(invalidation_price)) if invalidation_price else 0.0
-        noise_floor = max(
-            atr * (0.38 + 0.28 * min(max(self._atr_pctile, 0.0), 1.0)),
-            invalidation_gap + atr * 0.20,
-            min_risk,
-        )
-        if risk < noise_floor:
-            sl = price - noise_floor if side == "long" else price + noise_floor
-            risk = abs(price - sl)
-
-        pool_sl, _pool_target, pool_pick = self._find_sl_pool(
-            snap=snap,
-            side=side,
-            entry=price,
-            atr=atr,
-            ict=getattr(self, "_ict", None),
-            invalidation_price=invalidation_price,
-            max_buffer_atr=btc_sl_buffer_limits(1.25),
-            min_risk=min_risk,
-        )
-        if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
-            pool_risk = abs(price - pool_sl)
-            if pool_risk <= max_risk and pool_risk > risk:
-                current_frontier, current_tp_score = self._tp_frontier_for_candidate_sl(
-                    snap, side, price, atr, sl, _MIN_RR_RATIO)
-                pool_frontier, pool_tp_score = self._tp_frontier_for_candidate_sl(
-                    snap, side, price, atr, pool_sl, _MIN_RR_RATIO)
-                if current_frontier > 0.0 and pool_frontier <= 0.0:
-                    logger.info(
-                        "BTC SL envelope %s: keeping structural SL $%.1f; far liquidity anchor $%.1f "
-                        "destroys TP frontier (%s)",
-                        label, sl, pool_sl, self._tp_score_text(current_tp_score))
-                elif current_frontier > 0.0 and pool_frontier < current_frontier * 0.45:
-                    logger.info(
-                        "BTC SL envelope %s: keeping capital-efficient SL $%.1f over $%.1f; "
-                        "TP frontier %.3f -> %.3f would degrade execution quality",
-                        label, sl, pool_sl, current_frontier, pool_frontier)
-                else:
-                    sl = pool_sl
-                    risk = pool_risk
-                    try:
-                        details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                        logger.info(
-                            "BTC SL envelope %s: v58 sweep SL expanded behind live liquidity $%.1f "
-                            "(risk %.2fATR; %s; tp_frontier=%.3f %s)",
-                            label, sl, risk / max(atr, 1e-10), details,
-                            pool_frontier, self._tp_score_text(pool_tp_score))
-                    except Exception:
-                        pass
-            elif pool_risk > max_risk:
-                return None, (
-                    f"BTC protective SL pool ${pool_sl:.1f} beyond liquidation guard; "
-                    "refusing stop inside liquidity")
-
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
-        risk = abs(price - sl)
-        if not self._sl_is_protective(side, sl, price):
-            return None, "BTC SL crossed market after liquidity push"
-        if not self._sl_before_liquidation(side, sl, price):
-            return None, f"BTC SL breaches liquidation guard ${_liq_guard:.1f}"
-        if min_risk > 0.0 and risk < min_risk:
-            return None, f"BTC structural SL risk {risk:.1f}pts < required {min_risk:.1f}pts"
-        if risk > abs(price - structural_sl) + 1e-9:
-            logger.info(
-                "BTC SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, liquidity-aware)",
-                label, structural_sl, sl, risk / max(atr, 1e-10))
-        return sl, "ok"
 
     def _apply_institutional_sl_envelope(
         self,
@@ -2047,9 +1823,6 @@ class EntryEngine:
         Build the executable stop from structural invalidation, live noise,
         and protective liquidity. Returns (sl, reason).
         """
-        if is_btc_context(self):
-            return self._apply_btc_v58_institutional_sl_envelope(
-                snap, side, price, atr, structural_sl, invalidation_price, label, min_risk)
         if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
             return None, "non-protective structural SL"
         min_risk = max(0.0, float(min_risk or 0.0))
@@ -2080,12 +1853,7 @@ class EntryEngine:
         )
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
-            if pool_risk > max_risk:
-                return None, (
-                    f"protective SL pool ${pool_sl:.1f} sits beyond liquidation guard; "
-                    "refusing executable stop inside liquidity"
-                )
-            if pool_risk > risk:
+            if pool_risk > risk and pool_risk <= max_risk:
                 target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
                 pool_quality = float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)
                 accept_pool, geometry_reason = self._accepts_pool_stop_geometry(
@@ -2096,44 +1864,17 @@ class EntryEngine:
                     pool_quality,
                 )
                 if accept_pool:
-                    current_frontier, current_tp_score = self._tp_frontier_for_candidate_sl(
-                        snap, side, price, atr, sl, _MIN_RR_RATIO)
-                    pool_frontier, pool_tp_score = self._tp_frontier_for_candidate_sl(
-                        snap, side, price, atr, pool_sl, _MIN_RR_RATIO)
-                    # Institutional invariant: SL selection must not destroy TP
-                    # expectancy.  If the farther liquidity anchor leaves no
-                    # viable TP while the current structural envelope still has
-                    # one, the far pool becomes context/trailing information, not
-                    # the initial risk box.
-                    if current_frontier > 0.0 and pool_frontier <= 0.0:
-                        logger.info(
-                            "SL envelope %s: keeping structural SL $%.1f; far liquidity anchor $%.1f "
-                            "destroys TP frontier (%s)",
-                            label, sl, pool_sl, self._tp_score_text(current_tp_score))
-                    elif current_frontier > 0.0 and pool_frontier < current_frontier * 0.45:
-                        logger.info(
-                            "SL envelope %s: keeping capital-efficient SL $%.1f over $%.1f; "
-                            "TP frontier %.3f -> %.3f would degrade execution quality",
-                            label, sl, pool_sl, current_frontier, pool_frontier)
-                    else:
-                        sl = pool_sl
-                        risk = pool_risk
-                        details = ", ".join(getattr(pool_pick, "reasons", []) or [])
-                        logger.info(
-                            "SL envelope %s: anchored behind protective liquidity at $%.1f "
-                            "(risk %.2fATR; %s; %s; tp_frontier=%.3f %s)",
-                            label, sl, risk / max(atr, 1e-10), details, geometry_reason,
-                            pool_frontier, self._tp_score_text(pool_tp_score))
+                    sl = pool_sl
+                    risk = pool_risk
+                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                    logger.debug(
+                        "SL envelope %s: anchored to protective pool at $%.1f "
+                        "(risk %.2fATR; %s; %s)",
+                        label, sl, risk / max(atr, 1e-10), details, geometry_reason)
                 else:
-                    # Institutional invariant: if the selected protective pool
-                    # is the executable invalidation shelf, never place the SL
-                    # before/inside that liquidity.  The v77 selector handles
-                    # capital efficiency before a pool reaches this branch; once
-                    # it returns a pool, a rejected geometry means wait/refine.
-                    return None, (
-                        f"protective SL pool ${pool_sl:.1f} required but {geometry_reason}; "
-                        "refusing executable stop inside liquidity"
-                    )
+                    logger.info(
+                        "SL envelope %s: ignored protective pool $%.1f (%s)",
+                        label, pool_sl, geometry_reason)
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
@@ -2156,14 +1897,14 @@ class EntryEngine:
         self, ps, action: str, side: str, snap, flow, ict,
         price: float, atr: float, now: float, phase: str
     ) -> tuple[bool, str]:
-        """Route only structurally accepted, executable post-sweep entries.
+        """Dynamic market-aware execution diagnostics before signal construction.
 
-        This is not a retail yes/no filter.  It prices the post-sweep auction as
-        an execution-quality surface: delivery proof, chase distance, flow/CVD,
-        premium/discount, and multi-timeframe structure all compound into one
-        score.  If the entry lacks any real delivery acceptance, or the combined
-        quality falls below the current market-profile floor, the setup is held
-        for more evidence instead of being sent to sizing/execution.
+        This layer no longer vetoes sweep decisions. The quantitative
+        posterior/EV model already decides whether a post-sweep auction has
+        positive executable edge. The quality gate now converts institutional
+        observations into a continuous quality score and audit trail so weak
+        conditions reduce confidence/position size downstream instead of creating
+        a hidden low-quality veto.
         """
         profile = self._market_profile(snap, flow, ict, price, atr, side)
         a = max(float(atr or 0.0), 1e-9)
@@ -2186,127 +1927,83 @@ class EntryEngine:
 
         score = 1.0
         notes = []
-        critical = []
 
-        # 1) Delivery/structure proof.  No accepted delivery = no executable
-        # entry.  A real sweep thesis needs CISD, OTE/retrace acceptance, or a
-        # strong displacement footprint.  Raw posterior math alone is not enough.
-        accepted_delivery = (disp >= min_disp) or cisd or ote
-        if not accepted_delivery:
+        # 1) Delivery/structure proof. Weak proof is a size/confidence penalty.
+        if disp < min_disp and not (cisd or ote):
             miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
-            score *= max(0.38, 1.0 - 0.48 * miss)
-            msg = f"delivery_unaccepted DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
-            notes.append(msg)
-            critical.append(msg)
-        elif disp < min_disp:
-            # CISD/OTE can rescue a shallow raw displacement, but size/confidence
-            # must still be reduced because price has not travelled far enough.
-            miss = min(1.0, (min_disp - disp) / max(min_disp, 1e-9))
-            score *= max(0.72, 1.0 - 0.18 * miss)
-            notes.append(f"shallow_delivery_rescued DISP={disp:.2f}ATR<{min_disp:.2f}ATR via CISD/OTE")
+            score *= max(0.45, 1.0 - 0.38 * miss)
+            notes.append(
+                f"delivery_weak DISP={disp:.2f}ATR<{min_disp:.2f}ATR no CISD/OTE"
+            )
 
-        # 2) Chase distance.  Far-from-raid entries require accepted retrace or
-        # very strong displacement; otherwise the entry is paying liquidity, not
-        # harvesting it.
-        if dist_from_sweep_atr > chase_limit and not (cisd or ote or disp >= strong_disp):
+        # 2) Chase distance. Far-from-sweep entries need more quality.
+        if dist_from_sweep_atr > chase_limit and not (cisd or ote):
             over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
-            score *= max(0.42, 1.0 - 0.32 * over)
-            msg = f"chase_unaccepted {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
-            notes.append(msg)
-            critical.append(msg)
-        elif dist_from_sweep_atr > chase_limit:
-            over = min(2.0, (dist_from_sweep_atr - chase_limit) / max(chase_limit, 1e-9))
-            score *= max(0.75, 1.0 - 0.12 * over)
-            notes.append(f"extended_but_accepted {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR")
+            score *= max(0.45, 1.0 - 0.25 * over)
+            notes.append(
+                f"chase_extended {dist_from_sweep_atr:.2f}ATR>{chase_limit:.2f}ATR"
+            )
 
-        # 3) Flow/CVD opposition.  Severe contra flow without strong delivery is
-        # an execution-integrity defect; mild opposition is a sizing penalty.
+        # 3) Flow/CVD opposition becomes a regime penalty.
         flow_dir = str(getattr(flow, "direction", "") or "").lower()
         flow_conv = abs(float(getattr(flow, "conviction", 0.0) or 0.0))
         cvd = float(getattr(flow, "cvd_trend", 0.0) or 0.0)
-        flow_bad = bool(flow_dir and flow_dir != side_l and flow_conv >= opp_flow)
-        cvd_bad = ((side_l == "long" and cvd <= -opp_cvd)
-                   or (side_l == "short" and cvd >= opp_cvd))
-        if flow_bad:
+        if flow_dir and flow_dir != side_l and flow_conv >= opp_flow:
             excess = min(1.0, (flow_conv - opp_flow) / max(1.0 - opp_flow, 1e-9))
-            score *= max(0.55, 1.0 - 0.24 * excess)
+            score *= max(0.50, 1.0 - 0.25 * excess)
             notes.append(f"flow_contra {flow_dir}={flow_conv:.2f}")
-        if cvd_bad:
+        if side_l == "long" and cvd <= -opp_cvd:
             excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
-            score *= max(0.56, 1.0 - 0.23 * excess)
+            score *= max(0.52, 1.0 - 0.22 * excess)
             notes.append(f"cvd_contra {cvd:.2f}")
-        if flow_bad and cvd_bad and disp < strong_disp:
-            critical.append(f"flow_and_cvd_contra_without_strong_delivery DISP={disp:.2f}ATR<{strong_disp:.2f}ATR")
+        if side_l == "short" and cvd >= opp_cvd:
+            excess = min(1.0, (abs(cvd) - opp_cvd) / max(1.0 - opp_cvd, 1e-9))
+            score *= max(0.52, 1.0 - 0.22 * excess)
+            notes.append(f"cvd_contra {cvd:.2f}")
 
-        # 4) Continuation requires acceptance away from the swept pool.
+        # 4) Continuation needs acceptance, but lack of proof reduces quality.
         if action_l == "continue":
             accepted = disp >= profile.displacement_min(_ENTRY_CONT_MIN_ACCEPT_ATR)
             if not (accepted and (cisd or disp >= strong_disp or ote)):
-                score *= 0.56
-                msg = f"continuation_without_acceptance DISP={disp:.2f}ATR strong={strong_disp:.2f}"
-                notes.append(msg)
-                critical.append(msg)
+                score *= 0.62
+                notes.append(
+                    f"continuation_acceptance_soft DISP={disp:.2f}ATR strong={strong_disp:.2f}"
+                )
 
-        # 5) Premium/discount mismatch.  A reversal can fight P/D only with
-        # strong delivery plus CISD/OTE; otherwise the entry is structurally late.
+        # 5) Premium/discount mismatch is a penalty unless strong proof exists.
         pd = float(getattr(ict, "dealing_range_pd", 0.5) or 0.5)
         dr_long_max, dr_short_min = profile.dealing_range_bounds(
             _ENTRY_REVERSAL_PD_LONG_MAX, _ENTRY_REVERSAL_PD_SHORT_MIN)
         if action_l == "reverse" and disp < strong_disp:
             if side_l == "long" and pd > dr_long_max and not (cisd and ote):
-                score *= 0.66
-                msg = f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}"
-                notes.append(msg)
-                critical.append(msg)
+                score *= 0.70
+                notes.append(f"pd_contra_long PD={pd:.2f}>{dr_long_max:.2f}")
             if side_l == "short" and pd < dr_short_min and not (cisd and ote):
-                score *= 0.66
-                msg = f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}"
-                notes.append(msg)
-                critical.append(msg)
+                score *= 0.70
+                notes.append(f"pd_contra_short PD={pd:.2f}<{dr_short_min:.2f}")
 
-        # 6) Multi-timeframe context.  15m + 4h alignment against the trade is
-        # routeable only when the post-sweep delivery footprint is strong.
+        # 6) HTF contra trades are not prohibited; they require lower exposure.
         s15 = str(getattr(ict, "structure_15m", "") or "").lower()
         s4h = str(getattr(ict, "structure_4h", "") or "").lower()
-        htf_bull = int("bull" in s15) + int("bull" in s4h)
-        htf_bear = int("bear" in s15) + int("bear" in s4h)
+        htf_bull = ("bull" in s15) + ("bull" in s4h)
+        htf_bear = ("bear" in s15) + ("bear" in s4h)
         if disp < strong_disp:
             if side_l == "long" and htf_bear >= 2:
-                score *= 0.62
-                msg = f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}"
-                notes.append(msg)
-                critical.append(msg)
+                score *= 0.68
+                notes.append(f"htf_contra_long 15m/4h bearish DISP<{strong_disp:.2f}")
             if side_l == "short" and htf_bull >= 2:
-                score *= 0.62
-                msg = f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}"
-                notes.append(msg)
-                critical.append(msg)
+                score *= 0.68
+                notes.append(f"htf_contra_short 15m/4h bullish DISP<{strong_disp:.2f}")
 
-        score = max(0.05, min(1.0, score))
-        dynamic_floor = max(0.42, min(0.76, _ENTRY_EXECUTION_QUALITY_MIN * max(0.90, min(1.20, profile.selectivity))))
-        critical_floor = max(dynamic_floor, min(0.82, _ENTRY_CRITICAL_DEFECT_FLOOR * max(0.90, min(1.18, profile.selectivity))))
-
+        score = max(0.20, min(1.0, score))
         try:
             self._last_sweep_analysis["quality_score"] = score
-            self._last_sweep_analysis["quality_floor"] = dynamic_floor
-            self._last_sweep_analysis["quality_critical_floor"] = critical_floor
             self._last_sweep_analysis["quality_notes"] = notes[:8]
-            self._last_sweep_analysis["quality_critical"] = critical[:8]
         except Exception:
             pass
 
         note = " | ".join(notes[:4]) if notes else "clean"
-        if critical and score < critical_floor:
-            return False, (
-                f"entry_integrity_score={score:.2f}<{critical_floor:.2f} "
-                f"critical={' ; '.join(critical[:3])} | {profile.compact()}"
-            )
-        if score < dynamic_floor:
-            return False, (
-                f"entry_quality_score={score:.2f}<{dynamic_floor:.2f} "
-                f"{note} | {profile.compact()}"
-            )
-        return True, f"entry_quality_score={score:.2f}>={dynamic_floor:.2f} {note} | {profile.compact()}"
+        return True, f"dynamic_quality_score={score:.2f} {note} | {profile.compact()}"
 
     def _evaluate_pending_refined_entry(
         self, snap, flow, ict, price: float, atr: float, now: float
@@ -2630,12 +2327,11 @@ class EntryEngine:
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
 
-        # Continuation target is selected only by the EV-ranked liquidity
-        # selector below.  The DirectionEngine target is a directional hint,
-        # never a buffered executable TP.
-        tp = 0.0
+        tp_buf = atr * 0.35
+        tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf
+
         risk = abs(price - sl)
-        reward = 0.0
+        reward = abs(tp - price)
 
         if risk < 1e-10:
             logger.info(
@@ -2655,7 +2351,7 @@ class EntryEngine:
                 sl = sweep.pool.price + pool_clearance
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
-            reward = 0.0
+            reward = abs(tp - price)
             logger.debug(
                 f"SL (cont) expanded to pool+floor: risk={risk:.1f}pts "
                 f"({risk/atr:.2f}x ATR) side={side}")
@@ -2740,10 +2436,11 @@ class EntryEngine:
     def _find_tp(self, snap, side, price, atr, sl, min_rr):
         """Find TP via EV-ranked institutional liquidity selection + audit report.
 
-        The selector is the single TP authority: live-side geometry, delivery
-        probability, EV_R, reachable liquidity and fee-adjusted RR are calculated
-        once and ranked on one frontier score. Rejected pools remain visible in
-        diagnostics so Telegram explains why a visible pool was not used.
+        The selector is intentionally strict: a visible BSL/SSL must still pass
+        side, active-status, reach, R:R, probability, gauntlet, and execution-cost
+        gates.  The important upgrade here is observability: every rejected pool
+        is retained in self._last_pool_plan so logs and /thinking explain WHY the
+        visible pool was not used.
         """
         risk = abs(price - sl)
         if risk < 1e-10:
@@ -2752,11 +2449,8 @@ class EntryEngine:
                 "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
+        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         posterior_prob = self._current_quant_posterior()
-        if is_btc_context(self):
-            required_rr = btc_static_rr_floor(float(min_rr) + _TP_RR_SAFETY_BUFFER, posterior_prob)
-        else:
-            required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         try:
             from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:
@@ -2789,29 +2483,6 @@ class EntryEngine:
             logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
             return None, None
 
-        # Final geometry guard: a selected target must sit beyond entry on the
-        # profit side while the stop stays protective.  This is intentionally
-        # duplicated at strategy level so a future selector change cannot leak a
-        # malformed TP/SL pair into sizing or execution.
-        if side == "long" and not (sl < price < tp_price):
-            report = dict(report or {})
-            report["strategy_gate"] = (
-                f"selected TP failed geometry gate: long requires SL < entry < TP; "
-                f"sl={sl:.2f} entry={price:.2f} tp={tp_price:.2f}")
-            report["summary"] = report["strategy_gate"]
-            self._record_pool_report(report)
-            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
-            return None, None
-        if side == "short" and not (sl > price > tp_price):
-            report = dict(report or {})
-            report["strategy_gate"] = (
-                f"selected TP failed geometry gate: short requires SL > entry > TP; "
-                f"sl={sl:.2f} entry={price:.2f} tp={tp_price:.2f}")
-            report["summary"] = report["strategy_gate"]
-            self._record_pool_report(report)
-            logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
-            return None, None
-
         # Strategy-level BE gate: TP must clear round-trip fees + slippage.
         min_net_move = max(
             atr * _TP_MIN_NET_ATR,
@@ -2837,15 +2508,10 @@ class EntryEngine:
             return None, None
 
         if score is not None:
-            _components = getattr(score, "components", {}) or {}
-            _delivery_p = float(_components.get("delivery_prob", getattr(score, "sweep_prob", 0.0)) or 0.0)
-            _required_p = float(_components.get("required_delivery_prob", 0.0) or 0.0)
-            _ev_r = float(_components.get("expected_value_r", 0.0) or 0.0)
-            _frontier = float(_components.get("selection_ev", getattr(score, "ev", 0.0)) or 0.0)
             logger.info(
-                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P_delivery=%.4f P_required=%.4f EV_R=%.3f frontier=%.3f gauntlet=%d (%s)",
+                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
-                _delivery_p, _required_p, _ev_r, _frontier, score.gauntlet_n,
+                score.sweep_prob, score.ev, score.gauntlet_n,
                 ", ".join(score.reasons) if score.reasons else "institutional gates passed",
             )
         return tp_price, target
@@ -2877,7 +2543,7 @@ class EntryEngine:
                 "summary": "liquidity selector unavailable; abstaining from stop selection",
                 "selected": None, "candidates": [],
             })
-            return None, None, None
+            return None, None
 
         sl_price, target, pick, report_obj = _sel_sl(
             snap=snap, side=side, entry=entry, atr=atr,
@@ -2939,7 +2605,7 @@ class EntryEngine:
             if not isinstance(selected, dict):
                 return float(fallback)
             floor = float(selected.get("required_rr", fallback) or fallback)
-            return max(0.50, min(20.0, floor))
+            return max(0.50, min(float(fallback), floor))
         except Exception:
             return float(fallback)
 
@@ -2962,21 +2628,13 @@ class EntryEngine:
                 tf = r.get("timeframe", "")
                 ps = r.get("pool_side", "")
                 rr = float(r.get("rr") or 0.0)
-                frontier = float(r.get("selection_ev") or r.get("ev") or 0.0)
-                ev_r = float(r.get("expected_value_r") or 0.0)
-                p_del = float(r.get("delivery_prob") or r.get("sweep_prob") or 0.0)
-                p_req = float(r.get("required_delivery_prob") or 0.0)
+                ev = float(r.get("ev") or 0.0)
                 reason = r.get("reason", "")
                 notes = r.get("notes") or []
                 if isinstance(notes, list) and notes:
                     reason = f"{reason} ({', '.join(map(str, notes[:3]))})"
                 mark = "SELECTED" if r.get("selected") else ("OK" if r.get("eligible") else "NO")
-                if str(role).upper() == "TP":
-                    bits.append(
-                        f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} "
-                        f"P={p_del:.3f}/{p_req:.3f} EV_R={ev_r:.3f} frontier={frontier:.3f} — {reason}")
-                else:
-                    bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} frontier={frontier:.3f} — {reason}")
+                bits.append(f"{mark} {ps}@${px:.1f} {tf} rr={rr:.2f} ev={ev:.3f} — {reason}")
             return " | ".join(bits)
         except Exception as e:
             return f"pool audit format error: {e}"
@@ -3029,63 +2687,81 @@ class EntryEngine:
         rr_quality = 1.0 + min(max(rr - required_rr, 0.0), 3.0) * 0.18
         return sig * tf_mult * htf_mult * struct_mult * confluence_mult * distance_draw * rr_quality
 
-    # Legacy OB/momentum SL builder removed in v67.  The entry engine is
-    # sweep-only; every executable stop is now built from sweep invalidation +
-    # MTF liquidity shield via _apply_institutional_sl_envelope().
+    def _compute_sl(self, ict, side, price, atr):
+        """ICT Order Block-based SL for momentum/displacement entries.
 
-    def _push_sl_behind_pools(self, sl, side, price, atr):
-        """Force executable SL outside all nearby protective liquidity zones.
-
-        A stop placed *at* SSL/BSL is just more liquidity. This method treats
-        each pool between entry and the proposed SL as a stop-cluster envelope
-        and pushes the stop beyond the far edge of that envelope. Equality is
-        included deliberately: SL == pool.price is not protected.
+        Placement priority:
+          1. Nearest OB on the entry side (structural anchor — tightest valid SL)
+        Validation:
+          - OB SL must clear live noise.
+          - OB SL must remain before the exchange liquidation guard.
         """
-        snap = self._last_liq_snapshot
-        if snap is None or atr <= 0:
-            return sl
-
-        def _tf_rank(tf: str) -> int:
-            return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}.get(str(tf).lower(), 2)
-
-        def _status_usable(pool) -> bool:
-            status = str(getattr(pool, "status", "") or "").upper()
-            return status not in ("CONSUMED",)
-
-        def _pool_buffer(pool) -> float:
-            sig = float(getattr(pool, "significance", 0.0) or 0.0)
-            touches = max(1, int(getattr(pool, "touches", 1) or 1))
-            tf_rank = _tf_rank(str(getattr(pool, "timeframe", "5m") or "5m"))
-            sig_term = min(0.42, 0.045 * max(0.0, sig))
-            touch_term = min(0.24, 0.035 * max(0, touches - 2))
-            tf_term = min(0.22, 0.045 * max(0, tf_rank - 2))
-            return max(0.30, min(1.35, 0.30 + sig_term + touch_term + tf_term)) * atr
-
-        sl_origin = float(sl)
-        sl_new = float(sl)
-        max_push = 6.0 * atr
+        if ict is None:
+            return None
 
         if side == "long":
-            for t in list(getattr(snap, "ssl_pools", []) or []):
-                pool = getattr(t, "pool", t)
-                if not _status_usable(pool):
-                    continue
-                px = float(getattr(pool, "price", 0.0) or 0.0)
-                if sl_new <= px < price:
-                    candidate = px - _pool_buffer(pool)
-                    if sl_origin - candidate <= max_push:
-                        sl_new = min(sl_new, candidate)
+            ob = ict.nearest_ob_price
         else:
-            for t in list(getattr(snap, "bsl_pools", []) or []):
-                pool = getattr(t, "pool", t)
-                if not _status_usable(pool):
-                    continue
-                px = float(getattr(pool, "price", 0.0) or 0.0)
-                if price < px <= sl_new:
-                    candidate = px + _pool_buffer(pool)
-                    if candidate - sl_origin <= max_push:
-                        sl_new = max(sl_new, candidate)
-        return sl_new
+            ob = getattr(ict, 'nearest_ob_price_short', 0.0) or 0.0
+
+        sl = None
+        if ob > 0:
+            if side == "long" and ob < price:
+                sl = ob - atr * 0.20
+            elif side == "short" and ob > price:
+                sl = ob + atr * 0.20
+
+        if sl is not None:
+            ob_risk = abs(price - sl)
+            if ob_risk < atr * _SL_MIN_ATR_MULT or not self._sl_before_liquidation(side, sl, price):
+                sl = None
+
+        if sl is None:
+            return None
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            return None
+        risk = abs(price - sl)
+
+        # Hard floor: noise minimum
+        if risk < atr * _SL_MIN_ATR_MULT:
+            return None
+
+        if not self._sl_before_liquidation(side, sl, price):
+            return None
+        return sl
+
+    def _push_sl_behind_pools(self, sl, side, price, atr):
+        """Push SL behind nearby liquidity pools.
+
+        EE-6 FIX: cap the total push distance to _SL_PUSH_MAX_ATR from the
+        starting SL so a large `snap.bsl_pools` list with one outlier pool
+        far from price cannot shift SL to an unrealistic distance.
+        """
+        snap = self._last_liq_snapshot
+        if snap is None:
+            return sl
+        _SL_PUSH_MAX_ATR = 3.0     # never push SL more than 3 ATR from original
+        sl_origin = sl
+        buf = 0.25 * atr
+        if side == "long":
+            for t in snap.ssl_pools:
+                if sl < t.pool.price < price:
+                    candidate = t.pool.price - buf
+                    # Cap: candidate must not be more than _SL_PUSH_MAX_ATR ATR
+                    # below the original SL.
+                    if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = min(sl, candidate)
+        else:
+            for t in snap.bsl_pools:
+                if price < t.pool.price < sl:
+                    candidate = t.pool.price + buf
+                    if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
+                        continue
+                    sl = max(sl, candidate)
+        return sl
 
     @staticmethod
     def _ict_summary(ict, side):

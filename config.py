@@ -4,7 +4,7 @@ config.py — Unified Configuration v10.0
 Single source of truth. All institutional parameters inline.
 No config_overrides.py — everything lives here.
 
-Calibrated for selective positive-expectancy liquidity trades; no win-rate guarantee is implied.
+Calibrated for 65-75% WR, 3-6 trades per session.
 """
 import os
 try:
@@ -15,23 +15,19 @@ except ImportError:  # production image may not ship python-dotenv
 load_dotenv()
 
 # ── Exchange routing ──────────────────────────────────────────────────────────
-EXECUTION_EXCHANGE = "delta"
+EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
 DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
+COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
+COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
-
-# Keep module imports/test tooling/dashboard safe without live secrets. The bot
-# runtime still refuses to trade unless a configured exchange has both key and
-# secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
-# deployment-time fail-fast check.
-if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY and DELTA_SECRET_KEY):
-    raise ValueError("No Delta credentials in .env. Set DELTA_API_KEY and DELTA_SECRET_KEY.")
+if not DELTA_API_KEY and not COINSWITCH_API_KEY:
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY or COINSWITCH_API_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -39,6 +35,8 @@ LEVERAGE                 = 40
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
+COINSWITCH_SYMBOL        = "BTCUSDT"
+COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BALANCE_USAGE_PERCENTAGE = 60
@@ -75,10 +73,10 @@ TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
-# Quality signals are priced into the execution decision. Mechanical defects
-# always stop routing; weak delivery/coherence must clear an adaptive quality
-# floor before an order is allowed to reach sizing/execution.
-INSTITUTIONAL_STRICT_QUALITY_GATES = True
+# Style/quality signals are never hidden alpha vetoes. They are continuous
+# references used for score, size multiplier, expected utility, and attribution.
+# Only mechanical account/exchange safety can stop routing.
+INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
@@ -86,8 +84,6 @@ INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
-ENTRY_EXECUTION_QUALITY_MIN        = 0.52
-ENTRY_CRITICAL_DEFECT_FLOOR        = 0.62
 ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
 ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
@@ -96,8 +92,9 @@ POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
 
 
 # ── Order execution ───────────────────────────────────────────────────────────
-TICK_SIZE                        = 0.5
+TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
 TICK_SIZE_DELTA                  = 0.5
+TICK_SIZE_COINSWITCH             = 0.1
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -105,21 +102,12 @@ MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
 LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
-# v73: high-readiness accepted sweeps must not sit as passive maker orders.
-# Use the final EntryReadiness surface, not raw composite signal confidence, to
-# trigger fast native-bracket execution. This is still exchange-attached TP/SL.
-ENTRY_PROTECTED_CROSS_READINESS  = 0.78
-ENTRY_PROTECTED_CROSS_EDGE       = 0.06
-ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF = False
-ENTRY_PROTECTED_CROSS_MIN_CONF   = 0.70
-ENTRY_PROTECTED_CROSS_TICKS      = 2.0
-DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS = True
-PROTECTED_CROSS_FILL_TIMEOUT_SEC = 12.0
 REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
 # fails, the strategy aborts the entry instead of falling back to naked limit
-# + standalone conditionals.
+# + standalone conditionals. CoinSwitch still uses standalone SL/TP because it
+# has no Delta-style native bracket endpoint.
 DELTA_REQUIRE_NATIVE_BRACKET      = True
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
@@ -185,7 +173,7 @@ FEE_TO_RISK_SOFT_MAX        = 0.35
 FEE_TO_RISK_NO_ALLOC        = 0.75
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-GLOBAL_API_MIN_INTERVAL  = 0.25
+GLOBAL_API_MIN_INTERVAL  = 3.0
 DELTA_API_MIN_INTERVAL   = 0.25
 RATE_LIMIT_ORDERS        = 15
 
@@ -198,21 +186,13 @@ SL_LIMIT_OFFSET_TICKS    = 20
 #   4. Reject only when the stop crosses the liquidation guard.
 
 def get_tick_size(exchange: str | None = None) -> float:
-    """Authoritative Delta tick-size lookup for execution-sensitive price rounding."""
-    return float(TICK_SIZE_DELTA)
-
-
-# Unified EntryEngine opportunity model. These are not extra filters; they are
-# inputs to the single execution frontier score used to avoid random low-quality
-# trades while preserving the liquidity-hunt core.
-ENTRY_OPPORTUNITY_MIN_SCORE = 0.58
-ENTRY_OPPORTUNITY_MIN_EV_R = 0.04
-ENTRY_OPPORTUNITY_RISK_EFFICIENCY_WEIGHT = 0.22
-TP_MIN_EXPECTED_VALUE_R = 0.05
-TP_MIN_DELIVERY_PROB = 0.32
-TP_TARGET_DELIVERY_PROB = 0.55
-SL_IDEAL_RISK_ATR = 1.15
-SL_MAX_CAPITAL_DRAG_ATR = 4.50
+    """Authoritative tick-size lookup for execution-sensitive price rounding."""
+    ex = (exchange or EXECUTION_EXCHANGE or "").lower()
+    if ex == "delta":
+        return float(TICK_SIZE_DELTA)
+    if ex == "coinswitch":
+        return float(TICK_SIZE_COINSWITCH)
+    return float(TICK_SIZE)
 
 
 def validate_config() -> None:
@@ -470,9 +450,8 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
 # ── Institutional Dynamic Entry Quality References ───────────────────────────
-# These are adaptive scoring references for the executable entry surface. Weak
-# structure first lowers quality/size; critical defects pause routing until the
-# market provides accepted delivery.
+# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
+# signal quality and size; posterior/EV still owns trade expression.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
@@ -486,8 +465,6 @@ ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic p
 ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
 ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
-ENTRY_EXECUTION_QUALITY_MIN              = 0.52
-ENTRY_CRITICAL_DEFECT_FLOOR              = 0.62
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
 QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15
@@ -551,7 +528,7 @@ PAYOFF_TRAIL_MIN_COST_MULT = 0.75
 QUANT_CHOCH_EXPIRY_BARS = 10
 
 # ── Compatibility alias ───────────────────────────────────────────────────────
-EXCHANGE = "delta"
+EXCHANGE = COINSWITCH_EXCHANGE
 
 validate_config()
 
@@ -601,8 +578,8 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # ─────────────────────────────────────────────────────────────────────────────
 # MULTI-ASSET LIVE CATALOG SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
-# The scanner does NOT trade aliases. It queries Delta's live product catalog
-# and activates only contracts actually returned by the exchange.
+# The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
+# catalogs and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
 SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25
@@ -612,17 +589,15 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 6
+PORTFOLIO_MAX_OPEN_POSITIONS = 4
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 6
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
 # order is inside the portfolio risk cap but above the confidence-haircut target.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
-PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # six slots × 0.5% risk; aggregate account risk cap
-PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.
@@ -697,13 +672,3 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
-
-# Dashboard telemetry: non-blocking direct feed to local dashboard backend.
-# If the dashboard is offline, events are dropped; trading is never blocked.
-DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000")
-DASHBOARD_QUEUE_MAX = int(os.getenv("DASHBOARD_QUEUE_MAX", "2000"))
-DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
-DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
-DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
-DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))

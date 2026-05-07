@@ -872,7 +872,7 @@ class DeltaAPI:
         bracket_take_profit_price:  Optional[float] = None,
         trailing_stop_delta:        Optional[float] = None,
         mmp:            bool              = False,   # market maker protection
-        exchange:       str               = "",      # kept for generic compatibility
+        exchange:       str               = "",      # kept for CoinSwitch compat
         product_id:     Optional[int]     = None,
         trigger_price:  Optional[float]   = None,   # alias for stop_price
         quantity:       Optional[float]   = None,   # alias for size
@@ -892,7 +892,7 @@ class DeltaAPI:
         Normalised interface compatible with existing bot code.
         Returns {"success": True, "result": {"order_id": ..., ...}} on success.
         """
-        # Alias resolution (compat with generic exchange interface)
+        # Alias resolution (compat with CoinSwitch interface)
         _size  = size or quantity or 0.0
         _price = limit_price or price
         _stop  = stop_price or trigger_price
@@ -931,11 +931,11 @@ class DeltaAPI:
         }
 
         # post_only and time_in_force are ONLY valid on limit-type orders.
-        # Delta may reject MARKET and conditional-market orders if these fields
-        # are sent, even as False/"gtc". Keep native market-bracket payloads
-        # minimal: entry + exchange-attached SL/TP only.
-        _LIMIT_LIKE_TYPES = {"limit_order", "stop_limit_order", "take_profit_limit_order"}
-        if _otype in _LIMIT_LIKE_TYPES:
+        # Delta returns bad_schema if either field is present on stop_market_order
+        # or take_profit_market_order — even with value False/"gtc".
+        # stop_limit_order and take_profit_limit_order still accept both fields.
+        _CONDITIONAL_MARKET_TYPES = {"stop_market_order", "take_profit_market_order"}
+        if _otype not in _CONDITIONAL_MARKET_TYPES:
             body["post_only"]     = post_only
             body["time_in_force"] = time_in_force
 

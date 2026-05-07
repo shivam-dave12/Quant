@@ -889,15 +889,6 @@ class LiquidityTrailEngine:
         for target in pools or []:
             pool = getattr(target, "pool", target)
             try:
-                status = getattr(pool, "status", "")
-                status = str(getattr(status, "value", status)).upper()
-                if status in ("SWEPT", "CONSUMED"):
-                    continue
-                pside = str(getattr(getattr(pool, "side", ""), "value", getattr(pool, "side", ""))).upper()
-                if pos_side == "long" and pside and "SSL" not in pside:
-                    continue
-                if pos_side == "short" and pside and "BSL" not in pside:
-                    continue
                 pp = float(getattr(pool, "price", 0.0) or 0.0)
             except Exception:
                 continue
@@ -1061,13 +1052,9 @@ class LiquidityTrailEngine:
 
         reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
                   f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")
-        logger.info(f"Trail PROPOSAL: {reason}")
-        # v74: preserve the computed analytical R in the trail result. v73 returned
-        # r_multiple=0.0 for DELIVERY_LOCK, so logs showed R=0.00R while the stop
-        # was being advanced after 3–6ATR of delivery. That was an analytics/telemetry
-        # calculation bug and could mislead downstream dashboards.
+        logger.info(f"Trail: {reason}")
         return LiquidityTrailResult(new_sl=candidate_sl, anchor=None, reason=reason,
-                                    phase="DELIVERY_LOCK", r_multiple=r_multiple)
+                                    phase="DELIVERY_LOCK", r_multiple=0.0)
 
     @staticmethod
     def _better_sl(pos_side: str, a: Optional[float], b: Optional[float]) -> Optional[float]:
@@ -1141,7 +1128,7 @@ class LiquidityTrailEngine:
         )
         if gate_tag:
             reason = f"{reason}{gate_tag}"
-        logger.info(f"Trail PROPOSAL: {reason}")
+        logger.info(f"Trail: {reason}")
         return LiquidityTrailResult(
             new_sl=be_price, anchor=None, reason=reason,
             phase="BE_LOCK", r_multiple=r_multiple)
@@ -2157,7 +2144,7 @@ class LiquidityTrailEngine:
             f"gate={momentum_gate} "
             f"→ SL=${new_sl:,.1f} (+{improvement:.1f}pts)"
         )
-        logger.info(f"Trail PROPOSAL: {reason}")
+        logger.info(f"Trail: {reason}")
 
         return LiquidityTrailResult(
             new_sl=new_sl, anchor=anchor, reason=reason, phase=phase,

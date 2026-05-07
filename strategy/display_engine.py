@@ -1265,7 +1265,7 @@ HELP_TEXT = (
     "/trail [on|off|auto] — Adaptive exit override\n"
     "/config       — Show config values\n"
     "/set &lt;key&gt; &lt;val&gt; — Adjust config live\n"
-    "/setexchange — Delta-only build info\n"
+    "/setexchange &lt;delta|coinswitch&gt; — Switch exchange\n"
     "/killswitch   — Emergency close + cancel all\n"
     "/resetrisk    — Clear consecutive-loss lockout\n"
     "/start  /stop — Start / stop bot\n"

@@ -56,7 +56,7 @@ class HardeningTests(unittest.TestCase):
                 return {"ok": True}
 
         om = FakeOrderManager()
-        router = ExecutionRouter(delta_om=om)
+        router = ExecutionRouter(coinswitch_om=None, delta_om=om, default="delta")
 
         self.assertEqual(router.emergency_flatten(reason="unit_test"), {"ok": True})
         self.assertEqual(om.calls[0][1]["reason"], "unit_test")
@@ -546,7 +546,7 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(qty, 0.001)
         self.assertLessEqual(qty * sl_dist, 1000.0 * 0.005 + 1e-9)
 
-    def test_position_sizing_interprets_percent_style_risk(self):
+    def test_position_sizing_interprets_legacy_percent_style_risk(self):
         import config
         from strategy.quant_strategy import QuantStrategy
 

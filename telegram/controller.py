@@ -1,9 +1,9 @@
 """
 telegram/controller.py — Institutional Quant Telegram Bot Controller
 =================================================================
-All command handlers reflect the unified EntryEngine authority model:
+All command handlers reflect the QuantPosterior authority model:
 
-  /thinking   — EntryEngine opportunity, TP/SL EV and execution audit
+  /thinking   — posterior P(edge), EV, uncertainty, execution audit
   /status     — Full bot status (posterior flow + position)
   /pools      — Live liquidity pool map with priority scores
   /flow       — Detailed orderflow state (CVD + OB delta + tick aggression)
@@ -17,7 +17,7 @@ All command handlers reflect the unified EntryEngine authority model:
   /trail      — Adaptive exit override on/off/auto
   /config     — Show current config values
   /killswitch — Emergency: close all positions + cancel orders
-  /setexchange — Delta-only build info
+  /setexchange — Switch execution exchange (delta|coinswitch)
   /set <key> <val> — Live-adjust config
   /resetrisk  — Clear consecutive-loss lockout
   /huntstatus — Liquidity-draw telemetry only
@@ -259,7 +259,7 @@ class TelegramBotController:
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
                 {"command": "assets",      "description": "Multi-asset scanner universe"},
-                {"command": "thinking",    "description": "EntryEngine opportunity + TP/SL EV"},
+                {"command": "thinking",    "description": "posterior EV / uncertainty / execution audit"},
                 {"command": "position",    "description": "Current position + adaptive exit"},
                 {"command": "pnl",         "description": "Quick PnL snapshot"},
                 {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
@@ -282,7 +282,7 @@ class TelegramBotController:
                 {"command": "trail",       "description": "Toggle trailing SL on/off/auto"},
                 {"command": "config",      "description": "Show config values"},
                 {"command": "set",         "description": "Set config value live"},
-                {"command": "setexchange", "description": "Delta-only build info"},
+                {"command": "setexchange", "description": "Switch execution exchange"},
                 {"command": "killswitch",  "description": "Emergency close all"},
                 {"command": "resetrisk",   "description": "Clear risk lockout"},
                 {"command": "help",        "description": "Show commands"},
@@ -393,7 +393,7 @@ class TelegramBotController:
             "  /equity — Balance + unrealised + session return\n"
             "  /risk — Gate status, daily limits, cooldown\n\n"
             "🧠 <b>DECISION ANALYSIS</b>\n"
-            "  /thinking — EntryEngine opportunity + TP/SL EV\n"
+            "  /thinking — posterior P(edge), EV, uncertainty, execution audit\n"
             "  /pools — BSL/SSL pool map with priority scores\n"
             "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
             "  /structures — structure/AMD/PD features used by posterior\n"
@@ -410,7 +410,7 @@ class TelegramBotController:
             "  /trail [on|off|auto] — Adaptive exit override\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
-            "  /setexchange — Delta-only build info\n\n"
+            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
             "🚨 <b>EMERGENCY</b>\n"
             "  /killswitch — Close positions + cancel all\n"
             "  /resetrisk [full] — Clear risk lockout\n"
@@ -437,7 +437,7 @@ class TelegramBotController:
 
         This command intentionally avoids the old filter-stack view.
         It shows the current authority flow:
-            market observations -> EntryEngine opportunity -> TP/SL liquidity EV -> mechanical safety -> adaptive exit
+            market observations -> posterior/EV -> target surface -> safety/execution -> adaptive exit
         """
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
@@ -483,7 +483,7 @@ class TelegramBotController:
 
             lines = [
                 f"<b>🧠 QUANT DECISION CONSOLE @ ${price:,.2f}</b>",
-                "<code>Authority: observations → EntryEngine opportunity → TP/SL liquidity EV → mechanical safety → adaptive exit</code>",
+                "<code>Authority: observations → posterior/EV → target surface → safety/execution → adaptive exit</code>",
             ]
 
             # Data reliability
@@ -592,7 +592,7 @@ class TelegramBotController:
 
             # Posterior auction state
             sa = getattr(entry, '_last_sweep_analysis', None) if entry is not None else None
-            lines += ["", "<b>🧠 ENTRYENGINE OPPORTUNITY MODEL</b>"]
+            lines += ["", "<b>POSTERIOR AUCTION MODEL</b>"]
             if sa:
                 p_edge = _sf(sa.get('quant_posterior', sa.get('posterior', 0.0)))
                 qev = _sf(sa.get('quant_ev', sa.get('ev', 0.0)))
@@ -617,7 +617,7 @@ class TelegramBotController:
 
             # Expected-utility target surface
             surf = getattr(strat, '_last_target_surface', None)
-            lines += ["", "<b>🎯 TP LIQUIDITY EV FRONTIER</b>"]
+            lines += ["", "<b>EXPECTED-UTILITY TARGET SURFACE</b>"]
             if surf is not None:
                 best = getattr(surf, 'best', None)
                 terminal = getattr(surf, 'terminal', None)
@@ -632,11 +632,11 @@ class TelegramBotController:
                 for i, c in enumerate(cands, 1):
                     lines.append(f"    {i}. ${c.price:,.1f} {c.role} p={c.probability:.3f} EV={c.expected_value_r:+.3f} fullU={getattr(c,'full_position_utility',c.utility):+.3f} d={c.distance_atr:.1f}ATR")
             else:
-                lines.append("  No TP frontier built yet. It appears after an EntryEngine-approved sweep setup.")
+                lines.append("  No target surface built yet. It appears after a QuantPosterior-approved signal.")
 
             # Expected-utility stop surface
             stop_surf = getattr(strat, '_last_stop_surface', None)
-            lines += ["", "<b>🛡 SL LIQUIDITY SHIELD</b>"]
+            lines += ["", "<b>EXPECTED-UTILITY STOP SURFACE</b>"]
             if stop_surf is not None:
                 sbest = getattr(stop_surf, 'best', None)
                 if sbest:
@@ -646,7 +646,7 @@ class TelegramBotController:
                 for i, c in enumerate(list(getattr(stop_surf, 'candidates', []) or [])[:3], 1):
                     lines.append(f"    {i}. ${c.price:,.1f} {c.role} risk={c.risk_atr:.2f}ATR U={c.utility:+.3f}")
             else:
-                lines.append("  No SL shield built yet. It appears after an EntryEngine-approved sweep setup.")
+                lines.append("  No stop surface built yet. It appears after a QuantPosterior-approved signal.")
 
             # Execution safety and position/adaptive exit
             can_ok, risk_reason = rm.can_trade()
@@ -689,13 +689,13 @@ class TelegramBotController:
             if 'ACTIVE' in phase_val.upper():
                 lines.append("  Managing open risk through adaptive exit controller.")
             elif surf is not None and getattr(surf, 'has_positive_edge', False) and can_ok and cd_rem <= 0:
-                lines.append("  Positive TP frontier exists; execution waits only for EntryEngine opportunity and mechanical safety.")
+                lines.append("  Positive target surface exists; execution waits only for live posterior/safety alignment.")
             elif sa and _sf(sa.get('quant_posterior', 0.0)) > 0:
-                lines.append("  EntryEngine auction is live; waiting for sufficient opportunity score and TP/SL expectancy.")
+                lines.append("  Posterior auction is live; waiting for sufficient EV/uncertainty-adjusted acceptance.")
             elif 'POST_SWEEP' in state_u:
                 lines.append("  Sweep observed; collecting evidence for posterior acceptance or rejection.")
             else:
-                lines.append("  Scanning. No executable EntryEngine auction currently active.")
+                lines.append("  Scanning. No executable posterior auction currently active.")
 
             self.send_message("\n".join(lines))
             return None
@@ -714,9 +714,6 @@ class TelegramBotController:
         if not bot_running or not bot_instance:
             return "Bot not running."
         try:
-            fn = getattr(bot_instance, "format_portfolio_status_report", None)
-            if callable(fn):
-                return fn()
             strat = bot_instance.strategy
             dm    = bot_instance.data_manager
             if not strat or not dm:
@@ -1557,7 +1554,7 @@ class TelegramBotController:
             lines.append(f"  SL:    ${st['signal_sl']:,.1f}  TP: ${st['signal_tp']:,.1f}")
             lines.append(f"  R:R:   1:{st['signal_rr']:.2f}")
         else:
-            lines.append("\n  No executable EntryEngine auction currently active.")
+            lines.append("\n  No executable posterior auction currently active.")
 
         return "\n".join(lines)
 
@@ -1569,9 +1566,6 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
-        fn = getattr(bot_instance, "format_portfolio_balance_report", None) or getattr(bot_instance, "format_portfolio_equity_report", None)
-        if callable(fn):
-            return fn()
         rm = bot_instance.risk_manager
         if not rm:
             return "Risk manager not ready."
@@ -1644,42 +1638,40 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance:
-            return "Bot not running."
-        raw = (args or "").strip()
-        parts = raw.split()
-        action_words = {"on", "enable", "enabled", "1", "true", "yes", "off", "disable", "disabled", "0", "false", "no", "auto", "default", "reset"}
-        action = "status"
-        asset = None
-        for part in parts:
-            low = part.lower()
-            if low in action_words and action == "status":
-                action = low
-            else:
-                asset = part.upper()
-        if parts and action == "status" and parts[0].lower() not in action_words:
-            asset = parts[0].upper()
-        if hasattr(bot_instance, "set_trailing_override") and hasattr(bot_instance, "format_trailing_control_report"):
-            if action in ("on", "enable", "enabled", "1", "true", "yes"):
-                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(True, asset))
-            if action in ("off", "disable", "disabled", "0", "false", "no"):
-                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(False, asset))
-            if action in ("auto", "default", "reset"):
-                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(None, asset))
-            return bot_instance.format_trailing_control_report()
-
-        strat = getattr(bot_instance, "strategy", None)
-        if not strat:
-            return "Strategy not ready."
-        if action in ("on", "enable", "enabled", "1", "true", "yes"):
+        if not bot_instance: return "Bot not running."
+        strat = bot_instance.strategy
+        if not strat: return "Strategy not ready."
+        arg = (args or "").strip().lower()
+        if arg in ("on", "enable", "1", "true", "yes"):
             strat.set_trail_override(True)
-            return "🔒 <b>Trailing SL: FORCED ON</b>"
-        if action in ("off", "disable", "disabled", "0", "false", "no"):
-            strat.set_trail_override(False)
-            return "🔓 <b>Trailing SL: FORCED OFF</b>"
-        if action in ("auto", "default", "reset"):
+            return (
+                "🔒 <b>Trailing SL: FORCED ON</b>\n"
+                "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
+                "Will advance SL per phase logic regardless of config flag."
+            )
+        elif arg in ("off", "disable", "0", "false", "no"):
+            changed = strat.set_trail_override(False)
+            if changed is False:
+                return (
+                    "Trailing SL remains ON for the active position.\n"
+                    "Protective management cannot be disabled mid-trade; "
+                    "use /pause to stop new entries."
+                )
+            return (
+                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
+                "SL will remain at initial structural level.\n"
+                "Exit will be via TP fill, SL hit, or max-hold timeout."
+            )
+        else:
             strat.set_trail_override(None)
-        return f"🛡 <b>Trailing SL</b> effective={'ON' if strat.get_trail_enabled() else 'OFF'}"
+            enabled = strat.get_trail_enabled()
+            default_txt = "ON" if enabled else "OFF"
+            return (
+                f"🔄 <b>Trailing SL: AUTO</b>\n"
+                f"Using config default: <b>{default_txt}</b>\n"
+                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
+                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
+            )
 
     # ================================================================
     # /config
@@ -1866,7 +1858,43 @@ class TelegramBotController:
     # ================================================================
 
     def _cmd_setexchange(self, args: str) -> str:
-        return "🔒 <b>DELTA-ONLY BUILD</b>\nExchange switching was removed with the alternate-venue cleanup. Execution is locked to Delta native-bracket routing."
+        global bot_instance, bot_running
+
+        if not args:
+            active = getattr(config, "EXECUTION_EXCHANGE", "?")
+            return (
+                f"Current execution exchange: <b>{active.upper()}</b>\n\n"
+                f"Usage: /setexchange &lt;exchange&gt;\n"
+                f"Valid values: <code>delta</code>, <code>coinswitch</code>\n\n"
+                f"<i>Data is aggregated from both exchanges regardless of this setting.</i>"
+            )
+
+        target = args.strip().lower()
+
+        if not bot_running or bot_instance is None:
+            try:
+                from core.types import Exchange
+                Exchange.from_str(target)
+                config.EXECUTION_EXCHANGE = Exchange.from_str(target).value
+                return (f"✅ Execution exchange set to <b>{target.upper()}</b> "
+                        f"(bot not running — takes effect on next start)")
+            except ValueError:
+                return f"❌ Unknown exchange: <code>{target}</code>"
+
+        router = getattr(bot_instance, "execution_router", None)
+        if router is None:
+            return "❌ Execution router not available."
+
+        strategy = getattr(bot_instance, "strategy", None)
+        success, message = router.switch(target, strategy=strategy)
+
+        if success and bot_instance.order_manager:
+            try:
+                bot_instance.order_manager.set_leverage(leverage=int(config.LEVERAGE))
+            except Exception as e:
+                message += f"\n⚠️ Leverage set failed: {e}"
+
+        return message
 
     # ================================================================
     # /set
@@ -2118,9 +2146,6 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
-        fn = getattr(bot_instance, "format_portfolio_market_report", None)
-        if callable(fn):
-            return fn()
         strat = bot_instance.strategy
         dm    = bot_instance.data_manager
         if not strat or not dm:
@@ -2203,9 +2228,6 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
-        fn = getattr(bot_instance, "format_portfolio_risk_report", None)
-        if callable(fn):
-            return fn()
 
         strat = bot_instance.strategy
         rm    = bot_instance.risk_manager
@@ -2314,9 +2336,6 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
-        fn = getattr(bot_instance, "format_portfolio_sl_tp_report", None)
-        if callable(fn):
-            return fn()
 
         strat = bot_instance.strategy
         dm = bot_instance.data_manager
@@ -2522,11 +2541,6 @@ def main():
     )
     _sh.setFormatter(_fmt)
     logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh], force=True)
-    try:
-        from core.instruments import install_instrument_log_filter
-        install_instrument_log_filter()
-    except Exception:
-        pass
 
     def _signal_handler(signum, frame):
         logger.info(f"Signal {signum} — stopping controller")

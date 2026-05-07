@@ -2,10 +2,10 @@
 core/instruments.py — live-exchange instrument model and symbol context
 ========================================================================
 
-No symbol in this module is treated as executable by itself. Alias lists are
-only search keys used to match the live product catalog returned by Delta. An
-instrument becomes tradeable only when Delta confirms it through its own
-product endpoint.
+No symbol in this module is treated as executable by itself.  Alias lists are
+only search keys used to match the live product catalogs returned by Delta and
+CoinSwitch.  An instrument becomes tradeable only when the exchange confirms it
+through its own product/instrument endpoint.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ class AssetClass(str, Enum):
 
 class ExchangeName(str, Enum):
     DELTA = "delta"
+    COINSWITCH = "coinswitch"
 
 
 @dataclass(frozen=True)
@@ -137,76 +138,6 @@ def instrument_scope(instrument: Optional[TradableInstrument]) -> Iterator[None]
         yield
     finally:
         _CURRENT_INSTRUMENT.reset(token)
-
-
-def instrument_log_prefix(instrument: Optional[TradableInstrument] = None) -> str:
-    """Canonical per-asset log prefix used by the scanner.
-
-    The runtime has one strategy instance per Delta contract; logs must be
-    contract-scoped so a POSTERIOR/TP/SL line can be traced without guessing.
-    """
-    inst = instrument if instrument is not None else current_instrument()
-    if inst is None:
-        return ""
-    try:
-        asset = str(getattr(inst, "asset_id", "") or "").upper()
-        ex = str(getattr(getattr(inst, "primary_exchange", ""), "value", getattr(inst, "primary_exchange", "")) or "").upper()
-        sym = str(getattr(inst, "display_symbol", "") or getattr(inst, "execution_symbol", "") or "").upper()
-        if asset and ex and sym:
-            return f"[{asset}|{ex}:{sym}]"
-        if asset and sym:
-            return f"[{asset}:{sym}]"
-        if asset:
-            return f"[{asset}]"
-    except Exception:
-        pass
-    return ""
-
-
-def install_instrument_log_filter(root_logger=None) -> None:
-    """Prefix all logs emitted inside instrument_scope() with [ASSET|EX:SYMBOL].
-
-    This fixes the multi-asset ambiguity where strategy.entry_engine and
-    strategy.quant_strategy lines said RAW_TP_AUDIT / CANDIDATE DEFERRED without
-    showing which contract produced them.  It is intentionally idempotent and
-    only touches records while a current instrument context exists.
-    """
-    import logging
-    import re
-
-    class _InstrumentContextFilter(logging.Filter):
-        _asset_pat = re.compile(r"^\[[A-Z0-9_]+\|[A-Z]+:[A-Z0-9_./-]+\]\s*")
-
-        def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - exercised in runtime logs
-            prefix = instrument_log_prefix()
-            if not prefix:
-                return True
-            try:
-                msg = record.getMessage()
-            except Exception:
-                msg = str(getattr(record, "msg", ""))
-            if not msg or self._asset_pat.match(msg) or msg.startswith(prefix):
-                return True
-            # Leave pure visual separators global; everything else inside an
-            # asset scope gets an unambiguous contract prefix.
-            if set(msg.strip()) <= {"=", "-"}:
-                return True
-            record.msg = f"{prefix} {msg}"
-            record.args = ()
-            return True
-
-    root = root_logger if root_logger is not None else logging.getLogger()
-    # Avoid adding duplicates across Telegram restarts / tests.
-    for flt in list(getattr(root, "filters", []) or []):
-        if flt.__class__.__name__ == "_InstrumentContextFilter":
-            return
-    flt = _InstrumentContextFilter()
-    root.addFilter(flt)
-    for handler in list(getattr(root, "handlers", []) or []):
-        try:
-            handler.addFilter(flt)
-        except Exception:
-            pass
 
 
 def normalise_symbol(value: str) -> str:
