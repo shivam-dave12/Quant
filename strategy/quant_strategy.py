@@ -9418,19 +9418,28 @@ class QuantStrategy:
         aggregate_remaining_risk = None
         if portfolio_scoped:
             try:
-                aggregate_remaining_risk = float(bal.get("portfolio_remaining_risk_cap", 0.0) or 0.0)
-                if aggregate_remaining_risk <= 1e-10:
+                aggregate_remaining_risk = bal.get("portfolio_remaining_risk_cap", None)
+                aggregate_cap = float(bal.get("portfolio_aggregate_risk_cap", 0.0) or 0.0)
+                open_risk = float(bal.get("portfolio_open_risk_usd", 0.0) or 0.0)
+                if aggregate_remaining_risk is None:
+                    try:
+                        agg_pct = float(_cfg("PORTFOLIO_MAX_AGGREGATE_RISK_PCT", 0.0) or 0.0) / 100.0
+                    except Exception:
+                        agg_pct = 0.0
+                    aggregate_cap = max(0.0, target_risk_base * agg_pct) if agg_pct > 0 else 0.0
+                    aggregate_remaining_risk = max(0.0, aggregate_cap - open_risk) if aggregate_cap > 0 else None
+                else:
+                    aggregate_remaining_risk = float(aggregate_remaining_risk or 0.0)
+                if aggregate_remaining_risk is not None and aggregate_remaining_risk <= 1e-10:
                     logger.warning(
                         f"Sizing rejected: portfolio aggregate risk exhausted | "
-                        f"open_risk=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f} "
-                        f"cap=${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
+                        f"open_risk=${open_risk:.2f} cap=${aggregate_cap:.2f}")
                     return None
-                if risk_capital > aggregate_remaining_risk:
+                if aggregate_remaining_risk is not None and risk_capital > aggregate_remaining_risk:
                     logger.info(
                         f"Portfolio aggregate risk haircut: target_risk=${risk_capital:.2f} "
                         f"-> remaining=${aggregate_remaining_risk:.2f} "
-                        f"open=${float(bal.get('portfolio_open_risk_usd', 0.0) or 0.0):.2f}/"
-                        f"${float(bal.get('portfolio_aggregate_risk_cap', 0.0) or 0.0):.2f}")
+                        f"open=${open_risk:.2f}/${aggregate_cap:.2f}")
                     risk_capital = aggregate_remaining_risk
             except Exception:
                 aggregate_remaining_risk = None
