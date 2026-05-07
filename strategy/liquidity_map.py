@@ -57,9 +57,9 @@ FIX-B1  _merge_pools: two-pass pool rebirth for SWEPT/CONSUMED pools.
              recent SWEPT/CONSUMED pool within radius instead of spawning a new
              one. Reborn pool gets fresh created_at, zeroed sweep metadata, and
              new status so check_sweeps() can detect it again. The new sweep
-             produces a fresh detected_at timestamp → new _sweep_key in
-             entry_engine → correctly bypasses _processed_sweeps hold from the
-             original sweep event (Bug 3 self-heals).
+             produces a fresh structural pool after the processed-sweep hold
+             expires, so entry_engine may reconsider it as a new event while
+             timestamp churn inside the hold window remains suppressed.
 
 FIX-B1b Prune step: SWEPT pools evicted from active list after 2 hours.
         Companion to FIX-B1. Pools that haven't been reborn within 2 hours
@@ -846,9 +846,9 @@ class _TimeframeRegistry:
                     zeroed sweep metadata, and a new status so check_sweeps() can
                     detect it again on a future candle.
 
-        A reborn pool will produce a SweepResult with a new detected_at timestamp
-        when next swept, generating a new _sweep_key in entry_engine — correctly
-        bypassing the _processed_sweeps hold from the original sweep event.
+        A reborn pool will produce a fresh SweepResult when next swept.
+        entry_engine still suppresses same-level timestamp churn during the
+        processed-sweep hold, then admits the new event after that hold expires.
         """
         radius = atr * _CLUSTER_RADIUS_ATR.get(self.tf, 0.25)
         merged = list(existing)

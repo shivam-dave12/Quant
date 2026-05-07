@@ -549,3 +549,46 @@ def test_manual_exit_tracks_reduce_only_market_exit_without_recording_fake_pnl_i
     assert qs._pos.manual_exit_reason == "manual_test"
     assert [name for name, _ in om.calls] == ["cancel_all_exit_orders", "market"]
     assert qs._pnl_recorded_for == 0.0
+
+
+def test_tp_probability_uses_calibrated_probability_not_raw_mtf_score():
+    from strategy.liquidity_pool_selector import (
+        _pool_score_to_delivery_probability,
+        _posterior_delivery_probability,
+    )
+
+    # MTF raw score is a ranking score and can be > 1.0. It must not be used
+    # directly as hit probability or clamped to fake 95% delivery.
+    calibrated = _pool_score_to_delivery_probability(1.80, distance_atr=1.0, tf="4h", terminal_target=False)
+    assert 0.0 < calibrated < 0.70
+
+    fused = _posterior_delivery_probability(
+        calibrated,
+        posterior_prob=0.92,
+        confluence=2.50,
+        gauntlet_mult=1.00,
+        reach_mult=1.00,
+        terminal_target=False,
+    )
+    assert fused < 0.88
+
+
+def test_terminal_tp_probability_remains_capped_even_with_strong_posterior():
+    from strategy.liquidity_pool_selector import (
+        _pool_score_to_delivery_probability,
+        _posterior_delivery_probability,
+    )
+
+    terminal_base = _pool_score_to_delivery_probability(
+        1.80, distance_atr=26.0, tf="1d", terminal_target=True
+    )
+    terminal_fused = _posterior_delivery_probability(
+        terminal_base,
+        posterior_prob=0.95,
+        confluence=2.25,
+        gauntlet_mult=1.00,
+        reach_mult=0.40,
+        terminal_target=True,
+    )
+    assert terminal_base < 0.30
+    assert terminal_fused < 0.50

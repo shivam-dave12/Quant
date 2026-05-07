@@ -479,11 +479,10 @@ class EntryEngine:
         # the 60s window) and re-entered POST_SWEEP — looping every ~5s for up to
         # 60s per sweep.
         #
-        # Key schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
-        #   pool_price   — rounded to dollar to absorb tick-level float noise
-        #   pool_side    — "BSL" or "SSL" — different sides at same price are distinct
-        #   detected_at  — rounded to second; ensures a NEW sweep at the same level
-        #                  (detected_at differs) is never suppressed by a stale entry
+        # Key schema: (round(pool_price, 0), pool_side_value, timeframe)
+        #   pool_price — rounded to dollar to absorb tick-level float noise
+        #   pool_side  — "BSL" or "SSL" — different sides at same price are distinct
+        #   timeframe  — keeps independent HTF/LTF sweeps at the same price separate
         #
         # Value: expiry epoch time (now + 120s).  120s outlasts the 60s detection
         # window PLUS the 45s deferral cooldown with 15s margin.
@@ -1002,10 +1001,9 @@ class EntryEngine:
             # bar (bar start <= sweep_ts < bar close), extend the window
             # to (bar_close + 60s) so a sweep at bar-open still reaches
             # the entry engine for the full 5min + grace. The processed
-            # sweeps registry (_sweep_key keyed on detected_at rounded to
-            # seconds, 120s hold after enter_post_sweep) handles dedup —
-            # widening the detection window does not reintroduce sweep-
-            # loop reprocessing.
+            # sweeps registry (_sweep_key keyed on price/side/timeframe, 120s
+            # hold after enter_post_sweep) handles dedup — widening the
+            # detection window does not reintroduce sweep-loop reprocessing.
             _base_age_limit = int(now * 1000) - 60_000
             # Beginning of the current 5-minute bar (UTC-based)
             _cur_5m_start_ms = int(now // 300.0) * 300_000
@@ -1031,11 +1029,10 @@ class EntryEngine:
                     continue
 
                 # Still check _processed_sweeps — widened window MUST not
-                # reintroduce sweep-loop reprocessing. The registry key is
-                # seconds-rounded, so legitimate re-sweeps at the same price
-                # with a different detected_at are still admitted.
-                _bridge_key = (round(ev.pool_price, 0), side.value,
-                               round(ev.sweep_ts / 1000.0, 0))
+                # reintroduce sweep-loop reprocessing.  During the hold window,
+                # same price/side/timeframe is one liquidity event even if the
+                # upstream bridge refreshes its timestamp.
+                _bridge_key = (round(ev.pool_price, 0), side.value, '5m')
                 if self._processed_sweeps.get(_bridge_key, 0.0) > now:
                     _bridge_proc += 1
                     continue
@@ -1089,16 +1086,17 @@ class EntryEngine:
     def _sweep_key(sweep: SweepResult) -> tuple:
         """
         Canonical key for the processed-sweeps registry.
-        Schema: (round(pool_price, 0), pool_side_value, round(detected_at, 0))
-          pool_price  — dollar-rounded to absorb tick-level float noise
-          pool_side   — "BSL"/"SSL" — same price, different sides are distinct
-          detected_at — second-rounded; a genuinely NEW sweep at the same level
-                        (with a different detected_at) is never suppressed
+        Schema: (round(pool_price, 0), pool_side_value, timeframe)
+          pool_price — dollar-rounded to absorb tick-level float noise
+          pool_side  — "BSL"/"SSL" — same price, different sides are distinct
+          timeframe  — separates LTF/HTF sweeps at the same price.  The expiry
+                       window, not detected_at churn, controls when a same-level
+                       liquidity event may be reconsidered.
         """
         return (
-            round(sweep.pool.price, 0),
-            sweep.pool.side.value,
-            round(sweep.detected_at, 0),
+            round(float(getattr(sweep.pool, 'price', 0.0) or 0.0), 0),
+            getattr(getattr(sweep, 'pool', None), 'side', None).value,
+            str(getattr(getattr(sweep, 'pool', None), 'timeframe', '') or ''),
         )
 
     def _is_processed(self, sweep: SweepResult, now: float) -> bool:

@@ -173,6 +173,14 @@ _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
 
+# TP probability calibration.  mtf_pool_probability.raw_prob is an unbounded
+# liquidity SCORE (distance × TF prior × significance × recency × touch), not a
+# hit probability.  Treating that score directly as p made strong/fresh pools
+# look like 80-95% delivery events and could falsely approve weak TP geometry.
+_TP_SCORE_TO_PROB_MIDPOINT = 0.72
+_TP_DELIVERY_LOCAL_CAP     = 0.88
+_TP_DELIVERY_TERMINAL_CAP  = 0.52
+
 # Reasonable-distance preference. This is deliberately a soft ranking lens, not
 # a hard veto: nearest pools are not selected just because they are nearest, and
 # distant HTF pools can still win when probability/confluence/R:R justify them.
@@ -669,35 +677,105 @@ def _breakeven_move(entry: float, atr: float) -> float:
     return max(entry * fee_rate * 2.0, 0.0) + 0.18 * max(atr, 0.0)
 
 
+
+
+def _durable_tp_rr_floor(risk: float, be_move: float) -> float:
+    """Minimum full-position TP payoff before probability is evaluated.
+
+    A TP with tiny R:R can require a mathematically impossible near-100% hit
+    rate.  That is not a probability failure; it is invalid TP geometry.
+    Keep this separate so audit logs do not make the selector look like its
+    probability score can never reach the criterion.
+    """
+    risk_f = max(float(risk), 1e-9)
+    return max(
+        _TP_DURABLE_RR_FLOOR,
+        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
+    )
+
+def _pool_score_to_delivery_probability(
+    raw_score: float,
+    distance_atr: float,
+    tf: str,
+    terminal_target: bool = False,
+) -> float:
+    """Convert the MTF pool SCORE into a calibrated delivery probability.
+
+    ``mtf_pool_probability.raw_prob`` is intentionally an unnormalised ranking
+    score.  It can exceed 1.0 for fresh, high-significance HTF pools, so using
+    it directly as a probability is mathematically wrong.  This transform keeps
+    the same ordering signal but maps it through a saturating curve and a
+    distance/timeframe cap before any setup posterior is fused in.
+    """
+    score = max(float(raw_score or 0.0), 0.0)
+    if score <= 0.0:
+        return _TP_DELIVERY_PROB_FLOOR
+
+    # Saturating score transform: score=midpoint -> 50% of the local cap.
+    base = score / (score + _TP_SCORE_TO_PROB_MIDPOINT)
+
+    d = max(float(distance_atr or 0.0), 0.0)
+    rank = _tf_rank(tf)
+    max_reach = max(_max_reach_for_tf(tf), 1e-9)
+    # A first-sweep objective near/inside its TF reach can carry high, but not
+    # absurd, probability.  Terminal objectives are runners and must remain
+    # materially capped even when posterior is strong.
+    cap = _TP_DELIVERY_TERMINAL_CAP if terminal_target else _TP_DELIVERY_LOCAL_CAP
+    cap += min(max(rank - 3, 0), 3) * (0.018 if not terminal_target else 0.010)
+    if d > max_reach:
+        cap *= math.exp(-(d - max_reach) / max(float(_DECAY_LAMBDA.get(str(tf), 2.0)), 1.25))
+    else:
+        # Mild horizon decay within the same TF reach; keeps 0.25ATR pools from
+        # being misread as guaranteed while not biasing only to nearest pools.
+        cap *= (0.94 + 0.06 * math.exp(-d / max(max_reach, 1.0)))
+    cap = _clamp(cap, 0.08, 0.91)
+    return _clamp(base * cap, _TP_DELIVERY_PROB_FLOOR, cap)
+
+
 def _posterior_delivery_probability(
-    raw_prob: float,
+    pool_delivery_prob: float,
     posterior_prob: float,
     confluence: float,
     gauntlet_mult: float,
     reach_mult: float,
+    terminal_target: bool = False,
 ) -> float:
-    """Blend setup posterior with the pool's own delivery probability."""
-    pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
-    pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
-    pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
-    pool_prob *= math.sqrt(_clamp(reach_mult, 0.05, 1.25))
-    pool_prob = _clamp(pool_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
+    """Blend setup posterior with calibrated pool delivery probability.
+
+    This is intentionally conservative: confluence/reach adjust the calibrated
+    pool probability, but they do not turn a raw liquidity score into a fake
+    near-certainty.  Posterior fusion is also capped lower for terminal runners.
+    """
+    pool_prob = _clamp(pool_delivery_prob, _TP_DELIVERY_PROB_FLOOR, 0.91)
+    quality_mult = (
+        math.sqrt(_clamp(confluence, 0.40, 1.85))
+        * math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
+        * math.sqrt(_clamp(reach_mult, 0.05, 1.10))
+    )
+    pool_prob = _clamp(pool_prob * quality_mult, _TP_DELIVERY_PROB_FLOOR, 0.86 if not terminal_target else 0.58)
 
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
         return pool_prob
-    return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
+
+    # Fuse live auction acceptance with path delivery as a geometric mean.  This
+    # requires both the setup and the path to be good; one cannot fully overwrite
+    # the other.
+    fused = math.sqrt(pool_prob * posterior)
+    cap = 0.84 if not terminal_target else 0.62
+    return _clamp(fused, _TP_DELIVERY_PROB_FLOOR, cap)
 
 
 def _institutional_rr_floor(
     static_min_rr: float,
     posterior_prob: float,
-    raw_prob: float,
+    pool_delivery_prob: float,
     confluence: float,
     gauntlet_mult: float,
     reach_mult: float,
     risk: float,
     be_move: float,
+    terminal_target: bool = False,
 ) -> Tuple[float, float, float]:
     """Return (required_rr, delivery_probability, cost_r).
 
@@ -710,20 +788,17 @@ def _institutional_rr_floor(
     """
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
-    durable_floor = max(
-        _TP_DURABLE_RR_FLOOR,
-        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
-    )
+    durable_floor = _durable_tp_rr_floor(risk_f, be_move)
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
         delivery_p = _posterior_delivery_probability(
-            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
+            pool_delivery_prob, 0.0, confluence, gauntlet_mult, reach_mult, terminal_target)
         ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
         return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
 
     delivery_p = _posterior_delivery_probability(
-        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
+        pool_delivery_prob, posterior, confluence, gauntlet_mult, reach_mult, terminal_target)
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
     posterior_floor = max(durable_floor, ev_floor)
     return posterior_floor, delivery_p, cost_r
@@ -903,6 +978,11 @@ def score_tp_pools(
 
             reward = abs(tp_price - entry)
             rr = reward / risk
+            durable_floor = _durable_tp_rr_floor(risk, be_move)
+            if rr < durable_floor:
+                # Invalid TP geometry: no realistic hit-rate can make a
+                # micro-payoff full-position target institutional.
+                continue
 
             # ─── EV components ────────────────────────────────────────────
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
@@ -925,21 +1005,24 @@ def score_tp_pools(
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
+            pool_delivery_prob = _pool_score_to_delivery_probability(
+                raw_prob, dist_atr, tf, terminal_target)
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
-                raw_prob,
+                pool_delivery_prob,
                 confluence,
                 gauntlet_mult,
                 reach_mult,
                 risk,
                 be_move,
+                terminal_target,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
-                raw_prob, rr, rr_floor, dist_atr, reward, be_move)
+                pool_delivery_prob, rr, rr_floor, dist_atr, reward, be_move)
             utility *= reach_mult
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
@@ -986,6 +1069,7 @@ def score_tp_pools(
                 ev           = ev,
                 components   = {
                     "raw_prob":    raw_prob,
+                    "pool_delivery_prob": pool_delivery_prob,
                     "confluence":  confluence,
                     "rr_quality":  utility_components["rr_utility"],
                     "be_quality":  utility_components["be_quality"],
@@ -1270,6 +1354,15 @@ def diagnose_tp_pools(
 
             row.reward = abs(row.tp_price - entry)
             row.rr = row.reward / risk
+            durable_floor = _durable_tp_rr_floor(risk, be_move)
+            if row.rr < durable_floor:
+                row.required_rr = durable_floor
+                row.required_delivery_prob = _required_delivery_probability(row.rr, 0.0)
+                row.reason = (
+                    f"R:R {row.rr:.2f} < durable payoff floor {durable_floor:.2f}; "
+                    "probability not evaluated because required hit-rate would be unrealistic"
+                )
+                rows.append(row); continue
 
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
             row.sweep_prob = norm_prob
@@ -1290,15 +1383,18 @@ def diagnose_tp_pools(
             reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
+            pool_delivery_prob = _pool_score_to_delivery_probability(
+                raw_prob, row.distance_atr, tf, terminal_target)
             rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
-                raw_prob,
+                pool_delivery_prob,
                 confluence,
                 gauntlet_mult,
                 reach_mult,
                 risk,
                 be_move,
+                terminal_target,
             )
             row.required_rr = rr_floor
             row.delivery_prob = delivery_prob
@@ -1315,7 +1411,7 @@ def diagnose_tp_pools(
                     terminal_target,
                 )
                 rows.append(row); continue
-            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            utility, comps = _target_utility(pool_delivery_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr, tf, terminal_target)
