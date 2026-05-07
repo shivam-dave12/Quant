@@ -12,7 +12,7 @@ those priors into per-contract runtime values.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, Optional
 import math
 
@@ -84,6 +84,15 @@ class InstrumentPolicy:
     tick_agg_window_sec: float
     vwap_window: int
     cvd_window: int
+    # Portfolio mechanics. These are not alpha filters; they define how much
+    # account cash/risk a confirmed instrument may consume once its posterior
+    # is accepted. Values are intentionally ticker-overridable so BTC, metals,
+    # ETFs, high-beta xStocks and lower-liquidity RWA contracts do not share
+    # the same capital sleeve.
+    portfolio_weight: float = 1.0
+    max_position_margin_pct: float = 0.20
+    max_trade_risk_pct: float = 0.005
+    min_lot_elastic_margin_pct: float = 0.0
     notes: str = ""
 
     @property
@@ -101,6 +110,85 @@ class InstrumentPolicy:
         d["evaluation_interval_sec"] = self.evaluation_interval_sec
         return d
 
+
+
+# Per-ticker institutional portfolio priors.  These are allocation/risk priors,
+# not entry filters.  They prevent BTC-calibrated margin/risk from leaking into
+# PAXG/SLVON and xStock products.  Users can override any value through
+# config.TICKER_RISK_POLICY without touching strategy code.
+_DEFAULT_TICKER_RISK_POLICY: Dict[str, Dict[str, float]] = {
+    # Crypto: deep book, tight spread, lowest contract floor friction.
+    "BTC":   {"risk_multiplier": 1.00, "margin_pct": 0.20, "portfolio_weight": 1.30, "max_position_margin_pct": 0.24, "max_trade_risk_pct": 0.0060, "min_lot_elastic_margin_pct": 0.18},
+
+    # Metals / tokenised commodities: slower auction, gap/slippage-aware sizing.
+    "GOLD":  {"risk_multiplier": 0.72, "margin_pct": 0.15, "portfolio_weight": 0.95, "max_position_margin_pct": 0.18, "max_trade_risk_pct": 0.0045, "min_lot_elastic_margin_pct": 0.16},
+    "SILVER":{"risk_multiplier": 0.64, "margin_pct": 0.14, "portfolio_weight": 0.85, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0040, "min_lot_elastic_margin_pct": 0.16},
+    "OIL":   {"risk_multiplier": 0.60, "margin_pct": 0.13, "portfolio_weight": 0.75, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.14},
+
+    # ETF/index-like xStock derivatives.
+    "SPY":   {"risk_multiplier": 0.46, "margin_pct": 0.105, "portfolio_weight": 0.64, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0032, "min_lot_elastic_margin_pct": 0.20},
+    "QQQ":   {"risk_multiplier": 0.52, "margin_pct": 0.110, "portfolio_weight": 0.70, "max_position_margin_pct": 0.15, "max_trade_risk_pct": 0.0035, "min_lot_elastic_margin_pct": 0.22},
+
+    # Single-name xStock derivatives.  High beta/liquidity gets more budget;
+    # wider/less stable RWA contracts get less budget and stricter risk.
+    "AAPL":  {"risk_multiplier": 0.42, "margin_pct": 0.095, "portfolio_weight": 0.55, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0028, "min_lot_elastic_margin_pct": 0.22},
+    "NVDA":  {"risk_multiplier": 0.62, "margin_pct": 0.120, "portfolio_weight": 0.82, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0042, "min_lot_elastic_margin_pct": 0.26},
+    "TSLA":  {"risk_multiplier": 0.54, "margin_pct": 0.115, "portfolio_weight": 0.72, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0037, "min_lot_elastic_margin_pct": 0.25},
+    "AMZN":  {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
+    "META":  {"risk_multiplier": 0.44, "margin_pct": 0.100, "portfolio_weight": 0.58, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0030, "min_lot_elastic_margin_pct": 0.22},
+    "COIN":  {"risk_multiplier": 0.56, "margin_pct": 0.115, "portfolio_weight": 0.74, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.25},
+    "CRCL":  {"risk_multiplier": 0.36, "margin_pct": 0.090, "portfolio_weight": 0.44, "max_position_margin_pct": 0.12, "max_trade_risk_pct": 0.0024, "min_lot_elastic_margin_pct": 0.18},
+    "GOOGL": {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
+}
+
+
+def _ticker_policy_overrides(asset_id: str) -> Dict[str, float]:
+    key = str(asset_id or "").upper()
+    merged: Dict[str, float] = dict(_DEFAULT_TICKER_RISK_POLICY.get(key, {}))
+    raw = _cfg("TICKER_RISK_POLICY", {})
+    try:
+        if isinstance(raw, dict):
+            user_row = raw.get(key) or raw.get(key.lower()) or {}
+            if isinstance(user_row, dict):
+                merged.update(user_row)
+    except Exception:
+        pass
+    return merged
+
+
+def _clamp(v: Any, lo: float, hi: float, default: float) -> float:
+    try:
+        f = float(v)
+        if math.isfinite(f):
+            return max(lo, min(hi, f))
+    except Exception:
+        pass
+    return float(default)
+
+
+def _with_ticker_policy(policy: InstrumentPolicy) -> InstrumentPolicy:
+    row = _ticker_policy_overrides(policy.asset_id)
+    if not row:
+        return policy
+    changes: Dict[str, Any] = {}
+    if "risk_multiplier" in row:
+        changes["risk_multiplier"] = _clamp(row["risk_multiplier"], 0.05, 2.00, policy.risk_multiplier)
+    if "margin_pct" in row:
+        changes["margin_pct"] = _clamp(row["margin_pct"], 0.01, 0.60, policy.margin_pct)
+    if "portfolio_weight" in row:
+        changes["portfolio_weight"] = _clamp(row["portfolio_weight"], 0.05, 5.00, policy.portfolio_weight)
+    if "max_position_margin_pct" in row:
+        changes["max_position_margin_pct"] = _clamp(row["max_position_margin_pct"], 0.02, 0.75, policy.max_position_margin_pct)
+    if "max_trade_risk_pct" in row:
+        changes["max_trade_risk_pct"] = _clamp(row["max_trade_risk_pct"], 0.0005, 0.0300, policy.max_trade_risk_pct)
+    if "min_lot_elastic_margin_pct" in row:
+        changes["min_lot_elastic_margin_pct"] = _clamp(row["min_lot_elastic_margin_pct"], 0.0, 0.60, policy.min_lot_elastic_margin_pct)
+    if changes:
+        suffix = f"ticker-capital={policy.asset_id}"
+        notes = policy.notes or ""
+        changes["notes"] = notes if suffix in notes else (notes + ("; " if notes else "") + suffix)
+        return replace(policy, **changes)
+    return policy
 
 def _cap_leverage(inst: Optional[TradableInstrument], default: int) -> int:
     base = max(1, int(default))
@@ -136,7 +224,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     base_cooldown = _i('QUANT_COOLDOWN_SEC', 300)
 
     if ac == AssetClass.EQUITY:
-        return InstrumentPolicy(
+        return _with_ticker_policy(InstrumentPolicy(
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
             margin_pct=min(base_margin, _f('POLICY_EQUITY_MARGIN_PCT', 0.12)),
             risk_multiplier=_f('POLICY_EQUITY_RISK_MULT', 0.55),
@@ -166,10 +254,10 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             vwap_window=_i('POLICY_EQUITY_VWAP_WINDOW', 60),
             cvd_window=_i('POLICY_EQUITY_CVD_WINDOW', 30),
             notes='xStock/RWA equity policy; no BTC lot/risk assumptions',
-        )
+        ))
 
     if ac == AssetClass.COMMODITY:
-        return InstrumentPolicy(
+        return _with_ticker_policy(InstrumentPolicy(
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
             margin_pct=min(base_margin, _f('POLICY_COMMODITY_MARGIN_PCT', 0.14)),
             risk_multiplier=_f('POLICY_COMMODITY_RISK_MULT', 0.70),
@@ -199,10 +287,10 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             vwap_window=_i('POLICY_COMMODITY_VWAP_WINDOW', 55),
             cvd_window=_i('POLICY_COMMODITY_CVD_WINDOW', 25),
             notes='commodity-token policy; instrument-native tick/lot/ATR',
-        )
+        ))
 
     # Crypto/default policy keeps the original aggressive BTC runtime prior.
-    return InstrumentPolicy(
+    return _with_ticker_policy(InstrumentPolicy(
         asset_id=asset_id, asset_class=getattr(ac, 'value', str(ac)), leverage=lev,
         margin_pct=base_margin,
         risk_multiplier=_f('POLICY_CRYPTO_RISK_MULT', 1.0),
@@ -232,7 +320,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
         vwap_window=_i('QUANT_VWAP_WINDOW', 50),
         cvd_window=_i('QUANT_CVD_WINDOW', 20),
         notes='crypto policy',
-    )
+    ))
 
 
 def active_policy(inst: Optional[TradableInstrument] = None) -> InstrumentPolicy:

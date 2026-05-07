@@ -20,6 +20,8 @@ from collections import deque
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
 from core.pnl import gross_pnl_usd
+from core.instruments import current_instrument
+from core.market_policy import active_policy
 
 logger = logging.getLogger(__name__)
 
@@ -344,10 +346,19 @@ class RiskManager:
                 )
                 self._apply_daily_reset()
 
+            _inst = None
+            try:
+                _inst = current_instrument()
+            except Exception:
+                _inst = None
+            _asset_id = str(getattr(_inst, "asset_id", "") or "BTC").upper()
+            _symbol = str(getattr(_inst, "display_symbol", getattr(config, "DELTA_SYMBOL", "BTCUSD")) or "").upper()
+            _exchange = str(getattr(getattr(_inst, "primary_exchange", None), "value", getattr(config, "EXECUTION_EXCHANGE", "")) or "").lower()
+            _is_inverse = (_exchange == "delta" and (_symbol == "BTCUSD" or _asset_id == "BTC"))
+
             if pnl_override is not None:
                 pnl = float(pnl_override)
             else:
-                _is_inverse = str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
                 gross_pnl = gross_pnl_usd(
                     side=side,
                     entry_price=entry_price,
@@ -360,15 +371,19 @@ class RiskManager:
                 commission = (entry_price + exit_price) * quantity * fee_rate
                 pnl        = gross_pnl - commission
                 logger.debug(
-                    f"P&L breakdown: gross=${gross_pnl:+.4f} "
+                    f"P&L breakdown [{_asset_id}]: gross=${gross_pnl:+.4f} "
                     f"commission=${commission:.4f} net=${pnl:+.4f}"
-                    + (" [inverse]" if _is_inverse else " [linear]")
+                    + (" [delta_inverse_btc]" if _is_inverse else " [linear]")
                 )
 
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            margin_used       = notional_at_entry / config.LEVERAGE if config.LEVERAGE > 0 else notional_at_entry
+            try:
+                _lev = max(1.0, float(active_policy(_inst).leverage))
+            except Exception:
+                _lev = max(1.0, float(getattr(config, "LEVERAGE", 1) or 1))
+            margin_used       = notional_at_entry / _lev if _lev > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
 
             trade = TradeRecord(
@@ -401,7 +416,8 @@ class RiskManager:
                 f"📊 Trade recorded: {side.upper()} | "
                 f"Net P&L: ${pnl:+.2f} | "
                 f"Return on margin: {return_on_margin:+.2f}% | "
-                f"Qty: {quantity:.4f} BTC | "
+                f"Qty: {quantity:.4f} {_asset_id} | "
+                f"Lev: {_lev:.0f}x | "
                 f"Total trades: {self.total_trades}"
             )
 

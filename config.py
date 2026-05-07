@@ -601,12 +601,39 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
 PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
-PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
+PORTFOLIO_BUDGET_MODE = "institutional_risk_parity"   # institutional_risk_parity | equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
 # order is inside the portfolio risk cap but above the confidence-haircut target.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
+# Portfolio-level institutional caps. Risk is controlled at portfolio level,
+# while each ticker receives its own cash sleeve from TICKER_RISK_POLICY.
+PORTFOLIO_MAX_CONCURRENT_RISK_PCT = 0.030   # all open SL-risk <= 3.0% equity
+PORTFOLIO_MAX_TOTAL_MARGIN_USAGE_PCT = 0.75 # all open margin <= 75% liquid equity
+PORTFOLIO_MIN_LOT_ELASTIC_ENABLED = True    # allow min-lot borrow from unused sleeve only inside caps
+
+# Per-ticker capital/risk priors. These are used by core.market_policy and can be
+# changed without touching strategy code. portfolio_weight controls cash-sleeve
+# priority; risk_multiplier scales signal-size; margin_pct is the normal per-trade
+# cash usage; max_position_margin_pct and min_lot_elastic_margin_pct cap elastic
+# minimum-lot borrowing for xStock products.
+TICKER_RISK_POLICY = {
+    "BTC":   {"risk_multiplier": 1.00, "margin_pct": 0.20,  "portfolio_weight": 1.30, "max_position_margin_pct": 0.24, "max_trade_risk_pct": 0.0060, "min_lot_elastic_margin_pct": 0.18},
+    "GOLD":  {"risk_multiplier": 0.72, "margin_pct": 0.15,  "portfolio_weight": 0.95, "max_position_margin_pct": 0.18, "max_trade_risk_pct": 0.0045, "min_lot_elastic_margin_pct": 0.16},
+    "SILVER":{"risk_multiplier": 0.64, "margin_pct": 0.14,  "portfolio_weight": 0.85, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0040, "min_lot_elastic_margin_pct": 0.16},
+    "OIL":   {"risk_multiplier": 0.60, "margin_pct": 0.13,  "portfolio_weight": 0.75, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.14},
+    "SPY":   {"risk_multiplier": 0.46, "margin_pct": 0.105, "portfolio_weight": 0.64, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0032, "min_lot_elastic_margin_pct": 0.20},
+    "QQQ":   {"risk_multiplier": 0.52, "margin_pct": 0.110, "portfolio_weight": 0.70, "max_position_margin_pct": 0.15, "max_trade_risk_pct": 0.0035, "min_lot_elastic_margin_pct": 0.22},
+    "AAPL":  {"risk_multiplier": 0.42, "margin_pct": 0.095, "portfolio_weight": 0.55, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0028, "min_lot_elastic_margin_pct": 0.22},
+    "NVDA":  {"risk_multiplier": 0.62, "margin_pct": 0.120, "portfolio_weight": 0.82, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0042, "min_lot_elastic_margin_pct": 0.26},
+    "TSLA":  {"risk_multiplier": 0.54, "margin_pct": 0.115, "portfolio_weight": 0.72, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0037, "min_lot_elastic_margin_pct": 0.25},
+    "AMZN":  {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
+    "META":  {"risk_multiplier": 0.44, "margin_pct": 0.100, "portfolio_weight": 0.58, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0030, "min_lot_elastic_margin_pct": 0.22},
+    "COIN":  {"risk_multiplier": 0.56, "margin_pct": 0.115, "portfolio_weight": 0.74, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.25},
+    "CRCL":  {"risk_multiplier": 0.36, "margin_pct": 0.090, "portfolio_weight": 0.44, "max_position_margin_pct": 0.12, "max_trade_risk_pct": 0.0024, "min_lot_elastic_margin_pct": 0.18},
+    "GOOGL": {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
+}
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.

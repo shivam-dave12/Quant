@@ -189,6 +189,13 @@ _TP_FRONTIER_DECAY_EXPANSION = 2.75
 _TP_FRONTIER_SPAN_BONUS_MAX = 1.00
 _TP_FRONTIER_MAX_REACH_MULT = 2.50
 _TP_FRONTIER_MAX_ABS_ATR = 48.0
+# Single native bracket TP cannot express multiple child targets, but the target
+# selection model still prices institutional staged delivery.  A far frontier can
+# be selected when the path is executable even if direct full-position touch
+# probability is below a naive retail break-even threshold; size/risk downstream
+# then scales from the same posterior/utility context.
+_TP_MIN_FRONTIER_SCALE = 0.28
+_TP_MAX_PATH_CREDIT = 0.46
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -323,6 +330,60 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 def _required_delivery_probability(rr: float, cost_r: float) -> float:
     """Break-even hit probability for a TP at ``rr`` after execution cost."""
     return _clamp((1.0 + max(float(cost_r), 0.0)) / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
+
+
+def _frontier_path_credit(
+    *,
+    terminal_target: bool,
+    posterior: float,
+    confluence: float,
+    gauntlet_mult: float,
+    reach_mult: float,
+    rr: float,
+    distance_atr: float,
+) -> float:
+    """Credit for managed path delivery on external/HTF targets.
+
+    Retail TP math treats the terminal pool as an all-or-nothing fixed target.
+    Institutional execution prices the path: a trade can move stop to BE, trail
+    through intermediate liquidity, and express a terminal objective only when
+    the route quality justifies it.  This credit lowers the required full-touch
+    hurdle for terminal/frontier targets without accepting lottery pools.
+    """
+    if not terminal_target:
+        return 0.0
+    posterior_q = _clamp(posterior, 0.0, 0.95) / 0.95
+    conf_q = _clamp((confluence - 0.75) / 1.25, 0.0, 1.0)
+    lane_q = _clamp((gauntlet_mult - 0.45) / 0.55, 0.0, 1.0)
+    reach_q = _clamp(reach_mult, 0.05, 1.20) / 1.20
+    payoff_q = _clamp((rr - 1.0) / 5.5, 0.0, 1.0)
+    dist_drag = _clamp((distance_atr - 6.0) / 42.0, 0.0, 1.0)
+    credit = (
+        0.08
+        + 0.12 * posterior_q
+        + 0.09 * conf_q
+        + 0.08 * lane_q
+        + 0.06 * reach_q
+        + 0.08 * payoff_q
+        - 0.05 * dist_drag
+    )
+    return _clamp(credit, 0.0, _TP_MAX_PATH_CREDIT)
+
+
+def _frontier_scale_fraction(delivery_prob: float, required_prob: float, terminal_target: bool) -> float:
+    """Risk fraction implied by terminal path probability.
+
+    Used for diagnostics/selection.  The codebase still places one native bracket,
+    but this calculation keeps target choice from becoming a nearest-pool retail
+    shortcut: far objectives can be chosen when only a runner-sized fraction of
+    the position should be expected to reach them.
+    """
+    if required_prob <= 0.0:
+        return 1.0
+    frac = _clamp(delivery_prob / max(required_prob, 1e-9), 0.0, 1.0)
+    if terminal_target:
+        return _clamp(frac, _TP_MIN_FRONTIER_SCALE, 1.0)
+    return frac
 
 
 def _enum_value(v: Any, default: str = "") -> str:
@@ -788,6 +849,23 @@ def _institutional_rr_floor(
         terminal_target=terminal_target,
     )
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+    path_credit = _frontier_path_credit(
+        terminal_target=terminal_target,
+        posterior=posterior,
+        confluence=confluence,
+        gauntlet_mult=gauntlet_mult,
+        reach_mult=reach_mult,
+        rr=rr,
+        distance_atr=distance_atr,
+    )
+    if terminal_target:
+        # Terminal/frontier objectives are priced as managed delivery paths, not
+        # naive all-or-nothing full-size exits.  This prevents the selector from
+        # collapsing back to the nearest pool while still rejecting lottery routes.
+        ev_floor *= (1.0 - path_credit)
+        delivery_components["path_credit"] = path_credit
+        delivery_components["scale_fraction"] = _frontier_scale_fraction(
+            delivery_p, _required_delivery_probability(max(rr, 1e-9), cost_r), True)
     if posterior <= 0.0:
         # Without setup posterior, do not let conditional frontier math weaken
         # the static prior.  The target can still be far, but only if it clears
@@ -1217,8 +1295,11 @@ def score_tp_pools(
             if terminal_target:
                 model = utility_components.get("delivery_model", "frontier")
                 fp = float(utility_components.get("frontier_prob", 0.0) or 0.0)
+                scale = float(utility_components.get("scale_fraction", 1.0) or 1.0)
+                credit = float(utility_components.get("path_credit", 0.0) or 0.0)
                 reasons.append(
-                    f"terminal/frontier target ({dist_atr:.1f}>{max_reach:.1f}ATR; {model}; pathP={fp:.3f}; reach×{reach_mult:.2f})")
+                    f"terminal/frontier target ({dist_atr:.1f}>{max_reach:.1f}ATR; {model}; "
+                    f"pathP={fp:.3f}; scale≈{scale:.2f}; credit={credit:.2f}; reach×{reach_mult:.2f})")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
@@ -1260,6 +1341,8 @@ def score_tp_pools(
                     "frontier_decay": utility_components.get("frontier_decay", 1.0),
                     "delivery_model": utility_components.get("delivery_model", "direct"),
                     "required_delivery_prob": required_delivery_prob,
+                    "path_credit":  utility_components.get("path_credit", 0.0),
+                    "scale_fraction": utility_components.get("scale_fraction", _frontier_scale_fraction(delivery_prob, required_delivery_prob, terminal_target)),
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                 },
@@ -1487,7 +1570,9 @@ def diagnose_tp_pools(
             row.notes = []
             if terminal_target:
                 row.notes.append(
-                    f"frontier TP pathP={float(comps.get('frontier_prob', 0.0) or 0.0):.3f} reach×{reach_mult:.2f}")
+                    f"frontier TP pathP={float(comps.get('frontier_prob', 0.0) or 0.0):.3f} "
+                    f"scale≈{float(comps.get('scale_fraction', 1.0) or 1.0):.2f} "
+                    f"credit={float(comps.get('path_credit', 0.0) or 0.0):.2f} reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")

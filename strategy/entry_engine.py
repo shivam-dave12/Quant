@@ -1383,6 +1383,46 @@ class EntryEngine:
         except Exception:
             pass
 
+    def _adverse_selection_adjustment(self, ps, action: str, side: str, snap, flow, ict, price: float, atr: float) -> tuple[float, str]:
+        """Continuous adverse-selection price for late/chased entries.
+
+        This is not a gate.  It converts lateness, distance from the swept pool,
+        missing retrace, contra flow, and spread friction into a utility haircut so
+        the resolver naturally prefers fresh/high-quality auctions but can still
+        trade a strong move when the payoff frontier compensates for the chase.
+        """
+        try:
+            a = max(float(atr or 0.0), 1e-9)
+            sweep = getattr(ps, "sweep", None)
+            pool = getattr(sweep, "pool", None)
+            pool_px = float(getattr(pool, "price", price) or price)
+            disp = float(getattr(ps, "max_displacement", 0.0) or 0.0)
+            cisd = bool(getattr(ps, "cisd_detected", False))
+            ote = bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False))
+            profile = self._market_profile(snap, flow, ict, price, atr, side)
+            strong = max(profile.strong_displacement(_ENTRY_STRONG_DISP_ATR), 0.25)
+            chase = max(profile.chase_limit(_ENTRY_MAX_CHASE_ATR_WITHOUT_OTE), 0.35)
+            dist = abs(float(price) - pool_px) / a
+
+            # Price late displacement only when the trade is not in a retrace/value
+            # zone. CISD/OTE lower the penalty because they prove controlled
+            # acceptance/repricing instead of blind chase.
+            proof_credit = (0.18 if cisd else 0.0) + (0.28 if ote else 0.0)
+            late = max(0.0, disp - strong * (1.15 if str(action).lower() == "reverse" else 1.45))
+            chase_excess = max(0.0, dist - chase)
+            penalty = math.exp(-0.115 * late - 0.145 * chase_excess)
+            penalty = min(1.12, penalty + proof_credit)
+
+            # Spread/ATR friction from the profile is treated as execution toxicity.
+            spread_ratio = float(getattr(profile, "spread_atr", 0.0) or getattr(profile, "spread_to_atr", 0.0) or 0.0)
+            if spread_ratio > 0.0:
+                penalty *= max(0.55, 1.0 - min(spread_ratio, 1.25) * 0.22)
+
+            penalty = max(0.35, min(1.12, penalty))
+            return penalty, f"adverse×{penalty:.2f} disp={disp:.2f}ATR dist={dist:.2f}ATR cisd={int(cisd)} ote={int(ote)}"
+        except Exception as exc:
+            return 1.0, f"adverse_unavailable:{exc}"
+
     def _continuous_auction_decision(
         self, ps, snap, flow, ict, price: float, atr: float, now: float,
         phase: str, rev_dir: str, cont_dir: str, rev_total: float, cont_total: float,
@@ -1413,13 +1453,15 @@ class EntryEngine:
                 score_side = rev_total if action == "reverse" else cont_total
                 score_other = cont_total if action == "reverse" else rev_total
                 margin = (score_side - score_other) / max(abs(score_side) + abs(score_other) + 1.0, 1.0)
+                adverse_mult, adverse_reason = self._adverse_selection_adjustment(
+                    ps, action, side, snap, flow, ict, price, atr)
                 utility = (
                     1.80 * float(getattr(qd, "expected_value", 0.0) or 0.0)
                     + 0.85 * float(getattr(qd, "posterior", 0.0) or 0.0)
                     + 0.22 * float(getattr(qd, "llr", 0.0) or 0.0)
                     + 0.30 * margin
-                )
-                candidates.append((utility, action, side, qd, mem_reason))
+                ) * adverse_mult
+                candidates.append((utility, action, side, qd, mem_reason, adverse_mult, adverse_reason))
             except Exception as exc:
                 logger.debug("continuous auction posterior error: %s", exc)
         if not candidates:
@@ -1431,7 +1473,7 @@ class EntryEngine:
             return PostSweepDecision(
                 action="wait", direction="", confidence=0.0,
                 reason=f"CONTINUOUS_AUCTION_TIE {best[1]}={best[0]:.2f} {candidates[1][1]}={candidates[1][0]:.2f}")
-        _utility, action, side, qd, mem_reason = best
+        _utility, action, side, qd, mem_reason, adverse_mult, adverse_reason = best
         self._last_sweep_analysis["quant_posterior"] = qd.posterior
         self._last_sweep_analysis["quant_ev"] = qd.expected_value
         self._last_sweep_analysis["quant_components"] = getattr(qd, "components", {}) or {}
@@ -1445,7 +1487,15 @@ class EntryEngine:
         score_total = rev_total if action == "reverse" else cont_total
         other_total = cont_total if action == "reverse" else rev_total
         score_conf = min(1.0, max(score_total, 0.0) / 90.0)
-        conf = min(1.0, 0.80 * float(getattr(qd, "posterior", 0.0) or 0.0) + 0.20 * score_conf)
+        try:
+            quality_score = float((getattr(self, "_last_sweep_analysis", {}) or {}).get("quality_score", 1.0) or 1.0)
+        except Exception:
+            quality_score = 1.0
+        conf = min(1.0, (0.80 * float(getattr(qd, "posterior", 0.0) or 0.0) + 0.20 * score_conf)
+                   * math.sqrt(max(0.20, min(1.0, quality_score)))
+                   * math.sqrt(max(0.35, min(1.12, adverse_mult))))
+        self._last_sweep_analysis["adverse_selection"] = adverse_reason
+        self._last_sweep_analysis["adverse_selection_mult"] = adverse_mult
         if action == "reverse" and getattr(ps, "cisd_detected", False):
             conf = min(1.0, conf + 0.03)
         if action == "reverse" and getattr(ps, "ote_reached", False):
@@ -1453,7 +1503,7 @@ class EntryEngine:
         self._log_posterior_accept_once(
             ("continuous", action, side, phase, round(float(getattr(getattr(ps, "sweep", None), "pool", None).price), 1), int(ps.entered_at)),
             f"🧠 POSTERIOR ACCEPTED: {action.upper()} {side.upper()} [{phase}] "
-            f"(continuous auction resolver; {score_total:.0f} vs {other_total:.0f}) | {qd.compact()}",
+            f"(continuous auction resolver; {score_total:.0f} vs {other_total:.0f}; {adverse_reason}) | {qd.compact()}",
             now,
         )
         target = opp if action == "reverse" else self._find_opposing_target(side, snap, price, atr)
@@ -1709,83 +1759,18 @@ class EntryEngine:
 
         # Primary institutional resolver: evaluate every post-sweep tick with
         # Bayesian posterior/EV.  CISD/OTE/displacement are evidence features,
-        # not hard readiness gates.  The old score threshold remains only as a
-        # compatibility fallback below.
+        # not hard readiness gates. Legacy score thresholds below are telemetry only.
         continuous = self._continuous_auction_decision(
             ps, snap, flow, ict, price, atr, now, phase, rev_dir, cont_dir,
             rev_total, cont_total, opp, rev_r, cont_r)
         if continuous.action in ("reverse", "continue"):
             return continuous
 
-        if rev_total >= threshold and gap >= gap_min:
-            qd = evaluate_post_sweep_quant(
-                action="reverse", side=rev_dir, rev_score=rev_total, cont_score=cont_total,
-                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
-                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
-                snap=snap, flow=flow, ict=ict)
-            self._last_sweep_analysis["quant_posterior"] = qd.posterior
-            self._last_sweep_analysis["quant_ev"] = qd.expected_value
-            self._last_sweep_analysis["quant_components"] = qd.components
-            if not qd.accept:
-                return PostSweepDecision(
-                    action="wait", direction="", confidence=0.0,
-                    reason=f"QUANT_WAIT reverse: {qd.compact()}")
-            gate_ok, gate_reason = self._institutional_entry_quality_gate(
-                ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
-            if not gate_ok:
-                return PostSweepDecision(
-                    action="wait", direction="", confidence=0.0,
-                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
-            score_conf = min(1.0, rev_total / 90.0)
-            conf = 0.78 * qd.posterior + 0.22 * score_conf
-            if ps.cisd_detected: conf = min(1.0, conf + 0.05)
-            if ps.ote_reached: conf = min(1.0, conf + 0.03)
-            self._log_posterior_accept_once(
-                ("reverse", rev_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
-                f"🧠 POSTERIOR ACCEPTED: REVERSAL {rev_dir.upper()} [{phase}] "
-                f"(rev={rev_total:.0f} vs cont={cont_total:.0f}) | {qd.compact()}",
-                now,
-            )
-            return PostSweepDecision(
-                action="reverse", direction=rev_dir, confidence=conf,
-                next_target=opp,
-                reason=f"REVERSAL [{rev_total:.0f}v{cont_total:.0f}] "
-                       f"[{phase}] {' + '.join(rev_r[:5])}")
-
-        elif cont_total >= threshold * 0.9 and gap >= gap_min:
-            qd = evaluate_post_sweep_quant(
-                action="continue", side=cont_dir, rev_score=rev_total, cont_score=cont_total,
-                displacement_atr=ps.max_displacement, cisd=ps.cisd_detected,
-                ote=ps.ote_reached or ps.ote_holding, phase=phase, price=price, atr=atr,
-                snap=snap, flow=flow, ict=ict)
-            self._last_sweep_analysis["quant_posterior"] = qd.posterior
-            self._last_sweep_analysis["quant_ev"] = qd.expected_value
-            self._last_sweep_analysis["quant_components"] = qd.components
-            if not qd.accept:
-                return PostSweepDecision(
-                    action="wait", direction="", confidence=0.0,
-                    reason=f"QUANT_WAIT continue: {qd.compact()}")
-            gate_ok, gate_reason = self._institutional_entry_quality_gate(
-                ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
-            if not gate_ok:
-                return PostSweepDecision(
-                    action="wait", direction="", confidence=0.0,
-                    reason=f"DYNAMIC_QUALITY_WAIT: {gate_reason}")
-            cont_target = self._find_opposing_target(cont_dir, snap, price, atr)
-            self._log_posterior_accept_once(
-                ("continue", cont_dir, phase, round(sweep.pool.price, 1), int(ps.entered_at)),
-                f"🧠 POSTERIOR ACCEPTED: CONTINUATION {cont_dir.upper()} [{phase}] | {qd.compact()}",
-                now,
-            )
-            return PostSweepDecision(
-                action="continue", direction=cont_dir,
-                confidence=0.78 * qd.posterior + 0.22 * min(1.0, cont_total / 90.0),
-                next_target=cont_target,
-                reason=f"CONTINUATION [{cont_total:.0f}v{rev_total:.0f}] "
-                       f"[{phase}] {' + '.join(cont_r[:5])}")
-
+        # No legacy score-threshold fallback.  Old POST_SWEEP phase thresholds
+        # are telemetry only; routing is governed exclusively by the continuous
+        # auction posterior/EV resolver above.
         return PostSweepDecision(action="wait", direction="", confidence=0.0,
-                                  reason=f"WAIT [{rev_total:.0f}v{cont_total:.0f}]")
+                                  reason=f"CONTINUOUS_AUCTION_WAIT [{rev_total:.0f}v{cont_total:.0f}]")
 
     # ── Internal: regime-adaptive SL helpers ────────────────────────
 
@@ -1834,6 +1819,61 @@ class EntryEngine:
         if side == "short":
             return sl > price
         return False
+
+    def _coerce_protective_sl(
+        self,
+        side: str,
+        sl: float,
+        price: float,
+        atr: float,
+        *,
+        invalidation_price: float = 0.0,
+        min_risk: float = 0.0,
+        max_risk: float = 0.0,
+    ) -> tuple[float, str]:
+        """Return a side-correct, liquidation-survivable stop.
+
+        This is the hard invariant for every entry style: a LONG stop can only
+        live below entry and a SHORT stop can only live above entry.  When an
+        upstream structural anchor is on the wrong side (for example a reversal
+        wick/pool calculation around a fast sweep), we do not pass that broken
+        price downstream and later reject the trade.  We rebuild the stop from a
+        structural/statistical invalidation distance and let position sizing
+        shrink from the true risk.
+        """
+        a = max(float(atr or 0.0), 1e-9)
+        px = float(price or 0.0)
+        raw = float(sl or 0.0)
+        min_risk_f = max(float(min_risk or 0.0), a * _SL_MIN_ATR_MULT)
+        _liq, _guard, liq_room = self._liquidation_guard(side, px)
+        room = float(max_risk or 0.0) if float(max_risk or 0.0) > 0.0 else liq_room * 0.90
+        if room <= 0.0:
+            room = a * 30.0
+        room = max(room, min_risk_f)
+
+        inv = float(invalidation_price or 0.0)
+        inv_risk = abs(px - inv) if inv > 0.0 else 0.0
+        raw_risk = abs(px - raw) if raw > 0.0 else 0.0
+        # If raw is on the wrong side, ignore its small distance and rebuild
+        # from invalidation/noise. If raw is already protective, preserve it.
+        if self._sl_is_protective(side, raw, px):
+            risk = max(raw_risk, min_risk_f)
+            reason = "protective"
+        else:
+            risk = max(inv_risk + 0.25 * a, min_risk_f, a * 0.65)
+            reason = "repaired_wrong_side"
+
+        risk = min(max(risk, min_risk_f), max(room, min_risk_f))
+        fixed = px - risk if side == "long" else px + risk
+
+        # Keep the stop strictly before liquidation. If the first rebuilt stop is
+        # still outside the guard, cap it to the exchange-survivable surface.
+        if not self._sl_before_liquidation(side, fixed, px):
+            cap = max(liq_room * 0.82, min_risk_f) if liq_room > 0.0 else risk
+            cap = min(max(cap, min_risk_f), max(room, min_risk_f))
+            fixed = px - cap if side == "long" else px + cap
+            reason += "+liq_capped"
+        return fixed, reason
 
     @staticmethod
     def _liquidation_guard(side: str, entry: float) -> tuple:
@@ -1998,10 +2038,20 @@ class EntryEngine:
         Build the executable stop from structural invalidation, live noise,
         and protective liquidity. Returns (sl, reason).
         """
-        if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
-            return None, "non-protective structural SL"
+        if atr <= 0 or price <= 0:
+            return None, "invalid price/ATR for SL"
         self._last_liq_snapshot = snap
         min_risk = max(0.0, float(min_risk or 0.0))
+        if not self._sl_is_protective(side, structural_sl, price):
+            structural_sl, repair_reason = self._coerce_protective_sl(
+                side, structural_sl, price, atr,
+                invalidation_price=invalidation_price,
+                min_risk=min_risk,
+            )
+            logger.info(
+                "SL envelope %s: repaired non-protective structural SL via %s SL=$%.1f",
+                label, repair_reason, structural_sl,
+            )
 
         _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
         max_risk = liq_room * 0.90 if liq_room > 0 else atr * 30.0
@@ -2099,6 +2149,17 @@ class EntryEngine:
                         label, pool_sl, geometry_reason)
 
         sl = self._push_sl_behind_pools(sl, side, price, atr, max_risk=max_risk)
+        if not self._sl_is_protective(side, sl, price):
+            sl, repair_reason = self._coerce_protective_sl(
+                side, sl, price, atr,
+                invalidation_price=invalidation_price,
+                min_risk=max(min_risk, stat_floor),
+                max_risk=max_risk,
+            )
+            logger.info(
+                "SL envelope %s: liquidity push produced wrong-side SL; repaired via %s SL=$%.1f",
+                label, repair_reason, sl,
+            )
         risk = abs(price - sl)
 
         if not self._sl_is_protective(side, sl, price):
@@ -2420,6 +2481,16 @@ class EntryEngine:
             sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            sl, repair_reason = self._coerce_protective_sl(
+                side, sl, price, atr,
+                invalidation_price=sweep.wick_extreme,
+                min_risk=atr * _SL_MIN_ATR_MULT,
+            )
+            logger.info(
+                "SL repair: reversal initial wrong-side stop converted through %s SL=$%.1f",
+                repair_reason, sl,
+            )
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
             return
         risk = abs(price - sl)
@@ -2448,6 +2519,13 @@ class EntryEngine:
             else:
                 sl = sweep.wick_extreme + wick_clear
             sl = self._push_sl_behind_pools(sl, side, price, atr)
+            if not self._sl_is_protective(side, sl, price):
+                sl, repair_reason = self._coerce_protective_sl(
+                    side, sl, price, atr,
+                    invalidation_price=sweep.wick_extreme,
+                    min_risk=wick_clear,
+                )
+                logger.info("SL repair: wick-floor wrong-side stop converted through %s SL=$%.1f", repair_reason, sl)
             risk = abs(price - sl)
             logger.debug(
                 f"SL anchored to wick: risk={risk:.1f}pts ({risk/atr:.2f}x ATR) "
@@ -2563,6 +2641,13 @@ class EntryEngine:
             sl = sweep.pool.price + atr * _CONT_SL_BUFFER_ATR * regime_mult
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
+        if not self._sl_is_protective(side, sl, price):
+            sl, repair_reason = self._coerce_protective_sl(
+                side, sl, price, atr,
+                invalidation_price=sweep.pool.price,
+                min_risk=atr * _SL_MIN_ATR_MULT,
+            )
+            logger.info("SL repair: continuation initial wrong-side stop converted through %s SL=$%.1f", repair_reason, sl)
 
         tp_buf = atr * 0.35
         tp = target.pool.price - tp_buf if side == "long" else target.pool.price + tp_buf

@@ -9325,11 +9325,19 @@ class QuantStrategy:
                 f"MIN_MARGIN_USDT ${QCfg.MIN_MARGIN_USDT():.2f}"
             )
             return None
-        _bal_usage_pct = float(_cfg(
+        # Instrument-native margin allocation.  The old code used the global
+        # BALANCE_USAGE_PERCENTAGE for every symbol, so BTC, PAXG, SLVON and
+        # high-priced xStocks consumed the same margin fraction.  PortfolioManager
+        # now supplies a ticker-specific sleeve; QCfg.MARGIN_PCT() defines the
+        # normal cash usage inside that sleeve.
+        _policy_margin_frac = float(QCfg.MARGIN_PCT())
+        _global_cap_pct = float(_cfg(
             "MAX_ENTRY_MARGIN_USAGE_PCT",
             _cfg("BALANCE_USAGE_PERCENTAGE", 60.0),
         ))
-        _bal_usage_frac = max(0.01, min(1.0, _bal_usage_pct / 100.0))
+        _global_cap_frac = max(0.01, min(1.0, _global_cap_pct / 100.0))
+        _bal_usage_frac = max(0.01, min(_global_cap_frac, _policy_margin_frac))
+        _bal_usage_pct = _bal_usage_frac * 100.0
 
         # ── BUG 3 FIX: commission reserve ─────────────────────────────────────
         # Reserve: we charge an aggressive 2× the live taker rate (entry taker
@@ -9404,6 +9412,17 @@ class QuantStrategy:
             risk_pct = raw_risk_pct
 
         cash_budget = available * _bal_usage_frac
+        if portfolio_scoped:
+            try:
+                elastic_cash_budget = float(bal.get("portfolio_elastic_cash_budget_usd", cash_budget) or cash_budget)
+                remaining_margin_budget = float(bal.get("portfolio_remaining_margin_budget_usd", elastic_cash_budget) or elastic_cash_budget)
+                ticker_margin_cap = float(bal.get("portfolio_ticker_margin_cap_usd", elastic_cash_budget) or elastic_cash_budget)
+                # Use the larger of the normal ticker sleeve and the portfolio
+                # elastic min-lot budget, but never above remaining portfolio
+                # margin or the ticker-specific maximum margin cap.
+                cash_budget = max(cash_budget, min(elastic_cash_budget, remaining_margin_budget, ticker_margin_cap))
+            except Exception:
+                pass
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
             float(viability.round_trip_cost_pts),
@@ -9423,6 +9442,22 @@ class QuantStrategy:
 
         target_risk_base = risk_available if portfolio_scoped else available
         risk_capital = target_risk_base * risk_pct * total_mult
+        if portfolio_scoped:
+            try:
+                remaining_risk = float(bal.get("portfolio_remaining_risk_budget_usd", risk_capital) or 0.0)
+                ticker_risk_cap = float(bal.get("portfolio_ticker_max_risk_usd", risk_capital) or 0.0)
+                # Cap actual order risk by both portfolio remaining risk and
+                # the ticker-specific risk budget. This preserves dynamic
+                # confidence sizing while preventing one instrument from
+                # consuming the whole account's risk allowance.
+                if remaining_risk <= 0.0 or ticker_risk_cap <= 0.0:
+                    logger.info(
+                        "Sizing rejected: portfolio risk budget exhausted | "
+                        f"remaining=${remaining_risk:.2f} ticker_cap=${ticker_risk_cap:.2f}")
+                    return None
+                risk_capital = min(risk_capital, remaining_risk, ticker_risk_cap)
+            except Exception:
+                pass
         qty_raw = risk_capital / sl_dist
         max_allowed_margin = cash_budget
         # Non-portfolio behaviour is unchanged: the confidence-adjusted target
@@ -9530,6 +9565,9 @@ class QuantStrategy:
             f"({fee_to_risk:.2f}R) | "
             f"cash=${required_cash:.2f}/${cash_budget:.2f} | "
             f"risk_base=${target_risk_base:.2f} slot_available=${available:.2f} | "
+            f"alloc={bal.get('portfolio_budget_mode', 'single')} "
+            f"w={float(bal.get('portfolio_allocation_weight', 1.0) or 1.0):.2f} "
+            f"risk_rem=${float(bal.get('portfolio_remaining_risk_budget_usd', risk_capital) or risk_capital):.2f} | "
             f"headroom=${available - required_cash:.2f} | qty={qty}"
         )
         return qty
