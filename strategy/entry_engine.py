@@ -2515,10 +2515,13 @@ class EntryEngine:
             return None, None
 
         if score is not None:
+            comps = getattr(score, "components", {}) or {}
             logger.info(
-                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
+                "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f deliveryP=%.4f sweepP=%.4f EV=%.3f gauntlet=%d model=%s (%s)",
                 tp_price, score.distance_atr, score.rr,
+                float(comps.get("delivery_prob", score.sweep_prob) or 0.0),
                 score.sweep_prob, score.ev, score.gauntlet_n,
+                str(comps.get("delivery_model", "direct")),
                 ", ".join(score.reasons) if score.reasons else "institutional gates passed",
             )
         return tp_price, target

@@ -177,6 +177,19 @@ _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
 
+# Terminal/frontier target handling.  A far TP must not be selected because it is
+# simply far, and it must not be rejected just because the first-touch model says
+# the next immediate sweep probability is low.  Institutional target selection
+# treats HTF/external pools as conditional delivery objectives: if the auction
+# posterior, pool quality, HTF rank, confluence and path/gauntlet quality support
+# the route, the TP can be reasonably far and still executable.
+_TP_FRONTIER_PROB_FLOOR = 0.055
+_TP_FRONTIER_PROB_CAP   = 0.42
+_TP_FRONTIER_DECAY_EXPANSION = 2.75
+_TP_FRONTIER_SPAN_BONUS_MAX = 1.00
+_TP_FRONTIER_MAX_REACH_MULT = 2.50
+_TP_FRONTIER_MAX_ABS_ATR = 48.0
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -579,6 +592,16 @@ def _max_reach_for_tf(tf: str) -> float:
     return float(_MAX_REACH_ATR.get(str(tf), _MAX_REACH_ATR.get(str(tf).lower(), 12.0)))
 
 
+def _max_frontier_reach_for_tf(tf: str) -> float:
+    """Maximum executable TP frontier in ATR units for a timeframe.
+
+    This is not a nearest-target filter.  It prevents lottery objectives that are
+    so far beyond the timeframe's historical sweep horizon that even strong R:R
+    cannot make the path institutionally executable.
+    """
+    return min(_TP_FRONTIER_MAX_ABS_ATR, max(_max_reach_for_tf(tf) * _TP_FRONTIER_MAX_REACH_MULT, _max_reach_for_tf(tf) + 6.0))
+
+
 def _is_terminal_tp_candidate(target: Any, distance_atr: float) -> bool:
     """True when a beyond-reach pool is still a valid terminal objective.
 
@@ -633,7 +656,7 @@ def _posterior_delivery_probability(
     gauntlet_mult: float,
     reach_mult: float,
 ) -> float:
-    """Blend setup posterior with the pool's own delivery probability."""
+    """Direct first-sweep delivery probability for non-terminal objectives."""
     pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
     pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
     pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
@@ -646,6 +669,79 @@ def _posterior_delivery_probability(
     return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
 
+def _frontier_delivery_probability(
+    *,
+    direct_prob: float,
+    posterior_prob: float,
+    confluence: float,
+    gauntlet_mult: float,
+    reach_mult: float,
+    rr: float,
+    distance_atr: float,
+    significance: float,
+    tf: str,
+    terminal_target: bool,
+) -> Tuple[float, Dict[str, float]]:
+    """Path-adjusted probability for executable HTF/frontier TP targets.
+
+    The first-touch MTF model answers: "what is likely to be swept next?"  That
+    is useful for near targets but underprices external/HTF delivery targets.
+    Institutional execution does not require the far pool to be the *next* pool;
+    it requires a positive conditional path: auction posterior + pool quality +
+    HTF rank + confluence + acceptable gauntlet + payoff geometry.  This helper
+    produces that conditional delivery probability without turning every distant
+    pool into a valid TP.
+    """
+    direct = _clamp(direct_prob, _TP_DELIVERY_PROB_FLOOR, 0.93)
+    if not terminal_target:
+        return direct, {
+            "delivery_model": "direct",
+            "direct_prob": direct,
+            "frontier_prob": 0.0,
+            "frontier_decay": 1.0,
+        }
+
+    max_reach = _max_reach_for_tf(tf)
+    lam = max(float(_DECAY_LAMBDA.get(str(tf), _DECAY_LAMBDA.get(str(tf).lower(), 2.0))), 1.25)
+    overshoot = max(0.0, float(distance_atr) - max_reach)
+    # Far targets decay, but slower than first-touch reach: this is a conditional
+    # delivery route, not a prediction that the target is swept immediately.
+    frontier_decay = math.exp(-overshoot / max(lam * _TP_FRONTIER_DECAY_EXPANSION, 1e-9))
+    frontier_decay = _clamp(frontier_decay, 0.18, 1.00)
+
+    posterior_q = _clamp(float(posterior_prob) / 0.72, 0.0, 1.0)
+    sig_q = _clamp(float(significance) / 8.0, 0.0, 1.0)
+    tf_q = _clamp((_tf_rank(str(tf)) - 2.0) / 4.0, 0.0, 1.0)
+    conf_q = _clamp((float(confluence) - 0.80) / 1.35, 0.0, 1.0)
+    lane_q = _clamp((float(gauntlet_mult) - 0.45) / 0.55, 0.0, 1.0)
+    payoff_q = _clamp((float(rr) - 2.0) / 14.0, 0.0, 1.0)
+    reach_q = _clamp(math.sqrt(max(float(reach_mult), 0.0) / _TP_TERMINAL_PROFILE_FLOOR), 0.0, 1.0)
+
+    frontier = (
+        _TP_FRONTIER_PROB_FLOOR
+        + 0.115 * posterior_q
+        + 0.075 * sig_q
+        + 0.055 * tf_q
+        + 0.055 * conf_q
+        + 0.045 * lane_q
+        + 0.045 * payoff_q
+        + 0.025 * reach_q
+    ) * math.sqrt(frontier_decay)
+    frontier = _clamp(frontier, _TP_FRONTIER_PROB_FLOOR, _TP_FRONTIER_PROB_CAP)
+    return max(direct, frontier), {
+        "delivery_model": "frontier",
+        "direct_prob": direct,
+        "frontier_prob": frontier,
+        "frontier_decay": frontier_decay,
+        "posterior_q": posterior_q,
+        "sig_q": sig_q,
+        "tf_q": tf_q,
+        "conf_q": conf_q,
+        "lane_q": lane_q,
+        "payoff_q": payoff_q,
+    }
+
+
 def _institutional_rr_floor(
     static_min_rr: float,
     posterior_prob: float,
@@ -655,15 +751,19 @@ def _institutional_rr_floor(
     reach_mult: float,
     risk: float,
     be_move: float,
-) -> Tuple[float, float, float]:
-    """Return (required_rr, delivery_probability, cost_r).
+    *,
+    rr: float = 0.0,
+    distance_atr: float = 0.0,
+    significance: float = 0.0,
+    tf: str = "5m",
+    terminal_target: bool = False,
+) -> Tuple[float, float, float, Dict[str, float]]:
+    """Return (required_rr, delivery_probability, cost_r, delivery_components).
 
-    With no accepted setup posterior, preserve the legacy static floor. Once a
-    posterior exists, the pool is judged by positive expected value:
-        p * R - (1 - p) - cost_r >= 0
-    The static floor can be relaxed by observed auction posterior, but only
-    down to a durable payoff floor. If costs consume too much of the risk box,
-    the floor expands above the static prior instead of approving a micro-win.
+    The floor is a positive expected-value boundary, not a retail fixed R:R
+    parameter.  For normal targets we use direct sweep delivery probability.  For
+    HTF/frontier targets we use conditional path-adjusted delivery probability so
+    a reasonable far target can be selected when the route is executable.
     """
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
@@ -673,18 +773,27 @@ def _institutional_rr_floor(
     )
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
-    if posterior <= 0.0:
-        delivery_p = _posterior_delivery_probability(
-            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
-        ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
-
-    delivery_p = _posterior_delivery_probability(
+    direct_p = _posterior_delivery_probability(
         raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
+    delivery_p, delivery_components = _frontier_delivery_probability(
+        direct_prob=direct_p,
+        posterior_prob=posterior,
+        confluence=confluence,
+        gauntlet_mult=gauntlet_mult,
+        reach_mult=reach_mult,
+        rr=rr,
+        distance_atr=distance_atr,
+        significance=significance,
+        tf=tf,
+        terminal_target=terminal_target,
+    )
     ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-    posterior_floor = max(durable_floor, ev_floor)
-    return posterior_floor, delivery_p, cost_r
-
+    if posterior <= 0.0:
+        # Without setup posterior, do not let conditional frontier math weaken
+        # the static prior.  The target can still be far, but only if it clears
+        # the full positive-EV boundary.
+        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r, delivery_components
+    return max(durable_floor, ev_floor), delivery_p, cost_r, delivery_components
 
 def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
                          terminal_target: bool) -> float:
@@ -697,9 +806,15 @@ def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketP
 
 def _tp_selection_value(ev: float, rr: float, rr_floor: float,
                         distance_atr: float) -> float:
+    """Rank the executable target frontier, not simply the nearest pool.
+
+    ``ev`` has already paid for probability, path quality and gauntlet.  This
+    selection layer rewards durable payoff and reasonable delivery span so a
+    farther, executable HTF pool can beat a shallow near pool.
+    """
     surplus_r = max(float(rr) - float(rr_floor), 0.0)
-    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
-    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
+    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.30, 1.35))
+    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.055, _TP_FRONTIER_SPAN_BONUS_MAX)
     return float(ev) * payoff_frontier * delivery_span
 
 
@@ -727,15 +842,16 @@ def _tp_payoff_rejection_reason(
     )
 
 
-def _target_utility(raw_prob: float, rr: float, min_rr: float,
+def _target_utility(delivery_prob: float, rr: float, min_rr: float,
                     distance_atr: float, reward: float,
                     be_move: float) -> Tuple[float, Dict[str, float]]:
     """
-    Convert hit probability into trade utility.
+    Convert delivery probability into payoff utility.
 
-    Near pools often have high sweep probability but too little room after
-    fees, slippage, and BE migration. This utility still respects probability,
-    but pays for durable R and distance beyond the cost envelope.
+    This is not a nearest-pool heuristic.  It prices the executable objective by
+    conditional delivery probability, durable R, room beyond BE migration and
+    distance quality.  Far targets can rank first only when their conditional
+    path remains positive-EV after costs and gauntlet.
     """
     rr_excess = max(0.0, rr - float(min_rr))
     rr_utility = math.sqrt(max(rr, 0.0)) * (1.0 + min(rr_excess * 0.35, 1.25))
@@ -744,7 +860,7 @@ def _target_utility(raw_prob: float, rr: float, min_rr: float,
     be_quality = 0.35 + 0.65 * min(be_surplus_atr / 2.0, 1.0)
     distance_quality = 1.0 - math.exp(-max(distance_atr - 0.35, 0.0) / 1.8)
     distance_quality = max(0.25, distance_quality)
-    utility = raw_prob * rr_utility * be_quality * distance_quality
+    utility = _clamp(delivery_prob, _TP_DELIVERY_PROB_FLOOR, 0.95) * rr_utility * be_quality * distance_quality
     return utility, {
         "rr_utility": rr_utility,
         "be_quality": be_quality,
@@ -973,10 +1089,13 @@ def score_tp_pools(
     posterior_prob: float = 0.0,
 ) -> List[PoolScore]:
     """
-    Score every candidate TP pool. Returns PoolScore[], sorted by EV desc.
+    Score every candidate TP pool. Returns PoolScore[], sorted by executable
+    frontier utility.
 
-    The first element is the institutional choice. If empty, no pool meets
-    the constraints — caller should reject or wait; no synthetic ATR TP is created.
+    The first element is the institutional choice.  This is not nearest-pool
+    targeting: far HTF/external pools are allowed when conditional path delivery
+    is positive-EV after costs, gauntlet and volatility.  If empty, no liquidity
+    objective is executable; no synthetic ATR TP is created.
     """
     if snap is None or atr <= 0:
         return []
@@ -1019,6 +1138,8 @@ def score_tp_pools(
             tf = str(_safe(pool, "timeframe", "5m"))
             max_reach = _max_reach_for_tf(tf)
             terminal_target = dist_atr > max_reach
+            if terminal_target and dist_atr > _max_frontier_reach_for_tf(tf):
+                continue
             if terminal_target and not _is_terminal_tp_candidate(target, dist_atr):
                 continue
 
@@ -1056,7 +1177,7 @@ def score_tp_pools(
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
-            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+            rr_floor, delivery_prob, cost_r, delivery_components = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -1065,13 +1186,19 @@ def score_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
+                rr=rr,
+                distance_atr=dist_atr,
+                significance=sig,
+                tf=tf,
+                terminal_target=terminal_target,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
-                raw_prob, rr, rr_floor, dist_atr, reward, be_move)
+                delivery_prob, rr, rr_floor, dist_atr, reward, be_move)
             utility *= reach_mult
+            utility_components.update(delivery_components)
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
 
@@ -1088,8 +1215,10 @@ def score_tp_pools(
             if n_gauntlet > 0:
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
             if terminal_target:
+                model = utility_components.get("delivery_model", "frontier")
+                fp = float(utility_components.get("frontier_prob", 0.0) or 0.0)
                 reasons.append(
-                    f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
+                    f"terminal/frontier target ({dist_atr:.1f}>{max_reach:.1f}ATR; {model}; pathP={fp:.3f}; reach×{reach_mult:.2f})")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
@@ -1126,6 +1255,10 @@ def score_tp_pools(
                     "significance": sig,
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
+                    "direct_delivery_prob": utility_components.get("direct_prob", delivery_prob),
+                    "frontier_prob": utility_components.get("frontier_prob", 0.0),
+                    "frontier_decay": utility_components.get("frontier_decay", 1.0),
+                    "delivery_model": utility_components.get("delivery_model", "direct"),
                     "required_delivery_prob": required_delivery_prob,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
@@ -1269,6 +1402,11 @@ def diagnose_tp_pools(
             if row.distance_atr < 0.25:
                 row.reason = "too close: no durable delivery room after buffer/costs"
                 rows.append(row); continue
+            if terminal_target and row.distance_atr > _max_frontier_reach_for_tf(tf):
+                row.reason = (
+                    f"beyond executable frontier ({row.distance_atr:.1f}>{_max_frontier_reach_for_tf(tf):.1f} ATR for {tf}); "
+                    "lottery target, not institutional TP")
+                rows.append(row); continue
             if terminal_target and not _is_terminal_tp_candidate(target, row.distance_atr):
                 row.reason = (
                     f"distant weak LTF pool ({row.distance_atr:.1f}>{max_reach:.1f} ATR); "
@@ -1308,7 +1446,7 @@ def diagnose_tp_pools(
             reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
-            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+            rr_floor, delivery_prob, cost_r, delivery_components = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -1317,6 +1455,11 @@ def diagnose_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
+                rr=row.rr,
+                distance_atr=row.distance_atr,
+                significance=sig,
+                tf=tf,
+                terminal_target=terminal_target,
             )
             row.required_rr = rr_floor
             row.delivery_prob = delivery_prob
@@ -1333,7 +1476,8 @@ def diagnose_tp_pools(
                     terminal_target,
                 )
                 rows.append(row); continue
-            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            utility, comps = _target_utility(delivery_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            comps.update(delivery_components)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
@@ -1342,7 +1486,8 @@ def diagnose_tp_pools(
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
             if terminal_target:
-                row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
+                row.notes.append(
+                    f"frontier TP pathP={float(comps.get('frontier_prob', 0.0) or 0.0):.3f} reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")
@@ -1363,7 +1508,8 @@ def diagnose_tp_pools(
         selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
         report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
-                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
+                          f"EV={selected.ev:.3f}; deliveryP={selected.delivery_prob:.3f}; "
+                          f"sweepP={selected.sweep_prob:.3f}")
     else:
         if rows:
             # Surface the most relevant rejection, not just "no TP".
