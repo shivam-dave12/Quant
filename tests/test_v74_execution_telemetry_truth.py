@@ -7,7 +7,7 @@ from strategy.quant_strategy import QuantStrategy
 
 def test_v74_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
-    assert "v76-trail-safe-margin-true-flow" in src
+    assert "v77-symbol-profiled-btc-staged-target-flow" in src
     assert "v70-flow-audit" not in src
 
 
