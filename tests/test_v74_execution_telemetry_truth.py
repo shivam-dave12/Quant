@@ -7,7 +7,7 @@ from strategy.quant_strategy import QuantStrategy
 
 def test_v74_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
-    assert "v74-native-bracket-fast-fee-true-flow" in src
+    assert "v79-predictive-shelf-sl-staged-liquidity-flow" in src
     assert "v70-flow-audit" not in src
 
 

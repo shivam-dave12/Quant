@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
-from core.instruments import ExchangeName
+from core.instruments import ExchangeName, AssetClass
 from core.candle import Candle
 from exchanges.delta.api    import DeltaAPI
 from exchanges.delta.websocket import DeltaWebSocket
@@ -175,10 +175,16 @@ class DeltaDataManager:
             logger.info(f"✅ Delta REST warmup complete for {symbol}")
 
             self.is_ready = self._check_minimum_data()
+            snap = self.readiness_snapshot()
+            mins = snap.get("minimums", {})
+            missing = snap.get("missing", [])
             logger.info(
                 f"Delta DM[{self.symbol}] ready={self.is_ready} "
-                f"(1m={len(self._candles_1m)} 5m={len(self._candles_5m)} "
-                f"15m={len(self._candles_15m)} 4h={len(self._candles_4h)})"
+                f"(1m={len(self._candles_1m)}/{mins.get('1m')} "
+                f"5m={len(self._candles_5m)}/{mins.get('5m')} "
+                f"15m={len(self._candles_15m)}/{mins.get('15m')} "
+                f"4h={len(self._candles_4h)}/{mins.get('4h')})"
+                + (f" missing={','.join(missing)}" if missing else "")
             )
             return True
 
@@ -684,21 +690,66 @@ class DeltaDataManager:
 
     # ── Readiness ─────────────────────────────────────────────────────────────
 
-    def _check_minimum_data(self) -> bool:
+    def _minimum_data_requirements(self) -> Dict[str, int]:
+        """Instrument-aware startup readiness.
+
+        Delta xStock products often return a shallow 1m REST window even while
+        higher timeframes are fully populated.  Blocking the entire portfolio
+        until an arbitrary 100 one-minute bars appear is a retail-style warmup
+        gate: it stalls startup and can drop otherwise tradable symbols.
+
+        Institutional handling is tiered:
+          • BTC keeps the deeper 1m requirement because it is the fastest desk.
+          • Metals need enough 1m data for local sweep/wick structure.
+          • xStock/equity contracts may trade from robust 5m/15m/4h structure
+            with 1m used for execution timing, so the 1m floor is lower.
+        """
+        ac = getattr(self.instrument, "asset_class", None)
+        asset_id = str(getattr(self.instrument, "asset_id", "") or "").upper()
+
+        base = {
+            "1m":  int(getattr(config, "MIN_CANDLES_1M", 100)),
+            "5m":  int(getattr(config, "MIN_CANDLES_5M", 100)),
+            "15m": int(getattr(config, "MIN_CANDLES_15M", 100)),
+            "1h":  int(getattr(config, "MIN_CANDLES_1H", 20)),
+            "4h":  max(int(getattr(config, "MIN_CANDLES_4H", 40)), 29),
+            "1d":  int(getattr(config, "MIN_CANDLES_1D", 7)),
+        }
+
+        if asset_id == "BTC" or ac == AssetClass.CRYPTO:
+            return base
+
+        if ac == AssetClass.COMMODITY:
+            return {
+                **base,
+                "1m": int(getattr(config, "POLICY_COMMODITY_READY_MIN_1M_BARS", 75)),
+                "5m": min(base["5m"], int(getattr(config, "POLICY_COMMODITY_READY_MIN_5M_BARS", 65))),
+                "15m": min(base["15m"], int(getattr(config, "POLICY_COMMODITY_READY_MIN_15M_BARS", 65))),
+            }
+
+        if ac in (AssetClass.EQUITY, AssetClass.INDEX):
+            return {
+                **base,
+                "1m": int(getattr(config, "POLICY_EQUITY_READY_MIN_1M_BARS", 40)),
+                "5m": min(base["5m"], int(getattr(config, "POLICY_EQUITY_READY_MIN_5M_BARS", 70))),
+                "15m": min(base["15m"], int(getattr(config, "POLICY_EQUITY_READY_MIN_15M_BARS", 70))),
+            }
+
+        return base
+
+    def readiness_snapshot(self) -> Dict[str, object]:
         counts = {
             "1m": len(self._candles_1m), "5m": len(self._candles_5m),
             "15m": len(self._candles_15m), "1h": len(self._candles_1h),
             "4h": len(self._candles_4h),  "1d": len(self._candles_1d),
         }
-        mins = {
-            "1m":  getattr(config, "MIN_CANDLES_1M",   100),
-            "5m":  getattr(config, "MIN_CANDLES_5M",   100),
-            "15m": getattr(config, "MIN_CANDLES_15M",  100),
-            "1h":  getattr(config, "MIN_CANDLES_1H",    20),
-            "4h":  max(getattr(config, "MIN_CANDLES_4H", 40), 29),
-            "1d":  getattr(config, "MIN_CANDLES_1D",     7),
-        }
+        mins = self._minimum_data_requirements()
         missing = [f"{tf}({counts[tf]}<{mins[tf]})" for tf in mins if counts[tf] < mins[tf]]
+        return {"counts": counts, "minimums": mins, "missing": missing, "ready": not missing}
+
+    def _check_minimum_data(self) -> bool:
+        snap = self.readiness_snapshot()
+        missing = snap.get("missing", [])
         if missing:
             logger.debug(f"Delta DM not ready: {', '.join(missing)}")
             return False

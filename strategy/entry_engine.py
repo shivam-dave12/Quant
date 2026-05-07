@@ -1762,6 +1762,148 @@ class EntryEngine:
     def _tf_rank_for_stop_geometry(tf: str) -> int:
         return {"1m": 1, "2m": 1, "3m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6}.get(str(tf).lower(), 2)
 
+
+    @staticmethod
+    def _policy_float(name: str, default: float) -> float:
+        """Read the active instrument policy without making strategy import-time stateful."""
+        try:
+            from core.market_policy import policy_value as _policy_value
+            v = float(_policy_value(name, default) or default)
+            return v if math.isfinite(v) else float(default)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _policy_bool(name: str, default: bool) -> bool:
+        try:
+            from core.market_policy import policy_value as _policy_value
+            return bool(_policy_value(name, default))
+        except Exception:
+            return bool(default)
+
+    def _accepted_structure_invalidation(
+        self,
+        snap,
+        side: str,
+        entry: float,
+        atr: float,
+        deep_invalidation: float,
+        ps=None,
+    ) -> tuple[float, str]:
+        """Return the current accepted shelf/invalidation, not always the old sweep.
+
+        Institutional entries should be anticipated from an accepted liquidity shelf.
+        Once displacement/CISD/OTE proves that price has re-accepted away from
+        the engineered sweep, an old deep wick is no longer the only meaningful
+        invalidation for an intraday expression. We may use a LIVE protective
+        pool between the old sweep and current price as the stop shelf, but only
+        when delivery is actually accepted. This is not a fallback: the shelf is
+        a real SSL/BSL from the liquidity map, and the executable SL still sits
+        beyond that liquidity with a buffer.
+        """
+        if snap is None or atr <= 0 or not self._policy_bool("shelf_sl_enabled", True):
+            return float(deep_invalidation), "deep-sweep invalidation"
+        side = str(side or "").lower()
+        if side not in ("long", "short"):
+            return float(deep_invalidation), "deep-sweep invalidation"
+
+        disp = float(getattr(ps, "max_displacement", 0.0) or 0.0) if ps is not None else 0.0
+        cisd = bool(getattr(ps, "cisd_detected", False)) if ps is not None else False
+        ote = bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False)) if ps is not None else False
+        min_delivery = self._policy_float("shelf_sl_min_delivery_atr", 0.55)
+        if disp < min_delivery and not cisd and not ote:
+            return float(deep_invalidation), f"deep-sweep invalidation; delivery not accepted DISP={disp:.2f}ATR"
+
+        max_dist = self._policy_float("shelf_sl_max_distance_atr", 3.0)
+        min_sig = self._policy_float("shelf_sl_min_significance", 1.2)
+        pools = list(getattr(snap, "ssl_pools", []) or []) if side == "long" else list(getattr(snap, "bsl_pools", []) or [])
+        best = None
+        best_score = -1.0
+        for target in pools:
+            try:
+                pool = getattr(target, "pool", target)
+                status = str(getattr(pool, "status", "") or "").upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if px <= 0:
+                    continue
+                if side == "long" and not (px < entry):
+                    continue
+                if side == "short" and not (px > entry):
+                    continue
+                if side == "long" and px <= min(float(deep_invalidation), entry):
+                    continue
+                if side == "short" and px >= max(float(deep_invalidation), entry):
+                    continue
+                dist_atr = abs(entry - px) / max(atr, 1e-9)
+                if dist_atr > max_dist:
+                    continue
+                sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
+                if sig < min_sig:
+                    continue
+                tf_rank = self._tf_rank_for_stop_geometry(str(getattr(pool, "timeframe", "5m") or "5m"))
+                score = (sig * (1.0 + min(tf_rank, 4) * 0.08)) / (1.0 + dist_atr * 0.70)
+                touches = float(getattr(pool, "touches", 0.0) or 0.0)
+                score *= max(0.65, 1.0 - max(0.0, touches - 2.0) * 0.08)
+                if score > best_score:
+                    best_score = score
+                    best = (px, str(getattr(pool, "timeframe", "?")), sig, dist_atr)
+            except Exception:
+                continue
+        if best is None:
+            return float(deep_invalidation), "deep-sweep invalidation; no accepted live shelf"
+        px, tf, sig, dist = best
+        return float(px), f"accepted shelf invalidation {tf} @ ${px:,.1f} sig={sig:.2f} dist={dist:.2f}ATR"
+
+    def _predictive_late_entry_check(
+        self,
+        snap,
+        side: str,
+        entry: float,
+        atr: float,
+        sweep_price: float,
+        sl: float,
+    ) -> tuple[bool, str]:
+        """Block late/chasing entries; allow early predictive shelf entries."""
+        if atr <= 0:
+            return True, "ATR unavailable"
+        side = str(side or "").lower()
+        chase = abs(float(entry) - float(sweep_price)) / max(atr, 1e-9)
+        max_chase = self._policy_float("late_entry_max_chase_atr", 2.20)
+        if chase <= max_chase:
+            return False, f"chase ok {chase:.2f}ATR<={max_chase:.2f}ATR"
+
+        pools = list(getattr(snap, "bsl_pools", []) or []) if side == "long" else list(getattr(snap, "ssl_pools", []) or [])
+        risk = abs(float(entry) - float(sl))
+        best_rr = 0.0
+        for target in pools:
+            try:
+                pool = getattr(target, "pool", target)
+                status = str(getattr(pool, "status", "") or "").upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                px = float(getattr(pool, "price", 0.0) or 0.0)
+                if side == "long" and px <= entry:
+                    continue
+                if side == "short" and px >= entry:
+                    continue
+                dist_atr = abs(px - entry) / max(atr, 1e-9)
+                buf = max(0.10, min(0.50, 0.10 + 0.05 * dist_atr)) * atr
+                tp = px - buf if side == "long" else px + buf
+                if side == "long" and tp <= entry:
+                    continue
+                if side == "short" and tp >= entry:
+                    continue
+                rr = abs(tp - entry) / max(risk, 1e-9)
+                best_rr = max(best_rr, rr)
+            except Exception:
+                continue
+        min_rr = self._policy_float("late_entry_tp_compression_rr", 0.35)
+        if best_rr < min_rr:
+            return True, f"late/compressed entry: chase={chase:.2f}ATR>{max_chase:.2f}ATR nearest_tp_rr={best_rr:.2f}<{min_rr:.2f}"
+        return False, f"extended but still viable: chase={chase:.2f}ATR nearest_tp_rr={best_rr:.2f}"
+
     def _dominant_institutional_tp_reward(self, snap, side: str, entry: float, atr: float) -> float:
         """Approximate reward to the strongest real TP-side liquidity pool."""
         if snap is None or atr <= 0:
@@ -2265,10 +2407,19 @@ class EntryEngine:
         # Buffer scales with ATR-regime: compressed vol → tight buffer, expanded
         # vol → wider buffer (regime_mult: 0.60 low-vol → 1.40 high-vol).
         regime_mult = self._regime_sl_mult()
+        invalidation_anchor, invalidation_note = self._accepted_structure_invalidation(
+            snap, side, price, atr, sweep.wick_extreme, ps
+        )
         if side == "long":
-            sl = sweep.wick_extreme - atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = invalidation_anchor - atr * _REV_SL_BUFFER_ATR * regime_mult
         else:
-            sl = sweep.wick_extreme + atr * _REV_SL_BUFFER_ATR * regime_mult
+            sl = invalidation_anchor + atr * _REV_SL_BUFFER_ATR * regime_mult
+
+        if abs(float(invalidation_anchor) - float(sweep.wick_extreme)) > max(atr * 0.05, 1e-9):
+            logger.info(
+                "PREDICTIVE_SHELF_SL: %s side=%s sweep=$%.1f shelf=$%.1f entry=$%.1f",
+                invalidation_note, side, float(sweep.wick_extreme), float(invalidation_anchor), float(price)
+            )
 
         sl = self._push_sl_behind_pools(sl, side, price, atr)
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "reversal initial stop wrong-side"):
@@ -2288,7 +2439,7 @@ class EntryEngine:
         # PAST the wick extreme. This anchors SL to the structural level, not an
         # arbitrary price-ratio floor that ignores market structure entirely.
         min_risk, max_risk = self._sl_structural_bounds(
-            sweep.wick_extreme, sweep.pool.price, side, price, atr)
+            invalidation_anchor, sweep.pool.price, side, price, atr)
 
         if risk < min_risk:
             wick_clear = max(
@@ -2306,7 +2457,7 @@ class EntryEngine:
 
         # ── Institutional SL envelope ─────────────────────────────────────
         sl, sl_reason = self._apply_institutional_sl_envelope(
-            snap, side, price, atr, sl, sweep.wick_extreme, "reversal")
+            snap, side, price, atr, sl, invalidation_anchor, "reversal")
         if sl is None:
             logger.info(
                 f"CANDIDATE DEFERRED [sl_envelope]: {sl_reason} side={side} "
@@ -2344,10 +2495,21 @@ class EntryEngine:
             self._reset(now)
             return
 
+        late_block, late_reason = self._predictive_late_entry_check(
+            snap, side, price, atr, sweep.pool.price, sl
+        )
+        if late_block:
+            logger.info(
+                f"CANDIDATE DEFERRED [late_entry]: {late_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f}")
+            self._post_sweep = None
+            self._reset(now)
+            return
+
         self._last_sweep_reversal_dir = side
         self._last_sweep_reversal_time = now
 
-        # TP: pool → HTF → 2R (only if CISD)
+        # TP: EV-ranked liquidity ladder / terminal objective; no synthetic fallback.
         tp, target = self._find_tp(snap, side, price, atr, sl, _MIN_RR_RATIO)
         if tp is None:
             logger.info(
@@ -2456,6 +2618,17 @@ class EntryEngine:
         reward = abs(tp - price)
 
         if self._reject_bad_sl(side, sl, price, sweep.pool.price, now, "continuation structural stop wrong-side"):
+            return
+
+        late_block, late_reason = self._predictive_late_entry_check(
+            snap, side, price, atr, sweep.pool.price, sl
+        )
+        if late_block:
+            logger.info(
+                f"CANDIDATE DEFERRED [late_entry]: {late_reason} side={side} "
+                f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f}")
+            self._post_sweep = None
+            self._reset(now)
             return
 
         # ── Liquidation guard ─────────────────────────────────────────────

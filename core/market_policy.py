@@ -12,7 +12,7 @@ those priors into per-contract runtime values.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Any, Dict, Optional
 import math
 
@@ -85,6 +85,30 @@ class InstrumentPolicy:
     vwap_window: int
     cvd_window: int
     notes: str = ""
+    # v77 target/stop behavior profile.  These are not static trade triggers;
+    # they calibrate how the pool selector prices objectives for each product's
+    # auction behavior.  BTC can use a primary-liquidity funded runner, metals
+    # remain slower/cleaner, and xStocks receive spread-aware target behavior.
+    target_style: str = "single_full_position"
+    tp_durable_rr_floor: float = 1.35
+    tp_be_move_mult: float = 1.80
+    tp_terminal_profile_floor: float = 0.55
+    tp_terminal_reach_floor: float = 0.05
+    tp_primary_objective_min_rr: float = 1.05
+    tp_path_support_lift_max: float = 0.00
+    tp_posterior_blend_weight: float = 0.50
+    tp_min_delivery_prob_floor: float = 1e-6
+    # v79 predictive institutional flow: do not wait for a perfect one-shot TP.
+    # These calibrate whether a post-sweep move may use a live accepted shelf as
+    # invalidation and a liquidity ladder/runner as the target path.  They do
+    # not create synthetic fallback targets and they do not permit late chasing.
+    predictive_flow_enabled: bool = True
+    shelf_sl_enabled: bool = True
+    shelf_sl_max_distance_atr: float = 3.20
+    shelf_sl_min_significance: float = 1.20
+    shelf_sl_min_delivery_atr: float = 0.55
+    late_entry_max_chase_atr: float = 2.20
+    late_entry_tp_compression_rr: float = 0.35
 
     @property
     def evaluation_interval_sec(self) -> float:
@@ -235,8 +259,110 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     )
 
 
+def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
+    """Apply per-symbol behaviour profile without scattering ticker logic.
+
+    Institutional execution is not one-size-fits-all: BTC has deep continuous
+    liquidity and often trades best as a primary-liquidity objective plus runner;
+    metals have cleaner but slower auction paths; xStock tokens are more
+    spread-/venue-sensitive and should keep stricter target quality.
+    """
+    aid = str(pol.asset_id or "").upper()
+    # BTC: deep liquidity, high regime velocity, frequent near-pool refuels.
+    # Use staged liquidity objectives: TP can be a deeper runner if there is a
+    # valid nearer pool to finance BE/trailing. This fixes the v76 BTC pathology
+    # where 70 accepted sweeps died at a single full-position TP gate.
+    if aid == "BTC":
+        return replace(
+            pol,
+            min_rr=max(1.35, min(float(pol.min_rr), 1.65)),
+            max_rr=max(float(pol.max_rr), 5.5),
+            sl_buffer_atr_mult=max(float(pol.sl_buffer_atr_mult), 0.45),
+            target_style="btc_staged_liquidity_runner",
+            tp_durable_rr_floor=1.08,
+            tp_be_move_mult=1.25,
+            tp_terminal_profile_floor=0.68,
+            tp_terminal_reach_floor=0.12,
+            tp_primary_objective_min_rr=0.72,
+            tp_path_support_lift_max=0.24,
+            tp_posterior_blend_weight=0.64,
+            shelf_sl_max_distance_atr=2.60,
+            shelf_sl_min_significance=1.35,
+            shelf_sl_min_delivery_atr=0.50,
+            late_entry_max_chase_atr=2.00,
+            late_entry_tp_compression_rr=0.32,
+            notes=(pol.notes + "; BTC predictive staged-liquidity TP/SL profile").strip("; "),
+        )
+
+    # Metals/tokenised commodities: cleaner liquidity shelves but larger stop
+    # sweep envelopes. Keep full-position targets stricter than BTC, allow only
+    # mild path support from nearby objectives.
+    if aid in {"GOLD", "SILVER"}:
+        return replace(
+            pol,
+            min_rr=max(1.25, min(float(pol.min_rr), 1.65)),
+            target_style="commodity_staged_displacement",
+            tp_durable_rr_floor=0.98,
+            tp_be_move_mult=1.25,
+            tp_terminal_profile_floor=0.66,
+            tp_terminal_reach_floor=0.12,
+            tp_primary_objective_min_rr=0.30,
+            tp_path_support_lift_max=0.22,
+            tp_posterior_blend_weight=0.61,
+            shelf_sl_max_distance_atr=3.40,
+            shelf_sl_min_significance=1.15,
+            shelf_sl_min_delivery_atr=0.50,
+            late_entry_max_chase_atr=2.15,
+            late_entry_tp_compression_rr=0.28,
+            notes=(pol.notes + "; metal predictive staged-displacement TP/SL profile").strip("; "),
+        )
+
+    # High-beta xStocks / crypto-adjacent equities: allow some staged objective
+    # support, but keep the spread/venue penalties materially stronger than BTC.
+    if aid in {"NVDA", "TSLA", "COIN", "CRCL"}:
+        return replace(
+            pol,
+            target_style="high_beta_xstock_staged_spread_aware",
+            tp_durable_rr_floor=1.05,
+            tp_be_move_mult=1.35,
+            tp_terminal_profile_floor=0.62,
+            tp_terminal_reach_floor=0.10,
+            tp_primary_objective_min_rr=0.45,
+            tp_path_support_lift_max=0.18,
+            tp_posterior_blend_weight=0.56,
+            shelf_sl_max_distance_atr=3.00,
+            shelf_sl_min_significance=1.25,
+            shelf_sl_min_delivery_atr=0.60,
+            late_entry_max_chase_atr=1.90,
+            late_entry_tp_compression_rr=0.34,
+            notes=(pol.notes + "; high-beta xStock predictive staged TP/SL profile").strip("; "),
+        )
+
+    # Broad/large-cap xStocks: lower volatility, weaker 24/7 venue liquidity.
+    # Prefer clean full-position objectives and only a small path support lift.
+    if aid in {"SPY", "QQQ", "AAPL", "AMZN", "META", "GOOGL"}:
+        return replace(
+            pol,
+            target_style="large_cap_xstock_staged_clean",
+            tp_durable_rr_floor=1.12,
+            tp_be_move_mult=1.45,
+            tp_terminal_profile_floor=0.60,
+            tp_terminal_reach_floor=0.08,
+            tp_primary_objective_min_rr=0.55,
+            tp_path_support_lift_max=0.14,
+            tp_posterior_blend_weight=0.54,
+            shelf_sl_max_distance_atr=2.70,
+            shelf_sl_min_significance=1.25,
+            shelf_sl_min_delivery_atr=0.65,
+            late_entry_max_chase_atr=1.75,
+            late_entry_tp_compression_rr=0.38,
+            notes=(pol.notes + "; large-cap xStock predictive staged TP/SL profile").strip("; "),
+        )
+    return pol
+
+
 def active_policy(inst: Optional[TradableInstrument] = None) -> InstrumentPolicy:
-    return build_instrument_policy(inst if inst is not None else current_instrument())
+    return _apply_behavior_overrides(build_instrument_policy(inst if inst is not None else current_instrument()))
 
 
 def policy_value(name: str, default: Any = None, inst: Optional[TradableInstrument] = None) -> Any:

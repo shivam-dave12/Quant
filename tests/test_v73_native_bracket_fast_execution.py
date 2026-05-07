@@ -9,7 +9,7 @@ from exchanges.delta.api import DeltaAPI
 def test_v73_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
     # v74 supersedes the v73 runtime fingerprint while preserving v73 behavior.
-    assert "v74-native-bracket-fast-fee-true-flow" in src
+    assert "v79-predictive-shelf-sl-staged-liquidity-flow" in src
     assert "v70-flow-audit" not in src
 
 
