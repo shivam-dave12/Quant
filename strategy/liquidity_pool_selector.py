@@ -237,9 +237,12 @@ class PoolScore:
     reasons:       List[str]        = field(default_factory=list)
 
     def __repr__(self) -> str:
+        ev_r = float((self.components or {}).get("expected_value_r", 0.0) or 0.0)
+        p_del = float((self.components or {}).get("delivery_prob", self.sweep_prob) or 0.0)
+        frontier = float((self.components or {}).get("selection_ev", self.ev) or 0.0)
         return (f"PoolScore(tp=${self.tp_price:,.1f} "
                 f"dist={self.distance_atr:.1f}ATR rr={self.rr:.2f} "
-                f"P={self.sweep_prob:.2f} EV={self.ev:.3f})")
+                f"Pdel={p_del:.2f} EV_R={ev_r:.3f} frontier={frontier:.3f})")
 
 
 @dataclass

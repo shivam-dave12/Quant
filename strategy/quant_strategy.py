@@ -2833,31 +2833,31 @@ class QuantStrategy:
             return f"{float(qty):.6f} units"
 
     def _log_init(self):
-        logger.info("=" * 72)
-        logger.info("⚡ QuantStrategy v10.0 — INSTITUTIONAL LIQUIDITY-FIRST")
         with instrument_scope(getattr(self, "_instrument", None)):
+            logger.info("=" * 72)
+            logger.info("⚡ QuantStrategy v10.1 — UNIFIED INSTITUTIONAL ENTRYENGINE")
             _inst = getattr(self, "_instrument", None)
             _asset = getattr(_inst, "asset_id", QCfg.SYMBOL())
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
-            logger.info("   EntryArchitecture: v74-native-bracket-fast-fee-true-flow")
+            logger.info("   EntryArchitecture: v79-unified-entryengine-liquidity-ev (base=v74-native-bracket-fast-fee-true-flow)")
             if is_btc_context(self):
-                logger.info("   BTCOverlay: v58-strategy-liquidity-aware-tp-sl")
-        entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
-        logger.info(f"   Entry: {entry_status}")
-        liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
-        logger.info(f"   LiquidityMap: {liq_status}")
-        ict_status = "ENABLED" if self._ict else "DISABLED"
-        logger.info(f"   ICT Engine: {ict_status}")
-        dir_status = "ACTIVE" if self._dir_engine else "UNAVAILABLE"
-        logger.info(f"   DirectionEngine: {dir_status}")
-        conv_status = "ADVISORY/SAFETY" if self._conviction else "UNAVAILABLE"
-        logger.info(f"   ConvictionModel: {conv_status}")
-        liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
-        logger.info(f"   LiquidityTrail: {liq_trail}")
-        pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
-        logger.info(f"   PostTradeAgent: {pta_status}")
-        logger.info("=" * 72)
+                logger.info("   BTCOverlay: liquidity-aware TP/SL EV model")
+            entry_status = "SINGLE AUTHORITY (LiquidityMap -> EntryEngine posterior/TP/SL EV -> MechanicalRisk -> DeltaBracket)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
+            logger.info(f"   EntryEngine: {entry_status}")
+            liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
+            logger.info(f"   LiquidityMap: {liq_status}")
+            ict_status = "TELEMETRY/FEATURES" if self._ict else "UNAVAILABLE"
+            logger.info(f"   ICT Engine: {ict_status}")
+            dir_status = "TELEMETRY ONLY" if self._dir_engine else "UNAVAILABLE"
+            logger.info(f"   DirectionEngine: {dir_status}")
+            conv_status = "SIZE/ACCOUNT-SAFETY LENS ONLY" if self._conviction else "UNAVAILABLE"
+            logger.info(f"   ConvictionModel: {conv_status}")
+            liq_trail = "ACTIVE" if self._liq_trail else "UNAVAILABLE"
+            logger.info(f"   LiquidityTrail: {liq_trail}")
+            pta_status = "ACTIVE" if self._post_trade_agent else "UNAVAILABLE"
+            logger.info(f"   PostTradeAgent: {pta_status}")
+            logger.info("=" * 72)
 
     def _current_entry_session(self) -> str:
         if self._ict is None:

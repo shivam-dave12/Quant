@@ -2522,6 +2522,11 @@ def main():
     )
     _sh.setFormatter(_fmt)
     logging.basicConfig(level=getattr(config, "LOG_LEVEL", "INFO"), handlers=[_fh, _sh], force=True)
+    try:
+        from core.instruments import install_instrument_log_filter
+        install_instrument_log_filter()
+    except Exception:
+        pass
 
     def _signal_handler(signum, frame):
         logger.info(f"Signal {signum} — stopping controller")

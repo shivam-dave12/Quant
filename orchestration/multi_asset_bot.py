@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import config
 from aggregator.market_aggregator import MarketAggregator
-from core.instruments import ExchangeName, TradableInstrument, instrument_scope
+from core.instruments import ExchangeName, TradableInstrument, instrument_scope, install_instrument_log_filter
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
@@ -739,26 +739,27 @@ class MultiAssetQuantBot:
             return False
 
     def _build_asset_context(self, inst: TradableInstrument, delta_api) -> Optional[AssetContext]:
-        if ExchangeName.DELTA not in inst.by_exchange or delta_api is None:
-            logger.warning("%s skipped: Delta order manager unavailable", inst.asset_id)
-            return None
-        delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-        router = ExecutionRouter(delta_om=delta_om)
-        data = MarketAggregator(primary_dm=DeltaDataManager(instrument=inst), secondary_dm=None, instrument=inst)
+        with instrument_scope(inst):
+            if ExchangeName.DELTA not in inst.by_exchange or delta_api is None:
+                logger.warning("%s skipped: Delta order manager unavailable", inst.asset_id)
+                return None
+            delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
+            router = ExecutionRouter(delta_om=delta_om)
+            data = MarketAggregator(primary_dm=DeltaDataManager(instrument=inst), secondary_dm=None, instrument=inst)
 
-        ctx_holder: Dict[str, AssetContext] = {}
-        risk = PortfolioRiskManager(
-            shared_api=router,
-            allocator=self.guard.allocate_balance,
-            context_getter=lambda: ctx_holder.get("ctx"),
-            contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
-            manager=self.guard,
-        )
-        strategy = QuantStrategy(router, instrument=inst)
-        data.register_strategy(strategy)
-        ctx = AssetContext(inst, data, router, risk, strategy)
-        ctx_holder["ctx"] = ctx
-        return ctx
+            ctx_holder: Dict[str, AssetContext] = {}
+            risk = PortfolioRiskManager(
+                shared_api=router,
+                allocator=self.guard.allocate_balance,
+                context_getter=lambda: ctx_holder.get("ctx"),
+                contexts_getter=lambda: list(self.contexts) if self.contexts else list(ctx_holder.values()),
+                manager=self.guard,
+            )
+            strategy = QuantStrategy(router, instrument=inst)
+            data.register_strategy(strategy)
+            ctx = AssetContext(inst, data, router, risk, strategy)
+            ctx_holder["ctx"] = ctx
+            return ctx
 
     def _start_one_context(self, ctx: AssetContext) -> bool:
         inst = ctx.instrument
@@ -932,6 +933,7 @@ class MultiAssetQuantBot:
 
 
 def main() -> None:
+    install_instrument_log_filter()
     bot = MultiAssetQuantBot()
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):
