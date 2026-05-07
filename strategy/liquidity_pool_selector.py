@@ -56,6 +56,16 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.btc_institutional_policy import (
+        is_btc_context, btc_static_rr_floor, btc_durable_rr_floor, btc_sl_buffer_limits,
+    )
+except Exception:  # pragma: no cover
+    def is_btc_context(owner=None): return False
+    def btc_static_rr_floor(static_min_rr, posterior_prob=0.0): return float(static_min_rr)
+    def btc_durable_rr_floor(default_floor, be_move, risk): return float(default_floor)
+    def btc_sl_buffer_limits(max_buffer_atr): return float(max_buffer_atr)
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -696,10 +706,14 @@ def _institutional_rr_floor(
     """
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
-    durable_floor = max(
-        _TP_DURABLE_RR_FLOOR,
-        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
-    )
+    if is_btc_context():
+        static_floor = btc_static_rr_floor(static_floor, posterior_prob)
+        durable_floor = btc_durable_rr_floor(_TP_DURABLE_RR_FLOOR, be_move, risk_f)
+    else:
+        durable_floor = max(
+            _TP_DURABLE_RR_FLOOR,
+            _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
+        )
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     if posterior <= 0.0:
@@ -826,6 +840,10 @@ def score_tp_pools(
         session=session,
     )
     effective_min_rr = selector_profile.min_rr(float(min_rr))
+    if is_btc_context():
+        effective_min_rr = btc_static_rr_floor(effective_min_rr, posterior_prob)
+    if is_btc_context():
+        effective_min_rr = btc_static_rr_floor(effective_min_rr, posterior_prob)
     out: List[PoolScore] = []
     be_move = _breakeven_move(entry, atr)
 
@@ -924,6 +942,8 @@ def score_tp_pools(
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
                 reasons.append(f"payoff RR floor {rr_floor:.2f}")
+            if is_btc_context() and effective_min_rr < float(min_rr) - 1e-9:
+                reasons.append("BTC probability-weighted liquidity path")
             if utility_components["be_quality"] < 0.75:
                 reasons.append("thin post-BE room")
             if _safe(pool, "ob_aligned", False):
@@ -997,6 +1017,8 @@ def _sl_liquidity_buffer_atr(target: Any, quality: float, *, max_buffer_atr: flo
     effectively placing the SL inside/next to the same liquidity cluster.
     """
     pool = _safe(target, "pool", None)
+    if is_btc_context():
+        max_buffer_atr = btc_sl_buffer_limits(max_buffer_atr)
     tf_rank = _tf_rank(str(_safe(pool, "timeframe", "5m")))
     touches = max(1, int(_safe(pool, "touches", 1) or 1))
     touch_term = min(0.24, 0.035 * max(0, touches - 2))

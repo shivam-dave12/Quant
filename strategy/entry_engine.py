@@ -46,6 +46,13 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.btc_institutional_policy import is_btc_context, btc_static_rr_floor, btc_sl_buffer_limits
+except Exception:  # pragma: no cover
+    def is_btc_context(owner=None): return False
+    def btc_static_rr_floor(static_min_rr, posterior_prob=0.0): return float(static_min_rr)
+    def btc_sl_buffer_limits(max_buffer_atr): return float(max_buffer_atr)
+
+try:
     from strategy.quantitative_models import evaluate_post_sweep_quant
 except Exception:  # pragma: no cover
     from quantitative_models import evaluate_post_sweep_quant  # type: ignore
@@ -1838,6 +1845,70 @@ class EntryEngine:
 
         return True, f"pool SL geometry ok expansion={expansion:.2f}x rr={pool_rr:.2f}"
 
+    def _apply_btc_v58_institutional_sl_envelope(
+        self, snap, side: str, price: float, atr: float, structural_sl: float,
+        invalidation_price: float, label: str, min_risk: float = 0.0,
+    ):
+        """BTC-only v58 structural SL with institutional liquidity exclusion."""
+        if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
+            return None, "non-protective BTC structural SL"
+        min_risk = max(0.0, float(min_risk or 0.0))
+        _liq, _liq_guard, liq_room = self._liquidation_guard(side, price)
+        max_risk = liq_room * 0.98 if liq_room > 0 else atr * 30.0
+        sl = float(structural_sl)
+        risk = abs(float(price) - sl)
+        invalidation_gap = abs(float(price) - float(invalidation_price)) if invalidation_price else 0.0
+        noise_floor = max(
+            atr * (0.38 + 0.28 * min(max(self._atr_pctile, 0.0), 1.0)),
+            invalidation_gap + atr * 0.20,
+            min_risk,
+        )
+        if risk < noise_floor:
+            sl = price - noise_floor if side == "long" else price + noise_floor
+            risk = abs(price - sl)
+
+        pool_sl, _pool_target, pool_pick = self._find_sl_pool(
+            snap=snap,
+            side=side,
+            entry=price,
+            atr=atr,
+            ict=getattr(self, "_ict", None),
+            invalidation_price=invalidation_price,
+            max_buffer_atr=btc_sl_buffer_limits(1.25),
+            min_risk=min_risk,
+        )
+        if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
+            pool_risk = abs(price - pool_sl)
+            if pool_risk <= max_risk and pool_risk > risk:
+                sl = pool_sl
+                risk = pool_risk
+                try:
+                    details = ", ".join(getattr(pool_pick, "reasons", []) or [])
+                    logger.info(
+                        "BTC SL envelope %s: v58 sweep SL expanded behind live liquidity $%.1f "
+                        "(risk %.2fATR; %s)",
+                        label, sl, risk / max(atr, 1e-10), details)
+                except Exception:
+                    pass
+            elif pool_risk > max_risk:
+                return None, (
+                    f"BTC protective SL pool ${pool_sl:.1f} beyond liquidation guard; "
+                    "refusing stop inside liquidity")
+
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        risk = abs(price - sl)
+        if not self._sl_is_protective(side, sl, price):
+            return None, "BTC SL crossed market after liquidity push"
+        if not self._sl_before_liquidation(side, sl, price):
+            return None, f"BTC SL breaches liquidation guard ${_liq_guard:.1f}"
+        if min_risk > 0.0 and risk < min_risk:
+            return None, f"BTC structural SL risk {risk:.1f}pts < required {min_risk:.1f}pts"
+        if risk > abs(price - structural_sl) + 1e-9:
+            logger.info(
+                "BTC SL envelope %s: $%.1f -> $%.1f (risk %.2fATR, liquidity-aware)",
+                label, structural_sl, sl, risk / max(atr, 1e-10))
+        return sl, "ok"
+
     def _apply_institutional_sl_envelope(
         self,
         snap,
@@ -1853,6 +1924,9 @@ class EntryEngine:
         Build the executable stop from structural invalidation, live noise,
         and protective liquidity. Returns (sl, reason).
         """
+        if is_btc_context(self):
+            return self._apply_btc_v58_institutional_sl_envelope(
+                snap, side, price, atr, structural_sl, invalidation_price, label, min_risk)
         if atr <= 0 or not self._sl_is_protective(side, structural_sl, price):
             return None, "non-protective structural SL"
         min_risk = max(0.0, float(min_risk or 0.0))
@@ -2536,8 +2610,11 @@ class EntryEngine:
                 "summary": "invalid risk: entry and SL overlap", "candidates": []})
             return None, None
 
-        required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         posterior_prob = self._current_quant_posterior()
+        if is_btc_context(self):
+            required_rr = btc_static_rr_floor(float(min_rr) + _TP_RR_SAFETY_BUFFER, posterior_prob)
+        else:
+            required_rr = float(min_rr) + _TP_RR_SAFETY_BUFFER
         try:
             from strategy.liquidity_pool_selector import select_tp_with_report as _sel_tp
         except ImportError:

@@ -52,6 +52,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 try:
+    from strategy.btc_institutional_policy import is_btc_context, btc_static_rr_floor
+except Exception:  # pragma: no cover
+    def is_btc_context(owner=None): return False
+    def btc_static_rr_floor(static_min_rr, posterior_prob=0.0): return float(static_min_rr)
+
+try:
     from strategy.market_intelligence import build_market_profile, MarketProfile
 except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
@@ -1656,6 +1662,8 @@ class InstitutionalLevels:
 
             tp_distance_mult = max(0.10, min(3.0, float(tp_distance_mult or 1.0)))
             min_rr = float(QCfg.REVERSION_MIN_RR()) * tp_distance_mult
+            if is_btc_context(self):
+                min_rr = btc_static_rr_floor(min_rr, 0.0)
             now_s = (float(now_ms) / 1000.0) if now_ms and now_ms > 1e12 else time.time()
             tp, target, score, report = select_tp_with_report(
                 snap=snap,
@@ -2833,6 +2841,8 @@ class QuantStrategy:
             _venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in getattr(_inst, "by_exchange", {}).items()) if _inst is not None else QCfg.EXCHANGE().upper()
             logger.info(f"   {_asset} | {QCfg.SYMBOL()} | venues={_venues} | leverage={QCfg.LEVERAGE()}x | {QCfg.MARGIN_PCT():.0%} margin")
             logger.info("   EntryArchitecture: v74-native-bracket-fast-fee-true-flow")
+            if is_btc_context(self):
+                logger.info("   BTCOverlay: v58-strategy-liquidity-aware-tp-sl")
         entry_status = "ACTIVE (LiquidityMap -> QuantPosterior -> Risk/Execution)" if _ENTRY_ENGINE_AVAILABLE else "UNAVAILABLE"
         logger.info(f"   Entry: {entry_status}")
         liq_status = "ACTIVE" if _LIQ_MAP_AVAILABLE else "UNAVAILABLE"
