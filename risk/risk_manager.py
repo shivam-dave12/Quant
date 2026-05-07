@@ -20,8 +20,6 @@ from collections import deque
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
 from core.pnl import gross_pnl_usd
-from core.instruments import current_instrument
-from core.market_policy import active_policy
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +34,14 @@ class TradeRecord:
     pnl:         float
     is_win:      bool
     reason:      str
+    asset_id:    str = ""
+    symbol:      str = ""
+    venue:       str = ""
+    notional:    float = 0.0
+    margin_used: float = 0.0
+    leverage:    float = 1.0
+    return_on_margin: float = 0.0
+    qty_unit:    str = "units"
 
 
 class RiskManager:
@@ -319,6 +325,8 @@ class RiskManager:
         quantity:      float,
         reason:        str,
         pnl_override:  float = None,
+        instrument     = None,
+        leverage:      float = None,
     ):
         """
         Record a completed trade.
@@ -346,24 +354,22 @@ class RiskManager:
                 )
                 self._apply_daily_reset()
 
-            _inst = None
-            try:
-                _inst = current_instrument()
-            except Exception:
-                _inst = None
-            _asset_id = str(getattr(_inst, "asset_id", "") or "BTC").upper()
-            _symbol = str(getattr(_inst, "display_symbol", getattr(config, "DELTA_SYMBOL", "BTCUSD")) or "").upper()
-            _exchange = str(getattr(getattr(_inst, "primary_exchange", None), "value", getattr(config, "EXECUTION_EXCHANGE", "")) or "").lower()
-            _is_inverse = (_exchange == "delta" and (_symbol == "BTCUSD" or _asset_id == "BTC"))
-
             if pnl_override is not None:
                 pnl = float(pnl_override)
             else:
+                try:
+                    _asset_id = str(getattr(instrument, "asset_id", "") or "").upper()
+                except Exception:
+                    _asset_id = ""
+                _is_inverse = (
+                    str(getattr(config, "EXECUTION_EXCHANGE", "")).lower() == "delta"
+                    and _asset_id == "BTC"
+                )
                 gross_pnl = gross_pnl_usd(
                     side=side,
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    quantity_btc=quantity,
+                    quantity_units=quantity,
                     inverse=_is_inverse,
                 )
 
@@ -371,20 +377,26 @@ class RiskManager:
                 commission = (entry_price + exit_price) * quantity * fee_rate
                 pnl        = gross_pnl - commission
                 logger.debug(
-                    f"P&L breakdown [{_asset_id}]: gross=${gross_pnl:+.4f} "
+                    f"P&L breakdown: gross=${gross_pnl:+.4f} "
                     f"commission=${commission:.4f} net=${pnl:+.4f}"
-                    + (" [delta_inverse_btc]" if _is_inverse else " [linear]")
+                    + (" [inverse]" if _is_inverse else " [linear]")
                 )
 
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            try:
-                _lev = max(1.0, float(active_policy(_inst).leverage))
-            except Exception:
-                _lev = max(1.0, float(getattr(config, "LEVERAGE", 1) or 1))
-            margin_used       = notional_at_entry / _lev if _lev > 0 else notional_at_entry
+            lev = float(leverage if leverage is not None else getattr(config, "LEVERAGE", 1) or 1)
+            margin_used       = notional_at_entry / lev if lev > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
+            try:
+                asset_id = str(getattr(instrument, "asset_id", "") or "").upper()
+                symbol = str(getattr(instrument, "display_symbol", getattr(instrument, "canonical_symbol", "")) or "")
+                venue = str(getattr(getattr(instrument, "primary_exchange", None), "value", "") or "").upper()
+                asset_class = str(getattr(instrument, "asset_class", "") or "").lower()
+                qty_unit = "BTC" if asset_id == "BTC" else ("contracts" if asset_class else "units")
+            except Exception:
+                asset_id = symbol = venue = ""
+                qty_unit = "units"
 
             trade = TradeRecord(
                 timestamp   = time.time(),
@@ -395,6 +407,14 @@ class RiskManager:
                 pnl         = pnl,
                 is_win      = is_win,
                 reason      = reason,
+                asset_id    = asset_id,
+                symbol      = symbol,
+                venue       = venue,
+                notional    = notional_at_entry,
+                margin_used = margin_used,
+                leverage    = lev,
+                return_on_margin = return_on_margin,
+                qty_unit    = qty_unit,
             )
 
             self.trade_history.append(trade)
@@ -416,8 +436,7 @@ class RiskManager:
                 f"📊 Trade recorded: {side.upper()} | "
                 f"Net P&L: ${pnl:+.2f} | "
                 f"Return on margin: {return_on_margin:+.2f}% | "
-                f"Qty: {quantity:.4f} {_asset_id} | "
-                f"Lev: {_lev:.0f}x | "
+                f"Qty: {quantity:.4f} {qty_unit} | "
                 f"Total trades: {self.total_trades}"
             )
 
@@ -523,6 +542,9 @@ class RiskManager:
             wins   = self.winning_trades
             losses = self.losing_trades
 
+            # Count win-rate is a descriptive statistic only.  Portfolio
+            # health is capital/PnL weighted: a $5-margin loss and a $1-margin
+            # win must report as a losing session even if count WR is 50%.
             win_rate = (wins / total * 100) if total > 0 else 0.0
 
             win_pnls  = [t.pnl for t in self.trade_history if t.is_win]
@@ -535,6 +557,12 @@ class RiskManager:
             profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf")
 
             expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
+            total_margin = sum(float(getattr(t, "margin_used", 0.0) or 0.0) for t in self.trade_history)
+            win_margin = sum(float(getattr(t, "margin_used", 0.0) or 0.0) for t in self.trade_history if t.is_win)
+            loss_margin = sum(float(getattr(t, "margin_used", 0.0) or 0.0) for t in self.trade_history if not t.is_win)
+            margin_weighted_win_rate = (win_margin / total_margin * 100.0) if total_margin > 1e-10 else 0.0
+            net_margin_return_pct = (self.realized_pnl / total_margin * 100.0) if total_margin > 1e-10 else 0.0
+            capital_result = "PROFIT" if self.realized_pnl > 0 else ("LOSS" if self.realized_pnl < 0 else "FLAT")
 
             peak = 0.0
             equity = 0.0
@@ -563,6 +591,13 @@ class RiskManager:
                 "losing_trades":      losses,
                 "daily_trades":       len(self.daily_trades),
                 "win_rate":           round(win_rate, 2),
+                "count_win_rate":     round(win_rate, 2),
+                "margin_weighted_win_rate": round(margin_weighted_win_rate, 2),
+                "net_margin_return_pct": round(net_margin_return_pct, 2),
+                "total_margin_used":  round(total_margin, 4),
+                "winning_margin_used": round(win_margin, 4),
+                "losing_margin_used": round(loss_margin, 4),
+                "capital_result":     capital_result,
                 "avg_win":            round(avg_win, 4),
                 "avg_loss":           round(avg_loss, 4),
                 "profit_factor":      round(profit_factor, 3),

@@ -90,93 +90,6 @@ class PortfolioManager:
                 self._balance_cache[key] = {'ts': now, 'data': dict(raw)}
         return raw
 
-    def _instrument_policy(self, ctx: Optional[Any]):
-        try:
-            return active_policy(getattr(ctx, 'instrument', None) if ctx is not None else None)
-        except Exception:
-            return active_policy(None)
-
-    @staticmethod
-    def _position(ctx: Any) -> Any:
-        return getattr(ctx, 'position', None) or getattr(ctx, '_pos', None) or getattr(getattr(ctx, 'strategy', None), '_pos', None)
-
-    def _open_margin_used(self, ctx: Any) -> float:
-        try:
-            pos = self._position(ctx)
-            if pos is None:
-                return 0.0
-            qty = max(0.0, float(getattr(pos, 'quantity', 0.0) or 0.0))
-            entry = max(0.0, float(getattr(pos, 'entry_price', 0.0) or 0.0))
-            if qty <= 0.0 or entry <= 0.0:
-                return 0.0
-            pol = self._instrument_policy(ctx)
-            lev = max(1.0, float(getattr(pol, 'leverage', 1) or 1.0))
-            return qty * entry / lev
-        except Exception:
-            return 0.0
-
-    def _open_initial_risk(self, ctx: Any) -> float:
-        try:
-            pos = self._position(ctx)
-            if pos is None:
-                return 0.0
-            ir = float(getattr(pos, 'initial_risk', 0.0) or 0.0)
-            if ir > 0.0:
-                return ir
-            qty = max(0.0, float(getattr(pos, 'quantity', 0.0) or 0.0))
-            entry = float(getattr(pos, 'entry_price', 0.0) or 0.0)
-            sl = float(getattr(pos, 'sl_price', 0.0) or 0.0)
-            return abs(entry - sl) * qty if qty > 0.0 and entry > 0.0 and sl > 0.0 else 0.0
-        except Exception:
-            return 0.0
-
-    def _allocation_universe(self, ctx: Optional[Any], contexts: List[Any]) -> List[Any]:
-        """Capital is normalised over the most relevant tradable sleeve set.
-
-        If 14 products are being watched but only 6 can be open, normalising
-        over all 14 would underfund every ticker.  We therefore normalise over
-        the highest-weight instruments up to the slot cap, always including the
-        candidate being sized.
-        """
-        pool = [c for c in (contexts or []) if getattr(c, 'instrument', None) is not None]
-        if ctx is not None and getattr(ctx, 'instrument', None) is not None and ctx not in pool:
-            pool.append(ctx)
-        if not pool:
-            return []
-        ranked = sorted(pool, key=lambda c: float(getattr(self._instrument_policy(c), 'portfolio_weight', 1.0) or 1.0), reverse=True)
-        selected = ranked[:max(1, self.max_open_positions)]
-        if ctx is not None and ctx not in selected:
-            selected = selected[:-1] + [ctx] if selected else [ctx]
-        # Deduplicate by asset id but keep deterministic order.
-        out, seen = [], set()
-        for c in selected:
-            aid = getattr(getattr(c, 'instrument', None), 'asset_id', id(c))
-            if aid in seen:
-                continue
-            seen.add(aid)
-            out.append(c)
-        return out
-
-    def _allocation_share(self, ctx: Optional[Any], contexts: List[Any]) -> tuple[float, float, float, int]:
-        universe = self._allocation_universe(ctx, contexts)
-        if not universe:
-            return 1.0, 1.0, 1.0, 1
-        weights = []
-        for c in universe:
-            try:
-                weights.append(max(0.05, float(getattr(self._instrument_policy(c), 'portfolio_weight', 1.0) or 1.0)))
-            except Exception:
-                weights.append(1.0)
-        total_w = max(1e-9, sum(weights))
-        if ctx is None:
-            w = weights[0]
-        else:
-            try:
-                w = max(0.05, float(getattr(self._instrument_policy(ctx), 'portfolio_weight', 1.0) or 1.0))
-            except Exception:
-                w = 1.0
-        return max(0.0, min(1.0, w / total_w)), w, total_w, len(universe)
-
     def allocate_balance(self, ctx: Optional[Any], contexts: List[Any], raw_balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if raw_balance is None or not isinstance(raw_balance, dict):
             return raw_balance
@@ -186,88 +99,83 @@ class PortfolioManager:
         except Exception:
             return raw_balance
 
-        pol = self._instrument_policy(ctx)
         configured_slots = max(1, self.max_open_positions)
         active_universe = max(1, len(contexts or []))
-        institutional_modes = {'institutional', 'institutional_risk_parity', 'risk_parity', 'policy_weighted'}
+        slot_count = min(configured_slots, active_universe) if self.budget_mode in {'active_equal_slots', 'active_slots'} else configured_slots
+        slot_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
+        slot_available = min(slot_equity, raw_available)
 
-        if self.budget_mode in institutional_modes:
-            cash_share, alloc_weight, total_weight, sleeve_count = self._allocation_share(ctx, contexts or [])
-            slot_count = sleeve_count
-            sleeve_equity = raw_total * cash_share
-            sleeve_available = raw_available * cash_share
-            allocation_mode = 'institutional_risk_parity'
-        else:
-            slot_count = min(configured_slots, active_universe) if self.budget_mode in {'active_equal_slots', 'active_slots'} else configured_slots
-            sleeve_equity = raw_total / float(slot_count) if slot_count > 0 else raw_total
-            sleeve_available = min(sleeve_equity, raw_available)
-            cash_share = sleeve_equity / raw_total if raw_total > 0 else 1.0
-            alloc_weight = 1.0
-            total_weight = float(slot_count)
-            allocation_mode = self.budget_mode
+        pol = active_policy(getattr(ctx, 'instrument', None) if ctx is not None else None)
 
-        reserved_ctx = self.reserved_contexts(contexts or [])
-        open_risk = sum(self._open_initial_risk(c) for c in reserved_ctx)
-        open_margin = sum(self._open_margin_used(c) for c in reserved_ctx)
-        max_risk_budget = raw_total * max(0.0, float(getattr(config, 'PORTFOLIO_MAX_CONCURRENT_RISK_PCT', 0.030)))
-        max_margin_budget = raw_available * max(0.0, min(1.0, float(getattr(config, 'PORTFOLIO_MAX_TOTAL_MARGIN_USAGE_PCT', 0.75))))
-        remaining_risk = max(0.0, max_risk_budget - open_risk)
-        remaining_margin = max(0.0, max_margin_budget - open_margin)
+        # Portfolio exposure truth: cash is still slot-scoped, but risk must be
+        # tracked at the account level.  The config already defined
+        # PORTFOLIO_MAX_AGGREGATE_RISK_PCT, but prior builds did not calculate
+        # or enforce open account risk.  That meant six simultaneous min-lot
+        # exceptions could silently exceed the intended portfolio risk budget.
+        open_risk_usd = 0.0
+        open_margin_used = 0.0
+        for c in list(contexts or []):
+            if c is ctx:
+                # Candidate being sized is not open yet; avoid self-counting
+                # stale ENTERING placeholders on retries.
+                continue
+            if not getattr(c, 'has_position', False):
+                continue
+            try:
+                pos = c.strategy.get_position() if getattr(c, 'strategy', None) is not None else None
+            except Exception:
+                pos = None
+            if not isinstance(pos, dict):
+                continue
+            try:
+                entry = float(pos.get('entry_price', 0.0) or 0.0)
+                qty = abs(float(pos.get('quantity', 0.0) or 0.0))
+                sl = float(pos.get('sl_price', 0.0) or 0.0)
+                if entry <= 0.0 or qty <= 0.0:
+                    continue
+                if sl > 0.0:
+                    open_risk_usd += abs(entry - sl) * qty
+                inst = getattr(c, 'instrument', None)
+                lev = float(getattr(active_policy(inst), 'leverage', 1.0) or 1.0)
+                open_margin_used += (entry * qty / lev) if lev > 0 else entry * qty
+            except Exception:
+                continue
 
-        normal_cash_budget = sleeve_available * max(0.01, min(1.0, float(getattr(pol, 'margin_pct', 0.20))))
-        elastic_pct = max(0.0, min(1.0, float(getattr(pol, 'min_lot_elastic_margin_pct', 0.0) or 0.0)))
-        elastic_cash = 0.0
-        if bool(getattr(config, 'PORTFOLIO_MIN_LOT_ELASTIC_ENABLED', True)):
-            elastic_cash = min(remaining_margin, raw_available * elastic_pct)
-        # Do not let elastic borrowing exceed the ticker's own maximum margin cap.
-        ticker_margin_cap = min(remaining_margin, raw_available * max(0.01, min(1.0, float(getattr(pol, 'max_position_margin_pct', getattr(pol, 'margin_pct', 0.20))))))
-        executable_cash_budget = max(normal_cash_budget, min(elastic_cash, ticker_margin_cap))
+        aggregate_risk_cap = raw_total * max(0.0, float(getattr(config, 'PORTFOLIO_MAX_AGGREGATE_RISK_PCT', 3.0) or 0.0)) / 100.0
+        remaining_risk_cap = max(0.0, aggregate_risk_cap - open_risk_usd)
 
-        risk_available = raw_available if self.risk_budget_mode == 'portfolio_equity' else sleeve_available
-        risk_total = raw_total if self.risk_budget_mode == 'portfolio_equity' else sleeve_equity
+        # Margin/cash budget is slot-scoped and per-policy.  Risk-dollar base is
+        # portfolio equity by default, then multiplied by the instrument policy.
         adjusted = dict(raw_balance)
         adjusted['available_raw'] = raw_available
         adjusted['total_raw'] = raw_total
-        adjusted['available'] = max(0.0, sleeve_available)
-        adjusted['total'] = max(0.0, sleeve_equity)
-        adjusted['risk_available'] = risk_available
-        adjusted['risk_total'] = risk_total
+        adjusted['available'] = max(0.0, slot_available)
+        adjusted['total'] = max(0.0, slot_equity)
+        adjusted['risk_available'] = raw_available if self.risk_budget_mode == 'portfolio_equity' else slot_available
+        adjusted['risk_total'] = raw_total if self.risk_budget_mode == 'portfolio_equity' else slot_equity
+        adjusted['portfolio_open_risk_usd'] = round(open_risk_usd, 8)
+        adjusted['portfolio_open_margin_used'] = round(open_margin_used, 8)
+        adjusted['portfolio_aggregate_risk_cap'] = round(aggregate_risk_cap, 8)
+        adjusted['portfolio_remaining_risk_cap'] = round(remaining_risk_cap, 8)
         adjusted['portfolio_scoped'] = True
-        adjusted['portfolio_budget_mode'] = allocation_mode
+        adjusted['portfolio_budget_mode'] = self.budget_mode
         adjusted['portfolio_risk_budget_mode'] = self.risk_budget_mode
         adjusted['portfolio_slot_count'] = slot_count
-        adjusted['portfolio_slot_available'] = sleeve_available
-        adjusted['portfolio_slot_equity'] = sleeve_equity
-        adjusted['portfolio_cash_share'] = cash_share
-        adjusted['portfolio_allocation_weight'] = alloc_weight
-        adjusted['portfolio_total_weight'] = total_weight
+        adjusted['portfolio_slot_available'] = slot_available
+        adjusted['portfolio_slot_equity'] = slot_equity
         adjusted['portfolio_reserved_slots'] = self.count_open(contexts or [])
         adjusted['portfolio_max_slots'] = self.max_open_positions
-        adjusted['portfolio_open_risk_usd'] = open_risk
-        adjusted['portfolio_open_margin_usd'] = open_margin
-        adjusted['portfolio_max_risk_budget_usd'] = max_risk_budget
-        adjusted['portfolio_remaining_risk_budget_usd'] = remaining_risk
-        adjusted['portfolio_max_margin_budget_usd'] = max_margin_budget
-        adjusted['portfolio_remaining_margin_budget_usd'] = remaining_margin
-        adjusted['portfolio_normal_cash_budget_usd'] = normal_cash_budget
-        adjusted['portfolio_elastic_cash_budget_usd'] = executable_cash_budget
-        adjusted['portfolio_ticker_max_risk_usd'] = raw_total * max(0.0, float(getattr(pol, 'max_trade_risk_pct', 0.005)))
-        adjusted['portfolio_ticker_margin_cap_usd'] = ticker_margin_cap
         adjusted['instrument_policy'] = pol.asdict()
         adjusted['instrument_risk_multiplier'] = float(pol.risk_multiplier)
         adjusted['instrument_margin_pct'] = float(pol.margin_pct)
-        adjusted['instrument_portfolio_weight'] = float(getattr(pol, 'portfolio_weight', 1.0))
-        adjusted['instrument_max_position_margin_pct'] = float(getattr(pol, 'max_position_margin_pct', pol.margin_pct))
-        adjusted['instrument_max_trade_risk_pct'] = float(getattr(pol, 'max_trade_risk_pct', 0.005))
         if ctx is not None:
             adjusted['portfolio_asset_id'] = ctx.instrument.asset_id
         return adjusted
 
     def report_line(self, ctx: Any) -> str:
         pol = active_policy(ctx.instrument)
-        return (f"policy={pol.asset_class} lev={pol.leverage}x margin={pol.margin_pct:.1%} "
-                f"risk_mult={pol.risk_multiplier:.2f} weight={getattr(pol, 'portfolio_weight', 1.0):.2f} "
-                f"risk_cap={getattr(pol, 'max_trade_risk_pct', 0.005):.2%} loop={pol.loop_interval_sec:.2f}s")
+        return (f"policy={pol.asset_class} lev={pol.leverage}x margin={pol.margin_pct:.0%} "
+                f"risk_mult={pol.risk_multiplier:.2f} loop={pol.loop_interval_sec:.2f}s")
 
 
 class PortfolioRiskManager(RiskManager):

@@ -1123,8 +1123,9 @@ class HardeningTests(unittest.TestCase):
         payload = report.as_dict()
         self.assertIsNone(payload["selected"])
         candidate = payload["candidates"][0]
-        self.assertIn("beyond executable frontier", candidate["reason"])
-        self.assertIn("lottery target", candidate["reason"])
+        self.assertGreater(candidate["required_rr"], 100.0)
+        self.assertIn("delivery probability", candidate["reason"])
+        self.assertGreater(candidate["required_delivery_prob"], candidate["delivery_prob"])
 
     def test_tp_audit_prioritizes_executable_near_reject_over_lottery_rr(self):
         from strategy.liquidity_pool_selector import select_tp_with_report

@@ -26,17 +26,14 @@ COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-# Do not fail at import time. Tests, dashboards, and offline analyzers must be
-# able to import config.py without live exchange secrets. Runtime startup calls
-# validate_exchange_credentials() before building API clients.
-def validate_exchange_credentials() -> None:
-    has_delta = bool(DELTA_API_KEY and DELTA_SECRET_KEY)
-    has_cs = bool(COINSWITCH_API_KEY and COINSWITCH_SECRET_KEY)
-    if not (has_delta or has_cs):
-        raise ValueError(
-            "No exchange credentials in .env. Set DELTA_API_KEY+DELTA_SECRET_KEY "
-            "or COINSWITCH_API_KEY+COINSWITCH_SECRET_KEY."
-        )
+REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
+
+# Keep module imports/test tooling/dashboard safe without live secrets. The bot
+# runtime still refuses to trade unless a configured exchange has both key and
+# secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
+# deployment-time fail-fast check.
+if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -82,10 +79,10 @@ TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
-# Style/quality signals are never hidden alpha vetoes. They are continuous
-# references used for score, size multiplier, expected utility, and attribution.
-# Only mechanical account/exchange safety can stop routing.
-INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
+# Quality signals are priced into the execution decision. Mechanical defects
+# always stop routing; weak delivery/coherence must clear an adaptive quality
+# floor before an order is allowed to reach sizing/execution.
+INSTITUTIONAL_STRICT_QUALITY_GATES = True
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
@@ -93,6 +90,8 @@ INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
+ENTRY_EXECUTION_QUALITY_MIN        = 0.52
+ENTRY_CRITICAL_DEFECT_FLOOR        = 0.62
 ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
 ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
@@ -111,6 +110,16 @@ MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
 LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
+# v73: high-readiness accepted sweeps must not sit as passive maker orders.
+# Use the final EntryReadiness surface, not raw composite signal confidence, to
+# trigger fast native-bracket execution. This is still exchange-attached TP/SL.
+ENTRY_PROTECTED_CROSS_READINESS  = 0.78
+ENTRY_PROTECTED_CROSS_EDGE       = 0.06
+ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF = False
+ENTRY_PROTECTED_CROSS_MIN_CONF   = 0.70
+ENTRY_PROTECTED_CROSS_TICKS      = 2.0
+DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS = True
+PROTECTED_CROSS_FILL_TIMEOUT_SEC = 12.0
 REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
@@ -459,8 +468,9 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
 # ── Institutional Dynamic Entry Quality References ───────────────────────────
-# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
-# signal quality and size; posterior/EV still owns trade expression.
+# These are adaptive scoring references for the executable entry surface. Weak
+# structure first lowers quality/size; critical defects pause routing until the
+# market provides accepted delivery.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
@@ -474,6 +484,8 @@ ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic p
 ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
 ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
+ENTRY_EXECUTION_QUALITY_MIN              = 0.52
+ENTRY_CRITICAL_DEFECT_FLOOR              = 0.62
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
 QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15
@@ -600,40 +612,15 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
 PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
-PORTFOLIO_BUDGET_MODE = "institutional_risk_parity"   # institutional_risk_parity | equal_slots | active_equal_slots
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 6
+PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
 # order is inside the portfolio risk cap but above the confidence-haircut target.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
-# Portfolio-level institutional caps. Risk is controlled at portfolio level,
-# while each ticker receives its own cash sleeve from TICKER_RISK_POLICY.
-PORTFOLIO_MAX_CONCURRENT_RISK_PCT = 0.030   # all open SL-risk <= 3.0% equity
-PORTFOLIO_MAX_TOTAL_MARGIN_USAGE_PCT = 0.75 # all open margin <= 75% liquid equity
-PORTFOLIO_MIN_LOT_ELASTIC_ENABLED = True    # allow min-lot borrow from unused sleeve only inside caps
-
-# Per-ticker capital/risk priors. These are used by core.market_policy and can be
-# changed without touching strategy code. portfolio_weight controls cash-sleeve
-# priority; risk_multiplier scales signal-size; margin_pct is the normal per-trade
-# cash usage; max_position_margin_pct and min_lot_elastic_margin_pct cap elastic
-# minimum-lot borrowing for xStock products.
-TICKER_RISK_POLICY = {
-    "BTC":   {"risk_multiplier": 1.00, "margin_pct": 0.20,  "portfolio_weight": 1.30, "max_position_margin_pct": 0.24, "max_trade_risk_pct": 0.0060, "min_lot_elastic_margin_pct": 0.18},
-    "GOLD":  {"risk_multiplier": 0.72, "margin_pct": 0.15,  "portfolio_weight": 0.95, "max_position_margin_pct": 0.18, "max_trade_risk_pct": 0.0045, "min_lot_elastic_margin_pct": 0.16},
-    "SILVER":{"risk_multiplier": 0.64, "margin_pct": 0.14,  "portfolio_weight": 0.85, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0040, "min_lot_elastic_margin_pct": 0.16},
-    "OIL":   {"risk_multiplier": 0.60, "margin_pct": 0.13,  "portfolio_weight": 0.75, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.14},
-    "SPY":   {"risk_multiplier": 0.46, "margin_pct": 0.105, "portfolio_weight": 0.64, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0032, "min_lot_elastic_margin_pct": 0.20},
-    "QQQ":   {"risk_multiplier": 0.52, "margin_pct": 0.110, "portfolio_weight": 0.70, "max_position_margin_pct": 0.15, "max_trade_risk_pct": 0.0035, "min_lot_elastic_margin_pct": 0.22},
-    "AAPL":  {"risk_multiplier": 0.42, "margin_pct": 0.095, "portfolio_weight": 0.55, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0028, "min_lot_elastic_margin_pct": 0.22},
-    "NVDA":  {"risk_multiplier": 0.62, "margin_pct": 0.120, "portfolio_weight": 0.82, "max_position_margin_pct": 0.17, "max_trade_risk_pct": 0.0042, "min_lot_elastic_margin_pct": 0.26},
-    "TSLA":  {"risk_multiplier": 0.54, "margin_pct": 0.115, "portfolio_weight": 0.72, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0037, "min_lot_elastic_margin_pct": 0.25},
-    "AMZN":  {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
-    "META":  {"risk_multiplier": 0.44, "margin_pct": 0.100, "portfolio_weight": 0.58, "max_position_margin_pct": 0.14, "max_trade_risk_pct": 0.0030, "min_lot_elastic_margin_pct": 0.22},
-    "COIN":  {"risk_multiplier": 0.56, "margin_pct": 0.115, "portfolio_weight": 0.74, "max_position_margin_pct": 0.16, "max_trade_risk_pct": 0.0038, "min_lot_elastic_margin_pct": 0.25},
-    "CRCL":  {"risk_multiplier": 0.36, "margin_pct": 0.090, "portfolio_weight": 0.44, "max_position_margin_pct": 0.12, "max_trade_risk_pct": 0.0024, "min_lot_elastic_margin_pct": 0.18},
-    "GOOGL": {"risk_multiplier": 0.40, "margin_pct": 0.095, "portfolio_weight": 0.52, "max_position_margin_pct": 0.13, "max_trade_risk_pct": 0.0027, "min_lot_elastic_margin_pct": 0.21},
-}
+PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # six slots × 0.5% risk; aggregate account risk cap
+PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.
@@ -708,3 +695,13 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
+
+# Dashboard telemetry: non-blocking direct feed to local dashboard backend.
+# If the dashboard is offline, events are dropped; trading is never blocked.
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000")
+DASHBOARD_QUEUE_MAX = int(os.getenv("DASHBOARD_QUEUE_MAX", "2000"))
+DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
+DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
+DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
+DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))

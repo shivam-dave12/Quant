@@ -59,14 +59,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # ---------------------------------------------------------------------------
 
 def _c(name: str, default: Any = None) -> Any:
-    """Return config.<name>, falling back only when the attribute is absent.
-
-    Real import/validation errors must surface. Silently swallowing every
-    exception here made broken config look like a safe default, which is not
-    acceptable for live trading.
-    """
-    mod = sys.modules.get("config") or importlib.import_module("config")
-    return getattr(mod, name, default)
+    """Return config.<name>, falling back to default if the attribute is absent."""
+    try:
+        mod = sys.modules.get("config") or importlib.import_module("config")
+        return getattr(mod, name, default)
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------

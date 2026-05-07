@@ -53,29 +53,6 @@ def _ob_px(lvl) -> float:
     if isinstance(lvl, dict): return float(lvl.get("limit_price") or lvl.get("price") or 0)
     return 0.0
 
-def _active_tick_size(default: float = 0.1) -> float:
-    try:
-        from core.instruments import current_instrument
-        inst = current_instrument()
-        tick = float(getattr(inst, "tick_size", 0.0) or 0.0) if inst is not None else 0.0
-        if tick > 0:
-            return tick
-    except Exception:
-        pass
-    getter = getattr(config, "get_tick_size", None)
-    if callable(getter):
-        try:
-            tick = float(getter())
-            if tick > 0:
-                return tick
-        except Exception:
-            pass
-    return float(default)
-
-def _round_to_tick(price: float, tick: Optional[float] = None) -> float:
-    t = max(float(tick if tick is not None else _active_tick_size()), 1e-12)
-    return round(round(float(price) / t) * t, 10)
-
 def _ob_qty(lvl) -> float:
     """Extract quantity from an orderbook level (list or Delta dict format)."""
     if isinstance(lvl, (list, tuple)) and len(lvl) >= 2: return float(lvl[1])
@@ -488,13 +465,13 @@ class MakerTakerDecision:
             # ask+tick which places the order ABOVE all current asks — it would
             # sit unexecuted above the market, never filling.
             if side == "long":
-                candidate   = _round_to_tick(bid + tick, tick)
-                limit_price = min(candidate, _round_to_tick(ask - tick, tick))
+                candidate   = round(bid + tick, 1)
+                limit_price = min(candidate, round(ask - tick, 1))
                 if limit_price <= bid or limit_price >= ask:
                     limit_price = bid   # guaranteed maker fallback
             else:
-                candidate   = _round_to_tick(ask - tick, tick)
-                limit_price = max(candidate, _round_to_tick(bid + tick, tick))
+                candidate   = round(ask - tick, 1)
+                limit_price = max(candidate, round(bid + tick, 1))
                 if limit_price <= bid or limit_price >= ask:
                     # Bug #29 fix: post AT ask (not ask+tick).
                     # ask is the best resting sell in the book — our order

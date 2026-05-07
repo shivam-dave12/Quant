@@ -718,20 +718,7 @@ class LiquidityTrailEngine:
     @staticmethod
     def _be_tick_size() -> float:
         try:
-            from core.instruments import current_instrument
-            inst = current_instrument()
-            tick = float(getattr(inst, "tick_size", 0.0) or 0.0) if inst is not None else 0.0
-            if math.isfinite(tick) and tick > 0:
-                return tick
-        except Exception:
-            pass
-        try:
             import config as _cfg
-            getter = getattr(_cfg, "get_tick_size", None)
-            if callable(getter):
-                tick = float(getter())
-                if math.isfinite(tick) and tick > 0:
-                    return tick
             for name in ('TICK_SIZE', 'PRICE_TICK_SIZE'):
                 v = getattr(_cfg, name, None)
                 if v is not None:
@@ -741,13 +728,6 @@ class LiquidityTrailEngine:
         except Exception:
             pass
         return 0.5
-
-    @classmethod
-    def _round_price(cls, price: float) -> float:
-        tick = cls._be_tick_size()
-        if tick <= 0:
-            return float(price)
-        return round(round(float(price) / tick) * tick, 10)
 
     @classmethod
     def _round_be_price(cls, pos_side: str, price: float) -> float:
@@ -909,6 +889,15 @@ class LiquidityTrailEngine:
         for target in pools or []:
             pool = getattr(target, "pool", target)
             try:
+                status = getattr(pool, "status", "")
+                status = str(getattr(status, "value", status)).upper()
+                if status in ("SWEPT", "CONSUMED"):
+                    continue
+                pside = str(getattr(getattr(pool, "side", ""), "value", getattr(pool, "side", ""))).upper()
+                if pos_side == "long" and pside and "SSL" not in pside:
+                    continue
+                if pos_side == "short" and pside and "BSL" not in pside:
+                    continue
                 pp = float(getattr(pool, "price", 0.0) or 0.0)
             except Exception:
                 continue
@@ -938,7 +927,7 @@ class LiquidityTrailEngine:
         # highest stop below price, for a short the lowest stop above price.
         best = max(candidates, key=lambda x: x[0]) if pos_side == "long" else min(candidates, key=lambda x: x[0])
         sl, sig, tf, pp, buf = best
-        return self._round_price(sl), f"pool:{tf}@${pp:,.1f} sig={sig:.1f} buf={buf/atr:.2f}ATR"
+        return round(sl, 1), f"pool:{tf}@${pp:,.1f} sig={sig:.1f} buf={buf/atr:.2f}ATR"
 
     def _delivery_lock_from_swings(
         self, pos_side: str, price: float, true_be: float, atr: float,
@@ -990,7 +979,7 @@ class LiquidityTrailEngine:
         else:
             best = max(candidates, key=lambda x: (x[1], -x[0]))
         sl, _, tf, swing = best
-        return self._round_price(sl), f"swing:{tf}@${swing:,.1f}"
+        return round(sl, 1), f"swing:{tf}@${swing:,.1f}"
 
     def _try_delivery_structure_lock(
         self, pos_side: str, price: float, entry_price: float,
@@ -1031,7 +1020,7 @@ class LiquidityTrailEngine:
         q_sl = None
         if qtrail.accept:
             try:
-                q_sl = self._round_price(float(qtrail.components.get("candidate_sl", 0.0) or 0.0))
+                q_sl = round(float(qtrail.components.get("candidate_sl", 0.0) or 0.0), 1)
             except Exception:
                 q_sl = None
 
@@ -1072,9 +1061,13 @@ class LiquidityTrailEngine:
 
         reason = (f"[DELIVERY_LOCK] delivered={delivery_atr:.2f}ATR → SL=${candidate_sl:,.1f} "
                   f"behind {source_reason}; trueBE=${true_be:,.1f}; breathing={breathing:.2f}ATR")
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
+        # v74: preserve the computed analytical R in the trail result. v73 returned
+        # r_multiple=0.0 for DELIVERY_LOCK, so logs showed R=0.00R while the stop
+        # was being advanced after 3–6ATR of delivery. That was an analytics/telemetry
+        # calculation bug and could mislead downstream dashboards.
         return LiquidityTrailResult(new_sl=candidate_sl, anchor=None, reason=reason,
-                                    phase="DELIVERY_LOCK", r_multiple=0.0)
+                                    phase="DELIVERY_LOCK", r_multiple=r_multiple)
 
     @staticmethod
     def _better_sl(pos_side: str, a: Optional[float], b: Optional[float]) -> Optional[float]:
@@ -1148,7 +1141,7 @@ class LiquidityTrailEngine:
         )
         if gate_tag:
             reason = f"{reason}{gate_tag}"
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
         return LiquidityTrailResult(
             new_sl=be_price, anchor=None, reason=reason,
             phase="BE_LOCK", r_multiple=r_multiple)
@@ -1341,11 +1334,11 @@ class LiquidityTrailEngine:
 
         new_sl = (best.price - buf_points) if pos_side == "long" \
                  else (best.price + buf_points)
-        new_sl = self._round_price(new_sl)
+        new_sl = round(new_sl, 1)
 
         # BE floor applies only when BE is executable as a protective stop now.
         # For a short, a BE price below market is a target, not a valid buy-stop.
-        be_price = self._round_be_price(pos_side, self._be_price(pos_side, entry_price, atr, pos, fee_engine))
+        be_price = round(self._be_price(pos_side, entry_price, atr, pos, fee_engine), 1)
         be_invalid = self._stop_trigger_invalid_reason(pos_side, be_price, price)
         if be_invalid is None:
             if pos_side == "long" and new_sl < be_price:
@@ -2164,7 +2157,7 @@ class LiquidityTrailEngine:
             f"gate={momentum_gate} "
             f"→ SL=${new_sl:,.1f} (+{improvement:.1f}pts)"
         )
-        logger.info(f"Trail: {reason}")
+        logger.info(f"Trail PROPOSAL: {reason}")
 
         return LiquidityTrailResult(
             new_sl=new_sl, anchor=anchor, reason=reason, phase=phase,

@@ -12,18 +12,17 @@ and adds the institutional features that were missing from both:
        candidate TP eat momentum on the way and reduce expected hit-rate.
     3. SESSION / KILLZONE BONUS — pools formed in the active killzone or
        previous session are statistically more likely to be revisited.
-    4. QUALITY-SCALED SL BUFFER — the SL ATR buffer scales INVERSELY with
-       protective-pool quality. A high-significance pool gets a thin buffer
-       (the pool itself is the protection); a low-quality pool gets a wider
-       buffer (we don't trust the pool to actually halt price, so we widen).
+    4. LIQUIDITY-EXCLUSION SL BUFFER — the pool is the invalidation
+       reference, NOT the stop. Stronger/high-touch/HTF pools receive wider
+       clearance so the executable SL sits beyond the sweep envelope.
     5. EV (Expected Value) RANKING for TP — instead of "max significance"
        or "max raw R:R", we maximise:
                 EV  =  P(sweep) × R_distance × confluence × (1 - gauntlet_penalty)
        which is the true institutional objective.
     6. SL POOL selection — explicit selection of the best PROTECTIVE pool
        just beyond the structural invalidation, with:
-            • highest-significance opposing-side pool within search window
-            • quality-scaled buffer beyond pool price
+            • best all-timeframe opposing-side protective pool
+            • quality/timeframe/touch-scaled exclusion buffer beyond pool price
             • freshness penalty (already-tagged pools have weakened stops)
             • adjacency bonus from already-swept pools
 
@@ -134,23 +133,20 @@ _GAUNTLET_PENALTY_PER   = 0.18  # -18% per qualifying gauntlet pool
 _GAUNTLET_PENALTY_MAX   = 0.55  # but never wipe more than 55% of EV
 
 # SL pool selector tunables.
-_SL_BUFFER_BASE_ATR        = 0.18  # minimum buffer beyond pool price
-_SL_BUFFER_MAX_ATR         = 0.55  # ceiling on buffer
-_SL_BUFFER_QUALITY_SCALE   = 0.40  # inverse-scale: high quality → smaller buffer
-_SL_SEARCH_WINDOW_ATR      = 4.0   # max distance to look for a protective pool
-_SL_MIN_BEYOND_INVAL_ATR   = 0.05  # protective pool must be at least this far past invalidation
+#
+# v66: the stop is NOT the liquidity. A protective pool is the structural
+# invalidation reference; the executable stop must sit OUTSIDE the stop-cluster
+# / sweep envelope. High-quality/high-touch/HTF pools therefore require MORE
+# clearance, not less. We also evaluate every timeframe in the snapshot; a
+# fixed 4ATR hard window was causing HTF pools to be ignored instead of scored.
+_SL_BUFFER_BASE_ATR        = 0.30  # minimum exclusion zone beyond pool price
+_SL_BUFFER_MAX_ATR         = 1.35  # hard ceiling on exclusion buffer
+_SL_BUFFER_QUALITY_SCALE   = 0.55  # quality-scaled: stronger liquidity → wider buffer
+_SL_SOFT_DISTANCE_ATR      = 4.0   # distance where soft capital-drag penalty begins
+_SL_HARD_MAX_DISTANCE_ATR  = 18.0  # evaluate full MTF map; reject only extreme/liquidation-like anchors
+_SL_MIN_BEYOND_INVAL_ATR   = 0.10  # protective pool must be past structural invalidation
 _SL_MIN_SIGNIFICANCE       = 1.5   # don't anchor SL to garbage pools
-
-# Stop placement must be outside the full protective liquidity envelope, not
-# a few ticks behind a single visible pool.  These values are not entry
-# filters; they shape the SL price from the live pool distribution so the stop
-# is not parked in the middle of a stop cluster.
-_SL_ZONE_JOIN_ATR          = 0.65  # pools closer than this form one stop zone
-_SL_STOP_EXCLUSION_ATR     = 0.40  # SL must not sit within this distance of a pool
-_SL_ZONE_BASE_BUFFER_ATR   = 0.30  # minimum beyond the external zone edge
-_SL_ZONE_WIDTH_BUFFER_FRAC = 0.30  # wider stop zones need more external clearance
-_SL_ZONE_DENSITY_BUFFER    = 0.08  # extra buffer per log(pool_count)
-_SL_ZONE_MAX_BUFFER_ATR    = 1.35  # hard cap before liquidation/geometry guard
+_SL_LIQUIDITY_EXCLUSION_ATR = 0.30 # absolute minimum clearance away from the pool
 
 # Killzones (UTC). London 07-10, NY 12-16. Bonus active during + previous KZ.
 _KILLZONE_HOURS = (7, 8, 9, 10, 12, 13, 14, 15, 16)
@@ -176,26 +172,6 @@ _TP_DURABLE_RR_FLOOR     = 1.35
 _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
-
-# Terminal/frontier target handling.  A far TP must not be selected because it is
-# simply far, and it must not be rejected just because the first-touch model says
-# the next immediate sweep probability is low.  Institutional target selection
-# treats HTF/external pools as conditional delivery objectives: if the auction
-# posterior, pool quality, HTF rank, confluence and path/gauntlet quality support
-# the route, the TP can be reasonably far and still executable.
-_TP_FRONTIER_PROB_FLOOR = 0.055
-_TP_FRONTIER_PROB_CAP   = 0.42
-_TP_FRONTIER_DECAY_EXPANSION = 2.75
-_TP_FRONTIER_SPAN_BONUS_MAX = 1.00
-_TP_FRONTIER_MAX_REACH_MULT = 2.50
-_TP_FRONTIER_MAX_ABS_ATR = 48.0
-# Single native bracket TP cannot express multiple child targets, but the target
-# selection model still prices institutional staged delivery.  A far frontier can
-# be selected when the path is executable even if direct full-position touch
-# probability is below a naive retail break-even threshold; size/risk downstream
-# then scales from the same posterior/utility context.
-_TP_MIN_FRONTIER_SCALE = 0.28
-_TP_MAX_PATH_CREDIT = 0.46
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -226,22 +202,12 @@ class PoolScore:
 
 @dataclass
 class SLPoolPick:
-    """The chosen protective liquidity envelope and the buffered SL price.
-
-    ``target`` is the external-edge pool of the selected zone, not simply the
-    highest-scoring inner pool.  This is intentional: an institutional stop is
-    placed beyond the whole protective liquidity envelope, never in the middle
-    of clustered SSL/BSL liquidity.
-    """
-    target:       Any                    # external-edge PoolTarget on OPPOSING side
-    sl_price:     float                  # zone edge ± buffer
+    """The chosen protective pool and the buffered SL price."""
+    target:       Any                    # PoolTarget on the OPPOSING side
+    sl_price:     float                  # pool.price ± buffer
     buffer_atr:   float
-    quality:      float                  # composite [0, 1] quality of the zone
+    quality:      float                  # composite [0, 1] quality of the pick
     reasons:      List[str] = field(default_factory=list)
-    zone_size:    int = 1
-    zone_inner:   float = 0.0
-    zone_outer:   float = 0.0
-    zone_width_atr: float = 0.0
 
 
 @dataclass
@@ -332,60 +298,6 @@ def _required_delivery_probability(rr: float, cost_r: float) -> float:
     return _clamp((1.0 + max(float(cost_r), 0.0)) / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
 
 
-def _frontier_path_credit(
-    *,
-    terminal_target: bool,
-    posterior: float,
-    confluence: float,
-    gauntlet_mult: float,
-    reach_mult: float,
-    rr: float,
-    distance_atr: float,
-) -> float:
-    """Credit for managed path delivery on external/HTF targets.
-
-    Retail TP math treats the terminal pool as an all-or-nothing fixed target.
-    Institutional execution prices the path: a trade can move stop to BE, trail
-    through intermediate liquidity, and express a terminal objective only when
-    the route quality justifies it.  This credit lowers the required full-touch
-    hurdle for terminal/frontier targets without accepting lottery pools.
-    """
-    if not terminal_target:
-        return 0.0
-    posterior_q = _clamp(posterior, 0.0, 0.95) / 0.95
-    conf_q = _clamp((confluence - 0.75) / 1.25, 0.0, 1.0)
-    lane_q = _clamp((gauntlet_mult - 0.45) / 0.55, 0.0, 1.0)
-    reach_q = _clamp(reach_mult, 0.05, 1.20) / 1.20
-    payoff_q = _clamp((rr - 1.0) / 5.5, 0.0, 1.0)
-    dist_drag = _clamp((distance_atr - 6.0) / 42.0, 0.0, 1.0)
-    credit = (
-        0.08
-        + 0.12 * posterior_q
-        + 0.09 * conf_q
-        + 0.08 * lane_q
-        + 0.06 * reach_q
-        + 0.08 * payoff_q
-        - 0.05 * dist_drag
-    )
-    return _clamp(credit, 0.0, _TP_MAX_PATH_CREDIT)
-
-
-def _frontier_scale_fraction(delivery_prob: float, required_prob: float, terminal_target: bool) -> float:
-    """Risk fraction implied by terminal path probability.
-
-    Used for diagnostics/selection.  The codebase still places one native bracket,
-    but this calculation keeps target choice from becoming a nearest-pool retail
-    shortcut: far objectives can be chosen when only a runner-sized fraction of
-    the position should be expected to reach them.
-    """
-    if required_prob <= 0.0:
-        return 1.0
-    frac = _clamp(delivery_prob / max(required_prob, 1e-9), 0.0, 1.0)
-    if terminal_target:
-        return _clamp(frac, _TP_MIN_FRONTIER_SCALE, 1.0)
-    return frac
-
-
 def _enum_value(v: Any, default: str = "") -> str:
     try:
         if hasattr(v, "value"):
@@ -401,6 +313,49 @@ def _pool_status(pool: Any) -> str:
 
 def _pool_side(pool: Any) -> str:
     return _enum_value(_safe(pool, "side", ""), "")
+
+
+
+
+def _pool_status_text(pool: Any) -> str:
+    """Return normalized pool status text for live-vs-archived gates."""
+    return _pool_status(pool).upper()
+
+
+def _is_live_pool(pool: Any) -> bool:
+    """Only unswept, unconsumed liquidity can anchor TP/SL execution.
+
+    Swept/consumed pools remain useful as context for adjacency and market
+    narrative, but they must never be selected as a fresh delivery target or
+    protective stop anchor.
+    """
+    status = _pool_status_text(pool)
+    return status not in ("SWEPT", "CONSUMED")
+
+
+def _is_tp_pool_side(target: Any, side: str) -> bool:
+    pool = _safe(target, "pool", None)
+    pside = _pool_side(pool).upper()
+    if not pside:
+        # Some legacy tests/adapter snapshots separate BSL/SSL by collection
+        # but omit pool.side on the object.  Accept unknown here; explicit wrong
+        # side values are still rejected below.
+        return True
+    if side == "long":
+        return "BSL" in pside
+    return "SSL" in pside
+
+
+def _is_sl_pool_side(target: Any, side: str) -> bool:
+    pool = _safe(target, "pool", None)
+    pside = _pool_side(pool).upper()
+    if not pside:
+        # Collection membership is authoritative for older snapshots that do
+        # not carry pool.side; explicit wrong side values remain hard-rejected.
+        return True
+    if side == "long":
+        return "SSL" in pside
+    return "BSL" in pside
 
 
 def _target_signature(target: Any) -> Tuple[str, float, str]:
@@ -653,16 +608,6 @@ def _max_reach_for_tf(tf: str) -> float:
     return float(_MAX_REACH_ATR.get(str(tf), _MAX_REACH_ATR.get(str(tf).lower(), 12.0)))
 
 
-def _max_frontier_reach_for_tf(tf: str) -> float:
-    """Maximum executable TP frontier in ATR units for a timeframe.
-
-    This is not a nearest-target filter.  It prevents lottery objectives that are
-    so far beyond the timeframe's historical sweep horizon that even strong R:R
-    cannot make the path institutionally executable.
-    """
-    return min(_TP_FRONTIER_MAX_ABS_ATR, max(_max_reach_for_tf(tf) * _TP_FRONTIER_MAX_REACH_MULT, _max_reach_for_tf(tf) + 6.0))
-
-
 def _is_terminal_tp_candidate(target: Any, distance_atr: float) -> bool:
     """True when a beyond-reach pool is still a valid terminal objective.
 
@@ -717,7 +662,7 @@ def _posterior_delivery_probability(
     gauntlet_mult: float,
     reach_mult: float,
 ) -> float:
-    """Direct first-sweep delivery probability for non-terminal objectives."""
+    """Blend setup posterior with the pool's own delivery probability."""
     pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
     pool_prob *= math.sqrt(_clamp(confluence, 0.25, 2.25))
     pool_prob *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
@@ -730,79 +675,6 @@ def _posterior_delivery_probability(
     return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
 
-def _frontier_delivery_probability(
-    *,
-    direct_prob: float,
-    posterior_prob: float,
-    confluence: float,
-    gauntlet_mult: float,
-    reach_mult: float,
-    rr: float,
-    distance_atr: float,
-    significance: float,
-    tf: str,
-    terminal_target: bool,
-) -> Tuple[float, Dict[str, float]]:
-    """Path-adjusted probability for executable HTF/frontier TP targets.
-
-    The first-touch MTF model answers: "what is likely to be swept next?"  That
-    is useful for near targets but underprices external/HTF delivery targets.
-    Institutional execution does not require the far pool to be the *next* pool;
-    it requires a positive conditional path: auction posterior + pool quality +
-    HTF rank + confluence + acceptable gauntlet + payoff geometry.  This helper
-    produces that conditional delivery probability without turning every distant
-    pool into a valid TP.
-    """
-    direct = _clamp(direct_prob, _TP_DELIVERY_PROB_FLOOR, 0.93)
-    if not terminal_target:
-        return direct, {
-            "delivery_model": "direct",
-            "direct_prob": direct,
-            "frontier_prob": 0.0,
-            "frontier_decay": 1.0,
-        }
-
-    max_reach = _max_reach_for_tf(tf)
-    lam = max(float(_DECAY_LAMBDA.get(str(tf), _DECAY_LAMBDA.get(str(tf).lower(), 2.0))), 1.25)
-    overshoot = max(0.0, float(distance_atr) - max_reach)
-    # Far targets decay, but slower than first-touch reach: this is a conditional
-    # delivery route, not a prediction that the target is swept immediately.
-    frontier_decay = math.exp(-overshoot / max(lam * _TP_FRONTIER_DECAY_EXPANSION, 1e-9))
-    frontier_decay = _clamp(frontier_decay, 0.18, 1.00)
-
-    posterior_q = _clamp(float(posterior_prob) / 0.72, 0.0, 1.0)
-    sig_q = _clamp(float(significance) / 8.0, 0.0, 1.0)
-    tf_q = _clamp((_tf_rank(str(tf)) - 2.0) / 4.0, 0.0, 1.0)
-    conf_q = _clamp((float(confluence) - 0.80) / 1.35, 0.0, 1.0)
-    lane_q = _clamp((float(gauntlet_mult) - 0.45) / 0.55, 0.0, 1.0)
-    payoff_q = _clamp((float(rr) - 2.0) / 14.0, 0.0, 1.0)
-    reach_q = _clamp(math.sqrt(max(float(reach_mult), 0.0) / _TP_TERMINAL_PROFILE_FLOOR), 0.0, 1.0)
-
-    frontier = (
-        _TP_FRONTIER_PROB_FLOOR
-        + 0.115 * posterior_q
-        + 0.075 * sig_q
-        + 0.055 * tf_q
-        + 0.055 * conf_q
-        + 0.045 * lane_q
-        + 0.045 * payoff_q
-        + 0.025 * reach_q
-    ) * math.sqrt(frontier_decay)
-    frontier = _clamp(frontier, _TP_FRONTIER_PROB_FLOOR, _TP_FRONTIER_PROB_CAP)
-    return max(direct, frontier), {
-        "delivery_model": "frontier",
-        "direct_prob": direct,
-        "frontier_prob": frontier,
-        "frontier_decay": frontier_decay,
-        "posterior_q": posterior_q,
-        "sig_q": sig_q,
-        "tf_q": tf_q,
-        "conf_q": conf_q,
-        "lane_q": lane_q,
-        "payoff_q": payoff_q,
-    }
-
-
 def _institutional_rr_floor(
     static_min_rr: float,
     posterior_prob: float,
@@ -812,19 +684,15 @@ def _institutional_rr_floor(
     reach_mult: float,
     risk: float,
     be_move: float,
-    *,
-    rr: float = 0.0,
-    distance_atr: float = 0.0,
-    significance: float = 0.0,
-    tf: str = "5m",
-    terminal_target: bool = False,
-) -> Tuple[float, float, float, Dict[str, float]]:
-    """Return (required_rr, delivery_probability, cost_r, delivery_components).
+) -> Tuple[float, float, float]:
+    """Return (required_rr, delivery_probability, cost_r).
 
-    The floor is a positive expected-value boundary, not a retail fixed R:R
-    parameter.  For normal targets we use direct sweep delivery probability.  For
-    HTF/frontier targets we use conditional path-adjusted delivery probability so
-    a reasonable far target can be selected when the route is executable.
+    With no accepted setup posterior, preserve the legacy static floor. Once a
+    posterior exists, the pool is judged by positive expected value:
+        p * R - (1 - p) - cost_r >= 0
+    The static floor can be relaxed by observed auction posterior, but only
+    down to a durable payoff floor. If costs consume too much of the risk box,
+    the floor expands above the static prior instead of approving a micro-win.
     """
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
@@ -834,44 +702,18 @@ def _institutional_rr_floor(
     )
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
-    direct_p = _posterior_delivery_probability(
-        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
-    delivery_p, delivery_components = _frontier_delivery_probability(
-        direct_prob=direct_p,
-        posterior_prob=posterior,
-        confluence=confluence,
-        gauntlet_mult=gauntlet_mult,
-        reach_mult=reach_mult,
-        rr=rr,
-        distance_atr=distance_atr,
-        significance=significance,
-        tf=tf,
-        terminal_target=terminal_target,
-    )
-    ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-    path_credit = _frontier_path_credit(
-        terminal_target=terminal_target,
-        posterior=posterior,
-        confluence=confluence,
-        gauntlet_mult=gauntlet_mult,
-        reach_mult=reach_mult,
-        rr=rr,
-        distance_atr=distance_atr,
-    )
-    if terminal_target:
-        # Terminal/frontier objectives are priced as managed delivery paths, not
-        # naive all-or-nothing full-size exits.  This prevents the selector from
-        # collapsing back to the nearest pool while still rejecting lottery routes.
-        ev_floor *= (1.0 - path_credit)
-        delivery_components["path_credit"] = path_credit
-        delivery_components["scale_fraction"] = _frontier_scale_fraction(
-            delivery_p, _required_delivery_probability(max(rr, 1e-9), cost_r), True)
     if posterior <= 0.0:
-        # Without setup posterior, do not let conditional frontier math weaken
-        # the static prior.  The target can still be far, but only if it clears
-        # the full positive-EV boundary.
-        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r, delivery_components
-    return max(durable_floor, ev_floor), delivery_p, cost_r, delivery_components
+        delivery_p = _posterior_delivery_probability(
+            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
+        ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
+
+    delivery_p = _posterior_delivery_probability(
+        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
+    ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+    posterior_floor = max(durable_floor, ev_floor)
+    return posterior_floor, delivery_p, cost_r
+
 
 def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
                          terminal_target: bool) -> float:
@@ -884,15 +726,9 @@ def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketP
 
 def _tp_selection_value(ev: float, rr: float, rr_floor: float,
                         distance_atr: float) -> float:
-    """Rank the executable target frontier, not simply the nearest pool.
-
-    ``ev`` has already paid for probability, path quality and gauntlet.  This
-    selection layer rewards durable payoff and reasonable delivery span so a
-    farther, executable HTF pool can beat a shallow near pool.
-    """
     surplus_r = max(float(rr) - float(rr_floor), 0.0)
-    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.30, 1.35))
-    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.055, _TP_FRONTIER_SPAN_BONUS_MAX)
+    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
+    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
     return float(ev) * payoff_frontier * delivery_span
 
 
@@ -920,16 +756,15 @@ def _tp_payoff_rejection_reason(
     )
 
 
-def _target_utility(delivery_prob: float, rr: float, min_rr: float,
+def _target_utility(raw_prob: float, rr: float, min_rr: float,
                     distance_atr: float, reward: float,
                     be_move: float) -> Tuple[float, Dict[str, float]]:
     """
-    Convert delivery probability into payoff utility.
+    Convert hit probability into trade utility.
 
-    This is not a nearest-pool heuristic.  It prices the executable objective by
-    conditional delivery probability, durable R, room beyond BE migration and
-    distance quality.  Far targets can rank first only when their conditional
-    path remains positive-EV after costs and gauntlet.
+    Near pools often have high sweep probability but too little room after
+    fees, slippage, and BE migration. This utility still respects probability,
+    but pays for durable R and distance beyond the cost envelope.
     """
     rr_excess = max(0.0, rr - float(min_rr))
     rr_utility = math.sqrt(max(rr, 0.0)) * (1.0 + min(rr_excess * 0.35, 1.25))
@@ -938,7 +773,7 @@ def _target_utility(delivery_prob: float, rr: float, min_rr: float,
     be_quality = 0.35 + 0.65 * min(be_surplus_atr / 2.0, 1.0)
     distance_quality = 1.0 - math.exp(-max(distance_atr - 0.35, 0.0) / 1.8)
     distance_quality = max(0.25, distance_quality)
-    utility = _clamp(delivery_prob, _TP_DELIVERY_PROB_FLOOR, 0.95) * rr_utility * be_quality * distance_quality
+    utility = raw_prob * rr_utility * be_quality * distance_quality
     return utility, {
         "rr_utility": rr_utility,
         "be_quality": be_quality,
@@ -946,208 +781,6 @@ def _target_utility(delivery_prob: float, rr: float, min_rr: float,
         "be_move": be_move,
     }
 
-
-
-
-def _is_live_liquidity_target(target: Any, min_significance: float = 0.0) -> bool:
-    """True only for active, currently usable pool targets.
-
-    Stops and targets must not be derived from consumed/swept/archive pools.
-    This helper is deliberately shared by TP/SL logic so pool status semantics
-    stay consistent across target selection and stop protection.
-    """
-    try:
-        pool = _safe(target, "pool", target)
-        status = _pool_status(pool).upper()
-        if status in {"SWEPT", "CONSUMED", "ARCHIVED", "DEAD", "EXPIRED", "INVALID"}:
-            return False
-        if bool(_safe(pool, "is_swept", False)) or bool(_safe(target, "is_swept", False)):
-            return False
-        sig = float(_safe(target, "significance", _safe(pool, "significance", 0.0)) or 0.0)
-        return sig >= float(min_significance)
-    except Exception:
-        return False
-
-
-def _pool_price(target: Any) -> float:
-    return float(_safe(_safe(target, "pool", target), "price", 0.0) or 0.0)
-
-
-def _pool_significance(target: Any) -> float:
-    pool = _safe(target, "pool", target)
-    return float(_safe(target, "significance", _safe(pool, "significance", 0.0)) or 0.0)
-
-
-def _pool_microstructure_score(target: Any) -> float:
-    """Structural score used inside an SL envelope."""
-    pool = _safe(target, "pool", target)
-    sig = max(_pool_significance(target), 0.0)
-    return sig * _structural_bonus(pool) * _freshness_bonus(pool) * _touch_penalty(pool)
-
-
-def _protective_candidates(
-    snap: Any,
-    side: str,
-    entry: float,
-    atr: float,
-    invalidation_price: Optional[float],
-) -> Tuple[List[Any], str]:
-    """Return live protective pool targets for the trade side.
-
-    Long trades are protected by SSL below invalidation.  Shorts are protected
-    by BSL above invalidation.  The search window is still bounded by ATR and
-    liquidation/geometry checks in the caller, but selection is made at the
-    liquidity-zone level rather than one isolated pool.
-    """
-    if snap is None or atr <= 0:
-        return [], "no snapshot/ATR"
-    if side == "long":
-        pools = list(_safe(snap, "ssl_pools", []) or [])
-        inv = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
-        out = [t for t in pools
-               if _is_live_liquidity_target(t, _SL_MIN_SIGNIFICANCE)
-               and _pool_price(t) <= inv - _SL_MIN_BEYOND_INVAL_ATR * atr
-               and (entry - _pool_price(t)) <= _SL_SEARCH_WINDOW_ATR * atr]
-        return out, "SSL"
-    pools = list(_safe(snap, "bsl_pools", []) or [])
-    inv = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
-    out = [t for t in pools
-           if _is_live_liquidity_target(t, _SL_MIN_SIGNIFICANCE)
-           and _pool_price(t) >= inv + _SL_MIN_BEYOND_INVAL_ATR * atr
-           and (_pool_price(t) - entry) <= _SL_SEARCH_WINDOW_ATR * atr]
-    return out, "BSL"
-
-
-def _build_protective_zones(candidates: List[Any], side: str, atr: float) -> List[List[Any]]:
-    """Cluster nearby protective pools into executable stop zones."""
-    if not candidates or atr <= 0:
-        return []
-    # Long: from inner/high price down to external/low price.  Short: inverse.
-    reverse = side == "long"
-    ordered = sorted(candidates, key=_pool_price, reverse=reverse)
-    zones: List[List[Any]] = []
-    join = max(_SL_ZONE_JOIN_ATR * atr, 1e-9)
-    current: List[Any] = []
-    last_px: Optional[float] = None
-    for t in ordered:
-        px = _pool_price(t)
-        if px <= 0:
-            continue
-        if last_px is None or abs(px - last_px) <= join:
-            current.append(t)
-        else:
-            if current:
-                zones.append(current)
-            current = [t]
-        last_px = px
-    if current:
-        zones.append(current)
-    return zones
-
-
-def _zone_edges(zone: List[Any], side: str) -> Tuple[float, float, Any]:
-    """Return (inner_edge, external_edge, external_target)."""
-    ordered = sorted(zone, key=_pool_price)
-    if side == "long":
-        external = ordered[0]
-        inner = ordered[-1]
-    else:
-        external = ordered[-1]
-        inner = ordered[0]
-    return _pool_price(inner), _pool_price(external), external
-
-
-def _liquidity_zone_buffer_atr(zone: List[Any], side: str, atr: float,
-                               quality: float, max_buffer_atr: float) -> Tuple[float, float]:
-    """Calculate external stop clearance from zone width, density and quality."""
-    inner, outer, _ = _zone_edges(zone, side)
-    width_atr = abs(inner - outer) / max(atr, 1e-9)
-    density = math.log1p(max(len(zone), 1))
-    quality_buffer = _SL_BUFFER_BASE_ATR + (1.0 - _clamp(quality, 0.0, 1.0)) * _SL_BUFFER_QUALITY_SCALE
-    zone_buffer = (
-        _SL_ZONE_BASE_BUFFER_ATR
-        + _SL_ZONE_WIDTH_BUFFER_FRAC * min(width_atr, 2.0)
-        + _SL_ZONE_DENSITY_BUFFER * density
-    )
-    buffer_atr = max(quality_buffer, zone_buffer)
-    buffer_atr = min(buffer_atr, _SL_ZONE_MAX_BUFFER_ATR, float(max_buffer_atr))
-    return buffer_atr, width_atr
-
-
-def _move_stop_outside_nearby_liquidity(sl: float, side: str, atr: float,
-                                        candidates: List[Any], max_buffer_atr: float) -> float:
-    """Ensure the final SL is not sitting inside/adjacent to a live pool."""
-    if atr <= 0 or not candidates:
-        return sl
-    exclusion = _SL_STOP_EXCLUSION_ATR * atr
-    # Iterate because moving beyond one nearby pool can expose the next pool.
-    for _ in range(5):
-        near = [t for t in candidates if abs(_pool_price(t) - sl) <= exclusion]
-        if not near:
-            break
-        quality = _clamp(sum(_pool_microstructure_score(t) for t in near) / max(8.0 + 2.0 * len(near), 1.0), 0.0, 1.0)
-        buf_atr, _ = _liquidity_zone_buffer_atr(near, side, atr, quality, max_buffer_atr)
-        if side == "long":
-            new_sl = min(_pool_price(t) for t in near) - buf_atr * atr
-            if new_sl >= sl - 1e-9:
-                break
-            sl = new_sl
-        else:
-            new_sl = max(_pool_price(t) for t in near) + buf_atr * atr
-            if new_sl <= sl + 1e-9:
-                break
-            sl = new_sl
-    return sl
-
-
-def _score_sl_zones(candidates: List[Any], side: str, entry: float, atr: float,
-                    max_buffer_atr: float, min_risk: float = 0.0) -> List[Tuple[float, SLPoolPick]]:
-    """Score executable protective liquidity zones, not isolated pool lines."""
-    zones = _build_protective_zones(candidates, side, atr)
-    scored: List[Tuple[float, SLPoolPick]] = []
-    for zone in zones:
-        if not zone:
-            continue
-        inner, outer, external_target = _zone_edges(zone, side)
-        raw_zone_score = sum(_pool_microstructure_score(t) for t in zone)
-        # Normalize quality by zone size; a dense zone should help, but not make
-        # the buffer too tight.  The stop has to clear the envelope.
-        quality = _clamp(raw_zone_score / max(8.0 + 2.5 * math.log1p(len(zone)), 1.0), 0.0, 1.0)
-        buffer_atr, width_atr = _liquidity_zone_buffer_atr(zone, side, atr, quality, max_buffer_atr)
-        sl_price = outer - buffer_atr * atr if side == "long" else outer + buffer_atr * atr
-        sl_price = _move_stop_outside_nearby_liquidity(sl_price, side, atr, candidates, max_buffer_atr)
-        risk = abs(entry - sl_price)
-        if min_risk > 0.0 and risk < min_risk:
-            continue
-        risk_atr = risk / max(atr, 1e-9)
-        density_bonus = 1.0 + 0.20 * math.log1p(len(zone))
-        width_bonus = 1.0 + 0.10 * min(width_atr, 2.0)
-        # Risk efficiency is a soft ranking term only. Geometry/liquidation
-        # guards decide whether the final stop is tradable.
-        risk_efficiency = 1.0 / (1.0 + 0.12 * max(risk_atr - 1.0, 0.0))
-        selection_score = raw_zone_score * density_bonus * width_bonus * risk_efficiency
-        reasons = [
-            f"zone_score={raw_zone_score:.2f}",
-            f"zone_n={len(zone)}",
-            f"zone_width={width_atr:.2f}ATR",
-            f"external_edge=${outer:.1f}",
-        ]
-        if len(zone) > 1:
-            reasons.append("cluster-envelope stop")
-        pick = SLPoolPick(
-            target=external_target,
-            sl_price=sl_price,
-            buffer_atr=buffer_atr,
-            quality=quality,
-            reasons=reasons,
-            zone_size=len(zone),
-            zone_inner=inner,
-            zone_outer=outer,
-            zone_width_atr=width_atr,
-        )
-        scored.append((selection_score, pick))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored
 
 # ════════════════════════════════════════════════════════════════════════════
 # TP POOL SCORING
@@ -1167,13 +800,10 @@ def score_tp_pools(
     posterior_prob: float = 0.0,
 ) -> List[PoolScore]:
     """
-    Score every candidate TP pool. Returns PoolScore[], sorted by executable
-    frontier utility.
+    Score every candidate TP pool. Returns PoolScore[], sorted by EV desc.
 
-    The first element is the institutional choice.  This is not nearest-pool
-    targeting: far HTF/external pools are allowed when conditional path delivery
-    is positive-EV after costs, gauntlet and volatility.  If empty, no liquidity
-    objective is executable; no synthetic ATR TP is created.
+    The first element is the institutional choice. If empty, no pool meets
+    the constraints — caller should reject or wait; no synthetic ATR TP is created.
     """
     if snap is None or atr <= 0:
         return []
@@ -1202,10 +832,13 @@ def score_tp_pools(
     for target in pools:
         try:
             pool = target.pool
-            if not _is_live_liquidity_target(target, 0.0):
-                continue
             dist_atr = float(_safe(target, "distance_atr", 0.0))
             pool_price = float(_safe(pool, "price", 0.0))
+
+            if not _is_live_pool(pool):
+                continue
+            if not _is_tp_pool_side(target, side):
+                continue
 
             # Reach gates. Too-close remains a hard veto because fees/slippage
             # and BE migration consume the whole move. Too-far is NOT a hard
@@ -1216,8 +849,6 @@ def score_tp_pools(
             tf = str(_safe(pool, "timeframe", "5m"))
             max_reach = _max_reach_for_tf(tf)
             terminal_target = dist_atr > max_reach
-            if terminal_target and dist_atr > _max_frontier_reach_for_tf(tf):
-                continue
             if terminal_target and not _is_terminal_tp_candidate(target, dist_atr):
                 continue
 
@@ -1255,7 +886,7 @@ def score_tp_pools(
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
-            rr_floor, delivery_prob, cost_r, delivery_components = _institutional_rr_floor(
+            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -1264,19 +895,13 @@ def score_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
-                rr=rr,
-                distance_atr=dist_atr,
-                significance=sig,
-                tf=tf,
-                terminal_target=terminal_target,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
-                delivery_prob, rr, rr_floor, dist_atr, reward, be_move)
+                raw_prob, rr, rr_floor, dist_atr, reward, be_move)
             utility *= reach_mult
-            utility_components.update(delivery_components)
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
 
@@ -1293,13 +918,8 @@ def score_tp_pools(
             if n_gauntlet > 0:
                 reasons.append(f"gauntlet {n_gauntlet} pools −{(1-gauntlet_mult)*100:.0f}%")
             if terminal_target:
-                model = utility_components.get("delivery_model", "frontier")
-                fp = float(utility_components.get("frontier_prob", 0.0) or 0.0)
-                scale = float(utility_components.get("scale_fraction", 1.0) or 1.0)
-                credit = float(utility_components.get("path_credit", 0.0) or 0.0)
                 reasons.append(
-                    f"terminal/frontier target ({dist_atr:.1f}>{max_reach:.1f}ATR; {model}; "
-                    f"pathP={fp:.3f}; scale≈{scale:.2f}; credit={credit:.2f}; reach×{reach_mult:.2f})")
+                    f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
@@ -1336,13 +956,7 @@ def score_tp_pools(
                     "significance": sig,
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
-                    "direct_delivery_prob": utility_components.get("direct_prob", delivery_prob),
-                    "frontier_prob": utility_components.get("frontier_prob", 0.0),
-                    "frontier_decay": utility_components.get("frontier_decay", 1.0),
-                    "delivery_model": utility_components.get("delivery_model", "direct"),
                     "required_delivery_prob": required_delivery_prob,
-                    "path_credit":  utility_components.get("path_credit", 0.0),
-                    "scale_fraction": utility_components.get("scale_fraction", _frontier_scale_fraction(delivery_prob, required_delivery_prob, terminal_target)),
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                 },
@@ -1367,6 +981,55 @@ def score_tp_pools(
 # SL POOL SCORING
 # ════════════════════════════════════════════════════════════════════════════
 
+def _sl_pool_distance_penalty(distance_atr: float, tf: str) -> float:
+    """Soft capital-drag penalty for protective pools far from entry."""
+    tf_rank = _tf_rank(tf)
+    soft = _SL_SOFT_DISTANCE_ATR + 1.25 * max(0, tf_rank - 2)
+    excess = max(0.0, float(distance_atr) - soft)
+    return 1.0 / (1.0 + 0.18 * excess * excess)
+
+
+def _sl_liquidity_buffer_atr(target: Any, quality: float, *, max_buffer_atr: float = 2.0) -> float:
+    """Executable stop clearance beyond the liquidity pool.
+
+    Stronger pool = more stop concentration = larger sweep envelope. The
+    previous inverse model made high-quality pools use the smallest buffer,
+    effectively placing the SL inside/next to the same liquidity cluster.
+    """
+    pool = _safe(target, "pool", None)
+    tf_rank = _tf_rank(str(_safe(pool, "timeframe", "5m")))
+    touches = max(1, int(_safe(pool, "touches", 1) or 1))
+    touch_term = min(0.24, 0.035 * max(0, touches - 2))
+    tf_term = min(0.22, 0.045 * max(0, tf_rank - 2))
+    q = _clamp(float(quality), 0.0, 1.0)
+    buf = _SL_BUFFER_BASE_ATR + _SL_BUFFER_QUALITY_SCALE * q + touch_term + tf_term
+    buf = max(buf, _SL_LIQUIDITY_EXCLUSION_ATR)
+    return min(buf, _SL_BUFFER_MAX_ATR, max(float(max_buffer_atr or 0.0), _SL_LIQUIDITY_EXCLUSION_ATR))
+
+
+def _sl_pool_score(target: Any, *, entry: float, atr: float, side: str) -> Tuple[float, float, float, List[str]]:
+    """Return (score, quality, distance_atr, notes) for a protective SL anchor."""
+    pool = _safe(target, "pool", None)
+    pool_price = float(_safe(pool, "price", 0.0) or 0.0)
+    dist_atr = float(_safe(target, "distance_atr", 0.0) or 0.0)
+    if dist_atr <= 0.0 and atr > 0.0 and pool_price > 0.0:
+        dist_atr = abs(float(entry) - pool_price) / max(float(atr), 1e-9)
+    sig = float(_safe(target, "significance", 0.0) or 0.0)
+    struct = _structural_bonus(pool)
+    fresh = _freshness_bonus(pool)
+    touch = _touch_penalty(pool)
+    tf = str(_safe(pool, "timeframe", "5m") or "5m")
+    tf_rank = _tf_rank(tf)
+    tf_mult = 1.0 + 0.09 * max(0, tf_rank - 2)
+    distance_mult = _sl_pool_distance_penalty(dist_atr, tf)
+    score = sig * struct * fresh * touch * tf_mult * distance_mult
+    quality = _clamp(score / 12.0, 0.0, 1.0)
+    notes = [f"score={score:.2f}", f"dist={dist_atr:.1f}ATR", f"tf={tf}"]
+    if distance_mult < 0.90:
+        notes.append(f"soft distance penalty×{distance_mult:.2f}")
+    return score, quality, dist_atr, notes
+
+
 def score_sl_pool(
     snap,
     side:                str,
@@ -1379,36 +1042,63 @@ def score_sl_pool(
     now:                 Optional[float] = None,
     min_risk:            float = 0.0,
 ) -> Optional[SLPoolPick]:
-    """
-    Pick an institutional protective SL *envelope*, not a single pool line.
-
-    The old behavior could anchor to the best-looking individual SSL/BSL and
-    then place the SL only a small fixed ATR buffer behind it.  That can park a
-    stop inside the broader liquidity cluster.  This version first clusters all
-    live protective pools around structural invalidation, chooses the best zone,
-    then places the SL beyond the zone's external edge with a buffer derived
-    from zone width, density, freshness/quality and touch deterioration.
-    """
+    """Pick the best all-timeframe protective liquidity/invalidation shelf."""
     if snap is None or atr <= 0:
         return None
-
-    min_risk = max(0.0, float(min_risk or 0.0))
-    candidates, _ = _protective_candidates(snap, side, entry, atr, invalidation_price)
-    if not candidates:
+    side = (side or "").lower()
+    if side not in ("long", "short"):
         return None
-
-    scored = _score_sl_zones(
-        candidates=candidates,
-        side=side,
-        entry=entry,
-        atr=atr,
-        max_buffer_atr=max_buffer_atr,
-        min_risk=min_risk,
-    )
+    if side == "long":
+        pools = list(_safe(snap, "ssl_pools", []) or [])
+        inv_price = float(invalidation_price if invalidation_price is not None else entry - 0.3 * atr)
+        def _protects(t: Any) -> bool:
+            px = float(_safe(t.pool, "price", 0.0) or 0.0)
+            return px <= inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr
+    else:
+        pools = list(_safe(snap, "bsl_pools", []) or [])
+        inv_price = float(invalidation_price if invalidation_price is not None else entry + 0.3 * atr)
+        def _protects(t: Any) -> bool:
+            px = float(_safe(t.pool, "price", 0.0) or 0.0)
+            return px >= inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr
+    min_risk = max(0.0, float(min_risk or 0.0))
+    scored: List[Tuple[float, Any, float, float, float, List[str]]] = []
+    for t in pools:
+        pool = _safe(t, "pool", None)
+        if not _is_live_pool(pool):
+            continue
+        if not _is_sl_pool_side(t, side):
+            continue
+        if not _protects(t):
+            continue
+        if float(_safe(t, "significance", 0.0) or 0.0) < _SL_MIN_SIGNIFICANCE:
+            continue
+        score, quality, dist_atr, notes = _sl_pool_score(t, entry=entry, atr=atr, side=side)
+        if dist_atr > _SL_HARD_MAX_DISTANCE_ATR:
+            continue
+        buffer_atr = _sl_liquidity_buffer_atr(t, quality, max_buffer_atr=max_buffer_atr)
+        pool_price = float(_safe(pool, "price", 0.0) or 0.0)
+        sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+        if min_risk > 0.0 and abs(float(entry) - sl_price) < min_risk:
+            continue
+        scored.append((score, t, sl_price, buffer_atr, quality, notes))
     if not scored:
         return None
-
-    return scored[0][1]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_target, sl_price, buffer_atr, quality, notes = scored[0]
+    reasons: List[str] = list(notes)
+    reasons.append("outside-liquidity-zone")
+    if _safe(best_target.pool, "ob_aligned", False):
+        reasons.append("OB-aligned")
+    touches = int(_safe(best_target.pool, "touches", 1) or 1)
+    if touches > 3:
+        reasons.append(f"{touches} touches (stop-density widened)")
+    return SLPoolPick(
+        target     = best_target,
+        sl_price   = sl_price,
+        buffer_atr = buffer_atr,
+        quality    = quality,
+        reasons    = reasons,
+    )
 
 
 
@@ -1482,13 +1172,12 @@ def diagnose_tp_pools(
             if status in ("SWEPT", "CONSUMED"):
                 row.reason = f"archived {status.lower()} pool; not a live target"
                 rows.append(row); continue
+            if not _is_tp_pool_side(target, side):
+                expected = "BSL" if side == "long" else "SSL"
+                row.reason = f"wrong pool side for TP; expected live {expected}"
+                rows.append(row); continue
             if row.distance_atr < 0.25:
                 row.reason = "too close: no durable delivery room after buffer/costs"
-                rows.append(row); continue
-            if terminal_target and row.distance_atr > _max_frontier_reach_for_tf(tf):
-                row.reason = (
-                    f"beyond executable frontier ({row.distance_atr:.1f}>{_max_frontier_reach_for_tf(tf):.1f} ATR for {tf}); "
-                    "lottery target, not institutional TP")
                 rows.append(row); continue
             if terminal_target and not _is_terminal_tp_candidate(target, row.distance_atr):
                 row.reason = (
@@ -1529,7 +1218,7 @@ def diagnose_tp_pools(
             reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
-            rr_floor, delivery_prob, cost_r, delivery_components = _institutional_rr_floor(
+            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -1538,11 +1227,6 @@ def diagnose_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
-                rr=row.rr,
-                distance_atr=row.distance_atr,
-                significance=sig,
-                tf=tf,
-                terminal_target=terminal_target,
             )
             row.required_rr = rr_floor
             row.delivery_prob = delivery_prob
@@ -1559,8 +1243,7 @@ def diagnose_tp_pools(
                     terminal_target,
                 )
                 rows.append(row); continue
-            utility, comps = _target_utility(delivery_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
-            comps.update(delivery_components)
+            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
             selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
@@ -1569,10 +1252,7 @@ def diagnose_tp_pools(
             row.reason = "eligible; payoff-adjusted EV candidate"
             row.notes = []
             if terminal_target:
-                row.notes.append(
-                    f"frontier TP pathP={float(comps.get('frontier_prob', 0.0) or 0.0):.3f} "
-                    f"scale≈{float(comps.get('scale_fraction', 1.0) or 1.0):.2f} "
-                    f"credit={float(comps.get('path_credit', 0.0) or 0.0):.2f} reach×{reach_mult:.2f}")
+                row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
             if rr_floor < effective_min_rr - 1e-9:
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")
@@ -1593,8 +1273,7 @@ def diagnose_tp_pools(
         selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
         report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
-                          f"EV={selected.ev:.3f}; deliveryP={selected.delivery_prob:.3f}; "
-                          f"sweepP={selected.sweep_prob:.3f}")
+                          f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
     else:
         if rows:
             # Surface the most relevant rejection, not just "no TP".
@@ -1620,7 +1299,7 @@ def diagnose_sl_pool(
     limit: int = 8,
     min_risk: float = 0.0,
 ) -> PoolSelectionReport:
-    """Return an SL protective-zone audit table without relaxing SL rules."""
+    """Return an SL protective-pool audit table without relaxing SL rules."""
     report = PoolSelectionReport(role="SL", side=side, entry=float(entry), atr=float(atr))
     if snap is None:
         report.summary = "no liquidity snapshot"
@@ -1628,103 +1307,84 @@ def diagnose_sl_pool(
     if atr <= 0:
         report.summary = "ATR unavailable"
         return report
-
+    side = (side or "").lower()
     min_risk = max(0.0, float(min_risk or 0.0))
     rows: List[PoolCandidateDiagnostic] = []
-    raw_pools = list(_safe(snap, "ssl_pools", []) or []) if side == "long" else list(_safe(snap, "bsl_pools", []) or [])
-    pool_label = "SSL" if side == "long" else "BSL"
-    if not raw_pools:
-        report.summary = f"no protective {pool_label} pools"
-        return report
-
-    # Per-pool audit keeps /thinking useful, but selection below is zone-level.
+    candidates: List[Tuple[float, PoolCandidateDiagnostic, Any]] = []
     if side == "long":
-        inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
-        def _pool_veto(t):
-            px = _pool_price(t)
-            if not _is_live_liquidity_target(t, 0.0):
-                return "archived/swept/consumed pool; not protective"
+        pools = list(_safe(snap, "ssl_pools", []) or [])
+        inv_price = float(invalidation_price if invalidation_price is not None else entry - 0.3 * atr)
+        expected = "SSL"
+        def _protects(t):
+            px = float(_safe(t.pool, "price", 0.0) or 0.0)
             if px > inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr:
-                return "not beyond long invalidation"
-            if (entry - px) > _SL_SEARCH_WINDOW_ATR * atr:
-                return f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
-            if _pool_significance(t) < _SL_MIN_SIGNIFICANCE:
-                return f"significance {_pool_significance(t):.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
-            return ""
+                return False, "not beyond long invalidation"
+            return True, ""
     else:
-        inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
-        def _pool_veto(t):
-            px = _pool_price(t)
-            if not _is_live_liquidity_target(t, 0.0):
-                return "archived/swept/consumed pool; not protective"
+        pools = list(_safe(snap, "bsl_pools", []) or [])
+        inv_price = float(invalidation_price if invalidation_price is not None else entry + 0.3 * atr)
+        expected = "BSL"
+        def _protects(t):
+            px = float(_safe(t.pool, "price", 0.0) or 0.0)
             if px < inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr:
-                return "not beyond short invalidation"
-            if (px - entry) > _SL_SEARCH_WINDOW_ATR * atr:
-                return f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
-            if _pool_significance(t) < _SL_MIN_SIGNIFICANCE:
-                return f"significance {_pool_significance(t):.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
-            return ""
-
-    for target in raw_pools:
+                return False, "not beyond short invalidation"
+            return True, ""
+    if not pools:
+        report.summary = f"no protective {expected} pools"
+        return report
+    for target in pools:
         row = _candidate_base("SL", side, target, entry, atr)
         try:
-            why = _pool_veto(target)
-            if why:
+            status = row.status.upper()
+            if status in ("SWEPT", "CONSUMED"):
+                row.reason = f"archived {status.lower()} pool; context only, not executable SL anchor"
+                rows.append(row); continue
+            if not _is_sl_pool_side(target, side):
+                row.reason = f"wrong pool side for protective SL; expected live {expected}"
+                rows.append(row); continue
+            ok, why = _protects(target)
+            if not ok:
                 row.reason = why
-            else:
-                row.eligible = True
-                row.reason = "eligible inside protective liquidity envelope"
-                row.ev = _pool_microstructure_score(target)
-                row.notes = [f"pool_score={row.ev:.2f}"]
+                rows.append(row); continue
+            if row.significance < _SL_MIN_SIGNIFICANCE:
+                row.reason = f"significance {row.significance:.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
+                rows.append(row); continue
+            score, quality, dist_atr, notes = _sl_pool_score(target, entry=entry, atr=atr, side=side)
+            row.distance_atr = dist_atr
+            if dist_atr > _SL_HARD_MAX_DISTANCE_ATR:
+                row.reason = f"extreme SL anchor distance {dist_atr:.1f}ATR > {_SL_HARD_MAX_DISTANCE_ATR:.1f}ATR"
+                rows.append(row); continue
+            buffer_atr = _sl_liquidity_buffer_atr(target, quality, max_buffer_atr=max_buffer_atr)
+            pool_price = float(_safe(target.pool, "price", 0.0) or 0.0)
+            row.sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+            row.buffer_atr = buffer_atr
+            row.quality = quality
+            row.ev = score
+            row.notes = list(notes) + ["SL beyond liquidity-exclusion zone"]
+            if min_risk > 0.0 and abs(entry - row.sl_price) < min_risk:
+                row.reason = f"risk {abs(entry - row.sl_price):.1f}pts < required {min_risk:.1f}pts"
+                rows.append(row); continue
+            row.eligible = True
+            row.reason = "eligible all-timeframe protective SL anchor"
+            candidates.append((score, row, target))
             rows.append(row)
         except Exception as e:
             row.reason = f"diagnostic error: {e}"
             rows.append(row)
-
-    candidates, _ = _protective_candidates(snap, side, entry, atr, invalidation_price)
-    scored = _score_sl_zones(
-        candidates=candidates,
-        side=side,
-        entry=entry,
-        atr=atr,
-        max_buffer_atr=max_buffer_atr,
-        min_risk=min_risk,
-    )
-
-    if scored:
-        _, pick = scored[0]
-        selected_row = _candidate_base("SL", side, pick.target, entry, atr)
-        selected_row.selected = True
-        selected_row.eligible = True
-        selected_row.sl_price = pick.sl_price
-        selected_row.buffer_atr = pick.buffer_atr
-        selected_row.quality = pick.quality
-        selected_row.ev = scored[0][0]
-        selected_row.reason = "selected external liquidity-envelope SL"
-        selected_row.notes = list(pick.reasons or [])
-        report.selected = selected_row
-        report.summary = (
-            f"selected ${pick.sl_price:,.1f}; external edge ${pick.zone_outer:,.1f}; "
-            f"zone_n={pick.zone_size}; zone_width={pick.zone_width_atr:.2f}ATR; "
-            f"quality={pick.quality:.2f}; buffer={pick.buffer_atr:.2f}ATR"
-        )
-        # Mark the matching per-pool row as selected for row-level audit.
-        for r in rows:
-            if abs(r.pool_price - selected_row.pool_price) < 1e-9 and r.timeframe == selected_row.timeframe:
-                r.selected = True
-                r.sl_price = pick.sl_price
-                r.buffer_atr = pick.buffer_atr
-                r.quality = pick.quality
-                r.reason = selected_row.reason
-                r.notes = selected_row.notes
-                break
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if candidates:
+        selected = candidates[0][1]
+        selected.selected = True
+        selected.reason = "selected all-timeframe protective SL anchor; executable SL outside liquidity"
+        report.selected = selected
+        report.summary = (f"selected ${selected.sl_price:,.1f}; anchor ${selected.pool_price:,.1f}; "
+                          f"quality={selected.quality:.2f}; buffer={selected.buffer_atr:.2f}ATR")
     else:
         if rows:
-            rows_sorted = _sort_report_candidates(rows, limit)
-            report.summary = "no protective SL envelope; best visible pool rejected: " + (rows_sorted[0].reason or "unknown")
+            best_reject = max(rows, key=_candidate_report_priority)
+            report.summary = "no protective SL pool; best visible pool rejected: " + best_reject.reason
         else:
             report.summary = "no SL candidates found"
-
     report.candidates = _sort_report_candidates(rows, limit)
     return report
 
