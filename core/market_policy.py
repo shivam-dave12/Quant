@@ -107,6 +107,7 @@ class InstrumentPolicy:
     shelf_sl_max_distance_atr: float = 3.20
     shelf_sl_min_significance: float = 1.20
     shelf_sl_min_delivery_atr: float = 0.55
+    shelf_sl_min_entry_distance_atr: float = 0.18
     late_entry_max_chase_atr: float = 2.20
     late_entry_tp_compression_rr: float = 0.35
 
@@ -286,10 +287,11 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             tp_primary_objective_min_rr=0.72,
             tp_path_support_lift_max=0.24,
             tp_posterior_blend_weight=0.64,
-            shelf_sl_max_distance_atr=2.60,
-            shelf_sl_min_significance=1.35,
+            shelf_sl_max_distance_atr=2.80,
+            shelf_sl_min_significance=0.95,
             shelf_sl_min_delivery_atr=0.50,
-            late_entry_max_chase_atr=2.00,
+            shelf_sl_min_entry_distance_atr=0.18,
+            late_entry_max_chase_atr=1.85,
             late_entry_tp_compression_rr=0.32,
             notes=(pol.notes + "; BTC predictive staged-liquidity TP/SL profile").strip("; "),
         )
@@ -309,10 +311,11 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             tp_primary_objective_min_rr=0.30,
             tp_path_support_lift_max=0.22,
             tp_posterior_blend_weight=0.61,
-            shelf_sl_max_distance_atr=3.40,
-            shelf_sl_min_significance=1.15,
-            shelf_sl_min_delivery_atr=0.50,
-            late_entry_max_chase_atr=2.15,
+            shelf_sl_max_distance_atr=3.80,
+            shelf_sl_min_significance=0.85,
+            shelf_sl_min_delivery_atr=0.45,
+            shelf_sl_min_entry_distance_atr=0.16,
+            late_entry_max_chase_atr=1.95,
             late_entry_tp_compression_rr=0.28,
             notes=(pol.notes + "; metal predictive staged-displacement TP/SL profile").strip("; "),
         )
@@ -330,10 +333,11 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             tp_primary_objective_min_rr=0.45,
             tp_path_support_lift_max=0.18,
             tp_posterior_blend_weight=0.56,
-            shelf_sl_max_distance_atr=3.00,
-            shelf_sl_min_significance=1.25,
-            shelf_sl_min_delivery_atr=0.60,
-            late_entry_max_chase_atr=1.90,
+            shelf_sl_max_distance_atr=3.20,
+            shelf_sl_min_significance=0.95,
+            shelf_sl_min_delivery_atr=0.55,
+            shelf_sl_min_entry_distance_atr=0.18,
+            late_entry_max_chase_atr=1.75,
             late_entry_tp_compression_rr=0.34,
             notes=(pol.notes + "; high-beta xStock predictive staged TP/SL profile").strip("; "),
         )
@@ -351,10 +355,11 @@ def _apply_behavior_overrides(pol: InstrumentPolicy) -> InstrumentPolicy:
             tp_primary_objective_min_rr=0.55,
             tp_path_support_lift_max=0.14,
             tp_posterior_blend_weight=0.54,
-            shelf_sl_max_distance_atr=2.70,
-            shelf_sl_min_significance=1.25,
-            shelf_sl_min_delivery_atr=0.65,
-            late_entry_max_chase_atr=1.75,
+            shelf_sl_max_distance_atr=2.90,
+            shelf_sl_min_significance=1.00,
+            shelf_sl_min_delivery_atr=0.60,
+            shelf_sl_min_entry_distance_atr=0.20,
+            late_entry_max_chase_atr=1.60,
             late_entry_tp_compression_rr=0.38,
             notes=(pol.notes + "; large-cap xStock predictive staged TP/SL profile").strip("; "),
         )

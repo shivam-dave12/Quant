@@ -867,7 +867,7 @@ def _tp_payoff_rejection_reason(
             f"payoff floor {rr_floor:.2f})"
         )
         if terminal_target:
-            reason += "; terminal runner context, not full-position TP"
+            reason += "; terminal runner context requires staged path support"
         return reason
     return (
         f"R:R {rr:.2f} < payoff floor {rr_floor:.2f} "
@@ -1019,6 +1019,19 @@ def score_tp_pools(
                 be_move,
                 path_lift,
             )
+            # v80: staged profiles do not require the first actionable pool to
+            # be a perfect full-position target. The selected bracket TP must
+            # still be a real live liquidity pool and positive-EV, but an accepted
+            # auction posterior plus a nearer same-side objective can finance BE
+            # and make a 0.8-1.2R main objective institutional.
+            target_style = _policy_str("target_style", "single_full_position")
+            if "staged" in target_style and posterior_prob >= 0.82:
+                staged_floor = max(
+                    _policy_float("tp_staged_main_rr_floor", 0.72),
+                    _policy_float("tp_be_move_mult", _TP_MIN_BE_MOVE_MULT) * float(be_move) / max(risk, 1e-9),
+                )
+                if path_lift > 0.0 or dist_atr <= max_reach or terminal_target:
+                    rr_floor = min(rr_floor, staged_floor)
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
             if rr < rr_floor:
                 continue

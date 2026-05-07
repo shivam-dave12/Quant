@@ -1790,71 +1790,76 @@ class EntryEngine:
         deep_invalidation: float,
         ps=None,
     ) -> tuple[float, str]:
-        """Return the current accepted shelf/invalidation, not always the old sweep.
+        """Return the active invalidation shelf for a predictive entry.
 
-        Institutional entries should be anticipated from an accepted liquidity shelf.
-        Once displacement/CISD/OTE proves that price has re-accepted away from
-        the engineered sweep, an old deep wick is no longer the only meaningful
-        invalidation for an intraday expression. We may use a LIVE protective
-        pool between the old sweep and current price as the stop shelf, but only
-        when delivery is actually accepted. This is not a fallback: the shelf is
-        a real SSL/BSL from the liquidity map, and the executable SL still sits
-        beyond that liquidity with a buffer.
+        v80 rule: after sweep + accepted delivery, the stop is not forced back
+        to the old engineered wick. A live same-side liquidity shelf between
+        the old sweep and current price becomes the structural invalidation for
+        the intraday expression, provided it is real, unswept, sufficiently away
+        from the entry, and inside the instrument's chase envelope. This is not
+        a fallback: the shelf must be in the liquidity map and the executable SL
+        is still pushed beyond that shelf/liquidity cluster.
         """
+        try:
+            deep = float(deep_invalidation)
+        except Exception:
+            deep = 0.0
         if snap is None or atr <= 0 or not self._policy_bool("shelf_sl_enabled", True):
-            return float(deep_invalidation), "deep-sweep invalidation"
+            return deep, "deep-sweep invalidation"
         side = str(side or "").lower()
         if side not in ("long", "short"):
-            return float(deep_invalidation), "deep-sweep invalidation"
+            return deep, "deep-sweep invalidation"
 
         disp = float(getattr(ps, "max_displacement", 0.0) or 0.0) if ps is not None else 0.0
         cisd = bool(getattr(ps, "cisd_detected", False)) if ps is not None else False
         ote = bool(getattr(ps, "ote_reached", False) or getattr(ps, "ote_holding", False)) if ps is not None else False
         min_delivery = self._policy_float("shelf_sl_min_delivery_atr", 0.55)
         if disp < min_delivery and not cisd and not ote:
-            return float(deep_invalidation), f"deep-sweep invalidation; delivery not accepted DISP={disp:.2f}ATR"
+            return deep, f"deep-sweep invalidation; delivery not accepted DISP={disp:.2f}ATR"
 
         max_dist = self._policy_float("shelf_sl_max_distance_atr", 3.0)
-        min_sig = self._policy_float("shelf_sl_min_significance", 1.2)
+        min_sig = self._policy_float("shelf_sl_min_significance", 1.0)
+        min_entry_dist = self._policy_float("shelf_sl_min_entry_distance_atr", 0.18)
         pools = list(getattr(snap, "ssl_pools", []) or []) if side == "long" else list(getattr(snap, "bsl_pools", []) or [])
+
         best = None
-        best_score = -1.0
+        best_score = -1e9
         for target in pools:
             try:
                 pool = getattr(target, "pool", target)
                 status = str(getattr(pool, "status", "") or "").upper()
-                if status in ("SWEPT", "CONSUMED"):
+                if status in ("SWEPT", "CONSUMED", "ARCHIVED"):
                     continue
                 px = float(getattr(pool, "price", 0.0) or 0.0)
                 if px <= 0:
                     continue
-                if side == "long" and not (px < entry):
-                    continue
-                if side == "short" and not (px > entry):
-                    continue
-                if side == "long" and px <= min(float(deep_invalidation), entry):
-                    continue
-                if side == "short" and px >= max(float(deep_invalidation), entry):
-                    continue
+                if side == "long":
+                    if not (deep < px < entry):
+                        continue
+                else:
+                    if not (entry < px < deep):
+                        continue
                 dist_atr = abs(entry - px) / max(atr, 1e-9)
-                if dist_atr > max_dist:
+                if dist_atr < min_entry_dist or dist_atr > max_dist:
                     continue
                 sig = float(getattr(target, "significance", getattr(pool, "significance", 0.0)) or 0.0)
-                if sig < min_sig:
+                if sig < min_sig and not (cisd or disp >= min_delivery * 1.35):
                     continue
-                tf_rank = self._tf_rank_for_stop_geometry(str(getattr(pool, "timeframe", "5m") or "5m"))
-                score = (sig * (1.0 + min(tf_rank, 4) * 0.08)) / (1.0 + dist_atr * 0.70)
-                touches = float(getattr(pool, "touches", 0.0) or 0.0)
-                score *= max(0.65, 1.0 - max(0.0, touches - 2.0) * 0.08)
+                tf = str(getattr(pool, "timeframe", "5m") or "5m")
+                tf_rank = self._tf_rank_for_stop_geometry(tf)
+                touches = float(getattr(pool, "touches", 1.0) or 1.0)
+                proximity = 1.0 / (1.0 + max(dist_atr - min_entry_dist, 0.0) * 0.65)
+                score = max(sig, min_sig * 0.75) * proximity * (1.0 + min(tf_rank, 4) * 0.05)
+                score *= max(0.72, 1.0 - max(0.0, touches - 3.0) * 0.06)
                 if score > best_score:
                     best_score = score
-                    best = (px, str(getattr(pool, "timeframe", "?")), sig, dist_atr)
+                    best = (px, tf, sig, dist_atr, status or "LIVE")
             except Exception:
                 continue
         if best is None:
-            return float(deep_invalidation), "deep-sweep invalidation; no accepted live shelf"
-        px, tf, sig, dist = best
-        return float(px), f"accepted shelf invalidation {tf} @ ${px:,.1f} sig={sig:.2f} dist={dist:.2f}ATR"
+            return deep, "deep-sweep invalidation; no accepted live shelf"
+        px, tf, sig, dist, status = best
+        return float(px), f"accepted shelf invalidation {tf} @ ${px:,.1f} sig={sig:.2f} dist={dist:.2f}ATR status={status}"
 
     def _predictive_late_entry_check(
         self,
@@ -2442,18 +2447,25 @@ class EntryEngine:
             invalidation_anchor, sweep.pool.price, side, price, atr)
 
         if risk < min_risk:
-            wick_clear = max(
-                abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
-                atr * _SL_MIN_ATR_MULT)
-            if side == "long":
-                sl = sweep.wick_extreme - wick_clear
+            # v80: if a predictive shelf was accepted, expand beyond that shelf,
+            # not back to the old/deep sweep. Reverting to sweep.wick_extreme
+            # turned valid displacement entries into liquidation-guard failures.
+            using_predictive_shelf = abs(float(invalidation_anchor) - float(sweep.wick_extreme)) > max(atr * 0.05, 1e-9)
+            if using_predictive_shelf:
+                shelf_clear = max(atr * _SL_MIN_ATR_MULT, atr * 0.18)
+                sl = invalidation_anchor - shelf_clear if side == "long" else invalidation_anchor + shelf_clear
             else:
-                sl = sweep.wick_extreme + wick_clear
+                wick_clear = max(
+                    abs(sweep.wick_extreme - sweep.pool.price) * _SL_WICK_CLEARANCE,
+                    atr * _SL_MIN_ATR_MULT)
+                sl = sweep.wick_extreme - wick_clear if side == "long" else sweep.wick_extreme + wick_clear
             sl = self._push_sl_behind_pools(sl, side, price, atr)
             risk = abs(price - sl)
-            logger.debug(
-                f"SL anchored to wick: risk={risk:.1f}pts ({risk/atr:.2f}x ATR) "
-                f"wick_depth={abs(sweep.wick_extreme-sweep.pool.price):.1f} side={side}")
+            logger.info(
+                "PREDICTIVE_SHELF_SL_EXPAND: side=%s anchor=$%.1f sl=$%.1f risk=%.2fATR source=%s",
+                side, float(invalidation_anchor), float(sl), risk / max(atr, 1e-9),
+                "accepted_shelf" if using_predictive_shelf else "old_sweep",
+            )
 
         # ── Institutional SL envelope ─────────────────────────────────────
         sl, sl_reason = self._apply_institutional_sl_envelope(
@@ -2982,7 +2994,7 @@ class EntryEngine:
         and pushes the stop beyond the far edge of that envelope. Equality is
         included deliberately: SL == pool.price is not protected.
         """
-        snap = self._last_liq_snapshot
+        snap = getattr(self, "_last_liq_snapshot", None)
         if snap is None or atr <= 0:
             return sl
 
