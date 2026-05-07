@@ -839,10 +839,15 @@ class EntryEngine:
         if self._pending_refined is not None:
             p = self._pending_refined
             sig = p.original
+            try:
+                tp_price = float(getattr(sig, "tp_price", 0.0) or 0.0)
+            except Exception:
+                tp_price = 0.0
+            target = f"${tp_price:,.0f}" if tp_price > 0.0 else "pending-liquidity-tp"
             return {
                 "mode": "REFINE",
                 "direction": sig.side,
-                "target": f"${float(sig.tp_price):,.0f}",
+                "target": target,
                 "reason": p.last_reason,
                 "age_sec": max(0.0, time.time() - p.created_at),
                 "expires_in": max(0.0, p.expires_at - time.time()),
@@ -1101,8 +1106,30 @@ class EntryEngine:
         return self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now
 
     def invalidate_sweep_locks(self, reason: str = "regime_change") -> int:
-        """Clear processed sweep locks when the market regime materially changes."""
+        """Invalidate sweep locks only for explicit/operator resets.
+
+        Runtime logs showed that the old regime-change invalidation cleared the
+        processed-sweep registry immediately after a sweep was accepted into
+        POST_SWEEP.  The same price level was then re-presented a few seconds
+        later and the identical TP/SL criteria were evaluated again, creating
+        the duplicate-filter/delayed-decision behaviour this engine is designed
+        to avoid.
+
+        A market-regime change may alter sizing/score context, but it does not
+        create a fresh liquidity event.  Therefore regime changes must not clear
+        the anti-duplicate sweep registry or active deferral gate.  A hard
+        operator reset still uses force_reset(); non-regime callers of this
+        method keep the previous explicit-clear behaviour.
+        """
         n = len(self._processed_sweeps)
+        if str(reason or "").lower() == "regime_change":
+            if n:
+                logger.debug(
+                    "EntryEngine sweep locks preserved (%d) reason=regime_change",
+                    n,
+                )
+            return 0
+
         self._processed_sweeps.clear()
         self._gate_blocked_until = 0.0
         self._gate_block_key = ()

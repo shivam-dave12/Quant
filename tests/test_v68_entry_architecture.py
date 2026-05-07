@@ -149,3 +149,52 @@ def test_v68_pre_order_rejection_replaces_expired_sweep_lock():
     engine._processed_sweeps[key] = time.time() - 222.0
     engine.mark_pre_order_rejected(sig, cooldown_sec=30.0)
     assert engine._processed_sweeps[key] > time.time()
+
+
+def test_v68_regime_change_preserves_processed_sweep_locks_to_prevent_duplicate_filtering():
+    engine = EntryEngine()
+    sweep = _sweep()
+    key = engine._sweep_key(sweep)
+    engine._processed_sweeps[key] = time.time() + 120.0
+    engine._gate_blocked_until = time.time() + 45.0
+    engine._gate_block_key = ("long", "no_liquidity_tp")
+
+    cleared = engine.invalidate_sweep_locks("regime_change")
+
+    assert cleared == 0
+    assert engine._processed_sweeps.get(key, 0.0) > time.time()
+    assert engine._gate_blocked_until > time.time()
+    assert engine._gate_block_key == ("long", "no_liquidity_tp")
+
+
+def test_v68_explicit_non_regime_invalidation_still_clears_sweep_locks():
+    engine = EntryEngine()
+    sweep = _sweep()
+    key = engine._sweep_key(sweep)
+    engine._processed_sweeps[key] = time.time() + 120.0
+
+    cleared = engine.invalidate_sweep_locks("operator_reset")
+
+    assert cleared == 1
+    assert not engine._processed_sweeps
+
+
+def test_v68_refine_tracking_never_reports_zero_dollar_target():
+    engine = EntryEngine()
+    sig = _signal()
+    sig.tp_price = 0.0
+    engine._pending_refined = SimpleNamespace(
+        original=sig,
+        created_at=time.time(),
+        expires_at=time.time() + 60.0,
+        last_reason="test refine",
+        attempts=1,
+        min_viable_risk=1.0,
+        execution_gap=0.2,
+    )
+
+    info = engine.tracking_info
+
+    assert info is not None
+    assert info["target"] == "pending-liquidity-tp"
+    assert "$0" not in info["target"]
