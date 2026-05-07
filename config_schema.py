@@ -376,8 +376,8 @@ class ExecutionConfig(BaseModel):
         gt=0.0,
         description="Delta Exchange minimum price increment.",
     )
-    TICK_SIZE_COINSWITCH: float = Field(
-        default_factory=lambda: _c("TICK_SIZE_COINSWITCH", 0.1),
+    TICK_SIZE_REMOVED_ALT_EXCHANGE: float = Field(
+        default_factory=lambda: 0.5,
         gt=0.0,
     )
     ORDER_TIMEOUT_SECONDS: float = Field(

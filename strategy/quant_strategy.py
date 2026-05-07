@@ -3640,6 +3640,130 @@ class QuantStrategy:
             liquidation_guard=liq_guard,
         )
 
+    def _entry_engine_route_decision(self, signal, ict_ctx, flow_state,
+                                     liq_snapshot, price: float,
+                                     atr: float) -> InstitutionalDecision:
+        """Single route decision for the liquidity-first architecture.
+
+        EntryEngine owns the trade thesis: sweep, direction, executable entry,
+        liquidity-aware SL, liquidity TP, and R:R. This method does not re-score
+        or veto that alpha with another layer. It only blocks malformed or
+        mechanically unsafe orders and converts advisory context into sizing.
+        """
+        side = str(getattr(signal, "side", "") or "").lower()
+        entry = float(getattr(signal, "entry_price", price) or price)
+        sl = float(getattr(signal, "sl_price", 0.0) or 0.0)
+        tp = float(getattr(signal, "tp_price", 0.0) or 0.0)
+        rejects: List[str] = []
+        allows: List[str] = []
+
+        atr_f = max(float(atr or 0.0), 1e-9)
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
+        rr = tp_dist / max(sl_dist, 1e-9)
+        sl_atr = sl_dist / atr_f
+        tp_atr = tp_dist / atr_f
+
+        if side not in ("long", "short"):
+            rejects.append("invalid side")
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            rejects.append("non-positive entry/SL/TP")
+        if side == "long" and not (sl < entry < tp):
+            rejects.append("long levels are not protective/orderly")
+        if side == "short" and not (tp < entry < sl):
+            rejects.append("short levels are not protective/orderly")
+
+        liq_ok, liq_price, liq_guard, liq_reason = self._sl_liquidation_sanity(side, entry, sl)
+        if not liq_ok:
+            rejects.append(liq_reason)
+        elif liq_price > 0:
+            allows.append(f"SL before liquidation guard ${liq_guard:,.1f}")
+
+        # Minimum sanity only. EntryEngine already selected the TP using the
+        # liquidity selector and configured RR floor, so do not re-run an
+        # independent target/quality veto here.
+        if rr <= 0.0:
+            rejects.append("non-positive reward/risk")
+
+        target_realism = 1.0
+        try:
+            tr, target_allows, target_rejects = self._target_pool_realism(
+                signal, liq_snapshot, side, entry, tp, sl, atr_f)
+            target_realism = self._bounded(float(tr or 0.0), 0.05, 1.0)
+            allows.extend(target_allows[:4])
+            if target_rejects:
+                allows.append("target_advisory: " + " | ".join(map(str, target_rejects[:3])))
+        except Exception as exc:
+            target_realism = 0.55
+            allows.append(f"target_advisory unavailable: {exc}")
+
+        target_utility_note = self._target_utility_reject_reason(signal)
+        if target_utility_note:
+            allows.append("target_surface_advisory: " + target_utility_note)
+
+        sweep = getattr(signal, "sweep_result", None)
+        quality = self._bounded(float(getattr(sweep, "quality", 0.0) or 0.0))
+        conviction = self._bounded(float(getattr(signal, "conviction", 0.0) or 0.0))
+        rr_quality = self._bounded(rr / 3.0, 0.0, 1.0)
+        risk_quality = 1.0
+        if sl_atr < 0.35:
+            risk_quality = 0.55 + 0.45 * max(sl_atr / 0.35, 0.0)
+        elif sl_atr > 6.0:
+            risk_quality = max(0.45, 1.0 - (sl_atr - 6.0) / 12.0)
+
+        score = self._bounded(
+            0.32 * max(quality, conviction)
+            + 0.24 * conviction
+            + 0.20 * target_realism
+            + 0.14 * rr_quality
+            + 0.10 * risk_quality
+        )
+        if rr >= 2.5 and target_realism >= 0.65:
+            score = self._bounded(score + min((rr - 2.5) * 0.03, 0.10))
+
+        if score >= 0.82 and rr >= 2.5:
+            grade = "S"
+        elif score >= 0.70:
+            grade = "A"
+        elif score >= 0.55:
+            grade = "B"
+        else:
+            grade = "C"
+
+        # Size is dynamic. Route is not. Weak-but-valid theses get smaller size,
+        # not another hidden veto.
+        size_mult = self._bounded(
+            0.38 + 0.62 * score,
+            0.20,
+            1.10,
+        )
+        if rr >= 3.0 and target_realism >= 0.70:
+            size_mult = min(1.18, size_mult + 0.08)
+        if target_utility_note:
+            size_mult = max(0.20, size_mult * 0.75)
+        if rejects:
+            size_mult = 0.0
+
+        allows.append(
+            f"entry_engine_single_source score={score:.2f} grade={grade} "
+            f"RR={rr:.2f} SL={sl_atr:.2f}ATR TP={tp_atr:.2f}ATR size_mult={size_mult:.2f}"
+        )
+
+        return InstitutionalDecision(
+            allowed=not rejects,
+            score=score,
+            grade=grade,
+            size_mult=size_mult,
+            reject_reasons=rejects,
+            allow_reasons=allows,
+            rr=rr,
+            sl_atr=sl_atr,
+            tp_atr=tp_atr,
+            target_realism=target_realism,
+            liquidation_price=liq_price,
+            liquidation_guard=liq_guard,
+        )
+
     def get_position(self) -> Optional[Dict]:
         with self._lock: return None if self._pos.is_flat() else self._pos.to_dict()
 
@@ -5063,7 +5187,7 @@ class QuantStrategy:
                     if tf_15m:
                         ict_ctx.dealing_range_pd = getattr(tf_15m, 'premium_discount', 0.5)
                 # OB stop levels are intentionally not copied into ICTContext.
-                # v67 removed the legacy OB/momentum SL path; sweep entries now
+                # v67 removed the removed OB/momentum SL path; sweep entries now
                 # price stops only from sweep invalidation + MTF liquidity shield.
                 try:
                     sess = self._ict.get_amd_session_context(now_ms)
@@ -5471,21 +5595,10 @@ class QuantStrategy:
                 self._defer_entry_signal(signal, inst_veto, cooldown_sec=30.0)
                 return
 
-            required_confirms = self._entry_required_confirms(signal, atr)
-            sig_key = self._entry_signal_identity(signal, atr)
-            if sig_key == self._entry_confirm_key:
-                self._entry_confirm_count += 1
-            else:
-                self._entry_confirm_key = sig_key
-                self._entry_confirm_count = 1
-            if self._entry_confirm_count < required_confirms:
-                if now - self._last_entry_confirm_log >= 5.0:
-                    self._last_entry_confirm_log = now
-                    logger.debug(
-                        f"Entry confirm gate: {signal.side.upper()} "
-                        f"{self._entry_confirm_count}/{required_confirms}")
-                return
-
+            # Unified institutional route: EntryEngine is the single alpha owner.
+            # No confirm-gate, no second target-surface veto, no duplicate dynamic gate.
+            # QuantStrategy only performs account/mechanical safety and computes a
+            # size multiplier from the already-priced EntryEngine thesis.
             bal_info = risk_manager.get_available_balance()
             total_bal = float((bal_info or {}).get("total", 0))
             allowed, reason = self._risk_gate.can_trade(total_bal)
@@ -5494,37 +5607,25 @@ class QuantStrategy:
                 self._defer_entry_signal(signal, reason, cooldown_sec=60.0)
                 return
 
-            # Institutional decision matrix: all engines vote on one trade thesis.
-            _inst_decision = self._institutional_decision_matrix(
+            _inst_decision = self._entry_engine_route_decision(
                 signal, ict_ctx, flow_state, liq_snapshot, price, atr)
             self._last_institutional_decision = _inst_decision
             self._active_institutional_size_mult = _inst_decision.size_mult
             if not _inst_decision.allowed:
                 reject_str = " | ".join(_inst_decision.reject_reasons[:3])
                 logger.info(
-                    f"Safety audit paused routing {signal.side.upper()} "
-                    f"{signal.entry_type.value}: score={_inst_decision.score:.2f} "
-                    f"RR={_inst_decision.rr:.2f} target={_inst_decision.target_realism:.2f} | "
+                    f"Mechanical safety stopped routing {signal.side.upper()} "
+                    f"{signal.entry_type.value}: RR={_inst_decision.rr:.2f} "
+                    f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR | "
                     f"{reject_str}")
                 self._defer_entry_signal(
-                    signal, reject_str or "mechanical safety pause", cooldown_sec=45.0)
+                    signal, reject_str or "mechanical route safety", cooldown_sec=30.0)
                 return
             logger.info(
-                f"Decision audit PASS [{_inst_decision.grade}] "
-                f"score={_inst_decision.score:.2f} RR={_inst_decision.rr:.2f} "
-                f"SL={_inst_decision.sl_atr:.2f}ATR TP={_inst_decision.tp_atr:.2f}ATR "
-                f"target={_inst_decision.target_realism:.2f} "
+                f"UNIFIED ENTRYENGINE ROUTE PASS [{_inst_decision.grade}] "
+                f"RR={_inst_decision.rr:.2f} SL={_inst_decision.sl_atr:.2f}ATR "
+                f"TP={_inst_decision.tp_atr:.2f}ATR target={_inst_decision.target_realism:.2f} "
                 f"size_mult={_inst_decision.size_mult:.2f}")
-
-            _ug_ok, _ug_reason = self._unified_entry_gate(
-                signal, ict_ctx, flow_state, liq_snapshot, price, atr, now)
-            if not _ug_ok:
-                logger.info(
-                    f"Dynamic audit paused routing {signal.side.upper()} "
-                    f"{signal.entry_type.value}: {_ug_reason}")
-                self._defer_entry_signal(
-                    signal, _ug_reason or "unified institutional gate", cooldown_sec=90.0)
-                return
 
             logger.info(
                 f"ENTRY THESIS PRICED BY POSTERIOR/EV: {signal.entry_type.value} {signal.side.upper()} "
@@ -6277,10 +6378,8 @@ class QuantStrategy:
         )
 
         # ── Place entry ────────────────────────────────────────────────────────────
-        # Delta: bracket limit order (entry + SL + TP in one API call).
-        #   Avoids bad_schema from separate stop/take-profit order placement.
-        # CoinSwitch: standard limit entry, SL/TP placed separately after fill.
-        #
+        # Delta native bracket only: entry + SL + TP in one API call.
+        # No naked-entry fallback is allowed.
         # BUG 2 FIX: on_order_placed callback captures the exact moment the
         # limit order hits the exchange (REST 200 OK returned an order_id).
         # The on_tick watchdog switches from Stage A (pre-order, 45 s tolerance)
@@ -6297,23 +6396,12 @@ class QuantStrategy:
         limit_timeout = min(base_limit_timeout, float(getattr(config, 'PROTECTED_CROSS_FILL_TIMEOUT_SEC', 12.0))) if not use_maker else base_limit_timeout
         is_bracket = False
 
-        # v7 multi-asset protection policy:
-        # Every Delta contract (BTC, metals, xStocks, indices/RWA tokens) must use
-        # the same native bracket methodology: entry + SL + TP in one Delta order.
-        # If the bracket endpoint rejects the order for a non-BTC contract, do NOT
-        # fall back to a naked entry followed by standalone SL/TP. That fallback can
-        # leave the position temporarily unprotected and behaves differently from BTC.
-        # CoinSwitch has no Delta-native bracket endpoint, so only CoinSwitch uses the
-        # old fill-then-place-standalone-conditionals path.
-        _active_exchange = str(
-            getattr(order_manager, "active_exchange", None)
-            or getattr(order_manager, "_exchange_name", "")
-            or ""
-        ).lower()
-        _delta_requires_native_bracket = (
-            _active_exchange == "delta" and
-            bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
-        )
+        _active_exchange = "delta"
+        if not (_active_exchange == "delta"):
+            logger.critical("🚨 Delta-only invariant violation: non-Delta execution path requested")
+            self._last_exit_time = time.time()
+            return
+        _delta_requires_native_bracket = bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
 
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
@@ -6344,7 +6432,7 @@ class QuantStrategy:
             return
         if entry_data is not None:
             is_bracket = bool(entry_data.get("bracket_order", False))
-        elif _delta_requires_native_bracket:
+        else:
             logger.error(
                 "❌ Delta native bracket entry failed before order placement — refusing non-bracket fallback "
                 "so the position is not opened without exchange-attached TP/SL. "
@@ -6353,16 +6441,6 @@ class QuantStrategy:
             )
             self._last_tp_gate_rejection = time.time()
             return
-        else:
-            # CoinSwitch / non-Delta path: standard limit entry, then protected
-            # standalone SL/TP after fill because native bracket is unavailable.
-            entry_data = order_manager.place_limit_entry(
-                side=side, quantity=qty,
-                limit_price=limit_px,
-                timeout_sec=limit_timeout,
-                fallback_to_market=False,
-                on_order_placed=_on_order_placed,
-            )
 
         if not entry_data:
             logger.error("❌ Entry order failed")
@@ -6530,34 +6608,12 @@ class QuantStrategy:
                     "⚠️ Bracket child order IDs not found after fill — "
                     "trailing SL may not work. Check open orders manually.")
         else:
-            # CoinSwitch (and non-bracket) path: place SL/TP as separate orders
-            sweep = order_manager.cancel_symbol_conditionals()
-            if sweep:
-                # v4.6 BUG FIX #3: Wait for exchange to process cancellations
-                # Without this, old SL/TP can fire against the new position instantly
-                time.sleep(1.5)
-                filled = [
-                    oid for oid, r in sweep.items()
-                    if r in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL)
-                ]
-                if filled:
-                    self._last_reconcile_time = 0.0
-                    return
-
-            sl_data = order_manager.place_stop_loss(
-                side=exit_side, quantity=qty, trigger_price=sl_price)
-            if not sl_data:
-                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-                self._last_exit_time = time.time()
-                return
-
-            tp_data = order_manager.place_take_profit(
-                side=exit_side, quantity=qty, trigger_price=tp_price)
-            if not tp_data:
-                order_manager.cancel_order(sl_data["order_id"])
-                order_manager.place_market_order(side=exit_side, quantity=qty, reduce_only=True)
-                self._last_exit_time = time.time()
-                return
+            logger.critical(
+                "🚨 Delta-only invariant violation: entry filled without native bracket children; "
+                "aborting bookkeeping to avoid unmanaged SL/TP state."
+            )
+            self._last_exit_time = time.time()
+            return
 
         # ── Log execution cost snapshot (PATCH 5g) ────────────────────────────────
         if self._fee_engine is not None:
@@ -8384,16 +8440,11 @@ class QuantStrategy:
         else:
             fill_type  = getattr(pos, "entry_fill_type", "taker")
             # FIX Bug-A: use exchange-specific maker rate.
-            # Delta maker = rebate (negative); CoinSwitch maker = positive cost.
+            # Delta maker = rebate (negative); use Delta-specific maker fees.
             if fill_type == "maker":
-                if _is_delta_exchange:
-                    entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
-                else:
-                    entry_rate = float(getattr(_cfg_x, "COMMISSION_RATE_MAKER",
-                                               QCfg.COMMISSION_RATE() * 0.40))
+                entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE_MAKER", -0.00020))
             else:
-                entry_rate = (float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
-                              if _is_delta_exchange else QCfg.COMMISSION_RATE())
+                entry_rate = float(getattr(_cfg_x, "DELTA_COMMISSION_RATE", 0.00050))
             entry_fee = pos.entry_price * pos.quantity * entry_rate
         exit_fee  = fee_paid
         _exit_tag = "exact" if exit_fee_is_exact else "rate-est"
@@ -9379,7 +9430,7 @@ class QuantStrategy:
         # Cash/margin envelope.  In multi-asset mode, `available` is the
         # slot-scoped cash view.  The active instrument policy advertises a
         # margin percentage (BTC 20%, commodities 14%, equities 12%), but v74
-        # still used only the legacy 60% slot cap.  That made the policy margin
+        # still used only the balance-usage slot cap.  That made the policy margin
         # mostly telemetry and distorted cross-asset allocation.  v75 makes the
         # executable cash budget the minimum of: free slot cash, raw account
         # hard cap, and instrument policy margin cap.
@@ -9394,15 +9445,15 @@ class QuantStrategy:
         except Exception:
             policy_margin_pct = 0.0
         if portfolio_scoped:
-            legacy_cash_cap = raw_available_cash * _bal_usage_frac
-            policy_cash_cap = raw_total_cash * policy_margin_pct if policy_margin_pct > 0 else legacy_cash_cap
-            cash_budget = max(0.0, min(available, raw_available_cash, legacy_cash_cap, policy_cash_cap))
+            usage_cash_cap = raw_available_cash * _bal_usage_frac
+            policy_cash_cap = raw_total_cash * policy_margin_pct if policy_margin_pct > 0 else usage_cash_cap
+            cash_budget = max(0.0, min(available, raw_available_cash, usage_cash_cap, policy_cash_cap))
         else:
-            # Preserve single-asset legacy behaviour while still allowing the
+            # Preserve single-asset behaviour while still allowing the
             # policy margin to be shown in diagnostics.
-            legacy_cash_cap = available * _bal_usage_frac
-            policy_cash_cap = legacy_cash_cap
-            cash_budget = max(0.0, legacy_cash_cap)
+            usage_cash_cap = available * _bal_usage_frac
+            policy_cash_cap = usage_cash_cap
+            cash_budget = max(0.0, usage_cash_cap)
 
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
@@ -9523,7 +9574,7 @@ class QuantStrategy:
             logger.warning(
                 f"Sizing guard: required margin ${required_margin:.2f} > "
                 f"policy/slot cash cap ${max_allowed_margin:.2f} "
-                f"(policy {policy_margin_pct:.0%}, legacy {_bal_usage_pct:.0f}%, slot ${available:.2f}) "
+                f"(policy {policy_margin_pct:.0%}, usage {_bal_usage_pct:.0f}%, slot ${available:.2f}) "
                 f"— scaling down"
             )
             return None
@@ -9594,7 +9645,7 @@ class QuantStrategy:
         We use the exact inverse formula for correctness, but the linear approximation
         is included as a sanity check in debug logs.
 
-        Both Delta and CoinSwitch paths now produce identical results for small moves
+        Small-move PnL is reconciled consistently
         because the inverse-perp formula converges to linear.
 
         Fee basis: notional is measured at entry price (standard industry practice).
@@ -9604,10 +9655,7 @@ class QuantStrategy:
         _is_inverse = self._is_inverse_pnl_contract()
 
         # FIX Bug-A: use exchange-specific fee rates.
-        # Delta maker rate is NEGATIVE (rebate = -0.02%); CoinSwitch maker rate is
-        # positive (0.02%).  The old code always read COMMISSION_RATE_MAKER from config
-        # which is set to the CoinSwitch value (+0.00020), costing Delta maker entries
-        # 0.04% of notional instead of receiving the rebate.
+        # Delta maker rate is NEGATIVE (rebate = -0.02%); use Delta-specific maker fees.
         if entry_fill_type == "maker":
             if _is_delta_exchange:
                 entry_rate = float(getattr(config, "DELTA_COMMISSION_RATE_MAKER",
@@ -9616,12 +9664,10 @@ class QuantStrategy:
                 entry_rate = float(getattr(config, "COMMISSION_RATE_MAKER",
                                            QCfg.COMMISSION_RATE() * 0.40))
         else:
-            entry_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
-                          if _is_delta_exchange else QCfg.COMMISSION_RATE())
+            entry_rate = float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
 
         # Exit is always taker (stop or TP market order)
-        exit_rate = (float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
-                     if _is_delta_exchange else QCfg.COMMISSION_RATE())
+        exit_rate = float(getattr(config, "DELTA_COMMISSION_RATE", 0.00050))
 
         gross = gross_pnl_usd(
             pos.side,
@@ -9959,7 +10005,7 @@ class QuantStrategy:
 
         # FIX (CRITICAL-6): prefer the adapter's BTC-unit fields. The Delta
         # adapter now returns size in BTC (converted from contracts) and
-        # size_signed preserving direction. CoinSwitch adapter returns
+        # size_signed preserving direction. Adapter returns
         # size in BTC natively. Either way, we want BTC here.
         ex_size     = abs(float(ex_pos.get("size", 0.0)))
         ex_size_raw = float(ex_pos.get("size_signed",
@@ -9990,7 +10036,7 @@ class QuantStrategy:
                 )
                 return
             ex_entry=float(ex_pos.get("entry_price",0.0)); ex_upnl=float(ex_pos.get("unrealized_pnl",0.0))
-            # Guard: CoinSwitch sometimes returns entry_price=0 for a position that
+            # Guard: Exchange position feed can return entry_price=0 for a position that
             # has been filled but not yet fully settled in the position feed.
             if ex_entry < 1.0:
                 logger.warning(

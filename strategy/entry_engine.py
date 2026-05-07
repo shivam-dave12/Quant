@@ -26,7 +26,8 @@ Post-Sweep Phases:
 Evidence Model:
   Static factors (scored once): AMD, sweep quality, dealing range, pool sig
   Dynamic factors (per-tick with decay): flow, CVD, CISD, OTE, displacement
-  Decision: static_base + accumulated_dynamic >= phase-adjusted threshold
+  Decision: one quantitative opportunity score from posterior EV, liquidity
+  delivery, SL efficiency and structure. No duplicated route-veto stack.
 
 Exports (consumed by quant_strategy.py):
   EntryEngine, ICTTrailManager, OrderFlowState, ICTContext,
@@ -176,8 +177,8 @@ except Exception:
 
 # Post-Sweep evidence thresholds.
 # Institutional mode: the posterior/EV calculation decides whether a sweep
-# auction is worth expressing. Quality diagnostics below are continuous;
-# they reduce confidence/sizing instead of becoming hidden pass/fail filters.
+# auction is worth expressing. Diagnostics below are continuous; they shape one
+# execution opportunity score instead of becoming hidden pass/fail layers.
 _PS_THRESHOLD_EARLY  = 62.0
 _PS_THRESHOLD_NORMAL = 52.0
 _PS_THRESHOLD_MATURE = 45.0
@@ -1190,6 +1191,27 @@ class EntryEngine:
             f"${sweep.pool.price:,.1f} quality={sweep.quality:.2f} "
             f"wick=${sweep.wick_extreme:,.1f}")
 
+    def _entry_opportunity_score(self, *, qd, phase: str, evidence_score: float, opposing_score: float) -> tuple[float, str]:
+        """Single continuous opportunity score for EntryEngine authority.
+
+        This is the anti-overtrade mechanism: posterior probability, expected R,
+        evidence separation and uncertainty collapse into one frontier score. It
+        is not a separate filter stack and it does not re-check TP/SL.
+        """
+        try:
+            import config as _cfg
+            min_ev = float(getattr(_cfg, "ENTRY_OPPORTUNITY_MIN_EV_R", 0.04))
+        except Exception:
+            min_ev = 0.04
+        p = max(0.0, min(1.0, float(getattr(qd, "posterior", 0.0) or 0.0)))
+        ev = float(getattr(qd, "expected_value", 0.0) or 0.0)
+        ev_term = max(0.0, min(1.0, (ev - min_ev) / max(0.18, abs(min_ev) + 0.18)))
+        separation = max(0.0, float(evidence_score) - float(opposing_score))
+        sep_term = max(0.0, min(1.0, separation / 42.0))
+        phase_mult = {"DISPLACEMENT": 1.00, "CISD": 0.96, "OTE": 0.92, "MATURE": 0.86}.get(str(phase).upper(), 0.90)
+        score = phase_mult * (0.48 * p + 0.32 * ev_term + 0.20 * sep_term)
+        return max(0.0, min(1.0, score)), f"oppScore={score:.3f} p={p:.3f} ev={ev:+.3f}R sep={separation:.1f} phase×{phase_mult:.2f}"
+
     def _do_post_sweep(self, snap, flow, ict, price, atr, now) -> None:
         ps = self._post_sweep
         if ps is None:
@@ -1592,6 +1614,16 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"QUANT_WAIT reverse: {qd.compact()}")
+            opp_score, opp_reason = self._entry_opportunity_score(qd=qd, phase=phase, evidence_score=rev_total, opposing_score=cont_total)
+            try:
+                min_opp = float(_entry_cfg_value("ENTRY_OPPORTUNITY_MIN_SCORE", 0.58))
+            except Exception:
+                min_opp = 0.58
+            self._last_sweep_analysis["entry_opportunity_score"] = opp_score
+            self._last_sweep_analysis["entry_opportunity_reason"] = opp_reason
+            if opp_score < min_opp:
+                return PostSweepDecision(action="wait", direction="", confidence=0.0,
+                    reason=f"OPPORTUNITY_WAIT reverse: {opp_reason} < {min_opp:.2f}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "reverse", rev_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
@@ -1629,6 +1661,16 @@ class EntryEngine:
                 return PostSweepDecision(
                     action="wait", direction="", confidence=0.0,
                     reason=f"QUANT_WAIT continue: {qd.compact()}")
+            opp_score, opp_reason = self._entry_opportunity_score(qd=qd, phase=phase, evidence_score=cont_total, opposing_score=rev_total)
+            try:
+                min_opp = float(_entry_cfg_value("ENTRY_OPPORTUNITY_MIN_SCORE", 0.58))
+            except Exception:
+                min_opp = 0.58
+            self._last_sweep_analysis["entry_opportunity_score"] = opp_score
+            self._last_sweep_analysis["entry_opportunity_reason"] = opp_reason
+            if opp_score < min_opp:
+                return PostSweepDecision(action="wait", direction="", confidence=0.0,
+                    reason=f"OPPORTUNITY_WAIT continue: {opp_reason} < {min_opp:.2f}")
             gate_ok, gate_reason = self._institutional_entry_quality_gate(
                 ps, "continue", cont_dir, snap, flow, ict, price, atr, now, phase)
             if not gate_ok:
@@ -1981,12 +2023,11 @@ class EntryEngine:
                         "(risk %.2fATR; %s; %s)",
                         label, sl, risk / max(atr, 1e-10), details, geometry_reason)
                 else:
-                    # Institutional invariant: a protective pool is the stop-cluster /
-                    # invalidation shelf, not an optional cosmetic anchor. If the
-                    # only live all-timeframe SL shield lies beyond the proposed
-                    # structural stop and the trade cannot afford that risk, the
-                    # correct action is to wait/refine/skip — never route with an
-                    # executable stop between entry and the protective liquidity.
+                    # Institutional invariant: if the selected protective pool
+                    # is the executable invalidation shelf, never place the SL
+                    # before/inside that liquidity.  The v77 selector handles
+                    # capital efficiency before a pool reaches this branch; once
+                    # it returns a pool, a rejected geometry means wait/refine.
                     return None, (
                         f"protective SL pool ${pool_sl:.1f} required but {geometry_reason}; "
                         "refusing executable stop inside liquidity"
@@ -2597,11 +2638,10 @@ class EntryEngine:
     def _find_tp(self, snap, side, price, atr, sl, min_rr):
         """Find TP via EV-ranked institutional liquidity selection + audit report.
 
-        The selector is intentionally strict: a visible BSL/SSL must still pass
-        side, active-status, reach, R:R, probability, gauntlet, and execution-cost
-        gates.  The important upgrade here is observability: every rejected pool
-        is retained in self._last_pool_plan so logs and /thinking explain WHY the
-        visible pool was not used.
+        The selector is the single TP authority: live-side geometry, delivery
+        probability, EV_R, reachable liquidity and fee-adjusted RR are calculated
+        once and ranked on one frontier score. Rejected pools remain visible in
+        diagnostics so Telegram explains why a visible pool was not used.
         """
         risk = abs(price - sl)
         if risk < 1e-10:

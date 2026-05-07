@@ -7,7 +7,7 @@ BOTH exchanges while sourcing candles exclusively from the primary.
 Architecture
 ------------
                 ┌──────────────────┐     ┌──────────────────┐
-                │  CoinSwitchDM    │     │    DeltaDM       │
+                │    PrimaryDM    │     │   SecondaryDM    │
                 │  (data manager)  │     │  (data manager)  │
                 └───────┬──────────┘     └────────┬─────────┘
                         │  orderbook                │  orderbook
@@ -99,13 +99,13 @@ def _norm_levels(raw_levels: list) -> list:
 class MarketAggregator:
     """
     Unified data manager facade consumed by QuantStrategy.
-    Implements the same interface as CoinSwitchDataManager / DeltaDataManager.
+    Implements the same interface as DeltaDataManager-compatible source.
     """
 
     def __init__(
         self,
-        primary_dm,    # CoinSwitchDataManager | DeltaDataManager
-        secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
+        primary_dm,    # DeltaDataManager-compatible source
+        secondary_dm,  # DeltaDataManager-compatible source | None
         instrument=None,
     ) -> None:
         self.instrument = instrument
@@ -134,7 +134,7 @@ class MarketAggregator:
 
         logger.info(
             f"MarketAggregator initialised "
-            f"[{getattr(instrument, 'asset_id', 'legacy')}] "
+            f"[{getattr(instrument, 'asset_id', 'unscoped')}] "
             f"(primary={type(primary_dm).__name__} "
             f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__})"
         )
@@ -391,7 +391,7 @@ class MarketAggregator:
         Return the executable primary venue book.
 
         Cross-venue synthetic depth is useful for diagnostics, but it is not an
-        executable book: merging CoinSwitch and Delta levels can invent liquidity
+        executable book: merging multiple venue levels can invent liquidity
         that cannot be hit by a single Delta order. Consumers that route orders,
         compute spread, or validate stop placement must see the primary book.
         The secondary book is attached under `_secondary_book` as a side-channel

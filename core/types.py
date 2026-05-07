@@ -13,19 +13,14 @@ from typing import Dict, List, Optional
 # ── Exchange identifiers ──────────────────────────────────────────────────────
 
 class Exchange(str, Enum):
-    DELTA      = "delta"
-    COINSWITCH = "coinswitch"
+    DELTA = "delta"
 
     @classmethod
     def from_str(cls, value: str) -> "Exchange":
         v = value.strip().lower()
         if v in ("delta", "dx"):
             return cls.DELTA
-        if v in ("coinswitch", "cs", "cs_pro"):
-            return cls.COINSWITCH
-        raise ValueError(
-            f"Unknown exchange {value!r}. Valid values: 'delta', 'coinswitch'."
-        )
+        raise ValueError(f"Unknown exchange {value!r}. This build is Delta-only; valid value: 'delta'.")
 
 
 # ── Order / cancellation results ─────────────────────────────────────────────

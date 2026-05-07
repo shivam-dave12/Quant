@@ -1,5 +1,5 @@
 """
-liquidity_pool_selector.py — Industry-grade TP/SL liquidity pool selector v1.0
+liquidity_pool_selector.py — Unified institutional TP/SL selector v78
 ================================================================================
 Created 2026-04-26 as the dedicated pool-selection layer that joins the
 significance/proximity/structural model in liquidity_map.py with the
@@ -183,6 +183,38 @@ _TP_MIN_BE_MOVE_MULT     = 1.80
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
 
+# v78 unified execution-objective model.
+#
+# The selector must not behave like "filter on filter".  A pool either prices
+# a positive-expectancy full-position exit or it does not; after that the choice
+# is a single frontier score that balances expected value, delivery probability,
+# and payoff.  This keeps the bot from choosing lottery/moonshot targets just
+# because raw R:R is high, while still allowing HTF external liquidity when the
+# delivery probability and payoff edge justify it.
+try:
+    import config as _liq_cfg
+except Exception:  # pragma: no cover
+    _liq_cfg = None  # type: ignore
+
+def _cfg_float(name: str, default: float) -> float:
+    try:
+        return float(getattr(_liq_cfg, name, default)) if _liq_cfg is not None else float(default)
+    except Exception:
+        return float(default)
+
+_TP_EDGE_MARGIN_R        = _cfg_float("TP_MIN_EXPECTED_VALUE_R", 0.05)   # EV buffer over pure breakeven, in R
+_TP_HITRATE_REFERENCE    = _cfg_float("TP_TARGET_DELIVERY_PROB", 0.55)   # desired delivery reference for full TP
+_TP_TERMINAL_FULL_HAIRCUT = 0.88  # terminal objectives are more runner-like
+
+# SL capital efficiency.  Protective liquidity is mandatory context, but a
+# far/high-significance pool must earn its extra risk.  The stop selector now
+# scores "protected invalidation per unit risk" instead of simply picking the
+# highest absolute pool score.  This avoids unnecessarily huge risk boxes that
+# later destroy TP/RR geometry.
+_SL_IDEAL_RISK_ATR       = _cfg_float("SL_IDEAL_RISK_ATR", 1.15)
+_SL_CAPITAL_SOFT_ATR     = _cfg_float("SL_MAX_CAPITAL_DRAG_ATR", 4.50)
+_SL_CAPITAL_DECAY        = 0.26
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -251,6 +283,7 @@ class PoolCandidateDiagnostic:
     delivery_prob: float = 0.0
     required_delivery_prob: float = 0.0
     cost_r:        float = 0.0
+    expected_value_r: float = 0.0
     ev:            float = 0.0
     selection_ev:  float = 0.0
     confluence:    float = 1.0
@@ -308,6 +341,20 @@ def _required_delivery_probability(rr: float, cost_r: float) -> float:
     return _clamp((1.0 + max(float(cost_r), 0.0)) / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
 
 
+def _expected_value_r(delivery_prob: float, rr: float, cost_r: float) -> float:
+    """Expected value of the TP in R after the full loss and execution cost.
+
+    Formula: EV_R = p * reward_R - (1 - p) * 1R - cost_R.
+    This is the single payoff truth used by TP diagnostics and ranking; it is
+    intentionally separate from raw pool score so high-RR moonshots cannot look
+    institutional unless they also have enough delivery probability.
+    """
+    p = _clamp(float(delivery_prob), 0.0, 1.0)
+    r = max(float(rr), 0.0)
+    c = max(float(cost_r), 0.0)
+    return p * r - (1.0 - p) - c
+
+
 def _enum_value(v: Any, default: str = "") -> str:
     try:
         if hasattr(v, "value"):
@@ -347,7 +394,7 @@ def _is_tp_pool_side(target: Any, side: str) -> bool:
     pool = _safe(target, "pool", None)
     pside = _pool_side(pool).upper()
     if not pside:
-        # Some legacy tests/adapter snapshots separate BSL/SSL by collection
+        # Some compatibility snapshots separate BSL/SSL by collection
         # but omit pool.side on the object.  Accept unknown here; explicit wrong
         # side values are still rejected below.
         return True
@@ -697,7 +744,7 @@ def _institutional_rr_floor(
 ) -> Tuple[float, float, float]:
     """Return (required_rr, delivery_probability, cost_r).
 
-    With no accepted setup posterior, preserve the legacy static floor. Once a
+    With no accepted setup posterior, preserve the static compatibility floor. Once a
     posterior exists, the pool is judged by positive expected value:
         p * R - (1 - p) - cost_r >= 0
     The static floor can be relaxed by observed auction posterior, but only
@@ -719,12 +766,12 @@ def _institutional_rr_floor(
     if posterior <= 0.0:
         delivery_p = _posterior_delivery_probability(
             raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
-        ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+        ev_floor = ((1.0 - delivery_p) + cost_r + _TP_EDGE_MARGIN_R) / max(delivery_p, 1e-9)
         return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
 
     delivery_p = _posterior_delivery_probability(
         raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
-    ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+    ev_floor = ((1.0 - delivery_p) + cost_r + _TP_EDGE_MARGIN_R) / max(delivery_p, 1e-9)
     posterior_floor = max(durable_floor, ev_floor)
     return posterior_floor, delivery_p, cost_r
 
@@ -738,12 +785,35 @@ def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketP
     return mtf_reach * profile_reach
 
 
-def _tp_selection_value(ev: float, rr: float, rr_floor: float,
-                        distance_atr: float) -> float:
+def _tp_selection_value(
+    ev: float,
+    rr: float,
+    rr_floor: float,
+    distance_atr: float,
+    delivery_prob: float = 0.0,
+    required_delivery_prob: float = 0.0,
+    terminal_target: bool = False,
+) -> float:
+    """Single institutional TP frontier score.
+
+    We want a target that the market is likely to deliver to *and* that pays
+    enough R after costs.  Raw R:R alone is not rewarded; a distant target is
+    only promoted when probability clears the breakeven hit-rate and the EV is
+    already positive.
+    """
     surplus_r = max(float(rr) - float(rr_floor), 0.0)
-    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
-    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
-    return float(ev) * payoff_frontier * delivery_span
+    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.18, 0.70))
+    p = _clamp(float(delivery_prob), 0.0, 1.0)
+    req_p = max(float(required_delivery_prob), 1e-9)
+    hitrate_fit = _clamp(p / req_p, 0.35, 1.35)
+    hitrate_frontier = 0.70 + 0.30 * min(hitrate_fit, 1.35)
+    # Mildly penalise distance after the normal MTF reach model has already
+    # been applied.  This keeps full-position TP biased toward reachable
+    # liquidity and leaves very distant HTF pools for trailing/runner context.
+    excess_distance = max(float(distance_atr) - 5.0, 0.0)
+    distance_efficiency = 1.0 / (1.0 + 0.018 * excess_distance * excess_distance)
+    terminal_mult = _TP_TERMINAL_FULL_HAIRCUT if terminal_target else 1.0
+    return float(ev) * payoff_frontier * hitrate_frontier * distance_efficiency * terminal_mult
 
 
 def _tp_payoff_rejection_reason(
@@ -842,8 +912,6 @@ def score_tp_pools(
     effective_min_rr = selector_profile.min_rr(float(min_rr))
     if is_btc_context():
         effective_min_rr = btc_static_rr_floor(effective_min_rr, posterior_prob)
-    if is_btc_context():
-        effective_min_rr = btc_static_rr_floor(effective_min_rr, posterior_prob)
     out: List[PoolScore] = []
     be_move = _breakeven_move(entry, atr)
 
@@ -915,7 +983,13 @@ def score_tp_pools(
                 be_move,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
+            min_delivery_prob = min(_TP_HITRATE_REFERENCE, max(_cfg_float("TP_MIN_DELIVERY_PROB", 0.32), required_delivery_prob * 0.82))
             if rr < rr_floor:
+                continue
+            expected_value_r = _expected_value_r(delivery_prob, rr, cost_r)
+            if delivery_prob < min_delivery_prob:
+                continue
+            if expected_value_r < _TP_EDGE_MARGIN_R - 1e-9:
                 continue
             utility, utility_components = _target_utility(
                 raw_prob, rr, rr_floor, dist_atr, reward, be_move)
@@ -928,7 +1002,12 @@ def score_tp_pools(
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(ev, rr, rr_floor, dist_atr)
+            selection_ev = _tp_selection_value(
+                ev, rr, rr_floor, dist_atr,
+                delivery_prob=delivery_prob,
+                required_delivery_prob=required_delivery_prob,
+                terminal_target=terminal_target,
+            )
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -977,6 +1056,8 @@ def score_tp_pools(
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
                     "required_delivery_prob": required_delivery_prob,
+                    "min_delivery_prob": min_delivery_prob,
+                    "expected_value_r": expected_value_r,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                 },
@@ -1007,6 +1088,28 @@ def _sl_pool_distance_penalty(distance_atr: float, tf: str) -> float:
     soft = _SL_SOFT_DISTANCE_ATR + 1.25 * max(0, tf_rank - 2)
     excess = max(0.0, float(distance_atr) - soft)
     return 1.0 / (1.0 + 0.18 * excess * excess)
+
+
+def _sl_capital_efficiency(risk_atr: float, tf: str, quality: float) -> float:
+    """Risk-box efficiency multiplier for SL selection.
+
+    A farther SL is only institutionally better when it buys real protection.
+    This multiplier lets HTF/high-quality anchors survive, but prevents a far
+    pool from destroying R:R when a nearer valid invalidation shelf exists.
+    """
+    tf_rank = _tf_rank(tf)
+    risk = max(float(risk_atr), 0.0)
+    q = _clamp(float(quality), 0.0, 1.0)
+    soft = _SL_CAPITAL_SOFT_ATR + 0.80 * max(0, tf_rank - 2) + 0.75 * q
+    if risk <= 0.0:
+        return 0.0
+    if risk < _SL_IDEAL_RISK_ATR:
+        # Do not over-reward tiny/tight stops.  A small stop is only useful if
+        # it is not sitting inside noise/liquidity; min_risk and buffer checks
+        # handle the hard safety floor.
+        return 0.72 + 0.28 * (risk / max(_SL_IDEAL_RISK_ATR, 1e-9))
+    excess = max(0.0, risk - soft)
+    return 1.0 / (1.0 + _SL_CAPITAL_DECAY * excess * excess)
 
 
 def _sl_liquidity_buffer_atr(target: Any, quality: float, *, max_buffer_atr: float = 2.0) -> float:
@@ -1100,9 +1203,12 @@ def score_sl_pool(
         buffer_atr = _sl_liquidity_buffer_atr(t, quality, max_buffer_atr=max_buffer_atr)
         pool_price = float(_safe(pool, "price", 0.0) or 0.0)
         sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
+        risk_atr = abs(float(entry) - sl_price) / max(float(atr), 1e-9)
         if min_risk > 0.0 and abs(float(entry) - sl_price) < min_risk:
             continue
-        scored.append((score, t, sl_price, buffer_atr, quality, notes))
+        cap_eff = _sl_capital_efficiency(risk_atr, tf=str(_safe(pool, "timeframe", "5m") or "5m"), quality=quality)
+        capital_score = score * cap_eff
+        scored.append((capital_score, t, sl_price, buffer_atr, quality, notes + [f"capEff×{cap_eff:.2f}", f"risk={risk_atr:.2f}ATR"]))
     if not scored:
         return None
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -1178,6 +1284,8 @@ def diagnose_tp_pools(
         session=session,
     )
     effective_min_rr = selector_profile.min_rr(float(min_rr))
+    if is_btc_context():
+        effective_min_rr = btc_static_rr_floor(effective_min_rr, posterior_prob)
     rows: List[PoolCandidateDiagnostic] = []
     accepted: List[Tuple[float, PoolCandidateDiagnostic]] = []
 
@@ -1254,6 +1362,12 @@ def diagnose_tp_pools(
             row.delivery_prob = delivery_prob
             row.cost_r = cost_r
             row.required_delivery_prob = _required_delivery_probability(row.rr, cost_r)
+            row.expected_value_r = _expected_value_r(delivery_prob, row.rr, cost_r)
+            min_delivery_prob = min(_TP_HITRATE_REFERENCE, max(_cfg_float("TP_MIN_DELIVERY_PROB", 0.32), row.required_delivery_prob * 0.82))
+            if delivery_prob < min_delivery_prob:
+                row.reason = (f"delivery probability {delivery_prob:.4f} < institutional minimum {min_delivery_prob:.4f}; "
+                              f"RR {row.rr:.2f}, EV_R={row.expected_value_r:.2f}")
+                rows.append(row); continue
             if row.rr < rr_floor:
                 row.reason = _tp_payoff_rejection_reason(
                     row.rr,
@@ -1265,10 +1379,21 @@ def diagnose_tp_pools(
                     terminal_target,
                 )
                 rows.append(row); continue
+            if row.expected_value_r < _TP_EDGE_MARGIN_R - 1e-9:
+                row.reason = (
+                    f"expected value {row.expected_value_r:.2f}R < edge margin "
+                    f"{_TP_EDGE_MARGIN_R:.2f}R despite RR {row.rr:.2f}"
+                )
+                rows.append(row); continue
             utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
+            selection_ev = _tp_selection_value(
+                row.ev, row.rr, rr_floor, row.distance_atr,
+                delivery_prob=delivery_prob,
+                required_delivery_prob=row.required_delivery_prob,
+                terminal_target=terminal_target,
+            )
             row.selection_ev = selection_ev
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
@@ -1280,6 +1405,8 @@ def diagnose_tp_pools(
                 row.notes.append(f"payoff RR floor {rr_floor:.2f}")
             if selection_ev > row.ev + 1e-12:
                 row.notes.append(f"frontierEV={selection_ev:.3f}")
+            row.notes.append(f"EV_R={row.expected_value_r:.2f}")
+            row.notes.append(f"Pmin={min_delivery_prob:.2f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
             accepted.append((selection_ev, row))
@@ -1381,8 +1508,14 @@ def diagnose_sl_pool(
             row.sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
             row.buffer_atr = buffer_atr
             row.quality = quality
-            row.ev = score
-            row.notes = list(notes) + ["SL beyond liquidity-exclusion zone"]
+            risk_atr = abs(float(entry) - row.sl_price) / max(float(atr), 1e-9)
+            cap_eff = _sl_capital_efficiency(risk_atr, tf=str(_safe(target.pool, "timeframe", "5m") or "5m"), quality=quality)
+            row.ev = score * cap_eff
+            row.notes = list(notes) + [
+                "SL beyond liquidity-exclusion zone",
+                f"capEff×{cap_eff:.2f}",
+                f"risk={risk_atr:.2f}ATR",
+            ]
             if min_risk > 0.0 and abs(entry - row.sl_price) < min_risk:
                 row.reason = f"risk {abs(entry - row.sl_price):.1f}pts < required {min_risk:.1f}pts"
                 rows.append(row); continue

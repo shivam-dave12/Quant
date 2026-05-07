@@ -4,7 +4,7 @@ config.py — Unified Configuration v10.0
 Single source of truth. All institutional parameters inline.
 No config_overrides.py — everything lives here.
 
-Calibrated for 65-75% WR, 3-6 trades per session.
+Calibrated for selective positive-expectancy liquidity trades; no win-rate guarantee is implied.
 """
 import os
 try:
@@ -15,14 +15,12 @@ except ImportError:  # production image may not ship python-dotenv
 load_dotenv()
 
 # ── Exchange routing ──────────────────────────────────────────────────────────
-EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
+EXECUTION_EXCHANGE = "delta"
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
 DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
-COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
-COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
@@ -32,8 +30,8 @@ REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false"
 # runtime still refuses to trade unless a configured exchange has both key and
 # secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
 # deployment-time fail-fast check.
-if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
+if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY and DELTA_SECRET_KEY):
+    raise ValueError("No Delta credentials in .env. Set DELTA_API_KEY and DELTA_SECRET_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -41,8 +39,6 @@ LEVERAGE                 = 40
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
-COINSWITCH_SYMBOL        = "BTCUSDT"
-COINSWITCH_EXCHANGE      = "EXCHANGE_2"
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 BALANCE_USAGE_PERCENTAGE = 60
@@ -100,9 +96,8 @@ POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
 
 
 # ── Order execution ───────────────────────────────────────────────────────────
-TICK_SIZE                        = 0.5 if EXECUTION_EXCHANGE == "delta" else 0.1
+TICK_SIZE                        = 0.5
 TICK_SIZE_DELTA                  = 0.5
-TICK_SIZE_COINSWITCH             = 0.1
 LIMIT_ORDER_OFFSET_TICKS         = 3
 ORDER_TIMEOUT_SECONDS            = 600
 MAX_ORDER_RETRIES                = 2
@@ -124,8 +119,7 @@ REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
 # fails, the strategy aborts the entry instead of falling back to naked limit
-# + standalone conditionals. CoinSwitch still uses standalone SL/TP because it
-# has no Delta-style native bracket endpoint.
+# + standalone conditionals.
 DELTA_REQUIRE_NATIVE_BRACKET      = True
 
 # ── Data / Readiness ──────────────────────────────────────────────────────────
@@ -191,7 +185,7 @@ FEE_TO_RISK_SOFT_MAX        = 0.35
 FEE_TO_RISK_NO_ALLOC        = 0.75
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-GLOBAL_API_MIN_INTERVAL  = 3.0
+GLOBAL_API_MIN_INTERVAL  = 0.25
 DELTA_API_MIN_INTERVAL   = 0.25
 RATE_LIMIT_ORDERS        = 15
 
@@ -204,13 +198,21 @@ SL_LIMIT_OFFSET_TICKS    = 20
 #   4. Reject only when the stop crosses the liquidation guard.
 
 def get_tick_size(exchange: str | None = None) -> float:
-    """Authoritative tick-size lookup for execution-sensitive price rounding."""
-    ex = (exchange or EXECUTION_EXCHANGE or "").lower()
-    if ex == "delta":
-        return float(TICK_SIZE_DELTA)
-    if ex == "coinswitch":
-        return float(TICK_SIZE_COINSWITCH)
-    return float(TICK_SIZE)
+    """Authoritative Delta tick-size lookup for execution-sensitive price rounding."""
+    return float(TICK_SIZE_DELTA)
+
+
+# Unified EntryEngine opportunity model. These are not extra filters; they are
+# inputs to the single execution frontier score used to avoid random low-quality
+# trades while preserving the liquidity-hunt core.
+ENTRY_OPPORTUNITY_MIN_SCORE = 0.58
+ENTRY_OPPORTUNITY_MIN_EV_R = 0.04
+ENTRY_OPPORTUNITY_RISK_EFFICIENCY_WEIGHT = 0.22
+TP_MIN_EXPECTED_VALUE_R = 0.05
+TP_MIN_DELIVERY_PROB = 0.32
+TP_TARGET_DELIVERY_PROB = 0.55
+SL_IDEAL_RISK_ATR = 1.15
+SL_MAX_CAPITAL_DRAG_ATR = 4.50
 
 
 def validate_config() -> None:
@@ -549,7 +551,7 @@ PAYOFF_TRAIL_MIN_COST_MULT = 0.75
 QUANT_CHOCH_EXPIRY_BARS = 10
 
 # ── Compatibility alias ───────────────────────────────────────────────────────
-EXCHANGE = COINSWITCH_EXCHANGE
+EXCHANGE = "delta"
 
 validate_config()
 
@@ -599,8 +601,8 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # ─────────────────────────────────────────────────────────────────────────────
 # MULTI-ASSET LIVE CATALOG SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
-# The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
-# catalogs and activates only contracts actually returned by the exchange.
+# The scanner does NOT trade aliases. It queries Delta's live product catalog
+# and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
 SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
 SCANNER_TICK_SLEEP_SEC = 0.25

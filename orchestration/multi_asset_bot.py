@@ -23,8 +23,6 @@ from core.instruments import ExchangeName, TradableInstrument, instrument_scope
 from execution.instrument_registry import InstrumentRegistry, DiscoveryReport
 from execution.order_manager import OrderManager
 from execution.router import ExecutionRouter
-from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
-from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 from risk.risk_manager import RiskManager
@@ -88,11 +86,10 @@ class MultiAssetQuantBot:
 
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
-        has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
-        cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
-        return delta_api, cs_api
+        return delta_api
+
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -711,13 +708,12 @@ class MultiAssetQuantBot:
         try:
             logger.info("=" * 92)
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
-            logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
+            logger.info("   Delta live catalog only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
-            delta_api, cs_api = self._build_api_clients()
+            delta_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
-                coinswitch_api=cs_api,
                 requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
                 max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
                 require_primary=False,
@@ -729,7 +725,7 @@ class MultiAssetQuantBot:
                 return False
 
             for inst in self.discovery_report.matched:
-                ctx = self._build_asset_context(inst, delta_api, cs_api)
+                ctx = self._build_asset_context(inst, delta_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
             if not self.contexts:
@@ -742,29 +738,14 @@ class MultiAssetQuantBot:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
-    def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
-        primary_ex = inst.primary_exchange
-        cs_om = None
-        delta_om = None
-        if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
-            cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
-        if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
-            delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-        if not cs_om and not delta_om:
-            logger.warning("%s skipped: no executable order manager", inst.asset_id)
+    def _build_asset_context(self, inst: TradableInstrument, delta_api) -> Optional[AssetContext]:
+        if ExchangeName.DELTA not in inst.by_exchange or delta_api is None:
+            logger.warning("%s skipped: Delta order manager unavailable", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, default=primary_ex.value)
+        delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
+        router = ExecutionRouter(delta_om=delta_om)
+        data = MarketAggregator(primary_dm=DeltaDataManager(instrument=inst), secondary_dm=None, instrument=inst)
 
-        if primary_ex == ExchangeName.DELTA:
-            primary_dm = DeltaDataManager(instrument=inst)
-            secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
-        else:
-            primary_dm = CoinSwitchDataManager(instrument=inst)
-            secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
-        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst)
-
-        # Context is created after the risk manager, so use a tiny holder to let
-        # PortfolioRiskManager resolve its owning context at call-time.
         ctx_holder: Dict[str, AssetContext] = {}
         risk = PortfolioRiskManager(
             shared_api=router,
@@ -834,7 +815,7 @@ class MultiAssetQuantBot:
         return True
 
     def _startup_message(self) -> str:
-        lines = ["🏛 <b>PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
+        lines = ["🏛 <b>DELTA LIQUIDITY COMMAND CENTER ONLINE</b>", ""]
         lines.append("<b>Execution universe — asset-scoped strategy desks:</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
@@ -848,8 +829,8 @@ class MultiAssetQuantBot:
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
-        lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
+        lines.append("• Delta live products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
+        lines.append("• Alpha authority: EntryEngine posterior + liquidity TP/SL EV. PortfolioGuard only controls exposure mechanics.")
         return "\n".join(lines)
 
     def run(self) -> None:

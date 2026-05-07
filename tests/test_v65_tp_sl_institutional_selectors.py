@@ -149,7 +149,7 @@ def test_every_configured_ticker_has_liquidity_aware_tp_and_sl_geometry(asset):
     assert sl < 100.0 < tp
 
 
-def test_legacy_compute_tp_refuses_vwap_or_swing_fallback_without_liquidity_map():
+def test_compute_tp_refuses_vwap_or_swing_fallback_without_liquidity_map():
     tp = InstitutionalLevels.compute_tp(
         price=100.0,
         side="long",

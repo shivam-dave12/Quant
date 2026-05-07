@@ -2,10 +2,9 @@
 execution/instrument_registry.py — live catalog discovery and filtering
 ======================================================================
 
-The registry never creates synthetic executable contracts.  It reads Delta's
-/v2/products and CoinSwitch's futures instrument/ticker endpoints, normalises
-only contracts returned by the exchange, and then matches requested asset
-intents against those confirmed symbols.
+The registry never creates synthetic executable contracts. It reads Delta's
+/v2/products catalog, normalises only contracts returned by the exchange, and
+then matches requested asset intents against those confirmed symbols.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from core.instruments import (
     AssetClass, AssetIntent, ExchangeInstrument, ExchangeName, TradableInstrument,
-    configured_asset_intents, first_positive, normalise_symbol, slash_symbol,
+    configured_asset_intents, first_positive, normalise_symbol,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,9 +94,6 @@ def _unwrap_list(resp) -> List[dict]:
             v = data.get(key)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
-        # Some CoinSwitch endpoints return {exchange: {symbol: specs}}.
-        # Guard this strictly: ticker payloads also contain dicts with fields such
-        # as lowPrice24h/highPrice24h. Those field names are NOT symbols.
         rows: List[dict] = []
         for ex_val in data.values():
             if isinstance(ex_val, dict):
@@ -140,7 +136,6 @@ def _row_symbol(row: dict) -> str:
         v = row.get(k)
         if v:
             return str(v).upper()
-    # Common CoinSwitch nested payloads: {"exchange": "EXCHANGE_2", "data": {"BTCUSDT": {...}}}
     for k, v in row.items():
         if isinstance(v, dict) and normalise_symbol(str(k)).endswith(("USDT", "USD", "INR")):
             return str(k).upper()
@@ -191,7 +186,6 @@ class InstrumentRegistry:
         except Exception:
             self.execution_preference = ExchangeName.DELTA
         self.delta: Dict[str, ExchangeInstrument] = {}
-        self.coinswitch: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -269,160 +263,34 @@ class InstrumentRegistry:
         self.delta = out
         return out
 
-    def load_coinswitch(self, api) -> Dict[str, ExchangeInstrument]:
-        out: Dict[str, ExchangeInstrument] = {}
-        if api is None:
-            return out
-        rows: List[dict] = []
-        try:
-            if hasattr(api, "get_instrument_info"):
-                rows = _unwrap_list(api.get_instrument_info(exchange="EXCHANGE_2"))
-            # CoinSwitch ticker endpoint requires an explicit symbol; never call
-            # the generic ticker URL because it returns 422 "Input symbol is missing"
-            # and wastes startup time.  Missing all-instrument rows are handled by
-            # _augment_coinswitch_from_requested(), which probes exact symbols.
-        except Exception as e:
-            logger.warning("CoinSwitch instrument discovery failed: %s", e, exc_info=True)
-            rows = []
-        for r in rows:
-            sym = _row_symbol(r)
-            if not sym:
-                continue
-            rest_sym = normalise_symbol(sym)
-            ws_sym = slash_symbol(sym)
-            base = rest_sym
-            quote = ""
-            for q in ("USDT", "USD", "INR"):
-                if rest_sym.endswith(q):
-                    base, quote = rest_sym[:-len(q)], q
-                    break
-            ei = ExchangeInstrument(
-                exchange=ExchangeName.COINSWITCH,
-                symbol=rest_sym,
-                ws_symbol=ws_sym,
-                display_symbol=ws_sym,
-                asset_id=normalise_symbol(base or rest_sym),
-                asset_class=AssetClass.CRYPTO,
-                quote_asset=quote,
-                base_asset=base,
-                contract_type=str(r.get("contract_type") or r.get("type") or "perpetual_futures"),
-                status=str(r.get("status") or r.get("state") or "active"),
-                tick_size=first_positive(_safe_float(r.get("tick_size")), _safe_float(r.get("quote_precision"))),
-                lot_step=first_positive(_safe_float(r.get("lot_size")), _safe_float(r.get("quantity_precision"))),
-                min_qty=first_positive(_safe_float(r.get("min_qty")), _safe_float(r.get("minQuantity")), _safe_float(r.get("min_size"))),
-                max_qty=first_positive(_safe_float(r.get("max_qty")), _safe_float(r.get("maxQuantity"))),
-                max_leverage=first_positive(_safe_float(r.get("max_leverage")), _safe_float(r.get("leverage")), _safe_float(r.get("maxLeverage"))),
-                raw=r,
-            )
-            out[normalise_symbol(rest_sym)] = ei
-            out[normalise_symbol(ws_sym)] = ei
-        self.coinswitch = out
-        return out
-
-    def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
-        """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
-
-        CoinSwitch docs expose per-symbol futures ticker/orderbook/klines endpoints.
-        Some accounts return only a small instrument_info subset, so BTCUSDT can be
-        tradable even when the all-instrument response is incomplete.  This is not
-        synthetic: a symbol is added only after CoinSwitch replies successfully for
-        that exact symbol.
-        """
-        if api is None:
-            return out
-        seen = set(out.keys())
-        for intent in intents:
-            # CoinSwitch is crypto futures only in the current API/page. Do not
-            # probe commodities, indices or equity-token aliases there.
-            if intent.asset_class != AssetClass.CRYPTO:
-                continue
-            candidates: List[str] = []
-            for a in _ordered_aliases(intent):
-                if a.endswith("USDT"):
-                    candidates.append(a)
-            base = normalise_symbol(intent.asset_id)
-            if base and f"{base}USDT" not in candidates:
-                candidates.append(f"{base}USDT")
-            for sym in candidates:
-                if sym in seen:
-                    continue
-                try:
-                    fn = getattr(api, "get_futures_ticker", None) or getattr(api, "get_ticker", None)
-                    if not callable(fn):
-                        continue
-                    try:
-                        resp = fn(symbol=sym, exchange="EXCHANGE_2")
-                    except TypeError:
-                        resp = fn(sym)
-                    row = _unwrap_one(resp)
-                    if not row or str(row.get("error") or ""):
-                        continue
-                    # Require some live-market field so a generic error wrapper cannot activate it.
-                    if not any(k in row for k in ("symbol", "last_price", "lastPrice", "mark_price", "markPrice", "best_bid", "bestBid", "best_ask", "bestAsk", "funding_rate", "fundingRate", "open_interest", "openInterest")):
-                        continue
-                    returned_symbol = normalise_symbol(row.get("symbol") or row.get("s") or row.get("pair") or sym)
-                    # Exact-symbol validation: never let ticker field names like LOWPRICE24H
-                    # become activated instruments.
-                    if returned_symbol and returned_symbol != normalise_symbol(sym):
-                        logger.debug("CoinSwitch ticker returned %s while validating %s — ignoring", returned_symbol, sym)
-                        continue
-                    rest_sym = normalise_symbol(sym)
-                    ws_sym = slash_symbol(rest_sym)
-                    base2, quote = rest_sym, ""
-                    for q in ("USDT", "USD", "INR"):
-                        if rest_sym.endswith(q):
-                            base2, quote = rest_sym[:-len(q)], q
-                            break
-                    ei = ExchangeInstrument(
-                        exchange=ExchangeName.COINSWITCH, symbol=rest_sym, ws_symbol=ws_sym,
-                        display_symbol=ws_sym, asset_id=normalise_symbol(base2),
-                        asset_class=AssetClass.CRYPTO, quote_asset=quote, base_asset=base2,
-                        contract_type="perpetual_futures", status="active", raw=row,
-                    )
-                    out[normalise_symbol(rest_sym)] = ei
-                    out[normalise_symbol(ws_sym)] = ei
-                    seen.add(normalise_symbol(rest_sym)); seen.add(normalise_symbol(ws_sym))
-                    logger.info("CoinSwitch live ticker validated: %s", rest_sym)
-                    break
-                except Exception as e:
-                    logger.debug("CoinSwitch live validation failed for %s: %s", sym, e)
-        return out
-
     # ──────────────────────────────────────────────────────────────────────
     # Matching
     # ──────────────────────────────────────────────────────────────────────
-    def discover(self, delta_api=None, coinswitch_api=None, requested=None,
-                 max_active: int = 12, require_primary: bool = True) -> DiscoveryReport:
+    def discover(self, delta_api=None, requested=None, max_active: int = 12, require_primary: bool = True) -> DiscoveryReport:
+        """Discover tradable instruments from Delta only.
+
+        Alternate exchange discovery was removed from this build because it was not
+        returning usable data and only added startup latency plus routing debt.
+        """
         intents = configured_asset_intents(requested)
         delta = self.load_delta(delta_api)
-        coins = self.load_coinswitch(coinswitch_api)
-        coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
-        self.report = DiscoveryReport(requested=intents, raw_counts={
-            "delta": len(delta), "coinswitch": len({id(v) for v in coins.values()})
-        })
+        self.report = DiscoveryReport(requested=intents, raw_counts={"delta": len(delta)})
 
         matched: List[TradableInstrument] = []
         for intent in sorted(intents, key=lambda x: x.priority):
             aliases = _ordered_aliases(intent)
-            by_ex: Dict[ExchangeName, ExchangeInstrument] = {}
             dmatch = self._match_one(delta, aliases)
-            cmatch = self._match_one(coins, aliases)
-            if dmatch is not None:
-                by_ex[ExchangeName.DELTA] = self._retag(dmatch, intent)
-            if cmatch is not None:
-                by_ex[ExchangeName.COINSWITCH] = self._retag(cmatch, intent)
-            if not by_ex:
-                self.report.unavailable[intent.asset_id] = "not present in live Delta/CoinSwitch catalog; not traded"
+            if dmatch is None:
+                self.report.unavailable[intent.asset_id] = "not present in live Delta catalog; not traded"
                 continue
-            primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
-            if require_primary and self.execution_preference not in by_ex:
-                # still activate on fallback if explicit config allows; default false is handled by caller
-                pass
+            by_ex: Dict[ExchangeName, ExchangeInstrument] = {
+                ExchangeName.DELTA: self._retag(dmatch, intent)
+            }
             matched.append(TradableInstrument(
                 asset_id=intent.asset_id,
                 display_name=intent.display_name,
                 asset_class=intent.asset_class,
-                primary_exchange=primary,
+                primary_exchange=ExchangeName.DELTA,
                 by_exchange=by_ex,
                 priority=intent.priority,
             ))

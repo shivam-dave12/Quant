@@ -76,5 +76,5 @@ def test_unified_gate_blocks_signal_if_entry_integrity_surface_is_broken():
     assert "entry quality" in reason or "displacement" in reason
 
 
-def test_legacy_ob_momentum_sl_builder_removed_from_entry_engine():
+def test_removed_ob_momentum_sl_builder_absent_from_entry_engine():
     assert not hasattr(EntryEngine, "_compute_sl")
