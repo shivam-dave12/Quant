@@ -9,7 +9,7 @@ from exchanges.delta.api import DeltaAPI
 def test_v73_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
     # v74 supersedes the v73 runtime fingerprint while preserving v73 behavior.
-    assert "v77-symbol-profiled-btc-staged-target-flow" in src
+    assert "v78-adaptive-startup-readiness-symbol-profiled-flow" in src
     assert "v70-flow-audit" not in src
 
 

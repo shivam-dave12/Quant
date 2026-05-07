@@ -6,7 +6,7 @@ from strategy.quant_strategy import QuantStrategy
 
 def test_v76_runtime_fingerprint_present():
     src = inspect.getsource(QuantStrategy._log_init)
-    assert "v77-symbol-profiled-btc-staged-target-flow" in src
+    assert "v78-adaptive-startup-readiness-symbol-profiled-flow" in src
     assert "v74-native-bracket-fast-fee-true-flow" not in src
     assert "v70-flow-audit" not in src
 
