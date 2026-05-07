@@ -141,6 +141,17 @@ _SL_SEARCH_WINDOW_ATR      = 4.0   # max distance to look for a protective pool
 _SL_MIN_BEYOND_INVAL_ATR   = 0.05  # protective pool must be at least this far past invalidation
 _SL_MIN_SIGNIFICANCE       = 1.5   # don't anchor SL to garbage pools
 
+# Stop placement must be outside the full protective liquidity envelope, not
+# a few ticks behind a single visible pool.  These values are not entry
+# filters; they shape the SL price from the live pool distribution so the stop
+# is not parked in the middle of a stop cluster.
+_SL_ZONE_JOIN_ATR          = 0.65  # pools closer than this form one stop zone
+_SL_STOP_EXCLUSION_ATR     = 0.40  # SL must not sit within this distance of a pool
+_SL_ZONE_BASE_BUFFER_ATR   = 0.30  # minimum beyond the external zone edge
+_SL_ZONE_WIDTH_BUFFER_FRAC = 0.30  # wider stop zones need more external clearance
+_SL_ZONE_DENSITY_BUFFER    = 0.08  # extra buffer per log(pool_count)
+_SL_ZONE_MAX_BUFFER_ATR    = 1.35  # hard cap before liquidation/geometry guard
+
 # Killzones (UTC). London 07-10, NY 12-16. Bonus active during + previous KZ.
 _KILLZONE_HOURS = (7, 8, 9, 10, 12, 13, 14, 15, 16)
 
@@ -195,12 +206,22 @@ class PoolScore:
 
 @dataclass
 class SLPoolPick:
-    """The chosen protective pool and the buffered SL price."""
-    target:       Any                    # PoolTarget on the OPPOSING side
-    sl_price:     float                  # pool.price ± buffer
+    """The chosen protective liquidity envelope and the buffered SL price.
+
+    ``target`` is the external-edge pool of the selected zone, not simply the
+    highest-scoring inner pool.  This is intentional: an institutional stop is
+    placed beyond the whole protective liquidity envelope, never in the middle
+    of clustered SSL/BSL liquidity.
+    """
+    target:       Any                    # external-edge PoolTarget on OPPOSING side
+    sl_price:     float                  # zone edge ± buffer
     buffer_atr:   float
-    quality:      float                  # composite [0, 1] quality of the pick
+    quality:      float                  # composite [0, 1] quality of the zone
     reasons:      List[str] = field(default_factory=list)
+    zone_size:    int = 1
+    zone_inner:   float = 0.0
+    zone_outer:   float = 0.0
+    zone_width_atr: float = 0.0
 
 
 @dataclass
@@ -732,6 +753,208 @@ def _target_utility(raw_prob: float, rr: float, min_rr: float,
     }
 
 
+
+
+def _is_live_liquidity_target(target: Any, min_significance: float = 0.0) -> bool:
+    """True only for active, currently usable pool targets.
+
+    Stops and targets must not be derived from consumed/swept/archive pools.
+    This helper is deliberately shared by TP/SL logic so pool status semantics
+    stay consistent across target selection and stop protection.
+    """
+    try:
+        pool = _safe(target, "pool", target)
+        status = _pool_status(pool).upper()
+        if status in {"SWEPT", "CONSUMED", "ARCHIVED", "DEAD", "EXPIRED", "INVALID"}:
+            return False
+        if bool(_safe(pool, "is_swept", False)) or bool(_safe(target, "is_swept", False)):
+            return False
+        sig = float(_safe(target, "significance", _safe(pool, "significance", 0.0)) or 0.0)
+        return sig >= float(min_significance)
+    except Exception:
+        return False
+
+
+def _pool_price(target: Any) -> float:
+    return float(_safe(_safe(target, "pool", target), "price", 0.0) or 0.0)
+
+
+def _pool_significance(target: Any) -> float:
+    pool = _safe(target, "pool", target)
+    return float(_safe(target, "significance", _safe(pool, "significance", 0.0)) or 0.0)
+
+
+def _pool_microstructure_score(target: Any) -> float:
+    """Structural score used inside an SL envelope."""
+    pool = _safe(target, "pool", target)
+    sig = max(_pool_significance(target), 0.0)
+    return sig * _structural_bonus(pool) * _freshness_bonus(pool) * _touch_penalty(pool)
+
+
+def _protective_candidates(
+    snap: Any,
+    side: str,
+    entry: float,
+    atr: float,
+    invalidation_price: Optional[float],
+) -> Tuple[List[Any], str]:
+    """Return live protective pool targets for the trade side.
+
+    Long trades are protected by SSL below invalidation.  Shorts are protected
+    by BSL above invalidation.  The search window is still bounded by ATR and
+    liquidation/geometry checks in the caller, but selection is made at the
+    liquidity-zone level rather than one isolated pool.
+    """
+    if snap is None or atr <= 0:
+        return [], "no snapshot/ATR"
+    if side == "long":
+        pools = list(_safe(snap, "ssl_pools", []) or [])
+        inv = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
+        out = [t for t in pools
+               if _is_live_liquidity_target(t, _SL_MIN_SIGNIFICANCE)
+               and _pool_price(t) <= inv - _SL_MIN_BEYOND_INVAL_ATR * atr
+               and (entry - _pool_price(t)) <= _SL_SEARCH_WINDOW_ATR * atr]
+        return out, "SSL"
+    pools = list(_safe(snap, "bsl_pools", []) or [])
+    inv = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
+    out = [t for t in pools
+           if _is_live_liquidity_target(t, _SL_MIN_SIGNIFICANCE)
+           and _pool_price(t) >= inv + _SL_MIN_BEYOND_INVAL_ATR * atr
+           and (_pool_price(t) - entry) <= _SL_SEARCH_WINDOW_ATR * atr]
+    return out, "BSL"
+
+
+def _build_protective_zones(candidates: List[Any], side: str, atr: float) -> List[List[Any]]:
+    """Cluster nearby protective pools into executable stop zones."""
+    if not candidates or atr <= 0:
+        return []
+    # Long: from inner/high price down to external/low price.  Short: inverse.
+    reverse = side == "long"
+    ordered = sorted(candidates, key=_pool_price, reverse=reverse)
+    zones: List[List[Any]] = []
+    join = max(_SL_ZONE_JOIN_ATR * atr, 1e-9)
+    current: List[Any] = []
+    last_px: Optional[float] = None
+    for t in ordered:
+        px = _pool_price(t)
+        if px <= 0:
+            continue
+        if last_px is None or abs(px - last_px) <= join:
+            current.append(t)
+        else:
+            if current:
+                zones.append(current)
+            current = [t]
+        last_px = px
+    if current:
+        zones.append(current)
+    return zones
+
+
+def _zone_edges(zone: List[Any], side: str) -> Tuple[float, float, Any]:
+    """Return (inner_edge, external_edge, external_target)."""
+    ordered = sorted(zone, key=_pool_price)
+    if side == "long":
+        external = ordered[0]
+        inner = ordered[-1]
+    else:
+        external = ordered[-1]
+        inner = ordered[0]
+    return _pool_price(inner), _pool_price(external), external
+
+
+def _liquidity_zone_buffer_atr(zone: List[Any], side: str, atr: float,
+                               quality: float, max_buffer_atr: float) -> Tuple[float, float]:
+    """Calculate external stop clearance from zone width, density and quality."""
+    inner, outer, _ = _zone_edges(zone, side)
+    width_atr = abs(inner - outer) / max(atr, 1e-9)
+    density = math.log1p(max(len(zone), 1))
+    quality_buffer = _SL_BUFFER_BASE_ATR + (1.0 - _clamp(quality, 0.0, 1.0)) * _SL_BUFFER_QUALITY_SCALE
+    zone_buffer = (
+        _SL_ZONE_BASE_BUFFER_ATR
+        + _SL_ZONE_WIDTH_BUFFER_FRAC * min(width_atr, 2.0)
+        + _SL_ZONE_DENSITY_BUFFER * density
+    )
+    buffer_atr = max(quality_buffer, zone_buffer)
+    buffer_atr = min(buffer_atr, _SL_ZONE_MAX_BUFFER_ATR, float(max_buffer_atr))
+    return buffer_atr, width_atr
+
+
+def _move_stop_outside_nearby_liquidity(sl: float, side: str, atr: float,
+                                        candidates: List[Any], max_buffer_atr: float) -> float:
+    """Ensure the final SL is not sitting inside/adjacent to a live pool."""
+    if atr <= 0 or not candidates:
+        return sl
+    exclusion = _SL_STOP_EXCLUSION_ATR * atr
+    # Iterate because moving beyond one nearby pool can expose the next pool.
+    for _ in range(5):
+        near = [t for t in candidates if abs(_pool_price(t) - sl) <= exclusion]
+        if not near:
+            break
+        quality = _clamp(sum(_pool_microstructure_score(t) for t in near) / max(8.0 + 2.0 * len(near), 1.0), 0.0, 1.0)
+        buf_atr, _ = _liquidity_zone_buffer_atr(near, side, atr, quality, max_buffer_atr)
+        if side == "long":
+            new_sl = min(_pool_price(t) for t in near) - buf_atr * atr
+            if new_sl >= sl - 1e-9:
+                break
+            sl = new_sl
+        else:
+            new_sl = max(_pool_price(t) for t in near) + buf_atr * atr
+            if new_sl <= sl + 1e-9:
+                break
+            sl = new_sl
+    return sl
+
+
+def _score_sl_zones(candidates: List[Any], side: str, entry: float, atr: float,
+                    max_buffer_atr: float, min_risk: float = 0.0) -> List[Tuple[float, SLPoolPick]]:
+    """Score executable protective liquidity zones, not isolated pool lines."""
+    zones = _build_protective_zones(candidates, side, atr)
+    scored: List[Tuple[float, SLPoolPick]] = []
+    for zone in zones:
+        if not zone:
+            continue
+        inner, outer, external_target = _zone_edges(zone, side)
+        raw_zone_score = sum(_pool_microstructure_score(t) for t in zone)
+        # Normalize quality by zone size; a dense zone should help, but not make
+        # the buffer too tight.  The stop has to clear the envelope.
+        quality = _clamp(raw_zone_score / max(8.0 + 2.5 * math.log1p(len(zone)), 1.0), 0.0, 1.0)
+        buffer_atr, width_atr = _liquidity_zone_buffer_atr(zone, side, atr, quality, max_buffer_atr)
+        sl_price = outer - buffer_atr * atr if side == "long" else outer + buffer_atr * atr
+        sl_price = _move_stop_outside_nearby_liquidity(sl_price, side, atr, candidates, max_buffer_atr)
+        risk = abs(entry - sl_price)
+        if min_risk > 0.0 and risk < min_risk:
+            continue
+        risk_atr = risk / max(atr, 1e-9)
+        density_bonus = 1.0 + 0.20 * math.log1p(len(zone))
+        width_bonus = 1.0 + 0.10 * min(width_atr, 2.0)
+        # Risk efficiency is a soft ranking term only. Geometry/liquidation
+        # guards decide whether the final stop is tradable.
+        risk_efficiency = 1.0 / (1.0 + 0.12 * max(risk_atr - 1.0, 0.0))
+        selection_score = raw_zone_score * density_bonus * width_bonus * risk_efficiency
+        reasons = [
+            f"zone_score={raw_zone_score:.2f}",
+            f"zone_n={len(zone)}",
+            f"zone_width={width_atr:.2f}ATR",
+            f"external_edge=${outer:.1f}",
+        ]
+        if len(zone) > 1:
+            reasons.append("cluster-envelope stop")
+        pick = SLPoolPick(
+            target=external_target,
+            sl_price=sl_price,
+            buffer_atr=buffer_atr,
+            quality=quality,
+            reasons=reasons,
+            zone_size=len(zone),
+            zone_inner=inner,
+            zone_outer=outer,
+            zone_width_atr=width_atr,
+        )
+        scored.append((selection_score, pick))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
 # ════════════════════════════════════════════════════════════════════════════
 # TP POOL SCORING
 # ════════════════════════════════════════════════════════════════════════════
@@ -782,6 +1005,8 @@ def score_tp_pools(
     for target in pools:
         try:
             pool = target.pool
+            if not _is_live_liquidity_target(target, 0.0):
+                continue
             dist_atr = float(_safe(target, "distance_atr", 0.0))
             pool_price = float(_safe(pool, "price", 0.0))
 
@@ -939,97 +1164,35 @@ def score_sl_pool(
     min_risk:            float = 0.0,
 ) -> Optional[SLPoolPick]:
     """
-    Pick the best PROTECTIVE pool just past the structural invalidation
-    point, with a quality-scaled buffer.
+    Pick an institutional protective SL *envelope*, not a single pool line.
 
-    Logic:
-        - Pool side = OPPOSING side of trade (longs invalidated by SSL pool
-          break; shorts invalidated by BSL pool break).
-        - Pool must lie BEYOND invalidation_price (or beyond entry by
-          _SL_MIN_BEYOND_INVAL_ATR if invalidation_price not provided).
-        - Within _SL_SEARCH_WINDOW_ATR of invalidation point.
-        - Score = significance × structural × htf_alignment × freshness
-                  × adjacency_bonus  −  touch_penalty
-        - SL = pool.price ∓ buffer, where buffer scales INVERSELY with quality.
-
-    Returns None if no protective pool qualifies — caller should fall back
-    to OB-based or ATR-based SL.
+    The old behavior could anchor to the best-looking individual SSL/BSL and
+    then place the SL only a small fixed ATR buffer behind it.  That can park a
+    stop inside the broader liquidity cluster.  This version first clusters all
+    live protective pools around structural invalidation, chooses the best zone,
+    then places the SL beyond the zone's external edge with a buffer derived
+    from zone width, density, freshness/quality and touch deterioration.
     """
     if snap is None or atr <= 0:
         return None
 
-    # OPPOSING-side pools protect us. Long → SSL pool below us is the floor.
-    if side == "long":
-        opposing = list(_safe(snap, "ssl_pools", []) or [])
-        # Invalidation: by default, the lowest reasonable swing below entry.
-        inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
-        # Protective pools sit BELOW inv_price.
-        candidates = [t for t in opposing
-                      if _safe(t.pool, "price", 0.0) <= inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr
-                      and (entry - _safe(t.pool, "price", 0.0)) <= _SL_SEARCH_WINDOW_ATR * atr]
-    else:
-        opposing = list(_safe(snap, "bsl_pools", []) or [])
-        inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
-        candidates = [t for t in opposing
-                      if _safe(t.pool, "price", 0.0) >= inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr
-                      and (_safe(t.pool, "price", 0.0) - entry) <= _SL_SEARCH_WINDOW_ATR * atr]
-
-    candidates = [t for t in candidates
-                  if _safe(t, "significance", 0.0) >= _SL_MIN_SIGNIFICANCE]
+    min_risk = max(0.0, float(min_risk or 0.0))
+    candidates, _ = _protective_candidates(snap, side, entry, atr, invalidation_price)
     if not candidates:
         return None
 
-    min_risk = max(0.0, float(min_risk or 0.0))
-
-    # Score each candidate.
-    scored: List[Tuple[float, Any, float, float, float]] = []
-    for t in candidates:
-        sig = float(_safe(t, "significance", 0.0))
-        struct = _structural_bonus(t.pool)
-        fresh  = _freshness_bonus(t.pool)
-        touch  = _touch_penalty(t.pool)
-
-        # SL pools benefit from being ALIGNED with HTF on the OPPOSING side
-        # (i.e. for a LONG, an SSL pool aligned with bullish HTF means
-        # institutions defended that level). _htf_alignment_bonus already
-        # handles this — for a long-side trade looking at SSL pools, it
-        # returns 1.0 (no bonus) which is correct: we don't WANT bias here,
-        # we want raw structural strength. We therefore neutralise htf_m.
-        score = sig * struct * fresh * touch
-        quality = min(score / 10.0, 1.0)
-        buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-        buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
-        pool_price = float(_safe(t.pool, "price", 0.0))
-        sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
-        if min_risk > 0.0 and abs(entry - sl_price) < min_risk:
-            continue
-        scored.append((score, t, sl_price, buffer_atr, quality))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored = _score_sl_zones(
+        candidates=candidates,
+        side=side,
+        entry=entry,
+        atr=atr,
+        max_buffer_atr=max_buffer_atr,
+        min_risk=min_risk,
+    )
     if not scored:
         return None
-    best_score, best_target, sl_price, buffer_atr, quality = scored[0]
 
-    # Quality on a [0, 1] scale: a score of ~10 is institutional-grade.
-
-    # Quality-scaled buffer:
-    #   high quality (1.0) → smallest buffer (BASE)
-    #   low quality (0.0)  → maximum buffer (BASE + scale × MAX)
-
-
-    reasons: List[str] = [f"score={best_score:.2f}", f"sig={float(_safe(best_target, 'significance', 0.0)):.1f}"]
-    if _safe(best_target.pool, "ob_aligned", False):
-        reasons.append("OB-aligned")
-    if int(_safe(best_target.pool, "touches", 1)) > 3:
-        reasons.append(f"{int(_safe(best_target.pool, 'touches', 1))} touches (penalised)")
-
-    return SLPoolPick(
-        target     = best_target,
-        sl_price   = sl_price,
-        buffer_atr = buffer_atr,
-        quality    = quality,
-        reasons    = reasons,
-    )
+    return scored[0][1]
 
 
 
@@ -1226,7 +1389,7 @@ def diagnose_sl_pool(
     limit: int = 8,
     min_risk: float = 0.0,
 ) -> PoolSelectionReport:
-    """Return an SL protective-pool audit table without relaxing SL rules."""
+    """Return an SL protective-zone audit table without relaxing SL rules."""
     report = PoolSelectionReport(role="SL", side=side, entry=float(entry), atr=float(atr))
     if snap is None:
         report.summary = "no liquidity snapshot"
@@ -1237,86 +1400,100 @@ def diagnose_sl_pool(
 
     min_risk = max(0.0, float(min_risk or 0.0))
     rows: List[PoolCandidateDiagnostic] = []
-    candidates: List[Tuple[float, PoolCandidateDiagnostic, Any]] = []
-
-    if side == "long":
-        pools = list(_safe(snap, "ssl_pools", []) or [])
-        inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
-        def _protects(t):
-            px = float(_safe(t.pool, "price", 0.0))
-            if px > inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr:
-                return False, "not beyond long invalidation"
-            if (entry - px) > _SL_SEARCH_WINDOW_ATR * atr:
-                return False, f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
-            return True, ""
-    else:
-        pools = list(_safe(snap, "bsl_pools", []) or [])
-        inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
-        def _protects(t):
-            px = float(_safe(t.pool, "price", 0.0))
-            if px < inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr:
-                return False, "not beyond short invalidation"
-            if (px - entry) > _SL_SEARCH_WINDOW_ATR * atr:
-                return False, f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
-            return True, ""
-
-    if not pools:
-        report.summary = f"no protective {'SSL' if side == 'long' else 'BSL'} pools"
+    raw_pools = list(_safe(snap, "ssl_pools", []) or []) if side == "long" else list(_safe(snap, "bsl_pools", []) or [])
+    pool_label = "SSL" if side == "long" else "BSL"
+    if not raw_pools:
+        report.summary = f"no protective {pool_label} pools"
         return report
 
-    for target in pools:
+    # Per-pool audit keeps /thinking useful, but selection below is zone-level.
+    if side == "long":
+        inv_price = invalidation_price if invalidation_price is not None else entry - 0.3 * atr
+        def _pool_veto(t):
+            px = _pool_price(t)
+            if not _is_live_liquidity_target(t, 0.0):
+                return "archived/swept/consumed pool; not protective"
+            if px > inv_price - _SL_MIN_BEYOND_INVAL_ATR * atr:
+                return "not beyond long invalidation"
+            if (entry - px) > _SL_SEARCH_WINDOW_ATR * atr:
+                return f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
+            if _pool_significance(t) < _SL_MIN_SIGNIFICANCE:
+                return f"significance {_pool_significance(t):.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
+            return ""
+    else:
+        inv_price = invalidation_price if invalidation_price is not None else entry + 0.3 * atr
+        def _pool_veto(t):
+            px = _pool_price(t)
+            if not _is_live_liquidity_target(t, 0.0):
+                return "archived/swept/consumed pool; not protective"
+            if px < inv_price + _SL_MIN_BEYOND_INVAL_ATR * atr:
+                return "not beyond short invalidation"
+            if (px - entry) > _SL_SEARCH_WINDOW_ATR * atr:
+                return f"outside SL search window >{_SL_SEARCH_WINDOW_ATR:.1f}ATR"
+            if _pool_significance(t) < _SL_MIN_SIGNIFICANCE:
+                return f"significance {_pool_significance(t):.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
+            return ""
+
+    for target in raw_pools:
         row = _candidate_base("SL", side, target, entry, atr)
         try:
-            status = row.status.upper()
-            if status in ("SWEPT", "CONSUMED"):
-                row.reason = f"archived {status.lower()} pool; not protective"
-                rows.append(row); continue
-            ok, why = _protects(target)
-            if not ok:
+            why = _pool_veto(target)
+            if why:
                 row.reason = why
-                rows.append(row); continue
-            if row.significance < _SL_MIN_SIGNIFICANCE:
-                row.reason = f"significance {row.significance:.1f} < {_SL_MIN_SIGNIFICANCE:.1f}"
-                rows.append(row); continue
-
-            sig = float(_safe(target, "significance", 0.0))
-            struct = _structural_bonus(target.pool)
-            fresh = _freshness_bonus(target.pool)
-            touch = _touch_penalty(target.pool)
-            score = sig * struct * fresh * touch
-            quality = min(score / 10.0, 1.0)
-            buffer_atr = _SL_BUFFER_BASE_ATR + (1.0 - quality) * _SL_BUFFER_QUALITY_SCALE
-            buffer_atr = min(buffer_atr, _SL_BUFFER_MAX_ATR, max_buffer_atr)
-            pool_price = float(_safe(target.pool, "price", 0.0))
-            row.sl_price = (pool_price - buffer_atr * atr) if side == "long" else (pool_price + buffer_atr * atr)
-            row.buffer_atr = buffer_atr
-            row.quality = quality
-            row.ev = score
-            if min_risk > 0.0 and abs(entry - row.sl_price) < min_risk:
-                row.reason = f"risk {abs(entry - row.sl_price):.1f}pts < required {min_risk:.1f}pts"
-                rows.append(row); continue
-            row.eligible = True
-            row.reason = "eligible protective SL pool"
-            row.notes = [f"score={score:.2f}"]
-            candidates.append((score, row, target))
+            else:
+                row.eligible = True
+                row.reason = "eligible inside protective liquidity envelope"
+                row.ev = _pool_microstructure_score(target)
+                row.notes = [f"pool_score={row.ev:.2f}"]
             rows.append(row)
         except Exception as e:
             row.reason = f"diagnostic error: {e}"
             rows.append(row)
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    if candidates:
-        selected = candidates[0][1]
-        selected.selected = True
-        selected.reason = "selected protective SL anchor"
-        report.selected = selected
-        report.summary = (f"selected ${selected.sl_price:,.1f}; anchor ${selected.pool_price:,.1f}; "
-                          f"quality={selected.quality:.2f}; buffer={selected.buffer_atr:.2f}ATR")
+    candidates, _ = _protective_candidates(snap, side, entry, atr, invalidation_price)
+    scored = _score_sl_zones(
+        candidates=candidates,
+        side=side,
+        entry=entry,
+        atr=atr,
+        max_buffer_atr=max_buffer_atr,
+        min_risk=min_risk,
+    )
+
+    if scored:
+        _, pick = scored[0]
+        selected_row = _candidate_base("SL", side, pick.target, entry, atr)
+        selected_row.selected = True
+        selected_row.eligible = True
+        selected_row.sl_price = pick.sl_price
+        selected_row.buffer_atr = pick.buffer_atr
+        selected_row.quality = pick.quality
+        selected_row.ev = scored[0][0]
+        selected_row.reason = "selected external liquidity-envelope SL"
+        selected_row.notes = list(pick.reasons or [])
+        report.selected = selected_row
+        report.summary = (
+            f"selected ${pick.sl_price:,.1f}; external edge ${pick.zone_outer:,.1f}; "
+            f"zone_n={pick.zone_size}; zone_width={pick.zone_width_atr:.2f}ATR; "
+            f"quality={pick.quality:.2f}; buffer={pick.buffer_atr:.2f}ATR"
+        )
+        # Mark the matching per-pool row as selected for row-level audit.
+        for r in rows:
+            if abs(r.pool_price - selected_row.pool_price) < 1e-9 and r.timeframe == selected_row.timeframe:
+                r.selected = True
+                r.sl_price = pick.sl_price
+                r.buffer_atr = pick.buffer_atr
+                r.quality = pick.quality
+                r.reason = selected_row.reason
+                r.notes = selected_row.notes
+                break
     else:
         if rows:
-            report.summary = "no protective SL pool; best visible pool rejected: " + rows[0].reason
+            rows_sorted = _sort_report_candidates(rows, limit)
+            report.summary = "no protective SL envelope; best visible pool rejected: " + (rows_sorted[0].reason or "unknown")
         else:
             report.summary = "no SL candidates found"
+
     report.candidates = _sort_report_candidates(rows, limit)
     return report
 

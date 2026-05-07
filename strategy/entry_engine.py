@@ -2740,55 +2740,115 @@ class EntryEngine:
         return sl
 
     def _push_sl_behind_pools(self, sl, side, price, atr):
-        """Push SL behind active protective liquidity only.
+        """Push SL outside the live protective liquidity envelope.
 
-        This is a stop-protection adjustment, not a blind widening routine. It
-        ignores consumed/stale/insignificant pools, caps total expansion, and
-        uses the most recent snapshot supplied by the live evaluation path.
+        This is not a filter and not a parameter tweak.  It is executable stop
+        geometry: if active SSL/BSL pools are between entry and the proposed SL,
+        the final SL must clear the *external edge of that zone* plus a dynamic
+        buffer based on zone width and density.  That prevents stops from being
+        parked in the middle of liquidity.
         """
         snap = self._last_liq_snapshot
         if snap is None or atr <= 0:
             return sl
-        _SL_PUSH_MAX_ATR = 3.0
+
+        _SL_PUSH_MAX_ATR = 4.0
         _MIN_SIG = 1.0
-        sl_origin = sl
-        buf = 0.25 * atr
+        _JOIN_ATR = 0.65
+        _BASE_BUFFER_ATR = 0.30
+        _WIDTH_BUFFER_FRAC = 0.30
+        _DENSITY_BUFFER = 0.08
+        _MAX_BUFFER_ATR = 1.35
+        _STOP_EXCLUSION_ATR = 0.40
+
+        sl_origin = float(sl)
 
         def _active_pool(t) -> bool:
             try:
                 p = getattr(t, "pool", t)
                 status = str(getattr(p, "status", "") or getattr(p, "state", "") or "").upper()
-                if status in {"SWEPT", "CONSUMED", "ARCHIVED", "DEAD"}:
+                if status in {"SWEPT", "CONSUMED", "ARCHIVED", "DEAD", "EXPIRED", "INVALID"}:
                     return False
                 if bool(getattr(p, "is_swept", False)) or bool(getattr(t, "is_swept", False)):
                     return False
                 sig = float(getattr(t, "significance", getattr(p, "significance", 0.0)) or 0.0)
-                if sig < _MIN_SIG:
-                    return False
-                return True
+                return sig >= _MIN_SIG
             except Exception:
                 return False
 
+        def _px(t) -> float:
+            try:
+                return float(getattr(getattr(t, "pool", t), "price", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        def _cluster(prices):
+            if not prices:
+                return []
+            prices = sorted(set(float(x) for x in prices if x > 0.0))
+            zones = []
+            cur = [prices[0]]
+            join = _JOIN_ATR * atr
+            for px in prices[1:]:
+                if abs(px - cur[-1]) <= join:
+                    cur.append(px)
+                else:
+                    zones.append(cur)
+                    cur = [px]
+            zones.append(cur)
+            return zones
+
+        def _zone_buffer(zone):
+            width_atr = (max(zone) - min(zone)) / max(atr, 1e-9)
+            density = math.log1p(max(len(zone), 1))
+            return min(
+                _MAX_BUFFER_ATR,
+                _BASE_BUFFER_ATR + _WIDTH_BUFFER_FRAC * min(width_atr, 2.0) + _DENSITY_BUFFER * density,
+            ) * atr
+
+        def _within_push_cap(candidate):
+            if side == "long":
+                return sl_origin - candidate <= _SL_PUSH_MAX_ATR * atr
+            return candidate - sl_origin <= _SL_PUSH_MAX_ATR * atr
+
         if side == "long":
-            for t in getattr(snap, "ssl_pools", []) or []:
-                if not _active_pool(t):
-                    continue
-                pp = float(getattr(getattr(t, "pool", t), "price", 0.0) or 0.0)
-                if sl < pp < price:
-                    candidate = pp - buf
-                    if sl_origin - candidate > _SL_PUSH_MAX_ATR * atr:
-                        continue
+            pools = [t for t in getattr(snap, "ssl_pools", []) or [] if _active_pool(t)]
+            prices_between = [_px(t) for t in pools if sl < _px(t) < price]
+            if prices_between:
+                # Use the external edge of the lowest connected zone nearest to
+                # the proposed stop; then buffer beyond that zone.
+                zones = _cluster(prices_between)
+                zone = min(zones, key=lambda z: min(z))
+                candidate = min(zone) - _zone_buffer(zone)
+                if _within_push_cap(candidate):
                     sl = min(sl, candidate)
+            # Final guard: do not leave the SL adjacent to a live pool on either side.
+            for _ in range(4):
+                near = [_px(t) for t in pools if abs(_px(t) - sl) <= _STOP_EXCLUSION_ATR * atr]
+                if not near:
+                    break
+                candidate = min(near) - _zone_buffer(near)
+                if candidate >= sl or not _within_push_cap(candidate):
+                    break
+                sl = candidate
         else:
-            for t in getattr(snap, "bsl_pools", []) or []:
-                if not _active_pool(t):
-                    continue
-                pp = float(getattr(getattr(t, "pool", t), "price", 0.0) or 0.0)
-                if price < pp < sl:
-                    candidate = pp + buf
-                    if candidate - sl_origin > _SL_PUSH_MAX_ATR * atr:
-                        continue
+            pools = [t for t in getattr(snap, "bsl_pools", []) or [] if _active_pool(t)]
+            prices_between = [_px(t) for t in pools if price < _px(t) < sl]
+            if prices_between:
+                zones = _cluster(prices_between)
+                zone = max(zones, key=lambda z: max(z))
+                candidate = max(zone) + _zone_buffer(zone)
+                if _within_push_cap(candidate):
                     sl = max(sl, candidate)
+            for _ in range(4):
+                near = [_px(t) for t in pools if abs(_px(t) - sl) <= _STOP_EXCLUSION_ATR * atr]
+                if not near:
+                    break
+                candidate = max(near) + _zone_buffer(near)
+                if candidate <= sl or not _within_push_cap(candidate):
+                    break
+                sl = candidate
+
         return sl
 
     @staticmethod
