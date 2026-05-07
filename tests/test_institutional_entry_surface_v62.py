@@ -129,7 +129,8 @@ class InstitutionalEntrySurfaceV62Tests(unittest.TestCase):
         from strategy.quant_strategy import QuantStrategy
         src = inspect.getsource(QuantStrategy._enter_trade)
         self.assertIn("_maker_safe_delta_limit", src)
-        self.assertIn("retrying once with deeper post-only maker limit", src)
+        self.assertIn("repricing protected maker bracket from fresh book", src)
+        self.assertIn("DELTA_BRACKET_MAKER_MAX_ATTEMPTS", src)
         self.assertIn("failed after maker-safe retry", src)
         self.assertNotIn("fallback_to_market=True", src)
 

@@ -1274,6 +1274,11 @@ class OrderManager:
             f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
             f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
+        # Expose the exact failure reason to QuantStrategy so it can decide
+        # whether to reprice due to post-only crossing or stop because the
+        # exchange rejected the schema/size. This is local state only; it is
+        # overwritten on every bracket attempt.
+        self.last_bracket_failure = None
 
         data = self._adapter.place_bracket_limit_entry(
             side=side, quantity=quantity,
@@ -1282,6 +1287,12 @@ class OrderManager:
         if not data or data.get("_error"):
             sc = (data or {}).get("_sc", 0)
             raw = (data or {}).get("_raw", {})
+            err = ""
+            try:
+                err = str((raw or {}).get("error") or (raw or {}).get("message") or "")
+            except Exception:
+                err = ""
+            self.last_bracket_failure = {"reason": "api_error", "status_code": sc, "error": err, "raw": raw}
             logger.error(f"Bracket order failed: sc={sc} raw={raw}")
             return None
 
@@ -1480,7 +1491,9 @@ class OrderManager:
                 logger.info(f"Bracket order {order_id[:8]}… cancelled by exchange")
                 break
 
-        # Timeout — cancel and signal caller to retry after cooldown
+        # Timeout — cancel and signal caller to retry/reprice.  Timeout is not
+        # an exchange schema failure; it means the maker price did not get filled.
+        self.last_bracket_failure = {"reason": "timeout", "order_id": order_id, "limit_price": float(limit_price)}
         self.cancel_order(order_id)
         logger.info(f"Bracket order timeout after {timeout_sec:.0f}s — cancelled")
         return None

@@ -6309,15 +6309,8 @@ class QuantStrategy:
             bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
         )
 
-        def _maker_safe_delta_limit(px: float, depth_ticks: int = 1) -> float:
-            """Return a post-only-safe bracket entry limit for Delta.
-
-            Delta native brackets are intentionally post-only.  A valid thesis
-            should not be lost because the OTE limit is one tick through the
-            book at send time.  Reprice passively; never switch to a naked
-            taker fallback.
-            """
-            safe = float(px or price)
+        def _read_top_of_book():
+            """Return (best_bid, best_ask) from the freshest available book."""
             try:
                 ob = data_manager.get_orderbook() or {}
                 bids = ob.get("bids", []) or []
@@ -6330,48 +6323,127 @@ class QuantStrategy:
                     return 0.0
                 best_bid = _lvl_px(bids[0]) if bids else 0.0
                 best_ask = _lvl_px(asks[0]) if asks else 0.0
-                cushion = max(1, int(depth_ticks)) * tick
-                if side == "long" and best_ask > 0.0:
-                    safe = min(safe, best_ask - cushion)
-                    if best_bid > 0.0:
-                        safe = max(safe, best_bid - cushion) if safe >= best_ask else safe
-                elif side == "short" and best_bid > 0.0:
-                    safe = max(safe, best_bid + cushion)
-                    if best_ask > 0.0:
-                        safe = min(safe, best_ask + cushion) if safe <= best_bid else safe
+                if best_bid > 0.0 and best_ask > 0.0 and best_bid > best_ask:
+                    # Broken/stale book snapshot; do not trust it for post-only pricing.
+                    return 0.0, 0.0
+                return best_bid, best_ask
             except Exception as exc:
-                logger.debug("maker-safe Delta reprice skipped: %s", exc)
-            safe = _round_to_tick(safe)
-            if safe > 0 and abs(safe - px) > max(tick * 0.5, 1e-9):
+                logger.debug("top-of-book read skipped: %s", exc)
+                return 0.0, 0.0
+
+        def _maker_safe_delta_limit(px: float, depth_ticks: int = 1, mode: str = "aggressive") -> float:
+            """Return a Delta post-only-safe bracket entry price.
+
+            The previous implementation only nudged the model entry a few ticks.
+            That is not enough on a fast book: Delta rejects post_only if the
+            order would immediately execute at the matching engine.  This helper
+            prices from the *current top of book* immediately before REST send.
+
+            mode='aggressive': sit inside spread but strictly non-crossing.
+            mode='hard_join': join/step behind the passive side after an
+            immediate_execution_post_only rejection.
+            """
+            safe = float(px or price)
+            best_bid, best_ask = _read_top_of_book()
+            cushion = max(1, int(depth_ticks)) * tick
+            side_l = str(side).lower()
+
+            if side_l == "long":
+                if best_bid > 0.0 and best_ask > 0.0:
+                    if mode == "hard_join":
+                        safe = best_bid - cushion
+                    else:
+                        # Most aggressive maker buy: below best ask. If spread is
+                        # wide this can improve the bid; if the book moves before
+                        # REST reaches Delta, final clamp below prevents crossing.
+                        safe = min(float(px or best_ask), best_ask - cushion)
+                        if safe <= 0:
+                            safe = best_bid - cushion
+                    if safe >= best_ask:
+                        safe = best_bid - cushion
+                elif best_ask > 0.0:
+                    safe = min(float(px or best_ask), best_ask - cushion)
+                elif best_bid > 0.0:
+                    safe = min(float(px or best_bid), best_bid - cushion)
+                else:
+                    safe = float(px or price) - cushion
+            else:
+                if best_bid > 0.0 and best_ask > 0.0:
+                    if mode == "hard_join":
+                        safe = best_ask + cushion
+                    else:
+                        # Most aggressive maker sell: above best bid.
+                        safe = max(float(px or best_bid), best_bid + cushion)
+                        if safe <= 0:
+                            safe = best_ask + cushion
+                    if safe <= best_bid:
+                        safe = best_ask + cushion
+                elif best_bid > 0.0:
+                    safe = max(float(px or best_bid), best_bid + cushion)
+                elif best_ask > 0.0:
+                    safe = max(float(px or best_ask), best_ask + cushion)
+                else:
+                    safe = float(px or price) + cushion
+
+            safe = _round_to_tick(max(safe, tick))
+            if safe > 0 and abs(safe - float(px or safe)) > max(tick * 0.5, 1e-9):
                 logger.info(
-                    "Delta maker-safe bracket reprice: %s $%.2f -> $%.2f (%d tick passive cushion)",
-                    side.upper(), px, safe, max(1, int(depth_ticks)))
+                    "Delta maker-safe bracket reprice: %s $%.2f -> $%.2f (%s, %d tick cushion; bid=$%.2f ask=$%.2f)",
+                    side.upper(), float(px or safe), safe, mode, max(1, int(depth_ticks)), best_bid, best_ask)
             return safe
 
         if _delta_requires_native_bracket:
-            limit_px = _maker_safe_delta_limit(limit_px, depth_ticks=1)
-
-        entry_data = order_manager.place_bracket_limit_entry(
-            side=side, quantity=qty,
-            limit_price=limit_px,
-            sl_price=sl_price, tp_price=tp_price,
-            timeout_sec=limit_timeout,
-            on_order_placed=_on_order_placed,
-        )
-        if entry_data is None and _delta_requires_native_bracket:
-            retry_px = _maker_safe_delta_limit(limit_px, depth_ticks=2)
-            if retry_px > 0 and abs(retry_px - limit_px) >= max(tick * 0.5, 1e-9):
-                logger.warning(
-                    "Delta native bracket first attempt failed; retrying once with deeper post-only maker limit $%.2f -> $%.2f",
-                    limit_px, retry_px)
+            # Native brackets must stay post-only and protected.  Use shorter
+            # maker attempts and reprice from the live book instead of waiting
+            # a full 60s on one stale passive price.  No naked fallback.
+            max_attempts = int(getattr(config, "DELTA_BRACKET_MAKER_MAX_ATTEMPTS", 4))
+            attempt_timeout = float(getattr(config, "DELTA_BRACKET_MAKER_ATTEMPT_TIMEOUT_SEC", 12.0))
+            max_attempts = max(1, min(max_attempts, 8))
+            attempt_timeout = max(3.0, min(attempt_timeout, max(3.0, limit_timeout)))
+            deadline = time.time() + max(limit_timeout, attempt_timeout)
+            entry_data = None
+            last_px = float(limit_px)
+            last_reason = ""
+            for attempt in range(1, max_attempts + 1):
+                remaining = max(0.0, deadline - time.time())
+                if remaining <= 0.5:
+                    break
+                # After an immediate post-only rejection, price from hard join;
+                # after a timeout, re-enter aggressively but non-crossing so the
+                # quote has a realistic chance to fill.
+                if "immediate_execution_post_only" in last_reason:
+                    mode = "hard_join"
+                    depth = min(6, attempt + 1)
+                else:
+                    mode = "aggressive"
+                    depth = 1
+                limit_px = _maker_safe_delta_limit(last_px, depth_ticks=depth, mode=mode)
+                this_timeout = min(attempt_timeout, remaining)
                 entry_data = order_manager.place_bracket_limit_entry(
                     side=side, quantity=qty,
-                    limit_price=retry_px,
+                    limit_price=limit_px,
                     sl_price=sl_price, tp_price=tp_price,
-                    timeout_sec=limit_timeout,
+                    timeout_sec=this_timeout,
                     on_order_placed=_on_order_placed,
                 )
                 if entry_data is not None:
+                    entry_ref = limit_px
+                    break
+                failure = getattr(order_manager, "last_bracket_failure", None) or {}
+                last_reason = " ".join(str(failure.get(k, "")) for k in ("reason", "error", "status_code"))
+                logger.warning(
+                    "Delta native bracket attempt %d/%d failed (%s); repricing protected maker bracket from fresh book",
+                    attempt, max_attempts, last_reason.strip() or "unknown")
+                last_px = limit_px
+        else:
+            entry_data = order_manager.place_bracket_limit_entry(
+                side=side, quantity=qty,
+                limit_price=limit_px,
+                sl_price=sl_price, tp_price=tp_price,
+                timeout_sec=limit_timeout,
+                on_order_placed=_on_order_placed,
+            )
+        if entry_data is not None:
                     limit_px = retry_px
                     entry_ref = retry_px
         if entry_data is not None:
