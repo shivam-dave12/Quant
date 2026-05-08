@@ -1881,6 +1881,7 @@ class EntryEngine:
             max_buffer_atr=2.0,
             min_risk=min_risk,
         )
+        anchored_by_pool = False
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
             if pool_risk > max_risk:
@@ -1901,6 +1902,7 @@ class EntryEngine:
                 if accept_pool:
                     sl = pool_sl
                     risk = pool_risk
+                    anchored_by_pool = True
                     details = ", ".join(getattr(pool_pick, "reasons", []) or [])
                     logger.info(
                         "SL envelope %s: anchored behind protective liquidity at $%.1f "
@@ -1918,7 +1920,12 @@ class EntryEngine:
                         "refusing executable stop inside liquidity"
                     )
 
-        sl = self._push_sl_behind_pools(sl, side, price, atr)
+        # If the dedicated liquidity-pool selector already anchored the stop
+        # outside its protective shelf, do not run the legacy generic pusher
+        # again.  Double-buffering the same stop cluster widened GOLD/BTC stops
+        # from executable institutional risk into oversized no-TP geometry.
+        if not anchored_by_pool:
+            sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
 
         if not self._sl_is_protective(side, sl, price):

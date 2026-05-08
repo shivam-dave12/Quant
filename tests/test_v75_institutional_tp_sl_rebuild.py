@@ -184,3 +184,33 @@ def test_btc_and_silver_reject_extreme_terminal_pool_as_full_tp():
         )
     assert sil_tp is None
     assert "too far for SILVER full-position TP" in sil_report.summary
+
+
+def test_gold_accepted_auction_can_use_reasonable_htf_bsl_from_log_pattern():
+    """Regression for v76: accepted GOLD long was rejected by treating HTF BSL
+    as first-sweep probability only, despite reasonable distance and payoff.
+    """
+    entry = 4712.2
+    sl = 4690.6
+    atr = (entry - sl) / 5.31
+    snap = _snapshot(
+        bsl=[
+            _target(4754.2, PoolSide.BSL, entry=entry, atr=atr, tf="4h", sig_boost=120.0, htf_count=5),
+            _target(4723.6, PoolSide.BSL, entry=entry, atr=atr, tf="1h", sig_boost=80.0, htf_count=3),
+            _target(4727.7, PoolSide.BSL, entry=entry, atr=atr, tf="15m", sig_boost=80.0, htf_count=2),
+        ],
+        ssl=[],
+        nearest_bsl_atr=0.1,
+        nearest_ssl_atr=0.3,
+    )
+
+    with instrument_scope(_instrument("GOLD", AssetClass.COMMODITY)):
+        tp, target, score, report = select_tp_with_report(
+            snap, "long", entry=entry, sl=sl, atr=atr,
+            min_rr=2.0, posterior_prob=0.88,
+        )
+
+    assert tp is not None, report.summary
+    assert target.pool.price == pytest.approx(4754.2)
+    assert score.components["delivery_prob"] >= score.components["required_delivery_prob"]
+    assert score.rr >= 1.8

@@ -76,3 +76,30 @@ def test_sl_envelope_refuses_pool_beyond_liquidation_guard_instead_of_shrinking_
     assert sl is None
     assert "beyond liquidation guard" in reason
     assert "inside liquidity" in reason
+
+
+def test_sl_envelope_does_not_double_buffer_after_pool_anchor():
+    """Regression for v76 log: pool selector anchored GOLD behind SSL, then
+    legacy pusher widened the same stop again and killed TP geometry.
+    """
+    e = _engine_for_sl_envelope()
+    e._liquidation_guard = lambda side, entry: (4500.0, 4400.0, 500.0)
+    e._current_quant_posterior = lambda: 0.88
+    e._dominant_institutional_tp_reward = lambda snap, side, price, atr: 170.0
+    pick = SimpleNamespace(quality=1.0, reasons=["selected protective SSL"])
+    target = SimpleNamespace(pool=SimpleNamespace(price=4698.0))
+    e._find_sl_pool = lambda **kwargs: (4693.8, target, pick)
+    e._push_sl_behind_pools = lambda sl, side, price, atr: 4690.6
+
+    sl, reason = e._apply_institutional_sl_envelope(
+        snap=SimpleNamespace(),
+        side="long",
+        price=4712.2,
+        atr=4.07,
+        structural_sl=4702.6,
+        invalidation_price=4702.6,
+        label="reversal",
+    )
+
+    assert sl == 4693.8
+    assert reason == "ok"

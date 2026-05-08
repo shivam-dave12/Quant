@@ -936,6 +936,25 @@ def _calibrated_delivery_probability(
     except Exception:
         pass
 
+    # v77: conditional delivery lift.  Once the entry posterior has accepted a
+    # setup, the TP probability is no longer the same thing as the raw
+    # first-touch model.  A strong accepted auction can deliver to a reasonable
+    # HTF pool even when that pool is not the very next sweep.  Keep this lift
+    # bounded by distance/reach quality so it cannot resurrect v75 moonshots.
+    if posterior >= 0.70 and rr >= max(asset_profile.full_tp_rr_floor, 1.35):
+        if distance_q >= 0.45 and reach_q >= max(0.18, 0.55 * asset_profile.terminal_reach_floor):
+            conditional_lift = (
+                0.64 * base
+                + 0.17 * posterior
+                + 0.10 * math.sqrt(first_sweep)
+                + 0.09 * pool_q
+            )
+            conditional_lift *= (0.82 + 0.18 * distance_q)
+            conditional_lift *= (0.88 + 0.12 * _clamp(gauntlet_mult, 0.45, 1.00))
+            if terminal_target:
+                conditional_lift *= 0.90
+            base = max(base, conditional_lift)
+
     # Critical guardrail: pool quality/posterior cannot invent probability when
     # the path/reach model says the target is barely deliverable.  Cap delivery
     # by a path-quality envelope, then apply a tiny floor scaled by distance-fit.
@@ -951,6 +970,11 @@ def _calibrated_delivery_probability(
         path_cap = (0.30 + 0.65 * math.sqrt(first_sweep))
         path_cap *= (0.55 + 0.45 * distance_q)
         path_cap *= (0.60 + 0.40 * math.sqrt(_clamp(reach_q, 0.0, 1.0)))
+        if posterior >= 0.70 and distance_q >= 0.45 and rr >= max(asset_profile.full_tp_rr_floor, 1.35):
+            # Conditional accepted-auction cap lift: bounded by reach/distance,
+            # not by RR.  This lets GOLD/BTC/SILVER use realistic external
+            # liquidity without allowing unreachable full-position TPs.
+            path_cap += 0.18 * posterior * distance_q * math.sqrt(_clamp(reach_q, 0.0, 1.0))
 
     cap = 0.88 if asset_profile.asset_id in ("BTC", "GOLD", "SILVER") else 0.80
     if terminal_target:
