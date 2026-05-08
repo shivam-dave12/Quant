@@ -2388,6 +2388,7 @@ class PositionState:
     trade_mode: str = "reversion"  # "reversion" | "trend" | "momentum"
     entry_fill_type: str = "taker"  # v4.3: "maker" | "taker" — for correct PnL fee calc
     entry_fee_paid: float = 0.0    # v8.1: exact paid_commission from Delta entry order (0 = use estimate)
+    execution_leverage: float = 0.0
     trail_override: Optional[bool] = None  # v4.3: None=use config, True=force on, False=force off
     hold_extensions: int = 0  # v4.6: how many times max-hold has been extended
     consecutive_trail_holds: int = 0  # v5.1: structural trail tracking
@@ -2427,7 +2428,8 @@ class PositionState:
     def to_dict(self):
         return {"side": self.side, "quantity": self.quantity,
                 "entry_price": self.entry_price,
-                "sl_price": self.sl_price, "tp_price": self.tp_price}
+                "sl_price": self.sl_price, "tp_price": self.tp_price,
+                "execution_leverage": self.execution_leverage}
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RISK GATE with consecutive loss lockout
@@ -2782,7 +2784,7 @@ class QuantStrategy:
             ctx = {
                 "state": phase,
                 "price": price if price > 0 else None,
-                "leverage": QCfg.LEVERAGE(),
+                "leverage": self._position_leverage(p),
             }
             if p is not None and not getattr(p, "is_flat", lambda: True)():
                 ctx.update({
@@ -3227,37 +3229,157 @@ class QuantStrategy:
             "15m": 3, "30m": 3, "1h": 4, "4h": 5, "1d": 6,
         }.get(str(tf or "").lower(), 1)
 
-    def _sl_liquidation_sanity(self, side: str, entry: float, sl: float):
+    @staticmethod
+    def _liquidation_params() -> tuple[float, float]:
+        maint_margin = float(_cfg("MAINTENANCE_MARGIN_RATE", 0.005))
+        liq_buffer = float(_cfg("LIQUIDATION_BUFFER_PCT", 0.005))
+        return max(0.0, maint_margin), max(0.0, liq_buffer)
+
+    @staticmethod
+    def _liq_headroom_points(entry: float, sl: float) -> float:
+        risk = abs(float(entry or 0.0) - float(sl or 0.0))
+        risk_mult = float(_cfg("DYNAMIC_EXECUTION_LIQ_HEADROOM_RISK_MULT", 1.10))
+        min_pct = float(_cfg("DYNAMIC_EXECUTION_MIN_LIQ_HEADROOM_PCT", 0.0010))
+        return max(max(0.0, risk_mult - 1.0) * risk, max(0.0, float(entry or 0.0)) * max(0.0, min_pct))
+
+    @classmethod
+    def _liquidation_guard_for_leverage(cls, side: str, entry: float, leverage: Optional[float] = None):
+        entry = float(entry or 0.0)
+        if entry <= 0:
+            return 0.0, 0.0, 0.0
+        leverage = max(float(leverage or QCfg.LEVERAGE() or 1.0), 1.0)
+        maint_margin, liq_buffer = cls._liquidation_params()
+        liq_move = max((1.0 / leverage) - maint_margin, 0.001)
+        if str(side or "").lower() == "long":
+            liq_price = entry * (1.0 - liq_move)
+            guard = liq_price * (1.0 + liq_buffer)
+            return liq_price, guard, max(entry - guard, 0.0)
+        liq_price = entry * (1.0 + liq_move)
+        guard = liq_price * (1.0 - liq_buffer)
+        return liq_price, guard, max(guard - entry, 0.0)
+
+    @classmethod
+    def _stop_clears_liquidation_guard(cls, side: str, entry: float, sl: float, leverage: Optional[float] = None):
+        liq_price, guard, room = cls._liquidation_guard_for_leverage(side, entry, leverage=leverage)
+        if room <= 0:
+            return False, liq_price, guard
+        headroom = cls._liq_headroom_points(entry, sl)
+        if str(side or "").lower() == "long":
+            return float(sl or 0.0) > guard + headroom, liq_price, guard
+        return float(sl or 0.0) < guard - headroom, liq_price, guard
+
+    def _execution_leverage_for_stop(self, side: str, entry: float, sl: float):
+        side = str(side or "").lower()
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        if entry <= 0.0 or sl <= 0.0:
+            return 0.0, 0.0, 0.0, "missing entry/SL"
+        if side == "long" and sl >= entry:
+            return 0.0, 0.0, 0.0, "long SL is not protective"
+        if side == "short" and sl <= entry:
+            return 0.0, 0.0, 0.0, "short SL is not protective"
+        if side not in ("long", "short"):
+            return 0.0, 0.0, 0.0, "unknown side"
+
+        cap = max(1, int(math.floor(float(QCfg.LEVERAGE() or 1.0))))
+        min_lev = max(1, int(_cfg("DYNAMIC_EXECUTION_MIN_LEVERAGE", 1)))
+        floor = min(cap, min_lev)
+        dynamic_enabled = bool(_cfg("DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS", True))
+        if not dynamic_enabled:
+            ok, liq, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=cap)
+            return (float(cap), liq, guard, "policy leverage") if ok else (0.0, liq, guard, "policy leverage breaches liquidation guard")
+
+        hint = float(getattr(getattr(self, "_last_entry_signal", None), "execution_leverage", 0.0) or 0.0)
+        if hint > 0.0:
+            hint_i = max(floor, min(cap, int(math.floor(hint))))
+            ok, liq, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=hint_i)
+            if ok:
+                return float(hint_i), liq, guard, f"EntryEngine leverage hint {hint_i}x"
+
+        for lev in range(cap, floor - 1, -1):
+            ok, liq, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=lev)
+            if ok:
+                if lev < cap:
+                    return float(lev), liq, guard, f"derived leverage {lev}x for structural stop"
+                return float(lev), liq, guard, f"policy leverage {lev}x"
+        ok, liq, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=floor)
+        if ok:
+            return float(floor), liq, guard, f"minimum leverage {floor}x for structural stop"
+        return 0.0, liq, guard, f"no exchange leverage {floor}x-{cap}x keeps SL before liquidation"
+
+    def _sl_liquidation_sanity(self, side: str, entry: float, sl: float, leverage: Optional[float] = None):
         entry = float(entry or 0.0)
         sl = float(sl or 0.0)
         if entry <= 0 or sl <= 0:
             return False, 0.0, 0.0, "missing entry/SL"
         side = str(side or "").lower()
-        leverage = max(float(QCfg.LEVERAGE()), 1.0)
-        maint_margin = float(_cfg("MAINTENANCE_MARGIN_RATE", 0.005))
-        liq_buffer = float(_cfg("LIQUIDATION_BUFFER_PCT", 0.005))
-        liq_move = max((1.0 / leverage) - maint_margin, 0.001)
+        leverage_override = leverage
+        leverage = max(float(leverage or QCfg.LEVERAGE()), 1.0)
         if side == "long":
-            liq_price = entry * (1.0 - liq_move)
-            guard = liq_price * (1.0 + liq_buffer)
+            liq_price, guard, _room = self._liquidation_guard_for_leverage(side, entry, leverage=leverage)
             if sl >= entry:
                 return False, liq_price, guard, "long SL is not protective"
-            if sl <= guard:
+            ok, liq_price, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=leverage)
+            if not ok:
+                if leverage_override is None and bool(_cfg("DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS", True)):
+                    dyn_lev, dyn_liq, dyn_guard, dyn_reason = self._execution_leverage_for_stop(side, entry, sl)
+                    if dyn_lev > 0.0:
+                        return True, dyn_liq, dyn_guard, dyn_reason
                 return False, liq_price, guard, (
                     f"long SL ${sl:,.1f} is beyond liquidation guard ${guard:,.1f}"
                 )
             return True, liq_price, guard, ""
         if side == "short":
-            liq_price = entry * (1.0 + liq_move)
-            guard = liq_price * (1.0 - liq_buffer)
+            liq_price, guard, _room = self._liquidation_guard_for_leverage(side, entry, leverage=leverage)
             if sl <= entry:
                 return False, liq_price, guard, "short SL is not protective"
-            if sl >= guard:
+            ok, liq_price, guard = self._stop_clears_liquidation_guard(side, entry, sl, leverage=leverage)
+            if not ok:
+                if leverage_override is None and bool(_cfg("DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS", True)):
+                    dyn_lev, dyn_liq, dyn_guard, dyn_reason = self._execution_leverage_for_stop(side, entry, sl)
+                    if dyn_lev > 0.0:
+                        return True, dyn_liq, dyn_guard, dyn_reason
                 return False, liq_price, guard, (
                     f"short SL ${sl:,.1f} is beyond liquidation guard ${guard:,.1f}"
                 )
             return True, liq_price, guard, ""
         return False, 0.0, 0.0, "unknown side"
+
+    @staticmethod
+    def _position_leverage(pos: Optional[PositionState] = None) -> float:
+        try:
+            lev = float(getattr(pos, "execution_leverage", 0.0) or 0.0) if pos is not None else 0.0
+            if lev > 0.0 and math.isfinite(lev):
+                return max(1.0, lev)
+        except Exception:
+            pass
+        return max(float(QCfg.LEVERAGE()), 1.0)
+
+    def _set_execution_leverage(self, order_manager, leverage: float) -> bool:
+        target = max(1, int(math.floor(float(leverage or 0.0))))
+        if target <= 0:
+            return False
+        configured = max(1, int(math.floor(float(QCfg.LEVERAGE() or 1.0))))
+        current = max(1, int(getattr(self, "_last_execution_leverage_set", configured) or configured))
+        if target == current:
+            return True
+        if not bool(_cfg("DYNAMIC_LEVERAGE_PREORDER_SET", True)):
+            return True
+        if not hasattr(order_manager, "set_leverage"):
+            logger.error("Entry rejected: order manager cannot set dynamic execution leverage to %sx", target)
+            return False
+        try:
+            resp = order_manager.set_leverage(target)
+            ok = not isinstance(resp, dict) or (bool(resp.get("success", True)) and not resp.get("_error"))
+            if ok:
+                self._last_execution_leverage_set = target
+                logger.info("Execution leverage set to %sx for structural-stop route (policy cap %sx)", target, configured)
+                return True
+            logger.error("Entry rejected: dynamic leverage %sx was not confirmed by exchange: %s", target, resp)
+            return False
+        except Exception as exc:
+            logger.error("Entry rejected: failed to set dynamic leverage %sx: %s", target, exc)
+            return False
 
     def _target_pool_realism(self, signal, liq_snapshot, side: str,
                              entry: float, tp: float, sl: float, atr: float):
@@ -4416,7 +4538,8 @@ class QuantStrategy:
             try:
                 if pos.entry_price > 0 and pos.quantity > 0:
                     _notional = pos.entry_price * pos.quantity
-                    _margin = _notional / QCfg.LEVERAGE() if QCfg.LEVERAGE() > 0 else _notional
+                    _lev = self._position_leverage(pos)
+                    _margin = _notional / _lev if _lev > 0 else _notional
                     if _margin > 1e-10:
                         _margin_pnl_pct = (profit_pts * pos.quantity / _margin) * 100.0
             except Exception: pass
@@ -6228,20 +6351,6 @@ class QuantStrategy:
         td = abs(entry_ref - tp_price)
         if sd < 1e-10: return
         rr = td / sd
-        _liq_entry_ref = entry_ref
-        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
-            side, _liq_entry_ref, sl_price)
-        if not _liq_ok:
-            logger.warning(
-                f"Entry rejected by liquidation guard: {side.upper()} "
-                f"entry=${_liq_entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason}")
-            with self._lock:
-                self._last_tp_gate_rejection = time.time()
-            return
-        logger.info(
-            f"Liquidation guard OK: est_liq=${_liq_px:,.1f} "
-            f"guard=${_liq_guard:,.1f} SL=${sl_price:,.1f}")
-
         # ── FIX Bug-B STEP 2: Size using actual SL distance ──────────────────────
         # Now that sl_price is known, size from dollar risk / actual SL distance.
         # The institutional decision multiplier is applied on top of that base.
@@ -6296,10 +6405,27 @@ class QuantStrategy:
             return
         rr = td / sd
 
+        exec_leverage, _liq_px, _liq_guard, _lev_reason = self._execution_leverage_for_stop(
+            side, entry_ref, sl_price)
+        _liq_ok, _liq_px, _liq_guard, _liq_reason = self._sl_liquidation_sanity(
+            side, entry_ref, sl_price, leverage=exec_leverage if exec_leverage > 0.0 else None)
+        if exec_leverage <= 0.0 or not _liq_ok:
+            logger.warning(
+                f"Entry rejected by liquidation guard: {side.upper()} "
+                f"entry=${entry_ref:,.1f} SL=${sl_price:,.1f} | {_liq_reason or _lev_reason}")
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
+        logger.info(
+            f"Liquidation guard OK: lev={exec_leverage:.0f}x "
+            f"est_liq=${_liq_px:,.1f} guard=${_liq_guard:,.1f} "
+            f"SL=${sl_price:,.1f} | {_lev_reason}")
+
         qty = self._compute_quantity(
             risk_manager, entry_ref, sig=sig, ict_tier=ict_tier, sl_price=sl_price,
             prefetched_bal_info=bal_info, side=side, tp_price=tp_price,
-            use_maker_entry=use_maker, posterior_prob=exec_posterior
+            use_maker_entry=use_maker, posterior_prob=exec_posterior,
+            leverage_override=exec_leverage,
         )
         if qty is None or qty < QCfg.MIN_QTY():
             # No order was sent. Treat as a pre-order rejection, not a trade
@@ -6314,7 +6440,7 @@ class QuantStrategy:
         logger.info(
             f"ENTERING {side.upper()} @ ${entry_ref:,.2f} | qty={qty} | "
             f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} payoff/risk=1:{rr:.2f} | "
-            f"{'maker' if use_maker else 'taker'} | {_sig_diag}"
+            f"lev={exec_leverage:.0f}x | {'maker' if use_maker else 'taker'} | {_sig_diag}"
         )
 
         # ── Place entry ────────────────────────────────────────────────────────────
@@ -6355,6 +6481,11 @@ class QuantStrategy:
             _active_exchange == "delta" and
             bool(getattr(config, "DELTA_REQUIRE_NATIVE_BRACKET", True))
         )
+
+        if not self._set_execution_leverage(order_manager, exec_leverage):
+            with self._lock:
+                self._last_tp_gate_rejection = time.time()
+            return
 
         entry_data = order_manager.place_bracket_limit_entry(
             side=side, quantity=qty,
@@ -6656,6 +6787,7 @@ class QuantStrategy:
             trade_mode      = mode,
             entry_fill_type = actual_fill_type,  # v4.3: for correct PnL fee calc
             entry_fee_paid  = entry_fee_paid,     # v8.1: exact from Delta paid_commission
+            execution_leverage = exec_leverage,
             ict_entry_tier  = ict_tier,           # v7.0: confidence tier for analytics
             entry_session   = entry_session,
             # FIX 8b: capture actual HTF scores at entry so _record_pnl can log them correctly
@@ -8498,7 +8630,7 @@ class QuantStrategy:
                     reason       = exit_reason,
                     pnl_override = pnl,
                     instrument   = getattr(self, "_instrument", None),
-                    leverage     = QCfg.LEVERAGE(),
+                    leverage     = self._position_leverage(pos),
                 )
         except Exception as _rm_rec_e:
             logger.debug(f"risk_manager.record_trade error (non-fatal): {_rm_rec_e}")
@@ -8535,7 +8667,7 @@ class QuantStrategy:
         try:
             if pos.entry_price > 0 and pos.quantity > 0:
                 _exit_notional = pos.entry_price * pos.quantity
-                _exit_lev = QCfg.LEVERAGE()
+                _exit_lev = self._position_leverage(pos)
                 _exit_margin_used = _exit_notional / _exit_lev if _exit_lev > 0 else _exit_notional
                 if _exit_margin_used > 1e-10:
                     _exit_margin_pct = (pnl / _exit_margin_used) * 100.0
@@ -8656,7 +8788,7 @@ class QuantStrategy:
         try:
             _entry_px_hist = float(getattr(pos, 'entry_price', 0.0) or 0.0)
             _qty_hist = float(getattr(pos, 'quantity', 0.0) or 0.0)
-            _lev_hist = float(QCfg.LEVERAGE() or 1.0)
+            _lev_hist = float(self._position_leverage(pos) or 1.0)
             _hist_notional = _entry_px_hist * _qty_hist
             _hist_margin_used = _hist_notional / _lev_hist if _lev_hist > 0 else _hist_notional
             _hist_margin_pnl_pct = (pnl / _hist_margin_used * 100.0) if _hist_margin_used > 1e-10 else 0.0
@@ -8683,6 +8815,7 @@ class QuantStrategy:
             "sl":           getattr(pos, 'sl_price', 0.0),
             "tp":           getattr(pos, 'tp_price', 0.0),
             "init_sl_dist": init_sl_dist,
+            "execution_leverage": round(_lev_hist, 4),
             "notional":     round(_hist_notional, 4),
             "margin_used":  round(_hist_margin_used, 4),
             "pnl":          pnl,
@@ -8792,7 +8925,7 @@ class QuantStrategy:
             _qty = getattr(pos, 'quantity', 0.0)
             if _entry_px > 0 and _qty > 0:
                 _notional_f = _entry_px * _qty
-                _lev_f = QCfg.LEVERAGE()
+                _lev_f = self._position_leverage(pos)
                 _margin_used_final = _notional_f / _lev_f if _lev_f > 0 else _notional_f
                 if _margin_used_final > 1e-10:
                     _margin_pnl_pct_final = (pnl / _margin_used_final) * 100.0
@@ -9216,7 +9349,8 @@ class QuantStrategy:
                            side: str = "",
                            tp_price: float = 0.0,
                            use_maker_entry: bool = False,
-                           posterior_prob: Optional[float] = None) -> Optional[float]:
+                           posterior_prob: Optional[float] = None,
+                           leverage_override: Optional[float] = None) -> Optional[float]:
         """
         Risk-calibrated position sizing — sweep-posterior (CRIT-1 fix).
 
@@ -9267,7 +9401,7 @@ class QuantStrategy:
             pass
         min_qty = max(float(QCfg.MIN_QTY()), step)
         max_qty = max(min_qty, float(QCfg.MAX_QTY()))
-        leverage = max(float(QCfg.LEVERAGE()), 1.0)
+        leverage = max(float(leverage_override or QCfg.LEVERAGE()), 1.0)
 
         # ── Tier multiplier ───────────────────────────────────────────────────
         _tier_base = {"S": 1.00, "A": 0.80, "B": 0.65}.get(ict_tier, 0.50)
@@ -9830,7 +9964,7 @@ class QuantStrategy:
         if not p.is_flat() and p.entry_price > 0 and p.quantity > 0:
             try:
                 _rpt_notional = p.entry_price * p.quantity
-                _rpt_lev = QCfg.LEVERAGE()
+                _rpt_lev = self._position_leverage(p)
                 _rpt_margin = _rpt_notional / _rpt_lev if _rpt_lev > 0 else _rpt_notional
                 if _rpt_margin > 1e-10:
                     _rpt_profit = (price - p.entry_price) if p.side == "long" else (p.entry_price - price)
@@ -10061,7 +10195,8 @@ class QuantStrategy:
             self._pos = PositionState(phase=PositionPhase.ACTIVE, side=iside, quantity=ex_size,
                 entry_price=ex_entry, sl_price=sl_p, tp_price=tp_p, sl_order_id=sl_oid,
                 tp_order_id=tp_oid, entry_time=time.time(), initial_sl_dist=_adopt_sl_dist,
-                entry_atr=_adopt_atr, entry_session=self._current_entry_session())
+                entry_atr=_adopt_atr, entry_session=self._current_entry_session(),
+                execution_leverage=float(QCfg.LEVERAGE()))
             self.current_sl_price=sl_p; self.current_tp_price=tp_p
             self._confirm_long=self._confirm_short=0
             # Reset duplicate guards for the newly adopted position

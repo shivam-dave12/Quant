@@ -337,6 +337,7 @@ class EntrySignal:
     reason:         str   = ""
     ict_validation: str   = ""
     created_at:     float = field(default_factory=time.time)
+    execution_leverage: float = 0.0
 
 
 @dataclass
@@ -763,7 +764,7 @@ class EntryEngine:
                 reason=f"{reason}; wait for raid-origin pullback",
             )
             logger.info(
-                "EntryEngine refine watch armed after SL/risk rejection: %s sweep $%.1f side=%s initial_entry=$%.1f structural_sl=$%.1f reason=%s",
+                "EntryEngine refine watch armed after pre-order rejection: %s sweep $%.1f side=%s initial_entry=$%.1f structural_sl=$%.1f reason=%s",
                 getattr(getattr(sweep, 'pool', None), 'timeframe', '?'),
                 float(getattr(getattr(sweep, 'pool', None), 'price', 0.0) or 0.0),
                 side.upper(), entry_price, structural_sl, reason,
@@ -1801,7 +1802,7 @@ class EntryEngine:
         return False
 
     @staticmethod
-    def _liquidation_guard(side: str, entry: float) -> tuple:
+    def _policy_leverage_cap() -> float:
         try:
             import config as _liq_cfg
             # v70: use the active instrument policy leverage, not global BTC
@@ -1811,15 +1812,35 @@ class EntryEngine:
             # sl_envelope deferrals on non-BTC products.
             try:
                 from core.market_policy import policy_value as _policy_value
-                leverage = max(float(_policy_value("leverage", getattr(_liq_cfg, "LEVERAGE", 1.0)) or 1.0), 1.0)
+                return max(float(_policy_value("leverage", getattr(_liq_cfg, "LEVERAGE", 1.0)) or 1.0), 1.0)
             except Exception:
-                leverage = max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+                return max(float(getattr(_liq_cfg, "LEVERAGE", 1.0)), 1.0)
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _liquidation_params() -> tuple[float, float]:
+        try:
+            import config as _liq_cfg
             maint_margin = float(getattr(_liq_cfg, "MAINTENANCE_MARGIN_RATE", 0.005))
             liq_buffer = float(getattr(_liq_cfg, "LIQUIDATION_BUFFER_PCT", 0.005))
         except Exception:
-            leverage = 1.0
             maint_margin = 0.005
             liq_buffer = 0.005
+        return max(0.0, maint_margin), max(0.0, liq_buffer)
+
+    @staticmethod
+    def _dynamic_leverage_enabled() -> bool:
+        try:
+            import config as _liq_cfg
+            return bool(getattr(_liq_cfg, "DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS", True))
+        except Exception:
+            return True
+
+    @classmethod
+    def _liquidation_guard(cls, side: str, entry: float, leverage: Optional[float] = None) -> tuple:
+        leverage = max(float(leverage or cls._policy_leverage_cap() or 1.0), 1.0)
+        maint_margin, liq_buffer = cls._liquidation_params()
         entry = float(entry or 0.0)
         if entry <= 0:
             return 0.0, 0.0, 0.0
@@ -1832,15 +1853,82 @@ class EntryEngine:
         guard = liq_price * (1.0 - liq_buffer)
         return liq_price, guard, max(guard - entry, 0.0)
 
+    @classmethod
+    def _liq_headroom_points(cls, entry: float, sl: float) -> float:
+        risk = abs(float(entry or 0.0) - float(sl or 0.0))
+        try:
+            import config as _liq_cfg
+            risk_mult = float(getattr(_liq_cfg, "DYNAMIC_EXECUTION_LIQ_HEADROOM_RISK_MULT", 1.10))
+            min_pct = float(getattr(_liq_cfg, "DYNAMIC_EXECUTION_MIN_LIQ_HEADROOM_PCT", 0.0010))
+        except Exception:
+            risk_mult = 1.10
+            min_pct = 0.0010
+        extra_risk = max(0.0, risk_mult - 1.0) * risk
+        min_abs = max(0.0, float(entry or 0.0)) * max(0.0, min_pct)
+        return max(extra_risk, min_abs)
+
+    @classmethod
+    def _stop_clears_liquidation_guard(
+        cls,
+        side: str,
+        entry: float,
+        sl: float,
+        leverage: Optional[float] = None,
+    ) -> tuple[bool, float, float]:
+        _liq, guard, room = cls._liquidation_guard(side, entry, leverage=leverage)
+        if room <= 0:
+            return False, _liq, guard
+        headroom = cls._liq_headroom_points(entry, sl)
+        if side == "long":
+            return sl > guard + headroom, _liq, guard
+        return sl < guard - headroom, _liq, guard
+
+    @classmethod
+    def _execution_leverage_for_stop(cls, side: str, entry: float, sl: float) -> tuple[float, float, float, str]:
+        side = str(side or "").lower()
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        if side not in ("long", "short") or entry <= 0.0 or sl <= 0.0:
+            return 0.0, 0.0, 0.0, "missing entry/SL"
+        if not cls._sl_is_protective(side, sl, entry):
+            return 0.0, 0.0, 0.0, "non-protective SL"
+
+        cap = max(1, int(math.floor(cls._policy_leverage_cap())))
+        try:
+            import config as _liq_cfg
+            min_lev = max(1, int(getattr(_liq_cfg, "DYNAMIC_EXECUTION_MIN_LEVERAGE", 1)))
+        except Exception:
+            min_lev = 1
+
+        search_floor = min(cap, min_lev)
+        if not cls._dynamic_leverage_enabled():
+            ok, liq, guard = cls._stop_clears_liquidation_guard(side, entry, sl, leverage=cap)
+            return (float(cap), liq, guard, "policy leverage") if ok else (0.0, liq, guard, "policy leverage breaches liquidation guard")
+
+        for lev in range(cap, search_floor - 1, -1):
+            ok, liq, guard = cls._stop_clears_liquidation_guard(side, entry, sl, leverage=float(lev))
+            if ok:
+                if lev < cap:
+                    return float(lev), liq, guard, f"derived leverage {lev}x keeps structural SL before liquidation"
+                return float(lev), liq, guard, f"policy leverage {lev}x keeps structural SL before liquidation"
+        ok, liq, guard = cls._stop_clears_liquidation_guard(side, entry, sl, leverage=float(search_floor))
+        if ok:
+            return float(search_floor), liq, guard, f"minimum leverage {search_floor}x keeps structural SL before liquidation"
+        return 0.0, liq, guard, f"no exchange leverage {search_floor}x-{cap}x keeps structural SL before liquidation"
+
     def _sl_before_liquidation(self, side: str, sl: float, price: float) -> bool:
         if not self._sl_is_protective(side, sl, price):
             return False
-        _liq, guard, room = self._liquidation_guard(side, price)
-        if room <= 0:
-            return False
-        if side == "long":
-            return sl > guard
-        return sl < guard
+        ok, _liq, _guard = self._stop_clears_liquidation_guard(side, price, sl)
+        if ok:
+            return True
+        exec_lev, liq, guard, _reason = self._execution_leverage_for_stop(side, price, sl)
+        if exec_lev > 0.0:
+            self._last_execution_leverage_hint = exec_lev
+            self._last_execution_liq_guard_hint = guard
+            self._last_execution_liq_price_hint = liq
+            return True
+        return False
 
     def _reject_bad_sl(self, side: str, sl: float, price: float,
                        sweep_price: float, now: float, reason: str) -> bool:
@@ -1989,10 +2077,19 @@ class EntryEngine:
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
             if pool_risk > max_risk:
-                return None, (
-                    f"protective SL pool ${pool_sl:.1f} sits beyond liquidation guard; "
-                    "refusing executable stop inside liquidity"
-                )
+                exec_lev, liq_px, liq_guard, lev_reason = self._execution_leverage_for_stop(side, price, pool_sl)
+                if exec_lev <= 0.0:
+                    return None, (
+                        f"protective SL pool ${pool_sl:.1f} sits beyond liquidation guard; "
+                        f"dynamic leverage unavailable ({lev_reason})"
+                    )
+                self._last_execution_leverage_hint = exec_lev
+                self._last_execution_liq_guard_hint = liq_guard
+                self._last_execution_liq_price_hint = liq_px
+                logger.info(
+                    "SL envelope %s: protective pool beyond policy guard accepted "
+                    "with execution leverage %.0fx (%s)",
+                    label, exec_lev, lev_reason)
             if pool_risk > risk:
                 target_reward = self._dominant_institutional_tp_reward(snap, side, price, atr)
                 pool_quality = float(getattr(pool_pick, "quality", 0.0) if pool_pick is not None else 0.0)
@@ -2029,7 +2126,9 @@ class EntryEngine:
         if not self._sl_is_protective(side, sl, price):
             return None, "SL crossed market after liquidity push"
         if not self._sl_before_liquidation(side, sl, price):
-            return None, f"SL breaches liquidation guard ${_liq_guard:.1f}"
+            exec_lev, _liq_px2, liq_guard2, lev_reason = self._execution_leverage_for_stop(side, price, sl)
+            guard_txt = liq_guard2 if liq_guard2 > 0 else _liq_guard
+            return None, f"SL breaches liquidation guard ${guard_txt:.1f}; {lev_reason}"
         if min_risk > 0.0 and risk < min_risk:
             return None, f"no structural SL meeting execution risk {risk:.1f}pts < {min_risk:.1f}pts"
         if risk > abs(price - structural_sl) + 1e-9:
@@ -2349,6 +2448,7 @@ class EntryEngine:
                     f"risk {p.initial_risk:.1f}->{risk:.1f}pts "
                     f"pullback={pullback/max(atr,1e-9):.2f}ATR"),
             ict_validation=self._ict_summary(ict, side),
+            execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
         logger.info(
             "🎯 REFINED SWING ENTRY: %s @ $%.1f | SL=$%.1f TP=$%.1f "
@@ -2459,6 +2559,14 @@ class EntryEngine:
                 f"CANDIDATE DEFERRED [no_liquidity_tp]: side={side} "
                 f"sweep=${sweep.pool.price:.1f} entry=${price:.1f} sl=${sl:.1f} "
                 f"| {self._last_pool_plan_summary()}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason=f"no_liquidity_tp; {self._last_pool_plan_summary()}",
+                now=now,
+            )
             self._post_sweep = None
             self._reset(now)
             return
@@ -2470,6 +2578,16 @@ class EntryEngine:
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
                 f"side={side} sweep=${sweep.pool.price:.1f} "
                 f"entry=${price:.1f} tp=${tp:.1f} sl=${sl:.1f}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason=f"payoff_geometry rr={rr:.2f} < floor={rr_floor:.2f}",
+                now=now,
+                target_pool=target,
+                tp_price=tp,
+            )
             self._post_sweep = None
             self._reset(now)
             return
@@ -2484,6 +2602,7 @@ class EntryEngine:
             conviction=decision.confidence,
             reason=f"{decision.reason}{cisd}{disp}",
             ict_validation=self._ict_summary(ict, side),
+            execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
         logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
@@ -2595,6 +2714,14 @@ class EntryEngine:
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: initial_rr={rr:.2f} < institutional TP gate "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason=f"no_liquidity_tp; {self._last_pool_plan_summary()}",
+                now=now,
+            )
             self._post_sweep = None
             self._reset(now)
             return
@@ -2605,6 +2732,16 @@ class EntryEngine:
                 f"⚠️ ENTRY CANDIDATE DEFERRED [payoff_geometry]: rr={rr:.2f} < institutional_floor={rr_floor:.2f} "
                 f"side={side} sweep=${sweep.pool.price:.1f} entry=${price:.1f} "
                 f"tp=${tp:.1f} sl=${sl:.1f} | {self._last_pool_plan_summary()}")
+            self._arm_refine_watch_from_rejected_sweep(
+                sweep=sweep,
+                side=side,
+                entry_price=price,
+                structural_sl=sl,
+                reason=f"payoff_geometry rr={rr:.2f} < floor={rr_floor:.2f}",
+                now=now,
+                target_pool=target,
+                tp_price=tp,
+            )
             self._post_sweep = None
             self._reset(now)
             return
@@ -2615,6 +2752,7 @@ class EntryEngine:
             target_pool=target, sweep_result=sweep,
             conviction=decision.confidence, reason=decision.reason,
             ict_validation=self._ict_summary(ict, side),
+            execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
         logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
         # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.

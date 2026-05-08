@@ -277,7 +277,7 @@ class MultiAssetQuantBot:
                         try:
                             entry = float(r.get("entry", 0.0) or 0.0)
                             qty = float(r.get("qty", 0.0) or 0.0)
-                            lev = float(active_policy(ctx.instrument).leverage or 1)
+                            lev = float(r.get("execution_leverage", r.get("leverage", 0.0)) or active_policy(ctx.instrument).leverage or 1)
                             r["margin_used"] = (entry * qty / lev) if lev > 0 else entry * qty
                             pnl = float(r.get("pnl", 0.0) or 0.0)
                             r["margin_pnl_pct"] = pnl / r["margin_used"] * 100.0 if r["margin_used"] > 1e-10 else 0.0
@@ -680,7 +680,7 @@ class MultiAssetQuantBot:
                 r_now = move / init_dist if init_dist > 1e-10 else 0.0
                 mfe_r = float(getattr(pos, "peak_profit", 0.0) or 0.0) / init_dist if init_dist > 1e-10 else 0.0
                 notional = entry * qty if entry > 0 and qty > 0 else 0.0
-                lev_txt = str(pol.leverage).replace("x", "")
+                lev_txt = str(getattr(pos, "execution_leverage", 0.0) or pol.leverage).replace("x", "")
                 try:
                     lev = float(lev_txt)
                 except Exception:

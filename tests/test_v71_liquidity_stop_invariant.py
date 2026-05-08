@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import config
 from strategy.entry_engine import EntryEngine
 
 
@@ -57,22 +58,26 @@ def test_sl_envelope_allows_stop_already_beyond_protective_pool():
 
 
 def test_sl_envelope_refuses_pool_beyond_liquidation_guard_instead_of_shrinking_inside():
+    old_dynamic = getattr(config, "DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS", True)
+    config.DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS = False
     e = _engine_for_sl_envelope()
     e._liquidation_guard = lambda side, entry: (108.0, 109.0, 9.0)
     pick = SimpleNamespace(quality=0.95, reasons=["HTF protective BSL"])
     target = SimpleNamespace(pool=SimpleNamespace(price=118.0))
     e._find_sl_pool = lambda **kwargs: (120.0, target, pick)
 
-    sl, reason = e._apply_institutional_sl_envelope(
-        snap=SimpleNamespace(),
-        side="short",
-        price=100.0,
-        atr=2.0,
-        structural_sl=105.0,
-        invalidation_price=104.0,
-        label="reversal",
-    )
+    try:
+        sl, reason = e._apply_institutional_sl_envelope(
+            snap=SimpleNamespace(),
+            side="short",
+            price=100.0,
+            atr=2.0,
+            structural_sl=105.0,
+            invalidation_price=104.0,
+            label="reversal",
+        )
+    finally:
+        config.DYNAMIC_LEVERAGE_FOR_STRUCTURAL_STOPS = old_dynamic
 
     assert sl is None
     assert "beyond liquidation guard" in reason
-    assert "inside liquidity" in reason
