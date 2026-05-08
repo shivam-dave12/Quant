@@ -33,6 +33,10 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
+try:
+    from core.redaction import redact_sensitive
+except Exception:
+    def redact_sensitive(x): return x
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +245,7 @@ def _send_worker() -> None:
             logger.error("notifier: unexpected queue item shape: %d", len(item))
             _send_queue.task_done()
             continue
-        message = _repair_mojibake(str(message))
+        message = _repair_mojibake(str(redact_sensitive(message)))
 
         for attempt in range(_MAX_RETRIES):
             gap = _MIN_INTERVAL - (time.time() - last_send_ts)
@@ -460,7 +464,7 @@ def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=
     """
     if not telegram_config.TELEGRAM_ENABLED:
         return False
-    message = _repair_mojibake(str(message))
+    message = _repair_mojibake(str(redact_sensitive(message)))
     if enrich:
         try:
             message = _tg_enrich_asset_message(message, instrument=instrument, event_type=event_type, context=context)

@@ -431,9 +431,35 @@ class _DeltaAdapter:
         oid = self.extract_order_id(resp)
         if not oid:
             sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
-            return {"_raw": resp, "_sc": sc, "_error": True}
+            return {"_raw": resp, "_sc": sc, "_error": True, "_reason": "exchange_reject"}
         result = resp.get("result", {}) if isinstance(resp, dict) else {}
         result["order_id"] = oid
+        result["entry_order_type"] = "limit_bracket"
+        return result
+
+    def place_bracket_market_entry(self, side: str, quantity: float,
+                                   sl_price: float,
+                                   tp_price: float) -> Optional[Dict]:
+        # Native MARKET bracket: used only for high-readiness accepted sweeps.
+        # This is not a fallback and not naked exposure: Delta receives entry,
+        # bracket_stop_loss_price and bracket_take_profit_price in one request.
+        self.limiter.wait()
+        contracts = self._qty_to_contracts(quantity)
+        resp = self.api.place_order(
+            symbol                    = self.symbol,
+            side                      = side.lower(),
+            order_type                = "market",
+            size                      = contracts,
+            bracket_stop_loss_price   = float(sl_price),
+            bracket_take_profit_price = float(tp_price),
+        )
+        oid = self.extract_order_id(resp)
+        if not oid:
+            sc = resp.get("status_code", 0) if isinstance(resp, dict) else 0
+            return {"_raw": resp, "_sc": sc, "_error": True, "_reason": "exchange_reject"}
+        result = resp.get("result", {}) if isinstance(resp, dict) else {}
+        result["order_id"] = oid
+        result["entry_order_type"] = "market_bracket"
         return result
 
     def cancel_order(self, order_id: str) -> Dict:
@@ -1219,7 +1245,8 @@ class OrderManager:
                                   sl_price: float,
                                   tp_price: float,
                                   timeout_sec: float = 45.0,
-                                  on_order_placed=None) -> Optional[Dict]:
+                                  on_order_placed=None,
+                                  market_entry: bool = False) -> Optional[Dict]:
         """
         Bracket entry for Delta: places a single limit order with embedded SL + TP.
         Polls until filled, then queries open orders to retrieve bracket child IDs.
@@ -1238,15 +1265,21 @@ class OrderManager:
         if not hasattr(self._adapter, "place_bracket_limit_entry"):
             return None  # Non-Delta: caller uses place_limit_entry + separate SL/TP
 
+        mode = "MARKET" if market_entry else "LIMIT"
         logger.info(
-            f"[BRACKET] {side.upper()} {quantity} @ ${limit_price:.2f} "
+            f"[BRACKET/{mode}] {side.upper()} {quantity} @ ${limit_price:.2f} "
             f"SL=${sl_price:.2f} TP=${tp_price:.2f} (timeout={timeout_sec:.0f}s)"
         )
 
-        data = self._adapter.place_bracket_limit_entry(
-            side=side, quantity=quantity,
-            limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
-        )
+        if market_entry and hasattr(self._adapter, "place_bracket_market_entry"):
+            data = self._adapter.place_bracket_market_entry(
+                side=side, quantity=quantity, sl_price=sl_price, tp_price=tp_price,
+            )
+        else:
+            data = self._adapter.place_bracket_limit_entry(
+                side=side, quantity=quantity,
+                limit_price=limit_price, sl_price=sl_price, tp_price=tp_price,
+            )
         if not data or data.get("_error"):
             sc = (data or {}).get("_sc", 0)
             raw = (data or {}).get("_raw", {})
@@ -1280,12 +1313,20 @@ class OrderManager:
 
             if status == "FILLED":
                 fill_px = float(details.get("fill_price") or limit_price)
-                data["fill_type"]    = "maker"
+                # v74: preserve the actual entry mode for marketable native brackets.
+                # v73 always marked bracket fills as "maker", even when the order
+                # was submitted through place_bracket_market_entry(). That made
+                # execution-cost telemetry and any fee fallback logic understate cost
+                # for fast protected-cross entries. Native market bracket is still
+                # protected by exchange-attached SL/TP; only the fill classification
+                # changes.
+                data["fill_type"]    = "taker" if market_entry else "maker"
                 data["fill_price"]   = fill_px
                 data["bracket_order"] = True
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
+                            f" fill_type={data['fill_type']}"
                             f" fee=${data['paid_commission']:.4f}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
@@ -1445,10 +1486,15 @@ class OrderManager:
                 logger.info(f"Bracket order {order_id[:8]}… cancelled by exchange")
                 break
 
-        # Timeout — cancel and signal caller to retry after cooldown
+        # Timeout — cancel and signal caller to refine/reprice. This is a missed
+        # fill, not a bracket API failure, and must not trigger naked fallback.
         self.cancel_order(order_id)
         logger.info(f"Bracket order timeout after {timeout_sec:.0f}s — cancelled")
-        return None
+        data["_error"] = True
+        data["_reason"] = "not_filled_timeout"
+        data["_bracket_order_placed"] = True
+        data["bracket_order"] = False
+        return data
 
     def place_stop_loss(self, side: str, quantity: float,
                         trigger_price: float,

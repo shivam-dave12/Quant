@@ -48,23 +48,42 @@ function renderCharts(){
   }
 }
 
-function renderKPIs(){ const sys=state.system||{}; $('botStatus').textContent=sys.bot_online?'BOT ONLINE':'BOT OFFLINE'; $('botStatus').className=`pill ${sys.bot_online?'ok':'crit'}`; $('kpiGrid').innerHTML=[
-  kpi('Open Positions',`${sys.open_positions||0}`,`${sys.assets||0} assets tracked`),
-  kpi('Live UPNL',fmt.money(sys.total_upnl||0),'unrealized',Number(sys.total_upnl||0)>=0?'ok':'crit'),
-  kpi('Realized PNL',fmt.money(sys.total_realized||0),'closed trades',Number(sys.total_realized||0)>=0?'ok':'crit'),
-  kpi('Parsed Events',sys.parsed_events||0,`${sys.ingested_lines||0} log lines`),
-  kpi('Source',sys.source||'--',`mode ${sys.mode||'--'}`),
-  kpi('Heartbeat',fmt.age(sys.last_heartbeat),fmt.ts(sys.last_heartbeat),sys.bot_online?'ok':'warn'),
-].join(''); }
+function renderKPIs(){
+  const sys=state.system||{}; const m=state.metrics||{};
+  $('botStatus').textContent=sys.bot_online?'BOT ONLINE':'BOT OFFLINE';
+  $('botStatus').className=`pill ${sys.bot_online?'ok':'crit'}`;
+  $('kpiGrid').innerHTML=[
+    kpi('Open Positions',`${sys.open_positions||0}`,`${sys.assets||0} assets tracked`),
+    kpi('Live UPNL',fmt.money(sys.total_upnl||0),'unrealized',Number(sys.total_upnl||0)>=0?'ok':'crit'),
+    kpi('Realized PNL',fmt.money(sys.total_realized||0),'closed trades',Number(sys.total_realized||0)>=0?'ok':'crit'),
+    kpi('Win Rate',fmt.pct(m.win_rate||0),`${m.trade_count||0} closed trades`),
+    kpi('Profit Factor',fmt.n(m.profit_factor||0,2),`avg R ${fmt.n(m.avg_r||0,2)}`),
+    kpi('Decision Tape',m.decision_count||0,`${m.alert_count||0} alerts`),
+    kpi('Coverage',fmt.pct(m.coverage||0),`${m.fresh_assets||0} fresh / ${m.stale_assets||0} stale`),
+    kpi('Top Desk',m.best_asset||'--',`score ${fmt.n(m.best_score||0,0)}`),
+    kpi('Parsed Events',sys.parsed_events||0,`${sys.ingested_lines||0} log lines`),
+    kpi('Heartbeat',fmt.age(sys.last_heartbeat),fmt.ts(sys.last_heartbeat),sys.bot_online?'ok':'warn'),
+  ].join('');
+}
+
+function renderHealthBanner(){
+  const el=$('healthBanner'); if(!el) return;
+  const sys=state.system||{}, m=state.metrics||{};
+  let cls='ok', title='Telemetry healthy', body=`${sys.assets||0} assets · ${sys.parsed_events||0} parsed events · source ${sys.source||'--'}`;
+  if(!sys.bot_online && (sys.parsed_events||0)>0){ cls='warn'; title='Log data exists but heartbeat is stale'; body='Dashboard has parsed assets/events, but no recent heartbeat. Check the log-tail service and DASHBOARD_URL/DASHBOARD_ENABLED.'; }
+  if(!sys.bot_online && !(sys.parsed_events||0)){ cls='crit'; title='No telemetry received'; body=diagnostics?.probable_root_cause||'No direct telemetry or fallback log-tail events have reached the dashboard.'; }
+  el.className=`health-banner ${cls}`;
+  el.innerHTML=`<b>${title}</b><span>${htmlEscape(body)}</span><span>event age ${m.last_event_age_sec==null?'--':fmt.age(Date.now()/1000-m.last_event_age_sec)}</span>`;
+}
 
 function renderHeatmap(){ const heat=state.heatmap||[]; $('heatmap').innerHTML=heat.slice(0,12).map(h=>{ const cls=h.score>70?'ok':h.score>35?'warn':'crit'; return `<div class="heat" data-asset="${h.asset}"><div class="asset-row"><b>${h.asset}</b><span class="score ${cls}">${fmt.n(h.score,0)}</span></div><div class="mini">${h.state||''}</div><div class="mini">p ${fmt.n(h.posterior,2)} · EV ${fmt.n(h.ev,2)}</div></div>`}).join(''); document.querySelectorAll('.heat').forEach(x=>x.onclick=()=>selectAsset(x.dataset.asset,true)); }
 function renderAssets(){ const q=($('assetSearch').value||'').trim().toUpperCase(); const assets=(state.assets||[]).filter(a=>!q||a.asset.includes(q)||String(a.symbol).includes(q)); lastAssetList=assets; const sel=$('assetSelect'); const old=sel.value; sel.innerHTML=assets.map(a=>`<option value="${a.asset}">${a.asset} · ${a.symbol}</option>`).join(''); if(assets.some(a=>a.asset===old))sel.value=old; else if(selectedAsset)sel.value=selectedAsset; if(!selectedAsset && assets[0])selectedAsset=assets[0].asset;
-  $('assetList').innerHTML=assets.map(a=>{ const cls=sevClass(a.health); const active=a.asset===selectedAsset?'active':''; return `<div class="asset-card ${active}" data-asset="${a.asset}"><div class="asset-row"><div class="asset-name">${a.asset}</div><span class="badge ${cls}">${a.health||'OK'}</span></div><div class="asset-row mini"><span>${a.venue||''}:${a.symbol||''}</span><span>${fmt.price(a.price)}</span></div><div class="asset-row mini"><span>${a.phase||a.state}</span><span>p ${fmt.n(Math.max(a.posterior||0,a.confidence||0),2)} EV ${fmt.n(a.ev,2)}</span></div><div class="asset-row mini"><span>spread ${fmt.n(a.spread_bps,1)}bps</span><span>risk×${fmt.n(a.risk_mult,2)}</span></div></div>`}).join('') || `<div class="empty"><b>No assets parsed yet.</b><br>${htmlEscape(diagnostics?.probable_root_cause||'No direct telemetry/log-tail events received.')}<br><br><span class="mini">Check: <code>curl http://127.0.0.1:8000/api/diagnostics</code> and <code>systemctl status trading-dashboard-tail</code></span></div>`; document.querySelectorAll('.asset-card').forEach(x=>x.onclick=()=>selectAsset(x.dataset.asset,true)); }
+  $('assetList').innerHTML=assets.map(a=>{ const cls=sevClass(a.health); const active=a.asset===selectedAsset?'active':''; const edge=Math.max(Number(a.posterior||0),Number(a.confidence||0)); const quality=Math.max(0,Math.min(100,(edge*55)+(Math.max(0,Number(a.ev||0))*20)+(Math.max(0,1-Math.min(Number(a.spread_atr||0),3)/3)*25))); return `<div class="asset-card ${active}" data-asset="${a.asset}"><div class="asset-row"><div class="asset-name">${a.asset}</div><span class="badge ${cls}">${a.health||'OK'}</span></div><div class="asset-row mini"><span>${a.venue||''}:${a.symbol||''}</span><span>${fmt.price(a.price)}</span></div><div class="asset-row mini"><span>${a.phase||a.state}</span><span>p ${fmt.n(edge,2)} EV ${fmt.n(a.ev,2)}</span></div><div class="quality"><span style="width:${quality.toFixed(0)}%"></span></div><div class="asset-row mini"><span>spread ${fmt.n(a.spread_bps,1)}bps / ${fmt.n(a.spread_atr,2)}ATR</span><span>risk×${fmt.n(a.risk_mult,2)}</span></div></div>`}).join('') || `<div class="empty"><b>No assets parsed yet.</b><br>${htmlEscape(diagnostics?.probable_root_cause||'No direct telemetry/log-tail events received.')}<br><br><span class="mini">Check: <code>curl http://127.0.0.1:8000/api/diagnostics</code> and <code>systemctl status trading-dashboard-tail</code></span></div>`; document.querySelectorAll('.asset-card').forEach(x=>x.onclick=()=>selectAsset(x.dataset.asset,true)); }
 function renderPositions(){ const arr=state.positions||[]; $('positionsCount').textContent=arr.length; $('positionsList').innerHTML=arr.length?arr.map(p=>`<div class="item"><div class="item-row"><b>${p.asset}</b><span class="badge">${p.venue}:${p.symbol}</span></div><div class="item-row"><span>${p.side} · ${p.state} · trail ${p.trailing}</span><b class="${Number(p.upnl)>=0?'ok':'crit'}">${fmt.money(p.upnl)}</b></div><div class="item-row mini"><span>entry ${fmt.price(p.entry)} · px ${fmt.price(p.price)}</span><span>qty ${fmt.n(p.qty,4)}</span></div><div class="item-row mini"><span>SL ${fmt.price(p.sl)} · TP ${fmt.price(p.tp)}</span><span>R ${fmt.n(p.r,2)} MFE ${fmt.n(p.mfe_r,2)}</span></div></div>`).join(''):'<div class="empty">No live positions.</div>'; }
 function renderDecisions(){ const arr=state.decisions||[]; $('decisionsCount').textContent=arr.length; $('decisionFeed').innerHTML=arr.slice(0,80).map(d=>`<div class="item" data-asset="${d.asset}"><div class="item-row"><b>${d.asset}</b><span class="badge">${d.kind}</span></div><div class="item-row mini"><span>${d.side||''} p ${fmt.n(d.p,2)} EV ${fmt.n(d.ev,2)} RR ${fmt.n(d.rr,2)}</span><span>${fmt.ts(d.ts)}</span></div><div class="raw">${htmlEscape(d.reason||d.raw||'')}</div></div>`).join('')||'<div class="empty">No decisions yet.</div>'; document.querySelectorAll('#decisionFeed .item').forEach(x=>x.onclick=()=>selectAsset(x.dataset.asset,true)); }
 function renderAlerts(){ const arr=state.alerts||[]; $('alertsCount').textContent=arr.length; $('alertsList').innerHTML=arr.slice(0,80).map(a=>`<div class="item"><div class="item-row"><b class="${sevClass(a.severity)}">${htmlEscape(a.title)}</b><span class="badge ${sevClass(a.severity)}">${a.severity}</span></div><div class="item-row mini"><span>${a.asset||''} ${a.symbol||''}</span><span>${fmt.ts(a.ts)}</span></div><div class="raw">${htmlEscape(a.message)}</div></div>`).join('')||'<div class="empty">No alerts.</div>'; }
 function renderEvents(){ const arr=state.events||[]; $('eventsCount').textContent=arr.length; $('eventsList').innerHTML=arr.slice(0,120).map(e=>`<div class="item"><div class="item-row"><b class="blue">${e.type}</b><span class="mini">${fmt.ts(e.ts)}</span></div><div class="mini">${e.asset||''} ${e.venue||''}:${e.symbol||''}</div><div class="raw">${htmlEscape(e.last_reason||e.reason||e.message||e.last_decision||'')}</div></div>`).join('')||'<div class="empty">No events yet.</div>'; }
-function renderAll(){ if(!state)return; renderKPIs(); renderAssets(); renderHeatmap(); renderPositions(); renderDecisions(); renderAlerts(); renderEvents(); renderCharts(); }
+function renderAll(){ if(!state)return; renderKPIs(); renderHealthBanner(); renderAssets(); renderHeatmap(); renderPositions(); renderDecisions(); renderAlerts(); renderEvents(); renderCharts(); }
 async function refresh(asset){ const qs=asset?`?asset=${encodeURIComponent(asset)}`:''; const r=await fetch('/api/state'+qs); state=await r.json(); try { const d=await fetch('/api/diagnostics'); diagnostics=await d.json(); } catch(e){} renderAll(); }
 async function selectAsset(asset,openDrawer=false){ selectedAsset=asset; $('assetSelect').value=asset; await refresh(); if(openDrawer) await openDrawerFor(asset); }
 async function openDrawerFor(asset){ const r=await fetch(`/api/assets/${encodeURIComponent(asset)}`); const data=await r.json(); const a=(data.assets||[])[0]||{}; $('drawerTitle').textContent=`${asset} · ${a.symbol||''}`; const dec=(data.decisions||[]).slice(0,25); const alerts=(data.alerts||[]).slice(0,15); const pos=(data.positions||[]); $('drawerBody').innerHTML=`<div class="detail-grid">${[
