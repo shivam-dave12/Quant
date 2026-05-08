@@ -1313,12 +1313,20 @@ class OrderManager:
 
             if status == "FILLED":
                 fill_px = float(details.get("fill_price") or limit_price)
-                data["fill_type"]    = "maker"
+                # v74: preserve the actual entry mode for marketable native brackets.
+                # v73 always marked bracket fills as "maker", even when the order
+                # was submitted through place_bracket_market_entry(). That made
+                # execution-cost telemetry and any fee fallback logic understate cost
+                # for fast protected-cross entries. Native market bracket is still
+                # protected by exchange-attached SL/TP; only the fill classification
+                # changes.
+                data["fill_type"]    = "taker" if market_entry else "maker"
                 data["fill_price"]   = fill_px
                 data["bracket_order"] = True
                 # Propagate exact entry fee from Delta paid_commission
                 data["paid_commission"] = float(details.get("paid_commission", 0) or 0)
                 logger.info(f"✅ Bracket fill: {order_id[:8]}… @ ${fill_px:.2f}"
+                            f" fill_type={data['fill_type']}"
                             f" fee=${data['paid_commission']:.4f}")
 
                 # Query open orders to retrieve bracket SL/TP child order IDs.
