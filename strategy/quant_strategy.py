@@ -3427,7 +3427,9 @@ class QuantStrategy:
             allows.append(f"SL before liquidation guard ${liq_guard:,.1f}")
 
         if rr < 1.15:
-            rejects.append(f"R:R {rr:.2f} has no institutional expectancy after costs")
+            rejects.append(
+                f"PAYOFF_DENSITY {rr:.2f} below cost-clean reference; "
+                "target utility must carry route")
         if sl_atr < 0.55:
             rejects.append(f"SL {sl_atr:.2f}ATR is inside execution noise")
         if side == "long" and tp <= entry:
@@ -3564,13 +3566,14 @@ class QuantStrategy:
             "ENTRY_READINESS_BLOCK", "LIQUIDATION", "NOT ABOVE ENTRY", "NOT BELOW ENTRY",
             "TP IS NOT", "SL IS NOT", "NON-PROTECTIVE",
             "INVALID", "NON-POSITIVE", "CROSSED",
-            "INSIDE EXECUTION NOISE", "R:R",
+            "INSIDE EXECUTION NOISE",
             "NO POSITIVE EXECUTABLE UTILITY", "EXECUTABLE TARGET UTILITY",
             "EXECUTABLE TARGET SURFACE",
         )
         quality_tokens = (
             "TP REACH", "POST-SWEEP ENGINE", "DIRECTIONENGINE",
             "TARGET_REALISM", "DECISION_SCORE", "ENTRY_READINESS_PENALTY",
+            "PAYOFF_DENSITY",
         )
 
         for _r in rejects:

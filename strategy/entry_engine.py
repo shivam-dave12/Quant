@@ -2709,7 +2709,7 @@ class EntryEngine:
             if not isinstance(selected, dict):
                 return float(fallback)
             floor = float(selected.get("required_rr", fallback) or fallback)
-            return max(0.50, min(20.0, floor))
+            return max(0.01, min(20.0, floor))
         except Exception:
             return float(fallback)
 

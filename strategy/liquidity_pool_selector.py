@@ -168,8 +168,10 @@ _TERMINAL_REACH_FLOOR    = 0.05   # never zero out a valid terminal objective
 
 # Final TP payoff geometry. A high posterior can relax the static R:R prior,
 # but it cannot turn a BE-adjacent pool into a full-position institutional TP.
-_TP_DURABLE_RR_FLOOR     = 1.35
-_TP_MIN_BE_MOVE_MULT     = 1.80
+# TP payoff geometry is solved from expected utility.  These are risk-premium
+# bounds, not fixed R:R gates: the live delivery surface decides the floor.
+_TP_EDGE_HURDLE_MIN_R    = 0.012
+_TP_EDGE_HURDLE_MAX_R    = 0.180
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
 
@@ -240,6 +242,7 @@ class PoolCandidateDiagnostic:
     sweep_prob:    float = 0.0
     delivery_prob: float = 0.0
     required_delivery_prob: float = 0.0
+    edge_hurdle_r: float = 0.0
     cost_r:        float = 0.0
     ev:            float = 0.0
     selection_ev:  float = 0.0
@@ -278,6 +281,17 @@ class PoolSelectionReport:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class PayoffSurface:
+    """Cost-adjusted TP utility surface for one candidate pool."""
+    required_rr: float
+    delivery_prob: float
+    required_delivery_prob: float
+    cost_r: float
+    edge_hurdle_r: float
+    break_even_rr: float
+
+
 # INTERNAL HELPERS
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -293,9 +307,11 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(value)))
 
 
-def _required_delivery_probability(rr: float, cost_r: float) -> float:
-    """Break-even hit probability for a TP at ``rr`` after execution cost."""
-    return _clamp((1.0 + max(float(cost_r), 0.0)) / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
+def _required_delivery_probability(rr: float, cost_r: float,
+                                   edge_hurdle_r: float = 0.0) -> float:
+    """Required hit probability for a TP after costs and edge premium."""
+    numerator = 1.0 + max(float(cost_r), 0.0) + max(float(edge_hurdle_r), 0.0)
+    return _clamp(numerator / max(float(rr) + 1.0, 1e-9), 0.0, 1.0)
 
 
 def _enum_value(v: Any, default: str = "") -> str:
@@ -399,7 +415,7 @@ def _candidate_report_priority(r: PoolCandidateDiagnostic) -> float:
 
     req_p = r.required_delivery_prob
     if req_p <= 0.0 and r.rr > 0.0:
-        req_p = _required_delivery_probability(r.rr, r.cost_r)
+        req_p = _required_delivery_probability(r.rr, r.cost_r, r.edge_hurdle_r)
     delivery = max(r.delivery_prob, r.sweep_prob, 0.0)
     p_fit = _clamp(delivery / max(req_p, 1e-9), 0.0, 2.0)
 
@@ -675,7 +691,34 @@ def _posterior_delivery_probability(
     return _clamp(math.sqrt(pool_prob * posterior), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
 
-def _institutional_rr_floor(
+def _tp_edge_hurdle(
+    *,
+    posterior_prob: float,
+    delivery_prob: float,
+    confluence: float,
+    gauntlet_mult: float,
+    reach_mult: float,
+    cost_r: float,
+) -> float:
+    """Dynamic risk premium above mathematical break-even, in R units."""
+    posterior = _clamp(posterior_prob, 0.0, 0.95)
+    p = _clamp(delivery_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
+    conf_quality = math.sqrt(_clamp(confluence, 0.25, 2.25))
+    gauntlet_quality = _clamp(gauntlet_mult, 0.45, 1.00)
+    reach_quality = _clamp(reach_mult, 0.05, 1.25)
+    proof = _clamp(math.sqrt(max(p * max(posterior, p), 0.0)) * conf_quality, 0.0, 1.25)
+    hurdle = (
+        0.012
+        + 0.045 * (1.0 - p)
+        + 0.020 * max(float(cost_r), 0.0)
+        + 0.035 * (1.0 - gauntlet_quality)
+        + 0.025 * max(0.0, 1.0 - reach_quality)
+        + 0.035 * max(0.0, 0.62 - proof)
+    )
+    return _clamp(hurdle, _TP_EDGE_HURDLE_MIN_R, _TP_EDGE_HURDLE_MAX_R)
+
+
+def _tp_payoff_surface(
     static_min_rr: float,
     posterior_prob: float,
     raw_prob: float,
@@ -684,39 +727,44 @@ def _institutional_rr_floor(
     reach_mult: float,
     risk: float,
     be_move: float,
-) -> Tuple[float, float, float]:
-    """Return (required_rr, delivery_probability, cost_r).
-
-    With no accepted setup posterior, preserve the legacy static floor. Once a
-    posterior exists, the pool is judged by positive expected value:
-        p * R - (1 - p) - cost_r >= 0
-    The static floor can be relaxed by observed auction posterior, but only
-    down to a durable payoff floor. If costs consume too much of the risk box,
-    the floor expands above the static prior instead of approving a micro-win.
-    """
+    rr: float,
+) -> PayoffSurface:
+    """Solve the TP payoff surface from probability, cost, and route quality."""
     static_floor = max(0.01, float(static_min_rr))
     risk_f = max(float(risk), 1e-9)
-    durable_floor = max(
-        _TP_DURABLE_RR_FLOOR,
-        _TP_MIN_BE_MOVE_MULT * max(float(be_move), 0.0) / risk_f,
-    )
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
-    if posterior <= 0.0:
-        delivery_p = _posterior_delivery_probability(
-            raw_prob, 0.0, confluence, gauntlet_mult, reach_mult)
-        ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-        return max(static_floor, durable_floor, ev_floor), delivery_p, cost_r
-
     delivery_p = _posterior_delivery_probability(
         raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
-    ev_floor = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
-    posterior_floor = max(durable_floor, ev_floor)
-    return posterior_floor, delivery_p, cost_r
+    delivery_p = _clamp(delivery_p, _TP_DELIVERY_PROB_FLOOR, 0.95)
+    edge_hurdle = _tp_edge_hurdle(
+        posterior_prob=posterior,
+        delivery_prob=delivery_p,
+        confluence=confluence,
+        gauntlet_mult=gauntlet_mult,
+        reach_mult=reach_mult,
+        cost_r=cost_r,
+    )
+    break_even_rr = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
+    utility_floor = ((1.0 - delivery_p) + cost_r + edge_hurdle) / max(delivery_p, 1e-9)
+    if posterior <= 0.0:
+        required_rr = max(static_floor, utility_floor)
+    else:
+        prior_weight = max(0.0, 1.0 - posterior / 0.95) ** 2
+        prior_residual = max(0.0, static_floor - utility_floor) * prior_weight
+        required_rr = utility_floor + prior_residual
+    return PayoffSurface(
+        required_rr=required_rr,
+        delivery_prob=delivery_p,
+        required_delivery_prob=_required_delivery_probability(rr, cost_r, edge_hurdle),
+        cost_r=cost_r,
+        edge_hurdle_r=edge_hurdle,
+        break_even_rr=break_even_rr,
+    )
 
 
 def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
-                         terminal_target: bool) -> float:
+                          terminal_target: bool) -> float:
     mtf_reach = _terminal_reach_multiplier(distance_atr, tf)
     profile_reach = selector_profile.target_reach_penalty(distance_atr, tf)
     if terminal_target:
@@ -739,20 +787,22 @@ def _tp_payoff_rejection_reason(
     delivery_prob: float,
     required_delivery_prob: float,
     cost_r: float,
+    edge_hurdle_r: float,
     terminal_target: bool,
 ) -> str:
     if delivery_prob + 1e-9 < required_delivery_prob:
         reason = (
             f"delivery probability {delivery_prob:.4f} < required {required_delivery_prob:.4f} "
             f"for RR {rr:.2f} (static {static_floor:.2f}, cost={cost_r:.2f}R, "
-            f"payoff floor {rr_floor:.2f})"
+            f"edge={edge_hurdle_r:.2f}R, payoff floor {rr_floor:.2f})"
         )
         if terminal_target:
             reason += "; terminal runner context, not full-position TP"
         return reason
     return (
-        f"R:R {rr:.2f} < payoff floor {rr_floor:.2f} "
-        f"(static {static_floor:.2f}, p={delivery_prob:.4f}, cost={cost_r:.2f}R)"
+        f"R:R {rr:.2f} < dynamic payoff floor {rr_floor:.2f} "
+        f"(static {static_floor:.2f}, p={delivery_prob:.4f}, cost={cost_r:.2f}R, "
+        f"edge={edge_hurdle_r:.2f}R)"
     )
 
 
@@ -886,7 +936,7 @@ def score_tp_pools(
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(
                 target, sig, snap, side, entry, atr,
             )
-            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+            payoff = _tp_payoff_surface(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -895,8 +945,12 @@ def score_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
+                rr,
             )
-            required_delivery_prob = _required_delivery_probability(rr, cost_r)
+            rr_floor = payoff.required_rr
+            delivery_prob = payoff.delivery_prob
+            cost_r = payoff.cost_r
+            required_delivery_prob = payoff.required_delivery_prob
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
@@ -923,7 +977,7 @@ def score_tp_pools(
             if rr >= float(min_rr) + 1.0:
                 reasons.append(f"R:R {rr:.1f}")
             elif rr_floor < effective_min_rr - 1e-9:
-                reasons.append(f"payoff RR floor {rr_floor:.2f}")
+                reasons.append(f"dynamic payoff floor {rr_floor:.2f}")
             if utility_components["be_quality"] < 0.75:
                 reasons.append("thin post-BE room")
             if _safe(pool, "ob_aligned", False):
@@ -957,6 +1011,8 @@ def score_tp_pools(
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
                     "required_delivery_prob": required_delivery_prob,
+                    "edge_hurdle_r": payoff.edge_hurdle_r,
+                    "break_even_rr": payoff.break_even_rr,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                 },
@@ -1218,7 +1274,7 @@ def diagnose_tp_pools(
             reach_mult = _tp_reach_multiplier(row.distance_atr, tf, selector_profile, terminal_target)
             n_gauntlet, gauntlet_mult = _gauntlet_penalty(target, sig, snap, side, entry, atr)
             row.gauntlet_n = n_gauntlet
-            rr_floor, delivery_prob, cost_r = _institutional_rr_floor(
+            payoff = _tp_payoff_surface(
                 effective_min_rr,
                 posterior_prob,
                 raw_prob,
@@ -1227,26 +1283,29 @@ def diagnose_tp_pools(
                 reach_mult,
                 risk,
                 be_move,
+                row.rr,
             )
-            row.required_rr = rr_floor
-            row.delivery_prob = delivery_prob
-            row.cost_r = cost_r
-            row.required_delivery_prob = _required_delivery_probability(row.rr, cost_r)
-            if row.rr < rr_floor:
+            row.required_rr = payoff.required_rr
+            row.delivery_prob = payoff.delivery_prob
+            row.cost_r = payoff.cost_r
+            row.edge_hurdle_r = payoff.edge_hurdle_r
+            row.required_delivery_prob = payoff.required_delivery_prob
+            if row.rr < payoff.required_rr:
                 row.reason = _tp_payoff_rejection_reason(
                     row.rr,
-                    rr_floor,
+                    payoff.required_rr,
                     effective_min_rr,
-                    delivery_prob,
-                    row.required_delivery_prob,
-                    cost_r,
+                    payoff.delivery_prob,
+                    payoff.required_delivery_prob,
+                    payoff.cost_r,
+                    payoff.edge_hurdle_r,
                     terminal_target,
                 )
                 rows.append(row); continue
-            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            utility, comps = _target_utility(raw_prob, row.rr, payoff.required_rr, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
+            selection_ev = _tp_selection_value(row.ev, row.rr, payoff.required_rr, row.distance_atr)
             row.selection_ev = selection_ev
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
@@ -1254,8 +1313,8 @@ def diagnose_tp_pools(
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
-            if rr_floor < effective_min_rr - 1e-9:
-                row.notes.append(f"payoff RR floor {rr_floor:.2f}")
+            if payoff.required_rr < effective_min_rr - 1e-9:
+                row.notes.append(f"dynamic payoff floor {payoff.required_rr:.2f}")
             if selection_ev > row.ev + 1e-12:
                 row.notes.append(f"frontierEV={selection_ev:.3f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")

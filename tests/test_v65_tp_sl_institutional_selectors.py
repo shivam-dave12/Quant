@@ -114,6 +114,16 @@ def test_entry_engine_tp_rr_floor_is_not_clamped_down_to_static_fallback():
     assert engine._last_selected_tp_rr_floor(1.50) == pytest.approx(3.75)
 
 
+def test_entry_engine_tp_rr_floor_keeps_dynamic_probability_compensated_floor():
+    engine = EntryEngine.__new__(EntryEngine)
+    engine._last_pool_plan = {
+        "role": "TP",
+        "selected": {"required_rr": 0.32},
+    }
+
+    assert engine._last_selected_tp_rr_floor(1.50) == pytest.approx(0.32)
+
+
 @pytest.mark.parametrize("asset", [r["asset_id"] for r in MULTI_ASSET_REQUESTS])
 def test_every_configured_ticker_has_liquidity_aware_tp_and_sl_geometry(asset):
     # Asset-specific prices are normalized to a synthetic 100/2 ATR frame so the
