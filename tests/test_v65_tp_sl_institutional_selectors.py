@@ -296,3 +296,44 @@ def test_trailing_delivery_lock_ignores_archived_pools():
     assert new_sl is not None
     assert "$104.0" in reason
     assert 101.0 < new_sl < 108.0
+
+
+def test_wide_liquidity_stop_still_selects_real_tp_pool_with_trail_managed_risk():
+    """Regression for SILVER-like setup from live logs.
+
+    The protective SL is intentionally behind a far HTF liquidity shelf.  TP
+    selection must not reject every SSL just because the disaster SL makes the
+    full-stop RR look small; high-posterior setups should price TP delivery
+    against managed trail risk while keeping the executable SL untouched.
+    """
+    entry = 73.0
+    atr = 0.193
+    snap = _snapshot(
+        entry=entry,
+        atr=atr,
+        ssl=[
+            _target(72.90, PoolSide.SSL, sig=80.0, tf="5m", entry=entry, atr=atr, touches=3),
+            _target(72.50, PoolSide.SSL, sig=80.0, tf="1m", entry=entry, atr=atr, touches=3),
+            _target(72.40, PoolSide.SSL, sig=120.0, tf="15m", entry=entry, atr=atr, touches=3),
+        ],
+    )
+
+    tp, target, score, report = select_tp_with_report(
+        snap,
+        "short",
+        entry=entry,
+        sl=74.60,        # ≈8.3ATR protective disaster stop
+        atr=atr,
+        min_rr=2.20,
+        posterior_prob=0.926,
+    )
+
+    assert tp is not None
+    assert target is not None
+    assert target.pool.side is PoolSide.SSL
+    assert target.pool.price < entry
+    assert score.components["managed_risk_active"] == pytest.approx(1.0)
+    assert score.components["managed_rr"] > score.components["full_rr"]
+    selected = report.as_dict()["selected"]
+    assert selected["required_rr"] < selected["rr"]
+    assert any("managedRR" in str(n) for n in selected["notes"])

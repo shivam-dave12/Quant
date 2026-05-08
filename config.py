@@ -89,6 +89,18 @@ TP_WIDE_STOP_RR_SLOPE              = 0.060
 TP_WIDE_STOP_MAX_RR                = 1.55
 TP_TERMINAL_PATH_DRAG_SCALE        = 0.004
 TP_TERMINAL_PATH_DRAG_MAX_R        = 8.0
+# Wide protective SLs are disaster/invalidation guards.  When the posterior is
+# strong, TP selection evaluates real liquidity targets against a managed
+# trail-risk denominator so a valid pool is not rejected only because the SL is
+# correctly parked behind HTF liquidity.
+TP_MANAGED_RISK_ENABLED            = 1.0
+TP_MANAGED_RISK_MIN_STOP_ATR       = 4.0
+TP_MANAGED_RISK_MIN_POSTERIOR      = 0.82
+TP_MANAGED_RISK_MIN_TARGET_ATR     = 1.0
+TP_MANAGED_RISK_MIN_SIGNIFICANCE   = 8.0
+TP_MANAGED_RISK_BASE_ATR           = 1.35
+TP_MANAGED_RISK_MAX_ATR            = 2.75
+TP_MANAGED_RISK_MAX_STOP_FRACTION  = 0.48
 SL_DISTANCE_QUALITY_FLOOR_ATR      = 4.0
 SL_DISTANCE_QUALITY_FLOOR_BASE     = 0.05
 SL_DISTANCE_QUALITY_FLOOR_SLOPE    = 0.035

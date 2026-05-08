@@ -180,6 +180,23 @@ _TP_EDGE_HURDLE_MAX_R    = 0.180
 _TP_TERMINAL_PROFILE_FLOOR = 0.55
 _TP_DELIVERY_PROB_FLOOR  = 1e-6
 
+# Wide protective SL handling for TP selection.  A liquidity-aware SL can be a
+# disaster/invalidation stop several ATR away; TP selection must not treat that
+# full emergency stop as the only payoff denominator when the entry posterior is
+# strong and the liquidity trail is expected to compress risk quickly.  The
+# selector therefore evaluates an additional managed-risk denominator for WIDE
+# stops only.  The executable SL remains unchanged; this only prevents real
+# TP-side liquidity from being rejected as “too low RR” because the disaster
+# stop is intentionally behind HTF liquidity.
+_TP_MANAGED_RISK_ENABLED_DEFAULT       = True
+_TP_MANAGED_RISK_MIN_STOP_ATR          = 4.0
+_TP_MANAGED_RISK_MIN_POSTERIOR         = 0.82
+_TP_MANAGED_RISK_MIN_TARGET_ATR        = 1.00
+_TP_MANAGED_RISK_MIN_SIGNIFICANCE      = 8.0
+_TP_MANAGED_RISK_BASE_ATR              = 1.35
+_TP_MANAGED_RISK_MAX_ATR               = 2.75
+_TP_MANAGED_RISK_MAX_STOP_FRACTION     = 0.48
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -837,6 +854,104 @@ def _wide_stop_rr_floor(risk_atr: float, posterior_prob: float) -> float:
     return _clamp(floor, 0.0, max_rr)
 
 
+def _managed_tp_risk_denominator(
+    *,
+    full_risk: float,
+    atr: float,
+    posterior_prob: float,
+    target: Any,
+    distance_atr: float,
+    reward: float,
+    be_move: float,
+) -> Tuple[float, bool, Dict[str, float]]:
+    """Return the payoff denominator used for TP delivery math.
+
+    The executable SL can be deliberately far away because it must sit beyond
+    HTF stop-liquidity.  That is a disaster/invalidation guard, not always the
+    risk that the TP should be priced against when the auction posterior is
+    strong and the trail engine can migrate risk after first expansion.
+
+    We only activate this managed denominator for high-posterior, wide-stop,
+    real-liquidity targets.  Normal stops still use full SL risk, so the selector
+    does not become a blanket low-RR accepter.
+    """
+    full_risk = max(float(full_risk or 0.0), 1e-9)
+    atr_f = max(float(atr or 0.0), 1e-9)
+    risk_atr = full_risk / atr_f
+    posterior = _clamp(posterior_prob, 0.0, 0.95)
+    reward_f = max(float(reward or 0.0), 0.0)
+
+    enabled = bool(_cfg_float("TP_MANAGED_RISK_ENABLED", 1.0 if _TP_MANAGED_RISK_ENABLED_DEFAULT else 0.0) >= 0.5)
+    min_stop_atr = max(_cfg_float("TP_MANAGED_RISK_MIN_STOP_ATR", _TP_MANAGED_RISK_MIN_STOP_ATR), 0.25)
+    min_post = _clamp(_cfg_float("TP_MANAGED_RISK_MIN_POSTERIOR", _TP_MANAGED_RISK_MIN_POSTERIOR), 0.0, 0.95)
+    min_target_atr = max(_cfg_float("TP_MANAGED_RISK_MIN_TARGET_ATR", _TP_MANAGED_RISK_MIN_TARGET_ATR), 0.0)
+    min_sig = max(_cfg_float("TP_MANAGED_RISK_MIN_SIGNIFICANCE", _TP_MANAGED_RISK_MIN_SIGNIFICANCE), 0.0)
+
+    meta = {
+        "full_risk": full_risk,
+        "full_risk_atr": risk_atr,
+        "managed_risk": full_risk,
+        "managed_risk_atr": risk_atr,
+        "managed_risk_active": 0.0,
+        "managed_quality": 0.0,
+    }
+    if (not enabled
+            or risk_atr < min_stop_atr
+            or posterior < min_post
+            or float(distance_atr or 0.0) < min_target_atr
+            or reward_f <= max(float(be_move or 0.0), 0.0)):
+        return full_risk, False, meta
+
+    pool = _safe(target, "pool", None)
+    sig = float(_safe(target, "significance", 0.0) or 0.0)
+    if sig < min_sig:
+        return full_risk, False, meta
+
+    tf_rank = _tf_rank(str(_safe(pool, "timeframe", "5m") or "5m"))
+    sources = len(list(_safe(target, "tf_sources", []) or []))
+    sig_quality = _clamp(sig / 40.0, 0.0, 1.0)
+    tf_quality = _clamp((tf_rank - 1.0) / 4.0, 0.0, 1.0)
+    source_quality = _clamp((sources - 1.0) / 3.0, 0.0, 1.0)
+    distance_quality = _clamp((float(distance_atr or 0.0) - min_target_atr) / 3.0, 0.0, 1.0)
+    quality = _clamp(
+        0.48 * posterior
+        + 0.22 * sig_quality
+        + 0.14 * tf_quality
+        + 0.10 * source_quality
+        + 0.06 * distance_quality,
+        0.0,
+        1.0,
+    )
+
+    # Hard floor so fees/noise cannot turn a tiny target into a “managed risk”
+    # pass.  The cap keeps the denominator close to the risk that a liquidity
+    # trail should carry after the first delivery expansion, not the HTF disaster
+    # stop behind the pool.
+    base_atr = max(_cfg_float("TP_MANAGED_RISK_BASE_ATR", _TP_MANAGED_RISK_BASE_ATR), 0.25)
+    max_atr = max(_cfg_float("TP_MANAGED_RISK_MAX_ATR", _TP_MANAGED_RISK_MAX_ATR), base_atr)
+    max_stop_fraction = _clamp(
+        _cfg_float("TP_MANAGED_RISK_MAX_STOP_FRACTION", _TP_MANAGED_RISK_MAX_STOP_FRACTION),
+        0.10,
+        0.90,
+    )
+    quality_cap_atr = _clamp(base_atr + 1.55 * quality + 0.12 * max(0, tf_rank - 3), base_atr, max_atr)
+    fraction_cap = full_risk * max_stop_fraction
+    cost_floor = max(float(be_move or 0.0) * 1.75, atr_f * 0.85)
+    managed = min(full_risk, max(cost_floor, min(quality_cap_atr * atr_f, fraction_cap)))
+
+    # Do not activate for cosmetic reductions.
+    if managed >= full_risk * 0.92:
+        return full_risk, False, meta
+
+    meta.update({
+        "managed_risk": managed,
+        "managed_risk_atr": managed / atr_f,
+        "managed_risk_active": 1.0,
+        "managed_quality": quality,
+    })
+    return managed, True, meta
+
+
 def _terminal_path_drag_r(distance_atr: float, terminal_target: bool, reach_mult: float) -> float:
     if not terminal_target:
         return 0.0
@@ -1002,7 +1117,17 @@ def score_tp_pools(
                 continue
 
             reward = abs(tp_price - entry)
-            rr = reward / risk
+            full_rr = reward / risk
+            decision_risk, managed_risk_active, managed_risk_meta = _managed_tp_risk_denominator(
+                full_risk=risk,
+                atr=atr,
+                posterior_prob=posterior_prob,
+                target=target,
+                distance_atr=dist_atr,
+                reward=reward,
+                be_move=be_move,
+            )
+            decision_rr = reward / max(decision_risk, 1e-9)
 
             # ─── EV components ────────────────────────────────────────────
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
@@ -1032,21 +1157,28 @@ def score_tp_pools(
                 confluence,
                 gauntlet_mult,
                 reach_mult,
-                risk,
+                decision_risk,
                 be_move,
-                rr,
+                decision_rr,
                 distance_atr=dist_atr,
                 terminal_target=terminal_target,
             )
-            structural_rr_floor = _wide_stop_rr_floor(risk_atr, posterior_prob)
-            rr_floor = max(payoff.required_rr, structural_rr_floor)
+            structural_rr_floor_raw = _wide_stop_rr_floor(risk_atr, posterior_prob)
+            # Managed-risk TP selection already prices the wide protective stop
+            # as a disaster guard; do not re-apply the full-stop RR premium to
+            # the managed denominator, or valid liquidity targets get blocked.
+            structural_rr_floor = 0.0 if managed_risk_active else structural_rr_floor_raw
+            decision_rr_floor = max(payoff.required_rr, structural_rr_floor)
+            # Convert the managed-risk floor back to the full-stop denominator
+            # for downstream strategy guards that compare against full SL risk.
+            full_rr_floor = decision_rr_floor * (decision_risk / max(risk, 1e-9))
             delivery_prob = payoff.delivery_prob
             cost_r = payoff.cost_r
             required_delivery_prob = payoff.required_delivery_prob
-            if rr < rr_floor:
+            if decision_rr < decision_rr_floor:
                 continue
             utility, utility_components = _target_utility(
-                raw_prob, rr, rr_floor, dist_atr, reward, be_move)
+                raw_prob, decision_rr, decision_rr_floor, dist_atr, reward, be_move)
             utility *= reach_mult
             utility_components["reach_mult"] = reach_mult
             utility_components["max_reach_atr"] = max_reach
@@ -1056,7 +1188,7 @@ def score_tp_pools(
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(ev, rr, rr_floor, dist_atr)
+            selection_ev = _tp_selection_value(ev, decision_rr, decision_rr_floor, dist_atr)
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -1066,10 +1198,14 @@ def score_tp_pools(
             if terminal_target:
                 reasons.append(
                     f"terminal target beyond first-sweep reach ({dist_atr:.1f}>{max_reach:.1f}ATR; reach×{reach_mult:.2f})")
-            if rr >= float(min_rr) + 1.0:
-                reasons.append(f"R:R {rr:.1f}")
-            elif rr_floor < effective_min_rr - 1e-9:
-                reasons.append(f"dynamic payoff floor {rr_floor:.2f}")
+            if decision_rr >= float(min_rr) + 1.0:
+                reasons.append(f"managed R:R {decision_rr:.1f}" if managed_risk_active else f"R:R {decision_rr:.1f}")
+            elif decision_rr_floor < effective_min_rr - 1e-9:
+                reasons.append(f"dynamic payoff floor {decision_rr_floor:.2f}")
+            if managed_risk_active:
+                reasons.append(
+                    f"trail-managed risk {managed_risk_meta['managed_risk_atr']:.1f}ATR"
+                    f" vs disaster SL {managed_risk_meta['full_risk_atr']:.1f}ATR")
             if structural_rr_floor > payoff.required_rr + 1e-9:
                 reasons.append(f"wide-stop payoff floor {structural_rr_floor:.2f}")
             if utility_components["be_quality"] < 0.75:
@@ -1083,7 +1219,7 @@ def score_tp_pools(
                 target       = target,
                 tp_price     = tp_price,
                 distance_atr = dist_atr,
-                rr           = rr,
+                rr           = full_rr,
                 sweep_prob   = norm_prob,
                 raw_score    = raw_prob,
                 confluence   = confluence,
@@ -1102,8 +1238,19 @@ def score_tp_pools(
                     "be_move":     utility_components["be_move"],
                     "gauntlet":    gauntlet_mult,
                     "significance": sig,
-                    "rr_floor":    rr_floor,
-                    "wide_stop_rr_floor": structural_rr_floor,
+                    "rr_floor":    full_rr_floor,
+                    "decision_rr_floor": decision_rr_floor,
+                    "wide_stop_rr_floor": structural_rr_floor_raw,
+                    "active_wide_stop_rr_floor": structural_rr_floor,
+                    "full_rr":     full_rr,
+                    "managed_rr":  decision_rr,
+                    "decision_rr": decision_rr,
+                    "full_risk":   risk,
+                    "managed_risk": decision_risk,
+                    "full_risk_atr": managed_risk_meta.get("full_risk_atr", risk_atr),
+                    "managed_risk_atr": managed_risk_meta.get("managed_risk_atr", risk_atr),
+                    "managed_risk_active": 1.0 if managed_risk_active else 0.0,
+                    "managed_quality": managed_risk_meta.get("managed_quality", 0.0),
                     "delivery_prob": delivery_prob,
                     "required_delivery_prob": required_delivery_prob,
                     "edge_hurdle_r": payoff.edge_hurdle_r,
@@ -1361,7 +1508,17 @@ def diagnose_tp_pools(
                 rows.append(row); continue
 
             row.reward = abs(row.tp_price - entry)
-            row.rr = row.reward / risk
+            row.rr = row.reward / risk  # full disaster-stop RR, kept truthful in logs
+            decision_risk, managed_risk_active, managed_risk_meta = _managed_tp_risk_denominator(
+                full_risk=risk,
+                atr=atr,
+                posterior_prob=posterior_prob,
+                target=target,
+                distance_atr=row.distance_atr,
+                reward=row.reward,
+                be_move=be_move,
+            )
+            decision_rr = row.reward / max(decision_risk, 1e-9)
 
             raw_prob, norm_prob = _per_pool_sweep_prob(target, entry, atr, now_ts)
             row.sweep_prob = norm_prob
@@ -1389,23 +1546,26 @@ def diagnose_tp_pools(
                 confluence,
                 gauntlet_mult,
                 reach_mult,
-                risk,
+                decision_risk,
                 be_move,
-                row.rr,
+                decision_rr,
                 distance_atr=row.distance_atr,
                 terminal_target=terminal_target,
             )
-            structural_rr_floor = _wide_stop_rr_floor(risk_atr, posterior_prob)
-            rr_floor = max(payoff.required_rr, structural_rr_floor)
-            row.required_rr = rr_floor
+            structural_rr_floor_raw = _wide_stop_rr_floor(risk_atr, posterior_prob)
+            structural_rr_floor = 0.0 if managed_risk_active else structural_rr_floor_raw
+            decision_rr_floor = max(payoff.required_rr, structural_rr_floor)
+            full_rr_floor = decision_rr_floor * (decision_risk / max(risk, 1e-9))
+            row.required_rr = full_rr_floor
             row.delivery_prob = payoff.delivery_prob
             row.cost_r = payoff.cost_r
             row.edge_hurdle_r = payoff.edge_hurdle_r
             row.required_delivery_prob = payoff.required_delivery_prob
-            if row.rr < rr_floor:
+            row.quality = float(managed_risk_meta.get("managed_quality", 0.0))
+            if decision_rr < decision_rr_floor:
                 row.reason = _tp_payoff_rejection_reason(
-                    row.rr,
-                    rr_floor,
+                    decision_rr,
+                    decision_rr_floor,
                     effective_min_rr,
                     payoff.delivery_prob,
                     payoff.required_delivery_prob,
@@ -1413,11 +1573,18 @@ def diagnose_tp_pools(
                     payoff.edge_hurdle_r,
                     terminal_target,
                 )
+                if managed_risk_active:
+                    row.reason = (
+                        row.reason.replace("R:R", "managed R:R")
+                        + f"; full-stop RR {row.rr:.2f}, managed risk "
+                        + f"{managed_risk_meta['managed_risk_atr']:.2f}ATR vs disaster SL "
+                        + f"{managed_risk_meta['full_risk_atr']:.2f}ATR"
+                    )
                 rows.append(row); continue
-            utility, comps = _target_utility(raw_prob, row.rr, rr_floor, row.distance_atr, row.reward, be_move)
+            utility, comps = _target_utility(raw_prob, decision_rr, decision_rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, row.rr, rr_floor, row.distance_atr)
+            selection_ev = _tp_selection_value(row.ev, decision_rr, decision_rr_floor, row.distance_atr)
             row.selection_ev = selection_ev
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"
@@ -1425,8 +1592,12 @@ def diagnose_tp_pools(
             if terminal_target:
                 row.notes.append(f"terminal TP; reach×{reach_mult:.2f}")
             if confluence > 1.30: row.notes.append(f"conf×{confluence:.2f}")
-            if rr_floor < effective_min_rr - 1e-9:
-                row.notes.append(f"dynamic payoff floor {rr_floor:.2f}")
+            if managed_risk_active:
+                row.notes.append(
+                    f"managedRR={decision_rr:.2f} on {managed_risk_meta['managed_risk_atr']:.1f}ATR "
+                    f"trail-risk; fullRR={row.rr:.2f}")
+            if decision_rr_floor < effective_min_rr - 1e-9:
+                row.notes.append(f"dynamic payoff floor {decision_rr_floor:.2f}")
             if structural_rr_floor > payoff.required_rr + 1e-9:
                 row.notes.append(f"wide-stop floor {structural_rr_floor:.2f}")
             if selection_ev > row.ev + 1e-12:
@@ -1445,7 +1616,11 @@ def diagnose_tp_pools(
         selected.selected = True
         selected.reason = "selected by payoff-adjusted EV after all institutional gates"
         report.selected = selected
-        report.summary = (f"selected ${selected.tp_price:,.1f}; RR={selected.rr:.2f}; "
+        managed_note = next((str(n) for n in selected.notes if str(n).startswith("managedRR=")), "")
+        rr_txt = f"fullRR={selected.rr:.2f}" if managed_note else f"RR={selected.rr:.2f}"
+        if managed_note:
+            rr_txt += f"; {managed_note}"
+        report.summary = (f"selected ${selected.tp_price:,.1f}; {rr_txt}; "
                           f"EV={selected.ev:.3f}; P={selected.sweep_prob:.2f}")
     else:
         if rows:
