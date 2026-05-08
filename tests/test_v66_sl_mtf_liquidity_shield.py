@@ -56,6 +56,23 @@ def test_high_quality_stop_cluster_gets_wider_not_smaller_buffer():
     assert strong_pick.buffer_atr > weak_pick.buffer_atr
 
 
+def test_distant_low_quality_stop_anchor_is_rejected():
+    snap = _snapshot(
+        entry=100.0,
+        atr=2.0,
+        bsl=[_target(126.0, PoolSide.BSL, entry=100.0, atr=2.0, sig=3.0, tf="15m", touches=2)],
+    )
+
+    sl, target, pick, report = select_sl_with_report(
+        snap, "short", entry=100.0, atr=2.0, invalidation_price=101.0
+    )
+
+    assert sl is None
+    assert target is None
+    assert pick is None
+    assert "distance-adjusted floor" in report.as_dict()["summary"]
+
+
 def test_push_sl_behind_pools_handles_sl_equal_to_liquidity_pool():
     snap = _snapshot(
         bsl=[_target(105.0, PoolSide.BSL, sig=12.0, tf="15m", touches=6)],

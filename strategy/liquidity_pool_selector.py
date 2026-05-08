@@ -691,6 +691,9 @@ def _posterior_delivery_probability(
     confluence: float,
     gauntlet_mult: float,
     reach_mult: float,
+    rr: float = 0.0,
+    distance_atr: float = 0.0,
+    terminal_target: bool = False,
 ) -> float:
     """Blend setup posterior with the pool's own delivery probability."""
     pool_prob = _clamp(raw_prob, _TP_DELIVERY_PROB_FLOOR, 0.95)
@@ -712,8 +715,26 @@ def _posterior_delivery_probability(
         1.25,
     )
     blend_cap = _clamp(_cfg_float("TP_POSTERIOR_CONDITIONED_BLEND_MAX", 0.50), 0.0, 0.75)
-    pool_credibility = _clamp((pool_prob / max(posterior, pool_prob, 1e-9)) ** 0.25, 0.0, 1.0)
-    posterior_blend = _clamp(blend_cap * posterior * route_quality * pool_credibility, 0.0, blend_cap)
+    pool_credibility = _clamp((pool_prob / max(posterior, pool_prob, 1e-9)) ** 0.08, 0.0, 1.0)
+    payoff_quality = _clamp((float(rr or 0.0) - 0.80) / 2.40, 0.0, 1.0)
+    reach_bridge = _clamp(reach_mult, 0.001, 1.25)
+    if terminal_target:
+        # Terminal objectives can inherit auction posterior only when the route
+        # itself is reachable. This keeps genuine HTF liquidity alive while
+        # preventing lottery-distance pools from becoming full-position TPs.
+        reach_bridge = reach_bridge ** 0.65
+    else:
+        reach_bridge = reach_bridge ** 0.35
+    posterior_blend = _clamp(
+        blend_cap
+        * posterior
+        * route_quality
+        * pool_credibility
+        * reach_bridge
+        * (0.70 + 0.30 * payoff_quality),
+        0.0,
+        blend_cap,
+    )
     conditioned_prob = pool_prob + max(posterior - pool_prob, 0.0) * posterior_blend
     return _clamp(max(joint_prob, conditioned_prob), _TP_DELIVERY_PROB_FLOOR, 0.93)
 
@@ -755,6 +776,8 @@ def _tp_payoff_surface(
     risk: float,
     be_move: float,
     rr: float,
+    distance_atr: float = 0.0,
+    terminal_target: bool = False,
 ) -> PayoffSurface:
     """Solve the TP payoff surface from probability, cost, and route quality."""
     static_floor = max(0.01, float(static_min_rr))
@@ -762,7 +785,15 @@ def _tp_payoff_surface(
     cost_r = _clamp(0.75 * float(be_move) / risk_f, 0.0, 0.65)
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     delivery_p = _posterior_delivery_probability(
-        raw_prob, posterior, confluence, gauntlet_mult, reach_mult)
+        raw_prob,
+        posterior,
+        confluence,
+        gauntlet_mult,
+        reach_mult,
+        rr=rr,
+        distance_atr=distance_atr,
+        terminal_target=terminal_target,
+    )
     delivery_p = _clamp(delivery_p, _TP_DELIVERY_PROB_FLOOR, 0.95)
     edge_hurdle = _tp_edge_hurdle(
         posterior_prob=posterior,
@@ -772,6 +803,7 @@ def _tp_payoff_surface(
         reach_mult=reach_mult,
         cost_r=cost_r,
     )
+    edge_hurdle += _terminal_path_drag_r(distance_atr, terminal_target, reach_mult)
     break_even_rr = ((1.0 - delivery_p) + cost_r) / max(delivery_p, 1e-9)
     utility_floor = ((1.0 - delivery_p) + cost_r + edge_hurdle) / max(delivery_p, 1e-9)
     if posterior <= 0.0:
@@ -805,12 +837,26 @@ def _wide_stop_rr_floor(risk_atr: float, posterior_prob: float) -> float:
     return _clamp(floor, 0.0, max_rr)
 
 
+def _terminal_path_drag_r(distance_atr: float, terminal_target: bool, reach_mult: float) -> float:
+    if not terminal_target:
+        return 0.0
+    d = max(float(distance_atr or 0.0), 0.0)
+    reach_deficit = max(0.0, 1.0 - _clamp(reach_mult, 0.0, 1.0))
+    scale = max(_cfg_float("TP_TERMINAL_PATH_DRAG_SCALE", 0.004), 0.0)
+    max_drag = max(_cfg_float("TP_TERMINAL_PATH_DRAG_MAX_R", 8.0), 0.0)
+    drag = scale * (d ** 1.15) * (0.50 + reach_deficit)
+    return _clamp(drag, 0.0, max_drag)
+
+
 def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketProfile,
                           terminal_target: bool) -> float:
     mtf_reach = _terminal_reach_multiplier(distance_atr, tf)
     profile_reach = selector_profile.target_reach_penalty(distance_atr, tf)
     if terminal_target:
-        profile_reach = max(profile_reach, _TP_TERMINAL_PROFILE_FLOOR)
+        max_reach = max(_max_reach_for_tf(tf), 1e-9)
+        floor_decay = math.exp(-max(float(distance_atr) - max_reach, 0.0) / max_reach)
+        profile_floor = _TP_TERMINAL_PROFILE_FLOOR * floor_decay
+        profile_reach = max(profile_reach, profile_floor)
     return mtf_reach * profile_reach
 
 
@@ -989,6 +1035,8 @@ def score_tp_pools(
                 risk,
                 be_move,
                 rr,
+                distance_atr=dist_atr,
+                terminal_target=terminal_target,
             )
             structural_rr_floor = _wide_stop_rr_floor(risk_atr, posterior_prob)
             rr_floor = max(payoff.required_rr, structural_rr_floor)
@@ -1133,6 +1181,15 @@ def _sl_pool_score(target: Any, *, entry: float, atr: float, side: str) -> Tuple
     return score, quality, dist_atr, notes
 
 
+def _sl_distance_quality_floor(distance_atr: float) -> float:
+    reference = max(_cfg_float("SL_DISTANCE_QUALITY_FLOOR_ATR", 4.0), 0.0)
+    base = max(_cfg_float("SL_DISTANCE_QUALITY_FLOOR_BASE", 0.05), 0.0)
+    slope = max(_cfg_float("SL_DISTANCE_QUALITY_FLOOR_SLOPE", 0.035), 0.0)
+    max_floor = max(_cfg_float("SL_DISTANCE_QUALITY_FLOOR_MAX", 0.45), base)
+    floor = base + slope * max(float(distance_atr or 0.0) - reference, 0.0)
+    return _clamp(floor, 0.0, max_floor)
+
+
 def score_sl_pool(
     snap,
     side:                str,
@@ -1177,6 +1234,9 @@ def score_sl_pool(
             continue
         score, quality, dist_atr, notes = _sl_pool_score(t, entry=entry, atr=atr, side=side)
         if dist_atr > _SL_HARD_MAX_DISTANCE_ATR:
+            continue
+        quality_floor = _sl_distance_quality_floor(dist_atr)
+        if quality < quality_floor:
             continue
         buffer_atr = _sl_liquidity_buffer_atr(t, quality, max_buffer_atr=max_buffer_atr)
         pool_price = float(_safe(pool, "price", 0.0) or 0.0)
@@ -1332,6 +1392,8 @@ def diagnose_tp_pools(
                 risk,
                 be_move,
                 row.rr,
+                distance_atr=row.distance_atr,
+                terminal_target=terminal_target,
             )
             structural_rr_floor = _wide_stop_rr_floor(risk_atr, posterior_prob)
             rr_floor = max(payoff.required_rr, structural_rr_floor)
@@ -1464,6 +1526,13 @@ def diagnose_sl_pool(
             row.distance_atr = dist_atr
             if dist_atr > _SL_HARD_MAX_DISTANCE_ATR:
                 row.reason = f"extreme SL anchor distance {dist_atr:.1f}ATR > {_SL_HARD_MAX_DISTANCE_ATR:.1f}ATR"
+                rows.append(row); continue
+            quality_floor = _sl_distance_quality_floor(dist_atr)
+            if quality < quality_floor:
+                row.quality = quality
+                row.reason = (
+                    f"SL quality {quality:.2f} < distance-adjusted floor "
+                    f"{quality_floor:.2f} at {dist_atr:.1f}ATR")
                 rows.append(row); continue
             buffer_atr = _sl_liquidity_buffer_atr(target, quality, max_buffer_atr=max_buffer_atr)
             pool_price = float(_safe(target.pool, "price", 0.0) or 0.0)

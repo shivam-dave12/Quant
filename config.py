@@ -82,11 +82,17 @@ TRADE_COOLDOWN_SECONDS   = 300       # 5m cooldown after loss
 MIN_RISK_REWARD_RATIO    = 2.0       # expected-utility reference; thin R:R reduces size/EV
 TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
-TP_POSTERIOR_CONDITIONED_BLEND_MAX = 0.50
+TP_POSTERIOR_CONDITIONED_BLEND_MAX = 0.65
 TP_WIDE_STOP_RISK_ATR_REFERENCE    = 3.0
 TP_WIDE_STOP_BASE_RR               = 0.85
 TP_WIDE_STOP_RR_SLOPE              = 0.060
 TP_WIDE_STOP_MAX_RR                = 1.55
+TP_TERMINAL_PATH_DRAG_SCALE        = 0.004
+TP_TERMINAL_PATH_DRAG_MAX_R        = 8.0
+SL_DISTANCE_QUALITY_FLOOR_ATR      = 4.0
+SL_DISTANCE_QUALITY_FLOOR_BASE     = 0.05
+SL_DISTANCE_QUALITY_FLOOR_SLOPE    = 0.035
+SL_DISTANCE_QUALITY_FLOOR_MAX      = 0.45
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Quality signals are priced into the execution decision. Mechanical defects

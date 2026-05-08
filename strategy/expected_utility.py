@@ -88,6 +88,9 @@ def _pool_sig(obj: Any) -> float:
                 return v
     except Exception:
         pass
+    target_sig = _obj_float(obj, "significance", "quality", default=0.0)
+    if target_sig > 0.0:
+        return target_sig
     p = _pool(obj)
     return _obj_float(p, "significance", "quality", default=0.0)
 

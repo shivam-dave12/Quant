@@ -165,6 +165,66 @@ def test_wide_structural_stop_selects_htf_runner_instead_of_tiny_pool():
     assert near["rr"] < near["required_rr"]
 
 
+def test_posterior_conditioned_htf_target_passes_reachable_payoff():
+    snap = _snapshot(
+        entry=100.0,
+        atr=2.0,
+        ssl=[
+            _target(
+                91.0,
+                PoolSide.SSL,
+                sig=220.0,
+                tf="1h",
+                entry=100.0,
+                atr=2.0,
+                touches=3,
+                tf_sources=["15m", "1h"],
+            ),
+        ],
+    )
+
+    tp, target, score, report = select_tp_with_report(
+        snap, "short", entry=100.0, sl=103.75, atr=2.0, min_rr=2.2, posterior_prob=0.95
+    )
+
+    assert tp is not None
+    assert target is not None
+    assert target.pool.timeframe == "1h"
+    assert score.rr >= 2.0
+    selected = report.as_dict()["selected"]
+    assert selected["delivery_prob"] > selected["required_delivery_prob"]
+
+
+def test_lottery_distance_terminal_target_stays_rejected():
+    snap = _snapshot(
+        entry=100.0,
+        atr=0.22,
+        ssl=[
+            _target(
+                1.0,
+                PoolSide.SSL,
+                sig=220.0,
+                tf="1d",
+                entry=100.0,
+                atr=0.22,
+                touches=3,
+                tf_sources=["1d"],
+            ),
+        ],
+    )
+
+    tp, target, score, report = select_tp_with_report(
+        snap, "short", entry=100.0, sl=100.5, atr=0.22, min_rr=2.2, posterior_prob=0.95
+    )
+
+    assert tp is None
+    assert target is None
+    assert score is None
+    rejected = report.as_dict()["candidates"][0]
+    assert rejected["rr"] > 100.0
+    assert rejected["delivery_prob"] < rejected["required_delivery_prob"]
+
+
 @pytest.mark.parametrize("asset", [r["asset_id"] for r in MULTI_ASSET_REQUESTS])
 def test_every_configured_ticker_has_liquidity_aware_tp_and_sl_geometry(asset):
     # Asset-specific prices are normalized to a synthetic 100/2 ATR frame so the
