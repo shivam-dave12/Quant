@@ -375,7 +375,9 @@ def _target_distance_cap(dist_atr: float, tf_term: float, reliability: float, ro
 def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
                          snapshot: Any, flow: Any = None, ict: Any = None,
                          fee_bps: float = 8.0, slippage_bps: float = 2.0,
-                         posterior_prob: float = 0.0) -> TargetSurface:
+                         posterior_prob: float = 0.0,
+                         managed_risk_points: float = 0.0,
+                         managed_risk_active: bool = False) -> TargetSurface:
     side = (side or "").lower()
     entry = float(entry or 0.0)
     stop = float(stop or 0.0)
@@ -384,6 +386,18 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
     if side not in ("long", "short") or entry <= 0 or stop <= 0 or risk <= 0:
         return TargetSurface(side, entry, stop, risk, None, None, [], 0.0, ["invalid surface inputs"])
 
+    decision_risk = risk
+    managed_active = bool(managed_risk_active)
+    try:
+        mr = float(managed_risk_points or 0.0)
+        if managed_active and mr > 0.0 and mr < risk:
+            decision_risk = max(mr, _EPS)
+        else:
+            managed_active = False
+    except Exception:
+        managed_active = False
+        decision_risk = risk
+
     of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
     reliability = _feed_reliability(snapshot)
     try:
@@ -391,7 +405,7 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
     except Exception:
         total_cost_bps = 10.0
     cost_points = entry * (max(0.0, total_cost_bps) / 10_000.0)
-    cost_r = cost_points / max(risk, _EPS)
+    cost_r = cost_points / max(decision_risk, _EPS)
 
     cands: List[TargetUtility] = []
     pools = _get_pools_for_side(snapshot, side)
@@ -411,7 +425,8 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             continue
 
         dist = abs(tp_px - entry)
-        rr = dist / max(risk, _EPS)
+        full_rr = dist / max(risk, _EPS)
+        rr = dist / max(decision_risk, _EPS)
         dist_atr = pool_dist_atr
         exec_dist_atr = dist / atr
         sig = _pool_sig(target)
@@ -460,11 +475,12 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         if auction_p > 0.01 and role != "terminal":
             auction_edge = clamp((auction_p - 0.50) / 0.50, 0.0, 1.0)
             distance_decay_for_fusion = math.exp(-dist_atr / (7.0 + 2.5 * tf_term + reliability))
+            fusion_cap = 0.82 if managed_active else 0.68
             fusion_weight = clamp(
                 (0.22 + 0.30 * auction_edge + 0.16 * (1.0 - uncertainty)
                  + 0.08 * sig_term + 0.06 * gauntlet_penalty)
                 * distance_decay_for_fusion,
-                0.0, 0.68,
+                0.0, fusion_cap,
             )
             fused_p = p_path + fusion_weight * max(auction_p - p_path, 0.0)
             # Distance cap is a soft prior, not a hard veto, once the auction
@@ -472,7 +488,8 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             # is admitted; this prevents lottery distant targets while allowing
             # nearer executable pools to inherit live auction evidence.
             if fused_p > distance_cap:
-                p_hit = distance_cap + 0.65 * (fused_p - distance_cap)
+                cap_admission = 0.88 if managed_active else 0.65
+                p_hit = distance_cap + cap_admission * (fused_p - distance_cap)
             else:
                 p_hit = fused_p
             p_hit = clamp(max(p_path, p_hit), 0.001, 0.975)
@@ -481,6 +498,12 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
 
         path_risk = clamp((1.0 - gauntlet_penalty) + 0.40 * uncertainty + 0.20 * max(-of_align, 0.0)
                           + (0.030 * dist_atr if role == "terminal" else 0.008 * dist_atr), 0.0, 3.0)
+        if managed_active and role != "terminal":
+            # The liquidity selector already required a strong accepted auction
+            # and selected a trail-managed TP denominator.  Do not re-charge the
+            # full path-risk drag as if the disaster SL remains the live risk
+            # budget until TP; the trail engine is expected to compress risk.
+            path_risk *= 0.68
         loss_r = 1.0 + 0.38 * uncertainty + 0.26 * path_risk
         payoff_r = rr
         ev_r = p_hit * payoff_r - (1.0 - p_hit) * loss_r - cost_r
@@ -489,11 +512,13 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
         # second hard probability model.  Concavity is still applied, but as a
         # drag against excessive R:R rather than as a duplicate loss term.
         concavity_drag = 0.035 * max(payoff_r - 3.0, 0.0) ** 1.15
+        uncertainty_drag = 0.055 if managed_active and role != "terminal" else 0.12
+        path_drag_mult = 0.035 if managed_active and role != "terminal" else 0.070
         full_position_utility = (
             ev_r
             - concavity_drag
-            - 0.12 * uncertainty
-            - 0.070 * path_risk
+            - uncertainty_drag * uncertainty
+            - path_drag_mult * path_risk
         )
         if role == "terminal":
             terminal_drag = 0.35 + 0.030 * dist_atr + 0.25 * uncertainty
@@ -509,6 +534,8 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             f"cap={distance_cap:.3f}", f"pathP={p_path:.3f}", f"auctionP={auction_p:.3f}",
             f"pool=${px:,.1f}", f"execD={exec_dist_atr:.2f}ATR",
         ]
+        if managed_active:
+            notes.append(f"managedRiskRR={rr:.2f}; fullRR={full_rr:.2f}")
         cands.append(TargetUtility(tp_px, side, rr, dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,
@@ -528,6 +555,8 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
 
     notes = [f"of={of_align:+.2f}", f"htf={htf:+.2f}", f"pd={pd_affinity:+.2f}",
              f"U={uncertainty:.2f}", f"costR={cost_r:.3f}", f"feed={reliability:.2f}"]
+    if managed_active:
+        notes.append(f"managedRisk={decision_risk:.4f} vs disasterRisk={risk:.4f}")
     return TargetSurface(side, entry, stop, risk, best, terminal, cands, runner_fraction, notes)
 
 

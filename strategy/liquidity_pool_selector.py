@@ -976,11 +976,27 @@ def _tp_reach_multiplier(distance_atr: float, tf: str, selector_profile: MarketP
 
 
 def _tp_selection_value(ev: float, rr: float, rr_floor: float,
-                        distance_atr: float) -> float:
-    surplus_r = max(float(rr) - float(rr_floor), 0.0)
-    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
-    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
-    return float(ev) * payoff_frontier * delivery_span
+                        distance_atr: float, managed_risk_active: bool = False,
+                        significance: float = 0.0, tf_rank: int = 1) -> float:
+    """Rank eligible TP pools on an executable delivery frontier.
+
+    Pure EV tends to over-select the first nearby pool because reach probability
+    decays faster than payoff grows.  That is too defensive for BTC/metal
+    futures where the initial SL is a disaster guard and liquidity trailing is
+    expected to compress risk.  Once a pool has already passed probability,
+    cost, gauntlet, and managed-risk gates, the selector should prefer the
+    furthest *credible* liquidity objective on the payoff frontier, not the
+    nearest pool by default.
+    """
+    rr_f = max(float(rr), 0.0)
+    surplus_r = max(rr_f - float(rr_floor), 0.0)
+    payoff_frontier = (rr_f ** 0.68) * (1.0 + min(surplus_r * 0.34, 1.35))
+    delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.070, 0.80)
+    structural_quality = 1.0 + min(max(float(significance), 0.0) / 160.0, 0.45) + min(max(int(tf_rank) - 2, 0) * 0.06, 0.24)
+    if managed_risk_active:
+        delivery_span *= 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.055, 0.55)
+        payoff_frontier *= 1.0 + min(surplus_r * 0.18, 0.45)
+    return float(ev) * payoff_frontier * delivery_span * structural_quality
 
 
 def _tp_payoff_rejection_reason(
@@ -1188,7 +1204,12 @@ def score_tp_pools(
             #   - confluence and rr_quality are bounded by ~3-5×.
             #   - gauntlet_mult is a divisor in [0.45, 1.0].
             ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(ev, decision_rr, decision_rr_floor, dist_atr)
+            selection_ev = _tp_selection_value(
+                ev, decision_rr, decision_rr_floor, dist_atr,
+                managed_risk_active=managed_risk_active,
+                significance=sig,
+                tf_rank=_tf_rank(tf),
+            )
 
             reasons: List[str] = []
             if confluence > 1.30:
@@ -1584,7 +1605,12 @@ def diagnose_tp_pools(
             utility, comps = _target_utility(raw_prob, decision_rr, decision_rr_floor, row.distance_atr, row.reward, be_move)
             utility *= reach_mult
             row.ev = utility * _W_PROBABILITY * confluence * gauntlet_mult
-            selection_ev = _tp_selection_value(row.ev, decision_rr, decision_rr_floor, row.distance_atr)
+            selection_ev = _tp_selection_value(
+                row.ev, decision_rr, decision_rr_floor, row.distance_atr,
+                managed_risk_active=managed_risk_active,
+                significance=sig,
+                tf_rank=_tf_rank(tf),
+            )
             row.selection_ev = selection_ev
             row.eligible = True
             row.reason = "eligible; payoff-adjusted EV candidate"

@@ -3039,11 +3039,22 @@ class QuantStrategy:
             except Exception:
                 posterior_prob = 0.0
 
+            managed_risk_points = 0.0
+            managed_risk_active = False
+            try:
+                managed_risk_active = bool(getattr(signal, "tp_managed_risk_active", False))
+                managed_risk_points = float(getattr(signal, "tp_managed_risk", 0.0) or 0.0)
+            except Exception:
+                managed_risk_points = 0.0
+                managed_risk_active = False
+
             chosen_surface = build_target_surface(
                 side=side, entry=entry, stop=raw_sl, atr=atr_f,
                 snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
                 fee_bps=fee_bps, slippage_bps=slip_bps,
                 posterior_prob=posterior_prob,
+                managed_risk_points=managed_risk_points,
+                managed_risk_active=managed_risk_active,
             )
             self._last_target_surface = chosen_surface
             setattr(signal, "target_surface", chosen_surface)
@@ -3068,9 +3079,11 @@ class QuantStrategy:
             selected = self._selected_target_utility(chosen_surface, signal, atr_f)
             setattr(signal, "selected_target_utility", selected)
             raw_rr = abs(raw_tp - entry) / max(abs(entry - raw_sl), 1e-9)
+            managed_rr = float(getattr(signal, "tp_managed_rr", raw_rr) or raw_rr)
+            rr_label = f"fullRR={raw_rr:.2f} managedRR={managed_rr:.2f}" if managed_risk_active else f"RR={raw_rr:.2f}"
             logger.debug(
-                "TargetSurface audit: kept institutional SL/TP SL=$%.1f TP=$%.1f RR=%.2f posterior=%.3f | selected=%s | best=%s",
-                raw_sl, raw_tp, raw_rr, posterior_prob,
+                "TargetSurface audit: kept institutional SL/TP SL=$%.1f TP=$%.1f %s posterior=%.3f | selected=%s | best=%s",
+                raw_sl, raw_tp, rr_label, posterior_prob,
                 selected.compact() if selected is not None else "unpriced",
                 best.compact() if best is not None else "none",
             )
@@ -3407,7 +3420,19 @@ class QuantStrategy:
 
         risk = abs(entry - sl)
         reward = abs(tp - entry)
-        rr = reward / max(risk, 1e-9)
+        decision_risk = risk
+        try:
+            if bool(getattr(signal, "tp_managed_risk_active", False)):
+                mr = float(getattr(signal, "tp_managed_risk", 0.0) or 0.0)
+                if 0.0 < mr < risk:
+                    decision_risk = mr
+                    reasons.append(
+                        f"managed-risk TP pricing RR={reward / max(decision_risk, 1e-9):.2f} "
+                        f"fullRR={reward / max(risk, 1e-9):.2f}"
+                    )
+        except Exception:
+            decision_risk = risk
+        rr = reward / max(decision_risk, 1e-9)
         sig_score = self._bounded(significance / 8.0)
         tf_score = self._bounded(tf_rank / 4.0)
         rr_score = self._bounded(math.sqrt(max(rr, 0.0) / 4.0))
@@ -3541,7 +3566,17 @@ class QuantStrategy:
 
         sl_dist = abs(entry - sl)
         tp_dist = abs(tp - entry)
-        rr = tp_dist / max(sl_dist, 1e-9)
+        full_rr = tp_dist / max(sl_dist, 1e-9)
+        rr = full_rr
+        managed_risk_active = False
+        try:
+            managed_risk_active = bool(getattr(signal, "tp_managed_risk_active", False))
+            managed_rr = float(getattr(signal, "tp_managed_rr", 0.0) or 0.0)
+            if managed_risk_active and managed_rr > rr:
+                rr = managed_rr
+                allows.append(f"managed-risk payoff RR={rr:.2f} with full-stop RR={full_rr:.2f}")
+        except Exception:
+            managed_risk_active = False
         sl_atr = sl_dist / max(float(atr or 0.0), 1e-9)
         tp_atr = tp_dist / max(float(atr or 0.0), 1e-9)
 

@@ -338,6 +338,15 @@ class EntrySignal:
     ict_validation: str   = ""
     created_at:     float = field(default_factory=time.time)
     execution_leverage: float = 0.0
+    tp_full_rr: float = 0.0
+    tp_managed_rr: float = 0.0
+    tp_managed_risk: float = 0.0
+    tp_managed_risk_atr: float = 0.0
+    tp_managed_risk_active: bool = False
+    tp_required_rr: float = 0.0
+    tp_delivery_prob: float = 0.0
+    tp_required_delivery_prob: float = 0.0
+    tp_selection_ev: float = 0.0
 
 
 @dataclass
@@ -509,6 +518,7 @@ class EntryEngine:
         # Telegram /thinking command can still show WHY visible BSL/SSL pools
         # were not selected.
         self._last_pool_plan: Optional[Dict[str, Any]] = None
+        self._last_tp_score_components: Optional[Dict[str, Any]] = None
 
         # Signal handed to quant_strategy for execution. Used when a pre-order
         # rejection happens before any order reaches the exchange, so the exact
@@ -2450,6 +2460,7 @@ class EntryEngine:
             ict_validation=self._ict_summary(ict, side),
             execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
+        self._attach_tp_selection_context(self._signal)
         logger.info(
             "🎯 REFINED SWING ENTRY: %s @ $%.1f | SL=$%.1f TP=$%.1f "
             "R:R=%.2f risk %.1f->%.1fpts pullback=%.2fATR attempts=%d",
@@ -2604,6 +2615,7 @@ class EntryEngine:
             ict_validation=self._ict_summary(ict, side),
             execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
+        self._attach_tp_selection_context(self._signal)
         logger.info(f"🧪 EXECUTABLE CANDIDATE: REVERSAL {side.upper()} | "
                     f"SL=${sl:,.1f} TP=${tp:,.1f} R:R={rr:.1f}{cisd}{disp}")
         # BUG-2 FIX (STATE-DANGLE): Transition state to SCANNING immediately.
@@ -2754,6 +2766,7 @@ class EntryEngine:
             ict_validation=self._ict_summary(ict, side),
             execution_leverage=self._execution_leverage_for_stop(side, price, sl)[0],
         )
+        self._attach_tp_selection_context(self._signal)
         logger.info(f"🧪 EXECUTABLE CANDIDATE: CONTINUATION {side.upper()} R:R={rr:.1f}")
         # BUG-2 FIX (STATE-DANGLE): identical fix as _handle_reversal.
         # Transition to SCANNING immediately without nulling self._signal.
@@ -2797,6 +2810,7 @@ class EntryEngine:
                 "selected": None, "candidates": [],
             }
             self._record_pool_report(report)
+            self._last_tp_score_components = None
             return None, None
 
         tp_price, target, score, report_obj = _sel_tp(
@@ -2809,6 +2823,7 @@ class EntryEngine:
         report = report_obj.as_dict() if hasattr(report_obj, "as_dict") else dict(report_obj or {})
 
         self._record_pool_report(report)
+        self._last_tp_score_components = None
         if tp_price is None or target is None:
             logger.info("RAW_TP_AUDIT: %s", self._format_pool_plan(report))
             return None, None
@@ -2861,6 +2876,18 @@ class EntryEngine:
             return None, None
 
         if score is not None:
+            try:
+                comps = dict(getattr(score, "components", {}) or {})
+                comps.update({
+                    "tp_price": float(tp_price),
+                    "distance_atr": float(getattr(score, "distance_atr", 0.0) or 0.0),
+                    "sweep_prob": float(getattr(score, "sweep_prob", 0.0) or 0.0),
+                    "ev": float(getattr(score, "ev", 0.0) or 0.0),
+                    "gauntlet_n": int(getattr(score, "gauntlet_n", 0) or 0),
+                })
+                self._last_tp_score_components = comps
+            except Exception:
+                self._last_tp_score_components = None
             logger.info(
                 "RAW_TP_CANDIDATE: $%.1f dist=%.1fATR rr=%.2f P=%.4f EV=%.3f gauntlet=%d (%s)",
                 tp_price, score.distance_atr, score.rr,
@@ -2868,6 +2895,30 @@ class EntryEngine:
                 ", ".join(score.reasons) if score.reasons else "institutional gates passed",
             )
         return tp_price, target
+
+    def _attach_tp_selection_context(self, signal: EntrySignal) -> None:
+        """Copy selector-managed risk metadata onto the emitted signal.
+
+        The executable exchange SL remains the real protective stop.  These
+        fields let downstream expected-utility and decision surfaces price the
+        TP using the managed trail-risk denominator selected by the liquidity
+        TP engine, instead of re-vetoing the trade against the full disaster SL.
+        """
+        try:
+            comps = dict(self._last_tp_score_components or {})
+            if not comps:
+                return
+            signal.tp_full_rr = float(comps.get("full_rr", comps.get("rr", signal.rr_ratio)) or 0.0)
+            signal.tp_managed_rr = float(comps.get("managed_rr", signal.tp_full_rr) or 0.0)
+            signal.tp_managed_risk = float(comps.get("managed_risk", 0.0) or 0.0)
+            signal.tp_managed_risk_atr = float(comps.get("managed_risk_atr", 0.0) or 0.0)
+            signal.tp_managed_risk_active = bool(float(comps.get("managed_risk_active", 0.0) or 0.0) >= 0.5)
+            signal.tp_required_rr = float(comps.get("rr_floor", comps.get("decision_rr_floor", 0.0)) or 0.0)
+            signal.tp_delivery_prob = float(comps.get("delivery_prob", comps.get("sweep_prob", 0.0)) or 0.0)
+            signal.tp_required_delivery_prob = float(comps.get("required_delivery_prob", 0.0) or 0.0)
+            signal.tp_selection_ev = float(comps.get("selection_ev", comps.get("ev", 0.0)) or 0.0)
+        except Exception as e:
+            logger.debug("TP selection context attach failed: %s", e)
 
     def _find_sl_pool(self, snap, side, entry, atr, ict=None,
                        invalidation_price=None, max_buffer_atr=2.0,

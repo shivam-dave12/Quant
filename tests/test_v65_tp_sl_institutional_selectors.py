@@ -337,3 +337,83 @@ def test_wide_liquidity_stop_still_selects_real_tp_pool_with_trail_managed_risk(
     selected = report.as_dict()["selected"]
     assert selected["required_rr"] < selected["rr"]
     assert any("managedRR" in str(n) for n in selected["notes"])
+
+from strategy.expected_utility import build_target_surface
+
+
+def test_target_surface_respects_selector_managed_trail_risk_for_wide_sl():
+    """Downstream execution audit must not re-veto a selector-approved TP.
+
+    Regression for the SILVER live log: the selector priced the TP with managed
+    trail-risk, but the target surface repriced it against the full disaster SL
+    and marked utility negative.  The advisory surface must use the same managed
+    denominator when the selector explicitly activates it.
+    """
+    entry = 73.0
+    atr = 0.193
+    snap = _snapshot(
+        entry=entry,
+        atr=atr,
+        ssl=[
+            _target(
+                72.40,
+                PoolSide.SSL,
+                sig=120.0,
+                tf="15m",
+                entry=entry,
+                atr=atr,
+                touches=3,
+                tf_sources=["5m", "15m"],
+            ),
+        ],
+    )
+
+    surface = build_target_surface(
+        side="short",
+        entry=entry,
+        stop=74.60,
+        atr=atr,
+        snapshot=snap,
+        posterior_prob=0.95,
+        managed_risk_points=atr * 2.70,
+        managed_risk_active=True,
+        fee_bps=8.0,
+        slippage_bps=0.0,
+    )
+
+    assert surface.best is not None
+    assert surface.has_positive_edge
+    assert surface.best.rr > 0.90
+    assert any("managedRisk" in note for note in surface.notes)
+
+
+def test_managed_tp_frontier_prefers_farther_credible_liquidity_over_nearest_pool():
+    """When trail-managed risk is active, do not collapse to nearest TP only."""
+    entry = 73.0
+    atr = 0.193
+    snap = _snapshot(
+        entry=entry,
+        atr=atr,
+        ssl=[
+            _target(72.55, PoolSide.SSL, sig=110.0, tf="15m", entry=entry, atr=atr, touches=3),
+            _target(72.05, PoolSide.SSL, sig=180.0, tf="1h", entry=entry, atr=atr, touches=3,
+                    tf_sources=["15m", "1h"]),
+        ],
+    )
+
+    tp, target, score, report = select_tp_with_report(
+        snap,
+        "short",
+        entry=entry,
+        sl=74.60,
+        atr=atr,
+        min_rr=2.20,
+        posterior_prob=0.95,
+    )
+
+    assert tp is not None
+    assert target is not None
+    assert target.pool.price == pytest.approx(72.05)
+    assert score.components["managed_risk_active"] == pytest.approx(1.0)
+    near = next(c for c in report.as_dict()["candidates"] if c["pool_price"] == pytest.approx(72.55))
+    assert near["selected"] is False
