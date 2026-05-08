@@ -2827,7 +2827,29 @@ class EntryEngine:
             sig_term = min(0.42, 0.045 * max(0.0, sig))
             touch_term = min(0.24, 0.035 * max(0, touches - 2))
             tf_term = min(0.22, 0.045 * max(0, tf_rank - 2))
-            return max(0.30, min(1.35, 0.30 + sig_term + touch_term + tf_term)) * atr
+
+            # v75: asset-aware liquidity clearance. BTC/metals routinely sweep
+            # the obvious cluster and continue; using the same 1.35ATR cap as
+            # xStocks can leave the executable SL inside the stop-run envelope.
+            boost = 1.0
+            cap = 1.35
+            try:
+                from core.instruments import current_instrument
+                inst = current_instrument()
+                asset_id = str(getattr(inst, "asset_id", "") or "").upper() if inst is not None else ""
+                ac = getattr(inst, "asset_class", "") if inst is not None else ""
+                asset_class = str(getattr(ac, "value", ac) or "").lower()
+                if asset_id == "BTC":
+                    boost, cap = 1.18, 1.75
+                elif asset_id in ("GOLD", "SILVER") or asset_class == "commodity":
+                    boost, cap = 1.15, 1.70
+                elif asset_class == "index":
+                    boost, cap = 1.06, 1.50
+            except Exception:
+                pass
+
+            raw = 0.30 + sig_term + touch_term + tf_term
+            return max(0.30, min(cap, raw * boost)) * atr
 
         sl_origin = float(sl)
         sl_new = float(sl)
