@@ -1881,7 +1881,6 @@ class EntryEngine:
             max_buffer_atr=2.0,
             min_risk=min_risk,
         )
-        anchored_by_pool = False
         if pool_sl is not None and self._sl_is_protective(side, pool_sl, price):
             pool_risk = abs(price - pool_sl)
             if pool_risk > max_risk:
@@ -1902,7 +1901,6 @@ class EntryEngine:
                 if accept_pool:
                     sl = pool_sl
                     risk = pool_risk
-                    anchored_by_pool = True
                     details = ", ".join(getattr(pool_pick, "reasons", []) or [])
                     logger.info(
                         "SL envelope %s: anchored behind protective liquidity at $%.1f "
@@ -1920,12 +1918,7 @@ class EntryEngine:
                         "refusing executable stop inside liquidity"
                     )
 
-        # If the dedicated liquidity-pool selector already anchored the stop
-        # outside its protective shelf, do not run the legacy generic pusher
-        # again.  Double-buffering the same stop cluster widened GOLD/BTC stops
-        # from executable institutional risk into oversized no-TP geometry.
-        if not anchored_by_pool:
-            sl = self._push_sl_behind_pools(sl, side, price, atr)
+        sl = self._push_sl_behind_pools(sl, side, price, atr)
         risk = abs(price - sl)
 
         if not self._sl_is_protective(side, sl, price):
@@ -2834,29 +2827,7 @@ class EntryEngine:
             sig_term = min(0.42, 0.045 * max(0.0, sig))
             touch_term = min(0.24, 0.035 * max(0, touches - 2))
             tf_term = min(0.22, 0.045 * max(0, tf_rank - 2))
-
-            # v75: asset-aware liquidity clearance. BTC/metals routinely sweep
-            # the obvious cluster and continue; using the same 1.35ATR cap as
-            # xStocks can leave the executable SL inside the stop-run envelope.
-            boost = 1.0
-            cap = 1.35
-            try:
-                from core.instruments import current_instrument
-                inst = current_instrument()
-                asset_id = str(getattr(inst, "asset_id", "") or "").upper() if inst is not None else ""
-                ac = getattr(inst, "asset_class", "") if inst is not None else ""
-                asset_class = str(getattr(ac, "value", ac) or "").lower()
-                if asset_id == "BTC":
-                    boost, cap = 1.18, 1.75
-                elif asset_id in ("GOLD", "SILVER") or asset_class == "commodity":
-                    boost, cap = 1.15, 1.70
-                elif asset_class == "index":
-                    boost, cap = 1.06, 1.50
-            except Exception:
-                pass
-
-            raw = 0.30 + sig_term + touch_term + tf_term
-            return max(0.30, min(cap, raw * boost)) * atr
+            return max(0.30, min(1.35, 0.30 + sig_term + touch_term + tf_term)) * atr
 
         sl_origin = float(sl)
         sl_new = float(sl)
