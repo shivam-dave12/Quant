@@ -192,30 +192,24 @@ try:
     import config as _entry_gate_cfg
     _ENTRY_HARD_MIN_DISP_ATR = float(getattr(_entry_gate_cfg, "ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR", getattr(_entry_gate_cfg, "ENTRY_HARD_MIN_DISPLACEMENT_ATR", 0.75)))
     _ENTRY_STRONG_DISP_ATR   = float(getattr(_entry_gate_cfg, "ENTRY_STRONG_DISPLACEMENT_ATR", 1.25))
-    _ENTRY_REQUIRE_CISD_OR_OTE = bool(getattr(_entry_gate_cfg, "ENTRY_REQUIRE_CISD_OR_OTE", True))
     _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = float(getattr(_entry_gate_cfg, "ENTRY_MAX_CHASE_ATR_WITHOUT_OTE", 1.15))
     _ENTRY_REVERSAL_PD_LONG_MAX  = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_LONG_MAX", 0.62))
     _ENTRY_REVERSAL_PD_SHORT_MIN = float(getattr(_entry_gate_cfg, "ENTRY_REVERSAL_PD_SHORT_MIN", 0.38))
     _ENTRY_CONT_MIN_ACCEPT_ATR = float(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR", 0.55))
-    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = bool(getattr(_entry_gate_cfg, "ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS", True))
     _ENTRY_FLOW_HARD_OPPOSE = float(getattr(_entry_gate_cfg, "ENTRY_FLOW_HARD_OPPOSE_THRESHOLD", 0.40))
     _ENTRY_CVD_HARD_OPPOSE  = float(getattr(_entry_gate_cfg, "ENTRY_CVD_HARD_OPPOSE_THRESHOLD", 0.30))
-    _ENTRY_HTF_CONTRA_VETO = bool(getattr(_entry_gate_cfg, "ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP", True))
     _ENTRY_GATE_LOG_SEC = float(getattr(_entry_gate_cfg, "ENTRY_GATE_LOG_INTERVAL_SEC", 12.0))
     _ENTRY_EXECUTION_QUALITY_MIN = float(getattr(_entry_gate_cfg, "ENTRY_EXECUTION_QUALITY_MIN", 0.52))
     _ENTRY_CRITICAL_DEFECT_FLOOR = float(getattr(_entry_gate_cfg, "ENTRY_CRITICAL_DEFECT_FLOOR", 0.62))
 except Exception:
     _ENTRY_HARD_MIN_DISP_ATR = 0.75
     _ENTRY_STRONG_DISP_ATR   = 1.25
-    _ENTRY_REQUIRE_CISD_OR_OTE = True
     _ENTRY_MAX_CHASE_ATR_WITHOUT_OTE = 1.15
     _ENTRY_REVERSAL_PD_LONG_MAX  = 0.62
     _ENTRY_REVERSAL_PD_SHORT_MIN = 0.38
     _ENTRY_CONT_MIN_ACCEPT_ATR = 0.55
-    _ENTRY_CONT_REQUIRE_CISD_OR_BOS = True
     _ENTRY_FLOW_HARD_OPPOSE = 0.40
     _ENTRY_CVD_HARD_OPPOSE  = 0.30
-    _ENTRY_HTF_CONTRA_VETO = True
     _ENTRY_GATE_LOG_SEC = 12.0
     _ENTRY_EXECUTION_QUALITY_MIN = 0.52
     _ENTRY_CRITICAL_DEFECT_FLOOR = 0.62

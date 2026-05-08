@@ -73,6 +73,45 @@ def test_unified_entry_gate_does_not_double_apply_readiness_sizing():
     assert qs._active_institutional_size_mult == 0.50
 
 
+def test_route_readiness_is_single_authority_for_same_signal():
+    from strategy.quant_strategy import QuantStrategy, EntryReadinessDecision
+
+    qs = QuantStrategy.__new__(QuantStrategy)
+    calls = {"n": 0}
+    readiness = EntryReadinessDecision(
+        allowed=True,
+        score=0.82,
+        floor=0.55,
+        size_mult=0.70,
+        reason="cached pass",
+        hard_rejects=[],
+        penalties=[],
+        allows=["cached"],
+    )
+
+    def surface(*args, **kwargs):
+        calls["n"] += 1
+        return readiness
+
+    qs._entry_readiness_surface = surface
+    signal = SimpleNamespace(
+        side="long",
+        entry_type=SimpleNamespace(value="SWEEP_REVERSAL"),
+        entry_price=100.0,
+    )
+
+    first = qs._route_readiness_decision(
+        signal, SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), 100.0, 2.0
+    )
+    second = qs._route_readiness_decision(
+        signal, SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), 100.0, 2.0
+    )
+
+    assert first is readiness
+    assert second is readiness
+    assert calls["n"] == 1
+
+
 def test_selector_utility_components_have_single_distance_quality_key():
     src = open("strategy/liquidity_pool_selector.py", "r", encoding="utf-8").read()
     assert src.count('"distance_quality": distance_quality') == 1

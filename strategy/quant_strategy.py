@@ -57,11 +57,12 @@ except Exception:  # pragma: no cover - standalone tests
     from market_intelligence import build_market_profile, MarketProfile  # type: ignore
 
 try:
-    from strategy.expected_utility import build_target_surface, expected_utility_size_multiplier
+    from strategy.expected_utility import build_stop_surface, build_target_surface, expected_utility_size_multiplier
 except Exception:  # pragma: no cover - standalone tests
     try:
-        from expected_utility import build_target_surface, expected_utility_size_multiplier  # type: ignore
+        from expected_utility import build_stop_surface, build_target_surface, expected_utility_size_multiplier  # type: ignore
     except Exception:
+        build_stop_surface = None  # type: ignore
         build_target_surface = None  # type: ignore
         expected_utility_size_multiplier = None  # type: ignore
 
@@ -3043,6 +3044,15 @@ class QuantStrategy:
             setattr(signal, "target_surface", chosen_surface)
 
             self._last_stop_surface = None
+            if build_stop_surface is not None:
+                try:
+                    self._last_stop_surface = build_stop_surface(
+                        side=side, entry=entry, current_stop=raw_sl, atr=atr_f,
+                        snapshot=liq_snapshot, flow=flow_state, ict=ict_ctx,
+                        tick_size=QCfg.TICK_SIZE(),
+                    )
+                except Exception as _ss_e:
+                    logger.debug(f"StopSurface advisory annotation error: {_ss_e}")
             setattr(signal, "stop_surface", None)
 
             if getattr(chosen_surface, 'terminal', None) is not None:
@@ -3372,16 +3382,25 @@ class QuantStrategy:
             return ""
         selected = getattr(signal, "selected_target_utility", None)
         if selected is None:
-            return "selected TP is not priced on executable target surface"
+            return ""
         full_u = float(getattr(selected, "full_position_utility", 0.0) or 0.0)
         ev_r = float(getattr(selected, "expected_value_r", 0.0) or 0.0)
         if full_u <= 0.0 or ev_r <= 0.0:
             compact = selected.compact() if hasattr(selected, "compact") else str(selected)
             return f"selected TP has no positive executable utility: {compact}"
+        return ""
+
+    def _target_utility_advisory_reason(self, signal) -> str:
+        surface = getattr(signal, "target_surface", None) or getattr(self, "_last_target_surface", None)
+        if surface is None:
+            return ""
+        selected = getattr(signal, "selected_target_utility", None)
+        if selected is None:
+            return "selected TP is not priced on executable target surface"
         if not getattr(surface, "has_positive_edge", False):
             best = getattr(surface, "best", None)
             compact = best.compact() if best is not None and hasattr(best, "compact") else "none"
-            return f"no positive executable target utility: best={compact}"
+            return f"target surface has no stronger positive edge: best={compact}"
         return ""
 
     def _institutional_decision_matrix(self, signal, ict_ctx, flow_state,
@@ -3423,6 +3442,9 @@ class QuantStrategy:
         target_utility_reject = self._target_utility_reject_reason(signal)
         if target_utility_reject:
             rejects.append(target_utility_reject)
+        target_utility_advisory = ""
+        if not target_utility_reject:
+            target_utility_advisory = self._target_utility_advisory_reason(signal)
 
         sweep = getattr(signal, "sweep_result", None)
         quality = float(getattr(sweep, "quality", 0.0) or 0.0)
@@ -3438,6 +3460,8 @@ class QuantStrategy:
             try:
                 entry_readiness = self._entry_readiness_surface(
                     signal, ict_ctx, flow_state, liq_snapshot, price, atr)
+                self._last_entry_readiness = entry_readiness
+                self._last_entry_readiness_key = self._entry_signal_identity(signal, atr)
                 allows.extend(entry_readiness.allows[:4])
                 if entry_readiness.penalties:
                     allows.append("entry_readiness_penalty: " + " | ".join(entry_readiness.penalties[:3]))
@@ -3560,6 +3584,9 @@ class QuantStrategy:
                 advisory_rejects.append(_rs)
 
         quality_gap = 0.0
+        if target_utility_advisory:
+            quality_gap += 0.08
+            quality_advisories.append(target_utility_advisory)
         if target_realism < min_target_realism:
             gap = min_target_realism - target_realism
             quality_gap += gap * 0.65
@@ -4107,6 +4134,7 @@ class QuantStrategy:
                     f"_enter_trade background thread error ({mode}/{side}): {_e}",
                     exc_info=True)
               finally:
+                _gate_reject = False
                 with self._lock:
                     if self._pos.phase == PositionPhase.ENTERING:
                         # Distinguish pre-trade gate rejection (no order placed)
@@ -4641,6 +4669,19 @@ class QuantStrategy:
             allows=allows[:8],
         )
 
+    def _route_readiness_decision(self, signal, ict_ctx, flow_state,
+                                  liq_snapshot, price, atr) -> EntryReadinessDecision:
+        """Return the single cached route-readiness decision for this signal."""
+        key = self._entry_signal_identity(signal, atr)
+        cached = getattr(self, "_last_entry_readiness", None)
+        if cached is not None and getattr(self, "_last_entry_readiness_key", None) == key:
+            return cached
+        readiness = self._entry_readiness_surface(
+            signal, ict_ctx, flow_state, liq_snapshot, price, atr)
+        self._last_entry_readiness = readiness
+        self._last_entry_readiness_key = key
+        return readiness
+
     def _unified_entry_gate(self, signal, ict_ctx, flow_state,
                              liq_snapshot, price, atr, now):
         """
@@ -4651,9 +4692,8 @@ class QuantStrategy:
         matrix so valid fast sweeps are not blocked twice.  Critical defects
         pause routing; coherent but imperfect entries route with reduced size.
         """
-        readiness = self._entry_readiness_surface(
+        readiness = self._route_readiness_decision(
             signal, ict_ctx, flow_state, liq_snapshot, price, atr)
-        self._last_entry_readiness = readiness
         if not readiness.allowed:
             logger.info(
                 f"ENTRY_READINESS paused routing {str(getattr(signal, 'side', '')).upper()} "
@@ -5781,6 +5821,7 @@ class QuantStrategy:
                 mode=signal.entry_type.value.lower(),
                 ict_tier=_tier,
                 prefetched_bal_info=bal_info,   # Bug #5: reuse fetched balance
+                entry_now=now,
             )
             self._entry_confirm_key = None
             self._entry_confirm_count = 0

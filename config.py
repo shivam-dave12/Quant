@@ -56,13 +56,13 @@ REMAINDER_MIN_QTY        = 0.001
 
 # ── Risk management ──────────────────────────────────────────────────────────
 # RISK_PER_TRADE: FRACTION of available balance risked per trade (NOT percent).
-#   0.006 = 0.6% risk per trade.
+#   0.005 = 0.5% risk per trade.
 #   Previous value 0.60 was interpreted as percent by risk_manager (÷100 = 0.006 → 0.6%)
 #   but as FRACTION by quant_strategy._compute_quantity (× direct = 0.60 → 60%).
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.01    # 1% of available balance per trade
+RISK_PER_TRADE           = 0.005   # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -80,20 +80,11 @@ MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
 # Quality signals are priced into the execution decision. Mechanical defects
-# always stop routing; weak delivery/coherence must clear an adaptive quality
-# floor before an order is allowed to reach sizing/execution.
-INSTITUTIONAL_STRICT_QUALITY_GATES = True
+# always stop routing; weak delivery/coherence scales exposure dynamically.
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
 INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
-ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
-ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
-ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
-ENTRY_EXECUTION_QUALITY_MIN        = 0.52
-ENTRY_CRITICAL_DEFECT_FLOOR        = 0.62
-ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
-ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
 IC_IMPAIRMENT_SIZE_MULT            = 0.35
 POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
@@ -474,15 +465,12 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
-ENTRY_REQUIRE_CISD_OR_OTE                = True
 ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
 ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
 ENTRY_REVERSAL_PD_SHORT_MIN              = 0.38
 ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR    = 0.55
-ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS   = True
 ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic penalty reference
 ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
-ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
 ENTRY_EXECUTION_QUALITY_MIN              = 0.52
 ENTRY_CRITICAL_DEFECT_FLOOR              = 0.62
