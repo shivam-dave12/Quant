@@ -3019,7 +3019,10 @@ class QuantStrategy:
                 if self._fee_engine is not None:
                     snap = self._fee_engine.diagnostic_snapshot()
                     fee_bps = float(snap.get('rt_cost_maker_bps', snap.get('rt_cost_taker_bps', fee_bps)) or fee_bps)
-                    slip_bps = float(snap.get('slippage_ewma_bps', slip_bps) or slip_bps)
+                    # rt_cost_* is already all-in: fees + spread + entry/exit
+                    # slippage.  Passing slippage again double-counts execution
+                    # drag and makes utility reject otherwise valid targets.
+                    slip_bps = 0.0
             except Exception:
                 pass
 
@@ -6251,11 +6254,15 @@ class QuantStrategy:
         except Exception:
             exec_posterior = None
         if exec_posterior is None:
-            exec_posterior = max(
-                float(getattr(getattr(self, "_last_entry_signal", None), "conviction", 0.0) or 0.0),
-                float(signal_confidence or 0.0),
-            )
-            if exec_posterior <= 0.0:
+            try:
+                sig_p = float(
+                    getattr(getattr(self, "_last_entry_signal", None), "posterior_prob", 0.0)
+                    or getattr(getattr(self, "_last_entry_signal", None), "posterior", 0.0)
+                    or 0.0
+                )
+                if 0.0 < sig_p < 1.0:
+                    exec_posterior = sig_p
+            except Exception:
                 exec_posterior = None
 
         if not use_maker:
@@ -9377,6 +9384,15 @@ class QuantStrategy:
                 f"gap={viability.geometry_gap_pts:.1f}pts | "
                 f"repricing: structural_SL=${viability.required_sl_price:,.1f} "
                 f"or entry=${viability.required_entry_price:,.1f}{eu}")
+            return None
+
+        if viability.utility_known and viability.expected_net_utility_r <= 0.0:
+            logger.info(
+                f"No allocation: execution utility non-positive | route={viability.route} "
+                f"EU={viability.expected_net_utility_r:.2f}R posterior={viability.posterior_prob:.3f} "
+                f"net_win={viability.net_win_r:.2f}R net_loss={viability.net_loss_r:.2f}R "
+                f"rt_cost={viability.round_trip_cost_pts:.1f}pts "
+                f"SL-dist={sl_dist:.1f}pts TP-dist={viability.reward_dist:.1f}pts")
             return None
 
         if fee_to_risk > fee_soft:

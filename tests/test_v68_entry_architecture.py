@@ -146,6 +146,61 @@ def test_v68_pre_order_rejection_replaces_expired_sweep_lock():
     sweep = _sweep()
     sig = _signal(sweep=sweep)
     key = engine._sweep_key(sweep)
+    level_key = engine._sweep_level_key(sweep)
     engine._processed_sweeps[key] = time.time() - 222.0
+    engine._processed_sweep_levels[level_key] = time.time() - 222.0
     engine.mark_pre_order_rejected(sig, cooldown_sec=30.0)
     assert engine._processed_sweeps[key] > time.time()
+    assert engine._processed_sweep_levels[level_key] > time.time()
+
+
+def test_v68_same_level_sweep_replay_is_suppressed_even_with_new_detected_at():
+    engine = EntryEngine()
+    now = time.time()
+    first = _sweep(side=PoolSide.BSL, price=398.10, wick=399.0, direction="short")
+    replay = _sweep(side=PoolSide.BSL, price=398.12, wick=399.1, direction="short")
+    first.detected_at = now
+    replay.detected_at = now + 12.0
+
+    engine._lock_processed_sweep(first, now + 120.0, atr=0.38)
+
+    assert engine._sweep_key(first) != engine._sweep_key(replay)
+    assert engine._is_processed(replay, now + 12.0, atr=0.38)
+
+
+def test_v68_dead_post_sweep_without_delivery_is_abandoned_before_full_timeout():
+    engine = EntryEngine()
+    ps = SimpleNamespace(
+        sweep=_sweep(side=PoolSide.SSL, price=100.0, wick=99.5, direction="long"),
+        max_displacement=0.0,
+        cisd_detected=False,
+        ote_reached=False,
+        ote_holding=False,
+    )
+
+    invalid, reason = engine._post_sweep_invalidation_reason(
+        ps, _snapshot(), OrderFlowState(), ICTContext(),
+        price=100.1, atr=2.0, elapsed=120.0,
+    )
+
+    assert invalid
+    assert "dead auction" in reason
+
+
+def test_v68_post_sweep_abandons_when_price_crosses_structural_invalidation():
+    engine = EntryEngine()
+    ps = SimpleNamespace(
+        sweep=_sweep(side=PoolSide.SSL, price=100.0, wick=99.5, direction="long"),
+        max_displacement=0.6,
+        cisd_detected=False,
+        ote_reached=False,
+        ote_holding=False,
+    )
+
+    invalid, reason = engine._post_sweep_invalidation_reason(
+        ps, _snapshot(), OrderFlowState(), ICTContext(),
+        price=98.7, atr=2.0, elapsed=20.0,
+    )
+
+    assert invalid
+    assert "invalidated before entry" in reason

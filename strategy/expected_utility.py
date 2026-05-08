@@ -148,6 +148,25 @@ def _feed_reliability(snapshot: Any) -> float:
     return 0.82
 
 
+def _target_reach_buffer(distance_atr: float, atr: float) -> float:
+    """Match the executable TP buffer used by the liquidity selector."""
+    return max(0.10, min(0.50, 0.10 + 0.05 * float(distance_atr or 0.0))) * max(float(atr or 0.0), _EPS)
+
+
+def _executable_target_price(pool_price: float, side: str, entry: float,
+                             atr: float, distance_atr: float) -> float:
+    """Convert a raw liquidity pool into the TP price actually placed before it."""
+    buf = _target_reach_buffer(distance_atr, atr)
+    side = (side or "").lower()
+    if side == "long":
+        tp = float(pool_price) - buf
+        return tp if tp > float(entry) + 1e-9 else 0.0
+    if side == "short":
+        tp = float(pool_price) + buf
+        return tp if tp < float(entry) - 1e-9 else 0.0
+    return 0.0
+
+
 def _market_terms(side: str, flow: Any, ict: Any) -> Tuple[float, float, float, float]:
     side = (side or "").lower()
     sign = 1.0 if side == "long" else -1.0
@@ -364,7 +383,11 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
 
     of_align, htf, pd_affinity, uncertainty = _market_terms(side, flow, ict)
     reliability = _feed_reliability(snapshot)
-    cost_points = entry * ((float(fee_bps) + float(slippage_bps)) / 10_000.0)
+    try:
+        total_cost_bps = float(fee_bps) + float(slippage_bps)
+    except Exception:
+        total_cost_bps = 10.0
+    cost_points = entry * (max(0.0, total_cost_bps) / 10_000.0)
     cost_r = cost_points / max(risk, _EPS)
 
     cands: List[TargetUtility] = []
@@ -378,15 +401,22 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             continue
         if side == "short" and px >= entry:
             continue
-        dist = abs(px - entry)
+        pool_dist = abs(px - entry)
+        pool_dist_atr = pool_dist / atr
+        tp_px = _executable_target_price(px, side, entry, atr, pool_dist_atr)
+        if tp_px <= 0:
+            continue
+
+        dist = abs(tp_px - entry)
         rr = dist / max(risk, _EPS)
-        dist_atr = dist / atr
+        dist_atr = pool_dist_atr
+        exec_dist_atr = dist / atr
         sig = _pool_sig(target)
         tf_rank = _pool_tf_rank(target)
         sig_term = clamp(math.log1p(max(sig, 0.0)) / math.log(30.0), 0.0, 1.0)
         tf_term = clamp((tf_rank - 1) / 5.0, 0.0, 1.0)
 
-        lo, hi = min(entry, px), max(entry, px)
+        lo, hi = min(entry, tp_px), max(entry, tp_px)
         opp_hits = 0
         opp_sig_sum = 0.0
         for op in opposing:
@@ -474,8 +504,9 @@ def build_target_surface(*, side: str, entry: float, stop: float, atr: float,
             f"sig={sig:.1f}", f"tf={tf_rank}", f"reach={reach_decay:.2f}",
             f"feed={reliability:.2f}", f"gauntlet={opp_hits}/{opp_sig_sum:.1f}",
             f"cap={distance_cap:.3f}", f"pathP={p_path:.3f}", f"auctionP={auction_p:.3f}",
+            f"pool=${px:,.1f}", f"execD={exec_dist_atr:.2f}ATR",
         ]
-        cands.append(TargetUtility(px, side, rr, dist_atr, p_hit, ev_r, utility,
+        cands.append(TargetUtility(tp_px, side, rr, dist_atr, p_hit, ev_r, utility,
                                    full_position_utility, runner_utility,
                                    payoff_r, loss_r, cost_r, gauntlet_penalty,
                                    path_risk, role, tf_rank, sig, notes, target))
@@ -505,12 +536,24 @@ def expected_utility_size_multiplier(surface: Optional[TargetSurface], posterior
         return 0.0
     b = max(surface.best.payoff_r, _EPS)
     target_p = clamp(float(surface.best.probability or 0.0), 0.001, 0.999)
-    auction_p = clamp(float(posterior or 0.0), 0.001, 0.999)
+    auction_p_raw = float(posterior or 0.0)
+    auction_p = clamp(auction_p_raw, 0.001, 0.999)
     p = target_p
-    if surface.best.role != "terminal" and surface.best.full_position_utility > 0.0:
+    if (surface.best.role != "terminal"
+            and surface.best.full_position_utility > 0.0
+            and auction_p_raw > 0.01):
         p = clamp(0.72 * target_p + 0.28 * auction_p, 0.001, 0.999)
     q = 1.0 - p
-    kelly = (b * p - q) / b
+    try:
+        loss_r = max(float(getattr(surface.best, "loss_r", 1.0) or 1.0), _EPS)
+    except Exception:
+        loss_r = 1.0
+    try:
+        cost_r = max(0.0, float(getattr(surface.best, "cost_r", 0.0) or 0.0))
+    except Exception:
+        cost_r = 0.0
+    effective_loss_r = loss_r + cost_r
+    kelly = (b * p - q * effective_loss_r) / max(b * effective_loss_r, _EPS)
     edge = clamp(surface.best.full_position_utility, -2.0, 3.0)
     raw = 0.70 + 0.50 * clamp(kelly, -0.40, 0.80) + 0.14 * clamp(edge, -1.0, 1.0)
     if surface.runner_fraction > 0.0:

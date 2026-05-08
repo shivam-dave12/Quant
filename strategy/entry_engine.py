@@ -486,6 +486,11 @@ class EntryEngine:
         # must survive a state reset so the same sweep cannot sneak back in.
         # force_reset() clears it fully when the operator demands a hard reset.
         self._processed_sweeps: Dict[tuple, float] = {}
+        # Level-level lock: feeds can report the same pool sweep with a fresh
+        # detected_at each tick/bar. The event key above preserves legitimate
+        # later re-sweeps; this key suppresses same-level replay inside the
+        # active auction/cooldown window.
+        self._processed_sweep_levels: Dict[tuple, float] = {}
 
         # ── Diagnostic: sweep-rejection counters ──────────────────────────
         # Populated by _collect_sweeps() on every tick. Read by the strategy's
@@ -622,7 +627,9 @@ class EntryEngine:
                 return
             now = time.time()
             key = self._sweep_key(sweep)
+            level_key = self._sweep_level_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
+            old_level_exp = self._processed_sweep_levels.get(level_key, 0.0)
             new_exp = now + max(5.0, float(cooldown_sec))
             # If the prior lock already expired, replace it.  The previous
             # min(old_exp, new_exp) path kept a stale timestamp and logged
@@ -633,6 +640,10 @@ class EntryEngine:
                 self._processed_sweeps[key] = new_exp
             else:
                 self._processed_sweeps[key] = min(old_exp, new_exp)
+            if old_level_exp <= now:
+                self._processed_sweep_levels[level_key] = new_exp
+            else:
+                self._processed_sweep_levels[level_key] = min(old_level_exp, new_exp)
             logger.info(
                 f"EntryEngine pre-order rejection: sweep lock shortened "
                 f"to {max(0, int(self._processed_sweeps[key] - now))}s for "
@@ -719,12 +730,18 @@ class EntryEngine:
                 return
             cooldown = float(getattr(_cfg, 'PRE_ORDER_REJECT_SWEEP_COOLDOWN_SEC', 30.0)) if '_cfg' in globals() else 30.0
             key = self._sweep_key(sweep)
+            level_key = self._sweep_level_key(sweep)
             old_exp = self._processed_sweeps.get(key, 0.0)
+            old_level_exp = self._processed_sweep_levels.get(level_key, 0.0)
             new_exp = now + max(5.0, cooldown)
             if old_exp <= now:
                 self._processed_sweeps[key] = new_exp
             else:
                 self._processed_sweeps[key] = min(old_exp, new_exp)
+            if old_level_exp <= now:
+                self._processed_sweep_levels[level_key] = new_exp
+            else:
+                self._processed_sweep_levels[level_key] = min(old_level_exp, new_exp)
 
             sig = EntrySignal(
                 side=side,
@@ -796,9 +813,14 @@ class EntryEngine:
                 and hasattr(self._signal, 'sweep_result')
                 and self._signal.sweep_result is not None):
             key = self._sweep_key(self._signal.sweep_result)
+            level_key = self._sweep_level_key(self._signal.sweep_result)
             self._processed_sweeps[key] = max(
                 self._processed_sweeps.get(key, 0.0),
                 time.time() + cooldown_sec + 5.0  # 5s buffer beyond gate cooldown
+            )
+            self._processed_sweep_levels[level_key] = max(
+                self._processed_sweep_levels.get(level_key, 0.0),
+                time.time() + cooldown_sec + 5.0
             )
 
     def mark_gate_blocked(self, side: str, reason_prefix: str,
@@ -822,6 +844,7 @@ class EntryEngine:
         # state transition. force_reset() is called explicitly by the operator
         # and must guarantee a completely clean slate.
         self._processed_sweeps.clear()
+        self._processed_sweep_levels.clear()
 
     @property
     def state(self) -> str:
@@ -889,6 +912,8 @@ class EntryEngine:
         # clears the registry fully when an operator hard-reset is required.
         self._processed_sweeps = {k: v for k, v in self._processed_sweeps.items()
                                    if v > now}
+        self._processed_sweep_levels = {k: v for k, v in self._processed_sweep_levels.items()
+                                        if v > now}
 
     # ── Internal: flow EWMA (continuous-time) ─────────────────────────
 
@@ -966,7 +991,7 @@ class EntryEngine:
             if s.quality < _MIN_SWEEP_QUALITY:
                 _skipped_low_quality += 1
                 continue
-            if self._is_processed(s, now):
+            if self._is_processed(s, now, atr):
                 _skipped_processed += 1
                 continue
             sweeps.append(s)
@@ -1025,7 +1050,10 @@ class EntryEngine:
                 # with a different detected_at are still admitted.
                 _bridge_key = (round(ev.pool_price, 0), side.value,
                                round(ev.sweep_ts / 1000.0, 0))
-                if self._processed_sweeps.get(_bridge_key, 0.0) > now:
+                _bridge_level_key = self._sweep_level_key_from_parts(
+                    ev.pool_price, side.value, "5m", atr)
+                if (self._processed_sweeps.get(_bridge_key, 0.0) > now
+                        or self._processed_sweep_levels.get(_bridge_level_key, 0.0) > now):
                     _bridge_proc += 1
                     continue
 
@@ -1090,14 +1118,43 @@ class EntryEngine:
             round(sweep.detected_at, 0),
         )
 
-    def _is_processed(self, sweep: SweepResult, now: float) -> bool:
+    @staticmethod
+    def _sweep_level_key_from_parts(price: float, side_value: str,
+                                    timeframe: str = "", atr: float = 0.0) -> tuple:
+        """Canonical same-auction level key, independent of feed timestamp."""
+        px = float(price or 0.0)
+        bucket = max(0.01, abs(px) * 0.0005)
+        return (
+            round(px / bucket),
+            str(side_value or ""),
+            str(timeframe or ""),
+        )
+
+    def _sweep_level_key(self, sweep: SweepResult, atr: float = 0.0) -> tuple:
+        pool = getattr(sweep, "pool", None)
+        return self._sweep_level_key_from_parts(
+            float(getattr(pool, "price", 0.0) or 0.0),
+            str(getattr(getattr(pool, "side", ""), "value", getattr(pool, "side", "")) or ""),
+            str(getattr(pool, "timeframe", "") or ""),
+            atr,
+        )
+
+    def _lock_processed_sweep(self, sweep: SweepResult, expiry: float,
+                              atr: float = 0.0) -> None:
+        self._processed_sweeps[self._sweep_key(sweep)] = float(expiry)
+        self._processed_sweep_levels[self._sweep_level_key(sweep, atr)] = float(expiry)
+
+    def _is_processed(self, sweep: SweepResult, now: float, atr: float = 0.0) -> bool:
         """Return True if sweep is within its processed-sweep hold window."""
-        return self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now
+        if self._processed_sweeps.get(self._sweep_key(sweep), 0.0) > now:
+            return True
+        return self._processed_sweep_levels.get(self._sweep_level_key(sweep, atr), 0.0) > now
 
     def invalidate_sweep_locks(self, reason: str = "regime_change") -> int:
         """Clear processed sweep locks when the market regime materially changes."""
-        n = len(self._processed_sweeps)
+        n = len(self._processed_sweeps) + len(self._processed_sweep_levels)
         self._processed_sweeps.clear()
+        self._processed_sweep_levels.clear()
         self._gate_blocked_until = 0.0
         self._gate_block_key = ()
         if n:
@@ -1158,8 +1215,7 @@ class EntryEngine:
         # _collect_sweeps() cannot find and re-present the same sweep on any
         # subsequent tick, regardless of how the evaluation resolves (verdict, deferral, timeout, or early rejection inside _handle_reversal/continuation).
         # Expiry = now + 120s:  outlasts the 60s detection window + 45s deferral cooldown + 15s margin.
-        _reg_key = self._sweep_key(sweep)
-        self._processed_sweeps[_reg_key] = now + 120.0
+        self._lock_processed_sweep(sweep, now + 120.0, atr)
 
         self._post_sweep = _PostSweepState(
             sweep=sweep, entered_at=now,
@@ -1247,6 +1303,14 @@ class EntryEngine:
                 logger.info(f"POST_SWEEP: OTE ZONE ({retrace:.1%})")
             ps.ote_holding = in_ote
 
+        invalidate, invalid_reason = self._post_sweep_invalidation_reason(
+            ps, snap, flow, ict, price, atr, elapsed)
+        if invalidate:
+            logger.info("POST_SWEEP: abandoned %s", invalid_reason)
+            self._post_sweep = None
+            self._reset(now)
+            return
+
         # Evaluate evidence. If a prior candidate was deferred by the
         # target/stop utility surfaces, keep updating evidence but suppress
         # repeated "POSTERIOR ACCEPTED" lines. The auction is being monitored;
@@ -1279,6 +1343,53 @@ class EntryEngine:
             self._handle_continuation(ps.sweep, decision, snap, flow, ict, price, atr, now)
             # Same one-tick window fix as above.
             return
+
+
+    def _post_sweep_invalidation_reason(self, ps, snap, flow, ict,
+                                        price: float, atr: float,
+                                        elapsed: float) -> tuple[bool, str]:
+        """Return whether a post-sweep auction is no longer executable."""
+        if ps is None or atr <= 0:
+            return False, ""
+        sweep = ps.sweep
+        side = str(getattr(sweep, "direction", "") or "").lower()
+        if side not in ("long", "short"):
+            return False, ""
+
+        regime_mult = self._regime_sl_mult()
+        if side == "long":
+            invalidation = float(sweep.wick_extreme) - atr * _REV_SL_BUFFER_ATR * regime_mult
+            if price <= invalidation:
+                return True, (
+                    f"invalidated before entry: LONG price ${price:.1f} <= "
+                    f"structural stop ${invalidation:.1f}")
+        else:
+            invalidation = float(sweep.wick_extreme) + atr * _REV_SL_BUFFER_ATR * regime_mult
+            if price >= invalidation:
+                return True, (
+                    f"invalidated before entry: SHORT price ${price:.1f} >= "
+                    f"structural stop ${invalidation:.1f}")
+
+        if ps.cisd_detected or ps.ote_reached or ps.ote_holding:
+            return False, ""
+
+        try:
+            profile = self._market_profile(snap, flow, ict, price, atr, side)
+            disp_min = float(profile.displacement_min(_PS_DISP_MIN_ATR))
+            breathe = float(getattr(profile, "breathing_mult", 1.0) or 1.0)
+        except Exception:
+            disp_min = float(_PS_DISP_MIN_ATR)
+            breathe = 1.0
+        dead_after = max(
+            _PS_PHASE_DISPLACEMENT,
+            min(_PS_PHASE_CISD, _PS_PHASE_DISPLACEMENT * 1.35 * max(0.75, min(1.50, breathe))),
+        )
+        stall_disp = max(0.08, disp_min * (0.25 + 0.20 * max(0.0, min(self._atr_pctile, 1.0))))
+        if elapsed >= dead_after and float(getattr(ps, "max_displacement", 0.0) or 0.0) < stall_disp:
+            return True, (
+                f"dead auction: no accepted delivery after {elapsed:.0f}s "
+                f"(disp={ps.max_displacement:.2f}ATR < live floor {stall_disp:.2f}ATR, no CISD/OTE)")
+        return False, ""
 
 
     def _market_profile(self, snap=None, flow=None, ict=None, price: float = 0.0,
