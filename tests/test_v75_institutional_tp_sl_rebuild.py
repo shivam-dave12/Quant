@@ -135,3 +135,52 @@ def test_btc_sl_clearance_is_wider_than_equity_for_same_liquidity_cluster():
 
     assert btc_pick.buffer_atr > eq_pick.buffer_atr
     assert btc_sl > eq_sl
+
+
+def test_equity_selector_rejects_fake_moonshot_terminal_pool_from_log_pattern():
+    """Regression for the bad v75 behaviour: SPY/GOOGL-like 80-1000ATR TP.
+
+    These pools may remain useful as map context/runners, but must not be the
+    single full-position TP because huge RR can make raw EV look positive.
+    """
+    snap = _snapshot(
+        ssl=[_target(312.3, PoolSide.SSL, entry=400.8, atr=0.3315, tf="4h", sig_boost=120.0, htf_count=5)],
+        bsl=[_target(401.5, PoolSide.BSL, entry=400.8, atr=0.3315, tf="15m", sig_boost=40.0)],
+    )
+
+    with instrument_scope(_instrument("GOOGL", AssetClass.EQUITY)):
+        tp, target, score, report = select_tp_with_report(
+            snap, "short", entry=400.8, sl=401.8, atr=0.3315,
+            min_rr=1.5, posterior_prob=0.75,
+        )
+
+    assert tp is None
+    assert target is None
+    assert score is None
+    assert "too far for GOOGL full-position TP" in report.summary
+
+
+def test_btc_and_silver_reject_extreme_terminal_pool_as_full_tp():
+    btc_snap = _snapshot(
+        bsl=[_target(82772.8, PoolSide.BSL, entry=79819.0, atr=76.4, tf="4h", sig_boost=120.0, htf_count=5)],
+        ssl=[_target(79470.5, PoolSide.SSL, entry=79819.0, atr=76.4, tf="1h", sig_boost=80.0)],
+    )
+    with instrument_scope(_instrument("BTC", AssetClass.CRYPTO)):
+        btc_tp, _, _, btc_report = select_tp_with_report(
+            btc_snap, "long", entry=79819.0, sl=79357.4, atr=76.4,
+            min_rr=1.5, posterior_prob=0.70,
+        )
+    assert btc_tp is None
+    assert "too far for BTC full-position TP" in btc_report.summary
+
+    silver_snap = _snapshot(
+        ssl=[_target(65.6, PoolSide.SSL, entry=72.58, atr=0.1715, tf="4h", sig_boost=120.0, htf_count=5)],
+        bsl=[_target(74.4, PoolSide.BSL, entry=72.58, atr=0.1715, tf="4h", sig_boost=80.0)],
+    )
+    with instrument_scope(_instrument("SILVER", AssetClass.COMMODITY)):
+        sil_tp, _, _, sil_report = select_tp_with_report(
+            silver_snap, "short", entry=72.58, sl=74.6, atr=0.1715,
+            min_rr=1.5, posterior_prob=0.70,
+        )
+    assert sil_tp is None
+    assert "too far for SILVER full-position TP" in sil_report.summary

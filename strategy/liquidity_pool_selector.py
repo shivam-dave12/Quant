@@ -512,8 +512,15 @@ def _candidate_report_priority(r: PoolCandidateDiagnostic) -> float:
     rr_floor = r.required_rr if r.required_rr > 0.0 else 1.0
     rr_fit = _clamp(r.rr / max(rr_floor, 1e-9), 0.0, 2.0)
     proximity = 1.0 / (1.0 + max(r.distance_atr, 0.0) / 8.0)
+    priority = 0.55 * p_fit + 0.30 * rr_fit + 0.15 * proximity
 
-    return 0.55 * p_fit + 0.30 * rr_fit + 0.15 * proximity
+    # Diagnostic ordering must surface the nearest executable rejection before
+    # a moonshot/runner pool.  Otherwise a fake 100R target hides the real reason
+    # the trade has no usable TP.
+    reason = str(r.reason or "").lower()
+    if "too far" in reason or "runner/context" in reason:
+        priority *= 0.10
+    return priority
 
 
 def _hour_utc(now: Optional[float]) -> int:
@@ -769,7 +776,93 @@ def _target_distance_fit(distance_atr: float, asset_profile: _SelectorAssetProfi
         return 0.72 + 0.28 * (d - min_d) / max(pref - min_d, 1e-9)
     if d <= max_d:
         return max(0.62, 1.0 - 0.20 * (d - pref) / max(max_d - pref, 1e-9))
-    return max(0.12, 0.62 * math.exp(-(d - max_d) / max(max_d * 0.55, 1.0)))
+
+    # Extreme targets are not “high RR opportunities”; they are low-quality
+    # runner context.  Keep a tiny non-zero value for diagnostics, but do not
+    # let distance itself manufacture EV.
+    return max(0.01, 0.62 * math.exp(-(d - max_d) / max(max_d * 0.35, 1.0)))
+
+
+def _full_tp_distance_limit_atr(asset_profile: _SelectorAssetProfile,
+                                selector_profile: Optional[MarketProfile] = None) -> float:
+    """Maximum ATR distance acceptable for a *full-position* TP.
+
+    External liquidity can be farther than the first-sweep model, especially in
+    BTC/gold/silver.  But a single full TP must still be reachable by the
+    current auction.  Anything beyond this is runner/map context only; selecting
+    it as the only TP creates fake 50R/200R math and ruins execution.
+    """
+    asset_id = str(asset_profile.asset_id or "").upper()
+    asset_class = str(asset_profile.asset_class or "").lower()
+    limit = float(asset_profile.max_full_tp_atr)
+    try:
+        if selector_profile is not None:
+            if selector_profile.volatility in ("expanded", "stress"):
+                limit *= 1.10
+            if selector_profile.structure == "trend" and selector_profile.htf_alignment > 0.25:
+                limit *= 1.15
+    except Exception:
+        pass
+
+    if asset_id == "BTC":
+        return min(max(limit, 12.0), 22.0)
+    if asset_id in ("GOLD", "SILVER"):
+        return min(max(limit, 10.0), 18.0)
+    if asset_class == "commodity":
+        return min(max(limit, 9.0), 16.0)
+    if asset_class == "crypto":
+        return min(max(limit, 10.0), 18.0)
+    if asset_class == "index":
+        return min(max(limit, 7.0), 13.0)
+    if asset_class == "equity":
+        return min(max(limit, 5.0), 9.0)
+    return min(max(limit, 6.0), 14.0)
+
+
+def _minimum_institutional_delivery_probability(
+    asset_profile: _SelectorAssetProfile,
+    distance_atr: float,
+    terminal_target: bool,
+    selector_profile: Optional[MarketProfile] = None,
+) -> float:
+    """Absolute delivery-probability floor for approving a full TP.
+
+    Break-even probability falls toward zero as RR grows, which is exactly why
+    raw EV can mistakenly approve moonshot targets.  Institutional execution
+    requires a minimum path-delivery probability independent of payoff.
+    """
+    asset_id = str(asset_profile.asset_id or "").upper()
+    asset_class = str(asset_profile.asset_class or "").lower()
+    if asset_id in ("BTC", "GOLD", "SILVER"):
+        floor = 0.16
+    elif asset_class in ("crypto", "commodity"):
+        floor = 0.17
+    elif asset_class == "index":
+        floor = 0.19
+    elif asset_class == "equity":
+        floor = 0.20
+    else:
+        floor = 0.18
+    if terminal_target:
+        floor += 0.05
+    distance_fit = _target_distance_fit(distance_atr, asset_profile, selector_profile)
+    if distance_fit < 0.50:
+        floor += min(0.10, (0.50 - distance_fit) * 0.20)
+    return _clamp(floor, 0.12, 0.34)
+
+
+def _tp_delivery_rejection_reason(delivery_prob: float, required_delivery_prob: float,
+                                  min_delivery_prob: float, rr: float, cost_r: float,
+                                  terminal_target: bool) -> str:
+    req = max(float(required_delivery_prob), float(min_delivery_prob))
+    reason = (
+        f"delivery probability {delivery_prob:.4f} < institutional floor {req:.4f} "
+        f"(break-even {required_delivery_prob:.4f}, path-floor {min_delivery_prob:.4f}, "
+        f"RR {rr:.2f}, cost={cost_r:.2f}R)"
+    )
+    if terminal_target:
+        reason += "; terminal runner context, not full-position TP"
+    return reason
 
 
 def _pool_quality_probability(target: Any) -> float:
@@ -815,38 +908,56 @@ def _calibrated_delivery_probability(
     first_sweep = _clamp(max(float(norm_prob), min(float(raw_prob) / 2.0, 0.95)), 0.0, 0.95)
     posterior = _clamp(float(posterior_prob or 0.0), 0.0, 0.95)
     pool_q = _pool_quality_probability(target)
-    reach_q = _clamp(float(reach_mult), 0.02, 1.25)
+    reach_q = _clamp(float(reach_mult), 0.01, 1.25)
     distance_q = _target_distance_fit(distance_atr, asset_profile, selector_profile)
-    rr_q = _clamp((float(rr) / max(asset_profile.full_tp_rr_floor, 1e-9)) / 2.0, 0.0, 1.0)
+    rr_q = _clamp((min(float(rr), 12.0) / max(asset_profile.full_tp_rr_floor, 1e-9)) / 2.0, 0.0, 1.0)
 
     base = (
-        0.20 * math.sqrt(first_sweep)
-        + 0.27 * pool_q
-        + 0.22 * posterior
-        + 0.18 * math.sqrt(reach_q)
-        + 0.08 * distance_q
-        + 0.05 * rr_q
+        0.30 * math.sqrt(first_sweep)
+        + 0.24 * pool_q
+        + 0.18 * posterior
+        + 0.16 * math.sqrt(reach_q)
+        + 0.09 * distance_q
+        + 0.03 * rr_q
     )
     base *= math.sqrt(_clamp(confluence, 0.35, 2.25))
     base *= math.sqrt(_clamp(gauntlet_mult, 0.45, 1.00))
-    base *= (0.78 + 0.22 * _clamp(reach_q, asset_profile.terminal_reach_floor, 1.0))
+    base *= (0.70 + 0.30 * _clamp(reach_q, 0.0, 1.0))
 
     try:
         if selector_profile.structure == "trend" and selector_profile.htf_alignment > 0.25:
-            base *= 1.06
-        if selector_profile.volatility == "compressed" and terminal_target:
-            base *= 0.92
-        elif selector_profile.volatility in ("expanded", "stress"):
             base *= 1.04
+        if selector_profile.volatility == "compressed" and terminal_target:
+            base *= 0.90
+        elif selector_profile.volatility in ("expanded", "stress"):
+            base *= 1.03
         if selector_profile.liquidity_density <= 1.0 and terminal_target:
-            base *= 0.93
+            base *= 0.90
     except Exception:
         pass
+
+    # Critical guardrail: pool quality/posterior cannot invent probability when
+    # the path/reach model says the target is barely deliverable.  Cap delivery
+    # by a path-quality envelope, then apply a tiny floor scaled by distance-fit.
+    if terminal_target:
+        path_cap = (0.06 + 0.58 * math.sqrt(first_sweep))
+        path_cap *= (0.30 + 0.70 * distance_q)
+        path_cap *= (0.50 + 0.50 * math.sqrt(_clamp(reach_q, 0.0, 1.0)))
+        path_cap *= 0.82
+    else:
+        # For in-reach liquidity, a strong accepted setup can still have
+        # delivery probability well above its first-sweep score.  Do not cap
+        # these too harshly; the hard distance guard handles moonshots.
+        path_cap = (0.30 + 0.65 * math.sqrt(first_sweep))
+        path_cap *= (0.55 + 0.45 * distance_q)
+        path_cap *= (0.60 + 0.40 * math.sqrt(_clamp(reach_q, 0.0, 1.0)))
 
     cap = 0.88 if asset_profile.asset_id in ("BTC", "GOLD", "SILVER") else 0.80
     if terminal_target:
         cap -= 0.06
-    return _clamp(base, asset_profile.delivery_floor, cap)
+    cap = min(cap, path_cap)
+    floor = min(float(asset_profile.delivery_floor), max(0.005, 0.06 * distance_q))
+    return _clamp(base, floor, max(floor, cap))
 
 def _reach_buffer(distance_atr: float, atr: float) -> float:
     """
@@ -921,7 +1032,10 @@ def _institutional_rr_floor(
     posterior = _clamp(posterior_prob, 0.0, 0.95)
     soft_static = max(durable_floor, static_floor * float(asset_profile.static_rr_weight))
     if delivery_prob is not None:
-        delivery_p = _clamp(float(delivery_prob), asset_profile.delivery_floor, 0.95)
+        # Do not floor calibrated probability to the asset delivery prior here.
+        # A near-zero path probability must explode the required RR and fail the
+        # trade, otherwise lottery targets can pass purely because RR is huge.
+        delivery_p = _clamp(float(delivery_prob), _TP_DELIVERY_PROB_FLOOR, 0.95)
     else:
         delivery_p = _posterior_delivery_probability(
             raw_prob, posterior if posterior > 0 else 0.0, confluence, gauntlet_mult, reach_mult)
@@ -946,8 +1060,9 @@ def _tp_selection_value(ev: float, rr: float, rr_floor: float,
                         distance_atr: float,
                         asset_profile: Optional[_SelectorAssetProfile] = None,
                         selector_profile: Optional[MarketProfile] = None) -> float:
-    surplus_r = max(float(rr) - float(rr_floor), 0.0)
-    payoff_frontier = math.sqrt(max(float(rr), 0.0)) * (1.0 + min(surplus_r * 0.25, 1.00))
+    rr_eff = min(max(float(rr), 0.0), max(float(rr_floor) + 8.0, 12.0))
+    surplus_r = max(rr_eff - float(rr_floor), 0.0)
+    payoff_frontier = math.sqrt(rr_eff) * (1.0 + min(surplus_r * 0.18, 0.80))
     delivery_span = 1.0 + min(max(float(distance_atr) - 1.0, 0.0) * 0.035, 0.35)
     distance_fit = 1.0
     if asset_profile is not None:
@@ -988,8 +1103,11 @@ def _target_utility(raw_prob: float, rr: float, min_rr: float,
     fees, slippage, and BE migration. This utility still respects probability,
     but pays for durable R and distance beyond the cost envelope.
     """
-    rr_excess = max(0.0, rr - float(min_rr))
-    rr_utility = math.sqrt(max(rr, 0.0)) * (1.0 + min(rr_excess * 0.35, 1.25))
+    # Cap payoff contribution. A target can be 40R/200R mathematically, but a
+    # full-position TP should not be selected *because* the RR is absurd.
+    rr_eff = min(max(float(rr), 0.0), max(float(min_rr) + 8.0, 12.0))
+    rr_excess = max(0.0, rr_eff - float(min_rr))
+    rr_utility = math.sqrt(rr_eff) * (1.0 + min(rr_excess * 0.20, 0.85))
     delivery_room = max(0.0, reward - be_move)
     be_surplus_atr = delivery_room / max(be_move, 1e-9)
     be_quality = 0.35 + 0.65 * min(be_surplus_atr / 2.0, 1.0)
@@ -1074,6 +1192,9 @@ def score_tp_pools(
             tf = str(_safe(pool, "timeframe", "5m"))
             max_reach = _max_reach_for_tf(tf)
             terminal_target = dist_atr > max_reach
+            full_tp_limit_atr = _full_tp_distance_limit_atr(asset_profile, selector_profile)
+            if dist_atr > full_tp_limit_atr:
+                continue
             if terminal_target and not _is_terminal_tp_candidate(target, dist_atr):
                 continue
 
@@ -1138,6 +1259,10 @@ def score_tp_pools(
                 asset_profile=asset_profile,
             )
             required_delivery_prob = _required_delivery_probability(rr, cost_r)
+            min_delivery_prob = _minimum_institutional_delivery_probability(
+                asset_profile, dist_atr, terminal_target, selector_profile)
+            if delivery_prob + 1e-12 < max(required_delivery_prob, min_delivery_prob):
+                continue
             if rr < rr_floor:
                 continue
             utility, utility_components = _target_utility(
@@ -1201,6 +1326,7 @@ def score_tp_pools(
                     "rr_floor":    rr_floor,
                     "delivery_prob": delivery_prob,
                     "required_delivery_prob": required_delivery_prob,
+                    "min_delivery_prob": min_delivery_prob,
                     "posterior_prob": _clamp(posterior_prob, 0.0, 0.95),
                     "cost_r":      cost_r,
                     "asset_id":    asset_profile.asset_id,
@@ -1419,6 +1545,7 @@ def diagnose_tp_pools(
             tf = str(_safe(pool, "timeframe", "5m"))
             max_reach = _max_reach_for_tf(tf)
             terminal_target = row.distance_atr > max_reach
+            full_tp_limit_atr = _full_tp_distance_limit_atr(asset_profile, selector_profile)
 
             if status in ("SWEPT", "CONSUMED"):
                 row.reason = f"archived {status.lower()} pool; not a live target"
@@ -1504,6 +1631,22 @@ def diagnose_tp_pools(
             row.delivery_prob = delivery_prob
             row.cost_r = cost_r
             row.required_delivery_prob = _required_delivery_probability(row.rr, cost_r)
+            min_delivery_prob = _minimum_institutional_delivery_probability(
+                asset_profile, row.distance_atr, terminal_target, selector_profile)
+            if row.distance_atr > full_tp_limit_atr:
+                row.reason = (
+                    _tp_delivery_rejection_reason(
+                        delivery_prob, row.required_delivery_prob, min_delivery_prob,
+                        row.rr, cost_r, terminal_target)
+                    + f"; too far for {asset_profile.asset_id} full-position TP: "
+                    + f"{row.distance_atr:.1f}ATR > {full_tp_limit_atr:.1f}ATR; runner/context only"
+                )
+                rows.append(row); continue
+            if delivery_prob + 1e-12 < max(row.required_delivery_prob, min_delivery_prob):
+                row.reason = _tp_delivery_rejection_reason(
+                    delivery_prob, row.required_delivery_prob, min_delivery_prob,
+                    row.rr, cost_r, terminal_target)
+                rows.append(row); continue
             if row.rr < rr_floor:
                 row.reason = _tp_payoff_rejection_reason(
                     row.rr,
@@ -1535,6 +1678,7 @@ def diagnose_tp_pools(
                     f"{asset_profile.asset_id} distance-fit "
                     f"{_target_distance_fit(row.distance_atr, asset_profile, selector_profile):.2f}")
             row.notes.append(f"deliveryP={delivery_prob:.2f}")
+            row.notes.append(f"pathFloor={min_delivery_prob:.2f}")
             if n_gauntlet: row.notes.append(f"gauntlet={n_gauntlet}")
             if comps.get("be_quality", 1.0) < 0.75: row.notes.append("thin post-BE room")
             accepted.append((selection_ev, row))

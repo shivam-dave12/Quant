@@ -9366,6 +9366,22 @@ class QuantStrategy:
         else:
             risk_pct = raw_risk_pct
 
+        # Portfolio-level risk guard: the account-level aggregate risk cap must
+        # dominate per-trade sizing.  With six possible open positions and a 3%
+        # aggregate cap, one trade may not consume the full 1% static risk; the
+        # institutional per-slot cap is 0.5%.  This prevents a few large-margin
+        # losers from overwhelming several smaller winners.
+        try:
+            aggregate_risk_pct = float(_cfg("PORTFOLIO_MAX_AGGREGATE_RISK_PCT", 0.0))
+            max_open_positions = max(1, int(_cfg("PORTFOLIO_MAX_OPEN_POSITIONS", 1)))
+            if aggregate_risk_pct > 1.0:
+                aggregate_risk_pct /= 100.0
+            if math.isfinite(aggregate_risk_pct) and aggregate_risk_pct > 0.0:
+                per_slot_risk_cap = aggregate_risk_pct / max_open_positions
+                risk_pct = min(risk_pct, per_slot_risk_cap)
+        except Exception:
+            pass
+
         cash_budget = available * _bal_usage_frac
         taker_rate = abs(float(_cfg("COMMISSION_RATE", 0.00055)))
         reserve_fee_per_btc = max(
