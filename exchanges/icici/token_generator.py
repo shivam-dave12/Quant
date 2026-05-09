@@ -13,7 +13,7 @@ import platform
 import re
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 log = logging.getLogger(__name__)
 
@@ -204,7 +204,7 @@ def generate_api_session(
         page = context.new_page()
         page.set_default_timeout(ELEM_WAIT_MS)
         try:
-            page.goto(LOGIN_URL_TMPL.format(api_key=api_key), wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
+            page.goto(LOGIN_URL_TMPL.format(api_key=quote_plus(api_key)), wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
             page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_MS)
 
             _find(page, SELS_USER).fill("")
@@ -270,3 +270,36 @@ def generate_api_session_from_env(otp_getter=None, otp_code: str | None = None, 
         headless=headless,
         debug_dir=os.getenv("ICICI_DEBUG_DIR", "data/icici_debug"),
     )
+
+
+def login_url(api_key: str) -> str:
+    """Return the ICICI Breeze login URL with the AppKey URL-encoded."""
+    return LOGIN_URL_TMPL.format(api_key=quote_plus(str(api_key or "")))
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate ICICI Breeze API_Session from the login flow.")
+    parser.add_argument("--print-login-url", action="store_true", help="Print only the encoded login URL and exit.")
+    parser.add_argument("--otp", default=os.getenv("ICICI_OTP", ""), help="6 digit OTP/TOTP. Avoid shell history on shared hosts.")
+    parser.add_argument("--headed", action="store_true", help="Open a visible browser instead of headless Chromium.")
+    parser.add_argument("--save", default=os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt"), help="Path to save API_Session.")
+    args = parser.parse_args()
+
+    api_key = os.getenv("BREEZE_API_KEY", "")
+    if args.print_login_url:
+        print(login_url(api_key))
+        return 0
+
+    token = generate_api_session_from_env(otp_code=args.otp or None, headless=not args.headed)
+    path = Path(args.save)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token.strip() + "\n", encoding="utf-8")
+    print(f"ICICI API_Session generated and saved to {path}")
+    print("Next startup will exchange it through CustomerDetails for the Breeze session_token.")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

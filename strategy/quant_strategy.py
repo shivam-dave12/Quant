@@ -2818,10 +2818,10 @@ class QuantStrategy:
         """Human-readable quantity with correct unit per active instrument."""
         try:
             inst = getattr(self, "_instrument", None)
-            asset_id = str(getattr(inst, "asset_id", "") or "").upper()
-            if asset_id == "BTC":
-                return f"{float(qty):.6f} BTC"
-            return f"{float(qty):.6f} contracts"
+            ac = str(getattr(getattr(inst, "asset_class", ""), "value", getattr(inst, "asset_class", "")) or "").lower()
+            base = str(getattr(getattr(inst, "primary", None), "base_asset", "") or "").upper()
+            unit = base if base and "crypto" in ac else "contracts"
+            return f"{float(qty):.6f} {unit}"
         except Exception:
             return f"{float(qty):.6f} units"
 
@@ -8085,21 +8085,13 @@ class QuantStrategy:
         return str(getattr(config, "EXECUTION_EXCHANGE", "") or "").lower() == "delta"
 
     def _is_inverse_pnl_contract(self) -> bool:
-        """Return True only for BTC inverse contracts, never for Delta xStocks/metals.
-
-        Multi-asset mode can keep config.DELTA_SYMBOL at BTCUSD while the live
-        strategy instance is managing PAXG/SLVON/xStock contracts. Using that
-        global config value made non-BTC Delta exits use BTC inverse accounting.
-        """
+        """Return True for instruments whose exchange metadata marks inverse PnL."""
         try:
-            asset_id = str(getattr(self, "_asset_id", "") or "").upper()
             inst = getattr(self, "_instrument", None)
-            sym = str(
-                getattr(inst, "display_symbol", "")
-                or getattr(inst, "canonical_symbol", "")
-                or getattr(config, "DELTA_SYMBOL", "")
-            ).upper()
-            return self._is_delta_execution() and asset_id == "BTC" and "BTC" in sym
+            primary = getattr(inst, "primary", None)
+            raw = getattr(primary, "raw", {}) if primary is not None else {}
+            contract_type = str(getattr(primary, "contract_type", "") or raw.get("contract_type", "")).lower() if primary is not None else ""
+            return "inverse" in contract_type or "inverse" in str(raw).lower()
         except Exception:
             return False
 

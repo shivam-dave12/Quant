@@ -44,6 +44,11 @@ try:
     from agents.portfolio_cio import PortfolioCIO
 except Exception:
     PortfolioCIO = None  # type: ignore
+try:
+    from agents.tradable_ticker_desk import TradableTickerDesk, TradableDeskSelection
+except Exception:
+    TradableTickerDesk = None  # type: ignore
+    TradableDeskSelection = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ class AssetContext:
     last_heartbeat_sec: float = 0.0
     last_analysis_sec: float = 0.0
     ready: bool = False
+    started_at_sec: float = 0.0
 
     @property
     def phase_name(self) -> str:
@@ -88,6 +94,13 @@ class MultiAssetQuantBot:
         self.guard = PortfolioManager()
         self.discovery_report: Optional[DiscoveryReport] = None
         self.registry: Optional[InstrumentRegistry] = None
+        self.catalog_instruments: List[TradableInstrument] = []
+        self.delta_api = None
+        self.cs_api = None
+        self.icici_api = None
+        self.ticker_desk = TradableTickerDesk() if TradableTickerDesk is not None and bool(getattr(config, "DYNAMIC_TRADABLE_DESK_ENABLED", True)) else None
+        self.last_desk_selection = None
+        self._last_dynamic_desk_refresh = 0.0
         self.trading_enabled = True
         self.trading_pause_reason = ""
         self._last_scan_report = 0.0
@@ -106,10 +119,26 @@ class MultiAssetQuantBot:
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
         has_icici_discovery = bool(getattr(config, "ICICI_DISCOVERY_ENABLED", False))
+        wants_icici_details = bool(getattr(config, "DYNAMIC_DESK_ICICI_DETAILS_ENABLED", False))
+        wants_icici_runtime = bool(getattr(config, "ICICI_ENABLED", False))
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
-        icici_api = BreezeRestClient() if has_icici_discovery and BreezeRestClient is not None else None
+        icici_api = BreezeRestClient() if (has_icici_discovery or wants_icici_details or wants_icici_runtime) and BreezeRestClient is not None else None
+        if icici_api is not None and bool(getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)) and (wants_icici_details or wants_icici_runtime):
+            try:
+                session_info = icici_api.preflight_session()
+                logger.info("ICICI Breeze auth preflight OK — session=%s", session_info.get("session_token", "***"))
+            except Exception as exc:
+                msg = (
+                    "ICICI Breeze auth preflight unavailable: %s. "
+                    "Run token generator first and set BREEZE_API_SESSION/ICICI_API_SESSION or ICICI_API_SESSION_PATH; "
+                    "Security Master discovery can continue, but authenticated quotes/details are disabled."
+                )
+                if wants_icici_runtime or bool(getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", False)):
+                    logger.error(msg, exc)
+                    raise
+                logger.warning(msg, exc)
         return delta_api, cs_api, icici_api
 
 
@@ -776,6 +805,7 @@ class MultiAssetQuantBot:
             logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
             delta_api, cs_api, icici_api = self._build_api_clients()
+            self.delta_api, self.cs_api, self.icici_api = delta_api, cs_api, icici_api
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
@@ -786,17 +816,21 @@ class MultiAssetQuantBot:
                 include_exchanges=getattr(config, "UNIVERSE_INCLUDE_EXCHANGES", ""),
                 icici_security_master_url=getattr(config, "ICICI_SECURITY_MASTER_URL", None),
                 requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
-                max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 0)),
+                # v80: do not cap discovery.  The dynamic desk caps runtime
+                # subscriptions after cheap catalog/ticker screening.
+                max_active=0,
                 require_primary=False,
             )
+            self.catalog_instruments = list(self.discovery_report.matched)
             for line in self.discovery_report.terminal_lines(preview=int(getattr(config, "DISCOVERY_REPORT_PREVIEW", 80))):
                 logger.info(line)
-            if not self.discovery_report.matched:
+            if not self.catalog_instruments:
                 logger.error("No confirmed tradable instruments found. Scanner will not start.")
                 return False
 
+            selected = self._select_runtime_instruments(force=True)
             coverage_only = 0
-            for inst in self.discovery_report.matched:
+            for inst in selected:
                 if not self._has_supported_runtime(inst):
                     coverage_only += 1
                     continue
@@ -804,19 +838,98 @@ class MultiAssetQuantBot:
                 if ctx is not None:
                     self.contexts.append(ctx)
             if coverage_only:
-                logger.info("%d discovered instruments are coverage-only until their data/execution adapters are enabled", coverage_only)
+                logger.info("%d desk-selected instruments are coverage-only until their data/execution adapters are enabled", coverage_only)
             if not self.contexts:
-                logger.error("No asset contexts could be built.")
+                logger.error("No runtime contexts could be built from the dynamic desk shortlist.")
                 return False
-            logger.info("✅ Built %d isolated strategy contexts", len(self.contexts))
+            logger.info("✅ Built %d isolated strategy contexts from %d discovered instruments", len(self.contexts), len(self.catalog_instruments))
             self._dash_universe()
             return True
         except Exception:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
 
+    def _select_runtime_instruments(self, *, force: bool = False) -> List[TradableInstrument]:
+        """Select the instruments allowed to own live data subscriptions.
+
+        This is the v80 efficiency gate: discovery may return 188+ products, but
+        only the desk shortlist below gets candle/orderbook/trade streams.
+        """
+        if not self.catalog_instruments:
+            return []
+        if self.ticker_desk is None:
+            max_active = int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 0) or 0)
+            return self.catalog_instruments if max_active <= 0 else self.catalog_instruments[:max_active]
+        active_ids = [c.instrument.asset_id for c in self.contexts]
+        protected_ids = [c.instrument.asset_id for c in self.contexts if c.has_position]
+        selection = self.ticker_desk.select(
+            self.catalog_instruments,
+            delta_api=self.delta_api,
+            coinswitch_api=self.cs_api,
+            icici_api=self.icici_api,
+            active_ids=active_ids,
+            protected_ids=protected_ids,
+        )
+        self.last_desk_selection = selection
+        self._last_dynamic_desk_refresh = time.time()
+        if force or time.time() - self._last_scan_report >= float(getattr(config, "FUND_CIO_REPORT_SEC", 30.0)):
+            self._last_scan_report = time.time()
+            logger.info("%s", selection.compact_text(limit=int(getattr(config, "DYNAMIC_DESK_LOG_TOP_N", 12))))
+        try:
+            self._dash_emit({
+                "type": "tradable_desk",
+                "selected": [r.as_dict() for r in selection.rows if r.selected],
+                "rejected": [r.as_dict() for r in selection.rows if not r.selected][:50],
+                "message": selection.compact_text(limit=int(getattr(config, "DYNAMIC_DESK_LOG_TOP_N", 12))),
+                "notes": list(selection.notes),
+            })
+        except Exception:
+            pass
+        return list(selection.selected)
+
+    def _maybe_refresh_runtime_desks(self) -> None:
+        if self.ticker_desk is None or not self.catalog_instruments:
+            return
+        interval = float(getattr(config, "DYNAMIC_DESK_REFRESH_SEC", 180.0))
+        if interval <= 0 or time.time() - self._last_dynamic_desk_refresh < interval:
+            return
+        selected = self._select_runtime_instruments(force=False)
+        selected_ids = {x.asset_id for x in selected}
+        existing = {c.instrument.asset_id: c for c in self.contexts}
+
+        # Add newly selected desks.  They alone open fresh subscriptions.
+        for inst in selected:
+            if inst.asset_id in existing or not self._has_supported_runtime(inst):
+                continue
+            ctx = self._build_asset_context(inst, self.delta_api, self.cs_api)
+            if ctx is None:
+                continue
+            if self._start_one_context(ctx):
+                self.contexts.append(ctx)
+                logger.info("DynamicDesk activated %s — live streams opened only after shortlist selection", inst.asset_id)
+
+        # Retire unselected idle desks after a residency window.  Never retire a
+        # context with an open/entering/exiting position.
+        min_residency = float(getattr(config, "DYNAMIC_DESK_MIN_RESIDENCY_SEC", 600.0))
+        kept: List[AssetContext] = []
+        for ctx in self.contexts:
+            age = time.time() - float(getattr(ctx, "started_at_sec", 0.0) or 0.0)
+            if ctx.instrument.asset_id in selected_ids or ctx.has_position or age < min_residency:
+                kept.append(ctx)
+                continue
+            try:
+                ctx.data_manager.stop()
+            except Exception:
+                pass
+            logger.info("DynamicDesk parked %s — idle streams closed; will resubscribe only if setup quality improves", ctx.instrument.asset_id)
+        self.contexts = kept
+
     @staticmethod
     def _has_supported_runtime(inst: TradableInstrument) -> bool:
+        # ICICI discovery/details are included in the catalog, but the current
+        # strategy runtime still requires a candle-capable execution/data adapter.
+        # Until the ICICI runtime is explicitly enabled, Indian-market rows remain
+        # coverage candidates and do not open unsupported streams.
         return bool({ExchangeName.DELTA, ExchangeName.COINSWITCH}.intersection(set(inst.by_exchange.keys())))
 
     def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
@@ -870,6 +983,7 @@ class MultiAssetQuantBot:
                     return False
                 ready = ctx.data_manager.wait_until_ready(timeout_sec=float(getattr(config, "READY_TIMEOUT_SEC", 180)))
                 ctx.ready = bool(ready)
+                ctx.started_at_sec = time.time()
                 if not ready:
                     logger.error("%s data manager not ready", inst.asset_id)
                     return False
@@ -934,6 +1048,7 @@ class MultiAssetQuantBot:
         while self.running:
             try:
                 now_ms = int(time.time() * 1000)
+                self._maybe_refresh_runtime_desks()
                 cio_report = self._cio_report()
                 if cio_report is not None:
                     _now = time.time()

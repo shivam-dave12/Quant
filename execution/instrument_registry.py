@@ -434,7 +434,17 @@ class InstrumentRegistry:
             self.icici = out
             return out
         try:
-            rows = api.get_security_master_rows(url=security_master_url)
+            try:
+                import config as _config  # type: ignore
+                cache_path = getattr(_config, "ICICI_SECURITY_MASTER_CACHE_PATH", None)
+            except Exception:
+                cache_path = None
+            try:
+                rows = api.get_security_master_rows(url=security_master_url, cache_path=cache_path)
+            except TypeError:
+                # Older/fake clients used in tests may not accept cache_path.
+                rows = api.get_security_master_rows(url=security_master_url)
+            logger.info("ICICI security master rows loaded: %d", len(rows))
         except Exception as e:
             logger.warning("ICICI security master discovery failed: %s", e, exc_info=True)
             rows = []
@@ -444,17 +454,44 @@ class InstrumentRegistry:
             ).upper()
             if ex_code not in {"NSE", "NFO", "BSE"}:
                 continue
+            # ICICI security-master headers vary across files/days.  Accept the
+            # common NSE/NFO/BSE spellings instead of relying on one exact schema.
             stock = str(
                 r.get("ShortName") or r.get("StockCode") or r.get("stock_code") or
+                r.get("CompanyName") or r.get("Company Name") or r.get("ScripName") or
+                r.get("Underlying") or r.get("UnderlyingSymbol") or
                 r.get("Symbol") or r.get("symbol") or r.get("Name") or ""
             ).upper()
-            token = str(r.get("Token") or r.get("token") or r.get("ScripCode") or r.get("scrip_code") or "")
-            product = str(r.get("ProductType") or r.get("product_type") or r.get("Series") or r.get("series") or "")
-            right = str(r.get("OptionType") or r.get("option_type") or r.get("Right") or r.get("right") or "")
-            strike = str(r.get("StrikePrice") or r.get("strike_price") or r.get("Strike") or r.get("strike") or "")
-            expiry = str(r.get("ExpiryDate") or r.get("expiry_date") or r.get("Expiry") or r.get("expiry") or "")
+            token = str(
+                r.get("Token") or r.get("token") or r.get("ScripCode") or
+                r.get("scrip_code") or r.get("ExchangeToken") or r.get("exchange_token") or ""
+            )
+            product = str(
+                r.get("ProductType") or r.get("product_type") or r.get("InstrumentType") or
+                r.get("instrument_type") or r.get("Series") or r.get("series") or ""
+            )
+            right = str(
+                r.get("OptionType") or r.get("option_type") or r.get("Right") or
+                r.get("right") or r.get("CallPut") or r.get("call_put") or ""
+            )
+            strike = str(
+                r.get("StrikePrice") or r.get("strike_price") or r.get("Strike") or
+                r.get("strike") or r.get("StrikeRate") or r.get("strike_rate") or ""
+            )
+            expiry = str(
+                r.get("ExpiryDate") or r.get("expiry_date") or r.get("Expiry") or
+                r.get("expiry") or r.get("ExpiryDt") or r.get("expiry_dt") or ""
+            )
             if not stock and not token:
                 continue
+            icici_stock_alias = {
+                "CNXBAN": "BANKNIFTY",
+                "CNXBAN": "BANKNIFTY",
+                "NIFTY50": "NIFTY",
+                "NIFTYBANK": "BANKNIFTY",
+                "SENSEX50": "SENSEX",
+            }
+            stock = icici_stock_alias.get(normalise_symbol(stock), stock)
             text = f"{stock} {product} {right} {strike} {expiry} {ex_code}"
             ac = AssetClass.CASH
             if ex_code == "NFO":
@@ -492,7 +529,10 @@ class InstrumentRegistry:
                 min_qty=first_positive(_safe_float(r.get("LotSize")), _safe_float(r.get("lot_size"))),
                 raw=raw,
             )
-            out[normalise_symbol(symbol)] = inst
+            key = normalise_symbol(symbol)
+            if key in out and normalise_symbol(str(out[key].product_id or "")) != normalise_symbol(str(inst.product_id or "")):
+                key = f"{key}_{normalise_symbol(str(inst.product_id or len(out)))}"
+            out[key] = inst
         self.icici = out
         return out
 

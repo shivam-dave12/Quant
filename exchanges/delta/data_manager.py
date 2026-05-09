@@ -25,6 +25,16 @@ from exchanges.delta.websocket import DeltaWebSocket
 logger = logging.getLogger(__name__)
 
 
+def _configured_timeframes(name: str, default: str, allowed: set[str]) -> list[str]:
+    raw = str(getattr(config, name, default) or default)
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        tf = part.strip()
+        if tf and tf in allowed and tf not in out:
+            out.append(tf)
+    return out or [x for x in default.split(",") if x in allowed]
+
+
 class StreamStats:
     def __init__(self):
         self._last_update: Optional[datetime] = None
@@ -123,12 +133,22 @@ class DeltaDataManager:
                 testnet    = getattr(config, "DELTA_TESTNET", False),
             )
 
-            # Subscribe before connect (DeltaWebSocket queues until connected)
+            # Subscribe before connect (DeltaWebSocket queues until connected).
+            # v80: candle streams are configurable and are opened only for desks
+            # shortlisted by the dynamic tradable-selection desk.  This prevents
+            # 100+ products × 6 timeframes from flooding Delta at startup.
             self.ws.subscribe_orderbook(symbol, callback=self._on_orderbook, depth=20)
             self.ws.subscribe_trades(symbol, callback=self._on_trade)
-            for tf, (iv_min, _, _) in self._WARMUP_CONFIG.items():
+            stream_tfs = _configured_timeframes(
+                "DELTA_ACTIVE_CANDLE_STREAMS",
+                "1m,5m,15m,1h",
+                set(self._WARMUP_CONFIG.keys()),
+            )
+            for tf in stream_tfs:
+                iv_min, _, _ = self._WARMUP_CONFIG[tf]
                 self.ws.subscribe_candlestick(
                     symbol, interval=iv_min, callback=self._make_candle_cb(tf))
+            logger.info("Delta DM[%s]: live candle streams=%s", symbol, ",".join(stream_tfs))
 
             # Private channels
             if config.DELTA_API_KEY:
@@ -143,9 +163,16 @@ class DeltaDataManager:
             self.is_streaming = True
             logger.info(f"✅ Delta WS streams started for {symbol}")
 
-            # REST warmup
-            logger.info(f"Delta DM[{symbol}]: starting REST warmup...")
-            for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
+            # REST warmup runs only for this activated desk.  HTF frames can
+            # still be warmed by REST without maintaining permanent WS candle
+            # channels for every timeframe.
+            warmup_tfs = _configured_timeframes(
+                "DELTA_REST_WARMUP_TIMEFRAMES",
+                "1m,5m,15m,1h,4h,1d",
+                set(self._WARMUP_CONFIG.keys()),
+            )
+            logger.info("Delta DM[%s]: starting REST warmup for %s...", symbol, ",".join(warmup_tfs))
+            for tf in warmup_tfs:
                 self._warmup_klines(tf)
                 time.sleep(self._WARMUP_SLEEP)
 
