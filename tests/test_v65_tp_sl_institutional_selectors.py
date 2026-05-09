@@ -124,7 +124,17 @@ def test_entry_engine_tp_rr_floor_keeps_dynamic_probability_compensated_floor():
     assert engine._last_selected_tp_rr_floor(1.50) == pytest.approx(0.32)
 
 
-@pytest.mark.parametrize("asset", [r["asset_id"] for r in MULTI_ASSET_REQUESTS])
+_GEOMETRY_ASSETS = [r["asset_id"] for r in MULTI_ASSET_REQUESTS] or [
+    "CRYPTO_DYNAMIC",
+    "COMMODITY_DYNAMIC",
+    "EQUITY_DYNAMIC",
+    "INDEX_DYNAMIC",
+    "OPTION_DYNAMIC",
+    "FUTURE_DYNAMIC",
+]
+
+
+@pytest.mark.parametrize("asset", _GEOMETRY_ASSETS)
 def test_every_configured_ticker_has_liquidity_aware_tp_and_sl_geometry(asset):
     # Asset-specific prices are normalized to a synthetic 100/2 ATR frame so the
     # same invariant is tested across the complete configured ticker universe:

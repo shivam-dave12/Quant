@@ -99,6 +99,23 @@ def test_portfolio_cio_selects_only_top_execution_desk(tmp_path):
     assert "B" in {r.asset_id for r in report.rejected}
 
 
+def test_portfolio_cio_zero_caps_scan_and_select_all_eligible_desks(tmp_path):
+    mandate = FundMandate(
+        enabled=True,
+        paper_mode=True,
+        top_n_execution_desks=0,
+        top_n_depth_scan=0,
+        min_ticker_score=0.1,
+        min_execution_score=0.1,
+        min_warmup_ratio=0.5,
+        max_spread_bps_crypto=50.0,
+        audit_log_path=str(tmp_path / "audit.jsonl"),
+    )
+    report = PortfolioCIO(mandate).select_execution_queue([_ctx("A", 0.02), _ctx("B", 0.03), _ctx("C", 0.04)], _Guard())
+    assert {x.asset_id for x in report.selected} == {"A", "B", "C"}
+    assert len(report.setup_candidates) == 3
+
+
 def test_breeze_client_blocks_market_orders_before_network():
     client = BreezeRestClient(auth=SimpleNamespace())
     with pytest.raises(RuntimeError, match="market orders are not permitted"):

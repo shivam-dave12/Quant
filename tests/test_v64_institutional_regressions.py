@@ -5,16 +5,17 @@ from strategy.quant_strategy import PositionState, QuantStrategy
 
 
 class _DummyInstrument:
-    def __init__(self, asset_id: str, symbol: str) -> None:
+    def __init__(self, asset_id: str, symbol: str, contract_type: str = "") -> None:
         self.asset_id = asset_id
         self.display_symbol = symbol
         self.canonical_symbol = symbol
+        self.primary = type("Primary", (), {"contract_type": contract_type, "raw": {"contract_type": contract_type}, "base_asset": asset_id})()
 
 
-def _strategy(asset_id: str, symbol: str) -> QuantStrategy:
+def _strategy(asset_id: str, symbol: str, contract_type: str = "") -> QuantStrategy:
     qs = object.__new__(QuantStrategy)
     qs._asset_id = asset_id
-    qs._instrument = _DummyInstrument(asset_id, symbol)
+    qs._instrument = _DummyInstrument(asset_id, symbol, contract_type)
     return qs
 
 
@@ -50,7 +51,7 @@ class InstitutionalRegressionTests(unittest.TestCase):
     def test_delta_btc_contract_keeps_inverse_pnl_geometry(self):
         config.EXECUTION_EXCHANGE = "delta"
         config.DELTA_SYMBOL = "BTCUSD"
-        qs = _strategy("BTC", "BTCUSD")
+        qs = _strategy("BTC", "BTCUSD", contract_type="inverse_perpetual")
         self.assertTrue(qs._is_delta_execution())
         self.assertTrue(qs._is_inverse_pnl_contract())
 

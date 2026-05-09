@@ -604,7 +604,7 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
 # catalogs and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
-SCANNER_MAX_ACTIVE_INSTRUMENTS = 14
+SCANNER_MAX_ACTIVE_INSTRUMENTS = _env_int("SCANNER_MAX_ACTIVE_INSTRUMENTS", 0)
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
@@ -630,14 +630,16 @@ PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
 AGENTIC_FUND_ENABLED = _env_bool("AGENTIC_FUND_ENABLED", True)
 FUND_PAPER_MODE = _env_bool("FUND_PAPER_MODE", True)
 FUND_LIVE_ORDERING_ENABLED = _env_bool("FUND_LIVE_ORDERING_ENABLED", False)
-FUND_TOP_N_EXECUTION_DESKS = _env_int("FUND_TOP_N_EXECUTION_DESKS", 3)
-FUND_TOP_N_DEPTH_SCAN = _env_int("FUND_TOP_N_DEPTH_SCAN", 6)
+FUND_TOP_N_EXECUTION_DESKS = _env_int("FUND_TOP_N_EXECUTION_DESKS", 0)
+FUND_TOP_N_DEPTH_SCAN = _env_int("FUND_TOP_N_DEPTH_SCAN", 0)
 FUND_MIN_TICKER_SCORE = _env_float("FUND_MIN_TICKER_SCORE", 0.52)
 FUND_MIN_EXECUTION_SCORE = _env_float("FUND_MIN_EXECUTION_SCORE", 0.58)
 FUND_MIN_SETUP_SCORE = _env_float("FUND_MIN_SETUP_SCORE", 0.50)
 FUND_MAX_SPREAD_BPS_CRYPTO = _env_float("FUND_MAX_SPREAD_BPS_CRYPTO", 18.0)
 FUND_MAX_SPREAD_BPS_EQUITY = _env_float("FUND_MAX_SPREAD_BPS_EQUITY", 45.0)
 FUND_MAX_SPREAD_BPS_COMMODITY = _env_float("FUND_MAX_SPREAD_BPS_COMMODITY", 55.0)
+FUND_MAX_SPREAD_BPS_OPTION = _env_float("FUND_MAX_SPREAD_BPS_OPTION", 120.0)
+FUND_MAX_SPREAD_BPS_FUTURE = _env_float("FUND_MAX_SPREAD_BPS_FUTURE", 65.0)
 FUND_MAX_DATA_AGE_SEC = _env_float("FUND_MAX_DATA_AGE_SEC", 90.0)
 FUND_MIN_WARMUP_RATIO = _env_float("FUND_MIN_WARMUP_RATIO", 0.88)
 FUND_AUDIT_LOG_PATH = os.getenv("FUND_AUDIT_LOG_PATH", "data/fund_audit.jsonl")
@@ -660,33 +662,15 @@ COINDCX_ENABLED = _env_bool("COINDCX_ENABLED", False)
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY", "")
 
-# Requested universe.  Commodity/index/equity entries are discovery requests;
-# if neither exchange lists them, they remain unavailable and are not traded.
-MULTI_ASSET_REQUESTS = [
-    {"asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD"], "priority": 0},
-
-    # Commodity exposure available on Delta is tokenised/RWA futures, not physical spot futures.
-    {"asset_id": "OIL", "display_name": "Crude Oil / WTI", "asset_class": "commodity", "aliases": ["OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"], "priority": 10},
-    {"asset_id": "GOLD", "display_name": "Gold token derivatives", "asset_class": "commodity", "aliases": ["PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"], "priority": 11},
-    {"asset_id": "SILVER", "display_name": "Silver token derivatives", "asset_class": "commodity", "aliases": ["SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"], "priority": 12},
-
-    # Important: Delta SPXUSD is SPX6900 crypto, NOT S&P 500. Do not alias it here.
-    {"asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500", "S&P500"], "priority": 20},
-    # xStock index/ETF-like token derivatives visible in Delta's market table.
-    {"asset_id": "SPY", "display_name": "SP500 xStock token derivative", "asset_class": "equity", "aliases": ["SPYXUSD", "SPYX", "SPY", "SPYUSD", "SPYUSDT"], "priority": 21},
-    {"asset_id": "QQQ", "display_name": "Nasdaq xStock token derivative", "asset_class": "equity", "aliases": ["QQQXUSD", "QQQX", "QQQ", "QQQUSD", "QQQUSDT"], "priority": 22},
-
-    # Delta US equity exposure is through xStock/RWA token perpetuals, not direct shares.
-    {"asset_id": "AAPL", "display_name": "Apple xStock token derivative", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"], "priority": 30},
-    {"asset_id": "MSFT", "display_name": "Microsoft xStock token derivative", "asset_class": "equity", "aliases": ["MSFTXUSD", "MSFTX", "MSFT", "MSFTUSD", "MSFTUSDT"], "priority": 31},
-    {"asset_id": "NVDA", "display_name": "NVIDIA xStock token derivative", "asset_class": "equity", "aliases": ["NVDAXUSD", "NVDAX", "NVDA", "NVDAUSD", "NVDAUSDT"], "priority": 32},
-    {"asset_id": "TSLA", "display_name": "Tesla xStock token derivative", "asset_class": "equity", "aliases": ["TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"], "priority": 33},
-    {"asset_id": "AMZN", "display_name": "Amazon xStock token derivative", "asset_class": "equity", "aliases": ["AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"], "priority": 34},
-    {"asset_id": "META", "display_name": "Meta xStock token derivative", "asset_class": "equity", "aliases": ["METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"], "priority": 35},
-    {"asset_id": "COIN", "display_name": "Coinbase xStock token derivative", "asset_class": "equity", "aliases": ["COINXUSD", "COINX", "COIN", "COINUSD", "COINUSDT"], "priority": 36},
-    {"asset_id": "CRCL", "display_name": "Circle xStock token derivative", "asset_class": "equity", "aliases": ["CRCLXUSD", "CRCLX", "CRCL", "CRCLUSD", "CRCLUSDT"], "priority": 37},
-    {"asset_id": "GOOGL", "display_name": "Alphabet xStock token derivative", "asset_class": "equity", "aliases": ["GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"], "priority": 38},
-]
+# Dynamic universe discovery. The scanner reads live venue catalogs by default;
+# this list is intentionally empty so old fixed baskets cannot cap coverage.
+UNIVERSE_DISCOVERY_MODE = os.getenv("UNIVERSE_DISCOVERY_MODE", "dynamic").lower()
+UNIVERSE_INCLUDE_EXCHANGES = os.getenv("UNIVERSE_INCLUDE_EXCHANGES", "delta,coinswitch,icici,coindcx")
+UNIVERSE_INCLUDE_ASSET_CLASSES = os.getenv("UNIVERSE_INCLUDE_ASSET_CLASSES", "crypto,commodity,index,equity,option,future,cash")
+MULTI_ASSET_REQUESTS = []
+DISCOVERY_REPORT_PREVIEW = _env_int("DISCOVERY_REPORT_PREVIEW", 80)
+ICICI_DISCOVERY_ENABLED = _env_bool("ICICI_DISCOVERY_ENABLED", True)
+ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

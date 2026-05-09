@@ -135,6 +135,72 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     base_rr = _f('MIN_RISK_REWARD_RATIO', 2.0)
     base_cooldown = _i('QUANT_COOLDOWN_SEC', 300)
 
+    if ac == AssetClass.OPTION:
+        return InstrumentPolicy(
+            asset_id=asset_id, asset_class=ac.value, leverage=_cap_leverage(inst, min(lev, _i('POLICY_OPTION_LEVERAGE', 5))),
+            margin_pct=min(base_margin, _f('POLICY_OPTION_MARGIN_PCT', 0.06)),
+            risk_multiplier=_f('POLICY_OPTION_RISK_MULT', 0.35),
+            min_margin_usd=_f('POLICY_OPTION_MIN_MARGIN_USD', 0.5),
+            tick_eval_sec=_f('POLICY_OPTION_TICK_EVAL_SEC', 1.0),
+            loop_interval_sec=_f('POLICY_OPTION_LOOP_INTERVAL_SEC', 1.0),
+            min_1m_bars=_i('POLICY_OPTION_MIN_1M_BARS', 120),
+            min_5m_bars=_i('POLICY_OPTION_MIN_5M_BARS', 80),
+            atr_min_pctile=_f('POLICY_OPTION_ATR_MIN_PCTILE', 0.08),
+            atr_max_pctile=_f('POLICY_OPTION_ATR_MAX_PCTILE', 0.99),
+            max_hold_sec=_i('POLICY_OPTION_MAX_HOLD_SEC', 2400),
+            cooldown_sec=_i('POLICY_OPTION_COOLDOWN_SEC', 240),
+            loss_lockout_sec=_i('POLICY_OPTION_LOSS_LOCKOUT_SEC', 1800),
+            min_rr=max(1.25, min(base_rr, _f('POLICY_OPTION_MIN_RR', 1.60))),
+            max_rr=_f('POLICY_OPTION_MAX_RR', 4.0),
+            sl_buffer_atr_mult=_f('POLICY_OPTION_SL_BUFFER_ATR', 0.75),
+            trail_min_move_atr=_f('POLICY_OPTION_TRAIL_MIN_MOVE_ATR', 0.12),
+            slippage_tolerance=_f('POLICY_OPTION_SLIPPAGE_TOL', 0.0025),
+            spread_soft_atr_ratio=_f('QUANT_SPREAD_SOFT_ATR_RATIO_OPTION', 0.80),
+            spread_max_atr_ratio=_f('QUANT_MAX_SPREAD_ATR_RATIO_OPTION', 5.00),
+            spread_max_bps=_f('QUANT_MAX_SPREAD_BPS_OPTION', 120.0),
+            spread_max_ticks=_f('QUANT_MAX_SPREAD_TICKS_OPTION', 20.0),
+            spread_min_size_mult=_f('QUANT_SPREAD_MIN_SIZE_MULT', 0.35),
+            spread_haircut_max=_f('QUANT_SPREAD_SIZE_HAIRCUT_MAX', 0.65),
+            ob_depth_levels=_i('POLICY_OPTION_OB_DEPTH_LEVELS', 3),
+            tick_agg_window_sec=_f('POLICY_OPTION_TICK_AGG_WINDOW_SEC', 60.0),
+            vwap_window=_i('POLICY_OPTION_VWAP_WINDOW', 80),
+            cvd_window=_i('POLICY_OPTION_CVD_WINDOW', 40),
+            notes='listed-option policy; lower risk, wider spread envelope, no BTC assumptions',
+        )
+
+    if ac in (AssetClass.INDEX, AssetClass.FUTURE):
+        return InstrumentPolicy(
+            asset_id=asset_id, asset_class=getattr(ac, 'value', str(ac)), leverage=lev,
+            margin_pct=min(base_margin, _f('POLICY_FUTURE_MARGIN_PCT', 0.10)),
+            risk_multiplier=_f('POLICY_FUTURE_RISK_MULT', 0.60),
+            min_margin_usd=_f('POLICY_FUTURE_MIN_MARGIN_USD', 0.5),
+            tick_eval_sec=_f('POLICY_FUTURE_TICK_EVAL_SEC', 0.75),
+            loop_interval_sec=_f('POLICY_FUTURE_LOOP_INTERVAL_SEC', 0.75),
+            min_1m_bars=_i('POLICY_FUTURE_MIN_1M_BARS', 100),
+            min_5m_bars=_i('POLICY_FUTURE_MIN_5M_BARS', 75),
+            atr_min_pctile=_f('POLICY_FUTURE_ATR_MIN_PCTILE', 0.05),
+            atr_max_pctile=_f('POLICY_FUTURE_ATR_MAX_PCTILE', 0.985),
+            max_hold_sec=_i('POLICY_FUTURE_MAX_HOLD_SEC', 4200),
+            cooldown_sec=min(base_cooldown, _i('POLICY_FUTURE_COOLDOWN_SEC', 210)),
+            loss_lockout_sec=_i('POLICY_FUTURE_LOSS_LOCKOUT_SEC', 1800),
+            min_rr=max(1.45, min(base_rr, _f('POLICY_FUTURE_MIN_RR', 1.75))),
+            max_rr=_f('POLICY_FUTURE_MAX_RR', 5.0),
+            sl_buffer_atr_mult=_f('POLICY_FUTURE_SL_BUFFER_ATR', 0.55),
+            trail_min_move_atr=_f('POLICY_FUTURE_TRAIL_MIN_MOVE_ATR', 0.08),
+            slippage_tolerance=_f('POLICY_FUTURE_SLIPPAGE_TOL', 0.0012),
+            spread_soft_atr_ratio=_f('QUANT_SPREAD_SOFT_ATR_RATIO_FUTURE', 0.60),
+            spread_max_atr_ratio=_f('QUANT_MAX_SPREAD_ATR_RATIO_FUTURE', 3.00),
+            spread_max_bps=_f('QUANT_MAX_SPREAD_BPS_FUTURE', 65.0),
+            spread_max_ticks=_f('QUANT_MAX_SPREAD_TICKS_FUTURE', 14.0),
+            spread_min_size_mult=_f('QUANT_SPREAD_MIN_SIZE_MULT', 0.35),
+            spread_haircut_max=_f('QUANT_SPREAD_SIZE_HAIRCUT_MAX', 0.55),
+            ob_depth_levels=_i('POLICY_FUTURE_OB_DEPTH_LEVELS', 4),
+            tick_agg_window_sec=_f('POLICY_FUTURE_TICK_AGG_WINDOW_SEC', 45.0),
+            vwap_window=_i('POLICY_FUTURE_VWAP_WINDOW', 70),
+            cvd_window=_i('POLICY_FUTURE_CVD_WINDOW', 35),
+            notes='index/futures policy; instrument-native tick/lot/ATR',
+        )
+
     if ac == AssetClass.EQUITY:
         return InstrumentPolicy(
             asset_id=asset_id, asset_class=ac.value, leverage=lev,

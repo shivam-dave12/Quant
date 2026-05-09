@@ -42,7 +42,8 @@ class PortfolioCIO:
         ranked = self.ticker_selector.rank(diagnostics)
         by_id: Dict[str, Any] = {getattr(c.instrument, "asset_id", ""): c for c in contexts}
 
-        depth_scan_ids = {r.asset_id for r in ranked[: self.mandate.top_n_depth_scan]}
+        depth_scan_rows = ranked if self.mandate.top_n_depth_scan <= 0 else ranked[: self.mandate.top_n_depth_scan]
+        depth_scan_ids = {r.asset_id for r in depth_scan_rows}
         setup_candidates = self.setup_selector.evaluate_many(
             [ctx for ctx in contexts if getattr(ctx.instrument, "asset_id", "") in depth_scan_ids]
         )
@@ -66,7 +67,8 @@ class PortfolioCIO:
             ctx = by_id.get(row.asset_id)
             verdict = self.risk_committee.review_desk(enriched, setup, portfolio_guard, ctx, contexts)
             verdicts[row.asset_id] = verdict
-            if verdict.approved and len(selected) < self.mandate.top_n_execution_desks:
+            execution_room = self.mandate.top_n_execution_desks <= 0 or len(selected) < self.mandate.top_n_execution_desks
+            if verdict.approved and execution_room:
                 selected.append(enriched)
             else:
                 rejected.append(enriched)

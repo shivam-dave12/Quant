@@ -22,11 +22,16 @@ class AssetClass(str, Enum):
     COMMODITY = "commodity"
     INDEX = "index"
     EQUITY = "equity"
+    OPTION = "option"
+    FUTURE = "future"
+    CASH = "cash"
 
 
 class ExchangeName(str, Enum):
     DELTA = "delta"
     COINSWITCH = "coinswitch"
+    ICICI = "icici"
+    COINDCX = "coindcx"
 
 
 @dataclass(frozen=True)
@@ -164,50 +169,13 @@ def first_positive(*values: float) -> float:
 
 
 def default_asset_intents() -> List[AssetIntent]:
-    """Requested markets. Aliases are discovery hints only, not execution symbols.
+    """Legacy explicit requests.
 
-    IMPORTANT:
-    * SPXUSD on Delta is SPX6900 crypto, not the S&P 500 index. It is
-      intentionally NOT an alias for SPX_INDEX.
-    * xStock products are tokenized/RWA derivatives, not direct shares. They
-      are listed separately by their actual Delta symbols (AAPLXUSD, etc.).
+    The production universe is now discovered from venue catalogs. This returns
+    an empty list so the scanner cannot silently fall back to an old fixed
+    symbol basket when no explicit request list is provided.
     """
-    return [
-        AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO,
-                    ("BTCUSD", "BTCUSDT", "BTC/USDT", "XBTUSD", "BTC"), priority=0),
-        AssetIntent("OIL", "Crude Oil / WTI", AssetClass.COMMODITY,
-                    ("OIL", "WTI", "CL", "USOIL", "CRUDE", "CRUDEOIL", "OILUSD", "OILUSDT", "WTIUSDT"), priority=10),
-        AssetIntent("GOLD", "Gold token derivatives", AssetClass.COMMODITY,
-                    ("PAXGUSD", "XAUTUSD", "PAXG", "PAXGUSDT", "XAUT", "XAUTUSDT", "GOLD", "XAU", "XAUUSD"), priority=11),
-        AssetIntent("SILVER", "Silver token derivatives", AssetClass.COMMODITY,
-                    ("SLVONUSD", "SLVON", "SILVER", "XAG", "XAGUSD", "SLV", "SILVERUSDT"), priority=12),
-        AssetIntent("SPX_INDEX", "S&P 500 index", AssetClass.INDEX,
-                    ("SPX500USD", "US500", "SP500", "S&P500"), priority=20),
-        # Delta UI lists SPYXUSD/QQQXUSD as xStock token perpetuals. These are
-        # tokenised derivatives, not the direct S&P/Nasdaq index futures.
-        AssetIntent("SPY", "SP500 xStock token derivative", AssetClass.EQUITY,
-                    ("SPYXUSD", "SPYX", "SPY", "SPYUSD", "SPYUSDT"), priority=21),
-        AssetIntent("QQQ", "Nasdaq xStock token derivative", AssetClass.EQUITY,
-                    ("QQQXUSD", "QQQX", "QQQ", "QQQUSD", "QQQUSDT"), priority=22),
-        AssetIntent("AAPL", "Apple xStock token derivative", AssetClass.EQUITY,
-                    ("AAPLXUSD", "AAPLX", "AAPL", "AAPLUSD", "AAPLUSDT"), priority=30),
-        AssetIntent("MSFT", "Microsoft xStock token derivative", AssetClass.EQUITY,
-                    ("MSFTXUSD", "MSFTX", "MSFT", "MSFTUSD", "MSFTUSDT"), priority=31),
-        AssetIntent("NVDA", "NVIDIA xStock token derivative", AssetClass.EQUITY,
-                    ("NVDAXUSD", "NVDAX", "NVDA", "NVDAUSD", "NVDAUSDT"), priority=32),
-        AssetIntent("TSLA", "Tesla xStock token derivative", AssetClass.EQUITY,
-                    ("TSLAXUSD", "TSLAX", "TSLA", "TSLAUSD", "TSLAUSDT"), priority=33),
-        AssetIntent("AMZN", "Amazon xStock token derivative", AssetClass.EQUITY,
-                    ("AMZNXUSD", "AMZNX", "AMZN", "AMZNUSD", "AMZNUSDT"), priority=34),
-        AssetIntent("META", "Meta xStock token derivative", AssetClass.EQUITY,
-                    ("METAXUSD", "METAX", "META", "METAUSD", "METAUSDT"), priority=35),
-        AssetIntent("COIN", "Coinbase xStock token derivative", AssetClass.EQUITY,
-                    ("COINXUSD", "COINX", "COIN", "COINUSD", "COINUSDT"), priority=36),
-        AssetIntent("CRCL", "Circle xStock token derivative", AssetClass.EQUITY,
-                    ("CRCLXUSD", "CRCLX", "CRCL", "CRCLUSDT", "CRCLUSD"), priority=37),
-        AssetIntent("GOOGL", "Alphabet xStock token derivative", AssetClass.EQUITY,
-                    ("GOOGLXUSD", "GOOGLX", "GOOGL", "GOOG", "GOOGLUSD", "GOOGLUSDT"), priority=38),
-    ]
+    return []
 
 def configured_asset_intents(raw: Iterable[dict] | None = None) -> List[AssetIntent]:
     if not raw:

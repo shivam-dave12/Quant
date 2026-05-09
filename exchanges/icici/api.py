@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import csv
+import io
+import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -14,6 +18,7 @@ from .breeze_auth import BreezeTokenService
 
 class BreezeRestClient:
     BASE_URL = "https://api.icicidirect.com/breezeapi/api/v1"
+    SECURITY_MASTER_URL = "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
 
     def __init__(self, auth: BreezeTokenService | None = None) -> None:
         self.auth = auth or BreezeTokenService()
@@ -63,6 +68,33 @@ class BreezeRestClient:
     def get_quotes(self, **kwargs) -> Dict[str, Any]:
         return self.request("GET", "/quotes", kwargs)
 
+    def get_option_chain_quotes(self, **kwargs) -> Dict[str, Any]:
+        return self.request("GET", "/OptionChain", kwargs)
+
+    def get_historical_charts(self, **kwargs) -> Dict[str, Any]:
+        return self.request("GET", "/historicalcharts", kwargs)
+
+    def get_security_master_rows(self, *, url: str | None = None, cache_path: str | Path | None = None, timeout: float = 30.0) -> list[dict[str, str]]:
+        """Download and parse ICICI's daily Security Master file.
+
+        This is the catalog source for NSE/NFO stock codes, tokens, futures and
+        options. It is public, so discovery can run without consuming authenticated
+        Breeze API quota; order placement still requires a valid Breeze session.
+        """
+        source = url or self.SECURITY_MASTER_URL
+        data: bytes
+        if cache_path:
+            path = Path(cache_path)
+            if path.exists():
+                data = path.read_bytes()
+            else:
+                data = self._download_security_master(source, timeout)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        else:
+            data = self._download_security_master(source, timeout)
+        return self._parse_security_master_zip(data)
+
     def get_portfolio_positions(self) -> Dict[str, Any]:
         return self.request("GET", "/portfolio", {})
 
@@ -84,3 +116,31 @@ class BreezeRestClient:
 
     def square_off(self, **kwargs) -> Dict[str, Any]:
         return self.request("POST", "/squareoff", kwargs)
+
+    @staticmethod
+    def _download_security_master(url: str, timeout: float) -> bytes:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+
+    @staticmethod
+    def _parse_security_master_zip(data: bytes) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith((".csv", ".txt")):
+                    continue
+                raw = zf.read(name)
+                text = raw.decode("utf-8", errors="ignore")
+                sample = text[:4096]
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",|\t")
+                except Exception:
+                    dialect = csv.excel
+                reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+                for row in reader:
+                    cleaned = {str(k or "").strip(): str(v or "").strip() for k, v in row.items()}
+                    if cleaned:
+                        cleaned["_source_file"] = name
+                        rows.append(cleaned)
+        return rows

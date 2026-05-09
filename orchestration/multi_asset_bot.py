@@ -27,6 +27,10 @@ from exchanges.coinswitch.api import FuturesAPI as CoinSwitchAPI
 from exchanges.coinswitch.data_manager import CoinSwitchDataManager
 from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
+try:
+    from exchanges.icici.api import BreezeRestClient
+except Exception:
+    BreezeRestClient = None  # type: ignore
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
@@ -101,10 +105,12 @@ class MultiAssetQuantBot:
     def _build_api_clients(self):
         has_delta = bool(config.DELTA_API_KEY and config.DELTA_SECRET_KEY)
         has_cs = bool(config.COINSWITCH_API_KEY and config.COINSWITCH_SECRET_KEY)
+        has_icici_discovery = bool(getattr(config, "ICICI_DISCOVERY_ENABLED", False))
         delta_api = DeltaAPI(config.DELTA_API_KEY, config.DELTA_SECRET_KEY,
                              testnet=getattr(config, "DELTA_TESTNET", False)) if has_delta else None
         cs_api = CoinSwitchAPI(config.COINSWITCH_API_KEY, config.COINSWITCH_SECRET_KEY) if has_cs else None
-        return delta_api, cs_api
+        icici_api = BreezeRestClient() if has_icici_discovery and BreezeRestClient is not None else None
+        return delta_api, cs_api, icici_api
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
@@ -645,14 +651,17 @@ class MultiAssetQuantBot:
         try:
             if self.discovery_report:
                 for inst in self.discovery_report.matched:
+                    runtime_ready = self._has_supported_runtime(inst)
                     self._dash_emit({
                         "type": "catalog_asset",
                         "asset": inst.asset_id,
                         "venue": inst.primary_exchange.value.upper(),
                         "symbol": inst.display_symbol,
                         "primary": inst.primary_exchange.value.upper(),
+                        "policy": inst.asset_class.value,
+                        "data_status": "DISCOVERED" if runtime_ready else "COVERAGE_ONLY",
                         "last_reason": ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items()),
-                        "health": "OK",
+                        "health": "OK" if runtime_ready else "WATCH",
                     })
             for ctx in self.contexts:
                 inst = ctx.instrument
@@ -766,25 +775,36 @@ class MultiAssetQuantBot:
             logger.info("⚡ MULTI-ASSET INSTITUTIONAL LIQUIDITY SCANNER")
             logger.info("   Live exchange catalogs only — no synthetic commodity/index/equity feeds")
             logger.info("=" * 92)
-            delta_api, cs_api = self._build_api_clients()
+            delta_api, cs_api, icici_api = self._build_api_clients()
             self.registry = InstrumentRegistry(execution_preference=getattr(config, "EXECUTION_EXCHANGE", "delta"))
             self.discovery_report = self.registry.discover(
                 delta_api=delta_api,
                 coinswitch_api=cs_api,
+                icici_api=icici_api,
+                discovery_mode=getattr(config, "UNIVERSE_DISCOVERY_MODE", "dynamic"),
+                include_asset_classes=getattr(config, "UNIVERSE_INCLUDE_ASSET_CLASSES", ""),
+                include_exchanges=getattr(config, "UNIVERSE_INCLUDE_EXCHANGES", ""),
+                icici_security_master_url=getattr(config, "ICICI_SECURITY_MASTER_URL", None),
                 requested=getattr(config, "MULTI_ASSET_REQUESTS", None),
-                max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 8)),
+                max_active=int(getattr(config, "SCANNER_MAX_ACTIVE_INSTRUMENTS", 0)),
                 require_primary=False,
             )
-            for line in self.discovery_report.terminal_lines():
+            for line in self.discovery_report.terminal_lines(preview=int(getattr(config, "DISCOVERY_REPORT_PREVIEW", 80))):
                 logger.info(line)
             if not self.discovery_report.matched:
                 logger.error("No confirmed tradable instruments found. Scanner will not start.")
                 return False
 
+            coverage_only = 0
             for inst in self.discovery_report.matched:
+                if not self._has_supported_runtime(inst):
+                    coverage_only += 1
+                    continue
                 ctx = self._build_asset_context(inst, delta_api, cs_api)
                 if ctx is not None:
                     self.contexts.append(ctx)
+            if coverage_only:
+                logger.info("%d discovered instruments are coverage-only until their data/execution adapters are enabled", coverage_only)
             if not self.contexts:
                 logger.error("No asset contexts could be built.")
                 return False
@@ -794,6 +814,10 @@ class MultiAssetQuantBot:
         except Exception:
             logger.exception("MultiAssetQuantBot initialisation failed")
             return False
+
+    @staticmethod
+    def _has_supported_runtime(inst: TradableInstrument) -> bool:
+        return bool({ExchangeName.DELTA, ExchangeName.COINSWITCH}.intersection(set(inst.by_exchange.keys())))
 
     def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
@@ -882,7 +906,7 @@ class MultiAssetQuantBot:
         self._dash_universe()
         self._dash_heartbeat()
         if self.discovery_report:
-            send_telegram_message(self.discovery_report.telegram_html())
+            send_telegram_message(self.discovery_report.telegram_html(preview=int(getattr(config, "DISCOVERY_REPORT_PREVIEW", 80))))
         send_telegram_message(self._startup_message())
         return True
 

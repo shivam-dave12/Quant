@@ -29,13 +29,22 @@ class FakeCoinSwitch:
         return {"error": "not found"}
 
 
+class FakeICICI:
+    def get_security_master_rows(self, url=None):
+        return [
+            {"ExchangeCode": "NFO", "ShortName": "NIFTY", "TradingSymbol": "NIFTY28MAY2625000CE", "ProductType": "Options", "OptionType": "Call", "StrikePrice": "25000", "ExpiryDate": "28-May-2026", "Token": "12345", "LotSize": "75"},
+            {"ExchangeCode": "NFO", "ShortName": "CNXBAN", "TradingSymbol": "BANKNIFTY28MAY2655000PE", "ProductType": "Options", "OptionType": "Put", "StrikePrice": "55000", "ExpiryDate": "28-May-2026", "Token": "12346", "LotSize": "30"},
+            {"ExchangeCode": "NSE", "ShortName": "RELIANCE", "TradingSymbol": "RELIANCE", "Series": "EQ", "Token": "2885", "LotSize": "1"},
+        ]
+
+
 class InstrumentRegistryV4Tests(unittest.TestCase):
     def test_coinswitch_secondary_is_added_by_live_symbol_validation(self):
         intents = [AssetIntent("BTC", "Bitcoin", AssetClass.CRYPTO, ("BTCUSD", "BTCUSDT"), priority=0)]
         reg = InstrumentRegistry(execution_preference="delta")
         report = reg.discover(FakeDelta(), FakeCoinSwitch(), requested=[{
             "asset_id": "BTC", "display_name": "Bitcoin", "asset_class": "crypto", "aliases": ["BTCUSD", "BTCUSDT"], "priority": 0
-        }])
+        }], discovery_mode="static")
         btc = report.matched[0]
         self.assertIn(ExchangeName.DELTA, btc.by_exchange)
         self.assertIn(ExchangeName.COINSWITCH, btc.by_exchange)
@@ -45,7 +54,7 @@ class InstrumentRegistryV4Tests(unittest.TestCase):
         reg = InstrumentRegistry(execution_preference="delta")
         report = reg.discover(FakeDelta(), None, requested=[{
             "asset_id": "SPX_INDEX", "display_name": "S&P 500 index", "asset_class": "index", "aliases": ["SPX500USD", "US500", "SP500"], "priority": 0
-        }])
+        }], discovery_mode="static")
         self.assertEqual(report.matched, [])
         self.assertIn("SPX_INDEX", report.unavailable)
 
@@ -53,7 +62,7 @@ class InstrumentRegistryV4Tests(unittest.TestCase):
         reg = InstrumentRegistry(execution_preference="delta")
         report = reg.discover(FakeDelta(), None, requested=[{
             "asset_id": "AAPL", "display_name": "Apple xStock token derivative", "asset_class": "equity", "aliases": ["AAPLXUSD", "AAPL"], "priority": 0
-        }])
+        }], discovery_mode="static")
         self.assertEqual(report.matched[0].primary.symbol, "AAPLXUSD")
         self.assertEqual(report.matched[0].max_leverage, 25)
 
@@ -72,10 +81,34 @@ class InstrumentRegistryV4Tests(unittest.TestCase):
             {"asset_id": "QQQ", "display_name": "Nasdaq xStock token derivative", "asset_class": "equity", "aliases": ["QQQXUSD"], "priority": 1},
             {"asset_id": "COIN", "display_name": "Coinbase xStock token derivative", "asset_class": "equity", "aliases": ["COINXUSD"], "priority": 2},
             {"asset_id": "CRCL", "display_name": "Circle xStock token derivative", "asset_class": "equity", "aliases": ["CRCLXUSD"], "priority": 3},
-        ], max_active=10)
+        ], max_active=10, discovery_mode="static")
         syms = {x.primary.symbol for x in report.matched}
         self.assertEqual({"SPYXUSD", "QQQXUSD", "COINXUSD", "CRCLXUSD"}, syms)
         self.assertTrue(all(x.max_leverage == 25 for x in report.matched))
+
+    def test_dynamic_discovery_activates_all_live_catalog_symbols_without_request_basket(self):
+        reg = InstrumentRegistry(execution_preference="delta")
+        report = reg.discover(FakeDelta(), FakeCoinSwitch(), requested=[], max_active=0, discovery_mode="dynamic")
+        syms = {x.primary.symbol for x in report.matched}
+        self.assertIn("BTCUSD", syms)
+        self.assertIn("SPXUSD", syms)
+        self.assertIn("AAPLXUSD", syms)
+        self.assertGreaterEqual(len(report.matched), 7)
+
+    def test_zero_max_active_means_no_registry_cap(self):
+        reg = InstrumentRegistry(execution_preference="delta")
+        uncapped = reg.discover(FakeDelta(), None, requested=[], max_active=0, discovery_mode="dynamic")
+        capped = reg.discover(FakeDelta(), None, requested=[], max_active=2, discovery_mode="dynamic")
+        self.assertGreater(len(uncapped.matched), len(capped.matched))
+        self.assertEqual(len(capped.matched), 2)
+
+    def test_icici_security_master_options_enter_dynamic_coverage(self):
+        reg = InstrumentRegistry(execution_preference="delta")
+        report = reg.discover(None, None, icici_api=FakeICICI(), requested=[], max_active=0, discovery_mode="dynamic")
+        by_symbol = {x.primary.symbol: x for x in report.matched}
+        self.assertEqual(by_symbol["NIFTY28MAY2625000CE"].asset_class, AssetClass.OPTION)
+        self.assertEqual(by_symbol["BANKNIFTY28MAY2655000PE"].primary_exchange, ExchangeName.ICICI)
+        self.assertIn("RELIANCE", by_symbol)
 
 
 if __name__ == "__main__":

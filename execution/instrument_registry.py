@@ -2,16 +2,16 @@
 execution/instrument_registry.py — live catalog discovery and filtering
 ======================================================================
 
-The registry never creates synthetic executable contracts.  It reads Delta's
-/v2/products and CoinSwitch's futures instrument/ticker endpoints, normalises
-only contracts returned by the exchange, and then matches requested asset
-intents against those confirmed symbols.
+The registry never creates synthetic executable contracts. It reads venue
+catalogs first, normalises only contracts returned by the exchange, then builds
+a cross-venue universe. Explicit asset intents are optional overlays, not the
+default universe.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from core.instruments import (
     AssetClass, AssetIntent, ExchangeInstrument, ExchangeName, TradableInstrument,
@@ -73,6 +73,81 @@ def _asset_default_max_leverage(asset_class: AssetClass) -> float:
     if asset_class in (AssetClass.COMMODITY, AssetClass.INDEX):
         return 25.0
     return 0.0
+
+
+def _asset_class_from_text(text: str, default: AssetClass = AssetClass.CRYPTO) -> AssetClass:
+    n = normalise_symbol(text)
+    if any(x in n for x in ("OPTION", "OPTIONS", "OPT")):
+        return AssetClass.OPTION
+    if any(x in n for x in ("FUTURE", "FUTURES", "FUT")):
+        return AssetClass.FUTURE
+    if any(x in n for x in ("INDEX", "NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+        return AssetClass.INDEX
+    if any(x in n for x in ("GOLD", "SILVER", "CRUDE", "BRENT", "NATURALGAS", "NATGAS", "PAXG", "XAUT", "SLVON", "XAU", "XAG", "OIL")):
+        return AssetClass.COMMODITY
+    if any(x in n for x in ("EQUITY", "STOCK", "SHARE", "XSTOCK")):
+        return AssetClass.EQUITY
+    return default
+
+
+def _infer_delta_asset_class(row: dict, symbol: str, base: str) -> AssetClass:
+    text = " ".join(str(row.get(k, "")) for k in ("symbol", "description", "name", "contract_type", "product_type"))
+    nsym = normalise_symbol(symbol)
+    nbase = normalise_symbol(base)
+    if nsym.endswith("XUSD") or nbase.endswith("X"):
+        return AssetClass.EQUITY
+    return _asset_class_from_text(f"{text} {nbase} {nsym}", AssetClass.CRYPTO)
+
+
+def _canonical_asset_id(inst: ExchangeInstrument) -> str:
+    """Canonical key for cross-venue grouping without enumerating a fixed basket."""
+    sym = normalise_symbol(inst.symbol)
+    base = normalise_symbol(inst.base_asset or inst.asset_id or sym)
+    if inst.asset_class == AssetClass.FUTURE:
+        return sym or base
+    if inst.asset_class == AssetClass.EQUITY:
+        if base.endswith("X") and len(base) > 1:
+            return base[:-1]
+        if sym.endswith("XUSD") and len(sym) > 4:
+            return sym[:-4]
+    if inst.asset_class == AssetClass.OPTION:
+        raw = inst.raw or {}
+        stock = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or base)
+        expiry = normalise_symbol(raw.get("expiry_date") or raw.get("expiry") or raw.get("expiryDate") or "")
+        right = normalise_symbol(raw.get("right") or raw.get("option_type") or raw.get("optionType") or "")
+        strike = normalise_symbol(str(raw.get("strike_price") or raw.get("strike") or ""))
+        parts = [x for x in (stock, expiry, strike, right[:1]) if x]
+        return "_".join(parts) if parts else sym or base
+    for quote in ("USDT", "USD", "INR"):
+        if sym.endswith(quote) and len(sym) > len(quote):
+            return sym[:-len(quote)]
+    return base or sym
+
+
+def _display_name_for(inst: ExchangeInstrument, asset_id: str) -> str:
+    if inst.asset_class == AssetClass.OPTION:
+        raw = inst.raw or {}
+        right = str(raw.get("right") or raw.get("option_type") or "").strip()
+        strike = str(raw.get("strike_price") or raw.get("strike") or "").strip()
+        expiry = str(raw.get("expiry_date") or raw.get("expiry") or "").strip()
+        stock = str(raw.get("stock_code") or raw.get("underlying") or asset_id).strip()
+        bits = [stock, expiry, strike, right]
+        return " ".join(x for x in bits if x)
+    return str(inst.display_symbol or asset_id)
+
+
+def _parse_csv_set(value: str | Iterable[str] | None) -> Set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw = value.replace(";", ",").split(",")
+    else:
+        raw = list(value)
+    return {str(x).strip().lower() for x in raw if str(x).strip()}
+
+
+def _allow_value(value: str, allowed: Set[str]) -> bool:
+    return not allowed or "all" in allowed or str(value or "").lower() in allowed
 
 
 def _asset_default_step(asset_class: AssetClass, symbol: str) -> float:
@@ -184,6 +259,47 @@ class DiscoveryReport:
         return "\n".join(parts)
 
 
+def _discovery_report_terminal_lines(self: DiscoveryReport, preview: int = 80) -> List[str]:
+    lines = ["MULTI-ASSET LIVE CATALOG DISCOVERY"]
+    lines.append("   raw products: " + ", ".join(f"{k}={v}" for k, v in self.raw_counts.items()))
+    if self.matched:
+        shown = self.matched[:max(0, int(preview))]
+        lines.append(f"   discovered: {len(self.matched)} instruments; preview={len(shown)}")
+        for inst in shown:
+            exs = ", ".join(f"{ex.value}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
+            lines.append(f"     OK {inst.asset_id:<18} {inst.asset_class.value:<9} primary={inst.primary_exchange.value:<10} {exs}")
+        if len(self.matched) > len(shown):
+            lines.append(f"     ... {len(self.matched) - len(shown)} more instruments in discovery report")
+    if self.unavailable:
+        lines.append("   unavailable / skipped:")
+        for aid, reason in self.unavailable.items():
+            lines.append(f"     SKIP {aid:<18} {reason}")
+    return lines
+
+
+def _discovery_report_telegram_html(self: DiscoveryReport, preview: int = 60) -> str:
+    def esc(x):
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    parts = ["<b>MULTI-ASSET LIVE CATALOG DISCOVERY</b>"]
+    parts.append("Raw products: " + esc(", ".join(f"{k}={v}" for k, v in self.raw_counts.items())))
+    if self.matched:
+        shown = self.matched[:max(0, int(preview))]
+        parts.append(f"\n<b>Discovered:</b> {len(self.matched)} instruments; showing {len(shown)}")
+        for inst in shown:
+            parts.append(f"OK <b>{esc(inst.asset_id)}</b> - {esc(inst.asset_class.value)} - primary {esc(inst.primary_exchange.value.upper())} / {esc(inst.display_symbol)}")
+        if len(self.matched) > len(shown):
+            parts.append(f"... {len(self.matched) - len(shown)} more instruments")
+    if self.unavailable:
+        parts.append("\n<b>Unavailable / skipped:</b>")
+        for aid, reason in self.unavailable.items():
+            parts.append(f"SKIP <b>{esc(aid)}</b> - {esc(reason)}")
+    return "\n".join(parts)
+
+
+DiscoveryReport.terminal_lines = _discovery_report_terminal_lines  # type: ignore[method-assign]
+DiscoveryReport.telegram_html = _discovery_report_telegram_html  # type: ignore[method-assign]
+
+
 class InstrumentRegistry:
     def __init__(self, execution_preference: str = "delta") -> None:
         try:
@@ -192,6 +308,7 @@ class InstrumentRegistry:
             self.execution_preference = ExchangeName.DELTA
         self.delta: Dict[str, ExchangeInstrument] = {}
         self.coinswitch: Dict[str, ExchangeInstrument] = {}
+        self.icici: Dict[str, ExchangeInstrument] = {}
         self.report = DiscoveryReport()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -215,15 +332,7 @@ class InstrumentRegistry:
                     _safe_float(p.get("price_increment")),
                     _safe_float(p.get("minimum_tick_size")),
                 )
-                # Derive asset class before sizing/leverage defaults. Delta
-                # xStock symbols end in XUSD (AAPLXUSD, NVDAXUSD, ...); tokenised
-                # commodity contracts are explicitly requested via their aliases.
-                inferred_class = AssetClass.CRYPTO
-                nsym = normalise_symbol(sym)
-                if nsym.endswith("XUSD") or nsym in {"SPYXUSD", "QQQXUSD", "CRCLXUSD", "COINXUSD"}:
-                    inferred_class = AssetClass.EQUITY
-                elif nsym in {"PAXGUSD", "XAUTUSD", "SLVONUSD"}:
-                    inferred_class = AssetClass.COMMODITY
+                inferred_class = _infer_delta_asset_class(p, sym, base)
 
                 step = first_positive(
                     _safe_float(p.get("contract_value")),
@@ -319,6 +428,74 @@ class InstrumentRegistry:
         self.coinswitch = out
         return out
 
+    def load_icici(self, api, *, security_master_url: str | None = None) -> Dict[str, ExchangeInstrument]:
+        out: Dict[str, ExchangeInstrument] = {}
+        if api is None or not hasattr(api, "get_security_master_rows"):
+            self.icici = out
+            return out
+        try:
+            rows = api.get_security_master_rows(url=security_master_url)
+        except Exception as e:
+            logger.warning("ICICI security master discovery failed: %s", e, exc_info=True)
+            rows = []
+        for r in rows:
+            ex_code = str(
+                r.get("ExchangeCode") or r.get("exchange_code") or r.get("Exchange") or r.get("exchange") or ""
+            ).upper()
+            if ex_code not in {"NSE", "NFO", "BSE"}:
+                continue
+            stock = str(
+                r.get("ShortName") or r.get("StockCode") or r.get("stock_code") or
+                r.get("Symbol") or r.get("symbol") or r.get("Name") or ""
+            ).upper()
+            token = str(r.get("Token") or r.get("token") or r.get("ScripCode") or r.get("scrip_code") or "")
+            product = str(r.get("ProductType") or r.get("product_type") or r.get("Series") or r.get("series") or "")
+            right = str(r.get("OptionType") or r.get("option_type") or r.get("Right") or r.get("right") or "")
+            strike = str(r.get("StrikePrice") or r.get("strike_price") or r.get("Strike") or r.get("strike") or "")
+            expiry = str(r.get("ExpiryDate") or r.get("expiry_date") or r.get("Expiry") or r.get("expiry") or "")
+            if not stock and not token:
+                continue
+            text = f"{stock} {product} {right} {strike} {expiry} {ex_code}"
+            ac = AssetClass.CASH
+            if ex_code == "NFO":
+                ac = AssetClass.OPTION if (right or strike or "OPT" in normalise_symbol(product)) else AssetClass.FUTURE
+            elif ex_code == "BSE" and normalise_symbol(stock) in {"SENSEX", "BANKEX"}:
+                ac = AssetClass.INDEX
+            elif _asset_class_from_text(text, AssetClass.EQUITY) == AssetClass.INDEX:
+                ac = AssetClass.INDEX
+            symbol = normalise_symbol(
+                r.get("TradingSymbol") or r.get("trading_symbol") or r.get("Symbol") or stock or token
+            )
+            if not symbol:
+                symbol = normalise_symbol(f"{stock}{expiry}{strike}{right}")
+            raw = dict(r)
+            raw.setdefault("stock_code", stock)
+            raw.setdefault("exchange_code", ex_code)
+            raw.setdefault("product_type", "options" if ac == AssetClass.OPTION else ("futures" if ac == AssetClass.FUTURE else "cash"))
+            raw.setdefault("right", right)
+            raw.setdefault("strike_price", strike)
+            raw.setdefault("expiry_date", expiry)
+            inst = ExchangeInstrument(
+                exchange=ExchangeName.ICICI,
+                symbol=symbol,
+                ws_symbol=str(token or symbol),
+                display_symbol=str(symbol or stock),
+                asset_id=normalise_symbol(stock or symbol),
+                asset_class=ac,
+                product_id=_safe_int(token, 0) or None,
+                quote_asset="INR",
+                base_asset=normalise_symbol(stock or symbol),
+                contract_type=raw["product_type"],
+                status=str(r.get("Status") or r.get("status") or "active"),
+                tick_size=first_positive(_safe_float(r.get("TickSize")), _safe_float(r.get("tick_size")), 0.05),
+                lot_step=first_positive(_safe_float(r.get("LotSize")), _safe_float(r.get("lot_size")), _safe_float(r.get("MinimumLotQty"))),
+                min_qty=first_positive(_safe_float(r.get("LotSize")), _safe_float(r.get("lot_size"))),
+                raw=raw,
+            )
+            out[normalise_symbol(symbol)] = inst
+        self.icici = out
+        return out
+
     def _augment_coinswitch_from_requested(self, out: Dict[str, ExchangeInstrument], api, intents: List[AssetIntent]) -> Dict[str, ExchangeInstrument]:
         """Validate configured crypto symbols against CoinSwitch live ticker endpoint.
 
@@ -392,15 +569,42 @@ class InstrumentRegistry:
     # Matching
     # ──────────────────────────────────────────────────────────────────────
     def discover(self, delta_api=None, coinswitch_api=None, requested=None,
-                 max_active: int = 12, require_primary: bool = True) -> DiscoveryReport:
+                 max_active: int = 0, require_primary: bool = True,
+                 discovery_mode: str = "dynamic", include_asset_classes=None,
+                 include_exchanges=None, icici_api=None,
+                 icici_security_master_url: str | None = None) -> DiscoveryReport:
+        mode = str(discovery_mode or "dynamic").lower()
         intents = configured_asset_intents(requested)
-        delta = self.load_delta(delta_api)
-        coins = self.load_coinswitch(coinswitch_api)
-        coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
+        include_classes = _parse_csv_set(include_asset_classes)
+        include_exs = _parse_csv_set(include_exchanges)
+
+        delta = self.load_delta(delta_api) if _allow_value("delta", include_exs) else {}
+        coins = self.load_coinswitch(coinswitch_api) if _allow_value("coinswitch", include_exs) else {}
+        if intents and _allow_value("coinswitch", include_exs):
+            coins = self._augment_coinswitch_from_requested(coins, coinswitch_api, intents)
+        icici = self.load_icici(icici_api, security_master_url=icici_security_master_url) if _allow_value("icici", include_exs) else {}
+
         self.report = DiscoveryReport(requested=intents, raw_counts={
-            "delta": len(delta), "coinswitch": len({id(v) for v in coins.values()})
+            "delta": len({id(v) for v in delta.values()}),
+            "coinswitch": len({id(v) for v in coins.values()}),
+            "icici": len({id(v) for v in icici.values()}),
         })
 
+        if mode in {"static", "requested", "legacy"}:
+            matched = self._discover_requested(intents, delta, coins, require_primary=require_primary)
+        else:
+            matched = self._discover_dynamic(delta, coins, icici, intents, include_classes=include_classes)
+
+        matched.sort(key=lambda x: (
+            x.priority,
+            str(x.asset_class.value),
+            str(x.primary_exchange.value),
+            str(x.asset_id),
+        ))
+        self.report.matched = matched if int(max_active or 0) <= 0 else matched[:max(1, int(max_active))]
+        return self.report
+
+    def _discover_requested(self, intents: List[AssetIntent], delta, coins, *, require_primary: bool) -> List[TradableInstrument]:
         matched: List[TradableInstrument] = []
         for intent in sorted(intents, key=lambda x: x.priority):
             aliases = _ordered_aliases(intent)
@@ -416,7 +620,6 @@ class InstrumentRegistry:
                 continue
             primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
             if require_primary and self.execution_preference not in by_ex:
-                # still activate on fallback if explicit config allows; default false is handled by caller
                 pass
             matched.append(TradableInstrument(
                 asset_id=intent.asset_id,
@@ -426,9 +629,71 @@ class InstrumentRegistry:
                 by_exchange=by_ex,
                 priority=intent.priority,
             ))
+        return matched
 
-        self.report.matched = matched[:max(1, int(max_active))]
-        return self.report
+    def _discover_dynamic(self, delta, coins, icici, intents: List[AssetIntent], *, include_classes: Set[str]) -> List[TradableInstrument]:
+        overlay: Dict[str, AssetIntent] = {}
+        for intent in intents:
+            for alias in _ordered_aliases(intent):
+                overlay[alias] = intent
+            overlay[normalise_symbol(intent.asset_id)] = intent
+
+        grouped: Dict[str, Dict[ExchangeName, ExchangeInstrument]] = {}
+        meta: Dict[str, Tuple[str, AssetClass, int]] = {}
+        seen_ids: set[int] = set()
+        for catalog in (delta, coins, icici):
+            for inst in catalog.values():
+                if id(inst) in seen_ids or not inst.is_active:
+                    continue
+                seen_ids.add(id(inst))
+                intent = overlay.get(normalise_symbol(inst.symbol)) or overlay.get(normalise_symbol(inst.base_asset)) or overlay.get(normalise_symbol(inst.asset_id))
+                effective = self._retag(inst, intent) if intent else inst
+                if not _allow_value(effective.asset_class.value, include_classes):
+                    continue
+                asset_id = intent.asset_id if intent else _canonical_asset_id(effective)
+                existing = grouped.get(asset_id, {}).get(effective.exchange)
+                if existing is not None and normalise_symbol(existing.symbol) != normalise_symbol(effective.symbol):
+                    asset_id = f"{asset_id}_{normalise_symbol(effective.symbol)}"
+                grouped.setdefault(asset_id, {})[effective.exchange] = ExchangeInstrument(
+                    exchange=effective.exchange,
+                    symbol=effective.symbol,
+                    ws_symbol=effective.ws_symbol,
+                    display_symbol=effective.display_symbol,
+                    asset_id=asset_id,
+                    asset_class=effective.asset_class,
+                    product_id=effective.product_id,
+                    quote_asset=effective.quote_asset,
+                    base_asset=effective.base_asset,
+                    contract_type=effective.contract_type,
+                    status=effective.status,
+                    tick_size=effective.tick_size,
+                    lot_step=effective.lot_step,
+                    min_qty=effective.min_qty,
+                    max_qty=effective.max_qty,
+                    contract_value_btc=effective.contract_value_btc,
+                    max_leverage=effective.max_leverage,
+                    raw=effective.raw,
+                )
+                prev = meta.get(asset_id)
+                priority = intent.priority if intent else 10_000
+                display = intent.display_name if intent else _display_name_for(effective, asset_id)
+                ac = intent.asset_class if intent else effective.asset_class
+                if prev is None or priority < prev[2]:
+                    meta[asset_id] = (display, ac, priority)
+
+        out: List[TradableInstrument] = []
+        for asset_id, by_ex in grouped.items():
+            primary = self.execution_preference if self.execution_preference in by_ex else next(iter(by_ex.keys()))
+            display, ac, priority = meta.get(asset_id, (asset_id, next(iter(by_ex.values())).asset_class, 10_000))
+            out.append(TradableInstrument(
+                asset_id=asset_id,
+                display_name=display,
+                asset_class=ac,
+                primary_exchange=primary,
+                by_exchange=by_ex,
+                priority=priority,
+            ))
+        return out
 
     def _match_one(self, catalog: Dict[str, ExchangeInstrument], aliases) -> Optional[ExchangeInstrument]:
         # exact match first, preserving configured alias priority
