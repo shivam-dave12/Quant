@@ -220,6 +220,43 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(high.best.expected_value_r, low.best.expected_value_r)
         self.assertEqual(high.best.role, "external")
 
+    def test_target_surface_prices_executable_buffered_tp_not_raw_pool(self):
+        from strategy.expected_utility import build_target_surface
+
+        target = SimpleNamespace(
+            price=104.0,
+            timeframe="15m",
+            significance=12.0,
+            side="BSL",
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[target],
+            ssl_pools=[],
+            feed_reliability=0.90,
+        )
+
+        surface = build_target_surface(
+            side="long",
+            entry=100.0,
+            stop=98.0,
+            atr=1.0,
+            snapshot=snap,
+            flow=SimpleNamespace(tick_flow=0.30, cvd_trend=0.35),
+            ict=SimpleNamespace(
+                structure_15m="bullish",
+                structure_4h="bullish",
+                dealing_range_pd=0.30,
+            ),
+            fee_bps=10.0,
+            slippage_bps=0.0,
+            posterior_prob=0.90,
+        )
+
+        self.assertIsNotNone(surface.best)
+        self.assertAlmostEqual(surface.best.price, 103.70, places=6)
+        self.assertAlmostEqual(surface.best.rr, 1.85, places=6)
+        self.assertTrue(any("pool=$104.0" in note for note in surface.best.notes))
+
     def test_expected_utility_surface_does_not_rewrite_institutional_levels(self):
         from strategy.quant_strategy import QuantStrategy
 
@@ -286,6 +323,48 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(signal.stop_surface)
         self.assertIsNotNone(signal.target_surface)
         self.assertIsNotNone(signal.selected_target_utility)
+
+    def test_expected_utility_fee_snapshot_is_not_double_counted(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._entry_engine = SimpleNamespace(_last_sweep_analysis={"quant_posterior": 0.90})
+
+        class FakeFeeEngine:
+            def diagnostic_snapshot(self):
+                return {
+                    "rt_cost_maker_bps": 10.0,
+                    "rt_cost_taker_bps": 14.0,
+                    "slippage_ewma_bps": 5.0,
+                }
+
+        strategy._fee_engine = FakeFeeEngine()
+        signal = SimpleNamespace(
+            side="long",
+            entry_price=100.0,
+            sl_price=98.0,
+            tp_price=103.70,
+            rr_ratio=1.85,
+            posterior_prob=0.90,
+            target_pool=SimpleNamespace(pool=SimpleNamespace(price=104.0)),
+        )
+        snap = SimpleNamespace(
+            bsl_pools=[SimpleNamespace(price=104.0, side="BSL", timeframe="15m", significance=12.0)],
+            ssl_pools=[],
+            feed_reliability=0.90,
+        )
+
+        strategy._apply_expected_utility_target_surface(
+            signal,
+            snap,
+            SimpleNamespace(tick_flow=0.30, cvd_trend=0.35),
+            SimpleNamespace(structure_15m="bullish", structure_4h="bullish", dealing_range_pd=0.30),
+            100.0,
+            1.0,
+        )
+
+        self.assertIsNotNone(signal.selected_target_utility)
+        self.assertAlmostEqual(signal.selected_target_utility.cost_r, 0.05, places=6)
 
     def test_selected_tp_must_have_positive_executable_utility(self):
         from strategy.quant_strategy import QuantStrategy
@@ -377,6 +456,58 @@ class HardeningTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertTrue(any("executable utility" in r for r in decision.reject_reasons))
 
+    def test_positive_target_utility_prevents_low_rr_duplicate_block(self):
+        from strategy.quant_strategy import EntryType, QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._htf = SimpleNamespace(trend_15m=0.0, trend_4h=0.0)
+        strategy._last_hunt_prediction = None
+        strategy._entry_engine = SimpleNamespace(
+            _last_sweep_analysis={
+                "posterior": 0.84,
+                "displacement_atr": 1.20,
+                "cisd": True,
+                "ote": False,
+            }
+        )
+        good_target = SimpleNamespace(
+            full_position_utility=0.22,
+            expected_value_r=0.09,
+            compact=lambda: "near pool p=0.78 fullU=0.22",
+        )
+        signal = SimpleNamespace(
+            side="long",
+            entry_type=EntryType.SWEEP_REVERSAL,
+            entry_price=100.0,
+            sl_price=98.6,
+            tp_price=101.5,
+            target_pool=SimpleNamespace(
+                pool=SimpleNamespace(price=101.7, timeframe="15m", side="BSL"),
+                significance=16.0,
+                distance_atr=1.7,
+            ),
+            sweep_result=SimpleNamespace(quality=0.90),
+            conviction=0.90,
+            selected_target_utility=good_target,
+            target_surface=SimpleNamespace(has_positive_edge=True, best=good_target),
+        )
+        ict = SimpleNamespace(
+            direction_hint_side="",
+            direction_hint_confidence=0.0,
+            dealing_range_pd=0.25,
+            amd_phase="MANIPULATION",
+            amd_bias="bullish",
+            amd_confidence=0.90,
+        )
+        flow = SimpleNamespace(tick_flow=0.30, cvd_trend=0.30)
+
+        decision = strategy._institutional_decision_matrix(
+            signal, ict, flow, None, price=100.0, atr=1.0)
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reject_reasons, [])
+        self.assertTrue(any("PAYOFF_DENSITY" in r for r in decision.allow_reasons))
+
     def test_expected_utility_negative_surface_has_no_size_allocation(self):
         from strategy.expected_utility import expected_utility_size_multiplier
 
@@ -387,6 +518,49 @@ class HardeningTests(unittest.TestCase):
         )
 
         self.assertEqual(expected_utility_size_multiplier(surface, posterior=0.95), 0.0)
+
+    def test_expected_utility_size_uses_target_probability_when_posterior_missing(self):
+        from strategy.expected_utility import expected_utility_size_multiplier
+
+        surface = SimpleNamespace(
+            has_positive_edge=True,
+            best=SimpleNamespace(
+                payoff_r=2.0,
+                probability=0.70,
+                full_position_utility=0.40,
+                loss_r=1.0,
+                cost_r=0.0,
+                role="external",
+            ),
+            runner_fraction=0.0,
+        )
+
+        self.assertGreater(expected_utility_size_multiplier(surface, posterior=0.0), 0.98)
+
+    def test_expected_utility_size_penalizes_fat_left_tail_and_cost(self):
+        from strategy.expected_utility import expected_utility_size_multiplier
+
+        base_best = dict(
+            payoff_r=2.0,
+            probability=0.65,
+            full_position_utility=0.30,
+            role="external",
+        )
+        clean = SimpleNamespace(
+            has_positive_edge=True,
+            best=SimpleNamespace(**base_best, loss_r=1.0, cost_r=0.0),
+            runner_fraction=0.0,
+        )
+        fat_tail = SimpleNamespace(
+            has_positive_edge=True,
+            best=SimpleNamespace(**base_best, loss_r=2.0, cost_r=0.25),
+            runner_fraction=0.0,
+        )
+
+        self.assertLess(
+            expected_utility_size_multiplier(fat_tail, posterior=0.80),
+            expected_utility_size_multiplier(clean, posterior=0.80),
+        )
 
     def test_structural_be_gate_uses_peak_delivery_not_retraced_mark(self):
         from strategy.liquidity_trail import LiquidityTrailEngine
@@ -473,6 +647,38 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(qty)
         self.assertGreater(strategy._last_execution_viability["expected_net_utility_r"], 0.0)
         self.assertFalse(bool(strategy._last_execution_viability["allocation_allowed"]))
+
+    def test_negative_route_utility_blocks_sizing_even_when_geometry_is_valid(self):
+        from strategy.quant_strategy import QuantStrategy
+
+        strategy = object.__new__(QuantStrategy)
+        strategy._fee_engine = None
+        strategy._post_trade_agent = None
+        strategy._active_institutional_size_mult = 1.0
+        strategy._active_ic_size_mult = 1.0
+        strategy._active_post_exit_size_mult = 1.0
+
+        class FakeRisk:
+            def get_available_balance(self):
+                return {"available": 1000.0, "total": 1000.0}
+
+        qty = strategy._compute_quantity(
+            FakeRisk(),
+            price=10000.0,
+            sig=None,
+            ict_tier="S",
+            sl_price=9900.0,
+            tp_price=10050.0,
+            side="long",
+            use_maker_entry=True,
+            posterior_prob=0.20,
+            prefetched_bal_info={"available": 1000.0, "total": 1000.0},
+        )
+
+        self.assertIsNone(qty)
+        ctx = strategy._last_execution_viability
+        self.assertTrue(bool(ctx["allocation_allowed"]))
+        self.assertLessEqual(ctx["expected_net_utility_r"], 0.0)
 
     def test_log_case_maker_high_fee_geometry_is_refine_only(self):
         from strategy.quant_strategy import QuantStrategy, SignalBreakdown
@@ -1019,8 +1225,54 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(score)
         payload = report.as_dict()
         self.assertIsNone(payload["selected"])
-        self.assertGreaterEqual(payload["candidates"][0]["required_rr"], 1.35)
-        self.assertIn("payoff floor", payload["candidates"][0]["reason"])
+        candidate = payload["candidates"][0]
+        self.assertGreater(candidate["required_rr"], candidate["rr"])
+        self.assertLess(candidate["required_rr"], 1.35)
+        self.assertIn("delivery probability", candidate["reason"])
+
+    def test_tp_selector_accepts_probability_compensated_positive_utility_target(self):
+        from strategy.liquidity_pool_selector import select_tp_with_report
+
+        entry = 78645.0
+        sl = 78005.1
+        atr = 196.8
+        pool = SimpleNamespace(
+            price=79443.2,
+            timeframe="1d",
+            side="BSL",
+            significance=14.0,
+            htf_count=3,
+            touches=2,
+            status="ACTIVE",
+        )
+        target = SimpleNamespace(
+            pool=pool,
+            distance_atr=abs(pool.price - entry) / atr,
+            significance=14.0,
+            direction="long",
+            tf_sources=["1d"],
+        )
+        snap = SimpleNamespace(bsl_pools=[target], ssl_pools=[], feed_reliability=0.90)
+
+        tp, selected_target, score, report = select_tp_with_report(
+            snap=snap,
+            side="long",
+            entry=entry,
+            sl=sl,
+            atr=atr,
+            min_rr=2.20,
+            posterior_prob=0.862,
+            now=0,
+        )
+
+        self.assertIsNotNone(tp)
+        self.assertIs(selected_target, target)
+        self.assertLess(score.rr, 2.20)
+        self.assertGreater(score.rr, score.components["rr_floor"])
+        payload = report.as_dict()
+        self.assertEqual(payload["selected"]["pool_price"], pool.price)
+        self.assertGreater(payload["selected"]["delivery_prob"], payload["selected"]["required_delivery_prob"])
+        self.assertTrue(any("dynamic payoff floor" in n for n in payload["selected"]["notes"]))
 
     def test_tp_selector_prefers_durable_liquidity_over_near_payoff(self):
         from strategy.liquidity_pool_selector import select_tp_with_report

@@ -5,12 +5,17 @@ from dataclasses import asdict, dataclass, field
 from threading import RLock
 from time import time
 from typing import Any, Deque, Dict, List, Optional
+try:
+    from core.redaction import redact_sensitive
+except Exception:
+    def redact_sensitive(x): return x
 
 MAX_POINTS = 2500
 MAX_EVENTS = 4000
 MAX_ALERTS = 1000
 MAX_TRADES = 1000
 MAX_DECISIONS = 1500
+MAX_AGENT_HISTORY = 1500
 
 
 @dataclass
@@ -92,6 +97,9 @@ class TradeState:
     exit: float
     pnl: float
     r: float = 0.0
+    margin_used: float = 0.0
+    margin_pnl_pct: float = 0.0
+    capital_result: str = ""
     reason: str = ""
 
 
@@ -113,6 +121,22 @@ class DecisionState:
     raw: str = ""
 
 
+@dataclass
+class AgentState:
+    agent: str
+    role: str = ""
+    status: str = "IDLE"
+    score: float = 0.0
+    selected: int = 0
+    rejected: int = 0
+    approved: int = 0
+    blocked: int = 0
+    latency_ms: float = 0.0
+    last_reason: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+    last_update: float = field(default_factory=time)
+
+
 class DashboardState:
     def __init__(self) -> None:
         self._lock = RLock()
@@ -131,7 +155,9 @@ class DashboardState:
         self.spread_history: Dict[str, Deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=MAX_POINTS))
         self.r_history: Dict[str, Deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=MAX_POINTS))
         self.posterior_history: Dict[str, Deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=MAX_POINTS))
+        self.agent_history: Dict[str, Deque[dict[str, float]]] = defaultdict(lambda: deque(maxlen=MAX_AGENT_HISTORY))
         self.pnl_history: Deque[dict[str, float]] = deque(maxlen=MAX_POINTS)
+        self.agents: Dict[str, AgentState] = {}
         self.total_realized = 0.0
         self.ingested_lines = 0
         self.parsed_events = 0
@@ -149,6 +175,7 @@ class DashboardState:
             if asset:
                 asset_u = asset.upper()
                 assets = [x for x in assets if x.get("asset") == asset_u]
+            metrics = self._metrics(now, total_upnl)
             return {
                 "system": {
                     "bot_online": self.bot_online,
@@ -170,8 +197,10 @@ class DashboardState:
                 "trades": [asdict(x) for x in list(self.trades)],
                 "decisions": [asdict(x) for x in list(self.decisions)],
                 "events": list(self.events),
+                "agents": [asdict(x) for x in sorted(self.agents.values(), key=lambda a: a.agent)],
                 "charts": self._charts(asset),
                 "heatmap": self._heatmap(),
+                "metrics": metrics,
                 "ts": now,
             }
 
@@ -193,6 +222,7 @@ class DashboardState:
                 "spread": {a: list(self.spread_history.get(a, []))},
                 "r": {a: list(self.r_history.get(a, []))},
                 "posterior": {a: list(self.posterior_history.get(a, []))},
+                "agents": {k: list(v) for k, v in self.agent_history.items()},
                 "pnl": list(self.pnl_history),
             }
         return {
@@ -200,6 +230,7 @@ class DashboardState:
             "spread": {k: list(v) for k, v in self.spread_history.items()},
             "r": {k: list(v) for k, v in self.r_history.items()},
             "posterior": {k: list(v) for k, v in self.posterior_history.items()},
+            "agents": {k: list(v) for k, v in self.agent_history.items()},
             "pnl": list(self.pnl_history),
         }
 
@@ -211,8 +242,37 @@ class DashboardState:
             score += max(min(a.ev, 2.0), 0.0) * 20.0
             score += max(0.0, 1.0 - min(a.spread_atr, 3.0) / 3.0) * 20.0
             score += 15.0 if a.state in {"SCANNING", "POST_SWEEP", "DIRECTION"} else 5.0
+            score = max(0.0, min(100.0, score))
             out.append({"asset": a.asset, "score": round(score, 2), "state": a.state, "phase": a.phase, "price": a.price, "spread_bps": a.spread_bps, "posterior": max(a.posterior, a.confidence), "ev": a.ev})
         return sorted(out, key=lambda x: x["score"], reverse=True)
+
+    def _metrics(self, now: float, total_upnl: float) -> dict[str, Any]:
+        trade_list = list(self.trades)
+        wins = [t for t in trade_list if t.pnl > 0]
+        losses = [t for t in trade_list if t.pnl < 0]
+        gross_profit = sum(t.pnl for t in wins)
+        gross_loss = abs(sum(t.pnl for t in losses))
+        fresh_assets = sum(1 for a in self.assets.values() if now - a.last_update < 30)
+        stale_assets = max(0, len(self.assets) - fresh_assets)
+        latest_event_ts = max((float(e.get("ts", 0.0) or 0.0) for e in self.events), default=0.0)
+        best = self._heatmap()[0] if self.assets else {}
+        return {
+            "decision_count": len(self.decisions),
+            "alert_count": len(self.alerts),
+            "trade_count": len(trade_list),
+            "win_rate": (len(wins) / len(trade_list)) if trade_list else 0.0,
+            "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0),
+            "avg_r": (sum(t.r for t in trade_list) / len(trade_list)) if trade_list else 0.0,
+            "risk_heat": total_upnl + self.total_realized,
+            "fresh_assets": fresh_assets,
+            "stale_assets": stale_assets,
+            "coverage": (fresh_assets / len(self.assets)) if self.assets else 0.0,
+            "last_event_age_sec": (now - latest_event_ts) if latest_event_ts else None,
+            "best_asset": best.get("asset", ""),
+            "best_score": float(best.get("score", 0.0) or 0.0),
+            "agent_count": len(self.agents),
+            "agents_active": sum(1 for a in self.agents.values() if a.status not in {"IDLE", "OFFLINE"}),
+        }
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:
@@ -241,7 +301,7 @@ class DashboardState:
 
     def apply(self, event: dict[str, Any]) -> None:
         with self._lock:
-            event = dict(event)
+            event = redact_sensitive(dict(event))
             event.setdefault("ts", time())
             event.setdefault("type", "event")
             etype = str(event.get("type", "event"))
@@ -256,9 +316,12 @@ class DashboardState:
                 self.mode = str(event.get("mode", self.mode))
                 self.source = str(event.get("source", self.source))
                 return
-            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:
+            if etype in {"fund_cycle", "agent_update"}:
+                self._update_agents(event)
+                return
+            if etype in {"catalog_asset", "market_data", "scan", "direction", "spread", "candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch", "tail_status"}:
                 self._update_asset(event)
-                if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit"}:
+                if etype in {"candidate_deferred", "candidate_approved", "posterior", "sl_anchor", "sl_envelope", "tp_audit", "trail_proposal", "trail_hold", "trail_dispatch"}:
                     self._add_decision(event)
                 return
             if etype in {"position_opened", "position_update", "bracket_update", "trail_update"}:
@@ -338,7 +401,11 @@ class DashboardState:
             symbol=str(event.get("symbol", "")), venue=str(event.get("venue", "")).upper(),
             side=str(event.get("side", "")).upper(), entry=float(event.get("entry", 0.0) or 0.0),
             exit=float(event.get("exit", 0.0) or 0.0), pnl=pnl,
-            r=float(event.get("r", event.get("achieved_r", 0.0)) or 0.0), reason=str(event.get("reason", ""))))
+            r=float(event.get("r", event.get("achieved_r", 0.0)) or 0.0),
+            margin_used=float(event.get("margin_used", 0.0) or 0.0),
+            margin_pnl_pct=float(event.get("margin_pnl_pct", 0.0) or 0.0),
+            capital_result=str(event.get("capital_result", "PROFIT" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"))),
+            reason=str(event.get("reason", ""))))
 
     def _add_alert(self, event: dict[str, Any]) -> None:
         self.alerts.appendleft(AlertState(
@@ -353,3 +420,97 @@ class DashboardState:
             kind=str(event.get("type", "decision")), side=str(event.get("side", "")), p=float(event.get("posterior", event.get("confidence", 0.0)) or 0.0),
             ev=float(event.get("ev", 0.0) or 0.0), rr=float(event.get("rr", 0.0) or 0.0), entry=float(event.get("entry", 0.0) or 0.0),
             sl=float(event.get("sl", 0.0) or 0.0), tp=float(event.get("tp", 0.0) or 0.0), reason=str(event.get("last_reason", event.get("reason", ""))), raw=str(event.get("message", event.get("raw", "")))[:1800]))
+
+    def _update_agents(self, event: dict[str, Any]) -> None:
+        now = float(event.get("ts", time()) or time())
+        if event.get("type") == "agent_update":
+            name = str(event.get("agent", "Agent")).strip() or "Agent"
+            cur = self.agents.get(name) or AgentState(agent=name)
+            for field_name in ["role", "status", "last_reason"]:
+                val = event.get(field_name)
+                if val not in (None, ""):
+                    setattr(cur, field_name, str(val))
+            for field_name in ["score", "latency_ms"]:
+                val = event.get(field_name)
+                if val not in (None, ""):
+                    try: setattr(cur, field_name, float(val))
+                    except Exception: pass
+            for field_name in ["selected", "rejected", "approved", "blocked"]:
+                val = event.get(field_name)
+                if val not in (None, ""):
+                    try: setattr(cur, field_name, int(val))
+                    except Exception: pass
+            cur.detail = dict(event.get("detail") or cur.detail or {})
+            cur.last_update = now
+            self.agents[name] = cur
+            self.agent_history[name].append({"ts": now, "score": cur.score, "selected": cur.selected, "blocked": cur.blocked, "latency_ms": cur.latency_ms})
+            return
+
+        selected = list(event.get("selected") or [])
+        rejected = list(event.get("rejected") or [])
+        verdicts = dict(event.get("risk_verdicts") or {})
+        setup_candidates = list(event.get("setup_candidates") or [])
+        mode = str(event.get("mode", "paper")).upper()
+        selected_score = sum(float(x.get("score", 0.0) or 0.0) for x in selected) / max(1, len(selected))
+        agent_rows = [
+            ("PortfolioCIO", "Governor", "ACTIVE", selected_score, len(selected), len(rejected), 0, 0, "selected executable desks"),
+            ("UniverseAgent", "Discovery", "ACTIVE", self._agent_quality_from_assets(), len(self.assets), 0, 0, 0, "live instruments and data readiness"),
+            ("TickerSelectionAgent", "Ranking", "ACTIVE", selected_score, len(selected), len(rejected), 0, 0, "ranked by spread, freshness, depth, warmup"),
+            ("SetupSelectionAgent", "Alpha triage", "ACTIVE", self._avg_setup_score(setup_candidates), len(setup_candidates), 0, 0, 0, "cached setup quality and EV"),
+            ("RiskCommitteeAgent", "Risk", mode, self._risk_score(verdicts), len(selected), len(rejected), self._approved_count(verdicts), self._blocked_count(verdicts), "deterministic pre-entry gate"),
+            ("ExecutionDeskAgent", "Execution", "PAPER" if mode == "PAPER" else "LIVE", 1.0 if mode == "PAPER" else 0.85, 0, 0, 0, 0, "venue routing guard"),
+            ("PostTradeLearningAgent", "Learning", "WATCH", self._learning_score(), len(self.trades), 0, 0, 0, "closed-trade attribution"),
+        ]
+        for name, role, status, score, selected_n, rejected_n, approved_n, blocked_n, reason in agent_rows:
+            cur = self.agents.get(name) or AgentState(agent=name)
+            cur.role = role
+            cur.status = status
+            cur.score = max(0.0, min(1.0, float(score or 0.0)))
+            cur.selected = int(selected_n or 0)
+            cur.rejected = int(rejected_n or 0)
+            cur.approved = int(approved_n or 0)
+            cur.blocked = int(blocked_n or 0)
+            cur.last_reason = reason
+            cur.detail = {
+                "selected": selected[:12],
+                "rejected": rejected[:12],
+                "verdicts": verdicts,
+                "setup_candidates": setup_candidates[:12],
+                "notes": list(event.get("notes") or []),
+            }
+            cur.last_update = now
+            self.agents[name] = cur
+            self.agent_history[name].append({"ts": now, "score": cur.score, "selected": cur.selected, "blocked": cur.blocked, "latency_ms": cur.latency_ms})
+
+    def _agent_quality_from_assets(self) -> float:
+        if not self.assets:
+            return 0.0
+        fresh = sum(1 for a in self.assets.values() if time() - a.last_update < 30)
+        return fresh / max(1, len(self.assets))
+
+    @staticmethod
+    def _avg_setup_score(rows: list[dict[str, Any]]) -> float:
+        if not rows:
+            return 0.0
+        return sum(float(x.get("score", 0.0) or 0.0) for x in rows) / max(1, len(rows))
+
+    @staticmethod
+    def _approved_count(verdicts: dict[str, Any]) -> int:
+        return sum(1 for v in verdicts.values() if bool((v or {}).get("approved")))
+
+    @staticmethod
+    def _blocked_count(verdicts: dict[str, Any]) -> int:
+        return sum(1 for v in verdicts.values() if not bool((v or {}).get("approved")))
+
+    def _risk_score(self, verdicts: dict[str, Any]) -> float:
+        if not verdicts:
+            return 0.0
+        approved = self._approved_count(verdicts)
+        return approved / max(1, len(verdicts))
+
+    def _learning_score(self) -> float:
+        trades = list(self.trades)
+        if not trades:
+            return 0.0
+        wins = sum(1 for t in trades if t.pnl > 0)
+        return wins / max(1, len(trades))

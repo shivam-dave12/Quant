@@ -138,6 +138,10 @@ class TelegramBotController:
         self._last_getupdates_warn_ts: dict = {}   # status_code -> last warn ts
         self._getupdates_warn_throttle: float = 60.0
         self._last_getupdates_conn_warn_ts: float = 0.0
+        self._icici_otp_cv = threading.Condition()
+        self._icici_pending_otp: Optional[str] = None
+        self._icici_refresh_thread: Optional[threading.Thread] = None
+        self._icici_refresh_result: str = ""
 
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
@@ -259,6 +263,7 @@ class TelegramBotController:
                 {"command": "stop",        "description": "Stop trading bot"},
                 {"command": "status",      "description": "Full status + pool map"},
                 {"command": "assets",      "description": "Multi-asset scanner universe"},
+                {"command": "fund",        "description": "Agentic CIO desk selection"},
                 {"command": "thinking",    "description": "posterior EV / uncertainty / execution audit"},
                 {"command": "position",    "description": "Current position + adaptive exit"},
                 {"command": "pnl",         "description": "Quick PnL snapshot"},
@@ -283,6 +288,8 @@ class TelegramBotController:
                 {"command": "config",      "description": "Show config values"},
                 {"command": "set",         "description": "Set config value live"},
                 {"command": "setexchange", "description": "Switch execution exchange"},
+                {"command": "icici_refresh", "description": "Refresh ICICI Breeze token"},
+                {"command": "icici_otp",   "description": "Submit ICICI OTP"},
                 {"command": "killswitch",  "description": "Emergency close all"},
                 {"command": "resetrisk",   "description": "Clear risk lockout"},
                 {"command": "help",        "description": "Show commands"},
@@ -315,6 +322,7 @@ class TelegramBotController:
             "learn", "watchdog", "watchdog_status", "watchdog_heal",
             "watchdog_heal_on", "watchdog_heal_off",
             "watchdog_freeze", "watchdog_unfreeze",
+            "fund", "icici_refresh", "icici_otp",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -335,6 +343,7 @@ class TelegramBotController:
             elif cmd == "/stop":                return self._cmd_stop()
             elif cmd == "/status":              return self._cmd_status()
             elif cmd == "/assets":              return self._cmd_assets()
+            elif cmd == "/fund":                return self._cmd_fund()
             elif cmd == "/thinking":            return self._cmd_thinking()
             elif cmd == "/pools":               return self._cmd_pools()
             elif cmd == "/flow":                return self._cmd_flow()
@@ -351,6 +360,8 @@ class TelegramBotController:
             elif cmd == "/resetrisk":           return self._cmd_resetrisk(args)
             elif cmd == "/set":                 return self._cmd_set(args)
             elif cmd == "/setexchange":         return self._cmd_setexchange(args)
+            elif cmd == "/icici_refresh":       return self._cmd_icici_refresh()
+            elif cmd == "/icici_otp":           return self._cmd_icici_otp(args)
             elif cmd == "/huntstatus":          return self._cmd_huntstatus()
             elif cmd == "/pnl":                 return self._cmd_pnl()
             elif cmd == "/market":              return self._cmd_market()
@@ -427,6 +438,15 @@ class TelegramBotController:
         if callable(fn):
             return fn()
         return "Single-asset mode active. Use /status for the current BTCUSD scanner."
+
+    def _cmd_fund(self) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_fund_report", None)
+        if callable(fn):
+            return fn()
+        return "Agentic fund runtime is not available in this bot instance."
 
     # /thinking  ← CORE COMMAND — QuantPosterior decision console
     # ================================================================
@@ -714,6 +734,9 @@ class TelegramBotController:
         if not bot_running or not bot_instance:
             return "Bot not running."
         try:
+            fn = getattr(bot_instance, "format_portfolio_status_report", None)
+            if callable(fn):
+                return fn()
             strat = bot_instance.strategy
             dm    = bot_instance.data_manager
             if not strat or not dm:
@@ -1566,6 +1589,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_balance_report", None) or getattr(bot_instance, "format_portfolio_equity_report", None)
+        if callable(fn):
+            return fn()
         rm = bot_instance.risk_manager
         if not rm:
             return "Risk manager not ready."
@@ -1638,40 +1664,42 @@ class TelegramBotController:
 
     def _cmd_trail(self, args: str) -> str:
         global bot_instance
-        if not bot_instance: return "Bot not running."
-        strat = bot_instance.strategy
-        if not strat: return "Strategy not ready."
-        arg = (args or "").strip().lower()
-        if arg in ("on", "enable", "1", "true", "yes"):
+        if not bot_instance:
+            return "Bot not running."
+        raw = (args or "").strip()
+        parts = raw.split()
+        action_words = {"on", "enable", "enabled", "1", "true", "yes", "off", "disable", "disabled", "0", "false", "no", "auto", "default", "reset"}
+        action = "status"
+        asset = None
+        for part in parts:
+            low = part.lower()
+            if low in action_words and action == "status":
+                action = low
+            else:
+                asset = part.upper()
+        if parts and action == "status" and parts[0].lower() not in action_words:
+            asset = parts[0].upper()
+        if hasattr(bot_instance, "set_trailing_override") and hasattr(bot_instance, "format_trailing_control_report"):
+            if action in ("on", "enable", "enabled", "1", "true", "yes"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(True, asset))
+            if action in ("off", "disable", "disabled", "0", "false", "no"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(False, asset))
+            if action in ("auto", "default", "reset"):
+                return bot_instance.format_trailing_control_report(bot_instance.set_trailing_override(None, asset))
+            return bot_instance.format_trailing_control_report()
+
+        strat = getattr(bot_instance, "strategy", None)
+        if not strat:
+            return "Strategy not ready."
+        if action in ("on", "enable", "enabled", "1", "true", "yes"):
             strat.set_trail_override(True)
-            return (
-                "🔒 <b>Trailing SL: FORCED ON</b>\n"
-                "Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                "Will advance SL per phase logic regardless of config flag."
-            )
-        elif arg in ("off", "disable", "0", "false", "no"):
-            changed = strat.set_trail_override(False)
-            if changed is False:
-                return (
-                    "Trailing SL remains ON for the active position.\n"
-                    "Protective management cannot be disabled mid-trade; "
-                    "use /pause to stop new entries."
-                )
-            return (
-                "🔓 <b>Trailing SL: FORCED OFF</b>\n"
-                "SL will remain at initial structural level.\n"
-                "Exit will be via TP fill, SL hit, or max-hold timeout."
-            )
-        else:
+            return "🔒 <b>Trailing SL: FORCED ON</b>"
+        if action in ("off", "disable", "disabled", "0", "false", "no"):
+            strat.set_trail_override(False)
+            return "🔓 <b>Trailing SL: FORCED OFF</b>"
+        if action in ("auto", "default", "reset"):
             strat.set_trail_override(None)
-            enabled = strat.get_trail_enabled()
-            default_txt = "ON" if enabled else "OFF"
-            return (
-                f"🔄 <b>Trailing SL: AUTO</b>\n"
-                f"Using config default: <b>{default_txt}</b>\n"
-                f"Engine: Adaptive Exit (EAE + liquidity + true net BE)\n"
-                f"Send <code>/trail on</code> or <code>/trail off</code> to override."
-            )
+        return f"🛡 <b>Trailing SL</b> effective={'ON' if strat.get_trail_enabled() else 'OFF'}"
 
     # ================================================================
     # /config
@@ -1895,6 +1923,59 @@ class TelegramBotController:
                 message += f"\n⚠️ Leverage set failed: {e}"
 
         return message
+
+    # ================================================================
+    # /icici_refresh and /icici_otp
+    # ================================================================
+
+    def _wait_for_icici_otp(self, timeout_sec: float = 90.0) -> str:
+        deadline = time.time() + timeout_sec
+        with self._icici_otp_cv:
+            self._icici_pending_otp = None
+            while time.time() < deadline:
+                remaining = max(0.0, deadline - time.time())
+                self._icici_otp_cv.wait(timeout=min(remaining, 5.0))
+                if self._icici_pending_otp:
+                    otp = self._icici_pending_otp
+                    self._icici_pending_otp = None
+                    return otp
+        raise RuntimeError("Timed out waiting for ICICI OTP")
+
+    def _cmd_icici_refresh(self) -> str:
+        if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
+            return "ICICI Breeze token refresh is already running. Send /icici_otp <code> when the OTP arrives."
+
+        def _runner() -> None:
+            try:
+                from exchanges.icici.breeze_auth import BreezeTokenService
+                self.send_message(
+                    "ICICI Breeze refresh started. When the OTP arrives, reply with <code>/icici_otp 123456</code>."
+                )
+                service = BreezeTokenService()
+                session = service.refresh(otp_getter=lambda: self._wait_for_icici_otp(90.0))
+                self._icici_refresh_result = "ok"
+                masked = session.masked()
+                self.send_message(
+                    "ICICI Breeze token refreshed.\n"
+                    f"Session age: <code>{int(session.age_sec())}s</code>\n"
+                    f"Token: <code>{masked['session_token']}</code>"
+                )
+            except Exception as exc:
+                self._icici_refresh_result = str(exc)
+                self.send_message(f"ICICI Breeze token refresh failed: <code>{_esc(exc)}</code>")
+
+        self._icici_refresh_thread = threading.Thread(target=_runner, name="icici-token-refresh", daemon=True)
+        self._icici_refresh_thread.start()
+        return "ICICI Breeze token refresh started. Send /icici_otp <code> when the OTP arrives."
+
+    def _cmd_icici_otp(self, args: str) -> str:
+        code = (args or "").strip()
+        if not (len(code) == 6 and code.isdigit()):
+            return "Usage: /icici_otp <6-digit-code>"
+        with self._icici_otp_cv:
+            self._icici_pending_otp = code
+            self._icici_otp_cv.notify_all()
+        return "ICICI OTP received. Continuing Breeze login."
 
     # ================================================================
     # /set
@@ -2146,6 +2227,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_market_report", None)
+        if callable(fn):
+            return fn()
         strat = bot_instance.strategy
         dm    = bot_instance.data_manager
         if not strat or not dm:
@@ -2228,6 +2312,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_risk_report", None)
+        if callable(fn):
+            return fn()
 
         strat = bot_instance.strategy
         rm    = bot_instance.risk_manager
@@ -2336,6 +2423,9 @@ class TelegramBotController:
         global bot_instance, bot_running
         if not bot_running or not bot_instance:
             return "Bot not running."
+        fn = getattr(bot_instance, "format_portfolio_sl_tp_report", None)
+        if callable(fn):
+            return fn()
 
         strat = bot_instance.strategy
         dm = bot_instance.data_manager

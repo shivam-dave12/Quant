@@ -931,11 +931,11 @@ class DeltaAPI:
         }
 
         # post_only and time_in_force are ONLY valid on limit-type orders.
-        # Delta returns bad_schema if either field is present on stop_market_order
-        # or take_profit_market_order — even with value False/"gtc".
-        # stop_limit_order and take_profit_limit_order still accept both fields.
-        _CONDITIONAL_MARKET_TYPES = {"stop_market_order", "take_profit_market_order"}
-        if _otype not in _CONDITIONAL_MARKET_TYPES:
+        # Delta may reject MARKET and conditional-market orders if these fields
+        # are sent, even as False/"gtc". Keep native market-bracket payloads
+        # minimal: entry + exchange-attached SL/TP only.
+        _LIMIT_LIKE_TYPES = {"limit_order", "stop_limit_order", "take_profit_limit_order"}
+        if _otype in _LIMIT_LIKE_TYPES:
             body["post_only"]     = post_only
             body["time_in_force"] = time_in_force
 

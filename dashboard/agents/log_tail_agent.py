@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+try:
+    from core.redaction import redact_sensitive
+except Exception:
+    def redact_sensitive(x): return x
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 CTX = re.compile(r"\[(?P<asset>[A-Z0-9_\-]+)\|(?P<venue>[A-Z]+):(?P<symbol>[A-Z0-9_:\-]+)\]")
@@ -21,13 +25,19 @@ SPREAD = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\]
 POSTERIOR = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*POSTERIOR ACCEPTED: (?P<side>REVERSAL|CONTINUATION)?\s*(?P<trade_side>LONG|SHORT)?.*p=(?P<p>[0-9.]+).*EV=(?P<ev>[+\-0-9.]+).*LLR=(?P<llr>[0-9.]+).*U=(?P<u>[0-9.]+)")
 THESIS = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ENTRY THESIS.* (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+) \| SL=\$(?P<sl>[0-9,\.]+) TP=\$(?P<tp>[0-9,\.]+) R:R=(?P<rr>[0-9.]+)")
 DEFERRED = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*CANDIDATE DEFERRED \[(?P<why>[^\]]+)\]: (?P<body>.*)")
+TPAUDIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RAW_TP_AUDIT:\s*(?P<body>.*)")
+QUANT_WAIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*POST-SWEEP QUANT WAIT:\s*(?P<setup>REVERSAL|CONTINUATION)?\s*(?P<side>LONG|SHORT)?.*?p=(?P<p>[0-9.]+).*?EV=(?P<ev>[+\-0-9.]+).*?LLR=(?P<llr>[+\-0-9.]+).*?U=(?P<u>[0-9.]+)\s+(?P<body>.*)")
 SLANCHOR = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RAW_SL_ANCHOR: anchor=\$(?P<anchor>[0-9,\.]+) sl=\$(?P<sl>[0-9,\.]+) quality=(?P<quality>[0-9.]+) buffer=(?P<buffer>[0-9.]+)ATR")
 SLENV = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*SL envelope (?P<phase>[^:]+): (?P<body>.*)")
 ENTER = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ENTERING (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+) TP=\$(?P<tp>[0-9,\.]+)")
 ACTIVE = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*ACTIVE (?P<side>LONG|SHORT).*@ \$(?P<price>[0-9,\.]+).*SL=\$(?P<sl>[0-9,\.]+).*TP=\$(?P<tp>[0-9,\.]+)")
+ADOPT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*RECONCILE: adopted (?P<side>LONG|SHORT) @ \$(?P<entry>[0-9,\.]+)")
 BRACKET_SL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket SL order:.*@ \$(?P<sl>[0-9,\.]+)")
 BRACKET_TP = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Bracket TP order:.*@ \$(?P<tp>[0-9,\.]+)")
-TRAIL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:InstitutionalTrail|TRAIL|SL replaced|SL edited).*?(?:SL|trigger)=?\$?(?P<sl>[0-9,\.]+)?", re.I)
+TRAIL_APPLIED = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:EXCHANGE_APPLIED.*?new=\$?(?P<sl_new>[0-9,\.]+)|(?:SL edited in-place|SL replaced).*?(?:SL|trigger|stop)=?\$?(?P<sl>[0-9,\.]+))", re.I)
+TRAIL_DISPATCH = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*SL dispatch.*?trigger=\$?(?P<sl>[0-9,\.]+).*", re.I)
+TRAIL_PROPOSAL = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*Trail(?: PROPOSAL)?[: ]+\[(?P<phase>[^\]]+)\].*?→ SL=\$(?P<sl>[0-9,\.]+).*", re.I)
+TRAIL_HOLD = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*(?:Trail HOLD|PAYOFF_HOLD).*?SL=\$(?P<sl>[0-9,\.]+).*", re.I)
 EXIT = re.compile(r"\[(?P<asset>[^\|]+)\|(?P<venue>[^:]+):(?P<symbol>[^\]]+)\].*EXIT.*?(?P<side>LONG|SHORT)?.*PNL.*?\$?(?P<pnl>[\-+0-9\.]+)", re.I)
 PRICE_ANY = re.compile(r"price[= ](?P<price>[0-9]+(?:\.[0-9]+)?)")
 
@@ -45,7 +55,7 @@ def clean(line: str) -> str:
         line = obj.get("log", line)
     except Exception:
         pass
-    return ANSI.sub("", line).strip()
+    return str(redact_sensitive(ANSI.sub("", line).strip()))
 
 
 def base_ctx(m) -> dict[str, Any]:
@@ -79,6 +89,10 @@ def parse(line: str) -> Optional[dict[str, Any]]:
         ev = base_ctx(m); ev.update({"type": "candidate_approved", "phase": "THESIS_PRICED", "side": m.group('side'), "entry": fnum(m.group('entry')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "rr": fnum(m.group('rr')), "last_decision": s, "message": s}); return ev
     if m := DEFERRED.search(s):
         ev = base_ctx(m); body = m.group('body'); ev.update({"type": "candidate_deferred", "phase": "DEFERRED", "last_reason": f"{m.group('why')}: {body}", "reason": body, "message": s}); return ev
+    if m := TPAUDIT.search(s):
+        ev = base_ctx(m); body = m.group('body'); ev.update({"type": "tp_audit", "phase": "TP_AUDIT", "last_reason": body[:900], "reason": body, "message": s, "health": "OK"}); return ev
+    if m := QUANT_WAIT.search(s):
+        ev = base_ctx(m); body = m.group('body'); ev.update({"type": "candidate_deferred", "phase": "POST_SWEEP_QUANT_WAIT", "side": m.group('side') or "", "posterior": fnum(m.group('p')), "ev": fnum(m.group('ev')), "llr": fnum(m.group('llr')), "uncertainty": fnum(m.group('u')), "last_reason": body, "reason": body, "message": s, "health": "OK"}); return ev
     if m := SLANCHOR.search(s):
         ev = base_ctx(m); ev.update({"type": "sl_anchor", "phase": "SL_ANCHOR", "sl": fnum(m.group('sl')), "setup_quality": fnum(m.group('quality')), "last_reason": f"anchor ${m.group('anchor')} buffer {m.group('buffer')} ATR", "message": s}); return ev
     if m := SLENV.search(s):
@@ -87,12 +101,24 @@ def parse(line: str) -> Optional[dict[str, Any]]:
         ev = base_ctx(m); ev.update({"type": "position_opened", "side": m.group('side'), "entry": fnum(m.group('entry')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "state": "ENTERING", "bracket": "PENDING"}); return ev
     if m := ACTIVE.search(s):
         ev = base_ctx(m); ev.update({"type": "position_update", "side": m.group('side'), "price": fnum(m.group('price')), "sl": fnum(m.group('sl')), "tp": fnum(m.group('tp')), "state": "ACTIVE", "bracket": "VERIFIED"}); return ev
+    if m := ADOPT.search(s):
+        ev = base_ctx(m); ev.update({"type": "position_update", "side": m.group('side'), "entry": fnum(m.group('entry')), "price": fnum(m.group('entry')), "state": "ACTIVE", "bracket": "ADOPTED", "last_reason": "exchange position adopted by reconcile", "message": s}); return ev
     if m := BRACKET_SL.search(s):
         ev = base_ctx(m); ev.update({"type": "bracket_update", "sl": fnum(m.group('sl')), "bracket": "SL_VERIFIED"}); return ev
     if m := BRACKET_TP.search(s):
         ev = base_ctx(m); ev.update({"type": "bracket_update", "tp": fnum(m.group('tp')), "bracket": "TP_VERIFIED"}); return ev
-    if m := TRAIL.search(s):
-        ev = base_ctx(m); ev.update({"type": "trail_update", "trailing": "ON", "sl": fnum(m.group('sl')) if m.group('sl') else None, "message": s}); return ev
+    # Important: liquidity_trail.py logs many CANDIDATE/PROPOSAL/HOLD lines.
+    # Those are analytics, not exchange edits. Only dispatch/applied/edit/replaced
+    # logs are allowed to mutate the dashboard position SL.
+    if m := TRAIL_APPLIED.search(s):
+        sl_raw = m.groupdict().get("sl_new") or m.groupdict().get("sl")
+        ev = base_ctx(m); ev.update({"type": "trail_update", "trailing": "ON", "sl": fnum(sl_raw) if sl_raw else None, "message": s, "phase": "TRAIL_EXCHANGE_APPLIED"}); return ev
+    if m := TRAIL_DISPATCH.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_dispatch", "phase": "TRAIL_DISPATCHED", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
+    if m := TRAIL_HOLD.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_hold", "phase": "TRAIL_HOLD", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
+    if m := TRAIL_PROPOSAL.search(s):
+        ev = base_ctx(m); ev.update({"type": "trail_proposal", "phase": f"TRAIL_PROPOSAL_{m.group('phase')}", "sl": fnum(m.group('sl')), "last_reason": s, "message": s}); return ev
     if m := EXIT.search(s):
         ev = base_ctx(m); ev.update({"type": "position_closed", "side": m.group('side') or '', "pnl": fnum(m.group('pnl')), "reason": s}); return ev
     if any(x in s for x in ["ERRO", "ERROR", "Traceback", "NameError", "TypeError", "AttributeError"]):
@@ -110,6 +136,7 @@ class Poster:
     def __init__(self, url: str) -> None:
         self.url = url.rstrip('/')
     def post(self, ev: dict[str, Any]) -> None:
+        ev = redact_sensitive(dict(ev))
         ev.setdefault('source', 'log-tail')
         ev.setdefault('ts', time.time())
         try:

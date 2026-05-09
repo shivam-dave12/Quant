@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 
-def linear_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_btc: float) -> float:
+def linear_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_units: float) -> float:
     side_u = str(side).upper()
     if side_u == "LONG":
-        return (float(exit_price) - float(entry_price)) * float(quantity_btc)
+        return (float(exit_price) - float(entry_price)) * float(quantity_units)
     if side_u == "SHORT":
-        return (float(entry_price) - float(exit_price)) * float(quantity_btc)
+        return (float(entry_price) - float(exit_price)) * float(quantity_units)
     raise ValueError(f"invalid side: {side!r}")
 
 
-def inverse_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_btc: float) -> float:
+def inverse_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_units: float) -> float:
     """
     USD PnL for BTCUSD inverse exposure when order quantity is tracked in BTC.
 
@@ -25,7 +25,7 @@ def inverse_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_b
     """
     entry = float(entry_price)
     exit_ = float(exit_price)
-    qty = float(quantity_btc)
+    qty = float(quantity_units)
     if entry <= 0 or exit_ <= 0:
         raise ValueError("entry_price and exit_price must be positive")
     side_u = str(side).upper()
@@ -37,7 +37,7 @@ def inverse_pnl_usd(side: str, entry_price: float, exit_price: float, quantity_b
 
 
 def gross_pnl_usd(side: str, entry_price: float, exit_price: float,
-                  quantity_btc: float, inverse: bool = False) -> float:
+                  quantity_units: float, inverse: bool = False) -> float:
     if inverse:
-        return inverse_pnl_usd(side, entry_price, exit_price, quantity_btc)
-    return linear_pnl_usd(side, entry_price, exit_price, quantity_btc)
+        return inverse_pnl_usd(side, entry_price, exit_price, quantity_units)
+    return linear_pnl_usd(side, entry_price, exit_price, quantity_units)

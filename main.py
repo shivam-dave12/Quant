@@ -419,6 +419,14 @@ class QuantBot:
             logger.info(f"Exchanges configured — Delta: {has_delta} | "
                         f"CoinSwitch: {has_coinswitch}")
 
+            if not (has_delta or has_coinswitch):
+                logger.error(
+                    "No exchange credentials configured. Runtime trading is disabled: "
+                    "set DELTA_API_KEY/DELTA_SECRET_KEY or "
+                    "COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY before starting the bot."
+                )
+                return False
+
             # ── Build API clients ─────────────────────────────────────────────
             cs_api    = None
             delta_api = None

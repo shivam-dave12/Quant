@@ -14,6 +14,20 @@ except ImportError:  # production image may not ship python-dotenv
         return False
 load_dotenv()
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
 # ── Exchange routing ──────────────────────────────────────────────────────────
 EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
 
@@ -26,8 +40,14 @@ COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-if not DELTA_API_KEY and not COINSWITCH_API_KEY:
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY or COINSWITCH_API_KEY.")
+REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
+
+# Keep module imports/test tooling/dashboard safe without live secrets. The bot
+# runtime still refuses to trade unless a configured exchange has both key and
+# secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
+# deployment-time fail-fast check.
+if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
+    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
 
 # ── Symbol / Leverage ─────────────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
@@ -50,13 +70,13 @@ REMAINDER_MIN_QTY        = 0.001
 
 # ── Risk management ──────────────────────────────────────────────────────────
 # RISK_PER_TRADE: FRACTION of available balance risked per trade (NOT percent).
-#   0.006 = 0.6% risk per trade.
+#   0.005 = 0.5% risk per trade.
 #   Previous value 0.60 was interpreted as percent by risk_manager (÷100 = 0.006 → 0.6%)
 #   but as FRACTION by quant_strategy._compute_quantity (× direct = 0.60 → 60%).
 #   The inconsistency caused 100× over-sizing (entire balance at risk per trade),
 #   triggering the "required margin > available — scaling down" warnings in logs.
 #   Fix: one convention (fraction), both consumers agree. See risk_manager.py line 266.
-RISK_PER_TRADE           = 0.005    # 0.5% of available balance per trade
+RISK_PER_TRADE           = 0.005   # 0.5% of available balance per trade
 MAX_DAILY_LOSS           = 10000
 MAX_DAILY_LOSS_PCT       = 3.0       # day circuit breaker
 MAX_DRAWDOWN_PCT         = 15.0      # realistic drawdown limit
@@ -73,19 +93,12 @@ TARGET_RISK_REWARD_RATIO = 3.0
 MAX_RR_RATIO             = 20.0
 
 # ── Institutional dynamic execution audit ────────────────────────────────────
-# Style/quality signals are never hidden alpha vetoes. They are continuous
-# references used for score, size multiplier, expected utility, and attribution.
-# Only mechanical account/exchange safety can stop routing.
-INSTITUTIONAL_STRICT_QUALITY_GATES = False      # backward-compatible flag; ignored in dynamic mode
+# Quality signals are priced into the execution decision. Mechanical defects
+# always stop routing; weak delivery/coherence scales exposure dynamically.
 INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE = 0.66
 INSTITUTIONAL_TARGET_REALISM_REFERENCE = 0.52
 INSTITUTIONAL_MIN_DECISION_SCORE   = INSTITUTIONAL_DYNAMIC_SCORE_REFERENCE
 INSTITUTIONAL_MIN_TARGET_REALISM   = INSTITUTIONAL_TARGET_REALISM_REFERENCE
-ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR = 0.75
-ENTRY_HARD_MIN_DISPLACEMENT_ATR    = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
-ENTRY_STRONG_DISPLACEMENT_ATR      = 1.25
-ENTRY_MIN_POOL_SIGNIFICANCE        = 1.25
-ENTRY_MIN_SWEEP_QUALITY            = 0.20
 ENTRY_ENGINE_SIGNAL_COOLDOWN_SEC   = 10.0
 IC_IMPAIRMENT_SIZE_MULT            = 0.35
 POST_EXIT_IMPAIRMENT_SIZE_MULT     = 0.40
@@ -102,6 +115,16 @@ MAX_CONSECUTIVE_TIMEOUTS         = 2
 TIMEOUT_EXTENDED_LOCKOUT_SEC     = 1800
 SNIPER_MAX_DISTANCE_ATR          = 1.0
 LIMIT_ORDER_FILL_TIMEOUT_SEC     = 60.0
+# v73: high-readiness accepted sweeps must not sit as passive maker orders.
+# Use the final EntryReadiness surface, not raw composite signal confidence, to
+# trigger fast native-bracket execution. This is still exchange-attached TP/SL.
+ENTRY_PROTECTED_CROSS_READINESS  = 0.78
+ENTRY_PROTECTED_CROSS_EDGE       = 0.06
+ENTRY_PROTECTED_CROSS_REQUIRE_SIGNAL_CONF = False
+ENTRY_PROTECTED_CROSS_MIN_CONF   = 0.70
+ENTRY_PROTECTED_CROSS_TICKS      = 2.0
+DELTA_NATIVE_BRACKET_MARKET_FOR_PROTECTED_CROSS = True
+PROTECTED_CROSS_FILL_TIMEOUT_SEC = 12.0
 REQUEST_TIMEOUT                  = 30
 # Delta multi-asset protection policy: every Delta entry must use native bracket
 # placement (entry + SL + TP in one exchange transaction). If bracket placement
@@ -450,21 +473,21 @@ CONVICTION_MAX_ENTRIES_PER_SESSION = 3
 
 
 # ── Institutional Dynamic Entry Quality References ───────────────────────────
-# These are adaptive scoring references, not alpha vetoes. Weak structure lowers
-# signal quality and size; posterior/EV still owns trade expression.
+# These are adaptive scoring references for the executable entry surface. Weak
+# structure first lowers quality/size; critical defects pause routing until the
+# market provides accepted delivery.
 ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR       = 0.75
 ENTRY_HARD_MIN_DISPLACEMENT_ATR          = ENTRY_DYNAMIC_MIN_DISPLACEMENT_ATR  # compatibility alias
 ENTRY_STRONG_DISPLACEMENT_ATR            = 1.25
-ENTRY_REQUIRE_CISD_OR_OTE                = True
 ENTRY_MAX_CHASE_ATR_WITHOUT_OTE          = 1.15
 ENTRY_REVERSAL_PD_LONG_MAX               = 0.62
 ENTRY_REVERSAL_PD_SHORT_MIN              = 0.38
 ENTRY_CONTINUATION_MIN_ACCEPTANCE_ATR    = 0.55
-ENTRY_CONTINUATION_REQUIRE_CISD_OR_BOS   = True
 ENTRY_FLOW_HARD_OPPOSE_THRESHOLD         = 0.40  # compatibility name; dynamic penalty reference
 ENTRY_CVD_HARD_OPPOSE_THRESHOLD          = 0.30  # compatibility name; dynamic penalty reference
-ENTRY_HTF_CONTRA_MAX_WITHOUT_STRONG_DISP = True
 ENTRY_GATE_LOG_INTERVAL_SEC              = 12.0
+ENTRY_EXECUTION_QUALITY_MIN              = 0.52
+ENTRY_CRITICAL_DEFECT_FLOOR              = 0.62
 # ── Trail (liquidity-first) ───────────────────────────────────────────────────
 QUANT_TRAIL_LIQ_BASE_BUF_MAX_ATR  = 0.25
 QUANT_TRAIL_LIQ_BASE_BUF_MIN_ATR  = 0.15
@@ -589,15 +612,53 @@ SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cade
 # contract gets only one ENTERING/ACTIVE/EXITING slot.  The existing BTC-style
 # risk model is preserved by giving each contract a slot-scoped balance view
 # before QuantStrategy applies RISK_PER_TRADE and BALANCE_USAGE_PERCENTAGE.
-PORTFOLIO_MAX_OPEN_POSITIONS = 4
+PORTFOLIO_MAX_OPEN_POSITIONS = 6
 PORTFOLIO_MAX_OPEN_PER_CONTRACT = 1
-PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 4
+PORTFOLIO_MAX_OPEN_PER_ASSET_CLASS = 6
 PORTFOLIO_BUDGET_MODE = "equal_slots"   # equal_slots | active_equal_slots
 # In multi-asset mode, margin/cash is slot-scoped but dollar-risk must remain
 # portfolio-aware.  This prevents BTC min-lot rejection when a valid minimum
 # order is inside the portfolio risk cap but above the confidence-haircut target.
 PORTFOLIO_RISK_BUDGET_MODE = "portfolio_equity"  # portfolio_equity | slot_equity
 PORTFOLIO_MIN_LOT_MAX_RISK_MULT = 1.15
+PORTFOLIO_MAX_AGGREGATE_RISK_PCT = 3.0  # six slots × 0.5% risk; aggregate account risk cap
+PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
+
+# Agentic institutional fund runtime.
+# Agents select which desks may run entry logic. QuantStrategy still owns alpha
+# validation; Risk/Execution remain deterministic final authorities.
+AGENTIC_FUND_ENABLED = _env_bool("AGENTIC_FUND_ENABLED", True)
+FUND_PAPER_MODE = _env_bool("FUND_PAPER_MODE", True)
+FUND_LIVE_ORDERING_ENABLED = _env_bool("FUND_LIVE_ORDERING_ENABLED", False)
+FUND_TOP_N_EXECUTION_DESKS = _env_int("FUND_TOP_N_EXECUTION_DESKS", 3)
+FUND_TOP_N_DEPTH_SCAN = _env_int("FUND_TOP_N_DEPTH_SCAN", 6)
+FUND_MIN_TICKER_SCORE = _env_float("FUND_MIN_TICKER_SCORE", 0.52)
+FUND_MIN_EXECUTION_SCORE = _env_float("FUND_MIN_EXECUTION_SCORE", 0.58)
+FUND_MIN_SETUP_SCORE = _env_float("FUND_MIN_SETUP_SCORE", 0.50)
+FUND_MAX_SPREAD_BPS_CRYPTO = _env_float("FUND_MAX_SPREAD_BPS_CRYPTO", 18.0)
+FUND_MAX_SPREAD_BPS_EQUITY = _env_float("FUND_MAX_SPREAD_BPS_EQUITY", 45.0)
+FUND_MAX_SPREAD_BPS_COMMODITY = _env_float("FUND_MAX_SPREAD_BPS_COMMODITY", 55.0)
+FUND_MAX_DATA_AGE_SEC = _env_float("FUND_MAX_DATA_AGE_SEC", 90.0)
+FUND_MIN_WARMUP_RATIO = _env_float("FUND_MIN_WARMUP_RATIO", 0.88)
+FUND_AUDIT_LOG_PATH = os.getenv("FUND_AUDIT_LOG_PATH", "data/fund_audit.jsonl")
+FUND_CIO_DECISION_SEC = _env_float("FUND_CIO_DECISION_SEC", 3.0)
+FUND_CIO_REPORT_SEC = _env_float("FUND_CIO_REPORT_SEC", 30.0)
+
+# Optional venues. Delta/CoinSwitch are the current execution stack. ICICI and
+# CoinDCX are institutional adapters; enable only after credentials, static IP,
+# and paper-mode validation are complete.
+ICICI_ENABLED = _env_bool("ICICI_ENABLED", False)
+BREEZE_API_KEY = os.getenv("BREEZE_API_KEY", "")
+BREEZE_SECRET_KEY = os.getenv("BREEZE_SECRET_KEY", "")
+ICICI_CLIENT_ID = os.getenv("ICICI_CLIENT_ID", "")
+ICICI_PASSWORD = os.getenv("ICICI_PASSWORD", "")
+ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
+ICICI_SESSION_TTL_SEC = float(os.getenv("ICICI_SESSION_TTL_SEC", str(6 * 60 * 60)))
+ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
+
+COINDCX_ENABLED = _env_bool("COINDCX_ENABLED", False)
+COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
+COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY", "")
 
 # Requested universe.  Commodity/index/equity entries are discovery requests;
 # if neither exchange lists them, they remain unavailable and are not traded.
@@ -672,3 +733,13 @@ DELTA_BRACKET_CHILD_PRICE_TOL_TICKS = 6.0
 DELTA_BRACKET_CHILD_PRICE_TOL_PCT = 0.0025
 DELTA_EMERGENCY_FLATTEN_ON_BRACKET_MISMATCH = True
 TELEGRAM_ALERT_PROTECTION_FAILURE = True
+
+# Dashboard telemetry: non-blocking direct feed to local dashboard backend.
+# If the dashboard is offline, events are dropped; trading is never blocked.
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000")
+DASHBOARD_QUEUE_MAX = int(os.getenv("DASHBOARD_QUEUE_MAX", "2000"))
+DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
+DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
+DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
+DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))
