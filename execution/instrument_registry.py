@@ -57,6 +57,32 @@ def _deep_first_float(obj, names) -> float:
     return 0.0
 
 
+def _pick(row: dict, *names: str) -> str:
+    wanted = {n.lower().replace(" ", "").replace("_", "") for n in names}
+    for k, v in (row or {}).items():
+        nk = str(k).lower().replace(" ", "").replace("_", "")
+        if nk in wanted and v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def _icici_right(value: str) -> str:
+    n = normalise_symbol(value)
+    if n in {"CE", "CALL", "C"}:
+        return "Call"
+    if n in {"PE", "PUT", "P"}:
+        return "Put"
+    return str(value or "")
+
+
+def _is_icici_option_row(row: dict, ex_code: str, product: str, right: str, strike: str, expiry: str) -> bool:
+    text = normalise_symbol(" ".join(str(x) for x in [ex_code, product, right, strike, expiry, *list((row or {}).values())[:8]]))
+    if any(x in text for x in ("OPTIDX", "OPTSTK", "OPTION", "OPTIONS")):
+        return True
+    if normalise_symbol(right) in {"CE", "PE", "CALL", "PUT", "C", "P"} and _safe_float(strike) > 0 and bool(str(expiry).strip()):
+        return True
+    return False
+
 def _market_key_like(value: str) -> bool:
     n = normalise_symbol(str(value))
     if len(n) < 5:
@@ -449,7 +475,7 @@ class InstrumentRegistry:
             ex_code = str(
                 r.get("ExchangeCode") or r.get("exchange_code") or r.get("Exchange") or r.get("exchange") or ""
             ).upper()
-            if ex_code not in {"NSE", "NFO", "BSE"}:
+            if ex_code not in {"NSE", "NFO", "BSE", "BFO"}:
                 continue
             try:
                 import config as _cfg_mod  # type: ignore
@@ -458,32 +484,32 @@ class InstrumentRegistry:
                 _icici_options_only = True
             # ICICI security-master headers vary across files/days.  Accept the
             # common NSE/NFO/BSE spellings instead of relying on one exact schema.
-            stock = str(
-                r.get("ShortName") or r.get("StockCode") or r.get("stock_code") or
-                r.get("CompanyName") or r.get("Company Name") or r.get("ScripName") or
-                r.get("Underlying") or r.get("UnderlyingSymbol") or
-                r.get("Symbol") or r.get("symbol") or r.get("Name") or ""
-            ).upper()
-            token = str(
-                r.get("Token") or r.get("token") or r.get("ScripCode") or
-                r.get("scrip_code") or r.get("ExchangeToken") or r.get("exchange_token") or ""
-            )
-            product = str(
-                r.get("ProductType") or r.get("product_type") or r.get("InstrumentType") or
-                r.get("instrument_type") or r.get("Series") or r.get("series") or ""
-            )
-            right = str(
-                r.get("OptionType") or r.get("option_type") or r.get("Right") or
-                r.get("right") or r.get("CallPut") or r.get("call_put") or ""
-            )
-            strike = str(
-                r.get("StrikePrice") or r.get("strike_price") or r.get("Strike") or
-                r.get("strike") or r.get("StrikeRate") or r.get("strike_rate") or ""
-            )
-            expiry = str(
-                r.get("ExpiryDate") or r.get("expiry_date") or r.get("Expiry") or
-                r.get("expiry") or r.get("ExpiryDt") or r.get("expiry_dt") or ""
-            )
+            stock = str(_pick(
+                r, "ShortName", "StockCode", "stock_code", "CompanyName", "Company Name",
+                "ScripName", "Underlying", "UnderlyingSymbol", "Symbol", "symbol",
+                "Name", "SC_SYMBOL", "SC_NAME", "SecurityName", "Security Name"
+            )).upper()
+            token = str(_pick(
+                r, "Token", "token", "ScripCode", "scrip_code", "ExchangeToken",
+                "exchange_token", "TokenNumber", "Token Number", "InstrumentToken"
+            ))
+            product = str(_pick(
+                r, "ProductType", "product_type", "InstrumentType", "instrument_type",
+                "Series", "series", "InstrumentName", "Instrument Name", "InstType",
+                "Segment", "Product", "ProductCode"
+            ))
+            right = _icici_right(_pick(
+                r, "OptionType", "option_type", "Right", "right", "CallPut", "call_put",
+                "Option", "OptionName", "CPType", "PutCall"
+            ))
+            strike = str(_pick(
+                r, "StrikePrice", "strike_price", "Strike", "strike", "StrikeRate",
+                "strike_rate", "Strike Price", "STRIKE_PR", "ExercisePrice"
+            ))
+            expiry = str(_pick(
+                r, "ExpiryDate", "expiry_date", "Expiry", "expiry", "ExpiryDt",
+                "expiry_dt", "Expiry Date", "EXPIRY_DATE", "ContractExpiry"
+            ))
             if not stock and not token:
                 continue
             icici_stock_alias = {
@@ -495,8 +521,11 @@ class InstrumentRegistry:
             stock = icici_stock_alias.get(normalise_symbol(stock), stock)
             text = f"{stock} {product} {right} {strike} {expiry} {ex_code}"
             ac = AssetClass.CASH
-            if ex_code == "NFO":
-                ac = AssetClass.OPTION if (right or strike or "OPT" in normalise_symbol(product)) else AssetClass.FUTURE
+            is_option = _is_icici_option_row(r, ex_code, product, right, strike, expiry)
+            if ex_code in {"NFO", "BFO"}:
+                ac = AssetClass.OPTION if is_option else AssetClass.FUTURE
+            elif ex_code == "BSE" and is_option:
+                ac = AssetClass.OPTION
             elif ex_code == "BSE" and normalise_symbol(stock) in {"SENSEX", "BANKEX"}:
                 ac = AssetClass.INDEX
             elif _asset_class_from_text(text, AssetClass.EQUITY) == AssetClass.INDEX:
@@ -516,6 +545,7 @@ class InstrumentRegistry:
             raw.setdefault("exchange_code", ex_code)
             raw.setdefault("product_type", "options" if ac == AssetClass.OPTION else ("futures" if ac == AssetClass.FUTURE else "cash"))
             raw.setdefault("right", right)
+            raw.setdefault("option_type", right)
             raw.setdefault("strike_price", strike)
             raw.setdefault("expiry_date", expiry)
             inst = ExchangeInstrument(

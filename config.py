@@ -57,8 +57,35 @@ SYMBOL                   = "BTCUSDT"
 # core.market_policy.MAX_POLICY_LEVERAGE plus each venue's confirmed product cap.
 LEVERAGE                 = 1
 MAX_POLICY_LEVERAGE      = 40.0
-POLICY_CRYPTO_LEVERAGE_UTIL = 0.55
-POLICY_FUTURE_LEVERAGE_UTIL = 0.50
+# Venue leverage schedule is explicit broker/product policy, not a trading fallback.
+# Delta India may omit max_leverage in product discovery while still accepting
+# product-level leverage through /products/{id}/orders/leverage.  Keep known caps
+# here so leverage can be calculated before strategy startup without probing live
+# orders.  Target leverage is calculated as: min(product_cap * utilisation, firm_cap).
+DELTA_DEFAULT_FUTURE_MAX_LEVERAGE = 100.0
+DELTA_SYMBOL_MAX_LEVERAGE = {
+    "BTCUSD": 200.0,
+    "BTC": 200.0,
+    "ETHUSD": 100.0,
+    "ETH": 100.0,
+}
+DELTA_ASSET_CLASS_MAX_LEVERAGE = {
+    "future": 100.0,
+    "crypto": 100.0,
+    "commodity": 50.0,
+    "equity": 25.0,
+    "index": 25.0,
+}
+# Utilisation deliberately uses only a slice of the exchange cap.  Example:
+# BTC cap 200x × 0.20 = 40x target, bounded by MAX_POLICY_LEVERAGE=40.
+DELTA_SYMBOL_LEVERAGE_UTIL = {
+    "BTCUSD": 0.20,
+    "BTC": 0.20,
+    "ETHUSD": 0.28,
+    "ETH": 0.28,
+}
+POLICY_CRYPTO_LEVERAGE_UTIL = 0.28
+POLICY_FUTURE_LEVERAGE_UTIL = 0.28
 POLICY_COMMODITY_LEVERAGE_UTIL = 0.40
 POLICY_EQUITY_LEVERAGE_UTIL = 0.32
 POLICY_INDEX_LEVERAGE_UTIL = 0.35
@@ -781,7 +808,7 @@ DASHBOARD_POSITION_UPDATE_SEC = 1.0
 # subscriptions are opened only for the desk-selected shortlist.  This prevents
 # Delta from being flooded with 100+ simultaneous candle streams at startup.
 DYNAMIC_TRADABLE_DESK_ENABLED = True
-DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 8
+DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 12
 DYNAMIC_DESK_MIN_SCORE = 0.38
 DYNAMIC_DESK_REFRESH_SEC = 180.0
 DYNAMIC_DESK_MIN_RESIDENCY_SEC = 600.0
@@ -807,15 +834,15 @@ ICICI_SECURITY_MASTER_CACHE_PATH = "data/icici_security_master.zip"
 # Alpha desks are organised by asset/instrument thesis, not by broker venue.
 # Example: BTC is one global BTC desk; Delta/CoinSwitch/CoinDCX are venue routes
 # under that desk. Venue fragmentation must not create duplicate BTC strategies.
-DESK_ENABLED_IDS = "BTC_GLOBAL,CRYPTO_ALTS,ICICI_INDEX_OPTIONS,ICICI_STOCK_OPTIONS"
+DESK_ENABLED_IDS = ""  # empty = enable every desk with quota > 0
 DESK_MAX_ACTIVE_BY_ID = ""
 DESK_BTC_GLOBAL_MAX_ACTIVE = 1
 DESK_CRYPTO_ALTS_MAX_ACTIVE = 5
-DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 0
-DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 0
+DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 2
+DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 2
 DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 2
 DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 2
-VENUE_ROUTE_PREFERENCE = "delta,icici"
+VENUE_ROUTE_PREFERENCE = "delta,icici,coindcx,coinswitch"
 
 # Backward-compatible env aliases only. Do not use these names in new logic;
 # they are preserved so old .env files don't crash while v85 migrates configs.

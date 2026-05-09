@@ -109,17 +109,60 @@ def _primary_exchange(inst: Optional[TradableInstrument]) -> Optional[ExchangeNa
         return None
 
 
+def _symbol_keys(inst: Optional[TradableInstrument]) -> tuple[str, ...]:
+    if inst is None:
+        return ()
+    vals = []
+    for v in (getattr(inst, "execution_symbol", ""), getattr(inst, "display_symbol", ""), getattr(inst, "asset_id", "")):
+        k = "".join(ch for ch in str(v or "").upper() if ch.isalnum())
+        if k and k not in vals:
+            vals.append(k)
+    return tuple(vals)
+
+
+def _map_lookup(name: str, keys: tuple[str, ...], default: float = 0.0) -> float:
+    raw = _cfg(name, {})
+    if isinstance(raw, dict):
+        for k in keys:
+            for candidate in (k, k.replace("USDT", "USD"), k.replace("USD", "")):
+                if candidate in raw:
+                    try:
+                        v = float(raw[candidate])
+                        if math.isfinite(v) and v > 0:
+                            return v
+                    except Exception:
+                        pass
+    return float(default)
+
+
+def _venue_configured_max_leverage(inst: Optional[TradableInstrument]) -> float:
+    if inst is None:
+        return 0.0
+    ex = _primary_exchange(inst)
+    ac = getattr(inst, "asset_class", AssetClass.CRYPTO)
+    if ex == ExchangeName.DELTA:
+        keys = _symbol_keys(inst)
+        by_symbol = _map_lookup("DELTA_SYMBOL_MAX_LEVERAGE", keys, 0.0)
+        if by_symbol > 0:
+            return by_symbol
+        by_class = _cfg("DELTA_ASSET_CLASS_MAX_LEVERAGE", {})
+        if isinstance(by_class, dict):
+            try:
+                v = float(by_class.get(str(ac.value), 0.0) or 0.0)
+                if math.isfinite(v) and v > 0:
+                    return v
+            except Exception:
+                pass
+        if ac in (AssetClass.FUTURE, AssetClass.CRYPTO):
+            return _f("DELTA_DEFAULT_FUTURE_MAX_LEVERAGE", 0.0)
+    return 0.0
+
+
 def _confirmed_max_leverage(inst: Optional[TradableInstrument]) -> float:
     if inst is None:
-        # Single-symbol legacy mode has no TradableInstrument context. Treat it
-        # as a generic leveraged venue bounded by MAX_POLICY_LEVERAGE; multi-asset
-        # mode always supplies an instrument and therefore uses venue metadata.
         return max(1.0, _f("MAX_POLICY_LEVERAGE", 40.0))
     ex = _primary_exchange(inst)
     ac = getattr(inst, "asset_class", AssetClass.CRYPTO)
-    # ICICI Indian-market cash, futures and options are modelled as fully funded
-    # instruments in this bot. Do not set exchange leverage and do not divide
-    # notional by a leverage factor for margin P&L.
     if ex == ExchangeName.ICICI or ac in (AssetClass.CASH, AssetClass.OPTION):
         return 1.0
     try:
@@ -128,8 +171,9 @@ def _confirmed_max_leverage(inst: Optional[TradableInstrument]) -> float:
             return max(1.0, mx)
     except Exception:
         pass
-    # Unknown leverage is not permission to use a static number. Use 1x until
-    # the venue product row explicitly confirms otherwise.
+    configured = _venue_configured_max_leverage(inst)
+    if configured > 0:
+        return configured
     return 1.0
 
 
@@ -140,10 +184,14 @@ def _leverage_utilisation(inst: Optional[TradableInstrument]) -> float:
     ex = _primary_exchange(inst)
     if ex == ExchangeName.ICICI or ac in (AssetClass.CASH, AssetClass.OPTION):
         return 1.0
+    if ex == ExchangeName.DELTA:
+        sym_util = _map_lookup("DELTA_SYMBOL_LEVERAGE_UTIL", _symbol_keys(inst), 0.0)
+        if sym_util > 0:
+            return min(1.0, max(0.0, sym_util))
     if ac == AssetClass.CRYPTO:
-        return _f("POLICY_CRYPTO_LEVERAGE_UTIL", 0.55)
+        return _f("POLICY_CRYPTO_LEVERAGE_UTIL", 0.28)
     if ac == AssetClass.FUTURE:
-        return _f("POLICY_FUTURE_LEVERAGE_UTIL", 0.50)
+        return _f("POLICY_FUTURE_LEVERAGE_UTIL", 0.28)
     if ac == AssetClass.COMMODITY:
         return _f("POLICY_COMMODITY_LEVERAGE_UTIL", 0.40)
     if ac == AssetClass.EQUITY:
@@ -155,8 +203,12 @@ def _leverage_utilisation(inst: Optional[TradableInstrument]) -> float:
 
 def _target_leverage(inst: Optional[TradableInstrument]) -> int:
     venue_cap = _confirmed_max_leverage(inst)
-    configured_cap = max(1.0, _f("MAX_POLICY_LEVERAGE", venue_cap))
-    raw = min(venue_cap, configured_cap) * max(0.0, min(1.0, _leverage_utilisation(inst)))
+    firm_cap = max(1.0, _f("MAX_POLICY_LEVERAGE", venue_cap))
+    util = max(0.0, min(1.0, _leverage_utilisation(inst)))
+    # Institutional leverage uses the venue/product cap first, then applies a
+    # utilisation haircut, then the firm-level cap.  BTC example: 200x venue cap
+    # × 0.20 utilisation = 40x, capped by MAX_POLICY_LEVERAGE=40.
+    raw = min(venue_cap * util, firm_cap)
     return max(1, int(math.floor(raw)))
 
 

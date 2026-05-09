@@ -23,13 +23,18 @@ def test_icici_cash_and_options_are_one_x():
     assert active_policy(cash).margin_pct <= 0.06
 
 
-def test_unknown_exchange_leverage_does_not_infer_static_cap():
+def test_delta_equity_uses_configured_venue_schedule_when_product_row_omits_cap():
     equity = _inst(ExchangeName.DELTA, AssetClass.EQUITY, max_lev=0, symbol="AAPLXUSD")
-    assert active_policy(equity).leverage == 1
+    assert active_policy(equity).leverage == 8  # 25x venue schedule * 32% utilisation
 
 
-def test_confirmed_delta_leverage_is_used_below_cap():
-    crypto = _inst(ExchangeName.DELTA, AssetClass.CRYPTO, max_lev=40, symbol="BTCUSD")
+def test_delta_btc_uses_institutional_slice_of_venue_cap():
+    crypto = _inst(ExchangeName.DELTA, AssetClass.CRYPTO, max_lev=0, symbol="BTCUSD")
     pol = active_policy(crypto)
-    assert 1 <= pol.leverage < 40
-    assert pol.leverage == 22  # 40x venue cap * 55% institutional utilisation
+    assert pol.leverage == 40  # 200x venue schedule * 20% utilisation, firm-capped at 40x
+
+
+def test_confirmed_delta_leverage_is_used_with_symbol_utilisation():
+    crypto = _inst(ExchangeName.DELTA, AssetClass.CRYPTO, max_lev=100, symbol="ETHUSD")
+    pol = active_policy(crypto)
+    assert pol.leverage == 28  # 100x confirmed venue cap * 28% ETH utilisation
