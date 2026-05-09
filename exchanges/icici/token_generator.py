@@ -11,6 +11,8 @@ import logging
 import os
 import platform
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -72,6 +74,50 @@ SELS_OTPOK = [
     "button[type='submit']",
 ]
 
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _looks_like_missing_playwright_browser(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "executable doesn't exist" in text
+        or "please run the following command to download new browsers" in text
+        or "playwright install" in text
+        or "browser_type.launch" in text and "chromium" in text and "executable" in text
+    )
+
+
+def _install_playwright_chromium() -> None:
+    """Download the Playwright Chromium browser for the current runtime user.
+
+    This intentionally installs only Chromium, not the full browser bundle.  In
+    containers that run as a non-root user, Playwright stores the binary below
+    that user's cache directory, so installing it in the Docker image as root is
+    often not enough.  This helper lets live startup self-heal the exact failure
+    shown in the runtime log: package installed, browser binary missing.
+    """
+    if not _env_bool("ICICI_PLAYWRIGHT_AUTO_INSTALL", True):
+        raise RuntimeError(
+            "Playwright Chromium browser is missing and ICICI_PLAYWRIGHT_AUTO_INSTALL=False. "
+            "Run: python -m playwright install chromium"
+        )
+
+    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    log.warning("ICICI Playwright Chromium browser missing; installing runtime Chromium via: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=420)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Playwright Chromium install failed. Output:\n"
+            + (proc.stdout or "").strip()
+            + "\nRun manually inside the same container/user: python -m playwright install chromium"
+        )
+    log.info("ICICI Playwright Chromium browser installed for current runtime user")
 
 def launch_args() -> list[str]:
     if platform.system() == "Linux":
@@ -192,7 +238,14 @@ def generate_api_session(
 
     debug_path = Path(debug_dir)
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
+        try:
+            browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
+        except Exception as exc:
+            if _looks_like_missing_playwright_browser(exc):
+                _install_playwright_chromium()
+                browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])
+            else:
+                raise
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
