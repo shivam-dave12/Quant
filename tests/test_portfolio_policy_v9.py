@@ -18,7 +18,7 @@ class PortfolioPolicyV9Test(unittest.TestCase):
         aapl = inst('AAPL', AssetClass.EQUITY, 'AAPLXUSD', max_lev=25, tick=0.1, lot=1)
         with instrument_scope(aapl):
             pol = active_policy()
-            self.assertEqual(QCfg.LEVERAGE(), 25)
+            self.assertEqual(QCfg.LEVERAGE(), 8)
             self.assertLess(QCfg.MARGIN_PCT(), 0.20)
             self.assertGreaterEqual(QCfg.MIN_RR_RATIO(), 1.45)
             self.assertEqual(QCfg.LOT_STEP(), 1)

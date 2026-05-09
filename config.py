@@ -49,9 +49,19 @@ REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false"
 if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
     raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
 
-# ── Symbol / Leverage ─────────────────────────────────────────────────────────
+# ── Symbol / leverage policy ───────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
-LEVERAGE                 = 40
+# LEVERAGE is retained as a compatibility display knob only. v83 sizing uses
+# core.market_policy.MAX_POLICY_LEVERAGE plus each venue's confirmed product cap.
+LEVERAGE                 = 1
+MAX_POLICY_LEVERAGE      = _env_float("MAX_POLICY_LEVERAGE", 40.0)
+POLICY_CRYPTO_LEVERAGE_UTIL = _env_float("POLICY_CRYPTO_LEVERAGE_UTIL", 0.55)
+POLICY_FUTURE_LEVERAGE_UTIL = _env_float("POLICY_FUTURE_LEVERAGE_UTIL", 0.50)
+POLICY_COMMODITY_LEVERAGE_UTIL = _env_float("POLICY_COMMODITY_LEVERAGE_UTIL", 0.40)
+POLICY_EQUITY_LEVERAGE_UTIL = _env_float("POLICY_EQUITY_LEVERAGE_UTIL", 0.32)
+POLICY_INDEX_LEVERAGE_UTIL = _env_float("POLICY_INDEX_LEVERAGE_UTIL", 0.35)
+POLICY_GENERIC_LEVERAGE_UTIL = _env_float("POLICY_GENERIC_LEVERAGE_UTIL", 0.35)
+POLICY_ICICI_CASH_MARGIN_PCT = _env_float("POLICY_ICICI_CASH_MARGIN_PCT", 0.06)
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
@@ -663,6 +673,13 @@ ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_bre
 ICICI_SESSION_TTL_SEC = float(os.getenv("ICICI_SESSION_TTL_SEC", str(6 * 60 * 60)))
 ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
 ICICI_BREEZE_PREFLIGHT_ON_STARTUP = _env_bool("ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
+# When the bot is started from Telegram and a Breeze API_Session is missing,
+# launch the token-generator browser flow automatically, ask the approved
+# Telegram operator for OTP, scrape the API_Session from the redirect, then
+# exchange it through CustomerDetails before ICICI protected endpoints are used.
+ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = _env_bool("ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True)
+ICICI_TOKEN_GENERATOR_HEADLESS = _env_bool("ICICI_TOKEN_GENERATOR_HEADLESS", True)
+ICICI_OTP_WAIT_SEC = _env_float("ICICI_OTP_WAIT_SEC", 180.0)
 ICICI_AUTH_REQUIRED_FOR_DETAILS = _env_bool("ICICI_AUTH_REQUIRED_FOR_DETAILS", False)
 
 COINDCX_ENABLED = _env_bool("COINDCX_ENABLED", False)
@@ -761,3 +778,44 @@ DELTA_REST_WARMUP_TIMEFRAMES = os.getenv("DELTA_REST_WARMUP_TIMEFRAMES", "1m,5m,
 # ICICI security master cache.  Discovery should not fail just because the
 # public master URL is slow/unreachable during startup.
 ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v85 ASSET-DESK + VENUE-ROUTER INSTITUTIONAL ARCHITECTURE
+# ─────────────────────────────────────────────────────────────────────────────
+# Alpha desks are organised by asset/instrument thesis, not by broker venue.
+# Example: BTC is one global BTC desk; Delta/CoinSwitch/CoinDCX are venue routes
+# under that desk. Venue fragmentation must not create duplicate BTC strategies.
+DESK_ENABLED_IDS = os.getenv("DESK_ENABLED_IDS", "")
+DESK_MAX_ACTIVE_BY_ID = os.getenv("DESK_MAX_ACTIVE_BY_ID", "")
+DESK_BTC_GLOBAL_MAX_ACTIVE = _env_int("DESK_BTC_GLOBAL_MAX_ACTIVE", 1)
+DESK_CRYPTO_ALTS_MAX_ACTIVE = _env_int("DESK_CRYPTO_ALTS_MAX_ACTIVE", 7)
+DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = _env_int("DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE", 2)
+DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = _env_int("DESK_COMMODITIES_GLOBAL_MAX_ACTIVE", 2)
+DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = _env_int("DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 4)
+DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = _env_int("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 6)
+VENUE_ROUTE_PREFERENCE = os.getenv("VENUE_ROUTE_PREFERENCE", "delta,coindcx,coinswitch,icici")
+
+# Backward-compatible env aliases only. Do not use these names in new logic;
+# they are preserved so old .env files don't crash while v85 migrates configs.
+DESK_DELTA_BTC_MAX_ACTIVE = DESK_BTC_GLOBAL_MAX_ACTIVE
+DESK_DELTA_CRYPTO_MAX_ACTIVE = DESK_CRYPTO_ALTS_MAX_ACTIVE
+DESK_DELTA_US_STOCKS_MAX_ACTIVE = DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE
+DESK_DELTA_COMMODITIES_MAX_ACTIVE = DESK_COMMODITIES_GLOBAL_MAX_ACTIVE
+DESK_COINSWITCH_BTC_MAX_ACTIVE = 0
+DESK_COINSWITCH_CRYPTO_MAX_ACTIVE = 0
+DESK_COINDCX_BTC_MAX_ACTIVE = 0
+DESK_COINDCX_CRYPTO_MAX_ACTIVE = 0
+
+# Indian market mandate: only NFO/BFO options are eligible. Cash/futures rows may
+# be discovered for reference but are rejected before runtime subscription.
+ICICI_OPTIONS_ONLY = _env_bool("ICICI_OPTIONS_ONLY", True)
+ICICI_OPTIONS_RUNTIME_ENABLED = _env_bool("ICICI_OPTIONS_RUNTIME_ENABLED", True)
+ICICI_OPTION_MIN_DTE = _env_float("ICICI_OPTION_MIN_DTE", 2.0)
+ICICI_OPTION_MAX_DTE = _env_float("ICICI_OPTION_MAX_DTE", 21.0)
+ICICI_OPTION_MAX_THETA_TO_PREMIUM = _env_float("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08)
+ICICI_OPTION_MAX_SPREAD_BPS = _env_float("ICICI_OPTION_MAX_SPREAD_BPS", 180.0)
+ICICI_INDEX_OPTION_TARGET_ABS_DELTA = _env_float("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45)
+ICICI_STOCK_OPTION_TARGET_ABS_DELTA = _env_float("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50)
+ICICI_OPTION_DELTA_BAND = _env_float("ICICI_OPTION_DELTA_BAND", 0.22)
+ICICI_OPTION_IV_STRESS_PRIOR = _env_float("ICICI_OPTION_IV_STRESS_PRIOR", 0.24)
+INDIA_RISK_FREE_RATE = _env_float("INDIA_RISK_FREE_RATE", 0.065)

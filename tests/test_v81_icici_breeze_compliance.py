@@ -75,13 +75,13 @@ def _icici_inst(asset_id="NIFTY"):
         ws_symbol=asset_id,
         display_symbol=asset_id,
         asset_id=asset_id,
-        asset_class=AssetClass.CASH,
+        asset_class=AssetClass.OPTION,
         raw={"ExchangeCode": "NSE", "ShortName": asset_id, "Series": "EQ"},
     )
     return TradableInstrument(
         asset_id=asset_id,
         display_name=asset_id,
-        asset_class=AssetClass.CASH,
+        asset_class=AssetClass.OPTION,
         primary_exchange=ExchangeName.ICICI,
         by_exchange={ExchangeName.ICICI: ex},
         priority=1,

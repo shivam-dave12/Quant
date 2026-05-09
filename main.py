@@ -46,6 +46,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import config
+from core.market_policy import active_policy
 
 # ── IST Timezone logging ──────────────────────────────────────────────────────
 
@@ -409,7 +410,7 @@ class QuantBot:
             logger.info("=" * 80)
             logger.info("⚡ LIQUIDITY-FIRST QUANT BOT — DUAL-EXCHANGE")
             logger.info("   LiquidityMap → QuantPosterior → Risk/Execution → Adaptive Exit")
-            logger.info(f"   Symbol: {config.SYMBOL} | Leverage: {config.LEVERAGE}x | "
+            logger.info(f"   Symbol: {config.SYMBOL} | Max policy leverage cap: {getattr(config, 'MAX_POLICY_LEVERAGE', 1)}x | "
                         f"Execution: {config.EXECUTION_EXCHANGE.upper()}")
             logger.info("=" * 80)
 
@@ -546,18 +547,22 @@ class QuantBot:
                 logger.error("Bot components not initialised — call initialize() first")
                 return False
 
-            # ── Set leverage on active exchange ───────────────────────────────
+            # ── Set leverage on active exchange, only when policy > 1x ───────
             active_exch = self.execution_router.active_exchange
-            logger.info(f"Setting leverage to {config.LEVERAGE}x on {active_exch}...")
-            try:
-                resp = self.execution_router.set_leverage(leverage=int(config.LEVERAGE))
-                if isinstance(resp, dict):
-                    if resp.get("success") or not resp.get("error"):
-                        logger.info(f"✅ Leverage set to {config.LEVERAGE}x")
-                    else:
-                        logger.warning(f"⚠️  Leverage set: {resp.get('error', resp)}")
-            except Exception as e:
-                logger.warning(f"⚠️  Leverage set failed (non-fatal): {e}")
+            target_lev = max(1, int(active_policy().leverage))
+            if target_lev <= 1:
+                logger.info(f"Leverage unchanged at 1x on {active_exch} — policy is fully funded/non-leveraged")
+            else:
+                logger.info(f"Setting policy leverage to {target_lev}x on {active_exch}...")
+                try:
+                    resp = self.execution_router.set_leverage(leverage=target_lev)
+                    if isinstance(resp, dict):
+                        if resp.get("success") or not resp.get("error"):
+                            logger.info(f"✅ Leverage set to {target_lev}x")
+                        else:
+                            logger.warning(f"⚠️  Leverage set rejected: {resp.get('error', resp)}; using 1x policy until product metadata is corrected")
+                except Exception as e:
+                    logger.warning(f"⚠️  Leverage set failed: {e}; using 1x policy until product metadata is corrected")
 
             # ── Query initial balance ─────────────────────────────────────────
             try:

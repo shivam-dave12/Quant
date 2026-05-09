@@ -116,11 +116,11 @@ class RiskConfig(BaseModel):
         ge=1.0,
         le=20.0,
     )
-    LEVERAGE: int = Field(
-        default_factory=lambda: _c("LEVERAGE", 40),
-        ge=1,
-        le=125,
-        description="Exchange leverage.  Capped at 125× (max on most CEXes).",
+    MAX_POLICY_LEVERAGE: float = Field(
+        default_factory=lambda: _c("MAX_POLICY_LEVERAGE", 40.0),
+        ge=1.0,
+        le=125.0,
+        description="Upper bound only. Actual leverage is per instrument/exchange and is 1x when venue metadata does not confirm leverage.",
     )
     MIN_TIME_BETWEEN_TRADES_SEC: float = Field(
         default_factory=lambda: _c("MIN_TIME_BETWEEN_TRADES_SEC", 30.0),

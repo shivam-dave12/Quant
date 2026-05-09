@@ -108,7 +108,7 @@ class InstrumentRegistryV4Tests(unittest.TestCase):
         by_symbol = {x.primary.symbol: x for x in report.matched}
         self.assertEqual(by_symbol["NIFTY28MAY2625000CE"].asset_class, AssetClass.OPTION)
         self.assertEqual(by_symbol["BANKNIFTY28MAY2655000PE"].primary_exchange, ExchangeName.ICICI)
-        self.assertIn("RELIANCE", by_symbol)
+        self.assertNotIn("RELIANCE", by_symbol)  # v84 Indian mandate: options only
 
 
 if __name__ == "__main__":

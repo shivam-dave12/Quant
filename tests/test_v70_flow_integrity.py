@@ -37,8 +37,8 @@ def test_entry_engine_liquidation_guard_uses_active_instrument_policy_leverage()
         )
         with instrument_scope(inst):
             _liq, guard, room = EntryEngine._liquidation_guard("long", 100.0)
-        assert 90.0 < guard < 92.0
-        assert room > 8.0
+        assert 67.0 < guard < 68.0
+        assert room > 30.0
     finally:
         config.LEVERAGE = old_leverage
 
