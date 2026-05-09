@@ -261,11 +261,7 @@ class TerminalBurstFilter(logging.Filter):
 
 _ist_fmt = ISTFormatter(fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(asset_ctx)s%(message)s")
 _term_fmt = TerminalFormatter(
-    enable_color=(
-        bool(getattr(sys.stdout, "isatty", lambda: False)())
-        or os.getenv("FORCE_COLOR", "").lower() in ("1", "true", "yes")
-        or os.getenv("PY_COLORS", "") == "1"
-    )
+    enable_color=bool(getattr(sys.stdout, "isatty", lambda: False)())
 )
 
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")

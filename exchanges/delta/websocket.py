@@ -44,10 +44,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 import websocket          # pip install websocket-client
-from dotenv import load_dotenv
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
-
-load_dotenv()
+import config
 logger = logging.getLogger(__name__)
 
 
@@ -135,8 +133,8 @@ class DeltaWebSocket:
         secret_key: Optional[str] = None,
         testnet:    bool          = False,
     ):
-        self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
-        self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")
+        self.api_key    = api_key    or getattr(config, "DELTA_API_KEY", "")
+        self.secret_key = secret_key or getattr(config, "DELTA_SECRET_KEY", "")
         self.ws_url     = DELTA_WS_TESTNET if testnet else DELTA_WS_LIVE
 
         # Connection state

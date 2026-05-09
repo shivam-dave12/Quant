@@ -37,7 +37,7 @@ def _cfg(name: str, default: Any) -> Any:
 
 def _env_first(*names: str) -> str:
     for name in names:
-        value = os.getenv(name, "")
+        value = _cfg(name, "")
         if str(value or "").strip():
             return str(value).strip()
     return ""
@@ -85,13 +85,13 @@ class BreezeTokenService:
         cache_path: str | Path | None = None,
         ttl_sec: float | None = None,
     ) -> None:
-        self.api_key = api_key if api_key is not None else str(_cfg("BREEZE_API_KEY", os.getenv("BREEZE_API_KEY", "")))
-        self.secret_key = secret_key if secret_key is not None else str(_cfg("BREEZE_SECRET_KEY", os.getenv("BREEZE_SECRET_KEY", "")))
-        self.client_id = client_id if client_id is not None else str(_cfg("ICICI_CLIENT_ID", os.getenv("ICICI_CLIENT_ID", "")))
-        self.password = password if password is not None else str(_cfg("ICICI_PASSWORD", os.getenv("ICICI_PASSWORD", "")))
+        self.api_key = api_key if api_key is not None else str(_cfg("BREEZE_API_KEY", ""))
+        self.secret_key = secret_key if secret_key is not None else str(_cfg("BREEZE_SECRET_KEY", ""))
+        self.client_id = client_id if client_id is not None else str(_cfg("ICICI_CLIENT_ID", ""))
+        self.password = password if password is not None else str(_cfg("ICICI_PASSWORD", ""))
         self._api_session_override = str(api_session or "").strip()
         self._session_token_override = str(session_token or "").strip()
-        self.api_session_path = Path(api_session_path or _cfg("ICICI_API_SESSION_PATH", os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")))
+        self.api_session_path = Path(api_session_path or _cfg("ICICI_API_SESSION_PATH", "data/icici_api_session.txt"))
         self.cache_path = Path(cache_path or _cfg("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json"))
         self.ttl_sec = float(ttl_sec if ttl_sec is not None else _cfg("ICICI_SESSION_TTL_SEC", 6 * 60 * 60))
         self._lock = threading.RLock()

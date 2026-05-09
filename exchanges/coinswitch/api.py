@@ -11,13 +11,11 @@ import urllib.parse
 from typing import Dict, List, Optional, Any
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from urllib.parse import urlparse, urlencode
-from dotenv import load_dotenv
 import logging
 
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
 class FuturesAPI:
@@ -31,8 +29,8 @@ class FuturesAPI:
             api_key: CoinSwitch API key
             secret_key: CoinSwitch secret key
         """
-        self.api_key = api_key or os.getenv('COINSWITCH_API_KEY')
-        self.secret_key = secret_key or os.getenv('COINSWITCH_SECRET_KEY')
+        self.api_key = api_key or getattr(config, 'COINSWITCH_API_KEY', '')
+        self.secret_key = secret_key or getattr(config, 'COINSWITCH_SECRET_KEY', '')
         self.base_url = "https://coinswitch.co"
         
         if not self.api_key or not self.secret_key:

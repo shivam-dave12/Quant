@@ -17,6 +17,14 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
 
+try:
+    import config as cfg
+except Exception:  # allow standalone CLI diagnostics before project import is ready
+    cfg = None
+
+def _cfg(name: str, default=None):
+    return getattr(cfg, name, default) if cfg is not None else default
+
 log = logging.getLogger(__name__)
 
 LOGIN_URL_TMPL = "https://api.icicidirect.com/apiuser/login?api_key={api_key}"
@@ -77,10 +85,7 @@ SELS_OTPOK = [
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(_cfg(name, default))
 
 
 def _looks_like_missing_playwright_browser(exc: BaseException) -> bool:
@@ -94,15 +99,11 @@ def _looks_like_missing_playwright_browser(exc: BaseException) -> bool:
 
 
 def _ensure_playwright_runtime_path() -> Path:
-    candidates: list[Path] = []
-    explicit = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.extend([
-        Path(os.getenv("APP_DATA_DIR", "data")) / "ms-playwright",
-        Path("/app/.ms-playwright"),
+    candidates: list[Path] = [
+        Path(str(_cfg("PLAYWRIGHT_BROWSERS_PATH", "/app/.ms-playwright"))).expanduser(),
+        Path(str(_cfg("APP_DATA_DIR", "data"))) / "ms-playwright",
         Path("/tmp/ms-playwright"),
-    ])
+    ]
     last_exc: Exception | None = None
     for path in candidates:
         try:
@@ -111,12 +112,9 @@ def _ensure_playwright_runtime_path() -> Path:
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
-            home_raw = os.getenv("HOME")
-            home = Path(home_raw).expanduser() if home_raw else None
-            if not home or not home.exists() or not os.access(str(home), os.W_OK):
-                runtime_home = path.parent / "home"
-                runtime_home.mkdir(parents=True, exist_ok=True)
-                os.environ["HOME"] = str(runtime_home)
+            runtime_home = Path(str(_cfg("RUNTIME_HOME", path.parent / "home"))).expanduser()
+            runtime_home.mkdir(parents=True, exist_ok=True)
+            os.environ["HOME"] = str(runtime_home)
             return path
         except Exception as exc:
             last_exc = exc
@@ -143,7 +141,7 @@ def _install_playwright_chromium() -> None:
     cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
     log.warning(
         "ICICI Playwright Chromium browser missing; installing runtime Chromium via: %s (PLAYWRIGHT_BROWSERS_PATH=%s HOME=%s)",
-        " ".join(cmd), os.getenv("PLAYWRIGHT_BROWSERS_PATH"), os.getenv("HOME")
+        " ".join(cmd), os.environ.get("PLAYWRIGHT_BROWSERS_PATH"), os.environ.get("HOME")
     )
     env = os.environ.copy()
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=420, env=env)
@@ -352,13 +350,13 @@ def generate_api_session(
 
 def generate_api_session_from_env(otp_getter=None, otp_code: str | None = None, headless: bool = True) -> str:
     return generate_api_session(
-        api_key=os.getenv("BREEZE_API_KEY", ""),
-        client_id=os.getenv("ICICI_CLIENT_ID", ""),
-        password=os.getenv("ICICI_PASSWORD", ""),
+        api_key=str(_cfg("BREEZE_API_KEY", "")),
+        client_id=str(_cfg("ICICI_CLIENT_ID", "")),
+        password=str(_cfg("ICICI_PASSWORD", "")),
         otp_getter=otp_getter,
         otp_code=otp_code,
         headless=headless,
-        debug_dir=os.getenv("ICICI_DEBUG_DIR", "data/icici_debug"),
+        debug_dir=str(_cfg("ICICI_DEBUG_DIR", "data/icici_debug")),
     )
 
 
@@ -372,12 +370,12 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Generate ICICI Breeze API_Session from the login flow.")
     parser.add_argument("--print-login-url", action="store_true", help="Print only the encoded login URL and exit.")
-    parser.add_argument("--otp", default=os.getenv("ICICI_OTP", ""), help="6 digit OTP/TOTP. Avoid shell history on shared hosts.")
+    parser.add_argument("--otp", default="", help="6 digit OTP/TOTP. Avoid shell history on shared hosts.")
     parser.add_argument("--headed", action="store_true", help="Open a visible browser instead of headless Chromium.")
-    parser.add_argument("--save", default=os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt"), help="Path to save API_Session.")
+    parser.add_argument("--save", default=str(_cfg("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")), help="Path to save API_Session.")
     args = parser.parse_args()
 
-    api_key = os.getenv("BREEZE_API_KEY", "")
+    api_key = str(_cfg("BREEZE_API_KEY", ""))
     if args.print_login_url:
         print(login_url(api_key))
         return 0

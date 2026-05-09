@@ -19,7 +19,6 @@ ICICI_SESSION_CACHE_PATH.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -27,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config
 from exchanges.icici.breeze_auth import BreezeTokenService
 from exchanges.icici.token_generator import generate_api_session_from_env, login_url
 
@@ -36,12 +36,12 @@ def main() -> int:
     parser.add_argument("--login-url", action="store_true", help="Print encoded Breeze login URL and exit")
     parser.add_argument("--generate", action="store_true", help="Generate API_Session using ICICI login automation")
     parser.add_argument("--exchange", action="store_true", help="Exchange API_Session through CustomerDetails")
-    parser.add_argument("--otp", default=os.getenv("ICICI_OTP", ""), help="6 digit OTP/TOTP for headless login")
+    parser.add_argument("--otp", default="", help="6 digit OTP/TOTP for headless login")
     parser.add_argument("--headed", action="store_true", help="Use a headed browser for login automation")
-    parser.add_argument("--api-session-path", default=os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt"))
+    parser.add_argument("--api-session-path", default=config.ICICI_API_SESSION_PATH)
     args = parser.parse_args()
 
-    api_key = os.getenv("BREEZE_API_KEY", "")
+    api_key = config.BREEZE_API_KEY
     if args.login_url:
         print(login_url(api_key))
         return 0

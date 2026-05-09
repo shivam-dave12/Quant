@@ -15,61 +15,55 @@ except ImportError:  # production image may not ship python-dotenv
         return False
 
 APP_ROOT = Path(__file__).resolve().parent
-ENV_FILE = Path(os.getenv("BOT_ENV_FILE", str(APP_ROOT / ".env"))).expanduser()
-BOT_DOTENV_OVERRIDE = os.getenv("BOT_DOTENV_OVERRIDE", "true").strip().lower() in {"1", "true", "yes", "on"}
-DOTENV_LOADED = bool(load_dotenv(dotenv_path=ENV_FILE, override=BOT_DOTENV_OVERRIDE))
+
+# v89: only credentials/tokens are read from .env. All operational behaviour
+# lives in this file so AWS/Docker cannot silently override live gates.
+ENV_FILE = APP_ROOT / ".env"
+BOT_DOTENV_OVERRIDE = True
+DOTENV_LOADED = bool(load_dotenv(dotenv_path=ENV_FILE, override=True))
 
 def _raw_env(name: str, default: str = "") -> str:
+    # For diagnostics only; runtime policy must not depend on env except secrets.
     return os.getenv(name, default)
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
-
-
-def _env_float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
-
 # ── Exchange routing ──────────────────────────────────────────────────────────
-EXECUTION_EXCHANGE = os.getenv("EXECUTION_EXCHANGE", "delta").lower()
+EXECUTION_EXCHANGE = "delta"
 
-# ── Credentials ───────────────────────────────────────────────────────────────
+# ── Runtime profile: edit config.py, not .env ────────────────────────────────
+DELTA_TESTNET = False
+REQUIRE_EXCHANGE_CREDENTIALS = True
+
+APP_DATA_DIR = str(APP_ROOT / "data")
+PLAYWRIGHT_BROWSERS_PATH = str(APP_ROOT / ".ms-playwright")
+RUNTIME_HOME = str(APP_ROOT / ".runtime-home")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
+os.environ.setdefault("HOME", RUNTIME_HOME)
+
+# ── Credentials/secrets only: these remain in .env or cloud secret manager ───
 DELTA_API_KEY             = os.getenv("DELTA_API_KEY",    "")
 DELTA_SECRET_KEY          = os.getenv("DELTA_SECRET_KEY", "")
-DELTA_TESTNET             = os.getenv("DELTA_TESTNET", "false").lower() == "true"
 COINSWITCH_API_KEY        = os.getenv("COINSWITCH_API_KEY",    "")
 COINSWITCH_SECRET_KEY     = os.getenv("COINSWITCH_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-REQUIRE_EXCHANGE_CREDENTIALS = os.getenv("REQUIRE_EXCHANGE_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
-
-# Keep module imports/test tooling/dashboard safe without live secrets. The bot
-# runtime still refuses to trade unless a configured exchange has both key and
-# secret in main.initialize(). Set REQUIRE_EXCHANGE_CREDENTIALS=true for a
-# deployment-time fail-fast check.
-if REQUIRE_EXCHANGE_CREDENTIALS and not (DELTA_API_KEY or COINSWITCH_API_KEY):
-    raise ValueError("No exchange credentials in .env. Set DELTA_API_KEY/DELTA_SECRET_KEY or COINSWITCH_API_KEY/COINSWITCH_SECRET_KEY.")
+# Keep imports/test tooling/dashboard safe without live secrets. Live startup and
+# scripts/live_preflight.py enforce credentials through assert_live_ordering_ready().
+# Do not raise at import time; otherwise tests and offline tooling cannot load.
 
 # ── Symbol / leverage policy ───────────────────────────────────────────────────
 SYMBOL                   = "BTCUSDT"
 # LEVERAGE is retained as a compatibility display knob only. v83 sizing uses
 # core.market_policy.MAX_POLICY_LEVERAGE plus each venue's confirmed product cap.
 LEVERAGE                 = 1
-MAX_POLICY_LEVERAGE      = _env_float("MAX_POLICY_LEVERAGE", 40.0)
-POLICY_CRYPTO_LEVERAGE_UTIL = _env_float("POLICY_CRYPTO_LEVERAGE_UTIL", 0.55)
-POLICY_FUTURE_LEVERAGE_UTIL = _env_float("POLICY_FUTURE_LEVERAGE_UTIL", 0.50)
-POLICY_COMMODITY_LEVERAGE_UTIL = _env_float("POLICY_COMMODITY_LEVERAGE_UTIL", 0.40)
-POLICY_EQUITY_LEVERAGE_UTIL = _env_float("POLICY_EQUITY_LEVERAGE_UTIL", 0.32)
-POLICY_INDEX_LEVERAGE_UTIL = _env_float("POLICY_INDEX_LEVERAGE_UTIL", 0.35)
-POLICY_GENERIC_LEVERAGE_UTIL = _env_float("POLICY_GENERIC_LEVERAGE_UTIL", 0.35)
-POLICY_ICICI_CASH_MARGIN_PCT = _env_float("POLICY_ICICI_CASH_MARGIN_PCT", 0.06)
+MAX_POLICY_LEVERAGE      = 40.0
+POLICY_CRYPTO_LEVERAGE_UTIL = 0.55
+POLICY_FUTURE_LEVERAGE_UTIL = 0.50
+POLICY_COMMODITY_LEVERAGE_UTIL = 0.40
+POLICY_EQUITY_LEVERAGE_UTIL = 0.32
+POLICY_INDEX_LEVERAGE_UTIL = 0.35
+POLICY_GENERIC_LEVERAGE_UTIL = 0.35
+POLICY_ICICI_CASH_MARGIN_PCT = 0.06
 DELTA_SYMBOL             = "BTCUSD"
 DELTA_CONTRACT_VALUE_BTC = 0.001
 DELTA_BALANCE_CURRENCY   = "USD"
@@ -622,7 +616,7 @@ MI_ENABLE_DYNAMIC_POST_EXIT_GATES = True
 # The scanner does NOT trade aliases.  It queries Delta/CoinSwitch live product
 # catalogs and activates only contracts actually returned by the exchange.
 MULTI_ASSET_ENABLED = True
-SCANNER_MAX_ACTIVE_INSTRUMENTS = _env_int("SCANNER_MAX_ACTIVE_INSTRUMENTS", 0)
+SCANNER_MAX_ACTIVE_INSTRUMENTS = 0
 SCANNER_TICK_SLEEP_SEC = 0.25
 SCANNER_ASSET_HEARTBEAT_SEC = 60.0
 SCANNER_ASSET_ANALYSIS_LOG_SEC = 15.0  # per-contract proof-of-analysis log cadence
@@ -645,30 +639,30 @@ PORTFOLIO_REPORT_CAPITAL_WEIGHTED_METRICS = True
 # Agentic institutional fund runtime.
 # Agents select which desks may run entry logic. QuantStrategy still owns alpha
 # validation; Risk/Execution remain deterministic final authorities.
-AGENTIC_FUND_ENABLED = _env_bool("AGENTIC_FUND_ENABLED", True)
-FUND_PAPER_MODE = _env_bool("FUND_PAPER_MODE", True)
-FUND_LIVE_ORDERING_ENABLED = _env_bool("FUND_LIVE_ORDERING_ENABLED", False)
-FUND_TOP_N_EXECUTION_DESKS = _env_int("FUND_TOP_N_EXECUTION_DESKS", 0)
-FUND_TOP_N_DEPTH_SCAN = _env_int("FUND_TOP_N_DEPTH_SCAN", 0)
-FUND_MIN_TICKER_SCORE = _env_float("FUND_MIN_TICKER_SCORE", 0.52)
-FUND_MIN_EXECUTION_SCORE = _env_float("FUND_MIN_EXECUTION_SCORE", 0.58)
-FUND_MIN_SETUP_SCORE = _env_float("FUND_MIN_SETUP_SCORE", 0.50)
-FUND_MAX_SPREAD_BPS_CRYPTO = _env_float("FUND_MAX_SPREAD_BPS_CRYPTO", 18.0)
-FUND_MAX_SPREAD_BPS_EQUITY = _env_float("FUND_MAX_SPREAD_BPS_EQUITY", 45.0)
-FUND_MAX_SPREAD_BPS_COMMODITY = _env_float("FUND_MAX_SPREAD_BPS_COMMODITY", 55.0)
-FUND_MAX_SPREAD_BPS_OPTION = _env_float("FUND_MAX_SPREAD_BPS_OPTION", 120.0)
-FUND_MAX_SPREAD_BPS_FUTURE = _env_float("FUND_MAX_SPREAD_BPS_FUTURE", 65.0)
-FUND_MAX_DATA_AGE_SEC = _env_float("FUND_MAX_DATA_AGE_SEC", 90.0)
-FUND_MIN_WARMUP_RATIO = _env_float("FUND_MIN_WARMUP_RATIO", 0.88)
-FUND_AUDIT_LOG_PATH = os.getenv("FUND_AUDIT_LOG_PATH", "data/fund_audit.jsonl")
-FUND_CIO_DECISION_SEC = _env_float("FUND_CIO_DECISION_SEC", 3.0)
-FUND_CIO_REPORT_SEC = _env_float("FUND_CIO_REPORT_SEC", 30.0)
+AGENTIC_FUND_ENABLED = True
+FUND_PAPER_MODE = False
+FUND_LIVE_ORDERING_ENABLED = True
+FUND_TOP_N_EXECUTION_DESKS = 0
+FUND_TOP_N_DEPTH_SCAN = 0
+FUND_MIN_TICKER_SCORE = 0.52
+FUND_MIN_EXECUTION_SCORE = 0.58
+FUND_MIN_SETUP_SCORE = 0.50
+FUND_MAX_SPREAD_BPS_CRYPTO = 18.0
+FUND_MAX_SPREAD_BPS_EQUITY = 45.0
+FUND_MAX_SPREAD_BPS_COMMODITY = 55.0
+FUND_MAX_SPREAD_BPS_OPTION = 120.0
+FUND_MAX_SPREAD_BPS_FUTURE = 65.0
+FUND_MAX_DATA_AGE_SEC = 90.0
+FUND_MIN_WARMUP_RATIO = 0.88
+FUND_AUDIT_LOG_PATH = "data/fund_audit.jsonl"
+FUND_CIO_DECISION_SEC = 3.0
+FUND_CIO_REPORT_SEC = 30.0
 
 def live_ordering_config_summary() -> str:
     return (
-        f"env_file={ENV_FILE} loaded={DOTENV_LOADED} override={BOT_DOTENV_OVERRIDE}; "
-        f"FUND_PAPER_MODE={FUND_PAPER_MODE} raw={_raw_env('FUND_PAPER_MODE', '<unset>')}; "
-        f"FUND_LIVE_ORDERING_ENABLED={FUND_LIVE_ORDERING_ENABLED} raw={_raw_env('FUND_LIVE_ORDERING_ENABLED', '<unset>')}; "
+        f"policy_source=config.py; secrets_file={ENV_FILE} loaded={DOTENV_LOADED}; "
+        f"FUND_PAPER_MODE={FUND_PAPER_MODE}; "
+        f"FUND_LIVE_ORDERING_ENABLED={FUND_LIVE_ORDERING_ENABLED}; "
         f"EXECUTION_EXCHANGE={EXECUTION_EXCHANGE}; "
         f"DELTA_KEY={'set' if bool(DELTA_API_KEY) else 'missing'}; "
         f"ICICI_ENABLED={globals().get('ICICI_ENABLED', '<late-init>')}"
@@ -686,43 +680,43 @@ def assert_live_ordering_ready() -> tuple[bool, str]:
 # Optional venues. Delta/CoinSwitch are the current execution stack. ICICI and
 # CoinDCX are institutional adapters; enable only after credentials, static IP,
 # and paper-mode validation are complete.
-ICICI_ENABLED = _env_bool("ICICI_ENABLED", False)
+ICICI_ENABLED = True
 BREEZE_API_KEY = os.getenv("BREEZE_API_KEY", "")
 BREEZE_SECRET_KEY = os.getenv("BREEZE_SECRET_KEY", "")
 ICICI_CLIENT_ID = os.getenv("ICICI_CLIENT_ID", "")
 ICICI_PASSWORD = os.getenv("ICICI_PASSWORD", "")
-ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
+ICICI_API_SESSION_PATH = "data/icici_api_session.txt"
 # Optional manual tokens. Prefer BREEZE_API_SESSION/ICICI_API_SESSION because
 # CustomerDetails then returns the signed-request session_token.
 BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
 BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", os.getenv("ICICI_SESSION_TOKEN", ""))
-ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
-ICICI_SESSION_TTL_SEC = float(os.getenv("ICICI_SESSION_TTL_SEC", str(6 * 60 * 60)))
-ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
-ICICI_BREEZE_PREFLIGHT_ON_STARTUP = _env_bool("ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
+ICICI_SESSION_CACHE_PATH = "data/icici_breeze_session.json"
+ICICI_SESSION_TTL_SEC = float(6 * 60 * 60)
+ICICI_DEBUG_DIR = "data/icici_debug"
+ICICI_BREEZE_PREFLIGHT_ON_STARTUP = True
 # When the bot is started from Telegram and a Breeze API_Session is missing,
 # launch the token-generator browser flow automatically, ask the approved
 # Telegram operator for OTP, scrape the API_Session from the redirect, then
 # exchange it through CustomerDetails before ICICI protected endpoints are used.
-ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = _env_bool("ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True)
-ICICI_TOKEN_GENERATOR_HEADLESS = _env_bool("ICICI_TOKEN_GENERATOR_HEADLESS", True)
-ICICI_PLAYWRIGHT_AUTO_INSTALL = _env_bool("ICICI_PLAYWRIGHT_AUTO_INSTALL", True)
-ICICI_OTP_WAIT_SEC = _env_float("ICICI_OTP_WAIT_SEC", 180.0)
-ICICI_AUTH_REQUIRED_FOR_DETAILS = _env_bool("ICICI_AUTH_REQUIRED_FOR_DETAILS", False)
+ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP = True
+ICICI_TOKEN_GENERATOR_HEADLESS = True
+ICICI_PLAYWRIGHT_AUTO_INSTALL = True
+ICICI_OTP_WAIT_SEC = 180.0
+ICICI_AUTH_REQUIRED_FOR_DETAILS = True
 
-COINDCX_ENABLED = _env_bool("COINDCX_ENABLED", False)
+COINDCX_ENABLED = False
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
 COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY", "")
 
 # Dynamic universe discovery. The scanner reads live venue catalogs by default;
 # this list is intentionally empty so old fixed baskets cannot cap coverage.
-UNIVERSE_DISCOVERY_MODE = os.getenv("UNIVERSE_DISCOVERY_MODE", "dynamic").lower()
-UNIVERSE_INCLUDE_EXCHANGES = os.getenv("UNIVERSE_INCLUDE_EXCHANGES", "delta,coinswitch,icici,coindcx")
-UNIVERSE_INCLUDE_ASSET_CLASSES = os.getenv("UNIVERSE_INCLUDE_ASSET_CLASSES", "crypto,commodity,index,equity,option,future,cash")
+UNIVERSE_DISCOVERY_MODE = "dynamic"
+UNIVERSE_INCLUDE_EXCHANGES = "delta,icici"
+UNIVERSE_INCLUDE_ASSET_CLASSES = "crypto,commodity,index,equity,option,future"
 MULTI_ASSET_REQUESTS = []
-DISCOVERY_REPORT_PREVIEW = _env_int("DISCOVERY_REPORT_PREVIEW", 80)
-ICICI_DISCOVERY_ENABLED = _env_bool("ICICI_DISCOVERY_ENABLED", True)
-ICICI_SECURITY_MASTER_URL = os.getenv("ICICI_SECURITY_MASTER_URL", "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip")
+DISCOVERY_REPORT_PREVIEW = 80
+ICICI_DISCOVERY_ENABLED = True
+ICICI_SECURITY_MASTER_URL = "http://directlink.icicidirect.com/NewSecurityMaster/SecurityMaster.zip"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -772,13 +766,13 @@ TELEGRAM_ALERT_PROTECTION_FAILURE = True
 
 # Dashboard telemetry: non-blocking direct feed to local dashboard backend.
 # If the dashboard is offline, events are dropped; trading is never blocked.
-DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://127.0.0.1:8000")
-DASHBOARD_QUEUE_MAX = int(os.getenv("DASHBOARD_QUEUE_MAX", "2000"))
-DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
-DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
-DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
-DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))
+DASHBOARD_ENABLED = True
+DASHBOARD_URL = "http://127.0.0.1:8000"
+DASHBOARD_QUEUE_MAX = 2000
+DASHBOARD_TIMEOUT_SEC = 0.8
+DASHBOARD_HEARTBEAT_SEC = 5.0
+DASHBOARD_SCAN_UPDATE_SEC = 5.0
+DASHBOARD_POSITION_UPDATE_SEC = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v80 DYNAMIC INSTITUTIONAL TRADABLE-SELECTION DESK
@@ -786,26 +780,26 @@ DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC",
 # Discovery can see the full venue catalog, but live candle/orderbook/trade
 # subscriptions are opened only for the desk-selected shortlist.  This prevents
 # Delta from being flooded with 100+ simultaneous candle streams at startup.
-DYNAMIC_TRADABLE_DESK_ENABLED = _env_bool("DYNAMIC_TRADABLE_DESK_ENABLED", True)
-DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = _env_int("DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS", 12)
-DYNAMIC_DESK_MIN_SCORE = _env_float("DYNAMIC_DESK_MIN_SCORE", 0.38)
-DYNAMIC_DESK_REFRESH_SEC = _env_float("DYNAMIC_DESK_REFRESH_SEC", 180.0)
-DYNAMIC_DESK_MIN_RESIDENCY_SEC = _env_float("DYNAMIC_DESK_MIN_RESIDENCY_SEC", 600.0)
-DYNAMIC_DESK_DELTA_BULK_TICKERS = _env_bool("DYNAMIC_DESK_DELTA_BULK_TICKERS", True)
-DYNAMIC_DESK_ICICI_DETAILS_ENABLED = _env_bool("DYNAMIC_DESK_ICICI_DETAILS_ENABLED", True)
-DYNAMIC_DESK_ICICI_QUOTE_PROBES = _env_int("DYNAMIC_DESK_ICICI_QUOTE_PROBES", 8)
-DYNAMIC_DESK_ALWAYS_INCLUDE = os.getenv("DYNAMIC_DESK_ALWAYS_INCLUDE", "")
-DYNAMIC_DESK_LOG_TOP_N = _env_int("DYNAMIC_DESK_LOG_TOP_N", 12)
+DYNAMIC_TRADABLE_DESK_ENABLED = True
+DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = 8
+DYNAMIC_DESK_MIN_SCORE = 0.38
+DYNAMIC_DESK_REFRESH_SEC = 180.0
+DYNAMIC_DESK_MIN_RESIDENCY_SEC = 600.0
+DYNAMIC_DESK_DELTA_BULK_TICKERS = True
+DYNAMIC_DESK_ICICI_DETAILS_ENABLED = True
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = 8
+DYNAMIC_DESK_ALWAYS_INCLUDE = "BTCUSD,ETHUSD,SOLUSD"
+DYNAMIC_DESK_LOG_TOP_N = 12
 
 # Candle streaming policy for activated desks only.  HTF candles may still be
 # warmed through REST, but live WS candles should stay lean.  Empty value means
 # use the DeltaDataManager default map.
-DELTA_ACTIVE_CANDLE_STREAMS = os.getenv("DELTA_ACTIVE_CANDLE_STREAMS", "1m,5m,15m,1h")
-DELTA_REST_WARMUP_TIMEFRAMES = os.getenv("DELTA_REST_WARMUP_TIMEFRAMES", "1m,5m,15m,1h,4h,1d")
+DELTA_ACTIVE_CANDLE_STREAMS = "1m,5m,15m,1h"
+DELTA_REST_WARMUP_TIMEFRAMES = "1m,5m,15m,1h,4h,1d"
 
 # ICICI security master cache.  Discovery should not fail just because the
 # public master URL is slow/unreachable during startup.
-ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
+ICICI_SECURITY_MASTER_CACHE_PATH = "data/icici_security_master.zip"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v85 ASSET-DESK + VENUE-ROUTER INSTITUTIONAL ARCHITECTURE
@@ -813,15 +807,15 @@ ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH",
 # Alpha desks are organised by asset/instrument thesis, not by broker venue.
 # Example: BTC is one global BTC desk; Delta/CoinSwitch/CoinDCX are venue routes
 # under that desk. Venue fragmentation must not create duplicate BTC strategies.
-DESK_ENABLED_IDS = os.getenv("DESK_ENABLED_IDS", "")
-DESK_MAX_ACTIVE_BY_ID = os.getenv("DESK_MAX_ACTIVE_BY_ID", "")
-DESK_BTC_GLOBAL_MAX_ACTIVE = _env_int("DESK_BTC_GLOBAL_MAX_ACTIVE", 1)
-DESK_CRYPTO_ALTS_MAX_ACTIVE = _env_int("DESK_CRYPTO_ALTS_MAX_ACTIVE", 7)
-DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = _env_int("DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE", 2)
-DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = _env_int("DESK_COMMODITIES_GLOBAL_MAX_ACTIVE", 2)
-DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = _env_int("DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 4)
-DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = _env_int("DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 6)
-VENUE_ROUTE_PREFERENCE = os.getenv("VENUE_ROUTE_PREFERENCE", "delta,coindcx,coinswitch,icici")
+DESK_ENABLED_IDS = "BTC_GLOBAL,CRYPTO_ALTS,ICICI_INDEX_OPTIONS,ICICI_STOCK_OPTIONS"
+DESK_MAX_ACTIVE_BY_ID = ""
+DESK_BTC_GLOBAL_MAX_ACTIVE = 1
+DESK_CRYPTO_ALTS_MAX_ACTIVE = 5
+DESK_US_STOCK_DERIVATIVES_MAX_ACTIVE = 0
+DESK_COMMODITIES_GLOBAL_MAX_ACTIVE = 0
+DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE = 2
+DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE = 2
+VENUE_ROUTE_PREFERENCE = "delta,icici"
 
 # Backward-compatible env aliases only. Do not use these names in new logic;
 # they are preserved so old .env files don't crash while v85 migrates configs.
@@ -836,14 +830,14 @@ DESK_COINDCX_CRYPTO_MAX_ACTIVE = 0
 
 # Indian market mandate: only NFO/BFO options are eligible. Cash/futures rows may
 # be discovered for reference but are rejected before runtime subscription.
-ICICI_OPTIONS_ONLY = _env_bool("ICICI_OPTIONS_ONLY", True)
-ICICI_OPTIONS_RUNTIME_ENABLED = _env_bool("ICICI_OPTIONS_RUNTIME_ENABLED", True)
-ICICI_OPTION_MIN_DTE = _env_float("ICICI_OPTION_MIN_DTE", 2.0)
-ICICI_OPTION_MAX_DTE = _env_float("ICICI_OPTION_MAX_DTE", 21.0)
-ICICI_OPTION_MAX_THETA_TO_PREMIUM = _env_float("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08)
-ICICI_OPTION_MAX_SPREAD_BPS = _env_float("ICICI_OPTION_MAX_SPREAD_BPS", 180.0)
-ICICI_INDEX_OPTION_TARGET_ABS_DELTA = _env_float("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45)
-ICICI_STOCK_OPTION_TARGET_ABS_DELTA = _env_float("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50)
-ICICI_OPTION_DELTA_BAND = _env_float("ICICI_OPTION_DELTA_BAND", 0.22)
-ICICI_OPTION_IV_STRESS_PRIOR = _env_float("ICICI_OPTION_IV_STRESS_PRIOR", 0.24)
-INDIA_RISK_FREE_RATE = _env_float("INDIA_RISK_FREE_RATE", 0.065)
+ICICI_OPTIONS_ONLY = True
+ICICI_OPTIONS_RUNTIME_ENABLED = True
+ICICI_OPTION_MIN_DTE = 2.0
+ICICI_OPTION_MAX_DTE = 21.0
+ICICI_OPTION_MAX_THETA_TO_PREMIUM = 0.08
+ICICI_OPTION_MAX_SPREAD_BPS = 180.0
+ICICI_INDEX_OPTION_TARGET_ABS_DELTA = 0.45
+ICICI_STOCK_OPTION_TARGET_ABS_DELTA = 0.50
+ICICI_OPTION_DELTA_BAND = 0.22
+ICICI_OPTION_IV_STRESS_PRIOR = 0.24
+INDIA_RISK_FREE_RATE = 0.065

@@ -33,8 +33,8 @@ class CoinDCXRestClient:
     PRIVATE_BASE = "https://api.coindcx.com"
 
     def __init__(self, api_key: str | None = None, secret_key: str | None = None) -> None:
-        self.api_key = api_key if api_key is not None else str(_cfg("COINDCX_API_KEY", os.getenv("COINDCX_API_KEY", "")))
-        self.secret_key = secret_key if secret_key is not None else str(_cfg("COINDCX_SECRET_KEY", os.getenv("COINDCX_SECRET_KEY", "")))
+        self.api_key = api_key if api_key is not None else str(_cfg("COINDCX_API_KEY", ""))
+        self.secret_key = secret_key if secret_key is not None else str(_cfg("COINDCX_SECRET_KEY", ""))
         self.http = requests.Session()
 
     def get_tickers(self) -> Dict[str, Any] | list:

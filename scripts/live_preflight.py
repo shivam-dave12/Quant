@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys
+import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -12,7 +12,7 @@ print("=== Quant Bot Live Preflight ===")
 line("OK", "env", config.live_ordering_config_summary())
 ready, reason = config.assert_live_ordering_ready()
 line("OK" if ready else "WARN", "live_ordering", reason)
-browser_path = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", str(ROOT / ".ms-playwright"))).expanduser()
+browser_path = Path(config.PLAYWRIGHT_BROWSERS_PATH).expanduser()
 try:
     browser_path.mkdir(parents=True, exist_ok=True)
     probe = browser_path / ".write_test"; probe.write_text("ok"); probe.unlink(missing_ok=True)
@@ -20,7 +20,7 @@ try:
 except Exception as exc:
     line("FAIL", "playwright_path", f"{browser_path} not writable: {exc}"); raise SystemExit(2)
 if getattr(config, "ICICI_ENABLED", False) or getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", False):
-    missing=[n for n in ("BREEZE_API_KEY","BREEZE_SECRET_KEY","ICICI_CLIENT_ID","ICICI_PASSWORD") if not os.getenv(n)]
+    missing=[n for n in ("BREEZE_API_KEY","BREEZE_SECRET_KEY","ICICI_CLIENT_ID","ICICI_PASSWORD") if not getattr(config, n, "")]
     if missing:
         line("FAIL", "icici_credentials", "missing " + ",".join(missing)); raise SystemExit(2)
     line("OK", "icici_credentials", "required fields present")

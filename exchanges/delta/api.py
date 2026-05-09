@@ -32,10 +32,8 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from dotenv import load_dotenv
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
-
-load_dotenv()
+import config
 logger = logging.getLogger(__name__)
 
 
@@ -127,8 +125,8 @@ class DeltaAPI:
         testnet:    bool          = False,
         timeout:    int           = 10,  # was 30s — 30s × retries = multi-min main-thread freeze
     ):
-        self.api_key    = api_key    or os.getenv("DELTA_API_KEY",    "")
-        self.secret_key = secret_key or os.getenv("DELTA_SECRET_KEY", "")
+        self.api_key    = api_key    or getattr(config, "DELTA_API_KEY", "")
+        self.secret_key = secret_key or getattr(config, "DELTA_SECRET_KEY", "")
         self.base_url   = DELTA_TESTNET_URL if testnet else DELTA_LIVE_URL
         self.timeout    = timeout
         self._session   = requests.Session()
