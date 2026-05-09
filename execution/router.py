@@ -25,7 +25,7 @@ import config
 from core.types  import Exchange
 from execution.order_manager import (
     OrderManager, CancelResult, GlobalRateLimiter,
-    _CS_LIMITER, _DELTA_LIMITER,
+    _CS_LIMITER, _DELTA_LIMITER, _ICICI_LIMITER,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class ExecutionRouter:
         coinswitch_om: Optional[OrderManager],
         delta_om:      Optional[OrderManager],
         default:       str = "delta",
+        icici_om:      Optional[OrderManager] = None,
     ) -> None:
         self._lock        = threading.RLock()
         self._managers: Dict[str, OrderManager] = {}
@@ -50,6 +51,8 @@ class ExecutionRouter:
             self._managers[Exchange.COINSWITCH.value] = coinswitch_om
         if delta_om is not None:
             self._managers[Exchange.DELTA.value] = delta_om
+        if icici_om is not None:
+            self._managers[Exchange.ICICI.value] = icici_om
 
         if not self._managers:
             raise RuntimeError("ExecutionRouter requires at least one OrderManager")
@@ -69,8 +72,12 @@ class ExecutionRouter:
 
     def _sync_global_limiter(self) -> None:
         """Make GlobalRateLimiter point at the active exchange's limiter."""
-        limiter = _DELTA_LIMITER if self._active_key == Exchange.DELTA.value \
-                  else _CS_LIMITER
+        if self._active_key == Exchange.DELTA.value:
+            limiter = _DELTA_LIMITER
+        elif self._active_key == Exchange.ICICI.value:
+            limiter = _ICICI_LIMITER
+        else:
+            limiter = _CS_LIMITER
         GlobalRateLimiter.set_active(limiter)
 
     # ── Properties ───────────────────────────────────────────────────────────

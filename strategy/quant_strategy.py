@@ -191,15 +191,10 @@ class QCfg:
         return str(inst.primary_exchange.value if inst is not None else getattr(config, "EXCHANGE", getattr(config, "EXECUTION_EXCHANGE", "delta")))
     @staticmethod
     def LEVERAGE() -> int:
-        base = max(1, int(_cfg("LEVERAGE", 30)))
-        inst = current_instrument()
-        try:
-            max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0) if inst is not None else 0.0
-            if max_lev > 0:
-                return max(1, min(base, int(max_lev)))
-        except Exception:
-            pass
-        return base
+        # v83: use the institutional instrument policy. Global config.LEVERAGE is
+        # no longer a trade-sizing source because ICICI/options/cash must remain
+        # 1x and Delta product rows can publish different leverage caps per ticker.
+        return max(1, int(policy_value("leverage", 1)))
     @staticmethod
     def MARGIN_PCT() -> float: return float(policy_value("margin_pct", _cfg("QUANT_MARGIN_PCT", 0.20)))
     @staticmethod

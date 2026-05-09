@@ -170,7 +170,7 @@ class BreezeTokenService:
                     password=self.password,
                     otp_getter=otp_getter,
                     otp_code=otp_code,
-                    headless=True,
+                    headless=bool(_cfg("ICICI_TOKEN_GENERATOR_HEADLESS", True)),
                     debug_dir=str(_cfg("ICICI_DEBUG_DIR", "data/icici_debug")),
                 )
                 self._save_api_session(api_session)

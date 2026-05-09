@@ -20,6 +20,7 @@ from collections import deque
 import sys, os as _os; sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import config
 from core.pnl import gross_pnl_usd
+from core.market_policy import active_policy
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +386,11 @@ class RiskManager:
             is_win = pnl > 0
 
             notional_at_entry = entry_price * quantity
-            lev = float(leverage if leverage is not None else getattr(config, "LEVERAGE", 1) or 1)
+            try:
+                pol_lev = float(active_policy(instrument).leverage if instrument is not None else 1.0)
+            except Exception:
+                pol_lev = 1.0
+            lev = float(leverage if leverage is not None else pol_lev or 1.0)
             margin_used       = notional_at_entry / lev if lev > 0 else notional_at_entry
             return_on_margin  = (pnl / margin_used * 100) if margin_used > 0 else 0.0
             try:

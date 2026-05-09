@@ -1,6 +1,4 @@
-"""ICICI Breeze venue integration."""
-
 from .api import BreezeRestClient
-from .breeze_auth import BreezeSession, BreezeTokenService
+from .data_manager import ICICIOptionDataManager
 
-__all__ = ["BreezeRestClient", "BreezeSession", "BreezeTokenService"]
+__all__ = ["BreezeRestClient", "ICICIOptionDataManager"]

@@ -21,7 +21,7 @@ try:
 except Exception:  # pragma: no cover
     config = None  # type: ignore
 
-from core.instruments import AssetClass, TradableInstrument, current_instrument
+from core.instruments import AssetClass, ExchangeName, TradableInstrument, current_instrument
 
 
 def _cfg(name: str, default: Any) -> Any:
@@ -102,19 +102,72 @@ class InstrumentPolicy:
         return d
 
 
-def _cap_leverage(inst: Optional[TradableInstrument], default: int) -> int:
-    base = max(1, int(default))
-    if inst is None:
-        return base
+def _primary_exchange(inst: Optional[TradableInstrument]) -> Optional[ExchangeName]:
     try:
-        mx = float(getattr(inst, 'max_leverage', 0.0) or 0.0)
-        if mx > 0:
-            return max(1, min(base, int(mx)))
+        return inst.primary_exchange if inst is not None else None
+    except Exception:
+        return None
+
+
+def _confirmed_max_leverage(inst: Optional[TradableInstrument]) -> float:
+    if inst is None:
+        # Single-symbol legacy mode has no TradableInstrument context. Treat it
+        # as a generic leveraged venue bounded by MAX_POLICY_LEVERAGE; multi-asset
+        # mode always supplies an instrument and therefore uses venue metadata.
+        return max(1.0, _f("MAX_POLICY_LEVERAGE", 40.0))
+    ex = _primary_exchange(inst)
+    ac = getattr(inst, "asset_class", AssetClass.CRYPTO)
+    # ICICI Indian-market cash, futures and options are modelled as fully funded
+    # instruments in this bot. Do not set exchange leverage and do not divide
+    # notional by a leverage factor for margin P&L.
+    if ex == ExchangeName.ICICI or ac in (AssetClass.CASH, AssetClass.OPTION):
+        return 1.0
+    try:
+        mx = float(getattr(inst, "max_leverage", 0.0) or 0.0)
+        if math.isfinite(mx) and mx > 0:
+            return max(1.0, mx)
     except Exception:
         pass
-    if inst.asset_class in (AssetClass.EQUITY, AssetClass.COMMODITY, AssetClass.INDEX):
-        return min(base, 25)
-    return base
+    # Unknown leverage is not permission to use a static number. Use 1x until
+    # the venue product row explicitly confirms otherwise.
+    return 1.0
+
+
+def _leverage_utilisation(inst: Optional[TradableInstrument]) -> float:
+    if inst is None:
+        return 0.25
+    ac = getattr(inst, "asset_class", AssetClass.CRYPTO)
+    ex = _primary_exchange(inst)
+    if ex == ExchangeName.ICICI or ac in (AssetClass.CASH, AssetClass.OPTION):
+        return 1.0
+    if ac == AssetClass.CRYPTO:
+        return _f("POLICY_CRYPTO_LEVERAGE_UTIL", 0.55)
+    if ac == AssetClass.FUTURE:
+        return _f("POLICY_FUTURE_LEVERAGE_UTIL", 0.50)
+    if ac == AssetClass.COMMODITY:
+        return _f("POLICY_COMMODITY_LEVERAGE_UTIL", 0.40)
+    if ac == AssetClass.EQUITY:
+        return _f("POLICY_EQUITY_LEVERAGE_UTIL", 0.32)
+    if ac == AssetClass.INDEX:
+        return _f("POLICY_INDEX_LEVERAGE_UTIL", 0.35)
+    return _f("POLICY_GENERIC_LEVERAGE_UTIL", 0.35)
+
+
+def _target_leverage(inst: Optional[TradableInstrument]) -> int:
+    venue_cap = _confirmed_max_leverage(inst)
+    configured_cap = max(1.0, _f("MAX_POLICY_LEVERAGE", venue_cap))
+    raw = min(venue_cap, configured_cap) * max(0.0, min(1.0, _leverage_utilisation(inst)))
+    return max(1, int(math.floor(raw)))
+
+
+def _margin_pct_for(inst: Optional[TradableInstrument], base_margin: float, configured_name: str, configured_default: float) -> float:
+    # Margin budget is capital allocation, not leverage. Fully funded products
+    # still receive a position budget, but P&L/margin calculations remain 1x.
+    ex = _primary_exchange(inst)
+    ac = getattr(inst, "asset_class", AssetClass.CRYPTO) if inst is not None else AssetClass.CRYPTO
+    if ex == ExchangeName.ICICI or ac in (AssetClass.CASH, AssetClass.OPTION):
+        return min(base_margin, _f("POLICY_ICICI_CASH_MARGIN_PCT", 0.06))
+    return min(base_margin, _f(configured_name, configured_default))
 
 
 def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPolicy:
@@ -130,15 +183,49 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     ac = getattr(inst, 'asset_class', AssetClass.CRYPTO) if inst is not None else AssetClass.CRYPTO
     asset_id = getattr(inst, 'asset_id', 'GLOBAL') if inst is not None else 'GLOBAL'
 
-    lev = _cap_leverage(inst, _i('LEVERAGE', 30))
+    lev = _target_leverage(inst)
     base_margin = _f('QUANT_MARGIN_PCT', 0.20)
     base_rr = _f('MIN_RISK_REWARD_RATIO', 2.0)
     base_cooldown = _i('QUANT_COOLDOWN_SEC', 300)
 
+
+    if ac == AssetClass.CASH:
+        return InstrumentPolicy(
+            asset_id=asset_id, asset_class=ac.value, leverage=1,
+            margin_pct=_margin_pct_for(inst, base_margin, 'POLICY_ICICI_CASH_MARGIN_PCT', 0.06),
+            risk_multiplier=_f('POLICY_CASH_RISK_MULT', 0.30),
+            min_margin_usd=_f('POLICY_CASH_MIN_MARGIN_USD', 1.0),
+            tick_eval_sec=_f('POLICY_CASH_TICK_EVAL_SEC', 1.0),
+            loop_interval_sec=_f('POLICY_CASH_LOOP_INTERVAL_SEC', 1.0),
+            min_1m_bars=_i('POLICY_CASH_MIN_1M_BARS', 120),
+            min_5m_bars=_i('POLICY_CASH_MIN_5M_BARS', 80),
+            atr_min_pctile=_f('POLICY_CASH_ATR_MIN_PCTILE', 0.05),
+            atr_max_pctile=_f('POLICY_CASH_ATR_MAX_PCTILE', 0.98),
+            max_hold_sec=_i('POLICY_CASH_MAX_HOLD_SEC', 3600),
+            cooldown_sec=_i('POLICY_CASH_COOLDOWN_SEC', 300),
+            loss_lockout_sec=_i('POLICY_CASH_LOSS_LOCKOUT_SEC', 1800),
+            min_rr=max(1.25, min(base_rr, _f('POLICY_CASH_MIN_RR', 1.60))),
+            max_rr=_f('POLICY_CASH_MAX_RR', 4.0),
+            sl_buffer_atr_mult=_f('POLICY_CASH_SL_BUFFER_ATR', 0.65),
+            trail_min_move_atr=_f('POLICY_CASH_TRAIL_MIN_MOVE_ATR', 0.10),
+            slippage_tolerance=_f('POLICY_CASH_SLIPPAGE_TOL', 0.0015),
+            spread_soft_atr_ratio=_f('QUANT_SPREAD_SOFT_ATR_RATIO_CASH', 0.60),
+            spread_max_atr_ratio=_f('QUANT_MAX_SPREAD_ATR_RATIO_CASH', 3.00),
+            spread_max_bps=_f('QUANT_MAX_SPREAD_BPS_CASH', 60.0),
+            spread_max_ticks=_f('QUANT_MAX_SPREAD_TICKS_CASH', 12.0),
+            spread_min_size_mult=_f('QUANT_SPREAD_MIN_SIZE_MULT', 0.35),
+            spread_haircut_max=_f('QUANT_SPREAD_SIZE_HAIRCUT_MAX', 0.60),
+            ob_depth_levels=_i('POLICY_CASH_OB_DEPTH_LEVELS', 3),
+            tick_agg_window_sec=_f('POLICY_CASH_TICK_AGG_WINDOW_SEC', 60.0),
+            vwap_window=_i('POLICY_CASH_VWAP_WINDOW', 80),
+            cvd_window=_i('POLICY_CASH_CVD_WINDOW', 40),
+            notes='cash-market policy; fully funded 1x; no derivatives leverage',
+        )
+
     if ac == AssetClass.OPTION:
         return InstrumentPolicy(
-            asset_id=asset_id, asset_class=ac.value, leverage=_cap_leverage(inst, min(lev, _i('POLICY_OPTION_LEVERAGE', 5))),
-            margin_pct=min(base_margin, _f('POLICY_OPTION_MARGIN_PCT', 0.06)),
+            asset_id=asset_id, asset_class=ac.value, leverage=1,
+            margin_pct=_margin_pct_for(inst, base_margin, 'POLICY_OPTION_MARGIN_PCT', 0.06),
             risk_multiplier=_f('POLICY_OPTION_RISK_MULT', 0.35),
             min_margin_usd=_f('POLICY_OPTION_MIN_MARGIN_USD', 0.5),
             tick_eval_sec=_f('POLICY_OPTION_TICK_EVAL_SEC', 1.0),
@@ -165,13 +252,13 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
             tick_agg_window_sec=_f('POLICY_OPTION_TICK_AGG_WINDOW_SEC', 60.0),
             vwap_window=_i('POLICY_OPTION_VWAP_WINDOW', 80),
             cvd_window=_i('POLICY_OPTION_CVD_WINDOW', 40),
-            notes='listed-option policy; lower risk, wider spread envelope, no BTC assumptions',
+            notes='ICICI/options are fully funded in this bot; leverage disabled; wider spread envelope, no BTC assumptions',
         )
 
     if ac in (AssetClass.INDEX, AssetClass.FUTURE):
         return InstrumentPolicy(
             asset_id=asset_id, asset_class=getattr(ac, 'value', str(ac)), leverage=lev,
-            margin_pct=min(base_margin, _f('POLICY_FUTURE_MARGIN_PCT', 0.10)),
+            margin_pct=_margin_pct_for(inst, base_margin, 'POLICY_FUTURE_MARGIN_PCT', 0.10),
             risk_multiplier=_f('POLICY_FUTURE_RISK_MULT', 0.60),
             min_margin_usd=_f('POLICY_FUTURE_MIN_MARGIN_USD', 0.5),
             tick_eval_sec=_f('POLICY_FUTURE_TICK_EVAL_SEC', 0.75),
@@ -204,7 +291,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     if ac == AssetClass.EQUITY:
         return InstrumentPolicy(
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
-            margin_pct=min(base_margin, _f('POLICY_EQUITY_MARGIN_PCT', 0.12)),
+            margin_pct=_margin_pct_for(inst, base_margin, 'POLICY_EQUITY_MARGIN_PCT', 0.12),
             risk_multiplier=_f('POLICY_EQUITY_RISK_MULT', 0.55),
             min_margin_usd=_f('POLICY_EQUITY_MIN_MARGIN_USD', 0.5),
             tick_eval_sec=_f('POLICY_EQUITY_TICK_EVAL_SEC', 0.75),
@@ -237,7 +324,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
     if ac == AssetClass.COMMODITY:
         return InstrumentPolicy(
             asset_id=asset_id, asset_class=ac.value, leverage=lev,
-            margin_pct=min(base_margin, _f('POLICY_COMMODITY_MARGIN_PCT', 0.14)),
+            margin_pct=_margin_pct_for(inst, base_margin, 'POLICY_COMMODITY_MARGIN_PCT', 0.14),
             risk_multiplier=_f('POLICY_COMMODITY_RISK_MULT', 0.70),
             min_margin_usd=_f('POLICY_COMMODITY_MIN_MARGIN_USD', 0.5),
             tick_eval_sec=_f('POLICY_COMMODITY_TICK_EVAL_SEC', 0.50),
@@ -297,7 +384,7 @@ def build_instrument_policy(inst: Optional[TradableInstrument]) -> InstrumentPol
         tick_agg_window_sec=_f('QUANT_TICK_AGG_WINDOW_SEC', 30.0),
         vwap_window=_i('QUANT_VWAP_WINDOW', 50),
         cvd_window=_i('QUANT_CVD_WINDOW', 20),
-        notes='crypto policy',
+        notes='crypto policy; leverage derived from confirmed venue cap and asset utilisation',
     )
 
 

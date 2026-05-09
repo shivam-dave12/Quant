@@ -29,12 +29,10 @@ class PortfolioCIO:
 
     def select_execution_queue(self, contexts: List[Any], portfolio_guard: Any) -> FundCycleReport:
         if not self.mandate.enabled:
-            selected = [
-                self._synthetic_selection(ctx, i + 1)
-                for i, ctx in enumerate(contexts)
-                if getattr(ctx, "ready", False)
-            ]
-            report = FundCycleReport(time.time(), selected=tuple(selected), notes=("agentic mandate disabled",))
+            # No fabricated selections: disabled mandate means the CIO does not
+            # authorise desks. Runtime can still operate via the scanner's own
+            # explicit control path, but this agent will not manufacture a score.
+            report = FundCycleReport(time.time(), selected=tuple(), notes=("agentic mandate disabled; no CIO authorisation",))
             self.last_report = report
             return report
 
@@ -118,7 +116,7 @@ class PortfolioCIO:
         return self.last_report.compact_text()
 
     @staticmethod
-    def _synthetic_selection(ctx: Any, rank: int) -> TickerSelection:
+    def _context_selection_snapshot(ctx: Any, rank: int) -> TickerSelection:
         from fund.types import MarketDiagnostics
 
         inst = getattr(ctx, "instrument", None)
@@ -132,4 +130,4 @@ class PortfolioCIO:
             has_position=bool(getattr(ctx, "has_position", False)),
             phase=str(getattr(ctx, "phase_name", "UNKNOWN") or "UNKNOWN"),
         )
-        return TickerSelection(asset_id, 1.0, rank, d, selected=True, reason="agentic disabled")
+        return TickerSelection(asset_id, 1.0, rank, d, selected=True, reason="context snapshot")

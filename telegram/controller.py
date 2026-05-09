@@ -140,6 +140,7 @@ class TelegramBotController:
         self._last_getupdates_conn_warn_ts: float = 0.0
         self._icici_otp_cv = threading.Condition()
         self._icici_pending_otp: Optional[str] = None
+        self._icici_waiting_for_otp: bool = False
         self._icici_refresh_thread: Optional[threading.Thread] = None
         self._icici_refresh_result: str = ""
 
@@ -288,7 +289,8 @@ class TelegramBotController:
                 {"command": "config",      "description": "Show config values"},
                 {"command": "set",         "description": "Set config value live"},
                 {"command": "setexchange", "description": "Switch execution exchange"},
-                {"command": "icici_refresh", "description": "Refresh ICICI Breeze token"},
+                {"command": "icici_refresh", "description": "Run ICICI login + refresh Breeze token"},
+                {"command": "icici_login", "description": "Alias: run ICICI login token generator"},
                 {"command": "icici_otp",   "description": "Submit ICICI OTP"},
                 {"command": "killswitch",  "description": "Emergency close all"},
                 {"command": "resetrisk",   "description": "Clear risk lockout"},
@@ -322,7 +324,7 @@ class TelegramBotController:
             "learn", "watchdog", "watchdog_status", "watchdog_heal",
             "watchdog_heal_on", "watchdog_heal_off",
             "watchdog_freeze", "watchdog_unfreeze",
-            "fund", "icici_refresh", "icici_otp",
+            "fund", "icici_refresh", "icici_login", "icici_otp",
         }
         if not t.startswith("/"):
             parts = t.split(None, 1)
@@ -337,6 +339,10 @@ class TelegramBotController:
     def handle_command(self, raw_text: str) -> Optional[str]:
         global bot_instance, bot_thread, bot_running
         cmd, args = self._normalize_command(raw_text)
+        if re.fullmatch(r"\d{6}", (raw_text or "").strip()):
+            with self._icici_otp_cv:
+                if self._icici_waiting_for_otp:
+                    return self._cmd_icici_otp((raw_text or "").strip())
         try:
             if   cmd in ("/help", "/commands"): return self._cmd_help()
             elif cmd == "/start":               return self._cmd_start()
@@ -360,7 +366,8 @@ class TelegramBotController:
             elif cmd == "/resetrisk":           return self._cmd_resetrisk(args)
             elif cmd == "/set":                 return self._cmd_set(args)
             elif cmd == "/setexchange":         return self._cmd_setexchange(args)
-            elif cmd == "/icici_refresh":       return self._cmd_icici_refresh()
+            elif cmd in ("/icici_refresh", "/icici_login"):
+                return self._cmd_icici_refresh()
             elif cmd == "/icici_otp":           return self._cmd_icici_otp(args)
             elif cmd == "/huntstatus":          return self._cmd_huntstatus()
             elif cmd == "/pnl":                 return self._cmd_pnl()
@@ -421,7 +428,9 @@ class TelegramBotController:
             "  /trail [on|off|auto] — Adaptive exit override\n"
             "  /config — Show active config values\n"
             "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
-            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n\n"
+            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n"
+            "  /icici_refresh — Run Breeze login/token generator\n"
+            "  /icici_otp 123456 — Submit ICICI OTP when asked\n\n"
             "🚨 <b>EMERGENCY</b>\n"
             "  /killswitch — Close positions + cancel all\n"
             "  /resetrisk [full] — Clear risk lockout\n"
@@ -1916,11 +1925,8 @@ class TelegramBotController:
         strategy = getattr(bot_instance, "strategy", None)
         success, message = router.switch(target, strategy=strategy)
 
-        if success and bot_instance.order_manager:
-            try:
-                bot_instance.order_manager.set_leverage(leverage=int(config.LEVERAGE))
-            except Exception as e:
-                message += f"\n⚠️ Leverage set failed: {e}"
+        if success:
+            message += "\nℹ️ Leverage is recalculated per instrument/exchange by the active policy; no static leverage was pushed."
 
         return message
 
@@ -1928,45 +1934,71 @@ class TelegramBotController:
     # /icici_refresh and /icici_otp
     # ================================================================
 
-    def _wait_for_icici_otp(self, timeout_sec: float = 90.0) -> str:
+    def _icici_otp_timeout_sec(self) -> float:
+        return max(45.0, float(getattr(config, "ICICI_OTP_WAIT_SEC", 180.0) or 180.0))
+
+    def _telegram_icici_otp_getter(self) -> str:
+        timeout = self._icici_otp_timeout_sec()
+        self.send_message(
+            "🔐 <b>ICICI OTP required</b>\n"
+            "The Breeze token generator has opened ICICI login and reached OTP verification.\n"
+            "Reply with <code>/icici_otp 123456</code> or just <code>123456</code>.\n"
+            f"Timeout: <code>{int(timeout)}s</code>."
+        )
+        return self._wait_for_icici_otp(timeout)
+
+    def _wait_for_icici_otp(self, timeout_sec: float = 180.0) -> str:
         deadline = time.time() + timeout_sec
         with self._icici_otp_cv:
+            self._icici_waiting_for_otp = True
+            try:
+                while time.time() < deadline:
+                    if self._icici_pending_otp:
+                        otp = self._icici_pending_otp
+                        self._icici_pending_otp = None
+                        return otp
+                    remaining = max(0.0, deadline - time.time())
+                    self._icici_otp_cv.wait(timeout=min(remaining, 5.0))
+                raise RuntimeError("Timed out waiting for ICICI OTP")
+            finally:
+                self._icici_waiting_for_otp = False
+
+    def _clear_icici_pending_otp(self) -> None:
+        with self._icici_otp_cv:
             self._icici_pending_otp = None
-            while time.time() < deadline:
-                remaining = max(0.0, deadline - time.time())
-                self._icici_otp_cv.wait(timeout=min(remaining, 5.0))
-                if self._icici_pending_otp:
-                    otp = self._icici_pending_otp
-                    self._icici_pending_otp = None
-                    return otp
-        raise RuntimeError("Timed out waiting for ICICI OTP")
+            self._icici_waiting_for_otp = False
+
+    def _format_icici_session_ok(self, session) -> str:
+        masked = session.masked()
+        return (
+            "✅ <b>ICICI Breeze token ready</b>\n"
+            f"Session age: <code>{int(session.age_sec())}s</code>\n"
+            f"SessionToken: <code>{_esc(masked.get('session_token', '***'))}</code>"
+        )
 
     def _cmd_icici_refresh(self) -> str:
         if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
-            return "ICICI Breeze token refresh is already running. Send /icici_otp <code> when the OTP arrives."
+            return "ICICI Breeze token refresh is already running. Send <code>/icici_otp 123456</code> when the OTP arrives."
 
         def _runner() -> None:
             try:
                 from exchanges.icici.breeze_auth import BreezeTokenService
+                self._clear_icici_pending_otp()
                 self.send_message(
-                    "ICICI Breeze refresh started. When the OTP arrives, reply with <code>/icici_otp 123456</code>."
+                    "🔄 <b>ICICI Breeze token generator started</b>\n"
+                    "Launching ICICI login automation. Do not paste passwords or tokens in Telegram; only submit the OTP when asked."
                 )
                 service = BreezeTokenService()
-                session = service.refresh(otp_getter=lambda: self._wait_for_icici_otp(90.0))
+                session = service.refresh(otp_getter=self._telegram_icici_otp_getter)
                 self._icici_refresh_result = "ok"
-                masked = session.masked()
-                self.send_message(
-                    "ICICI Breeze token refreshed.\n"
-                    f"Session age: <code>{int(session.age_sec())}s</code>\n"
-                    f"Token: <code>{masked['session_token']}</code>"
-                )
+                self.send_message(self._format_icici_session_ok(session))
             except Exception as exc:
                 self._icici_refresh_result = str(exc)
-                self.send_message(f"ICICI Breeze token refresh failed: <code>{_esc(exc)}</code>")
+                self.send_message(f"❌ ICICI Breeze token refresh failed: <code>{_esc(exc)}</code>")
 
         self._icici_refresh_thread = threading.Thread(target=_runner, name="icici-token-refresh", daemon=True)
         self._icici_refresh_thread.start()
-        return "ICICI Breeze token refresh started. Send /icici_otp <code> when the OTP arrives."
+        return "ICICI Breeze token generator started. I will ask for OTP here when ICICI requests it."
 
     def _cmd_icici_otp(self, args: str) -> str:
         code = (args or "").strip()
@@ -1975,7 +2007,8 @@ class TelegramBotController:
         with self._icici_otp_cv:
             self._icici_pending_otp = code
             self._icici_otp_cv.notify_all()
-        return "ICICI OTP received. Continuing Breeze login."
+            waiting = self._icici_waiting_for_otp
+        return "ICICI OTP received. Continuing Breeze login." if waiting else "ICICI OTP captured. Waiting token generator will consume it if login is pending."
 
     # ================================================================
     # /set
@@ -2004,7 +2037,7 @@ class TelegramBotController:
         val_str = parts[1].strip()
 
         allowed = {
-            "leverage":         ("LEVERAGE",             int),
+            "max_leverage_cap": ("MAX_POLICY_LEVERAGE",  float),
             # CRIT-1 FIX: RISK_PER_TRADE is now the position-sizing lever.
             # QUANT_MARGIN_PCT is retired — _compute_quantity no longer reads it.
             "risk":             ("RISK_PER_TRADE",       float),
@@ -2030,30 +2063,12 @@ class TelegramBotController:
 
         old_val = getattr(cfg, attr_name, "?")
 
-        if key == "leverage":
-            global bot_instance, bot_running
-            if bot_running and bot_instance and bot_instance.strategy:
-                pos = bot_instance.strategy.get_position()
-                if pos:
-                    return (
-                        f"❌ Cannot change leverage while position is open.\n"
-                        f"Close position first, then /set leverage {new_val}."
-                    )
-            setattr(cfg, attr_name, new_val)
-            if bot_running and bot_instance:
-                om = getattr(bot_instance, 'order_manager', None)
-                if om:
-                    try:
-                        resp = om.set_leverage(leverage=int(new_val))
-                        if isinstance(resp, dict) and resp.get("error"):
-                            setattr(cfg, attr_name, old_val)
-                            return f"❌ Exchange rejected: {resp['error']}\nConfig reverted to {old_val}x."
-                        return (f"✅ <b>Leverage updated</b>: {old_val}x → <b>{new_val}x</b>\n"
-                                f"Config and exchange both updated.")
-                    except Exception as e:
-                        setattr(cfg, attr_name, old_val)
-                        return f"❌ Exchange API error: {e}\nConfig reverted to {old_val}x."
-            return f"✅ <b>LEVERAGE</b>: {old_val} → <b>{new_val}</b>  (exchange not updated — bot not running)"
+        if key == "max_leverage_cap":
+            if float(new_val) < 1.0 or float(new_val) > 125.0:
+                return "❌ max_leverage_cap must be between 1 and 125."
+            setattr(cfg, attr_name, float(new_val))
+            return (f"✅ <b>MAX_POLICY_LEVERAGE</b>: {old_val} → <b>{new_val}</b>\n"
+                    "Actual leverage is still recalculated per ticker/exchange; ICICI cash/options remain 1x.")
 
         # ── Risk per trade validation ─────────────────────────────────────
         if key == "risk":
@@ -2478,6 +2493,62 @@ class TelegramBotController:
     # ================================================================
     # BOT THREAD
     # ================================================================
+    # ICICI auto-login before bot startup
+    # ================================================================
+
+    def _should_auto_icici_token_on_start(self) -> bool:
+        if not bool(getattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True)):
+            return False
+        return bool(
+            getattr(config, "ICICI_ENABLED", False)
+            or getattr(config, "DYNAMIC_DESK_ICICI_DETAILS_ENABLED", False)
+            or getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", False)
+            or getattr(config, "ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
+        )
+
+    def _ensure_icici_session_before_bot_start(self) -> None:
+        if not self._should_auto_icici_token_on_start():
+            return
+        try:
+            from exchanges.icici.breeze_auth import BreezeTokenService
+            service = BreezeTokenService()
+            try:
+                service.require_configured(for_login=True)
+            except Exception as exc:
+                self.send_message(
+                    "⚠️ ICICI auto login skipped: "
+                    f"<code>{_esc(exc)}</code>"
+                )
+                return
+
+            # Fast path: valid cache, manual API_Session, or manual SessionToken.
+            try:
+                session = service.get_session(force_refresh=False)
+                self.send_message(self._format_icici_session_ok(session))
+                return
+            except Exception as first_exc:
+                logger.info("ICICI cached/API session not ready; starting Telegram OTP login: %s", first_exc)
+
+            self._clear_icici_pending_otp()
+            self.send_message(
+                "🔐 <b>ICICI Breeze login required before scanner start</b>\n"
+                "No usable API_Session/session cache was found. I am launching the ICICI token generator now; "
+                "submit only the OTP when requested."
+            )
+            session = service.refresh(otp_getter=self._telegram_icici_otp_getter)
+            self.send_message(self._format_icici_session_ok(session))
+        except Exception as exc:
+            # Do not kill Delta-only scanning unless ICICI auth is explicitly mandatory.
+            msg = f"ICICI auto token generator failed: {exc}"
+            if getattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", False) or getattr(config, "ICICI_ENABLED", False):
+                raise RuntimeError(msg) from exc
+            logger.warning(msg, exc_info=True)
+            self.send_message(
+                "⚠️ ICICI auth unavailable; continuing without authenticated ICICI quotes/details.\n"
+                f"Reason: <code>{_esc(exc)}</code>"
+            )
+
+    # ================================================================
 
     def _run_bot_thread(self):
         global bot_instance, bot_running
@@ -2493,6 +2564,7 @@ class TelegramBotController:
             # without this, multi-asset Telegram starts used controller-only logs.
             import main as _main_logging_bootstrap  # noqa: F401
             import config as _cfg
+            self._ensure_icici_session_before_bot_start()
             if bool(getattr(_cfg, "MULTI_ASSET_ENABLED", True)):
                 from orchestration.multi_asset_bot import MultiAssetQuantBot
                 logger.info("Telegram /start selected MultiAssetQuantBot (MULTI_ASSET_ENABLED=True)")

@@ -29,8 +29,10 @@ from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 try:
     from exchanges.icici.api import BreezeRestClient
+    from exchanges.icici.data_manager import ICICIOptionDataManager
 except Exception:
     BreezeRestClient = None  # type: ignore
+    ICICIOptionDataManager = None  # type: ignore
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
@@ -143,43 +145,28 @@ class MultiAssetQuantBot:
 
 
     def _instrument_leverage(self, inst: TradableInstrument) -> int:
-        configured = max(1, int(getattr(config, "LEVERAGE", 1)))
-        max_lev = float(getattr(inst, "max_leverage", 0.0) or 0.0)
-        if max_lev <= 0:
-            # Conservative fallback caps when an exchange product row omits the
-            # leverage field. Delta xStock UI contracts are 25x; do not send 40x
-            # just because BTC uses 40x.
-            ac = str(getattr(inst, "asset_class", "") or "").lower()
-            if "equity" in ac or "commodity" in ac or "index" in ac:
-                max_lev = 25.0
-        if max_lev > 0:
-            return max(1, min(configured, int(max_lev)))
-        return configured
+        # v83: leverage is produced by core.market_policy from the confirmed
+        # instrument/exchange. No global LEVERAGE and no guessed xStock caps.
+        with instrument_scope(inst):
+            return max(1, int(active_policy(inst).leverage))
 
     def _set_leverage_with_backoff(self, ctx: AssetContext, target: int) -> int:
-        """Set leverage, downgrading if Delta rejects max_leverage_exceeded."""
-        attempts = [int(target)]
-        for v in (25, 20, 10, 5, 3, 2, 1):
-            if v < attempts[-1] and v not in attempts:
-                attempts.append(v)
-        last_err = ""
-        for lev in attempts:
-            try:
-                res = ctx.execution_router.set_leverage(lev)
-                ok = isinstance(res, dict) and bool(res.get("success", True)) and not res.get("_error")
-                err = str((res or {}).get("error", "") if isinstance(res, dict) else "")
-                last_err = err or str(res)[:160]
-                if ok and "max_leverage_exceeded" not in err:
-                    return int(lev)
-                if "max_leverage_exceeded" not in last_err:
-                    break
-                logger.warning("%s leverage %sx rejected by exchange: %s — trying lower", ctx.instrument.asset_id, lev, last_err)
-            except Exception as e:
-                last_err = str(e)
-                if "max_leverage_exceeded" not in last_err:
-                    break
-        logger.warning("%s leverage set not confirmed; continuing data-only until order route validates. last=%s", ctx.instrument.asset_id, last_err)
-        return max(1, int(attempts[-1]))
+        """Set venue leverage only when the venue and product explicitly support it."""
+        inst = ctx.instrument
+        primary = getattr(inst, "primary_exchange", None)
+        if primary == ExchangeName.ICICI or int(target) <= 1:
+            logger.info("%s leverage unchanged at 1x — fully funded/non-leveraged venue policy", inst.asset_id)
+            return 1
+        try:
+            res = ctx.execution_router.set_leverage(int(target))
+            ok = isinstance(res, dict) and bool(res.get("success", True)) and not res.get("_error")
+            err = str((res or {}).get("error", "") if isinstance(res, dict) else "")
+            if ok and not err:
+                return int(target)
+            logger.warning("%s leverage %sx not confirmed by exchange: %s — forcing 1x policy until product metadata is corrected", inst.asset_id, target, err or str(res)[:160])
+        except Exception as e:
+            logger.warning("%s leverage %sx set failed: %s — forcing 1x policy until product metadata is corrected", inst.asset_id, target, e)
+        return 1
 
 
     def _active_context(self) -> Optional[AssetContext]:
@@ -775,7 +762,7 @@ class MultiAssetQuantBot:
                 try:
                     lev = float(lev_txt)
                 except Exception:
-                    lev = float(getattr(config, "LEVERAGE", 1) or 1)
+                    lev = 1.0
                 margin_used = notional / lev if lev > 0 else notional
                 margin_pnl_pct = (upnl / margin_used * 100.0) if margin_used > 1e-10 else 0.0
                 self._dash_emit({
@@ -926,26 +913,40 @@ class MultiAssetQuantBot:
 
     @staticmethod
     def _has_supported_runtime(inst: TradableInstrument) -> bool:
-        # ICICI discovery/details are included in the catalog, but the current
-        # strategy runtime still requires a candle-capable execution/data adapter.
-        # Until the ICICI runtime is explicitly enabled, Indian-market rows remain
-        # coverage candidates and do not open unsupported streams.
+        # Runtime is allowed only when there is a real venue adapter. ICICI is
+        # options-only and requires the Breeze polling data manager; cash/futures
+        # never become runtime desks.
+        if inst.primary_exchange == ExchangeName.ICICI:
+            return bool(
+                getattr(config, "ICICI_OPTIONS_RUNTIME_ENABLED", True)
+                and getattr(inst, "asset_class", None).value == "option"
+                and ICICIOptionDataManager is not None
+            )
         return bool({ExchangeName.DELTA, ExchangeName.COINSWITCH}.intersection(set(inst.by_exchange.keys())))
 
     def _build_asset_context(self, inst: TradableInstrument, delta_api, cs_api) -> Optional[AssetContext]:
         primary_ex = inst.primary_exchange
         cs_om = None
         delta_om = None
+        icici_om = None
         if ExchangeName.COINSWITCH in inst.by_exchange and cs_api is not None:
             cs_om = OrderManager(cs_api, exchange_name="coinswitch", instrument=inst)
         if ExchangeName.DELTA in inst.by_exchange and delta_api is not None:
             delta_om = OrderManager(delta_api, exchange_name="delta", instrument=inst)
-        if not cs_om and not delta_om:
+        if ExchangeName.ICICI in inst.by_exchange and self.icici_api is not None:
+            icici_om = OrderManager(self.icici_api, exchange_name="icici", instrument=inst)
+        if not cs_om and not delta_om and not icici_om:
             logger.warning("%s skipped: no executable order manager", inst.asset_id)
             return None
-        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, default=primary_ex.value)
+        router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, default=primary_ex.value)
 
-        if primary_ex == ExchangeName.DELTA:
+        if primary_ex == ExchangeName.ICICI:
+            if ICICIOptionDataManager is None:
+                logger.warning("%s skipped: ICICI option data manager unavailable", inst.asset_id)
+                return None
+            primary_dm = ICICIOptionDataManager(instrument=inst, api=self.icici_api)
+            secondary_dm = None
+        elif primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
         else:
@@ -977,7 +978,8 @@ class MultiAssetQuantBot:
                 target_lev = self._instrument_leverage(inst)
                 effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
                 max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
-                logger.info("%s leverage target=%sx effective=%sx%s", inst.asset_id, target_lev, effective_lev, max_txt)
+                desk_id = getattr(getattr(self, "ticker_desk", None), "router", None).desk_id_for(inst) if getattr(getattr(self, "ticker_desk", None), "router", None) else "UNKNOWN"
+                logger.info("[%s] %s leverage target=%sx effective=%sx%s", desk_id, inst.asset_id, target_lev, effective_lev, max_txt)
                 if not ctx.data_manager.start():
                     logger.error("%s data stream start failed", inst.asset_id)
                     return False
@@ -1025,21 +1027,24 @@ class MultiAssetQuantBot:
         return True
 
     def _startup_message(self) -> str:
-        lines = ["🏛 <b>PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
-        lines.append("<b>Execution universe — asset-scoped strategy desks:</b>")
+        lines = ["🏛 <b>DESK-WISE PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
+        lines.append("<b>Execution universe — asset desks with venue routing:</b>")
         for ctx in self.contexts:
             inst = ctx.instrument
             venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
             lev = self._instrument_leverage(inst)
             pol = active_policy(inst)
             cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
-            lines.append(f"• <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {float(cadence):.2f}s")
+            desk_id = self.ticker_desk.router.desk_id_for(inst) if self.ticker_desk is not None else "UNKNOWN"
+            lines.append(f"• <b>{desk_id}</b> / <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {float(cadence):.2f}s")
         lines.append("")
         lines.append("<b>Portfolio rules:</b>")
         lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
         lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
         lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Live exchange products only; no synthetic symbols. Delta SPXUSD is SPX6900 crypto, not S&P 500, so it is not used for SPX_INDEX.")
+        lines.append("• Live exchange products only; no synthetic symbols. Indian market runtime is options-only; cash/futures rows are rejected before execution.")
+        lines.append("• BTC is one global asset desk; Delta/CoinSwitch/CoinDCX are execution/data routes, not separate BTC strategies.")
+        lines.append("• Option desks use Black-Scholes diagnostics, DTE/theta controls, spread/liquidity checks and no leverage.")
         lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
         return "\n".join(lines)
 

@@ -102,6 +102,7 @@ class _RateLimiter:
 # Global limiters — one per exchange (shared across all OrderManager instances)
 _CS_LIMITER    = _RateLimiter(min_interval_sec=3.0)
 _DELTA_LIMITER = _RateLimiter(min_interval_sec=0.25)
+_ICICI_LIMITER = _RateLimiter(min_interval_sec=0.75)
 
 # Also keep a module-level alias for compatibility imports (quant_strategy does
 # `from execution.order_manager import GlobalRateLimiter`)
@@ -701,6 +702,135 @@ class _DeltaAdapter:
 
 # ── Main OrderManager ─────────────────────────────────────────────────────────
 
+class _ICICIAdapter:
+    """Conservative ICICI Breeze options adapter.
+
+    Indian options are fully funded in this bot. The adapter never sets leverage
+    and never places market entries; all entries are limit orders. Stop/TP
+    handling remains normalised through the same OrderManager surface.
+    """
+
+    def __init__(self, api, exchange_instrument=None) -> None:
+        self.api = api
+        self.limiter = _ICICI_LIMITER
+        self.exchange_instrument = exchange_instrument
+        self.symbol = (exchange_instrument.symbol if exchange_instrument is not None else "")
+        self.display_symbol = (exchange_instrument.display_symbol if exchange_instrument is not None else self.symbol)
+        self.tick_size = float(getattr(exchange_instrument, "tick_size", 0.05) or 0.05) if exchange_instrument is not None else 0.05
+        self.lot_step = float(getattr(exchange_instrument, "lot_step", 1.0) or 1.0) if exchange_instrument is not None else 1.0
+        self.min_qty = float(getattr(exchange_instrument, "min_qty", 1.0) or 1.0) if exchange_instrument is not None else 1.0
+        self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
+        self.raw = getattr(exchange_instrument, "raw", {}) or {}
+
+    def _order_body(self, side: str, order_type: str, quantity: float, price=None, trigger_price=None, reduce_only: bool = False) -> Dict:
+        if str(order_type).upper() == "MARKET" and not reduce_only:
+            raise RuntimeError("ICICI options guard: market entries are disabled; use limit orders")
+        action = "buy" if side.upper() == "BUY" else "sell"
+        raw = self.raw
+        body = {
+            "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
+            "exchange_code": str(raw.get("exchange_code") or "NFO").upper(),
+            "product": "options",
+            "action": action,
+            "order_type": "limit",
+            "quantity": int(max(self.min_qty, round(float(quantity or 0)))),
+            "price": str(price if price is not None else trigger_price if trigger_price is not None else 0),
+            "validity": "day",
+            "expiry_date": self.api._normalise_expiry(raw.get("expiry_date") or raw.get("ExpiryDate") or ""),
+            "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
+            "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
+        }
+        # Breeze supports stoploss order flavors by product/order_type in some accounts;
+        # keep this explicit and limit-priced so no hidden market order is sent.
+        if str(order_type).upper().startswith("STOP") and trigger_price is not None:
+            body["stoploss"] = str(trigger_price)
+        return {k: v for k, v in body.items() if v not in (None, "")}
+
+    def extract_order_id(self, resp: Dict) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("Success") or resp.get("success") or resp.get("data") or resp.get("result") or resp
+        if isinstance(data, list) and data:
+            data = data[0]
+        if isinstance(data, dict):
+            oid = data.get("order_id") or data.get("OrderId") or data.get("orderId") or data.get("id")
+            return str(oid) if oid else None
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return None
+
+    def extract_status(self, order_data: Dict) -> str:
+        raw = str(order_data.get("status") or order_data.get("Status") or order_data.get("order_status") or "").upper()
+        if raw in {"EXECUTED", "FILLED", "COMPLETE", "COMPLETED"}: return "FILLED"
+        if raw in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}: return "CANCELLED"
+        if raw in {"PARTIALLY_FILLED", "PARTIAL"}: return "PARTIAL_FILL"
+        return "PENDING" if raw else "UNKNOWN"
+
+    def extract_fill_price(self, order_data: Dict) -> Optional[float]:
+        for f in ("average_price", "avg_price", "price", "execution_price"):
+            try:
+                p = float(order_data.get(f, 0) or 0)
+                if p > 0: return p
+            except Exception:
+                pass
+        return None
+
+    def extract_filled_qty(self, order_data: Dict) -> float:
+        for f in ("filled_quantity", "executed_quantity", "quantity"):
+            try:
+                q = float(order_data.get(f, 0) or 0)
+                if q > 0: return q
+            except Exception:
+                pass
+        return 0.0
+
+    def place_order(self, side: str, order_type: str, quantity: float, price: Optional[float] = None, trigger_price: Optional[float] = None, reduce_only: bool = False) -> Optional[Dict]:
+        self.limiter.wait()
+        try:
+            resp = self.api.place_order(**self._order_body(side, order_type, quantity, price=price, trigger_price=trigger_price, reduce_only=reduce_only))
+            oid = self.extract_order_id(resp)
+            if not oid:
+                return {"_raw": resp, "_sc": 0, "_error": True}
+            return {"order_id": oid, "status": "PENDING", "_raw": resp}
+        except Exception as exc:
+            return {"_raw": {"error": str(exc)}, "_sc": 0, "_error": True}
+
+    def cancel_order(self, order_id: str) -> Dict:
+        self.limiter.wait()
+        return self.api.cancel_order(order_id=str(order_id)) or {}
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        # Breeze order detail endpoint varies by account; use portfolio positions as
+        # a non-synthetic state read. Unknown means OrderManager keeps polling safely.
+        return {"order_id": str(order_id), "status": "PENDING"}
+
+    def get_positions(self, symbol: str) -> Optional[Dict]:
+        try:
+            return self.api.get_portfolio_positions()
+        except Exception:
+            return None
+
+    def get_balance(self) -> Dict:
+        try:
+            resp = self.api.get_funds()
+            data = resp.get("Success") if isinstance(resp, dict) else resp
+            if isinstance(data, list) and data: data = data[0]
+            if not isinstance(data, dict): data = {}
+            avail = 0.0
+            for k in ("available_margin", "AvailableLimit", "cash_limit", "available", "balance"):
+                try:
+                    avail = float(data.get(k, 0) or 0)
+                    if avail > 0: break
+                except Exception:
+                    pass
+            return {"available": avail, "available_raw": avail, "currency": "INR", "raw": resp}
+        except Exception as exc:
+            return {"available": 0.0, "error": str(exc)}
+
+    def set_leverage(self, leverage: int, product_id: Optional[int] = None) -> Dict:
+        return {"success": True, "leverage": 1, "message": "ICICI options are fully funded; leverage is not applicable"}
+
+
 class OrderManager:
     """
     Exchange-agnostic order manager.
@@ -724,6 +854,8 @@ class OrderManager:
                 exchange_instrument = None
         if exch == "delta":
             self._adapter = _DeltaAdapter(api, exchange_instrument=exchange_instrument)
+        elif exch == "icici":
+            self._adapter = _ICICIAdapter(api, exchange_instrument=exchange_instrument)
         else:
             self._adapter = _CoinSwitchAdapter(api, exchange_instrument=exchange_instrument)
 

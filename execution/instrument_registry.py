@@ -65,13 +65,10 @@ def _market_key_like(value: str) -> bool:
 
 
 def _asset_default_max_leverage(asset_class: AssetClass) -> float:
-    # Conservative fallback when the product row omits max_leverage.
-    # Delta xStock/RWA contracts displayed in the UI are 25x; BTC remains governed
-    # by the actual product row/config.  These are caps, not trade triggers.
-    if asset_class == AssetClass.EQUITY:
-        return 25.0
-    if asset_class in (AssetClass.COMMODITY, AssetClass.INDEX):
-        return 25.0
+    # No inferred leverage caps. If a live product row does not publish leverage,
+    # the runtime policy treats the product as cash/1x until the venue confirms a
+    # higher cap. This prevents hidden BTC/xStock assumptions from entering order
+    # sizing or exchange leverage calls.
     return 0.0
 
 
@@ -454,6 +451,11 @@ class InstrumentRegistry:
             ).upper()
             if ex_code not in {"NSE", "NFO", "BSE"}:
                 continue
+            try:
+                import config as _cfg_mod  # type: ignore
+                _icici_options_only = bool(getattr(_cfg_mod, "ICICI_OPTIONS_ONLY", True))
+            except Exception:
+                _icici_options_only = True
             # ICICI security-master headers vary across files/days.  Accept the
             # common NSE/NFO/BSE spellings instead of relying on one exact schema.
             stock = str(
@@ -486,7 +488,6 @@ class InstrumentRegistry:
                 continue
             icici_stock_alias = {
                 "CNXBAN": "BANKNIFTY",
-                "CNXBAN": "BANKNIFTY",
                 "NIFTY50": "NIFTY",
                 "NIFTYBANK": "BANKNIFTY",
                 "SENSEX50": "SENSEX",
@@ -500,6 +501,11 @@ class InstrumentRegistry:
                 ac = AssetClass.INDEX
             elif _asset_class_from_text(text, AssetClass.EQUITY) == AssetClass.INDEX:
                 ac = AssetClass.INDEX
+            if _icici_options_only and ac != AssetClass.OPTION:
+                # Indian-market mandate: only listed options are eligible for the
+                # trading universe. Cash/future/index rows are not silently traded
+                # or used as synthetic substitutes for options.
+                continue
             symbol = normalise_symbol(
                 r.get("TradingSymbol") or r.get("trading_symbol") or r.get("Symbol") or stock or token
             )
