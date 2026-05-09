@@ -7,12 +7,20 @@ No config_overrides.py — everything lives here.
 Calibrated for 65-75% WR, 3-6 trades per session.
 """
 import os
+from pathlib import Path
 try:
     from dotenv import load_dotenv
 except ImportError:  # production image may not ship python-dotenv
     def load_dotenv(*_a, **_kw):
         return False
-load_dotenv()
+
+APP_ROOT = Path(__file__).resolve().parent
+ENV_FILE = Path(os.getenv("BOT_ENV_FILE", str(APP_ROOT / ".env"))).expanduser()
+BOT_DOTENV_OVERRIDE = os.getenv("BOT_DOTENV_OVERRIDE", "true").strip().lower() in {"1", "true", "yes", "on"}
+DOTENV_LOADED = bool(load_dotenv(dotenv_path=ENV_FILE, override=BOT_DOTENV_OVERRIDE))
+
+def _raw_env(name: str, default: str = "") -> str:
+    return os.getenv(name, default)
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -655,6 +663,25 @@ FUND_MIN_WARMUP_RATIO = _env_float("FUND_MIN_WARMUP_RATIO", 0.88)
 FUND_AUDIT_LOG_PATH = os.getenv("FUND_AUDIT_LOG_PATH", "data/fund_audit.jsonl")
 FUND_CIO_DECISION_SEC = _env_float("FUND_CIO_DECISION_SEC", 3.0)
 FUND_CIO_REPORT_SEC = _env_float("FUND_CIO_REPORT_SEC", 30.0)
+
+def live_ordering_config_summary() -> str:
+    return (
+        f"env_file={ENV_FILE} loaded={DOTENV_LOADED} override={BOT_DOTENV_OVERRIDE}; "
+        f"FUND_PAPER_MODE={FUND_PAPER_MODE} raw={_raw_env('FUND_PAPER_MODE', '<unset>')}; "
+        f"FUND_LIVE_ORDERING_ENABLED={FUND_LIVE_ORDERING_ENABLED} raw={_raw_env('FUND_LIVE_ORDERING_ENABLED', '<unset>')}; "
+        f"EXECUTION_EXCHANGE={EXECUTION_EXCHANGE}; "
+        f"DELTA_KEY={'set' if bool(DELTA_API_KEY) else 'missing'}; "
+        f"ICICI_ENABLED={globals().get('ICICI_ENABLED', '<late-init>')}"
+    )
+
+def assert_live_ordering_ready() -> tuple[bool, str]:
+    if FUND_PAPER_MODE:
+        return False, "FUND_PAPER_MODE is true"
+    if not FUND_LIVE_ORDERING_ENABLED:
+        return False, "FUND_LIVE_ORDERING_ENABLED is false"
+    if EXECUTION_EXCHANGE == "delta" and not (DELTA_API_KEY and DELTA_SECRET_KEY):
+        return False, "Delta API credentials are missing"
+    return True, "live ordering gates are open"
 
 # Optional venues. Delta/CoinSwitch are the current execution stack. ICICI and
 # CoinDCX are institutional adapters; enable only after credentials, static IP,

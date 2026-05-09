@@ -1076,10 +1076,15 @@ class MultiAssetQuantBot:
                         paper_mode = bool(getattr(mandate, "paper_mode", True))
                         live_enabled = bool(getattr(mandate, "live_ordering_enabled", False))
                         if paper_mode or not live_enabled:
+                            try:
+                                gate_detail = config.live_ordering_config_summary()
+                            except Exception:
+                                gate_detail = f"paper_mode={paper_mode} live_ordering={live_enabled}"
                             self._log_throttled_asset(
                                 ctx,
                                 "Agentic fund paper gate: live entry path held; "
-                                "set FUND_PAPER_MODE=False and FUND_LIVE_ORDERING_ENABLED=True after validation",
+                                "set FUND_PAPER_MODE=False and FUND_LIVE_ORDERING_ENABLED=True after validation; "
+                                f"actual={gate_detail}",
                             )
                             continue
                     allowed, reason = self.guard.can_evaluate_entry(ctx, self.contexts)

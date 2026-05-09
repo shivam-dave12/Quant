@@ -93,6 +93,37 @@ def _looks_like_missing_playwright_browser(exc: BaseException) -> bool:
     )
 
 
+def _ensure_playwright_runtime_path() -> Path:
+    candidates: list[Path] = []
+    explicit = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend([
+        Path(os.getenv("APP_DATA_DIR", "data")) / "ms-playwright",
+        Path("/app/.ms-playwright"),
+        Path("/tmp/ms-playwright"),
+    ])
+    last_exc: Exception | None = None
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+            home_raw = os.getenv("HOME")
+            home = Path(home_raw).expanduser() if home_raw else None
+            if not home or not home.exists() or not os.access(str(home), os.W_OK):
+                runtime_home = path.parent / "home"
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                os.environ["HOME"] = str(runtime_home)
+            return path
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise RuntimeError(f"No writable Playwright browser path available; last error: {last_exc}")
+
+
 def _install_playwright_chromium() -> None:
     """Download the Playwright Chromium browser for the current runtime user.
 
@@ -108,9 +139,14 @@ def _install_playwright_chromium() -> None:
             "Run: python -m playwright install chromium"
         )
 
+    browser_path = _ensure_playwright_runtime_path()
     cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-    log.warning("ICICI Playwright Chromium browser missing; installing runtime Chromium via: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=420)
+    log.warning(
+        "ICICI Playwright Chromium browser missing; installing runtime Chromium via: %s (PLAYWRIGHT_BROWSERS_PATH=%s HOME=%s)",
+        " ".join(cmd), os.getenv("PLAYWRIGHT_BROWSERS_PATH"), os.getenv("HOME")
+    )
+    env = os.environ.copy()
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=420, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             "Playwright Chromium install failed. Output:\n"
@@ -237,6 +273,7 @@ def generate_api_session(
         raise RuntimeError("Playwright is required: pip install playwright && python -m playwright install chromium") from exc
 
     debug_path = Path(debug_dir)
+    _ensure_playwright_runtime_path()
     with sync_playwright() as pw:
         try:
             browser = pw.chromium.launch(headless=headless, args=launch_args() if headless else ["--disable-gpu"])

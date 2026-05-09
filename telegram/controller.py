@@ -2564,6 +2564,17 @@ class TelegramBotController:
             # without this, multi-asset Telegram starts used controller-only logs.
             import main as _main_logging_bootstrap  # noqa: F401
             import config as _cfg
+            try:
+                live_ok, live_reason = _cfg.assert_live_ordering_ready()
+                live_summary = _cfg.live_ordering_config_summary()
+            except Exception:
+                live_ok, live_reason, live_summary = False, "live config check failed", "unavailable"
+            logger.info("LIVE_CONFIG %s; ready=%s reason=%s", live_summary, live_ok, live_reason)
+            self.send_message(
+                "🧭 <b>Live gate check</b>\n"
+                f"<code>{_esc(live_summary)}</code>\n"
+                f"Ready for real orders: <b>{'YES' if live_ok else 'NO'}</b> — <code>{_esc(live_reason)}</code>"
+            )
             self._ensure_icici_session_before_bot_start()
             if bool(getattr(_cfg, "MULTI_ASSET_ENABLED", True)):
                 from orchestration.multi_asset_bot import MultiAssetQuantBot
