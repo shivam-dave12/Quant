@@ -1,4 +1,4 @@
-# v86 live runtime essentials only.
+# v87 live runtime essentials only.
 # Do NOT install python-telegram-bot: this repo has a local telegram/ package and uses requests for Bot API.
 
 requests>=2.31,<3
@@ -10,3 +10,5 @@ pydantic>=2.7,<3
 fastapi>=0.111,<1
 uvicorn>=0.30,<1
 playwright>=1.44,<2
+# Chromium binary is intentionally not a pip package. Run once, or let startup auto-install:
+# python -m playwright install chromium
