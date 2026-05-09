@@ -654,9 +654,16 @@ BREEZE_API_KEY = os.getenv("BREEZE_API_KEY", "")
 BREEZE_SECRET_KEY = os.getenv("BREEZE_SECRET_KEY", "")
 ICICI_CLIENT_ID = os.getenv("ICICI_CLIENT_ID", "")
 ICICI_PASSWORD = os.getenv("ICICI_PASSWORD", "")
+ICICI_API_SESSION_PATH = os.getenv("ICICI_API_SESSION_PATH", "data/icici_api_session.txt")
+# Optional manual tokens. Prefer BREEZE_API_SESSION/ICICI_API_SESSION because
+# CustomerDetails then returns the signed-request session_token.
+BREEZE_API_SESSION = os.getenv("BREEZE_API_SESSION", os.getenv("ICICI_API_SESSION", ""))
+BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", os.getenv("ICICI_SESSION_TOKEN", ""))
 ICICI_SESSION_CACHE_PATH = os.getenv("ICICI_SESSION_CACHE_PATH", "data/icici_breeze_session.json")
 ICICI_SESSION_TTL_SEC = float(os.getenv("ICICI_SESSION_TTL_SEC", str(6 * 60 * 60)))
 ICICI_DEBUG_DIR = os.getenv("ICICI_DEBUG_DIR", "data/icici_debug")
+ICICI_BREEZE_PREFLIGHT_ON_STARTUP = _env_bool("ICICI_BREEZE_PREFLIGHT_ON_STARTUP", True)
+ICICI_AUTH_REQUIRED_FOR_DETAILS = _env_bool("ICICI_AUTH_REQUIRED_FOR_DETAILS", False)
 
 COINDCX_ENABLED = _env_bool("COINDCX_ENABLED", False)
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY", "")
@@ -727,3 +734,30 @@ DASHBOARD_TIMEOUT_SEC = float(os.getenv("DASHBOARD_TIMEOUT_SEC", "0.8"))
 DASHBOARD_HEARTBEAT_SEC = float(os.getenv("DASHBOARD_HEARTBEAT_SEC", "5"))
 DASHBOARD_SCAN_UPDATE_SEC = float(os.getenv("DASHBOARD_SCAN_UPDATE_SEC", "5"))
 DASHBOARD_POSITION_UPDATE_SEC = float(os.getenv("DASHBOARD_POSITION_UPDATE_SEC", "1"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v80 DYNAMIC INSTITUTIONAL TRADABLE-SELECTION DESK
+# ─────────────────────────────────────────────────────────────────────────────
+# Discovery can see the full venue catalog, but live candle/orderbook/trade
+# subscriptions are opened only for the desk-selected shortlist.  This prevents
+# Delta from being flooded with 100+ simultaneous candle streams at startup.
+DYNAMIC_TRADABLE_DESK_ENABLED = _env_bool("DYNAMIC_TRADABLE_DESK_ENABLED", True)
+DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS = _env_int("DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS", 12)
+DYNAMIC_DESK_MIN_SCORE = _env_float("DYNAMIC_DESK_MIN_SCORE", 0.38)
+DYNAMIC_DESK_REFRESH_SEC = _env_float("DYNAMIC_DESK_REFRESH_SEC", 180.0)
+DYNAMIC_DESK_MIN_RESIDENCY_SEC = _env_float("DYNAMIC_DESK_MIN_RESIDENCY_SEC", 600.0)
+DYNAMIC_DESK_DELTA_BULK_TICKERS = _env_bool("DYNAMIC_DESK_DELTA_BULK_TICKERS", True)
+DYNAMIC_DESK_ICICI_DETAILS_ENABLED = _env_bool("DYNAMIC_DESK_ICICI_DETAILS_ENABLED", True)
+DYNAMIC_DESK_ICICI_QUOTE_PROBES = _env_int("DYNAMIC_DESK_ICICI_QUOTE_PROBES", 8)
+DYNAMIC_DESK_ALWAYS_INCLUDE = os.getenv("DYNAMIC_DESK_ALWAYS_INCLUDE", "")
+DYNAMIC_DESK_LOG_TOP_N = _env_int("DYNAMIC_DESK_LOG_TOP_N", 12)
+
+# Candle streaming policy for activated desks only.  HTF candles may still be
+# warmed through REST, but live WS candles should stay lean.  Empty value means
+# use the DeltaDataManager default map.
+DELTA_ACTIVE_CANDLE_STREAMS = os.getenv("DELTA_ACTIVE_CANDLE_STREAMS", "1m,5m,15m,1h")
+DELTA_REST_WARMUP_TIMEFRAMES = os.getenv("DELTA_REST_WARMUP_TIMEFRAMES", "1m,5m,15m,1h,4h,1d")
+
+# ICICI security master cache.  Discovery should not fail just because the
+# public master URL is slow/unreachable during startup.
+ICICI_SECURITY_MASTER_CACHE_PATH = os.getenv("ICICI_SECURITY_MASTER_CACHE_PATH", "data/icici_security_master.zip")
