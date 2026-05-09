@@ -1,17 +1,12 @@
-# requirements.txt — Unified Dual-Exchange Quant Bot
+# v86 live runtime essentials only.
+# Do NOT install python-telegram-bot: this repo has a local telegram/ package and uses requests for Bot API.
 
-# HTTP + auth
-requests>=2.31.0
-cryptography>=41.0.0      # ED25519 for CoinSwitch signature
-python-dotenv>=1.0.0
-
-# WebSocket
-websocket-client>=1.7.0   # Delta Exchange (raw WS)
-python-socketio>=5.10.0   # CoinSwitch (Socket.IO)
-websockets>=12.0           # underlying async support
-
-# Telegram
-# (uses requests directly — no additional lib needed)
-
-# Utilities
-# All standard-library: threading, collections, dataclasses, enum, abc
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+websocket-client>=1.7,<2
+python-socketio[client]>=5.11,<6
+cryptography>=42,<47
+pydantic>=2.7,<3
+fastapi>=0.111,<1
+uvicorn>=0.30,<1
+playwright>=1.44,<2
