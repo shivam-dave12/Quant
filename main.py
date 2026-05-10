@@ -47,6 +47,7 @@ from typing import Optional
 
 import config
 from core.market_policy import active_policy
+from observability.institutional import InstitutionalLogFilter
 
 # ── IST Timezone logging ──────────────────────────────────────────────────────
 
@@ -267,6 +268,7 @@ _term_fmt = TerminalFormatter(
 _file_handler = logging.FileHandler("quant_bot.log", encoding="utf-8")
 _file_handler.setFormatter(_ist_fmt)
 _file_handler.addFilter(AssetContextFilter())
+_file_handler.addFilter(InstitutionalLogFilter())
 
 _stream_handler = logging.StreamHandler(
     stream=io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -275,6 +277,7 @@ _stream_handler = logging.StreamHandler(
 _stream_handler.setFormatter(_term_fmt)
 _stream_handler.addFilter(AssetContextFilter())
 _stream_handler.addFilter(TerminalBurstFilter())
+_stream_handler.addFilter(InstitutionalLogFilter())
 
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),
@@ -343,10 +346,11 @@ try:
 except ImportError:
     build_default_watchdog = None
 
-# Throttle raised 5 s → 30 s: pool-gate and other per-tick warnings
-# arrive faster than 5 s and would still flood Telegram even after
-# the primary dedup fixes.  30 s is a safe floor for operator paging.
-install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0)
+# Institutional v102: do not forward raw Python logs to Telegram.
+# Telegram is now an operator command-center only; critical crash alerts still
+# use send_telegram_message from the exception hook.
+if bool(getattr(config, "TELEGRAM_FORWARD_RAW_LOGS", False)):
+    install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=30.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

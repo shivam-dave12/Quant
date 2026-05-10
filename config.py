@@ -936,3 +936,12 @@ ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
 # option/underlying historical warmups do not burst through account API limits.
 ICICI_BREEZE_THROTTLE_ENABLED = True
 ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.35
+
+# v102 institutional observability: raw legacy tick logs and raw log-to-Telegram
+# forwarding are disabled. Operator views are desk-wise, explainable reports.
+INSTITUTIONAL_OBSERVABILITY_ENABLED = True
+TELEGRAM_FORWARD_RAW_LOGS = False
+TELEGRAM_LEGACY_STRATEGY_ALERTS_ENABLED = False
+INSTITUTIONAL_DESK_CYCLE_LOG_SEC = 60.0
+SCANNER_ASSET_ANALYSIS_LOG_SEC = 0.0
+SCANNER_ASSET_HEARTBEAT_SEC = 0.0
