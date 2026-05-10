@@ -891,6 +891,13 @@ ICICI_OPTIONS_ONLY = True
 ICICI_OPTIONS_RUNTIME_ENABLED = True
 ICICI_OPTION_MIN_DTE = 2.0
 ICICI_OPTION_MAX_DTE = 21.0
+# ICICI options are selected by a desk-first chain pipeline. The full Security
+# Master is evaluated, but only desk-relevant quote/Greek candidates are pushed
+# into runtime. Budgets below are derived from active desk capacity; there is no
+# flat global 1200-row cap and no hardcoded approved-symbol list.
+ICICI_OPTION_CHAIN_SCAN_MULTIPLIER = 10.0
+ICICI_OPTION_STRIKE_SCAN_MULTIPLIER = 3.0
+DYNAMIC_DESK_MAX_REPORT_ROWS = 400
 ICICI_OPTION_MAX_THETA_TO_PREMIUM = 0.08
 ICICI_OPTION_MAX_SPREAD_BPS = 180.0
 ICICI_INDEX_OPTION_TARGET_ABS_DELTA = 0.45

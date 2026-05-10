@@ -2717,7 +2717,7 @@ def main():
 
     def _signal_handler(signum, frame):
         logger.info(f"Signal {signum} — stopping controller")
-        sys.exit(0)
+        raise SystemExit(0)
 
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGINT,  _signal_handler)

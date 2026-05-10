@@ -10,6 +10,7 @@ default universe.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -34,6 +35,181 @@ def _safe_int(v, default: int = 0) -> int:
         return int(v)
     except Exception:
         return default
+
+
+def _parse_icici_expiry(value: str) -> datetime | None:
+    """Parse common ICICI security-master expiry formats without assuming one schema."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw2 = raw.replace("/", "-").replace(".", "-").strip()
+    fmts = (
+        "%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y", "%d%b%Y", "%d-%B-%Y",
+        "%Y%m%d", "%d%m%Y", "%d-%m-%y", "%d%b%y",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(raw2.upper(), fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    try:
+        # Some files expose Excel serial dates.
+        f = float(raw2)
+        if f > 20000:
+            return datetime(1899, 12, 30, tzinfo=timezone.utc) + __import__("datetime").timedelta(days=f)
+    except Exception:
+        pass
+    return None
+
+
+def _icici_dte(expiry: str, now: datetime | None = None) -> float:
+    dt = _parse_icici_expiry(expiry)
+    if dt is None:
+        return 9999.0
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (dt - now).total_seconds() / 86400.0)
+
+
+def _icici_option_desk_id(inst: ExchangeInstrument) -> str:
+    raw = inst.raw or {}
+    text = normalise_symbol(" ".join(str(raw.get(k, "")) for k in (
+        "option_kind", "product_type", "ProductType", "InstrumentType", "InstrumentName",
+        "Series", "segment", "Segment", "exchange_code", "ExchangeCode",
+        "TradingSymbol", "Symbol", "SecurityName", "Security Name",
+    )))
+    # Do not use a hardcoded underlying allow-list.  Desk identity comes from
+    # venue/product metadata: BFO/OPTIDX are index derivatives; OPTSTK is stock.
+    if "OPTIDX" in text or "INDEXOPTION" in text or "BFO" in text:
+        return "ICICI_INDEX_OPTIONS"
+    return "ICICI_STOCK_OPTIONS"
+
+
+def _icici_option_chain_quality(rows: list[tuple[ExchangeInstrument, str, str, float, float]]) -> float:
+    """Score an ICICI underlying from its *own* option-chain structure.
+
+    This is a large-cap/liquidity proxy without a hardcoded stock list: large,
+    institutionally tradable underlyings tend to have richer strike ladders,
+    both call/put sides, multiple expiries and valid near-term contracts.  Live
+    Breeze quotes later confirm executable liquidity before runtime trading.
+    """
+    if not rows:
+        return 0.0
+    expiries = {r[1] for r in rows}
+    rights = {r[2] for r in rows}
+    strikes = {round(r[3], 4) for r in rows}
+    nearest = min((r[4] for r in rows), default=9999.0)
+    row_score = min(1.0, len(rows) / 160.0)
+    expiry_score = min(1.0, len(expiries) / 6.0)
+    rights_score = 1.0 if {"C", "P"}.issubset(rights) else 0.45
+    strike_score = min(1.0, len(strikes) / 40.0)
+    near_score = max(0.0, 1.0 - nearest / 35.0)
+    return 0.30 * row_score + 0.22 * expiry_score + 0.20 * rights_score + 0.20 * strike_score + 0.08 * near_score
+
+
+def _select_icici_options_for_runtime(options: list[ExchangeInstrument]) -> list[ExchangeInstrument]:
+    """Build ICICI runtime candidates from the full security master by desk.
+
+    No fixed `1200` global cap and no approved-symbol list.  The full ICICI
+    option universe is inspected and grouped by desk/underlying.  Runtime
+    candidates are derived from configured desk capacity: an options desk only
+    needs enough representative contracts to run live Breeze quote validation
+    and Black-Scholes scoring for the active slots, not every Security Master
+    row as a live TradableInstrument.
+    """
+    try:
+        import config as _cfg  # type: ignore
+        index_quota = max(0, int(getattr(_cfg, "DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 10)))
+        stock_quota = max(0, int(getattr(_cfg, "DESK_ICICI_STOCK_OPTIONS_MAX_ACTIVE", 10)))
+        min_dte = float(getattr(_cfg, "ICICI_OPTION_MIN_DTE", 2.0))
+        max_dte = float(getattr(_cfg, "ICICI_OPTION_MAX_DTE", 21.0))
+        scan_mult = max(4.0, float(getattr(_cfg, "ICICI_OPTION_CHAIN_SCAN_MULTIPLIER", 10.0)))
+        per_under_mult = max(2.0, float(getattr(_cfg, "ICICI_OPTION_STRIKE_SCAN_MULTIPLIER", 3.0)))
+    except Exception:
+        index_quota, stock_quota, min_dte, max_dte, scan_mult, per_under_mult = 10, 10, 2.0, 21.0, 10.0, 3.0
+
+    if index_quota <= 0 and stock_quota <= 0:
+        return []
+
+    now = datetime.now(timezone.utc)
+    # desk -> underlying -> rows(inst, expiry, right, strike, dte)
+    desk_under: dict[str, dict[str, list[tuple[ExchangeInstrument, str, str, float, float]]]] = {
+        "ICICI_INDEX_OPTIONS": {},
+        "ICICI_STOCK_OPTIONS": {},
+    }
+    rejected_bad_metadata = 0
+    for inst in options:
+        raw = inst.raw or {}
+        underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("Underlying") or inst.asset_id)
+        expiry = str(raw.get("expiry_date") or raw.get("expiry") or raw.get("ExpiryDate") or raw.get("Expiry") or "")
+        right_raw = normalise_symbol(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or "")
+        right = "C" if right_raw in {"C", "CE", "CALL"} else "P" if right_raw in {"P", "PE", "PUT"} else ""
+        strike = _safe_float(raw.get("strike_price") or raw.get("strike") or raw.get("StrikePrice") or raw.get("Strike"), 0.0)
+        dte = _icici_dte(expiry, now)
+        # Reject corrupt metadata only; this is not symbol allow-listing.
+        structural = {normalise_symbol(str(raw.get(k, ""))) for k in (
+            "exchange_code", "ExchangeCode", "Exchange", "segment", "Segment", "product_type",
+            "ProductType", "Product", "InstrumentType", "InstrumentName", "right", "option_type",
+            "OptionType", "strike_price", "StrikePrice", "expiry_date", "ExpiryDate",
+        )}
+        structural.update({"BSE", "NSE", "NFO", "BFO", "OPTION", "OPTIONS", "OPTIDX", "OPTSTK", "C", "P", "CE", "PE", "CALL", "PUT"})
+        if not underlying or underlying in structural or not expiry or not right or strike <= 0 or dte < min_dte or dte > max_dte:
+            rejected_bad_metadata += 1
+            continue
+        desk = _icici_option_desk_id(inst)
+        desk_under.setdefault(desk, {}).setdefault(underlying, []).append((inst, expiry, right, strike, dte))
+
+    selected: list[ExchangeInstrument] = []
+    diagnostics: dict[str, dict[str, int | float]] = {}
+    for desk, quota in (("ICICI_INDEX_OPTIONS", index_quota), ("ICICI_STOCK_OPTIONS", stock_quota)):
+        under_map = desk_under.get(desk, {})
+        if quota <= 0 or not under_map:
+            diagnostics[desk] = {"underlyings": len(under_map), "selected": 0}
+            continue
+        scored = []
+        for underlying, rows in under_map.items():
+            q = _icici_option_chain_quality(rows)
+            scored.append((q, underlying, rows))
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+        # Dynamic breadth: derived from active desk quota and observed universe
+        # breadth, not a fixed max-underlyings constant.  Large security masters
+        # get a broader scan; small ones are fully represented.
+        observed_underlyings = len(scored)
+        target_underlyings = min(observed_underlyings, max(quota, int((observed_underlyings ** 0.5) * max(1.0, quota ** 0.25))))
+        # Candidate budget is derived from number of live slots.  It controls
+        # quote/Greek work, not discovery.  The full chain remains indexed above.
+        candidate_budget = max(quota * 6, int(quota * scan_mult))
+        per_under_budget = max(2, int((candidate_budget / max(1, target_underlyings)) * per_under_mult))
+        desk_selected: list[ExchangeInstrument] = []
+        for _quality, underlying, rows in scored[:target_underlyings]:
+            # Prefer nearest valid expiries; within each expiry/right choose a
+            # balanced ladder around chain median until live quote gives real spot.
+            chain_map: dict[tuple[str, str], list[tuple[ExchangeInstrument, float, float]]] = {}
+            for inst, expiry, right, strike, dte in rows:
+                chain_map.setdefault((expiry, right), []).append((inst, strike, dte))
+            per_under: list[ExchangeInstrument] = []
+            for (_expiry, _right), chain_rows in sorted(chain_map.items(), key=lambda kv: (min(x[2] for x in kv[1]), kv[0])):
+                strikes = sorted(x[1] for x in chain_rows)
+                median = strikes[len(strikes)//2] if strikes else 0.0
+                chain_rows.sort(key=lambda x: (abs(x[1] - median), x[1]))
+                for inst, _strike, _dte in chain_rows:
+                    if len(per_under) >= per_under_budget:
+                        break
+                    per_under.append(inst)
+                if len(per_under) >= per_under_budget:
+                    break
+            desk_selected.extend(per_under)
+            if len(desk_selected) >= candidate_budget:
+                break
+        selected.extend(desk_selected[:candidate_budget])
+        diagnostics[desk] = {"underlyings": observed_underlyings, "scan_underlyings": target_underlyings, "selected": len(desk_selected[:candidate_budget]), "quota": quota}
+
+    logger.info(
+        "ICICI chain-desk candidate build: total_options=%d selected=%d rejected_bad_metadata=%d index=%s stock=%s",
+        len(options), len(selected), rejected_bad_metadata,
+        diagnostics.get("ICICI_INDEX_OPTIONS", {}), diagnostics.get("ICICI_STOCK_OPTIONS", {}),
+    )
+    return selected
 
 
 def _deep_first_float(obj, names) -> float:
@@ -605,6 +781,7 @@ class InstrumentRegistry:
             logger.warning("ICICI security master discovery failed: %s", e, exc_info=True)
             rows = []
         icici_seen = icici_option_rows = icici_added = icici_reject_structural = icici_reject_non_option = 0
+        option_candidates: list[ExchangeInstrument] = []
         for r in rows:
             icici_seen += 1
             ex_raw = str(
@@ -731,15 +908,23 @@ class InstrumentRegistry:
                 min_qty=first_positive(_safe_float(r.get("LotSize")), _safe_float(r.get("lot_size"))),
                 raw=raw,
             )
-            key = normalise_symbol(symbol)
+            option_candidates.append(inst)
+        pruned = _select_icici_options_for_runtime(option_candidates)
+        for inst in pruned:
+            key = normalise_symbol(inst.symbol)
             if key in out and normalise_symbol(str(out[key].product_id or "")) != normalise_symbol(str(inst.product_id or "")):
                 key = f"{key}_{normalise_symbol(str(inst.product_id or len(out)))}"
             out[key] = inst
-            icici_added += 1
+        icici_added = len(out)
         logger.info(
-            "ICICI options discovery summary: rows=%d option_like=%d added=%d rejected_structural=%d rejected_non_option=%d",
-            icici_seen, icici_option_rows, icici_added, icici_reject_structural, icici_reject_non_option
+            "ICICI options discovery summary: rows=%d option_like=%d candidates=%d added=%d rejected_structural=%d rejected_non_option=%d",
+            icici_seen, icici_option_rows, len(option_candidates), icici_added, icici_reject_structural, icici_reject_non_option
         )
+        if len(option_candidates) > len(out):
+            logger.info(
+                "ICICI chain-desk candidates retained for quote probing/runtime: %d/%d; full security master was evaluated by desk/underlying quality",
+                len(out), len(option_candidates)
+            )
         self.icici = out
         return out
 

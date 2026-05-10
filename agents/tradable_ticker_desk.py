@@ -292,8 +292,18 @@ class TradableTickerDesk:
                 f"retained={desk_retained} replaced={desk_replaced}"
             )
 
+        # Keep diagnostic rows bounded. Large option chains can contain tens of
+        # thousands of rejected/parked rows; retaining all of them delays startup
+        # and bloats Telegram/terminal reporting while adding no trading value.
+        max_rows = max(50, int(_cfg("DYNAMIC_DESK_MAX_REPORT_ROWS", 400)))
+        if len(rejected_rows) > max_rows:
+            notes.append(f"diagnostic rows truncated {max_rows}/{len(rejected_rows)}")
+            rejected_rows = rejected_rows[:max_rows]
         global_rank_items.extend(rejected_rows)
         global_rank_items.sort(key=lambda x: (x[1].selected, x[1].score), reverse=True)
+        if len(global_rank_items) > max_rows:
+            notes.append(f"rank rows truncated {max_rows}/{len(global_rank_items)}")
+            global_rank_items = global_rank_items[:max_rows]
         for rank, (inst, row) in enumerate(global_rank_items, 1):
             out_rows.append(self._replace_row(row, rank=rank, selected=inst.asset_id in selected_ids))
 
