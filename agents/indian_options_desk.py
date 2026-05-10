@@ -28,6 +28,54 @@ def _cfg(name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
+def _csv_symbols(raw: Any) -> set[str]:
+    if isinstance(raw, str):
+        vals = raw.replace(";", ",").split(",")
+    elif raw is None:
+        vals = []
+    else:
+        vals = list(raw)
+    return {normalise_symbol(str(x)) for x in vals if normalise_symbol(str(x))}
+
+
+def _structural_tokens(raw: Mapping[str, Any]) -> set[str]:
+    """Tokens that describe venue/product structure, not a tradable thesis.
+
+    This is intentionally not an approved-symbol list. It is a data-integrity
+    check: an option underlying cannot be the exchange segment, product type,
+    option right, strike, or expiry token from the same security-master row.
+    """
+    vals: set[str] = set()
+    for name in (
+        "exchange_code", "ExchangeCode", "Exchange", "exchange",
+        "segment", "Segment", "product_type", "ProductType", "Product",
+        "InstrumentType", "InstrumentName", "Series", "right", "Right",
+        "option_type", "OptionType", "CallPut", "strike_price", "StrikePrice",
+        "Strike", "expiry_date", "ExpiryDate", "Expiry",
+    ):
+        v = raw.get(name)
+        n = normalise_symbol(str(v or ""))
+        if n:
+            vals.add(n)
+    vals.update({"OPTION", "OPTIONS", "CALL", "PUT", "CE", "PE", "C", "P"})
+    return vals
+
+
+def _is_index_option_row(raw: Mapping[str, Any]) -> bool:
+    text = normalise_symbol(" ".join(str(raw.get(k, "")) for k in (
+        "product_type", "ProductType", "InstrumentType", "InstrumentName",
+        "Series", "segment", "Segment", "exchange_code", "ExchangeCode",
+        "TradingSymbol", "Symbol", "SecurityName", "Security Name",
+    )))
+    if "OPTIDX" in text or "INDEXOPTION" in text or "INDEXOPTIONS" in text:
+        return True
+    if "OPTSTK" in text or "STOCKOPTION" in text or "STOCKOPTIONS" in text:
+        return False
+    # BFO listed options are index derivatives in the ICICI master; NFO can be
+    # index or stock and should be resolved by product/instrument metadata.
+    return "BFO" in text
+
+
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -142,16 +190,30 @@ class BlackScholesModel:
 
 
 class IndianOptionsDesk:
-    INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+    def desk_id_for_row(self, raw: Mapping[str, Any]) -> str:
+        return "ICICI_INDEX_OPTIONS" if _is_index_option_row(raw) else "ICICI_STOCK_OPTIONS"
 
-    def desk_id_for_underlying(self, underlying: str) -> str:
-        return "ICICI_INDEX_OPTIONS" if normalise_symbol(underlying) in self.INDEX_UNDERLYINGS else "ICICI_STOCK_OPTIONS"
+    def desk_id_for_underlying(self, underlying: str, raw: Optional[Mapping[str, Any]] = None) -> str:
+        return self.desk_id_for_row(raw or {})
 
     def score_option(self, inst: TradableInstrument, quote: Optional[Mapping[str, Any]] = None) -> OptionSelectionScore:
         raw = dict(getattr(getattr(inst, "primary", None), "raw", {}) or {})
         if quote:
             raw.update(dict(quote))
-        underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("ShortName") or getattr(inst, "asset_id", ""))
+        underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("Underlying") or raw.get("UnderlyingSymbol") or getattr(inst, "asset_id", ""))
+        structural = _structural_tokens(raw)
+        if bool(_cfg("ICICI_OPTION_REJECT_STRUCTURAL_UNDERLYING", True)) and (not underlying or underlying in structural):
+            return OptionSelectionScore(
+                score=0.0,
+                desk_id="ICICI_REJECT_CORRUPT_OPTION",
+                underlying=underlying,
+                option_type=_right(raw),
+                strike=safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike") or raw.get("Strike"), 0.0),
+                expiry=str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or raw.get("Expiry") or ""),
+                dte=0.0,
+                bs=None,
+                reasons=("structural_underlying", f"underlying={underlying or 'missing'}"),
+            )
         right = _right(raw)
         strike = safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("strike") or raw.get("Strike"), 0.0)
         expiry_raw = raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("expiry") or raw.get("Expiry") or ""
@@ -177,7 +239,8 @@ class IndianOptionsDesk:
 
         min_dte = float(_cfg("ICICI_OPTION_MIN_DTE", 2.0))
         max_dte = float(_cfg("ICICI_OPTION_MAX_DTE", 21.0))
-        target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45 if self.desk_id_for_underlying(underlying) == "ICICI_INDEX_OPTIONS" else 0.50))
+        desk_id = self.desk_id_for_underlying(underlying, raw)
+        target_delta = float(_cfg("ICICI_INDEX_OPTION_TARGET_ABS_DELTA", 0.45) if desk_id == "ICICI_INDEX_OPTIONS" else _cfg("ICICI_STOCK_OPTION_TARGET_ABS_DELTA", 0.50))
         delta_band = float(_cfg("ICICI_OPTION_DELTA_BAND", 0.22))
         max_theta_premium = float(_cfg("ICICI_OPTION_MAX_THETA_TO_PREMIUM", 0.08))
         max_spread_bps = float(_cfg("ICICI_OPTION_MAX_SPREAD_BPS", 180.0))
@@ -195,10 +258,12 @@ class IndianOptionsDesk:
             # Avoid deep OTM lottery and deep ITM capital lock; prefer tradable ATM/near-ATM alpha.
             moneyness_score = clamp(1.0 - abs(bs.moneyness - 1.0) / 0.08)
             bs_score = 0.42 * delta_score + 0.36 * theta_score + 0.22 * moneyness_score
-        live_score = 1.0 if quote else 0.45
+        live_score = 1.0 if quote else 0.0 if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) else 0.45
         score = clamp(0.35 * bs_score + 0.25 * dte_score + 0.20 * spread_score + 0.20 * live_score)
+        if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote:
+            score = 0.0
 
-        reasons: list[str] = [self.desk_id_for_underlying(underlying).lower()]
+        reasons: list[str] = [desk_id.lower(), f"underlying={underlying}"]
         if dte <= 0:
             reasons.append("expiry_unknown")
         elif dte < min_dte:
@@ -216,10 +281,12 @@ class IndianOptionsDesk:
             reasons.append("wide_option_spread")
         if quote:
             reasons.append("breeze_quote")
+        elif bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)):
+            reasons.append("live_quote_required")
 
         return OptionSelectionScore(
             score=score,
-            desk_id=self.desk_id_for_underlying(underlying),
+            desk_id=desk_id,
             underlying=underlying,
             option_type=right,
             strike=strike,

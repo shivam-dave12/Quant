@@ -79,8 +79,6 @@ class VenueRoute:
 class InstitutionalDeskRouter:
     """Assigns a cross-venue instrument to its institutional asset desk."""
 
-    INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
-
     def __init__(self) -> None:
         configured = _csv_map(_cfg("DESK_MAX_ACTIVE_BY_ID", ""))
         # Quotas are now by strategy/asset desk, never by venue. Venue-level
@@ -108,7 +106,8 @@ class InstitutionalDeskRouter:
         if ExchangeName.ICICI in exchanges or getattr(inst, "primary_exchange", None) == ExchangeName.ICICI:
             if ac != AssetClass.OPTION:
                 return "ICICI_REJECT_NON_OPTION"
-            if underlying in self.INDEX_UNDERLYINGS:
+            kind = normalise_symbol(raw.get("option_kind") or raw.get("product_type") or raw.get("ProductType") or raw.get("InstrumentType") or raw.get("InstrumentName") or raw.get("Series") or "")
+            if "IDX" in kind or "INDEX" in kind:
                 return "ICICI_INDEX_OPTIONS"
             return "ICICI_STOCK_OPTIONS"
 
@@ -168,7 +167,8 @@ class InstitutionalDeskRouter:
             spread_score = 0.60 if spread_bps <= 0 else clamp(1.0 - spread_bps / 80.0)
             turnover = self._turnover_proxy(raw, price)
             turnover_score = clamp(__import__("math").log10(max(1.0, turnover)) / 9.0)
-            leverage_confirmed = safe_float(getattr(ex_inst, "max_leverage", 0.0), 0.0) > 0 or ex == ExchangeName.ICICI
+            configured_cap = self._configured_route_leverage_cap(ex, ex_inst.symbol, ex_inst.asset_class)
+            leverage_confirmed = safe_float(getattr(ex_inst, "max_leverage", 0.0), 0.0) > 0 or configured_cap > 0 or ex == ExchangeName.ICICI
             status_ok = getattr(ex_inst, "is_active", False)
             data_score = 1.0 if snap else (0.72 if raw else 0.35)
             venue_pref = self._venue_preference_score(ex)
@@ -178,6 +178,7 @@ class InstitutionalDeskRouter:
             if snap: reasons.append("live_snapshot")
             if turnover_score >= 0.55: reasons.append("liquid")
             if spread_bps > 80: reasons.append("wide_spread")
+            if configured_cap > 0 and safe_float(getattr(ex_inst, "max_leverage", 0.0), 0.0) <= 0: reasons.append("configured_leverage_cap")
             if not leverage_confirmed and ex != ExchangeName.ICICI: reasons.append("unconfirmed_leverage")
             routes.append(VenueRoute(
                 exchange=ex,
@@ -187,10 +188,43 @@ class InstitutionalDeskRouter:
                 executable=executable,
                 spread_bps=max(0.0, spread_bps),
                 turnover_score=turnover_score,
-                max_leverage=safe_float(getattr(ex_inst, "max_leverage", 0.0), 0.0),
+                max_leverage=safe_float(getattr(ex_inst, "max_leverage", 0.0), configured_cap),
             ))
         routes.sort(key=lambda r: (r.executable, r.score, self._venue_preference_score(r.exchange)), reverse=True)
         return tuple(routes)
+
+
+    def _configured_route_leverage_cap(self, ex: ExchangeName, symbol: str, asset_class: AssetClass) -> float:
+        if ex != ExchangeName.DELTA:
+            return 0.0
+        keys = []
+        base = normalise_symbol(symbol)
+        for k in (base, base.replace("USDT", "USD"), base.replace("USD", "")):
+            if k and k not in keys:
+                keys.append(k)
+        raw = _cfg("DELTA_SYMBOL_MAX_LEVERAGE", {})
+        if isinstance(raw, dict):
+            for k in keys:
+                try:
+                    v = float(raw.get(k, 0.0) or 0.0)
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+        by_class = _cfg("DELTA_ASSET_CLASS_MAX_LEVERAGE", {})
+        if isinstance(by_class, dict):
+            try:
+                v = float(by_class.get(str(asset_class.value), 0.0) or 0.0)
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+        if asset_class in (AssetClass.FUTURE, AssetClass.CRYPTO):
+            try:
+                return float(_cfg("DELTA_DEFAULT_FUTURE_MAX_LEVERAGE", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+        return 0.0
 
     def preferred_exchange_for(self, inst: TradableInstrument, *, market_snapshots: Mapping[ExchangeName, Mapping[str, Mapping]] | None = None) -> ExchangeName:
         routes = self.venue_routes_for(inst, market_snapshots=market_snapshots)

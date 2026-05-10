@@ -250,7 +250,11 @@ class TradableTickerDesk:
             inst for inst in instruments
             if inst.primary_exchange == ExchangeName.ICICI and inst.asset_class == AssetClass.OPTION
         ]
-        candidates.sort(key=lambda i: 0 if self.router.desk_id_for(i) == "ICICI_INDEX_OPTIONS" else 1)
+        # Quote probes are not symbol-approved. They are prioritised by row quality:
+        # derivative segment, non-structural underlying, usable strike/expiry/right,
+        # and index-vs-stock desk balance. The final selection still requires live
+        # Breeze quote data.
+        candidates.sort(key=self._icici_quote_probe_priority, reverse=True)
         out: Dict[str, dict] = {}
         failures = 0
         for inst in candidates[:limit]:
@@ -266,6 +270,30 @@ class TradableTickerDesk:
             notes.append(f"icici authenticated option quote probes={len(out)}")
             notes.append(f"icici authenticated quote probes={len(out)}")
         return out
+
+    def _icici_quote_probe_priority(self, inst: TradableInstrument) -> float:
+        raw = dict(getattr(getattr(inst, "primary", None), "raw", {}) or {})
+        underlying = normalise_symbol(raw.get("stock_code") or raw.get("underlying") or raw.get("Underlying") or "")
+        ex = normalise_symbol(raw.get("exchange_code") or raw.get("ExchangeCode") or "")
+        product = normalise_symbol(raw.get("product_type") or raw.get("ProductType") or raw.get("InstrumentType") or raw.get("option_kind") or "")
+        right = normalise_symbol(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or "")
+        strike = safe_float(raw.get("strike_price") or raw.get("StrikePrice") or raw.get("Strike"), 0.0)
+        expiry = str(raw.get("expiry_date") or raw.get("ExpiryDate") or raw.get("Expiry") or "")
+        structural = {ex, product, right, normalise_symbol(expiry), normalise_symbol(str(strike))}
+        score = 0.0
+        if ex in {"NFO", "BFO"}:
+            score += 2.0
+        if underlying and underlying not in structural:
+            score += 2.0
+        if strike > 0:
+            score += 1.0
+        if expiry:
+            score += 1.0
+        if right in {"CALL", "PUT", "CE", "PE", "C", "P"}:
+            score += 0.8
+        if self.router.desk_id_for(inst) == "ICICI_INDEX_OPTIONS":
+            score += 0.4
+        return score
 
     def _score_instrument(self, inst: TradableInstrument, *, delta_tickers: Mapping[str, dict], icici_quote: Optional[Mapping[str, Any]] = None, desk_id: str = "UNKNOWN", venue_routes: Sequence[Any] = ()) -> TradableDeskRow:
         primary = inst.primary
