@@ -453,13 +453,14 @@ class TradableTickerDesk:
         option_score = 0.0
         option_greeks = ""
         if primary.exchange == ExchangeName.ICICI and inst.asset_class == AssetClass.OPTION:
+            underlying_chain_desk = bool(raw.get("icici_underlying_desk"))
             opt = self.options.score_option(inst, quote_success)
             option_score = opt.score
             score = clamp(0.62 * opt.score + 0.18 * execution_score + 0.12 * spread_score + 0.08 * live_score)
             if opt.bs:
                 option_greeks = f"Δ={opt.bs.delta:+.2f} θ/prem={opt.bs.theta_to_premium:.1%} dte={opt.dte:.1f}"
             raw["_option_selection"] = opt.as_dict()
-            if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote_success:
+            if bool(_cfg("ICICI_OPTION_REQUIRE_LIVE_QUOTE", True)) and not quote_success and not underlying_chain_desk:
                 score = 0.0
 
         details = self._icici_detail_text({**primary.raw, **quote_success}) if primary.exchange == ExchangeName.ICICI else ""

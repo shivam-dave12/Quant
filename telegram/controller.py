@@ -2061,6 +2061,9 @@ class TelegramBotController:
     def _icici_renewal_retry_sec(self) -> float:
         return max(300.0, float(getattr(config, "ICICI_TOKEN_RENEWAL_RETRY_SEC", 30 * 60) or (30 * 60)))
 
+    def _icici_renewal_window_sec(self) -> float:
+        return max(0.0, float(getattr(config, "ICICI_TOKEN_RENEWAL_WINDOW_SEC", 4 * 60 * 60) or 0.0))
+
     def _icici_renewal_check_sec(self) -> float:
         return max(15.0, min(300.0, float(getattr(config, "ICICI_TOKEN_RENEWAL_CHECK_SEC", 60.0) or 60.0)))
 
@@ -2090,7 +2093,11 @@ class TelegramBotController:
         if not self._icici_renewal_enabled():
             return False
         now = now or self._icici_auth_now()
-        if now < self._icici_renewal_target(now):
+        target = self._icici_renewal_target(now)
+        if now < target:
+            return False
+        window_sec = self._icici_renewal_window_sec()
+        if window_sec > 0 and (now - target).total_seconds() > window_sec:
             return False
         date_key = now.date().isoformat()
         if self._icici_renewal_last_success_date == date_key:
@@ -2739,6 +2746,19 @@ class TelegramBotController:
         if not self._should_auto_icici_token_on_start():
             return
         try:
+            if self._icici_refresh_thread is not None and self._icici_refresh_thread.is_alive():
+                wait_sec = max(
+                    self._icici_otp_timeout_sec() + 60.0,
+                    float(getattr(config, "ICICI_STARTUP_TOKEN_WAIT_SEC", 300.0) or 300.0),
+                )
+                self.send_message(
+                    "🔐 <b>ICICI Breeze token refresh already running</b>\n"
+                    "Startup will wait for the active renewal instead of launching a second login."
+                )
+                self._icici_refresh_thread.join(timeout=wait_sec)
+                if self._icici_refresh_thread.is_alive():
+                    raise RuntimeError("ICICI token refresh is already running and did not complete before startup wait timeout")
+
             from exchanges.icici.breeze_auth import BreezeTokenService
             service = BreezeTokenService()
             try:

@@ -106,6 +106,10 @@ class InstitutionalDeskRouter:
         if ExchangeName.ICICI in exchanges or getattr(inst, "primary_exchange", None) == ExchangeName.ICICI:
             if ac != AssetClass.OPTION:
                 return "ICICI_REJECT_NON_OPTION"
+            if raw.get("icici_underlying_desk"):
+                desk_id = str(raw.get("desk_id") or "").strip().upper()
+                if desk_id in {"ICICI_INDEX_OPTIONS", "ICICI_STOCK_OPTIONS"}:
+                    return desk_id
             kind = normalise_symbol(raw.get("option_kind") or raw.get("product_type") or raw.get("ProductType") or raw.get("InstrumentType") or raw.get("InstrumentName") or raw.get("Series") or "")
             if "IDX" in kind or "INDEX" in kind:
                 return "ICICI_INDEX_OPTIONS"

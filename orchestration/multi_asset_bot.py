@@ -73,8 +73,9 @@ class AssetContext:
     strategy: QuantStrategy
     last_tick_time: float = 0.0
     last_report_sec: float = 0.0
-    last_heartbeat_sec: float = 0.0
-    last_analysis_sec: float = 0.0
+    last_decision_log_sec: float = 0.0
+    last_decision_log_key: str = ""
+    last_gate_log_sec: float = 0.0
     ready: bool = False
     started_at_sec: float = 0.0
 
@@ -1159,9 +1160,8 @@ class MultiAssetQuantBot:
                     ctx.last_tick_time = time.time()
                     if dt_ms > 5000:
                         logger.warning("%s on_tick took %.0fms", ctx.instrument.asset_id, dt_ms)
-                    self._maybe_analysis_audit(ctx, dt_ms)
+                    self._maybe_decision_audit(ctx, dt_ms)
                     self._dash_context(ctx, dt_ms=dt_ms)
-                    self._maybe_asset_heartbeat(ctx)
                 time.sleep(float(getattr(config, "SCANNER_TICK_SLEEP_SEC", 0.25)))
             except KeyboardInterrupt:
                 break
@@ -1172,62 +1172,159 @@ class MultiAssetQuantBot:
 
     def _log_throttled_asset(self, ctx: AssetContext, msg: str, interval: float = 60.0) -> None:
         now = time.time()
-        if now - ctx.last_heartbeat_sec >= interval:
-            ctx.last_heartbeat_sec = now
+        if now - ctx.last_gate_log_sec >= interval:
+            ctx.last_gate_log_sec = now
             with instrument_scope(ctx.instrument):
                 logger.info("%s | %s", ctx.instrument.asset_id, msg)
 
-    def _maybe_analysis_audit(self, ctx: AssetContext, dt_ms: float) -> None:
-        """Per-contract proof-of-analysis log.
+    @staticmethod
+    def _enum_name(value: Any) -> str:
+        return str(getattr(value, "name", value) or "")
 
-        This is deliberately separate from strategy internals.  It shows the
-        scanner is actually stepping every active contract, even when the
-        contract has no sweep or posterior event to report.
-        """
-        now = time.time()
-        interval = float(getattr(config, "SCANNER_ASSET_ANALYSIS_LOG_SEC", 15.0))
-        if interval <= 0 or now - ctx.last_analysis_sec < interval:
-            return
-        ctx.last_analysis_sec = now
-        try:
-            inst = ctx.instrument
-            price = ctx.data_manager.get_last_price()
-            pos = ctx.strategy.get_position()
-            state = ctx.phase_name if pos else "SCANNING"
-            with instrument_scope(inst):
-                book = self.guard.book_for_context(ctx)
-                desk_open = self.guard.count_open_for_desk(book.desk_id, self.contexts)
-                portfolio_open = self.guard.count_open(self.contexts)
-                if dt_ms > 250.0:
-                    logger.info(
-                        "DESK_LATENCY asset=%s desk=%s venue=%s symbol=%s state=%s price=%.4f eval_ms=%.1f desk_open=%d/%d open=%d/%d policy=%s",
-                        inst.asset_id, book.desk_id, inst.primary_exchange.value.upper(), inst.display_symbol,
-                        state, price, dt_ms, desk_open, book.max_open, portfolio_open, self.guard.max_open_positions,
-                        self.guard.report_line(ctx),
-                    )
-        except Exception as e:
-            logger.debug("analysis audit failed for %s: %s", ctx.instrument.asset_id, e)
+    @staticmethod
+    def _short_text(value: Any, limit: int = 140) -> str:
+        text = " ".join(str(value or "").replace("\n", " ").split())
+        return text[:limit]
 
-    def _maybe_asset_heartbeat(self, ctx: AssetContext) -> None:
-        now = time.time()
-        if now - ctx.last_heartbeat_sec < float(getattr(config, "SCANNER_ASSET_HEARTBEAT_SEC", 60.0)):
-            return
-        ctx.last_heartbeat_sec = now
-        self._dash_heartbeat()
+    @staticmethod
+    def _fmt_bool(value: Any) -> str:
+        return "Y" if bool(value) else "N"
+
+    def _decision_audit_parts(self, ctx: AssetContext, dt_ms: float) -> tuple[str, list[str]]:
+        inst = ctx.instrument
+        strat = ctx.strategy
+        entry = getattr(strat, "_entry_engine", None)
+        engine_state = self._enum_name(getattr(entry, "state", "unknown"))
+        price = 0.0
         try:
-            price = ctx.data_manager.get_last_price()
-            pos = ctx.strategy.get_position()
-            state = "IN_POSITION" if pos else "SCANNING"
+            price = float(ctx.data_manager.get_last_price() or 0.0)
+        except Exception:
+            pass
+        book = self.guard.book_for_context(ctx)
+        desk_open = self.guard.count_open_for_desk(book.desk_id, self.contexts)
+        firm_open = self.guard.count_open(self.contexts)
+        pos = None
+        try:
+            pos = strat.get_position()
+        except Exception:
+            pos = None
+
+        parts = [
+            "DESK_DECISION",
+            f"asset={inst.asset_id}",
+            f"desk={book.desk_id}",
+            f"venue={inst.primary_exchange.value.upper()}",
+            f"symbol={inst.display_symbol}",
+            f"state={'IN_POSITION' if pos else 'SCANNING'}",
+            f"engine={engine_state}",
+            f"price={price:.4f}",
+            f"eval_ms={dt_ms:.1f}",
+            f"desk_open={desk_open}/{book.max_open}",
+            f"firm_open={firm_open}/{self.guard.max_open_positions}",
+        ]
+
+        sig = getattr(strat, "_last_sig", None)
+        if sig is not None:
+            parts.append(
+                "calc="
+                f"comp={float(getattr(sig, 'composite', 0.0) or 0.0):+.4f},"
+                f"thr={float(getattr(sig, 'threshold_used', 0.0) or 0.0):.4f},"
+                f"dev={float(getattr(sig, 'deviation_atr', 0.0) or 0.0):+.2f}ATR,"
+                f"atr={float(getattr(sig, 'atr', 0.0) or 0.0):.4f},"
+                f"confirm={int(getattr(sig, 'n_confirming', 0) or 0)}/5,"
+                f"regime={self._fmt_bool(getattr(sig, 'regime_ok', False))}"
+            )
+
+        sweep = getattr(entry, "_last_sweep_analysis", None) if entry is not None else None
+        if isinstance(sweep, dict) and sweep:
+            parts.append(
+                "sweep="
+                f"rev={float(sweep.get('rev_score', sweep.get('reversal_score', 0.0)) or 0.0):.0f},"
+                f"cont={float(sweep.get('cont_score', sweep.get('continuation_score', 0.0)) or 0.0):.0f},"
+                f"p={float(sweep.get('quant_posterior', sweep.get('posterior', 0.0)) or 0.0):.3f},"
+                f"ev={float(sweep.get('quant_ev', sweep.get('expected_value', 0.0)) or 0.0):+.2f}R,"
+                f"disp={float(sweep.get('displacement_atr', 0.0) or 0.0):.2f}ATR,"
+                f"cisd={self._fmt_bool(sweep.get('cisd', False))},"
+                f"ote={self._fmt_bool(sweep.get('ote', False))},"
+                f"quality={float(sweep.get('quality_score', 0.0) or 0.0):.2f}"
+            )
+
+        inst_dec = getattr(strat, "_last_institutional_decision", None)
+        if inst_dec is not None:
+            reject = " | ".join(str(x) for x in (getattr(inst_dec, "reject_reasons", None) or [])[:3])
+            allow = " | ".join(str(x) for x in (getattr(inst_dec, "allow_reasons", None) or [])[:3])
+            parts.append(
+                "decision="
+                f"{'ALLOW' if bool(getattr(inst_dec, 'allowed', False)) else 'BLOCK'},"
+                f"grade={getattr(inst_dec, 'grade', '?')},"
+                f"score={float(getattr(inst_dec, 'score', 0.0) or 0.0):.2f},"
+                f"rr={float(getattr(inst_dec, 'rr', 0.0) or 0.0):.2f},"
+                f"target={float(getattr(inst_dec, 'target_realism', 0.0) or 0.0):.2f},"
+                f"size={float(getattr(inst_dec, 'size_mult', 0.0) or 0.0):.2f}"
+            )
+            parts.append("blocker=" + self._short_text(reject or "none"))
+            if allow:
+                parts.append("allow=" + self._short_text(allow, 120))
+        else:
+            blocker = "waiting_for_valid_sweep"
+            try:
+                skip = getattr(entry, "scan_skip_info", None)
+                if callable(skip):
+                    skip = skip()
+                if isinstance(skip, dict) and skip:
+                    bits: list[str] = []
+                    for group_name in ("liq", "bridge"):
+                        group = skip.get(group_name)
+                        if isinstance(group, dict):
+                            vals = [f"{k}={v}" for k, v in group.items() if v]
+                            if vals:
+                                bits.append(group_name + ":" + ",".join(vals[:4]))
+                    if bits:
+                        blocker = "scan_deferred " + " ".join(bits)
+            except Exception:
+                pass
+            try:
+                pool_plan = getattr(entry, "pool_plan_info", None)
+                if callable(pool_plan):
+                    pool_plan = pool_plan()
+                if isinstance(pool_plan, dict):
+                    summary = self._short_text(pool_plan.get("summary"), 120)
+                    if summary:
+                        blocker = f"{pool_plan.get('role', 'POOL')}_plan {summary}"
+            except Exception:
+                pass
+            parts.append("blocker=" + self._short_text(blocker))
+
+        key_fields = [
+            engine_state,
+            parts[-1],
+            parts[-2] if len(parts) > 1 else "",
+            str(bool(pos)),
+        ]
+        return "|".join(key_fields), parts
+
+    def _maybe_decision_audit(self, ctx: AssetContext, dt_ms: float) -> None:
+        now = time.time()
+        interval = float(getattr(
+            config,
+            "SCANNER_ASSET_DECISION_LOG_SEC",
+            30.0,
+        ) or 0.0)
+        if interval <= 0:
+            return
+        stale_sec = max(interval, float(getattr(config, "SCANNER_ASSET_DECISION_STALE_LOG_SEC", 180.0) or 180.0))
+        if now - ctx.last_decision_log_sec < interval:
+            return
+        try:
+            key, parts = self._decision_audit_parts(ctx, dt_ms)
+            if key == ctx.last_decision_log_key and now - ctx.last_decision_log_sec < stale_sec:
+                return
+            ctx.last_decision_log_key = key
+            ctx.last_decision_log_sec = now
             with instrument_scope(ctx.instrument):
-                book = self.guard.book_for_context(ctx)
-                desk_open = self.guard.count_open_for_desk(book.desk_id, self.contexts)
-                logger.info("DESK_HEARTBEAT asset=%s desk=%s venue=%s symbol=%s price=%.4f state=%s desk_open=%d/%d open=%d/%d",
-                            ctx.instrument.asset_id, book.desk_id, ctx.instrument.primary_exchange.value.upper(),
-                            ctx.instrument.display_symbol, price, state,
-                            desk_open, book.max_open,
-                            self.guard.count_open(self.contexts), self.guard.max_open_positions)
+                logger.info(" | ".join(parts))
         except Exception as e:
-            logger.debug("heartbeat failed for %s: %s", ctx.instrument.asset_id, e)
+            logger.debug("decision audit failed for %s: %s", ctx.instrument.asset_id, e)
 
     def stop(self) -> None:
         logger.info("Stopping multi-asset bot...")

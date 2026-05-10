@@ -16,6 +16,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # Keep old conftest behavior for Path.read_text() compatibility.
 _read_text = Path.read_text
 
@@ -3957,3 +3959,119 @@ def test_v106_icici_scheduler_retries_after_8_until_session_ready(monkeypatch):
 
     monkeypatch.setattr(controller.time, "time", lambda: 1_000.0 + 31 * 60)
     assert c._icici_renewal_due(now)
+
+
+def test_v107_icici_scheduler_does_not_fire_stale_morning_job_at_night(monkeypatch):
+    from datetime import datetime
+
+    import config
+
+    c = _telegram_controller_stub_for_icici()
+    monkeypatch.setattr(config, "ICICI_TOKEN_RENEWAL_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_TOKEN_RENEWAL_TIME", "08:00", raising=False)
+    monkeypatch.setattr(config, "ICICI_TOKEN_RENEWAL_WINDOW_SEC", 4 * 60 * 60, raising=False)
+    monkeypatch.setattr(c, "_icici_session_ready_for_today", lambda: False)
+
+    morning = datetime(2026, 5, 10, 8, 30, tzinfo=c._icici_auth_tz())
+    night = datetime(2026, 5, 10, 22, 20, tzinfo=c._icici_auth_tz())
+
+    assert c._icici_renewal_due(morning)
+    assert not c._icici_renewal_due(night)
+
+
+def test_v107_icici_startup_waits_for_existing_token_refresh(monkeypatch):
+    import threading
+    import time as pytime
+
+    import config
+
+    c = _telegram_controller_stub_for_icici()
+    c._icici_refresh_thread = threading.Thread(target=lambda: pytime.sleep(0.20), daemon=True)
+    c._icici_refresh_thread.start()
+    monkeypatch.setattr(config, "ICICI_AUTO_TOKEN_GENERATOR_ON_STARTUP", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_AUTH_REQUIRED_FOR_DETAILS", True, raising=False)
+    monkeypatch.setattr(config, "ICICI_STARTUP_TOKEN_WAIT_SEC", 0.01, raising=False)
+    monkeypatch.setattr(c, "_icici_otp_timeout_sec", lambda: -60.0)
+
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            c._ensure_icici_session_before_bot_start()
+    finally:
+        c._icici_refresh_thread.join(timeout=1.0)
+
+    assert any("already running" in msg for msg in c.sent)
+
+
+def test_v107_icici_underlying_chain_desk_is_selectable_without_quote(monkeypatch):
+    from agents.desk_router import InstitutionalDeskRouter
+    from agents.icici_chain_architect import build_underlying_payload
+    from agents.tradable_ticker_desk import TradableTickerDesk
+    from core.instruments import AssetClass, ExchangeInstrument, ExchangeName, TradableInstrument
+
+    def opt(strike, right):
+        raw = {
+            "stock_code": "NIFTY",
+            "exchange_code": "NFO",
+            "product_type": "OPTIDX",
+            "right": right,
+            "strike_price": str(strike),
+            "expiry_date": "19-May-2026",
+            "TradingSymbol": f"NIFTY_19MAY2026_{strike}_{right[:1].upper()}",
+        }
+        return ExchangeInstrument(
+            ExchangeName.ICICI,
+            raw["TradingSymbol"],
+            raw["TradingSymbol"],
+            raw["TradingSymbol"],
+            "NIFTY",
+            AssetClass.OPTION,
+            raw=raw,
+            tick_size=0.05,
+            lot_step=75,
+            min_qty=75,
+        )
+
+    rows = [opt(22800, "Call"), opt(23000, "Call"), opt(22800, "Put"), opt(23000, "Put")]
+    payload = build_underlying_payload("NIFTY", "ICICI_INDEX_OPTIONS", rows)
+    ei = ExchangeInstrument(
+        ExchangeName.ICICI,
+        "NIFTY",
+        "NIFTY",
+        "NIFTY",
+        "NIFTY",
+        AssetClass.OPTION,
+        raw=payload,
+        tick_size=0.05,
+        lot_step=75,
+        min_qty=75,
+    )
+    inst = TradableInstrument("NIFTY", "NIFTY", AssetClass.OPTION, ExchangeName.ICICI, {ExchangeName.ICICI: ei})
+
+    monkeypatch.setattr("config.ICICI_OPTION_REQUIRE_LIVE_QUOTE", True, raising=False)
+    monkeypatch.setattr("config.DYNAMIC_DESK_MAX_ACTIVE_CONTEXTS", 10, raising=False)
+    monkeypatch.setattr("config.DYNAMIC_DESK_MIN_SCORE", 0.38, raising=False)
+    monkeypatch.setattr("config.DESK_ICICI_INDEX_OPTIONS_MAX_ACTIVE", 4, raising=False)
+    monkeypatch.setattr("config.DESK_ENABLED_IDS", "", raising=False)
+
+    assert InstitutionalDeskRouter().desk_id_for(inst) == "ICICI_INDEX_OPTIONS"
+    selection = TradableTickerDesk().select([inst], icici_api=None)
+    row = next(r for r in selection.rows if r.asset_id == "NIFTY")
+
+    assert inst in selection.selected
+    assert row.selected is True
+    assert row.desk_id == "ICICI_INDEX_OPTIONS"
+    assert row.score >= 0.38
+
+
+def test_v107_multi_asset_operator_heartbeat_log_path_removed():
+    import inspect
+
+    from orchestration.multi_asset_bot import AssetContext, MultiAssetQuantBot
+
+    assert "last_heartbeat_sec" not in getattr(AssetContext, "__dataclass_fields__", {})
+    assert not hasattr(MultiAssetQuantBot, "_maybe_asset_heartbeat")
+    assert "_maybe_asset_heartbeat" not in inspect.getsource(MultiAssetQuantBot.run)
+    assert "DESK_HEARTBEAT" not in inspect.getsource(MultiAssetQuantBot)
