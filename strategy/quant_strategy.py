@@ -2528,6 +2528,37 @@ class DailyRiskGate:
 # ═══════════════════════════════════════════════════════════════
 # MAIN STRATEGY CLASS
 # ═══════════════════════════════════════════════════════════════
+
+def _icici_option_right(instrument) -> str:
+    """Return C/P for ICICI option contracts without using symbol allow-lists."""
+    try:
+        raw = getattr(getattr(instrument, "primary", None), "raw", {}) or {}
+        val = str(raw.get("right") or raw.get("option_type") or raw.get("OptionType") or raw.get("Right") or "").strip().upper()
+        if val in {"C", "CE", "CALL"}:
+            return "C"
+        if val in {"P", "PE", "PUT"}:
+            return "P"
+    except Exception:
+        pass
+    return ""
+
+
+def _is_icici_option_instrument(instrument) -> bool:
+    try:
+        return str(getattr(getattr(instrument, "primary_exchange", None), "value", getattr(instrument, "primary_exchange", ""))).lower() == "icici"
+    except Exception:
+        return False
+
+
+def _icici_allowed_thesis_side(instrument) -> str:
+    """Calls express bullish thesis; puts express bearish thesis. Both are bought."""
+    r = _icici_option_right(instrument)
+    if r == "C":
+        return "long"
+    if r == "P":
+        return "short"
+    return ""
+
 class QuantStrategy:
     def __init__(self, order_manager=None, instrument=None):
         self._instrument = instrument
@@ -5981,6 +6012,31 @@ class QuantStrategy:
         if price < 1.0: return
         atr = self._atr_5m.atr
         if atr < 1e-10: return
+
+        # ICICI options are long-premium only by design.  Liquidity/structure may
+        # produce a bullish or bearish underlying thesis, but the executable
+        # option position is always a BUY: bullish thesis buys calls, bearish
+        # thesis buys puts.  We never sell/write an option to open.
+        if bool(getattr(config, "ICICI_LONG_PREMIUM_ONLY", True)) and _is_icici_option_instrument(self._instrument):
+            thesis_side = str(side or "").lower()
+            allowed_thesis = _icici_allowed_thesis_side(self._instrument)
+            if allowed_thesis and thesis_side != allowed_thesis:
+                logger.info(
+                    "%s ICICI long-premium mapper skipped contract: thesis=%s requires %s but option_right=%s",
+                    self._asset_id, thesis_side, allowed_thesis, _icici_option_right(self._instrument),
+                )
+                return
+            if thesis_side == "short":
+                logger.info(
+                    "%s ICICI bearish thesis mapped to BUY PUT premium; internal execution side=long",
+                    self._asset_id,
+                )
+            elif thesis_side == "long":
+                logger.info(
+                    "%s ICICI bullish thesis mapped to BUY CALL premium; internal execution side=long",
+                    self._asset_id,
+                )
+            side = "long"
 
         # ── Risk gate ─────────────────────────────────────────────────────────────
         # Bug #5 fix: reuse prefetched balance when available; only call the REST

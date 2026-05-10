@@ -119,6 +119,27 @@ class BreezeRestClient:
     def get_historical_charts(self, **kwargs) -> Dict[str, Any]:
         return self.request("GET", "/historicalcharts", kwargs)
 
+    def get_historical_charts_v2(self, **kwargs) -> Dict[str, Any]:
+        """Breeze v2 historicalcharts fallback.
+
+        ICICI documents both v1 signed `/historicalcharts` and v2
+        `https://breezeapi.icicidirect.com/api/v2/historicalcharts`.  v2 uses
+        `X-SessionToken` + `apikey` headers and query parameters.  We keep this
+        as a read-only fallback only; orders still go through signed v1 routes.
+        """
+        session = self.auth.get_session(force_refresh=False)
+        headers = {"X-SessionToken": session.session_token, "apikey": self.auth.api_key}
+        resp = self.http.get(
+            "https://breezeapi.icicidirect.com/api/v2/historicalcharts",
+            headers=headers,
+            params=kwargs,
+            timeout=20.0,
+        )
+        data = self._json_or_raise(resp, "/api/v2/historicalcharts")
+        if resp.status_code >= 400 or data.get("Error"):
+            raise RuntimeError(f"Breeze v2 historicalcharts failed HTTP {resp.status_code}: {data.get('Error') or data}")
+        return data
+
     def get_security_master_rows(self, *, url: str | None = None, cache_path: str | Path | None = None, timeout: float = 12.0) -> list[dict[str, str]]:
         """Download and parse ICICI's daily Security Master file.
 

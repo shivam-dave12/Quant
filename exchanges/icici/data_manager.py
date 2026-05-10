@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
     config = None  # type: ignore
 
 from .api import BreezeRestClient
+from .market_session import icici_market_session_state
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,20 @@ class ICICIOptionDataManager:
 
     def start(self) -> bool:
         try:
+            session = icici_market_session_state()
+            if not session.is_open:
+                if bool(_cfg("ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP", True)):
+                    self.warmup_closed_market(session.reason)
+                if not bool(_cfg("ICICI_ALLOW_CLOSED_MARKET_WARMUP", False)):
+                    logger.warning(
+                        "ICICI option DM dormant: %s; historical warmup=%s; live quote/trading disabled for %s",
+                        session.reason,
+                        self._historical_count_summary(),
+                        getattr(self.instrument, "asset_id", "?"),
+                    )
+                    return False
             self.api.preflight_session()
-            self._warmup()
+            self._warmup(historical_only=False)
             if self._last_price <= 0 or len(self._candles.get("1m", ())) < int(_cfg("ICICI_OPTION_MIN_READY_1M_BARS", 30)):
                 logger.error("ICICI option DM not ready: missing real quote/historical candles for %s", getattr(self.instrument, "asset_id", "?"))
                 return False
@@ -64,6 +77,20 @@ class ICICIOptionDataManager:
         except Exception as exc:
             logger.error("ICICI option data start failed for %s: %s", getattr(self.instrument, "asset_id", "?"), exc)
             return False
+
+    def warmup_closed_market(self, reason: str = "market closed") -> None:
+        """Fetch historical candles outside live trading hours without enabling trading."""
+        try:
+            self.api.preflight_session()
+            self._warmup(historical_only=not bool(_cfg("ICICI_CLOSED_MARKET_QUOTE_PROBE", False)))
+            logger.info(
+                "ICICI closed-market historical warmup for %s complete: %s; reason=%s",
+                getattr(self.instrument, "asset_id", "?"),
+                self._historical_count_summary(),
+                reason,
+            )
+        except Exception as exc:
+            logger.warning("ICICI closed-market historical warmup failed for %s: %s", getattr(self.instrument, "asset_id", "?"), exc)
 
     def stop(self) -> None:
         self._running = False
@@ -89,17 +116,25 @@ class ICICIOptionDataManager:
                 logger.debug("ICICI quote poll failed: %s", exc)
             time.sleep(max(0.5, interval))
 
-    def _warmup(self) -> None:
+    def _warmup(self, historical_only: bool = False) -> None:
         for tf in ("1m", "5m", "15m", "1h"):
             try:
                 self._load_historical(tf)
             except Exception as exc:
-                logger.debug("ICICI historical warmup %s failed: %s", tf, exc)
-        self._refresh_quote()
+                logger.warning("ICICI historical warmup %s failed for %s: %s", tf, getattr(self.instrument, "asset_id", "?"), exc)
+        if not historical_only:
+            self._refresh_quote()
+
+    def _historical_count_summary(self) -> str:
+        with self._lock:
+            return " ".join(f"{tf}={len(self._candles.get(tf, ())) }" for tf in ("1m", "5m", "15m", "1h"))
 
     def _load_historical(self, timeframe: str) -> None:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
-        interval = {"1m": "1minute", "5m": "5minute", "15m": "15minute", "1h": "30minute", "4h": "day", "1d": "day"}.get(timeframe, "1minute")
+        # Breeze v1/v2 documents these intervals: 1minute, 5minute, 30minute, 1day.
+        # There is no native 15minute or 1h interval; use 5m/30m source bars
+        # rather than sending unsupported values and getting empty historicals.
+        interval = {"1m": "1minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "1day", "1d": "1day"}.get(timeframe, "1minute")
         to_dt = datetime.now(timezone.utc)
         from_dt = to_dt - timedelta(days=5 if timeframe in {"1m", "5m", "15m"} else 45)
         body = {
@@ -113,8 +148,27 @@ class ICICIOptionDataManager:
             "right": self.api._normalise_right(raw.get("right") or raw.get("OptionType") or ""),
             "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
         }
-        resp = self.api.get_historical_charts(**{k: v for k, v in body.items() if v})
+        req = {k: v for k, v in body.items() if v}
+        resp = self.api.get_historical_charts(**req)
         rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
+        if not rows and bool(_cfg("ICICI_HISTORICAL_V2_FALLBACK", True)):
+            v2_req = dict(req)
+            v2_req["exch_code"] = v2_req.pop("exchange_code", "NFO")
+            # v2 examples accept human-cased values.
+            if str(v2_req.get("product_type", "")).lower() == "options":
+                v2_req["product_type"] = "Options"
+            if str(v2_req.get("right", "")).lower() == "call":
+                v2_req["right"] = "Call"
+            elif str(v2_req.get("right", "")).lower() == "put":
+                v2_req["right"] = "Put"
+            # v2 sample URL uses a space-separated timestamp.
+            try:
+                v2_req["from_date"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
+                v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+            resp = self.api.get_historical_charts_v2(**v2_req)
+            rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
         if isinstance(rows, dict):
             rows = rows.get("data") or rows.get("candles") or []
         parsed = []

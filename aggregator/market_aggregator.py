@@ -104,13 +104,15 @@ class MarketAggregator:
 
     def __init__(
         self,
-        primary_dm,    # CoinSwitchDataManager | DeltaDataManager
-        secondary_dm,  # DeltaDataManager | CoinSwitchDataManager | None
+        primary_dm,    # executable data manager
+        secondary_dm,  # optional venue side-channel
         instrument=None,
+        analysis_dm=None,  # optional non-executable structural/chart source
     ) -> None:
         self.instrument = instrument
         self._primary   = primary_dm
         self._secondary = secondary_dm
+        self._analysis  = analysis_dm
 
         self._lock = threading.RLock()
 
@@ -136,7 +138,8 @@ class MarketAggregator:
             f"MarketAggregator initialised "
             f"[{getattr(instrument, 'asset_id', 'legacy')}] "
             f"(primary={type(primary_dm).__name__} "
-            f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__})"
+            f"secondary={'none' if secondary_dm is None else type(secondary_dm).__name__} "
+            f"analysis={'none' if analysis_dm is None else type(analysis_dm).__name__})"
         )
 
     # ── Internal: secondary trade tap ────────────────────────────────────────
@@ -203,6 +206,7 @@ class MarketAggregator:
 
         primary_ok = [False]
         secondary_ok = [False]
+        analysis_ok = [False]
 
         def start_primary():
             primary_ok[0] = self._primary.start()
@@ -216,13 +220,28 @@ class MarketAggregator:
                 logger.warning(f"Secondary DM start failed (non-fatal): {e}")
                 secondary_ok[0] = False
 
+        def start_analysis():
+            if self._analysis is None:
+                analysis_ok[0] = True
+                return
+            try:
+                analysis_ok[0] = self._analysis.start()
+            except Exception as e:
+                logger.warning(f"Analysis DM start failed: {e}")
+                analysis_ok[0] = False
+
         t1 = threading.Thread(target=start_primary,   daemon=True)
         t2 = threading.Thread(target=start_secondary, daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t3 = threading.Thread(target=start_analysis,  daemon=True)
+        t1.start(); t2.start(); t3.start()
+        t1.join(); t2.join(); t3.join()
 
         if not primary_ok[0]:
             logger.error("❌ Primary DM failed to start — cannot trade")
+            return False
+
+        if self._analysis is not None and not analysis_ok[0]:
+            logger.error("❌ Analysis DM failed to start — refusing strategy without structural chart")
             return False
 
         if self._secondary and not secondary_ok[0]:
@@ -244,12 +263,22 @@ class MarketAggregator:
                 self._secondary.stop()
             except Exception:
                 pass
+        if self._analysis:
+            try:
+                self._analysis.stop()
+            except Exception:
+                pass
 
     def restart_streams(self) -> bool:
         ok = self._primary.restart_streams()
         if self._secondary:
             try:
                 self._secondary.restart_streams()
+            except Exception:
+                pass
+        if self._analysis:
+            try:
+                self._analysis.restart_streams()
             except Exception:
                 pass
         return ok
@@ -322,12 +351,25 @@ class MarketAggregator:
     def register_strategy(self, strategy) -> None:
         self._strategy_ref = strategy
         self._primary.register_strategy(strategy)
+        if self._analysis is not None:
+            try:
+                self._analysis.register_strategy(strategy)
+            except Exception:
+                pass
         # Secondary does NOT register strategy — we don't want double
         # on_realtime_trade calls.  The tap above handles secondary trades.
 
-    # ── Candles — primary exchange only ──────────────────────────────────────
+    # ── Candles — structural chart source only ───────────────────────────────
 
     def get_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
+        # ICICI options use the underlying chart for liquidity/ICT/structure,
+        # while price/orderbook/execution remain on the option contract.  Other
+        # venues use primary executable candles exactly as before.
+        if self._analysis is not None:
+            return self._analysis.get_candles(timeframe, limit)
+        return self._primary.get_candles(timeframe, limit)
+
+    def get_execution_candles(self, timeframe: str = "5m", limit: int = 100) -> List[Dict]:
         return self._primary.get_candles(timeframe, limit)
 
     # ── Price — weighted average (display only) ────────────────────────────

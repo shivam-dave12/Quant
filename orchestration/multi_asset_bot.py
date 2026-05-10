@@ -29,10 +29,18 @@ from exchanges.delta.api import DeltaAPI
 from exchanges.delta.data_manager import DeltaDataManager
 try:
     from exchanges.icici.api import BreezeRestClient
+    from exchanges.icici.market_session import icici_market_session_state
     from exchanges.icici.data_manager import ICICIOptionDataManager
+    from exchanges.icici.underlying_data_manager import ICICIUnderlyingDataManager
 except Exception:
     BreezeRestClient = None  # type: ignore
     ICICIOptionDataManager = None  # type: ignore
+    ICICIUnderlyingDataManager = None  # type: ignore
+    def icici_market_session_state():  # type: ignore
+        class _S:
+            is_open = True
+            reason = "ICICI market session guard unavailable"
+        return _S()
 from risk.risk_manager import RiskManager
 from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManager
 from core.market_policy import active_policy
@@ -950,19 +958,22 @@ class MultiAssetQuantBot:
             return None
         router = ExecutionRouter(coinswitch_om=cs_om, delta_om=delta_om, icici_om=icici_om, default=primary_ex.value)
 
+        analysis_dm = None
         if primary_ex == ExchangeName.ICICI:
             if ICICIOptionDataManager is None:
                 logger.warning("%s skipped: ICICI option data manager unavailable", inst.asset_id)
                 return None
             primary_dm = ICICIOptionDataManager(instrument=inst, api=self.icici_api)
             secondary_dm = None
+            if bool(getattr(config, "ICICI_USE_UNDERLYING_CHART_FOR_STRUCTURE", True)) and ICICIUnderlyingDataManager is not None:
+                analysis_dm = ICICIUnderlyingDataManager(instrument=inst, api=self.icici_api)
         elif primary_ex == ExchangeName.DELTA:
             primary_dm = DeltaDataManager(instrument=inst)
             secondary_dm = CoinSwitchDataManager(instrument=inst) if ExchangeName.COINSWITCH in inst.by_exchange and cs_api else None
         else:
             primary_dm = CoinSwitchDataManager(instrument=inst)
             secondary_dm = DeltaDataManager(instrument=inst) if ExchangeName.DELTA in inst.by_exchange and delta_api else None
-        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst)
+        data = MarketAggregator(primary_dm=primary_dm, secondary_dm=secondary_dm, instrument=inst, analysis_dm=analysis_dm)
 
         # Context is created after the risk manager, so use a tiny holder to let
         # PortfolioRiskManager resolve its owning context at call-time.
@@ -980,11 +991,62 @@ class MultiAssetQuantBot:
         ctx_holder["ctx"] = ctx
         return ctx
 
+    def _icici_session_open_or_dormant(self, ctx: AssetContext) -> bool:
+        """Return True when ICICI data should start now; otherwise mark dormant."""
+        try:
+            if ctx.instrument.primary_exchange != ExchangeName.ICICI:
+                return True
+            session = icici_market_session_state()
+            if session.is_open or bool(getattr(config, "ICICI_ALLOW_CLOSED_MARKET_WARMUP", False)):
+                return True
+            # Closed market: do not trade, but allow Breeze historicalcharts warmup
+            # so the desk can validate contracts and build context outside hours.
+            if bool(getattr(config, "ICICI_ALLOW_CLOSED_MARKET_HISTORICAL_WARMUP", True)):
+                try:
+                    primary = getattr(ctx.data_manager, "_primary", None)
+                    warm = getattr(primary, "warmup_closed_market", None)
+                    if callable(warm):
+                        warm(session.reason)
+                    analysis = getattr(ctx.data_manager, "_analysis", None)
+                    awarm = getattr(analysis, "warmup_closed_market", None)
+                    if callable(awarm):
+                        awarm(session.reason)
+                except Exception as exc:
+                    logger.warning("%s ICICI closed-market historical warmup failed: %s", ctx.instrument.asset_id, exc)
+            ctx.ready = False
+            ctx.started_at_sec = time.time()
+            setattr(ctx, "dormant_reason", session.reason)
+            logger.warning(
+                "%s ICICI option runtime dormant — %s; historical warmup allowed but live quote/trading disabled until session opens",
+                ctx.instrument.asset_id,
+                session.reason,
+            )
+            return False
+        except Exception:
+            return True
+
+    def _maybe_activate_dormant_icici(self, ctx: AssetContext) -> None:
+        if ctx.ready or ctx.instrument.primary_exchange != ExchangeName.ICICI:
+            return
+        retry_sec = float(getattr(config, "ICICI_DORMANT_RETRY_SEC", 300.0))
+        last = float(getattr(ctx, "last_icici_dormant_retry", 0.0) or 0.0)
+        if time.time() - last < retry_sec:
+            return
+        setattr(ctx, "last_icici_dormant_retry", time.time())
+        session = icici_market_session_state()
+        if not session.is_open and not bool(getattr(config, "ICICI_ALLOW_CLOSED_MARKET_WARMUP", False)):
+            self._log_throttled_asset(ctx, f"ICICI option desk dormant: {session.reason}")
+            return
+        logger.info("%s ICICI session is open; retrying option data manager start", ctx.instrument.asset_id)
+        self._start_one_context(ctx)
+
     def _start_one_context(self, ctx: AssetContext) -> bool:
         inst = ctx.instrument
         try:
             with instrument_scope(inst):
                 logger.info("▶️ Starting %s [%s/%s] | %s", inst.asset_id, inst.primary_exchange.value, inst.display_symbol, self.guard.report_line(ctx))
+                if not self._icici_session_open_or_dormant(ctx):
+                    return True
                 target_lev = self._instrument_leverage(inst)
                 effective_lev = self._set_leverage_with_backoff(ctx, target_lev)
                 max_txt = f" (cap={inst.max_leverage:g}x)" if getattr(inst, "max_leverage", 0.0) else ""
@@ -1073,6 +1135,7 @@ class MultiAssetQuantBot:
                         logger.info("CIO_SELECTION\n%s", self.cio.format_report() if self.cio else "")
                 for ctx in list(self.contexts):
                     if not ctx.ready:
+                        self._maybe_activate_dormant_icici(ctx)
                         continue
                     interval = self.guard.evaluation_interval(ctx)
                     if not ctx.has_position and ctx.last_tick_time > 0 and time.time() - ctx.last_tick_time < interval:

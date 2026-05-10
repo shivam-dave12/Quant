@@ -722,10 +722,14 @@ class _ICICIAdapter:
         self.max_qty = float(getattr(exchange_instrument, "max_qty", 0.0) or 0.0) if exchange_instrument is not None else 0.0
         self.raw = getattr(exchange_instrument, "raw", {}) or {}
 
-    def _order_body(self, side: str, order_type: str, quantity: float, price=None, trigger_price=None, reduce_only: bool = False) -> Dict:
+    def _order_body(self, side: str, order_type: str, quantity: float, price=None, trigger_price=None, reduce_only: bool = False, **kwargs) -> Dict:
         if str(order_type).upper() == "MARKET" and not reduce_only:
             raise RuntimeError("ICICI options guard: market entries are disabled; use limit orders")
-        action = "buy" if side.upper() == "BUY" else "sell"
+        # Indian options in this bot are long-premium by construction.  A bearish
+        # underlying thesis must be expressed by BUYING a put, never by selling a
+        # call/put.  Therefore all opening ICICI orders are BUY; exits/reducing
+        # protective orders are SELL.
+        action = "sell" if reduce_only else "buy"
         raw = self.raw
         body = {
             "stock_code": str(raw.get("stock_code") or raw.get("ShortName") or "").upper(),
@@ -784,10 +788,10 @@ class _ICICIAdapter:
                 pass
         return 0.0
 
-    def place_order(self, side: str, order_type: str, quantity: float, price: Optional[float] = None, trigger_price: Optional[float] = None, reduce_only: bool = False) -> Optional[Dict]:
+    def place_order(self, side: str, order_type: str, quantity: float, price: Optional[float] = None, trigger_price: Optional[float] = None, reduce_only: bool = False, **kwargs) -> Optional[Dict]:
         self.limiter.wait()
         try:
-            resp = self.api.place_order(**self._order_body(side, order_type, quantity, price=price, trigger_price=trigger_price, reduce_only=reduce_only))
+            resp = self.api.place_order(**self._order_body(side, order_type, quantity, price=price, trigger_price=trigger_price, reduce_only=reduce_only, **kwargs))
             oid = self.extract_order_id(resp)
             if not oid:
                 return {"_raw": resp, "_sc": 0, "_error": True}
