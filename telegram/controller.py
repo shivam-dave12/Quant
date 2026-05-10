@@ -260,41 +260,28 @@ class TelegramBotController:
         try:
             url      = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
             commands = [
-                {"command": "start",       "description": "Start trading bot"},
-                {"command": "stop",        "description": "Stop trading bot"},
-                {"command": "status",      "description": "Full status + pool map"},
-                {"command": "assets",      "description": "Multi-asset scanner universe"},
-                {"command": "fund",        "description": "Agentic CIO desk selection"},
-                {"command": "thinking",    "description": "posterior EV / uncertainty / execution audit"},
-                {"command": "position",    "description": "Current position + adaptive exit"},
-                {"command": "pnl",         "description": "Quick PnL snapshot"},
-                {"command": "market",      "description": "Price, ATR, bias, session — one glance"},
-                {"command": "pools",       "description": "Live liquidity pool map"},
-                {"command": "flow",        "description": "CVD + OB delta + tick aggression"},
-                {"command": "structures",  "description": "Structure/AMD/PD posterior features"},
-                {"command": "sl",          "description": "Current SL/TP levels + distances"},
-                {"command": "trades",      "description": "Recent trade history"},
-                {"command": "stats",       "description": "Signal attribution analysis"},
-                {"command": "learn",       "description": "Post-trade analysis · Bayesian adaptive parameters · IC"},
-                {"command": "balance",     "description": "Wallet balance"},
-                {"command": "equity",      "description": "Balance + unrealised PnL"},
-                {"command": "risk",        "description": "Risk gate status + limits"},
-                {"command": "watchdog",    "description": "Watchdog status"},
-                {"command": "watchdog_heal", "description": "Watchdog auto-heal on/off"},
-                {"command": "watchdog_freeze", "description": "Engage watchdog breaker"},
-                {"command": "watchdog_unfreeze", "description": "Clear watchdog breaker"},
-                {"command": "pause",       "description": "Pause trading"},
-                {"command": "resume",      "description": "Resume trading"},
-                {"command": "trail",       "description": "Toggle trailing SL on/off/auto"},
-                {"command": "config",      "description": "Show config values"},
-                {"command": "set",         "description": "Set config value live"},
-                {"command": "setexchange", "description": "Switch execution exchange"},
-                {"command": "icici_refresh", "description": "Run ICICI login + refresh Breeze token"},
-                {"command": "icici_login", "description": "Alias: run ICICI login token generator"},
+                {"command": "start",  "description": "Start hedge-fund command center"},
+                {"command": "stop",   "description": "Stop runtime"},
+                {"command": "desks",  "description": "Desk-wise portfolio board"},
+                {"command": "desk",   "description": "Deep dive a desk: /desk BTC_GLOBAL"},
+                {"command": "asset",  "description": "Full audit for an asset: /asset BTC"},
+                {"command": "why",    "description": "Why/why-not decision trail: /why BTC"},
+                {"command": "calc",   "description": "Full calculation audit: /calc BTC"},
+                {"command": "params", "description": "Runtime params and asset policy"},
+                {"command": "selector", "description": "Ticker selector scores/reasons"},
+                {"command": "shutdown", "description": "Last SIGTERM/crash diagnostics"},
+                {"command": "health", "description": "Runtime health and not-ready desks"},
+                {"command": "icici",  "description": "ICICI option desk status"},
+                {"command": "fund",   "description": "CIO / execution queue"},
+                {"command": "risk",   "description": "Portfolio risk board"},
+                {"command": "position", "description": "Open positions"},
+                {"command": "pnl",    "description": "Portfolio PnL"},
+                {"command": "pause",  "description": "Pause trading; keep scanning"},
+                {"command": "resume", "description": "Resume trading"},
+                {"command": "icici_login", "description": "Run ICICI login token generator"},
                 {"command": "icici_otp",   "description": "Submit ICICI OTP"},
-                {"command": "killswitch",  "description": "Emergency close all"},
-                {"command": "resetrisk",   "description": "Clear risk lockout"},
-                {"command": "help",        "description": "Show commands"},
+                {"command": "killswitch", "description": "Emergency close/cancel"},
+                {"command": "help",   "description": "Command map"},
             ]
             payload = {
                 "commands":      commands,
@@ -316,7 +303,7 @@ class TelegramBotController:
     def _normalize_command(self, text: str) -> tuple:
         t = (text or "").strip()
         bare_cmds = {
-            "start", "stop", "status", "assets", "thinking", "pools", "flow",
+            "start", "stop", "status", "desks", "desk", "asset", "why", "calc", "params", "selector", "shutdown", "health", "icici", "assets", "thinking", "pools", "flow",
             "structures", "position", "trades", "stats", "config",
             "pause", "resume", "balance", "trail", "killswitch",
             "set", "help", "huntstatus", "setexchange", "resetrisk",
@@ -347,8 +334,18 @@ class TelegramBotController:
             if   cmd in ("/help", "/commands"): return self._cmd_help()
             elif cmd == "/start":               return self._cmd_start()
             elif cmd == "/stop":                return self._cmd_stop()
-            elif cmd == "/status":              return self._cmd_status()
-            elif cmd == "/assets":              return self._cmd_assets()
+            elif cmd == "/status":              return self._cmd_desks()
+            elif cmd == "/desks":               return self._cmd_desks()
+            elif cmd == "/desk":                return self._cmd_desk(args)
+            elif cmd == "/asset":               return self._cmd_asset(args)
+            elif cmd == "/why":                 return self._cmd_why(args)
+            elif cmd == "/calc":                return self._cmd_calc(args)
+            elif cmd == "/params":              return self._cmd_params(args)
+            elif cmd == "/selector":            return self._cmd_selector(args)
+            elif cmd in ("/shutdown", "/laststop", "/crash"): return self._cmd_shutdown()
+            elif cmd == "/health":              return self._cmd_health()
+            elif cmd == "/icici":               return self._cmd_icici()
+            elif cmd == "/assets":              return self._cmd_desks()
             elif cmd == "/fund":                return self._cmd_fund()
             elif cmd == "/thinking":            return self._cmd_thinking()
             elif cmd == "/pools":               return self._cmd_pools()
@@ -401,43 +398,106 @@ class TelegramBotController:
     def _cmd_help(self) -> str:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏛️ <b>INSTITUTIONAL QUANT BOT</b>\n"
+            "🏛️ <b>HEDGE-FUND COMMAND CENTER</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<i>QuantPosterior master flow · liquidity features · adaptive exit</i>\n\n"
-            "📊 <b>QUICK VIEW</b>\n"
-            "  /pnl — Snapshot: uPnL, realised, last trades\n"
-            "  /market — Price, ATR, AMD, MTF, flow, pools\n"
-            "  /sl — SL/TP, true net BE, adaptive exit state\n"
-            "  /equity — Balance + unrealised + session return\n"
-            "  /risk — Gate status, daily limits, cooldown\n\n"
-            "🧠 <b>DECISION ANALYSIS</b>\n"
-            "  /thinking — posterior P(edge), EV, uncertainty, execution audit\n"
-            "  /pools — BSL/SSL pool map with priority scores\n"
-            "  /flow — Order flow (CVD, OB delta, tick aggression)\n"
-            "  /structures — structure/AMD/PD features used by posterior\n"
-            "  /huntstatus — liquidity-draw telemetry, not execution authority\n\n"
-            "📈 <b>POSITION &amp; HISTORY</b>\n"
-            "  /position — Position + adaptive exit state\n"
-            "  /trades — Last 10 trades with R, MFE, fees\n"
-            "  /stats — Win rate attribution by tier/reason\n"
-            "  /learn — Post-trade Bayesian adaptive params\n"
-            "  /balance — Wallet balance detail\n\n"
+            "<i>Desk-wise operator reports. Raw legacy log spam is disabled.</i>\n\n"
+            "📚 <b>DESK COMMANDS</b>\n"
+            "  /desks — portfolio desk board\n"
+            "  /desk &lt;id&gt; — full desk audit, e.g. /desk BTC_GLOBAL\n"
+            "  /asset &lt;symbol&gt; — calculated values for one instrument\n"
+            "  /why &lt;symbol&gt; — why/why-not decision trail\n"
+            "  /health — runtime readiness and not-ready causes\n"
+            "  /icici — ICICI options desk, underlying/contract state\n\n"
+            "💼 <b>PORTFOLIO</b>\n"
+            "  /fund — CIO execution queue\n"
+            "  /risk — risk board\n"
+            "  /position — open positions\n"
+            "  /pnl — portfolio PnL\n\n"
             "⚙️ <b>CONTROL</b>\n"
-            "  /start · /stop — Start/stop bot\n"
-            "  /pause · /resume — Pause trading (keep monitoring)\n"
-            "  /trail [on|off|auto] — Adaptive exit override\n"
-            "  /config — Show active config values\n"
-            "  /set &lt;key&gt; &lt;val&gt; — Live-adjust config\n"
-            "  /setexchange &lt;delta|coinswitch&gt; — Switch execution\n"
-            "  /icici_refresh — Run Breeze login/token generator\n"
-            "  /icici_otp 123456 — Submit ICICI OTP when asked\n\n"
-            "🚨 <b>EMERGENCY</b>\n"
-            "  /killswitch — Close positions + cancel all\n"
-            "  /resetrisk [full] — Clear risk lockout\n"
+            "  /start · /stop · /pause · /resume\n"
+            "  /icici_login · /icici_otp 123456\n"
+            "  /killswitch — emergency close/cancel\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
     # ================================================================
+
+
+    def _cmd_desks(self) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_institutional_desks_report", None)
+        return fn() if callable(fn) else self._cmd_assets()
+
+    def _cmd_desk(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_institutional_desk_report", None)
+        return fn(args) if callable(fn) else "Desk report unavailable."
+
+    def _cmd_asset(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_institutional_asset_report", None)
+        return fn(args) if callable(fn) else "Asset audit unavailable."
+
+    def _cmd_why(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_institutional_why_report", None)
+        return fn(args) if callable(fn) else "Why report unavailable."
+
+    def _cmd_calc(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        if not (args or "").strip():
+            return "Use: <code>/calc BTC</code> or <code>/calc NIFTY_19MAY2026_22800_C</code>"
+        fn = getattr(bot_instance, "format_calculation_report", None)
+        return fn(args) if callable(fn) else "Calculation audit unavailable."
+
+    def _cmd_params(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_parameter_report", None)
+        return fn(args) if callable(fn) else "Parameter report unavailable."
+
+    def _cmd_selector(self, args: str) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_selector_report", None)
+        return fn(args) if callable(fn) else "Selector audit unavailable."
+
+    def _cmd_shutdown(self) -> str:
+        global bot_instance
+        fn = getattr(bot_instance, "format_shutdown_diagnostics_report", None) if bot_instance is not None else None
+        if callable(fn):
+            return fn()
+        try:
+            from observability.institutional import format_shutdown_diagnostics
+            return format_shutdown_diagnostics()
+        except Exception as e:
+            return f"Shutdown diagnostics unavailable: {_esc(e)}"
+
+    def _cmd_health(self) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_institutional_health_report", None)
+        return fn() if callable(fn) else "Health report unavailable."
+
+    def _cmd_icici(self) -> str:
+        global bot_instance
+        if bot_instance is None:
+            return "Bot is not running."
+        fn = getattr(bot_instance, "format_icici_desk_report", None)
+        return fn() if callable(fn) else "ICICI report unavailable."
 
     def _cmd_assets(self) -> str:
         global bot_instance
@@ -2717,6 +2777,20 @@ def main():
 
     def _signal_handler(signum, frame):
         logger.info(f"Signal {signum} — stopping controller")
+        try:
+            import json, os, time as _time
+            from pathlib import Path
+            Path("data").mkdir(exist_ok=True)
+            Path("data/last_shutdown.json").write_text(json.dumps({
+                "component": "telegram_controller",
+                "signal": int(signum),
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "time": _time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "note": "External SIGTERM/SIGINT received by Python process; sender not available via standard signal handler.",
+            }, indent=2))
+        except Exception:
+            pass
         raise SystemExit(0)
 
     if threading.current_thread() is threading.main_thread():

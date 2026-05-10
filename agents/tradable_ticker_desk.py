@@ -126,6 +126,7 @@ class TradableTickerDesk:
         self.always_include = _parse_csv(_cfg("DYNAMIC_DESK_ALWAYS_INCLUDE", ""))
         self.router = InstitutionalDeskRouter()
         self.options = IndianOptionsDesk()
+        self.last_selection: Optional[TradableDeskSelection] = None
 
     def select(
         self,
@@ -317,7 +318,9 @@ class TradableTickerDesk:
             notes.append(f"stream load avoided for {len(instruments) - len(selected)} catalog instruments")
         if active_set:
             notes.append(f"previous_active={len(active_set)}")
-        return TradableDeskSelection(time.time(), tuple(selected), tuple(parked), tuple(out_rows), tuple(notes))
+        selection = TradableDeskSelection(time.time(), tuple(selected), tuple(parked), tuple(out_rows), tuple(notes))
+        self.last_selection = selection
+        return selection
 
     @staticmethod
     def _replace_row(row: TradableDeskRow, **updates: Any) -> TradableDeskRow:

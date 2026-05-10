@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import telegram.config as telegram_config
+import config
 try:
     from core.redaction import redact_sensitive
 except Exception:
@@ -453,6 +454,19 @@ def _tg_enrich_asset_message(message: str, *, instrument=None, event_type: Optio
         return message
     return f"{header}\n{message}"
 
+def _is_legacy_strategy_telegram(message: str, event_type: Optional[str]) -> bool:
+    if bool(getattr(config, "TELEGRAM_LEGACY_STRATEGY_ALERTS_ENABLED", False)):
+        return False
+    if event_type in {"CRASH", "ORDER", "FILL", "EXIT", "KILLSWITCH", "RISK"}:
+        return False
+    m = str(message)
+    legacy = (
+        "[THINK]", "DIR_TELEMETRY", "POST_SWEEP", "POST-SWEEP",
+        "SWEEPS detected", "FLOW_ADVISORY", "POOL-GATE", "RAW_TP_AUDIT",
+        "RAW_SL_AUDIT", "periodic report", "QuantPosterior"
+    )
+    return any(x in m for x in legacy)
+
 def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=None, event_type: Optional[str] = None, context: Optional[Dict[str, Any]] = None, enrich: bool = True) -> bool:
     """Enqueue a Telegram message for async delivery.  Never blocks the caller.
 
@@ -463,6 +477,8 @@ def send_telegram_message(message: str, parse_mode: str = "HTML", *, instrument=
     caller is not blocked.
     """
     if not telegram_config.TELEGRAM_ENABLED:
+        return False
+    if _is_legacy_strategy_telegram(str(message), event_type):
         return False
     message = _repair_mojibake(str(redact_sensitive(message)))
     if enrich:

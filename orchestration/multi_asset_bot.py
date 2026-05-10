@@ -46,6 +46,7 @@ from orchestration.portfolio_manager import PortfolioManager, PortfolioRiskManag
 from core.market_policy import active_policy
 from strategy.quant_strategy import QuantStrategy
 from telegram.notifier import send_telegram_message
+from observability import institutional as obs
 try:
     from telemetry.dashboard_emitter import DashboardEmitter
 except Exception:
@@ -211,38 +212,37 @@ class MultiAssetQuantBot:
         c = self._active_context(); return c.risk_manager if c else None
 
     def format_assets_report(self) -> str:
-        def esc(x):
-            return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        lines = ["📡 <b>MULTI-ASSET SCANNER</b>", ""]
-        lines.append(f"Reserved slots: {self.guard.count_open(self.contexts)}/{self.guard.max_open_positions}")
-        lines.append(f"Budget mode: {esc(self.guard.budget_mode)} · one contract slot max: {self.guard.max_per_contract}")
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            try:
-                px = ctx.data_manager.get_last_price()
-            except Exception:
-                px = 0.0
-            pos = ctx.strategy.get_position()
-            state = ctx.phase_name if pos else ("READY" if ctx.ready else "NOT READY")
-            try:
-                bal = ctx.risk_manager.get_available_balance() or {}
-                budget = float(bal.get("available", 0.0) or 0.0)
-                raw = float(bal.get("available_raw", budget) or budget)
-                budget_txt = f"slot=${budget:,.2f} raw=${raw:,.2f}"
-            except Exception:
-                budget_txt = "slot=n/a"
-            venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
-            lev_txt = f" · lev≤{inst.max_leverage:g}x" if getattr(inst, "max_leverage", 0.0) else ""
-            try:
-                pol_txt = self.guard.report_line(ctx)
-            except Exception:
-                pol_txt = "policy=n/a"
-            lines.append(f"• <b>{esc(inst.asset_id)}</b> primary={esc(inst.primary_exchange.value.upper())} {esc(inst.display_symbol)} [{esc(venues)}] — {esc(state)} @ {px:,.4f} · {esc(budget_txt)}{lev_txt} · {esc(pol_txt)}")
-        if self.discovery_report and self.discovery_report.unavailable:
-            lines.append("\n<b>Unavailable:</b>")
-            for aid, reason in self.discovery_report.unavailable.items():
-                lines.append(f"⚪ {esc(aid)} — {esc(reason)}")
-        return "\n".join(lines)
+        return obs.format_desks(self)
+
+    def format_institutional_desks_report(self) -> str:
+        return obs.format_desks(self)
+
+    def format_institutional_desk_report(self, desk: str) -> str:
+        return obs.format_desk(self, desk)
+
+    def format_institutional_asset_report(self, asset: str) -> str:
+        return obs.format_asset(self, asset)
+
+    def format_institutional_why_report(self, asset: str) -> str:
+        return obs.format_why(self, asset)
+
+    def format_institutional_health_report(self) -> str:
+        return obs.format_health(self)
+
+    def format_icici_desk_report(self) -> str:
+        return obs.format_icici(self)
+
+    def format_calculation_report(self, asset: str) -> str:
+        return obs.format_calculations(self, asset)
+
+    def format_parameter_report(self, query: str = "") -> str:
+        return obs.format_parameters(self, query)
+
+    def format_selector_report(self, desk: str = "") -> str:
+        return obs.format_selector(self, desk)
+
+    def format_shutdown_diagnostics_report(self) -> str:
+        return obs.format_shutdown_diagnostics()
 
     def _cio_report(self):
         if self.cio is None:
@@ -280,10 +280,7 @@ class MultiAssetQuantBot:
         return False, "CIO parked desk"
 
     def format_fund_report(self) -> str:
-        if self.cio is None:
-            return "Agentic fund runtime is disabled."
-        self._cio_report()
-        return self.cio.format_report()
+        return obs.format_desks(self)
 
 
     # ---------------------------------------------------------------------
@@ -1093,35 +1090,14 @@ class MultiAssetQuantBot:
         self.running = True
         self._dash_universe()
         self._dash_heartbeat()
-        if self.discovery_report:
-            send_telegram_message(self.discovery_report.telegram_html(preview=int(getattr(config, "DISCOVERY_REPORT_PREVIEW", 80))))
-        send_telegram_message(self._startup_message())
+        send_telegram_message(self._startup_message(), event_type="RUNTIME", enrich=False)
         return True
 
     def _startup_message(self) -> str:
-        lines = ["🏛 <b>DESK-WISE PORTFOLIO COMMAND CENTER ONLINE</b>", ""]
-        lines.append("<b>Execution universe — asset desks with venue routing:</b>")
-        for ctx in self.contexts:
-            inst = ctx.instrument
-            venues = ", ".join(f"{ex.value.upper()}:{ei.display_symbol}" for ex, ei in inst.by_exchange.items())
-            lev = self._instrument_leverage(inst)
-            pol = active_policy(inst)
-            cadence = getattr(pol, "loop_interval_sec", getattr(pol, "tick_eval_sec", 0.0))
-            desk_id = self.ticker_desk.router.desk_id_for(inst) if self.ticker_desk is not None else "UNKNOWN"
-            lines.append(f"• <b>{desk_id}</b> / <b>{inst.asset_id}</b> — {inst.primary_exchange.value.upper()}:{inst.display_symbol} | venues {venues} | lev {lev}x | {pol.asset_class} | risk×{pol.risk_multiplier:.2f} | margin {pol.margin_pct:.0%} | cadence {float(cadence):.2f}s")
-        lines.append("")
-        lines.append("<b>Portfolio rules:</b>")
-        lines.append(f"• Multiple simultaneous contracts allowed: {self.guard.max_open_positions} portfolio slots")
-        lines.append(f"• One live/entering/exit slot per contract: max {self.guard.max_per_contract}")
-        lines.append(f"• Balance allocation: {self.guard.budget_mode}; cash is slot-scoped, risk base is {self.guard.risk_budget_mode}; sizing uses per-instrument policy, not BTC defaults")
-        lines.append("• Live exchange products only; no synthetic symbols. Indian market runtime is options-only; cash/futures rows are rejected before execution.")
-        lines.append("• BTC is one global asset desk; Delta/CoinSwitch/CoinDCX are execution/data routes, not separate BTC strategies.")
-        lines.append("• Option desks use Black-Scholes diagnostics, DTE/theta controls, spread/liquidity checks and no leverage.")
-        lines.append("• Alpha remains posterior/EV based; PortfolioGuard only controls exposure mechanics")
-        return "\n".join(lines)
+        return obs.format_startup(self)
 
     def run(self) -> None:
-        logger.info("📊 Multi-asset loop active")
+        logger.info("🏛 Institutional desk loop active — desk-wise audit enabled")
         while self.running:
             try:
                 now_ms = int(time.time() * 1000)
@@ -1132,7 +1108,7 @@ class MultiAssetQuantBot:
                     report_sec = float(getattr(config, "FUND_CIO_REPORT_SEC", 30.0))
                     if report_sec > 0 and _now - self._last_cio_report_log >= report_sec:
                         self._last_cio_report_log = _now
-                        logger.info("CIO_SELECTION\n%s", self.cio.format_report() if self.cio else "")
+                        logger.info("%s", obs.format_cycle_log(self))
                 for ctx in list(self.contexts):
                     if not ctx.ready:
                         self._maybe_activate_dormant_icici(ctx)
@@ -1209,12 +1185,13 @@ class MultiAssetQuantBot:
             pos = ctx.strategy.get_position()
             state = ctx.phase_name if pos else "SCANNING"
             with instrument_scope(inst):
-                logger.info(
-                    "ANALYSIS_TICK asset=%s primary=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d %s",
-                    inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
-                    state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
-                    self.guard.report_line(ctx),
-                )
+                if dt_ms > 250.0:
+                    logger.info(
+                        "DESK_LATENCY asset=%s venue=%s symbol=%s state=%s price=%.4f eval_ms=%.1f slots=%d/%d policy=%s",
+                        inst.asset_id, inst.primary_exchange.value.upper(), inst.display_symbol,
+                        state, price, dt_ms, self.guard.count_open(self.contexts), self.guard.max_open_positions,
+                        self.guard.report_line(ctx),
+                    )
         except Exception as e:
             logger.debug("analysis audit failed for %s: %s", ctx.instrument.asset_id, e)
 
@@ -1229,7 +1206,7 @@ class MultiAssetQuantBot:
             pos = ctx.strategy.get_position()
             state = "IN_POSITION" if pos else "SCANNING"
             with instrument_scope(ctx.instrument):
-                logger.info("%s %s %s | price %.4f | %s | open=%d/%d",
+                logger.info("DESK_HEARTBEAT asset=%s venue=%s symbol=%s price=%.4f state=%s open=%d/%d",
                             ctx.instrument.asset_id, ctx.instrument.primary_exchange.value.upper(),
                             ctx.instrument.display_symbol, price, state,
                             self.guard.count_open(self.contexts), self.guard.max_open_positions)
@@ -1244,7 +1221,7 @@ class MultiAssetQuantBot:
                 ctx.data_manager.stop()
             except Exception:
                 pass
-        send_telegram_message("🛑 <b>MULTI-ASSET INSTITUTIONAL BOT STOPPED</b>")
+        send_telegram_message("🛑 <b>HEDGE-FUND COMMAND CENTER STOPPED</b>", event_type="RUNTIME", enrich=False)
 
 
 def main() -> None:
@@ -1252,6 +1229,20 @@ def main() -> None:
     if threading.current_thread() is threading.main_thread():
         def _signal_handler(signum, frame):
             logger.info("Shutdown signal %s received", signum)
+            try:
+                import json, os, time as _time
+                from pathlib import Path
+                Path("data").mkdir(exist_ok=True)
+                Path("data/last_shutdown.json").write_text(json.dumps({
+                    "component": "multi_asset_bot",
+                    "signal": int(signum),
+                    "pid": os.getpid(),
+                    "ppid": os.getppid(),
+                    "time": _time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    "note": "External SIGTERM/SIGINT received by Python process; sender not available via standard signal handler.",
+                }, indent=2))
+            except Exception:
+                pass
             bot.stop()
             sys.exit(0)
         signal.signal(signal.SIGINT, _signal_handler)
