@@ -930,3 +930,9 @@ INDIA_RISK_FREE_RATE = 0.065
 ICICI_USE_UNDERLYING_CHART_FOR_STRUCTURE = True
 ICICI_LONG_PREMIUM_ONLY = True
 ICICI_UNDERLYING_MIN_READY_1M_BARS = 20
+
+# v101 Breeze compliance/rate guard. Breeze historicalcharts interval for 1m is
+# "minute" (not "1minute"). Multi-desk ICICI startup uses a shared throttle so
+# option/underlying historical warmups do not burst through account API limits.
+ICICI_BREEZE_THROTTLE_ENABLED = True
+ICICI_BREEZE_MIN_CALL_GAP_SEC = 0.35
