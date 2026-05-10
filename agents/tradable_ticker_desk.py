@@ -24,6 +24,11 @@ from core.instruments import AssetClass, ExchangeName, TradableInstrument, norma
 from fund.types import clamp, safe_float
 from .desk_router import InstitutionalDeskRouter
 from .indian_options_desk import IndianOptionsDesk
+try:
+    from exchanges.icici.rate_limiter import breeze_throttle
+except Exception:  # pragma: no cover
+    def breeze_throttle(reason: str = "breeze") -> None:
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +371,7 @@ class TradableTickerDesk:
         for inst in candidates[:limit]:
             try:
                 if hasattr(icici_api, "get_quote_for_instrument"):
+                    breeze_throttle(f"quote_probe:{inst.asset_id}")
                     out[str(inst.asset_id)] = icici_api.get_quote_for_instrument(inst.primary)
             except Exception as exc:
                 failures += 1

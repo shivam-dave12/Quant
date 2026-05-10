@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 
 from .api import BreezeRestClient
 from .market_session import icici_market_session_state
+from .rate_limiter import breeze_throttle
 
 logger = logging.getLogger(__name__)
 
@@ -131,10 +132,10 @@ class ICICIOptionDataManager:
 
     def _load_historical(self, timeframe: str) -> None:
         raw = getattr(getattr(self.instrument, "primary", None), "raw", {}) or {}
-        # Breeze v1/v2 documents these intervals: 1minute, 5minute, 30minute, 1day.
-        # There is no native 15minute or 1h interval; use 5m/30m source bars
+        # Breeze historicalcharts accepts: minute, 5minute, 30minute, day.
+        # There is no native 15m/1h interval; use 5m/30m source bars
         # rather than sending unsupported values and getting empty historicals.
-        interval = {"1m": "1minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "1day", "1d": "1day"}.get(timeframe, "1minute")
+        interval = {"1m": "minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "day", "1d": "day"}.get(timeframe, "minute")
         to_dt = datetime.now(timezone.utc)
         from_dt = to_dt - timedelta(days=5 if timeframe in {"1m", "5m", "15m"} else 45)
         body = {
@@ -149,6 +150,7 @@ class ICICIOptionDataManager:
             "strike_price": str(raw.get("strike_price") or raw.get("StrikePrice") or ""),
         }
         req = {k: v for k, v in body.items() if v}
+        breeze_throttle(f"historical:{timeframe}:{getattr(self.instrument, 'asset_id', '?')}")
         resp = self.api.get_historical_charts(**req)
         rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
         if not rows and bool(_cfg("ICICI_HISTORICAL_V2_FALLBACK", True)):
@@ -167,6 +169,7 @@ class ICICIOptionDataManager:
                 v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 pass
+            breeze_throttle(f"historical_v2:{timeframe}:{getattr(self.instrument, 'asset_id', '?')}")
             resp = self.api.get_historical_charts_v2(**v2_req)
             rows = resp.get("Success") or resp.get("data") or resp.get("result") or []
         if isinstance(rows, dict):
@@ -186,6 +189,7 @@ class ICICIOptionDataManager:
                 self._last_price = float(parsed[-1]["close"])
 
     def _refresh_quote(self) -> None:
+        breeze_throttle(f"quote:{getattr(self.instrument, 'asset_id', '?')}")
         q = self.api.get_quote_for_instrument(getattr(self.instrument, "primary", None))
         row = q.get("Success") if isinstance(q, dict) else {}
         if isinstance(row, list) and row:

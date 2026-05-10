@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 
 import config
 from .api import BreezeRestClient
+from .rate_limiter import breeze_throttle
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ class ICICIUnderlyingDataManager:
                 logger.debug("ICICI underlying historical warmup %s failed for %s: %s", tf, self._underlying_code(), exc)
 
     def _load_historical(self, timeframe: str) -> None:
-        interval = {"1m": "1minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "1day", "1d": "1day"}.get(timeframe, "5minute")
+        interval = {"1m": "minute", "5m": "5minute", "15m": "5minute", "1h": "30minute", "4h": "day", "1d": "day"}.get(timeframe, "minute")
         to_dt = datetime.now(timezone.utc)
         from_dt = to_dt - timedelta(days=7 if timeframe in {"1m", "5m", "15m"} else 90)
         base_req = {
@@ -130,6 +131,7 @@ class ICICIUnderlyingDataManager:
         # candles are generated.
         for req in (base_req, {**base_req, "product_type": "Cash"}):
             try:
+                breeze_throttle(f"underlying_historical:{timeframe}:{self._underlying_code()}")
                 resp = self.api.get_historical_charts(**{k: v for k, v in req.items() if v})
                 rows = self._rows(resp)
                 if rows:
@@ -143,6 +145,7 @@ class ICICIUnderlyingDataManager:
             v2_req["from_date"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
             v2_req["to_date"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
             try:
+                breeze_throttle(f"underlying_historical_v2:{timeframe}:{self._underlying_code()}")
                 resp = self.api.get_historical_charts_v2(**v2_req)
                 rows = self._rows(resp)
             except Exception:
